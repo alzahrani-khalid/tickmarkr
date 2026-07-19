@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a change that respects tickmarkr's design invariants
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem and how your proposal respects tickmarkr's five design invariants
+        (see [CONTRIBUTING.md](../../CONTRIBUTING.md)). Paste version and doctor output so maintainers
+        can see your environment before triage.
+
+  - type: input
+    id: tickmarkr-version
+    attributes:
+      label: tickmarkr version
+      description: Output of `tickmarkr version`
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: tickmarkr doctor output
+      description: Paste the full output of `tickmarkr doctor`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: invariant
+    attributes:
+      label: Which design invariant does this proposal touch?
+      description: Pick the primary invariant your proposal affects
+      options:
+        - acceptance[] required on every task
+        - Integration branches only (tickmarkr/<runId>, never main)
+        - Gates never trust worker claims
+        - State is files + git only
+        - Machine-parseable verdicts (fail closed)
+        - Does not touch an invariant
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What problem does this solve, and how should it work?
+    validations:
+      required: true

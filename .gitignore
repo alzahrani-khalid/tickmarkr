@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+.tickmarkr/
+.env
+.env.*
+*.local.*
+.DS_Store

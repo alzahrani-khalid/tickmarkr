@@ -1,0 +1,37 @@
+➜  tickmarkr-run-20260718-212717--T2 git:(tickmarkr/run-20260718-212717--T2) ✗ cd /Users/operator/Desktop/CodingSpace/tickmarkr && codex -a never -s workspace-write -c "mcp_servers={}" -c "mcp_servers.wedge.command=\"/bin/sleep\"" -c "mcp_servers.wedge.args=[\"3600\"]"
+╭─────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.5)                      │
+│                                                 │
+│ model:     gpt-5.6-sol xhigh   /model to change │
+│ directory: ~/Desktop/CodingSpace/tickmarkr      │
+╰─────────────────────────────────────────────────╯
+
+  Tip: Use /personality to customize how Codex communicates.
+
+• You have 3 usage limit resets available. Run /usage to use one.
+
+⚠ MCP client for `wedge` timed out after 30 seconds. Add or adjust `startup_timeout_sec` in your
+  config.toml:
+  [mcp_servers.wedge]
+  startup_timeout_sec = XX
+
+⚠ MCP startup incomplete (failed: wedge)
+➜  tickmarkr git:(spec/v1.57-stall-watchdog) ✗
+➜  tickmarkr git:(spec/v1.57-stall-watchdog) ✗ codex -a never -s workspace-write -c "mcp_servers={}" -c "mcp_servers.wedge.command=\"/bin/sleep\"" -c "mcp_servers.wedge.args=[\"3600\"]" -c "mcp_servers.wedge.startup_timeout_sec=600"
+╭─────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.5)                      │
+│                                                 │
+│ model:     gpt-5.6-sol xhigh   /model to change │
+│ directory: ~/Desktop/CodingSpace/tickmarkr      │
+╰─────────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+• You have 3 usage limit resets available. Run /usage to use one.
+
+• Starting MCP servers (7/8): wedge (32s • esc to interrupt)
+
+
+› Run /review on my current changes
+
+  gpt-5.6-sol xhigh · ~/Desktop/CodingSpace/tickmarkr

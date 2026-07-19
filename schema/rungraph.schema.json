@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "spec": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "speckit",
+            "gsd",
+            "prd",
+            "native",
+            "taskmaster"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "paths",
+        "hash"
+      ]
+    },
+    "tasks": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "goal": {
+            "type": "string",
+            "minLength": 1
+          },
+          "shape": {
+            "type": "string",
+            "enum": [
+              "plan",
+              "spec",
+              "implement",
+              "tests",
+              "docs",
+              "migration",
+              "ui",
+              "refactor",
+              "chore"
+            ]
+          },
+          "complexity": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "deps": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "files": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "context": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "acceptance": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "oracle": {
+                      "type": "string",
+                      "const": "command"
+                    },
+                    "command": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "oracle",
+                    "command"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "oracle": {
+                      "type": "string",
+                      "const": "test"
+                    },
+                    "test": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "oracle",
+                    "test"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "oracle": {
+                      "type": "string",
+                      "const": "judge"
+                    },
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "oracle",
+                    "text"
+                  ]
+                }
+              ]
+            }
+          },
+          "scopeHints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "confidence": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "paths"
+              ]
+            }
+          },
+          "gates": {
+            "default": [
+              "build",
+              "test",
+              "lint",
+              "evidence",
+              "scope",
+              "acceptance",
+              "review"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "build",
+                "test",
+                "lint",
+                "evidence",
+                "scope",
+                "acceptance",
+                "review"
+              ]
+            }
+          },
+          "routingHints": {
+            "type": "object",
+            "properties": {
+              "pin": {
+                "type": "object",
+                "properties": {
+                  "via": {
+                    "type": "string"
+                  },
+                  "model": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "via",
+                  "model"
+                ]
+              },
+              "floor": {
+                "type": "string",
+                "enum": [
+                  "cheap",
+                  "mid",
+                  "frontier"
+                ]
+              },
+              "source": {
+                "type": "string"
+              },
+              "escalate": {
+                "type": "boolean"
+              }
+            }
+          },
+          "humanGate": {
+            "default": false,
+            "type": "boolean"
+          },
+          "timeoutMinutes": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "status": {
+            "default": "pending",
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "gated",
+              "failed",
+              "done",
+              "human"
+            ]
+          },
+          "evidence": {
+            "default": {
+              "commits": [],
+              "artifacts": [],
+              "gateResults": []
+            },
+            "type": "object",
+            "properties": {
+              "commits": {
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "artifacts": {
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "gateResults": {
+                "default": [],
+                "type": "array",
+                "items": {}
+              }
+            }
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "goal",
+          "shape",
+          "complexity",
+          "acceptance"
+        ]
+      }
+    }
+  },
+  "required": [
+    "version",
+    "spec",
+    "tasks"
+  ],
+  "$comment": "Structural schema only; duplicate-id/unknown-dep/cycle checks live in validateGraph()."
+}

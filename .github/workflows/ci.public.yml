@@ -1,0 +1,36 @@
+# The public tree's CI — shipped by the export in place of the private ci.yml, which the export
+# excludes because its selftest job invokes the private export script that never ships.
+# Everything here runs against the checked-out tree on its own: no private files, no secrets,
+# no agent CLIs. No paths-ignore: documentation-only PRs get a conclusive check too.
+name: CI (public)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-public-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Runs ONLY in the public repo. This file is tracked privately (the export ships it),
+    # but in the private tree the manifest suite would correctly fail against .planning/
+    # and every private push would bill a second full CI run. After the launch rename the
+    # private repo is tickmarkr-dev, so the canonical name selects the public repo alone.
+    if: github.repository == 'alzahrani-khalid/tickmarkr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      # full suite, coverage-gated — includes the export-boundary manifest suite, which in the
+      # public tree validates the current git index and never skips
+      - run: npm run test:coverage

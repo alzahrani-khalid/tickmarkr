@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    // ANSI/control-char regexes are deliberate (baseline fingerprinting, status-watch strip helpers)
+    "eslint/no-control-regex": "off",
+    // style preference — long dense lines and regex anchors are intentional in this repo
+    "unicorn/prefer-string-starts-ends-with": "off"
+  },
+  "env": {
+    "builtin": true
+  }
+}

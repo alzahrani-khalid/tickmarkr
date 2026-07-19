@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "spec": {
+    "source": "gsd",
+    "paths": [".planning/phases/01-run-graph/01-01-PLAN.md"],
+    "hash": "abc123def456abc123def456abc123def456abc123def456abc123def456abcd"
+  },
+  "tasks": [
+    {
+      "id": "P01-01",
+      "title": "Define RunGraph schema and validation",
+      "goal": "Establish the RunGraph data model with zod validation, cycle detection, and the load/save primitives",
+      "shape": "implement",
+      "complexity": 5,
+      "deps": [],
+      "files": ["src/graph/**", "src/config/**"],
+      "context": [".planning/phases/01-run-graph/01-01-PLAN.md"],
+      "acceptance": ["validateGraph accepts a valid graph", "cycle detection works"],
+      "gates": ["build", "test", "lint", "evidence", "scope", "acceptance", "review"],
+      "humanGate": false,
+      "status": "done",
+      "evidence": {
+        "commits": ["abc111", "abc222"],
+        "artifacts": [".tickmarkr/runs/run-20260701-120000/prompts/T1-P01-01.md"],
+        "gateResults": [
+          { "gate": "build", "pass": true, "details": "npm run build clean" },
+          { "gate": "test", "pass": true, "details": "npm test green" },
+          { "gate": "lint", "pass": true, "details": "no lint issues" },
+          { "gate": "evidence", "pass": true, "details": "2 commits found" },
+          { "gate": "scope", "pass": true, "details": "files match the allowed set" },
+          { "gate": "acceptance", "pass": true, "details": "criteria met" },
+          { "gate": "review", "pass": true, "details": "review approved" }
+        ]
+      }
+    },
+    {
+      "id": "P01-02",
+      "title": "Add graph load/save helpers",
+      "goal": "Implement loadGraph, saveGraph, getTask, setStatus, readyTasks, and isComplete",
+      "shape": "implement",
+      "complexity": 3,
+      "deps": ["P01-01"],
+      "files": ["src/graph/graph.ts"],
+      "context": [],
+      "acceptance": ["saveGraph writes valid JSON", "loadGraph re-validates on read"],
+      "gates": ["build", "test", "lint", "evidence", "scope", "acceptance", "review"],
+      "humanGate": false,
+      "status": "pending",
+      "evidence": {
+        "commits": [],
+        "artifacts": [],
+        "gateResults": []
+      }
+    }
+  ]
+}

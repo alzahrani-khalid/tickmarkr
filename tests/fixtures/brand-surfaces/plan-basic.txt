@@ -1,0 +1,14 @@
+tickmarkr plan — dry run (12 channels available)
+mode: risk-based (default) · explore on
+
+  T1     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    floor cheap ← mode risk-based
+
+est. cost (API channels only, rough): ~$0.00 + judge/review/consult calls
+
+routing lints:
+  ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
+  ! codex: no detection data — run tickmarkr doctor
+  ! cursor-agent: no detection data — run tickmarkr doctor
+  ! opencode: no detection data — run tickmarkr doctor
+  ! pi: no detection data — run tickmarkr doctor

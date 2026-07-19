@@ -1,0 +1,3 @@
+const ROOT = join(import.meta.dirname, "../..");
+const PHASE = join(ROOT, ".planning/phases/43-readable-worker-panes");
+const MEAS = join(PHASE, "measurement");

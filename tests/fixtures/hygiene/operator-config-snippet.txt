@@ -1,0 +1,9 @@
+  test("MODEL-10: loadConfig resolves grok tiers from DEFAULT_CONFIG after overlay dedup", () => {
+    const overlay = join(process.cwd(), ".tickmarkr", "config.yaml");
+    if (!existsSync(overlay)) return;
+    const models = loadConfig(process.cwd()).tiers["cursor-agent"].models;
+    expect(models["grok-4.5-xhigh"]).toBe("mid");
+    expect(models["grok-4.5-fast-xhigh"]).toBe("cheap");
+    expect(loadConfig(process.cwd()).setup).toBe("npm install --no-audit --no-fund");
+    expect(loadConfig(process.cwd()).taskTimeoutMinutes).toBe(15);
+  });

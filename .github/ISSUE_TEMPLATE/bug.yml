@@ -1,0 +1,44 @@
+name: Bug report
+description: Report incorrect tickmarkr behavior with evidence maintainers can verify
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. **Triage requires verifiable evidence** — paste the outputs below
+        (redact secrets). Support is best-effort on the **latest tickmarkr version only**.
+
+  - type: input
+    id: tickmarkr-version
+    attributes:
+      label: tickmarkr version
+      description: Output of `tickmarkr version` (and `node --version` if relevant)
+      placeholder: "tickmarkr v1.59.0 · node v20.x"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: tickmarkr doctor output
+      description: Paste the full output of `tickmarkr doctor` (makes real CLI probes; may take a minute)
+    validations:
+      required: true
+
+  - type: textarea
+    id: journal-excerpt
+    attributes:
+      label: journal excerpt
+      description: Paste relevant lines from `.tickmarkr/runs/<runId>/journal.jsonl` for the failing task or run
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: What happened?
+      description: Minimal steps to reproduce, expected vs actual behavior
+    validations:
+      required: true

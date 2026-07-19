@@ -1,0 +1,2 @@
+{"taskId":"T1","shape":"implement","adapter":"codex","model":"gpt-5.6-terra","channel":"sub","attempts":1,"outcome":"done","durationMs":520586,"firstAttemptOk":true,"gateFails":0,"consults":0,"tokens":{"input":145199,"output":14925,"cacheRead":2600704},"meteredAttempts":1}
+{"taskId":"T2","shape":"tests","adapter":"pi","model":"zai/glm-5.2","channel":"sub","attempts":1,"outcome":"done","durationMs":640604,"firstAttemptOk":true,"gateFails":0,"consults":0,"tokens":{"input":67392,"output":28003,"cacheRead":965504,"cacheWrite":0},"meteredAttempts":1}

@@ -1,0 +1,195 @@
+{
+  "sample": {
+    "version": 1,
+    "spec": {
+      "source": "prd",
+      "paths": [
+        "fixtures/sample.prd.md"
+      ],
+      "hash": "d14f70f03043d8abe9d1329dd36cf496e41eff96eb016f10ca613f0dbe42d250"
+    },
+    "tasks": [
+      {
+        "id": "T1",
+        "title": "Implement greet(name) in src/greet.js",
+        "goal": "Implement greet(name) in src/greet.js",
+        "shape": "implement",
+        "complexity": 3,
+        "deps": [],
+        "files": [
+          "src/**"
+        ],
+        "context": [],
+        "acceptance": [
+          "greet(\"\u0064rover\") returns a string containing \"\u0064rover\"",
+          "module exports a single function"
+        ],
+        "gates": [
+          "build",
+          "test",
+          "lint",
+          "evidence",
+          "scope",
+          "acceptance",
+          "review"
+        ],
+        "humanGate": false,
+        "status": "pending",
+        "evidence": {
+          "commits": [],
+          "artifacts": [],
+          "gateResults": []
+        }
+      },
+      {
+        "id": "T2",
+        "title": "Cover greet with tests",
+        "goal": "Cover greet with tests",
+        "shape": "tests",
+        "complexity": 5,
+        "deps": [
+          "T1"
+        ],
+        "files": [
+          "test/**"
+        ],
+        "context": [],
+        "acceptance": [
+          "tests fail when greet drops the name",
+          "npm test exits 0"
+        ],
+        "gates": [
+          "build",
+          "test",
+          "lint",
+          "evidence",
+          "scope",
+          "acceptance",
+          "review"
+        ],
+        "humanGate": false,
+        "status": "pending",
+        "evidence": {
+          "commits": [],
+          "artifacts": [],
+          "gateResults": []
+        }
+      },
+      {
+        "id": "T3",
+        "title": "Document usage in README",
+        "goal": "Document usage in README",
+        "shape": "docs",
+        "complexity": 5,
+        "deps": [
+          "T1"
+        ],
+        "files": [],
+        "context": [],
+        "acceptance": [
+          "README shows an executable example"
+        ],
+        "gates": [
+          "build",
+          "test",
+          "lint",
+          "evidence",
+          "scope",
+          "acceptance",
+          "review"
+        ],
+        "humanGate": true,
+        "status": "pending",
+        "evidence": {
+          "commits": [],
+          "artifacts": [],
+          "gateResults": []
+        }
+      }
+    ]
+  },
+  "pin": {
+    "version": 1,
+    "spec": {
+      "source": "prd",
+      "paths": [
+        "fixtures/sample-pin.prd.md"
+      ],
+      "hash": "966c8809023a8947bef65e2caf85cca524f411b747cba89a7e5b07b2f2e87314"
+    },
+    "tasks": [
+      {
+        "id": "T1",
+        "title": "Implement pinned compiler work",
+        "goal": "Implement pinned compiler work",
+        "shape": "implement",
+        "complexity": 7,
+        "deps": [],
+        "files": [
+          "src/compiler.ts",
+          "src/types.ts"
+        ],
+        "context": [],
+        "acceptance": [
+          "compiler returns a graph"
+        ],
+        "gates": [
+          "build",
+          "test",
+          "lint",
+          "evidence",
+          "scope",
+          "acceptance",
+          "review"
+        ],
+        "routingHints": {
+          "pin": {
+            "via": "claude-code",
+            "model": "sonnet"
+          }
+        },
+        "humanGate": false,
+        "status": "pending",
+        "evidence": {
+          "commits": [],
+          "artifacts": [],
+          "gateResults": []
+        }
+      },
+      {
+        "id": "T2",
+        "title": "Verify pinned compiler work",
+        "goal": "Verify pinned compiler work",
+        "shape": "tests",
+        "complexity": 5,
+        "deps": [
+          "T1"
+        ],
+        "files": [
+          "tests/compiler.test.ts"
+        ],
+        "context": [],
+        "acceptance": [
+          "tests reject malformed input",
+          "reviewer approves the output"
+        ],
+        "gates": [
+          "build",
+          "test",
+          "lint",
+          "evidence",
+          "scope",
+          "acceptance",
+          "review"
+        ],
+        "humanGate": true,
+        "status": "pending",
+        "evidence": {
+          "commits": [],
+          "artifacts": [],
+          "gateResults": []
+        }
+      }
+    ]
+  }
+}

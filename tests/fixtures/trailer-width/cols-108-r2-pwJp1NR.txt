@@ -1,0 +1,31 @@
+bash '/Users/operator/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees/tickmarkr-run-20260711-185020--P43-03/.planning/phases/43-readable-worker-panes/measurement/probe-run.sh'
+➜  tickmarkr bash '/Users/operator/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees/tickmarkr-run-20260711-185020--P43-03/.planning/phases/43-readable-worker-panes/measurement/probe-run.sh'
+PROBE_TPUT_COLS=108
+2026.07.09-a3815c0
+PROBE_AGENT_START
+
+
+  Cursor Agent
+  v2026.07.09-a3815c0
+  Tip: Use /config to customize Cursor settings and behavior.
+
+
+  You are running a tickmarkr measurement probe. Do NOT use tools. Reply with ONLY one final line (no
+  code fence):
+  TICKMARKR_RESULT_vis09probe {"ok":true,"summary":"VIS-09 trailer-width probe: this summary is
+  intentionally long enough to force hard-wrapping of the TICKMARKR_RESULT JSON at narrow pane widths
+  so we can measure when parseWorkerResult stops recovering the trailer from real TUI
+  output.","deviations":[]}
+
+
+  TICKMARKR_RESULT_vis09probe {"ok":true,"summary":"VIS-09 trailer-width probe: this summary is
+  intentionally long enough to force hard-wrapping of the TICKMARKR_RESULT JSON at narrow pane widths so we
+  can measure when parseWorkerResult stops recovering the trailer from real TUI
+  output.","deviations":[]}
+
+
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  → Add a follow-up
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  Auto · 16.1%                                                                              Run Everything
+  ~/Desktop/CodingSpace/tickmarkr · milestone/v1.12-native-grok

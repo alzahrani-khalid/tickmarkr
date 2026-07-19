@@ -1,0 +1,99 @@
+{"ts":"2026-07-11T02:51:59.977Z","event":"run-start","data":{"baseRef":"28279f3106d6541c8f17f49384351edebfbd16e2","commands":{"build":"npm run -s build","test":"npm run -s test"},"channels":["claude-code:fable","claude-code:opus","claude-code:sonnet","claude-code:haiku","codex:gpt-5.6-sol","codex:gpt-5.5","codex:gpt-5.6-terra","codex:gpt-5.6-luna","cursor-agent:composer-2.5","cursor-agent:grok-4.5-xhigh","cursor-agent:grok-4.5-fast-xhigh","opencode:zai-coding-plan/glm-5.2","pi:zai/glm-5.2","pi:openai-codex/gpt-5.6-sol","pi:anthropic/claude-opus-4-8"]}}
+{"ts":"2026-07-11T02:52:00.070Z","event":"task-dispatch","taskId":"P01-parseDuration","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":0,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:00.072Z","event":"task-dispatch","taskId":"P02-semverCompare","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":0,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:00.073Z","event":"task-dispatch","taskId":"P03-topoSort","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":0,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:00.074Z","event":"task-dispatch","taskId":"P04-lruCache","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":0,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:00.076Z","event":"task-dispatch","taskId":"P05-parseCsvLine","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":0,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:00.077Z","event":"task-dispatch","taskId":"P06-rpnEval","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":0,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:03.351Z","event":"worktree-setup","taskId":"P04-lruCache","data":{"code":0}}
+{"ts":"2026-07-11T02:52:03.355Z","event":"worktree-setup","taskId":"P05-parseCsvLine","data":{"code":0}}
+{"ts":"2026-07-11T02:52:03.357Z","event":"worktree-setup","taskId":"P03-topoSort","data":{"code":0}}
+{"ts":"2026-07-11T02:52:03.361Z","event":"worktree-setup","taskId":"P02-semverCompare","data":{"code":0}}
+{"ts":"2026-07-11T02:52:03.361Z","event":"worktree-setup","taskId":"P06-rpnEval","data":{"code":0}}
+{"ts":"2026-07-11T02:52:03.362Z","event":"worktree-setup","taskId":"P01-parseDuration","data":{"code":0}}
+{"ts":"2026-07-11T02:52:05.089Z","event":"worker-result","taskId":"P04-lruCache","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:06.190Z","event":"worker-result","taskId":"P05-parseCsvLine","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:06.254Z","event":"worker-result","taskId":"P03-topoSort","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:06.256Z","event":"worker-result","taskId":"P06-rpnEval","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:06.334Z","event":"worker-result","taskId":"P02-semverCompare","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:06.385Z","event":"worker-result","taskId":"P01-parseDuration","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:52.096Z","event":"gate-result","taskId":"P04-lruCache","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:52.096Z","event":"gate-result","taskId":"P04-lruCache","data":{"gate":"test","pass":false,"details":"new failures vs baseline:\n❯ tests/run/daemon-interactive.test.ts (# tests | # failed) #ms\nTest Files # failed | # passed | # skipped (#)\nTests # failed | # passed | # skipped (#)\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests # ⎯⎯⎯⎯⎯⎯⎯\nFAIL tests/run/daemon-interactive.test.ts > daemon v#.# interactive workers (fake adapter, zero tokens) > interactive rows ARE metered — usage from the disk store, no driver.read on the path"}}
+{"ts":"2026-07-11T02:52:52.097Z","event":"escalation","taskId":"P04-lruCache","data":{"step":"retry","attempt":1}}
+{"ts":"2026-07-11T02:52:52.097Z","event":"task-dispatch","taskId":"P04-lruCache","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":1,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:53.202Z","event":"worktree-setup","taskId":"P04-lruCache","data":{"code":0}}
+{"ts":"2026-07-11T02:52:53.922Z","event":"gate-result","taskId":"P05-parseCsvLine","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:53.922Z","event":"gate-result","taskId":"P05-parseCsvLine","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:53.922Z","event":"gate-result","taskId":"P05-parseCsvLine","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:52:53.923Z","event":"escalation","taskId":"P05-parseCsvLine","data":{"step":"retry","attempt":1}}
+{"ts":"2026-07-11T02:52:53.923Z","event":"task-dispatch","taskId":"P05-parseCsvLine","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":1,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:54.986Z","event":"worktree-setup","taskId":"P05-parseCsvLine","data":{"code":0}}
+{"ts":"2026-07-11T02:52:55.319Z","event":"gate-result","taskId":"P06-rpnEval","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:55.319Z","event":"gate-result","taskId":"P06-rpnEval","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:55.319Z","event":"gate-result","taskId":"P06-rpnEval","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:52:55.320Z","event":"escalation","taskId":"P06-rpnEval","data":{"step":"retry","attempt":1}}
+{"ts":"2026-07-11T02:52:55.320Z","event":"task-dispatch","taskId":"P06-rpnEval","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":1,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:55.636Z","event":"worker-result","taskId":"P04-lruCache","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:55.757Z","event":"gate-result","taskId":"P03-topoSort","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:55.757Z","event":"gate-result","taskId":"P03-topoSort","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:55.757Z","event":"gate-result","taskId":"P03-topoSort","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:52:55.758Z","event":"escalation","taskId":"P03-topoSort","data":{"step":"retry","attempt":1}}
+{"ts":"2026-07-11T02:52:55.758Z","event":"task-dispatch","taskId":"P03-topoSort","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":1,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:56.264Z","event":"gate-result","taskId":"P02-semverCompare","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:56.264Z","event":"gate-result","taskId":"P02-semverCompare","data":{"gate":"test","pass":false,"details":"new failures vs baseline:\n❯ tests/cli/cli.test.ts (# tests | # failed) #ms\n→ expected 'resumed run-x — done: #, failed: #, h…' to match /done: #/\nTest Files # failed | # passed | # skipped (#)\nTests # failed | # passed | # skipped (#)\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests # ⎯⎯⎯⎯⎯⎯⎯\nFAIL tests/cli/cli.test.ts > tickmarkr resume > happy path: continues a prior run from its journal via the fake adapter (zero tokens)\nAssertionError: expected 'resumed run-x — done: #, failed: #, h…' to match /done: #/\n\"resumed run-x — done: #, failed: #, human: #, blocked: #, pending: #"}}
+{"ts":"2026-07-11T02:52:56.265Z","event":"escalation","taskId":"P02-semverCompare","data":{"step":"retry","attempt":1}}
+{"ts":"2026-07-11T02:52:56.265Z","event":"task-dispatch","taskId":"P02-semverCompare","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":1,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:56.619Z","event":"gate-result","taskId":"P01-parseDuration","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:56.620Z","event":"gate-result","taskId":"P01-parseDuration","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:52:56.620Z","event":"gate-result","taskId":"P01-parseDuration","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:52:56.620Z","event":"escalation","taskId":"P01-parseDuration","data":{"step":"retry","attempt":1}}
+{"ts":"2026-07-11T02:52:56.621Z","event":"task-dispatch","taskId":"P01-parseDuration","data":{"assignment":{"adapter":"pi","model":"anthropic/claude-opus-4-8","channel":"sub","tier":"frontier"},"attempt":1,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:52:56.796Z","event":"worktree-setup","taskId":"P06-rpnEval","data":{"code":0}}
+{"ts":"2026-07-11T02:52:57.091Z","event":"worktree-setup","taskId":"P03-topoSort","data":{"code":0}}
+{"ts":"2026-07-11T02:52:57.506Z","event":"worker-result","taskId":"P05-parseCsvLine","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:52:57.846Z","event":"worktree-setup","taskId":"P02-semverCompare","data":{"code":0}}
+{"ts":"2026-07-11T02:52:58.016Z","event":"worktree-setup","taskId":"P01-parseDuration","data":{"code":0}}
+{"ts":"2026-07-11T02:52:59.736Z","event":"worker-result","taskId":"P06-rpnEval","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:53:00.298Z","event":"worker-result","taskId":"P03-topoSort","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:53:01.477Z","event":"worker-result","taskId":"P01-parseDuration","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:53:01.500Z","event":"worker-result","taskId":"P02-semverCompare","data":{"ok":false,"summary":"worker produced no TICKMARKR_RESULT trailer","deviations":[],"finished":true,"exitCode":1,"mode":"print"}}
+{"ts":"2026-07-11T02:53:39.965Z","event":"gate-result","taskId":"P04-lruCache","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:39.966Z","event":"gate-result","taskId":"P04-lruCache","data":{"gate":"test","pass":false,"details":"new failures vs baseline:\n❯ tests/run/daemon-interactive.test.ts (# tests | # failed) #ms\nTest Files # failed | # passed | # skipped (#)\nTests # failed | # passed | # skipped (#)\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests # ⎯⎯⎯⎯⎯⎯⎯\nFAIL tests/run/daemon-interactive.test.ts > daemon v#.# interactive workers (fake adapter, zero tokens) > interactive rows ARE metered — usage from the disk store, no driver.read on the path"}}
+{"ts":"2026-07-11T02:53:39.966Z","event":"escalation","taskId":"P04-lruCache","data":{"step":"escalate","attempt":2}}
+{"ts":"2026-07-11T02:53:39.966Z","event":"failover-deviation","taskId":"P04-lruCache","data":{"site":"escalate","static":"claude-code:fable","chosen":"codex:gpt-5.6-sol"}}
+{"ts":"2026-07-11T02:53:39.966Z","event":"task-dispatch","taskId":"P04-lruCache","data":{"assignment":{"adapter":"codex","model":"gpt-5.6-sol","channel":"sub","tier":"frontier"},"attempt":2,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:53:40.986Z","event":"worktree-setup","taskId":"P04-lruCache","data":{"code":0}}
+{"ts":"2026-07-11T02:53:42.934Z","event":"gate-result","taskId":"P05-parseCsvLine","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:42.934Z","event":"gate-result","taskId":"P05-parseCsvLine","data":{"gate":"test","pass":false,"details":"new failures vs baseline:\n❯ tests/run/daemon-interactive.test.ts (# tests | # failed) #ms\nTest Files # failed | # passed | # skipped (#)\nTests # failed | # passed | # skipped (#)\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests # ⎯⎯⎯⎯⎯⎯⎯\nFAIL tests/run/daemon-interactive.test.ts > daemon v#.# interactive workers (fake adapter, zero tokens) > interactive rows ARE metered — usage from the disk store, no driver.read on the path"}}
+{"ts":"2026-07-11T02:53:42.934Z","event":"escalation","taskId":"P05-parseCsvLine","data":{"step":"escalate","attempt":2}}
+{"ts":"2026-07-11T02:53:42.934Z","event":"failover-deviation","taskId":"P05-parseCsvLine","data":{"site":"escalate","static":"claude-code:fable","chosen":"codex:gpt-5.6-sol"}}
+{"ts":"2026-07-11T02:53:42.935Z","event":"task-dispatch","taskId":"P05-parseCsvLine","data":{"assignment":{"adapter":"codex","model":"gpt-5.6-sol","channel":"sub","tier":"frontier"},"attempt":2,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:53:44.153Z","event":"worktree-setup","taskId":"P05-parseCsvLine","data":{"code":0}}
+{"ts":"2026-07-11T02:53:45.728Z","event":"gate-result","taskId":"P06-rpnEval","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:45.728Z","event":"gate-result","taskId":"P06-rpnEval","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:45.728Z","event":"gate-result","taskId":"P06-rpnEval","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:53:45.728Z","event":"escalation","taskId":"P06-rpnEval","data":{"step":"escalate","attempt":2}}
+{"ts":"2026-07-11T02:53:45.728Z","event":"failover-deviation","taskId":"P06-rpnEval","data":{"site":"escalate","static":"claude-code:fable","chosen":"codex:gpt-5.6-sol"}}
+{"ts":"2026-07-11T02:53:45.729Z","event":"task-dispatch","taskId":"P06-rpnEval","data":{"assignment":{"adapter":"codex","model":"gpt-5.6-sol","channel":"sub","tier":"frontier"},"attempt":2,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:53:46.321Z","event":"gate-result","taskId":"P03-topoSort","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:46.321Z","event":"gate-result","taskId":"P03-topoSort","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:46.321Z","event":"gate-result","taskId":"P03-topoSort","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:53:46.321Z","event":"escalation","taskId":"P03-topoSort","data":{"step":"escalate","attempt":2}}
+{"ts":"2026-07-11T02:53:46.322Z","event":"failover-deviation","taskId":"P03-topoSort","data":{"site":"escalate","static":"claude-code:fable","chosen":"codex:gpt-5.6-sol"}}
+{"ts":"2026-07-11T02:53:46.322Z","event":"task-dispatch","taskId":"P03-topoSort","data":{"assignment":{"adapter":"codex","model":"gpt-5.6-sol","channel":"sub","tier":"frontier"},"attempt":2,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:53:47.000Z","event":"worktree-setup","taskId":"P06-rpnEval","data":{"code":0}}
+{"ts":"2026-07-11T02:53:47.652Z","event":"worktree-setup","taskId":"P03-topoSort","data":{"code":0}}
+{"ts":"2026-07-11T02:53:48.299Z","event":"gate-result","taskId":"P01-parseDuration","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:48.299Z","event":"gate-result","taskId":"P01-parseDuration","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:48.299Z","event":"gate-result","taskId":"P01-parseDuration","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:53:48.299Z","event":"escalation","taskId":"P01-parseDuration","data":{"step":"escalate","attempt":2}}
+{"ts":"2026-07-11T02:53:48.299Z","event":"failover-deviation","taskId":"P01-parseDuration","data":{"site":"escalate","static":"claude-code:fable","chosen":"codex:gpt-5.6-sol"}}
+{"ts":"2026-07-11T02:53:48.300Z","event":"task-dispatch","taskId":"P01-parseDuration","data":{"assignment":{"adapter":"codex","model":"gpt-5.6-sol","channel":"sub","tier":"frontier"},"attempt":2,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:53:49.001Z","event":"gate-result","taskId":"P02-semverCompare","data":{"gate":"build","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:49.001Z","event":"gate-result","taskId":"P02-semverCompare","data":{"gate":"test","pass":true,"details":"exit 0"}}
+{"ts":"2026-07-11T02:53:49.001Z","event":"gate-result","taskId":"P02-semverCompare","data":{"gate":"evidence","pass":false,"details":"no commits — worker claimed work but committed nothing"}}
+{"ts":"2026-07-11T02:53:49.001Z","event":"escalation","taskId":"P02-semverCompare","data":{"step":"escalate","attempt":2}}
+{"ts":"2026-07-11T02:53:49.001Z","event":"failover-deviation","taskId":"P02-semverCompare","data":{"site":"escalate","static":"claude-code:fable","chosen":"codex:gpt-5.6-sol"}}
+{"ts":"2026-07-11T02:53:49.002Z","event":"task-dispatch","taskId":"P02-semverCompare","data":{"assignment":{"adapter":"codex","model":"gpt-5.6-sol","channel":"sub","tier":"frontier"},"attempt":2,"provenance":"pin pi:anthropic/claude-opus-4-8 (task hint, exp06)"}}
+{"ts":"2026-07-11T02:53:49.850Z","event":"worktree-setup","taskId":"P01-parseDuration","data":{"code":0}}
+{"ts":"2026-07-11T02:53:50.302Z","event":"worktree-setup","taskId":"P02-semverCompare","data":{"code":0}}

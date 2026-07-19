@@ -1,0 +1,17 @@
+tickmarkr plan — dry run (2 channels available)
+mode: risk-based (default) · explore on
+
+model auth: 2 channel(s) unauthed — claude-code:fable (HTTP 403: forbidden — probed 2026-07-13), claude-code:opus (insufficient credit — probed 2026-07-13)
+
+  T1     migration  !! T1: no channel at tier>=frontier; available: claude-code:sonnet, claude-code:haiku
+    floor frontier ← mode risk-based
+
+est. cost (API channels only, rough): ~$0.00 + judge/review/consult calls
+
+routing lints:
+  ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
+  ! routing seed names dead adapter 'cursor-agent' for shape 'implement' — auto-prefer is routing around it
+  ! routing seed names dead adapter 'codex' for shape 'implement' — auto-prefer is routing around it
+  ! routing seed names dead adapter 'opencode' for shape 'tests' — auto-prefer is routing around it
+  ! review: no cross-vendor reviewer pair in fleet — set review.required: false to waive
+  ! T1: unroutable — T1: no channel at tier>=frontier; available: claude-code:sonnet, claude-code:haiku

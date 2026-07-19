@@ -1,0 +1,161 @@
+{
+  "run-20260708-014223": {
+    "P01-01": "done",
+    "P01-02": "done",
+    "P01-03": "done"
+  },
+  "run-20260708-104100": {
+    "P02-01": "done",
+    "P02-02": "done",
+    "P02-03": "done"
+  },
+  "run-20260708-131243": {
+    "P03-01": "done",
+    "P03-02": "done",
+    "P03-03": "human"
+  },
+  "run-20260708-143742": {
+    "P03-03": "done",
+    "P03-04": "done"
+  },
+  "run-20260711-021241": {
+    "P29-01": "done",
+    "P29-02": "done",
+    "P29-03": "done",
+    "P29-04": "done"
+  },
+  "run-20260711-023953": {
+    "P30-01": "done",
+    "P30-02": "human"
+  },
+  "run-20260711-032005": {
+    "P30-01": "done",
+    "P30-02": "done",
+    "P30-03": "done"
+  },
+  "run-20260711-034830": {
+    "P01-clamp": "done",
+    "P02-chunk": "done",
+    "P03-uniq": "done",
+    "P04-docs-glossary": "done",
+    "P05-docs-overview": "done",
+    "P06-docs-faq": "done"
+  },
+  "run-20260711-040652": {},
+  "run-20260711-040830": {
+    "P01-clamp": "done",
+    "P02-chunk": "done",
+    "P03-uniq": "done",
+    "P04-docs-glossary": "done",
+    "P05-docs-overview": "done",
+    "P06-docs-faq": "done"
+  },
+  "run-20260711-050438": {
+    "P01-parseDuration": "pending",
+    "P02-semverCompare": "pending",
+    "P03-topoSort": "pending"
+  },
+  "run-20260711-052304": {
+    "P01-parseDuration": "done",
+    "P02-semverCompare": "done",
+    "P03-topoSort": "done",
+    "P04-lruCache": "done",
+    "P05-parseCsvLine": "done",
+    "P06-rpnEval": "done"
+  },
+  "run-20260711-053124": {
+    "P01-parseDuration": "done",
+    "P02-semverCompare": "done",
+    "P03-topoSort": "done",
+    "P04-lruCache": "done",
+    "P05-parseCsvLine": "done",
+    "P06-rpnEval": "done"
+  },
+  "run-20260711-053555": {
+    "P01-parseDuration": "done",
+    "P02-semverCompare": "done",
+    "P03-topoSort": "done",
+    "P04-lruCache": "done",
+    "P05-parseCsvLine": "done",
+    "P06-rpnEval": "done"
+  },
+  "run-20260711-054342": {
+    "P01-parseDuration": "done",
+    "P02-semverCompare": "done",
+    "P03-topoSort": "done",
+    "P04-lruCache": "done",
+    "P05-parseCsvLine": "done",
+    "P06-rpnEval": "done"
+  },
+  "run-20260711-054746": {
+    "P01-parseDuration": "done",
+    "P02-semverCompare": "done",
+    "P03-topoSort": "done",
+    "P04-lruCache": "done",
+    "P05-parseCsvLine": "done",
+    "P06-rpnEval": "done"
+  },
+  "run-20260711-055133": {
+    "P01-parseDuration": "pending",
+    "P02-semverCompare": "pending",
+    "P03-topoSort": "pending",
+    "P04-lruCache": "pending",
+    "P05-parseCsvLine": "pending",
+    "P06-rpnEval": "pending"
+  },
+  "run-20260711-055809": {
+    "P33-01": "done",
+    "P33-02": "done",
+    "P33-03": "done"
+  },
+  "run-20260711-062008": {
+    "P34-01": "done",
+    "P34-02": "done"
+  },
+  "run-20260711-075017": {
+    "P35-01": "done"
+  },
+  "run-20260711-083431": {
+    "P36-01": "done",
+    "P36-02": "done"
+  },
+  "run-20260711-085948": {
+    "P37-01": "done"
+  },
+  "run-20260711-101750": {
+    "P38-01": "done"
+  },
+  "run-20260711-104426": {
+    "P39-01": "done",
+    "P39-02": "done",
+    "P39-03": "done"
+  },
+  "run-20260711-132625": {
+    "P40-01": "done",
+    "P40-02": "done"
+  },
+  "run-20260711-142742": {
+    "P41-01": "done",
+    "P41-02": "done"
+  },
+  "run-20260711-154920": {
+    "P42-01": "pending"
+  },
+  "run-20260711-165142": {
+    "P42-01": "done"
+  },
+  "run-20260711-185020": {
+    "P43-01": "done",
+    "P43-02": "done",
+    "P43-03": "done"
+  },
+  "run-20260712-003216": {
+    "P44-01": "done",
+    "P44-02": "done",
+    "P44-03": "done",
+    "P44-04": "done"
+  },
+  "run-20260712-010826": {
+    "P45-01": "done"
+  }
+}

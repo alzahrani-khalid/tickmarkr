@@ -1,0 +1,80 @@
+➜  tickmarkr git:(milestone/v1.12-native-grok) bash '/Users/operator/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees/tickmarkr-run-20260711-185020--P43-03/.planning/phases/43-readable-worker-panes/measurement/probe-run.sh'
+PROBE_TPUT_COLS=25
+2026.07.09-a3815c0
+PROBE_AGENT_START
+
+
+  Cursor Agent
+  v2026.07.09-a3815c0
+  Tip: Use /mcp to
+  connect Cursor to
+  your tools and data
+  sources.
+
+
+  You are running
+  a tickmarkr
+  measurement
+  probe. Do NOT
+  use tools.
+  Reply with ONLY
+  one final line
+  (no code
+  fence):
+  TICKMARKR_RESULT_v
+  is09probe
+  {"ok":true,"sum
+  mary":"VIS-09
+  trailer-width
+  probe: this
+  summary is
+  intentionally
+  long enough to
+  force
+  hard-wrapping
+  of the
+  TICKMARKR_RESULT
+  JSON at narrow
+  pane widths so
+  we can measure
+  when
+  parseWorkerResu
+  lt stops
+  recovering the
+  trailer from
+  real TUI
+  output.","devia
+  tions":[]}
+
+
+  TICKMARKR_RESULT_vis09
+  probe {"ok":true,"s
+  ummary":"VIS-09
+  trailer-width
+  probe: this summary
+  is intentionally
+  long enough to
+  force hard-wrapping
+  of the
+  TICKMARKR_RESULT JSON
+  at narrow pane
+  widths so we can
+  measure when
+  parseWorkerResult
+  stops recovering
+  the trailer from
+  real TUI output.","
+  deviations":[]}
+
+
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  → Add a follow-up
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  Au·15  Run Everything
+  to .8
+     %
+
+
+  ~/Desktop/CodingSpace/
+  tickmarkr · milestone/v1.
+  12-native-grok

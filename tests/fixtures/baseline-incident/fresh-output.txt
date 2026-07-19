@@ -1,0 +1,15 @@
+[tickmarkr] tickmarkr run-20260711-154920: 1 done, 0 failed, 0 awaiting human
+[tickmarkr] routing 2 channel(s) — claude-code (1), codex (1)
+stdout | tests/config/config.test.ts > tickmarkr approve — fail-closed human gate approval
+
+ ❯ tests/config/config.test.ts (2 tests | 1 failed) 5ms
+   × config > MODEL-10 > loadConfig resolves grok tiers 4ms
+     → expected 15 to be 35 // Object.is equality
+   ✓ config > MODEL-10 > a passing one 0ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  tests/config/config.test.ts > config > MODEL-10 > loadConfig resolves grok tiers
+AssertionError: expected 15 to be 35
+ Test Files  1 failed (1)
+      Tests  1 failed | 815 passed (816)

@@ -1,0 +1,2 @@
+{"taskId":"P02-01","shape":"tests","adapter":"opencode","model":"opencode/kimi-k2","channel":"api","attempts":1,"outcome":"done","durationMs":438346,"firstAttemptOk":true,"tokens":{"input":1000000,"output":500000},"meteredAttempts":1}
+{"taskId":"T1","shape":"implement","adapter":"pi","model":"zai/glm-5.2","channel":"sub","attempts":3,"outcome":"done","durationMs":1366854,"firstAttemptOk":false,"tokens":{"input":1000000,"output":1000000},"meteredAttempts":1}

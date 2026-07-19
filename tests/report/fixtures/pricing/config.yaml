@@ -1,0 +1,6 @@
+cost:
+  models:
+    "opencode/kimi-k2": { inPerMtok: 2, outPerMtok: 8, rateDate: 2026-07-13 }
+    "zai/glm-5.2": { inPerMtok: 5, outPerMtok: 25, rateDate: 2026-07-13 }
+  subs:
+    pi: { planMonthly: 100, windowsPerMonthLow: 400, windowsPerMonthHigh: 1200 }

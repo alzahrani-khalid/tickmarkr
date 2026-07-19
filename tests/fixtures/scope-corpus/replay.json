@@ -1,0 +1,93 @@
+[
+  {
+    "runId": "run-20260708-104100",
+    "taskId": "P02-03",
+    "offenders": [
+      ".planning/phases/02-routing-hints/02-03-SUMMARY.md"
+    ],
+    "deviations": [
+      ".planning/phases/02-routing-hints/02-03-SUMMARY.md (required by the plan's <output>section, outside the declared file scope)"
+    ],
+    "historicalPass": true,
+    "details": "out-of-scope but declared as deviation:\n.planning/phases/02-routing-hints/02-03-SUMMARY.md\ndeclared: .planning/phases/02-routing-hints/02-03-SUMMARY.md (required by the plan's <output>section, outside the declared file scope)",
+    "line": 58
+  },
+  {
+    "runId": "run-20260708-143742",
+    "taskId": "P03-03",
+    "offenders": [
+      ".planning/phases/03-starvation-visibility/03-03-SUMMARY.md"
+    ],
+    "deviations": [
+      ".planning/phases/03-starvation-visibility/03-03-SUMMARY.md — created per the plan's<output> requirement, outside the declared file scope"
+    ],
+    "historicalPass": true,
+    "details": "out-of-scope but declared as deviation:\n.planning/phases/03-starvation-visibility/03-03-SUMMARY.md\ndeclared: .planning/phases/03-starvation-visibility/03-03-SUMMARY.md — created per the plan's<output> requirement, outside the declared file scope",
+    "line": 19
+  },
+  {
+    "runId": "run-20260711-023953",
+    "taskId": "P30-01",
+    "offenders": [
+      "tests/route/matrix.test.ts"
+    ],
+    "deviations": [
+      "tests/route/matrix.test.ts"
+    ],
+    "historicalPass": true,
+    "details": "out-of-scope but declared as deviation:\ntests/route/matrix.test.ts\ndeclared: tests/route/matrix.test.ts",
+    "line": 8
+  },
+  {
+    "runId": "run-20260711-023953",
+    "taskId": "P30-01",
+    "offenders": [
+      "tests/route/matrix.test.ts"
+    ],
+    "deviations": [
+      "tests/route/matrix.test.ts"
+    ],
+    "historicalPass": true,
+    "details": "out-of-scope but declared as deviation:\ntests/route/matrix.test.ts\ndeclared: tests/route/matrix.test.ts",
+    "line": 18
+  },
+  {
+    "runId": "run-20260711-032005",
+    "taskId": "P30-01",
+    "offenders": [
+      "tests/route/matrix.test.ts"
+    ],
+    "deviations": [
+      "tests/route/matrix.test.ts — cheap-band pin updated for new grok cheap seed (required for full npm test green, outside declared file scope)"
+    ],
+    "historicalPass": true,
+    "details": "out-of-scope but declared as deviation:\ntests/route/matrix.test.ts\ndeclared: tests/route/matrix.test.ts — cheap-band pin updated for new grok cheap seed (required for full npm test green, outside declared file scope)",
+    "line": 8
+  },
+  {
+    "runId": "run-20260711-034830",
+    "taskId": "P01-clamp",
+    "offenders": [
+      "vitest.config.ts"
+    ],
+    "deviations": [
+      "vitest.config.ts (added calibration/** to test include glob so the out-of-tests/ test file is discoverable)"
+    ],
+    "historicalPass": true,
+    "details": "out-of-scope but declared as deviation:\nvitest.config.ts\ndeclared: vitest.config.ts (added calibration/** to test include glob so the out-of-tests/ test file is discoverable)",
+    "line": 13
+  },
+  {
+    "runId": "run-20260711-034830",
+    "taskId": "P03-uniq",
+    "offenders": [
+      "vitest.config.ts"
+    ],
+    "deviations": [
+      "vitest.config.ts"
+    ],
+    "historicalPass": true,
+    "details": "out-of-scope but declared as deviation:\nvitest.config.ts\ndeclared: vitest.config.ts",
+    "line": 24
+  }
+]

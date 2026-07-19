@@ -1,0 +1,74 @@
+[
+  {
+    "cols": 108,
+    "capture": "cols-108-r1-pwJp1NM.txt",
+    "repeat": 1,
+    "parseOk": true,
+    "summaryLen": 229,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  },
+  {
+    "cols": 53,
+    "capture": "cols-53-r1-pwJp1NN.txt",
+    "repeat": 1,
+    "parseOk": true,
+    "summaryLen": 226,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  },
+  {
+    "cols": 25,
+    "capture": "cols-25-r1-pwJp1NP.txt",
+    "repeat": 1,
+    "parseOk": false,
+    "summaryLen": 40,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  },
+  {
+    "cols": 24,
+    "capture": "cols-24-r1-pwJp1NQ.txt",
+    "repeat": 1,
+    "parseOk": false,
+    "summaryLen": 40,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  },
+  {
+    "cols": 108,
+    "capture": "cols-108-r2-pwJp1NR.txt",
+    "repeat": 2,
+    "parseOk": true,
+    "summaryLen": 229,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  },
+  {
+    "cols": 53,
+    "capture": "cols-53-r2-pwJp1NS.txt",
+    "repeat": 2,
+    "parseOk": true,
+    "summaryLen": 226,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  },
+  {
+    "cols": 25,
+    "capture": "cols-25-r2-pwJp1NT.txt",
+    "repeat": 2,
+    "parseOk": false,
+    "summaryLen": 40,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  },
+  {
+    "cols": 24,
+    "capture": "cols-24-r2-pwJp1NV.txt",
+    "repeat": 2,
+    "parseOk": false,
+    "summaryLen": 40,
+    "cli": "cursor-agent",
+    "cliVersion": "2026.07.09-a3815c0"
+  }
+]
