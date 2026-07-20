@@ -2058,7 +2058,9 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       interactive: true,
       slot: async (cwd: string, name: string) => ({ id: "p1", name, cwd }),
       run: async (_s: { id: string; name: string; cwd: string }, cmd: string) => {
-        const m = /TICKMARKR_RESULT_([0-9a-z]+)/i.exec(cmd);
+        // v1.62 T1: the delivered line is a nonce-free script invocation — the trailer lives in the script
+        const p = /^bash '(.+)'$/.exec(cmd)?.[1];
+        const m = p ? /TICKMARKR_RESULT_([0-9a-z]+)/i.exec(readFileSync(p, "utf8")) : null;
         if (m) nonce = m[1];
       },
       waitOutput: async () => {

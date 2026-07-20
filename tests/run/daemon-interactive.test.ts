@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -50,8 +50,9 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
       { tasks: { T1: [{ shell: `echo alive > v.txt && ${COMMIT} v`, result: { ok: true, summary: "tui still open" } }] } },
     );
     const inner = new SubprocessDriver();
-    // strip the appended exit marker from the WORKER command only (gates/consult still need theirs)
-    // and hold the process open — models a TUI that finished but didn't exit
+    // strip the exit marker from the WORKER dispatch script only (gates/consult still need theirs)
+    // and hold the process open — models a TUI that finished but didn't exit. v1.62 T1: the delivered
+    // line is a script invocation, so the marker is edited out of the script file, not the line.
     const driver = idriver({
       slot: inner.slot.bind(inner),
       waitOutput: inner.waitOutput.bind(inner),
@@ -59,8 +60,14 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
       read: inner.read.bind(inner),
       close: inner.close.bind(inner),
       worktree: inner.worktree.bind(inner),
-      run: (s: Slot, cmd: string) =>
-        inner.run(s, cmd.includes("TICKMARKR_RESULT") ? cmd.replace(/; printf.*$/, "; sleep 3") : cmd),
+      run: (s: Slot, cmd: string) => {
+        const p = /^bash '(.+)'$/.exec(cmd)?.[1];
+        const script = p ? readFileSync(p, "utf8") : "";
+        if (p && script.includes("TICKMARKR_RESULT")) {
+          writeFileSync(p, script.replace(/\nprintf[^\n]*\$\?$/, "\nsleep 3"));
+        }
+        return inner.run(s, cmd);
+      },
     });
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-alive", driver });
     expect(s.done).toEqual(["T1"]);

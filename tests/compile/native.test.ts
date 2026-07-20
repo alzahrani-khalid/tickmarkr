@@ -260,6 +260,54 @@ describe("native spec test-oracle collectable-home lint (OBS-97)", () => {
     expect(() => compileNativeText("## T1: SrcOnly\n- files: src/**\n- acceptance:\n  - test: covered\n")).toThrow(/OBS-97/);
   });
 
+  // v1.62: the probe expands {a,b} alternatives and substitutes ? wildcards before probing.
+  test("a brace glob entry naming collectable test paths passes the collectable home lint", () => {
+    // brace + star (falsely rejected before v1.62)
+    const braced = compileNativeText("## T1: Braced\n- files: tests/{compile,gates}/*.test.ts\n- acceptance:\n  - test: covered\n");
+    expect(braced.tasks[0].files).toEqual(["tests/{compile,gates}/*.test.ts"]);
+    // the brace comma is part of the entry, not a files[] separator; suffix braces expand too
+    const suffix = compileNativeText("## T1: Suffix\n- files: src/a.ts, tests/foo.{test,spec}.ts\n- acceptance:\n  - test: covered\n");
+    expect(suffix.tasks[0].files).toEqual(["src/a.ts", "tests/foo.{test,spec}.ts"]);
+    const filenames = compileNativeText("## T1: Names\n- files: tests/{a,b}.test.ts\n- acceptance:\n  - test: covered\n");
+    expect(filenames.tasks[0].files).toEqual(["tests/{a,b}.test.ts"]);
+  });
+
+  test("a single-character wildcard entry naming a collectable test path passes the collectable home lint", () => {
+    // ? standing in for filename chars, the tests/ prefix, and the .test.ts suffix
+    for (const scope of ["tests/route?.test.ts", "test?/unit.test.ts", "tests/unit.test.t?"]) {
+      const g = compileNativeText(`## T1: Qmark\n- files: ${scope}\n- acceptance:\n  - test: covered\n`);
+      expect(g.tasks[0].files, scope).toEqual([scope]);
+    }
+    // mixed ?s needing DIFFERENT chars per position (per-position search, falsely rejected before)
+    const mixed = compileNativeText("## T1: MixedQ\n- files: test?/unit.tes?.ts\n- acceptance:\n  - test: covered\n");
+    expect(mixed.tasks[0].files).toEqual(["test?/unit.tes?.ts"]);
+  });
+
+  test("pathological brace entries stay bounded and fail closed instead of ballooning compile", () => {
+    // 12 groups would be 4096 branches unbounded — the cap keeps compile instant and the
+    // scope still fails the lint (no branch is collectable)
+    const bomb = "{a,b}".repeat(12) + ".md";
+    expect(() => compileNativeText(`## T1: Bomb\n- files: ${bomb}\n- acceptance:\n  - test: covered\n`)).toThrow(/OBS-97/);
+    // more ?s than the search cap: fail-closed, never a hang
+    expect(() => compileNativeText("## T1: ManyQ\n- files: ?????/????.????.??\n- acceptance:\n  - test: covered\n")).toThrow(/OBS-97/);
+  });
+
+  test("a brace glob entry that cannot host a collectable test path still fails compilation", () => {
+    for (const scope of ["tests/{a,b}.spec.ts", "src/{gates,run}/**", "scripts/{rig,repro}.mjs"]) {
+      expect(() => compileNativeText(`## T1: BracedHomeless\n- files: ${scope}\n- acceptance:\n  - test: covered\n`), scope).toThrow(/OBS-97/);
+    }
+  });
+
+  test("star glob and literal path probes behave as before the extension", () => {
+    for (const scope of ["tests/**/*.ts", "**", "tests/*/unit.test.ts", "tests/a.test.ts", "tests/gates/**"]) {
+      const g = compileNativeText(`## T1: Prior\n- files: ${scope}\n- acceptance:\n  - test: covered\n`);
+      expect(g.tasks[0].files, scope).toEqual([scope]);
+    }
+    for (const scope of ["src/**", "scripts/rig.mjs"]) {
+      expect(() => compileNativeText(`## T1: PriorHomeless\n- files: ${scope}\n- acceptance:\n  - test: covered\n`), scope).toThrow(/OBS-97/);
+    }
+  });
+
   test("a task carrying a typed test oracle and an empty file scope compiles because an empty scope is unrestricted", () => {
     const omitted = compileNativeText("## T1: Unrestricted\n- acceptance:\n  - test: covered\n");
     expect(omitted.tasks[0].files).toEqual([]);

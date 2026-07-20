@@ -7,7 +7,7 @@ import { stringify } from "yaml";
 import { trailerPattern, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, discoverChannels, getAdapter, probeAll, readDoctor } from "../adapters/registry.js";
 import { type Assignment, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter } from "../adapters/types.js";
-import { bannerShell } from "../brand.js";
+import { bannerShell, paneDispatchCommand } from "../brand.js";
 import {
   globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
@@ -638,6 +638,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
 
       const interactive = icmd !== null;
+      // OBS-85 (v1.62 T1): both dispatch branches deliver ONE short script invocation — banner,
+      // adapter command, and nonce exit marker live in a per-attempt script beside the prompt
+      // artifact (the same paneDispatchCommand pattern judge/review/consult dispatches use). The
+      // delivered pane line carries no command substitution and no trailing shell text, so paste
+      // timing can never interleave a `$(…)` with what follows it (the codex corruption class).
+      const workerCmd = interactive ? icmd : adapter.invoke(t, wt, assignment, { promptFile }).command;
+      const dispatchScript = promptFile.replace(/\.md$/, ".sh");
+      writeFileSync(dispatchScript, [
+        "export BASH_SILENCE_DEPRECATION_WARNING=1",
+        bannerShell(),
+        workerCmd,
+        exitMarkerCmd,
+      ].join("\n"));
       // SPEND-01: this attempt's dispatch wall-clock — the usage collect cursor. Captured once here, the
       // single site, so a test can reason about it; keep Date.now() out of profile.ts (still pure) and
       // out of adapter module scope (the cursor is a parameter, threaded from the daemon).
@@ -679,9 +692,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (interactive) {
         // v1.2 interactive: the TUI doesn't exit on completion — the trailer is the finish line.
         // The exit wrapper still fires if the TUI dies (crash/quit): fast-fail instead of burning the timeout.
-        // T5: the pane announces itself first — same brand header (logo + dim identity) as the
-        // judge/review/consult dispatch scripts; one printf one-liner, dispatch mechanics unchanged.
-        await driver.run(slot, `${bannerShell()}; ${icmd}; ${exitMarkerCmd}`);
+        await driver.run(slot, paneDispatchCommand(dispatchScript));
         let paged = false;
         // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
         // Any other blocked/idle dialog still pages the operator (paged latch below).
@@ -766,9 +777,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           output = await driver.read(slot, 1000);
         }
       } else {
-        const inv = adapter.invoke(t, wt, assignment, { promptFile });
-        // T5: same brand header as the interactive path and the gate/consult dispatch scripts.
-        await driver.run(slot, `${bannerShell()}; ${inv.command}; ${exitMarkerCmd}`);
+        await driver.run(slot, paneDispatchCommand(dispatchScript));
         // OBS-54: headless workers have the same output-inactivity budget as visible panes.
         // OBS-82: same normalized-snapshot compare as the interactive site — spinner-only repaints
         // exhaust the budget here too; harvest below still reads the raw pane.

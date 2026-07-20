@@ -2,11 +2,14 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { HerdrDriver } from "../../src/drivers/herdr.js";
+import { DELIVERY_ATTEMPTS, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string } }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once" }
+
+// OBS-85 fixture text: what the incident panes actually showed instead of the typed dispatch line.
+const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
 
 function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string; cwd: string } {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-"));
@@ -14,6 +17,7 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const map = join(dir, "agents.txt"); // agent rename registry: "<name> <paneId>" per line
   const ctr = join(dir, "tabctr.txt"); // incTabs: distinct tab ids (t1,t2,…) so coexisting tabs are distinguishable
   const taken = join(dir, "taken.txt"); // DEFECT-01: names a prior (killed) process's kept pane still holds
+  const verctr = join(dir, "verctr.txt"); // corrupt:"once" — first delivery verify fails, later ones match
   const bin = join(dir, "herdr");
   const cwd = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-cwd-"));
   if (opts.takenNames?.length) writeFileSync(taken, opts.takenNames.join("\n") + "\n");
@@ -46,6 +50,16 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const agentList = opts.survivingWatch
     ? `echo '{"result":{"agents":[{"name":"${opts.survivingWatch.name}","pane_id":"${opts.survivingWatch.pane}","workspace_id":"wTEST"}]}}'`
     : `echo '{"result":{"agents":[]}}'`;
+  // OBS-85: the delivery read-back rides `wait output --match <cmd>` (exit 0 = pane echoed the typed
+  // command). corrupt:"always" never matches; corrupt:"once" fails the first verify then matches —
+  // the cleared-and-retyped path. pane read then serves the corrupted-transcript capture.
+  const waitOutput =
+    opts.corrupt === "always"
+      ? "exit 1"
+      : opts.corrupt === "once"
+        ? `n=$(cat '${verctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${verctr}'; [ $n -le 1 ] && exit 1; exit 0`
+        : `exit ${waitExit}`;
+  const paneRead = opts.corrupt ? CORRUPT_READ : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
@@ -61,9 +75,10 @@ case "$1 $2" in
   "pane layout") ${paneLayout} ;;
   "pane close") ${paneClose} ;;
   "notification show") echo '{}' ;;
-  "wait output") exit ${waitExit} ;;
+  "wait output") ${waitOutput} ;;
   "wait agent-status") exit 0 ;;
-  "pane read")   printf 'line1\\nTICKMARKR_EXIT:0\\n' ;;
+  "pane send-text") echo '{}' ;;
+  "pane read")   ${paneRead} ;;
   *) echo '{}' ;;
 esac
 `,
@@ -108,7 +123,8 @@ describe("HerdrDriver (stubbed binary)", () => {
     await d.close(slot);
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("agent get n1"); // re-resolution happened
-    expect(calls).toContain("pane run w1:p42 echo hi"); // fresh id used, not the cached w1:p9
+    expect(calls).toContain("pane send-text w1:p42 echo hi"); // fresh id used, not the cached w1:p9
+    expect(calls).toContain("pane send-keys w1:p42 Enter"); // delivery verified, then entered (OBS-85)
     expect(calls).toContain("pane read w1:p42 --source recent-unwrapped --lines 50");
     expect(calls).toContain("tab close w1:t1"); // slot now carries a tabId → close reaps the whole tab
   });
@@ -174,6 +190,87 @@ esac
     const d = new HerdrDriver(bin);
     await d.notify("run done", { sound: "done" });
     expect(readFileSync(log, "utf8")).toContain("notification show run done --sound done");
+  });
+});
+
+// OBS-85: pane paste corrupted the codex dispatch line twice across two runs (v1.58 T2, v1.61 T10) —
+// `pane run` pressed Enter on a line nobody had verified. run() now types (send-text, NO enter),
+// reads the pane's own transcript back, and presses Enter only when it contains the typed command;
+// a corrupted paste is cleared (C-u) and retyped, bounded, then fails closed with the transcript.
+describe("HerdrDriver verified delivery (OBS-85)", () => {
+  test("a verified delivery types the command reads the pane back and only then presses enter", async () => {
+    const { bin, log, cwd } = makeStub();
+    const d = new HerdrDriver(bin);
+    await d.run(await d.slot(cwd, "n1"), "echo hi");
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const send = lines.findIndex((l) => l === "pane send-text w1:p42 echo hi");
+    const read = lines.findIndex((l, i) => i > send && l.startsWith("wait output w1:p42 --match echo hi"));
+    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
+    expect(send).toBeGreaterThanOrEqual(0);
+    expect(read).toBeGreaterThan(send); // read-back (transcript match for the typed command) after typing…
+    expect(enter).toBeGreaterThan(read); // …and Enter only after the read-back verified
+    expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(1); // clean first try — no retype
+    // the command never rides the atomic text+enter verb (slot()'s env seed legitimately still does)
+    expect(lines.some((l) => l.startsWith("pane run ") && l.includes("echo hi"))).toBe(false);
+  });
+
+  test("a delivery whose read back lacks the typed command is cleared and retyped", async () => {
+    const { bin, log, cwd } = makeStub(0, { corrupt: "once" });
+    const d = new HerdrDriver(bin);
+    await d.run(await d.slot(cwd, "n1"), "echo hi"); // resolves — second attempt reads back faithfully
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const sends = lines.flatMap((l, i) => (l === "pane send-text w1:p42 echo hi" ? [i] : []));
+    const clear = lines.findIndex((l) => l === "pane send-keys w1:p42 C-u");
+    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
+    expect(sends).toHaveLength(2); // typed, corrupted read-back, retyped
+    expect(clear).toBeGreaterThan(sends[0]); // the corrupted line is cleared…
+    expect(clear).toBeLessThan(sends[1]); // …before the retype
+    expect(enter).toBeGreaterThan(sends[1]); // Enter only for the verified retype
+  });
+
+  test("a delivery that stays corrupted after bounded retries throws without ever pressing enter", async () => {
+    const { bin, log, cwd } = makeStub(0, { corrupt: "always" });
+    const d = new HerdrDriver(bin);
+    await expect(d.run(await d.slot(cwd, "n1"), "echo hi")).rejects.toThrow(/corrupted after 3 attempts/);
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-text /gm)).toHaveLength(DELIVERY_ATTEMPTS); // bounded, never looped
+    expect(calls).not.toMatch(/pane send-keys \S+ Enter/); // enter never pressed
+  });
+
+  test("the corruption error carries the captured pane transcript", async () => {
+    const { bin, cwd } = makeStub(0, { corrupt: "always" });
+    const d = new HerdrDriver(bin);
+    // the stub's corrupted read-back is the OBS-85 incident text — the error must quote it
+    await expect(d.run(await d.slot(cwd, "n1"), "echo hi")).rejects.toThrow(/rev-parseprintf/);
+  });
+
+  test("no code path presses enter on a delivery whose read back verification did not contain the typed command", async () => {
+    // corrupt-once: two delivery read-backs, only ONE of them verified → exactly one Enter
+    const once = makeStub(0, { corrupt: "once" });
+    const d1 = new HerdrDriver(once.bin);
+    await d1.run(await d1.slot(once.cwd, "n1"), "echo hi");
+    const lines = readFileSync(once.log, "utf8").trim().split("\n");
+    expect(lines.filter((l) => l.startsWith("wait output w1:p42 --match echo hi"))).toHaveLength(2);
+    expect(lines.filter((l) => l === "pane send-keys w1:p42 Enter")).toHaveLength(1);
+    // corrupt-always: zero verified read-backs → zero Enters, anywhere
+    const never = makeStub(0, { corrupt: "always" });
+    const d2 = new HerdrDriver(never.bin);
+    await expect(d2.run(await d2.slot(never.cwd, "n2"), "echo hi")).rejects.toThrow();
+    expect(readFileSync(never.log, "utf8")).not.toMatch(/pane send-keys \S+ Enter/);
+  });
+
+  test("every existing driver run call site keeps working under the verified delivery sequence", async () => {
+    // the two run() shapes call sites dispatch today: a worker/gate command into a task slot, and
+    // narrator()'s watch command into its split pane — both must deliver (type→verify→enter) end to end
+    const { bin, log, cwd } = makeStub();
+    const d = new HerdrDriver(bin);
+    await d.run(await d.slot(cwd, "T1-worker-fake-a0-tag"), "bash dispatch.sh");
+    await d.narrator(cwd, "tickmarkr status --watch", "run-x");
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("pane send-text w1:p42 bash dispatch.sh");
+    expect(calls).toContain("pane send-keys w1:p42 Enter");
+    expect(calls).toContain("pane send-text w1:p7 tickmarkr status --watch");
+    expect(calls).toContain("pane send-keys w1:p7 Enter");
   });
 });
 
@@ -566,7 +663,8 @@ describe("HerdrDriver narrator pane (T2)", () => {
     expect(calls).toContain("agent rename w1:p7 tickmarkr:watch:run:0:run-watch");
     expect(calls).not.toContain("tab create");
     expect(calls.match(/pane split /g)).toHaveLength(1);
-    expect(calls.match(/pane run w1:p7 tickmarkr status --watch/g)).toHaveLength(1);
+    expect(calls.match(/pane send-text w1:p7 tickmarkr status --watch/g)).toHaveLength(1); // OBS-85 verified delivery
+    expect(calls.match(/pane send-keys w1:p7 Enter/g)).toHaveLength(1);
     expect(second).toEqual(first);
     expect(first.tabId).toBeUndefined();
     await d.close(first);

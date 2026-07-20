@@ -151,12 +151,88 @@ describe("worker/judge header parity (T5)", () => {
     } as ExecutorDriver;
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-wb", driver });
     expect(s.done).toEqual(["T1"]);
-    // the worker pane opens with the banner one-liner before the agent command and exit trailer
-    const workerCmd = commands.find((c) => c.includes("TICKMARKR_''EXIT_"))!;
-    expect(workerCmd.startsWith(`${bannerShell()}; `)).toBe(true);
-    // judge/review panes dispatch a script holding the SAME one-liner — one header shape for the fleet
-    const gateCmd = commands.find((c) => c.startsWith("bash '"))!;
-    const script = readFileSync(gateCmd.slice(6, -1), "utf8");
-    expect(script).toContain(bannerShell());
+    // v1.62 T1: EVERY pane dispatch — worker and judge/review alike — is one short script invocation;
+    // both scripts hold the SAME banner one-liner — one header shape for the fleet
+    const scripts = commands.filter((c) => c.startsWith("bash '")).map((c) => readFileSync(c.slice(6, -1), "utf8"));
+    const worker = scripts.find((body) => body.includes("TICKMARKR_RESULT"))!;
+    const gate = scripts.find((body) => !body.includes("TICKMARKR_RESULT"))!;
+    expect(worker).toContain(bannerShell());
+    expect(gate).toContain(bannerShell());
+  }, 30_000);
+});
+
+// v1.62 T1 (OBS-85): worker dispatch delivers a script invocation, never an inline line — the codex
+// paste-corruption class needs a delivered line that interleaves a $(…) substitution with trailing
+// shell text; the script pattern removes both from the delivered line entirely.
+describe("worker dispatch script delivery (v1.62 T1)", () => {
+  interface Captured { line: string; script: string }
+  async function dispatchVia(interactive: boolean, runId: string): Promise<Captured> {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo s > s.txt && ${COMMIT} s`, result: { ok: true, summary: "scripted" } }] } },
+    );
+    const inner = new SubprocessDriver();
+    const commands: string[] = [];
+    const driver: ExecutorDriver = {
+      id: interactive ? "spy-interactive" : "spy",
+      interactive,
+      slot: inner.slot.bind(inner),
+      run: async (s, c) => { commands.push(c); return inner.run(s, c); },
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: async () => {},
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+      status: async () => "unknown",
+    } as ExecutorDriver;
+    const s = await runDaemon(repo, { adapters: [fake], runId, driver });
+    expect(s.done).toEqual(["T1"]);
+    // the worker's delivered line is the one whose script carries the fake's TICKMARKR_RESULT echo
+    const line = commands.find((c) => {
+      const p = /^bash '(.+)'$/.exec(c)?.[1];
+      return p !== undefined && readFileSync(p, "utf8").includes("TICKMARKR_RESULT");
+    })!;
+    return { line, script: readFileSync(/^bash '(.+)'$/.exec(line)![1], "utf8") };
+  }
+  // memoized: two daemon runs total (print + interactive), shared by the four assertions below
+  let printCap: Captured | undefined;
+  let interCap: Captured | undefined;
+  const headless = async () => (printCap ??= await dispatchVia(false, "run-wds-print"));
+  const interactive = async () => (interCap ??= await dispatchVia(true, "run-wds-int"));
+
+  test("a headless worker dispatch delivers a short script invocation with no shell command substitution in the delivered line", async () => {
+    const { line } = await headless();
+    expect(line).toMatch(/^bash '[^']+\.sh'$/);
+    expect(line.length).toBeLessThan(250);
+    expect(line).not.toContain("$(");
+    expect(line).not.toContain("`");
+  }, 30_000);
+
+  test("an interactive worker dispatch delivers a short script invocation with no shell command substitution in the delivered line", async () => {
+    const { line } = await interactive();
+    expect(line).toMatch(/^bash '[^']+\.sh'$/);
+    expect(line.length).toBeLessThan(250);
+    expect(line).not.toContain("$(");
+    expect(line).not.toContain("`");
+  }, 30_000);
+
+  test("the worker dispatch script contains the brand banner then the adapter command then the nonce exit marker in order", async () => {
+    for (const cap of [await headless(), await interactive()]) {
+      const banner = cap.script.indexOf(bannerShell());
+      const adapterCmd = cap.script.indexOf("TICKMARKR_RESULT");
+      const marker = cap.script.search(/TICKMARKR_''EXIT_[0-9a-f]{8}:/); // nonce-suffixed, never the bare trailer
+      expect(banner).toBeGreaterThan(-1);
+      expect(adapterCmd).toBeGreaterThan(banner);
+      expect(marker).toBeGreaterThan(adapterCmd);
+    }
+  }, 30_000);
+
+  test("the nonce appears in the dispatch script but never in the delivered pane line", async () => {
+    for (const cap of [await headless(), await interactive()]) {
+      const nonce = /TICKMARKR_''EXIT_([0-9a-f]{8}):/.exec(cap.script)![1];
+      expect(cap.script).toContain(nonce);
+      expect(cap.line).not.toContain(nonce);
+    }
   }, 30_000);
 });

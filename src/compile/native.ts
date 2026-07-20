@@ -132,25 +132,85 @@ export function compileNative(file: string): RunGraph {
     );
   }
 
-  const csv = (value?: string) => (value && value.toLowerCase() !== "none" ? value.split(",").map((item) => item.trim()).filter(Boolean) : []);
+  // v1.62 (OBS-97): commas inside {a,b} alternatives are part of one glob entry, not separators —
+  // split only at brace depth 0 so a brace glob reaches the lint (and the scope gate) intact.
+  const splitTop = (value: string): string[] => {
+    const parts: string[] = [];
+    let depth = 0;
+    let current = "";
+    for (const ch of value) {
+      if (ch === "," && depth === 0) {
+        parts.push(current);
+        current = "";
+        continue;
+      }
+      if (ch === "{") depth++;
+      else if (ch === "}" && depth > 0) depth--;
+      current += ch;
+    }
+    return [...parts, current];
+  };
+  const csv = (value?: string) => (value && value.toLowerCase() !== "none" ? splitTop(value).map((item) => item.trim()).filter(Boolean) : []);
 
   // OBS-97: a typed test: oracle needs a collectable home. vitest only collects COLLECTABLE_TESTS
   // paths, so a task whose non-empty files[] cannot host one makes scope-green and acceptance-green
   // mutually exclusive by construction — run-20260719-210434 burned two dispatch attempts before a
   // consult diagnosed exactly this. Empty files[] stays exempt: no file scope means unrestricted
   // (src/gates/scope.ts). An entry hosts a collectable path iff its glob can produce one — probed by
-  // substituting each wildcard run with a test-shaped segment (also covers literal test-file paths).
+  // substituting each wildcard run with a test-shaped segment (also covers literal test-file paths);
+  // v1.62 extends the probe to {a,b} brace alternatives and ? single-character wildcards.
   const collectable = picomatch(COLLECTABLE_TESTS, { dot: true });
   // Single-token substitution is not a true glob-overlap test (tests/**/*.ts needs "probe.test",
   // a bare ** needs the whole collectable path) — probe with several test-shaped tokens and accept
   // if ANY candidate satisfies both globs. Scopes that truly cannot host one still fail every probe.
   const PROBE_TOKENS = ["probe.test.ts", "probe.test", "tests/probe.test.ts"];
+  // v1.62: {a,b} alternatives expand to concrete branches before probing (innermost group first, so
+  // nesting resolves); an unbalanced brace is literal to picomatch and stays unexpanded. Expansion is
+  // BOUNDED: past BRANCH_CAP branches, further alternatives are dropped — dropping candidates can only
+  // reject, never accept (every accept needs a concrete witness), so the cap stays fail-closed while a
+  // pathological {a,b}{a,b}… entry can no longer balloon compile time.
+  const BRANCH_CAP = 64;
+  const expandBraces = (glob: string): string[] => {
+    let branches = [glob];
+    for (;;) {
+      let changed = false;
+      const next: string[] = [];
+      for (const branch of branches) {
+        const inner = branch.match(/\{([^{}]*)\}/);
+        if (!inner) {
+          next.push(branch);
+          continue;
+        }
+        changed = true;
+        for (const alt of inner[1].split(",")) next.push(branch.replace(inner[0], alt));
+      }
+      branches = next.slice(0, BRANCH_CAP);
+      if (!changed) return branches;
+    }
+  };
+  // v1.62: a ? never blocks self-match (it matches any one char), so hosting hinges on the probe
+  // clearing the collectable literals — search ? positions over that alphabet PER POSITION (a mixed
+  // scope like test?/unit.tes?.ts needs different chars at each ?). Every accepted probe is a concrete
+  // path satisfying BOTH globs (a witness), so expansion and substitution can only lift false
+  // rejections — a scope with no witness still fails every probe. Bounded: entries with more than
+  // QMARK_CAP ?s stay fail-closed (4^4 = 256 candidates is the ceiling per probe).
+  const QMARK_CHARS = ["t", "e", "s", "."];
+  const QMARK_CAP = 4;
+  const qmarkVariants = (probe: string): string[] => {
+    const qCount = (probe.match(/\?/g) ?? []).length;
+    if (qCount === 0 || qCount > QMARK_CAP) return [probe];
+    let variants = [probe];
+    for (let i = 0; i < qCount; i++) {
+      variants = variants.flatMap((v) => QMARK_CHARS.map((ch) => v.replace("?", ch)));
+    }
+    return [probe, ...variants];
+  };
   const canHostTest = (entry: string) => {
     const self = picomatch(entry, { dot: true });
-    return PROBE_TOKENS.some((token) => {
-      const probe = entry.replace(/\*+/g, token);
-      return self(probe) && collectable(probe);
-    });
+    return expandBraces(entry)
+      .flatMap((branch) => PROBE_TOKENS.map((token) => branch.replace(/\*+/g, token)))
+      .flatMap(qmarkVariants)
+      .some((probe) => self(probe) && collectable(probe));
   };
   const homeless = drafts
     .filter((draft) => {

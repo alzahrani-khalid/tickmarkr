@@ -8,6 +8,11 @@ import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, 
 export const TRAILER_SAFE_FLOOR_COLS = 108;
 export const TRAILER_WIDTH_MARGIN = 2; // cols below (floor + margin) refuse a rightward first split
 
+// OBS-85 verified delivery: bounded type→read-back→enter attempts before failing closed.
+export const DELIVERY_ATTEMPTS = 3;
+const DELIVERY_VERIFY_TIMEOUT_MS = 2000; // per attempt — a paste that hasn't rendered in 2s is retyped
+const DELIVERY_READ_LINES = 80;
+
 /** First-generation join direction from measured trailer-safe floor (43-MEASUREMENT.md). */
 export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILER_SAFE_FLOOR_COLS, margin = TRAILER_WIDTH_MARGIN): "right" | "down" {
   if (paneCols == null || paneCols <= 0) return "down";
@@ -278,10 +283,42 @@ export class HerdrDriver implements ExecutorDriver {
     return { id: pane, name, cwd, tabId: entry.tabId, group };
   }
 
+  // OBS-85 verified delivery: a pane paste can interleave a long dispatch line with itself (codex
+  // `$(git rev-parse…)` mashed into its trailing printf — v1.58 T2 attempts 2-4, v1.61 T10). Never
+  // the atomic `pane run` (text+Enter in one request, uninspectable between the two): type WITHOUT
+  // enter, read the pane back — `wait output --match` checks the same unwrapped transcript pane
+  // read exposes, event-driven so wrap and render timing can't race the check — and press Enter
+  // only when that read-back contains the typed command. A corrupted paste is captured (pane read),
+  // cleared (C-u), and retyped, bounded; persistent corruption fails closed WITH the captured
+  // transcript — the dispatch-time pincer the ledger asks for, not post-hoc `git:` archaeology.
   async run(slot: Slot, cmd: string): Promise<void> {
     const pane = await this.paneId(slot);
-    const r = await this.herdr(`pane run ${shq(pane)} ${shq(cmd)}`, slot.cwd);
-    if (r.code !== 0) throw new Error(`herdr pane run failed: ${r.stderr || r.stdout}`);
+    let transcript = "";
+    for (let attempt = 0; attempt < DELIVERY_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        // clear the corrupted input line before retyping; a failed clear must NOT be retyped onto —
+        // corrupt-prefix + clean-retype would concatenate and false-verify by containment
+        const cleared = await this.herdr(`pane send-keys ${shq(pane)} C-u`, slot.cwd);
+        if (cleared.code !== 0) throw new Error(`herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85); pane transcript:\n${transcript}`);
+      }
+      const typed = await this.herdr(`pane send-text ${shq(pane)} ${shq(cmd)}`, slot.cwd);
+      if (typed.code !== 0) throw new Error(`herdr pane send-text failed: ${typed.stderr || typed.stdout}`);
+      const back = await this.herdr(
+        `wait output ${shq(pane)} --match ${shq(cmd)} --timeout ${DELIVERY_VERIFY_TIMEOUT_MS}`,
+        slot.cwd,
+        DELIVERY_VERIFY_TIMEOUT_MS + 15_000,
+      );
+      // ponytail: transcript containment (scrollback included); anchor to the prompt line if a
+      // prior echo of the same command ever false-verifies. Dead pane → error envelope → unverified.
+      if (this.waitOk(back.code, back.stdout)) {
+        const enter = await this.herdr(`pane send-keys ${shq(pane)} Enter`, slot.cwd);
+        if (enter.code !== 0) throw new Error(`herdr pane send-keys Enter failed: ${enter.stderr || enter.stdout}`);
+        return;
+      }
+      // capture the corrupted delivery BEFORE clearing it — the OBS-85 byte-level evidence
+      transcript = (await this.herdr(`pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`, slot.cwd)).stdout;
+    }
+    throw new Error(`herdr delivery corrupted after ${DELIVERY_ATTEMPTS} attempts — enter never pressed (OBS-85); pane transcript:\n${transcript}`);
   }
 
   private waitOk(code: number, stdout: string): boolean {
