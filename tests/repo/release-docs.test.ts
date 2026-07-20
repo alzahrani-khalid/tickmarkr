@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { afterAll, beforeAll, describe, test, expect } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -263,14 +263,13 @@ describe("release documentation", () => {
         for (const dir of cleanup2) rmSync(dir, { recursive: true, force: true });
       });
 
-      function runOnto(cwd: string, mirrorPath: string): { status: number; stderr: string } {
-        try {
-          execFileSync("bash", [EXPORT_SCRIPT, "--onto", mirrorPath], { cwd, encoding: "utf8" });
-          return { status: 0, stderr: "" };
-        } catch (err) {
-          const e = err as { status: number; stderr: string };
-          return { status: e.status, stderr: e.stderr };
-        }
+      function runOnto(cwd: string, mirrorPath: string): { status: number; stdout: string; stderr: string } {
+        const result = spawnSync("bash", [EXPORT_SCRIPT, "--onto", mirrorPath], {
+          cwd,
+          encoding: "utf8",
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
       }
 
       // source checkout satisfying every file the export reads (version + docs allowlist)
@@ -347,7 +346,10 @@ describe("release documentation", () => {
         git(publicMirror, "config", `url.${publicOrigin}.insteadOf`, PUBLIC_SSH);
 
         const result = runOnto(src, publicMirror);
-        expect(result).toEqual({ status: 0, stderr: "" });
+        expect(result.status).toBe(0);
+        // the test configures an insteadOf rewrite; it should surface the divergence note
+        expect(result.stderr).toMatch(/insteadOf rewrites the mirror origin/);
+        expect(result.stderr).toContain("configured: " + PUBLIC_SSH);
         expect(git(publicMirror, "log", "-1", "--format=%s")).toBe("tickmarkr 9.9.9 — public export");
       });
 
@@ -416,6 +418,233 @@ describe("release documentation", () => {
         expect(result.status).not.toBe(0);
         expect(result.stderr).toMatch(/including ignored files/);
         expect(existsSync(join(ignoredMirror, "secret.log"))).toBe(true);
+      });
+
+      test("a mirror publish that fails after replacement begins restores the mirror to its pristine remote main", () => {
+        // Plant a failing pre-commit hook (invisible to the cleanliness guard) to trigger mid-replacement
+        // failure. The trap should restore the mirror completely — both staged changes and untracked debris.
+        const src = makeSourceRepo();
+        const failOrigin = makeRepo({ "baseline.txt": "baseline public\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-trap-restore-"));
+        cleanup2.push(failOrigin, base);
+
+        const failMirror = join(base, "mirror");
+        git(base, "clone", "-q", failOrigin, failMirror);
+        git(failMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
+        git(failMirror, "config", `url.${failOrigin}.insteadOf`, PUBLIC_HTTPS);
+
+        // Snapshot the clean state before planting the hook
+        const beforeSha = git(failMirror, "rev-parse", "HEAD");
+        const beforeBranch = git(failMirror, "symbolic-ref", "--short", "HEAD");
+        const beforeFiles = new Set(readdirSync(failMirror).filter((f) => f !== ".git"));
+
+        // Plant a failing pre-commit hook in .git/hooks — invisible to status --porcelain --ignored
+        mkdirSync(join(failMirror, ".git", "hooks"), { recursive: true });
+        writeFileSync(
+          join(failMirror, ".git", "hooks", "pre-commit"),
+          "#!/bin/bash\nexit 1\n",
+          { mode: 0o755 }
+        );
+
+        // Verify: the cleanliness guard (status --porcelain --ignored) sees nothing
+        expect(git(failMirror, "status", "--porcelain")).toBe("");
+        expect(git(failMirror, "status", "--porcelain", "--ignored")).toBe("");
+
+        // Run export-public.sh --onto; the commit will fail at pre-commit hook, trap fires
+        const result = runOnto(src, failMirror);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain("failed — restoring");
+
+        // Verify the mirror was restored: same commit, no divergence
+        expect(git(failMirror, "rev-parse", "HEAD")).toBe(beforeSha);
+        expect(git(failMirror, "symbolic-ref", "--short", "HEAD")).toBe(beforeBranch);
+
+        // Verify all tracked and untracked content is gone (trap did reset --hard + clean -qfdx)
+        // Files should match the baseline (minus .git which we exclude from comparison)
+        const afterFiles = new Set(readdirSync(failMirror).filter((f) => f !== ".git"));
+        expect(afterFiles).toEqual(beforeFiles);
+
+        // Verify the index is clean (no staged changes left from the failed replacement)
+        expect(git(failMirror, "status", "--porcelain")).toBe("");
+        // Verify untracked debris is gone (trap ran clean -qfdx on extraction leftovers)
+        expect(git(failMirror, "status", "--porcelain", "--ignored")).toBe("");
+
+        // Verify git metadata survived intact (not clobbered by filesystem ops)
+        git(failMirror, "fsck", "--no-progress");
+      });
+
+      test("the restore path is forced through a planted hook failure the cleanliness guard cannot see", () => {
+        // Focused test: verify that hook failures bypass the pre-run cleanliness guard and still
+        // get caught and restored. This proves the guard's status --porcelain --ignored is blind
+        // to .git/hooks, and the trap path handles recovery.
+        const src = makeSourceRepo();
+        const guardOrigin = makeRepo({ "public.txt": "public\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-hook-guard-check-"));
+        cleanup2.push(guardOrigin, base);
+
+        const guardMirror = join(base, "mirror");
+        git(base, "clone", "-q", guardOrigin, guardMirror);
+        git(guardMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
+        git(guardMirror, "config", `url.${guardOrigin}.insteadOf`, PUBLIC_HTTPS);
+
+        const beforeSha = git(guardMirror, "rev-parse", "HEAD");
+
+        // Plant hook after clone — so it's definitely not visible to any pre-run checks
+        mkdirSync(join(guardMirror, ".git", "hooks"), { recursive: true });
+        writeFileSync(
+          join(guardMirror, ".git", "hooks", "pre-commit"),
+          "#!/bin/bash\nexit 1\n",
+          { mode: 0o755 }
+        );
+
+        // Precondition: verify the guard (invoked by export-public before any mutation) is blind to it
+        const guardResult = git(guardMirror, "status", "--porcelain", "--ignored");
+        expect(guardResult).toBe("");
+
+        // But the export-public command should still fail when git commit tries to run
+        const result = runOnto(src, guardMirror);
+        expect(result.status).not.toBe(0);
+
+        // Verify the trap was invoked by checking for the restore message
+        expect(result.stderr).toMatch(/failed — restoring.*origin\/main/);
+
+        // Verify mirror was restored to exactly its prior state
+        expect(git(guardMirror, "rev-parse", "HEAD")).toBe(beforeSha);
+      });
+
+      test("the mirror publish success path surfaces the origin-rewrite divergence note in its captured diagnostic output", () => {
+        // When the mirror has an insteadOf rewrite configured, the script observes the divergence
+        // between the configured URL and the effective URL, and emits a warning to stderr.
+        // This test verifies the diagnostic is actually captured and observable.
+        const src = makeSourceRepo();
+        const publicOrigin = makeRepo({ "baseline.txt": "baseline\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-divergence-note-"));
+        cleanup2.push(publicOrigin, base);
+
+        const publicMirror = join(base, "mirror");
+        git(base, "clone", "-q", publicOrigin, publicMirror);
+        git(publicMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
+        // Configure an insteadOf rewrite so EFFECTIVE_ORIGIN differs from MIRROR_ORIGIN
+        git(publicMirror, "config", `url.${publicOrigin}.insteadOf`, PUBLIC_HTTPS);
+
+        const result = runOnto(src, publicMirror);
+        expect(result.status).toBe(0);
+        // The divergence note should be observable in stderr, not a hardcoded empty literal
+        expect(result.stderr).toContain("insteadOf rewrites the mirror origin");
+        expect(result.stderr).toContain(publicOrigin);
+        expect(result.stderr).toContain("configured: " + PUBLIC_HTTPS);
+      });
+
+      describe("nothing-to-publish re-export", () => {
+        // First publish + manual push (the operator's documented step), then re-run --onto with
+        // an unchanged source: nothing stages, and the script must say so instead of letting an
+        // empty commit exit 1 and misfire the failure-restore trap.
+        let bareOrigin: string;
+        let reMirror: string;
+        let publishedSha: string;
+        let rerun: { status: number; stdout: string; stderr: string };
+
+        beforeAll(() => {
+          const src = makeSourceRepo();
+          const seedRepo = makeRepo({ "previous-release.txt": "previous public release\n" });
+          const base = mkdtempSync(join(tmpdir(), "tickmarkr-reexport-"));
+          cleanup2.push(seedRepo, base);
+          // bare origin so the mirror's push lands like it would on GitHub
+          bareOrigin = join(base, "origin.git");
+          git(base, "clone", "-q", "--bare", seedRepo, bareOrigin);
+          reMirror = join(base, "mirror");
+          git(base, "clone", "-q", bareOrigin, reMirror);
+          git(reMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
+          git(reMirror, "config", `url.${bareOrigin}.insteadOf`, PUBLIC_HTTPS);
+
+          const first = runOnto(src, reMirror);
+          expect(first.status).toBe(0);
+          git(reMirror, "push", "-q", "origin", "main");
+          publishedSha = git(reMirror, "rev-parse", "HEAD");
+
+          rerun = runOnto(src, reMirror);
+        }, 60_000);
+
+        test("re-running the mirror publish for an already-published unchanged export reports nothing to publish and exits successfully", () => {
+          expect(rerun.status).toBe(0);
+          expect(rerun.stdout).toContain("nothing to publish");
+          // the failure-restore message can no longer appear on a run where nothing actually failed
+          expect(rerun.stderr).not.toContain("failed — restoring");
+          expect(rerun.stdout + rerun.stderr).not.toContain("failed — restoring");
+        });
+
+        test("a nothing-to-publish re-export leaves the mirror at its remote main with no new commit", () => {
+          const remoteMain = git(bareOrigin, "rev-parse", "main");
+          expect(remoteMain).toBe(publishedSha);
+          expect(git(reMirror, "rev-parse", "HEAD")).toBe(remoteMain);
+          expect(git(reMirror, "rev-parse", "origin/main")).toBe(remoteMain);
+          // and it left no debris behind — tree and index clean, metadata intact
+          expect(git(reMirror, "status", "--porcelain", "--ignored")).toBe("");
+          git(reMirror, "fsck", "--no-progress");
+        });
+      });
+
+      // No offline test covers the note's ABSENCE without a rewrite: the identity guard requires
+      // the configured origin to be the real GitHub URL, so a rewrite-free success path would
+      // `git fetch` the live repository — a network dependency the suite must not carry. Absence
+      // follows by construction from the guard's strict-inequality condition, pinned below.
+
+      // The effective-origin divergence guard: its leading comment block and its code.
+      function divergenceGuard(): { comment: string; body: string } {
+        const match = readFile(EXPORT_SCRIPT).match(
+          /((?:[ \t]*#[^\n]*\n)+)([ \t]*EFFECTIVE_ORIGIN=[^\n]*\n[ \t]*if \[\[ -n "\$EFFECTIVE_ORIGIN"[^\n]*\n[\s\S]*?\n[ \t]*fi)/
+        );
+        expect(match, "effective-origin divergence guard not found in export-public.sh").toBeTruthy();
+        return { comment: match![1], body: match![2] };
+      }
+
+      test("a rewritten mirror origin is detected and handled by the shipped divergence policy in a fixture that runs without network access", () => {
+        // The configured origin is the real GitHub URL, but git's insteadOf rewrite sends every
+        // network operation (the script's own `git fetch origin` included) to a local stand-in —
+        // the entire run needs no network access.
+        const src = makeSourceRepo();
+        const localOrigin = makeRepo({ "previous-release.txt": "previous public release\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-divergence-policy-"));
+        cleanup2.push(localOrigin, base);
+        const rewrittenMirror = join(base, "mirror");
+        git(base, "clone", "-q", localOrigin, rewrittenMirror);
+        git(rewrittenMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
+        git(rewrittenMirror, "config", `url.${localOrigin}.insteadOf`, PUBLIC_HTTPS);
+
+        const result = runOnto(src, rewrittenMirror);
+        // Shipped policy is the retained warning: the rewrite is detected (the note names the
+        // real rewritten target) and handled by completing the publish rather than refusing.
+        expect(result.status).toBe(0);
+        expect(result.stderr).toContain("insteadOf rewrites the mirror origin");
+        expect(result.stderr).toContain(localOrigin);
+        expect(result.stderr).toContain("configured: " + PUBLIC_HTTPS);
+        expect(git(rewrittenMirror, "log", "-1", "--format=%s")).toBe("tickmarkr 9.9.9 — public export");
+      });
+
+      test("the shipped policy is either a hard refusal on effective-origin divergence with every fixture passing offline, or the retained warning with the retention reason recorded in the guard's own comment", () => {
+        const { comment, body } = divergenceGuard();
+        if (/\bexit 1\b/.test(body)) {
+          // Hard-refusal arm: the offline insteadOf fixtures throughout this suite are the
+          // "every fixture passing offline" proof; the refusal must say what it refuses.
+          expect(body).toMatch(/refus/i);
+        } else {
+          // Retained-warning arm: the decision and its rationale live in the guard's own comment.
+          expect(comment).toMatch(/warning retained/i);
+          expect(comment).toMatch(/never pushes/);
+          expect(comment).toMatch(/insteadOf/);
+          expect(body).toContain(">&2");
+        }
+      });
+
+      test("the decision recorded in the guard comment matches what the code actually does", () => {
+        const { comment, body } = divergenceGuard();
+        // The comment records a retained warning, so the code must warn — and must not refuse.
+        // Flipping either side alone (code to hard-fail, or comment to claim refusal) fails here.
+        expect(comment).toMatch(/warning retained/i);
+        expect(comment).toMatch(/NOT a hard refusal/i);
+        expect(body).toContain('echo "export-public: note');
+        expect(body).toContain(">&2");
+        expect(body).not.toMatch(/\bexit\b/);
       });
     });
   });

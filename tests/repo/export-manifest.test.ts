@@ -171,6 +171,19 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
     },
   );
 
+  test("the advanced reference is reachable from the shipped package", { timeout: 120_000 }, () => {
+    const c = getCandidate();
+    const readme = readFileSync(join(c.root, "README.md"), "utf8");
+    const repo = (
+      JSON.parse(readFileSync(join(c.root, "package.json"), "utf8")) as { repository: { url: string } }
+    ).repository.url
+      .replace(/^git\+/, "")
+      .replace(/\.git$/, "");
+    expect(readme).toContain(`${repo}/blob/main/FLEET.md`);
+    expect(c.paths).toContain("FLEET.md");
+    expect(existsSync(join(c.root, "FLEET.md"))).toBe(true);
+  });
+
   test("the manifest accepts only the enumerated public path set and the minimal vendored fixture inputs and rejects every path in the private path classes at any depth", () => {
     const accepted = [
       "package.json",

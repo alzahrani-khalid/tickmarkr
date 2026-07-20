@@ -11,7 +11,8 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.59.0";
+const PRIOR_RELEASE_VERSION = "1.60.0";
+const RELEASING_PATH = join(ROOT, "RELEASING.md");
 
 describe("tickmarkr version", () => {
   beforeEach(() => {
@@ -48,7 +49,7 @@ describe("tickmarkr version", () => {
     expect(r.stdout).toBe(`${PKG_VERSION}\n`);
   });
 
-  test("the package manifest and its lockfile carry the same incremented version with no stale copy of the prior version anywhere else in the tree", () => {
+  test("the package manifest, lockfile, and release guide all carry the current version — no stale prior-version declaration survives a bump", () => {
     const lock = JSON.parse(readFileSync(LOCK_PATH, "utf8")) as { version: string; packages: Record<string, { version?: string }> };
     expect(PKG_VERSION).not.toBe(PRIOR_RELEASE_VERSION);
     expect(lock.version).toBe(PKG_VERSION);
@@ -56,6 +57,11 @@ describe("tickmarkr version", () => {
     for (const path of [PKG_PATH, LOCK_PATH] as const) {
       expect(readFileSync(path, "utf8")).not.toContain(`"version": "${PRIOR_RELEASE_VERSION}"`);
     }
+    // the release guide's tag example must track the CURRENT version — a stale example walks an
+    // operator into tagging the previous release (self-enforcing: every bump must refresh it)
+    const releasing = readFileSync(RELEASING_PATH, "utf8");
+    expect(releasing).toContain(`v${PKG_VERSION}`);
+    expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
   test.each(["version", "--version", "-v"] as const)("built CLI: %s prints version on stdout, exit 0", (cmd) => {

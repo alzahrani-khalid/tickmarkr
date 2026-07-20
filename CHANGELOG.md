@@ -2,6 +2,16 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.61 — review residue
+
+The v1.60 pre-merge review panel's nine carried findings, retired: the mirror-publish
+script's failure-recovery path is behaviorally tested and its diagnostics pinned; the
+OBS-96 reproduction record names its amplified mechanism probe honestly; parked
+human-gate tasks say so in `status`; FLEET.md's routing-precedence wording matches
+route(); the fleet config module is split under the size ceiling; and compile now
+rejects a `test:` acceptance oracle whose file scope cannot host a collectable test
+(OBS-97).
+
 ## v1.60 — fleet integrity
 
 Provenance notes survive unrelated fleet writes; the retired quality-env preview path is removed from routing; step-3 fleet editing re-prompts instead of hard-exiting; gate cells read at a glance; fresh-clone first-run test contention is fixed evidence-first; private release publish is guarded to the public repo identity; RELEASING.md matches the two-repository ritual.

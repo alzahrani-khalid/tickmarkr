@@ -169,7 +169,16 @@ describe("native spec compiler", () => {
     const specs = readdirSync("specs").filter((file) => file.endsWith(".spec.md"));
     const marked = specs.filter((file) => TICKMARKR_NATIVE_MARKER.test(readFileSync(join("specs", file), "utf8")));
     expect(marked.length).toBeGreaterThan(0);
-    for (const file of marked) expect(compileSource(join("specs", file)).spec.source).toBe("native");
+    for (const file of marked) {
+      // OBS-97: pre-lint archives (read-only history, never amended) may trip the collectable-home
+      // lint; that exact rejection is tolerated here — any other failure still fails this test.
+      try {
+        expect(compileSource(join("specs", file)).spec.source).toBe("native");
+      } catch (error) {
+        expect(error).toBeInstanceOf(CompileError);
+        expect((error as Error).message).toMatch(/OBS-97/);
+      }
+    }
   });
 
   test("a compiled task keeps every line of a multiline goal", () => {
@@ -216,6 +225,51 @@ describe("native spec typed acceptance oracles (v1.19)", () => {
   test("an empty typed oracle value fails loudly", () => {
     expect(() => compileNativeText("## T1: Empty\n- acceptance:\n  - command:\n")).toThrow(/command oracle must carry a value/);
     expect(() => compileNativeText("## T1: Empty\n- acceptance:\n  - judge:   \n")).toThrow(/judge oracle must carry a value/);
+  });
+});
+
+// OBS-97: a typed test: oracle on a task whose non-empty files[] cannot host a vitest-collectable
+// tests/**/*.test.ts path makes scope-green and acceptance-green mutually exclusive — compile rejects it.
+describe("native spec test-oracle collectable-home lint (OBS-97)", () => {
+  const homeless = "## T3: Homeless\n- files: scripts/rig.mjs, package.json\n- acceptance:\n  - test: rig proves the race\n";
+
+  test("a task carrying a typed test oracle with a non-empty file scope hosting no collectable test path fails compilation with a message naming the task", () => {
+    expect(() => compileNativeText(homeless)).toThrow(CompileError);
+    expect(() => compileNativeText(homeless)).toThrow(/T3/);
+  });
+
+  test("the compile failure message names the missing path class", () => {
+    expect(() => compileNativeText(homeless)).toThrow(/tests\/\*\*\/\*\.test\.ts/);
+  });
+
+  test("a task carrying a typed test oracle and a collectable test path in its file scope compiles", () => {
+    const literal = compileNativeText("## T1: Housed\n- files: src/a.ts, tests/a.test.ts\n- acceptance:\n  - test: covered\n");
+    expect(literal.tasks[0].files).toEqual(["src/a.ts", "tests/a.test.ts"]);
+    // a directory glob that can host a collectable path is a home too
+    const glob = compileNativeText("## T1: Globbed\n- files: tests/gates/**\n- acceptance:\n  - test: covered\n");
+    expect(glob.tasks[0].files).toEqual(["tests/gates/**"]);
+  });
+
+  test("wide globs that can host a collectable test are not falsely rejected", () => {
+    // each of these CAN match a tests/**/*.test.ts path, so the lint must accept them
+    for (const scope of ["tests/**/*.ts", "**", "tests/*/unit.test.ts"]) {
+      const g = compileNativeText(`## T1: Wide\n- files: ${scope}\n- acceptance:\n  - test: covered\n`);
+      expect(g.tasks[0].files, scope).toEqual([scope]);
+    }
+    // while globs that genuinely cannot host one still fail
+    expect(() => compileNativeText("## T1: SrcOnly\n- files: src/**\n- acceptance:\n  - test: covered\n")).toThrow(/OBS-97/);
+  });
+
+  test("a task carrying a typed test oracle and an empty file scope compiles because an empty scope is unrestricted", () => {
+    const omitted = compileNativeText("## T1: Unrestricted\n- acceptance:\n  - test: covered\n");
+    expect(omitted.tasks[0].files).toEqual([]);
+    const none = compileNativeText("## T1: None\n- files: none\n- acceptance:\n  - test: covered\n");
+    expect(none.tasks[0].files).toEqual([]);
+  });
+
+  test("a task whose acceptance carries only command and judge oracles compiles regardless of file scope shape", () => {
+    const g = compileNativeText("## T1: NoTestOracle\n- files: scripts/rig.mjs\n- acceptance:\n  - command: npm test\n  - judge: behaves under load\n  - plain criterion\n");
+    expect(g.tasks[0].acceptance).toHaveLength(3);
   });
 });
 

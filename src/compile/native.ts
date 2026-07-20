@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
+import picomatch from "picomatch";
 import { type AcceptanceItem, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, SHAPES, TIERS, type RunGraph, validateGraph } from "../graph/schema.js";
 import { CompileError, inferShape, sha256 } from "./common.js";
+
+// OBS-97: mirror of the vitest.config.ts suite include — the only path class vitest collects.
+export const COLLECTABLE_TESTS = "tests/**/*.test.ts";
 
 export const LEGACY_PREFIX = ["dro", "vr"].join("");
 export const TICKMARKR_NATIVE_MARKER = /^<!--\s*tickmarkr:spec(?:\s+v1)?\s*-->\s*$/m;
@@ -129,6 +133,39 @@ export function compileNative(file: string): RunGraph {
   }
 
   const csv = (value?: string) => (value && value.toLowerCase() !== "none" ? value.split(",").map((item) => item.trim()).filter(Boolean) : []);
+
+  // OBS-97: a typed test: oracle needs a collectable home. vitest only collects COLLECTABLE_TESTS
+  // paths, so a task whose non-empty files[] cannot host one makes scope-green and acceptance-green
+  // mutually exclusive by construction — run-20260719-210434 burned two dispatch attempts before a
+  // consult diagnosed exactly this. Empty files[] stays exempt: no file scope means unrestricted
+  // (src/gates/scope.ts). An entry hosts a collectable path iff its glob can produce one — probed by
+  // substituting each wildcard run with a test-shaped segment (also covers literal test-file paths).
+  const collectable = picomatch(COLLECTABLE_TESTS, { dot: true });
+  // Single-token substitution is not a true glob-overlap test (tests/**/*.ts needs "probe.test",
+  // a bare ** needs the whole collectable path) — probe with several test-shaped tokens and accept
+  // if ANY candidate satisfies both globs. Scopes that truly cannot host one still fail every probe.
+  const PROBE_TOKENS = ["probe.test.ts", "probe.test", "tests/probe.test.ts"];
+  const canHostTest = (entry: string) => {
+    const self = picomatch(entry, { dot: true });
+    return PROBE_TOKENS.some((token) => {
+      const probe = entry.replace(/\*+/g, token);
+      return self(probe) && collectable(probe);
+    });
+  };
+  const homeless = drafts
+    .filter((draft) => {
+      const files = csv(draft.fields.files);
+      return files.length > 0 && !files.some(canHostTest)
+        && draft.acceptance.some((item) => typeof item !== "string" && item.oracle === "test");
+    })
+    .map((draft) => draft.id);
+  if (homeless.length) {
+    throw new CompileError(
+      `OBS-97: task${homeless.length === 1 ? "" : "s"} ${homeless.join(", ")} carr${homeless.length === 1 ? "ies" : "y"} a test: acceptance oracle but files[] cannot host a vitest-collectable test path (${COLLECTABLE_TESTS}).\n` +
+        `Add a ${COLLECTABLE_TESTS} entry to files[] in ${file}, or replace the test: oracle with command:/judge:.`,
+    );
+  }
+
   const tasks = drafts.map((draft) => {
     const { fields } = draft;
     const shape = fields.shape ?? inferShape(draft.title);

@@ -8,12 +8,14 @@ tier provenance, and run-time routing flags. Implementation anchors: `src/config
 
 ## Routing precedence
 
-Routing obeys a strict precedence — **pin > prefer > floors > marginal-cost auto**:
+Routing obeys a strict precedence — **pin > floors > prefer > marginal-cost auto**; floors filter channel eligibility before preference ordering applies:
 
 - **pin** a shape to an exact channel: `map: { plan: { pin: { via: claude-code, model: fable } } }`
-- **prefer**-rank adapters per shape: `map: { implement: { prefer: [cursor-agent, codex] } }`
 - **floors** set the minimum capability band per shape (`migration: frontier`, `tests: cheap`);
-  auto-routing then picks the cheapest authed channel at or above the floor
+  only channels at or above the floor stay eligible for auto-routing
+- **prefer**-rank adapters per shape among eligible channels:
+  `map: { implement: { prefer: [cursor-agent, codex] } }`; marginal-cost auto then picks the
+  cheapest sufficient tier within that ordering
 - **deny/allow** bench models or whole adapters without touching tiers (see `routing.deny` in config)
 - **tiers** classify models into bands — only classified, doctor-authed models ever route
 

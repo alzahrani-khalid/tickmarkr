@@ -23,8 +23,19 @@ const GRAPH = validateGraph({
 });
 const DEF_HASH = graphDefinitionHash(GRAPH);
 
-const seed = (repo: string, events: JournalEvent[]) => {
-  saveGraph(repo, GRAPH);
+// T6 (v1.61): a graph whose task parks at a DESIGNED human gate — pre-dispatch, so no gate
+// result ever exists for it. Separate from GRAPH: the byte-pinned golden below must not drift.
+const HUMAN_GRAPH = validateGraph({
+  version: 1,
+  spec: { source: "prd", paths: ["p"], hash: "h" },
+  tasks: [
+    { id: "T1", title: "gated", goal: "Ship the risky migration safely.", shape: "migration", complexity: 3, acceptance: ["a"], gates: mandatoryGates, humanGate: true },
+  ],
+});
+const HUMAN_DEF_HASH = graphDefinitionHash(HUMAN_GRAPH);
+
+const seed = (repo: string, events: JournalEvent[], graph = GRAPH) => {
+  saveGraph(repo, graph);
   const dir = join(tickmarkrDir(repo), "runs", "run-watch");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
@@ -170,6 +181,36 @@ describe("status checklist rendering", () => {
       const out = await status([], repo);
       expect(strip(row(out, "T2"))).toContain("failed · test");
       expect(strip(row(out, "T1"))).not.toContain("done ·"); // healthy rows carry no gate words
+    });
+  });
+
+  test("a task parked at a designed human gate names that gate in words in its own status cell", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      { ts, event: "run-start", data: { pid: process.pid, graphDefinitionHash: HUMAN_DEF_HASH } },
+      { ts, event: "task-human", taskId: "T1", data: { reason: 'humanGate: "gated" requires approval before dispatch', kind: "human-gate" } },
+    ], HUMAN_GRAPH);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(row(out, "T1"))).toContain("human · awaiting approval");
+    });
+  });
+
+  test("the parked human-gate label renders before any gate result exists for the task", async () => {
+    const repo = mkRepo();
+    // the daemon parks a designed human gate BEFORE dispatch — this fixture mirrors that exactly:
+    // no task-dispatch, no gate-result anywhere in the journal
+    const events: JournalEvent[] = [
+      { ts, event: "run-start", data: { pid: process.pid, graphDefinitionHash: HUMAN_DEF_HASH } },
+      { ts, event: "task-human", taskId: "T1", data: { kind: "human-gate" } },
+    ];
+    expect(events.some((e) => e.event === "gate-result")).toBe(false);
+    seed(repo, events, HUMAN_GRAPH);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(row(out, "T1"))).toContain("awaiting approval");
     });
   });
 

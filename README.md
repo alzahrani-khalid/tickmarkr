@@ -160,9 +160,9 @@ Nothing is written until you confirm; pressing Enter through every step leaves c
 Step 5/6 uses an arrow-driven candidate picker ranked by the production router; step 3 may ask
 for a benchmark-provenance note when you classify a new model.
 
-Routing-mode semantics, pin/prefer/floor precedence, review and consult steering syntax,
+Routing-mode semantics, pin/floor/prefer precedence, review and consult steering syntax,
 provenance rules, and `--quality` / `--mode` flags are documented in
-**[FLEET.md](FLEET.md)** (advanced reference).
+**[FLEET.md](https://github.com/alzahrani-khalid/tickmarkr/blob/main/FLEET.md)** (advanced reference).
 
 ## Steering
 
@@ -170,7 +170,7 @@ Fleet step 6/6 sets `review.prefer` and `consult.prefer`; routing modes (`risk-b
 `partner-led`, `staff-led`) are chosen in step 4/6. Full grammar — including when review
 prefer may name a **bare adapter** versus `adapter:model`, and why consult prefer entries
 require **`adapter:model`** form — plus `tickmarkr run --supersedes` rerun control, is in
-**[FLEET.md](FLEET.md)**.
+**[FLEET.md](https://github.com/alzahrani-khalid/tickmarkr/blob/main/FLEET.md)**.
 
 ## Model scoping and auth detection
 
@@ -366,7 +366,7 @@ accepted contributions are credited via `Co-authored-by:` on the release commit.
 
 ## Documentation
 
-- **[FLEET.md](FLEET.md)** — routing modes, steering syntax, tier provenance, and run flags (advanced reference)
+- **[FLEET.md](https://github.com/alzahrani-khalid/tickmarkr/blob/main/FLEET.md)** — routing modes, steering syntax, tier provenance, and run flags (advanced reference)
 - **[LICENSE](LICENSE)** — MIT license
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup and contribution guidelines
 - **[SECURITY.md](SECURITY.md)** — security policy and private vulnerability reporting

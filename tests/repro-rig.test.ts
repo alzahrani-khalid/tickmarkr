@@ -121,43 +121,63 @@ describe("OBS-96 cold-clone repro rig — private-only, telemetry, paired warm c
     expect(verdict.warmControlsGreen).toBe(1);
   });
 
-  test("three independently cold attempts against unfixed HEAD reproduce the same built-CLI failure signature the fix task will target", async () => {
+  test("the embedded reproduction record names the amplified mechanism probe as the source of its verdict", async () => {
     if (!inPrivateTree) {
       assertRigAbsentFromPublicTree();
       return;
     }
     const rig = await loadRig();
     const rec = rig.REPRO_RECORD as {
-      sha: string;
-      verdict: { attempts: number; redFirstRuns: number; signature: string; sameSignatureAcrossRedRuns: boolean; warmControlsGreen: number; reproduced: boolean };
-      attempts: { n: number; builtCliCrashes: { version: number; help: number }; missingDist: boolean; coldSuiteExit: number }[];
+      verdictSource: string;
+      mechanismFinding: string;
+      fixRationale: string;
+      verdict: { signature: string; reproduced: boolean; redFirstRuns: number; sameSignatureAcrossRedRuns: boolean; warmControlsGreen: number };
+      attempts: { builtCliCrashes: { version: number; help: number }; missingDist: boolean; coldSuiteExit: number }[];
+      sampleCrashStderr: string;
     };
-    // the verbatim record of the live --attempts 3 run: 3 independently cold clones of unfixed HEAD,
-    // all red on the one built-CLI target signature, each with a green warm-control on the same clone
+    expect(rec.verdictSource.toLowerCase()).toMatch(/amplified mechanism probe/);
+    expect(rec.verdictSource).toMatch(/rig part b/i);
+    expect(rec.verdictSource).not.toMatch(/natural single-pass npm test.*verdict/i);
     const TARGET = "tests/cli/cli.test.ts+tests/cli/version.test.ts";
     expect(rec.verdict.signature).toBe(TARGET);
     expect(rec.verdict.reproduced).toBe(true);
     expect(rec.verdict.redFirstRuns).toBe(3);
-    expect(rec.verdict.sameSignatureAcrossRedRuns).toBe(true);
-    expect(rec.verdict.warmControlsGreen).toBe(3);
-    expect(rec.attempts).toHaveLength(3);
-    // every recorded attempt crashed the built CLI in BOTH files (version-family + help/unknown) with
-    // dist PRESENT (missingDist:false) — the OBS-96 target, never the ignore-scripts missing-dist phantom
+    expect(rec.mechanismFinding).toMatch(/bin\.test\.ts:37/);
+    expect(rec.mechanismFinding).toMatch(/truncate-then-write|mid-suite tsc/i);
+    expect(rec.fixRationale).toMatch(/bin\.test\.ts|T9/i);
+    expect(rec.sampleCrashStderr).toMatch(/dist\/route\/router\.js/);
     for (const a of rec.attempts) {
       expect(a.builtCliCrashes.version).toBeGreaterThan(0);
       expect(a.builtCliCrashes.help).toBeGreaterThan(0);
       expect(a.missingDist).toBe(false);
     }
-    // feed the recorded shape back through the rig's OWN verdict logic — it independently agrees these
-    // three cold attempts reproduce the target signature (all red, one key, warm-control green)
     const records = rec.attempts.map(() => ({
       red: true,
       firstRun: { exitCode: 1, signature: { key: TARGET } },
       warmControl: { exitCode: 0 },
     }));
-    const verdict = rig.verdictOf(records);
-    expect(verdict.reproduced).toBe(true);
-    expect(verdict.sameSignatureAcrossRedRuns).toBe(true);
-    expect(verdict.signatures).toEqual([TARGET]);
+    expect(rig.verdictOf(records).reproduced).toBe(true);
+  });
+
+  test("the embedded reproduction record does not claim natural cold-clone reproduction", async () => {
+    if (!inPrivateTree) {
+      assertRigAbsentFromPublicTree();
+      return;
+    }
+    const rig = await loadRig();
+    const rec = rig.REPRO_RECORD as {
+      verdictSource: string;
+      naturalColdSuites: string;
+      attempts: { coldSuiteExit: number }[];
+    };
+    const serialized = JSON.stringify(rec);
+    expect(rec.verdictSource.toLowerCase()).toContain("not natural");
+    expect(rec.naturalColdSuites.toLowerCase()).toMatch(/exited 0|exit 0/);
+    for (const a of rec.attempts) expect(a.coldSuiteExit).toBe(0);
+    expect(serialized.toLowerCase()).not.toMatch(/natural cold-clone reproduction.*reproduced\s*=\s*true/);
+    expect(serialized.toLowerCase()).not.toMatch(/three independently cold attempts all reproduced/);
+    expect(readFileSync(join(ROOT, RIG), "utf8")).not.toMatch(
+      /Three independently cold attempts\s*\n\s*\* ALL reproduced the built-CLI/i,
+    );
   });
 });

@@ -84,6 +84,13 @@ const failedSuffix = (states: GateState[]): string => {
   return f.length ? ` · ${f.join(", ")}` : "";
 };
 
+// a designed human gate parks the task BEFORE any gate result exists (daemon.ts execTask), so the
+// awaited approval is named from task state alone — never from gate results. Failed gates win the
+// cell when present: a post-approval park is not awaiting the designed gate. Plain text for column
+// math; rendered with a dim dot + warn words. TTY-only — the non-TTY surface stays byte-pinned.
+const humanGateSuffix = (t: Task, st: TaskStatus, states: GateState[]): string =>
+  st === "human" && t.humanGate && failedGates(states).length === 0 ? " · awaiting approval" : "";
+
 const shortGoal = (goal: string, max: number): string => {
   const clause = goal.split(/[,;.?!]/, 1)[0]!.trim();
   if (clause.length <= max) return clause;
@@ -217,7 +224,7 @@ const renderFrame = (cwd: string): string => {
   const taskVerdict = (st: TaskStatus): Verdict =>
     st === "done" ? "pass" : st === "failed" ? "fail" : st === "human" ? "warn" : "neutral";
   const idW = Math.max(...cells.map((c) => c.t.id.length), 2);
-  const stW = Math.max(...cells.map((c) => (String(c.st) + c.label + failedSuffix(c.states)).length));
+  const stW = Math.max(...cells.map((c) => (String(c.st) + c.label + failedSuffix(c.states) + humanGateSuffix(c.t, c.st, c.states)).length));
   const chainW = gateChainWidth(true);
   const assignW = Math.max(...cells.map((c) => c.assignCol.length));
   const goalW = Math.max(8, width - (5 + idW) - 2 - chainW - 2 - stW - 2 - assignW);
@@ -226,10 +233,12 @@ const renderFrame = (cwd: string): string => {
     const stWord = st === "done" ? ok(String(st)) : st === "failed" ? fail(String(st)) : st === "human" ? warn(String(st)) : String(st);
     // a fail names its gate in words right here — the one moment gate identity is needed on a row
     const f = failedGates(states);
+    const human = humanGateSuffix(t, st, states);
     const statusCell = stWord +
       (label ? (label === " starved" ? fail(label) : dim(label)) : "") +
       (f.length ? dim(" · ") + fail(f.join(", ")) : "") +
-      " ".repeat(stW - (String(st) + label + failedSuffix(states)).length);
+      (human ? dim(" · ") + warn("awaiting approval") : "") +
+      " ".repeat(stW - (String(st) + label + failedSuffix(states) + human).length);
     return `  ${statusRow(taskVerdict(st), `${t.id.padEnd(idW)} ${goal}  ${gateChain(states, true)}  ${statusCell}  ${dim(assignCol)}`)}`;
   });
   return [header, hr, gatesLegend, ...rows].join("\n");
