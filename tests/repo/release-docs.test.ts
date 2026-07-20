@@ -1,13 +1,20 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { execSync } from "node:child_process";
-import { describe, test, expect } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { execFileSync, execSync } from "node:child_process";
+import { afterAll, beforeAll, describe, test, expect } from "vitest";
+import { parse as parseYaml } from "yaml";
+import { makeRepo } from "../helpers/tmprepo.js";
 
 const ROOT = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim();
 const RELEASING_MD = join(ROOT, "RELEASING.md");
 const CHANGELOG_MD = join(ROOT, "CHANGELOG.md");
 const TESTING_MD = join(ROOT, "docs/codebase/TESTING.md");
 const PACKAGE_JSON = join(ROOT, "package.json");
+const RELEASE_YML = join(ROOT, ".github/workflows/release.yml");
+const EXPORT_SCRIPT = join(ROOT, "scripts/export-public.sh");
+const PUBLIC_HTTPS = "https://github.com/alzahrani-khalid/tickmarkr.git";
+const PUBLIC_SSH = "git@github.com:alzahrani-khalid/tickmarkr.git";
 
 function readFile(path: string): string {
   return readFileSync(path, "utf8");
@@ -72,6 +79,28 @@ describe("release documentation", () => {
       expect(content).toContain("Private documentation pages");
       expect(content).toContain("CONCERNS.md");
     });
+
+    test("the releasing documentation states the trusted-publisher binding follows repository identity and must be re-saved after a rename", () => {
+      const content = readFile(RELEASING_MD);
+      expect(content).toContain("follows the repository **identity**");
+      expect(content).toMatch(/trusted-publisher binding/i);
+      expect(content).toMatch(/binding.*followed.*renamed/is);
+      expect(content).toMatch(/rename.*binding must be re-saved/is);
+    });
+
+    test("the releasing documentation's append-only one-commit-per-release language is unchanged from its prior form", () => {
+      const content = readFile(RELEASING_MD);
+      // pinned verbatim as this language read before the v1.60 truth-check rewrite
+      expect(content).toContain(
+        "The private development repository retains full history; the public repository follows an append-only model with one commit per release."
+      );
+      expect(content).toContain(
+        "The public repository maintains **append-only history** with one commit per release."
+      );
+      expect(content).toContain(
+        "**Do not force-push:** Public history is append-only. Force-pushing orphans external forks and invalidates open pull requests. Each release is one new commit on top of `main`."
+      );
+    });
   });
 
   describe("CHANGELOG.md", () => {
@@ -104,6 +133,290 @@ describe("release documentation", () => {
       expect(content).toContain("Global config");
       expect(content).toContain("Native spec marker");
       expect(content).toContain("Resume");
+    });
+  });
+
+  describe("release workflow publish guard and provenance", () => {
+    test("the release workflow's publish job runs only when the repository matches the public identity", () => {
+      const workflow = parseYaml(readFile(RELEASE_YML));
+      const jobs = Object.values(workflow.jobs) as Array<{ if?: string; steps: Array<{ run?: string }> }>;
+      const publishJobs = jobs.filter((job) =>
+        job.steps.some((step) => step.run?.includes("npm publish"))
+      );
+      expect(publishJobs.length).toBeGreaterThan(0);
+      for (const job of publishJobs) {
+        expect(job.if).toBe("github.repository == 'alzahrani-khalid/tickmarkr'");
+      }
+    });
+
+    test("the release workflow's publish step always includes the provenance flag", () => {
+      const workflow = parseYaml(readFile(RELEASE_YML));
+      const steps = (Object.values(workflow.jobs) as Array<{ steps: Array<{ run?: string }> }>)
+        .flatMap((job) => job.steps)
+        .filter((step) => step.run?.includes("npm publish"));
+      expect(steps.length).toBeGreaterThan(0);
+      for (const step of steps) {
+        expect(step.run).toContain("--provenance");
+      }
+    });
+
+    test("the release workflow contains no comment describing provenance as conditional on a future repository move", () => {
+      const content = readFile(RELEASE_YML);
+      const comments = content
+        .split("\n")
+        .filter((line) => line.trimStart().startsWith("#"));
+      for (const comment of comments) {
+        expect(comment).not.toMatch(/restore the flag|pending the squashed public export|stays private/i);
+        expect(comment).not.toMatch(/provenance.*(when|until|pending|requires a PUBLIC)/i);
+      }
+    });
+  });
+
+  // Behavioral check of `export-public.sh --onto <mirror>` against a synthetic source repo and a
+  // local origin+clone pair. Skipped inside the exported public tree (the script never ships).
+  describe("scripted mirror publish mode", { skip: !existsSync(EXPORT_SCRIPT) }, () => {
+    const PAGES = [
+      "ARCHITECTURE.md", "CLI-DESIGN.md", "CONVENTIONS.md", "INTEGRATIONS.md",
+      "STACK.md", "STRUCTURE.md", "TESTING.md",
+    ];
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@test.local", ...args], {
+        cwd, encoding: "utf8",
+      }).trim();
+
+    let originDir: string;
+    let mirror: string;
+    let originMain: string;
+    let divergentSha: string;
+    const cleanup: string[] = [];
+
+    beforeAll(() => {
+      // synthetic private repo satisfying everything the export reads (version + docs allowlist)
+      const privRepo = makeRepo({
+        "package.json": JSON.stringify({ name: "fixture", version: "9.9.9" }, null, 2) + "\n",
+        "src.txt": "fixture source\n",
+        ...Object.fromEntries(PAGES.map((p) => [`docs/codebase/${p}`, `# ${p}\n`])),
+      });
+      // "public repo" remote with one prior release commit, and its persistent mirror clone
+      originDir = makeRepo({ "previous-release.txt": "previous public release\n" });
+      originMain = git(originDir, "rev-parse", "HEAD");
+      const base = mkdtempSync(join(tmpdir(), "tickmarkr-mirror-"));
+      cleanup.push(privRepo, originDir, base);
+      mirror = join(base, "mirror");
+      git(base, "clone", "-q", originDir, mirror);
+      // Production pins the public GitHub identity. Keep this fixture offline by storing that raw
+      // origin while git's standard insteadOf rewrite sends fetches to the synthetic local remote.
+      git(mirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
+      git(mirror, "config", `url.${originDir}.insteadOf`, PUBLIC_HTTPS);
+      // diverge the mirror locally — the script must discard this via reset to origin/main
+      writeFileSync(join(mirror, "divergent.txt"), "local-only divergence\n");
+      git(mirror, "add", "-A");
+      git(mirror, "commit", "-q", "--no-gpg-sign", "-m", "local divergence");
+      divergentSha = git(mirror, "rev-parse", "HEAD");
+
+      execFileSync("bash", [EXPORT_SCRIPT, "--onto", mirror], {
+        cwd: privRepo,
+        encoding: "utf8",
+        env: { ...process.env, TMPDIR: base },
+      });
+    }, 60_000);
+
+    afterAll(() => {
+      for (const dir of cleanup) rmSync(dir, { recursive: true, force: true });
+    });
+
+    test("the scripted mirror publish mode resets the mirror clone to its own remote main before applying the export", () => {
+      // the export commit sits directly on origin/main — the divergent local commit was discarded
+      expect(git(mirror, "rev-parse", "HEAD~1")).toBe(originMain);
+      expect(git(mirror, "log", "--format=%H")).not.toContain(divergentSha);
+      expect(existsSync(join(mirror, "divergent.txt"))).toBe(false);
+      // and nothing was pushed: the remote's main is untouched
+      expect(git(originDir, "rev-parse", "main")).toBe(originMain);
+    });
+
+    test("the scripted mirror publish mode never deletes the mirror clone's own git metadata directory", () => {
+      expect(existsSync(join(mirror, ".git"))).toBe(true);
+      // metadata is intact and functional: the clone still knows its remote and passes fsck
+      expect(git(mirror, "config", "--get", "remote.origin.url")).toBe(PUBLIC_HTTPS);
+      git(mirror, "fsck", "--no-progress");
+      // tracked files are replaced via git rm, never a filesystem glob that can match .git
+      // (comments quote the retired glob as a warning, so only command lines are scanned)
+      const script = readFile(EXPORT_SCRIPT);
+      expect(script).toContain('git -C "$MIRROR" rm -rq -- .');
+      const commandLines = script.split("\n").filter((l) => !l.trimStart().startsWith("#"));
+      expect(commandLines.join("\n")).not.toMatch(/rm -rf -- \*/);
+    });
+
+    test("the scripted mirror publish mode's commit message contains the version read from the export's own package manifest", () => {
+      const exportedPkg = JSON.parse(git(mirror, "show", "HEAD:package.json")) as { version: string };
+      expect(exportedPkg.version).toBe("9.9.9");
+      expect(git(mirror, "log", "-1", "--format=%s")).toBe(
+        `tickmarkr ${exportedPkg.version} — public export`
+      );
+      // the version is read from the export tree's manifest, not the private checkout's
+      expect(readFile(EXPORT_SCRIPT)).toContain('"$EXPORT_DIR/package.json"');
+    });
+
+    describe("--onto target guard", () => {
+      const cleanup2: string[] = [];
+      afterAll(() => {
+        for (const dir of cleanup2) rmSync(dir, { recursive: true, force: true });
+      });
+
+      function runOnto(cwd: string, mirrorPath: string): { status: number; stderr: string } {
+        try {
+          execFileSync("bash", [EXPORT_SCRIPT, "--onto", mirrorPath], { cwd, encoding: "utf8" });
+          return { status: 0, stderr: "" };
+        } catch (err) {
+          const e = err as { status: number; stderr: string };
+          return { status: e.status, stderr: e.stderr };
+        }
+      }
+
+      // source checkout satisfying every file the export reads (version + docs allowlist)
+      function makeSourceRepo(): string {
+        const repo = makeRepo({
+          "package.json": JSON.stringify({ name: "fixture", version: "9.9.9" }, null, 2) + "\n",
+          "src.txt": "fixture source\n",
+          ...Object.fromEntries(PAGES.map((p) => [`docs/codebase/${p}`, `# ${p}\n`])),
+        });
+        cleanup2.push(repo);
+        return repo;
+      }
+
+      test("refuses a target inside the source checkout itself", () => {
+        const src = makeSourceRepo();
+        const result = runOnto(src, ".");
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/inside the source checkout/);
+        // and nothing was touched: the checkout still has its own history intact
+        expect(existsSync(join(src, "src.txt"))).toBe(true);
+      });
+
+      test("refuses a target whose origin remote matches the source checkout's own origin", () => {
+        // a "public" remote, one clone playing the source checkout, another playing the (wrong) mirror
+        const sharedRemote = makeRepo({ "seed.txt": "seed\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-shared-origin-"));
+        cleanup2.push(sharedRemote, base);
+
+        const src = join(base, "src");
+        git(base, "clone", "-q", sharedRemote, src);
+        for (const [rel, content] of [
+          ["package.json", JSON.stringify({ name: "fixture", version: "9.9.9" }, null, 2) + "\n"],
+          ...PAGES.map((p): [string, string] => [`docs/codebase/${p}`, `# ${p}\n`]),
+        ] as Array<[string, string]>) {
+          const full = join(src, rel);
+          mkdirSync(dirname(full), { recursive: true });
+          writeFileSync(full, content);
+        }
+        git(src, "add", "-A");
+        git(src, "commit", "-q", "--no-gpg-sign", "-m", "fixture content");
+
+        const wrongMirror = join(base, "wrong-mirror");
+        git(base, "clone", "-q", sharedRemote, wrongMirror);
+
+        const result = runOnto(src, wrongMirror);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/matches the source checkout's own origin/);
+      });
+
+      test("refuses a clean mirror whose origin is not the expected public repository", () => {
+        const src = makeSourceRepo();
+        const wrongOrigin = makeRepo({ "wrong-repo.txt": "must survive\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-wrong-public-origin-"));
+        cleanup2.push(wrongOrigin, base);
+        const wrongMirror = join(base, "mirror");
+        git(base, "clone", "-q", wrongOrigin, wrongMirror);
+        const before = git(wrongMirror, "rev-parse", "HEAD");
+
+        const result = runOnto(src, wrongMirror);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/expected public repository.*alzahrani-khalid\/tickmarkr/i);
+        expect(git(wrongMirror, "rev-parse", "HEAD")).toBe(before);
+        expect(existsSync(join(wrongMirror, "wrong-repo.txt"))).toBe(true);
+      });
+
+      test("accepts the expected public repository in SSH remote form", () => {
+        const src = makeSourceRepo();
+        const publicOrigin = makeRepo({ "previous-release.txt": "previous public release\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-public-ssh-origin-"));
+        cleanup2.push(publicOrigin, base);
+        const publicMirror = join(base, "mirror");
+        git(base, "clone", "-q", publicOrigin, publicMirror);
+        git(publicMirror, "remote", "set-url", "origin", PUBLIC_SSH);
+        git(publicMirror, "config", `url.${publicOrigin}.insteadOf`, PUBLIC_SSH);
+
+        const result = runOnto(src, publicMirror);
+        expect(result).toEqual({ status: 0, stderr: "" });
+        expect(git(publicMirror, "log", "-1", "--format=%s")).toBe("tickmarkr 9.9.9 — public export");
+      });
+
+      test("refuses a mirror subdirectory instead of partially replacing that repository", () => {
+        const src = makeSourceRepo();
+        const publicOrigin = makeRepo({ "nested/keep.txt": "must survive\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-mirror-subdir-"));
+        cleanup2.push(publicOrigin, base);
+        const publicMirror = join(base, "mirror");
+        git(base, "clone", "-q", publicOrigin, publicMirror);
+        const before = git(publicMirror, "rev-parse", "HEAD");
+
+        const result = runOnto(src, join(publicMirror, "nested"));
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/repository toplevel/i);
+        expect(git(publicMirror, "rev-parse", "HEAD")).toBe(before);
+        expect(existsSync(join(publicMirror, "nested", "keep.txt"))).toBe(true);
+      });
+
+      test("refuses a target with an uncommitted or untracked local change", () => {
+        const src = makeSourceRepo();
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-dirty-mirror-"));
+        cleanup2.push(base);
+        const dirtyMirror = join(base, "mirror");
+        git(base, "clone", "-q", originDir, dirtyMirror);
+        writeFileSync(join(dirtyMirror, "stray-untracked.txt"), "should block the run\n");
+
+        const result = runOnto(src, dirtyMirror);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/local or untracked changes/);
+        // and it was never reset — the stray file is still there, untouched
+        expect(existsSync(join(dirtyMirror, "stray-untracked.txt"))).toBe(true);
+      });
+
+      test("refuses a mirror with a non-main branch checked out", () => {
+        // reset --hard origin/main moves the CURRENT branch; off main, the export commit would
+        // land on the wrong branch while `git push origin main` pushes nothing new
+        const src = makeSourceRepo();
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-branch-mirror-"));
+        cleanup2.push(base);
+        const branchedMirror = join(base, "mirror");
+        git(base, "clone", "-q", originDir, branchedMirror);
+        git(branchedMirror, "checkout", "-q", "-b", "release-work");
+        const before = git(branchedMirror, "rev-parse", "HEAD");
+
+        const result = runOnto(src, branchedMirror);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/checked out, not main/);
+        expect(git(branchedMirror, "rev-parse", "HEAD")).toBe(before);
+      });
+
+      test("refuses a mirror holding a gitignored leftover file invisible to plain status", () => {
+        // ignored files survive reset + git rm; if the export's replacement .gitignore stops
+        // covering one, git add -A would publish it past the export-dir secret scan
+        const src = makeSourceRepo();
+        const ignoringOrigin = makeRepo({ ".gitignore": "secret.log\n", "tracked.txt": "x\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-ignored-mirror-"));
+        cleanup2.push(ignoringOrigin, base);
+        const ignoredMirror = join(base, "mirror");
+        git(base, "clone", "-q", ignoringOrigin, ignoredMirror);
+        writeFileSync(join(ignoredMirror, "secret.log"), "would bypass the export-dir scan\n");
+        // precondition: plain porcelain is blind to it — exactly the bypass being closed
+        expect(git(ignoredMirror, "status", "--porcelain")).toBe("");
+
+        const result = runOnto(src, ignoredMirror);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/including ignored files/);
+        expect(existsSync(join(ignoredMirror, "secret.log"))).toBe(true);
+      });
     });
   });
 

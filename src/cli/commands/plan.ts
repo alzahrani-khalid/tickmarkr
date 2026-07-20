@@ -8,7 +8,7 @@ import { loadGraph } from "../../graph/graph.js";
 import { resolveRunMode } from "../../run/daemon.js";
 import { excludedChannels, exclusionLine } from "../../route/preference.js";
 import { staffLedEvidence } from "../../route/profile.js";
-import { QUALITY_ENV, route, RoutingError } from "../../route/router.js";
+import { route, RoutingError } from "../../route/router.js";
 import { modelId } from "../../gates/review.js";
 import { loadRoutingProfile } from "../../run/journal.js";
 import type { BillingChannel, WorkerAdapter } from "../../adapters/types.js";
@@ -44,7 +44,6 @@ export async function plan(argv: string[], cwd = process.cwd(), adapters: Worker
   if (values.mode !== undefined && !(ROUTING_MODES as readonly string[]).includes(values.mode)) {
     throw new Error(`--mode must be one of ${ROUTING_MODES.join(" | ")} (got ${values.mode})`);
   }
-  delete process.env[QUALITY_ENV];
   const g = loadGraph(cwd);
   const { cfg, mode, source } = resolveRunMode(cwd, { flag: values.mode as RoutingMode | undefined, spec: g.mode });
   // readDoctor cache path: staleness line only fires here (probeAll fallback is fresh by construction).

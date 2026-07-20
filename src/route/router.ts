@@ -14,8 +14,13 @@ export interface RoutingPreferContext {
   overlayPreferShapes: ReadonlySet<string>;
 }
 
-export interface ExploreContext { noExplore?: boolean; quality?: boolean }
+export interface ExploreContext { noExplore?: boolean }
 export const NO_EXPLORE_ENV = "TICKMARKR_NO_EXPLORE";
+// OBS-89 (v1.60): the TICKMARKR_QUALITY variable is RETIRED — nothing in src reads it anymore and
+// route() ignores it entirely (the v1.47 one-band floor raise, its exploration suppression, and the
+// env fallback were deleted, not moved). The name survives solely as a scrub target: the spawn seam
+// keeps erasing a stale operator shell's legacy export from child environments, and the retired-seam
+// tests (tests/run/git.test.ts, tests/setup.ts, tests/gates/baseline.test.ts) pin that contract.
 export const QUALITY_ENV = "TICKMARKR_QUALITY";
 // OBS-74: every routing env seam, in one list — the spawn seam (src/run/git.ts) scrubs exactly
 // these from child env so gate/baseline/tip-verify children are hermetic by construction.
@@ -23,14 +28,8 @@ export const ROUTING_ENV_SEAMS = [QUALITY_ENV, NO_EXPLORE_ENV] as const;
 
 const exploreCap = (cfg: TickmarkrConfig) => cfg.routing.explore?.cap ?? EXPLORE_CAP;
 
-const qualityOn = (exploreCtx?: ExploreContext): boolean =>
-  !!exploreCtx?.quality || process.env[QUALITY_ENV] === "1";
-
-export const raiseTier = (tier: Tier): Tier =>
-  tier === "cheap" ? "mid" : tier === "mid" ? "frontier" : "frontier";
-
 const exploreOff = (task: Task, cfg: TickmarkrConfig, exploreCtx?: ExploreContext): boolean => {
-  if (qualityOn(exploreCtx) || exploreCtx?.noExplore || process.env[NO_EXPLORE_ENV] === "1") return true;
+  if (exploreCtx?.noExplore || process.env[NO_EXPLORE_ENV] === "1") return true;
   const e = cfg.routing.explore;
   if (!e) return false;
   if (e.mode === "off") return true;
@@ -139,13 +138,6 @@ function withoutExcluded(channels: BillingChannel[], exclude?: ReadonlySet<strin
   return channels.filter((c) => !exclude.has(channelKey(c)));
 }
 
-const qualityBound = (quality: boolean, configFloor: Tier | undefined, taskFloor: Tier | undefined): string | undefined => {
-  if (!quality) return undefined;
-  if (configFloor) return `floor ${configFloor}→${raiseTier(configFloor)} (--quality)`;
-  if (taskFloor) return `floor ${taskFloor}→${raiseTier(taskFloor)} (--quality)`;
-  return undefined;
-};
-
 const maybeSlaLint = (
   lints: string[], task: Task, profile: RoutingProfile | undefined, slaMinutes: number | undefined, c: BillingChannel,
 ): void => {
@@ -164,7 +156,6 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   channels = withoutExcluded(channels, exclude);
   const lints: string[] = [];
   const advisoryFloor = cfg.routing.floors[task.shape];
-  const quality = qualityOn(exploreCtx);
   const floor = advisoryFloor;
   const slaMinutes = cfg.routing.sla?.[task.shape];
   // ponytail: sla is plan-time advisory only — never thread into learnedScore (would reroute warm rivals).
@@ -209,8 +200,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     }
   };
 
-  const taskFloorRaw = task.routingHints?.floor;
-  const taskFloor = taskFloorRaw && quality ? raiseTier(taskFloorRaw) : taskFloorRaw;
+  const taskFloor = task.routingHints?.floor;
   const source = task.routingHints?.source;
   const src = source ? `, ${source}` : ""; // never interpolate a possibly-undefined source
 
@@ -240,11 +230,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   }
 
   const baseTier: Tier = floor ?? "cheap";
-  let minTier: Tier = taskFloor && TIER_RANK[taskFloor] > TIER_RANK[baseTier] ? taskFloor : baseTier; // task floor is a hard >= constraint in all paths (D-04)
-  if (quality && advisoryFloor) {
-    const raised = raiseTier(advisoryFloor);
-    if (TIER_RANK[raised] > TIER_RANK[minTier]) minTier = raised;
-  }
+  const minTier: Tier = taskFloor && TIER_RANK[taskFloor] > TIER_RANK[baseTier] ? taskFloor : baseTier; // task floor is a hard >= constraint in all paths (D-04)
   if (prefActive) for (const p of prefer ?? []) preflightPrefer(p);
   // key order is a contract: prefer > marginal cost > tier (cheapest sufficient) > learned score (v1.6 ROUTE-06)
   // > frontier spread (v1.58) > discovery order (same-tier fairness, D2). The learned score decides only the
@@ -337,10 +323,9 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     spreadDecided = channelKey(eligible[0]) !== channelKey(sortedStatic[0]);
   }
   const bound =
-    qualityBound(quality, advisoryFloor, taskFloorRaw) ??
-    (taskFloor && TIER_RANK[taskFloor] >= TIER_RANK[baseTier] ? `floor ${taskFloor} (task hint${src})` :
+    taskFloor && TIER_RANK[taskFloor] >= TIER_RANK[baseTier] ? `floor ${taskFloor} (task hint${src})` :
     floor ? `floor ${floor} (config floors)` :
-    "tier cheap (default)");
+    "tier cheap (default)";
   // name the key that actually broke the tie: prefer outranks the marginal-cost/tier keys, so if the
   // winner matched a prefer entry, prefer decided it — not "cheapest sufficient tier" (ROUTE-03, WR-01)
   const preferVia = preferFromAuto(task.shape, preferCtx)

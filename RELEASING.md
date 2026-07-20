@@ -1,27 +1,65 @@
 # Releasing tickmarkr
 
-## One-time setup (operator)
+## The two-repository split — how it was actually executed
 
-Before the first automated publish, configure **npm trusted publishing** for the `tickmarkr` package:
+Development happens in the **private** repository (`alzahrani-khalid/tickmarkr-dev`); publishing
+happens from the **public** repository (`alzahrani-khalid/tickmarkr`). The split was executed as a
+rename dance, in this order:
+
+1. The private repository was originally named `alzahrani-khalid/tickmarkr`. It was **renamed to
+   `alzahrani-khalid/tickmarkr-dev` first**, and every local checkout's `origin` was repointed to
+   the new name.
+2. With the `tickmarkr` name freed, the **public `alzahrani-khalid/tickmarkr` repository was
+   created fresh** and seeded with a squashed export (see below).
+3. The npm **trusted-publisher binding was re-saved** against the new public repository — required
+   because of how the binding actually pins (next section).
+
+### Trusted publishing follows repository identity, not name
+
+npm's trusted-publisher binding follows the repository **identity** (GitHub's immutable internal
+repository ID), not the `owner/name` string. When the private repository was renamed, the saved
+binding silently followed the renamed `tickmarkr-dev` repository; the first publish from the newly
+created public `tickmarkr` repository failed with `E404` until the binding was **re-saved** against
+the public repository. After any repository rename or re-creation, the binding must be re-saved:
 
 1. Open the package on npm → **Publishing access** → **Trusted publishers**.
-2. Add a GitHub Actions trusted publisher:
+2. Save the GitHub Actions trusted publisher against the repository that actually publishes:
    - **Organization or user:** `alzahrani-khalid`
-   - **Repository:** `tickmarkr`
+   - **Repository:** `tickmarkr` (the public repository)
    - **Workflow filename:** `release.yml`
-3. Save. No `NPM_TOKEN` GitHub secret is required — the workflow authenticates via OIDC (`permissions: id-token: write`).
+3. Save. No `NPM_TOKEN` GitHub secret is required — the workflow authenticates via OIDC
+   (`permissions: id-token: write`).
 
-## Release flow
+**Symptom to remember:** a publish that fails with `E404` from a workflow that previously worked is
+the trusted-publisher binding pointing at the wrong repository identity — re-save it.
 
-1. Bump `version` in `package.json` and commit.
-2. Tag and push a `v*` tag (e.g. `v1.58.0`):
+## Release flow (guarded — publishes only from the public repository)
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) is a shared tracked file: the
+export ships it verbatim, so the identical workflow exists in both repositories. Its publish job
+carries a repository-identity guard:
+
+```yaml
+if: github.repository == 'alzahrani-khalid/tickmarkr'
+```
+
+A `v*` tag pushed in the private `tickmarkr-dev` repository therefore **skips the publish job
+entirely** — no billing, no doomed OIDC publish. Tagging the private repository does not release
+anything; publication happens only when the tag is pushed in the public repository.
+
+Per release:
+
+1. In the private repository: bump `version` in `package.json`, commit, and run the export in
+   mirror publish mode (below). Review the mirror commit, then push the mirror's `main`.
+2. In the **public** repository (the mirror), tag the export commit and push the tag:
 
    ```bash
-   git tag -a v1.58.0 -m "v1.58.0"
-   git push origin v1.58.0
+   git tag -a v1.60.0 -m "v1.60.0"
+   git push origin v1.60.0
    ```
 
-3. [`.github/workflows/release.yml`](.github/workflows/release.yml) runs on the tag push:
+3. The tag push runs `release.yml` in the public repository:
+   - `npm install -g npm@11` (OIDC trusted publishing needs a current npm)
    - `npm ci`
    - `npm run build`
    - `npm run lint`
@@ -32,7 +70,8 @@ Publish is fail-closed: a failing build, lint, or test blocks publication.
 
 ## Public GitHub export (squashed snapshot)
 
-The public `tickmarkr` repository is a **squashed** export — no `.planning/`, `specs/`, `.tickmarkr/`, operator history, or private documentation. The private development repository retains full history; the public repository follows an append-only model with one commit per release.
+The public `tickmarkr` repository is a **squashed** export — no `.planning/`, `specs/`,
+`.tickmarkr/`, operator history, or private documentation. The private development repository retains full history; the public repository follows an append-only model with one commit per release.
 
 ### Prerequisites
 
@@ -78,33 +117,37 @@ Private documentation pages (`.planning/`, `docs/superpowers/`, `docs/analysis/`
 
 ### Publish to GitHub — append-only model
 
-The public repository maintains **append-only history** with one commit per release. Instead of force-pushing, each export is committed on top of a persistent clone:
+The public repository maintains **append-only history** with one commit per release. Instead of force-pushing, each export is committed on top of a persistent clone by the script itself:
 
 1. Clone the public repository (one time):
+
    ```bash
    git clone git@github.com:alzahrani-khalid/tickmarkr.git tickmarkr-public-mirror
-   cd tickmarkr-public-mirror
    ```
 
-2. For each release, sync the export into the persistent clone and commit:
+2. For each release, run the export in mirror publish mode:
+
    ```bash
-   # From the export directory printed by export-public.sh
-   cd /path/to/export
-   
-   # Copy the export tree into the public mirror
-   cd /path/to/tickmarkr-public-mirror
-   rm -rf -- */ *.* .* 2>/dev/null; true
-   cd /path/to/export && git ls-files | tar --files-from - -c | (cd /path/to/tickmarkr-public-mirror && tar -xf -)
-   
-   # Verify the diff
-   git diff --stat
-   
-   # Commit on top of main (one commit per release)
-   git add -A
-   git commit -m "tickmarkr $(grep -m1 'version' ../path/to/private/package.json | sed 's/.*"\([^"]*\)".*/\1/') — public export"
-   
-   # Push to main (normal fast-forward, never force-push)
-   git push origin main
+   bash scripts/export-public.sh --onto /path/to/tickmarkr-public-mirror
+   ```
+
+   After building and leak-checking the export exactly as above (a leak aborts before the mirror
+   is touched), `--onto`:
+   - fetches the mirror's `origin` and **resets the mirror clone to its own `origin/main`**
+     (`git reset --hard origin/main`) before applying anything;
+   - removes the mirror's tracked files with `git rm` only — it never runs a filesystem delete
+     against the mirror, so the mirror's own `.git` metadata directory is never at risk (the
+     retired manual recipe's `rm -rf -- */ *.* .*` glob could match `.git`);
+   - extracts the export's committed tree on top;
+   - records a single commit on top of `main` — `tickmarkr <version> — public export`, with the
+     version read from the export's own `package.json`;
+   - **never pushes**.
+
+3. Review the mirror commit, then push manually:
+
+   ```bash
+   git -C /path/to/tickmarkr-public-mirror show --stat
+   git -C /path/to/tickmarkr-public-mirror push origin main   # normal fast-forward, never force-push
    ```
 
 The public history is fully reviewable and fork-friendly: every external fork has a stable merge-base, and each release is a single diffable commit pinned by a tag.

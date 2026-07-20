@@ -66,14 +66,23 @@ const gateStates = (task: Task, events: JournalEvent[]): GateState[] => {
 // verdict semantics only: pass brand green, fail red, skip/open dim chrome — everything else stays quiet
 const GATE_STATE_TOKEN: Record<GateState, (s: string) => string> = { pass: ok, fail, skip: dim, open: dim };
 
+// TTY cells are bare glyphs in fixed GATE_NAMES order — gate identity lives once in the frame
+// legend, and in words on a failing row; non-TTY keeps the letter+box chips (byte-pinned surface)
 const gateChain = (states: GateState[], unicode: boolean): string =>
-  GATE_NAMES.map((gate, i) => {
-    const chip = `${GATE_KEYS[gate]}${gateBox(states[i]!, unicode)}`;
-    return unicode ? GATE_STATE_TOKEN[states[i]!](chip) : chip;
-  }).join(" ");
+  GATE_NAMES.map((gate, i) => unicode
+    ? GATE_STATE_TOKEN[states[i]!](gateBox(states[i]!, true))
+    : `${GATE_KEYS[gate]}${gateBox(states[i]!, false)}`).join(" ");
 
-// plain (uncolored) chip width for column math — ANSI codes have zero display width
-const gateChainWidth = (unicode: boolean): number => GATE_NAMES.reduce((w, gate) => w + GATE_KEYS[gate].length + (unicode ? 1 : 3) + 1, -1);
+// plain (uncolored) cell width for column math — ANSI codes have zero display width
+const gateChainWidth = (unicode: boolean): number =>
+  GATE_NAMES.reduce((w, gate) => w + (unicode ? 1 : GATE_KEYS[gate].length + 3) + 1, -1);
+
+const failedGates = (states: GateState[]): string[] => GATE_NAMES.filter((_, i) => states[i] === "fail");
+// plain-text form of the failed-gate words for column math; rendered with a dim dot + red names
+const failedSuffix = (states: GateState[]): string => {
+  const f = failedGates(states);
+  return f.length ? ` · ${f.join(", ")}` : "";
+};
 
 const shortGoal = (goal: string, max: number): string => {
   const clause = goal.split(/[,;.?!]/, 1)[0]!.trim();
@@ -203,21 +212,24 @@ const renderFrame = (cwd: string): string => {
       : `no runs yet${dot}`) +
     `${gauge} ${done === g.tasks.length && g.tasks.length > 0 ? ok(tally) : tally}`;
   const hr = rule(Math.min(width, 100));
-  const gatesLegend = legend(`   gates: ${GATE_NAMES.map((gate) => `${GATE_KEYS[gate]} ${gate}`).join(" · ")}`);
+  const gatesLegend = legend(`   gates: ${GATE_NAMES.join(" · ")}`);
 
   const taskVerdict = (st: TaskStatus): Verdict =>
     st === "done" ? "pass" : st === "failed" ? "fail" : st === "human" ? "warn" : "neutral";
   const idW = Math.max(...cells.map((c) => c.t.id.length), 2);
-  const stW = Math.max(...cells.map((c) => (String(c.st) + c.label).length));
+  const stW = Math.max(...cells.map((c) => (String(c.st) + c.label + failedSuffix(c.states)).length));
   const chainW = gateChainWidth(true);
   const assignW = Math.max(...cells.map((c) => c.assignCol.length));
   const goalW = Math.max(8, width - (5 + idW) - 2 - chainW - 2 - stW - 2 - assignW);
   const rows = cells.map(({ t, st, label, assignCol, states }) => {
     const goal = shortGoal(t.goal, goalW).padEnd(goalW);
     const stWord = st === "done" ? ok(String(st)) : st === "failed" ? fail(String(st)) : st === "human" ? warn(String(st)) : String(st);
+    // a fail names its gate in words right here — the one moment gate identity is needed on a row
+    const f = failedGates(states);
     const statusCell = stWord +
       (label ? (label === " starved" ? fail(label) : dim(label)) : "") +
-      " ".repeat(stW - (String(st) + label).length);
+      (f.length ? dim(" · ") + fail(f.join(", ")) : "") +
+      " ".repeat(stW - (String(st) + label + failedSuffix(states)).length);
     return `  ${statusRow(taskVerdict(st), `${t.id.padEnd(idW)} ${goal}  ${gateChain(states, true)}  ${statusCell}  ${dim(assignCol)}`)}`;
   });
   return [header, hr, gatesLegend, ...rows].join("\n");

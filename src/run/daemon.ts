@@ -24,7 +24,7 @@ import { cleanupRunWorktrees, gitHead, linkNodeModules, sh, shGit, WORKTREE_LAYO
 import { classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
 import { acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
-import { nextChannel, QUALITY_ENV, route } from "../route/router.js";
+import { nextChannel, route } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
 import { normalizeStallSnapshot } from "./stall.js";
 
@@ -153,9 +153,8 @@ async function cherryPickCommits(wt: string, commits: string[]): Promise<string[
 }
 
 export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promise<RunSummary> {
-  // v1.51 T2: retired --quality env seam. Mode resolution owns premium routing now; an exported
-  // TICKMARKR_QUALITY must not resurrect the old one-band floor raise in daemon dispatches.
-  delete process.env[QUALITY_ENV];
+  // v1.51 T2 / OBS-89 (v1.60): retired --quality env seam. Mode resolution owns premium routing;
+  // route() no longer reads the retired env at all, so the old entrypoint scrub is gone with it.
   const adapters = opts.adapters ?? allAdapters();
   const health = readDoctor(repoRoot) ?? (await probeAll(adapters));
   const driver: ExecutorDriver = opts.driver ?? new SubprocessDriver();

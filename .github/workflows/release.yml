@@ -11,6 +11,9 @@ permissions:
 
 jobs:
   release:
+    # Publishes ONLY from the public repo — same guard as ci.public.yml. A tag pushed in the
+    # private tickmarkr-dev repo skips this job entirely instead of attempting a doomed publish.
+    if: github.repository == 'alzahrani-khalid/tickmarkr'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +27,4 @@ jobs:
       - run: npm run build
       - run: npm run lint
       - run: npm test
-      # Publishing runs from this PUBLIC repository: --provenance binds the npm package to this
-      # source and workflow via GitHub OIDC (trusted publishing).
       - run: npm publish --provenance --access public

@@ -335,14 +335,9 @@ describe("tickmarkr fleet", () => {
 
   test("assigning a tier to an unclassified model still requires a typed provenance note", async () => {
     const { repo, adapter } = setup();
-    queueAnswers("cheap", "");
-    const missing = await drive(repo, adapter, makeIO().io, KEYS.enter + KEYS.enter + KEYS.down + KEYS.t);
-    expect(missing).toEqual({
-      out: "fleet: assigning a tier to an unclassified model requires a typed benchmark-provenance note",
-      code: 1,
-    });
-
-    queueAnswers("mid", "AA Index 54, SWE-bench Pro 62%", "y");
+    // v1.60 T2: an empty note no longer destroys the session — the requirement is enforced by
+    // re-prompting the provenance field until a note is typed; nothing lands without one
+    queueAnswers("mid", "", "AA Index 54, SWE-bench Pro 62%", "y");
     const ok = await drive(
       repo,
       adapter,
@@ -351,6 +346,7 @@ describe("tickmarkr fleet", () => {
       ["--global-dir", isolatedGlobal()],
     );
     expect(ok).toMatch(/^fleet: wrote /);
+    expect(mockQuestion.mock.calls[2][0]).toContain("benchmark-provenance note is required");
     const overlay = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
     expect(overlay).toContain("fake-2: mid");
     expect(overlay).toContain("AA Index 54, SWE-bench Pro 62%");
@@ -1055,6 +1051,34 @@ review:
     expect(rawCalls.at(-1)).toBe(false);
   });
 
+  // v1.60 T3: previews rank with the picker's exploration setting (noExplore). Seed a profile where
+  // exploration WOULD divert the pick: docs gets a two-entry prefer so fake-1 and fake-2 sit in
+  // separate prefer groups (the ROUTE-17 rep-bonus key fires ACROSS groups; within one group the
+  // sub-vs-api cost key would decide first and no probe could ever flip it). fake-1 is warm past
+  // EXPLORE_CAP (bonus 0, positive learned score); fake-2 has one dispatch (probe due, bonus 0.8,
+  // cold score 0). Exploration-live routing picks the fake-2 probe; noExplore picks fake-1 — so a
+  // row ranked with exploration on would disagree with the picker's rank-1.
+  test("a step-4 or step-5 preview row's routed candidate always matches the candidate picker's rank-1 result for the same shape and channel set", async () => {
+    const { repo, adapter } = setup();
+    withOverlay(repo, `${FAKE_TIERS}routing:
+  map:
+    docs:
+      prefer: [fake:fake-1, fake:fake-2]
+`);
+    const runDir = join(tickmarkrDir(repo), "runs", "run-20260701-000000");
+    mkdirSync(runDir, { recursive: true });
+    const row = (model: string, channel: string) =>
+      JSON.stringify({ taskId: "T1", shape: "docs", adapter: "fake", model, channel, attempts: 1, outcome: "done", durationMs: 1000, gateFails: 0, consults: 0 });
+    writeFileSync(join(runDir, "telemetry.jsonl"), [...Array(6).fill(row("fake-1", "sub")), row("fake-2", "api")].join("\n") + "\n");
+    const { io, writes } = makeIO();
+    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    expect(out).toBe("fleet: quit without writing");
+    const rowRouted = /fake:fake-\d/.exec(pointerLine(writes[8]))?.[0]; // step-5 docs row
+    const rank1 = /fake:fake-\d/.exec(pointerLine(writes[9]))?.[0]; // picker cursor starts on rank-1
+    expect(rank1).toBe("fake:fake-1"); // the warm incumbent — never the due exploration probe
+    expect(rowRouted).toBe(rank1);
+  });
+
   // ── v1.56 T3: cost visibility on the shape screen ─────────────────────────
   // The DEFAULT map pins plan and spec to claude-code:fable, which cannot route in the fake
   // fleet — re-pin them onto fake-1 so all nine shapes route. Auto rows land on fake-1
@@ -1120,5 +1144,160 @@ review:
     // docs pinned to fake-2 (api, frontier) via the picker — the row carries the default
     // pricing-table frontier per-task estimate ($2.50), same figure the picker row showed
     expect(pointerLine(writes[11])).toContain("fake:fake-2 (api, frontier)  api ~$2.50/task");
+  });
+
+  // ── OBS-88: provenance notes survive fleet writes ─────────────────────────
+  // yaml.parse discards comments, so the write path used to know only the current session's own
+  // notes — the next fleet write of any kind silently stripped every prior # note. The session now
+  // harvests existing notes from the overlay bytes at load and re-attaches them on write.
+  const NOTE = "SWE-bench Pro 62.1 — fleet 2026-07-18";
+  const NOTED_TIERS = `tiers:
+  fake:
+    vendor: fake
+    channel: sub
+    models:
+      fake-1: mid  # ${NOTE}
+`;
+  const setupNoted = (extra = "") => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, NOTED_TIERS + extra);
+    stampDoctor(repo);
+    return { repo, adapter: fakeAdapter(repo) };
+  };
+  const MODE_ONLY_WRITE = KEYS.enter.repeat(3) + KEYS.down + KEYS.enter + KEYS.enter + KEYS.enter;
+
+  test("a provenance note attached to one model tier survives a fleet write that only changes a different model's tier", async () => {
+    const { repo, adapter } = setupNoted();
+    // classify the unclassified fake-2 (down from fake-1's row, t, typed tier + note), never touching fake-1
+    queueAnswers("cheap", "AA Index 54", "y");
+    const out = await drive(
+      repo, adapter, makeIO().io,
+      KEYS.enter + KEYS.enter + KEYS.down + KEYS.t + KEYS.enter + KEYS.enter + KEYS.enter + KEYS.enter,
+      ["--global-dir", isolatedGlobal()],
+    );
+    expect(out).toMatch(/^fleet: wrote /);
+    const written = readFileSync(overlayAt(repo), "utf8");
+    expect(written).toContain(`fake-1: mid  # ${NOTE}`); // the untouched note, byte-for-byte
+    expect(written).toMatch(/fake-2: cheap {2}# AA Index 54 — fleet \d{4}-\d{2}-\d{2}/); // fresh note stamped
+    expect(parsedOverlay(repo).tiers.fake.models).toMatchObject({ "fake-1": "mid", "fake-2": "cheap" });
+  });
+
+  test("a provenance note attached to one model tier survives a fleet write that only changes routing mode or steering preferences", async () => {
+    // a mode-only write
+    const a = setupNoted();
+    queueAnswers("y");
+    expect(await drive(a.repo, a.adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", isolatedGlobal()])).toMatch(/^fleet: wrote /);
+    const afterMode = readFileSync(overlayAt(a.repo), "utf8");
+    expect(afterMode).toContain("mode: staff-led");
+    expect(afterMode).toContain(`fake-1: mid  # ${NOTE}`);
+    // a steering-only write
+    const b = setupNoted();
+    queueAnswers("codex:gpt-5.6-sol", "y");
+    expect(await drive(b.repo, b.adapter, makeIO().io, TO_STEER + KEYS.f + KEYS.enter, ["--global-dir", isolatedGlobal()])).toMatch(/^fleet: wrote /);
+    const afterSteer = readFileSync(overlayAt(b.repo), "utf8");
+    expect(parsedOverlay(b.repo).review.prefer).toEqual(["codex:gpt-5.6-sol"]);
+    expect(afterSteer).toContain(`fake-1: mid  # ${NOTE}`);
+  });
+
+  test("a repo overlay with no existing provenance comments loads a fleet session with no provenance data and writes no spurious notes", async () => {
+    const { repo, adapter } = setup(); // FAKE_TIERS carries no comments
+    queueAnswers("y");
+    const out = await drive(repo, adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", isolatedGlobal()]);
+    expect(out).toMatch(/^fleet: wrote /);
+    const written = readFileSync(overlayAt(repo), "utf8");
+    expect(written).toContain("mode: staff-led");
+    expect(written).toMatch(/^ {6}fake-1: mid$/m); // the tier line exactly, no comment appended
+    expect(written).not.toContain("#"); // no spurious notes anywhere
+  });
+
+  test("an operator's hand-written deny reason or benchmark note is never silently dropped by a fleet edit that never touched it", async () => {
+    const { repo, adapter } = setupNoted(`routing:
+  deny:
+    models:
+      - fake:fake-2  # burned quota — re-enable in August
+`);
+    queueAnswers("y");
+    const out = await drive(repo, adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", isolatedGlobal()]);
+    expect(out).toMatch(/^fleet: wrote /);
+    const written = readFileSync(overlayAt(repo), "utf8");
+    expect(written).toContain("- fake:fake-2  # burned quota — re-enable in August"); // hand-written deny reason
+    expect(written).toContain(`fake-1: mid  # ${NOTE}`); // benchmark note
+    expect(parsedOverlay(repo).routing.deny.models).toEqual(["fake:fake-2"]); // comments never change the data
+  });
+
+  // ── v1.60 T2: step-3 input mistakes re-prompt instead of destroying the session ──
+  // The typed tier/provenance entry used to return { code: 1 } from inside step 3, unwinding
+  // the whole editor and discarding every in-session edit. Mistakes now re-prompt the same
+  // field; the only remaining discard paths are the operator's own (esc/q, or N at the diff).
+  // Drive: deny fake-1 with space (the in-session edit that must survive), down to the
+  // unclassified fake-2 row, t opens the typed tier entry.
+  const TO_MISTAKE = KEYS.enter + KEYS.enter + KEYS.space + KEYS.down + KEYS.t;
+  const THROUGH_REVIEW = KEYS.enter + KEYS.enter + KEYS.enter + KEYS.enter; // leave steps 3-6 to the diff confirm
+
+  test("an invalid tier entry at step 3 re-prompts the tier field and keeps every other in-session edit intact", async () => {
+    const { repo, adapter } = setup();
+    queueAnswers("bogus", "mid", "AA Index 54", "y");
+    const out = await drive(repo, adapter, makeIO().io, TO_MISTAKE + THROUGH_REVIEW, ["--global-dir", isolatedGlobal()]);
+    expect(out).toMatch(/^fleet: wrote /);
+    // the second question is the tier field again, naming the rejected entry
+    expect(mockQuestion.mock.calls[0][0]).toContain("tier (cheap|mid|frontier)>");
+    expect(mockQuestion.mock.calls[1][0]).toContain("invalid tier bogus");
+    expect(mockQuestion.mock.calls[1][0]).toContain("tier (cheap|mid|frontier)>");
+    // the pre-mistake deny toggle survived all the way into the written overlay
+    const overlay = parsedOverlay(repo);
+    expect(overlay.routing.deny.models).toEqual(["fake:fake-1"]);
+    expect(overlay.tiers.fake.models["fake-2"]).toBe("mid");
+  });
+
+  test("an empty provenance note at step 3 re-prompts the provenance field and keeps every other in-session edit intact", async () => {
+    const { repo, adapter } = setup();
+    queueAnswers("mid", "", "AA Index 54", "y");
+    const out = await drive(repo, adapter, makeIO().io, TO_MISTAKE + THROUGH_REVIEW, ["--global-dir", isolatedGlobal()]);
+    expect(out).toMatch(/^fleet: wrote /);
+    // the third question is the provenance field again, still demanding a typed note
+    expect(mockQuestion.mock.calls[1][0]).toContain("benchmark provenance note (required):");
+    expect(mockQuestion.mock.calls[2][0]).toContain("benchmark-provenance note is required");
+    const overlay = parsedOverlay(repo);
+    expect(overlay.routing.deny.models).toEqual(["fake:fake-1"]);
+    expect(overlay.tiers.fake.models["fake-2"]).toBe("mid");
+    expect(readFileSync(overlayAt(repo), "utf8")).toMatch(/fake-2: mid {2}# AA Index 54 — fleet \d{4}-\d{2}-\d{2}/);
+  });
+
+  test("a corrected entry after a re-prompt applies the tier assignment exactly as if it had been entered correctly the first time", async () => {
+    const gdir = isolatedGlobal();
+    const bytes = KEYS.enter + KEYS.enter + KEYS.down + KEYS.t + THROUGH_REVIEW;
+    // session A stumbles through both mistake classes before the corrections land
+    const a = setup();
+    queueAnswers("bogus", "mid", "", "AA Index 54", "y");
+    expect(await drive(a.repo, a.adapter, makeIO().io, bytes, ["--global-dir", gdir])).toMatch(/^fleet: wrote /);
+    // session B types the same entries correctly the first time
+    const b = setup();
+    queueAnswers("mid", "AA Index 54", "y");
+    expect(await drive(b.repo, b.adapter, makeIO().io, bytes, ["--global-dir", gdir])).toMatch(/^fleet: wrote /);
+    // byte-identical overlays: the mistakes left no trace on what was written
+    expect(readFileSync(overlayAt(a.repo), "utf8")).toBe(readFileSync(overlayAt(b.repo), "utf8"));
+  });
+
+  test("no step-3 input mistake can any longer discard an operator's in-session fleet edits before the review screen is reached", async () => {
+    const { repo, adapter } = setup();
+    const before = readFileSync(overlayAt(repo), "utf8");
+    const io = makeIO();
+    // every step-3 mistake class in one session, after the in-session deny edit: t on the
+    // classified fake-1 row (used to return code 1 and unwind the editor), then both typed
+    // mistakes on the unclassified fake-2 row; the session must still reach the review diff
+    // carrying every edit — the only discard is the operator's N
+    queueAnswers("bogus", "", "frontier", "", "AA Index 54", "n");
+    const out = await drive(
+      repo, adapter, io.io,
+      KEYS.enter + KEYS.enter + KEYS.space + KEYS.t + KEYS.down + KEYS.t + THROUGH_REVIEW,
+      ["--global-dir", isolatedGlobal()],
+    );
+    expect(out).toBe("fleet: discarded overlay changes");
+    const all = strip(io.writes.join(""));
+    // t on a classified row renders the inline notice and the session stays alive
+    expect(all).toContain("tier reassignment on classified models is not supported in v1");
+    expect(all).toContain("fake:fake-1"); // the deny edit reached the review diff
+    expect(all).toContain("fake-2: frontier"); // and so did the corrected classification
+    expect(readFileSync(overlayAt(repo), "utf8")).toBe(before);
   });
 });

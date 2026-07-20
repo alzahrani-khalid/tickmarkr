@@ -13,6 +13,7 @@ import {
   fleetRepoOverlayFromDelta,
   formatFleetPrint,
   globalConfigDir,
+  harvestFleetProvenance,
   overlayBytesLoadError,
   overlayPreferShapes,
   readOverlayFile,
@@ -48,6 +49,11 @@ export type FleetIO = { input?: FleetInput; output?: FleetOutput };
 const isDeniedAdapter = (id: string, editable: FleetEditable) => editable.denyAdapters.includes(id);
 const isDeniedModel = (adapter: string, model: string, editable: FleetEditable) =>
   editable.denyModels.includes(`${adapter}:${model}`);
+
+// v1.60 T3: every preview surface ranks with the SAME exploration setting as the candidate picker
+// (rankCandidates routes noExplore so repeated calls agree) — a due probe must never make a
+// step-4/5 row disagree with the picker's rank-1 for the same shape and channel set.
+const PREVIEW_EXPLORE = { noExplore: true } as const;
 
 function previewTask(shape: Shape): Task {
   return {
@@ -230,7 +236,10 @@ export async function fleet(
 
   const rm = resolveRunMode(cwd, { globalDir });
   const cfg = rm.cfg;
-  const initial = fleetEditableFromConfig(cfg);
+  // OBS-88: harvest existing `# note` comments from the overlay bytes at session load — the
+  // session must know about every prior note, not only its own edits, or the next write strips them
+  const harvested = harvestFleetProvenance(currentRepoOverlayText(cwd));
+  const initial = fleetEditableFromConfig(cfg, harvested.tiers);
   const editable = structuredClone(initial) as FleetEditable;
   const health = cached;
   const term = openTerm(input, output);
@@ -327,14 +336,29 @@ export async function fleet(
           changed = true;
         } else if (k.name === "t" && rows[mCursor]) {
           if (rows[mCursor].kind === "classified") {
-            return { out: "fleet: tier reassignment on classified models is not supported in v1 — edit config directly", code: 1 };
+            // v1.60 T2: t on a classified row is a step-3 input mistake like any other — the
+            // notice renders inline and the session (with every in-session edit) stays alive
+            term.frame([
+              ...listFrame(title, modelsLegend, renderRows(rows), mCursor),
+              "fleet: tier reassignment on classified models is not supported in v1 — edit config directly",
+            ]);
+            continue;
           }
-          const tier = (await term.askTyped(`tier (${TIERS.join("|")})> `)) as Tier;
-          if (!TIERS.includes(tier)) return { out: `fleet: invalid tier ${tier}`, code: 1 };
-          const note = await term.askTyped("benchmark provenance note (required): ");
-          if (!note) return { out: "fleet: assigning a tier to an unclassified model requires a typed benchmark-provenance note", code: 1 };
+          // v1.60 T2: an input mistake re-prompts the same field — a typo must never unwind
+          // the whole editor and discard every in-session edit before the review screen
+          let tier = (await term.askTyped(`tier (${TIERS.join("|")})> `)) as Tier;
+          while (!TIERS.includes(tier)) {
+            tier = (await term.askTyped(`fleet: invalid tier ${tier || "(empty)"} — tier (${TIERS.join("|")})> `)) as Tier;
+          }
+          let note = await term.askTyped("benchmark provenance note (required): ");
+          while (!note) {
+            note = await term.askTyped("fleet: a typed benchmark-provenance note is required — benchmark provenance note (required): ");
+          }
           editable.tiers[a.id] ??= {};
-          editable.tiers[a.id][rows[mCursor].model] = { tier, provenance: note };
+          // stamp at typing time — the serializer writes provenance verbatim, so harvested notes
+          // round-trip byte-for-byte instead of accreting a fresh date suffix every write (OBS-88)
+          const today = new Date().toISOString().slice(0, 10);
+          editable.tiers[a.id][rows[mCursor].model] = { tier, provenance: `${note} — fleet ${today}` };
           changed = true;
         }
         if (changed) term.frame(listFrame(title, modelsLegend, renderRows(rowsData()), mCursor));
@@ -362,7 +386,7 @@ export async function fleet(
       let apiUsd = 0;
       for (const shape of SHAPES) {
         try {
-          const a = route(previewTask(shape), previewCfg(cand), channels, profile).assignment;
+          const a = route(previewTask(shape), previewCfg(cand), channels, profile, undefined, undefined, PREVIEW_EXPLORE).assignment;
           tierCount[a.tier] = (tierCount[a.tier] ?? 0) + 1;
           if (a.channel === "sub") subs += 1;
           else {
@@ -426,7 +450,7 @@ export async function fleet(
       SHAPES.map((shape) => {
         let now: string;
         try {
-          const r = route(previewTask(shape), previewCfg(selectedMode), channels, profile);
+          const r = route(previewTask(shape), previewCfg(selectedMode), channels, profile, undefined, undefined, PREVIEW_EXPLORE);
           now = `${r.assignment.adapter}:${r.assignment.model} (${r.assignment.channel}, ${r.assignment.tier})  ${costSignal(r.assignment, cfg.pricing)}`;
         } catch (e) {
           now = (e as Error).message;
@@ -545,7 +569,16 @@ export async function fleet(
       if (Object.keys(block).length) merged[key] = block;
       else delete merged[key];
     }
-    const after = withModeLine(repoOverlayYaml(merged, provenanceMap(editable)), writeMode);
+    // OBS-88: session notes (which include the harvested ones attached at load) win per model;
+    // harvested notes alone cover entries with no editable seat — e.g. a null tombstone's comment
+    const tierNotes = structuredClone(harvested.tiers);
+    for (const [ad, ms] of Object.entries(provenanceMap(editable))) {
+      for (const [m, n] of Object.entries(ms)) (tierNotes[ad] ??= {})[m] = n;
+    }
+    const after = withModeLine(
+      repoOverlayYaml(merged, tierNotes, { adapters: harvested.denyAdapters, models: harvested.denyModels }),
+      writeMode,
+    );
     if ((!modeChanged && !steeringChanged && fleetEditableEquals(initial, editable)) || before === after) {
       return "fleet: no overlay changes (empty diff)";
     }

@@ -74,7 +74,7 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T2"))).toMatch(/B✓ T✗ L○ E○ S○ A- R-/);
+      expect(strip(row(out, "T2"))).toMatch(/✓ ✗ ○ ○ ○ - -/);
       expect(strip(row(out, "T2"))).toContain("pending"); // data plain — no off-palette status color
       expect(row(out, "T2")).not.toContain("\x1b[36m");
       expect(row(out, "T2").match(/fake:fake-2/g)).toHaveLength(1);
@@ -124,6 +124,89 @@ describe("status checklist rendering", () => {
     } finally {
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;
+      if (noColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = noColor;
+    }
+  });
+
+  test("a TTY gate chain renders as glyph-only cells with no letter prefix on any cell", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      dispatch("T1", "fake-1"), gate("T1", "build", true), gate("T1", "test", true), { ts, event: "task-done", taskId: "T1", data: {} },
+      dispatch("T2", "fake-2"), gate("T2", "build", true), gate("T2", "test", false),
+    ]);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(row(out, "T1"))).toContain("✓ ✓ ○ ○ ○ - -");
+      expect(strip(row(out, "T2"))).toContain("✓ ✗ ○ ○ ○ - -");
+      expect(strip(row(out, "T3"))).toContain("○ ○ ○ ○ ○ - -");
+      // no letter+glyph (or letter+dash) chip survives anywhere in the frame
+      expect(strip(out)).not.toMatch(/[A-Z][✓✗○]|\b[A-Z]-/);
+    });
+  });
+
+  test("the TTY frame legend names all seven gates in fixed order once per frame", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), dispatch("T1", "fake-1")]);
+
+    await withTty(async () => {
+      const plain = strip(await status([], repo));
+      expect(plain.split("gates: build · test · lint · evidence · scope · acceptance · review")).toHaveLength(2); // exactly once
+      expect(plain).not.toContain("B build"); // letter keys are gone from the TTY legend
+    });
+  });
+
+  test("a task with a failed gate names that gate in words in its own status cell", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      dispatch("T1", "fake-1"), gate("T1", "build", true), gate("T1", "test", true), { ts, event: "task-done", taskId: "T1", data: {} },
+      dispatch("T2", "fake-2"), gate("T2", "build", true), gate("T2", "test", false), { ts, event: "task-failed", taskId: "T2", data: {} },
+    ]);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(row(out, "T2"))).toContain("failed · test");
+      expect(strip(row(out, "T1"))).not.toContain("done ·"); // healthy rows carry no gate words
+    });
+  });
+
+  test("non-TTY and NO_COLOR output is byte-identical to its pre-redesign form", async () => {
+    const repo = mkRepo();
+    // deterministic fixture: events backdated exactly 10 minutes (age renders "10m"), a garbage
+    // pid (renders "unknown", never probes), fixed 120 columns — the status-brand golden idiom
+    const old = new Date(Date.now() - 600_000).toISOString();
+    const at = (e: JournalEvent): JournalEvent => ({ ...e, ts: old });
+    seed(repo, [
+      { ts: old, event: "run-start", data: { pid: "not-a-pid", graphDefinitionHash: DEF_HASH } },
+      at(dispatch("T1", "fake-1")), at(gate("T1", "build", true)), at(gate("T1", "test", true)), { ts: old, event: "task-done", taskId: "T1", data: {} },
+      at(dispatch("T2", "fake-2")), at(gate("T2", "build", true)), at(gate("T2", "test", false)), { ts: old, event: "task-failed", taskId: "T2", data: {} },
+    ]);
+    // golden literal captured from the pre-redesign implementation over this exact fixture — it must never drift
+    const golden =
+      "tickmarkr status / run run-watch / last event 10m ago / daemon pid unknown / 1/3 done\n" +
+      "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
+      "  [x] T1 Finish report  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
+      "  [!] T2 Run mixed gates  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
+      "  [ ] T3 Queue the undispatched follow-up  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const noColor = process.env.NO_COLOR;
+    try {
+      Object.defineProperty(process.stdout, "columns", { configurable: true, value: 120 });
+      for (const [ttyValue, noColorValue] of [[false, undefined], [true, "1"]] as const) {
+        Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: ttyValue });
+        if (noColorValue === undefined) delete process.env.NO_COLOR;
+        else process.env.NO_COLOR = noColorValue;
+        expect(await status([], repo)).toBe(golden);
+      }
+    } finally {
+      if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+      if (columns) Object.defineProperty(process.stdout, "columns", columns);
+      else delete (process.stdout as { columns?: number }).columns;
       if (noColor === undefined) delete process.env.NO_COLOR;
       else process.env.NO_COLOR = noColor;
     }

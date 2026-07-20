@@ -1,16 +1,22 @@
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test } from "vitest";
 import { version } from "../../src/cli/commands/version.js";
 import { dispatch, USAGE } from "../../src/cli/index.js";
+import { spawnCli, assertCliSuccess } from "../helpers/built-cli.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ENTRY = join(ROOT, "dist/cli/index.js");
-const PKG_VERSION = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version as string;
+const PKG_PATH = join(ROOT, "package.json");
+const LOCK_PATH = join(ROOT, "package-lock.json");
+const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
+const PRIOR_RELEASE_VERSION = "1.59.0";
 
 describe("tickmarkr version", () => {
+  beforeEach(() => {
+    process.env.TICKMARKR_BUILT_CLI_ENTRY = ENTRY;
+  });
   test("version() returns exactly the package.json version string", async () => {
     expect(await version()).toBe(PKG_VERSION);
     expect(await version([])).toBe(PKG_VERSION);
@@ -35,9 +41,26 @@ describe("tickmarkr version", () => {
     }
   });
 
+  test("the built CLI's version command reports the same version string as the package manifest", () => {
+    const r = spawnCli(["version"]);
+    assertCliSuccess(r, "version command");
+    expect(r.stderr).toBe("");
+    expect(r.stdout).toBe(`${PKG_VERSION}\n`);
+  });
+
+  test("the package manifest and its lockfile carry the same incremented version with no stale copy of the prior version anywhere else in the tree", () => {
+    const lock = JSON.parse(readFileSync(LOCK_PATH, "utf8")) as { version: string; packages: Record<string, { version?: string }> };
+    expect(PKG_VERSION).not.toBe(PRIOR_RELEASE_VERSION);
+    expect(lock.version).toBe(PKG_VERSION);
+    expect(lock.packages[""]?.version).toBe(PKG_VERSION);
+    for (const path of [PKG_PATH, LOCK_PATH] as const) {
+      expect(readFileSync(path, "utf8")).not.toContain(`"version": "${PRIOR_RELEASE_VERSION}"`);
+    }
+  });
+
   test.each(["version", "--version", "-v"] as const)("built CLI: %s prints version on stdout, exit 0", (cmd) => {
-    const r = spawnSync(process.execPath, [ENTRY, cmd], { encoding: "utf8" });
-    expect(r.status).toBe(0);
+    const r = spawnCli([cmd]);
+    assertCliSuccess(r, `version: ${cmd}`);
     expect(r.stderr).toBe("");
     expect(r.stdout).toBe(`${PKG_VERSION}\n`);
   });

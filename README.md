@@ -143,94 +143,34 @@ away from a failing adapter will never retry it in subsequent `tickmarkr resume`
 
 ## Choosing your fleet: `tickmarkr fleet`
 
-`tickmarkr doctor` is a pure sensor; `tickmarkr fleet` is the actuator. It walks six steps —
-probe data, agent CLIs, model tiers, routing mode, shape routing with a candidate picker, and
-steering preferences — and ends in a unified diff of your config overlay that is written **only
-on explicit confirm**. Pressing Enter through every step writes nothing. Assigning a tier to a
-model that has no classification yet requires a typed benchmark-provenance note, stored as a
-config comment beside the assignment.
-
-The shape routing step (step 5/6) features an **arrow-driven candidate picker** that ranks
-available channels by the production router's own logic, showing economics (tier + channel
-cost signals for API and sub channels) and the router's rationale for each rank. This replaces
-typed pin entry with verifiable suggestions. Step 4/6 shows an estimated spend context line
-across all shapes under each routing mode's resolved floors, also derived from the same preview
-routing machinery.
+Configure which agent CLIs and models tickmarkr may route before your first run:
 
 ```bash
-tickmarkr fleet          # interactive editor (requires a TTY)
-tickmarkr fleet --print  # effective fleet state (repo > global > defaults), non-interactive — good for CI drift checks
+tickmarkr doctor          # probe auth + capabilities (run after install or credential changes)
+tickmarkr fleet           # interactive editor (requires a TTY) — six steps, confirm to write
+tickmarkr fleet --print   # effective fleet state (repo > global > defaults), non-interactive
+tickmarkr plan            # lint the resolved routing table against your spec
+tickmarkr run             # dispatch with the fleet you confirmed
 ```
 
-Routing obeys a strict precedence — **pin > prefer > floors > marginal-cost auto**:
+`tickmarkr doctor` is a pure sensor; `tickmarkr fleet` is the actuator. The editor walks **six
+steps** — probe data, agent CLIs, model tiers, routing mode, shape routing with a **candidate
+picker**, and steering preferences — and ends in a unified diff of your repo config overlay.
+Nothing is written until you confirm; pressing Enter through every step leaves config unchanged.
+Step 5/6 uses an arrow-driven candidate picker ranked by the production router; step 3 may ask
+for a benchmark-provenance note when you classify a new model.
 
-- **pin** a shape to an exact channel: `map: { plan: { via: claude-code, model: fable } }`
-- **prefer**-rank adapters per shape: `map: { implement: { prefer: [cursor-agent, codex] } }`
-- **floors** set the minimum capability band per shape (`migration: frontier`, `tests: cheap`);
-  auto-routing then picks the cheapest authed channel at or above the floor
-- **deny/allow** bench models or whole adapters without touching tiers (see `deny.models` below)
-- **tiers** classify models into bands — only classified, doctor-authed models ever route
+Routing-mode semantics, pin/prefer/floor precedence, review and consult steering syntax,
+provenance rules, and `--quality` / `--mode` flags are documented in
+**[FLEET.md](FLEET.md)** (advanced reference).
 
-More levers, all optional and absent-safe (absent config keeps default behavior):
+## Steering
 
-- `routing.explore` — fence the exploration budget: `mode: off`, `excludeShapes`,
-  `excludeComplexityAtOrAbove`, and a per-channel `cap`; `run --no-explore` disables
-  exploration probes for a single run
-- `tiers.<adapter>.windows` — declare context-window sizes per model; doctor grows a window
-  column and `plan` warns (advisory, never blocking) when a task's payload estimate exceeds
-  the routed model's window
-- `routing.sla` — per-shape latency expectations, surfaced as advisory plan lints against the
-  learned performance profile
-- `run --quality` — compatibility alias for `run --mode partner-led` for that run; it disables
-  exploration and records the selected mode in routing provenance
-
-## Steering: routing modes, reviewer preferences, and reruns
-
-### Routing modes
-
-`routing.mode` is a preset that compiles into floor assignments at config load time. The router never sees the mode itself; it receives resolved floors only.
-
-Three routing modes are available:
-
-- **`risk-based`** (default): byte-identical to pre-v1.51 routing. Absent `mode` key resolves as risk-based.
-- **`partner-led`**: resolves every non-overridden shape to a `frontier` floor and disables exploration — use when quality is paramount and cost is secondary.
-- **`staff-led`**: lowers each mode default by one tier (e.g., `implement` and `refactor` become `cheap` instead of `mid`) while keeping the preset floor for the integrity set (`plan`, `spec`, `migration`, `ui`) at `frontier`.
-
-Explicit `routing.floors` entries beat mode-preset deltas and are linted during plan if they shadow the mode's delta; an explicit integrity floor below `frontier` is also linted. The mode is compiled once at config load and never consulted during routing.
-
-### Review preferences
-
-`review.prefer` is an ordered list of reviewer seats for the cross-vendor code-review gate. Entries are matched by diversity (never the same vendor or model as the original worker), and routing reorders the available channels only — it does not admit unauthed or denied channels.
-
-```yaml
-review:
-  prefer: [codex, kimi]           # bare adapter: inherits model from the routed channel
-  prefer: [codex:gpt-5.6-sol, kimi:kimi-code/k3]  # adapter:model explicit
-  prefer: [codex, kimi:kimi-code/k3]  # mixed: bare and explicit
-```
-
-**Grammar**: review prefer entries may name a bare adapter (inheriting the model from the current channel) or an explicit `adapter:model` pair. Bare adapters rank every diversity-eligible channel for that adapter; explicit pairs rank one diversity-eligible channel.
-
-### Consult preferences
-
-`consult.prefer` is a ranked failover list of seats for escalations on deadlock or gate stalls. Unlike review, a consult seat has no channel to inherit a model from, so entries **must be explicit `adapter:model` pairs**.
-
-```yaml
-consult:
-  adapter: claude-code
-  model: fable
-  prefer: [codex:gpt-5.6-sol, kimi:kimi-code/k3]   # adapter:model ONLY
-```
-
-The daemon walks the preference list to the first live adapter, then the pinned `consult.adapter:model` pair as the final fallback. Failed or unparseable verdicts fall to the next entry.
-
-**Grammar**: consult prefer entries require `adapter:model` form — a bare adapter name is invalid and fails config load. Every entry must declare both the adapter and the model because a consult seat runs independently with no channel context.
-
-### Rerun control: --supersedes
-
-`tickmarkr run --supersedes <prior-runId>` marks the current run as a rerun of a prior engagement. The current task graph is used for the rerun; compile it fresh first if the spec changed. The prior runId is recorded in the new journal, and the prior journal records the successor, for audit trails and change attribution.
-
-Use this when you modify the spec or worker logic and want to mark an intentional rerun while preserving the relationship in both run journals.
+Fleet step 6/6 sets `review.prefer` and `consult.prefer`; routing modes (`risk-based`,
+`partner-led`, `staff-led`) are chosen in step 4/6. Full grammar — including when review
+prefer may name a **bare adapter** versus `adapter:model`, and why consult prefer entries
+require **`adapter:model`** form — plus `tickmarkr run --supersedes` rerun control, is in
+**[FLEET.md](FLEET.md)**.
 
 ## Model scoping and auth detection
 
@@ -426,6 +366,7 @@ accepted contributions are credited via `Co-authored-by:` on the release commit.
 
 ## Documentation
 
+- **[FLEET.md](FLEET.md)** — routing modes, steering syntax, tier provenance, and run flags (advanced reference)
 - **[LICENSE](LICENSE)** — MIT license
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup and contribution guidelines
 - **[SECURITY.md](SECURITY.md)** — security policy and private vulnerability reporting

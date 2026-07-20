@@ -4,7 +4,7 @@ import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
 import { pickDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
 import { type RunSummary, formatSummary, resolveRunMode, runDaemon } from "../../run/daemon.js";
-import { route, type ExploreContext, NO_EXPLORE_ENV, QUALITY_ENV } from "../../route/router.js";
+import { route, type ExploreContext, NO_EXPLORE_ENV } from "../../route/router.js";
 import { formatJournalNarration, loadRoutingProfile, type JournalEvent } from "../../run/journal.js";
 import { ttyVisual } from "../../adapters/model-lints.js";
 import { statusRow, type Verdict } from "../../brand.js";
@@ -30,8 +30,9 @@ const summaryGreen = (s: RunSummary) =>
   && s.tipVerify !== "failed";
 
 // v1.51 T2: --quality is a pure compatibility alias for `--mode partner-led` (this run only). It
-// carries no one-band floor raise of its own: the flag never sets ExploreContext.quality or the
-// TICKMARKR_QUALITY env, so no downstream code raises a floor on its behalf (proven in mode-sources).
+// carries no one-band floor raise of its own — and since the OBS-89 rip (v1.60) route() no longer
+// reads the retired TICKMARKR_QUALITY env at all, so no downstream code can raise a floor on its
+// behalf (proven in mode-sources).
 const QUALITY_ALIAS_NOTICE =
   "tickmarkr: --quality is a compatibility alias for --mode partner-led (this run only) — "
   + "the v1.47 one-band floor raise is retired (deprecated); use --mode partner-led";
@@ -61,7 +62,6 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
   }
   if (values.quality) console.warn(QUALITY_ALIAS_NOTICE);
   const flagMode = (values.mode as RoutingMode | undefined) ?? (values.quality ? "partner-led" : undefined);
-  delete process.env[QUALITY_ENV];
   const graph = loadGraph(cwd);
   const { cfg, conflict } = resolveRunMode(cwd, { flag: flagMode, spec: graph.mode });
   if (conflict) {

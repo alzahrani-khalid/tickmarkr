@@ -196,3 +196,27 @@ describe("26-A′ cold-start parity: cold profile ≡ no profile (empty + thin-d
     expect(route(t, cfg, channels, cold)).toEqual(route(t, cfg, channels));
   });
 });
+
+describe("OBS-89 (v1.60) quality-env parity: route() reads no quality env", () => {
+  const { repo, globalDir } = emptyRepo();
+  const cfg = loadConfig(repo, { globalDir });
+  const channels = channelsOf(cfg);
+
+  test("every routing floor and tier resolution is identical with and without the quality environment variable set in the calling process", () => {
+    // Full-Route deep-equal over every shape, bare and with a task-hint floor — pre-rip,
+    // TICKMARKR_QUALITY=1 raised advisory and hint floors a band, so tier, provenance bound, and
+    // often the assignment itself diverged; a stray operator-shell export can no longer skew any
+    // caller (the OBS-74 preview/actuator divergence class this closes for good).
+    const tasks = [...SHAPES].flatMap((shape) => [
+      mkTask(shape),
+      { ...mkTask(shape), routingHints: { floor: "mid" as const, source: "obs-89 parity fixture" } },
+    ]);
+    const baseline = tasks.map((t) => route(t, cfg, channels));
+    process.env.TICKMARKR_QUALITY = "1";
+    try {
+      tasks.forEach((t, i) => expect(route(t, cfg, channels)).toEqual(baseline[i]));
+    } finally {
+      delete process.env.TICKMARKR_QUALITY;
+    }
+  });
+});

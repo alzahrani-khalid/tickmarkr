@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parse } from "yaml";
-import { ConfigError, DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate, fleetRepoOverlayFromDelta, globalConfigDir, loadConfig, ModelPricingSchema, repoOverlayYaml, serializeFleetOverlay, SubPricingSchema, TIER_RANK, type FleetEditable } from "../../src/config/config.js";
+import { ConfigError, DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate, fleetRepoOverlayFromDelta, globalConfigDir, harvestFleetProvenance, loadConfig, ModelPricingSchema, repoOverlayYaml, serializeFleetOverlay, SubPricingSchema, TIER_RANK, unifiedYamlDiff, type FleetEditable } from "../../src/config/config.js";
 
 function repoWithOverlay(yaml: string, globalDir?: string) {
   const gDir = globalDir ?? mkdtempSync(join(tmpdir(), "tickmarkr-cfg-g-"));
@@ -648,5 +648,115 @@ describe("OBS-75 fleet serializer round-trip", () => {
     expect("gpt-5.6-luna" in cfg.tiers.codex.models).toBe(false); // null tombstone applied
     expect(cfg.tiers.codex.models["gpt-5.5"]).toBe("frontier");
     expect(cfg.tiers.kimi.models["kimi-code/k3"]).toBe("frontier"); // default seeds survive the model-less entry
+  });
+});
+
+// OBS-88: yaml.parse discards comments, so the write path used to know only the current session's
+// own notes — every prior # note (typed benchmark provenance, hand-written deny reasons) was
+// silently stripped on the next fleet write. harvestFleetProvenance reads them back from the raw
+// overlay bytes at session load; the serializer re-attaches them verbatim.
+describe("OBS-88 provenance harvest", () => {
+  const NOTE = "SWE-bench Pro 62.1 — fleet 2026-07-18";
+
+  test("a fleet session that reassigns a tier without changing its provenance note preserves the original note byte-for-byte", () => {
+    const overlayText = serializeFleetOverlay(
+      { tiers: { fake: { vendor: "fake", channel: "sub", models: { "fake-1": "mid" } } } },
+      { fake: { "fake-1": NOTE } },
+    );
+    expect(overlayText).toContain(`fake-1: mid  # ${NOTE}`);
+    // session load: the harvested note rides the editable state from the start
+    const harvested = harvestFleetProvenance(overlayText);
+    expect(harvested.tiers).toEqual({ fake: { "fake-1": NOTE } });
+    const initial: FleetEditable = {
+      denyAdapters: [], denyModels: [],
+      tiers: { fake: { "fake-1": { tier: "mid", provenance: NOTE } } },
+      map: {}, floors: {},
+    };
+    const edited = structuredClone(initial);
+    edited.tiers.fake["fake-1"] = { tier: "frontier", provenance: NOTE };
+    const out = fleetRepoOverlayFromDelta(initial, edited, parse(overlayText) as Record<string, unknown>);
+    const rewritten = serializeFleetOverlay(out, harvested.tiers);
+    expect(rewritten).toContain(`fake-1: frontier  # ${NOTE}`);
+    // and the note is STILL byte-identical after a second harvest→serialize round trip
+    expect(harvestFleetProvenance(rewritten).tiers.fake["fake-1"]).toBe(NOTE);
+  });
+
+  test("harvest reads notes on tombstones and deny entries and the serializer re-attaches them", () => {
+    const text = [
+      "routing:",
+      "  deny:",
+      "    adapters:",
+      "      - grok  # flaky auth — retry in Aug",
+      "    models:",
+      "      - codex:gpt-5.5  # burned quota",
+      "tiers:",
+      "  codex:",
+      "    models:",
+      "      gpt-old: null  # retired 2026-07",
+      "",
+    ].join("\n");
+    const h = harvestFleetProvenance(text);
+    expect(h.denyAdapters).toEqual({ grok: "flaky auth — retry in Aug" });
+    expect(h.denyModels).toEqual({ "codex:gpt-5.5": "burned quota" });
+    expect(h.tiers).toEqual({ codex: { "gpt-old": "retired 2026-07" } });
+    const y = serializeFleetOverlay(parse(text) as Record<string, unknown>, h.tiers, { adapters: h.denyAdapters, models: h.denyModels });
+    expect(y).toContain("- grok  # flaky auth — retry in Aug");
+    expect(y).toContain("- codex:gpt-5.5  # burned quota");
+    expect(y).toContain("gpt-old: null  # retired 2026-07");
+    expect(parse(y)).toEqual(parse(text)); // comments never change what the loader sees
+  });
+
+  test("harvest fails open to empty on unreadable or comment-free overlays", () => {
+    expect(harvestFleetProvenance("")).toEqual({ tiers: {}, denyAdapters: {}, denyModels: {} });
+    expect(harvestFleetProvenance(": : :")).toEqual({ tiers: {}, denyAdapters: {}, denyModels: {} });
+    expect(harvestFleetProvenance("tiers:\n  fake:\n    models:\n      fake-1: mid\n"))
+      .toEqual({ tiers: {}, denyAdapters: {}, denyModels: {} });
+  });
+});
+
+// v1.60 T3: shortest-edit matching on the ONE confirmation surface an operator reviews before a
+// write — the old greedy scan resynced on the first mismatched line only, so one inserted line
+// cascaded into a whole-file remove/re-add hunk.
+describe("unifiedYamlDiff shortest-edit matching", () => {
+  const BODY = [
+    "routing:",
+    "  mode: risk-based",
+    "tiers:",
+    "  fake:",
+    "    channel: sub",
+    "    models:",
+    "      fake-1: mid",
+    "",
+  ];
+  // hunks: the body lines of each "@@" section, in order
+  const hunksOf = (diff: string): string[][] => {
+    const out: string[][] = [];
+    for (const line of diff.split("\n").slice(2)) {
+      if (line === "@@") out.push([]);
+      else if (line !== "") out.at(-1)!.push(line);
+    }
+    return out;
+  };
+
+  test("inserting one line into an unchanged overlay body produces a diff with exactly one hunk containing only that line", () => {
+    const before = BODY.join("\n");
+    const after = [...BODY.slice(0, 2), "  learned: off", ...BODY.slice(2)].join("\n");
+    const hunks = hunksOf(unifiedYamlDiff(before, after));
+    expect(hunks).toEqual([["+  learned: off"]]);
+  });
+
+  test("reordering two adjacent unrelated overlay lines produces no diff hunk larger than the two changed lines", () => {
+    const before = BODY.join("\n");
+    const after = [...BODY.slice(0, 3), BODY[4], BODY[3], ...BODY.slice(5)].join("\n"); // swap "  fake:" and "    channel: sub"
+    const hunks = hunksOf(unifiedYamlDiff(before, after));
+    const changed = hunks.flat();
+    expect(changed.length).toBe(2); // one removal + one re-insertion of a single swapped line
+    for (const hunk of hunks) expect(hunk.length).toBeLessThanOrEqual(2);
+  });
+
+  test("changing one line between two unchanged neighbours never shows the neighbours as removed and re-added", () => {
+    const after = BODY.map((l) => (l === "    channel: sub" ? "    channel: api" : l)).join("\n");
+    const hunks = hunksOf(unifiedYamlDiff(BODY.join("\n"), after));
+    expect(hunks).toEqual([["-    channel: sub", "+    channel: api"]]);
   });
 });

@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG, type TickmarkrConfig, TIER_RANK } from "../../src/config/config.js";
 import { type AuthHealth, type BillingChannel, channelKey, type WorkerAdapter } from "../../src/adapters/types.js";
@@ -415,5 +417,55 @@ describe("v1.58 frontier spread", () => {
   test("a spread-decided auto pick names the spread in provenance", () => {
     const r = route(mkTask({ shape: "migration" }), cfg, FR);
     expect(r.provenance).toContain("marginal-cost auto (via frontier spread)");
+  });
+});
+
+describe("OBS-89 (v1.60): the retired quality env is inert in route()", () => {
+  test("setting the quality environment variable before calling route directly has no effect on the resolved tier or floor", () => {
+    // pre-rip, TICKMARKR_QUALITY=1 raised the advisory floor a band (implement mid→frontier) and
+    // raised a task-hint floor too — every case below would have routed a higher tier with a
+    // "→…(--quality)" bound in provenance
+    const tasks = [
+      mkTask({ shape: "implement" }), // advisory floor mid — the raise target the rip deleted
+      mkTask({ shape: "migration" }), // advisory floor frontier — already top band
+      mkTask({ shape: "chore", routingHints: { floor: "mid", source: "obs-89 fixture" } }), // task-hint floor
+    ];
+    const baseline = tasks.map((t) => route(t, cfg, CH));
+    process.env.TICKMARKR_QUALITY = "1";
+    try {
+      tasks.forEach((t, i) => {
+        const r = route(t, cfg, CH);
+        expect(r.assignment.tier).toBe(baseline[i].assignment.tier);
+        expect(r.provenance).toBe(baseline[i].provenance); // the floor bound is named here — no raise, no (--quality)
+        expect(r).toEqual(baseline[i]);
+      });
+    } finally {
+      delete process.env.TICKMARKR_QUALITY;
+    }
+  });
+
+  test("no source file references the quality environment variable name outside of a historical comment or test fixture", () => {
+    // Sweep every file under src/ with comments stripped. After the OBS-89 rip nothing READS the
+    // retired TICKMARKR_QUALITY variable; the sole surviving non-comment reference in src is the
+    // inert scrub-target constant declaration in src/route/router.ts, kept only so the spawn seam
+    // (src/run/git.ts) goes on erasing a stale operator shell's legacy export from child
+    // environments — a retired-seam contract pinned by test fixtures (tests/run/git.test.ts,
+    // tests/setup.ts, tests/gates/baseline.test.ts) that import the constant. Anything beyond that
+    // single declaration — above all any process.env read of the name — fails this sweep.
+    const stripComments = (s: string) =>
+      s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+    const srcFiles = readdirSync("src", { recursive: true })
+      .map(String).filter((f) => f.endsWith(".ts")).map((f) => join("src", f));
+    const stripped = new Map(srcFiles.map((f) => [f, stripComments(readFileSync(f, "utf8"))]));
+    // (a) no src file reads the variable — neither by literal nor through the constant
+    for (const [f, code] of stripped) {
+      expect(code, f).not.toMatch(/process\.env\s*(\.\s*TICKMARKR_QUALITY|\[\s*(QUALITY_ENV|["']TICKMARKR_QUALITY["'])\s*\])/);
+    }
+    // (b) outside comments the name survives in exactly one place: the scrub-target declaration
+    const refs = [...stripped].filter(([, code]) => code.includes("TICKMARKR_QUALITY")).map(([f]) => f);
+    expect(refs).toEqual([join("src", "route", "router.ts")]);
+    const routerCode = stripped.get(join("src", "route", "router.ts"))!;
+    expect(routerCode.match(/TICKMARKR_QUALITY/g)).toHaveLength(1);
+    expect(routerCode).toContain(`export const QUALITY_ENV = "TICKMARKR_QUALITY";`);
   });
 });

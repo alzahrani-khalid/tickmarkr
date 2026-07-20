@@ -1,9 +1,8 @@
-import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { dispatch, USAGE } from "../../src/cli/index.js";
 import { parse } from "yaml";
 import { compile } from "../../src/cli/commands/compile.js";
@@ -24,6 +23,8 @@ import { validateGraph } from "../../src/graph/schema.js";
 import { gitHead } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
 import { COMMIT, authedModels, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
+import { spawnCli, assertCliSuccess, assertCliExit, type BuiltCliResult } from "../helpers/built-cli.js";
+import vitestConfig, { DIST_COUPLED_TESTS } from "../../vitest.config.js";
 
 // only fake is installed+authed, so discoverChannels yields fake channels ONLY — routing can never
 // pick a real CLI, and no real binary is invoked. Paired with TICKMARKR_FAKE_SCRIPT this keeps the
@@ -54,6 +55,9 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ENTRY = join(ROOT, "dist/cli/index.js");
 
 describe("tickmarkr help", () => {
+  beforeEach(() => {
+    process.env.TICKMARKR_BUILT_CLI_ENTRY = ENTRY;
+  });
   test.each(["help", "-h", "--help"])("%s prints USAGE on stdout and exits 0", async (cmd) => {
     const r = await dispatch(cmd, []);
     expect(r.out).toBe(USAGE);
@@ -68,16 +72,16 @@ describe("tickmarkr help", () => {
 
   test("built CLI: help/-h/--help exit 0 with USAGE on stdout", () => {
     for (const cmd of ["help", "-h", "--help"]) {
-      const r = spawnSync(process.execPath, [ENTRY, cmd], { encoding: "utf8" });
-      expect(r.status).toBe(0);
+      const r = spawnCli([cmd]);
+      assertCliSuccess(r, `help: ${cmd}`);
       expect(r.stderr).toBe("");
       expect(r.stdout).toBe(`${USAGE}\n`);
     }
   });
 
   test("built CLI: unknown command exits 1 with USAGE on stdout", () => {
-    const r = spawnSync(process.execPath, [ENTRY, "nonexistent"], { encoding: "utf8" });
-    expect(r.status).toBe(1);
+    const r = spawnCli(["nonexistent"]);
+    assertCliExit(r, 1, "unknown command");
     expect(r.stdout).toBe(`${USAGE}\n`);
   });
 });
@@ -418,3 +422,116 @@ describe("tickmarkr doctor — model drift suggestion fragment (MODEL-05/06/07)"
     expect(() => loadConfig(typo.repo, { globalDir: typo.globalDir })).toThrow(ConfigError);
   });
 });
+
+describe("built-cli helper (OBS-96 piece 1)", () => {
+  test("test: a forced non-zero exit from the built CLI in a test using the shared helper produces a failure message containing the exit status and the child's stderr", () => {
+    const failed: BuiltCliResult = {
+      status: 1,
+      signal: null,
+      stderr: "fatal error: something went wrong",
+      stdout: "",
+      durationMs: 1500,
+    };
+    expect(() => assertCliSuccess(failed, "forced failure")).toThrow(/exit status: 1[\s\S]*fatal error: something went wrong/);
+  });
+
+  test("test: a forced non-zero exit from the built CLI in a test using the shared helper produces a failure message containing the elapsed wall-clock duration", () => {
+    const failed: BuiltCliResult = {
+      status: 1,
+      signal: null,
+      stderr: "error output",
+      stdout: "",
+      durationMs: 14500,
+    };
+    expect(() => assertCliSuccess(failed, "slow failure")).toThrow(/elapsed: 14500ms/);
+  });
+
+  test("test: every built-CLI assertion in both test files runs through the shared helper rather than a raw spawnSync assertion", () => {
+    for (const rel of ["tests/cli/cli.test.ts", "tests/cli/version.test.ts"]) {
+      const src = readFileSync(join(ROOT, rel), "utf8");
+      expect(src).not.toMatch(/\bspawnSync\s*\(/);
+      expect(src).toMatch(/\bassertCli(Success|Exit)\s*\(/);
+    }
+  });
+
+  test("the helper's failure message alone is enough to distinguish a slow cold-contention failure from a fast genuine regression without re-running anything", () => {
+    const slow: BuiltCliResult = { status: 1, signal: null, stderr: "test timeout error", stdout: "", durationMs: 75000 };
+    const fast: BuiltCliResult = { status: 1, signal: null, stderr: "assertion failed: expected 5 to be 10", stdout: "", durationMs: 800 };
+    const slowMsg = captureAssertFail(() => assertCliSuccess(slow, "cold contention"));
+    const fastMsg = captureAssertFail(() => assertCliSuccess(fast, "real bug"));
+    expect(slowMsg).toContain("elapsed: 75000ms");
+    expect(fastMsg).toContain("elapsed: 800ms");
+    expect(slowMsg).toMatch(/elapsed: (\d+)ms/);
+    expect(fastMsg).toMatch(/elapsed: (\d+)ms/);
+    expect(Number(slowMsg.match(/elapsed: (\d+)ms/)![1])).toBeGreaterThan(30000);
+    expect(Number(fastMsg.match(/elapsed: (\d+)ms/)![1])).toBeLessThan(5000);
+  });
+});
+
+describe("OBS-96 fix (piece 3) — dist mid-suite rewrite race", () => {
+  // The rig's telemetry (scripts/repro-obs96.mjs REPRO_RECORD) captured the contended resource:
+  // bin.test.ts:37 rewrites ROOT dist (tsc truncate-then-write) while forks here + version.test.ts
+  // spawn node dist/cli/index.js and import a mid-rewrite module (dist/route/router.js, empty →
+  // SyntaxError, exit 1, no stdout). A first run in a freshly built dist passes iff the writer can
+  // never overlap the readers, so this pins the scheduling contract that makes that true — and its
+  // closure over the whole test tree, so a future dist reader/writer outside the set turns it red.
+  //
+  // Fix verification record (2026-07-19, this host — darwin arm64 18-way):
+  //   pre-fix c20c22f: rig cold attempt reproduced the target signature (probe crashes both files,
+  //     missingDist:false, warm-control 1200 reads / 0 crashes green) — the rig is live, not an artifact;
+  //   post-fix fd1f7dc: 5/5 independently cold rig attempts — cold `npm test` exit 0, failedFiles [],
+  //     `✓ |built-cli| cli.test.ts + version.test.ts + bin.test.ts` serialized at the tail of each run;
+  //     the rig's part-(b) probe still crashes by construction (it spawns its own concurrent
+  //     `npm run build` writers OUTSIDE vitest — the raw mechanism, which no suite scheduling can or
+  //     should mask) and each probe red's paired warm control stayed green, so those reds are the
+  //     manufactured race, not a suite regression.
+  interface ProjectEntry {
+    test: {
+      name?: string;
+      pool?: string;
+      include?: string[];
+      exclude?: string[];
+      poolOptions?: { forks?: { singleFork?: boolean } };
+    };
+  }
+
+  test("test: the full suite passes on a first run in a freshly built dist directory with no prior warm run in the same process", () => {
+    // the rig-evidenced set: the one mid-suite dist writer + the two spawnCli readers
+    expect([...DIST_COUPLED_TESTS].sort()).toEqual(["tests/cli/bin.test.ts", "tests/cli/cli.test.ts", "tests/cli/version.test.ts"]);
+
+    // 1) they run in ONE fork, files sequential, after the parallel fan-out — writer ∦ readers
+    const projects = (vitestConfig as { test?: { projects?: ProjectEntry[] } }).test?.projects ?? [];
+    const builtCli = projects.find((p) => p.test.name === "built-cli");
+    expect(builtCli).toBeDefined();
+    expect(builtCli!.test.include).toEqual(DIST_COUPLED_TESTS);
+    expect(builtCli!.test.poolOptions?.forks?.singleFork).toBe(true);
+    expect(builtCli!.test.pool).toBeUndefined(); // forks is the default pool — singleFork applies
+
+    // 2) every OTHER project excludes all three, so no parallel fork can also pick them up
+    for (const p of projects) {
+      if (p.test.name === "built-cli") continue;
+      for (const f of DIST_COUPLED_TESTS) expect(p.test.exclude).toContain(f);
+    }
+
+    // 3) closure: every test file that spawns the built CLI or rebuilds ROOT dist mid-suite is in
+    // the serialized set — nothing dist-coupled can run in a parallel fork
+    const testFiles = readdirSync(join(ROOT, "tests"), { recursive: true, encoding: "utf8" })
+      .filter((p) => p.endsWith(".test.ts"))
+      .map((p) => join("tests", p));
+    expect(testFiles.length).toBeGreaterThan(30); // the sweep saw the real tree
+    const distCoupled = testFiles.filter((rel) => {
+      const src = readFileSync(join(ROOT, rel), "utf8");
+      return /TICKMARKR_BUILT_CLI_ENTRY|helpers\/built-cli|\bspawnCli\s*\(/.test(src) || /\[\s*["']run["'],\s*["']build["']\s*\]/.test(src);
+    });
+    expect(distCoupled.sort()).toEqual([...DIST_COUPLED_TESTS].sort());
+  });
+});
+
+function captureAssertFail(fn: () => void): string {
+  try {
+    fn();
+  } catch (e) {
+    return String(e);
+  }
+  return "";
+}

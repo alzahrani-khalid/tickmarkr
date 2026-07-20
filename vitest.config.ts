@@ -1,4 +1,4 @@
-import { coverageConfigDefaults, defineConfig } from "vitest/config";
+import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/config";
 
 // v1.22 T3 / OBS-17: seal herdr control-plane vars before workers fork so the suite never inherits
 // HERDR_ENV=1 (or a live socket) from the operator's shell. Tests may re-set these explicitly
@@ -11,11 +11,45 @@ for (const k of ["HERDR_ENV", "HERDR_SOCKET_PATH"] as const) delete process.env[
 // broke on the dev machine while green in CI (2026-07-15). Point XDG at a committed empty dir.
 process.env.XDG_CONFIG_HOME = new URL("./tests/.xdg-empty", import.meta.url).pathname;
 
+// OBS-96 fix (v1.60 T9): the repro rig's captured crash telemetry (scripts/repro-obs96.mjs
+// REPRO_RECORD.sampleCrashStderr) identifies the contended resource as the ROOT dist tree:
+// tests/cli/bin.test.ts:37 runs a full `npm run build` MID-SUITE (tsc emits truncate-then-write)
+// while parallel forks in cli.test.ts/version.test.ts spawn `node dist/cli/index.js` — a reader
+// that imports a module inside the rewrite window loads an empty/partial file (captured:
+// dist/route/router.js) and exits 1 with no stdout, the exact fresh-clone first-run signature.
+// These three files are the suite's ONLY mid-suite dist writer + readers (closure is red-pinned by
+// the OBS-96 guard test in cli.test.ts), so they run in one single fork, sequentially, after the
+// parallel fan-out (vitest per-project poolOptions.forks.singleFork) — dist access is mutually
+// exclusive by construction. Everything else keeps full parallelism: NOT a fork cap (the v1.60
+// scope consult forbids caps chosen without evidence — this serializes exactly the evidenced set).
+export const DIST_COUPLED_TESTS = [
+  "tests/cli/bin.test.ts", // writer: rebuilds + packs ROOT dist mid-suite
+  "tests/cli/cli.test.ts", // reader: spawns node dist/cli/index.js
+  "tests/cli/version.test.ts", // reader: spawns node dist/cli/index.js
+];
+
 export default defineConfig({
   test: {
-    include: ["tests/**/*.test.ts"],
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
     testTimeout: 20000,
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: "suite",
+          include: ["tests/**/*.test.ts"],
+          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "built-cli",
+          include: DIST_COUPLED_TESTS,
+          poolOptions: { forks: { singleFork: true } },
+        },
+      },
+    ],
     coverage: {
       provider: "v8",
       include: [

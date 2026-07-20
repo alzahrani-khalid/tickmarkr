@@ -28,6 +28,7 @@ const PUBLIC_EXACT = new Set([
   "CHANGELOG.md",
   "CODE_OF_CONDUCT.md",
   "CONTRIBUTING.md",
+  "FLEET.md",
   "LICENSE",
   "README.md",
   "RELEASING.md",
