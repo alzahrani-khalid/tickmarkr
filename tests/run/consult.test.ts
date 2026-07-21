@@ -135,6 +135,19 @@ describe("consult", () => {
     expect(files.some((f) => f.startsWith("T1-"))).toBe(true);
   });
 
+  // T3 secret redaction: the dossier artifact is masked at the persist seam; the Dossier in memory is not.
+  test("a consult dossier transcript carrying a secret assignment persists with the value masked", async () => {
+    const { cfg, fake, runDir } = setup({ action: "retry", notes: "redaction path" });
+    const leaky: Dossier = { ...dossier, transcript: 'worker ran: export DEPLOY_TOKEN="hunter2secretvalue99"' };
+    const v = await consult(leaky, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
+    expect(v).toEqual({ action: "retry", notes: "redaction path" });
+    const md = readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!;
+    const persisted = readFileSync(join(runDir, "consults", md), "utf8");
+    expect(persisted).not.toContain("hunter2secretvalue99");
+    expect(persisted).toContain('DEPLOY_TOKEN="[REDACTED]"'); // key name survives, value does not
+    expect(leaky.transcript).toContain("hunter2secretvalue99"); // in-memory original untouched
+  });
+
   test("v1.24: excludeAdapter on reroute is preserved when a non-empty string", async () => {
     const { cfg, fake, runDir } = setup({
       action: "reroute", notes: "trust dialog blocks the CLI", excludeAdapter: "cursor-agent",

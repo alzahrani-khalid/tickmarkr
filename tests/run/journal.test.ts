@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
+import { buildDossierPrompt, type Dossier } from "../../src/run/consult.js";
 import { ATTEMPT_CAP_RELEASE, appendProfileDiscount, engagementComparable, formatJournalNarration, gateResultJournalData, Journal, newRunId, parseRunId, readAllTelemetry, readProfileDiscounts, recordedGraphDefinitionHash, TelemetryRowSchema } from "../../src/run/journal.js";
+import { MASK, redactSecrets } from "../../src/run/redact.js";
 
 // Phase 46 (RES-01/RES-02 derivation half): the verbatim vendored incident fixture — a line subset of
 // run-20260711-185020 quoted at plan time, never regenerated from the live .tickmarkr tree.
@@ -206,6 +208,21 @@ describe("journal", () => {
     expect(rw.attempts).toBe(1); // Phase 46 non-interaction: one dispatch ⇒ one attempt; the retry adds nothing
     expect(rw.tried).toEqual(ro.tried);
     expect(channelKey(rw.lastAssignment!)).toBe(channelKey(ro.lastAssignment!));
+  });
+
+  // T3 secret redaction: append masks the persisted bytes only — memory, narration parity, and replay
+  // outcomes are untouched (the credential-free corpus persists byte-identically by construction).
+  test("a journaled event whose payload carries a vendor key shape persists the payload with the credential masked", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-j-"));
+    const j = Journal.create(dir, "run-1");
+    const data = { output: "worker echoed ANTHROPIC_API_KEY=sk-ant-api03-AbCd1234EfGh5678IjKl" };
+    j.append("worker-result", "T1", data);
+    const raw = readFileSync(join(j.dir, "journal.jsonl"), "utf8");
+    expect(raw).not.toContain("AbCd1234EfGh5678IjKl");
+    expect(raw).toContain("sk-ant-[REDACTED]"); // credential class survives, value does not
+    expect(j.read()[0].data.output).toBe("worker echoed ANTHROPIC_API_KEY=sk-ant-[REDACTED]");
+    // the in-memory original is untouched — redaction happens at the persistence seam only
+    expect(data.output).toContain("sk-ant-api03-AbCd1234EfGh5678IjKl");
   });
 
   test("telemetry rows round-trip", () => {
@@ -464,6 +481,101 @@ describe("T5 signalQuality telemetry", () => {
     });
     expect(parsed.success).toBe(true);
     expect(TelemetryRowSchema.safeParse(v15row).success).toBe(true); // legacy rows unchanged
+  });
+});
+
+// T3 secret redaction (repo-scan Tier A #2): the shared pass every persistence seam for captured
+// agent text routes through — journal payloads and telemetry (Journal.append/telemetry) and consult
+// dossier artifacts (consult.ts). Lives beside the journal suite rather than its own file so the
+// tests/run file count documented in docs/codebase/TESTING.md stays truthful.
+describe("redactSecrets (persistence-seam redaction pass)", () => {
+  // Fixture literals stay below scripts/export-public.sh's leak-scanner thresholds; the AWS shape
+  // (scanner threshold == the real shape) is assembled at runtime so the file bytes never match.
+  const AWS_EXAMPLE_KEY = ["AKIA", "IOSFODNN7EXAMPLE"].join("");
+
+  test("text without credential shapes passes through byte-identical", () => {
+    const samples = [
+      "plain prose about gates, tasks and worktrees",
+      JSON.stringify({ ts: "t", event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, details: "842 tests passed" } }),
+      "task-dispatch pi:zai/glm-5.2 attempt 0 — risk-based mode",
+      "the token refresh flow needs another look", // secret-ish word without an assignment shape
+      '{"tokens":{"input":52340,"output":1200},"maxTokens":30000000}', // telemetry counts, not credentials
+      "commit abc1234deadbeef on tickmarkr/run-20260721-231121",
+    ];
+    for (const s of samples) expect(redactSecrets(s)).toBe(s);
+  });
+
+  test("masking preserves enough prefix to identify the credential class without exposing the value", () => {
+    expect(redactSecrets("sk-ant-api03-AbCd1234EfGh5678")).toBe(`sk-ant-${MASK}`);
+    expect(redactSecrets("ghp_AbCdEfGhIjKlMnOp1234")).toBe(`ghp_${MASK}`);
+    expect(redactSecrets(AWS_EXAMPLE_KEY)).toBe(`AKIA${MASK}`);
+    expect(redactSecrets("xoxb-12345678")).toBe(`xoxb-${MASK}`);
+    expect(redactSecrets("sk-proj-AbCd1234EfGh5678IjKl")).toBe(`sk-proj-${MASK}`);
+  });
+
+  test("vendor key families are masked with the class prefix kept", () => {
+    expect(redactSecrets("sk-AbCdEfGh12345678")).toBe(`sk-${MASK}`);
+    expect(redactSecrets("github_pat_11AAAAAAA0abcdefgh")).toBe(`github_pat_${MASK}`);
+    expect(redactSecrets("glpat-AbCdEfGh1234")).toBe(`glpat-${MASK}`);
+    expect(redactSecrets("npm_AbCdEfGhIjKlMnOp1234")).toBe(`npm_${MASK}`);
+    expect(redactSecrets("AIzaSyA1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tUvW")).toBe(`AIza${MASK}`);
+  });
+
+  test("secret assignment patterns mask the value and keep the key name", () => {
+    expect(redactSecrets("OPENAI_API_KEY=Zx9AbCdEfGh12345")).toBe(`OPENAI_API_KEY=${MASK}`);
+    expect(redactSecrets('"apiKey": "Zx9AbCdEfGh12345"')).toBe(`"apiKey": "${MASK}"`);
+    expect(redactSecrets("password: correcthorsebattery")).toBe(`password: ${MASK}`);
+    expect(redactSecrets('export DEPLOY_TOKEN="hunter2secretvalue99"')).toBe(`export DEPLOY_TOKEN="${MASK}"`);
+    expect(redactSecrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload")).toBe(`Authorization: Bearer ${MASK}`);
+  });
+
+  test("a redacted JSON journal line still parses", () => {
+    const line = JSON.stringify({
+      ts: "t", event: "worker-result", taskId: "T1",
+      data: { output: 'echoed ANTHROPIC_API_KEY=sk-ant-api03-AbCd1234EfGh5678 and set password: "hunter2secretvalue99"' },
+    });
+    const parsed = JSON.parse(redactSecrets(line)) as { data: { output: string } };
+    expect(parsed.data.output).toContain(`sk-ant-${MASK}`);
+    expect(parsed.data.output).not.toContain("hunter2secretvalue99");
+  });
+
+  test("redaction is idempotent — re-persisting a masked line changes nothing", () => {
+    const once = redactSecrets("journal captured OPENAI_API_KEY=Zx9AbCdEfGh12345 beside sk-ant-api03-AbCd1234EfGh5678");
+    expect(once).toContain(MASK);
+    expect(redactSecrets(once)).toBe(once);
+  });
+
+  test("redaction stays linear on parked-diff-scale payloads", () => {
+    // Regression: a leading [A-Za-z0-9_.-]* in the assignment pattern backtracked quadratically —
+    // ~24s on one 130K token, paid on every journal append. Bound is ~100× current cost so it only
+    // trips on a complexity regression, never on machine load.
+    const giantToken = "A".repeat(130_000);
+    const diffWithKeyword = `--- a/big.min.js\n+${"sha512-AbCdEf0123456789".repeat(7000)}\ntoken refresh flow`;
+    const t0 = performance.now();
+    expect(redactSecrets(giantToken)).toBe(giantToken);
+    expect(redactSecrets(diffWithKeyword)).toBe(diffWithKeyword);
+    expect(performance.now() - t0).toBeLessThan(5000);
+  });
+
+  test("existing journal replay and dossier fixtures keep their outcomes under the redaction pass", () => {
+    // Journal side: the vendored incident fixture is credential-free ⇒ the pass is byte-inert, and a
+    // journal persisted through the redacting seam replays to the same statuses and resume state.
+    const fixture = readFileSync(INCIDENT_FIX, "utf8");
+    expect(redactSecrets(fixture)).toBe(fixture);
+    const j = Journal.create(mkdtempSync(join(tmpdir(), "tickmarkr-redact-")), "run-1");
+    writeFileSync(join(j.dir, "journal.jsonl"), fixture);
+    const st = j.replayResumeState().get("P43-03")!;
+    expect(st.attempts).toBe(5);
+    expect(st.tried).toEqual(["pi:zai/glm-5.2", "cursor-agent:composer-2.5"]);
+    expect(j.replayStatuses().get("P43-03")).toBe("pending");
+    // Dossier side: a credential-free dossier prompt persists byte-identical under the same pass.
+    const d: Dossier = {
+      taskId: "T1", trigger: "gate-fail", journalTail: '[{"event":"gate-result"}]',
+      transcript: "worker said things", diff: "scope: touched README.md",
+      gates: [{ gate: "scope", pass: false, details: "undeclared out-of-scope edits" }],
+    };
+    const prompt = buildDossierPrompt(d, "abc12345");
+    expect(redactSecrets(prompt)).toBe(prompt);
   });
 });
 

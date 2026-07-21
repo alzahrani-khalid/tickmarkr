@@ -4,7 +4,7 @@ import { DEFAULT_DIFF_CAP } from "../config/config.js";
 import { renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { sh } from "../run/git.js";
 import { checkDiffCap, fetchTaskDiff } from "./review.js";
-import { extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
+import { COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
@@ -12,13 +12,16 @@ const JUDGE_TIMEOUT_MS = 900_000;
 
 export interface JudgeVerdict {
   pass: boolean;
-  criteria: Array<{ criterion: string; met: boolean; reason: string }>;
+  criteria: Array<{ criterion: string; met: boolean; reason: string; evidence: string }>;
 }
 
 const JudgeVerdictRowSchema = z.object({
   criterion: z.string(),
   met: z.boolean(),
   reason: z.string(),
+  // v1.64: a verbatim quote from the judged diff grounding the ruling — required; a verdict
+  // omitting it is malformed and fails closed like any other shape violation.
+  evidence: z.string(),
 });
 
 const JudgeVerdictSchema = z.object({
@@ -194,6 +197,8 @@ You are a strict acceptance judge. Decide whether the diff satisfies EVERY accep
 Judge only what the diff proves — plausible-but-wrong must fail. Do not award partial credit.
 Deterministic command/test oracles have already passed mechanically; judge ONLY the rubric items below.
 
+${COMPLETION_FAKING_CHECKLIST}
+
 ## Task ${task.id}: ${task.title}
 Goal: ${task.goal}
 
@@ -208,8 +213,9 @@ ${diff}
 ${verdictNonceLine(nonce)}
 
 Respond with ONLY this JSON (no prose before or after):
-{"nonce": "${nonce}", "pass": true|false, "criteria": [{"criterion": "c1", "met": true|false, "reason": "..."}]}
+{"nonce": "${nonce}", "pass": true|false, "criteria": [{"criterion": "c1", "met": true|false, "reason": "...", "evidence": "..."}]}
 Each criteria[].criterion MUST be the stable id from the rubric (c1, c2, ...) exactly once.
+Each criteria[].evidence MUST be a short verbatim quote copied from the diff above that grounds the ruling; a quote not found in the diff voids the whole verdict.
 `;
   const raw = await runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS);
   const extracted = extractVerdictJson<JudgeVerdict>(raw, nonce);
@@ -222,6 +228,15 @@ Each criteria[].criterion MUST be the stable id from the rubric (c1, c2, ...) ex
       meta: { unparseable: true, judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
   }
   const { verdict: v, inconsistencies } = checkJudgeVerdict(extracted, expectedIds);
+  // v1.64: quoted evidence must appear verbatim in `diff` — the exact string embedded in the prompt
+  // above, never the worktree or any other artifact. A quote the diff doesn't contain is a
+  // hallucinated verdict: treated as unparseable so GATE-09 retries the judge on a failover channel.
+  const fabricated = v.criteria.filter((row) => !row.evidence.trim() || !diff.includes(row.evidence));
+  if (fabricated.length) {
+    return { gate: "acceptance", pass: false,
+      details: warn + detBlock + `judge verdict quotes evidence absent from the judged diff (${fabricated.map((row) => row.criterion).join(", ")}) — treating as unparseable, failing closed`,
+      meta: { unparseable: true, judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
+  }
   const pass = v.pass === true && inconsistencies.length === 0 && v.criteria.every((row) => row.met);
   const lines = v.criteria.map((row) => `${row.met ? "✓" : "✗"} ${row.criterion}: ${row.reason}`);
   if (!v.pass) lines.push("judge verdict pass=false");

@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -213,6 +213,25 @@ describe("reviewGate", () => {
     expect(r.pass).toBe(true);
     expect(r.details).toMatch(/skipped/i);
     expect(r.meta).toEqual({ skipped: true });
+  });
+
+  // v1.64 gate-integrity: the cross-vendor review prompt carries the same completion-faking checklist
+  // as the acceptance judge, so reviewers hunt the concrete shortcuts by name.
+  test("the review prompt names the completion faking shortcuts as an explicit checklist", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: true, issues: [] } });
+    let capturedPrompt = "";
+    const orig = fake.headlessCommand.bind(fake);
+    fake.headlessCommand = (promptFile, model) => {
+      capturedPrompt = readFileSync(promptFile, "utf8");
+      return orig(promptFile, model);
+    };
+    await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+    expect(capturedPrompt).toContain("Completion-faking checklist");
+    for (const shortcut of ["hardcoded-result", "test-weakening", "vacuous-assertion", "fixture-overfit", "self-mocking", "check-bypass"]) {
+      expect(capturedPrompt).toContain(shortcut);
+    }
+    expect(capturedPrompt).toMatch(/criterion fails.*name which shortcut/i);
   });
 
   test("approve → pass; request-changes → fail with issues", async () => {

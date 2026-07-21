@@ -81,8 +81,10 @@ export function desiredPanes(rows: JournalEvent[], runId: string): Set<string> {
         clearTask(row.taskId!);
         break;
       case "run-end":
+        // OBS-103: run-end retires EVERY run-tagged pane, the watch narrator included. The fold
+        // keys on the run identity in the pane name, so a narrator a prior daemon instance opened
+        // (stop→resume cycle) retires all the same; a later run-resume re-desires it above.
         desired.clear();
-        desired.add(formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }));
         break;
     }
   }

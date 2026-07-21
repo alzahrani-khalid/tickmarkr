@@ -8,6 +8,7 @@ import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { augmentFakeVerdictOutput, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
 import { sh } from "./git.js";
+import { redactSecrets } from "./redact.js";
 
 export interface ConsultVerdict {
   action: "retry" | "reroute" | "decompose" | "human";
@@ -143,7 +144,9 @@ export async function consult(
   const dir = join(runDir, "consults");
   mkdirSync(dir, { recursive: true });
   const promptFile = join(dir, `${d.taskId}-${n}.md`);
-  writeFileSync(promptFile, buildDossierPrompt(d, nonce));
+  // T3 secret redaction: the persisted dossier artifact (transcript/diff/journal tail — also what the
+  // consult model reads) is masked at this seam; the in-memory Dossier stays untouched.
+  writeFileSync(promptFile, redactSecrets(buildDossierPrompt(d, nonce)));
 
   // One seat = the WHOLE invoke-and-parse unit, both visibility branches (OBS-69 class: a headless-only
   // failover would leave the production pane path hard-failing on seat one). null = no parseable verdict.

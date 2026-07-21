@@ -14,7 +14,7 @@ import {
 } from "../config/config.js";
 import { herdrSealShellPrefix, SubprocessDriver } from "../drivers/subprocess.js";
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
-import { type Baseline, captureBaseline, detectGateCommands } from "../gates/baseline.js";
+import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
 import { runGates, type GateEvent } from "../gates/run-gates.js";
 import type { GateResult } from "../gates/types.js";
 import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus } from "../graph/graph.js";
@@ -314,13 +314,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // names a successor that has no journal. Append-only — the prior journal is never rewritten.
     prior?.append("superseded", undefined, { by: runId });
     for (const warning of baseline.warnings ?? []) journal.append("baseline-warning", undefined, { ...warning });
+    // Tier A #3: run each task's command-typed acceptance oracles against the pristine baseline —
+    // one that already exits 0 verifies nothing. Warning only, taskId-stamped; never a gate input.
+    for (const w of await detectVacuousOracles(repoRoot, graph.tasks)) journal.append("baseline-warning", w.taskId, { ...w });
   }
 
   // T6: open the narrator AFTER run-start/run-resume is journaled so the watch surface has a run to
   // show. driver.narrator is undefined on subprocess → no-op (subprocess spawns nothing). Swallowed:
   // a failed-to-open or later-dead watch pane never affects the run.
+  // OBS-103: hold the returned slot — narrator() adopts an already-open watch by its owned name
+  // (a prior daemon instance's, after a stop→resume cycle), so the run-end sweep below can retire
+  // it regardless of which instance split the pane.
+  const watchName = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
+  let watchSlot: Slot | undefined;
   try {
-    await driver.narrator?.(repoRoot, "tickmarkr status --watch", runId);
+    watchSlot = await driver.narrator?.(repoRoot, "tickmarkr status --watch", runId);
   } catch {
     /* cosmetic-only — the run proceeds without a live surface */
   }
@@ -350,7 +358,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const reconcile = async (opts?: { spareLiveLlm?: boolean }) => {
     if (keepForever) return;
     try {
-      await driver.reconcile?.(desiredPanes(journal.read(), runId), runId, opts);
+      const desired = desiredPanes(journal.read(), runId);
+      // The watch pane is never the DRIVER sweep's candidate (panesToClose spares role "watch":
+      // herdr's watches bookkeeping lives in close(), and a raw pane-close in the sweep would
+      // leave narrator() a stale cache) — the driver always sees it as desired; its lifecycle is
+      // decided here from the fold alone.
+      await driver.reconcile?.(new Set([...desired, watchName]), runId, opts);
+      // OBS-103: when the fold retires the watch (run-end boundary), close the narrator. The
+      // decision keys on the run identity in the pane name — narrator() adopts a prior daemon
+      // instance's pane under the same owned name, so a stop→resume cycle's leftover narrator
+      // closes exactly like one this instance opened. A narrator carrying a non-canonical name
+      // (no run identity) is never this run's to sweep.
+      if (watchSlot && watchSlot.name === watchName && !desired.has(watchName)) {
+        const w = watchSlot;
+        watchSlot = undefined;
+        await driver.close(w);
+      }
     } catch {
       /* cosmetic — visibility is never a gate */
     }

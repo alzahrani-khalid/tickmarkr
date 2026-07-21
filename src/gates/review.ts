@@ -4,7 +4,7 @@ import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
 import { marginalCostRank } from "../route/router.js";
-import { extractVerdictJson, generateVerdictNonce, type GateVia, runLlm, verdictNonceLine } from "./llm.js";
+import { COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 
 export interface ReviewVerdict { approve: boolean; issues: string[] }
@@ -106,6 +106,8 @@ export async function reviewGate(
   const prompt = `TICKMARKR-REVIEW
 You are a skeptical cross-vendor code reviewer. Another agent (vendor: ${author.adapter}) authored this diff.
 Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
+
+${COMPLETION_FAKING_CHECKLIST}
 
 ## Task ${task.id}: ${task.title} (complexity ${task.complexity})
 ## Acceptance criteria

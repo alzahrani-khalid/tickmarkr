@@ -6,6 +6,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 import { TIERS, type TaskStatus } from "../graph/schema.js";
 import { buildProfile, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
+import { redactSecrets } from "./redact.js";
 
 export interface JournalEvent {
   ts: string;
@@ -348,9 +349,12 @@ export class Journal {
 
   append(event: string, taskId?: string, data: Record<string, unknown> = {}): void {
     const row: JournalEvent = { ts: new Date().toISOString(), event, ...(taskId ? { taskId } : {}), data };
-    appendFileSync(this.journalPath, JSON.stringify(row) + "\n");
+    // T3 secret redaction: only the persisted bytes are masked — the caller's data stays untouched in
+    // memory. The narrator receives the persisted (masked) row so a pane sink never shows a credential.
+    const line = redactSecrets(JSON.stringify(row));
+    appendFileSync(this.journalPath, line + "\n");
     try {
-      this.narrate?.(row);
+      this.narrate?.(JSON.parse(line) as JournalEvent);
     } catch {
       // narration is observational; a broken sink must not affect the journal or run
     }
@@ -444,7 +448,8 @@ export class Journal {
   }
 
   telemetry(row: TelemetryRow): void {
-    appendFileSync(join(this.dir, "telemetry.jsonl"), JSON.stringify(row) + "\n");
+    // T3 secret redaction: same persistence seam as append — credential-free rows are byte-identical.
+    appendFileSync(join(this.dir, "telemetry.jsonl"), redactSecrets(JSON.stringify(row)) + "\n");
   }
 
   // Per-run, raw (NOT schema-validated) — report.ts reads v1.5 core fields; stays byte-compatible.

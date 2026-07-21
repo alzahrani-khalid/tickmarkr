@@ -1,8 +1,8 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { captureBaseline, compareToBaseline, detectGateCommands, fingerprint } from "../../src/gates/baseline.js";
+import { captureBaseline, compareToBaseline, detectGateCommands, detectVacuousOracles, fingerprint } from "../../src/gates/baseline.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -185,6 +185,46 @@ describe("baseline forgiveness", () => {
     const legacyBaseline = { commands: { test: { exitCode: 1, fingerprints: ["FAIL tests/a.test.ts > old failure"] } } };
 
     expect((await compareToBaseline(repo, { test: "bash run.sh" }, legacyBaseline, ["test"]))[0].pass).toBe(true);
+  });
+});
+
+// Tier A #3 (2026-07-21 repo-scan reconciliation): vacuous command oracles surface at baseline capture.
+describe("vacuous command oracles at baseline", () => {
+  test("an oracle passing at baseline is named in a per-task warning; a mixed task lists only the vacuous ones", async () => {
+    const repo = makeRepo({ "present.txt": "x" });
+    const warnings = await detectVacuousOracles(repo, [
+      { id: "T1", acceptance: [
+        { oracle: "command", command: "test -f present.txt" },
+        { oracle: "command", command: "test -f absent.txt" },
+      ] },
+      { id: "T2", acceptance: [{ oracle: "command", command: "test -f absent.txt" }] },
+    ]);
+    expect(warnings).toEqual([{
+      kind: "vacuous-oracle",
+      taskId: "T1",
+      oracles: ["test -f present.txt"],
+      reason: expect.stringContaining("test -f present.txt"),
+    }]);
+    expect(warnings[0].reason).toContain("T1");
+  });
+
+  test("a command oracle that fails at baseline capture produces no vacuous warning", async () => {
+    const repo = makeRepo({ "a.txt": "x" });
+    const warnings = await detectVacuousOracles(repo, [
+      { id: "T1", acceptance: [{ oracle: "command", command: "test -f does-not-exist.txt" }] },
+    ]);
+    expect(warnings).toEqual([]);
+  });
+
+  test("a task with only judge oracles produces no vacuous warning and no oracle execution", async () => {
+    const repo = makeRepo({ "a.txt": "x" });
+    // judge items whose TEXT is shell-runnable — if the pass wrongly executed them, a marker file appears
+    const warnings = await detectVacuousOracles(repo, [
+      { id: "T1", acceptance: ["touch executed-string.txt", { oracle: "judge", text: "touch executed-judge.txt" }] },
+    ]);
+    expect(warnings).toEqual([]);
+    expect(existsSync(join(repo, "executed-string.txt"))).toBe(false);
+    expect(existsSync(join(repo, "executed-judge.txt"))).toBe(false);
   });
 });
 

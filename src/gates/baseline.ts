@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
+import type { AcceptanceItem } from "../graph/schema.js";
 import { sh } from "../run/git.js";
 import type { GateResult } from "./types.js";
 
@@ -97,6 +98,41 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
     }];
   }
   return base;
+}
+
+export interface VacuousOracleWarning {
+  kind: "vacuous-oracle";
+  taskId: string;
+  oracles: string[];
+  reason: string;
+}
+
+// Tier A #3 (2026-07-21 repo-scan reconciliation): a command oracle that already exits 0 before any
+// work exists cannot falsify the work — surface it at baseline capture. Observational only: journaled
+// warning, never a gate input, and an oracle that fails at baseline changes nothing. Judge oracles
+// (including plain-string compat judges) are never executed; test oracles stay gate-only (they need
+// the detected runner and the worker's diff to mean anything).
+export async function detectVacuousOracles(
+  cwd: string,
+  tasks: ReadonlyArray<{ id: string; acceptance: AcceptanceItem[] }>,
+): Promise<VacuousOracleWarning[]> {
+  const out: VacuousOracleWarning[] = [];
+  for (const t of tasks) {
+    const vacuous: string[] = [];
+    for (const a of t.acceptance) {
+      if (typeof a !== "object" || a.oracle !== "command") continue;
+      if ((await sh(a.command, cwd)).code === 0) vacuous.push(a.command);
+    }
+    if (vacuous.length) {
+      out.push({
+        kind: "vacuous-oracle",
+        taskId: t.id,
+        oracles: vacuous,
+        reason: `vacuous acceptance oracle on ${t.id}: already passes before any work exists — ${vacuous.map((c) => `$ ${c}`).join("; ")}`,
+      });
+    }
+  }
+  return out;
 }
 
 // HYG-08 (D-01): headline the runner's own failure naming; demote the fingerprint diff to a secondary

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
+import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot, type SlotOpts } from "../../src/drivers/types.js";
 import { graphDefinitionHash, loadGraph, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
@@ -141,5 +143,75 @@ describe("Phase 46 resume-replay (RES-01/RES-02 daemon oracles, zero tokens)", (
     expect(s.done).toEqual(["T1"]);
     const post = postResume(Journal.open(repo, "run-rr4").read());
     expect(post.some((e) => e.event === "task-dispatch" && e.taskId === "T1")).toBe(true);
+  });
+}, 120000);
+
+// OBS-103: after a stop→resume cycle the run-end sweep must retire the prior daemon instance's
+// narrator too — the v1.63 run left it open and the operator closed it by hand. The pane world
+// below mirrors the herdr contract at the two seams that matter: narrator() ADOPTS an already-open
+// watch by its owned name (never learning which instance split the pane), and the driver sweep
+// NEVER closes watch panes (panesToClose spares role "watch") — so zero survivors proves the
+// daemon's own name-keyed close retired the narrator, not a fantasy sweep.
+describe("OBS-103 run-end narrator sweep across daemon instances (fake adapter, zero tokens)", () => {
+  test("a resumed run reaching run end leaves zero run-tagged panes open including a narrator opened by the prior daemon instance", async () => {
+    const { repo, fake } = setupResumeRepo();
+    const runId = "run-rr5";
+    await seedJournal(repo, runId, [
+      // Replay a completed task so this oracle exercises only resume reconciliation → run-end.
+      // Dispatch/gates/merge are covered above and only add child-process pressure to the suite.
+      { event: "task-done", taskId: "T1", data: { attempts: 1, assignment: fake1 } },
+    ]);
+    const watchName = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
+    const orphanWorker = formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId });
+    // the prior (killed) daemon instance's leftovers: its narrator pane and its worker pane
+    const live = new Set<string>([watchName, orphanWorker]);
+    const inner = new SubprocessDriver();
+    const byId = new Map<string, string>();
+    const driver: ExecutorDriver = {
+      id: "pane-world",
+      interactive: false,
+      async slot(cwd: string, name: string, o?: SlotOpts) {
+        const s = await inner.slot(cwd, name);
+        const paneName = o?.owned ? formatOwnedName(o.owned) : name;
+        live.add(paneName);
+        byId.set(s.id, paneName);
+        return s;
+      },
+      run: inner.run.bind(inner),
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      status: inner.status.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      async close(s: Slot) {
+        live.delete(byId.get(s.id) ?? s.name);
+        return inner.close(s); // no-op for the adopted pane — inner never created it
+      },
+      worktree: inner.worktree.bind(inner),
+      // herdr contract: the resumed daemon finds the already-running watch by its owned name and
+      // adopts it — the pane predates this process, so no inner slot backs it.
+      async narrator(cwd: string, _command: string, rid?: string) {
+        const name = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId: rid! });
+        live.add(name); // idempotent: already live when adopting the prior instance's pane
+        const s = { id: `adopted-${name}`, name, cwd };
+        byId.set(s.id, name);
+        return s;
+      },
+      // herdr contract (panesToClose): the sweep closes owned-but-undesired panes but NEVER a
+      // watch pane — only the daemon's name-keyed close can retire the narrator.
+      async reconcile(desired: Set<string>) {
+        for (const name of live) {
+          const owned = parseOwnedName(name);
+          if (owned && owned.role !== "watch" && !desired.has(name)) live.delete(name);
+        }
+      },
+    };
+    expect(live.has(watchName)).toBe(true); // seed: the narrator the prior instance opened
+    const s = await runDaemon(repo, { adapters: [fake], runId, resume: true, driver });
+    expect(s.done).toEqual(["T1"]); // the resumed run reached run-end green
+    const replayDispatched = postResume(Journal.open(repo, runId).read()).some((e) => e.event === "task-dispatch");
+    expect(replayDispatched).toBe(false); // boundary-only: no worker/gate/merge child-process burst
+    const runTagged = [...live].filter((n) => parseOwnedName(n)?.runId === runId);
+    expect(runTagged).toEqual([]); // zero survivors — the prior instance's narrator included
   });
 }, 120000);

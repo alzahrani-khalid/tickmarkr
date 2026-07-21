@@ -327,6 +327,103 @@ describe("acceptanceGate — deterministic oracles (T2)", () => {
   });
 });
 
+// v1.64 gate-integrity: adversarial rubric — the judge prompt carries the completion-faking checklist,
+// every criterion row must quote diff evidence, and a quote the judged diff doesn't contain is a
+// hallucinated verdict (treated as unparseable → GATE-09 failover retry).
+describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
+  test("the acceptance judge prompt names the completion faking shortcuts as an explicit checklist", async () => {
+    const { repo, base } = repoWithDiff();
+    let capturedPrompt = "";
+    const fake = fakeWithJudge({ pass: true, criteria: [] });
+    const orig = fake.headlessCommand.bind(fake);
+    fake.headlessCommand = (promptFile, model) => {
+      capturedPrompt = readFileSync(promptFile, "utf8");
+      return orig(promptFile, model);
+    };
+    await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(capturedPrompt).toContain("Completion-faking checklist");
+    for (const shortcut of ["hardcoded-result", "test-weakening", "vacuous-assertion", "fixture-overfit", "self-mocking", "check-bypass"]) {
+      expect(capturedPrompt).toContain(shortcut);
+    }
+    // the checklist instructs the verdict to name which shortcut a failed criterion matches
+    expect(capturedPrompt).toMatch(/criterion fails.*name which shortcut/i);
+    // the response format demands the per-criterion quoted evidence field
+    expect(capturedPrompt).toContain('"evidence"');
+    expect(capturedPrompt).toMatch(/verbatim quote copied from the diff/i);
+  });
+
+  test("a judge verdict quoting evidence present in the diff parses and its verdict stands", async () => {
+    const { repo, base } = repoWithDiff();
+    // evidence is a verbatim slice of the committed change in repoWithDiff
+    const ok = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "greets by name", evidence: "module.exports = (n) =>" }] });
+    const r1 = await acceptanceGate(task, repo, base, { adapter: ok, model: "fake-1" });
+    expect(r1).toMatchObject({ gate: "acceptance", pass: true });
+    expect(r1.meta?.unparseable).toBeUndefined();
+    // a failing verdict with genuine evidence stands too — the parsed verdict decides
+    const bad = fakeWithRawJudge({ pass: false, criteria: [{ criterion: "c1", met: false, reason: "hardcoded-result shortcut", evidence: "module.exports = (n) =>" }] });
+    const r2 = await acceptanceGate(task, repo, base, { adapter: bad, model: "fake-1" });
+    expect(r2.pass).toBe(false);
+    expect(r2.details).toContain("hardcoded-result");
+    expect(r2.meta?.unparseable).toBeUndefined();
+  });
+
+  test("a judge verdict whose quoted evidence is absent from the diff fails closed", async () => {
+    // the bystander file exists in the worktree but never changes: quoting it proves the check runs
+    // against the diff the judge received, not the worktree or any other artifact
+    const repo = makeRepo({ "greet.js": "module.exports = () => 'hi';\n", "bystander.txt": "untouched worktree text\n" });
+    const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    writeFileSync(join(repo, "greet.js"), "module.exports = (n) => 'hi ' + n;\n");
+    execSync("git add -A && git commit -m greet --no-gpg-sign", { cwd: repo });
+    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: "untouched worktree text" }] });
+    const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/evidence absent from the judged diff/i);
+    expect(r.details).toContain("c1");
+    // treated as unparseable: GATE-09 retries the judge on a failover channel off this meta
+    expect(r.meta).toMatchObject({ unparseable: true, judge: "fake:fake-1" });
+  });
+
+  test("a judge verdict missing the evidence field entirely fails closed", async () => {
+    const { repo, base } = repoWithDiff();
+    // spy bypasses the fake adapter's zero-token evidence-injection seam: the gate itself must reject
+    const spy = vi.spyOn(llm, "runLlm").mockImplementation(async (_a, _m, prompt) => {
+      const n = llm.extractPromptNonce(prompt)!;
+      return JSON.stringify({ nonce: n, pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
+    });
+    const r = await acceptanceGate(task, repo, base, { adapter: fakeWithJudge({}), model: "fake-1" });
+    spy.mockRestore();
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/malformed verdict shape/i);
+  });
+
+  test("an empty evidence string fails closed like an absent quote", async () => {
+    const { repo, base } = repoWithDiff();
+    // every diff contains the empty string — a vacuous quote must not slip through includes()
+    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: "  " }] });
+    const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(r.pass).toBe(false);
+    expect(r.meta).toMatchObject({ unparseable: true });
+  });
+
+  test("existing passing and failing judge verdict fixtures keep their outcomes under the extended schema", async () => {
+    const { repo, base } = repoWithDiff();
+    // pre-v1.64 fixtures carry no evidence field — the fake seam quotes the diff for them, so the
+    // whole zero-token suite keeps its outcomes while real judges face the strict schema
+    const pass = await acceptanceGate(task, repo, base,
+      { adapter: fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "uses n" }] }), model: "fake-1" });
+    expect(pass).toMatchObject({ gate: "acceptance", pass: true });
+    const fail = await acceptanceGate(task, repo, base,
+      { adapter: fakeWithJudge({ pass: false, criteria: [{ criterion: "c1", met: false, reason: "hardcoded" }] }), model: "fake-1" });
+    expect(fail.pass).toBe(false);
+    expect(fail.details).toContain("hardcoded");
+    expect(fail.meta?.unparseable).toBeUndefined();
+    const inconsistent = await acceptanceGate(task, repo, base,
+      { adapter: fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: false, reason: "contradiction" }] }), model: "fake-1" });
+    expect(inconsistent.pass).toBe(false);
+    expect(inconsistent.details).toMatch(/pass=true contradicts unmet criterion c1/i);
+  });
+});
+
 describe("acceptanceGate — only-judge warning (T2)", () => {
   test("only judge oracles → warning in details; judge verdict still decides", async () => {
     const { repo, base } = repoWithDiff();

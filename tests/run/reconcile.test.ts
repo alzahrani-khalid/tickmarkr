@@ -44,11 +44,9 @@ describe("ownership contract", () => {
 });
 
 describe("desiredPanes", () => {
-  it("is empty before run-start and retains the watch after run-end", () => {
+  it("is empty before run-start and again after run-end", () => {
     expect(desiredPanes([], runId)).toEqual(new Set());
-    expect(desiredPanes([ev("run-start", undefined), ev("run-end", undefined)], runId)).toEqual(new Set([
-      formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }),
-    ]));
+    expect(desiredPanes([ev("run-start", undefined), ev("run-end", undefined)], runId)).toEqual(new Set());
   });
 
   it("wants the watch pane plus each in-flight worker attempt", () => {
@@ -86,7 +84,9 @@ describe("desiredPanes", () => {
     expect([...desired]).toEqual([formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId })]);
   });
 
-  it("retains only the watch at run-end", () => {
+  // OBS-103: pre-v1.64 the fold re-added the watch here, so the run-end sweep could never take the
+  // narrator and a stop→resume cycle's leftover watch pane survived until the operator closed it.
+  it("the run end reconcile desired set excludes the watch narrator so the sweep closes it", () => {
     const rows = [
       ev("run-start", undefined),
       ev("task-dispatch", "T6", { attempt: 0 }),
@@ -96,9 +96,35 @@ describe("desiredPanes", () => {
       ev("task-done", "T6", {}),
       ev("run-end", undefined, {}),
     ];
-    expect(desiredPanes(rows, runId)).toEqual(new Set([
-      formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }),
-    ]));
+    const desired = desiredPanes(rows, runId);
+    expect(desired.has(formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }))).toBe(false);
+    expect(desired).toEqual(new Set()); // run-end retires EVERY run-tagged pane, narrator included
+  });
+
+  it("the narrator stays open at every non-terminal reconcile safe point", () => {
+    const watch = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
+    const rows: JournalEvent[] = [ev("run-start", undefined)];
+    // every safe point the daemon sweeps at, short of run-end: task lifecycle events, terminal
+    // task events (done/failed/human), and a run-resume boundary after a daemon kill
+    const safePoints: JournalEvent[] = [
+      ev("task-dispatch", "T1", { attempt: 0 }),
+      ev("worker-result", "T1", { ok: true }),
+      ev("gate-result", "T1", { gate: "acceptance", pass: true }),
+      ev("gate-result", "T1", { gate: "review", pass: true }),
+      ev("task-done", "T1", {}),
+      ev("task-dispatch", "T2", { attempt: 0 }),
+      ev("task-failed", "T2", {}),
+      ev("task-dispatch", "T3", { attempt: 0 }),
+      ev("task-human", "T3", {}),
+      ev("run-resume", undefined),
+    ];
+    expect(desiredPanes(rows, runId).has(watch)).toBe(true); // run-start itself is a safe point
+    for (const row of safePoints) {
+      rows.push(row);
+      expect(desiredPanes(rows, runId).has(watch), `watch desired after ${row.event}`).toBe(true);
+    }
+    rows.push(ev("run-end", undefined));
+    expect(desiredPanes(rows, runId).has(watch)).toBe(false); // only the terminal boundary retires it
   });
 
   it("opens the judge pane after worker-result, retires it and opens review after acceptance passes, then retires review", () => {

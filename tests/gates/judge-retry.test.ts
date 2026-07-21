@@ -109,6 +109,22 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
     expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake:fake-1" } });
   });
 
+  test("fabricated evidence counts as a judge flake: retried once on failover, parsed retry stands", async () => {
+    // v1.64: a verdict quoting evidence the judged diff doesn't contain is treated as unparseable —
+    // the same meta.unparseable signal GATE-09 keys on, so the retry machinery needs no new wiring.
+    const { repo, base } = repoWithCommit();
+    const fabricated = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r", evidence: "quote found in no diff anywhere" }] };
+    const fake = fakeWith({ judge: [fabricated, PASS] });
+    const { results } = await runGates(
+      mkTask({ gates: JUDGE_GATES, files: [] }),
+      { ...(await ctxFor(repo, base, fake)) },
+    );
+    const acc = results.filter((r) => r.gate === "acceptance");
+    expect(acc).toHaveLength(1);
+    expect(acc[0].pass).toBe(true);
+    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake:fake-2" } });
+  });
+
   test("double-garbage fails closed exactly as today (SC-2)", async () => {
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ judge: ["garbage one", "garbage two"] });

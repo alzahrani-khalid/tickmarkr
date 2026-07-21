@@ -411,6 +411,42 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(warning!.data.reason).toContain("test");
   });
 
+  test("a command oracle that passes at baseline capture produces a journaled warning naming the task and the oracle", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { acceptance: ["done", { oracle: "command", command: "test -f base.txt" }] })],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+
+    await runDaemon(repo, { adapters: [fake], runId: "run-vacuous-oracle" });
+
+    const warning = Journal.open(repo, "run-vacuous-oracle").read()
+      .find((e) => e.event === "baseline-warning" && e.data.kind === "vacuous-oracle");
+    expect(warning).toBeDefined();
+    expect(warning!.taskId).toBe("T1");
+    expect(warning!.data.oracles).toEqual(["test -f base.txt"]);
+    expect(warning!.data.reason).toContain("T1");
+    expect(warning!.data.reason).toContain("test -f base.txt");
+  });
+
+  test("the vacuous warning never changes any gate outcome or task state", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { acceptance: ["done", { oracle: "command", command: "test -f base.txt" }] })],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-vacuous-inert" });
+
+    const evs = Journal.open(repo, "run-vacuous-inert").read();
+    expect(evs.some((e) => e.event === "baseline-warning" && e.data.kind === "vacuous-oracle")).toBe(true);
+    // observational only: every gate still passes, the task still lands done, nothing parks or fails
+    expect(s.done).toEqual(["T1"]);
+    expect(s.failed).toEqual([]);
+    expect(evs.filter((e) => e.event === "gate-result").length).toBeGreaterThan(0);
+    expect(evs.filter((e) => e.event === "gate-result").every((e) => e.data.pass === true)).toBe(true);
+    const g = JSON.parse(readFileSync(join(tickmarkrDir(repo), "graph.json"), "utf8"));
+    expect(g.tasks.find((t: { id: string }) => t.id === "T1").status).toBe("done");
+  });
+
   test("v1.4: task-pin miss journals a routing-lint through the existing seam and the task still runs", async () => {
     const { repo, fake } = setupRepo(
       [T("T1", { routingHints: { pin: { via: "gemini", model: "flash" }, source: "02-03-PLAN.md" } })],
