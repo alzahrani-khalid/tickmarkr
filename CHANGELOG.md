@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.63 — runtime integrity
+
+The signal-reaper suite now runs in a serialized vitest project so its fixed fire deadline survives full-suite fork fan-out (OBS-98). Fatal setup errors after run-start append a terminal journal event before the daemon exits, status renders the recorded cause, and a baseline where every configured command is missing surfaces a wrong-environment warning (OBS-99). Compile refuses the pristine scaffold template init writes unchanged (OBS-100). Skills carry the OBS-99/101 verified-handoff and version-preflight fixes already on main.
+
 ## v1.62 — dispatch integrity
 
 Worker dispatch now delivers a per-attempt script, never an inline line (OBS-85, verified pane delivery), eliminating paste-timing interleave corruption in codex channels. OBS-97 probe correctly handles brace glob patterns and single-character wildcards.

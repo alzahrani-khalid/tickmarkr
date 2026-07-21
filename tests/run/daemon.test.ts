@@ -346,6 +346,71 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(Journal.open(r2, "run-setup-fail").read().some((e) => e.event === "worktree-setup" && e.data.code === 7)).toBe(true);
   });
 
+  test("a setup failure between the run start append and worker dispatch leaves a journal whose last event is terminal and names the failure", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    await shOk("git branch tickmarkr", repo); // refs/heads/tickmarkr blocks refs/heads/tickmarkr/run-*
+
+    await expect(runDaemon(repo, { adapters: [fake], runId: "run-setup-fatal" })).rejects.toThrow(/tickmarkr\/run-setup-fatal|cannot lock ref|command failed/);
+
+    const events = Journal.open(repo, "run-setup-fatal").read();
+    expect(events.map((e) => e.event)).not.toContain("task-dispatch");
+    const last = events.at(-1)!;
+    expect(last.event).toBe("run-end");
+    expect(last.data.phase).toBe("setup");
+    expect(last.data.error).toMatch(/tickmarkr\/run-setup-fatal|cannot lock ref|command failed/);
+  });
+
+  test("a healthy run start path journals no terminal event before the task loop", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+
+    await runDaemon(repo, { adapters: [fake], runId: "run-healthy-start" });
+
+    const events = Journal.open(repo, "run-healthy-start").read();
+    const dispatchIdx = events.findIndex((e) => e.event === "task-dispatch");
+    expect(dispatchIdx).toBeGreaterThan(events.findIndex((e) => e.event === "run-start"));
+    expect(events.slice(0, dispatchIdx).some((e) => e.event === "run-end")).toBe(false);
+  });
+
+  test("no fatal path between the run start append and the task loop can exit the daemon without appending a terminal journal event", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    await shOk("git branch tickmarkr", repo);
+
+    await expect(runDaemon(repo, { adapters: [fake], runId: "run-preloop-fatal" })).rejects.toThrow();
+
+    const events = Journal.open(repo, "run-preloop-fatal").read();
+    expect(events.find((e) => e.event === "run-start")).toBeDefined();
+    expect(events.find((e) => e.event === "task-dispatch")).toBeUndefined();
+    expect(events.at(-1)?.event).toBe("run-end");
+    expect(events.at(-1)?.data.error).toEqual(expect.any(String));
+  });
+
+  test("a baseline where every configured command is missing produces a journaled warning naming the commands", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { humanGate: true })],
+      { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "unreachable" } }] } },
+      "gates:\n  build: definitely-missing-tickmarkr-build\n  test: definitely-missing-tickmarkr-test\n",
+    );
+
+    await runDaemon(repo, { adapters: [fake], runId: "run-missing-baseline" });
+
+    const warning = Journal.open(repo, "run-missing-baseline").read().find((e) => e.event === "baseline-warning");
+    expect(warning).toBeDefined();
+    expect(warning!.data.kind).toBe("wrong-environment");
+    expect(warning!.data.commands).toEqual(["build", "test"]);
+    expect(warning!.data.reason).toMatch(/wrong environment/i);
+    expect(warning!.data.reason).toContain("build");
+    expect(warning!.data.reason).toContain("test");
+  });
+
   test("v1.4: task-pin miss journals a routing-lint through the existing seam and the task still runs", async () => {
     const { repo, fake } = setupRepo(
       [T("T1", { routingHints: { pin: { via: "gemini", model: "flash" }, source: "02-03-PLAN.md" } })],

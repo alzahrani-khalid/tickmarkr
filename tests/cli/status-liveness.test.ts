@@ -52,6 +52,22 @@ describe("VIS-11 status liveness (SC4)", () => {
     expect(out).not.toContain("dead");
   });
 
+  test("status for a setup-failed run shows the recorded failure cause", async () => {
+    const repo = mkRepo();
+    seedGraph(repo);
+    const dead = spawnSync("true").pid!;
+    seedJournal(repo, [
+      ev("run-start", { pid: dead }),
+      ev("run-end", { phase: "setup", error: "cannot lock ref refs/heads/tickmarkr/run-x", fatal: true }),
+    ]);
+
+    const out = await status([], repo);
+
+    expect(out).toContain("finished");
+    expect(out).toContain("setup failed");
+    expect(out).toContain("cannot lock ref refs/heads/tickmarkr/run-x");
+  });
+
   test("live recorded pid renders alive", async () => {
     const repo = mkRepo();
     seedGraph(repo);

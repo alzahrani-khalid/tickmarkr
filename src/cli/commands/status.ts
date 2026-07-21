@@ -121,19 +121,32 @@ const daemonPid = (events: JournalEvent[]): number | undefined => {
   return undefined;
 };
 
+const terminalFailureCause = (events: JournalEvent[]): string | undefined => {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.event !== "run-end" || typeof e.data.error !== "string") continue;
+    const phase = typeof e.data.phase === "string" && e.data.phase.trim()
+      ? `${e.data.phase.trim()} failed`
+      : "run failed";
+    return `${phase}: ${e.data.error.replace(/\s+/g, " ").trim()}`;
+  }
+  return undefined;
+};
+
 const liveness = (events: JournalEvent[]): string => {
   const last = events.at(-1);
   if (!last) return "last event unknown · daemon pid unknown";
   const age = fmtAge(Date.now() - Date.parse(last.ts));
   const pid = daemonPid(events);
-  if (pid === undefined) return `last event ${age} ago · daemon pid unknown`;
+  const cause = terminalFailureCause(events);
+  if (pid === undefined) return `last event ${age} ago · daemon pid unknown${cause ? ` · ${cause}` : ""}`;
   // a dead pid after run-end is a clean exit, not a crash — "dead" is only alarming (red) while
   // the run is still incomplete (operator's crash indicator)
   const ended = events.some((e) => e.event === "run-end");
   let state: string;
   try { process.kill(pid, 0); state = "alive"; } // no throw ⇒ alive
   catch (k) { state = (k as NodeJS.ErrnoException).code === "ESRCH" ? (ended ? "finished" : "dead") : "alive"; } // EPERM ⇒ alive
-  return `last event ${age} ago · daemon pid ${pid} ${state}`;
+  return `last event ${age} ago · daemon pid ${pid} ${state}${cause ? ` · ${cause}` : ""}`;
 };
 
 const renderFrame = (cwd: string): string => {

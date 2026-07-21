@@ -173,6 +173,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // v1.54 T2: declared before the try so the finally can always deregister (a throw before
   // registration leaves it undefined — the guard below covers that path).
   let onTermination: ((sig: NodeJS.Signals) => void) | undefined;
+  let journal!: Journal;
+  let runStarted = false;
+  let taskLoopStarted = false;
+  let branch = "";
   try {
   let graph = loadGraph(repoRoot);
   // v1.51 T2: the routing mode resolves BEFORE any routing input is built — run flag > spec front-matter
@@ -244,12 +248,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   process.on("SIGINT", onTermination);
   process.on("SIGTERM", onTermination);
 
-  const journal = opts.resume ? Journal.open(repoRoot, runId, opts.narrate) : Journal.create(repoRoot, runId, opts.narrate);
+  journal = opts.resume ? Journal.open(repoRoot, runId, opts.narrate) : Journal.create(repoRoot, runId, opts.narrate);
   const branchEvent = opts.resume
     ? [...journal.read()].reverse().find((e) => (e.event === "run-start" || e.event === "run-end" || e.event === "merge") && typeof e.data.branch === "string")
     : undefined;
   const recordedBranch = typeof branchEvent?.data.branch === "string" ? branchEvent.data.branch : undefined;
-  const branch = recordedBranch
+  branch = recordedBranch
     ? branchEvent!.event === "merge" ? recordedBranch.slice(0, recordedBranch.lastIndexOf("--")) : recordedBranch
     : integrationBranch(cfg, runId);
   if (lock.reclaimed) journal.append("lock-reclaimed", undefined, lock.reclaimed); // HARD-02 audit trail
@@ -305,9 +309,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     baseline = await captureBaseline(repoRoot, commands);
     writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline, null, 2));
     journal.append("run-start", undefined, { pid: process.pid, baseRef, commands, channels: channels.map(channelKey), branch, graphDefinitionHash: graphDefinitionHash(graph), mode: rm.mode.mode, modeSource: rm.source, ...(prior ? { supersedes: prior.runId } : {}) }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
+    runStarted = true;
     // v1.53 T5: mark the prior run AFTER this run's run-start exists, so the prior journal never
     // names a successor that has no journal. Append-only — the prior journal is never rewritten.
     prior?.append("superseded", undefined, { by: runId });
+    for (const warning of baseline.warnings ?? []) journal.append("baseline-warning", undefined, { ...warning });
   }
 
   // T6: open the narrator AFTER run-start/run-resume is journaled so the watch surface has a run to
@@ -1034,6 +1040,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     }
   };
 
+  taskLoopStarted = true;
   const inflight = new Map<string, Promise<void>>();
   while (true) {
     // v1.54 T2: a signal that landed while nothing was racing `aborted` (empty inflight window)
@@ -1125,6 +1132,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     { tier: summary.tipVerify === "failed" ? "attention" : "routine" },
   );
   return summary;
+  } catch (err) {
+    if (runStarted && !taskLoopStarted && !journal.read().some((e) => e.event === "run-end")) {
+      journal.append("run-end", undefined, {
+        runId,
+        branch,
+        done: [],
+        failed: [],
+        human: [],
+        blocked: [],
+        pending: [],
+        phase: "setup",
+        fatal: true,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    throw err;
   } finally {
     // v1.54 T2: deregister on EVERY exit (normal run end, throw, termination unwind) — the daemon
     // test suite runs runDaemon dozens of times in one process; a leaked handler would close a

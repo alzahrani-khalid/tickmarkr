@@ -5,7 +5,14 @@ import { sh } from "../run/git.js";
 import type { GateResult } from "./types.js";
 
 export interface Baseline {
-  commands: Record<string, { exitCode: number; fingerprints: string[] }>;
+  commands: Record<string, { exitCode: number; fingerprints: string[]; missingCommand?: boolean }>;
+  warnings?: BaselineWarning[];
+}
+
+export interface BaselineWarning {
+  kind: "wrong-environment";
+  commands: string[];
+  reason: string;
 }
 
 // incident #2 (run-20260709-104447): a vitest ✓ PASS line with "error" in the test NAME, wrapped in ANSI
@@ -50,12 +57,44 @@ export function detectGateCommands(repoRoot: string, cfg: TickmarkrConfig): Reco
   return out;
 }
 
+const shellToken = (cmd: string): string | undefined => {
+  for (const raw of cmd.trim().split(/\s+/)) {
+    if (!raw || /^[A-Za-z_][A-Za-z0-9_]*=/.test(raw)) continue;
+    if (raw === "env") continue;
+    return raw.replace(/^['"]|['"]$/g, "");
+  }
+  return undefined;
+};
+
+const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function missingConfiguredCommand(cmd: string, result: { code: number; stdout: string; stderr: string }): boolean {
+  if (result.code !== 127) return false;
+  const token = shellToken(cmd);
+  if (!token) return false;
+  const output = `${result.stdout}\n${result.stderr}`;
+  return new RegExp(`(?:^|[:\\s])${reEscape(token)}:\\s+(?:command not found|No such file or directory)`, "i").test(output);
+}
+
 export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   for (const [name, cmd] of Object.entries(commands)) {
     const r = await sh(cmd, cwd);
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
-    base.commands[name] = { exitCode: r.code, fingerprints: fingerprint((r.stdout + "\n" + r.stderr).split(cwd).join("")) };
+    base.commands[name] = {
+      exitCode: r.code,
+      fingerprints: fingerprint((r.stdout + "\n" + r.stderr).split(cwd).join("")),
+      missingCommand: missingConfiguredCommand(cmd, r),
+    };
+  }
+  const names = Object.keys(commands);
+  const missing = names.filter((name) => base.commands[name]?.missingCommand === true);
+  if (names.length > 0 && missing.length === names.length) {
+    base.warnings = [{
+      kind: "wrong-environment",
+      commands: missing,
+      reason: `wrong environment: every configured baseline command was missing (${missing.join(", ")})`,
+    }];
   }
   return base;
 }

@@ -24,15 +24,49 @@ function expectFieldError(field: string, source: string) {
   }
 }
 
-describe("native spec template round-trip", () => {
-  test("specTemplate() compiles via auto-detection as native with ≥2 tasks, all acceptance non-empty", () => {
+describe("native spec scaffold guard", () => {
+  function writeScaffold(body = specTemplate()) {
     const file = join(mkdtempSync(join(tmpdir(), "tickmarkr-template-")), "tickmarkr.spec.md");
-    writeFileSync(file, specTemplate());
+    writeFileSync(file, body);
+    return file;
+  }
+
+  test("compiling the unedited scaffold template fails with an error naming the spec path", () => {
+    const file = writeScaffold();
     expect(specTemplate()).toMatch(/^<!-- tickmarkr:spec -->/);
-    const graph = compileSource(file); // no type → auto-detect must pick native via the marker
-    expect(graph.spec.source).toBe("native");
-    expect(graph.tasks.length).toBeGreaterThanOrEqual(2);
-    for (const t of graph.tasks) expect(t.acceptance.length).toBeGreaterThan(0);
+
+    expect(() => compileSource(file)).toThrow(CompileError);
+    expect(() => compileSource(file)).toThrow(file);
+  });
+
+  test("the pristine template error tells the operator to edit the spec before compiling", () => {
+    const file = writeScaffold();
+
+    expect(() => compileSource(file)).toThrow(/edit .* before compiling/i);
+  });
+
+  test("a spec edited away from the template compiles as before", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const file = writeScaffold(specTemplate().replace("# tickmarkr native spec", "# edited tickmarkr native spec"));
+
+    try {
+      const graph = compileSource(file);
+
+      expect(graph.spec.source).toBe("native");
+      expect(graph.tasks.map((task) => task.id)).toEqual(["T1", "T2"]);
+      expect(graph.tasks[0]).toMatchObject({ title: "Scaffold the feature", files: ["src/feature.ts"] });
+      expect(graph.tasks[1]).toMatchObject({ title: "Cover it with tests", deps: ["T1"], files: ["tests/feature.test.ts"] });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("every existing compile fixture still compiles unchanged", () => {
+    expect(compileSource("fixtures/sample.native.md", "native").spec.source).toBe("native");
+    expect(compileSource("fixtures/sample.prd.md").spec.source).toBe("prd");
+    expect(compileSource("fixtures/sample-pin.prd.md").spec.source).toBe("prd");
+    expect(compileSource("fixtures/speckit-sample").spec.source).toBe("speckit");
+    expect(compileSource("fixtures/gsd-sample/07-live-check").spec.source).toBe("gsd");
   });
 });
 

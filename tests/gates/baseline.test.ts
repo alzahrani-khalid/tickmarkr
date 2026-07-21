@@ -105,6 +105,30 @@ describe("baseline forgiveness", () => {
     expect(results.map((r) => r.gate)).toEqual(["build"]);
   });
 
+  test("a baseline where at least one configured command runs produces no wrong-environment warning", async () => {
+    const repo = makeRepo({ "run.sh": "echo 'ran and failed'; exit 1\n" });
+    const baseline = await captureBaseline(repo, {
+      build: "definitely-missing-tickmarkr-build",
+      test: "bash run.sh",
+    });
+
+    expect(baseline.commands.build.missingCommand).toBe(true);
+    expect(baseline.commands.test.missingCommand).toBe(false);
+    expect(baseline.warnings ?? []).toEqual([]);
+  });
+
+  test("the wrong-environment warning distinguishes missing commands from commands that ran and failed", async () => {
+    const repo = makeRepo({ "run.sh": "echo 'intentional command failure'; exit 127\n" });
+    const baseline = await captureBaseline(repo, {
+      build: "definitely-missing-tickmarkr-build",
+      test: "bash run.sh",
+    });
+
+    expect(baseline.commands.build).toMatchObject({ exitCode: 127, missingCommand: true });
+    expect(baseline.commands.test).toMatchObject({ exitCode: 127, missingCommand: false });
+    expect(baseline.warnings ?? []).toEqual([]);
+  });
+
   test("identical failure line differing only by absolute cwd prefix is forgiven (worktree regression)", async () => {
     // v1.4 live regression: baseline captured at repo root, gate compared inside a task worktree —
     // a warning path like <cwd>/src/app-error-boundary.tsx fingerprinted differently per cwd

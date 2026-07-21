@@ -36,6 +36,10 @@ function invalid(task: string, field: string, detail: string): never {
 export function compileNative(file: string): RunGraph {
   if (!existsSync(file)) throw new CompileError(`no such native spec file: ${file}`);
   const content = readFileSync(file, "utf8");
+  // Exact shared-template check: init writes specTemplate(), and any edit changes the body.
+  if (content === specTemplate()) {
+    throw new CompileError(`${file} is the unedited tickmarkr init scaffold. Edit ${file} before compiling.`);
+  }
   const drafts: Draft[] = [];
   let plainCount = 0; // v1.19: plain-string acceptance items compiled as judge oracles (compat) — warn once
   let specMode: (typeof GRAPH_ROUTING_MODES)[number] | undefined;

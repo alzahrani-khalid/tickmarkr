@@ -28,6 +28,8 @@ export const DIST_COUPLED_TESTS = [
   "tests/cli/version.test.ts", // reader: spawns node dist/cli/index.js
 ];
 
+export const SIGNAL_REAPER_TESTS = ["tests/run/reconcile-live.test.ts"];
+
 export default defineConfig({
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
@@ -38,7 +40,7 @@ export default defineConfig({
         test: {
           name: "suite",
           include: ["tests/**/*.test.ts"],
-          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS],
+          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS],
         },
       },
       {
@@ -46,6 +48,15 @@ export default defineConfig({
         test: {
           name: "built-cli",
           include: DIST_COUPLED_TESTS,
+          poolOptions: { forks: { singleFork: true } },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "signal-reaper",
+          include: SIGNAL_REAPER_TESTS,
+          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS],
           poolOptions: { forks: { singleFork: true } },
         },
       },

@@ -11,7 +11,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.61.0";
+const PRIOR_RELEASE_VERSION = "1.62.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 
 describe("tickmarkr version", () => {

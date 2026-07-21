@@ -54,8 +54,8 @@ Per release:
 2. In the **public** repository (the mirror), tag the export commit and push the tag:
 
    ```bash
-   git tag -a v1.62.0 -m "v1.62.0"
-   git push origin v1.62.0
+   git tag -a v1.63.0 -m "v1.63.0"
+   git push origin v1.63.0
    ```
 
 3. The tag push runs `release.yml` in the public repository:
@@ -67,6 +67,21 @@ Per release:
    - `npm publish --provenance --access public` (only if all checks pass)
 
 Publish is fail-closed: a failing build, lint, or test blocks publication.
+
+## Post-publish local sync (mandatory)
+
+A successful publish is not done until the operator machine runs it. Immediately after the
+registry shows the new version:
+
+1. `npm i -g tickmarkr@latest` — registry propagation can lag a minute; if the next step still
+   shows the prior release, wait and retry once.
+2. `tickmarkr version` must report exactly the just-published version. A mismatch is a hard
+   stop: diagnose the publish or the install — never leave the machine half-updated (a stale
+   binary silently skips daemon gates; see the version preflight in the agent docs).
+3. `tickmarkr init --force` in every active tickmarkr workspace (this repository and each
+   consumer repository) to refresh the scaffolded `.agents`/`.claude` skills and agent-docs
+   blocks to the shipped versions. Stale scaffolded skills in a consumer repository have
+   carried defective launch guidance before (OBS-99) — the refresh closes that class.
 
 ## Public GitHub export (squashed snapshot)
 

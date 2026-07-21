@@ -89,9 +89,10 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
     const loopContent = fs.readFileSync(loopPath, 'utf-8')
     const autoContent = fs.readFileSync(autoPath, 'utf-8')
 
-    // Worker-proven sandbox mode from src/adapters/codex.ts headlessCommand
-    expect(overseerContent).toContain('--sandbox workspace-write')
-    expect(loopContent).toContain('--sandbox workspace-write')
-    expect(autoContent).toContain('--sandbox workspace-write')
+    // Workers keep workspace-write via the codex adapter (proven across runs), but
+    // ORCHESTRATOR sessions that launch tickmarkr run must be unsandboxed per OBS-99.
+    expect(overseerContent).toContain('--dangerously-bypass-approvals-and-sandbox')
+    expect(loopContent).toContain('--dangerously-bypass-approvals-and-sandbox')
+    expect(autoContent).toContain('--dangerously-bypass-approvals-and-sandbox')
   })
 })
