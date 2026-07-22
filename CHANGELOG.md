@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.66 — fleet studio
+
+This fleet-studio release ships a dependency-free terminal UI engine with alternate-screen rendering and incremental line repaint, the `tickmarkr ui` full-screen app exposing read-only Fleet, Routing, Preview, and Profile views, picker-parity candidate inspection so the studio never disagrees with the router, a plan dry-run preview with per-task routing consequences and cost signals, learned-routing profile inspection that names when a pin overrides a higher-scored channel, and retires the OBS-77 askTyped line-mode flow in favor of modal text input.
+
 ## v1.65 — fleet resilience
 
 This fleet-resilience release adds typed worker-failure taxonomy for precise failover classification, quota-style free failover routing that limits retry burden, a transcript noise filter to clean consult dossiers, a doctor flag-drift warning to flag stale disable/allow policies, the quirk registry convention for provenance-tracked disable reasons, and macOS CI lanes for platform-specific workloads.

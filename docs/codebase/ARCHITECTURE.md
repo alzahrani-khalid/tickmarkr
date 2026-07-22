@@ -60,6 +60,7 @@
 Side modules (CLI-facing, not in the dispatch loop):
   PLAN — `src/plan/` (scope/intent LLM helpers for `tickmarkr scope` / `plan`)
   REPORT — `src/report/cost.ts` (pure telemetry → cost estimates for `tickmarkr report`)
+  TUI — `src/tui/` (dependency-free alternate-screen line engine for Fleet Studio)
 ```
 
 ## Component Responsibilities
@@ -73,6 +74,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 | Router | Resolves a task to `{adapter, model, channel, tier}` + an escalation ladder; learned scores from telemetry live in `profile.ts` | `src/route/router.ts`, `src/route/profile.ts`, `src/route/preference.ts`, `src/route/candidates.ts` |
 | Plan helpers | LLM-backed scope/intent clarification for `tickmarkr scope` and human-in-the-loop plan gates | `src/plan/scope.ts`, `src/plan/prompt.ts` |
 | Report cost | Pure telemetry → per-channel cost estimates (no network) | `src/report/cost.ts` |
+| Terminal engine | Renders a diffed line model in the alternate screen, routes named keys, tracks resize, and restores terminal state | `src/tui/engine.ts`, `src/tui/frame.ts`, `src/tui/input.ts` |
 | Adapter registry | Discovers installed/authed CLIs (`probe()`), builds the available `BillingChannel[]` | `src/adapters/registry.ts` |
 | Worker adapters | One per agent CLI: headless/interactive command strings + output parsing | `src/adapters/claude-code.ts`, `src/adapters/codex.ts`, `src/adapters/cursor-agent.ts`, `src/adapters/opencode.ts`, `src/adapters/fake.ts` |
 | Executor drivers | Slot lifecycle (pane or subprocess), wait/read/notify primitives, worktree creation | `src/drivers/herdr.ts`, `src/drivers/subprocess.ts`, `src/drivers/types.ts` |
@@ -160,6 +162,12 @@ Side modules (CLI-facing, not in the dispatch loop):
 - Location: `src/report/cost.ts` (`estimateCosts()`)
 - Depends on: adapters/types (TokenUsage), config (pricing tables), run/journal (TelemetryRow)
 - Used by: `src/cli/commands/report.ts`
+
+**TUI (`src/tui/`):**
+- Purpose: dependency-free terminal presentation engine for Fleet Studio
+- Location: `engine.ts` (lifecycle and resize), `frame.ts` (alternate-screen line-diff renderer), `input.ts` (keypress decoder and named-key router)
+- Depends on: Node streams and ANSI CSI only; input/output streams are injected for non-TTY tests
+- Used by: Fleet Studio command and its views
 
 **Run (`src/run/`):**
 - Purpose: the orchestration runtime — daemon loop, ledger, git integration, merge, escalation, locking, pane hygiene, stall detection
@@ -315,4 +323,4 @@ Side modules (CLI-facing, not in the dispatch loop):
 
 ---
 
-*Architecture analysis: 2026-07-19*
+*Architecture analysis: 2026-07-22*

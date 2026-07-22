@@ -44,4 +44,12 @@ describe("cli dispatch", () => {
     expect(r.out).toBe("tickmarkr ping: boom"); // catches: raw stack traces leaking to the operator
     expect(r.code).toBe(1);
   });
+
+  test("non-tty invocation refuses with a message naming the line-mode alternatives", async () => {
+    const r = await dispatch("ui", []);
+    expect(r.out).toContain("tickmarkr ui:");
+    expect(r.out).toContain("fleet --print");
+    expect(r.out).toContain("status --watch");
+    expect(r.code).toBe(1);
+  });
 });

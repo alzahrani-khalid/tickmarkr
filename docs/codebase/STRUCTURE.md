@@ -53,6 +53,10 @@ tickmarkr/
 │   │   ├── profile.ts                # telemetry-learned scores + exploration bonus
 │   │   ├── preference.ts             # doctor-derived prefer/exclude ranks
 │   │   └── candidates.ts             # rankCandidates() for plan picker output
+│   ├── tui/                         # dependency-free terminal line engine
+│   │   ├── engine.ts                 # TerminalEngine lifecycle, resize, and handler recovery
+│   │   ├── frame.ts                  # alternate-screen line-diff renderer
+│   │   └── input.ts                  # key sequence decoder and named-key router
 │   ├── run/                         # orchestration runtime
 │   │   ├── daemon.ts                 # runDaemon(): the main loop — largest file in src/
 │   │   ├── journal.ts                # Journal class: event log + telemetry log, resume replay
@@ -64,7 +68,7 @@ tickmarkr/
 │   │   └── stall.ts                  # spinner-safe stall-inactivity snapshot normalizer
 │   └── index.ts                     # VERSION constant only
 ├── tests/                          # vitest — mirrors src/ 1:1, plus e2e/ and helpers/
-│   ├── adapters/ · cli/ · compile/ · config/ · drivers/ · gates/ · graph/ · plan/ · report/ · route/ · run/
+│   ├── adapters/ · cli/ · compile/ · config/ · drivers/ · gates/ · graph/ · plan/ · report/ · route/ · tui/ · run/
 │   ├── e2e/
 │   │   └── real-cli.test.ts          # opt-in, TICKMARKR_E2E=1, spends tokens, needs a real installed CLI
 │   ├── helpers/
@@ -139,6 +143,11 @@ tickmarkr/
 - Contains: `estimateCosts()` in `cost.ts`
 - Key files: `src/report/cost.ts`
 
+**`src/tui/`:**
+- Purpose: reusable, dependency-free terminal presentation primitives
+- Contains: `TerminalEngine` lifecycle and resize handling, the alternate-screen line-diff `Frame`, and an injected-stream key router
+- Key files: `src/tui/engine.ts`, `src/tui/frame.ts`, `src/tui/input.ts`
+
 **`src/run/`:**
 - Purpose: the orchestration runtime — the daemon loop and everything it directly needs (ledger, git, merge, escalation, locking, pane hygiene, stall detection)
 - Contains: `daemon.ts` (main loop), `journal.ts` (event/telemetry log), `git.ts` (shell + worktree primitives), `merge.ts` (integration branch), `consult.ts` (frontier-model escalation), `lock.ts` (run lock), `reconcile.ts` (pane reconcile), `stall.ts` (stall normalizer)
@@ -190,6 +199,7 @@ tickmarkr/
 - `src/route/router.ts`: routing resolution
 - `src/gates/run-gates.ts`: gate sequencing
 - `src/graph/schema.ts`: the RunGraph/Task data model
+- `src/tui/engine.ts`: alternate-screen terminal engine with injectable streams
 
 **Testing:**
 - `tests/<dir>/<name>.test.ts` mirrors `src/<dir>/<name>.ts`
@@ -258,4 +268,4 @@ tickmarkr/
 
 ---
 
-*Structure analysis: 2026-07-19*
+*Structure analysis: 2026-07-22*

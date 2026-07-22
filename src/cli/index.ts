@@ -13,6 +13,7 @@ import { resume } from "./commands/resume.js";
 import { run } from "./commands/run.js";
 import { scope } from "./commands/scope.js";
 import { status } from "./commands/status.js";
+import { ui } from "./commands/ui.js";
 import { unlock } from "./commands/unlock.js";
 import { version } from "./commands/version.js";
 
@@ -23,7 +24,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS: CommandMap = {
-  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, unlock, approve, version,
+  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, version,
 };
 
 const VERSION_FLAGS = new Set(["version", "--version", "-v"]);
@@ -45,6 +46,7 @@ usage: tickmarkr <command>
   resume <id>   continue a run from its journal
   report <id>   cost/quality report (--md for committable execution record)
   profile       show learned routing profile (profile reset = forget history via cursor, keeps telemetry)
+  ui            open the Fleet Studio TUI (full-screen tabbed cockpit)
   unlock        remove a stale/garbage run lock (refuses if the holder is alive)
   approve <id> <task>  approve a parked human gate (--by <name> --reason <text>); takes effect on resume`;
 
