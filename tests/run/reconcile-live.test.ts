@@ -1,10 +1,12 @@
 // OBS-17 T2: live reconciliation — the daemon sweeps tickmarkr-owned panes to the journal-derived
 // desired set at every safe point, and the herdr driver closes owned-but-undesired panes plus the
 // tabs those closes emptied. Foreign panes, operator tabs, and other workspaces are never touched.
+import { execSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { FakeAdapter } from "../../src/adapters/fake.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type OwnedName, type Slot, type SlotOpts } from "../../src/drivers/types.js";
@@ -410,4 +412,122 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
     expect(ops.filter((o) => o.kind === "close" && o.name === hungPane)).toHaveLength(1);
     expect(fired.liveAtExit).not.toContain(hungPane);
   });
+});
+
+
+// v1.69 T7: seed-mode pane hygiene parity — a completed seed-mode worker pane is reaped by the
+// same reconcile sweep that reaps any other completed worker pane.
+describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
+  class SeedFakeAdapter extends FakeAdapter {
+    id = "seedfake";
+    interactiveCommand(): string | null {
+      return null;
+    }
+    interactiveSeed = {
+      launch: (model: string) => `launch-tui --model ${model}`,
+      readinessMatch: "TUI ready",
+      seedLine: (promptFile: string) => `read ${promptFile}`,
+    };
+    channels() {
+      return [{ adapter: "seedfake", vendor: "seed", model: "fake-1", channel: "sub", tier: "frontier" }];
+    }
+  }
+
+  function makeSeedDriver() {
+    const inner = new SubprocessDriver();
+    const live = new Set<string>();
+    const byId = new Map<string, string>();
+    const sweeps: { desired: string[]; closed: string[] }[] = [];
+    const closedNames: string[] = [];
+    let buf = "banner\nTUI ready\n> ";
+
+    const driver: ExecutorDriver = {
+      id: "seed-reconcile",
+      interactive: true,
+      slot: async (cwd: string, name: string, o?: SlotOpts) => {
+        const s = await inner.slot(cwd, name);
+        const paneName = o?.owned ? formatOwnedName(o.owned) : name;
+        live.add(paneName);
+        byId.set(s.id, paneName);
+        return { ...s, name: paneName, cwd };
+      },
+      run: async (s: Slot, cmd: string) => {
+        if (cmd.startsWith("launch-tui ")) {
+          // launch: banner already in buf
+          return;
+        }
+        if (cmd.startsWith("read ")) {
+          const promptFile = cmd.slice(5);
+          buf += `\n${cmd}\n`;
+          execSync(`echo done > done.txt && ${COMMIT} done`, { cwd: s.cwd });
+          const nonce = /TICKMARKR_RESULT_([0-9a-z]+)/.exec(readFileSync(promptFile, "utf8"))?.[1] ?? "";
+          if (nonce) {
+            buf += `TICKMARKR_RESULT_${nonce} {"ok":true,"summary":"seeded","deviations":[]}\n`;
+          }
+          return;
+        }
+        // gate/consult scripts and regular interactive dispatch scripts
+        const m = /^bash '(.+)'$/.exec(cmd);
+        if (m) {
+          try {
+            buf += execSync(`bash ${JSON.stringify(m[1])}`, { cwd: s.cwd, encoding: "utf8" });
+          } catch {
+            /* gate failures are reflected in the empty buffer */
+          }
+        }
+      },
+      waitOutput: async (_s: Slot, pattern: string, _ms: number, o?: { regex?: boolean }) =>
+        o?.regex ? new RegExp(pattern).test(buf) : buf.includes(pattern),
+      waitAgentStatus: async () => true,
+      status: async () => "unknown",
+      read: async (_s: Slot, lines: number) => buf.split("\n").slice(-lines).join("\n"),
+      notify: async () => {},
+      close: async (s: Slot) => {
+        const n = byId.get(s.id) ?? s.name;
+        closedNames.push(n);
+        live.delete(n);
+        return inner.close(s);
+      },
+      worktree: inner.worktree.bind(inner),
+      async reconcile(desired: Set<string>) {
+        const closed: string[] = [];
+        for (const name of live) {
+          if (parseOwnedName(name) && !desired.has(name)) {
+            live.delete(name);
+            closed.push(name);
+          }
+        }
+        sweeps.push({ desired: [...desired], closed });
+      },
+    };
+
+    return { driver, live, sweeps, closedNames };
+  }
+
+  test("a completed seed-mode attempt's worker pane is closed by the same post-run sweep that closes any other completed worker pane", async () => {
+    const { repo, fake, scriptPath } = setupRepo(
+      [T("T1"), T("T2", { shape: "chore" }) ],
+      {
+        tasks: {
+          T1: [{ shell: "true", result: { ok: true, summary: "seeded" } }],
+          T2: [{ shell: "true", result: { ok: true, summary: "other" } }],
+        },
+      },
+      "visibility:\n  worker: interactive\n  keepPanes: run\ntaskTimeoutMinutes: 0.2\n" +
+      "routing:\n  map:\n    implement:\n      pin: { via: seedfake, model: fake-1 }\n    chore:\n      pin: { via: fake, model: fake-1 }\n",
+    );
+    const { driver, live, sweeps, closedNames } = makeSeedDriver();
+    const s = await runDaemon(repo, { adapters: [new SeedFakeAdapter(scriptPath), fake], runId: "run-seed-sweep", driver });
+    expect(s.done).toEqual(["T1", "T2"]);
+    const w1 = owned("worker", "T1", 0, "run-seed-sweep");
+    const w2 = owned("worker", "T2", 0, "run-seed-sweep");
+    expect(live.has(w1)).toBe(false);
+    expect(live.has(w2)).toBe(false);
+    expect(closedNames).toContain(w1);
+    expect(closedNames).toContain(w2);
+    // run-end sweep sees no worker panes left — they were already reaped by the same post-attempt
+    // close path every other completed worker pane uses.
+    expect(sweeps.at(-1)!.closed).not.toContain(w1);
+    expect(sweeps.at(-1)!.closed).not.toContain(w2);
+  }, 30_000);
 });

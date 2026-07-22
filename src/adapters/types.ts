@@ -52,6 +52,15 @@ export function modelAuthed(health: AuthHealth | undefined, model: string, allow
 export interface Invocation { command: string }
 export interface WorkerResult { ok: boolean; summary: string; deviations: string[]; raw: string }
 
+// v1.69 T6: adapters whose real TUI has no argv-seeding surface can still be launched interactively by
+// opening the TUI first, waiting for a deterministic readiness marker, and then injecting the task as a
+// single submitted turn. `interactiveSeed` is ignored unless `interactiveCommand` is also in play.
+export interface InteractiveSeed {
+  launch(model: string): string;
+  readinessMatch: string;
+  seedLine(promptFile: string): string;
+}
+
 // v1.23 T1: live tokens-in-context from a CLI's on-disk session store. `tokens` is the LAST turn's
 // input-side fill (never a sum over turns). `limit` only when the store states a real window size.
 export interface ContextUsage {
@@ -103,6 +112,9 @@ export interface WorkerAdapter {
   headlessCommand(promptFile: string, model: string): string;
   // v1.2: launch the CLI's real interactive TUI with the prompt injected; null = adapter can't → print fallback
   interactiveCommand(promptFile: string, model: string): string | null;
+  // v1.69 T6: launch the real TUI without a prompt, wait for readiness, then inject one seed turn.
+  // When present, the daemon uses this instead of the single-command interactiveCommand path.
+  interactiveSeed?: InteractiveSeed;
   // v1.29 T1: same-session retry capability; absent means the CLI has no solid resume semantics.
   resumeCommand?(sessionId: string, promptFile: string, model: string): string;
   // v1.53 T3: capture the CLI's own session id from a completed attempt's output (kimi ends every

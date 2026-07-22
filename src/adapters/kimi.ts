@@ -6,6 +6,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
+import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerResult } from "./types.js";
 
 // KIMI-03 → v1.58 T5: the "no harness-readable counter" block (research F-6, 2026-07-17) is
@@ -72,14 +73,119 @@ export function parseKimiResult(raw: string, nonce: string): WorkerResult {
 // line only: prompt/model prose can contain lookalike text, and the anchored charset keeps a
 // captured id shell-safe by construction (shq in resumeCommand is the second layer). Last valid
 // line wins — a run may echo stale resume lines mid-transcript.
+//
+// v1.69 T7: the native TUI cold-start banner also prints `Session: session_<uuid>` at launch.
+// Prefer a banner Session line when present so seed-mode captures the id from the launch banner
+// itself rather than waiting for a completion-time resume trailer (which the TUI may never emit).
 const RESUME_TRAILER_RE = /^\s*To resume this session: kimi -r (session_[0-9a-f-]+)\s*$/;
+const BANNER_SESSION_LINE_RE = /^\s*Session:\s*(session_[0-9a-f-]+)\s*$/;
 export function kimiSessionId(output: string): string | undefined {
   let id: string | undefined;
   for (const line of output.split("\n")) {
+    const banner = BANNER_SESSION_LINE_RE.exec(line);
+    if (banner) {
+      id = banner[1];
+      continue;
+    }
     const m = RESUME_TRAILER_RE.exec(line);
     if (m) id = m[1];
   }
   return id;
+}
+
+// v1.69 T6: the native TUI takes -m <alias>, where config.toml aliases are the bare model suffix of
+// the tickmarkr channel id (live probe 2026-07-22). Keep the mapping explicit and localized.
+function kimiAlias(model: string): string {
+  return model.replace(/^kimi-code\//, "");
+}
+
+// v1.69 T7: the cold-start banner prints the model alias and session id. Parse them from the
+// banner text already captured for the readiness match — no new probe, no extra dispatch.
+const BANNER_MODEL_RE = /^Model:\s*(.+)$/m;
+const BANNER_SESSION_RE = /^Session:\s*(session_[0-9a-f-]+)$/m;
+export function kimiBannerModel(banner: string): string | undefined {
+  const m = BANNER_MODEL_RE.exec(banner);
+  if (!m) return undefined;
+  const alias = m[1].trim();
+  if (!alias) return undefined;
+  return `kimi-code/${alias}`;
+}
+export function kimiBannerSessionId(banner: string): string | undefined {
+  return BANNER_SESSION_RE.exec(banner)?.[1];
+}
+
+export type KimiBannerConfirm =
+  | { ok: true; sessionId?: string }
+  | { ok: false; error: string };
+
+// Fail closed on a named-model mismatch; a missing Model line is not a mismatch (banner partial).
+export function confirmKimiSeedBanner(banner: string, assignedModel: string): KimiBannerConfirm {
+  const saw = kimiBannerModel(banner);
+  if (saw !== undefined && saw !== assignedModel) {
+    return { ok: false, error: `model mismatch: expected ${assignedModel}, saw ${saw}` };
+  }
+  return { ok: true, sessionId: kimiBannerSessionId(banner) };
+}
+
+export interface KimiInteractiveSeedResult {
+  output: string;
+  seedFailed: boolean;
+  seedError?: string;
+  // Session id from the launch banner itself — not from the attempt's completion text.
+  sessionId?: string;
+}
+
+// Shared launch-then-seed surface (T6) + banner confirm helpers (T7). One definition so the
+// adapter property and runKimiInteractiveSeed cannot drift.
+const KIMI_SEED = {
+  launch: (model: string) => `kimi -y -m ${shq(kimiAlias(model))}`,
+  readinessMatch: "Send /help for help information.",
+  seedLine: (promptFile: string) => `Read ${promptFile} and do exactly what it says.`,
+};
+
+// v1.69 T7: kimi-local launch-then-seed that confirms the banner model and captures the session id
+// from the SAME pane text already present for the readiness match. No extra probe, no extra
+// dispatch — one read of the launch banner, then seed or fail closed.
+export async function runKimiInteractiveSeed(opts: {
+  driver: Pick<ExecutorDriver, "run" | "waitOutput" | "read">;
+  slot: Slot;
+  assignment: Assignment;
+  promptFile: string;
+  taskTimeoutMinutes: number;
+}): Promise<KimiInteractiveSeedResult> {
+  await opts.driver.run(opts.slot, KIMI_SEED.launch(opts.assignment.model));
+
+  const ready = await opts.driver.waitOutput(
+    opts.slot,
+    KIMI_SEED.readinessMatch,
+    opts.taskTimeoutMinutes * 60_000,
+  );
+
+  // Banner text already on the pane for the readiness match — the only text model/session use.
+  const banner = await opts.driver.read(opts.slot, 1000);
+
+  if (!ready) {
+    return { output: banner, seedFailed: true, seedError: `readiness pattern not seen: ${KIMI_SEED.readinessMatch}` };
+  }
+
+  const confirm = confirmKimiSeedBanner(banner, opts.assignment.model);
+  if (!confirm.ok) {
+    return { output: banner, seedFailed: true, seedError: confirm.error };
+  }
+
+  const seedText = KIMI_SEED.seedLine(opts.promptFile);
+  await opts.driver.run(opts.slot, seedText);
+
+  let output = "";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await new Promise((r) => setTimeout(r, 200));
+    output = await opts.driver.read(opts.slot, 1000);
+    const bottom = output.trimEnd().split("\n").pop() ?? "";
+    if (!bottom.includes(seedText)) {
+      return { output, seedFailed: false, sessionId: confirm.sessionId };
+    }
+  }
+  return { output, seedFailed: true, seedError: "seed line never left the input box", sessionId: confirm.sessionId };
 }
 
 export const kimi: WorkerAdapter = {
@@ -111,6 +217,12 @@ export const kimi: WorkerAdapter = {
   // ("unknown command '…'", live-verified 2026-07-17, OBS-67) and -p is non-interactive-only.
   // null → the daemon's print fallback (types.ts:101) keeps kimi workers visible without a TUI.
   interactiveCommand: () => null,
+  // v1.69 T6/T7: launch the real TUI, wait for the cold-start readiness marker, then submit the
+  // prompt as one user turn. Banner model/session confirmation for seed mode lives in
+  // runKimiInteractiveSeed / confirmKimiSeedBanner (same pane text as the readiness match — no
+  // extra probe). Live-probed 2026-07-22 (kimi 0.28.1): `kimi -y` opens the TUI with yolo active
+  // and prints the model/session lines plus "Send /help for help information." before the input box.
+  interactiveSeed: KIMI_SEED,
   // v1.53 T3 resume — live-probed 2026-07-18: `-p` + `-S <id>` compose cleanly (no OBS-67-class
   // flag rejection) and the resumed session carries prior conversation state. `-S <id>` is the
   // deterministic form; `-c` rejected as primary — cwd-keyed, nondeterministic under worktree

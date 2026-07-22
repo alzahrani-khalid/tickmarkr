@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.69 — eval-lab + kimi-seeding
+
+This eval-lab and kimi-seeding release ships checked-in fixtures with fail-as-shipped and pass-with-reference selfchecks, identical cross-channel prompts, incremental JSON reports with identity stamping, and a held-out known-fail judge canary. It also adds kimi launch-then-seed TUI workers with readiness checks, model and session banner confirmation, and pane cleanup after harvest.
+
 ## v1.68 — runs cockpit
 
 This runs-cockpit release ships the fifth Fleet Studio tab with a journal timeline and run-level now-line, per-task gate ladder rendered through the status glyph vocabulary, attempt history naming typed failure reasons, a consult dossier viewer listing verdicts with persisted prompt content, a live per-channel cost ticker and tip-verify state line reusing the cost-signal formatter, human-gate approve routed through the existing approve path, interactive-harvest settle-retry at the parse boundary (OBS-111), and a default fork-cap for gate and verify children (OBS-110).

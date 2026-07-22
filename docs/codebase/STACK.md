@@ -71,7 +71,7 @@
 - Optional: `herdr` CLI on `PATH` plus `HERDR_ENV=1` for the visible-pane driver; silently falls back to the invisible `SubprocessDriver` when absent
 
 **Production:**
-- No server/deployment target — tickmarkr has no production runtime distinct from development. It ships as the npm package `tickmarkr` (`package.json:2`, `files: ["dist", "schema", "skills"]`) and is invoked locally or from an unattended shell/CI job as the `tickmarkr` or `tkr` binary (`package.json:22-25`).
+- No server/deployment target — tickmarkr has no production runtime distinct from development. It ships as the npm package `tickmarkr` (`package.json:2`, `files: ["dist", "schema", "skills", "fixtures"]`) and is invoked locally or from an unattended shell/CI job as the `tickmarkr` or `tkr` binary (`package.json:22-25`).
 
 ---
 

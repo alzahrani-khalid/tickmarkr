@@ -21,6 +21,7 @@ import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHa
 import type { Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { cleanupRunWorktrees, gitHead, linkNodeModules, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
 import { acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
@@ -661,18 +662,23 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         : cfg.visibility.worker === "interactive" && driver.interactive
           ? adapter.interactiveCommand(promptFile, assignment.model)
           : null;
-      if (cfg.visibility.worker === "interactive" && icmd === null && !modeFallbackNoted) {
+      // v1.69 T6: adapters that declare interactiveSeed launch the real TUI and inject the prompt as a
+      // user turn; they do NOT need the argv-seeding surface that interactiveCommand represents.
+      const hasSeed = retryMode !== "resume" && cfg.visibility.worker === "interactive" && driver.interactive && !!adapter.interactiveSeed;
+      if (cfg.visibility.worker === "interactive" && icmd === null && !hasSeed && !modeFallbackNoted) {
         modeFallbackNoted = true;
         journal.append("worker-mode-fallback", t.id, { reason: driver.interactive ? "adapter" : "driver" });
       }
 
-      const interactive = icmd !== null;
+      const interactive = icmd !== null || hasSeed;
       // OBS-85 (v1.62 T1): both dispatch branches deliver ONE short script invocation — banner,
       // adapter command, and nonce exit marker live in a per-attempt script beside the prompt
       // artifact (the same paneDispatchCommand pattern judge/review/consult dispatches use). The
       // delivered pane line carries no command substitution and no trailing shell text, so paste
       // timing can never interleave a `$(…)` with what follows it (the codex corruption class).
-      const workerCmd = interactive ? icmd : adapter.invoke(t, wt, assignment, { promptFile }).command;
+      const workerCmd = interactive
+        ? (hasSeed ? ":" : icmd)
+        : adapter.invoke(t, wt, assignment, { promptFile }).command;
       const dispatchScript = promptFile.replace(/\.md$/, ".sh");
       writeFileSync(dispatchScript, [
         "export BASH_SILENCE_DEPRECATION_WARNING=1",
@@ -719,113 +725,128 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let exitCode: number | null;
       let timedOut = false;
       let settleParsed: WorkerResult | undefined;
+      let seedResult: InteractiveSeedResult | undefined;
       if (interactive) {
         // v1.2 interactive: the TUI doesn't exit on completion — the trailer is the finish line.
         // The exit wrapper still fires if the TUI dies (crash/quit): fast-fail instead of burning the timeout.
-        await driver.run(slot, paneDispatchCommand(dispatchScript));
-        let paged = false;
-        // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
-        // Any other blocked/idle dialog still pages the operator (paged latch below).
-        let trustAnswered = false;
         finished = false;
         exitCode = null;
-        output = await driver.read(slot, 1000);
-        // OBS-54: reaping keys on new pane output, not dispatch wall clock. Poll at least twice per
-        // stall window (and at the existing 30s cadence for normal windows) so an active worker resets it.
-        const stallWindowMs = taskTimeoutMinutes * 60_000;
-        // OBS-82: the stall clock compares NORMALIZED snapshots so a spinner glyph/elapsed-time
-        // repaint is silence, not activity. ONLY this inactivity compare sees normalized text —
-        // trailer detection, harvest, paging, and quota checks all read the raw pane.
-        let lastStallSnapshot = normalizeStallSnapshot(output);
-        let lastOutputAt = Date.now();
-        while (Date.now() - lastOutputAt < stallWindowMs) {
-          const sliceStart = Date.now();
-          const remaining = stallWindowMs - (sliceStart - lastOutputAt);
-          const slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
-          if (await driver.waitOutput(slot, `(${trailerPattern(nonce)})|TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true })) {
-            // verify before accepting: a worker that merely DISPLAYS a marker (e.g. editing tickmarkr's
-            // own source, where "TICKMARKR_EXIT:" is a string literal) must not end the wait. Only a
-            // parseable trailer or a digit-suffixed exit marker in the harvest is completion.
-            output = await driver.read(slot, 1000); // TUI transcripts carry chrome — read deeper than print's 500
-            finished = new RegExp(trailerPattern(nonce)).test(output);
-            const exit = exitRe.exec(output);
-            if (finished || exit) {
-              exitCode = exit ? Number(exit[1]) : null; // null ⇔ the TUI is still alive
-              await sampleContext(); // final poll-seam sample before leaving the wait
-              break;
-            }
-          }
-          const currentStallSnapshot = normalizeStallSnapshot(await driver.read(slot, 1000));
-          if (currentStallSnapshot !== lastStallSnapshot) {
-            lastStallSnapshot = currentStallSnapshot;
-            lastOutputAt = Date.now();
-          }
-          // v1.23 T2: piggyback on this poll slice — same cadence as blocked/idle checks, no new timer.
-          await sampleContext();
-          // page on "idle" too: herdr's blocked-scrape is strict and proved flaky for TUI dialogs
-          // (live check: cursor's trust dialog scraped as idle). "unknown" never pages — that's just
-          // a pane the scraper can't read (subprocess, dead pane); the task timeout covers those.
-          const st = paged ? "" : await driver.status(slot);
-          if (!paged && (st === "blocked" || st === "idle")) {
-            // T5: once-per-slot auto-answer when the adapter declares a trust dialog and the pane
-            // text matches. tickmarkr created the worktree from the operator's own repo — safe by construction.
-            if (!trustAnswered && adapter.trustDialog && driver.sendKey) {
-              try {
-                const paneText = await driver.read(slot, 80);
-                if (matchesTrustDialog(paneText, adapter.trustDialog)) {
-                  trustAnswered = true;
-                  // v1.25 T1: audit trail for live runs — prove the dialog appeared and was answered.
-                  // Latch + sendKey + no-page continue stay byte-identical; this append is additive only.
-                  journal.append("trust-auto-answer", t.id, { slot: slot.name, adapter: adapter.id });
-                  await driver.sendKey(slot, adapter.trustDialog.key);
-                  const spent = Date.now() - sliceStart;
-                  if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
-                  continue; // do not page — keep waiting for the trailer
-                }
-              } catch {
-                /* read/send failed — fall through to page the operator */
+        if (adapter.interactiveSeed) {
+          // v1.69 T6: launch the real TUI without a prompt, wait for readiness, inject one seed turn,
+          // then fall through to the normal trailer harvest. A failed seed is recorded as a finished
+          // failure rather than allowed to race the trailer wait.
+          seedResult = await runInteractiveSeed({ driver, slot, adapter, assignment, promptFile, taskTimeoutMinutes });
+          output = seedResult.output;
+        } else {
+          await driver.run(slot, paneDispatchCommand(dispatchScript));
+          output = await driver.read(slot, 1000);
+        }
+        if (seedResult?.seedFailed) {
+          finished = false;
+        } else {
+          let paged = false;
+          // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
+          // Any other blocked/idle dialog still pages the operator (paged latch below).
+          let trustAnswered = false;
+          finished = false;
+          exitCode = null;
+          // OBS-54: reaping keys on new pane output, not dispatch wall clock. Poll at least twice per
+          // stall window (and at the existing 30s cadence for normal windows) so an active worker resets it.
+          const stallWindowMs = taskTimeoutMinutes * 60_000;
+          // OBS-82: the stall clock compares NORMALIZED snapshots so a spinner glyph/elapsed-time
+          // repaint is silence, not activity. ONLY this inactivity compare sees normalized text —
+          // trailer detection, harvest, paging, and quota checks all read the raw pane.
+          let lastStallSnapshot = normalizeStallSnapshot(output);
+          let lastOutputAt = Date.now();
+          while (Date.now() - lastOutputAt < stallWindowMs) {
+            const sliceStart = Date.now();
+            const remaining = stallWindowMs - (sliceStart - lastOutputAt);
+            const slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
+            if (await driver.waitOutput(slot, `(${trailerPattern(nonce)})|TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true })) {
+              // verify before accepting: a worker that merely DISPLAYS a marker (e.g. editing tickmarkr's
+              // own source, where "TICKMARKR_EXIT:" is a string literal) must not end the wait. Only a
+              // parseable trailer or a digit-suffixed exit marker in the harvest is completion.
+              output = await driver.read(slot, 1000); // TUI transcripts carry chrome — read deeper than print's 500
+              finished = new RegExp(trailerPattern(nonce)).test(output);
+              const exit = exitRe.exec(output);
+              if (finished || exit) {
+                exitCode = exit ? Number(exit[1]) : null; // null ⇔ the TUI is still alive
+                await sampleContext(); // final poll-seam sample before leaving the wait
+                break;
               }
             }
-            paged = true; // page once — the visible pane is the operator's to unblock; task timeout is the backstop
-            const why = st === "blocked" ? "is blocked on a prompt — approve in its pane" : "looks idle without finishing — check its pane";
-            await driver.notify(`tickmarkr ${runId}: ${slot.name} ${why}`, { tier: "attention" });
+            const currentStallSnapshot = normalizeStallSnapshot(await driver.read(slot, 1000));
+            if (currentStallSnapshot !== lastStallSnapshot) {
+              lastStallSnapshot = currentStallSnapshot;
+              lastOutputAt = Date.now();
+            }
+            // v1.23 T2: piggyback on this poll slice — same cadence as blocked/idle checks, no new timer.
+            await sampleContext();
+            // page on "idle" too: herdr's blocked-scrape is strict and proved flaky for TUI dialogs
+            // (live check: cursor's trust dialog scraped as idle). "unknown" never pages — that's just
+            // a pane the scraper can't read (subprocess, dead pane); the task timeout covers those.
+            const st = paged ? "" : await driver.status(slot);
+            if (!paged && (st === "blocked" || st === "idle")) {
+              // T5: once-per-slot auto-answer when the adapter declares a trust dialog and the pane
+              // text matches. tickmarkr created the worktree from the operator's own repo — safe by construction.
+              if (!trustAnswered && adapter.trustDialog && driver.sendKey) {
+                try {
+                  const paneText = await driver.read(slot, 80);
+                  if (matchesTrustDialog(paneText, adapter.trustDialog)) {
+                    trustAnswered = true;
+                    // v1.25 T1: audit trail for live runs — prove the dialog appeared and was answered.
+                    // Latch + sendKey + no-page continue stay byte-identical; this append is additive only.
+                    journal.append("trust-auto-answer", t.id, { slot: slot.name, adapter: adapter.id });
+                    await driver.sendKey(slot, adapter.trustDialog.key);
+                    const spent = Date.now() - sliceStart;
+                    if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
+                    continue; // do not page — keep waiting for the trailer
+                  }
+                } catch {
+                  /* read/send failed — fall through to page the operator */
+                }
+              }
+              paged = true; // page once — the visible pane is the operator's to unblock; task timeout is the backstop
+              const why = st === "blocked" ? "is blocked on a prompt — approve in its pane" : "looks idle without finishing — check its pane";
+              await driver.notify(`tickmarkr ${runId}: ${slot.name} ${why}`, { tier: "attention" });
+            }
+            // a dead pane or a false-positive marker display returns fast — sleep the unspent slice, never hot-spin
+            const spent = Date.now() - sliceStart;
+            if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
           }
-          // a dead pane or a false-positive marker display returns fast — sleep the unspent slice, never hot-spin
-          const spent = Date.now() - sliceStart;
-          if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
-        }
-        if (!finished && exitCode === null) {
-          // timed out (or only ever saw false positives): harvest whatever the pane holds now
-          timedOut = Date.now() - lastOutputAt >= stallWindowMs;
-          output = await driver.read(slot, 1000);
-          finished = new RegExp(trailerPattern(nonce)).test(output);
-          const exit = exitRe.exec(output);
-          exitCode = exit ? Number(exit[1]) : null;
-        }
-        if (finished) {
-          await driver.waitAgentStatus(slot, "idle", 5_000); // settle, then re-harvest the final render
-          output = await driver.read(slot, 1000);
-        }
-        // T5 / OBS-111: an interactive harvest can race the TUI's final paint. When the pane
-        // contains the nonce token but the JSON hasn't balanced yet, settle and re-read through
-        // the existing pane-read seam once or twice before recording a malformed-trailer cause.
-        if (interactive) {
-          const stallWindowMs = taskTimeoutMinutes * 60_000;
-          const settleDeadline = attemptStart + stallWindowMs;
-          const settleDelayMs = 1_000;
-          const maxSettleRetries = 2;
-          let settleTries = 0;
-          settleParsed = adapter.parse(output, nonce);
-          while (settleParsed.summary === UNPARSEABLE_TRAILER_SUMMARY && settleTries < maxSettleRetries) {
-            const remaining = settleDeadline - Date.now();
-            if (remaining <= 0) break;
-            await new Promise((r) => setTimeout(r, Math.min(settleDelayMs, remaining)));
+          if (!finished && exitCode === null) {
+            // timed out (or only ever saw false positives): harvest whatever the pane holds now
+            timedOut = Date.now() - lastOutputAt >= stallWindowMs;
             output = await driver.read(slot, 1000);
-            settleParsed = adapter.parse(output, nonce);
-            settleTries++;
+            finished = new RegExp(trailerPattern(nonce)).test(output);
+            const exit = exitRe.exec(output);
+            exitCode = exit ? Number(exit[1]) : null;
           }
-          if (settleParsed.summary !== UNPARSEABLE_TRAILER_SUMMARY) {
-            finished = settleParsed.summary !== NO_TRAILER_SUMMARY;
+          if (finished) {
+            await driver.waitAgentStatus(slot, "idle", 5_000); // settle, then re-harvest the final render
+            output = await driver.read(slot, 1000);
+          }
+          // T5 / OBS-111: an interactive harvest can race the TUI's final paint. When the pane
+          // contains the nonce token but the JSON hasn't balanced yet, settle and re-read through
+          // the existing pane-read seam once or twice before recording a malformed-trailer cause.
+          if (interactive) {
+            const stallWindowMs = taskTimeoutMinutes * 60_000;
+            const settleDeadline = attemptStart + stallWindowMs;
+            const settleDelayMs = 1_000;
+            const maxSettleRetries = 2;
+            let settleTries = 0;
+            settleParsed = adapter.parse(output, nonce);
+            while (settleParsed.summary === UNPARSEABLE_TRAILER_SUMMARY && settleTries < maxSettleRetries) {
+              const remaining = settleDeadline - Date.now();
+              if (remaining <= 0) break;
+              await new Promise((r) => setTimeout(r, Math.min(settleDelayMs, remaining)));
+              output = await driver.read(slot, 1000);
+              settleParsed = adapter.parse(output, nonce);
+              settleTries++;
+            }
+            if (settleParsed.summary !== UNPARSEABLE_TRAILER_SUMMARY) {
+              finished = settleParsed.summary !== NO_TRAILER_SUMMARY;
+            }
           }
         }
       } else {

@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import { approve } from "./commands/approve.js";
 import { compile } from "./commands/compile.js";
 import { doctor } from "./commands/doctor.js";
+import { evalCommand } from "./commands/eval.js";
 import { fleet } from "./commands/fleet.js";
 import { init } from "./commands/init.js";
 import { plan } from "./commands/plan.js";
@@ -24,7 +25,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS: CommandMap = {
-  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, version,
+  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, version, eval: evalCommand,
 };
 
 const VERSION_FLAGS = new Set(["version", "--version", "-v"]);
@@ -41,6 +42,7 @@ usage: tickmarkr <command>
   compile <src> spec → .tickmarkr/graph.json (fails without acceptance criteria)
   scope <intent> draft a compiled native spec beside an answered intent (--force to overwrite)
   plan          dry-run routing table + cost estimate + floor lints
+  eval          run checked-in fixtures against every channel in isolated temp repos
   run           execute the graph (--concurrency N --driver herdr|subprocess --route-strict)
   status        live run state
   resume <id>   continue a run from its journal

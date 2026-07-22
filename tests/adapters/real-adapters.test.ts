@@ -125,6 +125,19 @@ describe("real adapters", () => {
     );
   });
 
+  test("kimi declares an interactiveSeed launch-then-seed capability", () => {
+    expect(kimi.interactiveSeed).toBeDefined();
+    expect(kimi.interactiveCommand("/tmp/p.md", "kimi-code/k3")).toBeNull();
+    const launch = kimi.interactiveSeed!.launch("kimi-code/k3");
+    expect(launch).toContain("kimi -y");
+    expect(launch).toContain("-m");
+    expect(launch).toContain("k3");
+    expect(kimi.interactiveSeed!.readinessMatch).toBe("Send /help for help information.");
+    const seed = kimi.interactiveSeed!.seedLine("/tmp/p.md");
+    expect(seed).toContain("/tmp/p.md");
+    expect(seed).toContain("do exactly what it says");
+  });
+
   test("QUOTA_RE matches the ZAI coding-plan exhaustion text, not unrelated failures", () => {
     // research Pitfall 3: ZAI surfaces "Insufficient balance…", which "insufficient credit" missed
     expect(QUOTA_RE.test("Insufficient balance or no resource package. Please recharge.")).toBe(true);

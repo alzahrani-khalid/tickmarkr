@@ -15,7 +15,7 @@ tickmarkr/
 │   │   └── fake.ts                # deterministic scripted adapter — zero-token test double
 │   ├── cli/
 │   │   ├── index.ts               # argv → command dispatch table + usage text
-│   │   └── commands/              # one file per subcommand (init/doctor/fleet/compile/scope/plan/run/status/resume/report/profile/unlock/approve/version)
+│   │   └── commands/              # one file per subcommand (init/doctor/fleet/compile/scope/plan/eval/run/status/resume/report/profile/unlock/approve/version)
 │   ├── compile/                  # spec front-ends → RunGraph
 │   │   ├── index.ts               # compileSource(): type detection + dispatch
 │   │   ├── common.ts              # CompileError, sha256(), inferShape()
@@ -24,6 +24,8 @@ tickmarkr/
 │   │   ├── speckit.ts             # GitHub Spec Kit tasks.md front-end
 │   │   ├── prd.ts                 # bare markdown PRD front-end
 │   │   └── gsd.ts                 # GSD .planning/ phase-dir front-end (v1.3)
+│   ├── eval/                     # eval lab: fixture discovery, seeding, and qualification
+│   │   └── fixtures.ts            # checked-in fixture enumeration + isolated temp-repo seeding
 │   ├── config/
 │   │   └── config.ts              # TickmarkrConfig type, DEFAULT_CONFIG seed table, loadConfig(), configTemplate()
 │   ├── drivers/                  # ExecutorDriver interface + implementations
@@ -74,7 +76,8 @@ tickmarkr/
 │   ├── helpers/
 │   │   └── tmprepo.ts                 # makeRepo(), setupRepo(), T() — shared git-backed fixtures
 │   └── smoke.test.ts                  # top-level sanity check, no mirrored src file
-├── fixtures/                       # sample spec inputs consumed by compiler tests
+├── fixtures/                       # shipped (package.json files + export allowlist): compiler samples + eval-lab trees
+│   ├── eval/                          # eval-lab fixtures (start/ + solution/ per fixture id)
 │   ├── gsd-sample/07-live-check/      # *-PLAN.md + *-SUMMARY.md fixtures for compile/gsd.test.ts
 │   ├── speckit-sample/tasks.md
 │   └── sample.prd.md
@@ -107,6 +110,11 @@ tickmarkr/
 - Purpose: adapt heterogeneous spec formats (native tickmarkr spec, Spec Kit, bare PRD, GSD `.planning/`) into the one RunGraph shape
 - Contains: type-detection front door (`index.ts`), primary native front-end (`native.ts`), advisory scope-lint scan (`collateral.ts`), one parser per legacy/alternate format, shared error type + helpers (`common.ts`)
 - Key files: `src/compile/index.ts`, `src/compile/native.ts`, `src/compile/gsd.ts`
+
+**`src/eval/`:**
+- Purpose: checked-in fixture harness for the eval lab — discover fixtures, validate their required parts, and seed each one into its own fresh temporary git repository before any check or dispatch runs
+- Contains: fixture discovery + validation (`fixtures.ts`), and the isolated temp-repo seeding helper used by the `eval` command
+- Key files: `src/eval/fixtures.ts`
 
 **`src/config/`:**
 - Purpose: single seed table + layered override resolution

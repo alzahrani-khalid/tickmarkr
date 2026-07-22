@@ -11,7 +11,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.67.0";
+const PRIOR_RELEASE_VERSION = "1.68.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -65,16 +65,17 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the runs-cockpit theme and the shipped changes rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.68[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/runs[- ]cockpit/i);
-    for (const change of ["journal timeline", "gate ladder", "attempt history", "consult dossier", "cost ticker", "tip-verify", "human-gate approve", "settle-retry", "fork-cap"]) {
+  test("the changelog entry names both the eval-lab and kimi-seeding themes and the shipped changes rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.69[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/eval[- ]lab/i);
+    expect(entry).toMatch(/kimi[- ]seeding/i);
+    for (const change of ["checked-in fixtures", "fail-as-shipped", "pass-with-reference", "cross-channel prompts", "incremental JSON", "identity stamping", "held-out known-fail judge canary", "launch-then-seed", "readiness", "model and session", "pane cleanup"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.67.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.68.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

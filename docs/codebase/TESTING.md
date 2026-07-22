@@ -28,14 +28,15 @@ There is no separate watch-mode script in `package.json`; run `npx vitest` direc
 **Structure:**
 ```
 tests/
-├── adapters/       20 *.test.ts files (fake, registry, prompt, per-vendor auth/usage, etc.)
+├── adapters/       21 *.test.ts files (fake, registry, prompt, per-vendor auth/usage, kimi TUI seed, etc.)
 ├── brand.test.ts   byte-pinned brand exports
-├── cli/            31 *.test.ts files (init, plan, status, fleet, approve, doctor, report-*, mode-*, etc.)
+├── cli/            32 *.test.ts files (init, plan, status, fleet, approve, doctor, report-*, mode-*, etc.)
 ├── compile/        6 *.test.ts files (gsd, prd, speckit, native, collateral, scope-seam)
-├── config/         3 *.test.ts files
+├── config/         4 *.test.ts files
 ├── docs-*.test.ts  export-guarded docs-truth suites (codebase, concerns, stack, testing)
 ├── drivers/        6 *.test.ts files (herdr, subprocess, env-seal, trailer-width, etc.)
 ├── e2e/            real-cli.test.ts          (gated, spends tokens — see below)
+├── eval/           1 *.test.ts file          (fixture harness tests for the eval lab)
 ├── fixtures/       codex-mcp-spinner/capture.ts (non-*.test.ts capture helper)
 ├── gates/          12 *.test.ts files
 ├── graph/          4 *.test.ts files
@@ -47,13 +48,13 @@ tests/
 ├── repo/           9 *.test.ts files (export fixtures/manifest, readme + contact + community boundaries, build provisioning, release docs)
 ├── report/         2 *.test.ts files
 ├── route/          16 *.test.ts files (router, explore, failover, profile, etc.)
-├── run/            25 *.test.ts files (daemon, journal, merge, consult, stall, etc.)
+├── run/            26 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, etc.)
 ├── scripts/        probe-rig.test.ts
 ├── setup.ts        (setupFiles in vitest.config.ts — global env seal, not a *.test.ts file)
 ├── skills-pipeline-layout.test.ts
 └── smoke.test.ts   (top-level canary: package exports a valid VERSION)
 ```
-Extra test files beyond a 1:1 mirror are additive, not a different convention: `evidence-scope.test.ts` and `via-driver.test.ts` cover cross-module interactions that don't belong to one gate file; `daemon-interactive.test.ts` isolates the v1.2 interactive-worker path from the main `daemon.test.ts`.
+Extra test files beyond a 1:1 mirror are additive, not a different convention: `evidence-scope.test.ts` and `via-driver.test.ts` cover cross-module interactions that don't belong to one gate file; `daemon-interactive.test.ts` isolates the v1.2 interactive-worker path from the main `daemon.test.ts`; `interactive-seed.test.ts` isolates the v1.69 launch-then-seed adapter capability; `kimi-tui-seed.test.ts` covers the v1.69 T7 kimi banner model/session assertions; `reconcile-live.test.ts` covers the seed-mode pane-hygiene parity sweep.
 
 ## Test Structure
 

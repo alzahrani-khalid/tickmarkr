@@ -1,6 +1,6 @@
 {
   "name": "tickmarkr",
-  "version": "1.68.0",
+  "version": "1.69.0",
   "description": "Spec in, verified work out.",
   "type": "module",
   "license": "MIT",
@@ -26,7 +26,8 @@
   "files": [
     "dist",
     "schema",
-    "skills"
+    "skills",
+    "fixtures"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

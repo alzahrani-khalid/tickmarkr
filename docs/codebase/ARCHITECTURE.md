@@ -60,6 +60,7 @@
 Side modules (CLI-facing, not in the dispatch loop):
   PLAN — `src/plan/` (scope/intent LLM helpers for `tickmarkr scope` / `plan`)
   REPORT — `src/report/cost.ts` (pure telemetry → cost estimates for `tickmarkr report`)
+  EVAL — `src/eval/` (checked-in fixture harness for `tickmarkr eval`)
   TUI — `src/tui/` (dependency-free alternate-screen line engine for Fleet Studio)
 ```
 
@@ -67,13 +68,14 @@ Side modules (CLI-facing, not in the dispatch loop):
 
 | Component | Responsibility | File |
 |-----------|----------------|------|
-| CLI dispatcher | Maps `argv[2]` to command handlers (init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, unlock, approve, version) | `src/cli/index.ts` |
+| CLI dispatcher | Maps `argv[2]` to command handlers (init, doctor, fleet, compile, scope, plan, eval, run, status, resume, report, profile, unlock, approve, version) | `src/cli/index.ts` |
 | Compile front-ends | Turn a spec artifact into a validated RunGraph; fail loudly if `acceptance[]` would be empty | `src/compile/index.ts`, `src/compile/native.ts` (primary), `src/compile/speckit.ts`, `src/compile/prd.ts`, `src/compile/gsd.ts`, `src/compile/collateral.ts` (advisory scope-lint only) |
 | RunGraph schema + ops | Single source-of-truth data model: zod validation, duplicate-id/unknown-dep/cycle checks, pure CRUD | `src/graph/schema.ts`, `src/graph/graph.ts` |
 | Config loader | Layered YAML config (built-in defaults < global < repo overlay) with null-tombstone deep merge | `src/config/config.ts` |
 | Router | Resolves a task to `{adapter, model, channel, tier}` + an escalation ladder; learned scores from telemetry live in `profile.ts` | `src/route/router.ts`, `src/route/profile.ts`, `src/route/preference.ts`, `src/route/candidates.ts` |
 | Plan helpers | LLM-backed scope/intent clarification for `tickmarkr scope` and human-in-the-loop plan gates | `src/plan/scope.ts`, `src/plan/prompt.ts` |
 | Report cost | Pure telemetry → per-channel cost estimates (no network) | `src/report/cost.ts` |
+| Eval fixture harness | Discovers checked-in fixtures, validates their required parts, and seeds each into an isolated temporary git repository before any check or dispatch runs | `src/eval/fixtures.ts` |
 | Terminal engine | Renders a diffed line model in the alternate screen, routes named keys, tracks resize, and restores terminal state | `src/tui/engine.ts`, `src/tui/frame.ts`, `src/tui/input.ts` |
 | Adapter registry | Discovers installed/authed CLIs (`probe()`), builds the available `BillingChannel[]` | `src/adapters/registry.ts` |
 | Worker adapters | One per agent CLI: headless/interactive command strings + output parsing | `src/adapters/claude-code.ts`, `src/adapters/codex.ts`, `src/adapters/cursor-agent.ts`, `src/adapters/opencode.ts`, `src/adapters/fake.ts` |
@@ -162,6 +164,12 @@ Side modules (CLI-facing, not in the dispatch loop):
 - Location: `src/report/cost.ts` (`estimateCosts()`)
 - Depends on: adapters/types (TokenUsage), config (pricing tables), run/journal (TelemetryRow)
 - Used by: `src/cli/commands/report.ts`
+
+**Eval (`src/eval/`):**
+- Purpose: checked-in fixture harness for the `tickmarkr eval` qualification lab
+- Location: `src/eval/fixtures.ts` (`discoverFixtures()`, `seedFixture()`)
+- Depends on: `src/run/git.ts` (`shGitOk`) for temp-repo git plumbing
+- Used by: `src/cli/commands/eval.ts`
 
 **TUI (`src/tui/`):**
 - Purpose: dependency-free terminal presentation engine for Fleet Studio

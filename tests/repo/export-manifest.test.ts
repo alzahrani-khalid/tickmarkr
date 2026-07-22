@@ -48,6 +48,8 @@ const PUBLIC_PREFIXES = [
   ".github/workflows/",
   "assets/",
   "docs/codebase/", // docs allowlist lands in T3; CONCERNS.md stays denied below
+  // fixtures/ is enumerated here (compiler samples + eval-lab trees under fixtures/eval/) —
+  // fail-closed: a new top-level fixtures path only ships because this prefix admits it.
   "fixtures/",
   "schema/",
   "skills/tickmarkr-auto/",
@@ -159,6 +161,17 @@ const getCandidate = (): Candidate => (sharedCandidate ??= loadCandidate());
 afterAll(() => sharedCandidate?.cleanup());
 
 describe("export boundary — fail-closed dual-context allowlist manifest", () => {
+  test("the checked-in fixture directory is included in the package manifest's published file set, not only present in the source tree", { timeout: 120_000 }, () => {
+    const candidate = getCandidate();
+    // package.json `files` is the published npm set; fixtures must be enumerated there, not merely present in the source tree.
+    const manifest = JSON.parse(readFileSync(join(candidate.root, "package.json"), "utf8")) as { files?: string[] };
+    expect(manifest.files).toContain("fixtures");
+    // dual check: the export allowlist also enumerates fixtures/ (PUBLIC_PREFIXES), so eval + compiler fixtures ship.
+    expect(PUBLIC_PREFIXES).toContain("fixtures/");
+    expect(accepts("fixtures/eval/sample/start/a.txt")).toBe(true);
+    expect(candidate.paths.some((p) => p.startsWith("fixtures/"))).toBe(true);
+  });
+
   test(
     "the manifest test validates the exact export candidate tree when the export script is present and validates the current git index without invoking the script when it is absent, and it never skips in either context",
     { timeout: 120_000 },
