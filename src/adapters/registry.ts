@@ -59,6 +59,47 @@ export function formatCandidateCliRow({ binary, version }: CandidateCliDetection
   return `  ! ${binary.padEnd(14)} detected: ${ver} (no tickmarkr adapter — not routable)`;
 }
 
+// v1.65 T3: same guarded spawn pattern as probeCandidateVersion — bounded, error/status-checked,
+// fail-open. undefined = binary unavailable/broken ⇒ no drift verdict (the existing auth reporting
+// already names an uninstalled CLI; drift must never pile on).
+export function probeHelpText(bin: string): string | undefined {
+  try {
+    const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: 10000 });
+    if (r.error || r.status !== 0) return undefined;
+    return `${r.stdout || ""}\n${r.stderr || ""}`;
+  } catch {
+    return undefined;
+  }
+}
+
+// Whole-token match only: "-p" must never count as present because "--print" contains it, and
+// "--output" must not match a listed "--output-format". Splitting on non-flag chars keeps each
+// help-listed flag intact as one token ("-p, --print <fmt>" → "-p", "--print", "fmt").
+export function missingDeclaredFlags(helpText: string, flags: string[]): string[] {
+  const tokens = new Set(helpText.split(/[^A-Za-z0-9_-]+/));
+  return flags.filter((f) => !tokens.has(f));
+}
+
+// v1.65 T3: advisory hardcoded-flag drift check. Reads help, mutates nothing — health, doctor.json,
+// discoverChannels, and routing never see these strings; they are doctor display rows only.
+export function flagDriftWarnings(
+  adapters: WorkerAdapter[],
+  health: Record<string, AuthHealth>,
+  helpOf: (bin: string) => string | undefined = probeHelpText,
+): string[] {
+  const out: string[] = [];
+  for (const a of adapters) {
+    const decl = a.hardcodedFlags;
+    if (!decl || !health[a.id]?.installed) continue;
+    const help = helpOf(decl.binary);
+    if (help === undefined) continue;
+    for (const flag of missingDeclaredFlags(help, decl.flags)) {
+      out.push(`flag drift: ${a.id} hardcodes ${flag} but ${decl.binary} --help no longer lists it (advisory — routing unchanged)`);
+    }
+  }
+  return out;
+}
+
 export function allAdapters(opts: { fakeScriptPath?: string } = {}): WorkerAdapter[] {
   // pi + grok + kimi appended LAST: same-tier ties resolve by discovery order (Phase 6 D2), so
   // appending keeps the Phase 6 shape→channel matrix byte-identical; inserting anywhere else

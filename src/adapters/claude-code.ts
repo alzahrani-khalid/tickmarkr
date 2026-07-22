@@ -46,6 +46,9 @@ export const claudeCode: WorkerAdapter = {
   probeCwd: "neutral",
   probe: async () => probeVersion("claude"),
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("claude-code", cfg),
+  // v1.65 T3: every flag the command builders below hardcode — doctor checks `claude --help` still
+  // lists each (all present on claude 2.x, verified 2026-07-22). Advisory only, never routing.
+  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r"] },
   // --strict-mcp-config --mcp-config '{"mcpServers":{}}': pin the MCP surface to empty so fresh-worktree
   // workers/gates don't load project .mcp.json servers (herdr scrapes dialogs as idle — v1.4 incident,
   // memory tickmarkr-worker-mcp-dialog-stall). Live-verified 2026-07-10 on claude 2.1.205 (operator check):

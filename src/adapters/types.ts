@@ -147,6 +147,10 @@ export interface WorkerAdapter {
   trust?(repoRoot: string): TrustVerdict;
   // v1.22 T5 / OBS-19: optional trust-dialog fingerprint for runtime auto-answer (see TrustDialog).
   trustDialog?: TrustDialog;
+  // v1.65 T3: the CLI flags this adapter's command strings hardcode, checked by doctor against
+  // `<binary> --help` (flagDriftWarnings). Advisory only — a drift warning never changes channel
+  // availability, routing, or dispatch; only doctor reads this.
+  hardcodedFlags?: { binary: string; flags: string[] };
 }
 
 export function channelsFromConfig(adapterId: string, cfg: TickmarkrConfig): BillingChannel[] {

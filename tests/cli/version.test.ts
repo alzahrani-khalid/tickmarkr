@@ -11,7 +11,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.63.0";
+const PRIOR_RELEASE_VERSION = "1.64.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -65,16 +65,16 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the gate-integrity theme and the shipped changes rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.64[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/gate[- ]integrity/i);
-    for (const change of ["completion-faking checklist", "quoted evidence", "vacuous command oracles", "redact", "status-watch narrator"]) {
+  test("the changelog entry names the fleet-resilience theme and the shipped changes rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.65[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/fleet[- ]resilience/i);
+    for (const change of ["typed worker-failure taxonomy", "quota-style free failover", "transcript noise filter", "doctor flag-drift warning", "quirk registry"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.63.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.64.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

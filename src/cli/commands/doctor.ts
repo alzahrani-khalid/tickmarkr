@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { allAdapters, detectCandidateClis, probeAll, probeModels, readAutoPrefer, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, detectCandidateClis, flagDriftWarnings, probeAll, probeModels, readAutoPrefer, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
@@ -87,6 +87,9 @@ export async function doctor(
   // HYG-07(a): doctor just probed fresh (probeAll above), so servability attribution is current by construction.
   const servable = servableExclusions(cfg, adapters, health);
   if (servable.length) rows.push(attentionRow(servabilityLine(servable)));
+  // v1.65 T3: hardcoded-flag drift — advisory warn rows only. Runs AFTER writeDoctor so the verdicts
+  // can never leak into doctor.json, and discoverChannels/routing never read them.
+  rows.push(...flagDriftWarnings(adapters, health).map(attentionRow));
   // MODEL-05/06: print-only drift fragment; advisory, whole-line-commented additions, tickmarkr NEVER applies it.
   // TTY gets a one-line summary + the fragment as a file (the full dump drowned everything else,
   // v1.33.1 onboarding); machine/CI surface keeps the inline dump — layout is pinned by tests.

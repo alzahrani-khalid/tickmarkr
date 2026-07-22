@@ -503,7 +503,10 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #   explore: { mode: on, excludeShapes: [], excludeComplexityAtOrAbove: null, cap: 5 }  # optional; absent ⇒ byte-identical
 #   sla: { implement: 15 }  # optional per-shape minutes — advisory plan lint only; absent ⇒ no lint
 #   allow: { adapters: [claude-code, codex] }   # optional fleet allowlist; presence activates even if empty (fail-closed)
-#   deny: { models: [codex:gpt-5.5] }           # optional fleet denylist; deny beats allow on conflict
+#   deny:                                      # optional fleet denylist; deny beats allow on conflict
+#     models:
+#       - pi:zai/glm-5.2  # OBS-57: pi passes run-start probe but hangs at finish without TICKMARKR_RESULT — remove after no-trailer demotion ships (v1.46 provider-outage taxonomy)
+#   # incident-born deny/pin entries MUST name OBS id + root cause + removal condition (see docs/codebase/CONVENTIONS.md)
 #   # entry grammar: adapter id | model id | adapter:model (entries in either list accept all three forms)
 #   # a hint pinning a denied channel FAILS at plan time (RoutingError) — never silent reroute
 #   # tombstone: deny: null in a repo overlay removes a global deny (arrays replace wholesale, never merge)

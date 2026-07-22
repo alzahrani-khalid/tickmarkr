@@ -121,6 +121,8 @@ When adding a new code path that needs visibility, append a journal event or ret
 
 **No JSDoc/TSDoc anywhere in `src/`.** Do not add `/** ... */` doc blocks — the codebase relies on precise types plus targeted inline comments instead.
 
+**Routing quirk provenance:** every routing exclusion (`routing.deny`, `routing.allow`) or pin (`routing.map.*.pin`) that exists because of a live incident must carry an inline `#` comment on the entry naming its **observation id** (the `OBS-NN` key in `.planning/OBSERVATIONS.md`), **root cause** (what failed in production), and **removal condition** (the specific shipped fix or gate that makes the workaround safe to delete). Prefer the block-list form for deny entries so the comment rides the list item — the shipped `configTemplate()` demonstrates the convention on `pi:zai/glm-5.2` / OBS-57. Do not add incident-born quirks without all three fields; a bare deny with no provenance is for fleet-wide policy, not a workaround nobody dares remove.
+
 ## Function Design
 
 **Size:** Most functions are short and single-purpose (gates, adapters, compile front-ends average well under 30 lines). The one deliberate exception is `runDaemon`/`execTask` in `src/run/daemon.ts` — a ~280-line closure-based state machine covering dispatch, retries, escalation, quota failover, and merge. This is accepted as inherent complexity of a single sequential state machine, not sprawl to copy elsewhere; keep new orchestration logic inside its existing closures rather than splitting the state machine across files.

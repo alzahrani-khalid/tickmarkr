@@ -98,6 +98,9 @@ export const kimi: WorkerAdapter = {
       : { ...h, authed: false, note: "no valid ~/.kimi-code/credentials/kimi-code.json (kimi login to fix)" };
   },
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("kimi", cfg),
+  // v1.65 T3: every flag the command builders below hardcode (-S is resumeCommand's) — verified in
+  // `kimi --help` 2026-07-22.
+  hardcodedFlags: { binary: "kimi", flags: ["-p", "--model", "--output-format", "-S"] },
   // KIMI-02 headless. -p prompt mode + explicit model, NO permission flag: kimi 0.26.0 rejects
   // -p combined with -y/--auto at argument parse time ("Cannot combine --prompt with --yolo",
   // OBS-67 — doctor probes all failed on it), and prompt mode is already non-interactive with

@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.65 — fleet resilience
+
+This fleet-resilience release adds typed worker-failure taxonomy for precise failover classification, quota-style free failover routing that limits retry burden, a transcript noise filter to clean consult dossiers, a doctor flag-drift warning to flag stale disable/allow policies, the quirk registry convention for provenance-tracked disable reasons, and macOS CI lanes for platform-specific workloads.
+
 ## v1.64 — gate integrity
 
 This gate-integrity release adds a completion-faking checklist to judge and review prompts, requires quoted evidence from the judged diff, warns on vacuous command oracles at baseline, redacts secrets at journal and consult-dossier persistence seams, and closes status-watch narrators during run-end reconciliation.

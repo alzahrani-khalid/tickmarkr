@@ -286,6 +286,54 @@ describe("T2 doctor brand surface", () => {
   });
 });
 
+// v1.65 T3: hardcoded-flag drift surface — advisory warn rows read from a real `<binary> --help`
+// spawn (temp shell scripts stand in for installed CLIs; no agent CLI runs, zero tokens).
+describe("hardcoded flag drift (v1.65 T3)", () => {
+  const helpBin = (lines: string[]) => {
+    const p = join(mkdtempSync(join(tmpdir(), "tickmarkr-helpbin-")), "fakecli");
+    writeFileSync(p, `#!/bin/sh\ncat <<'EOF'\n${lines.join("\n")}\nEOF\n`, { mode: 0o755 });
+    return p;
+  };
+  const stubFlags = (id: string, binary: string, flags: string[], installed = true) =>
+    ({
+      id,
+      vendor: "x",
+      probe: async () => ({ installed, authed: installed, models: [] }),
+      hardcodedFlags: { binary, flags },
+    }) as unknown as WorkerAdapter;
+
+  test("test: an installed binary whose help output lacks a declared flag produces a doctor warning naming the adapter and the flag", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const bin = helpBin(["Usage: fakecli [options]", "  -p, --print      print mode", "  --model <model>  choose model"]);
+    const out = await doctor(["--"], repo, [stubFlags("claude-code", bin, ["-p", "--model", "--output-format"])]);
+    expect(out).toMatch(/! flag drift: claude-code hardcodes --output-format/);
+    expect(out).toContain(`${bin} --help no longer lists it`);
+    // still-listed flags draw no warning; a short flag inside a longer one ("-p" ⊄ "--print") counts as listed
+    expect(out).not.toMatch(/flag drift: claude-code hardcodes -p /);
+    expect(out).not.toMatch(/flag drift: claude-code hardcodes --model/);
+  });
+
+  test("test: a binary whose help lists every declared flag produces no drift warning", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const bin = helpBin(["Usage: fakecli [options]", "  -p, --print", "  --model <model>", "  --output-format <fmt>"]);
+    const out = await doctor(["--"], repo, [stubFlags("claude-code", bin, ["-p", "--model", "--output-format"])]);
+    expect(out).not.toMatch(/flag drift:/);
+  });
+
+  test("test: an unavailable binary produces no drift warning beyond the existing auth reporting", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gone = join(mkdtempSync(join(tmpdir(), "tickmarkr-nobin-")), "not-a-cli");
+    const adapters = [
+      stubFlags("claude-code", gone, ["-p", "--model"], false), // CLI not installed at all
+      stubFlags("codex", gone, ["--sandbox"]), // probe says installed, but the help binary is gone
+    ];
+    const out = await doctor(["--"], repo, adapters);
+    // the existing reporting still names the uninstalled CLI; drift never piles on for either case
+    expect(out).toMatch(/✗ claude-code\s+not installed/);
+    expect(out).not.toMatch(/flag drift:/);
+  });
+});
+
 describe("T3 brand banner (TTY gate)", () => {
   const withoutTTY = async (fn: () => Promise<void>) => {
     const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");

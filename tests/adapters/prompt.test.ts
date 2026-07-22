@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { buildTaskPrompt, parseWorkerResult, trailerPattern } from "../../src/adapters/prompt.js";
+import { buildTaskPrompt, classifyDeadChannel, parseWorkerResult, trailerPattern } from "../../src/adapters/prompt.js";
 import { validateGraph } from "../../src/graph/schema.js";
 
 const N = "testnonce"; // fixed nonce for direct-call tests; the daemon uses a random per-run one
@@ -145,6 +145,43 @@ describe("trailerPattern (interactive completion anchor)", () => {
     const re = new RegExp(trailerPattern(N));
     expect(re.test(`│ TICKMARKR_RESULT_${N} {"ok":true,"summary":"x"} │`)).toBe(true);
     expect(re.test(`╭────────╮\n│ Update available: pi 0.81.0 │\n╰────────╯\nTICKMARKR_RESULT_${N} {"ok":false,"summary":"done"}`)).toBe(true);
+  });
+});
+
+// v1.65 T1: typed dead-channel classification lives at THIS parsing boundary — the daemon consumes
+// the returned type and never re-derives it from raw text.
+describe("classifyDeadChannel (v1.65 T1)", () => {
+  const dead = (raw: string) => classifyDeadChannel(parseWorkerResult(raw, N));
+
+  test("auth signatures in no-trailer output classify auth-required", () => {
+    expect(dead("Not logged in. Please run /login to authenticate.")).toBe("auth-required");
+    expect(dead("Error: invalid API key provided")).toBe("auth-required");
+  });
+
+  test("setup signatures in no-trailer output classify setup-required", () => {
+    expect(dead("zsh: command not found: codex")).toBe("setup-required");
+    expect(dead("Error: spawn cursor-agent ENOENT")).toBe("setup-required");
+  });
+
+  test("provider-outage signatures in no-trailer output classify provider-outage", () => {
+    expect(dead("committing…\nUnable to reach the model provider\n")).toBe("provider-outage");
+    expect(dead("api error: overloaded_error")).toBe("provider-outage");
+  });
+
+  test("CLI-reported timeout signatures in no-trailer output classify timeout", () => {
+    expect(dead("Error: request timed out after 120000ms")).toBe("timeout");
+    expect(dead("fetch failed: ETIMEDOUT")).toBe("timeout");
+  });
+
+  test("a parseable trailer is the worker speaking — never a dead channel, even over matching text", () => {
+    const okFalse = parseWorkerResult(`Not logged in mentioned during work\nTICKMARKR_RESULT_${N} {"ok":false,"summary":"tests failing"}`, N);
+    expect(classifyDeadChannel(okFalse)).toBeUndefined();
+    const okTrue = parseWorkerResult(`note: request timed out handled in code\nTICKMARKR_RESULT_${N} {"ok":true,"summary":"done"}`, N);
+    expect(classifyDeadChannel(okTrue)).toBeUndefined();
+  });
+
+  test("a no-trailer failure without a dead-channel signature stays untyped", () => {
+    expect(dead("still working on the diff...")).toBeUndefined();
   });
 });
 

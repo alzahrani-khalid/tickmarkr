@@ -760,3 +760,33 @@ describe("unifiedYamlDiff shortest-edit matching", () => {
     expect(hunks).toEqual([["-    channel: sub", "+    channel: api"]]);
   });
 });
+
+// v1.65 T5: quirk entries carry incident provenance — config template + CONVENTIONS.md
+describe("v1.65 T5 quirk incident provenance", () => {
+  const conventions = readFileSync(join(import.meta.dirname, "../../docs/codebase/CONVENTIONS.md"), "utf8");
+  const template = configTemplate();
+
+  test("test: the shipped config template demonstrates an incident-provenance comment on a deny or pin example", () => {
+    expect(template).toMatch(/deny:/);
+    expect(template).toMatch(/OBS-\d+/);
+    expect(template).toMatch(/remove after/i);
+    expect(template).toMatch(/pi:zai\/glm-5\.2.*OBS-57/);
+  });
+
+  test("the conventions doc states that incident-born exclusions and pins name their observation id root cause and removal condition", () => {
+    expect(conventions).toMatch(/incident-born/i);
+    expect(conventions).toMatch(/routing\.deny/);
+    expect(conventions).toMatch(/routing\.map.*\.pin/);
+    expect(conventions).toMatch(/observation id/i);
+    expect(conventions).toMatch(/root cause/i);
+    expect(conventions).toMatch(/removal condition/i);
+  });
+
+  test("the worked example reads as a real quirk entry rather than placeholder filler", () => {
+    const quirkLine = template.split("\n").find((l) => l.includes("pi:zai/glm-5.2") && l.includes("OBS-57"));
+    expect(quirkLine).toBeDefined();
+    expect(quirkLine).toMatch(/TICKMARKR_RESULT/);
+    expect(quirkLine).toMatch(/v1\.46 provider-outage taxonomy/);
+    expect(quirkLine).not.toMatch(/TODO|FIXME|example-id|OBS-XXX|placeholder/i);
+  });
+});

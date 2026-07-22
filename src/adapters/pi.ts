@@ -50,6 +50,8 @@ export const pi: WorkerAdapter = {
     return { ...h, servable: parsePiModels(r.stdout || ""), note: "auth verified via pi --list-models (free; auth-filtered by pi)" };
   },
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("pi", cfg),
+  // v1.65 T3: every flag the command builders below hardcode — verified in `pi --help` 2026-07-22.
+  hardcodedFlags: { binary: "pi", flags: ["-p", "--approve", "--model"] },
   // --approve: pi's per-directory trust prompt would stall fresh worktrees (herdr scrapes the dialog
   // as idle — cursor/claude incident class, milestone PITFALLS #2). Global option, legal in BOTH modes
   // per pi --help v0.80.3 (2026-07-10) — NOT print-only like cursor's --trust. Chosen over the more

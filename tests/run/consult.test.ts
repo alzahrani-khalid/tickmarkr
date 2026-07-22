@@ -148,6 +148,22 @@ describe("consult", () => {
     expect(leaky.transcript).toContain("hunter2secretvalue99"); // in-memory original untouched
   });
 
+  // v1.65 T2: the dossier's transcript is squashed by the LLM noise filter at prompt-build time,
+  // so the persisted consults/ artifact (what the model reads) carries signal without spinner churn.
+  test("consult dossier transcripts route through the filter before persistence", async () => {
+    const { cfg, fake, runDir } = setup({ action: "retry", notes: "filter path" });
+    const churn = Array.from({ length: 60 }, (_, i) => `⠋ Starting MCP servers (${i}s • esc to interrupt)`).join("\n");
+    const noisy: Dossier = { ...dossier, transcript: `${churn}\nFAIL tests/x.test.ts > boom\nprocess exited with exit code 1` };
+    const v = await consult(noisy, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
+    expect(v).toEqual({ action: "retry", notes: "filter path" });
+    const md = readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!;
+    const persisted = readFileSync(join(runDir, "consults", md), "utf8");
+    expect(persisted.split("\n").filter((l) => l.includes("Starting MCP servers")).length).toBeLessThanOrEqual(1);
+    expect(persisted).toContain("FAIL tests/x.test.ts > boom"); // failure signal survives into the artifact
+    expect(persisted).toContain("process exited with exit code 1");
+    expect(noisy.transcript.split("\n").filter((l) => l.includes("Starting MCP servers")).length).toBe(60); // in-memory untouched
+  });
+
   test("v1.24: excludeAdapter on reroute is preserved when a non-empty string", async () => {
     const { cfg, fake, runDir } = setup({
       action: "reroute", notes: "trust dialog blocks the CLI", excludeAdapter: "cursor-agent",

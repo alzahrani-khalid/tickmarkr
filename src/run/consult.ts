@@ -9,6 +9,7 @@ import { augmentFakeVerdictOutput, extractVerdictJson, gateExitTrailer, gatePane
 import type { GateResult } from "../gates/types.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
+import { filterLlmTranscript } from "./stall.js";
 
 export interface ConsultVerdict {
   action: "retry" | "reroute" | "decompose" | "human";
@@ -90,6 +91,8 @@ export interface Dossier {
 
 const ACTIONS = ["retry", "reroute", "decompose", "human"] as const;
 
+// v1.65 T2: transcript noise (spinner repaints, CR churn, pass-run spam) is squashed at build time —
+// the filtered form is what persists to the consults/ artifact AND what the model reads; fail-open.
 export function buildDossierPrompt(d: Dossier, nonce: string): string {
   return `TICKMARKR-CONSULT
 You are a senior engineering consult for the tickmarkr orchestrator. A worker task hit trouble.
@@ -104,7 +107,7 @@ ${d.gates.map((g) => `- [${g.pass ? "pass" : "FAIL"}] ${g.gate}: ${g.details}`).
 ${d.diff || "(none)"}
 
 ## Worker transcript (tail)
-${d.transcript || "(none)"}
+${filterLlmTranscript(d.transcript) || "(none)"}
 
 ## Journal (recent events)
 ${d.journalTail}

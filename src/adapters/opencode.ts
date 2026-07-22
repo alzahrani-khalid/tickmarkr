@@ -23,6 +23,9 @@ export const opencode: WorkerAdapter = {
   probeCwd: "neutral",
   probe: async () => probeVersion("opencode"),
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("opencode", cfg),
+  // v1.65 T3: every flag the command builders below hardcode (-m on run, --prompt on the TUI) —
+  // per the 2026-07-10 live verification, opencode 1.17.15.
+  hardcodedFlags: { binary: "opencode", flags: ["-m", "--prompt"] },
   headlessCommand: (promptFile: string, model: string) =>
     `opencode run -m ${shq(model)} "$(cat ${shq(promptFile)})"`,
   interactiveCommand: (promptFile: string, model: string) =>

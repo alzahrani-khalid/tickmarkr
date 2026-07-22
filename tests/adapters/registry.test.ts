@@ -8,9 +8,10 @@ import { codex } from "../../src/adapters/codex.js";
 import { cursorAgent } from "../../src/adapters/cursor-agent.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { grok } from "../../src/adapters/grok.js";
+import { kimi } from "../../src/adapters/kimi.js";
 import { opencode } from "../../src/adapters/opencode.js";
 import { pi } from "../../src/adapters/pi.js";
-import { discoverChannels, modelAuthExclusions, probeAll, probeModels, readAutoPrefer, readDoctor, writeDoctor, deriveAutoPrefer } from "../../src/adapters/registry.js";
+import { discoverChannels, flagDriftWarnings, missingDeclaredFlags, modelAuthExclusions, probeAll, probeModels, readAutoPrefer, readDoctor, writeDoctor, deriveAutoPrefer } from "../../src/adapters/registry.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { modelAuthed, type WorkerAdapter } from "../../src/adapters/types.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
@@ -739,5 +740,69 @@ describe("OBS-30 autoPrefer", () => {
     expect(autoPrefer?.implement).toContain("fake");
     expect(autoPrefer?.derivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(readDoctor(repo)?.fake?.modelAuth?.["fake-1"]?.authed).toBe(true);
+  });
+});
+
+// v1.65 T3: hardcoded-flag drift is advisory display only — it must never touch health or channels.
+describe("hardcoded flag drift (v1.65 T3)", () => {
+  test("test: drift warnings never change channel availability or routing", () => {
+    const adapter = {
+      id: "fake",
+      vendor: "x",
+      hardcodedFlags: { binary: "fake-cli", flags: ["--gone-flag"] },
+      channels: () => [{ adapter: "fake", vendor: "fake", model: "fake-1", channel: "sub" as const, tier: "mid" as const }],
+    } as unknown as WorkerAdapter;
+    const health = {
+      fake: {
+        installed: true, authed: true, models: [],
+        modelAuth: { "fake-1": { authed: true, probedAt: "2026-07-22T00:00:00.000Z" } },
+      },
+    };
+    const before = structuredClone(health);
+    const channelsBefore = discoverChannels(DEFAULT_CONFIG, [adapter], health);
+
+    const warnings = flagDriftWarnings([adapter], health, () => "Usage: fake-cli (help lists no flags at all)");
+
+    expect(warnings).toEqual([
+      "flag drift: fake hardcodes --gone-flag but fake-cli --help no longer lists it (advisory — routing unchanged)",
+    ]);
+    // the drift check mutated nothing: the doctor.json payload and channel discovery are byte-identical
+    expect(health).toEqual(before);
+    expect(discoverChannels(DEFAULT_CONFIG, [adapter], health)).toEqual(channelsBefore);
+    expect(channelsBefore.map((c) => c.model)).toEqual(["fake-1"]);
+  });
+
+  test("declared flags match whole help tokens only — never substrings of longer flags", () => {
+    const help = "Usage: cli [options]\n  --print          print mode\n  --output-format <fmt>";
+    expect(missingDeclaredFlags(help, ["-p"])).toEqual(["-p"]); // "-p" inside "--print" is not listed
+    expect(missingDeclaredFlags(help, ["--output"])).toEqual(["--output"]); // prefix of --output-format is not listed
+    expect(missingDeclaredFlags("  -p, --print", ["-p", "--print"])).toEqual([]);
+  });
+
+  test("an adapter without a declaration or without installed health is skipped", () => {
+    const bare = { id: "bare", vendor: "x" } as unknown as WorkerAdapter;
+    const declared = { id: "gone", vendor: "x", hardcodedFlags: { binary: "gone-cli", flags: ["-p"] } } as unknown as WorkerAdapter;
+    const health = {
+      bare: { installed: true, authed: true, models: [] },
+      gone: { installed: false, authed: false, models: [] },
+    };
+    const helpOf = vi.fn(() => "no flags");
+    expect(flagDriftWarnings([bare, declared], health, helpOf)).toEqual([]);
+    expect(helpOf).not.toHaveBeenCalled(); // uninstalled ⇒ not even a help spawn
+  });
+
+  test("every adapter whose command strings hardcode flags declares those flags for the probe", () => {
+    const tokens = (s: string) => new Set(s.split(/[^A-Za-z0-9_-]+/));
+    for (const a of [claudeCode, codex, cursorAgent, opencode, pi, grok, kimi]) {
+      expect(a.hardcodedFlags, a.id).toBeDefined();
+      expect(a.hardcodedFlags!.flags.length, a.id).toBeGreaterThan(0);
+      // the declaration is honest: each declared flag appears verbatim in the adapter's own command strings
+      const t = tokens([
+        a.headlessCommand("/tmp/p.md", "m"),
+        a.interactiveCommand("/tmp/p.md", "m") ?? "",
+        a.resumeCommand?.("sid", "/tmp/p.md", "m") ?? "",
+      ].join("\n"));
+      for (const f of a.hardcodedFlags!.flags) expect(t.has(f), `${a.id} declares ${f}`).toBe(true);
+    }
   });
 });

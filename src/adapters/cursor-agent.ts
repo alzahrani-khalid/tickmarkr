@@ -41,6 +41,8 @@ export const cursorAgent: WorkerAdapter = {
   vendor: "cursor",
   probe: async () => probeVersion("cursor-agent"),
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("cursor-agent", cfg),
+  // v1.65 T3: every flag the command builders below hardcode — verified in `cursor-agent --help` 2026-07-22.
+  hardcodedFlags: { binary: "cursor-agent", flags: ["-p", "--model", "--force", "--output-format"] },
   headlessCommand: (promptFile: string, model: string) =>
     `cursor-agent -p "$(cat ${shq(promptFile)})" --model ${shq(model)} --force --output-format text`,
   // NO --trust here: cursor rejects it outside --print ("--trust can only be used with --print/headless

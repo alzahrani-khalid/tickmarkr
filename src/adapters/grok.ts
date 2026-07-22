@@ -99,6 +99,8 @@ export const grok: WorkerAdapter = {
       : { ...h, authed: false, note: "no valid ~/.grok/auth.json entry (grok login to fix)" };
   },
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("grok", cfg),
+  // v1.65 T3: every flag the command builders below hardcode — verified in `grok --help` 2026-07-22.
+  hardcodedFlags: { binary: "grok", flags: ["-p", "--model", "--permission-mode", "--output-format"] },
   // GROK-02 headless. --output-format plain is the default but pin it explicitly; live-verified
   // 2026-07-11 (40-RESEARCH F-3): trailer intact + unwrapped, exit 0. "$(cat file)" matches every
   // other adapter and is already quoting-proven. --permission-mode bypassPermissions is the

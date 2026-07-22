@@ -1,6 +1,7 @@
 import { BANNER, GLYPHS, type Verdict, dim, fail, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
-import { blockedTasks, graphDefinitionHash, loadGraph, pendingTasks } from "../../graph/graph.js";
+import { blockedTasks, graphDefinitionHash, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
+import { foldActivity } from "../../run/activity.js";
 import { Journal, type JournalEvent, engagementComparable } from "../../run/journal.js";
 
 // ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
@@ -182,7 +183,10 @@ const renderFrame = (cwd: string): string => {
   }
   const effective: RunGraph = { ...g, tasks: g.tasks.map((t) => ({ ...t, status: replayed?.get(t.id) ?? t.status })) };
   const starved = new Set(blockedTasks(effective).map((t) => t.id));
-  const waiting = new Set(pendingTasks(effective).map((t) => t.id));
+  // OBS-104: ONE activity fold feeds both surfaces — never re-derived here. Comparable events only
+  // (a recompiled graph's journal must not animate the wrong tasks); with no or stale journal the
+  // dep-waiting cells still derive from the effective graph statuses.
+  const activity = foldActivity(comparable ? events : [], effective.tasks);
   const unicode = visual();
   const divider = unicode ? " · " : " / ";
   const width = process.stdout.columns ?? 120;
@@ -190,7 +194,7 @@ const renderFrame = (cwd: string): string => {
 
   const cells = g.tasks.map((t) => {
     const st = replayed?.get(t.id) ?? t.status;
-    const label = starved.has(t.id) ? " starved" : waiting.has(t.id) ? " dep-waiting" : "";
+    const label = starved.has(t.id) ? " starved" : activity.cells.has(t.id) ? ` ${activity.cells.get(t.id)!}` : "";
     const channel = assignments.get(t.id) ?? "-";
     const assignCol = contexts.has(t.id) ? `${channel}${divider}ctx ${contexts.get(t.id)}` : channel;
     return { t, st, label, assignCol, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
@@ -232,6 +236,10 @@ const renderFrame = (cwd: string): string => {
       : `no runs yet${dot}`) +
     `${gauge} ${done === g.tasks.length && g.tasks.length > 0 ? ok(tally) : tally}`;
   const hr = rule(Math.min(width, 100));
+  // OBS-104 run-level now line: names the most recent journal event. TTY frame only — the non-TTY
+  // machine surface is byte-pinned (status-brand golden) and must not drift. Rendered BELOW the task
+  // rows: the line names task ids, and rows must stay the first id-bearing lines for grep consumers.
+  const nowLine = activity.now ? [legend(`   now: ${activity.now}`)] : [];
   const gatesLegend = legend(`   gates: ${GATE_NAMES.join(" · ")}`);
 
   const taskVerdict = (st: TaskStatus): Verdict =>
@@ -254,7 +262,7 @@ const renderFrame = (cwd: string): string => {
       " ".repeat(stW - (String(st) + label + failedSuffix(states) + human).length);
     return `  ${statusRow(taskVerdict(st), `${t.id.padEnd(idW)} ${goal}  ${gateChain(states, true)}  ${statusCell}  ${dim(assignCol)}`)}`;
   });
-  return [header, hr, gatesLegend, ...rows].join("\n");
+  return [header, hr, gatesLegend, ...rows, ...nowLine].join("\n");
 };
 
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {

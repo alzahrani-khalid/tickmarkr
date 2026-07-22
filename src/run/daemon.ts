@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { trailerPattern, writePrompt } from "../adapters/prompt.js";
+import { classifyDeadChannel, trailerPattern, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, discoverChannels, getAdapter, probeAll, readDoctor } from "../adapters/registry.js";
 import { type Assignment, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
@@ -478,7 +478,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
     // ROUTE-13: learned within-band failover + deviation audit. nextChannel stays pure (route/ never
     // journals); the daemon compares the learned pick against the static pick and owns the journal write.
-    const failover = (site: "consult-reroute" | "quota-failover" | "escalate"): Assignment | null => {
+    const failover = (site: "consult-reroute" | "quota-failover" | "dead-channel" | "escalate"): Assignment | null => {
       const next = nextChannel(assignment, t, cfg, channels, tried, profile, demotedChannels);
       if (profile && next) {
         const staticNext = nextChannel(assignment, t, cfg, channels, tried, undefined, demotedChannels);
@@ -906,6 +906,37 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           continue;
         }
         await park(t, "quota exhausted on every eligible channel", "quota", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
+        return;
+      }
+      // v1.65 T1: typed dead-channel failure — the parse boundary classified this no-trailer result
+      // as auth-required / setup-required / provider-outage / timeout (classifyDeadChannel; the
+      // daemon consumes the type, never re-derives it from raw text). Same free failover as quota —
+      // no escalation-ladder step — plus run-wide exclusion via demotedChannels: unlike a quota
+      // window that may reset, a dead channel stays dead for this run (OBS-57 class). Strictly
+      // AFTER the quota check so quota behavior stays byte-identical (a quota hit returns/continues
+      // before reaching here); provider-outage lands here only once the v1.46 same-channel requeue
+      // cap above is spent, so a transient blip still recovers in place.
+      const dead = classifyDeadChannel(result);
+      if (dead) {
+        const from = channelKey(assignment);
+        demotedChannels.add(from); // excluded for later attempts AND later tasks in this run
+        const next = failover("dead-channel");
+        journal.append("dead-channel-failover", t.id, { reason: dead, from, to: next ? channelKey(next) : null });
+        if (next) {
+          await driver.notify(`tickmarkr ${runId}: ${t.id} dead channel (${dead}) failover`, { tier: "attention" });
+          // OBS-17 T2 (quota parity): the superseded slot holds a dead-end, not failure context.
+          if (!keepForever) {
+            const idx = keptSlots.indexOf(slot);
+            if (idx >= 0) {
+              keptSlots.splice(idx, 1);
+              try { await closeSlot(slot); } catch { /* cosmetic — reconcile is the backstop */ }
+            }
+          }
+          assignment = next;
+          tried.push(channelKey(next));
+          continue;
+        }
+        await park(t, `dead channel (${dead}) and no eligible channel remains`, "reroute-exhausted", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       if (!finished) {

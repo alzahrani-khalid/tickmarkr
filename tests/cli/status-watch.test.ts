@@ -100,14 +100,24 @@ describe("status checklist rendering", () => {
       dispatch("T2", "fake-2"),
     ]);
 
-    await withTty(async () => {
-      const out = await status([], repo);
-      expect(out).toContain("1/3 done");
-      expect(strip(row(out, "T1"))).toContain("✓ T1 Finish report");
-      expect(strip(row(out, "T2"))).toContain("- T2 Run mixed gates");
-      expect(strip(row(out, "T3"))).toContain("- T3 Queue the undispatched follow-up");
-      expect(row(out, "T3")).toContain("dep-waiting");
-    });
+    // v1.65 T4: T2's live-attempt activity cell widens the status column — give the frame room
+    // so the goal column keeps its full text for this assertion.
+    const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    Object.defineProperty(process.stdout, "columns", { configurable: true, value: 180 });
+    try {
+      await withTty(async () => {
+        const out = await status([], repo);
+        expect(out).toContain("1/3 done");
+        expect(strip(row(out, "T1"))).toContain("✓ T1 Finish report");
+        expect(strip(row(out, "T2"))).toContain("- T2 Run mixed gates");
+        expect(strip(row(out, "T2"))).toContain("attempt 1 in flight on fake:fake-2 since 08:00:00");
+        expect(strip(row(out, "T3"))).toContain("- T3 Queue the undispatched follow-up");
+        expect(row(out, "T3")).toContain("dep-waiting on T2"); // the unmet dep is named (OBS-104)
+      });
+    } finally {
+      if (columns) Object.defineProperty(process.stdout, "columns", columns);
+      else delete (process.stdout as { columns?: number }).columns;
+    }
   });
 
   test("uses ASCII boxes without ANSI when NO_COLOR or stdout is not a TTY", async () => {
@@ -193,7 +203,21 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T1"))).toContain("human · awaiting approval");
+      // v1.65 T4: the activity cell names the park kind between the status word and the approval hint
+      expect(strip(row(out, "T1"))).toContain("human parked (human-gate) · awaiting approval");
+    });
+  });
+
+  // v1.65 T4 (OBS-104): the cockpit carries a run-level now line so the operator can tell
+  // dispatching from gating from merging without tailing the journal.
+  test("the surface carries a run-level line naming the most recent journal event", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), dispatch("T2", "fake-2"), { ts, event: "worker-result", taskId: "T2", data: { ok: true, finished: true } }, gate("T2", "build", true)]);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(out)).toContain("now: gate-result — T2 — build passed");
+      expect(strip(row(out, "T2"))).toContain("gate test running"); // and the watched task names its running gate
     });
   });
 
