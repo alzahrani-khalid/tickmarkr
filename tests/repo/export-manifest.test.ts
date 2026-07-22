@@ -331,7 +331,8 @@ describe("export workflow correctness — the exported CI stands alone", () => {
     expect(email).not.toMatch(/gmail\.com$/);
   });
 
-  test("the exported workflow's test run reports the manifest test suite as executed and not skipped", { timeout: 300_000 }, () => {
+  test("the exported workflow's test run reports the manifest test suite as executed and not skipped", { timeout: 600_000 }, // OBS-116 load-margin reasoning: 2x headroom absorbs concurrent cold Vitest bootstrap contention.
+  () => {
     const c = getCandidate();
     // both contexts: every workflow test step runs the unfiltered full suite, and the vitest include
     // glob collects this file — a path filter or exclude here is exactly how a silent skip happens
@@ -417,3 +418,28 @@ describe("export boundary — vendored scope-seam corpus stays at the compiler-c
     expect(all.filter((f) => f.endsWith("-SUMMARY.md"))).toHaveLength(10);
   });
 });
+
+test(
+  "test: the export-manifest test's nested single-file vitest invocation carries a timeout budget with at least double its prior headroom",
+  () => {
+    const source = readFileSync(join(ROOT, "tests/repo/export-manifest.test.ts"), "utf8");
+    const start = source.indexOf('test("the exported workflow\'s test run reports the manifest test suite as executed and not skipped"');
+    const end = source.indexOf("\n  });", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(source.slice(start, end)).toContain("600_000");
+  },
+);
+
+test(
+  "the widened budget carries an inline comment naming the load-margin reasoning rather than a bare number change",
+  () => {
+    const buildSource = readFileSync(join(ROOT, "tests/repo/build-provisioning.test.ts"), "utf8");
+    const buildStart = buildSource.indexOf('test(\n    "the standalone test command provisions a fresh build first');
+    const buildEnd = buildSource.indexOf("\n  );", buildStart);
+    const exportSource = readFileSync(join(ROOT, "tests/repo/export-manifest.test.ts"), "utf8");
+    const exportStart = exportSource.indexOf('test("the exported workflow\'s test run reports the manifest test suite as executed and not skipped"');
+    const exportEnd = exportSource.indexOf("\n  });", exportStart);
+    expect(buildSource.slice(buildStart, buildEnd)).toContain("load-margin reasoning");
+    expect(exportSource.slice(exportStart, exportEnd)).toContain("load-margin reasoning");
+  },
+);

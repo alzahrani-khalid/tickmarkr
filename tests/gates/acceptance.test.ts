@@ -347,9 +347,10 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
     }
     // the checklist instructs the verdict to name which shortcut a failed criterion matches
     expect(capturedPrompt).toMatch(/criterion fails.*name which shortcut/i);
-    // the response format demands the per-criterion quoted evidence field
+    // the response format demands the per-criterion structured-citation evidence field
     expect(capturedPrompt).toContain('"evidence"');
-    expect(capturedPrompt).toMatch(/verbatim quote copied from the diff/i);
+    expect(capturedPrompt).toMatch(/structured citation/i);
+    expect(capturedPrompt).toContain('"line"');
   });
 
   test("a judge verdict quoting evidence present in the diff parses and its verdict stands", async () => {
@@ -421,6 +422,62 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
       { adapter: fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: false, reason: "contradiction" }] }), model: "fake-1" });
     expect(inconsistent.pass).toBe(false);
     expect(inconsistent.details).toMatch(/pass=true contradicts unmet criterion c1/i);
+  });
+});
+
+// v1.70 evidence-comparison T1: evidence is a structured {path, line} citation checked against the
+// diff's actual changed hunks — a citation to an untouched file or an unchanged line fails closed, and
+// a met criterion with no citation at all is malformed shape (the same failure a missing field is today).
+describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
+  test("a verdict citing a file and line genuinely changed in the judged diff is accepted as valid evidence for that criterion", async () => {
+    const { repo, base } = repoWithDiff(); // repoWithDiff rewrites greet.js line 1 — cite that added line
+    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "uses n", evidence: { path: "greet.js", line: 1 } }] });
+    const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(r).toMatchObject({ gate: "acceptance", pass: true });
+    expect(r.meta?.unparseable).toBeUndefined();
+  });
+
+  test("a verdict citing a file untouched by the judged diff is rejected as fabricated evidence rather than accepted", async () => {
+    // bystander.txt exists in the repo but the committed diff only touches greet.js
+    const repo = makeRepo({ "greet.js": "module.exports = () => 'hi';\n", "bystander.txt": "one\ntwo\nthree\n" });
+    const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    writeFileSync(join(repo, "greet.js"), "module.exports = (n) => 'hi ' + n;\n");
+    execSync("git add -A && git commit -m greet --no-gpg-sign", { cwd: repo });
+    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path: "bystander.txt", line: 1 } }] });
+    const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/evidence absent from the judged diff/i);
+    expect(r.details).toContain("c1");
+    expect(r.meta).toMatchObject({ unparseable: true });
+  });
+
+  test("a verdict citing a line outside every changed hunk of a file that was otherwise touched is rejected rather than accepted", async () => {
+    // a 20-line file; only line 10 changes, so git's 3-line context hunk covers ~7..13 — line 1 is
+    // in the diff's file but outside every changed hunk
+    const lines = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
+    const repo = makeRepo({ "big.txt": lines });
+    const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    writeFileSync(join(repo, "big.txt"), lines.replace("line 10\n", "line 10 CHANGED\n"));
+    execSync("git add -A && git commit -m edit --no-gpg-sign", { cwd: repo });
+    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path: "big.txt", line: 1 } }] });
+    const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/evidence absent from the judged diff/i);
+    expect(r.meta).toMatchObject({ unparseable: true });
+  });
+
+  test("a criterion marked met with no citation at all fails the same way a malformed verdict shape fails today", async () => {
+    const { repo, base } = repoWithDiff();
+    // spy bypasses the fake seam's evidence injection: a met criterion returned with NO evidence field
+    const spy = vi.spyOn(llm, "runLlm").mockImplementation(async (_a, _m, prompt) => {
+      const n = llm.extractPromptNonce(prompt)!;
+      return JSON.stringify({ nonce: n, pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
+    });
+    const r = await acceptanceGate(task, repo, base, { adapter: fakeWithJudge({}), model: "fake-1" });
+    spy.mockRestore();
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/malformed verdict shape/i);
+    expect(r.meta?.unparseable).toBeUndefined();
   });
 });
 

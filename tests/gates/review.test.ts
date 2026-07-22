@@ -325,6 +325,60 @@ describe("reviewGate", () => {
   });
 });
 
+// v1.70 T5 (review-convergence): the gate classifies findings by severity — only material findings
+// block approval — and carries a deferred concern's rationale into the recorded details.
+describe("reviewGate material/minor classification (v1.70 T5)", () => {
+  test("a review verdict with only minor findings and no material ones approves the task rather than blocking it", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: true, findings: [
+      { note: "style nit in the loop", severity: "minor" },
+      { note: "prefer a clearer name", severity: "minor" },
+    ] } });
+    const r = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+    expect(r.pass).toBe(true);
+    expect(r.details).toMatch(/approved/i);
+    // the minor findings are still recorded, they simply do not block
+    expect(r.details).toContain("style nit in the loop");
+  });
+
+  test("a review verdict with at least one material finding still blocks approval exactly as today", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: false, findings: [
+      { note: "off-by-one drops the last row", severity: "material" },
+      { note: "minor spacing", severity: "minor" },
+    ] } });
+    const r = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+    expect(r.pass).toBe(false);
+    expect(r.details).toContain("off-by-one drops the last row");
+    // fails closed the same way a legacy request-changes verdict does: pass:false + the reviewer channel
+    expect(r.meta).toEqual({ reviewer: "fake:fake-2" });
+  });
+
+  test("a deferred finding is carried into the gate's recorded details with its rationale rather than silently dropped", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: true, findings: [
+      { note: "helper could be memoized", severity: "minor", defer: true, rationale: "not hot on this path; out of scope" },
+    ] } });
+    const r = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+    // a deferred minor concern does not block
+    expect(r.pass).toBe(true);
+    // …but its note AND its rationale survive into the recorded details
+    expect(r.details).toContain("helper could be memoized");
+    expect(r.details).toContain("not hot on this path; out of scope");
+    expect(r.details).toMatch(/defer/i);
+  });
+
+  test("a deferred finding without a rationale fails closed as a shape inconsistency", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: true, findings: [
+      { note: "silently swallowed", severity: "minor", defer: true },
+    ] } });
+    const r = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/deferred findings\[0\] requires a rationale/i);
+  });
+});
+
 describe("runGates ordering + short-circuit", () => {
   test("evidence failure stops before acceptance/review (no LLM spend on empty work)", async () => {
     const repo = makeRepo({ "a.txt": "x\n" }); // no commits after base

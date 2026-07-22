@@ -20,6 +20,7 @@ import type { GateResult } from "../gates/types.js";
 import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus } from "../graph/graph.js";
 import type { Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
+import { runEnvironment } from "./environment.js";
 import { cleanupRunWorktrees, gitHead, linkNodeModules, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
@@ -127,6 +128,10 @@ export function formatSummary(s: RunSummary): string {
 }
 
 const MAX_ATTEMPTS = 10; // ponytail: hard cap so a pathological ladder can never loop forever
+// v1.70 T5: request-changes review rounds a single task may draw before it parks for a human decision
+// instead of cycling. Well below MAX_ATTEMPTS so review non-convergence is caught long before the
+// global cap. ponytail: literal constant; lift to cfg.review.roundCap only if a second knob-turner appears.
+const REVIEW_ROUND_CAP = 3;
 const BLOCKED_POLL_MS = 30_000; // between trailer-wait slices, check whether the pane is blocked on a prompt
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
@@ -309,7 +314,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     baseRef = await gitHead(repoRoot);
     baseline = await captureBaseline(repoRoot, commands);
     writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline, null, 2));
-    journal.append("run-start", undefined, { pid: process.pid, baseRef, commands, channels: channels.map(channelKey), branch, graphDefinitionHash: graphDefinitionHash(graph), mode: rm.mode.mode, modeSource: rm.source, ...(prior ? { supersedes: prior.runId } : {}) }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
+    // v1.70 T2: environment identity beside the graph/branch identity — running tickmarkr version,
+    // loaded-config hash, and the probed CLI version of each adapter holding a channel in the run,
+    // gathered through the existing probe/config-load paths (no second mechanism).
+    const environment = runEnvironment(cfg, channels, health);
+    journal.append("run-start", undefined, { pid: process.pid, baseRef, commands, channels: channels.map(channelKey), branch, graphDefinitionHash: graphDefinitionHash(graph), mode: rm.mode.mode, modeSource: rm.source, environment, ...(prior ? { supersedes: prior.runId } : {}) }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
     runStarted = true;
     // v1.53 T5: mark the prior run AFTER this run's run-start exists, so the prior journal never
     // names a successor that has no journal. Append-only — the prior journal is never rewritten.
@@ -463,6 +472,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // stays unblocked); inert to replayStatuses (unknown events ignored, pinned at journal.test.ts:70-80).
     if (rs) journal.append("resume-restore", t.id, { attempts: rs.attempts, tried: [...tried], assignment });
     const badReviewers: string[] = []; // v1.1: reviewer channels that produced unparseable output for this task
+    // v1.70 T5 (review-convergence): failed review rounds this task has drawn, counted from the per-task
+    // review history already in the journal — the SAME review gate-result stream onGate reads to grow the
+    // reviewer-exclusion list (badReviewers), never a second parallel counter. request-changes rounds do
+    // not exclude their reviewer (a fix is re-checked by the same seat), so their count lives here in the
+    // shared history rather than in badReviewers' garbage-only exclusion subset.
+    const reviewRoundsDrawn = () =>
+      journal.read().filter((e) =>
+        e.taskId === t.id && e.event === "gate-result" &&
+        (e.data as { gate?: string }).gate === "review" &&
+        (e.data as { pass?: boolean }).pass === false,
+      ).length;
     let feedback = "";
     let ladderIdx = 0;
     let modeFallbackNoted = false; // v1.2: journal the interactive→print fallback once per task, not per attempt
@@ -567,6 +587,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const exitRe = new RegExp(`TICKMARKR_EXIT_${nonce}:(\\d+)`);
       if (attempt >= MAX_ATTEMPTS) {
         await park(t, `attempt cap (${MAX_ATTEMPTS}) reached`, "attempt-cap", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
+        return;
+      }
+      // v1.70 T5: a task that has already drawn REVIEW_ROUND_CAP request-changes review rounds parks for
+      // a human decision instead of dispatching another round. Condition on the review history (data),
+      // never the code path — and let an operator's approval (the human decision the cap asked for)
+      // release it, mirroring the humanGate guard's condition-on-approval precedent. Rounds only accrue
+      // after attempt 0, so the guard skips the journal read on the happy path.
+      if (attempt > 0 && !approved.has(t.id) && reviewRoundsDrawn() >= REVIEW_ROUND_CAP) {
+        await park(t, `review round cap (${REVIEW_ROUND_CAP}) reached — request-changes reviews not converging; a human should decide`, "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       // OBS-57: a demoted channel must not be re-dispatched on consult retry or provider requeue.

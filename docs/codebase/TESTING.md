@@ -46,9 +46,9 @@ tests/
 ├── plan/           2 *.test.ts files (scope, scope-flow)
 ├── readme-steering.test.ts
 ├── repo/           9 *.test.ts files (export fixtures/manifest, readme + contact + community boundaries, build provisioning, release docs)
-├── report/         2 *.test.ts files
+├── report/         4 *.test.ts files
 ├── route/          16 *.test.ts files (router, explore, failover, profile, etc.)
-├── run/            26 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, etc.)
+├── run/            27 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, environment, etc.)
 ├── scripts/        probe-rig.test.ts
 ├── setup.ts        (setupFiles in vitest.config.ts — global env seal, not a *.test.ts file)
 ├── skills-pipeline-layout.test.ts

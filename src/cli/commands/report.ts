@@ -1,8 +1,11 @@
+import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { ttyVisual } from "../../adapters/model-lints.js";
 import { addUsage, type TokenUsage } from "../../adapters/types.js";
 import { dim, rule, title } from "../../brand.js";
 import { loadConfig } from "../../config/config.js";
+import { buildProofBundle } from "../../report/bundle.js";
+import { compareRuns } from "../../report/compare.js";
 import { estimateCosts, type ChannelCost } from "../../report/cost.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
 import { Journal, loadRoutingProfile, type JournalEvent, type TelemetryRow } from "../../run/journal.js";
@@ -313,16 +316,50 @@ const stylizeReport = (out: string): string => {
 export async function report(argv: string[], cwd = process.cwd()): Promise<string> {
   const { values, positionals } = parseArgs({
     args: argv,
-    options: { md: { type: "boolean" } },
+    options: {
+      md: { type: "boolean" },
+      // v1.70 T3: baseline run id for cost/gate/duration delta + environment comparability guard
+      compare: { type: "string" },
+      // v1.70 T4: write a portable, schema-versioned proof packet (local file only — no network)
+      bundle: { type: "string" },
+    },
     allowPositionals: true,
   });
   const runId = positionals[0] ?? Journal.latestRunId(cwd, { withJournal: true });
-  if (!runId) throw new Error("no runs found — usage: tickmarkr report <run-id> [--md]");
+  if (!runId) throw new Error("no runs found — usage: tickmarkr report <run-id> [--md] [--compare <baseline-run-id>] [--bundle <path>]");
   const j = Journal.open(cwd, runId);
   const events = j.read();
-  if (values.md) {
-    const rows = j.readTelemetry();
-    return renderMarkdownRecord(runId, events, estimateCosts(rows, loadConfig(cwd).cost), rows);
+  const rows = j.readTelemetry();
+  const cfg = loadConfig(cwd);
+
+  let bundleNote = "";
+  if (values.bundle) {
+    // Local-only write of the pure proof packet — no network path exists in buildProofBundle.
+    const packet = buildProofBundle(runId, events);
+    writeFileSync(values.bundle, JSON.stringify(packet, null, 2) + "\n");
+    bundleNote = `wrote proof bundle → ${values.bundle}\n`;
   }
-  return stylizeReport(textReport(runId, events, j.readTelemetry(), cwd));
+
+  let comparison = "";
+  if (values.compare) {
+    const baselineRunId = values.compare;
+    const baseline = Journal.open(cwd, baselineRunId);
+    const outcome = compareRuns({
+      runId,
+      baselineRunId,
+      events,
+      baselineEvents: baseline.read(),
+      rows,
+      baselineRows: baseline.readTelemetry(),
+      cost: cfg.cost,
+    });
+    // Fail closed: missing run-start yields a clear reason, never a partial table.
+    if (!outcome.ok) throw new Error(outcome.reason);
+    comparison = "\n" + outcome.text;
+  }
+
+  if (values.md) {
+    return bundleNote + renderMarkdownRecord(runId, events, estimateCosts(rows, cfg.cost), rows) + comparison;
+  }
+  return bundleNote + stylizeReport(textReport(runId, events, rows, cwd)) + comparison;
 }

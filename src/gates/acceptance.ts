@@ -10,18 +10,25 @@ import type { GateResult } from "./types.js";
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
 const JUDGE_TIMEOUT_MS = 900_000;
 
+// v1.70: evidence is a structured {path, line} citation into a line the judged diff actually changed
+// (checked against real hunks below), so a real judge can no longer ground a ruling in an unchanged
+// context line or a coincidental repeat elsewhere in the diff text. A plain string is still accepted as
+// the legacy free-text quote — pre-v1.70 fixtures and the zero-token fake seam (llm.ts injectFakeEvidence,
+// out of this module's scope) still emit one — and keeps v1.64's substring check.
+export interface EvidenceCitation { path: string; line: number }
 export interface JudgeVerdict {
   pass: boolean;
-  criteria: Array<{ criterion: string; met: boolean; reason: string; evidence: string }>;
+  criteria: Array<{ criterion: string; met: boolean; reason: string; evidence: string | EvidenceCitation }>;
 }
 
+const CitationSchema = z.object({ path: z.string(), line: z.number().int() });
 const JudgeVerdictRowSchema = z.object({
   criterion: z.string(),
   met: z.boolean(),
   reason: z.string(),
-  // v1.64: a verbatim quote from the judged diff grounding the ruling — required; a verdict
-  // omitting it is malformed and fails closed like any other shape violation.
-  evidence: z.string(),
+  // Required, either form: a row omitting evidence is malformed and fails closed like any other shape
+  // violation. Object → structured citation; string → legacy quote.
+  evidence: z.union([CitationSchema, z.string()]),
 });
 
 const JudgeVerdictSchema = z.object({
@@ -125,6 +132,50 @@ function tail(out: string, n = 8): string {
   return "\n" + t.split("\n").slice(-n).join("\n");
 }
 
+// v1.70: the new-file line numbers each hunk actually ADDS, per changed path — parsed from the
+// unified-diff hunk headers so a citation is validated against real changed locations, not a substring
+// of the whole diff text (which also matches unchanged context lines and the diff's own +++/@@ headers).
+// Only `+` lines are changed locations; context lines advance the new-file counter but are not changes.
+// ponytail: assumes git's default a/ b/ prefixes (fetchTaskDiff uses plain `git diff`); revisit if a
+// caller passes a --no-prefix diff.
+function changedLinesByFile(diff: string): Map<string, Set<number>> {
+  const byFile = new Map<string, Set<number>>();
+  let path: string | null = null;
+  let newLine = 0;
+  let inHunk = false;
+  for (const raw of diff.split("\n")) {
+    if (raw.startsWith("diff --git")) { inHunk = false; path = null; continue; }
+    if (!inHunk && raw.startsWith("--- ")) continue;
+    if (!inHunk && raw.startsWith("+++ ")) {
+      const p = raw.slice(4).trim();
+      path = p === "/dev/null" ? null : p.replace(/^[ab]\//, "");
+      continue;
+    }
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+    if (hunk) { newLine = Number(hunk[1]); inHunk = true; continue; }
+    if (!inHunk || path === null) continue;
+    const c = raw[0];
+    if (c === "+") {
+      let set = byFile.get(path);
+      if (!set) { set = new Set(); byFile.set(path, set); }
+      set.add(newLine);
+      newLine++;
+    } else if (c === " ") {
+      newLine++;
+    } else if (c !== "-") {
+      inHunk = false; // "\ No newline", a trailing blank, or the next section — hunk body ended
+    }
+  }
+  return byFile;
+}
+
+// A citation is valid evidence iff the diff adds the cited line of the cited file. A legacy free-text
+// quote (string) keeps v1.64's substring check — non-empty and present somewhere in the diff.
+function citesChangedLocation(evidence: string | EvidenceCitation, changed: Map<string, Set<number>>, diff: string): boolean {
+  if (typeof evidence === "string") return evidence.trim().length > 0 && diff.includes(evidence);
+  return changed.get(evidence.path)?.has(evidence.line) ?? false;
+}
+
 export interface AcceptanceGateOpts {
   // the repo's test command (detectGateCommands); named-test oracles filter through it via -t.
   // Absent ⇒ a test oracle fails closed (cannot run a named test deterministically without a runner).
@@ -213,9 +264,9 @@ ${diff}
 ${verdictNonceLine(nonce)}
 
 Respond with ONLY this JSON (no prose before or after):
-{"nonce": "${nonce}", "pass": true|false, "criteria": [{"criterion": "c1", "met": true|false, "reason": "...", "evidence": "..."}]}
+{"nonce": "${nonce}", "pass": true|false, "criteria": [{"criterion": "c1", "met": true|false, "reason": "...", "evidence": {"path": "path/to/file", "line": 42}}]}
 Each criteria[].criterion MUST be the stable id from the rubric (c1, c2, ...) exactly once.
-Each criteria[].evidence MUST be a short verbatim quote copied from the diff above that grounds the ruling; a quote not found in the diff voids the whole verdict.
+Each criteria[].evidence MUST be a structured citation {"path", "line"} pointing at a line the diff above actually adds or changes (the new-file line number); a citation to an unchanged or nonexistent location voids the whole verdict.
 `;
   const raw = await runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS);
   const extracted = extractVerdictJson<JudgeVerdict>(raw, nonce);
@@ -228,13 +279,16 @@ Each criteria[].evidence MUST be a short verbatim quote copied from the diff abo
       meta: { unparseable: true, judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
   }
   const { verdict: v, inconsistencies } = checkJudgeVerdict(extracted, expectedIds);
-  // v1.64: quoted evidence must appear verbatim in `diff` — the exact string embedded in the prompt
-  // above, never the worktree or any other artifact. A quote the diff doesn't contain is a
-  // hallucinated verdict: treated as unparseable so GATE-09 retries the judge on a failover channel.
-  const fabricated = v.criteria.filter((row) => !row.evidence.trim() || !diff.includes(row.evidence));
+  // v1.70: each citation must point at a line the diff actually changed — validated against the hunks
+  // of `diff` (the exact string embedded in the prompt above), never the worktree or any other artifact.
+  // A citation to an untouched file or a line outside every changed hunk is a hallucinated verdict:
+  // treated as unparseable so GATE-09 retries the judge on a failover channel. (A legacy free-text quote
+  // still validates by substring, for the fake seam and pre-v1.70 fixtures.)
+  const changed = changedLinesByFile(diff);
+  const fabricated = v.criteria.filter((row) => !citesChangedLocation(row.evidence, changed, diff));
   if (fabricated.length) {
     return { gate: "acceptance", pass: false,
-      details: warn + detBlock + `judge verdict quotes evidence absent from the judged diff (${fabricated.map((row) => row.criterion).join(", ")}) — treating as unparseable, failing closed`,
+      details: warn + detBlock + `judge verdict cites evidence absent from the judged diff (${fabricated.map((row) => row.criterion).join(", ")}) — treating as unparseable, failing closed`,
       meta: { unparseable: true, judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
   }
   const pass = v.pass === true && inconsistencies.length === 0 && v.criteria.every((row) => row.met);

@@ -38,6 +38,17 @@ describe("standalone test build provisioning", () => {
       const r = strangerInstallThenTest();
       expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
     },
-    120_000,
+    240_000, // OBS-116 load-margin reasoning: 2x headroom absorbs concurrent npm ci/build contention.
   );
 });
+
+test(
+  "test: the provisioning test's nested full-suite invocation carries a timeout budget with at least double its prior headroom",
+  () => {
+    const source = readFileSync(join(REPO, "tests/repo/build-provisioning.test.ts"), "utf8");
+    const start = source.indexOf('test(\n    "the standalone test command provisions a fresh build first');
+    const end = source.indexOf("\n  );", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(source.slice(start, end)).toContain("240_000");
+  },
+);

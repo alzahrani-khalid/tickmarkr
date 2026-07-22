@@ -827,6 +827,36 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(slotOpts.find((o) => o.name === gatePaneName("consult", "T1"))?.opts).toEqual({ label: "CONSULT T1", owned: { role: "consult", taskId: "T1", attempt: 0, runId: "run-uniq" } });
   });
 
+  // v1.70 T5 (review-convergence): a task whose review keeps drawing material findings must not cycle
+  // through review rounds forever. With consult answering "retry" the escalation ladder would loop until
+  // the global attempt cap; the review round cap stops it far earlier and parks for a human decision.
+  test("a task that has already reached the review round cap is parked for a human decision instead of dispatching another review round", async () => {
+    const { repo, fake } = setupRepo(
+      // deterministic command oracle for acceptance: the review gate is the one under test, so this
+      // isolates it and avoids spawning a fake-judge subprocess on every one of the (up to 4) rounds.
+      [T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
+      {
+        review: { approve: false, findings: [{ note: "blocking bug", severity: "material" }] }, // material every round
+        consult: { action: "retry", notes: "keep going" }, // never parks via consult — only the cap can stop it
+        tasks: { T1: [{ shell: `echo v >> f.txt && ${COMMIT} v`, result: { ok: true, summary: "v" } }] },
+      },
+    );
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-revcap" });
+    expect(s.human).toEqual(["T1"]);
+    const evs = Journal.open(repo, "run-revcap").read();
+    const humanEv = evs.find((e) => e.event === "task-human" && e.taskId === "T1");
+    expect(String(humanEv?.data.reason)).toMatch(/review round cap/i);
+    // exactly REVIEW_ROUND_CAP failing review rounds ran, then the cap parked it before a 4th round
+    const reviewRounds = evs.filter((e) =>
+      e.event === "gate-result" &&
+      (e.data as { gate?: string }).gate === "review" &&
+      (e.data as { pass?: boolean }).pass === false,
+    ).length;
+    expect(reviewRounds).toBe(3);
+    // parked by the review round cap, NOT the global attempt cap (10) — review non-convergence is caught early
+    expect(evs.some((e) => e.event === "task-human" && /attempt cap/.test(String(e.data.reason ?? "")))).toBe(false);
+  });
+
   // ── Phase 11 wave 2: TEL-02 counter population + park discrimination ──
   const telem = (repo: string, runId: string) => Journal.open(repo, runId).readTelemetry();
 

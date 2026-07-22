@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.70 — evidence/comparison + review-convergence
+
+This evidence/comparison release ships an evidence-addressed judge verdict schema with path/line citations, run-start environment identity, `report --compare` with comparability guards and cost/gate/duration deltas, and `report --bundle` proof packets with task outcomes, evidence citations, content hashes, and secret redaction. The review-convergence contract classifies material and minor findings, records defer-with-rationale decisions, and parks tasks at the review round cap; nested infrastructure tests also gain load-margin timeout budgets.
+
 ## v1.69 — eval-lab + kimi-seeding
 
 This eval-lab and kimi-seeding release ships checked-in fixtures with fail-as-shipped and pass-with-reference selfchecks, identical cross-channel prompts, incremental JSON reports with identity stamping, and a held-out known-fail judge canary. It also adds kimi launch-then-seed TUI workers with readiness checks, model and session banner confirmation, and pane cleanup after harvest.
