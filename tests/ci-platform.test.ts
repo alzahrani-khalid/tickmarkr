@@ -1,10 +1,15 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
 import { describe, expect, test } from "vitest";
 
 const repoRoot = join(import.meta.dirname, "..");
-const workflowPaths = [".github/workflows/ci.yml", ".github/workflows/ci.public.yml"];
+// The public export ships ci.public.yml but not the private ci.yml — assert on the workflows
+// present in THIS checkout, and require at least one so the export context can't go vacuous.
+const workflowPaths = [".github/workflows/ci.yml", ".github/workflows/ci.public.yml"].filter((p) =>
+  existsSync(join(repoRoot, p)),
+);
+if (workflowPaths.length === 0) throw new Error("no CI workflow definitions found to assert on");
 const gateCommands = ["npm run build", "npm run lint", "npm run test:coverage"];
 
 type Workflow = {
