@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { BillingChannel } from "../../src/adapters/types.js";
 import { candidateRow, costSignal, shapeCandidates } from "../../src/cli/commands/fleet-picker.js";
-import { DEFAULT_CONFIG, INTEGRITY_FLOOR_SHAPES, type TickmarkrConfig } from "../../src/config/config.js";
+import { DEFAULT_CONFIG, fleetEditableFromConfig, INTEGRITY_FLOOR_SHAPES, type TickmarkrConfig } from "../../src/config/config.js";
 import { SHAPES } from "../../src/graph/schema.js";
+import { FleetStaging } from "../../src/tui/staging.js";
 import { createRoutingView, routingPreviewTask } from "../../src/tui/views/routing-view.js";
 
 // Delegation oracle (judge criterion): wrap the shared picker glue in a call-through spy so the
@@ -119,5 +120,102 @@ describe("routing view — the policy grid (v1.66 T4)", () => {
     expect(view.render(FRAME).some((l) => l.includes("candidates: spec"))).toBe(true);
     view.closeInspector();
     expect(view.inspectorRows()).toBeNull();
+  });
+});
+
+describe("routing view — staged policy edits (v1.67 T2)", () => {
+  test("test: selecting a candidate in the inspector stages a pin for that shape", () => {
+    const staging = new FleetStaging(fleetEditableFromConfig(cfg));
+    const view = createRoutingView({ data, staging });
+    view.openInspector("docs");
+    view.moveInspectorCursor(1); // take the rank-2 candidate, not the default top pick
+    // the inspector ranks the clean injected config, so the test's own ranking is the oracle
+    const ranked = shapeCandidates(routingPreviewTask("docs"), cfg, CH);
+    const chosen = ranked[1]!.assignment;
+
+    view.stageInspectorPin();
+
+    // the pin landed in the staging buffer — and nowhere else
+    expect(staging.current.map.docs?.pin).toEqual({ via: chosen.adapter, model: chosen.model });
+    expect(staging.loadedState.map.docs?.pin).toBeUndefined();
+    expect(staging.isDirty).toBe(true);
+    const row = gridRow(view.render(FRAME), "docs")!;
+    expect(row).toContain(`${chosen.adapter}:${chosen.model}`);
+    expect(row).toContain("●"); // staged pin cell renders marked
+  });
+
+  test("test: floor and mode edits stage into the buffer and render marked as staged", () => {
+    const staging = new FleetStaging(fleetEditableFromConfig(cfg));
+    const view = createRoutingView({ data, staging });
+    // floor edit on the selected shape (the cursor starts on plan)
+    view.stageFloor("mid");
+    expect(staging.current.floors.plan).toBe("mid");
+    expect(staging.loadedState.floors.plan).toBe("frontier");
+    expect(staging.isDirty).toBe(true);
+    expect(gridRow(view.render(FRAME), "plan")).toContain("●");
+
+    // a mode edit stages the preset's compiled floor table — never a private mode variable
+    view.stageMode("partner-led");
+    expect(staging.current.floors.implement).toBe("frontier");
+    expect(staging.current.floors.tests).toBe("frontier");
+    expect(staging.current.floors.chore).toBe("frontier");
+    expect(view.selectedMode).toBe("partner-led"); // derived from the buffer, not stored
+    const lines = view.render(FRAME);
+    expect(lines.some((l) => l.includes("mode: partner-led") && l.includes("●"))).toBe(true);
+    expect(gridRow(lines, "tests")).toContain("frontier●");
+  });
+
+  test("test: a staged cell renders distinguishably from a saved cell and reverting clears the mark", () => {
+    const staging = new FleetStaging(fleetEditableFromConfig(cfg));
+    const view = createRoutingView({ data, staging });
+    // stage a prefer-chain change on implement; leave the spec row saved
+    view.moveCursor(2); // implement
+    expect(view.selectedShape).toBe("implement");
+    view.stagePrefer(["kimi", "codex"]);
+
+    const lines = view.render(FRAME);
+    const stagedRow = gridRow(lines, "implement")!;
+    const savedRow = gridRow(lines, "spec")!;
+    expect(stagedRow).toContain("kimi, codex");
+    expect(stagedRow).toContain("●");
+    expect(savedRow).not.toContain("●");
+    expect(stagedRow).not.toEqual(savedRow);
+    expect(lines.some((l) => l.includes("● staged"))).toBe(true);
+
+    // reverting through the view discards the buffer and the marks clear with it
+    view.revert();
+    expect(staging.isDirty).toBe(false);
+    const after = view.render(FRAME);
+    expect(gridRow(after, "implement")).toContain("cursor-agent, codex"); // saved chain back
+    expect(after.every((l) => !l.includes("●"))).toBe(true);
+  });
+
+  test("test: the inspector rows for a shape still match the shared ranking for the same inputs", () => {
+    const staging = new FleetStaging(fleetEditableFromConfig(cfg));
+    const view = createRoutingView({ data, staging });
+    view.moveCursor(3); // tests
+    view.openInspector();
+    const before = view.inspectorRows()!;
+    expect(before.length).toBeGreaterThan(0);
+    expect(before.some((r) => r.includes("below floor"))).toBe(false);
+
+    // stage a floor raise for the very shape the inspector is ranking
+    view.stageFloor("frontier");
+
+    // the oracle: the shared picker ranking over the effective (staged) config
+    const effCfg: TickmarkrConfig = {
+      ...cfg,
+      routing: { ...cfg.routing, floors: { ...cfg.routing.floors, tests: "frontier" } },
+    };
+    const expected = shapeCandidates(routingPreviewTask("tests"), effCfg, CH).map((c) => candidateRow(c, cfg.pricing));
+    const rows = view.inspectorRows()!;
+    expect(rows).toEqual(expected);
+    // the staged floor visibly reshaped the ranking: the pool past the frontier channel now
+    // ranks below-floor with the operator-override tag
+    expect(rows).not.toEqual(before);
+    expect(rows.some((r) => r.includes("below floor"))).toBe(true);
+    // and the rendered panel carries the same rows
+    const lines = view.render(FRAME);
+    for (const row of expected) expect(lines.some((l) => l.includes(row)), row).toBe(true);
   });
 });

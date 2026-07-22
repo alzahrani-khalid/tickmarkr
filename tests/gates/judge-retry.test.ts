@@ -3,13 +3,15 @@
 // runGates, before any failing result reaches the daemon. The flaked first verdict NEVER enters results.
 // Detection is meta-only (acceptance.ts:42 extractJson→null shape-check failure → meta.unparseable:true),
 // never string-matching details (D-03). Fix lives in src/gates/run-gates.ts (straight-line, exactly-once).
+// T6: the retry exclusion now matches consult reroute semantics — the flaked channel's whole adapter is
+// banned, not just its exact channel key.
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
+import { shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
@@ -23,6 +25,43 @@ const mkTask = (over: Record<string, unknown> = {}) =>
     tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 8, acceptance: ["a"], ...over }],
   }).tasks[0];
 
+class FakeAdapterB extends FakeAdapter {
+  id = "fake-b";
+  vendor = "fake-b";
+  private bPath: string;
+
+  constructor(scriptPath: string) {
+    super(scriptPath);
+    this.bPath = scriptPath;
+  }
+
+  headlessCommand(promptFile: string, model: string): string {
+    const base = super.headlessCommand(promptFile, model);
+    // The shared llm.ts augment path only fires for adapter id "fake". fake-b must bind its own
+    // nonce so extractVerdictJson accepts the verdict exactly like the real adapter path.
+    const nodeScript = `(function(){
+      const fs = require("fs");
+      const path = require("path");
+      const prompt = fs.readFileSync(${JSON.stringify(promptFile)}, "utf8");
+      const nonce = (prompt.match(/VERDICT_NONCE:\\s*([0-9a-f]+)/i) || [])[1];
+      if (!nonce) return;
+      let role = "";
+      if (/TICKMARKR-(?:JUDGE|SCOPE)/.test(prompt)) role = "judge";
+      else if (/TICKMARKR-REVIEW/.test(prompt)) role = "review";
+      else if (/TICKMARKR-CONSULT/.test(prompt)) role = "consult";
+      if (!role) return;
+      try {
+        const file = path.join(path.dirname(${JSON.stringify(this.bPath)}), role + ".json");
+        const obj = JSON.parse(fs.readFileSync(file, "utf8"));
+        if (obj && typeof obj === "object" && !obj.nonce) {
+          process.stdout.write("\\n" + JSON.stringify({ ...obj, nonce }));
+        }
+      } catch {}
+    })()`;
+    return `${base}; node -e ${shq(nodeScript)}`;
+  }
+}
+
 function fakeWith(extra: object): FakeAdapter {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-judge-retry-"));
   const p = join(dir, "s.json");
@@ -30,14 +69,22 @@ function fakeWith(extra: object): FakeAdapter {
   return new FakeAdapter(p);
 }
 
+function fakeBWith(extra: object): FakeAdapterB {
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-judge-retry-b-"));
+  const p = join(dir, "s.json");
+  writeFileSync(p, JSON.stringify({ tasks: {}, ...extra }));
+  return new FakeAdapterB(p);
+}
+
 const author: Assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
-// the two-channel fake fleet: fake-1 (fake-a, sub) + fake-2 (fake-b, api) — a failover judge exists by construction
-const CH_BOTH: BillingChannel[] = [
+// two-adapter fleet: fake-1 (fake) + fake-2 (fake-b) — cross-adapter judge failover by construction
+const CH_TWO_ADAPTERS: BillingChannel[] = [
+  { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
+  { adapter: "fake-b", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
+];
+const CH_ONE_ADAPTER_TWO_CHANNELS: BillingChannel[] = [
   { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
   { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
-];
-const CH_ONE: BillingChannel[] = [
-  { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
 ];
 const noResult = { ok: true, summary: "", deviations: [] as string[], raw: "" };
 const JUDGE_GATES = ["build", "test", "lint", "evidence", "scope", "acceptance"];
@@ -51,7 +98,7 @@ function repoWithCommit() {
 }
 
 async function ctxFor(
-  repo: string, base: string, fake: FakeAdapter,
+  repo: string, base: string, adapters: WorkerAdapter[],
   opts: { channels?: BillingChannel[]; judgeModel?: string } = {},
 ) {
   const cfg = structuredClone(DEFAULT_CONFIG);
@@ -62,7 +109,7 @@ async function ctxFor(
     result: noResult,
     commands: {} as Record<string, string>,
     baseline: await captureBaseline(repo, {}),
-    channels: opts.channels ?? CH_BOTH, adapters: [fake], cfg,
+    channels: opts.channels ?? CH_TWO_ADAPTERS, adapters, cfg,
   };
 }
 
@@ -72,41 +119,43 @@ function traceOf(onGate?: (e: GateEvent) => void | Promise<void>) {
   return { trace, hook };
 }
 
-const PASS = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r" }] };
-const FAIL = { pass: false, criteria: [{ criterion: "c1", met: false, reason: "nope" }] };
+const PASS = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r", evidence: "+y" }] };
+const FAIL = { pass: false, criteria: [{ criterion: "c1", met: false, reason: "nope", evidence: "+y" }] };
 
 describe("GATE-09 judge-flake retry (run-gates level)", () => {
-  test("flake-then-good: judge retried once on failover, final verdict is the parsed pass", async () => {
+  test("an unparseable primary verdict retries on a channel from a different adapter when one is live", async () => {
     const { repo, base } = repoWithCommit();
     // SC-1 shape (vendored run-20260711-185020 P43-03 L70-72): garbage first verdict, then a good one.
     const fake = fakeWith({ judge: ["judge output garbage — not a verdict", PASS] });
+    const fakeB = fakeBWith({ judge: [PASS] });
     const { trace, hook } = traceOf();
     const { results } = await runGates(
       mkTask({ gates: JUDGE_GATES, files: [] }),
-      { ...(await ctxFor(repo, base, fake)), onGate: hook },
+      { ...(await ctxFor(repo, base, [fake, fakeB])), onGate: hook },
     );
     // exactly ONE acceptance result recorded — the flaked first verdict never enters results (Pitfall 5)
     const acc = results.filter((r) => r.gate === "acceptance");
     expect(acc).toHaveLength(1);
     expect(acc[0].pass).toBe(true);
-    // failover attribution: flaked on fake-1, retried on fake-2 (pickReviewer sort over channels minus flaked)
-    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake:fake-2" } });
+    // failover attribution: flaked on fake-1, retried on fake-b (whole-adapter exclusion)
+    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake-b:fake-2" } });
     // single-recorded-result pin: exactly one onGate end for acceptance (no false journal event)
     expect(trace.filter((e) => e.phase === "end" && e.gate === "acceptance")).toHaveLength(1);
   });
 
-  test("same-channel fallback: single-channel fleet retries on the flaked channel (D-03)", async () => {
+  test("a fleet with only one adapter still retries within that adapter", async () => {
     const { repo, base } = repoWithCommit();
+    // single-adapter fleet with two channels: adapter-level exclusion has no other adapter to pivot to,
+    // so it degrades to a channel-level reroute within the same adapter.
     const fake = fakeWith({ judge: ["judge output garbage", PASS] });
     const { results } = await runGates(
       mkTask({ gates: JUDGE_GATES, files: [] }),
-      { ...(await ctxFor(repo, base, fake, { channels: CH_ONE })) }, // empty candidate set → same channel
+      { ...(await ctxFor(repo, base, [fake], { channels: CH_ONE_ADAPTER_TWO_CHANNELS })) },
     );
     const acc = results.filter((r) => r.gate === "acceptance");
     expect(acc).toHaveLength(1);
     expect(acc[0].pass).toBe(true);
-    // equal keys = honest attribution: retried on the same channel — no alternative (documented fallback)
-    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake:fake-1" } });
+    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake:fake-2" } });
   });
 
   test("fabricated evidence counts as a judge flake: retried once on failover, parsed retry stands", async () => {
@@ -115,22 +164,46 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
     const { repo, base } = repoWithCommit();
     const fabricated = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r", evidence: "quote found in no diff anywhere" }] };
     const fake = fakeWith({ judge: [fabricated, PASS] });
+    const fakeB = fakeBWith({ judge: [PASS] });
     const { results } = await runGates(
       mkTask({ gates: JUDGE_GATES, files: [] }),
-      { ...(await ctxFor(repo, base, fake)) },
+      { ...(await ctxFor(repo, base, [fake, fakeB])) },
     );
     const acc = results.filter((r) => r.gate === "acceptance");
     expect(acc).toHaveLength(1);
     expect(acc[0].pass).toBe(true);
-    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake:fake-2" } });
+    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake-b:fake-2" } });
+  });
+
+  test("the exclusion axis matches the consult reroute's adapter exclusion semantics", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ judge: ["judge output garbage", PASS] });
+    const fakeB = fakeBWith({ judge: [PASS] });
+    // Two channels on the flaked adapter (fake), one on a different adapter (fake-b).
+    // The fake-b channel is lower tier, so exact-channel exclusion would prefer fake:fake-2;
+    // adapter-level exclusion forces the retry onto fake-b:fake-2, matching consult excludeAdapter.
+    const channels: BillingChannel[] = [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
+      { adapter: "fake-b", vendor: "fake-b", model: "fake-2", channel: "api", tier: "cheap" },
+    ];
+    const { results } = await runGates(
+      mkTask({ gates: JUDGE_GATES, files: [] }),
+      { ...(await ctxFor(repo, base, [fake, fakeB], { channels })) },
+    );
+    const acc = results.filter((r) => r.gate === "acceptance");
+    expect(acc).toHaveLength(1);
+    expect(acc[0].pass).toBe(true);
+    expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake-b:fake-2" } });
   });
 
   test("double-garbage fails closed exactly as today (SC-2)", async () => {
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ judge: ["garbage one", "garbage two"] });
+    const fakeB = fakeBWith({ judge: ["garbage b"] });
     const { results } = await runGates(
       mkTask({ gates: JUDGE_GATES, files: [] }),
-      { ...(await ctxFor(repo, base, fake)) },
+      { ...(await ctxFor(repo, base, [fake, fakeB])) },
     );
     const acc = results.filter((r) => r.gate === "acceptance");
     expect(acc).toHaveLength(1);
@@ -139,19 +212,20 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
     // the final result carries both channels + the unparseable flag (the retry also flaked)
     expect(acc[0].meta).toMatchObject({
       unparseable: true,
-      judgeRetry: { flaked: "fake:fake-1", retried: "fake:fake-2" },
+      judgeRetry: { flaked: "fake:fake-1", retried: "fake-b:fake-2" },
     });
   });
 
-  test("parseable pass:false is NEVER retried (SC-3 fence — the REQUIREMENTS.md out-of-scope line)", async () => {
+  test("a parseable primary verdict never triggers the exclusion path", async () => {
     // Fixture shape = the vendored run-20260712-010826 P45-01 attempt-0 parseable pass:false (byte-match
     // miss) — a REAL acceptance failure. The flake signal is extractJson→null (acceptance.ts:42); a parsed
     // verdict is never one. A would-be pass served as element 1 must NEVER be consumed.
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ judge: [FAIL, PASS] }); // parseable fail first; the pass must never be served
+    const fakeB = fakeBWith({ judge: [PASS] });
     const { results } = await runGates(
       mkTask({ gates: JUDGE_GATES, files: [] }),
-      { ...(await ctxFor(repo, base, fake)) },
+      { ...(await ctxFor(repo, base, [fake, fakeB])) },
     );
     const acc = results.filter((r) => r.gate === "acceptance");
     expect(acc).toHaveLength(1);
@@ -164,9 +238,10 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
     const { repo, base } = repoWithCommit();
     const inconsistent = { pass: true, criteria: [{ criterion: "c1", met: false, reason: "contradiction" }] };
     const fake = fakeWith({ judge: [inconsistent, PASS] });
+    const fakeB = fakeBWith({ judge: [PASS] });
     const { results } = await runGates(
       mkTask({ gates: JUDGE_GATES, files: [] }),
-      { ...(await ctxFor(repo, base, fake)) },
+      { ...(await ctxFor(repo, base, [fake, fakeB])) },
     );
     const acc = results.filter((r) => r.gate === "acceptance");
     expect(acc).toHaveLength(1);
@@ -181,9 +256,10 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
     // its review — pinned explicitly so nobody optimizes review away on the retry path.
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ judge: ["garbage", PASS], review: { approve: true, issues: [] } });
+    const fakeB = fakeBWith({ judge: [PASS], review: { approve: true, issues: [] } });
     const { results } = await runGates(
       mkTask({ gates: [...JUDGE_GATES, "review"], files: [], complexity: 8 }),
-      { ...(await ctxFor(repo, base, fake)) },
+      { ...(await ctxFor(repo, base, [fake, fakeB])) },
     );
     const acc = results.filter((r) => r.gate === "acceptance");
     expect(acc).toHaveLength(1);

@@ -3,11 +3,16 @@
 // up front and hands the facts in. Auth comes from the doctor cache (AuthHealth), enabled/denied
 // state and provenance notes from the harvested fleet overlay, and the per-channel health digest
 // is folded from journal telemetry rows (TelemetryRow) — never from any new state file.
+// v1.67 write path: with a shared FleetStaging attached, deny/allow toggles and tier overrides
+// stage into the buffer (never disk), the roster renders the buffer's CURRENT state, rows whose
+// staged state differs from saved render marked, and deny-vs-pin conflicts are detected against
+// the same buffer the routing view stages pins into.
 import type { View } from "../app.js";
 import type { AuthHealth } from "../../adapters/types.js";
 import type { Tier } from "../../config/config.js";
 import type { TelemetryRow } from "../../run/journal.js";
-import { GLYPHS, bold, dim, fail, legend } from "../../brand.js";
+import type { FleetStaging } from "../staging.js";
+import { GLYPHS, bold, dim, fail, legend, warn } from "../../brand.js";
 
 /** One discovered adapter and its classified models (cfg.tiers via channels()). */
 export type FleetRosterEntry = {
@@ -111,6 +116,90 @@ export type FleetView = View & {
   expanded(adapter: string): boolean;
   /** channelKey of the cursor's channel, or null when the cursor sits on an adapter row. */
   selectedChannel(): string | null;
+  /** Stage a deny⇄allow toggle for one adapter into the shared buffer. No-op without staging. */
+  toggleDenyAdapter(adapter: string): void;
+  /** Stage a deny⇄allow toggle for one channel ("adapter:model"). No-op without staging. */
+  toggleDenyChannel(channelKey: string): void;
+  /** Stage a tier override for one channel ("adapter:model"). No-op without staging. */
+  stageTierOverride(channelKey: string, tier: Tier): void;
+};
+
+/** A channel that is denied in the staged buffer while a routing.map pin still points at it —
+ *  the fleet view stages the deny, the routing view stages the pin, and BOTH are read out of the
+ *  one shared staging model, so either view surfaces the same conflict set. */
+export type StagedConflict = {
+  /** channelKey ("adapter:model") that is both denied and pinned in the buffer. */
+  channelKey: string;
+  /** shapes whose pin the deny would dead-end (deny wins over pin in saved config). */
+  shapes: string[];
+};
+
+/** Detect deny-vs-pin conflicts from the shared staging model. The buffer's CURRENT state holds
+ *  both views' staged state — the fleet view's deny/allow + tier edits and the routing view's
+ *  pin/floor edits — so reading it sees the combination before anything is saved. A conflict is
+ *  a pinned channel denied by its own entry OR by its adapter's deny (the adapter deny reaches
+ *  every channel under it, same rule as denyOf). */
+export function stagedConflicts(staging: FleetStaging): StagedConflict[] {
+  const cur = staging.current;
+  const byChannel = new Map<string, string[]>();
+  for (const [shape, entry] of Object.entries(cur.map)) {
+    const pin = entry?.pin;
+    if (!pin) continue;
+    const key = `${pin.via}:${pin.model}`;
+    if (cur.denyModels.includes(key) || cur.denyAdapters.includes(pin.via)) {
+      byChannel.set(key, [...(byChannel.get(key) ?? []), shape]);
+    }
+  }
+  return [...byChannel.entries()].map(([channelKey, shapes]) => ({ channelKey, shapes }));
+}
+
+/** Rows whose staged state differs from the loaded (saved) state: adapter deny flips, channel
+ *  deny flips, and tier overrides. Staged rows render marked so an unsaved edit never reads as
+ *  saved state. Same JSON leaf-comparison semantics as the staging model's own delta count. */
+function stagedRowSets(staging: FleetStaging): { adapters: Set<string>; channels: Set<string> } {
+  const cur = staging.current;
+  const saved = staging.loadedState;
+  const flipped = (a: string[], b: string[]): Set<string> =>
+    new Set([...a.filter((x) => !b.includes(x)), ...b.filter((x) => !a.includes(x))]);
+  const channels = flipped(cur.denyModels, saved.denyModels);
+  const tierAdapters = new Set([...Object.keys(cur.tiers), ...Object.keys(saved.tiers)]);
+  for (const adapter of tierAdapters) {
+    const models = new Set([
+      ...Object.keys(cur.tiers[adapter] ?? {}),
+      ...Object.keys(saved.tiers[adapter] ?? {}),
+    ]);
+    for (const model of models) {
+      if (JSON.stringify(cur.tiers[adapter]?.[model]) !== JSON.stringify(saved.tiers[adapter]?.[model])) {
+        channels.add(`${adapter}:${model}`);
+      }
+    }
+  }
+  return { adapters: flipped(cur.denyAdapters, saved.denyAdapters), channels };
+}
+
+/** The roster renders the buffer's CURRENT state when a staging model is attached: deny lists
+ *  and tier badges come from the buffer, everything else (health, telemetry, notes, row shape)
+ *  from the injected facts. Without staging the injected facts render as-is (saved state). */
+function overlayStaged(data: FleetViewData, staging: FleetStaging | undefined): FleetViewData {
+  if (!staging) return data;
+  const cur = staging.current;
+  return {
+    ...data,
+    denyAdapters: cur.denyAdapters,
+    denyModels: cur.denyModels,
+    adapters: data.adapters.map((a) => ({
+      ...a,
+      models: a.models.map((m) => ({ ...m, tier: cur.tiers[a.adapter]?.[m.model]?.tier ?? m.tier })),
+    })),
+  };
+}
+
+/** Sorted in-place toggle so a stage-then-unstage leaves the list byte-identical to loaded. */
+const toggleIn = (list: string[], value: string): void => {
+  const i = list.indexOf(value);
+  if (i >= 0) list.splice(i, 1);
+  else list.push(value);
+  list.sort();
 };
 
 // fleet.ts formatAge voice — the operator already reads "12m old" on the classic fleet screen.
@@ -171,7 +260,7 @@ function digestLine(d: ChannelHealth, noun: string): string {
 
 type Row = { kind: "adapter"; adapter: string } | { kind: "model"; adapter: string; model: string };
 
-export function createFleetView(data?: FleetViewData): FleetView {
+export function createFleetView(data?: FleetViewData, staging?: FleetStaging): FleetView {
   // One expanded bit per adapter, default expanded — the roster shows everything at a glance.
   const expandedMap = new Map<string, boolean>((data?.adapters ?? []).map((a) => [a.adapter, true]));
   let cursor = 0;
@@ -220,48 +309,77 @@ export function createFleetView(data?: FleetViewData): FleetView {
       return row?.kind === "model" ? `${row.adapter}:${row.model}` : null;
     },
 
+    toggleDenyAdapter(adapter: string): void {
+      staging?.apply((buffer) => toggleIn(buffer.denyAdapters, adapter));
+    },
+
+    toggleDenyChannel(channelKey: string): void {
+      staging?.apply((buffer) => toggleIn(buffer.denyModels, channelKey));
+    },
+
+    stageTierOverride(channelKey: string, tier: Tier): void {
+      const split = channelKey.indexOf(":");
+      if (split <= 0) return;
+      const adapter = channelKey.slice(0, split);
+      const model = channelKey.slice(split + 1);
+      staging?.apply((buffer) => {
+        buffer.tiers[adapter] ??= {};
+        // spread keeps an existing provenance note riding the staged assignment
+        buffer.tiers[adapter][model] = { ...buffer.tiers[adapter][model], tier };
+      });
+    },
+
     render(_props: { cols: number; rows: number }): string[] {
       if (!data) {
         // T2 stub surface — the shell registers the view before any data source is wired.
         return ["Fleet view", "Harness roster and health (read-only in v1.66)."];
       }
-      const digest = foldChannelHealth(data.telemetry);
+      const eff = overlayStaged(data, staging);
+      const staged = staging ? stagedRowSets(staging) : null;
+      const conflicts = new Map((staging ? stagedConflicts(staging) : []).map((c) => [c.channelKey, c.shapes]));
+      const digest = foldChannelHealth(eff.telemetry);
       const lines: string[] = [bold("Fleet view — harness roster")];
       lines.push(
         legend(
-          `doctor cache: ${formatCacheAge(data.doctorAgeMs)} · ${data.adapters.length} adapters · ` +
-          `${data.telemetry.length} journal rows · ↑↓ select · → expand · ← collapse · space toggle`,
+          `doctor cache: ${formatCacheAge(eff.doctorAgeMs)} · ${eff.adapters.length} adapters · ` +
+          `${eff.telemetry.length} journal rows · ↑↓ select · → expand · ← collapse · space toggle`,
         ),
       );
 
       const rows = visibleRows();
       rows.forEach((row, i) => {
         const pointer = i === cursor ? `${GLYPHS.pointer} ` : "  ";
-        const h = data.health[row.adapter];
+        const h = eff.health[row.adapter];
         if (row.kind === "adapter") {
           const marker = expandedMap.get(row.adapter) !== false ? "▾" : "▸";
           const state = !h?.installed
             ? `${fail(GLYPHS.fail)} not installed`
             : `${h.version ?? "installed"} · ${h.authed ? "authed" : "unauthed"}`;
-          const counts = h?.installed ? ` · ${plural(entryOf(data, row.adapter)?.models.length ?? 0, "model")}` : "";
-          const deny = data.denyAdapters.includes(row.adapter)
-            ? ` · ${fail("denied")}${note(data.notes?.denyAdapters?.[row.adapter])}`
+          const counts = h?.installed ? ` · ${plural(entryOf(eff, row.adapter)?.models.length ?? 0, "model")}` : "";
+          const deny = eff.denyAdapters.includes(row.adapter)
+            ? ` · ${fail("denied")}${note(eff.notes?.denyAdapters?.[row.adapter])}`
             : "";
-          lines.push(`${pointer}${marker} ${bold(row.adapter)}  ${state}${counts}${deny}`);
+          const stagedBit = staged?.adapters.has(row.adapter) ? ` · ${warn("● staged")}` : "";
+          lines.push(`${pointer}${marker} ${bold(row.adapter)}  ${state}${counts}${deny}${stagedBit}`);
           return;
         }
-        const m = data.adapters.find((a) => a.adapter === row.adapter)?.models.find((mm) => mm.model === row.model);
+        const m = eff.adapters.find((a) => a.adapter === row.adapter)?.models.find((mm) => mm.model === row.model);
         if (!m) return;
         const key = `${row.adapter}:${row.model}`;
         const auth = modelAuthText(h, row.model);
-        const dn = denyOf(data, row.adapter, row.model);
+        const dn = denyOf(eff, row.adapter, row.model);
         const deny = dn.denied ? `  ${fail(GLYPHS.fail)} denied${note(dn.note)}` : "";
         const d = digest.get(key);
         const healthBit = d && d.tasks > 0 ? `  ${dim(`${d.done}/${d.tasks} done`)}` : "";
-        lines.push(`${pointer}  ${row.model.padEnd(28)} [${m.tier}] ${m.channel}  ${auth}${deny}${healthBit}`);
+        const stagedBit = staged?.channels.has(key) ? `  ${warn("● staged")}` : "";
+        const pinnedFor = conflicts.get(key);
+        const conflictBit = pinnedFor
+          ? `  ${warn(`${GLYPHS.attention} conflict: pinned for ${pinnedFor.join(", ")}`)}`
+          : "";
+        lines.push(`${pointer}  ${row.model.padEnd(28)} [${m.tier}] ${m.channel}  ${auth}${deny}${healthBit}${stagedBit}${conflictBit}`);
       });
 
-      lines.push(...detailPanel(data, digest, rows[cursor]));
+      lines.push(...detailPanel(eff, digest, rows[cursor]));
       return lines;
     },
   };

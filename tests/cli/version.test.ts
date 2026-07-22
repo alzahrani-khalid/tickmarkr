@@ -11,7 +11,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.65.0";
+const PRIOR_RELEASE_VERSION = "1.66.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -66,15 +66,15 @@ describe("tickmarkr version", () => {
   });
 
   test("the changelog entry names the fleet-studio theme and the shipped changes rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.66[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.67[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
     expect(entry).toMatch(/fleet[- ]studio/i);
-    for (const change of ["dependency-free terminal UI engine", "tickmarkr ui", "read-only Fleet, Routing, Preview, and Profile", "plan dry-run preview", "OBS-77 askTyped"]) {
+    for (const change of ["staged-changes editing", "pins, floors, prefer", "allow/deny", "YAML diff modal", "atomic overlay write", "live-run reload guard", "repo↔global target toggle"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.65.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.66.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

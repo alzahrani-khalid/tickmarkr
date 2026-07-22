@@ -30,7 +30,7 @@ There is no separate watch-mode script in `package.json`; run `npx vitest` direc
 tests/
 ├── adapters/       20 *.test.ts files (fake, registry, prompt, per-vendor auth/usage, etc.)
 ├── brand.test.ts   byte-pinned brand exports
-├── cli/            30 *.test.ts files (init, plan, status, fleet, approve, doctor, report-*, mode-*, etc.)
+├── cli/            31 *.test.ts files (init, plan, status, fleet, approve, doctor, report-*, mode-*, etc.)
 ├── compile/        6 *.test.ts files (gsd, prd, speckit, native, collateral, scope-seam)
 ├── config/         3 *.test.ts files
 ├── docs-*.test.ts  export-guarded docs-truth suites (codebase, concerns, stack, testing)

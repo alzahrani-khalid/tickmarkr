@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { collateralLints, sourceScopeLints } from "../../src/compile/collateral.js";
+import { collateralLints, newDirectoryLints, sourceScopeLints } from "../../src/compile/collateral.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -152,5 +152,64 @@ describe("sourceScopeLints (plan-time OBS-76 source sweep)", () => {
     const t = stask("T5", files, ["drop every remaining modeFloor read"]);
     sourceScopeLints([t], repo);
     expect(t.files).toEqual(["src/config/config.ts"]);
+  });
+});
+
+// v1.67 T5 (OBS-108): a task whose files[] introduces a new top-level src/ directory must also
+// include the architecture pages the docs-truth suite pins.
+const ARCH_PAGES = ["docs/codebase/ARCHITECTURE.md", "docs/codebase/STRUCTURE.md"];
+const EXISTING_DIR_FIXTURE = {
+  "src/existing/file.ts": "export const a = 1;\n",
+  ...Object.fromEntries(ARCH_PAGES.map((p) => [p, `# ${p}\n`])),
+};
+
+describe("newDirectoryLints (plan-time OBS-108 source directory sweep)", () => {
+  test("test: the plan lint flags a task whose file scope introduces a new top-level source directory without the architecture pages", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+    const lints = newDirectoryLints(
+      [{ id: "T1", files: ["src/newmodule/foo.ts"] }],
+      repo,
+    );
+    expect(lints).toHaveLength(1);
+    expect(lints[0]).toContain("T1");
+    expect(lints[0]).toContain("src/newmodule/");
+    expect(lints[0]).toContain("docs/codebase/ARCHITECTURE.md");
+    expect(lints[0]).toContain("docs/codebase/STRUCTURE.md");
+  });
+
+  test("test: a task touching only existing source directories draws no new-directory lint", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+    const lints = newDirectoryLints(
+      [{ id: "T1", files: ["src/existing/foo.ts"] }],
+      repo,
+    );
+    expect(lints).toEqual([]);
+  });
+
+  test("a task introducing a new directory that includes both architecture pages draws no lint", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+    const lints = newDirectoryLints(
+      [{ id: "T1", files: ["src/newmodule/foo.ts", "docs/codebase/ARCHITECTURE.md", "docs/codebase/STRUCTURE.md"] }],
+      repo,
+    );
+    expect(lints).toEqual([]);
+  });
+
+  test("a glob covering the architecture pages satisfies the lint", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+    const lints = newDirectoryLints(
+      [{ id: "T1", files: ["src/newmodule/foo.ts", "docs/codebase/*.md"] }],
+      repo,
+    );
+    expect(lints).toEqual([]);
+  });
+
+  test("both additions are advisory surfaces that change no dispatch gate or task state", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+    const files = ["src/newmodule/foo.ts"];
+    const t = { id: "T1", files };
+    newDirectoryLints([t], repo);
+    expect(t.files).toEqual(["src/newmodule/foo.ts"]);
+    expect(files).toEqual(["src/newmodule/foo.ts"]);
   });
 });

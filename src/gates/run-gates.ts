@@ -101,16 +101,23 @@ export async function runGates(
     // worker attempt — exactly what this fix forbids; only its meta-carries-channel pattern is mirrored.
     // Straight-line single `if` — NO loop/counter/knob: exactly-once by construction (a knob is a
     // fail-closed weakening vector); a second garbage verdict fails the gate closed exactly as today.
+    // T6: exclusion mirrors consult reroute semantics — the flaked channel's whole adapter is banned, not
+    // just its exact channel key, so an outage window cannot re-select the vendor being routed around.
+    // If no other adapter is live, the exclusion degrades to a channel-level reroute within the same
+    // adapter so a single-adapter fleet still retries (matching the daemon's unknown-excludeAdapter
+    // degradation path).
     if (a.meta?.unparseable === true && typeof a.meta.judge === "string") {
       const flakedKey = a.meta.judge;
-      const candidate = ctx.channels
-        .filter((c) => channelKey(c) !== flakedKey)
+      const flakedAdapter = flakedKey.slice(0, flakedKey.indexOf(":"));
+      const pick = (pool: BillingChannel[]) => pool
         // pickReviewer's sort (review.ts:37): TIER_RANK desc, marginalCostRank asc — proven ordering; both
-        // symbols already imported by a sibling gate file. No vendor-diversity axis (the judge isn't review).
+        // symbols already imported by a sibling gate file.
         .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y))[0];
-      // ponytail: same-channel fallback when the fleet has no alternative (D-03). One judge call against a
-      // deterministic garbage source is wasted, bounded; fail-closed unchanged on a second garbage verdict.
-      const retry = candidate ?? { adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model };
+      const crossAdapter = pick(ctx.channels.filter((c) => c.adapter !== flakedAdapter));
+      const sameAdapter = pick(ctx.channels.filter((c) => c.adapter === flakedAdapter && channelKey(c) !== flakedKey));
+      // Prefer a different adapter; if the fleet only has one adapter, retry on a different channel of
+      // that adapter; if the fleet has only one channel, fall back to the original judge config.
+      const retry = crossAdapter ?? sameAdapter ?? { adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model };
       const retryAdapter = getAdapter(retry.adapter, ctx.adapters);
       const retryJvia = ctx.via
         // unconditional -r1 suffix: under keepPanes:forever a same-channel retry cannot collide with the

@@ -140,6 +140,55 @@ function criteriaSymbols(acceptance: Task["acceptance"]): string[] {
   return [...out].sort();
 }
 
+const ARCH_PAGES = ["docs/codebase/ARCHITECTURE.md", "docs/codebase/STRUCTURE.md"];
+
+function topLevelSrcDir(file: string): string | undefined {
+  const parts = file.replace(/^\.\//, "").replace(/\/+$/, "").split("/");
+  if (parts[0] !== "src" || parts.length < 2 || !parts[1]) return undefined;
+  return parts[1];
+}
+
+function existingSrcTopLevels(repoRoot: string): Set<string> {
+  const out = new Set<string>();
+  let entries;
+  try {
+    entries = readdirSync(join(repoRoot, "src"), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    if (e.isDirectory()) out.add(e.name);
+  }
+  return out;
+}
+
+// OBS-108 (v1.67 T5): a task whose files[] creates a new top-level src/ directory must also
+// include the architecture pages the docs-truth suite pins. Advisory only — never blocks compile.
+export function newDirectoryLints(
+  tasks: ReadonlyArray<Pick<Task, "id" | "files">>,
+  repoRoot: string,
+): string[] {
+  const existing = existingSrcTopLevels(repoRoot);
+  const lines: string[] = [];
+  for (const t of tasks) {
+    // OBS-22: scopeGate accepts picomatch globs; advisory warnings must agree.
+    const scoped = picomatch(t.files.map((f) => f.replace(/^\.\//, "")), { dot: true });
+    const newDirs = new Set<string>();
+    for (const f of t.files) {
+      const dir = topLevelSrcDir(f);
+      if (!dir || existing.has(dir)) continue;
+      newDirs.add(`src/${dir}/`);
+    }
+    if (!newDirs.size) continue;
+    const missing = ARCH_PAGES.filter((p) => !scoped(p));
+    if (!missing.length) continue;
+    const dirList = [...newDirs].sort().join(", ");
+    const dirLabel = newDirs.size > 1 ? "directories" : "directory";
+    lines.push(`${t.id}: new top-level source ${dirLabel} ${dirList} must include ${missing.join(" and ")} in files[]`);
+  }
+  return lines;
+}
+
 /**
  * OBS-76 class: sweep src/ for out-of-scope source files that reference a symbol the acceptance
  * criteria name — the v1.52 router.ts omission, named at plan time instead of one judge round in.
@@ -149,12 +198,13 @@ export function sourceScopeLints(
   tasks: ReadonlyArray<Pick<Task, "id" | "files" | "acceptance">>,
   repoRoot: string,
 ): string[] {
+  const newDirLints = newDirectoryLints(tasks, repoRoot);
   const perTask = tasks
     .map((t) => ({ t, needles: criteriaSymbols(t.acceptance) }))
     .filter((x) => x.needles.length);
-  if (!perTask.length) return [];
+  if (!perTask.length) return newDirLints;
   const srcFiles = walkCode(repoRoot, "src");
-  if (!srcFiles.length) return [];
+  if (!srcFiles.length) return newDirLints;
 
   const read = makeReader(repoRoot);
   const lines: string[] = [];
@@ -176,5 +226,5 @@ export function sourceScopeLints(
     const tail = hits.length > MAX_HITS_PER_TASK ? " (capped)" : "";
     lines.push(`${t.id}: criteria implicate out-of-scope source not in files[]: ${listed}${tail}`);
   }
-  return lines;
+  return [...newDirLints, ...lines];
 }

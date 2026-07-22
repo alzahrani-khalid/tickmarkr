@@ -74,10 +74,6 @@ const gateChain = (states: GateState[], unicode: boolean): string =>
     ? GATE_STATE_TOKEN[states[i]!](gateBox(states[i]!, true))
     : `${GATE_KEYS[gate]}${gateBox(states[i]!, false)}`).join(" ");
 
-// plain (uncolored) cell width for column math — ANSI codes have zero display width
-const gateChainWidth = (unicode: boolean): number =>
-  GATE_NAMES.reduce((w, gate) => w + (unicode ? 1 : GATE_KEYS[gate].length + 3) + 1, -1);
-
 const failedGates = (states: GateState[]): string[] => GATE_NAMES.filter((_, i) => states[i] === "fail");
 // plain-text form of the failed-gate words for column math; rendered with a dim dot + red names
 const failedSuffix = (states: GateState[]): string => {
@@ -194,10 +190,13 @@ const renderFrame = (cwd: string): string => {
 
   const cells = g.tasks.map((t) => {
     const st = replayed?.get(t.id) ?? t.status;
-    const label = starved.has(t.id) ? " starved" : activity.cells.has(t.id) ? ` ${activity.cells.get(t.id)!}` : "";
+    const isStarved = starved.has(t.id);
+    const phrase = isStarved ? undefined : activity.cells.get(t.id);
+    const label = isStarved ? " starved" : phrase ? ` ${phrase}` : "";
     const channel = assignments.get(t.id) ?? "-";
-    const assignCol = contexts.has(t.id) ? `${channel}${divider}ctx ${contexts.get(t.id)}` : channel;
-    return { t, st, label, assignCol, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
+    const ctx = contexts.get(t.id);
+    const assignCol = ctx !== undefined ? `${channel}${divider}ctx ${ctx}` : channel;
+    return { t, st, label, assignCol, isStarved, phrase, channel, ctx, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
   });
 
   if (!unicode) {
@@ -242,27 +241,40 @@ const renderFrame = (cwd: string): string => {
   const nowLine = activity.now ? [legend(`   now: ${activity.now}`)] : [];
   const gatesLegend = legend(`   gates: ${GATE_NAMES.join(" · ")}`);
 
+  // Two-line card per task (operator request, v1.67): line 1 carries identity + verdict — glyph,
+  // id, goal at full width, and only SHORT status words. Line 2 carries the machinery, dim and
+  // aligned under the goal: gate chain, live activity phrase (or channel), ctx. Long channel names
+  // and activity phrases live on line 2 only, so they can never squeeze the goal or wrap line 1.
   const taskVerdict = (st: TaskStatus): Verdict =>
     st === "done" ? "pass" : st === "failed" ? "fail" : st === "human" ? "warn" : "neutral";
   const idW = Math.max(...cells.map((c) => c.t.id.length), 2);
-  const stW = Math.max(...cells.map((c) => (String(c.st) + c.label + failedSuffix(c.states) + humanGateSuffix(c.t, c.st, c.states)).length));
-  const chainW = gateChainWidth(true);
-  const assignW = Math.max(...cells.map((c) => c.assignCol.length));
-  const goalW = Math.max(8, width - (5 + idW) - 2 - chainW - 2 - stW - 2 - assignW);
-  const rows = cells.map(({ t, st, label, assignCol, states }) => {
-    const goal = shortGoal(t.goal, goalW).padEnd(goalW);
+  // plain-text status suffixes for width math only — starved / failed gate names / approval hint
+  const suffixPlain = (c: (typeof cells)[number]): string =>
+    (c.isStarved ? " · starved" : "") + failedSuffix(c.states) + humanGateSuffix(c.t, c.st, c.states);
+  const stW = Math.max(...cells.map((c) => String(c.st).length + suffixPlain(c).length));
+  const avail = Math.max(8, width - (5 + idW) - 2 - stW);
+  const goals = cells.map((c) => shortGoal(c.t.goal, avail));
+  const goalW = Math.max(8, ...goals.map((s) => s.length));
+  const indent = " ".repeat(idW + 5); // line 2 starts under the goal column
+  const rows = cells.map(({ t, st, states, isStarved, phrase, channel, ctx }, i) => {
     const stWord = st === "done" ? ok(String(st)) : st === "failed" ? fail(String(st)) : st === "human" ? warn(String(st)) : String(st);
     // a fail names its gate in words right here — the one moment gate identity is needed on a row
     const f = failedGates(states);
     const human = humanGateSuffix(t, st, states);
     const statusCell = stWord +
-      (label ? (label === " starved" ? fail(label) : dim(label)) : "") +
-      (f.length ? dim(" · ") + fail(f.join(", ")) : "") +
-      (human ? dim(" · ") + warn("awaiting approval") : "") +
-      " ".repeat(stW - (String(st) + label + failedSuffix(states) + human).length);
-    return `  ${statusRow(taskVerdict(st), `${t.id.padEnd(idW)} ${goal}  ${gateChain(states, true)}  ${statusCell}  ${dim(assignCol)}`)}`;
-  });
-  return [header, hr, gatesLegend, ...rows, ...nowLine].join("\n");
+      (isStarved ? dot + fail("starved") : "") +
+      (f.length ? dot + fail(f.join(", ")) : "") +
+      (human ? dot + warn("awaiting approval") : "");
+    const line1 = `  ${statusRow(taskVerdict(st), `${t.id.padEnd(idW)} ${goals[i]!.padEnd(goalW)}  ${statusCell}`)}`;
+    // activity already names its channel for in-flight attempts — never repeat it
+    const detail = [
+      ...(phrase ? [phrase, ...(phrase.includes(channel) || channel === "-" ? [] : [channel])] : [channel]),
+      ...(ctx !== undefined ? [`ctx ${ctx}`] : []),
+    ].join(" · ");
+    return [line1, `${indent}${gateChain(states, true)}  ${dim(detail)}`, ""];
+  }).flat();
+  if (!nowLine.length) rows.pop(); // cards end blank-separated; drop the dangling one
+  return [header, hr, gatesLegend, "", ...rows, ...nowLine].join("\n");
 };
 
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {

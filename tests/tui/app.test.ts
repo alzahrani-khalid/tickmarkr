@@ -105,4 +105,58 @@ describe("studio app", () => {
     expect(app.viewLabels).toEqual(["Fleet", "Routing", "Preview", "Profile"]);
     app.stop();
   });
+
+  test("the status bar shows the staged-change count and clears when the buffer is reverted", async () => {
+    const { input, output } = makeStreams();
+    const app = new StudioApp({ input, output });
+    app.start();
+    await wait();
+
+    expect(app.lines.some((l) => l.includes("no staged changes"))).toBe(true);
+
+    app.stageEdit((buffer) => {
+      buffer.denyAdapters.push("grok");
+      buffer.denyAdapters.sort();
+    });
+    await wait();
+    expect(app.lines.some((l) => l.includes("1 staged change"))).toBe(true);
+    expect(app.lines.some((l) => l.includes("no staged changes"))).toBe(false);
+
+    input.write("u");
+    await wait();
+    expect(app.lines.some((l) => l.includes("no staged changes"))).toBe(true);
+    expect(app.lines.some((l) => l.includes("1 staged change"))).toBe(false);
+
+    app.stop();
+  });
+
+  test("quitting with staged changes asks for confirmation and a clean quit exits immediately", async () => {
+    const clean = makeStreams();
+    const cleanApp = new StudioApp({ input: clean.input, output: clean.output });
+    cleanApp.start();
+    await wait();
+    clean.input.write("q");
+    await wait();
+    await expect(cleanApp.exited).resolves.toBeUndefined();
+
+    const dirty = makeStreams();
+    const dirtyApp = new StudioApp({ input: dirty.input, output: dirty.output });
+    dirtyApp.start();
+    await wait();
+
+    dirtyApp.stageEdit((buffer) => {
+      buffer.denyAdapters.push("grok");
+      buffer.denyAdapters.sort();
+    });
+    await wait();
+    expect(dirtyApp.lines.some((l) => l.includes("1 staged change"))).toBe(true);
+
+    dirty.input.write("q");
+    await wait();
+    expect(dirtyApp.lines.some((l) => l.includes("Quit with 1 staged change"))).toBe(true);
+
+    dirty.input.write("y");
+    await wait();
+    await expect(dirtyApp.exited).resolves.toBeUndefined();
+  });
 });

@@ -1,6 +1,13 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
-import { createFleetView, foldChannelHealth, type FleetViewData } from "../../src/tui/views/fleet-view.js";
+import {
+  createFleetView,
+  foldChannelHealth,
+  stagedConflicts,
+  type FleetViewData,
+} from "../../src/tui/views/fleet-view.js";
+import { FleetStaging } from "../../src/tui/staging.js";
+import type { FleetEditable } from "../../src/config/config.js";
 
 // Every fixture in this file is built inline in memory — no tmpdir, no repo, no files. That is
 // the point: the view's render path consumes injected data only.
@@ -190,5 +197,155 @@ describe("fleet view — the harness roster", () => {
     // the module's only telemetry source is the journal's TelemetryRow type — no state-file reads
     const src = VIEW_SRC();
     expect(src).toMatch(/import\s+type\s*\{[^}]*TelemetryRow[^}]*\}\s*from\s*["'][^"']*journal\.js["']/);
+  });
+});
+
+// v1.67 T3: the write path. The roster stages deny/allow toggles and tier overrides into the
+// shared FleetStaging buffer (never disk), renders the buffer's current state, and marks rows
+// whose staged state differs from saved.
+describe("fleet view — staged roster edits", () => {
+  /** A staging model whose loaded state mirrors the injected fixture's saved state. */
+  function stagedFixture(): { data: FleetViewData; staging: FleetStaging } {
+    const data = fixture();
+    const tiers: FleetEditable["tiers"] = {};
+    for (const a of data.adapters) {
+      tiers[a.adapter] = {};
+      for (const m of a.models) tiers[a.adapter][m.model] = { tier: m.tier };
+    }
+    const staging = new FleetStaging({
+      denyAdapters: [...data.denyAdapters],
+      denyModels: [...data.denyModels],
+      tiers,
+      map: {},
+      floors: {},
+    });
+    return { data, staging };
+  }
+
+  test("toggling deny on a channel stages the deny and renders the row as staged", () => {
+    const { data, staging } = stagedFixture();
+    const view = createFleetView(data, staging);
+
+    view.toggleDenyChannel("claude-code:sonnet");
+
+    // the edit landed in the staging buffer — the loaded (saved) state is untouched
+    expect(staging.current.denyModels).toContain("claude-code:sonnet");
+    expect(staging.loadedState.denyModels).not.toContain("claude-code:sonnet");
+    expect(staging.isDirty).toBe(true);
+
+    // the row renders the staged deny AND is visibly distinct from saved state
+    const row = view.render(PROPS).find((l) => l.includes("sonnet"));
+    expect(row).toBeDefined();
+    expect(row!).toContain("✗ denied");
+    expect(row!).toContain("● staged");
+    // an untouched row carries no staged marker
+    const fable = view.render(PROPS).find((l) => l.includes("fable"));
+    expect(fable!).not.toContain("● staged");
+
+    // toggling back stages the allow: identical to saved ⇒ the row is no longer staged
+    view.toggleDenyChannel("claude-code:sonnet");
+    expect(staging.current.denyModels).not.toContain("claude-code:sonnet");
+    const unstage = view.render(PROPS).find((l) => l.includes("sonnet"));
+    expect(unstage!).not.toContain("✗ denied");
+    expect(unstage!).not.toContain("● staged");
+
+    // the allow direction stages too: lifting pi's saved deny marks that row
+    view.toggleDenyChannel("pi:zai/glm-5.2");
+    expect(staging.current.denyModels).not.toContain("pi:zai/glm-5.2");
+    const lifted = view.render(PROPS).find((l) => l.includes("zai/glm-5.2"));
+    expect(lifted!).not.toContain("✗ denied");
+    expect(lifted!).toContain("● staged");
+  });
+
+  test("a tier override stages into the buffer and renders marked", () => {
+    const { data, staging } = stagedFixture();
+    const view = createFleetView(data, staging);
+
+    view.stageTierOverride("claude-code:sonnet", "frontier");
+
+    // staged into the buffer; the loaded state still says mid
+    expect(staging.current.tiers["claude-code"]?.["sonnet"]?.tier).toBe("frontier");
+    expect(staging.loadedState.tiers["claude-code"]?.["sonnet"]?.tier).toBe("mid");
+
+    // the badge renders the staged tier, marked as an unsaved edit
+    const row = view.render(PROPS).find((l) => l.includes("sonnet"));
+    expect(row!).toContain("[frontier]");
+    expect(row!).not.toContain("[mid]");
+    expect(row!).toContain("● staged");
+    // untouched channels keep their saved tier with no marker
+    const zai = view.render(PROPS).find((l) => l.includes("zai/glm-5.2"));
+    expect(zai!).toContain("[mid]");
+    expect(zai!).not.toContain("● staged");
+  });
+
+  test("a staged deny conflicting with a staged pin surfaces a conflict marker", () => {
+    const { data, staging } = stagedFixture();
+    const view = createFleetView(data, staging);
+
+    // the routing view stages a pin on claude-code:fable for implement (same shared buffer)
+    staging.apply((buffer) => {
+      buffer.map.implement = { pin: { via: "claude-code", model: "fable" } };
+    });
+    // no conflict while the channel stays allowed
+    expect(view.render(PROPS).find((l) => l.includes("fable"))!).not.toContain("conflict");
+
+    // the fleet view stages a deny on that very channel — the staged pin now routes into a deny
+    view.toggleDenyChannel("claude-code:fable");
+
+    const row = view.render(PROPS).find((l) => l.includes("fable"))!;
+    expect(row).toContain("✗ denied");
+    expect(row).toContain("● staged");
+    expect(row).toContain("! conflict: pinned for implement");
+  });
+
+  test("reverting the buffer restores the roster rendering to saved state", () => {
+    const { data, staging } = stagedFixture();
+    const view = createFleetView(data, staging);
+    const savedRender = view.render(PROPS);
+
+    view.toggleDenyChannel("claude-code:sonnet");
+    view.stageTierOverride("claude-code:fable", "cheap");
+    expect(view.render(PROPS).join("\n")).toContain("● staged");
+    expect(view.render(PROPS)).not.toEqual(savedRender);
+
+    staging.revert();
+
+    expect(staging.isDirty).toBe(false);
+    const restored = view.render(PROPS);
+    expect(restored).toEqual(savedRender);
+    expect(restored.join("\n")).not.toContain("● staged");
+  });
+
+  test("conflict detection reads both views' staged state from the shared staging model", () => {
+    const { data, staging } = stagedFixture();
+    // the fleet view attaches to the SAME staging model the routing view stages pins into
+    const view = createFleetView(data, staging);
+
+    // the saved state holds NEITHER side: no pin anywhere, and fable is not denied
+    expect(staging.loadedState.map).toEqual({});
+    expect(staging.loadedState.denyModels).not.toContain("claude-code:fable");
+    expect(stagedConflicts(staging)).toEqual([]);
+
+    // the fleet view stages its edit first, through the view's own seam: deny the channel —
+    // with no staged pin in the shared model yet, detection still reads no conflict
+    view.toggleDenyChannel("claude-code:fable");
+    expect(staging.current.denyModels).toContain("claude-code:fable");
+    expect(stagedConflicts(staging)).toEqual([]);
+
+    // the routing view stages its edit into the same shared buffer: pin implement to that channel
+    staging.apply((buffer) => {
+      buffer.map.implement = { pin: { via: "claude-code", model: "fable" } };
+    });
+
+    // NOW the conflict reads — detection saw BOTH views' staged state in the one shared staging
+    // model: the fleet side's staged deny and the routing side's staged pin
+    expect(stagedConflicts(staging)).toEqual([{ channelKey: "claude-code:fable", shapes: ["implement"] }]);
+    expect(view.render(PROPS).find((l) => l.includes("fable"))!).toContain("! conflict: pinned for implement");
+
+    // a staged pin on an allowed channel adds no conflict — only deny ∩ pin counts
+    staging.apply((buffer) => {
+      buffer.map.tests = { pin: { via: "claude-code", model: "sonnet" } };
+    });
+    expect(stagedConflicts(staging)).toEqual([{ channelKey: "claude-code:fable", shapes: ["implement"] }]);
   });
 });

@@ -42,6 +42,13 @@ const seed = (repo: string, events: JournalEvent[], graph = GRAPH) => {
 };
 
 const row = (out: string, taskId: string) => out.split("\n").find((line) => new RegExp(`\\b${taskId}\\b`).test(line))!;
+// v1.67: the TTY frame renders each task as a two-line card — line 1 identity+verdict, line 2
+// gate chain + machinery. card() joins both lines; row() still fences what belongs on line 1.
+const card = (out: string, taskId: string) => {
+  const lines = out.split("\n");
+  const i = lines.findIndex((line) => new RegExp(`\\b${taskId}\\b`).test(line));
+  return `${lines[i]}\n${lines[i + 1] ?? ""}`;
+};
 // the v1.34 ledger frame colorizes chips and task boxes — strip ANSI to fence glyphs/order, not styling
 const strip = (s: string) => s.replace(/\x1b\[[\d;]*m/g, "");
 const ts = "2026-07-14T08:00:00.000Z";
@@ -85,10 +92,10 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T2"))).toMatch(/✓ ✗ ○ ○ ○ - -/);
+      expect(strip(card(out, "T2"))).toMatch(/✓ ✗ ○ ○ ○ - -/);
       expect(strip(row(out, "T2"))).toContain("pending"); // data plain — no off-palette status color
-      expect(row(out, "T2")).not.toContain("\x1b[36m");
-      expect(row(out, "T2").match(/fake:fake-2/g)).toHaveLength(1);
+      expect(card(out, "T2")).not.toContain("\x1b[36m");
+      expect(card(out, "T2").match(/fake:fake-2/g)).toHaveLength(1); // channel once per card, never repeated
     });
   });
 
@@ -110,9 +117,11 @@ describe("status checklist rendering", () => {
         expect(out).toContain("1/3 done");
         expect(strip(row(out, "T1"))).toContain("✓ T1 Finish report");
         expect(strip(row(out, "T2"))).toContain("- T2 Run mixed gates");
-        expect(strip(row(out, "T2"))).toContain("attempt 1 in flight on fake:fake-2 since 08:00:00");
+        // machinery lives on the card's second line, never crowding the goal on line 1
+        expect(strip(card(out, "T2"))).toContain("attempt 1 in flight on fake:fake-2 since 08:00:00");
+        expect(strip(row(out, "T2"))).not.toContain("attempt 1 in flight");
         expect(strip(row(out, "T3"))).toContain("- T3 Queue the undispatched follow-up");
-        expect(row(out, "T3")).toContain("dep-waiting on T2"); // the unmet dep is named (OBS-104)
+        expect(card(out, "T3")).toContain("dep-waiting on T2"); // the unmet dep is named (OBS-104)
       });
     } finally {
       if (columns) Object.defineProperty(process.stdout, "columns", columns);
@@ -160,9 +169,9 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T1"))).toContain("✓ ✓ ○ ○ ○ - -");
-      expect(strip(row(out, "T2"))).toContain("✓ ✗ ○ ○ ○ - -");
-      expect(strip(row(out, "T3"))).toContain("○ ○ ○ ○ ○ - -");
+      expect(strip(card(out, "T1"))).toContain("✓ ✓ ○ ○ ○ - -");
+      expect(strip(card(out, "T2"))).toContain("✓ ✗ ○ ○ ○ - -");
+      expect(strip(card(out, "T3"))).toContain("○ ○ ○ ○ ○ - -");
       // no letter+glyph (or letter+dash) chip survives anywhere in the frame
       expect(strip(out)).not.toMatch(/[A-Z][✓✗○]|\b[A-Z]-/);
     });
@@ -203,8 +212,9 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      // v1.65 T4: the activity cell names the park kind between the status word and the approval hint
-      expect(strip(row(out, "T1"))).toContain("human parked (human-gate) · awaiting approval");
+      // v1.67 cards: the verdict line carries the approval hint; the park kind is line-2 machinery
+      expect(strip(row(out, "T1"))).toContain("human · awaiting approval");
+      expect(strip(card(out, "T1"))).toContain("parked (human-gate)");
     });
   });
 
@@ -217,7 +227,7 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       const out = await status([], repo);
       expect(strip(out)).toContain("now: gate-result — T2 — build passed");
-      expect(strip(row(out, "T2"))).toContain("gate test running"); // and the watched task names its running gate
+      expect(strip(card(out, "T2"))).toContain("gate test running"); // and the watched task names its running gate
     });
   });
 

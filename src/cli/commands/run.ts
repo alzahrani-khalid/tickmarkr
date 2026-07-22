@@ -3,7 +3,9 @@ import { allAdapters, discoverChannels, probeAll, readDoctor } from "../../adapt
 import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
 import { pickDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
+import { type TaskStatus } from "../../graph/schema.js";
 import { type RunSummary, formatSummary, resolveRunMode, runDaemon } from "../../run/daemon.js";
+import { isRunLockLive } from "../../run/lock.js";
 import { route, type ExploreContext, NO_EXPLORE_ENV } from "../../route/router.js";
 import { formatJournalNarration, loadRoutingProfile, type JournalEvent } from "../../run/journal.js";
 import { ttyVisual } from "../../adapters/model-lints.js";
@@ -68,6 +70,16 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     // Loud, never silent: live intent (the flag) may override compiled intent (the spec) — strict refuses.
     if (values["route-strict"]) throw new Error(`--route-strict: refusing to dispatch — ${conflict}`);
     console.warn(`tickmarkr: !! ${conflict}`);
+  }
+  // OBS-107 (v1.67 T5): advisory only — a stale compiled graph with prior terminal statuses and no
+  // live daemon will otherwise finish with zero work and confuse the operator. The recompile remedy
+  // is named; dispatch proceeds unchanged.
+  const TERMINAL_STATUSES: TaskStatus[] = ["done", "failed", "human"];
+  if (graph.tasks.some((t) => TERMINAL_STATUSES.includes(t.status)) && !isRunLockLive(cwd)) {
+    console.warn(
+      "tickmarkr: compiled graph carries terminal statuses from a prior run and no daemon is active — "
+      + "run `tickmarkr compile <src>` to recompile; proceeding with stale graph",
+    );
   }
   const noExplore = !!values["no-explore"];
   const exploreCtx: ExploreContext | undefined = noExplore ? { noExplore } : undefined;
