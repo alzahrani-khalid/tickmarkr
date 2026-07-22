@@ -7,6 +7,13 @@ import { ROUTING_ENV_SEAMS } from "../route/router.js";
 
 export { ROUTING_ENV_SEAMS };
 
+// OBS-110: gate/baseline/tip-verify children are vitest suites; without a fork cap, concurrent
+// full-suite gate runs fork a worker-per-core pool per worktree and saturate the operator box.
+// Default to a modest cap through the environment so vitest honors it natively; never pass it
+// as argv (OBS-55) so child test oracles stay intact. The operator's own export wins.
+export const FORK_CAP_ENV = "VITEST_MAX_FORKS";
+export const DEFAULT_FORK_CAP = "6";
+
 export interface ShResult { code: number; stdout: string; stderr: string; timedOut?: boolean }
 
 // stdin "ignore": same class as HARD-05 / SubprocessDriver — never leave an open pipe a child can block on
@@ -18,6 +25,8 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   // children are hermetic by construction; the daemon's own process.env stays unchanged.
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
+  // OBS-110: apply the default fork cap only when the operator has not already set one.
+  if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = DEFAULT_FORK_CAP;
   return new Promise((resolve) => {
     // detached: bash gets its own process group so a timeout can kill the whole tree —
     // SIGKILLing bash alone orphans grandchildren (codex/pi) that hold the stdio pipes

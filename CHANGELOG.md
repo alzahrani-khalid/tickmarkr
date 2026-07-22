@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.68 — runs cockpit
+
+This runs-cockpit release ships the fifth Fleet Studio tab with a journal timeline and run-level now-line, per-task gate ladder rendered through the status glyph vocabulary, attempt history naming typed failure reasons, a consult dossier viewer listing verdicts with persisted prompt content, a live per-channel cost ticker and tip-verify state line reusing the cost-signal formatter, human-gate approve routed through the existing approve path, interactive-harvest settle-retry at the parse boundary (OBS-111), and a default fork-cap for gate and verify children (OBS-110).
+
 ## v1.67 — fleet studio write path
 
 This fleet-studio-write release adds staged-changes editing for fleet customization (pins, floors, prefer chain, allow/deny toggles, mode selection), a YAML diff modal that shows the overlay delta before atomic overlay write, live-run reload guards that surface "changes apply on next run" for active executions, and a repo↔global target toggle to draft changes in global config or workspace scope.

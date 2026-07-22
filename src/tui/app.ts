@@ -5,6 +5,7 @@ import { createFleetView } from "./views/fleet-view.js";
 import { createPreviewView } from "./views/preview-view.js";
 import { createProfileView } from "./views/profile-view.js";
 import { createRoutingView } from "./views/routing-view.js";
+import { createRunsView } from "./views/runs-view.js";
 import { renderDiffModal } from "./views/diff-modal.js";
 import { buildSaveProposal, confirmSave, type SaveProposal, type SaveTarget } from "./save.js";
 import { FleetStaging, type FleetEdit } from "./staging.js";
@@ -13,6 +14,8 @@ export type View = {
   id: string;
   label: string;
   render(props: { cols: number; rows: number }): string[];
+  /** Optional per-view key handler (e.g. up/down cursor movement). */
+  key?(name: string): void;
 };
 
 export type StudioOptions = {
@@ -65,7 +68,7 @@ export class StudioApp {
     this.repoRoot = opts.repoRoot ?? process.cwd();
     this.globalDir = opts.globalDir;
     this.staging = new FleetStaging(opts.loaded ?? emptyFleetEditable());
-    this.views = [createFleetView(), createRoutingView(), createPreviewView(), createProfileView()];
+    this.views = [createFleetView(), createRoutingView(), createPreviewView(), createProfileView(), createRunsView()];
     this.exited = new Promise((resolve) => {
       this.resolveExit = resolve;
     });
@@ -117,6 +120,13 @@ export class StudioApp {
       const idx = i - 1;
       this.engine.key(String(i), () => {
         if (!this.isModalOpen) this.setView(idx);
+      });
+    }
+
+    // per-view navigation
+    for (const name of ["up", "down"]) {
+      this.engine.key(name, () => {
+        if (!this.isModalOpen) this.forwardViewKey(name);
       });
     }
 
@@ -280,6 +290,11 @@ export class StudioApp {
     this.paint();
   }
 
+  private forwardViewKey(name: string): void {
+    this.views[this.active]?.key?.(name);
+    this.paint();
+  }
+
   private showNotice(): void {
     this.notice = READONLY_NOTICE;
     this.paint();
@@ -339,7 +354,7 @@ export class StudioApp {
   private renderHelp(): string[] {
     return [
       "Key bindings",
-      "1-4      switch view",
+      "1-5      switch view",
       "tab      cycle views",
       "?        show this help",
       "esc / q  quit",

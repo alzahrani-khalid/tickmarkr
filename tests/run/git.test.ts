@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, createWorktree, gitHead, linkNodeModules, removeWorktree, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { DEFAULT_FORK_CAP, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, createWorktree, gitHead, linkNodeModules, removeWorktree, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -87,6 +87,50 @@ describe("routing env scrub at the spawn seam (OBS-74)", () => {
       expect(r.stdout).toBe("unset");
     } finally {
       delete process.env[QUALITY_ENV];
+    }
+  });
+});
+
+describe("fork-cap default at the spawn seam (OBS-110)", () => {
+  const resetForkCap = () => {
+    const before = process.env[FORK_CAP_ENV];
+    delete process.env[FORK_CAP_ENV];
+    return before;
+  };
+  const restoreForkCap = (before: string | undefined) => {
+    if (before === undefined) delete process.env[FORK_CAP_ENV];
+    else process.env[FORK_CAP_ENV] = before;
+  };
+
+  test("a child spawned with no fork-cap variable in the parent environment receives the default value", async () => {
+    const before = resetForkCap();
+    try {
+      const r = await sh(`printf '%s' "\${${FORK_CAP_ENV}-unset}"`, "/tmp");
+      expect(r.stdout).toBe(DEFAULT_FORK_CAP);
+    } finally {
+      restoreForkCap(before);
+    }
+  });
+
+  test("a child spawned with the operator's own fork-cap variable already set in the parent environment keeps that value unchanged", async () => {
+    const before = process.env[FORK_CAP_ENV];
+    process.env[FORK_CAP_ENV] = "12";
+    try {
+      const r = await sh(`printf '%s' "\${${FORK_CAP_ENV}-unset}"`, "/tmp");
+      expect(r.stdout).toBe("12");
+    } finally {
+      restoreForkCap(before);
+    }
+  });
+
+  test("a plain git plumbing command spawned through the same helper still succeeds with the default variable present", async () => {
+    const before = resetForkCap();
+    try {
+      const repo = makeRepo({ "a.txt": "hello\n" });
+      const head = await gitHead(repo);
+      expect(head).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      restoreForkCap(before);
     }
   });
 });

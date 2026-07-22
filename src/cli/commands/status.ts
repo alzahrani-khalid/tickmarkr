@@ -17,7 +17,7 @@ export type StatusOpts = {
   sleep?: (ms: number) => Promise<void>;
 };
 
-const GATE_KEYS = { build: "B", test: "T", lint: "L", evidence: "E", scope: "S", acceptance: "A", review: "R" } as const;
+export const GATE_KEYS = { build: "B", test: "T", lint: "L", evidence: "E", scope: "S", acceptance: "A", review: "R" } as const;
 
 const attemptStartIdx = (events: JournalEvent[], taskId: string): number => {
   let idx = -1;
@@ -31,13 +31,13 @@ const attemptStartIdx = (events: JournalEvent[], taskId: string): number => {
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
 
 // non-TTY machine surface only — the TTY frame draws task verdicts via statusRow
-const taskBox = (status: TaskStatus): string => {
+export const taskBox = (status: TaskStatus): string => {
   if (status === "done") return "[x]";
   if (status === "failed" || status === "human") return "[!]";
   return "[ ]";
 };
 
-const gateBox = (state: "open" | "pass" | "fail" | "skip", unicode: boolean): string => {
+export const gateBox = (state: "open" | "pass" | "fail" | "skip", unicode: boolean): string => {
   if (unicode) {
     // shared glyph vocabulary: pass/fail verdicts, dash for skip, dim circle for not-yet-run
     return state === "pass" ? GLYPHS.pass : state === "fail" ? GLYPHS.fail : state === "skip" ? GLYPHS.neutral : GLYPHS.toggleInactive;
@@ -45,12 +45,12 @@ const gateBox = (state: "open" | "pass" | "fail" | "skip", unicode: boolean): st
   return state === "pass" ? "[x]" : state === "fail" ? "[!]" : state === "skip" ? "." : "[ ]";
 };
 
-type GateState = "open" | "pass" | "fail" | "skip";
+export type GateState = "open" | "pass" | "fail" | "skip";
 
-const defaultGateStates = (task: Task): GateState[] =>
+export const defaultGateStates = (task: Task): GateState[] =>
   GATE_NAMES.map((gate) => task.gates.includes(gate) ? "open" : "skip");
 
-const gateStates = (task: Task, events: JournalEvent[]): GateState[] => {
+export const gateStates = (task: Task, events: JournalEvent[]): GateState[] => {
   const outcomes = new Map<string, "pass" | "fail" | "skip">();
   const start = attemptStartIdx(events, task.id);
   if (start >= 0) {
@@ -69,12 +69,12 @@ const GATE_STATE_TOKEN: Record<GateState, (s: string) => string> = { pass: ok, f
 
 // TTY cells are bare glyphs in fixed GATE_NAMES order — gate identity lives once in the frame
 // legend, and in words on a failing row; non-TTY keeps the letter+box chips (byte-pinned surface)
-const gateChain = (states: GateState[], unicode: boolean): string =>
+export const gateChain = (states: GateState[], unicode: boolean): string =>
   GATE_NAMES.map((gate, i) => unicode
     ? GATE_STATE_TOKEN[states[i]!](gateBox(states[i]!, true))
     : `${GATE_KEYS[gate]}${gateBox(states[i]!, false)}`).join(" ");
 
-const failedGates = (states: GateState[]): string[] => GATE_NAMES.filter((_, i) => states[i] === "fail");
+export const failedGates = (states: GateState[]): string[] => GATE_NAMES.filter((_, i) => states[i] === "fail");
 // plain-text form of the failed-gate words for column math; rendered with a dim dot + red names
 const failedSuffix = (states: GateState[]): string => {
   const f = failedGates(states);
@@ -85,10 +85,10 @@ const failedSuffix = (states: GateState[]): string => {
 // awaited approval is named from task state alone — never from gate results. Failed gates win the
 // cell when present: a post-approval park is not awaiting the designed gate. Plain text for column
 // math; rendered with a dim dot + warn words. TTY-only — the non-TTY surface stays byte-pinned.
-const humanGateSuffix = (t: Task, st: TaskStatus, states: GateState[]): string =>
+export const humanGateSuffix = (t: Task, st: TaskStatus, states: GateState[]): string =>
   st === "human" && t.humanGate && failedGates(states).length === 0 ? " · awaiting approval" : "";
 
-const shortGoal = (goal: string, max: number): string => {
+export const shortGoal = (goal: string, max: number): string => {
   const clause = goal.split(/[,;.?!]/, 1)[0]!.trim();
   if (clause.length <= max) return clause;
   if (max <= 3) return clause.slice(0, Math.max(0, max));

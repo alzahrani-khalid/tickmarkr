@@ -4,9 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { classifyDeadChannel, trailerPattern, writePrompt } from "../adapters/prompt.js";
+import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, discoverChannels, getAdapter, probeAll, readDoctor } from "../adapters/registry.js";
-import { type Assignment, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter } from "../adapters/types.js";
+import { type Assignment, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import {
   globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
@@ -718,6 +718,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let output: string;
       let exitCode: number | null;
       let timedOut = false;
+      let settleParsed: WorkerResult | undefined;
       if (interactive) {
         // v1.2 interactive: the TUI doesn't exit on completion — the trailer is the finish line.
         // The exit wrapper still fires if the TUI dies (crash/quit): fast-fail instead of burning the timeout.
@@ -805,6 +806,28 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           await driver.waitAgentStatus(slot, "idle", 5_000); // settle, then re-harvest the final render
           output = await driver.read(slot, 1000);
         }
+        // T5 / OBS-111: an interactive harvest can race the TUI's final paint. When the pane
+        // contains the nonce token but the JSON hasn't balanced yet, settle and re-read through
+        // the existing pane-read seam once or twice before recording a malformed-trailer cause.
+        if (interactive) {
+          const stallWindowMs = taskTimeoutMinutes * 60_000;
+          const settleDeadline = attemptStart + stallWindowMs;
+          const settleDelayMs = 1_000;
+          const maxSettleRetries = 2;
+          let settleTries = 0;
+          settleParsed = adapter.parse(output, nonce);
+          while (settleParsed.summary === UNPARSEABLE_TRAILER_SUMMARY && settleTries < maxSettleRetries) {
+            const remaining = settleDeadline - Date.now();
+            if (remaining <= 0) break;
+            await new Promise((r) => setTimeout(r, Math.min(settleDelayMs, remaining)));
+            output = await driver.read(slot, 1000);
+            settleParsed = adapter.parse(output, nonce);
+            settleTries++;
+          }
+          if (settleParsed.summary !== UNPARSEABLE_TRAILER_SUMMARY) {
+            finished = settleParsed.summary !== NO_TRAILER_SUMMARY;
+          }
+        }
       } else {
         await driver.run(slot, paneDispatchCommand(dispatchScript));
         // OBS-54: headless workers have the same output-inactivity budget as visible panes.
@@ -851,7 +874,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // an absent record leaves `tokens`/`metered` untouched (never a materialized zero).
       const attemptUsage = adapter.collectUsage?.(wt, attemptStart);
       if (attemptUsage) { tokens = addUsage(tokens, attemptUsage); metered++; }
-      const result = adapter.parse(output, nonce);
+      const result = settleParsed ?? adapter.parse(output, nonce);
       const cause = classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut });
       journal.append("worker-result", t.id, {
         ok: result.ok, summary: result.summary, deviations: result.deviations, finished, exitCode,

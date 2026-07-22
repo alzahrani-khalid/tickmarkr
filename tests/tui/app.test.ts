@@ -20,7 +20,7 @@ function makeStreams() {
 const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
 describe("studio app", () => {
-  test("the studio opens on the fleet view with a tab bar naming all four views", async () => {
+  test("the tab bar names five views including Runs and a number key switches the active view to it", async () => {
     const { input, output } = makeStreams();
     const app = new StudioApp({ input, output });
     app.start();
@@ -31,6 +31,27 @@ describe("studio app", () => {
     expect(lines[0]).toContain("Routing");
     expect(lines[0]).toContain("Preview");
     expect(lines[0]).toContain("Profile");
+    expect(lines[0]).toContain("Runs");
+
+    input.write("5");
+    await wait();
+    expect(app.lines.some((l) => l.includes("no run loaded"))).toBe(true);
+
+    app.stop();
+  });
+
+  test("the studio opens on the fleet view with a tab bar naming all five views", async () => {
+    const { input, output } = makeStreams();
+    const app = new StudioApp({ input, output });
+    app.start();
+    await wait();
+
+    const lines = app.lines;
+    expect(lines[0]).toContain("Fleet");
+    expect(lines[0]).toContain("Routing");
+    expect(lines[0]).toContain("Preview");
+    expect(lines[0]).toContain("Profile");
+    expect(lines[0]).toContain("Runs");
     expect(lines.some((l) => l.includes("Fleet view"))).toBe(true);
 
     app.stop();
@@ -71,7 +92,7 @@ describe("studio app", () => {
     await wait();
     const helpLines = app.lines;
     expect(helpLines.some((l) => l.includes("Key bindings"))).toBe(true);
-    expect(helpLines.some((l) => l.includes("1-4"))).toBe(true);
+    expect(helpLines.some((l) => l.includes("1-5"))).toBe(true);
     expect(helpLines.some((l) => l.includes("tab"))).toBe(true);
     expect(helpLines.some((l) => l.includes("esc"))).toBe(true);
 
@@ -102,7 +123,7 @@ describe("studio app", () => {
     const { input, output } = makeStreams();
     const app = new StudioApp({ input, output });
     app.start();
-    expect(app.viewLabels).toEqual(["Fleet", "Routing", "Preview", "Profile"]);
+    expect(app.viewLabels).toEqual(["Fleet", "Routing", "Preview", "Profile", "Runs"]);
     app.stop();
   });
 

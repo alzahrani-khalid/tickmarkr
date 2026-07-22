@@ -1,11 +1,15 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { dirname } from "node:path";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { shq, type Assignment, type Invocation } from "../../src/adapters/types.js";
+import type { Task } from "../../src/graph/schema.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
+import { NO_TRAILER_SUMMARY, UNPARSEABLE_TRAILER_SUMMARY } from "../../src/adapters/prompt.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 
@@ -26,6 +30,48 @@ function idriver(overrides: Record<string, unknown> = {}): ExecutorDriver {
     status: async () => "unknown",
     ...overrides,
   } as ExecutorDriver;
+}
+
+// T5 / OBS-111: deterministic pane-read staging for parse-boundary tests. The real subprocess still
+// emits a well-formed trailer on the waitOutput seam; these staged strings simulate what driver.read
+// returns from the pane, including the race where the token is present but the JSON is not yet balanced.
+function nonceFor(repo: string, runId: string, taskId: string): string {
+  const pf = join(repo, ".tickmarkr", "runs", runId, "prompts", `${taskId}-a0.md`);
+  try {
+    return /TICKMARKR_RESULT_([0-9a-z]+)/.exec(readFileSync(pf, "utf8"))?.[1] ?? "";
+  } catch {
+    return "";
+  }
+}
+function withNonce(repo: string, runId: string, taskId: string, text: string): string {
+  return text.replace(/<NONCE>/g, nonceFor(repo, runId, taskId));
+}
+
+function stagedInteractiveDriver(
+  repo: string,
+  runId: string,
+  taskId: string,
+  stages: string[],
+  opts: { noToken?: boolean } = {},
+): ExecutorDriver {
+  const inner = new SubprocessDriver();
+  let readIdx = 0;
+  return idriver({
+    slot: inner.slot.bind(inner),
+    run: inner.run.bind(inner),
+    waitOutput: opts.noToken ? () => Promise.resolve(false) : inner.waitOutput.bind(inner),
+    waitAgentStatus: inner.waitAgentStatus.bind(inner),
+    read: (slot: Slot, lines?: number) => {
+      if (!slot.name.includes("-worker-")) return inner.read(slot, lines);
+      const text = stages[Math.min(readIdx, stages.length - 1)];
+      readIdx++;
+      return Promise.resolve(withNonce(repo, runId, taskId, text));
+    },
+    notify: inner.notify.bind(inner),
+    close: inner.close.bind(inner),
+    worktree: inner.worktree.bind(inner),
+    status: async () => "unknown",
+  });
 }
 
 describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
@@ -393,5 +439,92 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
     const prompt = readFileSync(join(Journal.open(repo, "run-prompt-test-naming").dir, "prompts", "T1-a0.md"), "utf8");
     expect(prompt).toMatch(/verbatim/i);
     expect(prompt).toMatch(/test:.*criterion.*verbatim/i);
+  }, 30_000);
+
+  test("an interactive attempt whose first harvest only balances into a valid trailer after a settle re-read is recorded with the re-read's outcome rather than the malformed-trailer cause", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "settled green" } }] } },
+      "taskTimeoutMinutes: 0.05\n",
+    );
+    const driver = stagedInteractiveDriver(repo, "run-settle-green", "T1", [
+      "",
+      `TICKMARKR_RESULT_<NONCE> {"ok":true, "summary": "settled green`,
+      `TICKMARKR_RESULT_<NONCE> {"ok":true, "summary": "settled green`,
+      `TICKMARKR_RESULT_<NONCE> {"ok":true,"summary":"settled green","deviations":[]}`,
+    ]);
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-settle-green", driver });
+    expect(s.done).toEqual(["T1"]);
+    const wr = Journal.open(repo, "run-settle-green").read().find((e) => e.event === "worker-result");
+    expect(wr?.data.ok).toBe(true);
+    expect(wr?.data.summary).toBe("settled green");
+    expect(wr?.data.cause).toBeUndefined();
+  }, 30_000);
+
+  test("an interactive attempt whose harvest never contains the nonce-tagged trailer token is recorded as unparseable without any settle re-read", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "no trailer token" } },
+      "taskTimeoutMinutes: 0.05\n",
+    );
+    const started = Date.now();
+    const driver = stagedInteractiveDriver(repo, "run-no-token", "T1", [""], { noToken: true });
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-no-token", driver });
+    expect(s.human).toEqual(["T1"]);
+    const wr = Journal.open(repo, "run-no-token").read().find((e) => e.event === "worker-result");
+    expect(wr?.data.ok).toBe(false);
+    expect(wr?.data.summary).toBe(NO_TRAILER_SUMMARY);
+    expect(wr?.data.cause).toBe("stall-timeout");
+    expect(Date.now() - started).toBeLessThan(4_500); // 0.05m stall window + small overhead, no settle retries
+  }, 30_000);
+
+  test("the settle re-read is bounded to at most two attempts and never runs out the attempt's own stall window", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "would need three retries" } }] } },
+      "taskTimeoutMinutes: 0.05\n",
+    );
+    const started = Date.now();
+    const driver = stagedInteractiveDriver(repo, "run-bound", "T1", [
+      "",
+      `TICKMARKR_RESULT_<NONCE> {"ok":true, "summary": "x`,
+      `TICKMARKR_RESULT_<NONCE> {"ok":true, "summary": "x`,
+      `TICKMARKR_RESULT_<NONCE> {"ok":true, "summary": "x`,
+      `TICKMARKR_RESULT_<NONCE> {"ok":true, "summary": "x`,
+      `TICKMARKR_RESULT_<NONCE> {"ok":true,"summary":"would need three retries","deviations":[]}`,
+    ]);
+    await runDaemon(repo, { adapters: [fake], runId: "run-bound", driver });
+    expect(Date.now() - started).toBeLessThan(3_000); // 0.05m stall window; two 1s retries must fit inside it
+    const wr = Journal.open(repo, "run-bound").read().find((e) => e.event === "worker-result");
+    expect(wr?.data.ok).toBe(false);
+    expect(wr?.data.summary).toBe(UNPARSEABLE_TRAILER_SUMMARY);
+    expect(wr?.data.cause).toBe("malformed-trailer");
+  }, 30_000);
+
+  test("a headless attempt's malformed-trailer handling is unchanged by the settle-retry addition", async () => {
+    const { repo, scriptPath } = setupRepo([T("T1")], { tasks: {} });
+    class MalformedTrailerFake extends FakeAdapter {
+      private readonly workerScript = join(dirname(scriptPath), "malformed-headless.sh");
+      invoke(task: Task, _cwd: string, _assignment: Assignment, ctx: { promptFile: string }): Invocation {
+        const nonce = /TICKMARKR_RESULT_([0-9a-z]+)/.exec(readFileSync(ctx.promptFile, "utf8"))?.[1] ?? "";
+        writeFileSync(this.workerScript, [
+          "#!/bin/bash",
+          "set -e",
+          "echo ok > ok.txt",
+          "git add -A",
+          "git commit --no-gpg-sign -m ok",
+          `echo 'TICKMARKR_RESULT_${nonce} {"ok":true, "summary": "headless unchanged'`,
+          `printf '\\nTICKMARKR_EXIT_${nonce}:0\\n'`,
+        ].join("\n"));
+        return { command: `bash ${shq(this.workerScript)}` };
+      }
+    }
+    const s = await runDaemon(repo, { adapters: [new MalformedTrailerFake(scriptPath)], runId: "run-headless-unchanged" });
+    expect(s.done).toEqual(["T1"]);
+    const wr = Journal.open(repo, "run-headless-unchanged").read().find((e) => e.event === "worker-result");
+    expect(wr?.data.mode).toBe("print");
+    expect(wr?.data.ok).toBe(false);
+    expect(wr?.data.summary).toBe(UNPARSEABLE_TRAILER_SUMMARY);
+    expect(wr?.data.cause).toBe("malformed-trailer");
   }, 30_000);
 });
