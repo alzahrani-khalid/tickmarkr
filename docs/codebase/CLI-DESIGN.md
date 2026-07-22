@@ -27,6 +27,13 @@ glance doesn't ship. **Color is never the only signal**: every colored state pai
 a distinct glyph or word (✓ vs ○ vs ✗ vs ! vs -, authed vs unauthed), so every state
 survives `NO_COLOR` and non-TTY byte-pinned output unambiguously.
 
+A system which recovers by design must render that recovery, not just its failures. In
+the live status frame, recoverable infrastructure and dispatch parks are amber attention
+rows whose second line names the recorded typed cause; red is reserved for verified work
+failure, an exhausted escalation ladder, or a task still unresolved after the run ends.
+The progress gauge follows the same cause-based severity, so availability noise alone can
+never turn completed progress red.
+
 ## Tokens (`TOKENS`)
 
 | Token | Renders | Use |

@@ -2,17 +2,32 @@ import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import type { InteractiveSeed } from "../../src/adapters/types.js";
+import type { Assignment, InteractiveSeed, WorkerAdapter } from "../../src/adapters/types.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import { runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
+import { runInteractiveSeed } from "../../src/run/interactive-seed.js";
 import { Journal } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+
+function fakeBannerModel(banner: string): string | undefined {
+  const m = /^Model: (.+)$/m.exec(banner);
+  if (!m) return undefined;
+  const alias = m[1].trim();
+  return alias ? `fake-${alias}` : undefined;
+}
 
 const SEED: InteractiveSeed = {
   launch: (model: string) => `launch-tui --model ${model}`,
   readinessMatch: "TUI ready",
   seedLine: (promptFile: string) => `read ${promptFile}`,
+  confirmBanner: (banner, assignedModel) => {
+    const saw = fakeBannerModel(banner);
+    if (saw !== undefined && saw !== assignedModel) {
+      return { ok: false, error: `model mismatch: expected ${assignedModel}, saw ${saw}` };
+    }
+    return { ok: true };
+  },
 };
 
 class SeedFakeAdapter extends FakeAdapter {
@@ -83,6 +98,99 @@ function makeSeedDriver(promptFile: string, opts: { ready?: boolean; stick?: boo
 
   return { driver, runs, waits, buf };
 }
+
+const BANNER_ASSIGNMENT: Assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "mid" };
+
+function makeBannerSeedDriver(banner: string, promptFile: string, opts: { submit?: boolean } = {}) {
+  let buf = banner.includes("TUI ready") ? banner : `${banner}\nTUI ready\n> `;
+  const runs: string[] = [];
+  const seedCmd = SEED.seedLine(promptFile);
+  const slot: Slot = { id: "p1", name: "banner-seed", cwd: "/tmp" };
+
+  const driver: ExecutorDriver = {
+    id: "banner-seed-stub",
+    interactive: true,
+    slot: async () => slot,
+    run: async (_s: Slot, cmd: string) => {
+      runs.push(cmd);
+      if (cmd === seedCmd && opts.submit !== false) {
+        buf += `\n${cmd}\n[submitted]\n`;
+      } else if (cmd === seedCmd) {
+        buf += `\n${cmd}\n`;
+      }
+    },
+    waitOutput: async (_s: Slot, pattern: string, _ms: number, o?: { regex?: boolean }) =>
+      o?.regex ? new RegExp(pattern).test(buf) : buf.includes(pattern),
+    waitAgentStatus: async () => true,
+    status: async () => "unknown",
+    read: async (_s: Slot, lines: number) => buf.split("\n").slice(-lines).join("\n"),
+    notify: async () => {},
+    close: async () => {},
+    worktree: async (repo: string) => repo,
+  };
+
+  return { driver, slot, runs, seedCmd };
+}
+
+function bannerSeedAdapter(): Pick<WorkerAdapter, "interactiveSeed"> {
+  return { interactiveSeed: SEED };
+}
+
+describe("runInteractiveSeed launch banner confirmation", () => {
+  test("a launch banner naming the assigned model proceeds to seed injection unchanged", async () => {
+    const promptFile = "/tmp/prompt-match.md";
+    const banner = "Model: 1\n";
+    const { driver, slot, runs, seedCmd } = makeBannerSeedDriver(banner, promptFile);
+    const r = await runInteractiveSeed({
+      driver,
+      slot,
+      adapter: bannerSeedAdapter() as WorkerAdapter,
+      assignment: BANNER_ASSIGNMENT,
+      promptFile,
+      taskTimeoutMinutes: 0.1,
+    });
+    expect(r.seedFailed).toBe(false);
+    expect(runs).toHaveLength(2);
+    expect(runs[0]).toBe(SEED.launch("fake-1"));
+    expect(runs[1]).toBe(seedCmd);
+  });
+
+  test("a launch banner naming a different model than the assignment fails the attempt closed before any seed line is injected", async () => {
+    const promptFile = "/tmp/prompt-mismatch.md";
+    const banner = "Model: 2\n";
+    const { driver, slot, runs } = makeBannerSeedDriver(banner, promptFile);
+    const r = await runInteractiveSeed({
+      driver,
+      slot,
+      adapter: bannerSeedAdapter() as WorkerAdapter,
+      assignment: BANNER_ASSIGNMENT,
+      promptFile,
+      taskTimeoutMinutes: 0.1,
+    });
+    expect(r.seedFailed).toBe(true);
+    expect(r.seedError).toMatch(/model mismatch/);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toBe(SEED.launch("fake-1"));
+    expect(r.output).toContain("Model: 2");
+  });
+
+  test("a launch banner missing a recognizable model line is not treated as a mismatch", async () => {
+    const promptFile = "/tmp/prompt-no-model.md";
+    const banner = "Session: session_abc\n";
+    const { driver, slot, runs, seedCmd } = makeBannerSeedDriver(banner, promptFile);
+    const r = await runInteractiveSeed({
+      driver,
+      slot,
+      adapter: bannerSeedAdapter() as WorkerAdapter,
+      assignment: BANNER_ASSIGNMENT,
+      promptFile,
+      taskTimeoutMinutes: 0.1,
+    });
+    expect(r.seedFailed).toBe(false);
+    expect(runs).toHaveLength(2);
+    expect(runs[1]).toBe(seedCmd);
+  });
+});
 
 describe("daemon interactive seed path (fake adapter, zero tokens)", () => {
   test("an adapter declaring the seed capability launches through a launch-then-seed sequence instead of the existing single-command interactive path", async () => {
@@ -169,5 +277,27 @@ describe("daemon interactive seed path (fake adapter, zero tokens)", () => {
     expect(runs[0]).toMatch(/^bash '/);
     expect(runs[0]).not.toContain(SEED.launch("fake-1"));
     expect(runs[0]).not.toContain(SEED.seedLine(`${repo}/.tickmarkr/runs/run-unchanged/prompts/T1-a0.md`));
+  }, 30_000);
+
+  test("a seed-mode launch that prints a readiness banner is not classified as an early-launch dead channel while waiting for the worker trailer", async () => {
+    setEarlyLaunchLivenessMsForTests(50);
+    try {
+      const { repo, scriptPath } = setupRepo(
+        [T("T1")],
+        { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "seeded" } }] }, consult: { action: "human", notes: "stuck after seed" } },
+        "visibility:\n  worker: interactive\ntaskTimeoutMinutes: 0.02\n",
+      );
+      const promptFile = `${repo}/.tickmarkr/runs/run-seed-banner/prompts/T1-a0.md`;
+      const { driver } = makeSeedDriver(promptFile, { stick: true });
+      const started = Date.now();
+      const s = await runDaemon(repo, { adapters: [new SeedFakeAdapter(scriptPath)], runId: "run-seed-banner", driver });
+      expect(Date.now() - started).toBeGreaterThan(800);
+      expect(s.human).toEqual(["T1"]);
+      const evs = Journal.open(repo, "run-seed-banner").read();
+      expect(evs.some((e) => e.event === "dead-channel-failover")).toBe(false);
+      expect(evs.find((e) => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+    } finally {
+      resetEarlyLaunchLivenessMsForTests();
+    }
   }, 30_000);
 });

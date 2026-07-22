@@ -136,6 +136,18 @@ const BLOCKED_POLL_MS = 30_000; // between trailer-wait slices, check whether th
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
 const NO_TRAILER_DEMOTION_STREAK = 2; // OBS-57: consecutive no-trailer windows demote a channel for the rest of the run
+// OBS-117 (v1.71 T6): a worker pane that never prints a byte by T+60s after dispatch is a dead
+// channel — don't burn the full stall window waiting for a silent launch failure. Checked on the
+// existing stall-wait poll cadence only (no new timer). Spinner/ANSI repaints count as output.
+export const EARLY_LAUNCH_LIVENESS_MS = 60_000;
+let earlyLaunchLivenessMs = EARLY_LAUNCH_LIVENESS_MS;
+/** Test seam — lowers the empty-pane liveness window without sleeping 60s per case. */
+export function setEarlyLaunchLivenessMsForTests(ms: number): void {
+  earlyLaunchLivenessMs = ms;
+}
+export function resetEarlyLaunchLivenessMsForTests(): void {
+  earlyLaunchLivenessMs = EARLY_LAUNCH_LIVENESS_MS;
+}
 
 async function commitsAheadOf(base: string, wt: string): Promise<string[]> {
   const head = await gitHead(wt);
@@ -277,6 +289,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // GATE-08 lesson at the humanGate guard: condition on the data, not the code path). Dead-code
   // equivalence to the router.ts:194 profile⇒undefined pattern: no map entry ⇒ today's literal.
   const resume = opts.resume ? journal.replayResumeState() : new Map<string, ResumeState>();
+  const replayedExclusions = opts.resume ? journal.replayExcludedChannels() : new Set<string>();
   if (opts.resume) {
     // v1.53 T5: a superseded run is dead — resuming it beside its successor is the exact
     // two-concurrent-runs hazard supersession exists to prevent. Fail closed, naming the successor.
@@ -309,7 +322,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if ((st === "human" || st === "failed") && getTask(graph, id).status === "pending") continue;
       graph = setStatus(graph, id, st);
     }
-    journal.append("run-resume", undefined, { pid: process.pid }); // v1.13 (VIS-11): record the live daemon pid for status liveness
+    journal.append("run-resume", undefined, {
+      pid: process.pid, // v1.13 (VIS-11): record the live daemon pid for status liveness
+      ...(replayedExclusions.size > 0 ? { excludedChannels: [...replayedExclusions].sort() } : {}),
+    });
   } else {
     baseRef = await gitHead(repoRoot);
     baseline = await captureBaseline(repoRoot, commands);
@@ -357,7 +373,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const keptSlots: Slot[] = [];
   const runTag = runId.replace(/^run-/, ""); // full date-time — cross-run unique even across days
   // OBS-57: per-run in-run demotion — channels that burn consecutive no-trailer windows route around for later attempts.
-  const demotedChannels = new Set<string>();
+  // v1.71 OBS-119: on resume, re-seed from the journal fold (replayedExclusions) before any dispatch.
+  const demotedChannels = new Set(replayedExclusions);
   const noTrailerStreak = new Map<string, number>();
 
   // OBS-17 T2: reconcile at every safe point — run start/resume (just journaled above), each task
@@ -451,7 +468,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // fresh-budget release, prefer nextChannel over the surviving tried-list so burned channels are
     // not re-tried first (consult bans / prior failovers survive the release).
     const rs = resume.get(t.id);
-    if (rs?.lastAssignment && rs.attempts > 0 && channels.some((c) => channelKey(c) === channelKey(rs.lastAssignment!))) {
+    if (rs?.lastAssignment && rs.attempts > 0
+        && channels.some((c) => channelKey(c) === channelKey(rs.lastAssignment!))
+        && !demotedChannels.has(channelKey(rs.lastAssignment!))) {
       assignment = rs.lastAssignment; // restore the consult-chosen assignment (bypasses route()'s static re-pick)
     } else if (rs && rs.tried.length) {
       // trailing-reroute edge (kill between verdict and dispatch), a stale fleet, OR a fresh-budget
@@ -753,6 +772,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let output: string;
       let exitCode: number | null;
       let timedOut = false;
+      let earlyLaunchDead = false;
       let settleParsed: WorkerResult | undefined;
       let seedResult: InteractiveSeedResult | undefined;
       if (interactive) {
@@ -785,12 +805,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // OBS-82: the stall clock compares NORMALIZED snapshots so a spinner glyph/elapsed-time
           // repaint is silence, not activity. ONLY this inactivity compare sees normalized text —
           // trailer detection, harvest, paging, and quota checks all read the raw pane.
+          let everHadOutput = output.length > 0;
           let lastStallSnapshot = normalizeStallSnapshot(output);
           let lastOutputAt = Date.now();
           while (Date.now() - lastOutputAt < stallWindowMs) {
             const sliceStart = Date.now();
             const remaining = stallWindowMs - (sliceStart - lastOutputAt);
-            const slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
+            let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
+            if (!everHadOutput) {
+              const earlyLeft = earlyLaunchLivenessMs - (sliceStart - attemptStart);
+              if (earlyLeft > 0) slice = Math.min(slice, earlyLeft);
+            }
             if (await driver.waitOutput(slot, `(${trailerPattern(nonce)})|TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true })) {
               // verify before accepting: a worker that merely DISPLAYS a marker (e.g. editing tickmarkr's
               // own source, where "TICKMARKR_EXIT:" is a string literal) must not end the wait. Only a
@@ -804,10 +829,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 break;
               }
             }
-            const currentStallSnapshot = normalizeStallSnapshot(await driver.read(slot, 1000));
+            const paneText = await driver.read(slot, 1000);
+            if (paneText.length > 0) everHadOutput = true;
+            const currentStallSnapshot = normalizeStallSnapshot(paneText);
             if (currentStallSnapshot !== lastStallSnapshot) {
               lastStallSnapshot = currentStallSnapshot;
               lastOutputAt = Date.now();
+            }
+            // OBS-117 (v1.71 T6): zero raw output by the early-launch deadline is a dead channel now.
+            if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
+              earlyLaunchDead = true;
+              output = paneText;
+              break;
             }
             // v1.23 T2: piggyback on this poll slice — same cadence as blocked/idle checks, no new timer.
             await sampleContext();
@@ -884,20 +917,32 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // OBS-82: same normalized-snapshot compare as the interactive site — spinner-only repaints
         // exhaust the budget here too; harvest below still reads the raw pane.
         const stallWindowMs = taskTimeoutMinutes * 60_000;
-        let lastStallSnapshot = normalizeStallSnapshot(await driver.read(slot, 500));
+        const initialPane = await driver.read(slot, 500);
+        let everHadOutput = initialPane.length > 0;
+        let lastStallSnapshot = normalizeStallSnapshot(initialPane);
         let lastOutputAt = Date.now();
         finished = false;
         while (Date.now() - lastOutputAt < stallWindowMs) {
           const remaining = stallWindowMs - (Date.now() - lastOutputAt);
-          const slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
+          let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
+          if (!everHadOutput) {
+            const earlyLeft = earlyLaunchLivenessMs - (Date.now() - attemptStart);
+            if (earlyLeft > 0) slice = Math.min(slice, earlyLeft);
+          }
           if (await driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true })) {
             finished = true;
             break;
           }
-          const currentStallSnapshot = normalizeStallSnapshot(await driver.read(slot, 500));
+          const paneText = await driver.read(slot, 500);
+          if (paneText.length > 0) everHadOutput = true;
+          const currentStallSnapshot = normalizeStallSnapshot(paneText);
           if (currentStallSnapshot !== lastStallSnapshot) {
             lastStallSnapshot = currentStallSnapshot;
             lastOutputAt = Date.now();
+          }
+          if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
+            earlyLaunchDead = true;
+            break;
           }
         }
         output = await driver.read(slot, 500);
@@ -989,10 +1034,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // AFTER the quota check so quota behavior stays byte-identical (a quota hit returns/continues
       // before reaching here); provider-outage lands here only once the v1.46 same-channel requeue
       // cap above is spent, so a transient blip still recovers in place.
-      const dead = classifyDeadChannel(result);
+      // OBS-117 (v1.71 T6): a silent launch failure has no CLI signature to parse — the same
+      // setup-required typed dead-channel path a late-harvest "command not found" would take.
+      const dead = classifyDeadChannel(result) ?? (earlyLaunchDead ? "setup-required" : undefined);
       if (dead) {
         const from = channelKey(assignment);
         demotedChannels.add(from); // excluded for later attempts AND later tasks in this run
+        journal.append("channel-exclusion", t.id, { channel: from, reason: dead, kind: "dead-channel" });
         const next = failover("dead-channel");
         journal.append("dead-channel-failover", t.id, { reason: dead, from, to: next ? channelKey(next) : null });
         if (next) {
@@ -1179,9 +1227,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     for (const t of ready) {
       const p = execTask(t)
         .catch(async (err) => {
+          const taskEvents = journal.read().filter((e) => e.taskId === t.id);
+          const dispatch = [...taskEvents].reverse().find((e) => e.event === "task-dispatch");
+          const verifiedFailure = taskEvents.some((e) => e.event === "gate-result" && e.data.pass === false);
+          const kind: ParkKind = verifiedFailure ? "gate-fail" : dispatch ? "dispatch" : "infra";
+          const attempts = dispatch && Number.isInteger(dispatch.data.attempt) ? dispatch.data.attempt as number : 0;
           graph = setStatus(graph, t.id, "failed");
           saveGraph(repoRoot, graph);
-          journal.append("task-failed", t.id, { error: String(err) });
+          journal.append("task-failed", t.id, { error: String(err), kind, attempts });
           journal.telemetry({ taskId: t.id, shape: t.shape, adapter: "-", model: "-", channel: "-", attempts: 0, outcome: "failed", durationMs: 0 });
           await reconcile({ spareLiveLlm: true }); // task-failed is a terminal event
         })

@@ -20,6 +20,7 @@ import { COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 // is inert, so the only exclusion mechanism in play is the replayed `tried` list + restored assignment.
 const fake1 = { adapter: "fake", model: "fake-1", channel: "sub" as const, tier: "frontier" as const };
 const fake2 = { adapter: "fake", model: "fake-2", channel: "api" as const, tier: "frontier" as const };
+const AUTH_FAIL = "echo 'Not logged in. Please run /login to authenticate.'; exit 1";
 
 // One-task repo + fake script whose step 0 commits a file and returns ok — the resumed dispatch completes
 // and merges, proving the seeded state flows through gates unharmed. A fresh FakeAdapter instance resets
@@ -215,3 +216,88 @@ describe("OBS-103 run-end narrator sweep across daemon instances (fake adapter, 
     expect(runTagged).toEqual([]); // zero survivors — the prior instance's narrator included
   });
 }, 120000);
+
+// v1.71 T4 (OBS-119 second gap): dead-channel exclusions survive resume via journal replay.
+describe("OBS-119 dead-channel exclusion resume (v1.71 T4, zero tokens)", () => {
+  test("a channel excluded mid-run after a dead-channel failure is recorded in the journal as a typed exclusion event", async () => {
+    const { repo } = setupResumeRepo();
+    writeFileSync(join(tickmarkrDir(repo), "config.yaml"), "judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\n");
+    const sdir = mkdtempSync(join(tmpdir(), "tickmarkr-de-"));
+    const scriptPath = join(sdir, "s.json");
+    writeFileSync(scriptPath, JSON.stringify({
+      judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
+      review: { approve: true, issues: [] },
+      consult: { action: "retry", notes: "retry" },
+      tasks: { T1: [
+        { shell: AUTH_FAIL },
+        { shell: `echo done > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1 done" } },
+      ] },
+    }));
+    const fakeDead = new FakeAdapter(scriptPath);
+    const runId = "run-de-excl";
+    const s = await runDaemon(repo, { adapters: [fakeDead], runId });
+    expect(s.done).toEqual(["T1"]);
+    const excl = Journal.open(repo, runId).read().filter((e) => e.event === "channel-exclusion");
+    expect(excl).toHaveLength(1);
+    expect(excl[0]!.data).toMatchObject({ channel: "fake:fake-1", reason: "auth-required", kind: "dead-channel" });
+  }, 30_000);
+
+  test("resuming a run whose journal recorded a dead-channel exclusion re-seeds that exclusion before the daemon dispatches any task", async () => {
+    const { repo, fake } = setupResumeRepo();
+    await seedJournal(repo, "run-de-seed", [
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 0 } },
+      { event: "channel-exclusion", taskId: "T1", data: { channel: "fake:fake-1", reason: "auth-required", kind: "dead-channel" } },
+    ]);
+    await runDaemon(repo, { adapters: [fake], runId: "run-de-seed", resume: true });
+    const all = Journal.open(repo, "run-de-seed").read();
+    const resumeIdx = all.findIndex((e) => e.event === "run-resume");
+    const dispatchIdx = all.findIndex((e, i) => i > resumeIdx && e.event === "task-dispatch");
+    expect(resumeIdx).toBeGreaterThanOrEqual(0);
+    expect(dispatchIdx).toBeGreaterThan(resumeIdx);
+    expect((all[resumeIdx]!.data as { excludedChannels: string[] }).excludedChannels).toEqual(["fake:fake-1"]);
+  }, 30_000);
+
+  test("a channel with no recorded exclusion event is not present in the replayed exclusion set", async () => {
+    const { repo, fake } = setupResumeRepo();
+    await seedJournal(repo, "run-de-absent", [
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 0 } },
+    ]);
+    expect([...Journal.open(repo, "run-de-absent").replayExcludedChannels()]).toEqual([]);
+    await runDaemon(repo, { adapters: [fake], runId: "run-de-absent", resume: true });
+    const runResume = Journal.open(repo, "run-de-absent").read().find((e) => e.event === "run-resume")!;
+    expect(runResume.data).not.toHaveProperty("excludedChannels");
+  }, 30_000);
+
+  test("a task whose only prior attempt landed on the now-excluded channel picks a different channel on resume rather than re-dispatching onto it", async () => {
+    const { repo, fake } = setupResumeRepo();
+    await seedJournal(repo, "run-de-reroute", [
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 0 } },
+      { event: "channel-exclusion", taskId: "T1", data: { channel: "fake:fake-1", reason: "auth-required", kind: "dead-channel" } },
+    ]);
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-de-reroute", resume: true });
+    expect(s.done).toEqual(["T1"]);
+    const post = postResume(Journal.open(repo, "run-de-reroute").read())
+      .filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+    expect(post.length).toBeGreaterThanOrEqual(1);
+    expect(channelKey(dispatchAssignment(post[0]!))).toBe("fake:fake-2");
+    for (const d of post) expect(channelKey(dispatchAssignment(d))).not.toBe("fake:fake-1");
+  }, 30_000);
+
+  test("the exclusion replay is seeded from the journal the same way attempt counts and tried channels already are on resume, not a second recovery mechanism", async () => {
+    const repo = makeRepo({ "base.txt": "base\n" });
+    saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks: [T("T1")] }));
+    const j = Journal.create(repo, "run-de-fold");
+    const baseRef = await gitHead(repo);
+    j.append("run-start", undefined, { baseRef, commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    j.append("task-dispatch", "T1", { assignment: fake1, attempt: 0 });
+    j.append("dead-channel-failover", "T1", { reason: "auth-required", from: "fake:fake-1", to: "fake:fake-2" });
+    writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+    // pre-v1.71 compat: failover.from alone replays; channel-exclusion is additive, not a second store
+    expect([...j.replayExcludedChannels()]).toEqual(["fake:fake-1"]);
+    j.append("channel-exclusion", "T1", { channel: "fake:fake-1", reason: "auth-required", kind: "dead-channel" });
+    expect([...j.replayExcludedChannels()]).toEqual(["fake:fake-1"]);
+    const resumeState = j.replayResumeState().get("T1")!;
+    expect(resumeState.attempts).toBe(1);
+    expect(resumeState.tried).toEqual(["fake:fake-1"]);
+  });
+});

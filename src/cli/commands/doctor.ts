@@ -1,13 +1,13 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { allAdapters, detectCandidateClis, flagDriftWarnings, probeAll, probeModels, readAutoPrefer, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readAutoPrefer, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { DEFAULT_CONFIG, loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
-import { disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
+import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
 
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
 const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value: string) =>
@@ -29,7 +29,7 @@ export async function doctor(
   // otherwise prints nothing until the end — silence here reads as a hang (v1.33.1)
   console.error("probing installed agent CLIs — one short LLM call per configured model, may take a minute...");
   const probeProgressTTY = process.stderr.isTTY === true;
-  const health = await probeAll(adapters);
+  const health = await probeAll(adapters, { cwd });
   // MODEL-02: detect models where the adapter exposes a list surface, BEFORE writing doctor.json (write once, below).
   // Fail OPEN — the inverse of gates' fail-closed: detection is advisory, so a broken list surface NEVER fails doctor.
   for (const a of adapters) {
@@ -84,6 +84,10 @@ export async function doctor(
   rows.push(...modelLints(cfg, health, adapters, { tty: ttyVisual(), stateDir: stateDirName(cwd), overlayPreferShapes: overlayPreferShapes(cwd) }).map(attentionRow));
   const excluded = excludedChannels(cfg, adapters, health);
   if (excluded.length) rows.push(attentionRow(exclusionLine(excluded)));
+  rows.push(...denyPreferCollisions(cfg).map((c) => attentionRow(denyPreferCollisionLine(c))));
+  const aliasExcluded = modelAliasExclusions(cfg, adapters, health);
+  if (aliasExcluded.length) rows.push(attentionRow(modelAliasLine(aliasExcluded)));
+  rows.push(...binaryShadowWarnings(adapters, health, cwd).map(attentionRow));
   // HYG-07(a): doctor just probed fresh (probeAll above), so servability attribution is current by construction.
   const servable = servableExclusions(cfg, adapters, health);
   if (servable.length) rows.push(attentionRow(servabilityLine(servable)));

@@ -7,7 +7,7 @@ import { shq, type Assignment, type Invocation } from "../../src/adapters/types.
 import type { Task } from "../../src/graph/schema.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import { runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { NO_TRAILER_SUMMARY, UNPARSEABLE_TRAILER_SUMMARY } from "../../src/adapters/prompt.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
@@ -530,5 +530,89 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
     expect(wr?.data.ok).toBe(false);
     expect(wr?.data.summary).toBe(UNPARSEABLE_TRAILER_SUMMARY);
     expect(wr?.data.cause).toBe("malformed-trailer");
+  }, 30_000);
+});
+
+describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
+  test("a worker pane with zero output sixty seconds after dispatch is classified as a dead channel immediately rather than waiting for the full stall window", async () => {
+    setEarlyLaunchLivenessMsForTests(50);
+    try {
+      const { repo, fake } = setupRepo(
+        [T("T1")],
+        {
+          tasks: {
+            T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "recovered on next channel" } }],
+          },
+        },
+        "taskTimeoutMinutes: 5\nvisibility:\n  worker: interactive\n",
+      );
+      const started = Date.now();
+      const inner = new SubprocessDriver();
+      let workerRuns = 0;
+      const driver = idriver({
+        slot: inner.slot.bind(inner),
+        run: async (slot: Slot, cmd: string) => {
+          if (slot.name.includes("-worker-")) workerRuns++;
+          return inner.run(slot, cmd);
+        },
+        waitOutput: async (slot: Slot, pattern: string, ms: number, opts?: { regex?: boolean }) =>
+          workerRuns > 1 ? inner.waitOutput(slot, pattern, ms, opts) : false,
+        waitAgentStatus: inner.waitAgentStatus.bind(inner),
+        read: (slot: Slot, lines?: number) =>
+          slot.name.includes("-worker-") && workerRuns === 1
+            ? Promise.resolve("")
+            : inner.read(slot, lines),
+        notify: inner.notify.bind(inner),
+        close: inner.close.bind(inner),
+        worktree: inner.worktree.bind(inner),
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-early-dead", driver });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(s.done).toEqual(["T1"]);
+      const evs = Journal.open(repo, "run-early-dead").read();
+      expect(evs.some((e) => e.event === "dead-channel-failover")).toBe(true);
+      expect(evs.some((e) => e.event === "channel-exclusion" && e.data.kind === "dead-channel")).toBe(true);
+      expect(evs.some((e) => e.event === "consult-verdict")).toBe(false);
+    } finally {
+      resetEarlyLaunchLivenessMsForTests();
+    }
+  }, 30_000);
+
+  test("a worker pane that produces any output before sixty seconds elapses continues through the normal stall-window wait unaffected", async () => {
+    setEarlyLaunchLivenessMsForTests(2_000);
+    try {
+      const { repo, fake } = setupRepo(
+        [T("T1")],
+        { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "stalled" } },
+        "taskTimeoutMinutes: 0.02\nvisibility:\n  worker: interactive\n",
+      );
+      const started = Date.now();
+      const inner = new SubprocessDriver();
+      let workerReads = 0;
+      const driver = idriver({
+        slot: inner.slot.bind(inner),
+        run: inner.run.bind(inner),
+        waitOutput: async () => false,
+        waitAgentStatus: inner.waitAgentStatus.bind(inner),
+        read: (slot: Slot, lines?: number) => {
+          if (slot.name.includes("-worker-")) {
+            workerReads++;
+            return Promise.resolve(workerReads === 1 ? "booting\n" : "");
+          }
+          return inner.read(slot, lines);
+        },
+        notify: inner.notify.bind(inner),
+        close: inner.close.bind(inner),
+        worktree: inner.worktree.bind(inner),
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-early-skip", driver });
+      expect(Date.now() - started).toBeGreaterThan(1_000);
+      expect(s.human).toEqual(["T1"]);
+      const wr = Journal.open(repo, "run-early-skip").read().find((e) => e.event === "worker-result");
+      expect(wr?.data.cause).toBe("stall-timeout");
+      expect(Journal.open(repo, "run-early-skip").read().some((e) => e.event === "dead-channel-failover")).toBe(false);
+    } finally {
+      resetEarlyLaunchLivenessMsForTests();
+    }
   }, 30_000);
 });

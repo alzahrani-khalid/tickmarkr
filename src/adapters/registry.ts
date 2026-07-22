@@ -18,13 +18,101 @@ import { grok } from "./grok.js";
 import { kimi } from "./kimi.js";
 import { opencode } from "./opencode.js";
 import { pi } from "./pi.js";
-import { type AuthHealth, type BillingChannel, channelKey, type ModelAuth, modelAuthed, QUOTA_RE, type WorkerAdapter } from "./types.js";
+import { sealHerdrEnv } from "../drivers/subprocess.js";
+import { type AuthHealth, type BillingChannel, channelKey, type ModelAuth, modelAuthed, QUOTA_RE, shq, type WorkerAdapter } from "./types.js";
 
 // Agent-CLI binary names with no tickmarkr adapter — doctor sweeps these advisory-only (v1.48 T1).
 export const CANDIDATE_CLI_CATALOG = ["kimi", "gemini", "qwen", "aider", "goose", "amp", "droid", "auggie", "crush"] as const;
 
 // Binaries probed by registered adapters — kept beside the catalog so a test can forbid overlap.
 export const REGISTERED_ADAPTER_BINARIES = ["claude", "codex", "cursor-agent", "opencode", "pi", "grok"] as const;
+
+// OBS-117: worker panes run commands through `bash -lc` (SubprocessDriver + sh()), not bare spawnSync(bin).
+// Doctor must resolve adapter binaries the same way so a shadow install on PATH cannot disagree with dispatch.
+function shellSpawnSync(cmd: string, cwd: string, timeoutMs = 10000): { code: number; stdout: string; stderr: string } {
+  const r = spawnSync("bash", ["-lc", cmd], {
+    encoding: "utf8",
+    cwd,
+    timeout: timeoutMs,
+    env: sealHerdrEnv(process.env),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return { code: r.status ?? 1, stdout: (r.stdout || "").trim(), stderr: (r.stderr || "").trim() };
+}
+
+export function resolveShellBinary(bin: string, cwd = process.cwd()): { resolved?: string; all: string[] } {
+  const r = shellSpawnSync(`type -a ${shq(bin)} 2>/dev/null | sed -n 's/^.* is \\(.*\\)$/\\1/p'`, cwd);
+  const all = r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  return { resolved: all[0], all };
+}
+
+export function probeVersionShell(bin: string, cwd = process.cwd()): AuthHealth & { binaryPaths?: string[] } {
+  const { resolved, all } = resolveShellBinary(bin, cwd);
+  if (!resolved) return { installed: false, authed: false, models: [] };
+  const r = shellSpawnSync(`${shq(resolved)} --version`, cwd);
+  if (r.code !== 0) return { installed: false, authed: false, models: [], binaryPaths: all };
+  return {
+    installed: true,
+    authed: true,
+    version: (r.stdout || r.stderr).trim().split("\n")[0],
+    models: [],
+    note: "auth assumed; verified at dispatch (failover on auth/quota errors)",
+    binaryPaths: all,
+  };
+}
+
+export function binaryShadowWarnings(
+  adapters: WorkerAdapter[],
+  health: Record<string, AuthHealth>,
+  cwd = process.cwd(),
+  resolve?: (bin: string, cwd: string) => { resolved?: string; all: string[] },
+): string[] {
+  const resolveFn = resolve ?? resolveShellBinary;
+  const out: string[] = [];
+  for (const a of adapters) {
+    const bin = a.hardcodedFlags?.binary;
+    if (!bin || !health[a.id]?.installed) continue;
+    const { resolved, all } = resolveFn(bin, cwd);
+    if (all.length <= 1) continue;
+    out.push(`binary shadow: ${a.id} resolves to ${resolved ?? bin} but ${all.length} installs on PATH — ${all.join(", ")}`);
+  }
+  return out;
+}
+
+function modelListValidated(h: AuthHealth | undefined): boolean {
+  return !!h?.modelsDetectedAt && Array.isArray(h.models);
+}
+
+export function invalidConfiguredModels(cfg: TickmarkrConfig, adapterId: string, h: AuthHealth | undefined): string[] {
+  if (!modelListValidated(h)) return [];
+  const listed = new Set(h!.models);
+  const configured = Object.keys(cfg.tiers[adapterId]?.models ?? {});
+  // Fail open until the CLI list intersects at least one configured model — proves the list is authoritative
+  // for this adapter's tier namespace (MODEL-04: unrelated detected ids must not invalidate routing).
+  if (!configured.some((m) => listed.has(m))) return [];
+  return configured.filter((m) => !listed.has(m));
+}
+
+export function modelAliasExclusions(
+  cfg: TickmarkrConfig,
+  adapters: WorkerAdapter[],
+  health: Record<string, AuthHealth>,
+): { key: string; adapter: string; model: string }[] {
+  const out: { key: string; adapter: string; model: string }[] = [];
+  for (const a of adapters) {
+    const h = health[a.id];
+    if (!h?.installed || !h?.authed) continue;
+    for (const model of invalidConfiguredModels(cfg, a.id, h)) {
+      out.push({ key: channelKey({ adapter: a.id, model }), adapter: a.id, model });
+    }
+  }
+  return out;
+}
+
+export function modelAliasLine(excluded: { key: string; adapter: string; model: string }[]): string {
+  const parts = excluded.map(({ key, adapter }) => `${key} (not in ${adapter}'s reported model list)`);
+  return `model alias: ${excluded.length} channel(s) invalid — ${parts.join(", ")}`;
+}
 
 export type CandidateCliDetection = { binary: string; version: string | undefined };
 
@@ -115,9 +203,19 @@ export function getAdapter(id: string, adapters: WorkerAdapter[]): WorkerAdapter
   return a;
 }
 
-export async function probeAll(adapters: WorkerAdapter[]): Promise<Record<string, AuthHealth>> {
+export async function probeAll(adapters: WorkerAdapter[], opts: { cwd?: string } = {}): Promise<Record<string, AuthHealth>> {
+  const cwd = opts.cwd ?? process.cwd();
   const out: Record<string, AuthHealth> = {};
-  await Promise.all(adapters.map(async (a) => { out[a.id] = await a.probe(); }));
+  await Promise.all(adapters.map(async (a) => {
+    let h = await a.probe();
+    const bin = a.hardcodedFlags?.binary;
+    if (bin) {
+      const shell = probeVersionShell(bin, cwd);
+      h = { ...h, installed: shell.installed, version: shell.version ?? h.version };
+      if (!shell.installed) h = { ...h, installed: false, authed: false };
+    }
+    out[a.id] = h;
+  }));
   return out;
 }
 
@@ -367,10 +465,12 @@ export function discoverChannels(
     .flatMap((a) => {
       const h = health[a.id];
       const s = h?.servable;
+      const invalid = new Set(invalidConfiguredModels(cfg, a.id, h));
       // T2 (2026-07-13): only a model doctor marked authed (modelAuth[model].authed===true) advertises a
       // channel — routing an unknown or 403 into dispatch is fail-closed. Operators with pre-v1.21 doctor.json
       // can opt into the prior unknown-is-routable behavior with routing.allowUnverifiedModels.
-      return a.channels(cfg).filter((c) => modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)));
+      // OBS-117: configured aliases absent from the adapter CLI's own model list are not dispatchable.
+      return a.channels(cfg).filter((c) => !invalid.has(c.model) && modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)));
     });
   if (!cfg.routing.allow && !cfg.routing.deny) return base;
   return base.filter((c) => disallowedBy(c, cfg.routing) === null);

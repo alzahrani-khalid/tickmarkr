@@ -2,7 +2,14 @@ import { BANNER, GLYPHS, type Verdict, dim, fail, legend, ok, rule, statusRow, t
 import { blockedTasks, graphDefinitionHash, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
 import { foldActivity } from "../../run/activity.js";
-import { Journal, type JournalEvent, engagementComparable } from "../../run/journal.js";
+import {
+  Journal,
+  type JournalEvent,
+  engagementComparable,
+  isQualityFailureParkKind,
+  recordedTaskFailureKind,
+  runHasEnded,
+} from "../../run/journal.js";
 
 // ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
 const REFRESH_MS = 2000;
@@ -187,16 +194,26 @@ const renderFrame = (cwd: string): string => {
   const divider = unicode ? " · " : " / ";
   const width = process.stdout.columns ?? 120;
   const done = effective.tasks.filter((t) => t.status === "done").length;
+  const ended = comparable && runHasEnded(events);
 
   const cells = g.tasks.map((t) => {
     const st = replayed?.get(t.id) ?? t.status;
+    const failureKind = comparable ? recordedTaskFailureKind(events, t.id) : undefined;
+    const terminal = st === "failed" || st === "human";
+    // Unknown legacy task-failed events stay red. Typed availability noise is warn-tier only while
+    // the run is live; verified quality parks and every unresolved task in an ended run are red.
+    const redTier = terminal && (
+      ended
+      || (failureKind !== undefined && isQualityFailureParkKind(failureKind))
+      || (st === "failed" && failureKind === undefined)
+    );
     const isStarved = starved.has(t.id);
     const phrase = isStarved ? undefined : activity.cells.get(t.id);
     const label = isStarved ? " starved" : phrase ? ` ${phrase}` : "";
     const channel = assignments.get(t.id) ?? "-";
     const ctx = contexts.get(t.id);
     const assignCol = ctx !== undefined ? `${channel}${divider}ctx ${ctx}` : channel;
-    return { t, st, label, assignCol, isStarved, phrase, channel, ctx, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
+    return { t, st, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
   });
 
   if (!unicode) {
@@ -219,7 +236,7 @@ const renderFrame = (cwd: string): string => {
   // rows (pad plain text FIRST, colorize after: ANSI has zero display width and would corrupt
   // padEnd math)
   const dot = dim(" · ");
-  const anyFailed = cells.some((c) => c.st === "failed");
+  const anyFailed = cells.some((c) => c.redTier);
   const gaugeCells = 10;
   const fill = g.tasks.length ? Math.round((done / g.tasks.length) * gaugeCells) : 0;
   const gauge = (fill ? (anyFailed ? fail : ok)("█".repeat(fill)) : "") + (fill < gaugeCells ? dim("░".repeat(gaugeCells - fill)) : "");
@@ -245,19 +262,23 @@ const renderFrame = (cwd: string): string => {
   // id, goal at full width, and only SHORT status words. Line 2 carries the machinery, dim and
   // aligned under the goal: gate chain, live activity phrase (or channel), ctx. Long channel names
   // and activity phrases live on line 2 only, so they can never squeeze the goal or wrap line 1.
-  const taskVerdict = (st: TaskStatus): Verdict =>
-    st === "done" ? "pass" : st === "failed" ? "fail" : st === "human" ? "warn" : "neutral";
+  const taskVerdict = (c: (typeof cells)[number]): Verdict =>
+    c.st === "done" ? "pass" : c.redTier ? "fail" : c.st === "failed" || c.st === "human" ? "warn" : "neutral";
+  const statusWord = (c: (typeof cells)[number]): string =>
+    c.redTier ? "failed" : c.st === "failed" ? "warn" : String(c.st);
   const idW = Math.max(...cells.map((c) => c.t.id.length), 2);
   // plain-text status suffixes for width math only — starved / failed gate names / approval hint
   const suffixPlain = (c: (typeof cells)[number]): string =>
     (c.isStarved ? " · starved" : "") + failedSuffix(c.states) + humanGateSuffix(c.t, c.st, c.states);
-  const stW = Math.max(...cells.map((c) => String(c.st).length + suffixPlain(c).length));
+  const stW = Math.max(...cells.map((c) => statusWord(c).length + suffixPlain(c).length));
   const avail = Math.max(8, width - (5 + idW) - 2 - stW);
   const goals = cells.map((c) => shortGoal(c.t.goal, avail));
   const goalW = Math.max(8, ...goals.map((s) => s.length));
   const indent = " ".repeat(idW + 5); // line 2 starts under the goal column
-  const rows = cells.map(({ t, st, states, isStarved, phrase, channel, ctx }, i) => {
-    const stWord = st === "done" ? ok(String(st)) : st === "failed" ? fail(String(st)) : st === "human" ? warn(String(st)) : String(st);
+  const rows = cells.map((c, i) => {
+    const { t, st, failureKind, redTier, states, isStarved, phrase, channel, ctx } = c;
+    const word = statusWord(c);
+    const stWord = st === "done" ? ok(word) : redTier ? fail(word) : st === "failed" || st === "human" ? warn(word) : word;
     // a fail names its gate in words right here — the one moment gate identity is needed on a row
     const f = failedGates(states);
     const human = humanGateSuffix(t, st, states);
@@ -265,10 +286,11 @@ const renderFrame = (cwd: string): string => {
       (isStarved ? dot + fail("starved") : "") +
       (f.length ? dot + fail(f.join(", ")) : "") +
       (human ? dot + warn("awaiting approval") : "");
-    const line1 = `  ${statusRow(taskVerdict(st), `${t.id.padEnd(idW)} ${goals[i]!.padEnd(goalW)}  ${statusCell}`)}`;
+    const line1 = `  ${statusRow(taskVerdict(c), `${t.id.padEnd(idW)} ${goals[i]!.padEnd(goalW)}  ${statusCell}`)}`;
     // activity already names its channel for in-flight attempts — never repeat it
     const detail = [
       ...(phrase ? [phrase, ...(phrase.includes(channel) || channel === "-" ? [] : [channel])] : [channel]),
+      ...(failureKind && !phrase?.includes(failureKind) ? [failureKind] : []),
       ...(ctx !== undefined ? [`ctx ${ctx}`] : []),
     ].join(" · ");
     return [line1, `${indent}${gateChain(states, true)}  ${dim(detail)}`, ""];

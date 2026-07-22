@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { allAdapters } from "../../src/adapters/registry.js";
 import { kimi, kimiAuthed, parseKimiModels, parseKimiResult } from "../../src/adapters/kimi.js";
@@ -7,9 +8,12 @@ import { validateGraph } from "../../src/graph/schema.js";
 vi.mock("node:child_process", () => ({ spawnSync: vi.fn() }));
 vi.mock("node:os", () => ({ homedir: () => "/fake-home" }));
 vi.mock("node:fs", () => ({ readFileSync: vi.fn() }));
+vi.mock("../../src/run/git.js", () => ({ sh: vi.fn() }));
 
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { sh } from "../../src/run/git.js";
+import { invalidConfiguredModels, modelAliasExclusions } from "../../src/adapters/registry.js";
 
 const nowMs = Date.parse("2026-07-17T12:00:00Z");
 
@@ -67,25 +71,54 @@ describe("KIMI-01 kimiAuthed — refresh_token dominates epoch-seconds expiry", 
 
 describe("KIMI-04 parseKimiModels + listModels", () => {
   const mockedSpawn = vi.mocked(spawnSync);
+  const mockedSh = vi.mocked(sh);
 
-  beforeEach(() => mockedSpawn.mockReset());
+  beforeEach(() => {
+    mockedSpawn.mockReset();
+    mockedSh.mockReset();
+  });
   afterEach(() => vi.clearAllMocks());
 
   test("provider list output that fails to parse yields an empty model list", async () => {
     expect(parseKimiModels("not json")).toEqual([]);
-    mockedSpawn.mockImplementation((() => ({ status: 0, stdout: "not json", stderr: "" })) as typeof spawnSync);
+    mockedSh.mockResolvedValue({ code: 0, stdout: "not json", stderr: "" });
     expect(await kimi.listModels!()).toEqual([]);
-    mockedSpawn.mockImplementation((() => ({ status: 1, stdout: "", stderr: "err" })) as typeof spawnSync);
+    mockedSh.mockResolvedValue({ code: 1, stdout: "", stderr: "err" });
     expect(await kimi.listModels!()).toEqual([]);
   });
 
   test("valid provider list JSON yields model ids", async () => {
-    mockedSpawn.mockImplementation((() => ({ status: 0, stdout: PROVIDER_JSON, stderr: "" })) as typeof spawnSync);
+    mockedSh.mockResolvedValue({ code: 0, stdout: PROVIDER_JSON, stderr: "" });
     expect(await kimi.listModels!()).toEqual([
       "kimi-code/k3",
       "kimi-code/kimi-for-coding",
       "kimi-code/kimi-for-coding-highspeed",
     ]);
+  });
+
+  test("the alias validation reuses the adapter's existing model-list parser rather than a second parsing path", async () => {
+    mockedSh.mockResolvedValue({ code: 0, stdout: PROVIDER_JSON, stderr: "" });
+    const models = await kimi.listModels!();
+    expect(models).toEqual(parseKimiModels(PROVIDER_JSON));
+    const health = { installed: true, authed: true, models, modelsDetectedAt: "2026-07-22T12:00:00.000Z" };
+    const cfg = {
+      tiers: {
+        kimi: {
+          vendor: "moonshot",
+          channel: "sub",
+          models: { "kimi-code/k3": "frontier", "kimi-code/missing": "mid" },
+        },
+      },
+      routing: { map: {}, floors: {} },
+    } as any;
+    expect(invalidConfiguredModels(cfg, "kimi", health)).toEqual(["kimi-code/missing"]);
+    expect(modelAliasExclusions(cfg, [kimi], { kimi: health })).toEqual([
+      { key: "kimi:kimi-code/missing", adapter: "kimi", model: "kimi-code/missing" },
+    ]);
+    const { readFileSync: readFs } = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const registrySrc = readFs(join(import.meta.dirname, "../../src/adapters/registry.ts"), "utf8");
+    expect(registrySrc).not.toContain("parseKimiModels");
+    expect(registrySrc).not.toContain("provider list");
   });
 });
 

@@ -11,7 +11,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.69.0";
+const PRIOR_RELEASE_VERSION = "1.70.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -65,17 +65,17 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the evidence/comparison and review-convergence themes and the shipped changes rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.70[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/evidence[ /-]+comparison/i);
-    expect(entry).toMatch(/review[- ]convergence/i);
-    for (const change of ["evidence-addressed", "path/line", "run-start environment identity", "report --compare", "comparability guards", "report --bundle", "proof packet", "material", "minor", "defer", "round cap", "load-margin timeout"]) {
+  test("the changelog entry names the failure-severity-rendering and kimi-seeding-hardening themes and the shipped changes rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.71[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/failure[- ]severity[- ]rendering/i);
+    expect(entry).toMatch(/kimi[- ]seeding[- ]hardening/i);
+    for (const change of ["two-tier", "task status", "recoverable", "dispatch", "work failure", "typed", "delivery", "attempt history", "early liveness", "worker pane", "model-verification", "serialized", "interactiveSeed", "narrow-pane", "doctor", "resume preflight", "deny", "prefer", "dead-channel"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.69.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.70.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

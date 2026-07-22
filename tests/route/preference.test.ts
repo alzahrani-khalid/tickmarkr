@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -6,7 +6,7 @@ import { allAdapters, discoverChannels } from "../../src/adapters/registry.js";
 import { type AuthHealth, type BillingChannel, channelKey, channelsFromConfig } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../src/config/config.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { disallowedBy, preferRanks } from "../../src/route/preference.js";
+import { disallowedBy, denyPreferCollisions, preferEntryDenied, preferRanks } from "../../src/route/preference.js";
 import { nextChannel, route, RoutingError } from "../../src/route/router.js";
 import { authedModels } from "../helpers/tmprepo.js";
 
@@ -204,5 +204,82 @@ describe("T4 deny.models + prefer rank", () => {
     const c2 = structuredClone(cfg);
     c2.routing.map.implement = { tier: "mid", prefer: ["pi:zai/glm-5.2"] };
     expect(preferRanks({ adapter: "pi", model: "zai/glm-5.2" }, c2)).toEqual([{ shape: "implement", rank: 0 }]);
+  });
+});
+
+describe("T7 deny∩prefer static preflight", () => {
+  test("a prefer chain naming only channels fully covered by routing.deny is flagged by doctor before any run starts", () => {
+    const { repo, globalDir } = repoWithOverlay(`routing:
+  deny:
+    adapters: [cursor-agent, codex]
+  map:
+    implement:
+      prefer: [cursor-agent, codex]
+`);
+    const cfg = loadConfig(repo, { globalDir });
+    expect(denyPreferCollisions(cfg)).toEqual([{
+      kind: "prefer",
+      shape: "implement",
+      detail: "cursor-agent > codex",
+      disallowed: { by: "deny", entry: "cursor-agent" },
+    }]);
+  });
+
+  test("a pin naming a channel covered by routing.deny is flagged by doctor before any run starts", () => {
+    const { repo, globalDir } = repoWithOverlay(`routing:
+  deny:
+    adapters: [claude-code]
+  map:
+    plan:
+      pin: { via: claude-code, model: fable }
+    spec:
+      prefer: [codex]
+`);
+    const cfg = loadConfig(repo, { globalDir });
+    expect(denyPreferCollisions(cfg)).toContainEqual({
+      kind: "pin",
+      shape: "plan",
+      detail: "claude-code:fable",
+      disallowed: { by: "deny", entry: "claude-code" },
+    });
+  });
+
+  test("a prefer chain with at least one non-denied channel is not flagged", () => {
+    const { repo, globalDir } = repoWithOverlay(`routing:
+  deny:
+    adapters: [codex]
+  map:
+    implement:
+      prefer: [cursor-agent, codex]
+`);
+    const cfg = loadConfig(repo, { globalDir });
+    expect(denyPreferCollisions(cfg)).toEqual([]);
+  });
+
+  test("the preflight reuses the router's existing deny/prefer matching grammar rather than a second parser of the same config", () => {
+    const { repo, globalDir } = repoWithOverlay(`routing:
+  deny:
+    models: [codex:gpt-5.5]
+  map:
+    implement:
+      prefer: [codex:gpt-5.5, cursor-agent]
+`);
+    const cfg = loadConfig(repo, { globalDir });
+    const channels = channelsOf(cfg);
+    const deniedEntry = "codex:gpt-5.5";
+    expect(preferEntryDenied(deniedEntry, cfg)).toEqual({ by: "deny", entry: deniedEntry });
+    expect(preferEntryDenied("cursor-agent", cfg)).toBeNull();
+    expect(() => route(mkTask("implement"), cfg, channels)).toThrow(RoutingError);
+    const allDenied = structuredClone(cfg);
+    allDenied.routing.map.implement = { prefer: [deniedEntry] };
+    expect(denyPreferCollisions(allDenied)).toHaveLength(1);
+    expect(() => route(mkTask("implement"), allDenied, channels)).toThrow(RoutingError);
+    const routerSrc = readFileSync(join(import.meta.dirname, "../../src/route/router.ts"), "utf8");
+    const prefSrc = readFileSync(join(import.meta.dirname, "../../src/route/preference.ts"), "utf8");
+    expect(routerSrc).toContain("disallowedBy(");
+    expect(routerSrc).toContain("channelsFromConfig(p, cfg)");
+    expect(prefSrc).toContain("export function preferEntryDenied");
+    expect(prefSrc).toContain("route(preflightTask, probe, [])");
+    expect(prefSrc).not.toMatch(/if \(p\.includes\(":"\)\)/);
   });
 });

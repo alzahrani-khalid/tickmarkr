@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -13,7 +14,7 @@ import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
 import { gatePaneName } from "../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import { runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
 import { COMMIT, authedModels, setupRepo, T } from "../helpers/tmprepo.js";
@@ -1008,6 +1009,33 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(row.gateFails).toBeUndefined();
     expect(row.consults).toBeUndefined();
     expect(row.parkKind).toBeUndefined();
+  });
+
+  test("a zero-attempt dispatch exception is journaled with a typed non-quality cause", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "never runs" } }] } },
+    );
+    const inner = new SubprocessDriver();
+    const driver = {
+      id: "dispatch-refusal",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      async run() { throw new Error("delivery refused"); },
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+    };
+
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-dispatch-refusal", driver });
+
+    expect(s.failed).toEqual(["T1"]);
+    const event = Journal.open(repo, "run-dispatch-refusal").read().find((e) => e.event === "task-failed")!;
+    expect(event.data).toMatchObject({ kind: "dispatch", attempts: 0 });
   });
 
   test("TEL-01 liar-positive: trailer ok:true but gates fail ⇒ outcome !== 'done'", async () => {
@@ -2641,4 +2669,80 @@ describe("OBS-82 spinner-blind stall, headless site (fake adapter, zero tokens)"
     expect(s.human).toEqual(["T1"]);
     expect(Journal.open(repo, "run-spin-print").read().find((e) => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
   }, 30_000);
+});
+
+describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
+  const SETUP_FAIL = "echo 'zsh: command not found: codex'; exit 1";
+
+  test("the early classification records the same typed dead-channel reason and failover behavior a stall-window classification records today", async () => {
+    setEarlyLaunchLivenessMsForTests(50);
+    try {
+      const stall = setupRepo(
+        [T("T1")],
+        {
+          tasks: {
+            T1: [
+              { shell: SETUP_FAIL },
+              { shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "recovered" } },
+            ],
+          },
+        },
+        "taskTimeoutMinutes: 5\nvisibility:\n  worker: print\n",
+      );
+      await runDaemon(stall.repo, { adapters: [stall.fake], runId: "run-stall-setup" });
+      const stallFo = Journal.open(stall.repo, "run-stall-setup").read()
+        .find((e) => e.event === "dead-channel-failover")!.data;
+
+      const early = setupRepo(
+        [T("T1")],
+        {
+          tasks: {
+            T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "recovered" } }],
+          },
+        },
+        "taskTimeoutMinutes: 5\nvisibility:\n  worker: print\n",
+      );
+      const inner = new SubprocessDriver();
+      let workerRuns = 0;
+      const driver = {
+        id: "subprocess",
+        interactive: false,
+        status: inner.status.bind(inner),
+        slot: inner.slot.bind(inner),
+        run: async (slot: Slot, cmd: string) => {
+          if (slot.name.includes("-worker-")) workerRuns++;
+          return inner.run(slot, cmd);
+        },
+        waitOutput: async (slot: Slot, pattern: string, ms: number, opts?: { regex?: boolean }) =>
+          workerRuns > 1 ? inner.waitOutput(slot, pattern, ms, opts) : false,
+        waitAgentStatus: inner.waitAgentStatus.bind(inner),
+        read: (slot: Slot, lines?: number) =>
+          slot.name.includes("-worker-") && workerRuns === 1
+            ? Promise.resolve("")
+            : inner.read(slot, lines),
+        notify: inner.notify.bind(inner),
+        close: inner.close.bind(inner),
+        worktree: inner.worktree.bind(inner),
+      };
+      await runDaemon(early.repo, { adapters: [early.fake], runId: "run-early-setup", driver });
+      const earlyFo = Journal.open(early.repo, "run-early-setup").read()
+        .find((e) => e.event === "dead-channel-failover")!.data;
+
+      expect(earlyFo.reason).toBe(stallFo.reason);
+      expect(earlyFo.reason).toBe("setup-required");
+      expect(earlyFo.from).toBe(stallFo.from);
+      expect(earlyFo.to).toBe(stallFo.to);
+      expect(Object.keys(earlyFo).sort()).toEqual(Object.keys(stallFo).sort());
+    } finally {
+      resetEarlyLaunchLivenessMsForTests();
+    }
+  }, 30_000);
+
+  test("the early check adds no new polling timer beyond the existing stall-wait poll cadence", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src/run/daemon.ts"), "utf8");
+    expect(src).not.toMatch(/\bsetInterval\s*\(/);
+    expect(src).toMatch(/earlyLaunchLivenessMs/);
+    expect(src).toMatch(/!everHadOutput && Date\.now\(\) - attemptStart >= earlyLaunchLivenessMs/);
+    expect(src).not.toMatch(/setTimeout\([^)]*earlyLaunch/);
+  });
 });

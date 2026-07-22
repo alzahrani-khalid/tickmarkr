@@ -36,6 +36,8 @@ export class HerdrDriver implements ExecutorDriver {
   // grouped slot()/close() mutate shared group state across awaits — serialize them so two
   // concurrent first members can never both create the group tab (mergeSerial idiom, daemon.ts)
   private groupSerial: Promise<unknown> = Promise.resolve();
+  // OBS-119: concurrent deliveries contend on herdr's send path — one chain per driver (mergeSerial idiom)
+  private deliverySerial: Promise<unknown> = Promise.resolve();
 
   // VIS-10: the run's workspace id, captured once at construction (the daemon inherits it from the
   // operator's env before the driver is built). Required at slot() time, never in the constructor —
@@ -50,6 +52,20 @@ export class HerdrDriver implements ExecutorDriver {
     const p = this.groupSerial.then(fn, fn);
     this.groupSerial = p.catch(() => undefined);
     return p;
+  }
+
+  private deliveryQueue<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.deliverySerial.then(fn, fn);
+    this.deliverySerial = p.catch(() => undefined);
+    return p;
+  }
+
+  // ponytail: narrow panes hard-wrap the input line — collapse whitespace before comparing.
+  private deliveryMatches(transcript: string, cmd: string): boolean {
+    const norm = (s: string) => s.replace(/\s+/g, "");
+    const hay = norm(transcript);
+    const needle = norm(cmd);
+    return needle.length > 0 && hay.includes(needle);
   }
 
   static available(): boolean {
@@ -292,6 +308,10 @@ export class HerdrDriver implements ExecutorDriver {
   // cleared (C-u), and retyped, bounded; persistent corruption fails closed WITH the captured
   // transcript — the dispatch-time pincer the ledger asks for, not post-hoc `git:` archaeology.
   async run(slot: Slot, cmd: string): Promise<void> {
+    return this.deliveryQueue(() => this.deliver(slot, cmd));
+  }
+
+  private async deliver(slot: Slot, cmd: string): Promise<void> {
     const pane = await this.paneId(slot);
     let transcript = "";
     for (let attempt = 0; attempt < DELIVERY_ATTEMPTS; attempt++) {
@@ -308,9 +328,7 @@ export class HerdrDriver implements ExecutorDriver {
         slot.cwd,
         DELIVERY_VERIFY_TIMEOUT_MS + 15_000,
       );
-      // ponytail: transcript containment (scrollback included); anchor to the prompt line if a
-      // prior echo of the same command ever false-verifies. Dead pane → error envelope → unverified.
-      if (this.waitOk(back.code, back.stdout)) {
+      if (this.waitOk(back.code, back.stdout) || await this.deliveryReadMatches(pane, cmd, slot.cwd)) {
         const enter = await this.herdr(`pane send-keys ${shq(pane)} Enter`, slot.cwd);
         if (enter.code !== 0) throw new Error(`herdr pane send-keys Enter failed: ${enter.stderr || enter.stdout}`);
         return;
@@ -319,6 +337,11 @@ export class HerdrDriver implements ExecutorDriver {
       transcript = (await this.herdr(`pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`, slot.cwd)).stdout;
     }
     throw new Error(`herdr delivery corrupted after ${DELIVERY_ATTEMPTS} attempts — enter never pressed (OBS-85); pane transcript:\n${transcript}`);
+  }
+
+  private async deliveryReadMatches(pane: string, cmd: string, cwd: string): Promise<boolean> {
+    const read = await this.herdr(`pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`, cwd);
+    return read.code === 0 && this.deliveryMatches(read.stdout, cmd);
   }
 
   private waitOk(code: number, stdout: string): boolean {

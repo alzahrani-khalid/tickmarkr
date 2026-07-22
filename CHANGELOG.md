@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.71 — failure-severity-rendering + kimi-seeding-hardening
+
+This failure-severity-rendering and kimi-seeding-hardening release ships a two-tier task status vocabulary that distinguishes recoverable infrastructure dispatch failures (warn rendering) from verified work failures (terminal red), typed delivery-failure causes in task attempt history, early liveness classification for empty worker panes, seed-mode model-verification fixtures, serialized interactiveSeed delivery with narrow-pane safeguards, doctor and resume preflight checks for deny∩prefer routing contradictions, and journal dead-channel replay at resume.
+
 ## v1.70 — evidence/comparison + review-convergence
 
 This evidence/comparison release ships an evidence-addressed judge verdict schema with path/line citations, run-start environment identity, `report --compare` with comparability guards and cost/gate/duration deltas, and `report --bundle` proof packets with task outcomes, evidence citations, content hashes, and secret redaction. The review-convergence contract classifies material and minor findings, records defer-with-rationale decisions, and parks tasks at the review round cap; nested infrastructure tests also gain load-margin timeout budgets.

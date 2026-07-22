@@ -5,7 +5,7 @@ import { channelKey, TokenUsageSchema, type Assignment } from "../adapters/types
 import type { TickmarkrConfig } from "../config/config.js";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 import { TIERS, type TaskStatus } from "../graph/schema.js";
-import { buildProfile, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
+import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
 import { redactSecrets } from "./redact.js";
 
 export interface JournalEvent {
@@ -45,6 +45,11 @@ export interface ResumeState {
   lastAssignment?: Assignment;
 }
 
+// v1.71 OBS-119: run-wide channel exclusions derived from journal events — companion to
+// replayResumeState(), consumed by the daemon on resume to re-seed demotedChannels.
+export const CHANNEL_EXCLUSION_KINDS = ["dead-channel"] as const;
+export type ChannelExclusionKind = (typeof CHANNEL_EXCLUSION_KINDS)[number];
+
 // v1.24 OBS-18: explicit data on task-approved when the operator releases an attempt-cap park.
 // Approve stamps this; replayResumeState zeros the attempt counter (fresh budget) while keeping
 // tried (consult bans / burned channels). Absent on pre-v1.24 events ⇒ inert (corpus outcome-identical).
@@ -61,13 +66,47 @@ const DispatchAssignmentSchema = z.object({
 });
 
 export const PARK_KINDS = ["human-gate", "ladder-exhausted", "attempt-cap", "gate-fail", "quota",
-  "reroute-exhausted", "setup", "stall", "merge-conflict", "tip-moved"] as const;
+  "reroute-exhausted", "setup", "stall", "merge-conflict", "tip-moved", "infra", "dispatch"] as const;
 export type ParkKind = (typeof PARK_KINDS)[number];
 export const RETRY_MODES = ["resume", "fresh"] as const;
 export type RetryMode = (typeof RETRY_MODES)[number];
 
 export const WORKER_RESULT_CAUSES = ["provider-death", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer"] as const;
 export type WorkerResultCause = (typeof WORKER_RESULT_CAUSES)[number];
+
+// Status consumes the routing profile's existing quality split directly: verified park kinds classify
+// to 0, while availability/recovery noise classifies to null. Keep the synthetic row here at the
+// run↔route seam so presentation code never grows a second list of "bad" park kinds.
+export function isQualityFailureParkKind(kind: ParkKind): boolean {
+  return classify({
+    shape: "", adapter: "-", model: "-", channel: "-", attempts: 0,
+    outcome: "human", durationMs: 0, parkKind: kind,
+  }) === 0;
+}
+
+// The newest terminal event owns the cause. Unknown/malformed kinds fail toward undefined so a
+// task-failed row keeps the legacy red treatment instead of being mistaken for recoverable noise.
+export function recordedTaskFailureKind(events: JournalEvent[], taskId: string): ParkKind | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.taskId !== taskId || (e.event !== "task-human" && e.event !== "task-failed")) continue;
+    return typeof e.data.kind === "string" && (PARK_KINDS as readonly string[]).includes(e.data.kind)
+      ? e.data.kind as ParkKind
+      : undefined;
+  }
+  return undefined;
+}
+
+// Runs can end and later resume in the same journal. The newest lifecycle marker decides whether
+// an unresolved task is still recoverable by this live daemon or belongs to an ended run.
+export function runHasEnded(events: JournalEvent[]): boolean {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!.event;
+    if (event === "run-end" || event === "superseded") return true;
+    if (event === "run-start" || event === "run-resume") return false;
+  }
+  return false;
+}
 
 // OBS-53: provider-outage signatures in dead worker output ("Unable to reach the model provider" and kin).
 const PROVIDER_OUTAGE_RE = /Unable to reach the model provider|cannot reach the model provider|model provider.*(?:unavailable|unreachable)/i;
@@ -445,6 +484,20 @@ export class Journal {
       }
     }
     return m;
+  }
+
+  // v1.71 OBS-119: run-wide exclusion fold — same replay discipline as replayResumeState().
+  // channel-exclusion is the typed event; dead-channel-failover.from is the pre-v1.71 compat seam.
+  replayExcludedChannels(): Set<string> {
+    const excluded = new Set<string>();
+    for (const e of this.read()) {
+      if (e.event === "channel-exclusion" && typeof e.data.channel === "string") {
+        excluded.add(e.data.channel);
+      } else if (e.event === "dead-channel-failover" && typeof e.data.from === "string") {
+        excluded.add(e.data.from);
+      }
+    }
+    return excluded;
   }
 
   telemetry(row: TelemetryRow): void {

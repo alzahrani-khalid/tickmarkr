@@ -1,13 +1,26 @@
+import * as childProcess from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test, vi } from "vitest";
+import { beforeEach, afterEach, describe, expect, test, vi } from "vitest";
 import { hasCodexTrustedProject, seedCodexTrust } from "../../src/adapters/codex.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import * as registry from "../../src/adapters/registry.js";
 import { channelsFromConfig, type TrustVerdict, type WorkerAdapter } from "../../src/adapters/types.js";
 import { BANNER, TOKENS } from "../../src/brand.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
-import { makeRepo } from "../helpers/tmprepo.js";
+import { resume } from "../../src/cli/commands/resume.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
+import { gitHead } from "../../src/run/git.js";
+import { Journal } from "../../src/run/journal.js";
+import { makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
+
+const {
+  discoverChannels,
+  invalidConfiguredModels,
+  modelAliasExclusions,
+  probeVersionShell,
+} = registry;
 
 const stub = (id: string) =>
   ({ id, vendor: "x", probe: async () => ({ installed: true, authed: true, models: [] }) }) as unknown as WorkerAdapter;
@@ -19,6 +32,12 @@ const withOverlay = (repo: string, yaml: string) => {
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
   writeFileSync(join(repo, ".tickmarkr", "config.yaml"), yaml);
 };
+
+// Candidate-CLI sweep is covered in doctor-candidate-cli.test.ts; stubbing here avoids nine
+// real PATH probes per doctor() call (flaky vitest worker RPC timeouts under full-suite load).
+beforeEach(() => {
+  vi.spyOn(registry, "detectCandidateClis").mockReturnValue([]);
+});
 
 // HYG-07(a): a stub whose probe reports a servable list, with channels() wired so servableExclusions
 // can compute the drop exactly as discoverChannels would.
@@ -334,6 +353,108 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
   });
 });
 
+describe("OBS-117 doctor binary resolution + model-alias validation (T5)", () => {
+  const stubBinary = (id: string, binary: string, installed = true, version = "1.0.0") =>
+    ({
+      id,
+      vendor: "x",
+      probe: async () => ({ installed, authed: installed, models: [], version }),
+      hardcodedFlags: { binary, flags: ["--version"] },
+    }) as unknown as WorkerAdapter;
+
+  const stubListModels = (id: string, models: string[], detectedAt = "2026-07-22T12:00:00.000Z") =>
+    ({
+      id,
+      vendor: "x",
+      probe: async () => ({ installed: true, authed: true, models, modelsDetectedAt: detectedAt }),
+      channels: (cfg: any) => channelsFromConfig(id, cfg),
+      listModels: async () => models,
+    }) as unknown as WorkerAdapter;
+
+  test("doctor resolves an adapter's binary through the same shell resolution a dispatched worker pane uses rather than a bare process spawn", () => {
+    const binDir = mkdtempSync(join(tmpdir(), "tickmarkr-shellbin-"));
+    const bin = join(binDir, "fakecli");
+    writeFileSync(bin, "#!/bin/sh\necho shell-resolved 9.9.9\n", { mode: 0o755 });
+    const pathBefore = process.env.PATH;
+    vi.stubEnv("PATH", `${binDir}:${pathBefore}`);
+    try {
+      const shell = probeVersionShell("fakecli", binDir);
+      const bare = childProcess.spawnSync("fakecli", ["--version"], { encoding: "utf8" });
+      expect(shell.installed).toBe(true);
+      expect(shell.version).toBe("shell-resolved 9.9.9");
+      const registrySrc = readFileSync(join(import.meta.dirname, "../../src/adapters/registry.ts"), "utf8");
+      expect(registrySrc).toContain('spawnSync("bash", ["-lc"');
+      expect(bare.status).toBe(0);
+      expect((bare.stdout || bare.stderr).trim().split("\n")[0]).toBe(shell.version);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  test("doctor warns when more than one install of the same adapter binary is resolvable on the machine", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const dir1 = mkdtempSync(join(tmpdir(), "kimi-shadow-1-"));
+    const dir2 = mkdtempSync(join(tmpdir(), "kimi-shadow-2-"));
+    const bin1 = join(dir1, "kimi");
+    const bin2 = join(dir2, "kimi");
+    writeFileSync(bin1, "#!/bin/sh\necho kimi shadow 1.0.0\n", { mode: 0o755 });
+    writeFileSync(bin2, "#!/bin/sh\necho kimi shadow 1.0.0\n", { mode: 0o755 });
+    vi.stubEnv("PATH", `${dir1}:${dir2}:${process.env.PATH}`);
+    try {
+      const out = await doctor(["--"], repo, [stubBinary("kimi", "kimi")], { banner: false });
+      expect(out).toMatch(/binary shadow: kimi/);
+      expect(out).toContain(bin1);
+      expect(out).toContain(bin2);
+      expect(out).toMatch(/installs on PATH/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  test("a configured model alias absent from the adapter CLI's own reported model list is marked invalid rather than treated as dispatchable", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, `tiers:
+  kimi:
+    vendor: moonshot
+    channel: sub
+    models:
+      kimi-code/k3: frontier
+      kimi-code/kimi-for-coding: mid
+      kimi-code/kimi-for-coding-highspeed: null
+`);
+    const models = ["kimi-code/k3"];
+    const adapter = stubListModels("kimi", models);
+    const health = { kimi: { installed: true, authed: true, models, modelsDetectedAt: "2026-07-22T12:00:00.000Z", modelAuth: { "kimi-code/k3": { authed: true, probedAt: "2026-07-22T12:00:00.000Z" }, "kimi-code/kimi-for-coding": { authed: true, probedAt: "2026-07-22T12:00:00.000Z" } } } };
+    expect(invalidConfiguredModels({ tiers: { kimi: { vendor: "moonshot", channel: "sub", models: { "kimi-code/k3": "frontier", "kimi-code/kimi-for-coding": "mid" } } } } as any, "kimi", health.kimi)).toEqual(["kimi-code/kimi-for-coding"]);
+    expect(discoverChannels({ tiers: { kimi: { vendor: "moonshot", channel: "sub", models: { "kimi-code/k3": "frontier", "kimi-code/kimi-for-coding": "mid" } } }, routing: { map: {}, floors: {}, allow: undefined, deny: undefined } } as any, [adapter], health).map((c) => c.model)).toEqual(["kimi-code/k3"]);
+    const out = await doctor(["--"], repo, [adapter], { banner: false });
+    expect(out).toMatch(/model alias: 1 channel\(s\) invalid/);
+    expect(out).toContain("kimi-code/kimi-for-coding");
+    expect(out).toContain("not in kimi's reported model list");
+  });
+
+  test("a configured model alias present in the adapter CLI's own reported model list is treated as dispatchable unchanged", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, `tiers:
+  kimi:
+    vendor: moonshot
+    channel: sub
+    models:
+      kimi-code/k3: frontier
+      kimi-code/kimi-for-coding: null
+      kimi-code/kimi-for-coding-highspeed: null
+`);
+    const models = ["kimi-code/k3"];
+    const adapter = stubListModels("kimi", models);
+    const cfg = { tiers: { kimi: { vendor: "moonshot", channel: "sub", models: { "kimi-code/k3": "frontier" } } }, routing: { map: {}, floors: {}, allow: undefined, deny: undefined } } as any;
+    const health = { kimi: { installed: true, authed: true, models, modelsDetectedAt: "2026-07-22T12:00:00.000Z", modelAuth: { "kimi-code/k3": { authed: true, probedAt: "2026-07-22T12:00:00.000Z" } } } };
+    expect(discoverChannels(cfg, [adapter], health).map((c) => c.model)).toEqual(["kimi-code/k3"]);
+    expect(modelAliasExclusions(cfg, [adapter], health)).toEqual([]);
+    const out = await doctor(["--"], repo, [adapter], { banner: false });
+    expect(out).not.toMatch(/model alias:/);
+  });
+});
+
 describe("T3 brand banner (TTY gate)", () => {
   const withoutTTY = async (fn: () => Promise<void>) => {
     const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -376,5 +497,73 @@ describe("T3 brand banner (TTY gate)", () => {
       out2 = await doctor(["--"], repo2, ADAPTERS5);
     });
     expect(out2!).toBe(out!);
+  });
+});
+
+describe("T7 deny∩prefer static preflight (doctor + resume)", () => {
+  afterEach(() => { delete process.env.TICKMARKR_FAKE_SCRIPT; });
+
+  test("a prefer chain naming only channels fully covered by routing.deny is flagged by doctor before any run starts", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, `routing:
+  deny:
+    adapters: [cursor-agent, codex]
+  map:
+    implement:
+      prefer: [cursor-agent, codex]
+`);
+    const out = await doctor(["--"], repo, ADAPTERS5, { banner: false });
+    expect(out).toMatch(/deny∩prefer: routing\.map\.implement\.prefer cursor-agent > codex fully disallowed by routing\.deny \(cursor-agent\)/);
+  });
+
+  test("a pin naming a channel covered by routing.deny is flagged by doctor before any run starts", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, `routing:
+  deny:
+    adapters: [claude-code]
+  map:
+    plan:
+      pin: { via: claude-code, model: fable }
+`);
+    const out = await doctor(["--"], repo, ADAPTERS5, { banner: false });
+    expect(out).toMatch(/deny∩prefer: routing\.map\.plan\.pin claude-code:fable is disallowed by routing\.deny \(claude-code\)/);
+  });
+
+  test("a prefer chain with at least one non-denied channel is not flagged", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, `routing:
+  deny:
+    adapters: [codex]
+  map:
+    implement:
+      prefer: [cursor-agent, codex]
+`);
+    const out = await doctor(["--"], repo, ADAPTERS5, { banner: false });
+    expect(out).not.toMatch(/deny∩prefer:/);
+  });
+
+  test("resuming a run whose config carries a deny-prefer collision is flagged before the daemon dispatches another task", async () => {
+    const { repo, scriptPath } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: "echo one", result: { ok: true, summary: "t1" } }] } },
+      `routing:
+  deny:
+    adapters: [fake]
+  map:
+    implement:
+      prefer: [fake]
+`,
+    );
+    process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+    const j = Journal.create(repo, "run-deny-prefer");
+    const baseRef = await gitHead(repo);
+    j.append("run-start", undefined, { baseRef, commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    j.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0 });
+    writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+
+    await expect(resume(["run-deny-prefer"], repo)).rejects.toThrow(/deny∩prefer: routing\.map\.implement\.prefer fake fully disallowed/);
+    const events = Journal.open(repo, "run-deny-prefer").read();
+    expect(events.some((e) => e.event === "run-resume")).toBe(false);
+    expect(events.filter((e) => e.event === "task-dispatch")).toHaveLength(1);
   });
 });

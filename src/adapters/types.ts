@@ -55,10 +55,16 @@ export interface WorkerResult { ok: boolean; summary: string; deviations: string
 // v1.69 T6: adapters whose real TUI has no argv-seeding surface can still be launched interactively by
 // opening the TUI first, waiting for a deterministic readiness marker, and then injecting the task as a
 // single submitted turn. `interactiveSeed` is ignored unless `interactiveCommand` is also in play.
+export type SeedBannerConfirmResult =
+  | { ok: true; sessionId?: string }
+  | { ok: false; error: string };
+
 export interface InteractiveSeed {
   launch(model: string): string;
   readinessMatch: string;
   seedLine(promptFile: string): string;
+  // v1.71 T2: optional launch-banner model check — runs on the generic dispatch path before seed injection.
+  confirmBanner?(banner: string, assignedModel: string): SeedBannerConfirmResult;
 }
 
 // v1.23 T1: live tokens-in-context from a CLI's on-disk session store. `tokens` is the LAST turn's

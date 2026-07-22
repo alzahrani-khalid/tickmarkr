@@ -218,6 +218,95 @@ describe("status checklist rendering", () => {
     });
   });
 
+  test("test: a task parked on a zero-attempt infra or dispatch cause while the run is still live renders as a warn-tier row rather than the red failed glyph or word", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      { ts, event: "task-failed", taskId: "T2", data: { error: "delivery refused", kind: "dispatch", attempts: 0 } },
+    ]);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(row(out, "T2"))).toContain("! T2");
+      expect(strip(row(out, "T2"))).not.toMatch(/✗|failed/);
+      expect(row(out, "T2")).not.toContain("\x1b[31m");
+    });
+  });
+
+  test("test: a task parked after its escalation ladder is exhausted renders as the red failed row", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      { ts, event: "task-human", taskId: "T2", data: { reason: "escalation ladder exhausted", kind: "ladder-exhausted" } },
+    ]);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(row(out, "T2"))).toContain("✗ T2");
+      expect(strip(row(out, "T2"))).toContain("failed");
+      expect(row(out, "T2")).toContain("\x1b[31m");
+    });
+  });
+
+  test("test: a task still parked or failed once the run itself has ended renders as the red failed row regardless of its recorded cause", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      { ts, event: "task-human", taskId: "T2", data: { reason: "quota exhausted", kind: "quota" } },
+      { ts, event: "task-failed", taskId: "T3", data: { error: "delivery refused", kind: "dispatch", attempts: 0 } },
+      { ts, event: "run-end", data: { done: [], failed: ["T3"], human: ["T2"] } },
+    ]);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      for (const id of ["T2", "T3"]) {
+        expect(strip(row(out, id))).toContain(`✗ ${id}`);
+        expect(strip(row(out, id))).toContain("failed");
+        expect(row(out, id)).toContain("\x1b[31m");
+      }
+    });
+  });
+
+  test("test: the two-line card's second line names the task's recorded typed cause word for a warn-tier row", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      { ts, event: "task-failed", taskId: "T2", data: { error: "delivery refused", kind: "dispatch", attempts: 0 } },
+    ]);
+
+    await withTty(async () => {
+      const out = await status([], repo);
+      expect(strip(row(out, "T2"))).not.toContain("dispatch");
+      expect(strip(card(out, "T2")).split("\n")[1]).toContain("dispatch");
+    });
+  });
+
+  test("test: the progress gauge fills red only when a red-tier row is present among the tasks, never for a set that is only running or warn-tier parked", async () => {
+    const warnRepo = mkRepo();
+    seed(warnRepo, [
+      runStart(),
+      dispatch("T1", "fake-1"),
+      { ts, event: "task-done", taskId: "T1", data: {} },
+      { ts, event: "task-failed", taskId: "T2", data: { error: "delivery refused", kind: "dispatch", attempts: 0 } },
+      dispatch("T3", "fake-3"),
+    ]);
+    const redRepo = mkRepo();
+    seed(redRepo, [
+      runStart(),
+      dispatch("T1", "fake-1"),
+      { ts, event: "task-done", taskId: "T1", data: {} },
+      { ts, event: "task-human", taskId: "T2", data: { reason: "escalation ladder exhausted", kind: "ladder-exhausted" } },
+      dispatch("T3", "fake-3"),
+    ]);
+
+    await withTty(async () => {
+      const warnHeader = (await status([], warnRepo)).split("\n").find((line) => line.includes("run run-watch"))!;
+      const redHeader = (await status([], redRepo)).split("\n").find((line) => line.includes("run run-watch"))!;
+      expect(warnHeader).not.toContain("\x1b[31m");
+      expect(redHeader).toContain("\x1b[31m");
+    });
+  });
+
   // v1.65 T4 (OBS-104): the cockpit carries a run-level now line so the operator can tell
   // dispatching from gating from merging without tailing the journal.
   test("the surface carries a run-level line naming the most recent journal event", async () => {

@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +6,9 @@ import type { Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerResult } from "./types.js";
+import { runInteractiveSeed } from "../run/interactive-seed.js";
+import { sh } from "../run/git.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, type InteractiveSeed, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerResult } from "./types.js";
 
 // KIMI-03 → v1.58 T5: the "no harness-readable counter" block (research F-6, 2026-07-17) is
 // LIFTED for collectUsage — kimi 0.27.0 writes a wire journal per agent at
@@ -135,17 +136,16 @@ export interface KimiInteractiveSeedResult {
   sessionId?: string;
 }
 
-// Shared launch-then-seed surface (T6) + banner confirm helpers (T7). One definition so the
-// adapter property and runKimiInteractiveSeed cannot drift.
-const KIMI_SEED = {
+// Shared launch-then-seed surface (T6) + banner confirm (T7/T2). One definition so the adapter
+// property and the daemon's generic runInteractiveSeed path cannot drift.
+const KIMI_SEED: InteractiveSeed = {
   launch: (model: string) => `kimi -y -m ${shq(kimiAlias(model))}`,
   readinessMatch: "Send /help for help information.",
   seedLine: (promptFile: string) => `Read ${promptFile} and do exactly what it says.`,
+  confirmBanner: confirmKimiSeedBanner,
 };
 
-// v1.69 T7: kimi-local launch-then-seed that confirms the banner model and captures the session id
-// from the SAME pane text already present for the readiness match. No extra probe, no extra
-// dispatch — one read of the launch banner, then seed or fail closed.
+// v1.69 T7 / v1.71 T2: thin wrapper over the daemon's generic dispatch path for kimi-only tests.
 export async function runKimiInteractiveSeed(opts: {
   driver: Pick<ExecutorDriver, "run" | "waitOutput" | "read">;
   slot: Slot;
@@ -153,39 +153,8 @@ export async function runKimiInteractiveSeed(opts: {
   promptFile: string;
   taskTimeoutMinutes: number;
 }): Promise<KimiInteractiveSeedResult> {
-  await opts.driver.run(opts.slot, KIMI_SEED.launch(opts.assignment.model));
-
-  const ready = await opts.driver.waitOutput(
-    opts.slot,
-    KIMI_SEED.readinessMatch,
-    opts.taskTimeoutMinutes * 60_000,
-  );
-
-  // Banner text already on the pane for the readiness match — the only text model/session use.
-  const banner = await opts.driver.read(opts.slot, 1000);
-
-  if (!ready) {
-    return { output: banner, seedFailed: true, seedError: `readiness pattern not seen: ${KIMI_SEED.readinessMatch}` };
-  }
-
-  const confirm = confirmKimiSeedBanner(banner, opts.assignment.model);
-  if (!confirm.ok) {
-    return { output: banner, seedFailed: true, seedError: confirm.error };
-  }
-
-  const seedText = KIMI_SEED.seedLine(opts.promptFile);
-  await opts.driver.run(opts.slot, seedText);
-
-  let output = "";
-  for (let attempt = 0; attempt < 5; attempt++) {
-    await new Promise((r) => setTimeout(r, 200));
-    output = await opts.driver.read(opts.slot, 1000);
-    const bottom = output.trimEnd().split("\n").pop() ?? "";
-    if (!bottom.includes(seedText)) {
-      return { output, seedFailed: false, sessionId: confirm.sessionId };
-    }
-  }
-  return { output, seedFailed: true, seedError: "seed line never left the input box", sessionId: confirm.sessionId };
+  const r = await runInteractiveSeed({ ...opts, adapter: kimi });
+  return { output: r.output, seedFailed: r.seedFailed, seedError: r.seedError, sessionId: r.sessionId };
 }
 
 export const kimi: WorkerAdapter = {
@@ -218,10 +187,8 @@ export const kimi: WorkerAdapter = {
   // null → the daemon's print fallback (types.ts:101) keeps kimi workers visible without a TUI.
   interactiveCommand: () => null,
   // v1.69 T6/T7: launch the real TUI, wait for the cold-start readiness marker, then submit the
-  // prompt as one user turn. Banner model/session confirmation for seed mode lives in
-  // runKimiInteractiveSeed / confirmKimiSeedBanner (same pane text as the readiness match — no
-  // extra probe). Live-probed 2026-07-22 (kimi 0.28.1): `kimi -y` opens the TUI with yolo active
-  // and prints the model/session lines plus "Send /help for help information." before the input box.
+  // prompt as one user turn. Banner model/session confirmation runs on the daemon's generic
+  // runInteractiveSeed path via confirmBanner on KIMI_SEED (not a separate dispatch helper).
   interactiveSeed: KIMI_SEED,
   // v1.53 T3 resume — live-probed 2026-07-18: `-p` + `-S <id>` compose cleanly (no OBS-67-class
   // flag rejection) and the resumed session carries prior conversation state. `-S <id>` is the
@@ -302,7 +269,7 @@ export const kimi: WorkerAdapter = {
     }
   },
   listModels: async () => {
-    const r = spawnSync("kimi", ["provider", "list", "--json"], { encoding: "utf8", timeout: 15000 });
-    return r.error || r.status !== 0 ? [] : parseKimiModels(r.stdout || "");
+    const r = await sh("kimi provider list --json", process.cwd(), 15000);
+    return r.code !== 0 ? [] : parseKimiModels(r.stdout || "");
   },
 };

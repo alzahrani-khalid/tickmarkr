@@ -6,7 +6,7 @@ import { DELIVERY_ATTEMPTS, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once" }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string> }
 
 // OBS-85 fixture text: what the incident panes actually showed instead of the typed dispatch line.
 const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
@@ -18,9 +18,11 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const ctr = join(dir, "tabctr.txt"); // incTabs: distinct tab ids (t1,t2,…) so coexisting tabs are distinguishable
   const taken = join(dir, "taken.txt"); // DEFECT-01: names a prior (killed) process's kept pane still holds
   const verctr = join(dir, "verctr.txt"); // corrupt:"once" — first delivery verify fails, later ones match
+  const inflight = join(dir, "inflight.txt"); // contendDelivery: pane ids with an active delivery
   const bin = join(dir, "herdr");
   const cwd = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-cwd-"));
   if (opts.takenNames?.length) writeFileSync(taken, opts.takenNames.join("\n") + "\n");
+  if (opts.paneIds) for (const [name, id] of Object.entries(opts.paneIds)) writeFileSync(map, `${name} ${id}\n`, { flag: "a" });
   // opt-in capabilities: tab → tab create answers tab_id + root_pane (SKILL:343) and pane split
   // answers result.pane.pane_id; existing makeStub() callers keep today's '{}' tab-create default.
   // incTabs emits incrementing tab ids so a group tab and a dedicated role tab are distinguishable.
@@ -54,15 +56,31 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   // command). corrupt:"always" never matches; corrupt:"once" fails the first verify then matches —
   // the cleared-and-retyped path. pane read then serves the corrupted-transcript capture.
   const waitOutput =
-    opts.corrupt === "always"
+    opts.wrappedCmd
+      ? "exit 1"
+      : opts.corrupt === "always"
       ? "exit 1"
       : opts.corrupt === "once"
         ? `n=$(cat '${verctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${verctr}'; [ $n -le 1 ] && exit 1; exit 0`
         : `exit ${waitExit}`;
-  const paneRead = opts.corrupt ? CORRUPT_READ : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
+  const paneRead = opts.corrupt ? CORRUPT_READ : opts.wrappedCmd
+    ? `printf '> ${opts.wrappedCmd.slice(0, 20)}\\n${opts.wrappedCmd.slice(20)}\\n'`
+    : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
+  const deliveryContend = opts.contendDelivery
+    ? `
+delivery_pane() { for a in "$@"; do case "$a" in w1:p*) echo "$a"; return;; esac; done; }
+delivery_begin() { p=$(delivery_pane "$@"); [ -z "$p" ] && return; grep -qx "$p" '${inflight}' 2>/dev/null && exit 1; echo "$p" >> '${inflight}'; }
+delivery_end() { p=$(delivery_pane "$@"); [ -z "$p" ] && return; grep -vx "$p" '${inflight}' > '${inflight}.tmp' 2>/dev/null || : > '${inflight}.tmp'; mv '${inflight}.tmp' '${inflight}'; }
+delivery_clear() { p=$(delivery_pane "$@"); [ -z "$p" ] && return; n=$(wc -l < '${inflight}' 2>/dev/null | tr -d ' '); [ -z "$n" ] && n=0; [ "$n" -gt 1 ] && exit 1; delivery_end "$@"; echo '{}'; }
+pane_send_keys() { if [[ "$*" == *C-u* ]]; then delivery_clear "$@"; elif [[ "$*" == *Enter* ]]; then delivery_end "$@"; echo '{}'; else echo '{}'; fi; }
+`
+    : "";
+  const sendText = opts.contendDelivery ? `delivery_begin "$@"; echo '{}'` : "echo '{}'";
+  const sendKeys = opts.contendDelivery ? `pane_send_keys "$@"` : `echo '{}'`;
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
+${deliveryContend}
 echo "$@" >> '${log}'
 case "$1 $2" in
   "agent start") ${agentStart} ;;
@@ -77,7 +95,8 @@ case "$1 $2" in
   "notification show") echo '{}' ;;
   "wait output") ${waitOutput} ;;
   "wait agent-status") exit 0 ;;
-  "pane send-text") echo '{}' ;;
+  "pane send-text") ${sendText} ;;
+  "pane send-keys") ${sendKeys} ;;
   "pane read")   ${paneRead} ;;
   *) echo '{}' ;;
 esac
@@ -271,6 +290,47 @@ describe("HerdrDriver verified delivery (OBS-85)", () => {
     expect(calls).toContain("pane send-keys w1:p42 Enter");
     expect(calls).toContain("pane send-text w1:p7 tickmarkr status --watch");
     expect(calls).toContain("pane send-keys w1:p7 Enter");
+  });
+});
+
+// OBS-119 T3: concurrent interactiveSeed deliveries contend on herdr's shared send path unless
+// serialized; narrow panes hard-wrap the input line so wait-output --match false-positives as corrupt.
+describe("HerdrDriver delivery serialization and narrow-pane read-back (OBS-119 T3)", () => {
+  test("two deliveries dispatched to different panes at the same instant both complete rather than one failing closed on a delivery-clear error", async () => {
+    const { bin, log, cwd } = makeStub(1, { contendDelivery: true, corrupt: "once", paneIds: { "pane-a": "w1:p1", "pane-b": "w1:p2" } });
+    const d = new HerdrDriver(bin);
+    const a = { id: "w1:p1", name: "pane-a", cwd };
+    const b = { id: "w1:p2", name: "pane-b", cwd };
+    await Promise.all([d.run(a, "echo one"), d.run(b, "echo two")]);
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("pane send-keys w1:p1 Enter");
+    expect(calls).toContain("pane send-keys w1:p2 Enter");
+    expect(calls).not.toMatch(/delivery clear failed/);
+  });
+
+  test("a delivery whose read-back is line-wrapped by a narrow pane width is still recognized as matching the typed command", async () => {
+    const cmd = "read /very/long/path/to/prompt.md";
+    const { bin, log, cwd } = makeStub(0, { wrappedCmd: cmd });
+    const d = new HerdrDriver(bin);
+    await d.run({ id: "w1:p42", name: "narrow", cwd }, cmd);
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const send = lines.findIndex((l) => l === `pane send-text w1:p42 ${cmd}`);
+    const read = lines.findIndex((l, i) => i > send && l.startsWith("pane read w1:p42"));
+    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
+    expect(send).toBeGreaterThanOrEqual(0);
+    expect(read).toBeGreaterThan(send);
+    expect(enter).toBeGreaterThan(read);
+    expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(1);
+    expect(lines.filter((l) => l === "pane send-keys w1:p42 C-u")).toHaveLength(0);
+  });
+
+  test("a delivery that is genuinely corrupted still fails closed with the captured transcript after a clean clear", async () => {
+    const { bin, log, cwd } = makeStub(0, { corrupt: "always" });
+    const d = new HerdrDriver(bin);
+    await expect(d.run({ id: "w1:p42", name: "bad", cwd }, "echo hi")).rejects.toThrow(/rev-parseprintf/);
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-keys w1:p42 C-u/gm)?.length ?? 0).toBeGreaterThan(0);
+    expect(calls).not.toMatch(/pane send-keys w1:p42 Enter/);
   });
 });
 

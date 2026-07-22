@@ -5,6 +5,7 @@ export interface InteractiveSeedResult {
   output: string;
   seedFailed: boolean;
   seedError?: string;
+  sessionId?: string;
 }
 
 // v1.69 T6: launch-then-seed handoff for adapters whose real TUI cannot be argv-seeded.
@@ -27,9 +28,18 @@ export async function runInteractiveSeed(opts: {
     seed.readinessMatch,
     opts.taskTimeoutMinutes * 60_000,
   );
+  const banner = await opts.driver.read(opts.slot, 1000);
   if (!ready) {
-    const output = await opts.driver.read(opts.slot, 1000);
-    return { output, seedFailed: true, seedError: `readiness pattern not seen: ${seed.readinessMatch}` };
+    return { output: banner, seedFailed: true, seedError: `readiness pattern not seen: ${seed.readinessMatch}` };
+  }
+
+  let sessionId: string | undefined;
+  if (seed.confirmBanner) {
+    const confirm = seed.confirmBanner(banner, opts.assignment.model);
+    if (!confirm.ok) {
+      return { output: banner, seedFailed: true, seedError: confirm.error };
+    }
+    sessionId = confirm.sessionId;
   }
 
   const seedText = seed.seedLine(opts.promptFile);
@@ -41,8 +51,8 @@ export async function runInteractiveSeed(opts: {
     output = await opts.driver.read(opts.slot, 1000);
     const bottom = output.trimEnd().split("\n").pop() ?? "";
     if (!bottom.includes(seedText)) {
-      return { output, seedFailed: false };
+      return { output, seedFailed: false, ...(sessionId ? { sessionId } : {}) };
     }
   }
-  return { output, seedFailed: true, seedError: "seed line never left the input box" };
+  return { output, seedFailed: true, seedError: "seed line never left the input box", ...(sessionId ? { sessionId } : {}) };
 }
