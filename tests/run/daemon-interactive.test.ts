@@ -494,7 +494,11 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
       `TICKMARKR_RESULT_<NONCE> {"ok":true,"summary":"would need three retries","deviations":[]}`,
     ]);
     await runDaemon(repo, { adapters: [fake], runId: "run-bound", driver });
-    expect(Date.now() - started).toBeLessThan(3_000); // 0.05m stall window; two 1s retries must fit inside it
+    // Coarse runaway guard only (CI runners measured 3166ms for overhead + two 1s settles — a 3s
+    // bound flaked the v1.68.0 release). The real fences are below: cause is malformed-trailer,
+    // NOT stall-timeout (settle retries never ate the 0.05m stall window), and the staged good
+    // trailer at read 6 was never reached (re-reads bounded at two).
+    expect(Date.now() - started).toBeLessThan(10_000);
     const wr = Journal.open(repo, "run-bound").read().find((e) => e.event === "worker-result");
     expect(wr?.data.ok).toBe(false);
     expect(wr?.data.summary).toBe(UNPARSEABLE_TRAILER_SUMMARY);
