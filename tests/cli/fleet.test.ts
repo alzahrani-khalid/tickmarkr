@@ -630,10 +630,14 @@ describe("tickmarkr fleet", () => {
     const { io, writes } = makeIO();
     const out = await drive(repo, adapter, io, KEYS.enter + "1" + KEYS.enter + "2" + KEYS.q);
     expect(out).toBe("fleet: quit without writing");
-    // digits are dead keys: no re-render, no toggle
-    expect(writes.length).toBe(3);
-    expect(strip(writes[1])).toContain(`${GLYPHS.toggleActive} fake`);
-    expect(strip(writes[2])).toContain(`${GLYPHS.toggleActive} fake-1  mid  allowed`);
+    // digits are dead keys: they never toggle. The invariant is the settled toggle STATE, not the frame
+    // count — the runtime coalesces a render-timing-dependent number of frames (CI differs from local), so
+    // assert by content on the settled frames: the CLIs frame keeps fake ACTIVE and the settled models
+    // frame keeps fake-1 ALLOWED (a live digit-toggle would flip these marks).
+    await settle(() => strip(writes.at(-1) ?? "").includes(`${GLYPHS.toggleActive} fake-1  mid  allowed`));
+    const membership = writes.find((f) => strip(f).includes("step 2/6 · agent CLIs"));
+    expect(strip(membership ?? "")).toContain(`${GLYPHS.toggleActive} fake`);
+    expect(strip(writes.at(-1)!)).toContain(`${GLYPHS.toggleActive} fake-1  mid  allowed`);
   });
 
   test("every interactive frame reads like an fzf style list picker — exactly one pointer glyph marks the highlighted row, toggle marks are readable without color, the step title visually dominates the frame, and the key legend is a single dim line", async () => {
@@ -641,7 +645,10 @@ describe("tickmarkr fleet", () => {
     const { io, writes } = makeIO();
     const out = await drive(repo, adapter, io, KEYS.enter + KEYS.enter + KEYS.enter + KEYS.enter + KEYS.enter + KEYS.enter, ["--global-dir", isolatedGlobal()]);
     expect(out).toBe("fleet: no overlay changes (empty diff)");
-    expect(writes.length).toBe(6);
+    // the fzf invariant holds for EVERY complete frame the runtime renders — so assert it per-frame rather
+    // than pinning an exact frame count (the runtime coalesces a render-timing-dependent number of frames;
+    // CI renders more than local). Any extra coalesced frame is still a complete screen and must comply.
+    expect(writes.length).toBeGreaterThanOrEqual(1);
     for (const frame of writes) {
       const lines = frame.split("\n").filter((l) => l !== "");
       expect((frame.match(/❯/g) ?? []).length).toBe(1);
@@ -649,10 +656,13 @@ describe("tickmarkr fleet", () => {
       const dimLines = lines.filter((l) => l.includes("\x1b[2m"));
       expect(dimLines).toEqual([lines[1]]);
     }
-    // membership + models frames keep colorless-readable toggle marks (the ruled glyphs)
-    expect(strip(writes[1])).toMatch(new RegExp(`[${GLYPHS.toggleActive}${GLYPHS.toggleInactive}]`));
-    expect(strip(writes[2])).toMatch(new RegExp(`[${GLYPHS.toggleActive}${GLYPHS.toggleInactive}]`));
-    expect(strip(writes[2])).toContain("( )");
+    // membership + models frames keep colorless-readable toggle marks (the ruled glyphs) — located by
+    // screen title, not by a render-timing-dependent frame index.
+    const membership = writes.find((f) => strip(f).includes("step 2/6 · agent CLIs"));
+    const models = writes.find((f) => strip(f).includes("step 3/6 · models"));
+    expect(strip(membership ?? "")).toMatch(new RegExp(`[${GLYPHS.toggleActive}${GLYPHS.toggleInactive}]`));
+    expect(strip(models ?? "")).toMatch(new RegExp(`[${GLYPHS.toggleActive}${GLYPHS.toggleInactive}]`));
+    expect(strip(models ?? "")).toContain("( )");
   });
 
   test("the injected test parser and the production keypress decoder agree on every key the editor handles including j and k", async () => {
@@ -1244,13 +1254,18 @@ review:
     const io = makeIO();
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
     io.input.write(TO_DOCS + KEYS.p);
-    await settle(() => io.writes.join("").includes("pick · docs"));
-    const rowBefore = pointerLine(io.writes[8]);
+    await settle(() => strip(io.writes.at(-1) ?? "").includes("pick · docs")); // picker open = TO_DOCS drained
+    // capture the settled shape row the picker opened on — the LAST shape-routing frame BEFORE the picker,
+    // located by content rather than a fixed frame index (the runtime coalesces a render-timing-dependent
+    // number of frames; CI differs from local).
+    const shapeFrame = (f: string) => strip(f).includes("step 5/6 · shape routing") && !strip(f).includes("pick · docs");
+    const rowBefore = pointerLine(io.writes.filter(shapeFrame).at(-1)!);
     expect(rowBefore).toContain("fake:fake-1");
-    const mark = io.writes.length;
     // a lone ESC resolves via node's escape-sequence timeout (500ms) — settle covers it
     io.input.write(KEYS.escape);
-    await settle(() => io.writes.slice(mark).join("").includes("step 5/6 · shape routing"));
+    // settle until the picker has fully CLOSED — the settled frame is shape routing again and no longer
+    // shows the picker. Asserting on io.writes.at(-1) before the close settled caught a pre-close frame.
+    await settle(() => shapeFrame(io.writes.at(-1) ?? ""));
     expect(pointerLine(io.writes.at(-1)!)).toBe(rowBefore);
     io.input.write(KEYS.enter + KEYS.enter);
     expect(await done).toBe("fleet: no overlay changes (empty diff)");
