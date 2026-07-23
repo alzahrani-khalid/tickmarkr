@@ -26,27 +26,30 @@ interface StubAgent { name?: string; pane_id: string; tab_id: string; workspace_
 function makeReconcileStub(agents: StubAgent[], opts: { listFails?: boolean; listGarbage?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reconcile-"));
   const log = join(dir, "log.txt");
-  const agentsFile = join(dir, "agents.json");
+  // herdr 0.7.5: reconcile reads ownership off `pane list` labels (not `agent list`). The registry
+  // carries "<pane_id>|<tab_id>|<label>|<workspace_id>" so a pane close is observable and reconcile
+  // can decide ownership per pane. Nameless shells register an empty label (foreign → never closed).
   const panesFile = join(dir, "panes.txt");
-  const namesFile = join(dir, "names.txt");
-  writeFileSync(agentsFile, JSON.stringify({ result: { agents } }));
-  writeFileSync(namesFile, "");
-  writeFileSync(panesFile, agents.map((a) => `${a.pane_id} ${a.tab_id}`).join("\n") + "\n");
-  const agentList = opts.listFails ? "exit 1" : opts.listGarbage ? "printf 'not json'" : `cat '${agentsFile}'`;
+  writeFileSync(panesFile, agents.map((a) => `${a.pane_id}|${a.tab_id}|${a.name ?? ""}|${a.workspace_id}`).join("\n") + "\n");
+  const paneList = opts.listFails
+    ? "exit 1"
+    : opts.listGarbage
+      ? "printf 'not json'"
+      : `{ printf '{"result":{"panes":['; sep=""; while IFS='|' read -r pid tid label ws; do [ -n "$pid" ] || continue; printf '%s{"pane_id":"%s","tab_id":"%s","label":"%s","workspace_id":"%s"}' "$sep" "$pid" "$tid" "$label" "$ws"; sep=","; done < '${panesFile}'; printf ']}}\\n'; }`;
   const bin = join(dir, "herdr");
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
 echo "$@" >> '${log}'
 case "$1 $2" in
-  "agent list") ${agentList} ;;
-  "agent start") echo '{"result":{"agent":{"pane_id":"w1:p9"}}}' ;;
-  "agent rename") echo "$4 $3" >> '${namesFile}'; echo '{}' ;;
-  "agent get") pane=$(grep "^$3 " '${namesFile}' 2>/dev/null | tail -1 | cut -d' ' -f2); if [ -n "$pane" ]; then echo "{\\"result\\":{\\"agent\\":{\\"pane_id\\":\\"$pane\\"}}}"; else exit 1; fi ;;
+  "pane list") ${paneList} ;;
+  "pane rename") printf '%s||%s|wT\\n' "$3" "$4" >> '${panesFile}'; echo '{}' ;;
   "pane split") echo '{"result":{"pane":{"pane_id":"w1:p7"}}}' ;;
-  "tab create") echo '{"result":{"tab":{"tab_id":"w1:tN"},"root_pane":{"pane_id":"w1:p0"}}}' ;;
-  "pane close") grep -v "^$3 " '${panesFile}' > '${panesFile}.tmp'; mv '${panesFile}.tmp' '${panesFile}'; echo '{}' ;;
-  "pane list") { printf '{"result":{"panes":['; sep=""; while read -r pid tid; do [ -n "$pid" ] || continue; printf '%s{"pane_id":"%s","tab_id":"%s"}' "$sep" "$pid" "$tid"; sep=","; done < '${panesFile}'; printf ']}}\\n'; } ;;
+  "tab create") echo '{"result":{"tab":{"tab_id":"w1:tN"},"root_pane":{"pane_id":"w1:p9"}}}' ;;
+  "pane close") grep -v "^$3|" '${panesFile}' > '${panesFile}.tmp' 2>/dev/null || :; mv '${panesFile}.tmp' '${panesFile}' 2>/dev/null || :; echo '{}' ;;
+  "pane wait-output") exit 0 ;;
+  "agent wait") exit 0 ;;
+  "pane read") printf 'line1\\nTICKMARKR_EXIT:0\\n' ;;
   *) echo '{}' ;;
 esac
 `,
@@ -120,7 +123,7 @@ describe("HerdrDriver.reconcile (stubbed binary)", () => {
     const d = new HerdrDriver(bin);
     await d.narrator("/tmp", "tickmarkr status --watch", RUN);
     expect(log()).toContain("pane split wT:pCALLER --direction right --no-focus");
-    expect(log()).toContain(`agent rename w1:p7 ${owned("watch", "run", 0, RUN)}`);
+    expect(log()).toContain(`pane rename w1:p7 ${owned("watch", "run", 0, RUN)}`);
   });
 });
 

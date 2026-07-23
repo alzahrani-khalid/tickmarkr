@@ -1,6 +1,6 @@
 {
   "name": "tickmarkr",
-  "version": "1.71.0",
+  "version": "1.72.0",
   "description": "Spec in, verified work out.",
   "type": "module",
   "license": "MIT",
@@ -39,7 +39,10 @@
     "e2e": "TICKMARKR_E2E=1 vitest run tests/e2e --testTimeout 900000"
   },
   "dependencies": {
+    "@types/react": "^19.2.17",
+    "ink": "^6.8.0",
     "picomatch": "^4.0.2",
+    "react": "^19.2.8",
     "yaml": "^2.5.0",
     "zod": "^4.0.0"
   },

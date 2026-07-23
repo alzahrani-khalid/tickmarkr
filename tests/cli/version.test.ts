@@ -1,7 +1,8 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { beforeEach, describe, expect, test } from "vitest";
+import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { version } from "../../src/cli/commands/version.js";
 import { dispatch, USAGE } from "../../src/cli/index.js";
 import { spawnCli, assertCliSuccess } from "../helpers/built-cli.js";
@@ -11,9 +12,19 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.70.0";
+const PRIOR_RELEASE_VERSION = "1.71.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
+
+// A fresh worktree has no dist/, and `ignore-scripts=true` npm config skips the pretest build,
+// so build on demand when this file runs outside the full suite (where bin.test.ts rebuilds).
+// OBS-96-safe: this file is inside the serialized dist-coupled fork, so nothing races the emit.
+// execFileSync, not spawnSync: the shared-helper hygiene guard pins raw spawnSync in this file,
+// and this is a build step, not a built-CLI assertion.
+beforeAll(() => {
+  if (existsSync(ENTRY)) return;
+  execFileSync("npm", ["run", "build"], { cwd: ROOT, stdio: "pipe" });
+}, 180_000);
 
 describe("tickmarkr version", () => {
   beforeEach(() => {
@@ -65,17 +76,17 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the failure-severity-rendering and kimi-seeding-hardening themes and the shipped changes rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.71[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/failure[- ]severity[- ]rendering/i);
-    expect(entry).toMatch(/kimi[- ]seeding[- ]hardening/i);
-    for (const change of ["two-tier", "task status", "recoverable", "dispatch", "work failure", "typed", "delivery", "attempt history", "early liveness", "worker pane", "model-verification", "serialized", "interactiveSeed", "narrow-pane", "doctor", "resume preflight", "deny", "prefer", "dead-channel"]) {
+  test("the changelog entry names the component-runtime migration and picker-everywhere themes rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.72[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/component[- ]runtime/i);
+    expect(entry).toMatch(/picker[- ]everywhere/i);
+    for (const change of ["ink", "react", "fleet editor", "beachhead", "component", "diff-confirm", "reload-guard", "overlay writer", "legacy", "askTyped", "picked", "typed", "adapters", "models", "tiers", "seats", "prefer chain", "chain order", "consult picker", "review picker", "staged edits", "non-interactive", "byte-identical"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.70.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.71.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

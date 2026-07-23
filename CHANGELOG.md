@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.72 — component-runtime migration + picker-everywhere
+
+This component-runtime-migration and picker-everywhere release adopts Ink (the React terminal renderer) as tickmarkr's interactive UI runtime, starting with the fleet editor (`tickmarkr fleet`) as the beachhead: all six fleet editor screens now render as components, the diff-confirm and reload-guard write path is preserved as the single overlay writer, and the legacy openTerm/askTyped engine is deleted from the fleet command. Closed vocabularies are picked, never typed — adapters, models, tiers, seats, and prefer chains — while free text survives only for genuinely free fields; ordered multi-select makes selection order the chain order, the consult picker offers full adapter-and-model seats and the review picker additionally offers bare adapters, and a rejected overlay write returns the operator to the editor with staged edits intact. The daemon and every non-interactive path never import the UI runtime, and `--print` output stays byte-identical.
+
 ## v1.71 — failure-severity-rendering + kimi-seeding-hardening
 
 This failure-severity-rendering and kimi-seeding-hardening release ships a two-tier task status vocabulary that distinguishes recoverable infrastructure dispatch failures (warn rendering) from verified work failures (terminal red), typed delivery-failure causes in task attempt history, early liveness classification for empty worker panes, seed-mode model-verification fixtures, serialized interactiveSeed delivery with narrow-pane safeguards, doctor and resume preflight checks for deny∩prefer routing contradictions, and journal dead-channel replay at resume.

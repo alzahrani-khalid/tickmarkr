@@ -14,45 +14,44 @@ const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
 function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string; cwd: string } {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-"));
   const log = join(dir, "log.txt");
-  const map = join(dir, "agents.txt"); // agent rename registry: "<name> <paneId>" per line
+  // herdr 0.7.5 durable identity is the PANE LABEL: `pane rename` registers "<paneId> <label>" and
+  // `pane list` reports it back (namedPaneId/statusByName/reconcile/priorWatch all resolve here).
+  const panes = join(dir, "panes.txt");
   const ctr = join(dir, "tabctr.txt"); // incTabs: distinct tab ids (t1,t2,…) so coexisting tabs are distinguishable
-  const taken = join(dir, "taken.txt"); // DEFECT-01: names a prior (killed) process's kept pane still holds
   const verctr = join(dir, "verctr.txt"); // corrupt:"once" — first delivery verify fails, later ones match
   const inflight = join(dir, "inflight.txt"); // contendDelivery: pane ids with an active delivery
   const bin = join(dir, "herdr");
   const cwd = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-cwd-"));
-  if (opts.takenNames?.length) writeFileSync(taken, opts.takenNames.join("\n") + "\n");
-  if (opts.paneIds) for (const [name, id] of Object.entries(opts.paneIds)) writeFileSync(map, `${name} ${id}\n`, { flag: "a" });
-  // opt-in capabilities: tab → tab create answers tab_id + root_pane (SKILL:343) and pane split
-  // answers result.pane.pane_id; existing makeStub() callers keep today's '{}' tab-create default.
-  // incTabs emits incrementing tab ids so a group tab and a dedicated role tab are distinguishable.
-  // VIS-10: default is now the VALID tab payload (post-fix every slot has a tab_id); tabFails
-  // (non-zero exit), tabGarbage (unparseable stdout), tabNoId (parses but no tab_id — the pre-fix
-  // degraded path) are the explicit degraded-path fixtures. opts.tab is a kept-as-no-op alias so
-  // existing { tab: true } callers keep working unchanged.
+  // DEFECT-01: a prior (killed) attempt's kept pane still carries the durable label — a stale pane-list
+  // entry the reclaim sweep must find and close before the fresh pane can be the sole holder of the name.
+  if (opts.takenNames?.length) for (const n of opts.takenNames) writeFileSync(panes, `w1:pSTALE ${n}\n`, { flag: "a" });
+  // pre-registered pane labels (delivery-contention test resolves names to fixed panes).
+  if (opts.paneIds) for (const [name, id] of Object.entries(opts.paneIds)) writeFileSync(panes, `${id} ${name}\n`, { flag: "a" });
+  // a surviving prior-run watch pane (narrator reclaim path).
+  if (opts.survivingWatch) writeFileSync(panes, `${opts.survivingWatch.pane} ${opts.survivingWatch.name}\n`, { flag: "a" });
+  // tab create answers tab_id + root_pane.pane_id; in 0.7.5 that root shell pane IS the worker pane
+  // (no separate `agent start … -- bash`). incTabs emits incrementing tab ids so a group tab and a
+  // dedicated role tab are distinguishable. tabFails/tabGarbage/tabNoId are the degraded-path fixtures.
   const tabCreate =
     opts.tabFails ? "exit 1" :
     opts.tabGarbage ? "printf 'not json'" :
     opts.incTabs
-    ? `n=$(cat '${ctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${ctr}'; echo "{\\"result\\":{\\"tab\\":{\\"tab_id\\":\\"w1:t$n\\"},\\"root_pane\\":{\\"pane_id\\":\\"w1:p0\\"}}}"`
+    ? `n=$(cat '${ctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${ctr}'; echo "{\\"result\\":{\\"tab\\":{\\"tab_id\\":\\"w1:t$n\\"},\\"root_pane\\":{\\"pane_id\\":\\"w1:p9\\"}}}"`
     : opts.tabNoId ? `echo '{}'`
-    : `echo '{"result":{"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:p0"}}}'`;
+    : `echo '{"result":{"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:p9"}}}'`;
   const paneSplit = opts.splitFails ? "exit 1" : `echo '{"result":{"pane":{"pane_id":"w1:p7"}}}'`;
   const paneLayout = opts.layoutFails ? "exit 1" : `w=${opts.paneCols ?? 222}; pid=""; for a in "$@"; do case "$a" in --pane) shift; pid="$1";; esac; done; [ -z "$pid" ] && pid=w1:p42; echo "{\\"result\\":{\\"layout\\":{\\"area\\":{\\"width\\":$w},\\"panes\\":[{\\"pane_id\\":\\"$pid\\",\\"rect\\":{\\"width\\":$w}}]}}}"`;
-  const rename = opts.renameFails ? "exit 1" : `echo "$4 $3" >> '${map}'; echo '{}'`;
+  // pane rename <pane> <name>: register the durable label ($3=pane, $4=label). renameFails rejects the
+  // SPLIT pane's rename only (w1:p7) — the old agent-rename fixture hit joins, not the tabSlot root — so
+  // the first group member still names its root pane and the join is what degrades (A1 fail-safe).
+  const paneRename = opts.renameFails
+    ? `if [ "$3" = "w1:p7" ]; then exit 1; fi; printf '%s %s\\n' "$3" "$4" >> '${panes}'; echo '{}'`
+    : `printf '%s %s\\n' "$3" "$4" >> '${panes}'; echo '{}'`;
   const tabRename = opts.tabRenameFails ? "exit 1" : "echo '{}'";
-  // DEFECT-01: agent start refuses a taken name on STDOUT (Pitfall 6 — herdr prints error json to stdout), exit 1.
-  const agentStart = opts.startFailsOther
-    ? `echo '{"error":{"code":"workspace_missing","message":"no such workspace"}}'; exit 1`
-    : `if [ -f '${taken}' ] && grep -qx "$3" '${taken}'; then echo "{\\"error\\":{\\"code\\":\\"agent_name_taken\\",\\"message\\":\\"agent name $3 already used; pane_id=w1:pSTALE\\"}}"; exit 1; fi; echo '{"result":{"agent":{"pane_id":"w1:p9"}}}'`;
-  // agent get resolves a taken name to its stale holder pane; otherwise the existing rename-map lookup.
-  const agentGet = `if [ -f '${taken}' ] && grep -qx "$3" '${taken}'; then echo '{"result":{"agent":{"pane_id":"w1:pSTALE"}}}'; else pane=$(grep "^$3 " '${map}' 2>/dev/null | tail -1 | cut -d' ' -f2); if [ -n "$pane" ]; then echo "{\\"result\\":{\\"agent\\":{\\"pane_id\\":\\"$pane\\"}}}"; elif [[ "$3" == tickmarkr:watch:* || "$3" == narrator-watch-* ]]; then exit 1; else echo '{"result":{"agent":{"pane_id":"w1:p42"}}}'; fi; fi`;
-  // closing the stale holder frees the name (unless paneCloseNoop → the fail-closed retry-ceiling test).
-  const paneClose = opts.paneCloseNoop ? `echo '{}'` : `if [ "$3" = "w1:pSTALE" ]; then : > '${taken}'; fi; echo '{}'`;
-  const agentList = opts.survivingWatch
-    ? `echo '{"result":{"agents":[{"name":"${opts.survivingWatch.name}","pane_id":"${opts.survivingWatch.pane}","workspace_id":"wTEST"}]}}'`
-    : `echo '{"result":{"agents":[]}}'`;
-  // OBS-85: the delivery read-back rides `wait output --match <cmd>` (exit 0 = pane echoed the typed
+  // pane close <pane>: drop its registry line (frees the label) unless paneCloseNoop (the reclaim
+  // fail-closed fixture — a close that never frees the name must make the driver reject).
+  const paneClose = opts.paneCloseNoop ? `echo '{}'` : `grep -v "^$3 " '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; echo '{}'`;
+  // OBS-85: the delivery read-back rides `pane wait-output --match <cmd>` (exit 0 = pane echoed the typed
   // command). corrupt:"always" never matches; corrupt:"once" fails the first verify then matches —
   // the cleared-and-retyped path. pane read then serves the corrupted-transcript capture.
   const waitOutput =
@@ -80,21 +79,32 @@ pane_send_keys() { if [[ "$*" == *C-u* ]]; then delivery_clear "$@"; elif [[ "$*
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
+PANES='${panes}'
+herdr_pane_list() {
+  out=""
+  if [ -f "$PANES" ]; then
+    while IFS=' ' read -r pid label; do
+      [ -z "$pid" ] && continue
+      e="{\\"pane_id\\":\\"$pid\\",\\"label\\":\\"$label\\",\\"tab_id\\":\\"w1:t1\\",\\"workspace_id\\":\\"wTEST\\",\\"agent_status\\":\\"idle\\"}"
+      if [ -z "$out" ]; then out="$e"; else out="$out,$e"; fi
+    done < "$PANES"
+  fi
+  echo "{\\"result\\":{\\"panes\\":[$out]}}"
+}
 ${deliveryContend}
 echo "$@" >> '${log}'
 case "$1 $2" in
-  "agent start") ${agentStart} ;;
-  "agent rename") ${rename} ;;
-  "agent get") ${agentGet} ;;
-  "agent list") ${agentList} ;;
   "tab create") ${tabCreate} ;;
   "tab rename") ${tabRename} ;;
+  "tab close") echo '{}' ;;
+  "pane rename") ${paneRename} ;;
+  "pane list") herdr_pane_list ;;
   "pane split") ${paneSplit} ;;
   "pane layout") ${paneLayout} ;;
   "pane close") ${paneClose} ;;
+  "pane wait-output") ${waitOutput} ;;
+  "agent wait") exit 0 ;;
   "notification show") echo '{}' ;;
-  "wait output") ${waitOutput} ;;
-  "wait agent-status") exit 0 ;;
   "pane send-text") ${sendText} ;;
   "pane send-keys") ${sendKeys} ;;
   "pane read")   ${paneRead} ;;
@@ -125,15 +135,18 @@ afterEach(() => {
 });
 
 describe("HerdrDriver (stubbed binary)", () => {
-  test("slot → agent start with name/cwd/--no-focus -- bash; pane id parsed", async () => {
+  test("slot → tab create --cwd root pane, named via pane rename; pane id parsed", async () => {
     const { bin, log } = makeStub();
     const d = new HerdrDriver(bin);
     const slot = await d.slot("/some/worktree", "run-1-T1-a0");
-    expect(slot.id).toBe("w1:p9");
-    expect(readFileSync(log, "utf8")).toContain("agent start run-1-T1-a0 --cwd /some/worktree --tab w1:t1 --no-focus -- bash");
+    expect(slot.id).toBe("w1:p9"); // the tab's root shell pane IS the worker pane (0.7.5)
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("tab create --label run-1-T1-a0 --no-focus --workspace wTEST --cwd /some/worktree");
+    expect(calls).toContain("pane rename w1:p9 run-1-T1-a0"); // durable identity is the pane label
+    expect(calls).not.toContain("agent start"); // the removed one-shot verb never runs (regression fence)
   });
 
-  test("run/read/close re-resolve pane id by agent name (ids never cached blindly)", async () => {
+  test("run/read/close re-resolve pane id by label via pane list (ids never cached blindly)", async () => {
     const { bin, log, cwd } = makeStub();
     const d = new HerdrDriver(bin);
     const slot = await d.slot(cwd, "n1");
@@ -141,10 +154,10 @@ describe("HerdrDriver (stubbed binary)", () => {
     expect(await d.read(slot, 50)).toContain("line1");
     await d.close(slot);
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("agent get n1"); // re-resolution happened
-    expect(calls).toContain("pane send-text w1:p42 echo hi"); // fresh id used, not the cached w1:p9
-    expect(calls).toContain("pane send-keys w1:p42 Enter"); // delivery verified, then entered (OBS-85)
-    expect(calls).toContain("pane read w1:p42 --source recent-unwrapped --lines 50");
+    expect(calls).toContain("pane list"); // re-resolution reads the label back (never a cached id)
+    expect(calls).toContain("pane send-text w1:p9 echo hi"); // resolved fresh from the label
+    expect(calls).toContain("pane send-keys w1:p9 Enter"); // delivery verified, then entered (OBS-85)
+    expect(calls).toContain("pane read w1:p9 --source recent-unwrapped --lines 50");
     expect(calls).toContain("tab close w1:t1"); // slot now carries a tabId → close reaps the whole tab
   });
 
@@ -155,6 +168,21 @@ describe("HerdrDriver (stubbed binary)", () => {
     const { bin: binTo, cwd: cwdTo } = makeStub(1);
     const to = new HerdrDriver(binTo);
     expect(await to.waitOutput(await to.slot(cwdTo, "b"), "TICKMARKR_EXIT:", 1000)).toBe(false);
+  });
+
+  // 0.7.5 `pane wait-output` treats --match (literal) and --regex (pattern) as MUTUALLY EXCLUSIVE; the
+  // old `--match <p> --regex` combo is rejected, so the exit-marker wait errored instantly instead of
+  // waiting and LLM-gate/consult verdicts were read before they rendered → unparseable. Pin exactly one.
+  test("waitOutput uses --regex xor --match, never the rejected combo (verdict-read regression)", async () => {
+    const { bin, log, cwd } = makeStub(0);
+    const d = new HerdrDriver(bin);
+    const slot = await d.slot(cwd, "j1");
+    await d.waitOutput(slot, "RGXMARK", 1000, { regex: true });
+    await d.waitOutput(slot, "LITMARK", 1000);
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("pane wait-output w1:p9 --regex RGXMARK --timeout 1000"); // regex → --regex <pattern>
+    expect(calls).toContain("pane wait-output w1:p9 --match LITMARK --timeout 1000"); // literal → --match <pattern>
+    expect(calls).not.toMatch(/--match \S+ --regex/); // never the mutually-exclusive combo again
   });
 
   test("a herdr wait response containing the literal substring error in payload text is not misread as a dead pane", async () => {
@@ -222,9 +250,9 @@ describe("HerdrDriver verified delivery (OBS-85)", () => {
     const d = new HerdrDriver(bin);
     await d.run(await d.slot(cwd, "n1"), "echo hi");
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const send = lines.findIndex((l) => l === "pane send-text w1:p42 echo hi");
-    const read = lines.findIndex((l, i) => i > send && l.startsWith("wait output w1:p42 --match echo hi"));
-    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
+    const send = lines.findIndex((l) => l === "pane send-text w1:p9 echo hi");
+    const read = lines.findIndex((l, i) => i > send && l.startsWith("pane wait-output w1:p9 --match echo hi"));
+    const enter = lines.findIndex((l) => l === "pane send-keys w1:p9 Enter");
     expect(send).toBeGreaterThanOrEqual(0);
     expect(read).toBeGreaterThan(send); // read-back (transcript match for the typed command) after typing…
     expect(enter).toBeGreaterThan(read); // …and Enter only after the read-back verified
@@ -238,9 +266,9 @@ describe("HerdrDriver verified delivery (OBS-85)", () => {
     const d = new HerdrDriver(bin);
     await d.run(await d.slot(cwd, "n1"), "echo hi"); // resolves — second attempt reads back faithfully
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const sends = lines.flatMap((l, i) => (l === "pane send-text w1:p42 echo hi" ? [i] : []));
-    const clear = lines.findIndex((l) => l === "pane send-keys w1:p42 C-u");
-    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
+    const sends = lines.flatMap((l, i) => (l === "pane send-text w1:p9 echo hi" ? [i] : []));
+    const clear = lines.findIndex((l) => l === "pane send-keys w1:p9 C-u");
+    const enter = lines.findIndex((l) => l === "pane send-keys w1:p9 Enter");
     expect(sends).toHaveLength(2); // typed, corrupted read-back, retyped
     expect(clear).toBeGreaterThan(sends[0]); // the corrupted line is cleared…
     expect(clear).toBeLessThan(sends[1]); // …before the retype
@@ -269,8 +297,8 @@ describe("HerdrDriver verified delivery (OBS-85)", () => {
     const d1 = new HerdrDriver(once.bin);
     await d1.run(await d1.slot(once.cwd, "n1"), "echo hi");
     const lines = readFileSync(once.log, "utf8").trim().split("\n");
-    expect(lines.filter((l) => l.startsWith("wait output w1:p42 --match echo hi"))).toHaveLength(2);
-    expect(lines.filter((l) => l === "pane send-keys w1:p42 Enter")).toHaveLength(1);
+    expect(lines.filter((l) => l.startsWith("pane wait-output w1:p9 --match echo hi"))).toHaveLength(2);
+    expect(lines.filter((l) => l === "pane send-keys w1:p9 Enter")).toHaveLength(1);
     // corrupt-always: zero verified read-backs → zero Enters, anywhere
     const never = makeStub(0, { corrupt: "always" });
     const d2 = new HerdrDriver(never.bin);
@@ -286,8 +314,8 @@ describe("HerdrDriver verified delivery (OBS-85)", () => {
     await d.run(await d.slot(cwd, "T1-worker-fake-a0-tag"), "bash dispatch.sh");
     await d.narrator(cwd, "tickmarkr status --watch", "run-x");
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane send-text w1:p42 bash dispatch.sh");
-    expect(calls).toContain("pane send-keys w1:p42 Enter");
+    expect(calls).toContain("pane send-text w1:p9 bash dispatch.sh");
+    expect(calls).toContain("pane send-keys w1:p9 Enter");
     expect(calls).toContain("pane send-text w1:p7 tickmarkr status --watch");
     expect(calls).toContain("pane send-keys w1:p7 Enter");
   });
@@ -342,28 +370,27 @@ describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/tab create/g)).toHaveLength(1); // exactly one tab, even under concurrent slot()
     expect(calls).toContain("tab create --label WORKERS"); // stage-named, not first-member-named (run-104447 incident)
-    expect(calls).toContain("pane split w1:p42 --direction right --no-focus"); // first join licensed at 222 cols (43-MEASUREMENT.md)
+    expect(calls).toContain("pane split w1:p9 --direction right --no-focus"); // first join licensed at 222 cols (43-MEASUREMENT.md)
     expect(calls).not.toMatch(/pane split w1:p7 --direction right/); // subsequent joins stack down
-    expect(calls).toContain("agent rename w1:p7 n2"); // split pane gets a durable name
-    expect(calls).toContain("agent get n2"); // rename verified live (research A1), not assumed
-    expect(calls).toContain(`pane run w1:p7 cd '${cwd}'`); // split shell cd's into ITS OWN worktree
-    expect(calls).toContain("pane close w1:p0"); // grouped first member reaps the orphan root pane
+    expect(calls).toContain("pane rename w1:p7 n2"); // split pane gets a durable label
+    expect(calls).toContain(`pane split w1:p9 --direction right --no-focus --cwd ${cwd}`); // split placed in ITS OWN worktree (no separate cd)
     expect(s1.tabId).toBe("w1:t1");
     expect(s2.tabId).toBe("w1:t1"); // shared tab
     expect(s2.id).toBe("w1:p7");
     expect(s2.group).toBe("workers");
   });
 
-  test("B: no-group slot keeps per-slot tab behavior but reaps the orphan root pane", async () => {
+  test("B: no-group slot keeps per-slot tab behavior; the tab root pane is the worker (no orphan reap)", async () => {
     const { bin, log, cwd } = makeStub(0, { tab: true });
     const d = new HerdrDriver(bin);
     const s = await d.slot(cwd, "solo");
     const calls = readFileSync(log, "utf8");
-    expect(s.id).toBe("w1:p9");
+    expect(s.id).toBe("w1:p9"); // tab root pane == worker pane
     expect(s.tabId).toBe("w1:t1");
     expect(s.group).toBeUndefined();
-    expect(calls).toContain(`agent start solo --cwd ${cwd} --tab w1:t1 --no-focus -- bash`);
-    expect(calls).toContain("pane close w1:p0"); // root pane (≠ agent pane w1:p9) reaped
+    expect(calls).toContain(`tab create --label solo --no-focus --workspace wTEST --cwd ${cwd}`);
+    expect(calls).toContain("pane rename w1:p9 solo");
+    expect(calls).not.toContain("pane close w1:p0"); // no second pane to reap — the root IS the worker
     await d.close(s);
     expect(readFileSync(log, "utf8")).toContain("tab close w1:t1"); // per-slot tab close unchanged
   });
@@ -375,7 +402,7 @@ describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
     const s2 = await d.slot(cwd, "n2", { group: "workers" });
     await d.close(s1);
     let calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane close w1:p42"); // n1's live pane closed
+    expect(calls).toContain("pane close w1:p9"); // n1's live pane closed
     expect(calls).not.toContain("tab close"); // one member still alive → tab survives
     await d.close(s2);
     calls = readFileSync(log, "utf8");
@@ -392,7 +419,7 @@ describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
     const s3 = await d.slot(cwd, "n3", { group: "workers" });
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/tab create/g)).toHaveLength(1); // still consolidated — no degrade
-    expect(calls.match(/pane split w1:p42 --direction right/g)).toHaveLength(2); // n2 + n3 both first-join right off n1
+    expect(calls.match(/pane split w1:p9 --direction right/g)).toHaveLength(2); // n2 + n3 both first-join right off n1
     expect(calls).not.toContain("pane split w1:p7"); // never split the dead pane
     expect(s3.tabId).toBe("w1:t1");
     expect(s3.group).toBe("workers");
@@ -435,8 +462,10 @@ describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/pane split/g)).toHaveLength(1); // tried once, then memoized unsupported
     expect(calls.match(/tab create/g)).toHaveLength(3); // degraded members get their own tabs
-    expect(calls).toContain(`agent start n2 --cwd ${cwd} --tab w1:t1 --no-focus -- bash`); // full fallback bootstrap
-    expect(calls).toContain(`agent start n3 --cwd ${cwd} --tab w1:t1 --no-focus -- bash`);
+    expect(calls).toContain(`tab create --label n2 --no-focus --workspace wTEST --cwd ${cwd}`); // full fallback bootstrap
+    expect(calls).toContain("pane rename w1:p9 n2");
+    expect(calls).toContain(`tab create --label n3 --no-focus --workspace wTEST --cwd ${cwd}`);
+    expect(calls).toContain("pane rename w1:p9 n3");
     expect(s1.group).toBe("workers");
     expect(s2.id).toBe("w1:p9");
     expect(s2.group).toBeUndefined(); // degraded slot is NOT a shared-tab member
@@ -450,7 +479,8 @@ describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
     const s2 = await d.slot(cwd, "n2", { group: "workers" });
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("pane close w1:p7"); // the unaddressable split pane is reaped
-    expect(calls).toContain(`agent start n2 --cwd ${cwd} --tab w1:t1 --no-focus -- bash`); // fallback bootstrap
+    expect(calls).toContain(`tab create --label n2 --no-focus --workspace wTEST --cwd ${cwd}`); // fallback bootstrap
+    expect(calls).toContain("pane rename w1:p9 n2");
     expect(s2.id).toBe("w1:p9");
     expect(s2.group).toBeUndefined();
   });
@@ -479,40 +509,36 @@ describe("HerdrDriver dedicated role-tabs (SUP-01)", () => {
   });
 });
 
-// DEFECT-01: `tickmarkr resume` with keepPanes:run re-dispatches at attempt=0 into a durable name a
-// prior (SIGKILLed) process's pane still holds → herdr agent start fails agent_name_taken. tabSlot
-// must reclaim (agent get → pane close the stale pane only → retry start once), not die.
-describe("HerdrDriver agent_name_taken reclaim (DEFECT-01)", () => {
-  test("reclaim resolves: agent get → pane close stale → retry start yields the fresh pane", async () => {
+// DEFECT-01: `tickmarkr resume` with keepPanes:run re-dispatches at attempt=0 into a durable label a
+// prior (SIGKILLed) process's pane still holds. 0.7.5's `pane rename` never collides, so the fresh pane
+// takes the label AND the stale pane keeps it — the driver must sweep the stale same-label pane(s) and
+// verify the fresh pane is the sole holder (else `pane list` would resolve the label ambiguously).
+describe("HerdrDriver pane-label reclaim (DEFECT-01)", () => {
+  test("reclaim resolves: pane rename fresh → sweep close the stale same-label pane → fresh is sole holder", async () => {
     const { bin, log, cwd } = makeStub(0, { takenNames: ["T1-worker-fake-a0-tag"] });
     const d = new HerdrDriver(bin);
     const slot = await d.slot(cwd, "T1-worker-fake-a0-tag"); // MUST resolve, not throw
-    expect(slot.id).toBe("w1:p9"); // the retry's fresh pane, not the stale w1:pSTALE
+    expect(slot.id).toBe("w1:p9"); // the fresh tab-create root pane, not the stale w1:pSTALE
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const starts = lines.flatMap((l, i) => (l.startsWith("agent start ") ? [i] : []));
-    const get = lines.findIndex((l) => l.startsWith("agent get T1-worker-fake-a0-tag"));
+    const rename = lines.findIndex((l) => l === "pane rename w1:p9 T1-worker-fake-a0-tag");
     const close = lines.findIndex((l) => l.startsWith("pane close w1:pSTALE"));
-    expect(starts).toHaveLength(2); // failed start, then the single retry
-    expect(starts[0]).toBeLessThan(get); // start (fail) → get → close → start (ok), in order
-    expect(get).toBeLessThan(close);
-    expect(close).toBeLessThan(starts[1]);
+    expect(rename).toBeGreaterThanOrEqual(0); // fresh pane labeled…
+    expect(close).toBeGreaterThan(rename); // …then the stale same-label pane swept
   });
 
-  test("reclaim fail-closed: a pane close that does not free the name rejects after exactly one retry", async () => {
+  test("reclaim fail-closed: a stale close that does not free the label rejects (no ambiguous resolution)", async () => {
     const { bin, log, cwd } = makeStub(0, { takenNames: ["T2-worker-fake-a0-tag"], paneCloseNoop: true });
     const d = new HerdrDriver(bin);
-    await expect(d.slot(cwd, "T2-worker-fake-a0-tag")).rejects.toThrow(/agent start failed/);
-    expect(readFileSync(log, "utf8").match(/^agent start /gm)).toHaveLength(2); // retried once, never looped
+    await expect(d.slot(cwd, "T2-worker-fake-a0-tag")).rejects.toThrow(/reclaim failed/);
+    expect(readFileSync(log, "utf8").match(/^pane close w1:pSTALE/gm)).toHaveLength(1); // swept once, never looped
   });
 
-  test("unrelated agent start failure throws immediately — no agent get, no pane close (Pitfall 4)", async () => {
-    const { bin, log, cwd } = makeStub(0, { startFailsOther: true });
+  test("a fresh dispatch with no stale label performs no reclaim close (sweep is a no-op)", async () => {
+    const { bin, log, cwd } = makeStub();
     const d = new HerdrDriver(bin);
-    await expect(d.slot(cwd, "T3-worker-fake-a0-tag")).rejects.toThrow(/agent start failed/);
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^agent start /gm)).toHaveLength(1); // no reclaim retry on a non-taken error
-    expect(calls).not.toContain("agent get T3-worker-fake-a0-tag");
-    expect(calls).not.toContain("pane close");
+    const slot = await d.slot(cwd, "T3-worker-fake-a0-tag"); // resolves cleanly
+    expect(slot.id).toBe("w1:p9");
+    expect(readFileSync(log, "utf8")).not.toContain("pane close"); // nothing stale to sweep
   });
 });
 
@@ -626,7 +652,7 @@ describe("HerdrDriver VIS-09 cap + cleanup overflow (VIS-13)", () => {
     expect(s2.tabId).toBe("w1:t1"); // gen 1
     expect(s3.tabId).toBe("w1:t2"); // gen 2 — the overflow member lives in the SECOND tab
     expect(s3.group).toBe("workers");
-    expect(calls).toContain("pane split w1:p42 --direction right --no-focus"); // D-10 width law: first join right when licensed
+    expect(calls).toContain("pane split w1:p9 --direction right --no-focus"); // D-10 width law: first join right when licensed
   });
 
   test("VIS-09: overflow teardown is per-tab refcounted (each tab closes when its own last leaves)", async () => {
@@ -720,7 +746,7 @@ describe("HerdrDriver narrator pane (T2)", () => {
     const second = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch", "run-watch");
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("pane split wTEST:pCALLER --direction right --no-focus");
-    expect(calls).toContain("agent rename w1:p7 tickmarkr:watch:run:0:run-watch");
+    expect(calls).toContain("pane rename w1:p7 tickmarkr:watch:run:0:run-watch");
     expect(calls).not.toContain("tab create");
     expect(calls.match(/pane split /g)).toHaveLength(1);
     expect(calls.match(/pane send-text w1:p7 tickmarkr status --watch/g)).toHaveLength(1); // OBS-85 verified delivery
@@ -736,8 +762,8 @@ describe("HerdrDriver narrator pane (T2)", () => {
     const { bin, log, cwd } = makeStub(0, { survivingWatch: { name: oldName, pane: "w1:pOLD" } });
     const next = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch", "run-new");
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("agent list");
-    expect(calls).toContain("agent rename w1:pOLD tickmarkr:watch:run:0:run-new");
+    expect(calls).toContain("pane list");
+    expect(calls).toContain("pane rename w1:pOLD tickmarkr:watch:run:0:run-new");
     expect(calls).not.toContain("pane split");
     expect(next).toEqual({ id: "w1:pOLD", name: "tickmarkr:watch:run:0:run-new", cwd });
   });

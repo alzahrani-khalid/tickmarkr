@@ -479,6 +479,36 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
     expect(r.details).toMatch(/malformed verdict shape/i);
     expect(r.meta?.unparseable).toBeUndefined();
   });
+
+  // OBS-129: a single-line modification (the T4/c2 shape — e.g. PRIOR_RELEASE_VERSION moving forward) where
+  // the judge cites an ADJACENT line of the same hunk, not the exact `+` line. Two frontier judges did this
+  // on correct work and the exact-added-line check voided the whole verdict, looping to a human park.
+  // The fix accepts any new-file line inside the changed hunk; the anti-hallucination guard still rejects a
+  // line outside every hunk (covered by the "outside every changed hunk" test above).
+  test("OBS-129: a citation to a context line inside the changed hunk validates, not only the exact +line", async () => {
+    const src = Array.from({ length: 8 }, (_, i) => `const L${i + 1} = ${i + 1};`).join("\n") + "\n";
+    const repo = makeRepo({ "consts.ts": src });
+    const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    writeFileSync(join(repo, "consts.ts"), src.replace("const L4 = 4;", "const L4 = 40;")); // only line 4 changes
+    execSync("git add -A && git commit -m edit --no-gpg-sign", { cwd: repo });
+    // line 4 is the `+` line; git's 3-context hunk spans new-file lines 1..7, so line 3 is a context line
+    // inside the SAME changed hunk — a near-miss the pre-OBS-129 exact check rejected.
+    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "L4 moved forward", evidence: { path: "consts.ts", line: 3 } }] });
+    const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(r).toMatchObject({ gate: "acceptance", pass: true });
+    expect(r.meta?.unparseable).toBeUndefined();
+  });
+
+  test("OBS-129: the judge prompt lists the citable new-file line numbers per changed file", async () => {
+    const { repo, base } = repoWithDiff(); // repoWithDiff rewrites greet.js line 1 → citable "greet.js: 1"
+    let capturedPrompt = "";
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
+    const orig = fake.headlessCommand.bind(fake);
+    fake.headlessCommand = (promptFile, model) => { capturedPrompt = readFileSync(promptFile, "utf8"); return orig(promptFile, model); };
+    await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(capturedPrompt).toMatch(/Citable evidence lines/i);
+    expect(capturedPrompt).toMatch(/greet\.js: 1\b/);
+  });
 });
 
 describe("acceptanceGate — only-judge warning (T2)", () => {

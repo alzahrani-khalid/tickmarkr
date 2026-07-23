@@ -64,6 +64,10 @@ describe("real adapters", () => {
     expect(codex.interactiveCommand("/p", "gpt-5.2")).toContain("--disable plugins");
     expect(cxHeadless).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     expect(cxHeadless).not.toContain("--full-auto");
+    // OBS-125: codex 0.144.x per-worktree "Hooks need review" gate — bypass hook trust so the operator's
+    // own trusted hooks run without stalling; the workspace-write sandbox stays (NOT the sandbox bypass).
+    expect(cxHeadless).toContain("--dangerously-bypass-hook-trust");
+    expect(cxHeadless).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     expect(cursorAgent.headlessCommand("/p", "composer-2")).toContain("--force");
     expect(opencode.headlessCommand("/p", "moonshotai/kimi-k2")).toMatch(/^opencode run -m/);
     // FLEET-01/02: pi headless — `pi -p ` prefix, model under shq, prompt via cat
@@ -104,6 +108,10 @@ describe("real adapters", () => {
     expect(cx).toContain("-a never");
     expect(cx).not.toContain("on-failure");
     expect(cx).toContain("-s workspace-write");
+    // OBS-125: the interactive worker (the mode that stalled at the hooks gate) carries the hook-trust
+    // bypass so it reasons past "Hooks need review"; sandbox kept (NOT --dangerously-bypass-approvals-and-sandbox).
+    expect(cx).toContain("--dangerously-bypass-hook-trust");
+    expect(cx).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     // worktree gitdirs live under the main repo's .git/worktrees — outside the sandbox root —
     // so both codex commands must whitelist the git common dir or every commit dies on index.lock
     expect(cx).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');

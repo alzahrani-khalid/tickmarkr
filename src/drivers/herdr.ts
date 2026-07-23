@@ -76,12 +76,17 @@ export class HerdrDriver implements ExecutorDriver {
     return sh(`${shq(this.bin)} ${args}`, cwd, timeoutMs);
   }
 
+  // herdr 0.7.5 (OBS-123): an "agent" is a DETECTED agent-CLI, so `agent get <name>` no longer resolves
+  // a tickmarkr-named bash pane. Durable identity is the pane LABEL (set via `pane rename`); resolve it
+  // by reading the label back from `pane list`.
   private async namedPaneId(name: string): Promise<string | null> {
-    const r = await this.herdr(`agent get ${shq(name)}`);
+    const r = await this.herdr(`pane list`);
     if (r.code !== 0) return null;
     try {
-      const id = JSON.parse(r.stdout).result?.agent?.pane_id;
-      return typeof id === "string" && id ? id : null;
+      const panes = JSON.parse(r.stdout).result?.panes;
+      if (!Array.isArray(panes)) return null;
+      const hit = panes.find((p: { label?: string; pane_id?: string }) => p.label === name && typeof p.pane_id === "string" && p.pane_id);
+      return hit?.pane_id ?? null;
     } catch {
       return null;
     }
@@ -134,7 +139,11 @@ export class HerdrDriver implements ExecutorDriver {
     if (!this.ws) throw new Error("herdr placement requires HERDR_WORKSPACE_ID — refusing untargeted pane (VIS-10: fail closed, never place by focus)");
     // pin the tab to the RUN's workspace, UNCONDITIONALLY (inherited via HERDR_WORKSPACE_ID), never the
     // operator's focused one (Intl-Dossier run-20260709-104447 incident: worker tabs opened in the tickmarkr repo workspace)
-    const t = await this.herdr(`tab create --label ${shq(label)} --no-focus --workspace ${shq(this.ws)}`);
+    // herdr 0.7.5 (OBS-123): `tab create --cwd` spawns the tab's root shell pane already at a prompt in
+    // the worktree — that root pane IS the worker pane. The old one-shot `agent start … -- bash` verb
+    // (which named a fresh bash pane) was removed; 0.7.5's `agent start` only ATTACHES to a DETECTED
+    // agent CLI, so tickmarkr names the bash pane itself via `pane rename` and types the worker command in.
+    const t = await this.herdr(`tab create --label ${shq(label)} --no-focus --workspace ${shq(this.ws)} --cwd ${shq(cwd)}`);
     if (t.code !== 0) throw new Error(`herdr tab create failed (exit ${t.code}, refusing untargeted placement): ${t.stderr || t.stdout}`);
     let res: { tab?: { tab_id?: string }; root_pane?: { pane_id?: string } };
     try {
@@ -143,38 +152,25 @@ export class HerdrDriver implements ExecutorDriver {
       throw new Error(`herdr tab create returned unparseable JSON (refusing untargeted placement): ${t.stdout}`);
     }
     const tabId = res?.tab?.tab_id;
-    const rootPane = res?.root_pane?.pane_id; // auto-created shell pane (SKILL:343)
+    const id = res?.root_pane?.pane_id; // the tab's root shell pane, already in cwd — this run's worker pane
     if (typeof tabId !== "string" || !tabId) throw new Error(`herdr tab create returned no tab_id (refusing untargeted placement): ${t.stdout}`);
+    if (typeof id !== "string" || !id) throw new Error(`herdr tab create returned no root pane id (refusing untargeted placement): ${t.stdout}`);
     // T5: the banner's pane identity line, derived from the T1 owned name (legacy names pass through).
     const identity = shq(paneIdentityLine(canonicalizeLegacyName(name, "")));
-    let r = await this.herdr(`agent start ${shq(name)} --cwd ${shq(cwd)} --tab ${shq(tabId)} --no-focus -- bash`);
-    if (r.code !== 0 && /agent_name_taken/.test(r.stderr + r.stdout)) {
-      // DEFECT-01: a prior (killed) process's kept pane still holds this durable name — reclaim it.
-      // The old attempt is void by construction: its worktree was rm -rf'd on re-dispatch (git.ts:34),
-      // so adoption is meaningless; close the stale PANE only (never its tab — sibling prior-run panes
-      // may still be under the operator's eye) and restart. Match BOTH streams (herdr's error-stream
-      // convention varies — Pitfall 6); an unrelated nonzero exit must never reach pane close (T-10-04).
-      const g = await this.herdr(`agent get ${shq(name)}`);
-      try {
-        const stale = JSON.parse(g.stdout).result?.agent?.pane_id;
-        if (typeof stale === "string" && stale) await this.herdr(`pane close ${shq(stale)}`);
-      } catch {
-        /* holder vanished between calls (agent_not_found) — retry the start regardless */
-      }
-      r = await this.herdr(`agent start ${shq(name)} --cwd ${shq(cwd)} --tab ${shq(tabId)} --no-focus -- bash`); // once
+    // durable identity: label the PANE (resolution + reconcile read it back via `pane list`); fail closed
+    // and reap the tab we just made if the rename fails (no orphan tab).
+    const rn = await this.herdr(`pane rename ${shq(id)} ${shq(name)}`);
+    if (rn.code !== 0) {
+      await this.herdr(`tab close ${shq(tabId)}`);
+      throw new Error(`herdr pane rename failed: ${rn.stderr || rn.stdout}`);
     }
-    if (r.code !== 0) throw new Error(`herdr agent start failed: ${r.stderr || r.stdout}`); // fail closed, no loop
-    const id = JSON.parse(r.stdout).result?.agent?.pane_id;
-    if (typeof id !== "string" || !id) throw new Error(`herdr agent start returned no pane id: ${r.stdout}`);
-    // tab create auto-spawns a root shell pane and agent start --tab adds the agent as a SECOND
-    // pane — reap the idle shell so no tab shows a dead "tickmarkr git:" prompt beside its agent
-    // (VIS-04 orphan fix). Best-effort: a failed reap costs cosmetics only.
-    if (typeof rootPane === "string" && rootPane && rootPane !== id) {
-      await this.herdr(`pane close ${shq(rootPane)}`);
-    }
+    // DEFECT-01: a prior (killed) process's kept pane may still carry this durable label (resume +
+    // keepPanes re-dispatches at attempt=0 into the same name). 0.7.5 rename never collides, so instead
+    // of agent_name_taken we sweep stale same-label panes and verify this fresh pane is the sole holder.
+    await this.reclaimStaleLabel(name, id);
     // VIS-10 hole 3: seed the run's workspace id into the agent pane's shell so a worker's own ad-hoc
-    // `herdr agent start` is workspace-targeted BY CONSTRUCTION — correct placement is the default a
-    // worker GETS, not a rule it must remember (P40-02 probe leak). Fail closed: a failed seed rejects.
+    // `herdr` call is workspace-targeted BY CONSTRUCTION — correct placement is the default a worker GETS,
+    // not a rule it must remember (P40-02 probe leak). Fail closed: a failed seed rejects.
     // v1.22 T3 / OBS-17: also strip HERDR_ENV + socket path so the worker cannot open/mutate panes in
     // the operator's session. Daemon-side this.herdr() calls keep process.env (unsealed).
     const seed = await this.herdr(
@@ -182,6 +178,31 @@ export class HerdrDriver implements ExecutorDriver {
     );
     if (seed.code !== 0) throw new Error(`herdr workspace-id seed failed (refusing untargeted pane): ${seed.stderr || seed.stdout}`);
     return { id, name, cwd, tabId };
+  }
+
+  // DEFECT-01 (0.7.5): close any OTHER pane still carrying this durable label (a prior killed attempt's
+  // kept pane), then verify none remain — else fail closed, since `pane list` would otherwise resolve the
+  // name to an ambiguous/stale pane. No-op on the common path (no dup labels). Best-effort closes; the
+  // post-sweep re-list is the fail-closed gate (a close that does not free the name must reject).
+  private async reclaimStaleLabel(name: string, fresh: string): Promise<void> {
+    const stale = await this.staleLabelPanes(name, fresh);
+    if (stale.length === 0) return;
+    for (const p of stale) await this.herdr(`pane close ${shq(p)}`);
+    if ((await this.staleLabelPanes(name, fresh)).length > 0) {
+      throw new Error(`herdr pane rename reclaim failed — durable name ${name} still held by a stale pane`);
+    }
+  }
+
+  private async staleLabelPanes(name: string, fresh: string): Promise<string[]> {
+    const r = await this.herdr(`pane list`);
+    try {
+      const panes = JSON.parse(r.stdout).result?.panes ?? [];
+      return panes
+        .filter((p: { label?: string; pane_id?: string }) => p.label === name && typeof p.pane_id === "string" && p.pane_id !== fresh)
+        .map((p: { pane_id: string }) => p.pane_id);
+    } catch {
+      return [];
+    }
   }
 
   // VIS-04 role-tab (extended VIS-09 item 2): first member bootstraps generation 1 (WORKERS);
@@ -261,7 +282,7 @@ export class HerdrDriver implements ExecutorDriver {
     // stack down. Rightward splits below the measured floor shred the marker (e8aa003 at COLUMNS≈2;
     // unrecoverable at 25 cols per measurement). Introspection failure → down (fail closed).
     const direction = entry.members.length === 1 ? workerSplitDirection(await this.paneWidth(srcPane)) : "down";
-    const sp = await this.herdr(`pane split ${shq(srcPane)} --direction ${direction} --no-focus`);
+    const sp = await this.herdr(`pane split ${shq(srcPane)} --direction ${direction} --no-focus --cwd ${shq(cwd)}`);
     if (sp.code !== 0) return null;
     let pane: string | undefined;
     try {
@@ -270,13 +291,13 @@ export class HerdrDriver implements ExecutorDriver {
       /* fall through to degrade */
     }
     if (typeof pane !== "string" || !pane) return null;
-    // the split pane is a bare shell: give it a durable agent name (SKILL:197) and VERIFY the name
-    // resolves back to this pane (research A1 is checked live per join, never assumed) — then cd the
-    // shell into this member's own worktree (a split inherits its parent's cwd, not ours).
-    const rn = await this.herdr(`agent rename ${shq(pane)} ${shq(name)}`);
+    // the split pane is a bare shell: give it a durable PANE label (0.7.5 — agent rename only binds
+    // detected agents; SKILL:197 was the old agent-name path) and VERIFY the label resolves back to this
+    // pane (research A1 is checked live per join, never assumed). `pane split --cwd` already placed the
+    // shell in this member's worktree, so no separate `cd` is needed.
+    const rn = await this.herdr(`pane rename ${shq(pane)} ${shq(name)}`);
     const verified = rn.code === 0 && (await this.paneId({ id: "", name, cwd })) === pane;
-    const cd = verified ? await this.herdr(`pane run ${shq(pane)} ${shq(`cd ${shq(cwd)}`)}`) : null;
-    if (!cd || cd.code !== 0) {
+    if (!verified) {
       await this.herdr(`pane close ${shq(pane)}`); // reap the failed join, best-effort
       return null;
     }
@@ -324,7 +345,7 @@ export class HerdrDriver implements ExecutorDriver {
       const typed = await this.herdr(`pane send-text ${shq(pane)} ${shq(cmd)}`, slot.cwd);
       if (typed.code !== 0) throw new Error(`herdr pane send-text failed: ${typed.stderr || typed.stdout}`);
       const back = await this.herdr(
-        `wait output ${shq(pane)} --match ${shq(cmd)} --timeout ${DELIVERY_VERIFY_TIMEOUT_MS}`,
+        `pane wait-output ${shq(pane)} --match ${shq(cmd)} --timeout ${DELIVERY_VERIFY_TIMEOUT_MS}`,
         slot.cwd,
         DELIVERY_VERIFY_TIMEOUT_MS + 15_000,
       );
@@ -355,8 +376,12 @@ export class HerdrDriver implements ExecutorDriver {
 
   async waitOutput(slot: Slot, pattern: string, timeoutMs: number, opts?: { regex?: boolean }): Promise<boolean> {
     const pane = await this.paneId(slot);
+    // 0.7.5: `--match` (literal) and `--regex` (pattern) are MUTUALLY EXCLUSIVE — the old
+    // `--match <p> --regex` form is rejected ("mutually exclusive"), which made the exit-marker wait
+    // error instantly instead of waiting, so LLM-gate/consult verdicts were read before they rendered
+    // and came back unparseable. Pick exactly one flag by whether the caller wants regex.
     const r = await this.herdr(
-      `wait output ${shq(pane)} --match ${shq(pattern)}${opts?.regex ? " --regex" : ""} --timeout ${Math.floor(timeoutMs)}`,
+      `pane wait-output ${shq(pane)} ${opts?.regex ? "--regex" : "--match"} ${shq(pattern)} --timeout ${Math.floor(timeoutMs)}`,
       slot.cwd,
       timeoutMs + 15_000,
     );
@@ -365,8 +390,11 @@ export class HerdrDriver implements ExecutorDriver {
 
   async waitAgentStatus(slot: Slot, status: string, timeoutMs: number): Promise<boolean> {
     const pane = await this.paneId(slot);
+    // 0.7.5: `wait agent-status` (top-level) was removed; `agent wait <target> --until <status>` replaces
+    // it. Target is the pane id; when herdr has detected the worker's agent CLI there this resolves, else
+    // it returns an error envelope → waitOk false (a best-effort settle, same as the old timeout path).
     const r = await this.herdr(
-      `wait agent-status ${shq(pane)} --status ${shq(status)} --timeout ${Math.floor(timeoutMs)}`,
+      `agent wait ${shq(pane)} --until ${shq(status)} --timeout ${Math.floor(timeoutMs)}`,
       slot.cwd,
       timeoutMs + 15_000,
     );
@@ -380,9 +408,13 @@ export class HerdrDriver implements ExecutorDriver {
   // shared by status() and the VIS-13 blocked glyph (renameGroupTab): resolve the live agent_status
   // by durable name; "unknown" on any failure (dead pane, unparseable json) — never throws.
   private async statusByName(name: string): Promise<string> {
-    const r = await this.herdr(`agent get ${shq(name)}`);
+    // 0.7.5: read the pane's herdr-detected agent_status off `pane list` (keyed by the durable label);
+    // "unknown" on any failure (no such label, unparseable json) — never throws.
+    const r = await this.herdr(`pane list`);
     try {
-      const s = JSON.parse(r.stdout).result?.agent?.agent_status;
+      const panes = JSON.parse(r.stdout).result?.panes;
+      const hit = Array.isArray(panes) ? panes.find((p: { label?: string; agent_status?: string }) => p.label === name) : undefined;
+      const s = hit?.agent_status;
       return typeof s === "string" ? s : "unknown";
     } catch {
       return "unknown";
@@ -448,18 +480,18 @@ export class HerdrDriver implements ExecutorDriver {
 
   private async priorWatch(runId: string): Promise<string | null> {
     if (!this.ws) throw new Error("herdr watch placement requires HERDR_WORKSPACE_ID — refusing unseeded pane");
-    const list = await this.herdr("agent list");
-    if (list.code !== 0) throw new Error(`herdr agent list failed: ${list.stderr || list.stdout}`);
-    let agents: { name?: string; pane_id?: string; workspace_id?: string }[];
+    const list = await this.herdr("pane list");
+    if (list.code !== 0) throw new Error(`herdr pane list failed: ${list.stderr || list.stdout}`);
+    let panes: { label?: string; pane_id?: string; workspace_id?: string }[];
     try {
-      agents = JSON.parse(list.stdout).result?.agents;
+      panes = JSON.parse(list.stdout).result?.panes;
     } catch {
-      throw new Error(`herdr agent list returned unparseable JSON: ${list.stdout}`);
+      throw new Error(`herdr pane list returned unparseable JSON: ${list.stdout}`);
     }
-    if (!Array.isArray(agents)) throw new Error(`herdr agent list returned no agents: ${list.stdout}`);
-    const prior = agents.find((a) => {
-      const owned = typeof a.name === "string" ? parseOwnedName(a.name) : null;
-      return a.workspace_id === this.ws && typeof a.pane_id === "string" && owned?.role === "watch" && owned.taskId === "run" && owned.runId !== runId;
+    if (!Array.isArray(panes)) throw new Error(`herdr pane list returned no panes: ${list.stdout}`);
+    const prior = panes.find((p) => {
+      const owned = typeof p.label === "string" ? parseOwnedName(p.label) : null;
+      return p.workspace_id === this.ws && typeof p.pane_id === "string" && owned?.role === "watch" && owned.taskId === "run" && owned.runId !== runId;
     });
     return prior?.pane_id ?? null;
   }
@@ -478,7 +510,7 @@ export class HerdrDriver implements ExecutorDriver {
       /* fail closed below */
     }
     if (typeof pane !== "string" || !pane) throw new Error(`herdr watch split returned no pane id: ${sp.stdout}`);
-    const renamed = await this.herdr(`agent rename ${shq(pane)} ${shq(name)}`);
+    const renamed = await this.herdr(`pane rename ${shq(pane)} ${shq(name)}`);
     if (renamed.code !== 0 || await this.namedPaneId(name) !== pane) {
       await this.herdr(`pane close ${shq(pane)}`);
       throw new Error(`herdr watch rename failed: ${renamed.stderr || renamed.stdout}`);
@@ -511,7 +543,7 @@ export class HerdrDriver implements ExecutorDriver {
       }
       const prior = runId ? await this.priorWatch(runId) : null;
       if (prior) {
-        const renamed = await this.herdr(`agent rename ${shq(prior)} ${shq(name)}`);
+        const renamed = await this.herdr(`pane rename ${shq(prior)} ${shq(name)}`);
         if (renamed.code !== 0 || await this.namedPaneId(name) !== prior) {
           throw new Error(`herdr watch reclaim failed: ${renamed.stderr || renamed.stdout}`);
         }
@@ -543,11 +575,14 @@ export class HerdrDriver implements ExecutorDriver {
   async reconcile(desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean }): Promise<void> {
     try {
       if (!this.ws) return;
-      const list = await this.herdr("agent list");
-      const agents: { name?: string; pane_id?: string; tab_id?: string; workspace_id?: string }[] =
-        JSON.parse(list.stdout).result?.agents ?? [];
+      // 0.7.5: enumerate owned panes from `pane list` (labels), not `agent list` (detected agents only).
+      // panesToClose skips any pane whose label doesn't parse as tickmarkr-owned (orchestrator/operator
+      // shells, undetected agents), so a fuller pane listing never widens the blast radius.
+      const list = await this.herdr("pane list");
+      const panes: { label?: string; pane_id?: string; tab_id?: string; workspace_id?: string }[] =
+        JSON.parse(list.stdout).result?.panes ?? [];
       const toClose = panesToClose(
-        agents.map((a) => ({ name: a.name, paneId: a.pane_id, tabId: a.tab_id, workspaceId: a.workspace_id })),
+        panes.map((p) => ({ name: p.label, paneId: p.pane_id, tabId: p.tab_id, workspaceId: p.workspace_id })),
         desired,
         this.ws,
         runId,

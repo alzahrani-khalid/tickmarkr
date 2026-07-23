@@ -1,8 +1,9 @@
 // v1.22b T1: VIS-10 ("no pane placed by focus heuristic") is a comment today — nothing fails the
 // build if a new pane/tab creation call site forgets placement. This is a source-level regression
-// oracle: it greps every `tab create`/`agent start`/`pane split` call site in the herdr driver and
-// pins that each carries an explicit workspace — a pinned `--workspace` on tab create, or a
-// HERDR_WORKSPACE_ID seed on the pane before it's handed back. A new creation site that omits
+// oracle: it greps every `tab create`/`pane split` call site in the herdr driver (the two pane-
+// establishing verbs in herdr 0.7.5 — the old `agent start -- bash` spawn was removed, OBS-123) and
+// pins that each carries an explicit workspace — a pinned `--workspace` on tab create, and a
+// HERDR_WORKSPACE_ID seed on the created pane before it's handed back. A new creation site that omits
 // placement fails this test, not just a code-review comment.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -17,8 +18,9 @@ describe("driver placement audit (VIS-10 guarantee as a regression oracle)", () 
     for (const call of calls) expect(call).toMatch(/--workspace\b/);
   });
 
-  it("every `agent start` call site seeds HERDR_WORKSPACE_ID before the pane is handed to the caller", () => {
-    const calls = [...src.matchAll(/herdr\(`agent start[^`]*`\)/g)];
+  it("every `tab create` call site seeds HERDR_WORKSPACE_ID on its root pane before it's handed to the caller", () => {
+    // 0.7.5: the tab's root shell pane IS the worker pane; the seed must reach it before slot() returns.
+    const calls = [...src.matchAll(/herdr\(`tab create[^`]*`\)/g)];
     expect(calls.length).toBeGreaterThan(0);
     for (const call of calls) {
       const after = src.slice(call.index!, call.index! + 2500);

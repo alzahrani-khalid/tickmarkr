@@ -1,6 +1,6 @@
 # Technology Stack
 
-**Analysis Date:** 2026-07-18
+**Analysis Date:** 2026-07-23
 
 ## Languages
 
@@ -25,7 +25,8 @@
 ## Frameworks
 
 **Core:**
-- None. Tickmarkr is a dependency-light Node CLI binary, not a web/app framework consumer. `package.json:22-25` exposes `bin: { tickmarkr: "dist/cli/index.js", tkr: "dist/cli/index.js" }` (both names invoke the same entrypoint); `src/cli/index.ts` is a hand-rolled command dispatcher (`COMMANDS` map, no CLI framework like commander/yargs).
+- Ink 6.8.0 + React 19.2.8 - declarative component runtime for interactive terminal surfaces, beginning with the `tickmarkr fleet` beachhead under `src/tui/ink/`. The adoption cause is the operator ruling `.planning/rulings/2026-07-22-v172-ink-beachhead.md`: OBS-69, OBS-70, OBS-77, and OBS-121 identify one defect family in hand-rolled raw-mode, keypress, frame, and readline plumbing. Non-interactive and daemon paths do not load this runtime.
+- Tickmarkr remains a hand-rolled CLI dispatcher rather than a command framework consumer. `package.json:22-25` exposes `bin: { tickmarkr: "dist/cli/index.js", tkr: "dist/cli/index.js" }` (both names invoke the same entrypoint); `src/cli/index.ts` owns the `COMMANDS` map without commander/yargs.
 
 **Testing:**
 - Vitest 3.2.7 - unit + integration runner (`vitest.config.ts`)
@@ -38,6 +39,8 @@
 ## Key Dependencies
 
 **Critical:**
+- ink 6.8.0 - React terminal renderer for component-owned interactive input and frames (`src/tui/ink/fleet-app.tsx`)
+- react 19.2.8 - component/state runtime used by the Ink fleet application; `@types/react` is build-only
 - zod 4.4.3 - single source of truth for the `RunGraph`/`Task` shape and all runtime validation (`src/graph/schema.ts`); also emits the public JSON Schema artifact via `z.toJSONSchema(RunGraphSchema, ...)` (`scripts/emit-schema.ts` → `schema/rungraph.schema.json`)
 - yaml 2.9.0 - parses the config overlay files (`src/config/config.ts:4,346-349`) and GSD phase-plan frontmatter (`src/compile/gsd.ts:3`)
 - picomatch 4.0.5 - glob matcher backing the scope gate, which checks whether a worker only touched paths matching `task.files` (`src/gates/scope.ts:1,17`)
@@ -59,7 +62,7 @@
 - `tickmarkr init` scaffolds both overlay files from a commented template (`src/cli/commands/init.ts`, `configTemplate()` in `src/config/config.ts:483`)
 
 **Build:**
-- `tsconfig.json` - `target: ES2022`, `module`/`moduleResolution: NodeNext`, `strict: true`, `declaration: true`, `outDir: dist`, `rootDir: src`, `skipLibCheck: true`
+- `tsconfig.json` - `target: ES2022`, `module`/`moduleResolution: NodeNext`, `jsx: react-jsx`, `strict: true`, `declaration: true`, `outDir: dist`, `rootDir: src`, `skipLibCheck: true`
 - `vitest.config.ts` - test glob `tests/**/*.test.ts`, `testTimeout: 20000`, v8 coverage with the thresholds above
 
 ## Platform Requirements
@@ -75,4 +78,4 @@
 
 ---
 
-*Stack analysis: 2026-07-18*
+*Stack analysis: 2026-07-23*

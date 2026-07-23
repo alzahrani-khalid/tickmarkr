@@ -132,10 +132,15 @@ function tail(out: string, n = 8): string {
   return "\n" + t.split("\n").slice(-n).join("\n");
 }
 
-// v1.70: the new-file line numbers each hunk actually ADDS, per changed path — parsed from the
-// unified-diff hunk headers so a citation is validated against real changed locations, not a substring
-// of the whole diff text (which also matches unchanged context lines and the diff's own +++/@@ headers).
-// Only `+` lines are changed locations; context lines advance the new-file counter but are not changes.
+// v1.70 / OBS-129: the new-file line numbers each changed HUNK spans, per path — parsed from the
+// unified-diff so a citation is validated against real changed regions, not a substring of the whole
+// diff text (which also matches the diff's own +++/@@ headers). A hunk's span is every new-file line it
+// carries: the added (`+`) lines AND the context lines git includes around them.
+// OBS-129: this is a changed-HUNK check, not an exact-added-LINE check. Requiring the exact `+` line made
+// honest judges fail closed on correct work — two frontier judges cited an adjacent line of the same
+// change (LLMs miscount exact line numbers), voiding the whole verdict. The anti-hallucination property
+// holds: a citation outside every hunk, or to an untouched file, still fails (matching the documented
+// "outside every changed hunk → rejected" contract in acceptance.test.ts).
 // ponytail: assumes git's default a/ b/ prefixes (fetchTaskDiff uses plain `git diff`); revisit if a
 // caller passes a --no-prefix diff.
 function changedLinesByFile(diff: string): Map<string, Set<number>> {
@@ -155,12 +160,12 @@ function changedLinesByFile(diff: string): Map<string, Set<number>> {
     if (hunk) { newLine = Number(hunk[1]); inHunk = true; continue; }
     if (!inHunk || path === null) continue;
     const c = raw[0];
-    if (c === "+") {
+    if (c === "+" || c === " ") {
+      // OBS-129: record every new-file line the hunk spans — added AND context — so a citation to an
+      // adjacent line of the same change validates, not only the exact `+` line.
       let set = byFile.get(path);
       if (!set) { set = new Set(); byFile.set(path, set); }
       set.add(newLine);
-      newLine++;
-    } else if (c === " ") {
       newLine++;
     } else if (c !== "-") {
       inHunk = false; // "\ No newline", a trailing blank, or the next section — hunk body ended
@@ -169,8 +174,22 @@ function changedLinesByFile(diff: string): Map<string, Set<number>> {
   return byFile;
 }
 
-// A citation is valid evidence iff the diff adds the cited line of the cited file. A legacy free-text
-// quote (string) keeps v1.64's substring check — non-empty and present somewhere in the diff.
+// Compact a sorted set of line numbers into "3, 7-9, 14" form for the judge's citable-lines index.
+function compressLines(lines: number[]): string {
+  const sorted = [...new Set(lines)].sort((a, b) => a - b);
+  const parts: string[] = [];
+  for (let i = 0; i < sorted.length; ) {
+    let j = i;
+    while (j + 1 < sorted.length && sorted[j + 1] === sorted[j]! + 1) j++;
+    parts.push(i === j ? `${sorted[i]}` : `${sorted[i]}-${sorted[j]}`);
+    i = j + 1;
+  }
+  return parts.join(", ");
+}
+
+// A citation is valid evidence iff the cited line falls inside a changed hunk of the cited file (OBS-129:
+// changed-hunk span, not exact-added-line). A legacy free-text quote (string) keeps v1.64's substring
+// check — non-empty and present somewhere in the diff.
 function citesChangedLocation(evidence: string | EvidenceCitation, changed: Map<string, Set<number>>, diff: string): boolean {
   if (typeof evidence === "string") return evidence.trim().length > 0 && diff.includes(evidence);
   return changed.get(evidence.path)?.has(evidence.line) ?? false;
@@ -242,6 +261,10 @@ export async function acceptanceGate(
   const capFail = checkDiffCap("acceptance", forCap.length, diffCap, warn + detBlock);
   if (capFail) return capFail;
   const expectedIds = judgeItems.map((_, index) => judgeCriterionId(index));
+  // OBS-129: give the judge the exact citable new-file line numbers per changed file, so it grounds each
+  // citation in a real changed line instead of miscounting. Validated below against this same `changed`.
+  const changed = changedLinesByFile(diff);
+  const citable = [...changed.entries()].map(([p, set]) => `- ${p}: ${compressLines([...set])}`).join("\n");
   const nonce = generateVerdictNonce();
   const prompt = `TICKMARKR-JUDGE
 You are a strict acceptance judge. Decide whether the diff satisfies EVERY acceptance criterion.
@@ -261,12 +284,15 @@ ${judgeItems.map((a, index) => `- ${renderJudgeCriterion(a, index)}`).join("\n")
 ${diff}
 \`\`\`
 
+## Citable evidence lines (new-file line numbers inside the changed hunks above)
+${citable || "(the diff changes no lines)"}
+
 ${verdictNonceLine(nonce)}
 
 Respond with ONLY this JSON (no prose before or after):
 {"nonce": "${nonce}", "pass": true|false, "criteria": [{"criterion": "c1", "met": true|false, "reason": "...", "evidence": {"path": "path/to/file", "line": 42}}]}
 Each criteria[].criterion MUST be the stable id from the rubric (c1, c2, ...) exactly once.
-Each criteria[].evidence MUST be a structured citation {"path", "line"} pointing at a line the diff above actually adds or changes (the new-file line number); a citation to an unchanged or nonexistent location voids the whole verdict.
+Each criteria[].evidence MUST be a structured citation {"path", "line"} whose "path" and "line" appear in the "Citable evidence lines" list above (a new-file line number inside a changed hunk); a citation outside every changed hunk or to an untouched file voids the whole verdict.
 `;
   const raw = await runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS);
   const extracted = extractVerdictJson<JudgeVerdict>(raw, nonce);
@@ -279,12 +305,11 @@ Each criteria[].evidence MUST be a structured citation {"path", "line"} pointing
       meta: { unparseable: true, judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
   }
   const { verdict: v, inconsistencies } = checkJudgeVerdict(extracted, expectedIds);
-  // v1.70: each citation must point at a line the diff actually changed — validated against the hunks
-  // of `diff` (the exact string embedded in the prompt above), never the worktree or any other artifact.
-  // A citation to an untouched file or a line outside every changed hunk is a hallucinated verdict:
-  // treated as unparseable so GATE-09 retries the judge on a failover channel. (A legacy free-text quote
-  // still validates by substring, for the fake seam and pre-v1.70 fixtures.)
-  const changed = changedLinesByFile(diff);
+  // v1.70 / OBS-129: each citation must fall inside a changed hunk of `diff` (the exact string embedded in
+  // the prompt above and enumerated in the citable-lines index), never the worktree or any other artifact.
+  // A citation to an untouched file or outside every changed hunk is a hallucinated verdict: treated as
+  // unparseable so GATE-09 retries the judge on a failover channel. (A legacy free-text quote still
+  // validates by substring, for the fake seam and pre-v1.70 fixtures.) `changed` is computed above.
   const fabricated = v.criteria.filter((row) => !citesChangedLocation(row.evidence, changed, diff));
   if (fabricated.length) {
     return { gate: "acceptance", pass: false,

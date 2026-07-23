@@ -5,56 +5,64 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 
 // Focused herdr stub for the tab-label regression: records every invocation to a log file and
-// answers the JSON shapes the driver expects for the group join/leave rename path. The
-// contract-critical bash lines (agent-get map lookup, rename registry, pane layout width, tab
-// create payload) are copied verbatim from the canonical makeStub in tests/drivers/herdr.test.ts —
-// drift here would diverge the recorded herdr command surface these regressions assert against.
-// Only the failure-mode branches these tests do not exercise (taken-name reclaim, split/rename/
-// layout/tab-create degrade) are omitted; the positive surface is byte-identical.
+// answers the JSON shapes the driver expects for the group join/leave rename path. Modeled on the
+// canonical makeStub in tests/drivers/herdr.test.ts (herdr 0.7.5): the tab's root pane IS the worker,
+// durable identity is the pane LABEL (`pane rename` → `pane list`), and agent_status is served off
+// `pane list` (the glyph's live observation source — renameGroupTab queries it on every relabel).
+// Only the failure-mode branches these tests do not exercise are omitted; the positive surface matches.
 interface StubOpts { incTabs?: boolean; tabRenameFails?: boolean; tabRenameFailOnce?: boolean; blockedNames?: string[] }
 
 function makeStub(opts: StubOpts = {}): { bin: string; log: string; cwd: string } {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-tab-"));
   const log = join(dir, "log.txt");
-  const map = join(dir, "agents.txt"); // agent rename registry: "<name> <paneId>" per line
+  const panes = join(dir, "panes.txt"); // pane registry: "<pane_id> <label>" per line
   const ctr = join(dir, "tabctr.txt"); // incTabs: distinct tab ids (t1,t2,…) so coexisting tabs are distinguishable
   const bin = join(dir, "herdr");
   const cwd = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-tab-cwd-"));
   const blocked = join(dir, "blocked.txt"); // VIS-13: names the driver observes as agent_status "blocked"
   if (opts.blockedNames?.length) writeFileSync(blocked, opts.blockedNames.join("\n") + "\n");
-  // tab create answers tab_id + root_pane (SKILL:343); incTabs emits incrementing ids so a group tab
-  // and a dedicated/per-slot tab are distinguishable in the recorded surface.
+  // tab create answers tab_id + root_pane (the worker pane); incTabs emits incrementing tab AND root
+  // pane ids so coexisting generations never collide on a shared pane id in the registry.
   const tabCreate = opts.incTabs
-    ? `n=$(cat '${ctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${ctr}'; echo "{\\"result\\":{\\"tab\\":{\\"tab_id\\":\\"w1:t$n\\"},\\"root_pane\\":{\\"pane_id\\":\\"w1:p0\\"}}}"`
-    : `echo '{"result":{"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:p0"}}}'`;
+    ? `n=$(cat '${ctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${ctr}'; echo "{\\"result\\":{\\"tab\\":{\\"tab_id\\":\\"w1:t$n\\"},\\"root_pane\\":{\\"pane_id\\":\\"w1:pR$n\\"}}}"`
+    : `echo '{"result":{"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:p9"}}}'`;
   const paneSplit = `echo '{"result":{"pane":{"pane_id":"w1:p7"}}}'`;
-  // pane ids compact when panes close — the driver re-resolves fresh via the durable name (spec §5)
   const paneLayout = `w=222; pid=""; for a in "$@"; do case "$a" in --pane) shift; pid="$1";; esac; done; [ -z "$pid" ] && pid=w1:p42; echo "{\\"result\\":{\\"layout\\":{\\"area\\":{\\"width\\":$w},\\"panes\\":[{\\"pane_id\\":\\"$pid\\",\\"rect\\":{\\"width\\":$w}}]}}}"`;
-  const rename = `echo "$4 $3" >> '${map}'; echo '{}'`;
+  const paneRename = `printf '%s %s\\n' "$3" "$4" >> '${panes}'; echo '{}'`;
   const tabRnCtr = join(dir, "tabrn.txt");
   const tabRename = opts.tabRenameFails
     ? "exit 1"
     : opts.tabRenameFailOnce
       ? `n=$(cat '${tabRnCtr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${tabRnCtr}'; [ "$n" -eq 1 ] && exit 1; echo '{}'`
       : "echo '{}'";
-  const agentStart = `echo '{"result":{"agent":{"pane_id":"w1:p9"}}}'`;
-  // VIS-13: a name in the blocked set answers agent_status "blocked" (the glyph's live observation
-  // source — renameGroupTab queries it on every relabel); otherwise the rename-map lookup (no
-  // agent_status → the driver reads "unknown" → bare token or ↻ for a retry).
-  const agentGet = `if [ -f '${blocked}' ] && grep -qx "$3" '${blocked}'; then echo "{\\"result\\":{\\"agent\\":{\\"pane_id\\":\\"w1:p42\\",\\"agent_status\\":\\"blocked\\"}}}"; else pane=$(grep "^$3 " '${map}' 2>/dev/null | tail -1 | cut -d' ' -f2); if [ -n "$pane" ]; then echo "{\\"result\\":{\\"agent\\":{\\"pane_id\\":\\"$pane\\"}}}"; else echo '{"result":{"agent":{"pane_id":"w1:p42"}}}'; fi; fi`;
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
+BLOCKED='${blocked}'
+PANES='${panes}'
+herdr_pane_list() {
+  out=""
+  if [ -f "$PANES" ]; then
+    while IFS=' ' read -r pid label; do
+      [ -z "$pid" ] && continue
+      st="idle"
+      if [ -f "$BLOCKED" ] && grep -qx "$label" "$BLOCKED"; then st="blocked"; fi
+      e="{\\"pane_id\\":\\"$pid\\",\\"label\\":\\"$label\\",\\"tab_id\\":\\"w1:t1\\",\\"workspace_id\\":\\"wTEST\\",\\"agent_status\\":\\"$st\\"}"
+      if [ -z "$out" ]; then out="$e"; else out="$out,$e"; fi
+    done < "$PANES"
+  fi
+  echo "{\\"result\\":{\\"panes\\":[$out]}}"
+}
 echo "$@" >> '${log}'
 case "$1 $2" in
-  "agent start") ${agentStart} ;;
-  "agent rename") ${rename} ;;
-  "agent get") ${agentGet} ;;
   "tab create") ${tabCreate} ;;
   "tab rename") ${tabRename} ;;
+  "tab close") echo '{}' ;;
+  "pane rename") ${paneRename} ;;
+  "pane list") herdr_pane_list ;;
   "pane split") ${paneSplit} ;;
   "pane layout") ${paneLayout} ;;
-  "pane close") echo '{}' ;;
+  "pane close") grep -v "^$3 " '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; echo '{}' ;;
   "notification show") echo '{}' ;;
   *) echo '{}' ;;
 esac

@@ -71,6 +71,16 @@ export function readCodexModelsCache(path?: string): { models: string[]; fetched
 // worktree cwd; in a plain repo it resolves to ./.git (already writable, harmless).
 const GITDIR_WRITABLE = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]"`;
 
+// OBS-125: codex 0.144.x gates enabled hooks behind PER-PROJECT-PATH hook trust — a NEW gate distinct
+// from the directory trust seedCodexTrust seeds. Every worker runs in a fresh ephemeral worktree, an
+// untrusted project, so codex re-prompts "Hooks need review" and the interactive worker stalls forever
+// (run-20260722/23 incidents). This flag runs the operator's OWN already-trusted hooks — including the
+// ~/.codex/hooks.json herdr-agent-state hook herdr relies on for agent detection, so the hooks can't
+// just be disabled — WITHOUT requiring persisted per-path trust for this invocation. It KEEPS the
+// -s/--sandbox workspace-write sandbox (deliberately NOT --dangerously-bypass-approvals-and-sandbox,
+// which would drop the sandbox). Listed by `codex --help` and `codex exec --help` (verified 2026-07-23).
+const CODEX_HOOK_TRUST = "--dangerously-bypass-hook-trust";
+
 // v1.22 T5 / OBS-16: codex keys trust on absolute path under [projects."<root>"] trust_level="trusted"
 // in ~/.codex/config.toml (CODEX_HOME relocates the dir). Worktrees inherit parent-project trust when
 // the REPO ROOT is trusted — seed the root once, cover every future worktree. Idempotent: a second
@@ -164,16 +174,17 @@ export const codex: WorkerAdapter = {
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("codex", cfg),
   // v1.65 T3: every flag the command builders below hardcode (incl. codexMcpSuppressionFlags' -c/
   // --disable and GITDIR_WRITABLE's -c) — all listed by top-level `codex --help`, verified 2026-07-22.
-  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "--model", "-a", "-s", "-c", "--disable"] },
+  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "--model", "-a", "-s", "-c", "--disable", "--dangerously-bypass-hook-trust"] },
   // --sandbox workspace-write is the autonomous sandbox mode (codex v0.144.1+)
   // MCP suppression built per dispatch (config can change between runs) — see codexMcpSuppressionFlags.
+  // CODEX_HOOK_TRUST (OBS-125) clears the per-worktree "Hooks need review" gate while keeping the sandbox.
   headlessCommand: (promptFile: string, model: string) =>
-    `codex exec --sandbox workspace-write ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
+    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
   // TUI uses expanded -a never -s workspace-write (exec-only flags do not apply)
   // (--help 2026-07-09: valid approval policies are untrusted|on-request|never; the previously
   // used `on-failure` is invalid and made codex exit 2 pre-inference)
   interactiveCommand: (promptFile: string, model: string) =>
-    `codex -a never -s workspace-write ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
+    `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },

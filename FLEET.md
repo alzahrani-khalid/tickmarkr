@@ -77,6 +77,17 @@ review:
 
 **Grammar**: review prefer entries may name a bare adapter (inheriting the model from the current channel) or an explicit `adapter:model` pair. Bare adapters rank every diversity-eligible channel for that adapter; explicit pairs rank one diversity-eligible channel.
 
+In the fleet editor (step 6/6), both prefer lists are staged with a picker over the discovered channels — space adds or drops an entry, selection order is chain order — so entries are never typed by hand.
+The review picker offers bare adapters and explicit `adapter:model` seats; the consult picker
+offers explicit seats only. A configured entry that is absent from current discovery remains a
+marked picker row until the operator deliberately drops it.
+
+After steering, the editor renders the unified overlay diff inside Ink and accepts `y` or `n`
+without opening a line editor. A `y` passes the exact candidate bytes through the production
+config-loader guard before the fleet command's single filesystem write. If that guard rejects the
+overlay, the editor returns to step 6 with the error inline and every staged edit intact; nothing
+is written.
+
 ## Consult preferences
 
 `consult.prefer` is a ranked failover list of seats for escalations on deadlock or gate stalls. Unlike review, a consult seat has no channel to inherit a model from, so entries **must be explicit `adapter:model` pairs**.
