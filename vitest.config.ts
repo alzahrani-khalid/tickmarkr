@@ -6,6 +6,14 @@ import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/con
 // Daemon process under a real run keeps its env — only the vitest process tree is sealed here.
 for (const k of ["HERDR_ENV", "HERDR_SOCKET_PATH"] as const) delete process.env[k];
 
+// Ink detects CI via `is-in-ci` (memoized at import time) and suppresses interactive re-renders when it's
+// set, so the fleet interaction tests read EMPTY frames under CI (release.yml) though they render real
+// frames locally — mid-session lastFrame assertions saw '\n'. is-in-ci checks ONLY these two vars
+// (node_modules/is-in-ci/index.js: check('CI') || check('CONTINUOUS_INTEGRATION')), so seal them here —
+// before workers fork — so is-in-ci memoizes non-CI in every worker and Ink renders identically in CI and
+// local. Real CI runs (release.yml) thus exercise the same interactive frames the local suite does.
+for (const k of ["CI", "CONTINUOUS_INTEGRATION"] as const) delete process.env[k];
+
 // Same leak class for the GLOBAL config overlay: the operator's ~/.config/tickmarkr/config.yaml
 // (e.g. extra pi tier models) must never reach unit-test fixtures — byte-pinned doctor/plan output
 // broke on the dev machine while green in CI (2026-07-15). Point XDG at a committed empty dir.
