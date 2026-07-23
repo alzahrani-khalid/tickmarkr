@@ -4,6 +4,7 @@ import { validateGraph } from "../graph/schema.js";
 import { route, RoutingError } from "./router.js";
 
 export interface Disallowed { by: "deny" | "allow"; entry: string }
+export type PreferenceRole = "worker" | "judge" | "review" | "consult";
 
 const adapterIds = (adapters: { id: string }[] | string[]): string[] =>
   typeof adapters[0] === "string" ? (adapters as string[]) : (adapters as { id: string }[]).map((a) => a.id);
@@ -48,10 +49,17 @@ export function preferRanks(c: { adapter: string; model: string }, cfg: Tickmark
 export function disallowedBy(
   c: { adapter: string; model: string },
   routing: TickmarkrConfig["routing"],
+  role: PreferenceRole = "worker",
 ): Disallowed | null {
   const { allow, deny } = routing;
   const matches = (e: string) => e === c.adapter || e === c.model || e === channelKey(c);
-  const d = [...(deny?.adapters ?? []), ...(deny?.models ?? [])].find(matches);
+  const workerDeny = role === "worker" ? deny?.workers : undefined;
+  const d = [
+    ...(deny?.adapters ?? []),
+    ...(deny?.models ?? []),
+    ...(workerDeny?.adapters ?? []),
+    ...(workerDeny?.models ?? []),
+  ].find(matches);
   if (d) return { by: "deny", entry: d };
   if (allow) {
     const entries = [...(allow.adapters ?? []), ...(allow.models ?? [])];

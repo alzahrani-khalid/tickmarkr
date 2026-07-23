@@ -12,7 +12,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.71.0";
+const PRIOR_RELEASE_VERSION = "1.72.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -76,17 +76,17 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the component-runtime migration and picker-everywhere themes rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.72[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/component[- ]runtime/i);
-    expect(entry).toMatch(/picker[- ]everywhere/i);
-    for (const change of ["ink", "react", "fleet editor", "beachhead", "component", "diff-confirm", "reload-guard", "overlay writer", "legacy", "askTyped", "picked", "typed", "adapters", "models", "tiers", "seats", "prefer chain", "chain order", "consult picker", "review picker", "staged edits", "non-interactive", "byte-identical"]) {
+  test("the changelog entry names the studio migration and liveness themes rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.73[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/studio[- ]migration/i);
+    expect(entry).toMatch(/liveness/i);
+    for (const change of ["ink", "component", "studio", "fleet", "routing", "preview", "profile", "runs", "consult dossier", "diff-confirm", "reload-guard", "staged edits", "engine", "keypress decoder", "input stream", "control plane", "phase-start", "spinner", "elapsed", "watcher-local", "last-output age", "terminal title", "append-only", "heartbeat", "gate-visible", "fork cap", "approve", "resume", "pane-slot", "deny"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.71.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.72.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

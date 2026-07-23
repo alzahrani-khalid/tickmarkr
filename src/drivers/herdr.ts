@@ -27,6 +27,7 @@ interface GroupEntry { tabId: string; label: string; members: { name: string; pa
 // monotonic generation counter so distinct overflow generations never collide as objects (VIS-13:
 // overflow labels are all "cleanup" — distinguished by their live member token, never a WORKERS-N).
 interface GroupState { generations: GroupEntry[]; created: number; splitUnsupported?: boolean }
+interface DispatchLease { release: () => void }
 
 export class HerdrDriver implements ExecutorDriver {
   id = "herdr";
@@ -36,8 +37,11 @@ export class HerdrDriver implements ExecutorDriver {
   // grouped slot()/close() mutate shared group state across awaits — serialize them so two
   // concurrent first members can never both create the group tab (mergeSerial idiom, daemon.ts)
   private groupSerial: Promise<unknown> = Promise.resolve();
-  // OBS-119: concurrent deliveries contend on herdr's send path — one chain per driver (mergeSerial idiom)
+  // OBS-120: canonical dispatch slots hold this chain from allocation through verified binding and
+  // delivery. Legacy/manual slots still serialize each delivery on the same chain (OBS-119).
   private deliverySerial: Promise<unknown> = Promise.resolve();
+  private dispatchLeases = new WeakMap<Slot, DispatchLease>();
+  private deliveredPanes = new WeakMap<Slot, string>();
 
   // VIS-10: the run's workspace id, captured once at construction (the daemon inherits it from the
   // operator's env before the driver is built). Required at slot() time, never in the constructor —
@@ -58,6 +62,41 @@ export class HerdrDriver implements ExecutorDriver {
     const p = this.deliverySerial.then(fn, fn);
     this.deliverySerial = p.catch(() => undefined);
     return p;
+  }
+
+  // OBS-120: ExecutorDriver exposes slot() and run() separately, so a canonical tickmarkr slot
+  // carries a lease across that API seam. The next dispatch cannot allocate until this slot's first
+  // run either delivers or fails. Allocation errors release immediately; no failed dispatch poisons
+  // the queue. The daemon calls run() directly after preparing the command for every owned slot.
+  private reserveDispatch(allocate: () => Promise<Slot>): Promise<Slot> {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const start = this.deliverySerial.then(() => undefined, () => undefined);
+    this.deliverySerial = start.then(() => held);
+    return start.then(async () => {
+      let slot: Slot | undefined;
+      try {
+        slot = await allocate();
+        this.dispatchLeases.set(slot, { release });
+        return slot;
+      } catch (error) {
+        if (slot) {
+          try { await this.close(slot); } catch { /* allocation already failed closed; cleanup is best-effort */ }
+        }
+        release();
+        throw error;
+      }
+    });
+  }
+
+  private async verifyPaneIdentityBinding(slot: Slot): Promise<string> {
+    const paneId = await this.namedPaneId(slot.name);
+    if (paneId !== slot.id) {
+      throw new Error(
+        `herdr pane identity binding verification failed for ${slot.name}: allocated ${slot.id}, resolved ${paneId ?? "none"} — refusing delivery`,
+      );
+    }
+    return paneId;
   }
 
   // ponytail: narrow panes hard-wrap the input line — collapse whitespace before comparing.
@@ -92,8 +131,11 @@ export class HerdrDriver implements ExecutorDriver {
     }
   }
 
-  // pane ids compact when panes close — resolve fresh via the durable agent name (spec §5)
+  // Before delivery, resolve fresh via the durable name because pane ids can compact. After delivery,
+  // pin the verified target so early liveness cannot drift to a label rebound onto another pane.
   private async paneId(slot: Slot): Promise<string> {
+    const delivered = this.deliveredPanes.get(slot);
+    if (delivered) return delivered;
     return await this.namedPaneId(slot.name) ?? slot.id;
   }
 
@@ -118,11 +160,17 @@ export class HerdrDriver implements ExecutorDriver {
     // reconcile.ts and this driver's own renameGroupTab/glyphFor decode role/taskId/attempt from
     // those shapes without a call-site migration; T2 retires this branch by always passing `owned`.
     const resolved = opts?.owned ? formatOwnedName(opts.owned) : name;
+    const allocate = opts?.group
+      ? () => this.serial(() => this.groupSlot(cwd, resolved, opts.group!))
+      : () => this.tabSlot(cwd, resolved, opts?.label);
+    // Production dispatch names are canonical even when the gate call site supplies the already-
+    // formatted name rather than SlotOpts.owned. Hold one lease across slot() → run(); legacy/manual
+    // slots retain their existing allocation-only semantics for compatibility.
+    if (parseOwnedName(resolved)) return this.reserveDispatch(allocate);
     // group wins if both are set (a group tab is already stage-labeled; passing both is a caller bug).
     // label (without group) → dedicated labeled tab via tabSlot's third param: no groups-map entry, no
     // refcount, no groupSerial, no degrade latch — dedicated tabs have no shared state to guard (SUP-01).
-    if (opts?.group) return this.serial(() => this.groupSlot(cwd, resolved, opts.group!));
-    return this.tabSlot(cwd, resolved, opts?.label); // label undefined → defaults to name (today's behavior)
+    return allocate(); // label undefined → defaults to name (today's behavior)
   }
 
   // today's per-slot tab path, plus the VIS-04 orphan reap
@@ -329,11 +377,26 @@ export class HerdrDriver implements ExecutorDriver {
   // cleared (C-u), and retyped, bounded; persistent corruption fails closed WITH the captured
   // transcript — the dispatch-time pincer the ledger asks for, not post-hoc `git:` archaeology.
   async run(slot: Slot, cmd: string): Promise<void> {
-    return this.deliveryQueue(() => this.deliver(slot, cmd));
+    const lease = this.dispatchLeases.get(slot);
+    if (lease) {
+      this.dispatchLeases.delete(slot);
+      try {
+        const paneId = await this.verifyPaneIdentityBinding(slot);
+        await this.deliver(slot, cmd, paneId);
+        this.deliveredPanes.set(slot, paneId);
+      } finally {
+        lease.release();
+      }
+      return;
+    }
+    return this.deliveryQueue(async () => {
+      const paneId = await this.paneId(slot);
+      await this.deliver(slot, cmd, paneId);
+      this.deliveredPanes.set(slot, paneId);
+    });
   }
 
-  private async deliver(slot: Slot, cmd: string): Promise<void> {
-    const pane = await this.paneId(slot);
+  private async deliver(slot: Slot, cmd: string, pane: string): Promise<void> {
     let transcript = "";
     for (let attempt = 0; attempt < DELIVERY_ATTEMPTS; attempt++) {
       if (attempt > 0) {

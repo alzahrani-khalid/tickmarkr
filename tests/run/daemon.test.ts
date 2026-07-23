@@ -115,6 +115,73 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(merges.every((m) => Object.keys(m.data).sort().join(",") === "branch,commit")).toBe(true);
   });
 
+  test("test: a run's journal contains a phase-start event naming the task and phase for the worker dispatch and for each verification phase that ran", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+
+    await runDaemon(repo, { adapters: [fake], runId: "run-phase-starts" });
+
+    const events = Journal.open(repo, "run-phase-starts").read();
+    const starts = events.filter((event) => event.event === "phase-start");
+    expect(starts.length).toBeGreaterThan(0);
+    expect(starts.every((event) => event.taskId === "T1" && typeof event.data.phase === "string")).toBe(true);
+    expect(starts.map((event) => event.data.phase)).toEqual([
+      "worker",
+      "gates",
+      "gate:build",
+      "gate:test",
+      "gate:lint",
+      "gate:evidence",
+      "gate:scope",
+      "judge",
+      "review",
+      "merge",
+    ]);
+    const gateStarts = starts.filter((event) => typeof event.data.gate === "string");
+    expect(gateStarts.map((event) => event.data.gate)).toEqual(
+      events.filter((event) => event.event === "gate-result").map((event) => event.data.gate),
+    );
+  });
+
+  test("test: phase-start events are appended when a phase begins rather than batched with that phase's outcome", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    const observed: Array<{ phase: unknown; outcomeAlreadyPresent: boolean }> = [];
+
+    await runDaemon(repo, {
+      adapters: [fake],
+      runId: "run-phase-timing",
+      narrate: (event) => {
+        if (event.event !== "phase-start") return;
+        const persisted = Journal.open(repo, "run-phase-timing").read();
+        const gate = event.data.gate;
+        const outcomeAlreadyPresent =
+          event.data.phase === "worker"
+            ? persisted.some((row) => row.event === "worker-result" && row.taskId === event.taskId)
+            : event.data.phase === "gates"
+              ? persisted.some((row) => row.event === "gate-result" && row.taskId === event.taskId)
+              : event.data.phase === "merge"
+                ? persisted.some((row) => row.event === "merge" && row.taskId === event.taskId)
+                : persisted.some((row) =>
+                    row.event === "gate-result" &&
+                    row.taskId === event.taskId &&
+                    row.data.gate === gate
+                  );
+        observed.push({ phase: event.data.phase, outcomeAlreadyPresent });
+      },
+    });
+
+    expect(observed.map((entry) => entry.phase)).toContain("worker");
+    expect(observed.map((entry) => entry.phase)).toContain("judge");
+    expect(observed.map((entry) => entry.phase)).toContain("review");
+    expect(observed.map((entry) => entry.phase)).toContain("merge");
+    expect(observed.every((entry) => entry.outcomeAlreadyPresent === false)).toBe(true);
+  });
+
   test("gate fail → retry with feedback → done (ladder step 1)", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
@@ -1096,6 +1163,100 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     writeFileSync(join(repo, "node_modules", "marker.txt"), "root\n");
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-obs47-realdir" });
     expect(s.done).toEqual(["T1"]); // real dir was replaced with the provisioned link → marker visible again
+  });
+
+  test("test: an attempt that adds a dependency to its manifest triggers an install into the gate-visible module tree before the first gate runs", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      {
+        tasks: {
+          T1: [{
+            shell: [
+              `node -e ${shq(`const fs=require("node:fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.dependencies={"added-dep":"file:./fixture-dep"};fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\\n")`)}`,
+              `${COMMIT} dependency`,
+            ].join(" && "),
+            result: { ok: true, summary: "added dependency" },
+          }],
+        },
+      },
+      "gates:\n  build: test -f node_modules/added-dep/marker.txt\n",
+    );
+    writeFileSync(join(repo, "package.json"), JSON.stringify({
+      name: "dependency-install-fixture",
+      version: "1.0.0",
+      private: true,
+    }, null, 2) + "\n");
+    mkdirSync(join(repo, "fixture-dep"), { recursive: true });
+    writeFileSync(join(repo, "fixture-dep", "package.json"), JSON.stringify({ name: "added-dep", version: "1.0.0" }));
+    writeFileSync(join(repo, "fixture-dep", "marker.txt"), "dependency\n");
+    mkdirSync(join(repo, "node_modules"), { recursive: true });
+    await shOk("git add package.json fixture-dep && git commit --no-gpg-sign -m fixture", repo);
+
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-dependency-install" });
+
+    expect(s.done).toEqual(["T1"]);
+    expect(readFileSync(join(repo, "node_modules", "added-dep", "marker.txt"), "utf8")).toBe("dependency\n");
+    const gateResults = Journal.open(repo, "run-dependency-install").read().filter((e) => e.event === "gate-result");
+    expect(gateResults[0]?.data).toMatchObject({ gate: "build", pass: true });
+  });
+
+  test("test: an attempt with an unchanged dependency manifest runs its gates without any install step", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "manifest unchanged" } }] } },
+      "gates:\n  build: test -f node_modules/stale-dep/marker.txt\n",
+    );
+    writeFileSync(join(repo, "package.json"), JSON.stringify({
+      name: "unchanged-dependency-fixture",
+      version: "1.0.0",
+      private: true,
+      dependencies: {
+        "must-not-install": "file:./missing-dependency",
+      },
+    }, null, 2) + "\n");
+    mkdirSync(join(repo, "node_modules", "stale-dep"), { recursive: true });
+    writeFileSync(join(repo, "node_modules", "stale-dep", "marker.txt"), "stale\n");
+    await shOk("git add package.json && git commit --no-gpg-sign -m fixture", repo);
+
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-dependency-unchanged" });
+
+    expect(s.done).toEqual(["T1"]);
+    expect(existsSync(join(repo, "node_modules", "must-not-install"))).toBe(false);
+    const gateResults = Journal.open(repo, "run-dependency-unchanged").read().filter((e) => e.event === "gate-result");
+    expect(gateResults[0]?.data).toMatchObject({ gate: "build", pass: true });
+  });
+
+  test("test: a failing install marks the attempt failed rather than letting gates run against a stale module tree", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      {
+        tasks: {
+          T1: [{
+            shell: [
+              `node -e ${shq(`const fs=require("node:fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.dependencies={"must-fail":"file:./missing-dependency"};fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\\n")`)}`,
+              `${COMMIT} dependency`,
+            ].join(" && "),
+            result: { ok: true, summary: "install will fail" },
+          }],
+        },
+      },
+      "gates:\n  build: test -f node_modules/stale-dep/marker.txt\n",
+    );
+    writeFileSync(join(repo, "package.json"), JSON.stringify({
+      name: "failing-dependency-fixture",
+      version: "1.0.0",
+      private: true,
+    }, null, 2) + "\n");
+    mkdirSync(join(repo, "node_modules", "stale-dep"), { recursive: true });
+    writeFileSync(join(repo, "node_modules", "stale-dep", "marker.txt"), "stale\n");
+    await shOk("git add package.json && git commit --no-gpg-sign -m fixture", repo);
+
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-dependency-install-fail" });
+
+    expect(s.failed).toEqual(["T1"]);
+    const events = Journal.open(repo, "run-dependency-install-fail").read();
+    expect(events.some((e) => e.event === "gate-result")).toBe(false);
+    expect(events.find((e) => e.event === "task-failed")?.data.error).toMatch(/dependency install failed/i);
   });
 
   test("OBS-47: the composed worker prompt states the worktree layout contract", async () => {

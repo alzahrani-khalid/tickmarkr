@@ -76,7 +76,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 | Plan helpers | LLM-backed scope/intent clarification for `tickmarkr scope` and human-in-the-loop plan gates | `src/plan/scope.ts`, `src/plan/prompt.ts` |
 | Report cost | Pure telemetry → per-channel cost estimates (no network) | `src/report/cost.ts` |
 | Eval fixture harness | Discovers checked-in fixtures, validates their required parts, and seeds each into an isolated temporary git repository before any check or dispatch runs | `src/eval/fixtures.ts` |
-| Terminal engine | Renders a diffed line model in the alternate screen, routes named keys, tracks resize, and restores terminal state | `src/tui/engine.ts`, `src/tui/frame.ts`, `src/tui/input.ts` |
+| Terminal UI | Ink Studio; legacy engine and views retired | `src/tui/ink/studio-app.tsx` |
 | Adapter registry | Discovers installed/authed CLIs (`probe()`), builds the available `BillingChannel[]` | `src/adapters/registry.ts` |
 | Worker adapters | One per agent CLI: headless/interactive command strings + output parsing | `src/adapters/claude-code.ts`, `src/adapters/codex.ts`, `src/adapters/cursor-agent.ts`, `src/adapters/opencode.ts`, `src/adapters/fake.ts` |
 | Executor drivers | Slot lifecycle (pane or subprocess), wait/read/notify primitives, worktree creation | `src/drivers/herdr.ts`, `src/drivers/subprocess.ts`, `src/drivers/types.ts` |

@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { createWorktree } from "../run/git.js";
+import { shq } from "../adapters/types.js";
+import { createWorktree, DEFAULT_FORK_CAP, FORK_CAP_ENV } from "../run/git.js";
 import type { ExecutorDriver, NotifyOpts, Slot } from "./types.js";
 
 // HARD-03: cap retained worker output so a chatty worker can't grow tickmarkr's heap unbounded.
@@ -16,16 +17,19 @@ export const MAX_BUF = 2 * 1024 * 1024;
 // is the "I am inside herdr" gate every agent skill checks before mutating panes.
 export const HERDR_CONTROL_VARS = ["HERDR_ENV", "HERDR_SOCKET_PATH"] as const;
 
-/** Copy of env with herdr control-plane vars stripped. Daemon process.env is left alone. */
+/** Copy of worker env with the fork cap applied and herdr control-plane vars stripped. */
 export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env };
+  if (!(FORK_CAP_ENV in out)) out[FORK_CAP_ENV] = DEFAULT_FORK_CAP;
   for (const k of HERDR_CONTROL_VARS) delete out[k];
   return out;
 }
 
-/** Shell prefix that unsets herdr control vars in a pane/login shell (herdr seed + daemon setup). */
-export function herdrSealShellPrefix(): string {
-  return HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + "; ";
+/** Pane/login-shell form of the same worker env seal (herdr seed + daemon setup). */
+export function herdrSealShellPrefix(env: NodeJS.ProcessEnv = process.env): string {
+  const forkCap = sealHerdrEnv(env)[FORK_CAP_ENV] ?? DEFAULT_FORK_CAP;
+  return `export ${FORK_CAP_ENV}=${shq(forkCap)}; ` +
+    HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + "; ";
 }
 
 interface SlotState { buf: string; proc?: ChildProcess; exited: boolean }

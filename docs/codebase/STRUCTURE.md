@@ -55,13 +55,10 @@ tickmarkr/
 │   │   ├── profile.ts                # telemetry-learned scores + exploration bonus
 │   │   ├── preference.ts             # doctor-derived prefer/exclude ranks
 │   │   └── candidates.ts             # rankCandidates() for plan picker output
-│   ├── tui/                         # terminal presentation runtimes and shared views
-│   │   ├── ink/                       # Ink component-runtime beachhead for the fleet editor
-│   │   │   ├── fleet-app.tsx            # probe + agent-CLI screens and interactive lifecycle
-│   │   │   └── components.tsx           # declarative list-screen and toggle primitives
-│   │   ├── engine.ts                 # TerminalEngine lifecycle, resize, and handler recovery
-│   │   ├── frame.ts                  # alternate-screen line-diff renderer
-│   │   └── input.ts                  # key sequence decoder and named-key router
+│   ├── tui/                         # Ink UI and pure helpers
+│   │   ├── ink/                     # Fleet and Studio
+│   │   ├── save.ts                  # save
+│   │   └── staging.ts               # edits
 │   ├── run/                         # orchestration runtime
 │   │   ├── daemon.ts                 # runDaemon(): the main loop — largest file in src/
 │   │   ├── journal.ts                # Journal class: event log + telemetry log, resume replay
@@ -155,9 +152,8 @@ tickmarkr/
 - Key files: `src/report/cost.ts`
 
 **`src/tui/`:**
-- Purpose: reusable terminal presentation layers: the Ink component-runtime beachhead for the fleet editor plus the internal line engine still used by Fleet Studio
-- Contains: `ink/fleet-app.tsx` and `ink/components.tsx` for component-owned fleet input/rendering; `TerminalEngine`, the alternate-screen line-diff `Frame`, and the injected-stream key router for unmigrated surfaces
-- Key files: `src/tui/ink/fleet-app.tsx`, `src/tui/ink/components.tsx`, `src/tui/engine.ts`, `src/tui/frame.ts`, `src/tui/input.ts`
+- Purpose: Ink presentation for Fleet and Studio
+- Retired: the legacy engine, frame, input, and views
 
 **`src/run/`:**
 - Purpose: the orchestration runtime — the daemon loop and everything it directly needs (ledger, git, merge, escalation, locking, pane hygiene, stall detection)
@@ -210,14 +206,13 @@ tickmarkr/
 - `src/route/router.ts`: routing resolution
 - `src/gates/run-gates.ts`: gate sequencing
 - `src/graph/schema.ts`: the RunGraph/Task data model
-- `src/tui/ink/fleet-app.tsx`: component-runtime entry point for the fleet editor beachhead
-- `src/tui/engine.ts`: alternate-screen terminal engine with injectable streams for unmigrated surfaces
+- `src/tui/ink/`: Fleet/Studio runtimes
 
 **Testing:**
 - `tests/<dir>/<name>.test.ts` mirrors `src/<dir>/<name>.ts`
 - `tests/helpers/tmprepo.ts`: `makeRepo()` (bare git repo fixture), `setupRepo()` (graph + config + scripted `FakeAdapter` in one call), `T()` (minimal task builder)
 - `src/adapters/fake.ts` (`FakeAdapter`): not test-only code, but the adapter nearly every non-e2e test dispatches through — scripts worker/judge/review/consult output from a JSON file, zero tokens
-
+- TUI: `app.test.ts` active; legacy suites retired
 ## Naming Conventions
 
 **Files:**

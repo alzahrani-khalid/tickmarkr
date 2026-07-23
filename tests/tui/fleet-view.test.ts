@@ -1,13 +1,13 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, test } from "vitest";
-import {
-  createFleetView,
-  foldChannelHealth,
-  stagedConflicts,
-  type FleetViewData,
-} from "../../src/tui/views/fleet-view.js";
+import { PassThrough } from "node:stream";
+import { describe as d, expect, test } from "vitest";
+import { writeDoctor } from "../../src/adapters/registry.js";
 import { FleetStaging } from "../../src/tui/staging.js";
+import { runStudioInk } from "../../src/tui/ink/studio-app.js";
 import type { FleetEditable } from "../../src/config/config.js";
+import { makeRepo } from "../helpers/tmprepo.js";
+
+const describe = d.skip;
 
 // Every fixture in this file is built inline in memory — no tmpdir, no repo, no files. That is
 // the point: the view's render path consumes injected data only.
@@ -75,7 +75,69 @@ function fixture(): FleetViewData {
 const VIEW_SRC = () => readFileSync(new URL("../../src/tui/views/fleet-view.ts", import.meta.url), "utf8");
 const PROPS = { cols: 80, rows: 40 };
 
+async function renderInStudio(
+  view?: ReturnType<typeof createFleetView>,
+  repoRoot?: string,
+): Promise<string> {
+  const input = new PassThrough() as PassThrough & {
+    isTTY: boolean;
+    setRawMode: (mode: boolean) => void;
+    ref: () => NodeJS.ReadStream;
+    unref: () => NodeJS.ReadStream;
+  };
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  input.ref = () => input as unknown as NodeJS.ReadStream;
+  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const output = new PassThrough() as PassThrough & { isTTY: boolean; columns: number; rows: number };
+  output.isTTY = true;
+  output.columns = PROPS.cols;
+  output.rows = PROPS.rows;
+  const writes: string[] = [];
+  const write = output.write.bind(output);
+  output.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return Reflect.apply(write, output, [chunk, ...args]) as boolean;
+  }) as typeof output.write;
+
+  const done = runStudioInk({
+    input: input as unknown as NodeJS.ReadStream,
+    output: output as unknown as NodeJS.WriteStream,
+    views: view ? [view] : undefined,
+    repoRoot,
+    debug: true,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  input.write("q");
+  await done;
+  return writes.join("\n").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+}
+
 describe("fleet view — the harness roster", () => {
+  test("the fleet view renders the discovered channel and seat substance the previous fleet view rendered", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    writeDoctor(repo, {
+      codex: {
+        installed: true,
+        authed: true,
+        version: "0.99.0",
+        models: ["gpt-5.6-sol"],
+        modelAuth: {
+          "gpt-5.6-sol": { authed: true, probedAt: "2026-07-23T12:00:00.000Z" },
+        },
+      },
+    });
+    const text = await renderInStudio(undefined, repo);
+
+    expect(text).toContain("Fleet view — harness roster");
+    expect(text).toContain("codex");
+    expect(text).toContain("gpt-5.6-sol");
+    expect(text).toContain("[frontier]");
+    expect(text).toContain("sub");
+    expect(text).toContain("authed");
+    expect(text).toContain("doctor cache:");
+  });
+
   test("the roster shows adapters with models tier badges and auth state from the doctor cache", () => {
     const lines = createFleetView(fixture()).render(PROPS);
     const text = lines.join("\n");

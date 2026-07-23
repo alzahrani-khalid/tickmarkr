@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { MAX_BUF, SubprocessDriver } from "../../src/drivers/subprocess.js";
+import { DEFAULT_FORK_CAP, FORK_CAP_ENV } from "../../src/run/git.js";
 
 describe("SubprocessDriver", () => {
   test("run + waitOutput + read", async () => {
@@ -96,5 +97,37 @@ describe("SubprocessDriver", () => {
     const out = await d.read(slot, 100);
     expect(out).not.toMatch(/TICKMARKR_RESULT/);
     await d.close(slot);
+  });
+
+  test("a dispatched worker's environment carries the fork cap so its self-checks run capped", async () => {
+    const before = process.env[FORK_CAP_ENV];
+    delete process.env[FORK_CAP_ENV];
+    const d = new SubprocessDriver();
+    const slot = await d.slot("/tmp", "default-fork-cap");
+    try {
+      await d.run(slot, `printf '%s\\n' "\${${FORK_CAP_ENV}-unset}"`);
+      expect(await d.waitAgentStatus(slot, "done", 5000)).toBe(true);
+      expect((await d.read(slot, 10)).trim()).toBe(DEFAULT_FORK_CAP);
+    } finally {
+      await d.close(slot);
+      if (before === undefined) delete process.env[FORK_CAP_ENV];
+      else process.env[FORK_CAP_ENV] = before;
+    }
+  });
+
+  test("an operator-set cap in the daemon environment reaches the worker unchanged rather than being overwritten by a default", async () => {
+    const before = process.env[FORK_CAP_ENV];
+    process.env[FORK_CAP_ENV] = "3";
+    const d = new SubprocessDriver();
+    const slot = await d.slot("/tmp", "operator-fork-cap");
+    try {
+      await d.run(slot, `printf '%s\\n' "\${${FORK_CAP_ENV}-unset}"`);
+      expect(await d.waitAgentStatus(slot, "done", 5000)).toBe(true);
+      expect((await d.read(slot, 10)).trim()).toBe("3");
+    } finally {
+      await d.close(slot);
+      if (before === undefined) delete process.env[FORK_CAP_ENV];
+      else process.env[FORK_CAP_ENV] = before;
+    }
   });
 });

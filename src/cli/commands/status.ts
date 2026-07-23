@@ -1,4 +1,6 @@
 import { BANNER, GLYPHS, type Verdict, dim, fail, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
+import { HerdrDriver } from "../../drivers/herdr.js";
+import { formatOwnedName } from "../../drivers/types.js";
 import { blockedTasks, graphDefinitionHash, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
 import { foldActivity } from "../../run/activity.js";
@@ -9,7 +11,9 @@ import {
   isQualityFailureParkKind,
   recordedTaskFailureKind,
   runHasEnded,
+  type TaskPhase,
 } from "../../run/journal.js";
+import { normalizeStallSnapshot } from "../../run/stall.js";
 
 // ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
 const REFRESH_MS = 2000;
@@ -22,9 +26,105 @@ const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 export type StatusOpts = {
   iterations?: number;
   sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  readWorkerOutput?: (taskId: string, attempt: number, runId: string) => Promise<string | undefined>;
 };
 
 export const GATE_KEYS = { build: "B", test: "T", lint: "L", evidence: "E", scope: "S", acceptance: "A", review: "R" } as const;
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+const ASCII_SPINNER = ["|", "/", "-", "\\"] as const;
+const SAVE_TERMINAL_TITLE = "\x1b[22;0t";
+const RESTORE_TERMINAL_TITLE = "\x1b[23;0t";
+
+type LivePhase = {
+  taskId: string;
+  phase: TaskPhase;
+  startedAt: number;
+  order: number;
+  attempt: number;
+};
+
+type WorkerLiveness = {
+  phaseStartedAt: number;
+  snapshot: string;
+  hasOutput: boolean;
+  lastOutputAt: number;
+};
+
+const taskPhase = (value: unknown): TaskPhase | undefined => {
+  if (value === "worker" || value === "gates" || value === "judge" || value === "review" || value === "merge") return value;
+  if (typeof value !== "string" || !value.startsWith("gate:")) return undefined;
+  return GATE_NAMES.includes(value.slice("gate:".length) as (typeof GATE_NAMES)[number]) ? value as TaskPhase : undefined;
+};
+
+const phaseGate = (phase: TaskPhase): string | undefined => {
+  if (phase === "judge") return "acceptance";
+  if (phase === "review") return "review";
+  return phase.startsWith("gate:") ? phase.slice("gate:".length) : undefined;
+};
+
+// A phase is live only between its append-only start marker and the matching real outcome. A newer
+// start for the same task supersedes the prior phase (gates → named gate, worker retry → worker).
+// No clock participates in this fold: time only decorates the derived live interval at render time.
+const livePhases = (events: JournalEvent[]): Map<string, LivePhase> => {
+  const live = new Map<string, LivePhase>();
+  for (let order = 0; order < events.length; order++) {
+    const event = events[order]!;
+    if (event.event === "run-start" || event.event === "run-resume" || event.event === "run-end" || event.event === "superseded") {
+      live.clear();
+      continue;
+    }
+    if (event.event === "phase-start" && event.taskId) {
+      const phase = taskPhase(event.data.phase);
+      const startedAt = Date.parse(event.ts);
+      const attempt = typeof event.data.attempt === "number" && Number.isInteger(event.data.attempt) && event.data.attempt >= 0
+        ? event.data.attempt
+        : 0;
+      if (phase && Number.isFinite(startedAt)) live.set(event.taskId, { taskId: event.taskId, phase, startedAt, order, attempt });
+      continue;
+    }
+    if (!event.taskId) continue;
+    const active = live.get(event.taskId);
+    if (!active) continue;
+    const gate = phaseGate(active.phase);
+    const matched =
+      (active.phase === "worker" && event.event === "worker-result")
+      || (active.phase === "gates" && event.event === "gate-result")
+      || (gate !== undefined && event.event === "gate-result" && event.data.gate === gate)
+      || (active.phase === "merge" && event.event === "merge")
+      || event.event === "task-done"
+      || event.event === "task-failed"
+      || event.event === "task-human"
+      || event.event === "task-approved"
+      || event.event === "task-dispatch";
+    if (matched) live.delete(event.taskId);
+  }
+  return live;
+};
+
+const phaseLabel = (phase: TaskPhase): string => phase.startsWith("gate:") ? `gate ${phase.slice("gate:".length)}` : phase;
+
+const fmtElapsed = (ms: number): string => {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${minutes % 60}m${seconds % 60}s`;
+};
+
+const workerOutputAge = (phase: LivePhase, now: number, worker?: WorkerLiveness): number =>
+  now - (worker?.phaseStartedAt === phase.startedAt && worker.hasOutput ? worker.lastOutputAt : phase.startedAt);
+
+const phaseDetail = (phase: LivePhase, now: number, worker?: WorkerLiveness): string => {
+  const elapsed = fmtElapsed(now - phase.startedAt);
+  if (phase.phase !== "worker") return `${phaseLabel(phase.phase)} · ${elapsed} elapsed`;
+  const age = fmtElapsed(workerOutputAge(phase, now, worker));
+  const output = worker?.phaseStartedAt === phase.startedAt && worker.hasOutput
+    ? `last output ${age} ago`
+    : `no output ${age}`;
+  return `${phaseLabel(phase.phase)} · ${elapsed} elapsed · ${output}`;
+};
 
 const attemptStartIdx = (events: JournalEvent[], taskId: string): number => {
   let idx = -1;
@@ -137,10 +237,10 @@ const terminalFailureCause = (events: JournalEvent[]): string | undefined => {
   return undefined;
 };
 
-const liveness = (events: JournalEvent[]): string => {
+const liveness = (events: JournalEvent[], now = Date.now()): string => {
   const last = events.at(-1);
   if (!last) return "last event unknown · daemon pid unknown";
-  const age = fmtAge(Date.now() - Date.parse(last.ts));
+  const age = fmtAge(now - Date.parse(last.ts));
   const pid = daemonPid(events);
   const cause = terminalFailureCause(events);
   if (pid === undefined) return `last event ${age} ago · daemon pid unknown${cause ? ` · ${cause}` : ""}`;
@@ -153,7 +253,19 @@ const liveness = (events: JournalEvent[]): string => {
   return `last event ${age} ago · daemon pid ${pid} ${state}${cause ? ` · ${cause}` : ""}`;
 };
 
-const renderFrame = (cwd: string): string => {
+type RenderedFrame = {
+  content: string;
+  hotPhase?: LivePhase;
+  runId?: string;
+  workerPhases: LivePhase[];
+};
+
+const renderFrame = (
+  cwd: string,
+  now = Date.now(),
+  animationFrame = 0,
+  workerLiveness = new Map<string, WorkerLiveness>(),
+): RenderedFrame => {
   const g = loadGraph(cwd);
   const runId = Journal.latestRunId(cwd, { withJournal: true });
   const assignments = new Map<string, string>();
@@ -195,6 +307,10 @@ const renderFrame = (cwd: string): string => {
   const width = process.stdout.columns ?? 120;
   const done = effective.tasks.filter((t) => t.status === "done").length;
   const ended = comparable && runHasEnded(events);
+  const taskIds = new Set(g.tasks.map((task) => task.id));
+  const phases = comparable ? livePhases(events) : new Map<string, LivePhase>();
+  for (const taskId of phases.keys()) if (!taskIds.has(taskId)) phases.delete(taskId);
+  const hotPhase = [...phases.values()].sort((a, b) => a.order - b.order).at(-1);
 
   const cells = g.tasks.map((t) => {
     const st = replayed?.get(t.id) ?? t.status;
@@ -207,28 +323,35 @@ const renderFrame = (cwd: string): string => {
       || (failureKind !== undefined && isQualityFailureParkKind(failureKind))
       || (st === "failed" && failureKind === undefined)
     );
-    const isStarved = starved.has(t.id);
-    const phrase = isStarved ? undefined : activity.cells.get(t.id);
+    const livePhase = phases.get(t.id);
+    const isStarved = !livePhase && starved.has(t.id);
+    const phrase = livePhase ? phaseDetail(livePhase, now, workerLiveness.get(t.id)) : isStarved ? undefined : activity.cells.get(t.id);
     const label = isStarved ? " starved" : phrase ? ` ${phrase}` : "";
     const channel = assignments.get(t.id) ?? "-";
     const ctx = contexts.get(t.id);
     const assignCol = ctx !== undefined ? `${channel}${divider}ctx ${ctx}` : channel;
-    return { t, st, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
+    return { t, st, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
   });
 
   if (!unicode) {
-    // machine/CI surface — layout unchanged (pipes, greps, and the golden pins depend on it)
-    const rows = cells.map(({ t, st, label, assignCol, states }) => {
+    // machine/CI surface — journals without phase-start stay byte-identical; new phase-aware frames
+    // use an ASCII spinner so pipes never receive terminal-only braille/ANSI.
+    const rows = cells.map(({ t, st, label, assignCol, livePhase, states }) => {
       const chain = gateChain(states, false);
-      const prefix = `  ${taskBox(st)} ${t.id} `;
-      const suffix = `  ${chain}  ${String(st)}${label}  ${assignCol}`;
+      const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${taskBox(st)} ${t.id} `;
+      const suffix = `  ${chain}  ${livePhase ? "running" : String(st)}${label}  ${assignCol}`;
       return `${prefix}${shortGoal(t.goal, Math.max(0, width - prefix.length - suffix.length))}${suffix}`;
     });
     const header = runId
-      ? `tickmarkr status${divider}run ${runId}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events).replaceAll(" · ", divider)}${divider}${done}/${g.tasks.length} done`
+      ? `tickmarkr status${divider}run ${runId}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, now).replaceAll(" · ", divider)}${divider}${done}/${g.tasks.length} done`
       : `tickmarkr status${divider}no runs yet${divider}${done}/${g.tasks.length} done`;
     const legendLine = `  gates: ${GATE_NAMES.map((gate) => `${GATE_KEYS[gate]} ${gate}`).join(divider)}`;
-    return [header, legendLine, ...rows].join("\n");
+    return {
+      content: [header, legendLine, ...rows].join("\n"),
+      ...(hotPhase ? { hotPhase } : {}),
+      ...(runId ? { runId } : {}),
+      workerPhases: [...phases.values()].filter((phase) => phase.phase === "worker"),
+    };
   }
 
   // TTY: cockpit frame composed through src/brand.ts (CLI-DESIGN.md) — dominant run title,
@@ -240,7 +363,7 @@ const renderFrame = (cwd: string): string => {
   const gaugeCells = 10;
   const fill = g.tasks.length ? Math.round((done / g.tasks.length) * gaugeCells) : 0;
   const gauge = (fill ? (anyFailed ? fail : ok)("█".repeat(fill)) : "") + (fill < gaugeCells ? dim("░".repeat(gaugeCells - fill)) : "");
-  const live = liveness(events)
+  const live = liveness(events, now)
     .replace(/\bdead\b/, fail("dead"))
     .replace(/\bfinished\b/, dim("finished"))
     .replace(/\balive\b/, ok("alive"))
@@ -265,7 +388,7 @@ const renderFrame = (cwd: string): string => {
   const taskVerdict = (c: (typeof cells)[number]): Verdict =>
     c.st === "done" ? "pass" : c.redTier ? "fail" : c.st === "failed" || c.st === "human" ? "warn" : "neutral";
   const statusWord = (c: (typeof cells)[number]): string =>
-    c.redTier ? "failed" : c.st === "failed" ? "warn" : String(c.st);
+    c.livePhase ? "running" : c.redTier ? "failed" : c.st === "failed" ? "warn" : String(c.st);
   const idW = Math.max(...cells.map((c) => c.t.id.length), 2);
   // plain-text status suffixes for width math only — starved / failed gate names / approval hint
   const suffixPlain = (c: (typeof cells)[number]): string =>
@@ -276,9 +399,11 @@ const renderFrame = (cwd: string): string => {
   const goalW = Math.max(8, ...goals.map((s) => s.length));
   const indent = " ".repeat(idW + 5); // line 2 starts under the goal column
   const rows = cells.map((c, i) => {
-    const { t, st, failureKind, redTier, states, isStarved, phrase, channel, ctx } = c;
+    const { t, st, failureKind, redTier, states, isStarved, phrase, channel, ctx, livePhase } = c;
     const word = statusWord(c);
-    const stWord = st === "done" ? ok(word) : redTier ? fail(word) : st === "failed" || st === "human" ? warn(word) : word;
+    const staleWorker = livePhase?.phase === "worker"
+      && workerOutputAge(livePhase, now, workerLiveness.get(t.id)) >= 60_000;
+    const stWord = staleWorker ? warn(word) : st === "done" ? ok(word) : redTier ? fail(word) : st === "failed" || st === "human" ? warn(word) : word;
     // a fail names its gate in words right here — the one moment gate identity is needed on a row
     const f = failedGates(states);
     const human = humanGateSuffix(t, st, states);
@@ -286,7 +411,10 @@ const renderFrame = (cwd: string): string => {
       (isStarved ? dot + fail("starved") : "") +
       (f.length ? dot + fail(f.join(", ")) : "") +
       (human ? dot + warn("awaiting approval") : "");
-    const line1 = `  ${statusRow(taskVerdict(c), `${t.id.padEnd(idW)} ${goals[i]!.padEnd(goalW)}  ${statusCell}`)}`;
+    const taskLabel = `${t.id.padEnd(idW)} ${goals[i]!.padEnd(goalW)}  ${statusCell}`;
+    const line1 = livePhase
+      ? `  ${(staleWorker ? warn : dim)(SPINNER[animationFrame % SPINNER.length]!)} ${taskLabel}`
+      : `  ${statusRow(taskVerdict(c), taskLabel)}`;
     // activity already names its channel for in-flight attempts — never repeat it
     const detail = [
       ...(phrase ? [phrase, ...(phrase.includes(channel) || channel === "-" ? [] : [channel])] : [channel]),
@@ -296,26 +424,109 @@ const renderFrame = (cwd: string): string => {
     return [line1, `${indent}${gateChain(states, true)}  ${dim(detail)}`, ""];
   }).flat();
   if (!nowLine.length) rows.pop(); // cards end blank-separated; drop the dangling one
-  return [header, hr, gatesLegend, "", ...rows, ...nowLine].join("\n");
+  return {
+    content: [header, hr, gatesLegend, "", ...rows, ...nowLine].join("\n"),
+    ...(hotPhase ? { hotPhase } : {}),
+    ...(runId ? { runId } : {}),
+    workerPhases: [...phases.values()].filter((phase) => phase.phase === "worker"),
+  };
 };
 
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {
   // cockpit surface: banner + frame on a TTY (doctor's pattern); pipes get the bare frame
-  if (!argv.includes("--watch")) return visual() ? BANNER + renderFrame(cwd) : renderFrame(cwd);
+  if (!argv.includes("--watch")) {
+    const { content } = renderFrame(cwd, opts.now?.() ?? Date.now());
+    return visual() ? BANNER + content : content;
+  }
 
   const iterations = opts.iterations ?? Infinity;
   const sleep = opts.sleep ?? defaultSleep;
+  const now = opts.now ?? Date.now;
   const bounded = Number.isFinite(iterations);
   const frames: string[] = [];
   const sep = "\n---\n";
   const tty = visual();
+  const workerLiveness = new Map<string, WorkerLiveness>();
+  const herdr = HerdrDriver.available() ? new HerdrDriver() : undefined;
+  const readWorkerOutput = opts.readWorkerOutput ?? (herdr
+    ? async (taskId: string, attempt: number, runId: string) => {
+        const name = formatOwnedName({ role: "worker", taskId, attempt, runId });
+        try {
+          return await herdr.read({ id: name, name, cwd }, 80);
+        } catch {
+          return undefined;
+        }
+      }
+    : undefined);
+  const observeWorkerOutput = async (active: LivePhase[], runId: string | undefined, observedAt: number) => {
+    const activeIds = new Set(active.map((phase) => phase.taskId));
+    for (const taskId of workerLiveness.keys()) if (!activeIds.has(taskId)) workerLiveness.delete(taskId);
+    if (!readWorkerOutput || !runId) return;
+    await Promise.all(active.map(async (phase) => {
+      const output = await readWorkerOutput(phase.taskId, phase.attempt, runId);
+      if (output === undefined) return;
+      const snapshot = normalizeStallSnapshot(output);
+      const prior = workerLiveness.get(phase.taskId);
+      if (!prior || prior.phaseStartedAt !== phase.startedAt) {
+        const hasOutput = snapshot.trim().length > 0;
+        workerLiveness.set(phase.taskId, {
+          phaseStartedAt: phase.startedAt,
+          snapshot,
+          hasOutput,
+          lastOutputAt: hasOutput ? observedAt : phase.startedAt,
+        });
+        return;
+      }
+      if (snapshot !== prior.snapshot && snapshot.trim().length > 0) {
+        prior.hasOutput = true;
+        prior.lastOutputAt = observedAt;
+      }
+      prior.snapshot = snapshot;
+    }));
+  };
+  let titleSaved = false;
+  const restoreTitle = () => {
+    if (!titleSaved) return;
+    titleSaved = false;
+    process.stdout.write(RESTORE_TERMINAL_TITLE);
+  };
+  const updateTitle = (hotPhase: LivePhase | undefined, nowMs: number) => {
+    if (!hotPhase) {
+      if (titleSaved) {
+        process.removeListener("exit", restoreTitle);
+        restoreTitle();
+      }
+      return;
+    }
+    if (!titleSaved) {
+      process.stdout.write(SAVE_TERMINAL_TITLE);
+      titleSaved = true;
+      process.once("exit", restoreTitle);
+    }
+    process.stdout.write(`\x1b]0;⏳ ${hotPhase.taskId} ${phaseLabel(hotPhase.phase)} ${fmtElapsed(nowMs - hotPhase.startedAt)}\x07`);
+  };
 
-  for (let i = 0; i < iterations; i++) {
-    const frame = renderFrame(cwd);
-    if (tty) process.stdout.write(`\x1b[2J\x1b[H${BANNER}${frame}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);
-    else process.stdout.write(frame + sep);
-    if (bounded) frames.push(frame);
-    if (i + 1 < iterations) await sleep(REFRESH_MS);
+  try {
+    for (let i = 0; i < iterations; i++) {
+      const nowMs = now();
+      const frame = renderFrame(cwd, nowMs, i, workerLiveness);
+      if (tty) {
+        updateTitle(frame.hotPhase, nowMs);
+        process.stdout.write(`\x1b[2J\x1b[H${BANNER}${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);
+      } else {
+        process.stdout.write(frame.content + sep);
+      }
+      if (bounded) frames.push(frame.content);
+      if (i + 1 < iterations) {
+        await observeWorkerOutput(frame.workerPhases, frame.runId, nowMs);
+        await sleep(REFRESH_MS);
+      }
+    }
+  } finally {
+    if (titleSaved) {
+      process.removeListener("exit", restoreTitle);
+      restoreTitle();
+    }
   }
   return bounded ? frames.join(sep) : "";
 }

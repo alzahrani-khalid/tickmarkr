@@ -1,5 +1,6 @@
 import { userInfo } from "node:os";
-import { ATTEMPT_CAP_RELEASE, Journal } from "../../run/journal.js";
+import { GATE_NAMES } from "../../graph/schema.js";
+import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal } from "../../run/journal.js";
 
 // GATE-08 (v1.12): approve a parked human gate so the next `tickmarkr resume <runId>` dispatches it.
 //
@@ -35,16 +36,35 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
 
   // OBS-18: only the most recent task-human for this task decides whether this approval grants a
   // fresh attempt budget. The closed daemon-issued kind, never a human prose string, controls release.
-  const lastHuman = journal.read().filter((e) => e.event === "task-human" && e.taskId === taskId).at(-1);
+  const events = journal.read();
+  let lastHumanIndex = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]!.event === "task-human" && events[i]!.taskId === taskId) {
+      lastHumanIndex = i;
+      break;
+    }
+  }
+  const lastHuman = events[lastHumanIndex];
   const capPark = lastHuman?.data.kind === ATTEMPT_CAP_RELEASE;
+  const gateFailPark = lastHuman?.data.kind === "gate-fail";
+  const failedGate = gateFailPark
+    ? events.slice(0, lastHumanIndex).reverse().find((e) =>
+        e.event === "gate-result" && e.taskId === taskId && e.data.pass === false
+        && typeof e.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(e.data.gate),
+      )?.data.gate as string | undefined
+    : undefined;
+  if (gateFailPark && !failedGate) {
+    throw new Error(`task ${taskId} is parked on gate-fail but has no failed gate result — refusing to infer one`);
+  }
 
   journal.append("task-approved", taskId, {
     by,
     ...(reason ? { reason } : {}),
     via: "cli",
     ...(capPark ? { release: ATTEMPT_CAP_RELEASE } : {}),
+    ...(failedGate ? { release: GATE_SATISFIED_RELEASE, gate: failedGate } : {}),
   });
-  return `approved ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to dispatch it`;
+  return `approved ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to ${failedGate ? "continue past the approved gate" : "dispatch it"}`;
 }
 
 interface ParsedArgs {

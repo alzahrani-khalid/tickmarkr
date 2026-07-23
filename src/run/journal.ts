@@ -4,7 +4,7 @@ import { z } from "zod";
 import { channelKey, TokenUsageSchema, type Assignment } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
-import { TIERS, type TaskStatus } from "../graph/schema.js";
+import { GATE_NAMES, TIERS, type GateName, type TaskStatus } from "../graph/schema.js";
 import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
 import { redactSecrets } from "./redact.js";
 
@@ -13,6 +13,14 @@ export interface JournalEvent {
   event: string;
   taskId?: string;
   data: Record<string, unknown>;
+}
+
+export type TaskPhase = "worker" | "gates" | `gate:${GateName}` | "judge" | "review" | "merge";
+
+export function phaseForGate(gate: GateName): TaskPhase {
+  if (gate === "acceptance") return "judge";
+  if (gate === "review") return "review";
+  return `gate:${gate}`;
 }
 
 export function formatJournalNarration({ event, taskId, data }: JournalEvent): string {
@@ -54,6 +62,9 @@ export type ChannelExclusionKind = (typeof CHANNEL_EXCLUSION_KINDS)[number];
 // Approve stamps this; replayResumeState zeros the attempt counter (fresh budget) while keeping
 // tried (consult bans / burned channels). Absent on pre-v1.24 events ⇒ inert (corpus outcome-identical).
 export const ATTEMPT_CAP_RELEASE = "attempt-cap" as const;
+// OBS-130: task-approved carries the exact failed gate the operator satisfied. The release tag keeps
+// ordinary humanGate and attempt-cap approvals byte-compatible while making this authority explicit.
+export const GATE_SATISFIED_RELEASE = "gate-satisfied" as const;
 
 // Fail-closed shape for a dispatched assignment (journal.ts:75-90 posture): a malformed assignment in
 // one dispatch degrades that single task toward today's behavior — counts toward attempts, contributes
@@ -399,6 +410,10 @@ export class Journal {
     }
   }
 
+  phaseStart(taskId: string, phase: TaskPhase, data: Record<string, unknown> = {}): void {
+    this.append("phase-start", taskId, { ...data, phase });
+  }
+
   read(): JournalEvent[] {
     return readJsonl(this.journalPath) as JournalEvent[];
   }
@@ -484,6 +499,20 @@ export class Journal {
       }
     }
     return m;
+  }
+
+  // OBS-130: gate satisfaction is authority, not an inferred daemon state. Only an explicit
+  // task-approved event with the typed release marker and a known gate enters this fold. A daemon-made
+  // gate-satisfied event, a prior pass/fail result, malformed data, or another task's approval is inert.
+  replaySatisfiedGates(): Map<string, GateName> {
+    const satisfied = new Map<string, GateName>();
+    for (const e of this.read()) {
+      if (e.event !== "task-approved" || !e.taskId || e.data.release !== GATE_SATISFIED_RELEASE) continue;
+      if (typeof e.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(e.data.gate)) {
+        satisfied.set(e.taskId, e.data.gate as GateName);
+      }
+    }
+    return satisfied;
   }
 
   // v1.71 OBS-119: run-wide exclusion fold — same replay discipline as replayResumeState().

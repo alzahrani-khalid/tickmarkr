@@ -343,6 +343,19 @@ describe("FLEET-06 config schema (V-9)", () => {
     expect(cfg.routing.deny).toEqual({ models: ["codex:gpt-5.5"] });
   });
 
+  test("routing.deny.workers parses as an additive preference block while flat deny remains unchanged", () => {
+    const { repo, globalDir } = repoWithOverlay(
+      "routing:\n  deny:\n    models: [codex:gpt-5.5]\n    workers:\n      adapters: [kimi]\n      models: [kimi:kimi-code/k3]\n",
+    );
+    expect(loadConfig(repo, { globalDir }).routing.deny).toEqual({
+      models: ["codex:gpt-5.5"],
+      workers: {
+        adapters: ["kimi"],
+        models: ["kimi:kimi-code/k3"],
+      },
+    });
+  });
+
   test("pure defaults: routing.allow and routing.deny are undefined", () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-cfg-r-"));
     const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-cfg-g-"));

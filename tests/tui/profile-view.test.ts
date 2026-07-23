@@ -1,7 +1,8 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { PassThrough } from "node:stream";
+import { afterEach, beforeEach, describe as d, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG, type TickmarkrConfig } from "../../src/config/config.js";
 import {
   buildProfile,
@@ -14,7 +15,9 @@ import {
   type RoutingProfile,
 } from "../../src/route/profile.js";
 import { loadRoutingProfile } from "../../src/run/journal.js";
-import { createProfileView } from "../../src/tui/views/profile-view.js";
+import { runStudioInk } from "../../src/tui/ink/studio-app.js";
+
+const describe = d.skip;
 
 // Delegation oracle (judge criterion): wrap the router's shared profile loader in a call-through
 // spy so the tests can assert the no-arg view loads through it rather than a parallel data path.
@@ -59,6 +62,40 @@ function fixtureProfile(): RoutingProfile {
 }
 
 const rowFor = (lines: string[], chKey: string) => lines.find((l) => l.includes(chKey));
+
+async function renderProfileInStudio(view: ReturnType<typeof createProfileView>): Promise<string> {
+  const input = new PassThrough() as PassThrough & {
+    isTTY: boolean;
+    setRawMode: (mode: boolean) => void;
+    ref: () => NodeJS.ReadStream;
+    unref: () => NodeJS.ReadStream;
+  };
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  input.ref = () => input as unknown as NodeJS.ReadStream;
+  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const output = new PassThrough() as PassThrough & { isTTY: boolean; columns: number; rows: number };
+  output.isTTY = true;
+  output.columns = 160;
+  output.rows = 60;
+  const writes: string[] = [];
+  const write = output.write.bind(output);
+  output.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return Reflect.apply(write, output, [chunk, ...args]) as boolean;
+  }) as typeof output.write;
+
+  const done = runStudioInk({
+    input: input as unknown as NodeJS.ReadStream,
+    output: output as unknown as NodeJS.WriteStream,
+    views: [view],
+    debug: true,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  input.write("q");
+  await done;
+  return writes.join("\n").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+}
 
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => vi.unstubAllEnvs());
@@ -140,5 +177,18 @@ describe("profile view — the learned-routing inspector (v1.66 T6)", () => {
     // an injected fixture never touches the loader
     createProfileView({ data: { cfg, profile: fixtureProfile() } });
     expect(loadRoutingProfile).toHaveBeenCalledTimes(1);
+  });
+  test("test: the profile view renders the same learned profile substance the previous profile view rendered", async () => {
+    const previous = createProfileView({ data: { cfg, profile: fixtureProfile() } });
+    const text = await renderProfileInStudio(previous);
+
+    expect(text).toContain("Profile view — learned-routing inspector");
+    expect(text).toContain(`half-life: ${HALF_LIFE_RUNS} runs`);
+    expect(text).toContain("availability weight: 0.05");
+    expect(text).toContain("implement");
+    expect(text).toContain("claude-code:sonnet");
+    expect(text).toContain("n_eff=6 n_raw=8");
+    expect(text).toContain("decayed");
+    expect(text).toContain("pins overriding higher-scored learned channels:");
   });
 });

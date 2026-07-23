@@ -6,7 +6,7 @@ import { DELIVERY_ATTEMPTS, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string> }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string } }
 
 // OBS-85 fixture text: what the incident panes actually showed instead of the typed dispatch line.
 const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
@@ -44,7 +44,9 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   // pane rename <pane> <name>: register the durable label ($3=pane, $4=label). renameFails rejects the
   // SPLIT pane's rename only (w1:p7) — the old agent-rename fixture hit joins, not the tabSlot root — so
   // the first group member still names its root pane and the join is what degrades (A1 fail-safe).
-  const paneRename = opts.renameFails
+  const paneRename = opts.dropBindingFor
+    ? `if [ "$4" != '${opts.dropBindingFor}' ]; then printf '%s %s\\n' "$3" "$4" >> '${panes}'; fi; echo '{}'`
+    : opts.renameFails
     ? `if [ "$3" = "w1:p7" ]; then exit 1; fi; printf '%s %s\\n' "$3" "$4" >> '${panes}'; echo '{}'`
     : `printf '%s %s\\n' "$3" "$4" >> '${panes}'; echo '{}'`;
   const tabRename = opts.tabRenameFails ? "exit 1" : "echo '{}'";
@@ -75,7 +77,11 @@ pane_send_keys() { if [[ "$*" == *C-u* ]]; then delivery_clear "$@"; elif [[ "$*
 `
     : "";
   const sendText = opts.contendDelivery ? `delivery_begin "$@"; echo '{}'` : "echo '{}'";
-  const sendKeys = opts.contendDelivery ? `pane_send_keys "$@"` : `echo '{}'`;
+  const sendKeys = opts.contendDelivery
+    ? `pane_send_keys "$@"`
+    : opts.rebindAfterDelivery
+      ? `if [[ "$*" == *Enter* ]]; then grep -v " ${opts.rebindAfterDelivery.name}$" '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; printf '%s %s\\n' '${opts.rebindAfterDelivery.pane}' '${opts.rebindAfterDelivery.name}' >> '${panes}'; fi; echo '{}'`
+      : `echo '{}'`;
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
@@ -146,7 +152,7 @@ describe("HerdrDriver (stubbed binary)", () => {
     expect(calls).not.toContain("agent start"); // the removed one-shot verb never runs (regression fence)
   });
 
-  test("run/read/close re-resolve pane id by label via pane list (ids never cached blindly)", async () => {
+  test("run verifies the pane label before delivery and later reads stay on the delivered pane", async () => {
     const { bin, log, cwd } = makeStub();
     const d = new HerdrDriver(bin);
     const slot = await d.slot(cwd, "n1");
@@ -359,6 +365,73 @@ describe("HerdrDriver delivery serialization and narrow-pane read-back (OBS-119 
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/^pane send-keys w1:p42 C-u/gm)?.length ?? 0).toBeGreaterThan(0);
     expect(calls).not.toMatch(/pane send-keys w1:p42 Enter/);
+  });
+});
+
+describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
+  test("test: two simultaneous dispatches allocate distinct panes and each delivery lands in the pane bound to its own task", async () => {
+    const { bin, log, cwd } = makeStub();
+    const d = new HerdrDriver(bin);
+    const dispatch = async (taskId: string, command: string) => {
+      const slot = await d.slot(cwd, taskId, {
+        group: "workers",
+        owned: { role: "worker", taskId, attempt: 0, runId: "run-critical" },
+      });
+      // Reproduce the real dispatch seam: command preparation yields after slot() returns.
+      // A correct allocation lease remains held until run(); the old split mutex does not.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await d.run(slot, command);
+      return slot;
+    };
+
+    const [first, second] = await Promise.all([
+      dispatch("T1", "echo task-one"),
+      dispatch("T2", "echo task-two"),
+    ]);
+
+    expect(first.id).not.toBe(second.id);
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const firstDelivery = lines.indexOf("pane send-text w1:p9 echo task-one");
+    const secondAllocation = lines.indexOf("pane split w1:p9 --direction right --no-focus --cwd " + cwd);
+    expect(firstDelivery).toBeGreaterThanOrEqual(0);
+    expect(secondAllocation).toBeGreaterThan(firstDelivery);
+    expect(lines).toContain("pane send-text w1:p7 echo task-two");
+  });
+
+  test("test: a pane-identity binding that fails verification fails that dispatch rather than typing into another task's pane", async () => {
+    const name = "tickmarkr:worker:T1:0:run-binding";
+    const { bin, log, cwd } = makeStub(0, { dropBindingFor: name });
+    const d = new HerdrDriver(bin);
+    const dispatch = async () => {
+      const slot = await d.slot(cwd, "T1", {
+        group: "workers",
+        owned: { role: "worker", taskId: "T1", attempt: 0, runId: "run-binding" },
+      });
+      await d.run(slot, "echo must-not-land");
+    };
+
+    await expect(dispatch()).rejects.toThrow(/identity binding/i);
+    expect(readFileSync(log, "utf8")).not.toContain("pane send-text");
+  });
+
+  test("test: the early liveness check watches the pane its task's delivery actually landed in", async () => {
+    const name = "tickmarkr:worker:T1:0:run-liveness";
+    const { bin, log, cwd } = makeStub(0, {
+      rebindAfterDelivery: { name, pane: "w1:pOTHER" },
+    });
+    const d = new HerdrDriver(bin);
+    const slot = await d.slot(cwd, "T1", {
+      group: "workers",
+      owned: { role: "worker", taskId: "T1", attempt: 0, runId: "run-liveness" },
+    });
+
+    await d.run(slot, "echo launched");
+    await d.read(slot, 500);
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("pane send-text w1:p9 echo launched");
+    expect(calls).toContain("pane read w1:p9 --source recent-unwrapped --lines 500");
+    expect(calls).not.toContain("pane read w1:pOTHER --source recent-unwrapped --lines 500");
   });
 });
 

@@ -74,6 +74,59 @@ export async function shGitOk(cmd: string, cwd: string): Promise<string> {
   return r.stdout;
 }
 
+const NPM_DEPENDENCY_MANIFESTS = ["package.json", "package-lock.json", "npm-shrinkwrap.json"];
+
+// OBS-126: compare the whole attempt (committed, staged, unstaged, or newly added manifest) with
+// the task's integration-tip baseline. A committed package.json change is invisible to `git status`,
+// while an untracked manifest is invisible to `git diff`, so both views are required.
+export async function npmDependencyManifestChanged(cwd: string, baselineRef: string): Promise<boolean> {
+  const paths = NPM_DEPENDENCY_MANIFESTS.map(shq).join(" ");
+  const diff = await shGit(`git diff --quiet ${shq(baselineRef)} -- ${paths}`, cwd);
+  if (diff.code === 1) return true;
+  if (diff.code !== 0) {
+    throw new Error(`dependency manifest comparison failed (${diff.code}): ${diff.stderr || diff.stdout}`);
+  }
+  const untracked = await shGit(`git ls-files --others --exclude-standard -- ${paths}`, cwd);
+  if (untracked.code !== 0) {
+    throw new Error(`dependency manifest comparison failed (${untracked.code}): ${untracked.stderr || untracked.stdout}`);
+  }
+  return untracked.stdout.trim().length > 0;
+}
+
+// npm reifies a worktree's node_modules symlink as a private directory, which makes a successful
+// install disappear at worktree cleanup. Build positional specs from the attempt manifest so the
+// daemon can install them at the main repo root (the provisioned link's target) without saving them
+// into that baseline manifest. `--install-links` packs file: dependencies before the attempt is removed.
+export function npmDependencyInstallCommand(cwd: string): string {
+  const manifestPath = join(cwd, "package.json");
+  const manifest = existsSync(manifestPath)
+    ? JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+    : {};
+  const dependencyGroups = [
+    manifest.peerDependencies,
+    manifest.devDependencies,
+    manifest.dependencies,
+    manifest.optionalDependencies,
+  ];
+  const dependencies: Record<string, string> = {};
+  for (const group of dependencyGroups) {
+    if (!group || typeof group !== "object" || Array.isArray(group)) continue;
+    for (const [name, spec] of Object.entries(group)) {
+      if (typeof spec === "string") dependencies[name] = spec;
+    }
+  }
+  const specs = Object.entries(dependencies).map(([name, rawSpec]) => {
+    let spec = rawSpec;
+    if (spec.startsWith("file:")) spec = `file:${resolve(cwd, spec.slice("file:".length))}`;
+    else if (spec.startsWith("./") || spec.startsWith("../")) spec = resolve(cwd, spec);
+    return shq(`${name}@${spec}`);
+  });
+  return [
+    "npm install --no-save --no-audit --no-fund --package-lock=false --install-links",
+    ...specs,
+  ].join(" ");
+}
+
 export async function gitHead(cwd: string): Promise<string> {
   return (await shGitOk("git rev-parse HEAD", cwd)).trim();
 }

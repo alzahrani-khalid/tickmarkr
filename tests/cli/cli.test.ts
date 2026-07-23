@@ -21,7 +21,9 @@ import type { AuthHealth, WorkerAdapter } from "../../src/adapters/types.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { gitHead } from "../../src/run/git.js";
+import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { COMMIT, authedModels, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 import { spawnCli, assertCliSuccess, assertCliExit, type BuiltCliResult } from "../helpers/built-cli.js";
 import vitestConfig, { DIST_COUPLED_TESTS } from "../../vitest.config.js";
@@ -166,6 +168,35 @@ describe("tickmarkr plan (dry-run, no dispatch)", () => {
 describe("tickmarkr resume", () => {
   afterEach(() => { delete process.env.TICKMARKR_FAKE_SCRIPT; }); // no fake-adapter leak into sibling suites
 
+  const dispatchFailedRun = async (runId: string) => {
+    const { repo, fake, scriptPath } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo retried > retried.txt && ${COMMIT} retried`, result: { ok: true, summary: "retried" } }] } },
+      "driver: subprocess\n",
+    );
+    writeDoctor(repo, FAKE_ONLY_DOCTOR);
+    process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+    const inner = new SubprocessDriver();
+    const failingDriver = {
+      id: "dispatch-refusal",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      async run() { throw new Error("delivery refused"); },
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+    };
+    const failed = await runDaemon(repo, { adapters: [fake], runId, driver: failingDriver });
+    expect(failed.failed).toEqual(["T1"]);
+    expect(Journal.open(repo, runId).read().find((e) => e.event === "task-failed")?.data)
+      .toMatchObject({ kind: "dispatch", attempts: 0 });
+    return repo;
+  };
+
   test("TICKMARKR_FAKE_SCRIPT selects the fake adapter script path", () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-fake-env-"));
     const scriptPath = join(dir, "fake.json");
@@ -201,6 +232,34 @@ describe("tickmarkr resume", () => {
     expect(out).toMatch(/resumed run-x/); // resume.ts formats the summary the operator sees
     expect(out).toMatch(/done: 2/); // T1 replayed done + T2 dispatched through the CLI entry → both done
   });
+
+  test("test: a resume invoked with the retry option re-attempts a task that failed at dispatch with a fresh dispatch", async () => {
+    const runId = "run-retry-dispatch";
+    const repo = await dispatchFailedRun(runId);
+
+    const { out, code } = await resume([runId, "--retry-failed"], repo);
+
+    expect(code).toBe(0);
+    expect(out).toMatch(/done: 1/);
+    const events = Journal.open(repo, runId).read();
+    const resumeIdx = events.findIndex((e) => e.event === "run-resume");
+    const dispatches = events.slice(resumeIdx + 1).filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0]!.data).toMatchObject({ attempt: 0, retryMode: "fresh" });
+  }, 30_000);
+
+  test("test: a resume without the retry option treats dispatch-failed tasks exactly as before", async () => {
+    const runId = "run-no-retry-dispatch";
+    const repo = await dispatchFailedRun(runId);
+
+    const { out, code } = await resume([runId], repo);
+
+    expect(code).toBe(2);
+    expect(out).toMatch(/failed: 1/);
+    const events = Journal.open(repo, runId).read();
+    const resumeIdx = events.findIndex((e) => e.event === "run-resume");
+    expect(events.slice(resumeIdx + 1).filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(0);
+  }, 30_000);
 });
 
 describe("tickmarkr run (flag branches, fake adapter, zero tokens)", () => {

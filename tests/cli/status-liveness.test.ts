@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { status } from "../../src/cli/commands/status.js";
-import { tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
+import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 
@@ -15,11 +15,14 @@ import type { JournalEvent } from "../../src/run/journal.js";
 
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-liveness-"));
 
-const seedGraph = (repo: string) =>
-  saveGraph(repo, validateGraph({
+const seedGraph = (repo: string) => {
+  const graph = validateGraph({
     version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
     tasks: [{ id: "T1", title: "a", goal: "a", shape: "implement", complexity: 3, acceptance: ["a"] }],
-  }));
+  });
+  saveGraph(repo, graph);
+  return graph;
+};
 
 const seedJournal = (repo: string, events: JournalEvent[]) => {
   const dir = join(tickmarkrDir(repo), "runs", "run-liveness");
@@ -128,5 +131,50 @@ describe("VIS-11 status liveness (SC4)", () => {
     const out = await status([], repo);
     expect(out).toContain("alive");
     expect(out).not.toContain("dead");
+  });
+
+  test("a live worker phase reports its no-output age from the watcher-local clock", async () => {
+    const repo = mkRepo();
+    const graph = seedGraph(repo);
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    seedJournal(repo, [
+      ev("run-start", { pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) }, new Date(startedAt - 1_000).toISOString()),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "fake-1" } }, new Date(startedAt).toISOString(), "T1"),
+      ev("phase-start", { phase: "worker" }, new Date(startedAt).toISOString(), "T1"),
+    ]);
+
+    const out = await status(["--watch"], repo, {
+      iterations: 1,
+      sleep: async () => {},
+      now: () => startedAt + 7_000,
+    });
+
+    expect(out).toContain("worker");
+    expect(out).toContain("no output 7s");
+  });
+
+  test("a live worker phase advances last-output age from watcher-local pane observations", async () => {
+    const repo = mkRepo();
+    const graph = seedGraph(repo);
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    seedJournal(repo, [
+      ev("run-start", { pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) }, new Date(startedAt - 1_000).toISOString()),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "fake-1" }, attempt: 2 }, new Date(startedAt).toISOString(), "T1"),
+      ev("phase-start", { phase: "worker", attempt: 2 }, new Date(startedAt).toISOString(), "T1"),
+    ]);
+    const times = [startedAt + 7_000, startedAt + 9_000, startedAt + 12_000];
+    const reads: Array<string | undefined> = ["first visible output", "first visible output"];
+
+    const out = await status(["--watch"], repo, {
+      iterations: 3,
+      sleep: async () => {},
+      now: () => times.shift()!,
+      readWorkerOutput: async () => reads.shift(),
+    });
+
+    const frames = out.split("\n---\n");
+    expect(frames[0]).toContain("no output 7s");
+    expect(frames[1]).toContain("last output 2s ago");
+    expect(frames[2]).toContain("last output 5s ago");
   });
 });

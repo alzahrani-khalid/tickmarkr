@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
+import { DEFAULT_FORK_CAP, FORK_CAP_ENV } from "../../src/run/git.js";
 import {
   HERDR_CONTROL_VARS,
   herdrSealShellPrefix,
@@ -157,6 +158,37 @@ esac
     for (const s of seeds) {
       expect(s).toContain("unset HERDR_ENV");
       expect(s).toContain("unset HERDR_SOCKET_PATH");
+    }
+  });
+
+  test("tabSlot seed carries the default fork cap into a fresh worker pane", async () => {
+    const before = process.env[FORK_CAP_ENV];
+    delete process.env[FORK_CAP_ENV];
+    try {
+      const { bin, log, cwd } = makeStub();
+      const d = new HerdrDriver(bin);
+      await d.slot(cwd, "T1-worker-fake-a0-r");
+      const seed = readFileSync(log, "utf8").split("\n").find((l) => l.includes("export HERDR_WORKSPACE_ID"));
+      expect(seed).toMatch(new RegExp(`export ${FORK_CAP_ENV}='?${DEFAULT_FORK_CAP}'?;`));
+    } finally {
+      if (before === undefined) delete process.env[FORK_CAP_ENV];
+      else process.env[FORK_CAP_ENV] = before;
+    }
+  });
+
+  test("tabSlot seed carries an operator-set fork cap unchanged", async () => {
+    const before = process.env[FORK_CAP_ENV];
+    process.env[FORK_CAP_ENV] = "3";
+    try {
+      const { bin, log, cwd } = makeStub();
+      const d = new HerdrDriver(bin);
+      await d.slot(cwd, "T1-worker-fake-a0-r");
+      const seed = readFileSync(log, "utf8").split("\n").find((l) => l.includes("export HERDR_WORKSPACE_ID"));
+      expect(seed).toMatch(new RegExp(`export ${FORK_CAP_ENV}='?3'?;`));
+      expect(seed).not.toMatch(new RegExp(`export ${FORK_CAP_ENV}='?${DEFAULT_FORK_CAP}'?;`));
+    } finally {
+      if (before === undefined) delete process.env[FORK_CAP_ENV];
+      else process.env[FORK_CAP_ENV] = before;
     }
   });
 

@@ -61,6 +61,9 @@ const PrefBlockSchema = z.object({
   adapters: z.array(z.string()).optional(),
   models: z.array(z.string()).optional(),
 });
+const DenyBlockSchema = PrefBlockSchema.extend({
+  workers: PrefBlockSchema.optional(),
+});
 
 // v1.20 REC-02: operator-maintained price table for the usage/cost report (src/report/cost.ts). Two
 // channel economics, never conflated (spec cost model): API = tokens × per-Mtok rate; sub = flat plan
@@ -140,7 +143,7 @@ export const TickmarkrConfigSchema = z.object({
     // Pre-v1.21 doctor.json lacks per-model verdicts. Keep legacy unknown-is-routable behavior opt-in.
     allowUnverifiedModels: z.boolean(),
     allow: PrefBlockSchema.optional(),
-    deny: PrefBlockSchema.optional(),
+    deny: DenyBlockSchema.optional(),
   }),
   tiers: z.record(z.string(), TierEntrySchema),
   pricing: z.record(z.string(), z.number()),
@@ -506,6 +509,8 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #   deny:                                      # optional fleet denylist; deny beats allow on conflict
 #     models:
 #       - pi:zai/glm-5.2  # OBS-57: pi passes run-start probe but hangs at finish without TICKMARKR_RESULT — remove after no-trailer demotion ships (v1.46 provider-outage taxonomy)
+#     workers:                                  # optional worker-only deny; flat adapters/models still deny every role
+#       models: [kimi:kimi-code/k3]
 #   # incident-born deny/pin entries MUST name OBS id + root cause + removal condition (see docs/codebase/CONVENTIONS.md)
 #   # entry grammar: adapter id | model id | adapter:model (entries in either list accept all three forms)
 #   # a hint pinning a denied channel FAILS at plan time (RoutingError) — never silent reroute

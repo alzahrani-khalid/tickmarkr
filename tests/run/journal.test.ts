@@ -80,6 +80,26 @@ describe("journal", () => {
     expect(Date.parse(evs[0].ts)).toBeGreaterThan(0);
   });
 
+  test("test: a journal recorded before this change replays to the same run status it replayed to before", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-j-"));
+    const j = Journal.create(dir, "run-legacy");
+    const legacyRows = [
+      { ts: "2026-07-22T00:00:00.000Z", event: "run-start", data: {} },
+      { ts: "2026-07-22T00:00:01.000Z", event: "task-dispatch", taskId: "T1", data: {} },
+      { ts: "2026-07-22T00:00:02.000Z", event: "task-done", taskId: "T1", data: {} },
+      { ts: "2026-07-22T00:00:03.000Z", event: "task-dispatch", taskId: "T2", data: {} },
+      { ts: "2026-07-22T00:00:04.000Z", event: "task-human", taskId: "T2", data: {} },
+      { ts: "2026-07-22T00:00:05.000Z", event: "task-dispatch", taskId: "T3", data: {} },
+    ];
+    writeFileSync(join(j.dir, "journal.jsonl"), legacyRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+    const before = [...j.replayStatuses()];
+    expect(before).toEqual([["T1", "done"], ["T2", "human"], ["T3", "pending"]]);
+
+    j.phaseStart("T1", "worker");
+    expect([...j.replayStatuses()]).toEqual(before);
+  });
+
   test("optional narration receives persisted rows without changing bytes or replay, and cannot break append", () => {
     vi.useFakeTimers();
     try {

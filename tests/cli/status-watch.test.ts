@@ -65,6 +65,12 @@ const gate = (taskId: string, name: string, pass: boolean): JournalEvent => ({
   taskId,
   data: { gate: name, pass },
 });
+const phaseStart = (taskId: string, phase: string, at: string): JournalEvent => ({
+  ts: at,
+  event: "phase-start",
+  taskId,
+  data: { phase },
+});
 
 const withTty = async (fn: () => Promise<void>) => {
   const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -318,6 +324,112 @@ describe("status checklist rendering", () => {
       expect(strip(out)).toContain("now: gate-result — T2 — build passed");
       expect(strip(card(out, "T2"))).toContain("gate test running"); // and the watched task names its running gate
     });
+  });
+
+  test("test: while a phase-start event has no matching outcome the frame renders that task's phase with an elapsed indication that advances between consecutive frames", async () => {
+    const repo = mkRepo();
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    seed(repo, [
+      runStart(),
+      dispatch("T2", "fake-2"),
+      { ts: new Date(startedAt - 1_000).toISOString(), event: "worker-result", taskId: "T2", data: { ok: true, finished: true } },
+      phaseStart("T2", "judge", new Date(startedAt).toISOString()),
+    ]);
+    const times = [startedAt + 2_000, startedAt + 5_000];
+    let clock = 0;
+
+    await withTty(async () => {
+      const out = await status(["--watch"], repo, {
+        iterations: 2,
+        sleep: async () => {},
+        now: () => times[clock++]!,
+      });
+      const [first, second] = out.split("\n---\n");
+      expect(strip(card(first!, "T2"))).toContain("judge · 2s elapsed");
+      expect(strip(card(second!, "T2"))).toContain("judge · 5s elapsed");
+      expect(strip(row(first!, "T2"))).toContain("⠋ T2");
+      expect(strip(row(second!, "T2"))).toContain("⠙ T2");
+    });
+  });
+
+  test("test: a task between its phase start and that phase's outcome never renders with an idle presentation", async () => {
+    const repo = mkRepo();
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    seed(repo, [
+      runStart(),
+      dispatch("T2", "fake-2"),
+      phaseStart("T2", "worker", new Date(startedAt).toISOString()),
+    ]);
+
+    await withTty(async () => {
+      const out = await status(["--watch"], repo, {
+        iterations: 1,
+        sleep: async () => {},
+        now: () => startedAt + 4_000,
+      });
+      expect(strip(row(out, "T2"))).toContain("⠋ T2");
+      expect(strip(row(out, "T2"))).toContain("running");
+      expect(strip(row(out, "T2"))).not.toContain("pending");
+      expect(strip(card(out, "T2"))).toContain("worker · 4s elapsed · no output 4s");
+    });
+  });
+
+  test("test: the watch updates its terminal title to name the hottest running phase and restores the title on exit", async () => {
+    const repo = mkRepo();
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    seed(repo, [
+      runStart(),
+      dispatch("T1", "fake-1"),
+      phaseStart("T1", "worker", new Date(startedAt - 1_000).toISOString()),
+      dispatch("T2", "fake-2"),
+      phaseStart("T2", "judge", new Date(startedAt).toISOString()),
+    ]);
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await withTty(async () => {
+        await status(["--watch"], repo, {
+          iterations: 1,
+          sleep: async () => {},
+          now: () => startedAt + 2_000,
+        });
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const output = writes.join("");
+    const saved = output.indexOf("\x1b[22;0t");
+    const titled = output.indexOf("\x1b]0;⏳ T2 judge 2s\x07");
+    const restored = output.lastIndexOf("\x1b[23;0t");
+    expect(saved).toBeGreaterThanOrEqual(0);
+    expect(titled).toBeGreaterThan(saved);
+    expect(restored).toBeGreaterThan(titled);
+  });
+
+  test("test: watching a journal that contains no phase-start events renders the frame content the watcher rendered before this change", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), dispatch("T2", "fake-2")]);
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: false });
+    try {
+      const before = await status([], repo, { now: () => Date.parse(ts) });
+      const watched = await status(["--watch"], repo, {
+        iterations: 1,
+        sleep: async () => {},
+        now: () => Date.parse(ts),
+      });
+      expect(watched).toBe(before);
+    } finally {
+      spy.mockRestore();
+      if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    }
   });
 
   test("the parked human-gate label renders before any gate result exists for the task", async () => {

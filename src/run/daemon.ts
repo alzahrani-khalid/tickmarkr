@@ -18,12 +18,12 @@ import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracle
 import { runGates, type GateEvent } from "../gates/run-gates.js";
 import type { GateResult } from "../gates/types.js";
 import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus } from "../graph/graph.js";
-import type { Task } from "../graph/schema.js";
+import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
-import { cleanupRunWorktrees, gitHead, linkNodeModules, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, phaseForGate, recordedTaskFailureKind, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
 import { acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
 import { nextChannel, route } from "../route/router.js";
@@ -40,6 +40,9 @@ export interface RunOptions {
   // sanctioned stop-amend-resume workflow keeps working — the daemon refuses a mismatched/unbound
   // journal unless this is set, then journals a graph-rehash event naming both hashes.
   graphChanged?: boolean;
+  // OBS-123: explicit recovery for tasks terminally failed during dispatch. Resume keeps every other
+  // failure terminal and clears this task's replayed attempt seed so the new dispatch is fresh.
+  retryFailed?: boolean;
   concurrency?: number;
   driver?: ExecutorDriver;
   adapters?: WorkerAdapter[];
@@ -289,6 +292,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // GATE-08 lesson at the humanGate guard: condition on the data, not the code path). Dead-code
   // equivalence to the router.ts:194 profile⇒undefined pattern: no map entry ⇒ today's literal.
   const resume = opts.resume ? journal.replayResumeState() : new Map<string, ResumeState>();
+  const satisfiedGates = opts.resume ? journal.replaySatisfiedGates() : new Map<string, GateName>();
   const replayedExclusions = opts.resume ? journal.replayExcludedChannels() : new Set<string>();
   if (opts.resume) {
     // v1.53 T5: a superseded run is dead — resuming it beside its successor is the exact
@@ -317,7 +321,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       });
     }
     baseline = JSON.parse(readFileSync(join(journal.dir, "baseline.json"), "utf8"));
+    const replayEvents = journal.read();
     for (const [id, st] of journal.replayStatuses()) {
+      if (opts.retryFailed && st === "failed" && recordedTaskFailureKind(replayEvents, id) === "dispatch") {
+        graph = setStatus(graph, id, "pending");
+        resume.delete(id);
+        continue;
+      }
       // operator release: a graph.json edit back to "pending" beats a replayed human/failed park (locked decision 12)
       if ((st === "human" || st === "failed") && getTask(graph, id).status === "pending") continue;
       graph = setStatus(graph, id, st);
@@ -325,6 +335,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     journal.append("run-resume", undefined, {
       pid: process.pid, // v1.13 (VIS-11): record the live daemon pid for status liveness
       ...(replayedExclusions.size > 0 ? { excludedChannels: [...replayedExclusions].sort() } : {}),
+      ...(opts.retryFailed ? { retryFailed: true } : {}),
     });
   } else {
     baseRef = await gitHead(repoRoot);
@@ -422,7 +433,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // merges are serialized — two concurrent `git merge`s in one worktree would corrupt each other
   let mergeChain: Promise<unknown> = Promise.resolve();
   const mergeSerial = (taskBranch: string, t: Task, gated: string) => {
-    const next = mergeChain.then(() => mergeTask(intWt, taskBranch, `tickmarkr: merge ${t.id} ${t.title}`, gated));
+    const next = mergeChain.then(() => {
+      journal.phaseStart(t.id, "merge");
+      return mergeTask(intWt, taskBranch, `tickmarkr: merge ${t.id} ${t.title}`, gated);
+    });
     mergeChain = next.catch(() => undefined);
     return next;
   };
@@ -588,6 +602,121 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       return false;
     };
 
+    // OBS-130: an operator-approved gate-fail resumes from the persisted task branch, after the exact
+    // satisfied gate. No worker dispatch and no earlier gate/judge invocation occur on this path.
+    // replaySatisfiedGates() admits only an explicit task-approved ledger event, scoped by task+gate.
+    const satisfiedGate = satisfiedGates.get(t.id);
+    if (satisfiedGate) {
+      const taskBase = await integrationHead(intWt);
+      const taskBranch = `${branch}--${t.id}`;
+      const priorWt = worktreePath(repoRoot, taskBranch);
+      if (!existsSync(priorWt)) {
+        throw new Error(`approved gate ${satisfiedGate} cannot resume: task worktree is missing`);
+      }
+      const commitsToCarry = await commitsAheadOf(taskBase, priorWt);
+      const wt = await driver.worktree(repoRoot, taskBranch, taskBase);
+      const carriedCommits = await cherryPickCommits(wt, commitsToCarry);
+      journal.append("worktree-recreation", t.id, { attempted: commitsToCarry, carried: carriedCommits });
+      if (!linkNodeModules(repoRoot, wt, { force: true })) {
+        await park(t, "environmental: node_modules link could not be re-asserted before gates (OBS-47)", "setup",
+          assignment, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+        return;
+      }
+      if (await npmDependencyManifestChanged(wt, taskBase)) {
+        const installCommand = npmDependencyInstallCommand(wt);
+        const installed = await sh(installCommand, repoRoot, 10 * 60_000);
+        if (installed.code !== 0) {
+          throw new Error(`dependency install failed (exit ${installed.code}): ${installed.stderr || installed.stdout}`);
+        }
+      }
+
+      const workerEvent = [...journal.read()].reverse()
+        .find((e) => e.event === "worker-result" && e.taskId === t.id);
+      if (!workerEvent) throw new Error(`approved gate ${satisfiedGate} cannot resume: worker result is missing`);
+      const priorResult: WorkerResult = {
+        ok: workerEvent.data.ok === true,
+        summary: typeof workerEvent.data.summary === "string" ? workerEvent.data.summary : "",
+        deviations: Array.isArray(workerEvent.data.deviations)
+          ? workerEvent.data.deviations.filter((d): d is string => typeof d === "string")
+          : [],
+        raw: "",
+      };
+      const gateAuthor = rs?.lastAssignment ?? assignment;
+      const satisfiedIndex = GATE_NAMES.indexOf(satisfiedGate);
+      const remainingGates = t.gates.filter((gate) => GATE_NAMES.indexOf(gate) > satisfiedIndex);
+      const resumedTask = { ...t, gates: remainingGates };
+
+      gateLoop: while (true) {
+        const gated = await gitHead(wt);
+        journal.phaseStart(t.id, "gates");
+        const { results } = await runGates(resumedTask, {
+          worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
+          commands, baseline, channels, adapters, cfg,
+          via: cfg.visibility.llm === "pane"
+            ? {
+                driver: trackedDriver,
+                keep: keepLlm,
+                onSlot: keepLlm ? (s: Slot) => keptSlots.push(s) : undefined,
+                nameFor: (role) => formatOwnedName({ role, taskId: t.id, attempt: 0, runId }),
+                labelFor: (role) => `${role.toUpperCase()} ${t.id}`,
+              }
+            : undefined,
+          excludeReviewers: badReviewers,
+          onGate: async (e) => {
+            if (e.phase === "start") {
+              journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total });
+              return;
+            }
+            const g = e.result;
+            journal.append("gate-result", t.id, {
+              gate: g.gate, pass: g.pass, details: g.details,
+              ...(g.meta?.skipped === true ? { skipped: true } : {}),
+            });
+            if (g.gate === "review" && !g.pass && /unparseable/.test(g.details)
+                && typeof g.meta?.reviewer === "string") {
+              badReviewers.push(g.meta.reviewer);
+            }
+          },
+        });
+        const approvedCommits = await commitsAheadOf(taskBase, wt);
+        graph = addEvidence(graph, t.id, { commits: approvedCommits, gateResults: results });
+        saveGraph(repoRoot, graph);
+        if (!results.every((g) => g.pass)) {
+          gateFails++;
+          await park(t, "post-approval gate failed", "gate-fail", gateAuthor, rs?.attempts ?? 0,
+            startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+
+        const m = await mergeSerial(taskBranch, t, gated);
+        if (m.tipMoved) {
+          journal.append("tip-moved", t.id, m.tipMoved);
+          if (tipMoves++ === 0) continue gateLoop;
+          await park(t, "task branch tip moved twice after gating", "tip-moved", gateAuthor,
+            rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+        if (!m.ok) {
+          journal.append("merge-conflict", t.id, { conflict: m.conflict });
+          await park(t, `merge conflict after approved gate: ${m.conflict ?? "unknown conflict"}`,
+            "merge-conflict", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+
+        graph = setStatus(graph, t.id, "done");
+        saveGraph(repoRoot, graph);
+        journal.append("task-done", t.id, { attempts: rs?.attempts ?? 0, assignment: gateAuthor });
+        journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
+        journal.telemetry({
+          taskId: t.id, shape: t.shape, adapter: gateAuthor.adapter, model: gateAuthor.model,
+          channel: gateAuthor.channel, attempts: rs?.attempts ?? 0, outcome: "done",
+          durationMs: Date.now() - startMs, firstAttemptOk: false, gateFails, consults, retryMode,
+        });
+        await reconcile({ spareLiveLlm: true });
+        return;
+      }
+    }
+
     // Phase 46 (RES-01): start at the replayed attempt count; a replayed count ≥ MAX_ATTEMPTS parks via
     // the existing attempt-cap check below with zero new code. Fresh path: rs is undefined ⇒ 0.
     // v1.24 OBS-18: after task-approved{release:attempt-cap}, replay zeros attempts so this loop
@@ -655,6 +784,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       graph = setStatus(graph, t.id, "running");
       saveGraph(repoRoot, graph);
       journal.append("task-dispatch", t.id, { assignment, attempt, provenance: dispatchProvenance(r.provenance), retryMode });
+      journal.phaseStart(t.id, "worker", { attempt, assignment });
 
       const taskBase = await integrationHead(intWt); // deps are merged → visible to this task
       const taskBranch = `${branch}--${t.id}`; // "--": a ref can't nest under the existing integration branch (locked decision 10)
@@ -1091,8 +1221,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await park(t, "environmental: node_modules link could not be re-asserted before gates (OBS-47)", "setup", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
+      // OBS-126: workers cannot write the provisioned node_modules target outside their sandbox.
+      // Once the link is known-good, the daemon installs only attempts whose npm manifest differs
+      // from the integration-tip baseline. Keep lock/package manifests untouched: the worker's
+      // committed files are the deliverable, while this step only provisions the gate-visible tree.
+      if (await npmDependencyManifestChanged(wt, taskBase)) {
+        const installCommand = npmDependencyInstallCommand(wt);
+        const installed = await sh(installCommand, repoRoot, 10 * 60_000);
+        if (installed.code !== 0) {
+          throw new Error(`dependency install failed (exit ${installed.code}): ${installed.stderr || installed.stdout}`);
+        }
+      }
       const onGate = async (e: GateEvent) => {
-        if (e.phase === "start") return;
+        if (e.phase === "start") {
+          journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total });
+          return;
+        }
         const g = e.result;
         // GATE-09 (ROADMAP SC-4): journal every judge retry as an attributable event — which gate flaked,
         // which channel flaked, which channel retried — so `tickmarkr journal`/report can distinguish "judge
@@ -1121,6 +1265,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let commits: string[] = [];
       gateLoop: while (true) {
         const gated = await gitHead(wt);
+        journal.phaseStart(t.id, "gates");
         ({ results, commits } = await runGates(t, {
           worktree: wt, baseRef: taskBase, result, author: assignment,
           commands, baseline, channels, adapters, cfg,

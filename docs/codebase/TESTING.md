@@ -50,6 +50,7 @@ tests/
 ├── route/          16 *.test.ts files (router, explore, failover, profile, etc.)
 ├── run/            27 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, environment, etc.)
 ├── scripts/        probe-rig.test.ts
+├── tui/            app active; legacy suites retired
 ├── setup.ts        (setupFiles in vitest.config.ts — global env seal, not a *.test.ts file)
 ├── skills-pipeline-layout.test.ts
 └── smoke.test.ts   (top-level canary: package exports a valid VERSION)

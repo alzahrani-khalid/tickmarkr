@@ -207,6 +207,56 @@ describe("T4 deny.models + prefer rank", () => {
   });
 });
 
+describe("T10 role-scoped deny", () => {
+  const adapters = allAdapters().filter((a) => a.id !== "fake");
+  const health = allHealthy();
+  const target = { adapter: "codex", model: "gpt-5.5" };
+
+  test("a model denied in the worker scope is excluded from worker routing while remaining eligible for judge and review seats", () => {
+    const { repo, globalDir } = repoWithOverlay(
+      "routing:\n  deny:\n    workers:\n      models: [codex:gpt-5.5]\n",
+    );
+    const cfg = loadConfig(repo, { globalDir });
+
+    expect(discoverChannels(cfg, adapters, health)).not.toContainEqual(expect.objectContaining(target));
+    expect(disallowedBy(target, cfg.routing, "worker")).toEqual({ by: "deny", entry: "codex:gpt-5.5" });
+    expect(disallowedBy(target, cfg.routing, "judge")).toBeNull();
+    expect(disallowedBy(target, cfg.routing, "review")).toBeNull();
+  });
+
+  test("a flat deny entry continues to exclude its target from every role exactly as before", () => {
+    const { repo, globalDir } = repoWithOverlay(
+      "routing:\n  deny:\n    models: [codex:gpt-5.5]\n",
+    );
+    const cfg = loadConfig(repo, { globalDir });
+
+    for (const role of ["worker", "judge", "review", "consult"] as const) {
+      expect(disallowedBy(target, cfg.routing, role)).toEqual({ by: "deny", entry: "codex:gpt-5.5" });
+    }
+    expect(discoverChannels(cfg, adapters, health)).not.toContainEqual(expect.objectContaining(target));
+  });
+
+  test("deny still beats allow on conflict inside the worker scope", () => {
+    const { repo, globalDir } = repoWithOverlay(
+      "routing:\n  allow:\n    models: [codex:gpt-5.5]\n  deny:\n    workers:\n      models: [codex:gpt-5.5]\n",
+    );
+    const cfg = loadConfig(repo, { globalDir });
+
+    expect(disallowedBy(target, cfg.routing, "worker")).toEqual({ by: "deny", entry: "codex:gpt-5.5" });
+  });
+
+  test("the role scoping lives in the shared preference seam rather than per-call-site filtering", () => {
+    const prefSrc = readFileSync(join(import.meta.dirname, "../../src/route/preference.ts"), "utf8");
+    const routerSrc = readFileSync(join(import.meta.dirname, "../../src/route/router.ts"), "utf8");
+
+    expect(prefSrc).toContain("export function disallowedBy");
+    expect(prefSrc).toContain('role === "worker"');
+    expect(prefSrc).toContain("deny?.workers");
+    expect(routerSrc).toContain("disallowedBy(");
+    expect(routerSrc).not.toContain("deny?.workers");
+  });
+});
+
 describe("T7 deny∩prefer static preflight", () => {
   test("a prefer chain naming only channels fully covered by routing.deny is flagged by doctor before any run starts", () => {
     const { repo, globalDir } = repoWithOverlay(`routing:

@@ -13,6 +13,69 @@ const countApproved = (dir: string, runId: string): number =>
   Journal.open(dir, runId).read().filter((e) => e.event === "task-approved").length;
 
 describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-token)", () => {
+  test("test: after approval of a gate-fail park a resume proceeds past the approved gate for that task without re-dispatching the worker and without re-judging", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      {
+        judge: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "operator override required" }] },
+        review: { approve: true, issues: [] },
+        consult: { action: "human", notes: "operator must decide" },
+        tasks: { T1: [{ shell: `echo approved > approved.txt && ${COMMIT} approved`, result: { ok: true, summary: "implemented" } }] },
+      },
+    );
+    const runId = "run-gate-satisfied";
+    const first = await runDaemon(repo, { adapters: [fake], runId });
+    expect(first.human).toEqual(["T1"]);
+
+    await approve([runId, "T1", "--by", "operator"], repo);
+    const beforeResume = Journal.open(repo, runId).read();
+    const dispatchesBefore = beforeResume.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").length;
+    const judgmentsBefore = beforeResume.filter((e) =>
+      e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "acceptance",
+    ).length;
+
+    const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(resumed.done).toEqual(["T1"]);
+    const afterResume = Journal.open(repo, runId).read();
+    expect(afterResume.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(dispatchesBefore);
+    expect(afterResume.filter((e) =>
+      e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "acceptance",
+    )).toHaveLength(judgmentsBefore);
+    expect(afterResume.slice(beforeResume.length).filter((e) =>
+      e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "review" && e.data.pass === true,
+    )).toHaveLength(1);
+    expect(afterResume.slice(beforeResume.length).some((e) => e.event === "merge" && e.taskId === "T1")).toBe(true);
+  }, 120_000);
+
+  test("test: the recorded approval marker is scoped to the approved task and gate and releases nothing else", async () => {
+    const { repo } = setupRepo([T("T1"), T("T2")], { tasks: {} });
+    const j = Journal.create(repo, "run-scoped-gate-approval");
+    j.append("gate-result", "T1", { gate: "acceptance", pass: false, details: "judge failed" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "operator decision required" });
+    j.append("gate-result", "T2", { gate: "review", pass: false, details: "review failed" });
+    j.append("task-human", "T2", { kind: "gate-fail", reason: "operator decision required" });
+
+    await approve(["run-scoped-gate-approval", "T1", "--by", "operator"], repo);
+
+    const approvals = j.read().filter((e) => e.event === "task-approved");
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]).toMatchObject({
+      taskId: "T1",
+      data: { by: "operator", release: "gate-satisfied", gate: "acceptance" },
+    });
+    expect(j.replayStatuses()).toEqual(new Map([["T1", "pending"], ["T2", "human"]]));
+  });
+
+  test("gate satisfaction on resume derives only from an explicit operator approval event in the ledger and is never inferred by the daemon", () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-no-inferred-gate-approval");
+    j.append("gate-result", "T1", { gate: "acceptance", pass: false, details: "judge failed" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "operator decision required" });
+    j.append("gate-satisfied", "T1", { gate: "acceptance", source: "daemon" });
+
+    expect(j.replaySatisfiedGates()).toEqual(new Map());
+  });
+
   test("unknown runId is a loud refusal; no journal directory is created", async () => {
     const { repo } = setupRepo([T("T1", { humanGate: true })], { tasks: {} });
     await expect(approve(["run-nope", "T1"], repo)).rejects.toThrow(/no journal for run-nope/i);

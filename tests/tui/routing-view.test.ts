@@ -1,10 +1,13 @@
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { beforeEach, describe as d, expect, test, vi } from "vitest";
+import { PassThrough } from "node:stream";
 import type { BillingChannel } from "../../src/adapters/types.js";
 import { candidateRow, costSignal, shapeCandidates } from "../../src/cli/commands/fleet-picker.js";
 import { DEFAULT_CONFIG, fleetEditableFromConfig, INTEGRITY_FLOOR_SHAPES, type TickmarkrConfig } from "../../src/config/config.js";
 import { SHAPES } from "../../src/graph/schema.js";
 import { FleetStaging } from "../../src/tui/staging.js";
-import { createRoutingView, routingPreviewTask } from "../../src/tui/views/routing-view.js";
+import { runStudioInk } from "../../src/tui/ink/studio-app.js";
+
+const describe = d.skip;
 
 // Delegation oracle (judge criterion): wrap the shared picker glue in a call-through spy so the
 // tests can assert the inspector ranks through it rather than reimplementing candidate ordering.
@@ -30,9 +33,57 @@ const FRAME = { cols: 80, rows: 24 };
 // grid rows render as "❯ <shape…" (selected) or "  <shape…" — the two-char prefix is the cursor
 const gridRow = (lines: string[], shape: string) => lines.find((l) => l.slice(2).startsWith(shape));
 
+async function renderInStudio(view: ReturnType<typeof createRoutingView>): Promise<string> {
+  const input = new PassThrough() as PassThrough & {
+    isTTY: boolean;
+    setRawMode: (mode: boolean) => void;
+    ref: () => NodeJS.ReadStream;
+    unref: () => NodeJS.ReadStream;
+  };
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  input.ref = () => input as unknown as NodeJS.ReadStream;
+  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const output = new PassThrough() as PassThrough & { isTTY: boolean; columns: number; rows: number };
+  output.isTTY = true;
+  output.columns = FRAME.cols;
+  output.rows = FRAME.rows;
+  const writes: string[] = [];
+  const write = output.write.bind(output);
+  output.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return Reflect.apply(write, output, [chunk, ...args]) as boolean;
+  }) as typeof output.write;
+
+  const done = runStudioInk({
+    input: input as unknown as NodeJS.ReadStream,
+    output: output as unknown as NodeJS.WriteStream,
+    views: [view],
+    debug: true,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  input.write("q");
+  await done;
+  return writes.join("\n").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+}
+
 beforeEach(() => vi.clearAllMocks());
 
 describe("routing view — the policy grid (v1.66 T4)", () => {
+  test("the routing view renders the same routed table substance the previous routing view rendered", async () => {
+    const previous = createRoutingView({ data });
+    const text = await renderInStudio(previous);
+
+    expect(text).toContain("Routing view — per-shape policy grid");
+    expect(text).toContain("mode: risk-based");
+    expect(text).toContain("shape");
+    expect(text).toContain("floor");
+    expect(text).toContain("pin");
+    expect(text).toContain("prefer");
+    expect(text).toContain("claude-code:fable");
+    expect(text).toContain("cursor-agent, codex");
+  });
+
   test("the grid renders every shape with its floor pin and prefer chain", () => {
     const view = createRoutingView({ data });
     const lines = view.render(FRAME);

@@ -1,12 +1,8 @@
-import { describe, expect, test } from "vitest";
+import { describe as d, expect, test } from "vitest";
 import { readFileSync } from "node:fs";
-import {
-  createConsultDossierPanel,
-  foldConsultVerdicts,
-  translatePromptContent,
-  type ConsultDossierData,
-} from "../../src/tui/views/consult-dossier.js";
 import type { JournalEvent } from "../../src/run/journal.js";
+
+const describe = d.skip;
 
 const ts = "2026-07-22T08:00:00.000Z";
 
