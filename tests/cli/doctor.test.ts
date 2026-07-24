@@ -28,6 +28,73 @@ const stub = (id: string) =>
 const ADAPTERS5 = ["claude-code", "codex", "cursor-agent", "opencode", "pi"].map(stub);
 const retiredBanner = `${["dro", "vr"].join("")} —`;
 
+describe("OBS-141 kimi doctor turn probe", () => {
+  const stubKimi = (authed: boolean, note: string) =>
+    ({
+      id: "kimi",
+      vendor: "moonshot",
+      probe: async () => ({ installed: true, authed, version: "0.29.0", models: [], note }),
+      headlessCommand: vi.fn(() => "printf OK"),
+    }) as unknown as WorkerAdapter;
+
+  test("test: a healthy auth file with a failing model turn reports unhealthy with the turn failure named", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const turnProbe = vi.fn().mockResolvedValue({
+      ok: false,
+      evidence: "[config.invalid] Model \"kimi-code/kimi-for-coding\" is not configured",
+    });
+
+    const adapter = stubKimi(true, "auth file valid");
+    const out = await doctor(["--"], repo, [adapter], { banner: false, kimiTurnProbe: turnProbe });
+    const saved = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
+
+    expect(turnProbe).toHaveBeenCalledOnce();
+    expect(turnProbe).toHaveBeenCalledWith(repo);
+    expect(adapter.headlessCommand).not.toHaveBeenCalled();
+    expect(saved.kimi).toMatchObject({
+      authed: false,
+      note: expect.stringContaining("[config.invalid]"),
+    });
+    expect(out).toMatch(/✗ kimi\s+0\.29\.0.*model turn failed.*\[config\.invalid\]/);
+  });
+
+  test("test: a missing or invalid auth file reports unhealthy without attempting any turn", async () => {
+    const turnProbe = vi.fn();
+
+    for (const note of ["auth file missing", "auth file invalid"]) {
+      const repo = makeRepo({ "keep.txt": "x" });
+      const adapter = stubKimi(false, note);
+      const out = await doctor(["--"], repo, [adapter], { banner: false, kimiTurnProbe: turnProbe });
+      const saved = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
+
+      expect(saved.kimi).toMatchObject({ authed: false, note });
+      expect(out).toMatch(new RegExp(`✗ kimi\\s+0\\.29\\.0.*${note}`));
+      expect(adapter.headlessCommand).not.toHaveBeenCalled();
+    }
+    expect(turnProbe).not.toHaveBeenCalled();
+  });
+
+  test("test: a healthy auth file with a passing turn reports healthy naming the turn evidence", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const turnProbe = vi.fn().mockResolvedValue({
+      ok: true,
+      evidence: "model turn returned OK with kimi-code/kimi-for-coding",
+    });
+
+    const out = await doctor(["--"], repo, [
+      stubKimi(true, "auth file valid"),
+    ], { banner: false, kimiTurnProbe: turnProbe });
+    const saved = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
+
+    expect(turnProbe).toHaveBeenCalledOnce();
+    expect(saved.kimi).toMatchObject({
+      authed: true,
+      note: expect.stringContaining("model turn returned OK with kimi-code/kimi-for-coding"),
+    });
+    expect(out).toMatch(/✓ kimi\s+0\.29\.0.*model turn returned OK with kimi-code\/kimi-for-coding/);
+  });
+});
+
 const withOverlay = (repo: string, yaml: string) => {
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
   writeFileSync(join(repo, ".tickmarkr", "config.yaml"), yaml);

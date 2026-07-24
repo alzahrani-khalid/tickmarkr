@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { filterLlmTranscript, normalizeStallSnapshot } from "../../src/run/stall.js";
+import { filterLlmTranscript, normalizeStallSnapshot, StallProgressTracker } from "../../src/run/stall.js";
 
 // OBS-82 fixture: consecutive HerdrDriver.read(slot, 1000) snapshots of a live wedged codex pane
 // (see tests/fixtures/codex-mcp-spinner/README.md for capture provenance). Loaded sorted so the
@@ -54,6 +54,28 @@ describe("stall normalizer", () => {
     // closed allowlist: unknown text passes through byte-identical
     const plain = "worker log: 5 of 7 suites passed, servers (6/7), retry 30 pending\n";
     expect(normalizeStallSnapshot(plain)).toBe(plain);
+  });
+});
+
+describe("stall progress tracker", () => {
+  test("ambiguity between repaint and progress resolves toward firing the watchdog because a spurious consult is recoverable and a silent one is not", () => {
+    const tracker = new StallProgressTracker();
+    expect(tracker.observe({ paneText: "seed accepted\nagent idle · context 0% · cursor row 1" })).toBe(true);
+    expect(tracker.observe({ paneText: "seed accepted\nagent idle · context 0% · cursor row 2" })).toBe(false);
+    expect(tracker.observe({ paneText: "seed accepted\nagent idle · context 0% · cursor row 1000" })).toBe(false);
+  });
+
+  test("seed submission transcript growth and context growth are monotonic progress signals", () => {
+    const tracker = new StallProgressTracker();
+    expect(tracker.observe({ paneText: "", seedSubmitted: true })).toBe(true);
+    expect(tracker.observe({ paneText: "", seedSubmitted: true })).toBe(false);
+    expect(tracker.observe({ paneText: "first transcript row" })).toBe(true);
+    expect(tracker.observe({ paneText: "repainted status row" })).toBe(false);
+    expect(tracker.observe({ paneText: "first transcript row\nsecond transcript row" })).toBe(true);
+    expect(tracker.observe({ paneText: "first transcript row\nsecond transcript row", contextTokens: 100 })).toBe(true);
+    expect(tracker.observe({ paneText: "first transcript row\nsecond transcript row", contextTokens: 100 })).toBe(false);
+    expect(tracker.observe({ paneText: "first transcript row\nsecond transcript row", contextTokens: 90 })).toBe(false);
+    expect(tracker.observe({ paneText: "first transcript row\nsecond transcript row", contextTokens: 101 })).toBe(true);
   });
 });
 

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { allAdapters } from "../../src/adapters/registry.js";
-import { kimi, kimiAuthed, parseKimiModels, parseKimiResult } from "../../src/adapters/kimi.js";
+import { kimi, kimiAuthed, parseKimiModels, parseKimiResult, probeKimiDoctorTurn } from "../../src/adapters/kimi.js";
 import { validateGraph } from "../../src/graph/schema.js";
 
 vi.mock("node:child_process", () => ({ spawnSync: vi.fn() }));
@@ -34,6 +34,42 @@ const PROVIDER_JSON = JSON.stringify({
     "kimi-code/kimi-for-coding": {},
     "kimi-code/kimi-for-coding-highspeed": {},
   },
+});
+
+describe("OBS-141 kimi doctor turn", () => {
+  const mockedSh = vi.mocked(sh);
+
+  beforeEach(() => mockedSh.mockReset());
+  afterEach(() => vi.clearAllMocks());
+
+  test("the real doctor turn command uses the full model contract and accepts kimi's exact OK answer line", async () => {
+    mockedSh.mockResolvedValue({
+      code: 0,
+      stdout: "• Thinking briefly\n\n• OK\n\nTo resume this session: kimi -r session_1234\n",
+      stderr: "",
+    });
+
+    await expect(probeKimiDoctorTurn("/repo")).resolves.toEqual({
+      ok: true,
+      evidence: "model turn returned OK with kimi-code/k3",
+    });
+    expect(mockedSh).toHaveBeenCalledOnce();
+    expect(mockedSh.mock.calls[0][0]).toContain("--model 'kimi-code/k3'");
+    expect(mockedSh.mock.calls[0][0]).toContain("Reply with exactly OK and nothing else.");
+  });
+
+  test("the real doctor turn command preserves a named model failure", async () => {
+    mockedSh.mockResolvedValue({
+      code: 1,
+      stdout: "",
+      stderr: "[config.invalid] Model \"kimi-code/k3\" is not configured in config.toml",
+    });
+
+    await expect(probeKimiDoctorTurn("/repo")).resolves.toEqual({
+      ok: false,
+      evidence: "[config.invalid] Model \"kimi-code/k3\" is not configured in config.toml",
+    });
+  });
 });
 
 describe("KIMI-01 kimiAuthed — refresh_token dominates epoch-seconds expiry", () => {
@@ -123,6 +159,28 @@ describe("KIMI-04 parseKimiModels + listModels", () => {
 });
 
 describe("KIMI-02 command shapes + trailer parse", () => {
+  test("test: the headless command carries a model identifier consistent with the interactive contract", () => {
+    const model = "kimi-code/kimi-for-coding";
+    const modelArg = `'${model}'`;
+    expect(kimi.headlessCommand("/tmp/p.md", model)).toContain(`--model ${modelArg}`);
+    expect(kimi.interactiveSeed?.launch(model)).toContain(`-m ${modelArg}`);
+  });
+
+  test("no retired alias form survives anywhere in the adapter's launch or resume command construction", () => {
+    const model = "kimi-code/kimi-for-coding";
+    const retiredAliasArg = "'kimi-for-coding'";
+    const commands = [
+      kimi.interactiveSeed!.launch(model),
+      kimi.headlessCommand("/tmp/p.md", model),
+      kimi.resumeCommand!("session_11111111-aaaa-bbbb-cccc-111111111111", "/tmp/p.md", model),
+    ];
+
+    for (const command of commands) {
+      expect(command).toContain(`'${model}'`);
+      expect(command).not.toMatch(new RegExp(`(?:-m|--model) ${retiredAliasArg}(?: |$)`));
+    }
+  });
+
   test("the headless command contains the prompt flag and the model id and NO permission flag", () => {
     const c = kimi.headlessCommand("/tmp/p.md", "kimi-code/k3");
     expect(c).toContain("-p");

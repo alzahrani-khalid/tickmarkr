@@ -12,7 +12,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.74.0";
+const PRIOR_RELEASE_VERSION = "1.75.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -81,16 +81,16 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the interface-literacy theme rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.75[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/interface[- ]literacy/i);
-    for (const change of ["clear-guard", "adapter-declared input box", "declare-then-consult", "delivery target", "shell-line model", "fail-closed", "Kimi Code", "steady-state", "trust auto-answer", "claude and codex", "workspace-trust", "trustDialog seam", "once-per-slot", "blocked/idle precondition", "cursor's declaration", "auto-guess", "pages the operator", "fleet --print", "review and consult steering", "print surface"]) {
+  test("the changelog entry names the earned-green theme rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.76[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/earned[- ]green/i);
+    for (const change of ["verifies submission", "declared input box", "settle-read seams", "bounded re-press", "verified-but-unsubmitted", "already-submitting panes", "double-submitted", "0.29.0 contract", "config.toml model key", "bare-suffix -m alias", "config.invalid", "banner-parse mapping", "real model turn", "candidate-sweep precedent", "zero-token", "measures progress, not repaints", "seed submitted", "silent watchdog", "picker escape test", "cursor-row identity", "frame race", "fail-closed"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.74.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.75.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

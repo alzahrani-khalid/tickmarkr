@@ -10,6 +10,7 @@ export const TRAILER_WIDTH_MARGIN = 2; // cols below (floor + margin) refuse a r
 
 // OBS-85 verified delivery: bounded type→read-back→enter attempts before failing closed.
 export const DELIVERY_ATTEMPTS = 3;
+const DELIVERY_SUBMIT_ATTEMPTS = 2; // initial Enter + one evidence-backed re-press (OBS-140)
 const DELIVERY_VERIFY_TIMEOUT_MS = 2000; // per attempt — a paste that hasn't rendered in 2s is retyped
 const DELIVERY_READ_LINES = 80;
 const DELIVERY_SETTLE_READ_ATTEMPTS = 6;
@@ -108,6 +109,22 @@ export class HerdrDriver implements ExecutorDriver {
     const hay = norm(transcript);
     const needle = norm(cmd);
     return needle.length > 0 && hay.includes(needle);
+  }
+
+  // Submission succeeds when the typed prompt disappears, or when it has moved above a fresh
+  // adapter-declared input box (the prompt is now transcript, not input). Shell-line delivery uses
+  // the same normalized seam: a prompt still at the bottom ends the pane text; output/a fresh prompt
+  // after it proves Enter registered. No adapter-specific fingerprint lives in the driver.
+  private submissionRegistered(transcript: string, cmd: string, inputBox?: InputBox): boolean {
+    const norm = (s: string) => s.replace(/\s+/g, "");
+    const hay = norm(transcript);
+    const needle = norm(cmd);
+    const promptAt = hay.lastIndexOf(needle);
+    if (needle.length === 0 || promptAt < 0) return true;
+    if (inputBox && matchesInputBox(transcript, inputBox)) {
+      return hay.lastIndexOf(norm(inputBox.fingerprint)) > promptAt;
+    }
+    return promptAt + needle.length < hay.length;
   }
 
   static available(): boolean {
@@ -435,8 +452,7 @@ export class HerdrDriver implements ExecutorDriver {
         DELIVERY_VERIFY_TIMEOUT_MS + 15_000,
       );
       if (this.waitOk(back.code, back.stdout) || await this.deliveryReadMatches(pane, cmd, slot.cwd)) {
-        const enter = await this.herdr(`pane send-keys ${shq(pane)} Enter`, slot.cwd);
-        if (enter.code !== 0) throw new Error(`herdr pane send-keys Enter failed: ${enter.stderr || enter.stdout}`);
+        await this.submitVerifiedDelivery(slot, cmd, pane);
         return;
       }
       // capture the corrupted delivery BEFORE clearing it — the OBS-85 byte-level evidence
@@ -445,20 +461,56 @@ export class HerdrDriver implements ExecutorDriver {
     throw new Error(`herdr delivery corrupted after ${DELIVERY_ATTEMPTS} attempts — enter never pressed (OBS-85); pane transcript:\n${transcript}`);
   }
 
+  private async submitVerifiedDelivery(slot: Slot, cmd: string, pane: string): Promise<void> {
+    let transcript = "";
+    const inputBox = this.inputBoxes.get(slot);
+    for (let attempt = 0; attempt < DELIVERY_SUBMIT_ATTEMPTS; attempt++) {
+      const enter = await this.herdr(`pane send-keys ${shq(pane)} Enter`, slot.cwd);
+      if (enter.code !== 0) throw new Error(`herdr pane send-keys Enter failed: ${enter.stderr || enter.stdout}`);
+
+      // Reuse the existing settle-read window. A first-read success returns before any timer; only
+      // a prompt that still occupies the delivery target spends the bounded settle window. This
+      // verification always completes before a possible re-press, so a slow submit cannot duplicate.
+      const settled = await this.settleDeliveryLine(
+        pane,
+        slot.cwd,
+        transcript,
+        inputBox,
+        (candidate) => this.submissionRegistered(candidate, cmd, inputBox),
+      );
+      transcript = settled.transcript;
+      if (settled.ok) return;
+      if (settled.readFailed) {
+        throw new Error(`herdr delivery corrupted — submission verification failed, refusing to re-press Enter (OBS-140); pane transcript:\n${transcript}`);
+      }
+    }
+    throw new Error(
+      `herdr delivery corrupted after ${DELIVERY_SUBMIT_ATTEMPTS} submit attempts — submission never registered (OBS-140); pane transcript:\n${transcript}`,
+    );
+  }
+
   private async settleDeliveryLine(
     pane: string,
     cwd: string,
     initialTranscript: string,
     inputBox?: InputBox,
-  ): Promise<{ ok: boolean; transcript: string; recognizedInputBox: boolean }> {
+    accept?: (transcript: string) => boolean,
+  ): Promise<{ ok: boolean; transcript: string; recognizedInputBox: boolean; readFailed?: boolean }> {
     let transcript = initialTranscript;
     for (let readAttempt = 0; readAttempt < DELIVERY_SETTLE_READ_ATTEMPTS; readAttempt++) {
       const read = await this.herdr(
         `pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`,
         cwd,
       );
-      if (read.code !== 0) return { ok: false, transcript: read.stdout || transcript, recognizedInputBox: false };
-      if (read.stdout === transcript) {
+      if (read.code !== 0) return { ok: false, transcript: read.stdout || transcript, recognizedInputBox: false, readFailed: true };
+      if (accept?.(read.stdout)) {
+        return {
+          ok: true,
+          transcript: read.stdout,
+          recognizedInputBox: inputBox !== undefined && matchesInputBox(read.stdout, inputBox),
+        };
+      }
+      if (accept === undefined && read.stdout === transcript) {
         return {
           ok: true,
           transcript,

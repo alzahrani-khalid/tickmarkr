@@ -28,7 +28,7 @@ import { acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
 import { nextChannel, route } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
-import { normalizeStallSnapshot } from "./stall.js";
+import { StallProgressTracker } from "./stall.js";
 
 export interface RunOptions {
   runId?: string;
@@ -868,13 +868,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // single site, so a test can reason about it; keep Date.now() out of profile.ts (still pure) and
       // out of adapter module scope (the cursor is a parameter, threaded from the daemon).
       const attemptStart = Date.now();
-      // v1.23 T2: once-per-attempt latch for context threshold crossing. Sample ONLY at existing poll
-      // seams (interactive wait slices) — never a new timer loop. null/unknown usage fails OPEN
+      // v1.23 T2: once-per-attempt latch for context threshold crossing. Sample ONLY at existing worker
+      // wait slices — never a new timer loop. null/unknown usage fails OPEN
       // (never treated as over-threshold). Journal + notify fire at most once while the value stays high.
       let contextWarned = false;
       let contextTokens: number | undefined;
       const sampleContext = async () => {
-        if (contextWarned || !adapter.contextUsage) return;
+        if (!adapter.contextUsage) return;
         let usage: { tokens: number; limit?: number } | null = null;
         try {
           // SessionRef id stays stable across resume attempts; adapters return null on a store miss.
@@ -884,7 +884,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
         if (!usage || typeof usage.tokens !== "number" || !Number.isFinite(usage.tokens)) return;
         contextTokens = usage.tokens; // last known valid sample, including under-threshold resume candidates
-        if (usage.tokens < cfg.contextWarnTokens) return;
+        if (contextWarned || usage.tokens < cfg.contextWarnTokens) return;
         contextWarned = true;
         lastContextTokens = usage.tokens;
         journal.append("context-sample", t.id, {
@@ -932,15 +932,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // OBS-54: reaping keys on new pane output, not dispatch wall clock. Poll at least twice per
           // stall window (and at the existing 30s cadence for normal windows) so an active worker resets it.
           const stallWindowMs = taskTimeoutMinutes * 60_000;
-          // OBS-82: the stall clock compares NORMALIZED snapshots so a spinner glyph/elapsed-time
-          // repaint is silence, not activity. ONLY this inactivity compare sees normalized text —
-          // trailer detection, harvest, paging, and quota checks all read the raw pane.
+          // v1.76: only monotonic work (seed submission, transcript growth, or context growth) resets
+          // the stall clock. Raw pane differences are terminal chrome until proven otherwise.
           let everHadOutput = output.length > 0;
-          let lastStallSnapshot = normalizeStallSnapshot(output);
-          let lastOutputAt = Date.now();
-          while (Date.now() - lastOutputAt < stallWindowMs) {
+          const stallProgress = new StallProgressTracker();
+          stallProgress.observe({ paneText: output, seedSubmitted: true, contextTokens });
+          let lastProgressAt = Date.now();
+          while (Date.now() - lastProgressAt < stallWindowMs) {
             const sliceStart = Date.now();
-            const remaining = stallWindowMs - (sliceStart - lastOutputAt);
+            const remaining = stallWindowMs - (sliceStart - lastProgressAt);
             let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
             if (!everHadOutput) {
               const earlyLeft = earlyLaunchLivenessMs - (sliceStart - attemptStart);
@@ -961,11 +961,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
             const paneText = await driver.read(slot, 1000);
             if (paneText.length > 0) everHadOutput = true;
-            const currentStallSnapshot = normalizeStallSnapshot(paneText);
-            if (currentStallSnapshot !== lastStallSnapshot) {
-              lastStallSnapshot = currentStallSnapshot;
-              lastOutputAt = Date.now();
-            }
             // OBS-117 (v1.71 T6): zero raw output by the early-launch deadline is a dead channel now.
             if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
               earlyLaunchDead = true;
@@ -974,6 +969,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
             // v1.23 T2: piggyback on this poll slice — same cadence as blocked/idle checks, no new timer.
             await sampleContext();
+            if (stallProgress.observe({ paneText, contextTokens })) lastProgressAt = Date.now();
             // page on "idle" too: herdr's blocked-scrape is strict and proved flaky for TUI dialogs
             // (live check: cursor's trust dialog scraped as idle). "unknown" never pages — that's just
             // a pane the scraper can't read (subprocess, dead pane); the task timeout covers those.
@@ -1008,7 +1004,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           if (!finished && exitCode === null) {
             // timed out (or only ever saw false positives): harvest whatever the pane holds now
-            timedOut = Date.now() - lastOutputAt >= stallWindowMs;
+            timedOut = Date.now() - lastProgressAt >= stallWindowMs;
             output = await driver.read(slot, 1000);
             finished = new RegExp(trailerPattern(nonce)).test(output);
             const exit = exitRe.exec(output);
@@ -1044,16 +1040,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       } else {
         await driver.run(slot, paneDispatchCommand(dispatchScript));
         // OBS-54: headless workers have the same output-inactivity budget as visible panes.
-        // OBS-82: same normalized-snapshot compare as the interactive site — spinner-only repaints
-        // exhaust the budget here too; harvest below still reads the raw pane.
+        // v1.76: same monotonic-progress measure as the interactive site; harvest stays raw.
         const stallWindowMs = taskTimeoutMinutes * 60_000;
         const initialPane = await driver.read(slot, 500);
         let everHadOutput = initialPane.length > 0;
-        let lastStallSnapshot = normalizeStallSnapshot(initialPane);
-        let lastOutputAt = Date.now();
+        const stallProgress = new StallProgressTracker();
+        stallProgress.observe({ paneText: initialPane, seedSubmitted: true, contextTokens });
+        let lastProgressAt = Date.now();
         finished = false;
-        while (Date.now() - lastOutputAt < stallWindowMs) {
-          const remaining = stallWindowMs - (Date.now() - lastOutputAt);
+        while (Date.now() - lastProgressAt < stallWindowMs) {
+          const remaining = stallWindowMs - (Date.now() - lastProgressAt);
           let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
           if (!everHadOutput) {
             const earlyLeft = earlyLaunchLivenessMs - (Date.now() - attemptStart);
@@ -1065,19 +1061,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           const paneText = await driver.read(slot, 500);
           if (paneText.length > 0) everHadOutput = true;
-          const currentStallSnapshot = normalizeStallSnapshot(paneText);
-          if (currentStallSnapshot !== lastStallSnapshot) {
-            lastStallSnapshot = currentStallSnapshot;
-            lastOutputAt = Date.now();
-          }
           if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
             earlyLaunchDead = true;
             break;
           }
+          await sampleContext();
+          if (stallProgress.observe({ paneText, contextTokens })) lastProgressAt = Date.now();
         }
         output = await driver.read(slot, 500);
         exitCode = Number(exitRe.exec(output)?.[1] ?? 1);
-        timedOut = !finished && Date.now() - lastOutputAt >= stallWindowMs;
+        timedOut = !finished && Date.now() - lastProgressAt >= stallWindowMs;
       }
       // SPEND-01 interactive metering race: the harvest loop breaks on the trailer, but the worker
       // shell may still be running post-trailer bookkeeping (session-store flush, fake usage stamp,

@@ -8,13 +8,13 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { kimiSessionId } from "../../src/adapters/kimi.js";
 import { type BillingChannel, shq } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
-import { TIER_RANK, type Tier } from "../../src/config/config.js";
+import { DEFAULT_CONFIG, TIER_RANK, type Tier } from "../../src/config/config.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
 import { gatePaneName } from "../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
+import { EARLY_LAUNCH_LIVENESS_MS, runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
 import { COMMIT, authedModels, setupRepo, T } from "../helpers/tmprepo.js";
@@ -2832,10 +2832,72 @@ describe("OBS-82 spinner-blind stall, headless site (fake adapter, zero tokens)"
   }, 30_000);
 });
 
+describe("v1.76 progress-based stall watchdog (fake adapter, zero tokens)", () => {
+  test("test: a worker pane emitting only cursor and status-bar repaints past the stall threshold triggers the stall escalation", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "repaint-only pane" } },
+      "taskTimeoutMinutes: 0.005\nvisibility:\n  worker: print\n",
+    );
+    const inner = new SubprocessDriver();
+    let workerReads = 0;
+    const driver = {
+      id: "subprocess",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      run: inner.run.bind(inner),
+      waitOutput: async (slot: Slot, pattern: string, ms: number, opts?: { regex?: boolean }) => {
+        if (!slot.name.includes("-worker-")) return inner.waitOutput(slot, pattern, ms, opts);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return false;
+      },
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: (slot: Slot, lines?: number) => {
+        if (!slot.name.includes("-worker-")) return inner.read(slot, lines);
+        workerReads++;
+        const repaint = Math.min(workerReads, 20);
+        return Promise.resolve([
+          "seed accepted",
+          "────────────────────────",
+          `agent idle · context 0% · cursor row ${repaint}`,
+        ].join("\n"));
+      },
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+    };
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-chrome-repaint", driver });
+
+    expect(summary.human).toEqual(["T1"]);
+    expect(workerReads).toBeLessThan(20); // watchdog fired while the repaint stream was still changing
+    expect(Journal.open(repo, "run-chrome-repaint").read().find((e) => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+  }, 30_000);
+
+  test("test: a worker making real transcript progress at the same cadence does not trigger it", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{
+        shell: `for n in 1 2 3 4 5; do echo "completed transcript step $n"; sleep 0.15; done; echo done > done.txt && ${COMMIT} done`,
+        result: { ok: true, summary: "transcript kept growing" },
+      }] } },
+      "taskTimeoutMinutes: 0.005\nvisibility:\n  worker: print\n",
+    );
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-transcript-progress" });
+
+    expect(summary.done).toEqual(["T1"]);
+    const result = Journal.open(repo, "run-transcript-progress").read().find((e) => e.event === "worker-result");
+    expect(result?.data.finished).toBe(true);
+    expect(result?.data.cause).toBeUndefined();
+  }, 30_000);
+});
+
 describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
   const SETUP_FAIL = "echo 'zsh: command not found: codex'; exit 1";
 
-  test("the early classification records the same typed dead-channel reason and failover behavior a stall-window classification records today", async () => {
+  test("test: the silent-launch fast path keeps its existing shorter deadline and error", async () => {
     setEarlyLaunchLivenessMsForTests(50);
     try {
       const stall = setupRepo(
@@ -2898,6 +2960,13 @@ describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
       resetEarlyLaunchLivenessMsForTests();
     }
   }, 30_000);
+
+  test("stall thresholds and their configuration surface are unchanged", () => {
+    expect(EARLY_LAUNCH_LIVENESS_MS).toBe(60_000);
+    expect(DEFAULT_CONFIG.taskTimeoutMinutes).toBe(30);
+    expect(DEFAULT_CONFIG.consult.stallMinutes).toBe(15);
+    expect(Object.keys(DEFAULT_CONFIG).filter((key) => /stall|timeout/i.test(key))).toEqual(["taskTimeoutMinutes"]);
+  });
 
   test("the early check adds no new polling timer beyond the existing stall-wait poll cadence", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src/run/daemon.ts"), "utf8");

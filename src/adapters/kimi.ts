@@ -69,6 +69,35 @@ export function parseKimiResult(raw: string, nonce: string): WorkerResult {
   return parseWorkerResult(stripped, nonce);
 }
 
+const KIMI_DOCTOR_TURN_MODEL = "kimi-code/k3";
+const KIMI_DOCTOR_TURN_PROMPT = "Reply with exactly OK and nothing else.";
+const KIMI_DOCTOR_TURN_TIMEOUT_MS = 60000;
+
+export interface KimiDoctorTurnResult {
+  ok: boolean;
+  evidence: string;
+}
+
+// OBS-141: intentionally separate from probe() so plan/run remain free file checks. Only doctor
+// calls this one-turn contract probe; its test seam stubs sh and never launches a real agent CLI.
+export async function probeKimiDoctorTurn(cwd: string): Promise<KimiDoctorTurnResult> {
+  const command = `kimi -p ${shq(KIMI_DOCTOR_TURN_PROMPT)} --model ${shq(KIMI_DOCTOR_TURN_MODEL)} --output-format text`;
+  const r = await sh(command, cwd, KIMI_DOCTOR_TURN_TIMEOUT_MS);
+  if (r.timedOut) {
+    return { ok: false, evidence: `turn timed out after ${KIMI_DOCTOR_TURN_TIMEOUT_MS}ms` };
+  }
+  const output = `${r.stderr}\n${r.stdout}`.trim().replace(/\s+/g, " ");
+  if (r.code !== 0) {
+    return { ok: false, evidence: output || `turn exited ${r.code}` };
+  }
+  const returnedOk = r.stdout.split("\n")
+    .map((line) => line.replace(/^[\s]*[•*-]\s+/, "").trim())
+    .includes("OK");
+  return returnedOk
+    ? { ok: true, evidence: `model turn returned OK with ${KIMI_DOCTOR_TURN_MODEL}` }
+    : { ok: false, evidence: `turn returned no exact OK answer${output ? `: ${output}` : ""}` };
+}
+
 // v1.53 T3: session-id capture from the run-output trailer — every `kimi -p` run (fresh or resumed)
 // ends with `To resume this session: kimi -r session_<uuid>` (live probe 2026-07-18). Anchored full
 // line only: prompt/model prose can contain lookalike text, and the anchored charset keeps a
@@ -94,22 +123,18 @@ export function kimiSessionId(output: string): string | undefined {
   return id;
 }
 
-// v1.69 T6: the native TUI takes -m <alias>, where config.toml aliases are the bare model suffix of
-// the tickmarkr channel id (live probe 2026-07-22). Keep the mapping explicit and localized.
-function kimiAlias(model: string): string {
-  return model.replace(/^kimi-code\//, "");
-}
-
 // v1.69 T7: the cold-start banner prints the model alias and session id. Parse them from the
-// banner text already captured for the readiness match — no new probe, no extra dispatch.
+// banner text already captured for the readiness match — no new probe, no extra dispatch. Kimi
+// 0.29.0 may print either the full config key or its display suffix; normalize both idempotently
+// to the full channel identifier routing uses.
 const BANNER_MODEL_RE = /^Model:\s*(.+)$/m;
 const BANNER_SESSION_RE = /^Session:\s*(session_[0-9a-f-]+)$/m;
 export function kimiBannerModel(banner: string): string | undefined {
   const m = BANNER_MODEL_RE.exec(banner);
   if (!m) return undefined;
-  const alias = m[1].trim();
-  if (!alias) return undefined;
-  return `kimi-code/${alias}`;
+  const printedModel = m[1].trim();
+  if (!printedModel) return undefined;
+  return printedModel.startsWith("kimi-code/") ? printedModel : `kimi-code/${printedModel}`;
 }
 export function kimiBannerSessionId(banner: string): string | undefined {
   return BANNER_SESSION_RE.exec(banner)?.[1];
@@ -145,7 +170,8 @@ export const KIMI_INPUT_BOX = declareInputBox("kimi", {
 // Shared launch-then-seed surface (T6) + banner confirm (T7/T2). One definition so the adapter
 // property and the daemon's generic runInteractiveSeed path cannot drift.
 const KIMI_SEED: InteractiveSeed = {
-  launch: (model: string) => `kimi -y -m ${shq(kimiAlias(model))}`,
+  // v1.76 T2 / OBS-141: 0.29.0 resolves only the full config.toml model key on the first turn.
+  launch: (model: string) => `kimi -y -m ${shq(model)}`,
   readinessMatch: "Send /help for help information.",
   seedLine: (promptFile: string) => `Read ${promptFile} and do exactly what it says.`,
   confirmBanner: confirmKimiSeedBanner,

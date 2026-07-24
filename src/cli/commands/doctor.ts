@@ -7,6 +7,7 @@ import { declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyV
 import { DEFAULT_CONFIG, loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
+import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
 
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
@@ -14,7 +15,10 @@ const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value:
   `  ${statusRow(verdict, kvRow(key, value).slice(2))}`;
 const attentionRow = (text: string) => `  ${statusRow("warn", text)}`;
 
-export type DoctorOpts = { banner?: boolean };
+export type DoctorOpts = {
+  banner?: boolean;
+  kimiTurnProbe?: (cwd: string) => Promise<KimiDoctorTurnResult>;
+};
 
 export async function doctor(
   _argv: string[],
@@ -30,6 +34,25 @@ export async function doctor(
   console.error("probing installed agent CLIs — one short LLM call per configured model, may take a minute...");
   const probeProgressTTY = process.stderr.isTTY === true;
   const health = await probeAll(adapters, { cwd });
+  const kimiAdapter = adapters.find((a) => a.id === kimi.id);
+  const kimiTurnEnabled = kimiAdapter !== undefined
+    && (kimiAdapter === kimi || opts.kimiTurnProbe !== undefined);
+  if (kimiTurnEnabled) {
+    const h = health.kimi;
+    if (h.installed && h.authed) {
+      let turn: KimiDoctorTurnResult;
+      try {
+        turn = await (opts.kimiTurnProbe ?? probeKimiDoctorTurn)(cwd);
+      } catch (e) {
+        turn = { ok: false, evidence: e instanceof Error ? e.message : String(e) };
+      }
+      health.kimi = {
+        ...h,
+        authed: turn.ok,
+        note: `${h.note ? `${h.note}; ` : ""}${turn.ok ? turn.evidence : `model turn failed: ${turn.evidence}`}`,
+      };
+    }
+  }
   // MODEL-02: detect models where the adapter exposes a list surface, BEFORE writing doctor.json (write once, below).
   // Fail OPEN — the inverse of gates' fail-closed: detection is advisory, so a broken list surface NEVER fails doctor.
   for (const a of adapters) {
@@ -42,14 +65,20 @@ export async function doctor(
       if (health[a.id].models.length) health[a.id].modelsDetectedAt = a.listModelsFetchedAt?.() ?? new Date().toISOString();
     } catch { /* fail open: leave models as-is, doctor stays healthy */ }
   }
-  await probeModels(cfg, cwd, adapters, health, probeProgressTTY
+  // A free Kimi auth failure or failed earned-green turn must not spend more probes. Every other
+  // adapter keeps the exact existing model-sweep path.
+  const modelProbeAdapters = kimiTurnEnabled && health.kimi.authed === false
+    ? adapters.filter((a) => a !== kimiAdapter)
+    : adapters;
+  await probeModels(cfg, cwd, modelProbeAdapters, health, probeProgressTTY
     ? (adapter, model, status, durationMs) => console.error(`  ${adapter}:${model} ${status} (${(durationMs / 1000).toFixed(1)}s)`)
     : undefined);
   writeDoctor(cwd, health);
   const rows = adapters.map((a) => {
     const h = health[a.id];
     const state = !h.installed ? "not installed" : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
-    return alignedStatusRow(h.installed ? "pass" : "fail", a.id, state);
+    const healthy = h.installed && (a.id !== kimi.id || h.authed);
+    return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
   });
   // v1.48 T1: advisory sweep for known agent CLIs with no adapter — never written to doctor.json health.
   rows.push(...detectCandidateClis().map(({ binary, version }) =>

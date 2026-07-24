@@ -7,7 +7,7 @@ import { DELIVERY_ATTEMPTS, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; changingPaneRead?: boolean; clearFailsThroughRead?: number }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" }
 
 // OBS-85 fixture text: what the incident panes actually showed instead of the typed dispatch line.
 const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
@@ -22,6 +22,9 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const verctr = join(dir, "verctr.txt"); // corrupt:"once" — first delivery verify fails, later ones match
   const readctr = join(dir, "readctr.txt"); // staged pane paints + clear guard timing
   const inflight = join(dir, "inflight.txt"); // contendDelivery: pane ids with an active delivery
+  const enterctr = join(dir, "enterctr.txt"); // submission verification: bounded Enter presses
+  const submitreadctr = join(dir, "submitreadctr.txt"); // slow-submit fixture: reads before registration
+  const typed = join(dir, "typed.txt"); // the currently typed delivery prompt
   const bin = join(dir, "herdr");
   const cwd = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-cwd-"));
   // DEFECT-01: a prior (killed) attempt's kept pane still carries the durable label — a stale pane-list
@@ -70,13 +73,23 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
     (frame, i) => `${i + 1}) printf '%s\\n' '${frame.replaceAll("'", "'\\''")}' ;;`,
   ).join(" ");
   const lastStagedRead = opts.paneReadFrames?.at(-1)?.replaceAll("'", "'\\''");
-  const paneRead = opts.changingPaneRead
+  const preSubmitPaneRead = opts.changingPaneRead
     ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; printf 'painting-frame-%s\\n' "$n"`
     : opts.paneReadFrames?.length
       ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; case "$n" in ${stagedReads} *) printf '%s\\n' '${lastStagedRead}' ;; esac`
       : opts.corrupt ? CORRUPT_READ : opts.wrappedCmd
         ? `printf '> ${opts.wrappedCmd.slice(0, 20)}\\n${opts.wrappedCmd.slice(20)}\\n'`
         : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
+  const stuckSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf 'Send /help for help information.\\n%s\\n' "$cmd"`;
+  const completedSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '%s\\nworker-output\\nSend /help for help information.\\n> \\n' "$cmd"`;
+  const postSubmitPaneRead = opts.submission === "never"
+    ? stuckSubmission
+    : opts.submission === "second"
+      ? `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -ge 2 ]; then ${completedSubmission}; else ${stuckSubmission}; fi`
+      : opts.submission === "slow"
+        ? `n=$(cat '${submitreadctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${submitreadctr}'; if [ "$n" -ge 3 ]; then ${completedSubmission}; else ${stuckSubmission}; fi`
+        : completedSubmission;
+  const paneRead = `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then ${postSubmitPaneRead}; else ${preSubmitPaneRead}; fi`;
   const deliveryContend = opts.contendDelivery
     ? `
 delivery_pane() { for a in "$@"; do case "$a" in w1:p*) echo "$a"; return;; esac; done; }
@@ -86,16 +99,19 @@ delivery_clear() { p=$(delivery_pane "$@"); [ -z "$p" ] && return; n=$(wc -l < '
 pane_send_keys() { if [[ "$*" == *C-u* ]]; then delivery_clear "$@"; elif [[ "$*" == *Enter* ]]; then delivery_end "$@"; echo '{}'; else echo '{}'; fi; }
 `
     : "";
-  const sendText = opts.contendDelivery ? `delivery_begin "$@"; echo '{}'` : "echo '{}'";
+  const sendText = opts.contendDelivery
+    ? `printf '%s' "$4" > '${typed}'; delivery_begin "$@"; echo '{}'`
+    : `printf '%s' "$4" > '${typed}'; echo '{}'`;
   const clearResult = opts.clearFailsThroughRead === undefined
     ? `echo '{}'`
     : `n=$(cat '${readctr}' 2>/dev/null || echo 0); [ "$n" -le ${opts.clearFailsThroughRead} ] && exit 1; echo '{}'`;
   const enterResult = opts.rebindAfterDelivery
     ? `if [[ "$*" == *Enter* ]]; then grep -v " ${opts.rebindAfterDelivery.name}$" '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; printf '%s %s\\n' '${opts.rebindAfterDelivery.pane}' '${opts.rebindAfterDelivery.name}' >> '${panes}'; fi; echo '{}'`
     : `echo '{}'`;
+  const countEnter = `if [[ "$*" == *Enter* ]]; then n=$(cat '${enterctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${enterctr}'; fi`;
   const sendKeys = opts.contendDelivery
-    ? `pane_send_keys "$@"`
-    : `if [[ "$*" == *C-u* ]]; then ${clearResult}; else ${enterResult}; fi`;
+    ? `${countEnter}; pane_send_keys "$@"`
+    : `${countEnter}; if [[ "$*" == *C-u* ]]; then ${clearResult}; else ${enterResult}; fi`;
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
@@ -171,7 +187,7 @@ describe("HerdrDriver (stubbed binary)", () => {
     const d = new HerdrDriver(bin);
     const slot = await d.slot(cwd, "n1");
     await d.run(slot, "echo hi");
-    expect(await d.read(slot, 50)).toContain("line1");
+    expect(await d.read(slot, 50)).toContain("worker-output");
     await d.close(slot);
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("pane list"); // re-resolution reads the label back (never a cached id)
@@ -394,7 +410,7 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
     await d.run({ id: "w1:p42", name: "painting", cwd }, "echo hi");
 
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)).toHaveLength(4);
+    expect(calls.match(/^pane read /gm)).toHaveLength(5); // includes the immediate post-Enter verification
     expect(calls).toContain("pane send-keys w1:p42 C-u");
     expect(calls).toContain("pane send-keys w1:p42 Enter");
   });
@@ -438,7 +454,7 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
     }
 
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)).toHaveLength(3);
+    expect(calls.match(/^pane read /gm)).toHaveLength(4); // includes the immediate post-Enter verification
     expect(calls).toContain("pane send-keys w1:p42 Enter");
     expect(usedShortTimer).toBe(false);
   });
@@ -534,6 +550,73 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
     expect(secondSend).toBeGreaterThanOrEqual(0);
     expect(readBack).toBeGreaterThan(secondSend);
     expect(enter).toBeGreaterThan(readBack);
+  });
+});
+
+describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
+  async function submissionSlot(d: HerdrDriver, cwd: string, taskId: string) {
+    return d.slot(cwd, `${taskId}-worker-${kimi.id}-a0-submit`, {
+      group: "workers",
+      owned: { role: "worker", taskId, attempt: 0, runId: "run-submit" },
+    });
+  }
+
+  test("test: a pane that swallows the first enter receives a bounded re-press and the delivery completes once the prompt leaves the input line", async () => {
+    const { bin, log, cwd } = makeStub(0, { submission: "second" });
+    const d = new HerdrDriver(bin);
+
+    await d.run(await submissionSlot(d, cwd, "T1"), "echo hi");
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(2);
+    expect(calls.match(/^pane send-text w1:p9 echo hi$/gm)).toHaveLength(1);
+  });
+
+  test("test: a pane that submits on the first enter sees no re-press and no added settle delay", async () => {
+    const { bin, log, cwd } = makeStub(0, { submission: "first" });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    let usedSettleTimer = false;
+    try {
+      const d = new HerdrDriver(bin);
+      await d.run(await submissionSlot(d, cwd, "T2"), "echo hi");
+      usedSettleTimer = timers.mock.calls.some(
+        ([, delay]) => typeof delay === "number" && delay > 0 && delay <= 1000,
+      );
+    } finally {
+      timers.mockRestore();
+    }
+
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const enter = lines.findIndex((line) => line === "pane send-keys w1:p9 Enter");
+    const verify = lines.findIndex((line, index) => index > enter && line.startsWith("pane read w1:p9"));
+    expect(lines.filter((line) => line === "pane send-keys w1:p9 Enter")).toHaveLength(1);
+    expect(verify).toBeGreaterThan(enter);
+    expect(usedSettleTimer).toBe(false);
+  });
+
+  test("test: submission that never registers within the bounded window fails closed with the existing delivery-failure error class", async () => {
+    const { bin, log, cwd } = makeStub(0, { submission: "never" });
+    const d = new HerdrDriver(bin);
+
+    await expect(d.run(await submissionSlot(d, cwd, "T3"), "echo hi")).rejects.toThrow(
+      /herdr delivery corrupted after .* submission never registered/,
+    );
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(2);
+  });
+
+  test("test: verification runs before any re-press so a slow but successful submit is never submitted twice", async () => {
+    const { bin, log, cwd } = makeStub(0, { submission: "slow" });
+    const d = new HerdrDriver(bin);
+
+    await d.run(await submissionSlot(d, cwd, "T4"), "echo hi");
+
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const enter = lines.findIndex((line) => line === "pane send-keys w1:p9 Enter");
+    const verifies = lines.filter((line, index) => index > enter && line.startsWith("pane read w1:p9"));
+    expect(verifies.length).toBeGreaterThan(1);
+    expect(lines.filter((line) => line === "pane send-keys w1:p9 Enter")).toHaveLength(1);
   });
 });
 

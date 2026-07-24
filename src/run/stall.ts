@@ -1,12 +1,9 @@
-// OBS-82: codex's MCP-startup spinner repaints a braille glyph + elapsed-time cell forever, so the
-// daemon's raw snapshot compare reads a wedged pane as active and the stall clock never fires.
-// This normalizer deletes ONLY presentation tokens from a closed allowlist — ANSI/VT escape
-// sequences, braille-range spinner glyphs, and elapsed-time tokens bound to time-unit suffixes.
-// Every other byte passes through identical: words, paths, server names, and progress counts
-// (a five-of-seven counter change IS activity) all remain change-sensitive. The asymmetry is the
-// design: an allowlist MISS degrades to today's recoverable no-reap behavior, while an over-broad
-// deletion would reap a healthy worker — a new failure class. Grow the allowlist only with
-// captured evidence (tests/fixtures/codex-mcp-spinner/).
+// OBS-82: normalize known presentation tokens before measuring transcript extent or filtering an
+// LLM-bound transcript. This remains a closed allowlist — ANSI/VT escapes, braille-range spinner
+// glyphs, and elapsed-time tokens bound to time-unit suffixes. Every other byte passes through
+// identical. v1.76 deliberately stopped treating arbitrary normalized byte changes as progress:
+// StallProgressTracker below requires monotonic evidence, so an unknown repaint fails closed toward
+// a recoverable consult instead of holding the watchdog silent.
 
 // CSI (with intermediates), OSC (BEL- or ST-terminated), DCS/SOS/PM/APC strings, single-char
 // escapes, and charset selection — the raw-pty forms; herdr pane reads are already rendered.
@@ -20,12 +17,52 @@ const SPINNER_RE = /[⠀-⣿]/g;
 // word: 9s, 41s, 3m, 1h, 800ms. Never bare digits — "(6/7)" and "5 of 7" stay change-sensitive.
 const ELAPSED_RE = /(?<![\w.])\d+(?:\.\d+)?(?:ms|[hms])(?!\w)/g;
 
-/** Normalize one pane snapshot for the stall-inactivity compare (trailer parsing, harvest,
- * waitOutput, and paging read the raw text; the LLM transcript filter below reuses this to
- * CLASSIFY presentation-only lines, never to rewrite kept bytes). Two snapshots that normalize
- * equal are the same frame modulo spinner presentation; any other byte difference is activity. */
+/** Normalize presentation tokens for transcript extent and LLM-noise classification. Trailer
+ * parsing, harvest, waitOutput, and paging always read the raw text. */
 export function normalizeStallSnapshot(text: string): string {
   return text.replace(ANSI_RE, "").replace(SPINNER_RE, "").replace(ELAPSED_RE, "");
+}
+
+export interface StallProgressSample {
+  paneText: string;
+  seedSubmitted?: boolean;
+  contextTokens?: number;
+}
+
+/**
+ * Monotonic worker-progress measure for the stall watchdog.
+ *
+ * Terminal chrome is allowed to repaint arbitrary bytes in place, so byte differences are not
+ * evidence of work. A rendered transcript is only known to have grown when it occupies more
+ * non-empty rows than any prior sample. Same-row rewrites are deliberately ambiguous and do not
+ * advance the clock: a recoverable early consult is safer than silencing the watchdog forever.
+ */
+export class StallProgressTracker {
+  private transcriptRows = 0;
+  private seedSubmitted = false;
+  private contextTokens: number | undefined;
+
+  observe(sample: StallProgressSample): boolean {
+    let advanced = false;
+    const rows = normalizeStallSnapshot(sample.paneText)
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .length;
+    if (rows > this.transcriptRows) {
+      this.transcriptRows = rows;
+      advanced = true;
+    }
+    if (sample.seedSubmitted && !this.seedSubmitted) {
+      this.seedSubmitted = true;
+      advanced = true;
+    }
+    const tokens = sample.contextTokens;
+    if (tokens !== undefined && Number.isFinite(tokens)) {
+      if (tokens > (this.contextTokens ?? 0)) advanced = true;
+      this.contextTokens = Math.max(this.contextTokens ?? 0, tokens);
+    }
+    return advanced;
+  }
 }
 
 // ─── v1.65 T2: LLM-bound transcript filter ──────────────────────────────────────────────────────

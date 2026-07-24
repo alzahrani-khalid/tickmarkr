@@ -10,6 +10,8 @@ import type { Assignment } from "../../src/adapters/types.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 
 const ASSIGNMENT: Assignment = { adapter: "kimi", model: "kimi-code/k3", channel: "sub", tier: "frontier" };
+const FULL_MODEL = "kimi-code/kimi-for-coding";
+const RETIRED_ALIAS = "kimi-for-coding";
 
 function makeKimiSeedDriver(banner: string, opts: { submit?: boolean } = {}) {
   let buf = banner;
@@ -51,6 +53,18 @@ function makeKimiSeedDriver(banner: string, opts: { submit?: boolean } = {}) {
 describe("kimi TUI seed banner checks", () => {
   test("kimi declares its bordered steady-state input box through the adapter contract", () => {
     expect(kimi.inputBox?.fingerprint).toBe("Send /help for help information.");
+  });
+
+  test("test: the interactive launch command carries the full configured model identifier rather than a stripped suffix", () => {
+    expect(kimi.interactiveSeed?.launch(FULL_MODEL)).toBe(`kimi -y -m '${FULL_MODEL}'`);
+  });
+
+  test("test: the banner model parse maps whatever the banner prints back to the same channel identifier routing uses", () => {
+    for (const printedModel of [FULL_MODEL, RETIRED_ALIAS]) {
+      const banner = `Model: ${printedModel}`;
+      expect(kimiBannerModel(banner)).toBe(FULL_MODEL);
+      expect(confirmKimiSeedBanner(banner, FULL_MODEL)).toEqual({ ok: true, sessionId: undefined });
+    }
   });
 
   test("the launch banner's named model line is checked against the assigned channel before the seed line is injected, failing closed on a mismatch rather than seeding blind", async () => {

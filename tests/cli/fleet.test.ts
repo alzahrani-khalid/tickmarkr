@@ -1288,7 +1288,7 @@ review:
     expect(readFileSync(overlayAt(repo), "utf8")).toContain("pin:");
   });
 
-  test("escape closes the picker without changing the shape row", async () => {
+  test("test: the escape path asserts the settled cursor row and passes across delayed frame timings", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
@@ -1301,11 +1301,14 @@ review:
     const rowBefore = pointerLine(io.writes.filter(shapeFrame).at(-1)!);
     expect(rowBefore).toContain("fake:fake-1");
     // a lone ESC resolves via node's escape-sequence timeout (500ms) — settle covers it
+    const mark = io.writes.length;
     io.input.write(KEYS.escape);
-    // settle until the picker has fully CLOSED — the settled frame is shape routing again and no longer
-    // shows the picker. Asserting on io.writes.at(-1) before the close settled caught a pre-close frame.
-    await settle(() => shapeFrame(io.writes.at(-1) ?? ""));
-    expect(pointerLine(io.writes.at(-1)!)).toBe(rowBefore);
+    // Assert the post-Escape cursor-row identity itself. Polling that fact tolerates a delayed close frame;
+    // filtering from mark excludes the pre-picker row, while a real move to another shape never satisfies it.
+    const escapedShapeRow = () => pointerLine(
+      io.writes.slice(mark).filter(shapeFrame).at(-1) ?? "",
+    );
+    await expect.poll(escapedShapeRow, { interval: 5, timeout: 2_000 }).toBe(rowBefore);
     io.input.write(KEYS.enter + KEYS.enter);
     expect(await done).toBe("fleet: no overlay changes (empty diff)");
     // the escape exit path inherits the OBS-70 close contract
