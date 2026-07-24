@@ -9,6 +9,7 @@ import { kimiSessionId } from "../../src/adapters/kimi.js";
 import { type BillingChannel, shq } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
 import { DEFAULT_CONFIG, TIER_RANK, type Tier } from "../../src/config/config.js";
+import { DeliveryReadinessError } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
 import { gatePaneName } from "../../src/gates/llm.js";
@@ -38,6 +39,29 @@ const interactiveDriver = () => {
     status: inner.status.bind(inner),
     slot: inner.slot.bind(inner),
     run: inner.run.bind(inner),
+    waitOutput: inner.waitOutput.bind(inner),
+    waitAgentStatus: inner.waitAgentStatus.bind(inner),
+    read: inner.read.bind(inner),
+    notify: inner.notify.bind(inner),
+    close: inner.close.bind(inner),
+    worktree: inner.worktree.bind(inner),
+  };
+};
+
+const readinessFailingDriver = (failures: number, waitedMs = 875, transcript = "cold pane still painting") => {
+  const inner = new SubprocessDriver();
+  let workerRuns = 0;
+  return {
+    id: "readiness-test",
+    interactive: false,
+    status: inner.status.bind(inner),
+    slot: inner.slot.bind(inner),
+    async run(slot: Slot, cmd: string) {
+      if ((slot.name.startsWith("tickmarkr:worker:") || slot.name.includes("-worker-")) && workerRuns++ < failures) {
+        throw new DeliveryReadinessError(waitedMs, transcript);
+      }
+      await inner.run(slot, cmd);
+    },
     waitOutput: inner.waitOutput.bind(inner),
     waitAgentStatus: inner.waitAgentStatus.bind(inner),
     read: inner.read.bind(inner),
@@ -1078,7 +1102,61 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(row.parkKind).toBeUndefined();
   });
 
-  test("a zero-attempt dispatch exception is journaled with a typed non-quality cause", async () => {
+  test("test: a first-attempt readiness failure re-dispatches a fresh attempt rather than failing the task", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [
+        { shell: "true", result: { ok: true, summary: "readiness prevents this command" } },
+        { shell: `echo ready > ready.txt && ${COMMIT} ready`, result: { ok: true, summary: "fresh retry" } },
+      ] } },
+    );
+
+    const s = await runDaemon(repo, {
+      adapters: [fake],
+      runId: "run-readiness-retry",
+      driver: readinessFailingDriver(1),
+    });
+
+    expect(s.done).toEqual(["T1"]);
+    expect(s.failed).toEqual([]);
+    const events = Journal.open(repo, "run-readiness-retry").read();
+    const dispatches = events.filter((e) => e.event === "task-dispatch");
+    expect(dispatches.map((e) => e.data.attempt)).toEqual([0, 1]);
+    expect(dispatches.map((e) => e.data.retryMode)).toEqual(["fresh", "fresh"]);
+    expect(events.filter((e) => e.event === "escalation").map((e) => e.data.step)).toEqual(["retry"]);
+    expect(events.some((e) => e.event === "task-failed")).toBe(false);
+  });
+
+  test("test: readiness failures that exhaust the attempt ladder park the task under the existing failure taxonomy", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      {
+        consult: { action: "retry", notes: "spend the next existing ladder rung" },
+        tasks: { T1: [{ shell: "true", result: { ok: true, summary: "never delivered" } }] },
+      },
+    );
+
+    const s = await runDaemon(repo, {
+      adapters: [fake],
+      runId: "run-readiness-exhausted",
+      driver: readinessFailingDriver(Number.POSITIVE_INFINITY),
+    });
+
+    expect(s.human).toEqual(["T1"]);
+    expect(s.failed).toEqual([]);
+    const events = Journal.open(repo, "run-readiness-exhausted").read();
+    expect(events.filter((e) => e.event === "escalation").map((e) => e.data.step)).toEqual([
+      "retry",
+      "escalate",
+      "consult",
+      "human",
+    ]);
+    expect(events.filter((e) => e.event === "task-dispatch")).toHaveLength(4);
+    expect(events.find((e) => e.event === "task-human")?.data.kind).toBe("ladder-exhausted");
+    expect(events.some((e) => e.event === "task-failed")).toBe(false);
+  });
+
+  test("test: a structural driver error still fails the task immediately without consuming the ladder", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "never runs" } }] } },
@@ -1101,8 +1179,36 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-dispatch-refusal", driver });
 
     expect(s.failed).toEqual(["T1"]);
-    const event = Journal.open(repo, "run-dispatch-refusal").read().find((e) => e.event === "task-failed")!;
+    const events = Journal.open(repo, "run-dispatch-refusal").read();
+    const event = events.find((e) => e.event === "task-failed")!;
     expect(event.data).toMatchObject({ kind: "dispatch", attempts: 0 });
+    expect(events.filter((e) => e.event === "task-dispatch")).toHaveLength(1);
+    expect(events.some((e) => e.event === "escalation")).toBe(false);
+  });
+
+  test("test: a readiness failure journals how long delivery waited and what the pane showed", async () => {
+    const transcript = "welcome banner\ninput box not listening";
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [
+        { shell: "true", result: { ok: true, summary: "readiness prevents this command" } },
+        { shell: `echo ready > ready.txt && ${COMMIT} ready`, result: { ok: true, summary: "fresh retry" } },
+      ] } },
+    );
+
+    await runDaemon(repo, {
+      adapters: [fake],
+      runId: "run-readiness-evidence",
+      driver: readinessFailingDriver(1, 1_375, transcript),
+    });
+
+    const event = Journal.open(repo, "run-readiness-evidence").read()
+      .find((e) => e.event === "delivery-readiness-failed");
+    expect(event?.data).toMatchObject({
+      attempt: 0,
+      waitedMs: 1_375,
+      transcript,
+    });
   });
 
   test("TEL-01 liar-positive: trailer ok:true but gates fail ⇒ outcome !== 'done'", async () => {

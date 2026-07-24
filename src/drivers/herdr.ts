@@ -1,4 +1,4 @@
-import { declaredInputBoxForWorkerName, matchesInputBox, shq, type InputBox } from "../adapters/types.js";
+import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, shq, type InputBox } from "../adapters/types.js";
 import { PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
@@ -15,6 +15,28 @@ const DELIVERY_VERIFY_TIMEOUT_MS = 2000; // per attempt — a paste that hasn't 
 const DELIVERY_READ_LINES = 80;
 const DELIVERY_SETTLE_READ_ATTEMPTS = 6;
 const DELIVERY_SETTLE_POLL_MS = 100;
+const DELIVERY_READINESS_TIMEOUT_MS = 1_000;
+
+interface DeliveryReadinessEvidence {
+  waitedMs: number;
+  timeoutMs: number;
+  transcript: string;
+}
+
+// OBS-142: a typed identity lets the daemon's next task distinguish cold-start variance from
+// structural driver faults without parsing prose. The message also carries the bounded wait and
+// final pane evidence so a terminal failure is diagnosable on its own.
+export class DeliveryReadinessError extends Error {
+  readonly phase = "READINESS";
+
+  constructor(
+    readonly waitedMs: number,
+    readonly transcript: string,
+  ) {
+    super(`herdr delivery READINESS failed after ${waitedMs}ms — interface never became interactive (OBS-142); pane transcript:\n${transcript}`);
+    this.name = "DeliveryReadinessError";
+  }
+}
 
 /** First-generation join direction from measured trailer-safe floor (43-MEASUREMENT.md). */
 export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILER_SAFE_FLOOR_COLS, margin = TRAILER_WIDTH_MARGIN): "right" | "down" {
@@ -111,16 +133,16 @@ export class HerdrDriver implements ExecutorDriver {
     return needle.length > 0 && hay.includes(needle);
   }
 
-  // Submission succeeds when the typed prompt disappears, or when it has moved above a fresh
-  // adapter-declared input box (the prompt is now transcript, not input). Shell-line delivery uses
-  // the same normalized seam: a prompt still at the bottom ends the pane text; output/a fresh prompt
-  // after it proves Enter registered. No adapter-specific fingerprint lives in the driver.
+  // Submission requires positive post-Enter evidence. A prompt echoed above a fresh input target
+  // proves registration; a declared box that is visibly empty after the verified paste also proves
+  // it consumed the prompt. Prompt absence alone is never success (OBS-142).
   private submissionRegistered(transcript: string, cmd: string, inputBox?: InputBox): boolean {
     const norm = (s: string) => s.replace(/\s+/g, "");
     const hay = norm(transcript);
     const needle = norm(cmd);
     const promptAt = hay.lastIndexOf(needle);
-    if (needle.length === 0 || promptAt < 0) return true;
+    if (needle.length === 0) return false;
+    if (promptAt < 0) return inputBox !== undefined && matchesEmptyInputBox(transcript, inputBox);
     if (inputBox && matchesInputBox(transcript, inputBox)) {
       return hay.lastIndexOf(norm(inputBox.fingerprint)) > promptAt;
     }
@@ -418,7 +440,8 @@ export class HerdrDriver implements ExecutorDriver {
     });
   }
 
-  private async deliver(slot: Slot, cmd: string, pane: string): Promise<void> {
+  private async deliver(slot: Slot, cmd: string, pane: string, verifySubmission = true): Promise<void> {
+    const readiness = await this.awaitDeliveryReadiness(slot, cmd, pane);
     let transcript = "";
     for (let attempt = 0; attempt < DELIVERY_ATTEMPTS; attempt++) {
       if (attempt > 0) {
@@ -452,7 +475,12 @@ export class HerdrDriver implements ExecutorDriver {
         DELIVERY_VERIFY_TIMEOUT_MS + 15_000,
       );
       if (this.waitOk(back.code, back.stdout) || await this.deliveryReadMatches(pane, cmd, slot.cwd)) {
-        await this.submitVerifiedDelivery(slot, cmd, pane);
+        if (verifySubmission) {
+          await this.submitVerifiedDelivery(slot, cmd, pane, readiness);
+        } else {
+          const enter = await this.herdr(`pane send-keys ${shq(pane)} Enter`, slot.cwd);
+          if (enter.code !== 0) throw new Error(`herdr pane send-keys Enter failed: ${enter.stderr || enter.stdout}`);
+        }
         return;
       }
       // capture the corrupted delivery BEFORE clearing it — the OBS-85 byte-level evidence
@@ -461,9 +489,32 @@ export class HerdrDriver implements ExecutorDriver {
     throw new Error(`herdr delivery corrupted after ${DELIVERY_ATTEMPTS} attempts — enter never pressed (OBS-85); pane transcript:\n${transcript}`);
   }
 
-  private async submitVerifiedDelivery(slot: Slot, cmd: string, pane: string): Promise<void> {
+  // The narrator launches a perpetual shell watch, not an adapter-backed input interface. Keep
+  // OBS-85's readiness + paste read-back and the historical single Enter, while worker/gate runs
+  // continue through positive post-Enter evidence in submitVerifiedDelivery.
+  private async deliverPersistentShellCommand(slot: Slot, cmd: string): Promise<void> {
+    return this.deliveryQueue(async () => {
+      const pane = await this.paneId(slot);
+      await this.deliver(slot, cmd, pane, false);
+      this.deliveredPanes.set(slot, pane);
+    });
+  }
+
+  private async submitVerifiedDelivery(
+    slot: Slot,
+    cmd: string,
+    pane: string,
+    readiness: DeliveryReadinessEvidence,
+  ): Promise<void> {
     let transcript = "";
     const inputBox = this.inputBoxes.get(slot);
+    // The base window preserves OBS-140's bounded behavior. A slow readiness observation grants
+    // the same measured time once more for submit paint, capped by the readiness bound itself.
+    const baseVerifyMs = (DELIVERY_SETTLE_READ_ATTEMPTS - 1) * DELIVERY_SETTLE_POLL_MS;
+    const verifyWindowMs = Math.min(
+      baseVerifyMs + readiness.timeoutMs,
+      baseVerifyMs + readiness.waitedMs,
+    );
     for (let attempt = 0; attempt < DELIVERY_SUBMIT_ATTEMPTS; attempt++) {
       const enter = await this.herdr(`pane send-keys ${shq(pane)} Enter`, slot.cwd);
       if (enter.code !== 0) throw new Error(`herdr pane send-keys Enter failed: ${enter.stderr || enter.stdout}`);
@@ -477,6 +528,7 @@ export class HerdrDriver implements ExecutorDriver {
         transcript,
         inputBox,
         (candidate) => this.submissionRegistered(candidate, cmd, inputBox),
+        verifyWindowMs,
       );
       transcript = settled.transcript;
       if (settled.ok) return;
@@ -495,9 +547,13 @@ export class HerdrDriver implements ExecutorDriver {
     initialTranscript: string,
     inputBox?: InputBox,
     accept?: (transcript: string) => boolean,
+    settleWindowMs?: number,
   ): Promise<{ ok: boolean; transcript: string; recognizedInputBox: boolean; readFailed?: boolean }> {
     let transcript = initialTranscript;
-    for (let readAttempt = 0; readAttempt < DELIVERY_SETTLE_READ_ATTEMPTS; readAttempt++) {
+    const readAttempts = settleWindowMs === undefined
+      ? DELIVERY_SETTLE_READ_ATTEMPTS
+      : Math.max(DELIVERY_SETTLE_READ_ATTEMPTS, Math.floor(settleWindowMs / DELIVERY_SETTLE_POLL_MS) + 1);
+    for (let readAttempt = 0; readAttempt < readAttempts; readAttempt++) {
       const read = await this.herdr(
         `pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`,
         cwd,
@@ -518,11 +574,66 @@ export class HerdrDriver implements ExecutorDriver {
         };
       }
       transcript = read.stdout;
-      if (readAttempt < DELIVERY_SETTLE_READ_ATTEMPTS - 1) {
+      if (readAttempt < readAttempts - 1) {
         await new Promise((resolve) => setTimeout(resolve, DELIVERY_SETTLE_POLL_MS));
       }
     }
     return { ok: false, transcript, recognizedInputBox: false };
+  }
+
+  private async awaitDeliveryReadiness(
+    slot: Slot,
+    cmd: string,
+    pane: string,
+  ): Promise<DeliveryReadinessEvidence> {
+    const inputBox = this.inputBoxes.get(slot);
+    const requireInputBox = inputBox !== undefined && inputBox.launchCommand?.(cmd) !== true;
+    const timeoutMs = inputBox?.readinessTimeoutMs ?? DELIVERY_READINESS_TIMEOUT_MS;
+    const started = Date.now();
+    let previous: string | undefined;
+    let transcript = "";
+    let reads = 0;
+
+    while (true) {
+      const elapsedBeforeRead = Date.now() - started;
+      const remainingBeforeRead = timeoutMs - elapsedBeforeRead;
+      if (remainingBeforeRead <= 0) throw new DeliveryReadinessError(elapsedBeforeRead, transcript);
+      const read = await this.herdr(
+        `pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`,
+        slot.cwd,
+        Math.max(1, Math.ceil(remainingBeforeRead)),
+      );
+      reads++;
+      transcript = read.stdout || transcript;
+      const waitedMs = Date.now() - started;
+      if (read.code !== 0) {
+        // Once at least one valid frame has been observed, a read that consumes the remainder of
+        // the readiness budget is the bounded window expiring, not a new submission/protocol
+        // identity. A first-read timeout and every non-timeout read failure remain structural.
+        if (read.timedOut && previous !== undefined && waitedMs >= timeoutMs) {
+          throw new DeliveryReadinessError(waitedMs, transcript);
+        }
+        const detail = read.stderr || read.stdout || `exit ${read.code}`;
+        throw new Error(`herdr pane read failed during readiness${read.timedOut ? " (timed out)" : ""}: ${detail}`);
+      }
+
+      if (previous !== undefined) {
+        const stableFrame = read.stdout === previous;
+        const targetReady = stableFrame && (requireInputBox
+          ? matchesInputBox(previous, inputBox!) && matchesInputBox(read.stdout, inputBox!)
+          : !this.deliveryMatches(read.stdout, cmd));
+        if (targetReady) return { waitedMs, timeoutMs, transcript: read.stdout };
+      }
+      previous = read.stdout;
+
+      const remaining = timeoutMs - waitedMs;
+      if (remaining <= 0) throw new DeliveryReadinessError(waitedMs, transcript);
+      // The second read is immediate: an already-painted stable target proves readiness with no
+      // added delay. Only observed change spends a poll interval, and every path remains bounded.
+      if (reads > 1) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(DELIVERY_SETTLE_POLL_MS, remaining)));
+      }
+    }
   }
 
   private async deliveryReadMatches(pane: string, cmd: string, cwd: string): Promise<boolean> {
@@ -719,7 +830,7 @@ export class HerdrDriver implements ExecutorDriver {
       const s = await this.watchSlot(cwd, name);
       this.watches.set(name, s);
       try {
-        await this.run(s, command);
+        await this.deliverPersistentShellCommand(s, command);
       } catch (err) {
         this.watches.delete(name);
         throw err;

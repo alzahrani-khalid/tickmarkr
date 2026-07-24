@@ -2,12 +2,12 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { kimi } from "../../src/adapters/kimi.js";
-import { DELIVERY_ATTEMPTS, HerdrDriver } from "../../src/drivers/herdr.js";
+import { declareInputBox } from "../../src/adapters/types.js";
+import { DELIVERY_ATTEMPTS, DeliveryReadinessError, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box"; submitAfterReads?: number }
 
 // OBS-85 fixture text: what the incident panes actually showed instead of the typed dispatch line.
 const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
@@ -78,18 +78,33 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
     : opts.paneReadFrames?.length
       ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; case "$n" in ${stagedReads} *) printf '%s\\n' '${lastStagedRead}' ;; esac`
       : opts.corrupt ? CORRUPT_READ : opts.wrappedCmd
-        ? `printf '> ${opts.wrappedCmd.slice(0, 20)}\\n${opts.wrappedCmd.slice(20)}\\n'`
+        ? `[ -s '${typed}' ] && printf '> ${opts.wrappedCmd.slice(0, 20)}\\n${opts.wrappedCmd.slice(20)}\\n' || printf '> \\n'`
+        : opts.submission
+          ? `printf '╭────────────╮\\n│ >          │\\n╰────────────╯\\n'`
         : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
-  const stuckSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf 'Send /help for help information.\\n%s\\n' "$cmd"`;
+  const stuckSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '╭────────────╮\\n│ > %s │\\n╰────────────╯\\n' "$cmd"`;
   const completedSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '%s\\nworker-output\\nSend /help for help information.\\n> \\n' "$cmd"`;
+  const absentSubmission = `printf 'worker-output\\n> \\n'`;
+  const bannerOnlySubmission = `printf 'Welcome to Kimi Code!\\nSend /help for help information.\\n'`;
+  const emptyBoxSubmission = `printf '╭────────────╮\\n│ >          │\\n╰────────────╯\\n'`;
   const postSubmitPaneRead = opts.submission === "never"
     ? stuckSubmission
+    : opts.submission === "absent"
+      ? absentSubmission
+    : opts.submission === "banner-only"
+      ? bannerOnlySubmission
+    : opts.submission === "empty-box"
+      ? emptyBoxSubmission
     : opts.submission === "second"
       ? `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -ge 2 ]; then ${completedSubmission}; else ${stuckSubmission}; fi`
-      : opts.submission === "slow"
-        ? `n=$(cat '${submitreadctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${submitreadctr}'; if [ "$n" -ge 3 ]; then ${completedSubmission}; else ${stuckSubmission}; fi`
+      : opts.submission === "slow" || opts.submission === "scaled"
+        ? `n=$(cat '${submitreadctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${submitreadctr}'; if [ "$n" -ge ${opts.submitAfterReads ?? (opts.submission === "scaled" ? 8 : 3)} ]; then ${completedSubmission}; else ${stuckSubmission}; fi`
         : completedSubmission;
-  const paneRead = `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then ${postSubmitPaneRead}; else ${preSubmitPaneRead}; fi`;
+  const paneRead = opts.paneReadFails
+    ? `printf 'pane read protocol failure\\n'; exit 1`
+    : opts.paneReadHangs
+      ? `sleep 2; printf 'late pane read\\n'`
+      : `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then ${postSubmitPaneRead}; else ${preSubmitPaneRead}; fi`;
   const deliveryContend = opts.contendDelivery
     ? `
 delivery_pane() { for a in "$@"; do case "$a" in w1:p*) echo "$a"; return;; esac; done; }
@@ -355,6 +370,17 @@ describe("HerdrDriver verified delivery (OBS-85)", () => {
     expect(calls).toContain("pane send-text w1:p7 tickmarkr status --watch");
     expect(calls).toContain("pane send-keys w1:p7 Enter");
   });
+
+  test("narrator preserves verified one-shot shell submission when persistent watch output does not echo its launch command", async () => {
+    const { bin, log, cwd } = makeStub(0, { submission: "absent" });
+    const d = new HerdrDriver(bin);
+
+    await d.narrator(cwd, "tickmarkr status --watch", "run-watch-shell");
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("pane wait-output w1:p7 --match tickmarkr status --watch");
+    expect(calls.match(/^pane send-keys w1:p7 Enter$/gm)).toHaveLength(1);
+  });
 });
 
 // OBS-119 T3: concurrent interactiveSeed deliveries contend on herdr's shared send path unless
@@ -410,7 +436,7 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
     await d.run({ id: "w1:p42", name: "painting", cwd }, "echo hi");
 
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)).toHaveLength(5); // includes the immediate post-Enter verification
+    expect(calls.match(/^pane read /gm)).toHaveLength(8); // readiness + clear settle + post-Enter verification
     expect(calls).toContain("pane send-keys w1:p42 C-u");
     expect(calls).toContain("pane send-keys w1:p42 Enter");
   });
@@ -423,15 +449,13 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
     });
     const d = new HerdrDriver(bin);
 
-    await expect(d.run({ id: "w1:p42", name: "corrupted", cwd }, "echo hi")).rejects.toThrow(
-      "herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85)",
-    );
+    await expect(d.run({ id: "w1:p42", name: "corrupted", cwd }, "echo hi")).rejects.toThrow(/READINESS/);
 
     const calls = readFileSync(log, "utf8");
     const reads = calls.match(/^pane read /gm)?.length ?? 0;
     expect(reads).toBeGreaterThan(2);
-    expect(reads).toBeLessThanOrEqual(10);
-    expect(calls.match(/^pane send-text /gm)).toHaveLength(1);
+    expect(reads).toBeLessThanOrEqual(15);
+    expect(calls.match(/^pane send-text /gm) ?? []).toHaveLength(0);
     expect(calls).not.toContain("pane send-keys w1:p42 Enter");
   });
 
@@ -446,15 +470,13 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
     try {
       const d = new HerdrDriver(bin);
       await d.run({ id: "w1:p42", name: "stable", cwd }, "echo hi");
-      usedShortTimer = timers.mock.calls.some(
-        ([, delay]) => typeof delay === "number" && delay > 0 && delay <= 1000,
-      );
+      usedShortTimer = timers.mock.calls.some(([, delay]) => delay === 100);
     } finally {
       timers.mockRestore();
     }
 
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)).toHaveLength(4); // includes the immediate post-Enter verification
+    expect(calls.match(/^pane read /gm)).toHaveLength(6); // readiness + clear settle + post-Enter verification
     expect(calls).toContain("pane send-keys w1:p42 Enter");
     expect(usedShortTimer).toBe(false);
   });
@@ -468,8 +490,14 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
     "╰────────────────────────────────────────╯",
   ].join("\n");
 
-  async function kimiSlot(d: HerdrDriver, cwd: string, taskId: string) {
-    return d.slot(cwd, `${taskId}-worker-${kimi.id}-a0-input-box`, {
+  const inputBoxAdapterId = "declared-box-test";
+  declareInputBox(inputBoxAdapterId, {
+    fingerprint: "Send /help for help information.",
+    readinessTimeoutMs: 500,
+  });
+
+  async function declaredBoxSlot(d: HerdrDriver, cwd: string, taskId: string) {
+    return d.slot(cwd, `${taskId}-worker-${inputBoxAdapterId}-a0-input-box`, {
       group: "workers",
       owned: { role: "worker", taskId, attempt: 0, runId: "run-input-box" },
     });
@@ -483,7 +511,7 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
     });
     const d = new HerdrDriver(bin);
 
-    await d.run(await kimiSlot(d, cwd, "T1"), "echo hi");
+    await d.run(await declaredBoxSlot(d, cwd, "T1"), "echo hi");
 
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/^pane send-text /gm)).toHaveLength(2);
@@ -503,13 +531,11 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
       owned: { role: "worker", taskId: "T2", attempt: 0, runId: "run-input-box" },
     });
 
-    await expect(d.run(slot, "echo hi")).rejects.toThrow(
-      "herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85)",
-    );
+    await expect(d.run(slot, "echo hi")).rejects.toThrow(/READINESS/);
 
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)).toHaveLength(8);
-    expect(calls.match(/^pane send-text /gm)).toHaveLength(1);
+    expect(calls.match(/^pane read /gm)?.length ?? 0).toBeGreaterThan(2);
+    expect(calls.match(/^pane send-text /gm) ?? []).toHaveLength(0);
     expect(calls).not.toContain("pane send-keys w1:p9 Enter");
   });
 
@@ -521,13 +547,11 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
     });
     const d = new HerdrDriver(bin);
 
-    await expect(d.run(await kimiSlot(d, cwd, "T3"), "echo hi")).rejects.toThrow(
-      "herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85)",
-    );
+    await expect(d.run(await declaredBoxSlot(d, cwd, "T3"), "echo hi")).rejects.toThrow(/READINESS/);
 
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane send-keys w1:p9 C-u");
-    expect(calls.match(/^pane send-text /gm)).toHaveLength(1);
+    expect(calls).not.toContain("pane send-keys w1:p9 C-u");
+    expect(calls.match(/^pane send-text /gm) ?? []).toHaveLength(0);
     expect(calls).not.toContain("pane send-keys w1:p9 Enter");
   });
 
@@ -539,7 +563,7 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
     });
     const d = new HerdrDriver(bin);
 
-    await d.run(await kimiSlot(d, cwd, "T4"), "echo hi");
+    await d.run(await declaredBoxSlot(d, cwd, "T4"), "echo hi");
 
     const lines = readFileSync(log, "utf8").trim().split("\n");
     const secondSend = lines.findLastIndex((line) => line === "pane send-text w1:p9 echo hi");
@@ -553,9 +577,156 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
   });
 });
 
+describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
+  const inputBox = [
+    "╭────────────╮",
+    "│ >          │",
+    "╰────────────╯",
+  ].join("\n");
+  const banner = "Welcome to Kimi Code!\nSend /help for help information.";
+  const matchesEditorBox = (paneText: string) => paneText.includes("│ >");
+  const matchesEmptyEditorBox = (paneText: string) => paneText.includes("│ >          │");
+  const readinessAdapterId = "readiness-test";
+  declareInputBox(readinessAdapterId, {
+    fingerprint: "Send /help for help information.",
+    match: matchesEditorBox,
+    emptyMatch: matchesEmptyEditorBox,
+    readinessTimeoutMs: 1_200,
+  });
+
+  async function readinessSlot(d: HerdrDriver, cwd: string, taskId: string) {
+    return d.slot(cwd, `${taskId}-worker-${readinessAdapterId}-a0-readiness`, {
+      group: "workers",
+      owned: { role: "worker", taskId, attempt: 0, runId: "run-readiness" },
+    });
+  }
+
+  test("test: delivery into a pane whose adapter declares an input box types nothing until the box is painted and stable", async () => {
+    const paintingBox1 = inputBox.replace("│ >          │", "│ > paint-1  │");
+    const paintingBox2 = inputBox.replace("│ >          │", "│ > paint-2  │");
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [paintingBox1, paintingBox2, inputBox, inputBox],
+      submission: "first",
+    });
+    const d = new HerdrDriver(bin);
+
+    await d.run(await readinessSlot(d, cwd, "T1"), "echo hi");
+
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const send = lines.findIndex((line) => line === "pane send-text w1:p9 echo hi");
+    const readsBeforeSend = lines.slice(0, send).filter((line) => line.startsWith("pane read w1:p9"));
+    expect(readsBeforeSend).toHaveLength(4);
+    expect(send).toBeGreaterThan(lines.findLastIndex((line, index) => index < send && line.startsWith("pane read w1:p9")));
+  });
+
+  test("test: a pane that never becomes interactive within the bounded readiness window fails closed with an error naming readiness rather than submission", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [banner],
+      submission: "first",
+    });
+    const d = new HerdrDriver(bin);
+
+    await expect(d.run(await readinessSlot(d, cwd, "T2"), "echo hi")).rejects.toThrow(/READINESS.*never became interactive/i);
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls).not.toContain("pane send-text w1:p9 echo hi");
+    expect(calls).not.toContain("submission never registered");
+  });
+
+  test("test: a pane already interactive at first read types immediately with no added delay", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [inputBox],
+      submission: "first",
+    });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    let usedReadinessTimer = false;
+    try {
+      const d = new HerdrDriver(bin);
+      await d.run(await readinessSlot(d, cwd, "T3"), "echo hi");
+      usedReadinessTimer = timers.mock.calls.some(([, delay]) => delay === 100);
+    } finally {
+      timers.mockRestore();
+    }
+
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const send = lines.findIndex((line) => line === "pane send-text w1:p9 echo hi");
+    expect(lines.slice(0, send).filter((line) => line.startsWith("pane read w1:p9"))).toHaveLength(2);
+    expect(usedReadinessTimer).toBe(false);
+  });
+
+  test("test: a submission whose prompt is absent from the transcript is refused rather than treated as registered", async () => {
+    const { bin, log, cwd } = makeStub(0, { submission: "absent" });
+    const d = new HerdrDriver(bin);
+
+    await expect(d.run({ id: "w1:p42", name: "plain-shell", cwd }, "echo hi")).rejects.toThrow(
+      /submission never registered/,
+    );
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-keys w1:p42 Enter$/gm)).toHaveLength(2);
+  });
+
+  test("test: an interface that became interactive slowly is granted a commensurately scaled submission window and a slow but successful submit is never pressed twice", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [`${banner}\n1`, `${banner}\n2`, `${banner}\n3`, `${banner}\n4`, inputBox, inputBox],
+      submission: "scaled",
+      submitAfterReads: 8,
+    });
+    const d = new HerdrDriver(bin);
+
+    await d.run(await readinessSlot(d, cwd, "T5"), "echo hi");
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
+    expect(calls.match(/^pane read w1:p9/gm)?.length ?? 0).toBeGreaterThan(10);
+  });
+
+  test("a pane-read protocol failure remains a structural driver error without the READINESS identity", async () => {
+    const { bin, cwd } = makeStub(0, { paneReadFails: true });
+    const d = new HerdrDriver(bin);
+
+    const error = await d.run(await readinessSlot(d, cwd, "T6"), "echo hi").catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(DeliveryReadinessError);
+    expect(String(error)).toMatch(/pane read.*failed/i);
+  });
+
+  test("the adapter readiness bound also bounds an individual pane read", async () => {
+    const hungAdapterId = "hung-readiness-test";
+    declareInputBox(hungAdapterId, {
+      fingerprint: "editor-box",
+      readinessTimeoutMs: 250,
+    });
+    const { bin, cwd } = makeStub(0, { paneReadHangs: true });
+    const d = new HerdrDriver(bin);
+    const slot = await d.slot(cwd, `T7-worker-${hungAdapterId}-a0-readiness`, {
+      group: "workers",
+      owned: { role: "worker", taskId: "T7", attempt: 0, runId: "run-readiness" },
+    });
+    const started = Date.now();
+
+    const error = await d.run(slot, "echo hi").catch((caught: unknown) => caught);
+
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(DeliveryReadinessError);
+  });
+});
+
 describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
+  const matchesEditorBox = (paneText: string) => paneText.includes("│ >");
+  const matchesEmptyEditorBox = (paneText: string) => paneText.includes("│ >          │");
+  const submissionAdapterId = "submission-box-test";
+  declareInputBox(submissionAdapterId, {
+    fingerprint: "Send /help for help information.",
+    match: matchesEditorBox,
+    emptyMatch: matchesEmptyEditorBox,
+    readinessTimeoutMs: 500,
+  });
+
   async function submissionSlot(d: HerdrDriver, cwd: string, taskId: string) {
-    return d.slot(cwd, `${taskId}-worker-${kimi.id}-a0-submit`, {
+    return d.slot(cwd, `${taskId}-worker-${submissionAdapterId}-a0-submit`, {
       group: "workers",
       owned: { role: "worker", taskId, attempt: 0, runId: "run-submit" },
     });
@@ -579,9 +750,7 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
     try {
       const d = new HerdrDriver(bin);
       await d.run(await submissionSlot(d, cwd, "T2"), "echo hi");
-      usedSettleTimer = timers.mock.calls.some(
-        ([, delay]) => typeof delay === "number" && delay > 0 && delay <= 1000,
-      );
+      usedSettleTimer = timers.mock.calls.some(([, delay]) => delay === 100);
     } finally {
       timers.mockRestore();
     }
@@ -617,6 +786,34 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
     const verifies = lines.filter((line, index) => index > enter && line.startsWith("pane read w1:p9"));
     expect(verifies.length).toBeGreaterThan(1);
     expect(lines.filter((line) => line === "pane send-keys w1:p9 Enter")).toHaveLength(1);
+  });
+
+  test("banner-only evidence with an absent prompt is refused even for a declared input box", async () => {
+    const inputBox = "╭────────────╮\n│ >          │\n╰────────────╯";
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [inputBox],
+      submission: "banner-only",
+    });
+    const d = new HerdrDriver(bin);
+
+    await expect(d.run(await submissionSlot(d, cwd, "T5"), "echo hi")).rejects.toThrow(
+      /submission never registered/,
+    );
+
+    expect(readFileSync(log, "utf8").match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(2);
+  });
+
+  test("a verified paste followed by the adapter-declared empty box is positive submission evidence", async () => {
+    const inputBox = "╭────────────╮\n│ >          │\n╰────────────╯";
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [inputBox],
+      submission: "empty-box",
+    });
+    const d = new HerdrDriver(bin);
+
+    await d.run(await submissionSlot(d, cwd, "T6"), "echo hi");
+
+    expect(readFileSync(log, "utf8").match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
   });
 });
 

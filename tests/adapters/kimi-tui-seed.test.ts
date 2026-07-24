@@ -52,7 +52,16 @@ function makeKimiSeedDriver(banner: string, opts: { submit?: boolean } = {}) {
 
 describe("kimi TUI seed banner checks", () => {
   test("kimi declares its bordered steady-state input box through the adapter contract", () => {
-    expect(kimi.inputBox?.fingerprint).toBe("Send /help for help information.");
+    const emptyEditor = "╭────────────╮\n│ >          │\n╰────────────╯";
+    const welcomeBanner = "Welcome to Kimi Code!\nSend /help for help information.";
+    expect(kimi.inputBox?.fingerprint).toBe("│ > ");
+    expect(kimi.inputBox?.match?.(emptyEditor)).toBe(true);
+    expect(kimi.inputBox?.emptyMatch?.(emptyEditor)).toBe(true);
+    expect(kimi.inputBox?.match?.(welcomeBanner)).toBe(false);
+    expect(kimi.inputBox?.emptyMatch?.(welcomeBanner)).toBe(false);
+    expect(kimi.inputBox?.launchCommand?.(kimi.interactiveSeed!.launch(FULL_MODEL))).toBe(true);
+    expect(kimi.inputBox?.launchCommand?.("Read /tmp/prompt.md and do exactly what it says.")).toBe(false);
+    expect(kimi.inputBox?.readinessTimeoutMs).toBe(15_000);
   });
 
   test("test: the interactive launch command carries the full configured model identifier rather than a stripped suffix", () => {

@@ -12,6 +12,7 @@ import {
   globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
 } from "../config/config.js";
+import { DeliveryReadinessError } from "../drivers/herdr.js";
 import { herdrSealShellPrefix, SubprocessDriver } from "../drivers/subprocess.js";
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
@@ -905,6 +906,36 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let earlyLaunchDead = false;
       let settleParsed: WorkerResult | undefined;
       let seedResult: InteractiveSeedResult | undefined;
+      const handleDeliveryReadiness = async (error: DeliveryReadinessError): Promise<boolean> => {
+        journal.append("delivery-readiness-failed", t.id, {
+          attempt,
+          waitedMs: error.waitedMs,
+          transcript: error.transcript,
+        });
+        if (keepOpen) keptSlots.push(slot);
+        else await closeSlot(slot);
+        feedback = `delivery readiness failed after ${error.waitedMs}ms; pane transcript:\n${error.transcript}`;
+        const step = r.ladder[Math.min(ladderIdx++, r.ladder.length - 1)];
+        journal.append("escalation", t.id, { step, attempt: attempt + 1 });
+        await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${step}`, { tier: "attention" });
+
+        if (step === "retry") return true;
+        if (step === "escalate") {
+          const next = failover("escalate");
+          if (next) {
+            assignment = next;
+            tried.push(channelKey(next));
+            return true;
+          }
+          // no channel left — fall through to a consult
+        }
+        if (step === "escalate" || step === "consult") {
+          const v = await runConsult("delivery-readiness", error.transcript, feedback, []);
+          return applyVerdict(v, attempt + 1, "dispatch");
+        }
+        await park(t, "escalation ladder exhausted", "ladder-exhausted", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
+        return false;
+      };
       if (interactive) {
         // v1.2 interactive: the TUI doesn't exit on completion — the trailer is the finish line.
         // The exit wrapper still fires if the TUI dies (crash/quit): fast-fail instead of burning the timeout.
@@ -914,10 +945,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // v1.69 T6: launch the real TUI without a prompt, wait for readiness, inject one seed turn,
           // then fall through to the normal trailer harvest. A failed seed is recorded as a finished
           // failure rather than allowed to race the trailer wait.
-          seedResult = await runInteractiveSeed({ driver, slot, adapter, assignment, promptFile, taskTimeoutMinutes });
+          try {
+            seedResult = await runInteractiveSeed({ driver, slot, adapter, assignment, promptFile, taskTimeoutMinutes });
+          } catch (error) {
+            if (!(error instanceof DeliveryReadinessError)) throw error;
+            if (await handleDeliveryReadiness(error)) continue attempts;
+            return;
+          }
           output = seedResult.output;
         } else {
-          await driver.run(slot, paneDispatchCommand(dispatchScript));
+          try {
+            await driver.run(slot, paneDispatchCommand(dispatchScript));
+          } catch (error) {
+            if (!(error instanceof DeliveryReadinessError)) throw error;
+            if (await handleDeliveryReadiness(error)) continue attempts;
+            return;
+          }
           output = await driver.read(slot, 1000);
         }
         if (seedResult?.seedFailed) {
@@ -1038,7 +1081,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
         }
       } else {
-        await driver.run(slot, paneDispatchCommand(dispatchScript));
+        try {
+          await driver.run(slot, paneDispatchCommand(dispatchScript));
+        } catch (error) {
+          if (!(error instanceof DeliveryReadinessError)) throw error;
+          if (await handleDeliveryReadiness(error)) continue attempts;
+          return;
+        }
         // OBS-54: headless workers have the same output-inactivity budget as visible panes.
         // v1.76: same monotonic-progress measure as the interactive site; harvest stays raw.
         const stallWindowMs = taskTimeoutMinutes * 60_000;

@@ -161,17 +161,42 @@ export interface KimiInteractiveSeedResult {
   sessionId?: string;
 }
 
-// v1.75 T1 / OBS-136: this readiness line is rendered inside Kimi Code's bordered steady-state
-// input box. The adapter owns the fingerprint; the driver only consults declarations generically.
+const kimiTuiLaunch = (model: string) => `kimi -y -m ${shq(model)}`;
+
+const KIMI_ANSI_SGR_RE = /\u001B\[[0-9;]*m/g;
+const KIMI_EDITOR_TOP_RE = /^╭─+╮$/;
+const KIMI_EDITOR_INPUT_RE = /^│ > .*│$/;
+const KIMI_EDITOR_EMPTY_RE = /^│ > +│$/;
+const KIMI_EDITOR_BOTTOM_RE = /^╰─+╯$/;
+
+function matchesKimiEditorBox(paneText: string, empty: boolean): boolean {
+  const lines = paneText.replace(KIMI_ANSI_SGR_RE, "").split("\n");
+  const input = empty ? KIMI_EDITOR_EMPTY_RE : KIMI_EDITOR_INPUT_RE;
+  return lines.some((line, index) =>
+    input.test(line)
+    && index > 0
+    && index + 1 < lines.length
+    && KIMI_EDITOR_TOP_RE.test(lines[index - 1])
+    && KIMI_EDITOR_BOTTOM_RE.test(lines[index + 1]));
+}
+
+// v1.75 T1 / OBS-136: Kimi's actual editor is a three-line bordered box whose content row starts
+// `│ > `. The welcome panel separately contains "Send /help..." and is only launch-liveness
+// evidence (OBS-142), so it must never satisfy this declaration. The adapter owns the full matcher,
+// empty-state matcher, launch distinction, and bounded cold-start window; the driver stays generic.
 export const KIMI_INPUT_BOX = declareInputBox("kimi", {
-  fingerprint: "Send /help for help information.",
+  fingerprint: "│ > ",
+  match: (paneText: string) => matchesKimiEditorBox(paneText, false),
+  emptyMatch: (paneText: string) => matchesKimiEditorBox(paneText, true),
+  launchCommand: (command: string) => command.startsWith("kimi -y -m "),
+  readinessTimeoutMs: 15_000,
 });
 
 // Shared launch-then-seed surface (T6) + banner confirm (T7/T2). One definition so the adapter
 // property and the daemon's generic runInteractiveSeed path cannot drift.
 const KIMI_SEED: InteractiveSeed = {
   // v1.76 T2 / OBS-141: 0.29.0 resolves only the full config.toml model key on the first turn.
-  launch: (model: string) => `kimi -y -m ${shq(model)}`,
+  launch: kimiTuiLaunch,
   readinessMatch: "Send /help for help information.",
   seedLine: (promptFile: string) => `Read ${promptFile} and do exactly what it says.`,
   confirmBanner: confirmKimiSeedBanner,
