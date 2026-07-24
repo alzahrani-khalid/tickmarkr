@@ -5,7 +5,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type TrustVerdict, type WorkerAdapter } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
 
 // SPEND-07: codex writes per-session JSONL to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — date-partitioned,
 // NOT cwd-keyed. session_meta.payload.cwd is FILE-SCOPED (one codex exec per cwd). token_count events carry
@@ -80,6 +80,13 @@ const GITDIR_WRITABLE = `-c "sandbox_workspace_write.writable_roots=[\\"$(git re
 // -s/--sandbox workspace-write sandbox (deliberately NOT --dangerously-bypass-approvals-and-sandbox,
 // which would drop the sandbox). Listed by `codex --help` and `codex exec --help` (verified 2026-07-23).
 const CODEX_HOOK_TRUST = "--dangerously-bypass-hook-trust";
+
+// v1.75 T2 / OBS-137: current Codex workspace-trust prompt (0.144.6). The exact heading
+// is distinct from normal agent output; Enter accepts the selected "Yes, continue" option.
+export const CODEX_TRUST_DIALOG: TrustDialog = {
+  fingerprint: "Do you trust the contents of this directory?",
+  key: "Enter",
+};
 
 // v1.22 T5 / OBS-16: codex keys trust on absolute path under [projects."<root>"] trust_level="trusted"
 // in ~/.codex/config.toml (CODEX_HOME relocates the dir). Worktrees inherit parent-project trust when
@@ -192,6 +199,7 @@ export const codex: WorkerAdapter = {
   // v1.22 T5: seed [projects."<repoRoot>"] trust_level="trusted" so fresh worktrees never stall on
   // "Do you trust this directory?" (OBS-16). doctor-only side effect.
   trust: (repoRoot: string) => seedCodexTrust(repoRoot),
+  trustDialog: CODEX_TRUST_DIALOG,
   // v1.5 MODEL-01: file read only (no `codex models` subcommand exists, verified 2026-07-10).
   // Already fails OPEN to [] internally — advisory detection, unlike gates' fail-closed.
   listModels: async () => readCodexModelsCache().models,

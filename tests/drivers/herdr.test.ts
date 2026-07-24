@@ -2,6 +2,7 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { kimi } from "../../src/adapters/kimi.js";
 import { DELIVERY_ATTEMPTS, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
@@ -440,6 +441,99 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
     expect(calls.match(/^pane read /gm)).toHaveLength(3);
     expect(calls).toContain("pane send-keys w1:p42 Enter");
     expect(usedShortTimer).toBe(false);
+  });
+});
+
+describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
+  const inputBox = [
+    "╭────────────────────────────────────────╮",
+    "│ Welcome to Kimi Code CLI!              │",
+    "│ Send /help for help information.       │",
+    "╰────────────────────────────────────────╯",
+  ].join("\n");
+
+  async function kimiSlot(d: HerdrDriver, cwd: string, taskId: string) {
+    return d.slot(cwd, `${taskId}-worker-${kimi.id}-a0-input-box`, {
+      group: "workers",
+      owned: { role: "worker", taskId, attempt: 0, runId: "run-input-box" },
+    });
+  }
+
+  test("test: a pane presenting its adapter's declared input box in steady state receives its delivery with no refusal", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      corrupt: "once",
+      paneReadFrames: [inputBox],
+      clearFailsThroughRead: 100,
+    });
+    const d = new HerdrDriver(bin);
+
+    await d.run(await kimiSlot(d, cwd, "T1"), "echo hi");
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-text /gm)).toHaveLength(2);
+    expect(calls).not.toContain("pane send-keys w1:p9 C-u");
+    expect(calls).toContain("pane send-keys w1:p9 Enter");
+  });
+
+  test("test: an adapter with no declaration keeps the current line model and a corrupted line still refuses fail-closed after the bounded settle window", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      corrupt: "always",
+      changingPaneRead: true,
+      clearFailsThroughRead: 100,
+    });
+    const d = new HerdrDriver(bin);
+    const slot = await d.slot(cwd, "T2-worker-fake-a0-no-input-box", {
+      group: "workers",
+      owned: { role: "worker", taskId: "T2", attempt: 0, runId: "run-input-box" },
+    });
+
+    await expect(d.run(slot, "echo hi")).rejects.toThrow(
+      "herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85)",
+    );
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane read /gm)).toHaveLength(8);
+    expect(calls.match(/^pane send-text /gm)).toHaveLength(1);
+    expect(calls).not.toContain("pane send-keys w1:p9 Enter");
+  });
+
+  test("test: a pane whose content matches neither a clean line nor the declared input box still refuses fail-closed with the same error as before", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      corrupt: "always",
+      paneReadFrames: ["printf \"git: 'rev-parseprintf' is not a git command\\n\""],
+      clearFailsThroughRead: 100,
+    });
+    const d = new HerdrDriver(bin);
+
+    await expect(d.run(await kimiSlot(d, cwd, "T3"), "echo hi")).rejects.toThrow(
+      "herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85)",
+    );
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("pane send-keys w1:p9 C-u");
+    expect(calls.match(/^pane send-text /gm)).toHaveLength(1);
+    expect(calls).not.toContain("pane send-keys w1:p9 Enter");
+  });
+
+  test("test: delivery into a recognized input box still verifies by read-back that the typed command landed before submission", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      corrupt: "once",
+      paneReadFrames: [inputBox],
+      clearFailsThroughRead: 100,
+    });
+    const d = new HerdrDriver(bin);
+
+    await d.run(await kimiSlot(d, cwd, "T4"), "echo hi");
+
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const secondSend = lines.findLastIndex((line) => line === "pane send-text w1:p9 echo hi");
+    const readBack = lines.findIndex(
+      (line, index) => index > secondSend && line.startsWith("pane wait-output w1:p9 --match echo hi"),
+    );
+    const enter = lines.findIndex((line) => line === "pane send-keys w1:p9 Enter");
+    expect(secondSend).toBeGreaterThanOrEqual(0);
+    expect(readBack).toBeGreaterThan(secondSend);
+    expect(enter).toBeGreaterThan(readBack);
   });
 });
 

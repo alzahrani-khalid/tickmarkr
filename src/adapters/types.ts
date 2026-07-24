@@ -104,6 +104,30 @@ export function matchesTrustDialog(paneText: string, dialog: TrustDialog): boole
   return paneText.includes(dialog.fingerprint);
 }
 
+// v1.75 T1 / OBS-136: an adapter whose steady-state TUI presents a bordered input box declares
+// one distinctive pane-text fingerprint. The herdr driver associates declarations with worker
+// slots by the existing adapter-bearing dispatch name before that name is canonicalized.
+// No declaration means no alternate target: the shell-line settle/clear model stays unchanged.
+export interface InputBox {
+  fingerprint: string;
+}
+
+const inputBoxes = new Map<string, InputBox>();
+
+export function declareInputBox(adapterId: string, inputBox: InputBox): InputBox {
+  inputBoxes.set(adapterId, inputBox);
+  return inputBox;
+}
+
+export function declaredInputBoxForWorkerName(workerName: string): InputBox | undefined {
+  const adapterId = /^.+-worker-(.+)-a\d+-.+$/.exec(workerName)?.[1];
+  return adapterId === undefined ? undefined : inputBoxes.get(adapterId);
+}
+
+export function matchesInputBox(paneText: string, inputBox: InputBox): boolean {
+  return paneText.includes(inputBox.fingerprint);
+}
+
 export interface WorkerAdapter {
   id: string;
   vendor: string;
@@ -165,6 +189,9 @@ export interface WorkerAdapter {
   trust?(repoRoot: string): TrustVerdict;
   // v1.22 T5 / OBS-19: optional trust-dialog fingerprint for runtime auto-answer (see TrustDialog).
   trustDialog?: TrustDialog;
+  // v1.75 T1 / OBS-136: optional steady-state TUI input-box fingerprint. The herdr delivery
+  // clear-guard may retype without a shell C-u only when this adapter's own worker pane matches it.
+  inputBox?: InputBox;
   // v1.65 T3: the CLI flags this adapter's command strings hardcode, checked by doctor against
   // `<binary> --help` (flagDriftWarnings). Advisory only — a drift warning never changes channel
   // availability, routing, or dispatch; only doctor reads this.

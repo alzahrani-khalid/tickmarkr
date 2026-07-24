@@ -8,7 +8,7 @@ import { parseWorkerResult } from "./prompt.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { runInteractiveSeed } from "../run/interactive-seed.js";
 import { sh } from "../run/git.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, type InteractiveSeed, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerResult } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type InteractiveSeed, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerResult } from "./types.js";
 
 // KIMI-03 → v1.58 T5: the "no harness-readable counter" block (research F-6, 2026-07-17) is
 // LIFTED for collectUsage — kimi 0.27.0 writes a wire journal per agent at
@@ -136,6 +136,12 @@ export interface KimiInteractiveSeedResult {
   sessionId?: string;
 }
 
+// v1.75 T1 / OBS-136: this readiness line is rendered inside Kimi Code's bordered steady-state
+// input box. The adapter owns the fingerprint; the driver only consults declarations generically.
+export const KIMI_INPUT_BOX = declareInputBox("kimi", {
+  fingerprint: "Send /help for help information.",
+});
+
 // Shared launch-then-seed surface (T6) + banner confirm (T7/T2). One definition so the adapter
 // property and the daemon's generic runInteractiveSeed path cannot drift.
 const KIMI_SEED: InteractiveSeed = {
@@ -190,6 +196,7 @@ export const kimi: WorkerAdapter = {
   // prompt as one user turn. Banner model/session confirmation runs on the daemon's generic
   // runInteractiveSeed path via confirmBanner on KIMI_SEED (not a separate dispatch helper).
   interactiveSeed: KIMI_SEED,
+  inputBox: KIMI_INPUT_BOX,
   // v1.53 T3 resume — live-probed 2026-07-18: `-p` + `-S <id>` compose cleanly (no OBS-67-class
   // flag rejection) and the resumed session carries prior conversation state. `-S <id>` is the
   // deterministic form; `-c` rejected as primary — cwd-keyed, nondeterministic under worktree

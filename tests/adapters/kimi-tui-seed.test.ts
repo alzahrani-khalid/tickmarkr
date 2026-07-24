@@ -49,6 +49,10 @@ function makeKimiSeedDriver(banner: string, opts: { submit?: boolean } = {}) {
 }
 
 describe("kimi TUI seed banner checks", () => {
+  test("kimi declares its bordered steady-state input box through the adapter contract", () => {
+    expect(kimi.inputBox?.fingerprint).toBe("Send /help for help information.");
+  });
+
   test("the launch banner's named model line is checked against the assigned channel before the seed line is injected, failing closed on a mismatch rather than seeding blind", async () => {
     const banner = "Model: kimi-for-coding\nSession: session_11111111-aaaa-bbbb-cccc-111111111111\n";
     const { driver, slot, runs } = makeKimiSeedDriver(banner);

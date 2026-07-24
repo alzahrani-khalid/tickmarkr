@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter } from "./types.js";
+import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
 // SPEND-01/SPEND-11: claude writes a per-session JSONL to ~/.claude/projects/<slug>/ where slug is the
 // realpath'd cwd with every non-alphanumeric char replaced by "-" (verified 114/114 — 36-DIAGNOSIS.md).
@@ -23,6 +23,13 @@ import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConf
 // Phase 18's operator-price × tokens derivation, not a CLI claim.
 const MAX_SESSION_FILES = 20; // newest-first; a long-lived project dir can hold many sessions
 const MAX_SESSION_BYTES = 8_000_000; // per-file cap; a runaway JSONL cannot make the read unbounded
+
+// v1.75 T2 / OBS-137: current Claude Code workspace-trust prompt (2.1.218). The full question
+// distinguishes this startup gate from routine agent text; Enter accepts the selected trust option.
+export const CLAUDE_TRUST_DIALOG: TrustDialog = {
+  fingerprint: "Quick safety check: Is this a project you created or one you trust?",
+  key: "Enter",
+};
 
 export function claudeSlug(real: string): string {
   return real.replace(/[^A-Za-z0-9]/g, "-");
@@ -60,14 +67,12 @@ export const claudeCode: WorkerAdapter = {
   // flag must always follow the value, never the prompt.
   headlessCommand: (promptFile: string, model: string) =>
     `claude -p "$(cat ${shq(promptFile)})" --model ${shq(model)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format text`,
-  // HYG-03: the residual first-entry dialog on an interactive TUI is the workspace TRUST dialog (not MCP
-  // config loading) — CLI-imposed, no flag to pre-accept, only store is claude's global last-writer-wins
-  // ~/.claude.json keyed on the exact path. Closed WON'T-FIX (decision B, 2026-07-10): tickmarkr writes nothing
-  // to that file (a seed races claude's own writes, nondeterministically). Amortizes to one operator dismissal
-  // per stable worktree path; blocked-pane paging surfaces it. Do NOT change this command to "fix" the dialog —
-  // see .planning/REQUIREMENTS.md HYG-03 and 21-02-LIVE-CHECK.md. Revisit if upstream ships a --trust flag.
+  // HYG-03 / OBS-137: the residual first-entry dialog is workspace trust, not MCP config loading.
+  // Claude's only store is global last-writer-wins ~/.claude.json, so tickmarkr still does not seed it;
+  // the daemon safely answers only the exact adapter-declared dialog once per slot.
   interactiveCommand: (promptFile: string, model: string) =>
     `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+  trustDialog: CLAUDE_TRUST_DIALOG,
   resumeCommand: (sessionId: string, promptFile: string, model: string) =>
     `claude -r ${shq(sessionId)} --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {

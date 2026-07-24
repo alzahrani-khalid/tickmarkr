@@ -246,6 +246,45 @@ describe("tickmarkr fleet", () => {
     expect(out3).toContain("# mode: partner-led (global config)");
   });
 
+  test("print output renders the review steering preferences when the loaded config declares them", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gdir = isolatedGlobal();
+    withOverlay(repo, `${FAKE_TIERS}review:
+  prefer: [fake:fake-1, fake]
+`);
+
+    const out = await fleet(["--print", "--global-dir", gdir], repo, [fakeAdapter(repo)]);
+
+    expect(out).toContain(`review:
+  prefer: ["fake:fake-1","fake"]
+`);
+  });
+
+  test("print output renders the consult steering preferences when the loaded config declares them", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gdir = isolatedGlobal();
+    withOverlay(repo, `${FAKE_TIERS}consult:
+  prefer: [fake:fake-1]
+`);
+
+    const out = await fleet(["--print", "--global-dir", gdir], repo, [fakeAdapter(repo)]);
+
+    expect(out).toContain(`consult:
+  prefer: ["fake:fake-1"]
+`);
+  });
+
+  test("a config declaring no steering renders no empty steering block", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gdir = isolatedGlobal();
+    withOverlay(repo, FAKE_TIERS);
+
+    const out = await fleet(["--print", "--global-dir", gdir], repo, [fakeAdapter(repo)]);
+
+    expect(out).not.toContain("\nreview:\n");
+    expect(out).not.toContain("\nconsult:\n");
+  });
+
   test("launching without a terminal prints the existing non-interactive guidance and renders no interactive frame", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const io = makeIO();

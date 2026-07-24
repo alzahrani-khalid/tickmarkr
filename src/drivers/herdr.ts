@@ -1,4 +1,4 @@
-import { shq } from "../adapters/types.js";
+import { declaredInputBoxForWorkerName, matchesInputBox, shq, type InputBox } from "../adapters/types.js";
 import { PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
@@ -44,6 +44,7 @@ export class HerdrDriver implements ExecutorDriver {
   private deliverySerial: Promise<unknown> = Promise.resolve();
   private dispatchLeases = new WeakMap<Slot, DispatchLease>();
   private deliveredPanes = new WeakMap<Slot, string>();
+  private inputBoxes = new WeakMap<Slot, InputBox>();
 
   // VIS-10: the run's workspace id, captured once at construction (the daemon inherits it from the
   // operator's env before the driver is built). Required at slot() time, never in the constructor —
@@ -156,6 +157,7 @@ export class HerdrDriver implements ExecutorDriver {
   }
 
   async slot(cwd: string, name: string, opts?: SlotOpts): Promise<Slot> {
+    const inputBox = declaredInputBoxForWorkerName(name);
     // T1 ownership contract: `opts.owned` (T2 call sites) names the pane canonically —
     // tickmarkr:<role>:<taskId>:<attempt>:<runId>. Without it, `name` passes through byte-identical
     // (today's legacy daemon/gates/consult shapes) — canonicalizeLegacyName (types.ts) is what lets
@@ -168,11 +170,12 @@ export class HerdrDriver implements ExecutorDriver {
     // Production dispatch names are canonical even when the gate call site supplies the already-
     // formatted name rather than SlotOpts.owned. Hold one lease across slot() → run(); legacy/manual
     // slots retain their existing allocation-only semantics for compatibility.
-    if (parseOwnedName(resolved)) return this.reserveDispatch(allocate);
+    const slot = parseOwnedName(resolved) ? await this.reserveDispatch(allocate) : await allocate();
+    if (inputBox) this.inputBoxes.set(slot, inputBox);
     // group wins if both are set (a group tab is already stage-labeled; passing both is a caller bug).
     // label (without group) → dedicated labeled tab via tabSlot's third param: no groups-map entry, no
     // refcount, no groupSerial, no degrade latch — dedicated tabs have no shared state to guard (SUP-01).
-    return allocate(); // label undefined → defaults to name (today's behavior)
+    return slot; // label undefined → defaults to name (today's behavior)
   }
 
   // today's per-slot tab path, plus the VIS-04 orphan reap
@@ -406,15 +409,23 @@ export class HerdrDriver implements ExecutorDriver {
         // line only after two consecutive pane reads agree; an already-stable frame returns on the
         // first fresh read without a timer. A changing pane is bounded and preserves OBS-85's
         // fail-closed error instead of guessing from an adapter fingerprint.
-        const settled = await this.settleDeliveryLine(pane, slot.cwd, transcript);
+        const settled = await this.settleDeliveryLine(
+          pane,
+          slot.cwd,
+          transcript,
+          this.inputBoxes.get(slot),
+        );
         transcript = settled.transcript;
         if (!settled.ok) {
           throw new Error(`herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85); pane transcript:\n${transcript}`);
         }
-        // Clear the corrupted input line before retyping; a failed clear must NOT be retyped onto —
-        // corrupt-prefix + clean-retype would concatenate and false-verify by containment.
-        const cleared = await this.herdr(`pane send-keys ${shq(pane)} C-u`, slot.cwd);
-        if (cleared.code !== 0) throw new Error(`herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85); pane transcript:\n${transcript}`);
+        if (!settled.recognizedInputBox) {
+          // Clear the corrupted shell input line before retyping; a failed clear must NOT be retyped
+          // onto — corrupt-prefix + clean-retype would concatenate and false-verify by containment.
+          // A stable adapter-declared input box is already an empty legitimate delivery target.
+          const cleared = await this.herdr(`pane send-keys ${shq(pane)} C-u`, slot.cwd);
+          if (cleared.code !== 0) throw new Error(`herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85); pane transcript:\n${transcript}`);
+        }
       }
       const typed = await this.herdr(`pane send-text ${shq(pane)} ${shq(cmd)}`, slot.cwd);
       if (typed.code !== 0) throw new Error(`herdr pane send-text failed: ${typed.stderr || typed.stdout}`);
@@ -438,21 +449,28 @@ export class HerdrDriver implements ExecutorDriver {
     pane: string,
     cwd: string,
     initialTranscript: string,
-  ): Promise<{ ok: boolean; transcript: string }> {
+    inputBox?: InputBox,
+  ): Promise<{ ok: boolean; transcript: string; recognizedInputBox: boolean }> {
     let transcript = initialTranscript;
     for (let readAttempt = 0; readAttempt < DELIVERY_SETTLE_READ_ATTEMPTS; readAttempt++) {
       const read = await this.herdr(
         `pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`,
         cwd,
       );
-      if (read.code !== 0) return { ok: false, transcript: read.stdout || transcript };
-      if (read.stdout === transcript) return { ok: true, transcript };
+      if (read.code !== 0) return { ok: false, transcript: read.stdout || transcript, recognizedInputBox: false };
+      if (read.stdout === transcript) {
+        return {
+          ok: true,
+          transcript,
+          recognizedInputBox: inputBox !== undefined && matchesInputBox(transcript, inputBox),
+        };
+      }
       transcript = read.stdout;
       if (readAttempt < DELIVERY_SETTLE_READ_ATTEMPTS - 1) {
         await new Promise((resolve) => setTimeout(resolve, DELIVERY_SETTLE_POLL_MS));
       }
     }
-    return { ok: false, transcript };
+    return { ok: false, transcript, recognizedInputBox: false };
   }
 
   private async deliveryReadMatches(pane: string, cmd: string, cwd: string): Promise<boolean> {

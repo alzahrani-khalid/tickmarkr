@@ -12,7 +12,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.73.0";
+const PRIOR_RELEASE_VERSION = "1.74.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -66,9 +66,14 @@ describe("tickmarkr version", () => {
     expect(PKG_VERSION).not.toBe(PRIOR_RELEASE_VERSION);
     expect(lock.version).toBe(PKG_VERSION);
     expect(lock.packages[""]?.version).toBe(PKG_VERSION);
-    for (const path of [PKG_PATH, LOCK_PATH] as const) {
-      expect(readFileSync(path, "utf8")).not.toContain(`"version": "${PRIOR_RELEASE_VERSION}"`);
-    }
+    // package.json's only "version": key is the package's own, so a stale prior string there is a
+    // genuine half-bump.
+    expect(readFileSync(PKG_PATH, "utf8")).not.toContain(`"version": "${PRIOR_RELEASE_VERSION}"`);
+    // The lockfile's own declarations are its root and root-package version; a pinned devDependency
+    // may legitimately carry the prior release's version string (oxlint tracks it), so assert the
+    // OWN fields moved rather than scanning the whole file.
+    expect(lock.version).not.toBe(PRIOR_RELEASE_VERSION);
+    expect(lock.packages[""]?.version).not.toBe(PRIOR_RELEASE_VERSION);
     // the release guide's tag example must track the CURRENT version — a stale example walks an
     // operator into tagging the previous release (self-enforcing: every bump must refresh it)
     const releasing = readFileSync(RELEASING_PATH, "utf8");
@@ -76,16 +81,16 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the harness-truth theme rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.74[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/harness[- ]truth/i);
-    for (const change of ["graph-rehash", "resume --graph-changed", "not comparable", "prior-graph", "channel attribution", "empty circles", "second run", "live engagement", "fail closed", "diff cap", "file-level facts", "anti-flooding", "clear-guard", "consecutive-stable", "settle-retry", "adapter fingerprints", "fixed sleeps", "already-stable", "redacted", "redaction seam", "journal weight", "telemetry", "judge rows"]) {
+  test("the changelog entry names the interface-literacy theme rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.75[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/interface[- ]literacy/i);
+    for (const change of ["clear-guard", "adapter-declared input box", "declare-then-consult", "delivery target", "shell-line model", "fail-closed", "Kimi Code", "steady-state", "trust auto-answer", "claude and codex", "workspace-trust", "trustDialog seam", "once-per-slot", "blocked/idle precondition", "cursor's declaration", "auto-guess", "pages the operator", "fleet --print", "review and consult steering", "print surface"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.73.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.74.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

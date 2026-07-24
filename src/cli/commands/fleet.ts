@@ -100,6 +100,13 @@ function withModeLine(yaml: string, mode: RoutingMode | undefined): string {
   return `routing:\n  mode: ${mode}\n${yaml}`;
 }
 
+function formatFleetSteering(cfg: ResolvedRunMode["cfg"]): string {
+  const blocks: string[] = [];
+  if (cfg.review.prefer?.length) blocks.push(`review:\n  prefer: ${JSON.stringify(cfg.review.prefer)}`);
+  if (cfg.consult.prefer?.length) blocks.push(`consult:\n  prefer: ${JSON.stringify(cfg.consult.prefer)}`);
+  return blocks.length ? `${blocks.join("\n")}\n` : "";
+}
+
 // v1.51 T4: one gloss per routing mode on the fleet mode screen — mirrors the preset compiler.
 const MODE_GLOSS: Record<RoutingMode, string> = {
   "partner-led": "every shape frontier · explore off",
@@ -133,7 +140,9 @@ export async function fleet(
     const rm = resolveRunMode(cwd, { globalDir });
     const body = formatFleetPrint(cwd, { globalDir });
     const nl = body.indexOf("\n");
-    return `${body.slice(0, nl)}\n# mode: ${rm.mode.mode} (${rm.source})${body.slice(nl)}`;
+    // Steering comes from the same resolved config snapshot the editor consumes below,
+    // not from another parse of either raw overlay.
+    return `${body.slice(0, nl)}\n# mode: ${rm.mode.mode} (${rm.source})${body.slice(nl)}${formatFleetSteering(rm.cfg)}`;
   }
 
   if (!interactive) return { out: NON_TTY_MSG, code: 1 };
