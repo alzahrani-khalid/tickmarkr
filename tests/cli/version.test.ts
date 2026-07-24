@@ -12,7 +12,7 @@ const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
-const PRIOR_RELEASE_VERSION = "1.76.0";
+const PRIOR_RELEASE_VERSION = "1.77.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
@@ -81,16 +81,16 @@ describe("tickmarkr version", () => {
     expect(releasing).not.toContain(`v${PRIOR_RELEASE_VERSION}`);
   });
 
-  test("the changelog entry names the readiness-truth theme rather than generic filler", () => {
-    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.77[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
-    expect(entry).toMatch(/readiness[- ]truth/i);
-    for (const change of ["painted interface", "interactive readiness", "declared input box", "stable clean line", "launch-liveness", "positive evidence", "prompt echoed", "box emptied", "READINESS", "fresh attempt", "structural driver errors", "fail-closed"]) {
+  test("the changelog entry names the evidence-literacy theme rather than generic filler", () => {
+    const entry = readFileSync(CHANGELOG_PATH, "utf8").match(/## v1\.78[\s\S]*?(?=\n## |$)/)?.[0] ?? "";
+    expect(entry).toMatch(/evidence[- ]literacy/i);
+    for (const change of ["execution echo", "launch submit window", "controlled time", "shared helper", "tracked temp dirs", "suite end", "fail-closed"]) {
       expect(entry.toLowerCase()).toContain(change.toLowerCase());
     }
   });
 
   test("the prior-release constant in the version parity test moved forward to the release before this one", () => {
-    expect(PRIOR_RELEASE_VERSION).toBe("1.76.0");
+    expect(PRIOR_RELEASE_VERSION).toBe("1.77.0");
     expect(PRIOR_RELEASE_VERSION).not.toBe(PKG_VERSION);
   });
 

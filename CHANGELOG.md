@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.78 — evidence-literacy
+
+This evidence-literacy release teaches the verifier and its tests to read the legitimate evidence classes reality produces. Launch submission now accepts a prompt-prefixed execution echo as positive shell-stage evidence; once seen, the launch submit window hands responsibility to readiness machinery instead of demanding first paint, while no echo and no paint continue to fail-closed. Driver timing oracles use controlled time through injected settle and clock seams rather than racing wall-clock bounds, and the signal-reaper and build-provisioning tests use controlled time or load-proof deadlines. Test-temp hygiene gets an owner: the shared helper tracks the temp repos it creates, and shared setup reaps tracked temp dirs at suite end, covering the dominant leak classes without a broad migration.
+
 ## v1.77 — readiness-truth
 
 This readiness-truth release stops treating a painted interface as one that is listening. Delivery now gates on bounded interactive readiness: an adapter with a declared input box must show that box painted and stable, while an adapter without one must show a stable clean line; `readinessMatch` remains launch-liveness evidence, never permission to type. Submission verification accepts positive evidence only — the prompt echoed into the transcript, or the box emptied while remaining visible — so an absent prompt can no longer false-green. The submit window derives from the observed readiness timing, and a pane that never becomes interactive fails closed in the named READINESS phase with its waited duration and pane evidence journaled. A READINESS failure consumes a normal fresh attempt because cold-start variance can recover in a new pane, while structural driver errors remain immediately terminal. Every wait stays bounded and every uncertain path stays fail-closed.

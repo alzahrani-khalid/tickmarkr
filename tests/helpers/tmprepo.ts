@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -13,6 +13,25 @@ export const T = (id: string, over: Record<string, unknown> = {}) => ({
   id, title: id, goal: id, shape: "implement", complexity: 3, acceptance: ["done"], ...over,
 });
 
+const testTempDirs = new Set<string>();
+
+/**
+ * The temp-directory seam for tests. Create test-owned temp directories through this helper
+ * so tests/setup.ts can reap them at suite teardown; production source has no cleanup role.
+ */
+export function makeTestTempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  testTempDirs.add(dir);
+  return dir;
+}
+
+export function reapTestTempDirs(): void {
+  for (const dir of testTempDirs) {
+    rmSync(dir, { recursive: true, force: true });
+    testTempDirs.delete(dir);
+  }
+}
+
 // one fixture for every daemon suite: graph + config overlay + scripted fake adapter
 export function setupRepo(tasks: unknown[], script: object, extraCfg = ""): { repo: string; fake: FakeAdapter; scriptPath: string } {
   const repo = makeRepo({ "base.txt": "base\n" });
@@ -22,14 +41,14 @@ export function setupRepo(tasks: unknown[], script: object, extraCfg = ""): { re
     join(tickmarkrDir(repo), "config.yaml"),
     `judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\n${extraCfg}`,
   );
-  const sdir = mkdtempSync(join(tmpdir(), "tickmarkr-script-"));
+  const sdir = makeTestTempDir("tickmarkr-script-");
   const scriptPath = join(sdir, "s.json");
   writeFileSync(scriptPath, JSON.stringify({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: { approve: true, issues: [] }, ...script }));
   return { repo, fake: new FakeAdapter(scriptPath), scriptPath };
 }
 
 export function makeRepo(files: Record<string, string>): string {
-  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-repo-"));
+  const dir = makeTestTempDir("tickmarkr-repo-");
   const git = (c: string) => execSync(`git ${c}`, { cwd: dir, encoding: "utf8" });
   git("init -b main");
   git("config user.email tickmarkr@test.local");

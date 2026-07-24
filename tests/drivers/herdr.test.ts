@@ -1,13 +1,29 @@
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { declareInputBox } from "../../src/adapters/types.js";
 import { DELIVERY_ATTEMPTS, DeliveryReadinessError, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box"; submitAfterReads?: number }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo"; submitAfterReads?: number }
+
+function steppedTimeSource() {
+  let nowMs = 0;
+  const sleeps: number[] = [];
+  return {
+    time: {
+      now: () => nowMs,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        nowMs += ms;
+      },
+    },
+    sleeps,
+    now: () => nowMs,
+  };
+}
 
 // OBS-85 fixture text: what the incident panes actually showed instead of the typed dispatch line.
 const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
@@ -87,6 +103,8 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const absentSubmission = `printf 'worker-output\\n> \\n'`;
   const bannerOnlySubmission = `printf 'Welcome to Kimi Code!\\nSend /help for help information.\\n'`;
   const emptyBoxSubmission = `printf '╭────────────╮\\n│ >          │\\n╰────────────╯\\n'`;
+  const bareCommandSubmission = `cat '${typed}' 2>/dev/null; printf '\\n'`;
+  const executionEchoSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '➜  worker git:(task) ✗ %s\\n' "$cmd"`;
   const postSubmitPaneRead = opts.submission === "never"
     ? stuckSubmission
     : opts.submission === "absent"
@@ -95,6 +113,10 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
       ? bannerOnlySubmission
     : opts.submission === "empty-box"
       ? emptyBoxSubmission
+    : opts.submission === "bare-command"
+      ? bareCommandSubmission
+    : opts.submission === "execution-echo"
+      ? executionEchoSubmission
     : opts.submission === "second"
       ? `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -ge 2 ]; then ${completedSubmission}; else ${stuckSubmission}; fi`
       : opts.submission === "slow" || opts.submission === "scaled"
@@ -431,7 +453,8 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
       paneReadFrames: ["welcome-frame-top", "welcome-frame-bottom", "ready-prompt", "ready-prompt"],
       clearFailsThroughRead: 3,
     });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await d.run({ id: "w1:p42", name: "painting", cwd }, "echo hi");
 
@@ -447,7 +470,8 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
       changingPaneRead: true,
       clearFailsThroughRead: 100,
     });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await expect(d.run({ id: "w1:p42", name: "corrupted", cwd }, "echo hi")).rejects.toThrow(/READINESS/);
 
@@ -465,20 +489,14 @@ describe("HerdrDriver delivery clear settling (OBS-135)", () => {
       paneReadFrames: ["ready-prompt"],
       clearFailsThroughRead: 2,
     });
-    const timers = vi.spyOn(globalThis, "setTimeout");
-    let usedShortTimer = false;
-    try {
-      const d = new HerdrDriver(bin);
-      await d.run({ id: "w1:p42", name: "stable", cwd }, "echo hi");
-      usedShortTimer = timers.mock.calls.some(([, delay]) => delay === 100);
-    } finally {
-      timers.mockRestore();
-    }
+    const { time, sleeps } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
+    await d.run({ id: "w1:p42", name: "stable", cwd }, "echo hi");
 
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/^pane read /gm)).toHaveLength(6); // readiness + clear settle + post-Enter verification
     expect(calls).toContain("pane send-keys w1:p42 Enter");
-    expect(usedShortTimer).toBe(false);
+    expect(sleeps).toHaveLength(0);
   });
 });
 
@@ -525,7 +543,8 @@ describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
       changingPaneRead: true,
       clearFailsThroughRead: 100,
     });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
     const slot = await d.slot(cwd, "T2-worker-fake-a0-no-input-box", {
       group: "workers",
       owned: { role: "worker", taskId: "T2", attempt: 0, runId: "run-input-box" },
@@ -601,15 +620,21 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
     });
   }
 
-  // OBS-143: the slow-interface SUCCESS path gets its own adapter with a bound that dwarfs
-  // worst-case stub spawn latency on loaded CI runners — the shared 1200ms bound exists for
-  // the timeout test and loses a real-time race here (each frame costs one stub process spawn).
-  const slowReadinessAdapterId = "readiness-slow-test";
-  declareInputBox(slowReadinessAdapterId, {
-    fingerprint: "Send /help for help information.",
-    match: matchesEditorBox,
-    emptyMatch: matchesEmptyEditorBox,
-    readinessTimeoutMs: 30_000,
+  test("test: a slow-interface timing scenario completes deterministically by stepping the injected time source rather than sleeping", async () => {
+    const stepped = steppedTimeSource();
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [`${banner}\n1`, `${banner}\n2`, inputBox, inputBox],
+      submission: "scaled",
+      submitAfterReads: 3,
+    });
+    const d = new HerdrDriver(bin, 3, stepped.time);
+
+    await d.run(await readinessSlot(d, cwd, "T0"), "echo hi");
+
+    expect(stepped.sleeps.length).toBeGreaterThan(0);
+    expect(stepped.sleeps.every((ms) => ms === 100)).toBe(true);
+    expect(stepped.now()).toBe(stepped.sleeps.reduce((total, ms) => total + ms, 0));
+    expect(readFileSync(log, "utf8").match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
   });
 
   test("test: delivery into a pane whose adapter declares an input box types nothing until the box is painted and stable", async () => {
@@ -619,7 +644,8 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
       paneReadFrames: [paintingBox1, paintingBox2, inputBox, inputBox],
       submission: "first",
     });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await d.run(await readinessSlot(d, cwd, "T1"), "echo hi");
 
@@ -635,7 +661,8 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
       paneReadFrames: [banner],
       submission: "first",
     });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await expect(d.run(await readinessSlot(d, cwd, "T2"), "echo hi")).rejects.toThrow(/READINESS.*never became interactive/i);
 
@@ -649,25 +676,20 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
       paneReadFrames: [inputBox],
       submission: "first",
     });
-    const timers = vi.spyOn(globalThis, "setTimeout");
-    let usedReadinessTimer = false;
-    try {
-      const d = new HerdrDriver(bin);
-      await d.run(await readinessSlot(d, cwd, "T3"), "echo hi");
-      usedReadinessTimer = timers.mock.calls.some(([, delay]) => delay === 100);
-    } finally {
-      timers.mockRestore();
-    }
+    const { time, sleeps } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
+    await d.run(await readinessSlot(d, cwd, "T3"), "echo hi");
 
     const lines = readFileSync(log, "utf8").trim().split("\n");
     const send = lines.findIndex((line) => line === "pane send-text w1:p9 echo hi");
     expect(lines.slice(0, send).filter((line) => line.startsWith("pane read w1:p9"))).toHaveLength(2);
-    expect(usedReadinessTimer).toBe(false);
+    expect(sleeps).toHaveLength(0);
   });
 
   test("test: a submission whose prompt is absent from the transcript is refused rather than treated as registered", async () => {
     const { bin, log, cwd } = makeStub(0, { submission: "absent" });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await expect(d.run({ id: "w1:p42", name: "plain-shell", cwd }, "echo hi")).rejects.toThrow(
       /submission never registered/,
@@ -683,17 +705,15 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
       submission: "scaled",
       submitAfterReads: 8,
     });
-    const d = new HerdrDriver(bin);
+    const stepped = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, stepped.time);
 
-    const slowSlot = await d.slot(cwd, `T5-worker-${slowReadinessAdapterId}-a0-readiness`, {
-      group: "workers",
-      owned: { role: "worker", taskId: "T5", attempt: 0, runId: "run-readiness" },
-    });
-    await d.run(slowSlot, "echo hi");
+    await d.run(await readinessSlot(d, cwd, "T5"), "echo hi");
 
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
     expect(calls.match(/^pane read w1:p9/gm)?.length ?? 0).toBeGreaterThan(10);
+    expect(stepped.now()).toBeLessThan(1_200);
   });
 
   test("a pane-read protocol failure remains a structural driver error without the READINESS identity", async () => {
@@ -719,11 +739,8 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
       group: "workers",
       owned: { role: "worker", taskId: "T7", attempt: 0, runId: "run-readiness" },
     });
-    const started = Date.now();
-
     const error = await d.run(slot, "echo hi").catch((caught: unknown) => caught);
 
-    expect(Date.now() - started).toBeLessThan(1_500);
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(DeliveryReadinessError);
   });
@@ -749,7 +766,8 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
 
   test("test: a pane that swallows the first enter receives a bounded re-press and the delivery completes once the prompt leaves the input line", async () => {
     const { bin, log, cwd } = makeStub(0, { submission: "second" });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await d.run(await submissionSlot(d, cwd, "T1"), "echo hi");
 
@@ -760,27 +778,22 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
 
   test("test: a pane that submits on the first enter sees no re-press and no added settle delay", async () => {
     const { bin, log, cwd } = makeStub(0, { submission: "first" });
-    const timers = vi.spyOn(globalThis, "setTimeout");
-    let usedSettleTimer = false;
-    try {
-      const d = new HerdrDriver(bin);
-      await d.run(await submissionSlot(d, cwd, "T2"), "echo hi");
-      usedSettleTimer = timers.mock.calls.some(([, delay]) => delay === 100);
-    } finally {
-      timers.mockRestore();
-    }
+    const { time, sleeps } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
+    await d.run(await submissionSlot(d, cwd, "T2"), "echo hi");
 
     const lines = readFileSync(log, "utf8").trim().split("\n");
     const enter = lines.findIndex((line) => line === "pane send-keys w1:p9 Enter");
     const verify = lines.findIndex((line, index) => index > enter && line.startsWith("pane read w1:p9"));
     expect(lines.filter((line) => line === "pane send-keys w1:p9 Enter")).toHaveLength(1);
     expect(verify).toBeGreaterThan(enter);
-    expect(usedSettleTimer).toBe(false);
+    expect(sleeps).toHaveLength(0);
   });
 
   test("test: submission that never registers within the bounded window fails closed with the existing delivery-failure error class", async () => {
     const { bin, log, cwd } = makeStub(0, { submission: "never" });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await expect(d.run(await submissionSlot(d, cwd, "T3"), "echo hi")).rejects.toThrow(
       /herdr delivery corrupted after .* submission never registered/,
@@ -792,7 +805,8 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
 
   test("test: verification runs before any re-press so a slow but successful submit is never submitted twice", async () => {
     const { bin, log, cwd } = makeStub(0, { submission: "slow" });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await d.run(await submissionSlot(d, cwd, "T4"), "echo hi");
 
@@ -809,7 +823,8 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
       paneReadFrames: [inputBox],
       submission: "banner-only",
     });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await expect(d.run(await submissionSlot(d, cwd, "T5"), "echo hi")).rejects.toThrow(
       /submission never registered/,
@@ -824,11 +839,95 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
       paneReadFrames: [inputBox],
       submission: "empty-box",
     });
-    const d = new HerdrDriver(bin);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
 
     await d.run(await submissionSlot(d, cwd, "T6"), "echo hi");
 
     expect(readFileSync(log, "utf8").match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
+  });
+});
+
+describe("HerdrDriver launch execution-echo evidence (OBS-144)", () => {
+  const inputBox = "╭────────────╮\n│ >          │\n╰────────────╯";
+  const launchCommand = "launch-agent --model test";
+  const adapterId = "launch-echo-test";
+  declareInputBox(adapterId, {
+    fingerprint: "│ >",
+    match: (paneText: string) => paneText.includes("│ >"),
+    emptyMatch: (paneText: string) => paneText.includes("│ >          │"),
+    launchCommand: (command: string) => command === launchCommand,
+    readinessTimeoutMs: 500,
+  });
+
+  async function launchSlot(d: HerdrDriver, cwd: string, taskId: string) {
+    return d.slot(cwd, `${taskId}-worker-${adapterId}-a0-launch`, {
+      group: "workers",
+      owned: { role: "worker", taskId, attempt: 0, runId: "run-launch-echo" },
+    });
+  }
+
+  test("test: a launch whose command is prompt-echoed by the shell verifies as submitted even when the launched interface has painted nothing yet", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: ["➜  worker git:(task) ✗"],
+      submission: "execution-echo",
+    });
+    const d = new HerdrDriver(bin);
+
+    await expect(d.run(await launchSlot(d, cwd, "T1"), launchCommand)).resolves.toBeUndefined();
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane read w1:p9/gm)).toHaveLength(3); // two shell-readiness frames + the execution echo
+    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
+  });
+
+  test("test: after an echo-verified launch the readiness gate owns the wait for the interface and no submit re-press is sent", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: ["$"],
+      submission: "execution-echo",
+    });
+    const d = new HerdrDriver(bin);
+    const slot = await launchSlot(d, cwd, "T2");
+
+    await d.run(slot, launchCommand);
+    await expect(d.waitOutput(slot, "interface-ready", 5_000)).resolves.toBe(true);
+
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const enter = lines.findIndex((line) => line === "pane send-keys w1:p9 Enter");
+    const readinessWait = lines.findIndex((line) =>
+      line.startsWith("pane wait-output w1:p9 --match interface-ready"));
+    expect(lines.filter((line) => line === "pane send-keys w1:p9 Enter")).toHaveLength(1);
+    expect(readinessWait).toBeGreaterThan(enter);
+  });
+
+  test("test: a delivery showing neither an execution echo nor an empty declared input box within its bounds still refuses fail-closed with the existing error identity", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: ["$"],
+      submission: "bare-command",
+    });
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
+
+    await expect(d.run(await launchSlot(d, cwd, "T3"), launchCommand)).rejects.toThrow(
+      /herdr delivery corrupted after 2 submit attempts — submission never registered \(OBS-140\)/,
+    );
+
+    expect(readFileSync(log, "utf8").match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(2);
+  });
+
+  test("test: a seed delivery into a painted input box keeps its current verification behavior unchanged", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      paneReadFrames: [inputBox],
+      submission: "empty-box",
+    });
+    const d = new HerdrDriver(bin);
+    const seedCommand = "read the task prompt";
+
+    await d.run(await launchSlot(d, cwd, "T4"), seedCommand);
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane send-text w1:p9 read the task prompt$/gm)).toHaveLength(1);
+    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
   });
 });
 
@@ -843,7 +942,7 @@ describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
       });
       // Reproduce the real dispatch seam: command preparation yields after slot() returns.
       // A correct allocation lease remains held until run(); the old split mutex does not.
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await Promise.resolve();
       await d.run(slot, command);
       return slot;
     };

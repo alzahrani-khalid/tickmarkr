@@ -23,6 +23,16 @@ interface DeliveryReadinessEvidence {
   transcript: string;
 }
 
+export interface HerdrTimeSource {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+const SYSTEM_TIME: HerdrTimeSource = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
 // OBS-142: a typed identity lets the daemon's next task distinguish cold-start variance from
 // structural driver faults without parsing prose. The message also carries the bounded wait and
 // final pane evidence so a terminal failure is diagnosable on its own.
@@ -76,7 +86,11 @@ export class HerdrDriver implements ExecutorDriver {
   private callerPane = process.env.HERDR_PANE_ID;
   private watches = new Map<string, Slot>();
 
-  constructor(private bin = "herdr", private workersPerTab = 3) {}
+  constructor(
+    private bin = "herdr",
+    private workersPerTab = 3,
+    private time: HerdrTimeSource = SYSTEM_TIME,
+  ) {}
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.groupSerial.then(fn, fn);
@@ -133,15 +147,32 @@ export class HerdrDriver implements ExecutorDriver {
     return needle.length > 0 && hay.includes(needle);
   }
 
+  private shellExecutionEchoed(transcript: string, cmd: string): boolean {
+    const norm = (s: string) => s.replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\s+/g, " ").trim();
+    const needle = norm(cmd);
+    if (!needle) return false;
+    return transcript.split("\n").some((rawLine) => {
+      const line = norm(rawLine);
+      if (line === needle || !line.endsWith(needle)) return false;
+      const prefix = line.slice(0, -needle.length).trimEnd();
+      if (/[│┃╭╰┌└]/.test(prefix)) return false;
+      return /^(?:[$%#>]|[➜❯❱›»λ])(?:\s|$)/.test(prefix)
+        || /[$%#>✗❯❱›»λ]$/.test(prefix);
+    });
+  }
+
   // Submission requires positive post-Enter evidence. A prompt echoed above a fresh input target
   // proves registration; a declared box that is visibly empty after the verified paste also proves
-  // it consumed the prompt. Prompt absence alone is never success (OBS-142).
+  // it consumed the prompt. At the launch stage, a structurally prompt-prefixed shell execution echo
+  // is stronger evidence than waiting for first paint from the launched interface (OBS-144).
+  // Prompt absence alone is never success (OBS-142).
   private submissionRegistered(transcript: string, cmd: string, inputBox?: InputBox): boolean {
     const norm = (s: string) => s.replace(/\s+/g, "");
     const hay = norm(transcript);
     const needle = norm(cmd);
     const promptAt = hay.lastIndexOf(needle);
     if (needle.length === 0) return false;
+    if (inputBox?.launchCommand?.(cmd) === true && this.shellExecutionEchoed(transcript, cmd)) return true;
     if (promptAt < 0) return inputBox !== undefined && matchesEmptyInputBox(transcript, inputBox);
     if (inputBox && matchesInputBox(transcript, inputBox)) {
       return hay.lastIndexOf(norm(inputBox.fingerprint)) > promptAt;
@@ -575,7 +606,7 @@ export class HerdrDriver implements ExecutorDriver {
       }
       transcript = read.stdout;
       if (readAttempt < readAttempts - 1) {
-        await new Promise((resolve) => setTimeout(resolve, DELIVERY_SETTLE_POLL_MS));
+        await this.time.sleep(DELIVERY_SETTLE_POLL_MS);
       }
     }
     return { ok: false, transcript, recognizedInputBox: false };
@@ -589,13 +620,13 @@ export class HerdrDriver implements ExecutorDriver {
     const inputBox = this.inputBoxes.get(slot);
     const requireInputBox = inputBox !== undefined && inputBox.launchCommand?.(cmd) !== true;
     const timeoutMs = inputBox?.readinessTimeoutMs ?? DELIVERY_READINESS_TIMEOUT_MS;
-    const started = Date.now();
+    const started = this.time.now();
     let previous: string | undefined;
     let transcript = "";
     let reads = 0;
 
     while (true) {
-      const elapsedBeforeRead = Date.now() - started;
+      const elapsedBeforeRead = this.time.now() - started;
       const remainingBeforeRead = timeoutMs - elapsedBeforeRead;
       if (remainingBeforeRead <= 0) throw new DeliveryReadinessError(elapsedBeforeRead, transcript);
       const read = await this.herdr(
@@ -605,7 +636,7 @@ export class HerdrDriver implements ExecutorDriver {
       );
       reads++;
       transcript = read.stdout || transcript;
-      const waitedMs = Date.now() - started;
+      const waitedMs = this.time.now() - started;
       if (read.code !== 0) {
         // Once at least one valid frame has been observed, a read that consumes the remainder of
         // the readiness budget is the bounded window expiring, not a new submission/protocol
@@ -631,7 +662,7 @@ export class HerdrDriver implements ExecutorDriver {
       // The second read is immediate: an already-painted stable target proves readiness with no
       // added delay. Only observed change spends a poll interval, and every path remains bounded.
       if (reads > 1) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(DELIVERY_SETTLE_POLL_MS, remaining)));
+        await this.time.sleep(Math.min(DELIVERY_SETTLE_POLL_MS, remaining));
       }
     }
   }

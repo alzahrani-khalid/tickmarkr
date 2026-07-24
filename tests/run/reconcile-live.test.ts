@@ -264,6 +264,15 @@ describe("daemon reconciliation at safe points (fake adapter, zero tokens)", () 
 // (never process.emit — vitest's listeners must not see a synthetic signal) with an injected exit.
 describe("daemon signal reaper (fake adapter, zero tokens)", () => {
   interface FiredState { code: number; liveAtExit: string[]; lockHeldAtExit: boolean }
+  interface ReconcileTestTiming {
+    now: () => number;
+    yield: () => Promise<void>;
+  }
+  const RECONCILE_FIRE_TIMEOUT_MS = 60_000;
+  const SYSTEM_RECONCILE_TIMING: ReconcileTestTiming = {
+    now: () => Date.now(),
+    yield: () => new Promise<void>((resolve) => setImmediate(resolve)),
+  };
 
   // Runs a daemon on paneWorld, waits until `fireWhen` holds, fires the daemon's SIGTERM handler,
   // and returns the world + the state snapshotted inside the injected exit (the "daemon exits" instant).
@@ -275,6 +284,7 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
     seed?: string[];
     patchFake?: (fake: ReturnType<typeof setupRepo>["fake"]) => void;
     fireWhen: (w: { live: Set<string>; ops: { kind: "slot" | "close"; name: string }[] }) => boolean;
+    timing?: ReconcileTestTiming;
   }) {
     const { repo, fake } = setupRepo(cfg.tasks, cfg.script, cfg.extraCfg);
     cfg.patchFake?.(fake);
@@ -287,10 +297,11 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
       exit: (code) => { fired ??= { code, liveAtExit: [...world.live], lockHeldAtExit: existsSync(lockPath) }; },
     });
     run.catch(() => { /* consumed again by the rejects assertion below */ });
-    const deadline = Date.now() + 15_000;
+    const timing = cfg.timing ?? SYSTEM_RECONCILE_TIMING;
+    const deadline = timing.now() + RECONCILE_FIRE_TIMEOUT_MS;
     while (!cfg.fireWhen(world)) {
-      if (Date.now() > deadline) throw new Error(`timed out waiting to fire; live: ${[...world.live].join(", ")}`);
-      await new Promise((r) => setTimeout(r, 10));
+      if (timing.now() > deadline) throw new Error(`timed out waiting to fire; live: ${[...world.live].join(", ")}`);
+      await timing.yield();
     }
     const lockHeldBeforeSignal = existsSync(lockPath);
     const handler = process.listeners("SIGTERM").find((l) => !before.includes(l)) as ((sig: string) => void) | undefined;
@@ -302,6 +313,35 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
   }
 
   const HANG = { shell: "sleep 30" }; // no result → no trailer: the worker slot stays open
+
+  test("test: the reconcile deadline scenario passes under an artificially slowed environment simulation", async () => {
+    let nowMs = 0;
+    let lagInjected = false;
+    const timing: ReconcileTestTiming = {
+      now: () => nowMs,
+      yield: async () => {
+        if (!lagInjected) {
+          lagInjected = true;
+          nowMs += 30_000;
+          return;
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      },
+    };
+    const runId = "run-sig-slow-environment";
+    const workerPane = owned("worker", "T1", 0, runId);
+
+    const { fired } = await terminate({
+      runId,
+      tasks: [T("T1")],
+      script: { tasks: { T1: [HANG] } },
+      fireWhen: ({ live }) => live.has(workerPane),
+      timing,
+    });
+
+    expect(nowMs).toBe(30_000);
+    expect(fired.liveAtExit).not.toContain(workerPane);
+  });
 
   test("a termination signal closes every open worker slot before the daemon exits", async () => {
     const runId = "run-sig-workers";

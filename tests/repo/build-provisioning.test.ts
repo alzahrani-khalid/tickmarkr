@@ -38,7 +38,9 @@ describe("standalone test build provisioning", () => {
       const r = strangerInstallThenTest();
       expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
     },
-    240_000, // OBS-116 load-margin reasoning: 2x headroom absorbs concurrent npm ci/build contention.
+    // OBS-143 load-margin reasoning: a load-proof 5x original budget absorbs install/build contention;
+    // child exit status remains the provisioning oracle, so this timeout is only a runaway guard.
+    600_000,
   );
 });
 
@@ -49,6 +51,21 @@ test(
     const start = source.indexOf('test(\n    "the standalone test command provisions a fresh build first');
     const end = source.indexOf("\n  );", start);
     expect(start).toBeGreaterThanOrEqual(0);
-    expect(source.slice(start, end)).toContain("240_000");
+    expect(source.slice(start, end)).toContain("600_000");
+  },
+);
+
+test(
+  "test: no timing oracle in the touched suites sleeps against an uncontrolled real-time bound",
+  () => {
+    const driverSuite = readFileSync(join(REPO, "tests/drivers/herdr.test.ts"), "utf8");
+    const reconcileSuite = readFileSync(join(REPO, "tests/run/reconcile-live.test.ts"), "utf8");
+    const provisioningSuite = readFileSync(join(REPO, "tests/repo/build-provisioning.test.ts"), "utf8");
+
+    expect(driverSuite).not.toMatch(/await new Promise\(\(resolve\) => setTimeout\(resolve,/);
+    expect(driverSuite).not.toContain("Date.now()");
+    expect(reconcileSuite).not.toMatch(/await new Promise\(\(r\) => setTimeout\(r,/);
+    expect(reconcileSuite).not.toContain("Date.now() + 15_000");
+    expect(provisioningSuite).toContain("600_000");
   },
 );

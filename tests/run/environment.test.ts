@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -7,7 +8,7 @@ import type { TickmarkrConfig } from "../../src/config/config.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { type RunEnvironment, UNKNOWN_ADAPTER_VERSION } from "../../src/run/environment.js";
 import { Journal } from "../../src/run/journal.js";
-import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import { COMMIT, makeTestTempDir, reapTestTempDirs, setupRepo, T } from "../helpers/tmprepo.js";
 
 // v1.70 T2: the run-start journal event stamps the run's environment identity — the running tickmarkr
 // version, a deterministic hash of the loaded config, and the probed CLI version of every adapter
@@ -81,3 +82,31 @@ describe("run-start environment identity (fake adapter, zero tokens)", () => {
     expect(env.adapterVersions.fake).toBe("fake");
   });
 }, 120000);
+
+describe("shared test temp-directory teardown", () => {
+  test("test: a directory created through the helper during a test no longer exists after the suite teardown runs", () => {
+    const dir = makeTestTempDir("tickmarkr-reaper-owned-");
+    expect(existsSync(dir)).toBe(true);
+
+    reapTestTempDirs();
+
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  test("test: teardown ignores a tracked directory a test already removed itself without erroring", () => {
+    const dir = makeTestTempDir("tickmarkr-reaper-self-removed-");
+    rmSync(dir, { recursive: true });
+
+    expect(() => reapTestTempDirs()).not.toThrow();
+  });
+
+  test("test: directories outside the helper's tracking are untouched by teardown", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reaper-untracked-"));
+    try {
+      reapTestTempDirs();
+      expect(existsSync(dir)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

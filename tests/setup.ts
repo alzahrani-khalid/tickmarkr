@@ -4,6 +4,10 @@
 // unit-test routing, so seal both before any test collects — green in a clean pane shell, red at the
 // gate otherwise. Constants are imported (not hardcoded) so a rename can't silently un-seal this.
 // Runtime entrypoints also delete QUALITY_ENV; this setup guard keeps direct route() unit tests hermetic.
+import { afterAll } from "vitest";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../src/route/router.js";
+import { reapTestTempDirs } from "./helpers/tmprepo.js";
 
 for (const k of [QUALITY_ENV, NO_EXPLORE_ENV]) delete process.env[k];
+
+afterAll(reapTestTempDirs);
