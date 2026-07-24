@@ -26,5 +26,11 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
+      # OBS-148: serialize the suite on the 2-core hosted runner. Under default vitest
+      # parallelism the driver timing tests starve nondeterministically (four distinct
+      # tests lost the race across three release rounds on 2026-07-24); every serialized
+      # context is always green. The product already honors this env (FORK_CAP_ENV).
       - run: npm test
+        env:
+          VITEST_MAX_FORKS: "1"
       - run: npm publish --provenance --access public
