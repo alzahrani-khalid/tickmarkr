@@ -4,7 +4,7 @@ import { DEFAULT_DIFF_CAP } from "../config/config.js";
 import { renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { sh } from "../run/git.js";
 import { checkDiffCap, fetchTaskDiff } from "./review.js";
-import { COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
+import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
@@ -19,6 +19,7 @@ export interface EvidenceCitation { path: string; line: number }
 export interface JudgeVerdict {
   pass: boolean;
   criteria: Array<{ criterion: string; met: boolean; reason: string; evidence: string | EvidenceCitation }>;
+  comments?: Array<{ path: string; line: number; body: string }>;
 }
 
 const CitationSchema = z.object({ path: z.string(), line: z.number().int() });
@@ -307,9 +308,10 @@ ${citable || "(the diff changes no lines)"}
 ${verdictNonceLine(nonce)}
 
 Respond with ONLY this JSON (no prose before or after):
-{"nonce": "${nonce}", "pass": true|false, "criteria": [{"criterion": "c1", "met": true|false, "reason": "...", "evidence": {"path": "path/to/file", "line": 42}}]}
+{"nonce": "${nonce}", "pass": true|false, "criteria": [{"criterion": "c1", "met": true|false, "reason": "...", "evidence": {"path": "path/to/file", "line": 42}}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
 Each criteria[].criterion MUST be the stable id from the rubric (c1, c2, ...) exactly once.
 Each criteria[].evidence MUST be a structured citation {"path", "line"} whose "path" and "line" appear in the "Citable evidence lines" list above (a new-file line number inside a changed hunk); a citation outside every changed hunk or to an untouched file voids the whole verdict.
+The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
   const raw = await runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS);
   const extracted = extractVerdictJson<JudgeVerdict>(raw, nonce);
@@ -337,5 +339,6 @@ Each criteria[].evidence MUST be a structured citation {"path", "line"} whose "p
   const lines = v.criteria.map((row) => `${row.met ? "✓" : "✗"} ${row.criterion}: ${row.reason}`);
   if (!v.pass) lines.push("judge verdict pass=false");
   lines.push(...inconsistencies);
-  return { gate: "acceptance", pass, details: warn + detBlock + (lines.join("\n") || "judge passed") };
+  const prose = warn + detBlock + (lines.join("\n") || "judge passed");
+  return { gate: "acceptance", pass, details: appendAnchoredReview(prose, extracted) };
 }

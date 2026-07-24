@@ -1,0 +1,28 @@
+export HERDR_WORKSPACE_ID='wW'; export TICKMARKR_PANE_IDENTITY='worker · T1 · attempt 0 · run-20260724-222251'; export VITEST_MAX_FORKS='6'; unset HERDR_ENV; unset HERDR_SOCKET_PATH;
+kimi -y -m 'kimi-code/kimi-for-coding'
+
+➜  tickmarkr-run-20260724-222251--T1 export HERDR_WORKSPACE_ID='wW'; export TICKMARKR_PANE_IDENTITY='worker · T1 · attempt 0 · run-20260724-222251'; export VITEST_MAX_FORKS='6'; unset HERDR_ENV; unset HERDR_SOCKET_PATH;
+➜  tickmarkr-run-20260724-222251--T1 kimi -y -m 'kimi-code/kimi-for-coding'
+
+
+ ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                                                                       │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                                                                       │
+ │  ▐█████▌  Send /help for help information.                                                                                                                                            │
+ │                                                                                                                                                                                       │
+ │  Directory: /Users/khalidalzahrani/Desktop/CodingSpace/tkr-probe6/.tickmarkr/worktrees.noindex/tickmarkr-run-20260724-222251--T1                                                      │
+ │  Session:   session_4d758ead-0dd9-475f-8ba4-bfa38741b59e                                                                                                                              │
+ │  Model:     K2.7 Coding                                                                                                                                                               │
+ │  Version:   0.29.0                                                                                                                                                                    │
+ │                                                                                                                                                                                       │
+ ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+
+ ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                                                                                     │
+ ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ yolo  K2.7 Coding thinking  …/.tickmarkr/worktrees.noindex/tickmarkr-run-20260724-222251--T1  tickmarkr/run-20260724-222251--T1                     shift+enter: newline | ctrl+c: cancel
+                                                                                                                                                                      context: 0% (0/256k)

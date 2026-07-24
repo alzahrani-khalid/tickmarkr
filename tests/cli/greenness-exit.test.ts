@@ -28,6 +28,9 @@ const SINGLE_VENDOR_DOCTOR = {
   pi: { installed: false, authed: false, models: [] },
 };
 
+// OBS-147 (v1.79 T3): every run/resume test dispatches through the real daemon, so each carries
+// an explicit 120s load-proof budget — the vitest default timeout is a real-time bound this
+// suite does not control, and a starved release runner exceeded it on healthy runs.
 describe("run/resume greenness exit contract", () => {
   afterEach(() => { delete process.env.TICKMARKR_FAKE_SCRIPT; });
 
@@ -43,7 +46,7 @@ describe("run/resume greenness exit contract", () => {
     expect(r.out).toMatch(/finished/);
     expect(r.out).toMatch(/failed: 0/);
     expect(r.code).toBe(0);
-  });
+  }, 120_000);
 
   test("run summary with a failed task exits 2", async () => {
     const { repo, scriptPath } = setupRepo([T("T1")], { tasks: {} });
@@ -55,7 +58,7 @@ describe("run/resume greenness exit contract", () => {
     expect(r.out).toMatch(/finished/);
     expect(r.out).toMatch(/failed: 1/);
     expect(r.code).toBe(2);
-  });
+  }, 120_000);
 
   test("run summary with a non-green parked task exits 2", async () => {
     const { repo, scriptPath } = setupRepo(
@@ -69,7 +72,7 @@ describe("run/resume greenness exit contract", () => {
     expect(r.out).toMatch(/finished/);
     expect(r.out).toMatch(/human: 1/);
     expect(r.code).toBe(2);
-  });
+  }, 120_000);
 
   test("resume applies the same greenness exit contract as run", async () => {
     const { repo } = setupRepo([T("T1")], { tasks: {} });
@@ -86,7 +89,7 @@ describe("run/resume greenness exit contract", () => {
     expect(r.out).toMatch(/resumed run-red/);
     expect(r.out).toMatch(/failed: 1/);
     expect(r.code).toBe(2);
-  });
+  }, 120_000);
 });
 
 describe("run --concurrency validation", () => {

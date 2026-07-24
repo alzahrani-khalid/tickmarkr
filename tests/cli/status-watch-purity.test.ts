@@ -102,4 +102,29 @@ describe("VIS-07 status --watch purity (D-02)", () => {
     expect(readFileSync(journal, "utf8")).toBe(bytesBefore);
     expect(snapshot(repo)).toEqual(before);
   });
+
+  test("the stream is pure formatting over journal truth with no new state, service, or storage", async () => {
+    const repo = mkRepo();
+    seed(repo);
+    const journal = join(repo, stateDirName(repo), "runs", "run-purity", "journal.jsonl");
+    writeFileSync(journal, readFileSync(journal, "utf8") + JSON.stringify({
+      ts: "2026-07-11T08:00:01.000Z",
+      event: "task-human",
+      taskId: "T1",
+      data: { kind: "human-gate", reason: "approval required" },
+    }) + "\n");
+    const bytesBefore = readFileSync(journal, "utf8");
+    const before = snapshot(repo);
+
+    const first = await status(["--watch", "--events"], repo, { iterations: 1, sleep: async () => {} });
+    const replay = await status(["--watch", "--events"], repo, { iterations: 1, sleep: async () => {} });
+
+    expect(replay).toBe(first);
+    expect(JSON.parse(first)).toMatchObject({
+      type: "human-decision-required",
+      approvalCommand: "tickmarkr approve run-purity T1",
+    });
+    expect(readFileSync(journal, "utf8")).toBe(bytesBefore);
+    expect(snapshot(repo)).toEqual(before);
+  });
 });

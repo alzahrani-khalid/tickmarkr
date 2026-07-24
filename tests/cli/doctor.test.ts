@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, afterEach, describe, expect, test, vi } from "vitest";
+import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
 import { hasCodexTrustedProject, seedCodexTrust } from "../../src/adapters/codex.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import * as registry from "../../src/adapters/registry.js";
@@ -10,7 +11,9 @@ import { channelsFromConfig, type TrustVerdict, type WorkerAdapter } from "../..
 import { BANNER, TOKENS } from "../../src/brand.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { resume } from "../../src/cli/commands/resume.js";
+import { loadConfig } from "../../src/config/config.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
+import { route } from "../../src/route/router.js";
 import { gitHead } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
 import { makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
@@ -417,6 +420,87 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
     // the existing reporting still names the uninstalled CLI; drift never piles on for either case
     expect(out).toMatch(/✗ claude-code\s+not installed/);
     expect(out).not.toMatch(/flag drift:/);
+  });
+});
+
+describe("OBS-145 resolved alias identity drift", () => {
+  const claudeAliasAdapter = () =>
+    ({
+      id: "claude-code",
+      vendor: "anthropic",
+      probe: async () => ({ installed: true, authed: true, models: [] }),
+      channels: (cfg: any) => channelsFromConfig("claude-code", cfg),
+      headlessCommand: vi.fn(() => "printf OK"),
+    }) as unknown as WorkerAdapter;
+
+  const onlyOpus = `tiers:
+  claude-code:
+    vendor: anthropic
+    channel: sub
+    models:
+      fable: null
+      opus: frontier
+      sonnet: null
+      haiku: null
+`;
+
+  test("test: an alias whose resolved identity differs from its stamped identity produces a drift warning naming both identities and the reclassification policy", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, onlyOpus);
+
+    const out = await doctor(["--"], repo, [claudeAliasAdapter()], {
+      banner: false,
+      resolveClaudeAliasIdentity: () => "claude-opus-5",
+    });
+
+    expect(out).toContain("claude-code:opus");
+    expect(out).toContain(CLAUDE_ALIAS_IDENTITY_STAMPS.opus);
+    expect(out).toContain("claude-opus-5");
+    expect(out).toContain("reclassify per benchmark policy");
+  });
+
+  test("test: an alias whose resolved identity matches its stamp produces no warning", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, onlyOpus);
+
+    const out = await doctor(["--"], repo, [claudeAliasAdapter()], {
+      banner: false,
+      resolveClaudeAliasIdentity: () => CLAUDE_ALIAS_IDENTITY_STAMPS.opus,
+    });
+
+    expect(out).not.toContain("resolved-identity drift:");
+  });
+
+  test("test: a drift warning changes no tier, no channel availability, and no routing decision", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, `${onlyOpus}routing:
+  map:
+    implement:
+      pin: { via: claude-code, model: opus }
+`);
+    const adapter = claudeAliasAdapter();
+    const configPath = join(repo, ".tickmarkr", "config.yaml");
+    const beforeBytes = readFileSync(configPath, "utf8");
+    const beforeCfg = loadConfig(repo);
+    const beforeChannels = adapter.channels(beforeCfg);
+    const task = {
+      id: "T2", title: "identity drift", goal: "prove advisory behavior",
+      shape: "implement", complexity: 3, acceptance: ["advisory"],
+    } as any;
+    const beforeRoute = route(task, beforeCfg, beforeChannels);
+
+    const out = await doctor(["--"], repo, [adapter], {
+      banner: false,
+      resolveClaudeAliasIdentity: () => "claude-opus-5",
+    });
+
+    const afterCfg = loadConfig(repo);
+    const afterChannels = adapter.channels(afterCfg);
+    expect(out).toContain("resolved-identity drift:");
+    expect(readFileSync(configPath, "utf8")).toBe(beforeBytes);
+    expect(afterCfg.tiers).toEqual(beforeCfg.tiers);
+    expect(afterChannels).toEqual(beforeChannels);
+    expect(route(task, afterCfg, afterChannels)).toEqual(beforeRoute);
   });
 });
 

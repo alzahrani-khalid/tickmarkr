@@ -32,6 +32,44 @@ export function generateVerdictNonce(): string {
   return randomBytes(4).toString("hex");
 }
 
+export interface AnchoredComment {
+  path: string;
+  line: number;
+  body: string;
+}
+
+// v1.79 T5: comments are an optional side channel on an otherwise authoritative verdict. The whole
+// block is accepted only when every row names one actionable path:line; absent or malformed input
+// becomes no comments and therefore preserves the pre-comments prose bytes and verdict semantics.
+export function parseAnchoredComments(verdict: unknown): AnchoredComment[] {
+  if (!verdict || typeof verdict !== "object") return [];
+  const raw = (verdict as Record<string, unknown>).comments;
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  const comments: AnchoredComment[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== "object") return [];
+    const { path, line, body } = row as Record<string, unknown>;
+    const cleanPath = typeof path === "string" ? path.trim() : "";
+    const cleanBody = typeof body === "string" ? body.trim() : "";
+    if (!cleanPath || /[\r\n]/.test(cleanPath) || !Number.isInteger(line) || (line as number) < 1 || !cleanBody) {
+      return [];
+    }
+    comments.push({ path: cleanPath, line: line as number, body: cleanBody });
+  }
+  return comments;
+}
+
+export function renderAnchoredReview(verdict: unknown): string {
+  const comments = parseAnchoredComments(verdict);
+  if (comments.length === 0) return "";
+  return `## Anchored review\n${comments.map((c) => `- ${c.path}:${c.line} — ${c.body}`).join("\n")}`;
+}
+
+export function appendAnchoredReview(prose: string, verdict: unknown): string {
+  const block = renderAnchoredReview(verdict);
+  return block ? `${prose}\n\n${block}` : prose;
+}
+
 export function verdictNonceLine(nonce: string): string {
   return `VERDICT_NONCE: ${nonce}`;
 }
@@ -164,6 +202,44 @@ export async function runViaDriver(
   let out = await via.driver.read(slot, 400);
   if (!via.keep) await via.driver.close(slot);
   out = augmentFakeVerdictOutput(adapter, out, nonce, prompt);
+  return dewrapPaneVerdict(out, nonce);
+}
+
+// OBS-155: a TUI renders the verdict as a bullet and HARD-wraps it at pane width with a 2-space
+// continuation indent, splitting words mid-token — so literal newlines land inside JSON string
+// literals and ZERO lines begin with `{`. `--source recent-unwrapped` cannot undo it: the wrap is
+// the TUI's own rendering, not a terminal soft wrap (driver.read already requests that source, and
+// the captured k3 transcript arrived wrapped anyway). A perfect verdict was therefore scored a
+// flake and rescued by a retry on another channel — 70 such judge-retries are on record across
+// k3, fable AND sol, so this is a width-dependent flake generator under every pane-mode gate.
+//
+// Fail-closed by construction, per the overseer's constraints: reconstruction is bounded to the
+// brace-delimited region, the rejoined text must PARSE, and it must carry THIS call's nonce.
+// Anything else returns the bytes untouched, so an unparseable verdict stays a failure. The
+// reconstruction is APPENDED, never substituted: extractJson takes the last balanced object, so
+// the good copy wins while the original rendering survives verbatim for the evidence capture.
+export function dewrapPaneVerdict(out: string, nonce: string): string {
+  if (!out.includes(nonce)) return out;
+  const lines = out.split("\n");
+  const start = lines.findIndex((line) => /^\s*(?:[•*-]\s+)?\{/.test(line));
+  if (start < 0) return out;
+  for (let end = start; end < lines.length; end++) {
+    const joined = lines
+      .slice(start, end + 1)
+      .map((line, i) => (i === 0 ? line.replace(/^\s*(?:[•*-]\s+)?/, "") : line.replace(/^\s+/, "")))
+      .join("")
+      .trimEnd();
+    if (!joined.endsWith("}")) continue;
+    try {
+      const parsed: unknown = JSON.parse(joined);
+      // the nonce IS the acceptance test — never reconstruct a verdict this call did not ask for
+      if (parsed && typeof parsed === "object" && (parsed as { nonce?: unknown }).nonce === nonce) {
+        return `${out}\n${joined}`;
+      }
+    } catch {
+      /* not yet a complete object — keep extending within the bounded region */
+    }
+  }
   return out;
 }
 

@@ -4,7 +4,7 @@ import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
 import { marginalCostRank } from "../route/router.js";
-import { COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlm, verdictNonceLine } from "./llm.js";
+import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 
 export type ReviewSeverity = "material" | "minor";
@@ -22,7 +22,12 @@ export interface ReviewFinding {
 
 // `approve`/`issues` is the legacy flat shape (every issue blocks). `findings` is the classified shape;
 // a verdict carrying it is decided by severity and the advisory `approve` flag is ignored for the gate.
-export interface ReviewVerdict { approve?: boolean; issues?: string[]; findings?: ReviewFinding[] }
+export interface ReviewVerdict {
+  approve?: boolean;
+  issues?: string[];
+  findings?: ReviewFinding[];
+  comments?: Array<{ path: string; line: number; body: string }>;
+}
 
 interface ReviewDecision { pass: boolean; headline: string; lines: string[] }
 
@@ -195,8 +200,9 @@ block approval. For a minor concern you have decided not to block on, set "defer
 one-line "rationale" — it is recorded in the review, never dropped.
 
 Respond with ONLY this JSON:
-{"nonce": "${nonce}", "approve": true|false, "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}]}
+{"nonce": "${nonce}", "approve": true|false, "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
 Approve iff no material finding remains; an empty findings list is a clean approval.
+The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
   const raw = await runLlm(
     getAdapter(reviewer.adapter, adapters),
@@ -225,10 +231,11 @@ Approve iff no material finding remains; an empty findings list is a clean appro
   const decided = findings !== null
     ? classifyReviewFindings(findings)
     : classifyReviewIssues(v.approve as boolean, v.issues as unknown[]);
+  const prose = `reviewer ${reviewer.adapter}:${reviewer.model} (${reviewer.vendor}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`;
   return {
     gate: "review",
     pass: decided.pass,
-    details: `reviewer ${reviewer.adapter}:${reviewer.model} (${reviewer.vendor}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`,
+    details: appendAnchoredReview(prose, v),
     meta: { reviewer: channelKey(reviewer) },
   };
 }

@@ -126,6 +126,32 @@ describe("model auth probes", () => {
     expect(health.fake.modelAuth?.["fake-denied"].probedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
+  // OBS-150 regression. Verbatim reason captured from .tickmarkr/doctor.json on 2026-07-24, when a HEALTHY
+  // codex:gpt-5.6-sol probe (replies "OK", exit 0) was marked unauthed: the bare 4xx alternative matched
+  // "485" inside the token footer "tokens used 26,485". Any comma-grouped number whose last group starts
+  // with 4 hit this — a fleet-wide dice roll, not a sol defect. If this string is ever classified as an
+  // auth failure again, the digit-group guard in AUTH_FAILURE_RE has regressed.
+  const SOL_TOKEN_FOOTER = "SessionStart hook: SessionStart hook: SessionStart Completed hook: SessionStart Completed hook: SessionStart Completed hook: UserPromptSubmit hook: UserPromptSubmit Completed codex OK hook: Stop hook: Stop Completed tokens used 26,485 OK";
+
+  test("reads a comma-grouped token footer as healthy but a bare 4xx code as an auth failure (OBS-150)", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-footer-"));
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const fake = new FakeAdapter(script);
+    vi.spyOn(fake, "headlessCommand").mockImplementation((_prompt, model) =>
+      model === "fake-4xx" ? "printf '%s' 'HTTP 403 Forbidden.'" : `printf '%s' ${JSON.stringify(SOL_TOKEN_FOOTER)}`);
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.tiers.fake = { vendor: "fake", channel: "sub", models: { "fake-footer": "mid", "fake-4xx": "cheap" } };
+    const health = await probeAll([fake]);
+
+    await probeModels(cfg, repo, [fake], health);
+
+    expect(health.fake.modelAuth).toMatchObject({
+      "fake-footer": { authed: true },
+      "fake-4xx": { authed: false, reason: "HTTP 403 Forbidden." },
+    });
+  });
+
   test("retries a timed-out probe once when its retry succeeds", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-retry-success-"));
     const script = join(repo, "fake.json");

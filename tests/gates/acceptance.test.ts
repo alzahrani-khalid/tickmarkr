@@ -7,7 +7,7 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq } from "../../src/adapters/types.js";
 import { acceptanceGate } from "../../src/gates/acceptance.js";
 import * as llm from "../../src/gates/llm.js";
-import { extractJson, runHeadless } from "../../src/gates/llm.js";
+import { dewrapPaneVerdict, extractJson, runHeadless } from "../../src/gates/llm.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -50,6 +50,46 @@ describe("extractJson", () => {
   });
 });
 
+// OBS-155 regression. The fixture is the VERBATIM pane capture from the k3 pane-judge probe
+// (run-20260724-224703) — the exact bytes acceptance parsed, per captureLlmOutput's contract.
+// k3's verdict was flawless; the pane hard-wrapped it under a "• " bullet with 2-space
+// continuation indents, splitting words mid-token, so no line begins with `{` and extractJson
+// returned null. That scored a perfect verdict as a flake and burned a retry on another channel.
+describe("dewrapPaneVerdict (OBS-155)", () => {
+  const NONCE = "9d83ffd3";
+  const capture = readFileSync(join(import.meta.dirname, "../fixtures/k3-pane-verdict/frame-01.txt"), "utf8");
+
+  test("a hard-wrapped bullet verdict is unreadable raw and parses once de-wrapped", () => {
+    // guard the fixture: if a line ever starts with `{`, the capture was tidied and this is theatre
+    expect(capture.split("\n").some((line) => line.trimStart().startsWith("{"))).toBe(false);
+    expect(capture).toContain(`TICKMARKR_EXIT_${NONCE}:0`);
+
+    expect(extractJson(capture)).toBeNull();
+
+    const verdict = extractJson<{ nonce: string; pass: boolean; criteria: { met: boolean }[] }>(
+      dewrapPaneVerdict(capture, NONCE),
+    );
+    expect(verdict?.nonce).toBe(NONCE);
+    expect(verdict?.pass).toBe(true);
+    expect(verdict?.criteria[0].met).toBe(true);
+  });
+
+  test("the nonce is the acceptance test — a verdict this call did not ask for is never reconstructed", () => {
+    // wrong nonce: bytes come back untouched, so the gate still sees an unparseable verdict and
+    // fails closed. This is the property that keeps a de-wrapper from loosening a fail-closed gate.
+    expect(dewrapPaneVerdict(capture, "deadbeef")).toBe(capture);
+    expect(extractJson(dewrapPaneVerdict(capture, "deadbeef"))).toBeNull();
+  });
+
+  test("the original rendering survives verbatim for the evidence capture", () => {
+    expect(dewrapPaneVerdict(capture, NONCE).startsWith(capture)).toBe(true);
+  });
+
+  test("output with no verdict at all is left alone", () => {
+    expect(dewrapPaneVerdict("just prose, no braces", NONCE)).toBe("just prose, no braces");
+  });
+});
+
 describe("runHeadless", () => {
   test("routes prompt file through adapter.headlessCommand", async () => {
     const fake = fakeWithJudge({ pass: true, criteria: [] });
@@ -73,6 +113,41 @@ describe("acceptanceGate", () => {
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toContain("hardcoded");
+  });
+
+  test("test: a verdict with a malformed or absent comment block parses exactly as today with no new failure mode", async () => {
+    const { repo, base } = repoWithDiff();
+    const verdict = {
+      pass: false,
+      criteria: [{
+        criterion: "c1",
+        met: false,
+        reason: "hardcoded",
+        evidence: "module.exports = (n) =>",
+      }],
+    };
+    const absent = await acceptanceGate(
+      task,
+      repo,
+      base,
+      { adapter: fakeWithRawJudge(verdict), model: "fake-1" },
+    );
+    const malformed = await acceptanceGate(
+      task,
+      repo,
+      base,
+      {
+        adapter: fakeWithRawJudge({
+          ...verdict,
+          comments: [{ path: "greet.js", line: "one", body: "replace the shortcut" }],
+        }),
+        model: "fake-1",
+      },
+    );
+
+    expect(malformed).toEqual(absent);
+    expect(malformed.pass).toBe(false);
+    expect(malformed.details).not.toContain("Anchored review");
   });
 
   test("a verdict omitting a criterion id fails closed", async () => {

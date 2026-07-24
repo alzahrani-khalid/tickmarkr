@@ -1,8 +1,8 @@
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { claudeCode, claudeSlug } from "../../src/adapters/claude-code.js";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { claudeCode, claudeSlug, probeClaudeAliasIdentity, resolveClaudeAliasIdentity } from "../../src/adapters/claude-code.js";
 import { addUsage } from "../../src/adapters/types.js";
 
 // SPEND-01/06: zero-token test — synthetic ~/.claude/projects/<slug>/*.jsonl under a temp HOME.
@@ -275,5 +275,33 @@ describe("SPEND-11: headless worktree-shaped metering + per-message dedup", () =
       ["/foo.bar_baz-qux0", "-foo-bar-baz-qux0"],
     ];
     for (const [input, expected] of pairs) expect(claudeSlug(input)).toBe(expected);
+  });
+});
+
+describe("OBS-145 resolved alias identity", () => {
+  test("test: identity resolution prefers the zero-cost on-disk source and falls back to the probe only when the store is silent", () => {
+    const cwd = scratch();
+    plantSession(cwd, [{
+      type: "assistant",
+      cwd: realpathSync(cwd),
+      timestamp: T3,
+      message: { role: "assistant", model: "claude-opus-5", content: [] },
+    }]);
+    const probe = vi.fn(() => "claude-opus-probe");
+
+    expect(resolveClaudeAliasIdentity(cwd, "opus", probe)).toBe("claude-opus-5");
+    expect(probe).not.toHaveBeenCalled();
+
+    const silentCwd = scratch();
+    expect(resolveClaudeAliasIdentity(silentCwd, "opus", probe)).toBe("claude-opus-probe");
+    expect(probe).toHaveBeenCalledOnce();
+    expect(probe).toHaveBeenCalledWith(silentCwd, "opus");
+  });
+
+  // CLAUDE.md invariant: npm test spends no tokens. The stated-identity probe is the only path in
+  // this adapter that would spend a turn, so its suite guard is pinned here — delete the guard and
+  // this fails loudly rather than the suite billing a real turn per alias, silently.
+  test("the stated-identity probe never spawns a real CLI under the test suite", () => {
+    expect(probeClaudeAliasIdentity(scratch(), "opus")).toBeUndefined();
   });
 });

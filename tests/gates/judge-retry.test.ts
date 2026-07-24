@@ -11,12 +11,14 @@ import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { buildTaskPrompt } from "../../src/adapters/prompt.js";
 import { shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import { extractVerdictJson, runHeadless, verdictNonceLine } from "../../src/gates/llm.js";
 import { validateGraph } from "../../src/graph/schema.js";
+import { buildDossierPrompt } from "../../src/run/consult.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const mkTask = (over: Record<string, unknown> = {}) =>
@@ -123,6 +125,41 @@ const PASS = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r",
 const FAIL = { pass: false, criteria: [{ criterion: "c1", met: false, reason: "nope", evidence: "+y" }] };
 
 describe("GATE-09 judge-flake retry (run-gates level)", () => {
+  test("test: a verdict carrying well-formed anchored comments renders them as an anchored review block in the retry prompt", async () => {
+    const { repo, base } = repoWithCommit();
+    const commentedFailure = {
+      ...FAIL,
+      comments: [
+        { path: "src/retry.ts", line: 41, body: "Keep the final retry inside the bounded loop." },
+        { path: "tests/retry.test.ts", line: 88, body: "Cover the exhausted-attempt boundary." },
+      ],
+    };
+    const fake = fakeWith({ judge: [commentedFailure] });
+    const { results } = await runGates(
+      mkTask({ gates: JUDGE_GATES, files: [] }),
+      { ...(await ctxFor(repo, base, [fake], { channels: CH_ONE_ADAPTER_TWO_CHANNELS })) },
+    );
+    const failed = results.filter((g) => !g.pass);
+    const feedback = failed.map((g) => `${g.gate}: ${g.details}`).join("\n\n");
+    const retryPrompt = buildTaskPrompt(mkTask(), feedback, "feed1234");
+    const consultPrompt = buildDossierPrompt({
+      taskId: "T1",
+      trigger: "acceptance failed",
+      journalTail: "(none)",
+      transcript: "(none)",
+      diff: "(none)",
+      gates: failed,
+    }, "d0551e12");
+
+    for (const prompt of [retryPrompt, consultPrompt]) {
+      expect(prompt).toContain("## Anchored review");
+      expect(prompt).toContain("src/retry.ts:41");
+      expect(prompt).toContain("tests/retry.test.ts:88");
+      expect(prompt).toContain("Keep the final retry inside the bounded loop.");
+      expect(prompt).toContain("Cover the exhausted-attempt boundary.");
+    }
+  });
+
   test("an unparseable primary verdict retries on a channel from a different adapter when one is live", async () => {
     const { repo, base } = repoWithCommit();
     // SC-1 shape (vendored run-20260711-185020 P43-03 L70-72): garbage first verdict, then a good one.

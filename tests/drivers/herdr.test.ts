@@ -7,7 +7,7 @@ import { DELIVERY_ATTEMPTS, DeliveryReadinessError, HerdrDriver } from "../../sr
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo"; submitAfterReads?: number }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; boxWrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo"; submitAfterReads?: number }
 
 function steppedTimeSource() {
   let nowMs = 0;
@@ -78,7 +78,7 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   // command). corrupt:"always" never matches; corrupt:"once" fails the first verify then matches —
   // the cleared-and-retyped path. pane read then serves the corrupted-transcript capture.
   const waitOutput =
-    opts.wrappedCmd
+    opts.wrappedCmd || opts.boxWrappedCmd
       ? "exit 1"
       : opts.corrupt === "always"
       ? "exit 1"
@@ -93,7 +93,12 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
     ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; printf 'painting-frame-%s\\n' "$n"`
     : opts.paneReadFrames?.length
       ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; case "$n" in ${stagedReads} *) printf '%s\\n' '${lastStagedRead}' ;; esac`
-      : opts.corrupt ? CORRUPT_READ : opts.wrappedCmd
+      : opts.corrupt ? CORRUPT_READ : opts.boxWrappedCmd
+        // OBS-154: a TUI editor re-wraps a long delivery across ITS OWN bordered rows, so the pane
+        // carries `│` between fragments we typed as one line — the shape captured verbatim from
+        // kimi 0.29.1 at probe 6b (indented one column, per OBS-152).
+        ? `[ -s '${typed}' ] && printf ' ╭─────────╮\\n │ > ${opts.boxWrappedCmd.slice(0, 20)}   │\\n │   ${opts.boxWrappedCmd.slice(20)}   │\\n ╰─────────╯\\n' || printf ' ╭─────────╮\\n │ >       │\\n ╰─────────╯\\n'`
+      : opts.wrappedCmd
         ? `[ -s '${typed}' ] && printf '> ${opts.wrappedCmd.slice(0, 20)}\\n${opts.wrappedCmd.slice(20)}\\n' || printf '> \\n'`
         : opts.submission
           ? `printf '╭────────────╮\\n│ >          │\\n╰────────────╯\\n'`
@@ -432,6 +437,28 @@ describe("HerdrDriver delivery serialization and narrow-pane read-back (OBS-119 
     expect(send).toBeGreaterThanOrEqual(0);
     expect(read).toBeGreaterThan(send);
     expect(enter).toBeGreaterThan(read);
+    expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(1);
+    expect(lines.filter((l) => l === "pane send-keys w1:p42 C-u")).toHaveLength(0);
+  });
+
+  // OBS-154 regression. Probe 6b: kimi accepted the seed text perfectly and rendered it across three
+  // rows of its own bordered editor box; the read-back normalized whitespace but not `│`, so the
+  // needle was uncontainable, delivery "failed" verification, and the OBS-85 guard refused to retype
+  // onto a line that was in fact pristine. The shape here is the captured one — a long path-bearing
+  // command re-wrapped inside box chrome. Fails closed the moment the chrome guard is removed.
+  test("a delivery re-wrapped inside a TUI's own bordered editor rows is still recognized as matching the typed command", async () => {
+    const cmd = "Read /Users/probe/.tickmarkr/runs/run-1/prompts/T1-a0.md and do exactly what it says.";
+    const { bin, log, cwd } = makeStub(0, { boxWrappedCmd: cmd });
+    const d = new HerdrDriver(bin);
+    await d.run({ id: "w1:p42", name: "boxed", cwd }, cmd);
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const send = lines.findIndex((l) => l === `pane send-text w1:p42 ${cmd}`);
+    const read = lines.findIndex((l, i) => i > send && l.startsWith("pane read w1:p42"));
+    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
+    expect(send).toBeGreaterThanOrEqual(0);
+    expect(read).toBeGreaterThan(send);
+    expect(enter).toBeGreaterThan(read);
+    // the whole point: one typing, and never a clear — the line was never corrupt
     expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(1);
     expect(lines.filter((l) => l === "pane send-keys w1:p42 C-u")).toHaveLength(0);
   });

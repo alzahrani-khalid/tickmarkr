@@ -141,7 +141,14 @@ export class HerdrDriver implements ExecutorDriver {
 
   // ponytail: narrow panes hard-wrap the input line — collapse whitespace before comparing.
   private deliveryMatches(transcript: string, cmd: string): boolean {
-    const norm = (s: string) => s.replace(/\s+/g, "");
+    // OBS-154: a TUI editor re-wraps a long delivery across its own bordered rows, so the pane text
+    // carries `│` between fragments we typed as ONE line. Stripping whitespace alone left the needle
+    // uncontainable, so the read-back could not recognize its own SUCCESSFUL delivery and the OBS-85
+    // guard then refused to retype onto what it had been told was corruption (probe 6b).
+    // This is the opposite question to shellExecutionEchoed, which deliberately REJECTS box rows: a
+    // shell echo must come from a shell prompt, whereas here we only ask whether our text landed —
+    // and inside the editor box is exactly where it is supposed to land.
+    const norm = (s: string) => s.replace(/[│┃|]/g, "").replace(/\s+/g, "");
     const hay = norm(transcript);
     const needle = norm(cmd);
     return needle.length > 0 && hay.includes(needle);

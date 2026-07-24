@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
+import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, MODEL_ID_RE, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
 // SPEND-01/SPEND-11: claude writes a per-session JSONL to ~/.claude/projects/<slug>/ where slug is the
 // realpath'd cwd with every non-alphanumeric char replaced by "-" (verified 114/114 — 36-DIAGNOSIS.md).
@@ -24,6 +24,23 @@ import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConf
 const MAX_SESSION_FILES = 20; // newest-first; a long-lived project dir can hold many sessions
 const MAX_SESSION_BYTES = 8_000_000; // per-file cap; a runaway JSONL cannot make the read unbounded
 
+// OBS-145: these aliases float at the Claude CLI layer, while their tier/pricing decisions were
+// made for the dated identities below (claude-code seeds stamped 2026-07-09 — doctor's own lint).
+// Updating a stamp is a deliberate benchmark-policy act; doctor only compares against it and never
+// edits tiers, pricing, learned scores, or routing. `opus` is deliberately left at 4-8: the OBS-145
+// drill probed the alias at claude-opus-4-8 matching its stamp, then captured it re-pointing to
+// claude-opus-5 ~30 min later with zero events fired. The 2026-07-24 fit added an EXPLICIT
+// claude-opus-5 channel to the repo overlay — it did not re-date this alias's stamps, so the
+// alias channel still carries 4-8-dated tier/pricing while serving 5. That warning is true.
+export const CLAUDE_ALIAS_IDENTITY_STAMPS = {
+  fable: "claude-fable-5",
+  opus: "claude-opus-4-8",
+  sonnet: "claude-sonnet-5",
+  haiku: "claude-haiku-4-5-20251001",
+} as const;
+export type ClaudeAlias = keyof typeof CLAUDE_ALIAS_IDENTITY_STAMPS;
+export type ClaudeAliasIdentityProbe = (cwd: string, alias: ClaudeAlias) => string | undefined;
+
 // v1.75 T2 / OBS-137: current Claude Code workspace-trust prompt (2.1.218). The full question
 // distinguishes this startup gate from routine agent text; Enter accepts the selected trust option.
 export const CLAUDE_TRUST_DIALOG: TrustDialog = {
@@ -33,6 +50,94 @@ export const CLAUDE_TRUST_DIALOG: TrustDialog = {
 
 export function claudeSlug(real: string): string {
   return real.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// newest-first by mtime, bounded — mtime picks WHICH files to scan, never a record's cursor.
+// Shared by collectUsage (spend) and readClaudeAliasIdentity (OBS-145): same store, same bounds.
+function newestSessionFiles(dir: string): string[] {
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .map((f) => {
+      try {
+        return { f, m: statSync(join(dir, f)).mtimeMs };
+      } catch {
+        return undefined; // a stat failure just drops that file
+      }
+    })
+    .filter((x): x is { f: string; m: number } => x !== undefined)
+    .sort((a, b) => b.m - a.m)
+    .slice(0, MAX_SESSION_FILES)
+    .map((x) => x.f);
+}
+
+const belongsToAliasFamily = (identity: string, alias: ClaudeAlias): boolean =>
+  identity === alias || identity.split(/[^A-Za-z0-9]+/).includes(alias);
+
+// Zero-token first choice: Claude assistant records state the resolved message.model. The newest
+// matching family record in this cwd wins. Every failure is advisory/unknown, never an exception.
+export function readClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): string | undefined {
+  try {
+    const real = realpathSync(cwd);
+    const dir = join(homedir(), ".claude", "projects", claudeSlug(real));
+    let newest: { identity: string; timestamp: number } | undefined;
+    for (const f of newestSessionFiles(dir)) {
+      let text: string;
+      try {
+        text = readFileSync(join(dir, f), "utf8").slice(0, MAX_SESSION_BYTES);
+      } catch {
+        continue;
+      }
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        let raw: unknown;
+        try {
+          raw = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const rec = raw as { cwd?: unknown; timestamp?: unknown; message?: { model?: unknown } };
+        if (rec.cwd !== real || typeof rec.message?.model !== "string") continue;
+        const identity = rec.message.model;
+        const timestamp = Date.parse(String(rec.timestamp));
+        if (!MODEL_ID_RE.test(identity) || !belongsToAliasFamily(identity, alias) || !Number.isFinite(timestamp)) continue;
+        if (!newest || timestamp > newest.timestamp) newest = { identity, timestamp };
+      }
+    }
+    return newest?.identity;
+  } catch {
+    return undefined;
+  }
+}
+
+// Store silence earns one minimal stated-identity turn. The output contract is intentionally strict:
+// one safe model id from the requested alias family, otherwise unknown/fail-open. Vitest never spawns
+// a real agent CLI; tests inject the probe callback at resolveClaudeAliasIdentity instead.
+export function probeClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): string | undefined {
+  if (process.env.VITEST) return undefined;
+  try {
+    const r = spawnSync("claude", [
+      "-p",
+      "State the exact model identifier serving this request. Reply with only that identifier.",
+      "--model", alias,
+      "--permission-mode", "bypassPermissions",
+      "--strict-mcp-config",
+      "--mcp-config", '{"mcpServers":{}}',
+      "--output-format", "text",
+    ], { cwd, encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "pipe"] });
+    if (r.error || r.status !== 0) return undefined;
+    const identity = (r.stdout || "").trim();
+    return MODEL_ID_RE.test(identity) && belongsToAliasFamily(identity, alias) ? identity : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function resolveClaudeAliasIdentity(
+  cwd: string,
+  alias: ClaudeAlias,
+  probe: ClaudeAliasIdentityProbe = probeClaudeAliasIdentity,
+): string | undefined {
+  return readClaudeAliasIdentity(cwd, alias) ?? probe(cwd, alias);
 }
 
 export function probeVersion(bin: string): AuthHealth {
@@ -84,24 +189,10 @@ export const claudeCode: WorkerAdapter = {
       const real = realpathSync(cwd); // resolve symlinks (darwin /tmp → /private/tmp)
       const slug = claudeSlug(real);
       const dir = join(homedir(), ".claude", "projects", slug);
-      // newest-first by mtime, bounded — mtime picks WHICH files to scan, never a record's cursor.
-      const files = readdirSync(dir)
-        .filter((f) => f.endsWith(".jsonl"))
-        .map((f) => {
-          try {
-            return { f, m: statSync(join(dir, f)).mtimeMs };
-          } catch {
-            return undefined; // a stat failure just drops that file
-          }
-        })
-        .filter((x): x is { f: string; m: number } => x !== undefined)
-        .sort((a, b) => b.m - a.m)
-        .slice(0, MAX_SESSION_FILES);
-
       let input = 0, output = 0, kept = false;
       let cacheRead: number | undefined, cacheWrite: number | undefined;
       const seen = new Set<string>(); // message.id is globally unique across session files in one call
-      for (const { f } of files) {
+      for (const f of newestSessionFiles(dir)) {
         let text: string;
         try {
           text = readFileSync(join(dir, f), "utf8").slice(0, MAX_SESSION_BYTES);

@@ -18,7 +18,12 @@ function readmeHeroBlock(md: string): string {
   return md.slice(start, close + 1);
 }
 
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".tickmarkr", ".planning"]);
+// The scan guards against the logo being DUPLICATED as a second source of truth. Captured evidence
+// that merely contains a rendered banner is not duplication: `.overseer/` holds run journals and
+// `tests/fixtures/` holds verbatim pane captures, both of which record whatever the terminal showed
+// — and a capture must never be hand-edited to satisfy a scan (docs/codebase/TESTING.md). Same
+// reasoning as the pre-existing `.planning` exemption.
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".tickmarkr", ".planning", ".overseer", "fixtures"]);
 
 function listFiles(dir: string): string[] {
   const out: string[] = [];

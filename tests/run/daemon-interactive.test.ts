@@ -47,6 +47,21 @@ function withNonce(repo: string, runId: string, taskId: string, text: string): s
   return text.replace(/<NONCE>/g, nonceFor(repo, runId, taskId));
 }
 
+// v1.79 T3 / OBS-147: wraps every driver call in a fixed injected latency — a deterministic
+// stand-in for the starved release runner whose load flaked the early-dead liveness bound.
+function withInjectedLatency(driver: ExecutorDriver, latencyMs: number): ExecutorDriver {
+  const slowed: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(driver)) {
+    slowed[key] = typeof value === "function"
+      ? async (...args: unknown[]) => {
+          await new Promise((resolve) => setTimeout(resolve, latencyMs));
+          return (value as (...fnArgs: unknown[]) => unknown).apply(driver, args);
+        }
+      : value;
+  }
+  return slowed as unknown as ExecutorDriver;
+}
+
 function stagedInteractiveDriver(
   repo: string,
   runId: string,
@@ -467,7 +482,6 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
       { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "no trailer token" } },
       "taskTimeoutMinutes: 0.05\n",
     );
-    const started = Date.now();
     const driver = stagedInteractiveDriver(repo, "run-no-token", "T1", [""], { noToken: true });
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-no-token", driver });
     expect(s.human).toEqual(["T1"]);
@@ -475,7 +489,11 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
     expect(wr?.data.ok).toBe(false);
     expect(wr?.data.summary).toBe(NO_TRAILER_SUMMARY);
     expect(wr?.data.cause).toBe("stall-timeout");
-    expect(Date.now() - started).toBeLessThan(4_500); // 0.05m stall window + small overhead, no settle retries
+    // OBS-147: "no settle re-read" was previously proven by an upper bound on real elapsed run
+    // time — the class that flaked release CI. The recording itself (no-trailer summary,
+    // stall-timeout cause, human park) is pinned above; the settle loop's entry condition
+    // (unparseable-trailer only, never no-trailer) is pinned by the bounded-settle test below,
+    // whose staged ladder flips the outcome to done the moment the loop over-reads.
   }, 30_000);
 
   test("the settle re-read is bounded to at most two attempts and never runs out the attempt's own stall window", async () => {
@@ -484,7 +502,6 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
       { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "would need three retries" } }] } },
       "taskTimeoutMinutes: 0.05\n",
     );
-    const started = Date.now();
     const driver = stagedInteractiveDriver(repo, "run-bound", "T1", [
       "",
       `TICKMARKR_RESULT_<NONCE> {"ok":true, "summary": "x`,
@@ -494,11 +511,13 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
       `TICKMARKR_RESULT_<NONCE> {"ok":true,"summary":"would need three retries","deviations":[]}`,
     ]);
     await runDaemon(repo, { adapters: [fake], runId: "run-bound", driver });
-    // Coarse runaway guard only (CI runners measured 3166ms for overhead + two 1s settles — a 3s
-    // bound flaked the v1.68.0 release). The real fences are below: cause is malformed-trailer,
-    // NOT stall-timeout (settle retries never ate the 0.05m stall window), and the staged good
-    // trailer at read 6 was never reached (re-reads bounded at two).
-    expect(Date.now() - started).toBeLessThan(10_000);
+    // OBS-147: the old coarse runaway guard here was an upper bound on real elapsed run time — a
+    // 3s version flaked the v1.68.0 release and its 10s replacement stayed in the same
+    // uncontrolled class (CI runners measured 3166ms for overhead + two 1s settles at calm load).
+    // The real fences need no stopwatch: cause is malformed-trailer, NOT stall-timeout (settle
+    // retries never ate the 0.05m stall window), and the staged good trailer at read 6 was never
+    // reached (re-reads bounded at two) — a third re-read would consume it and flip this outcome
+    // to done. Runaway is bounded by the test's own budget.
     const wr = Journal.open(repo, "run-bound").read().find((e) => e.event === "worker-result");
     expect(wr?.data.ok).toBe(false);
     expect(wr?.data.summary).toBe(UNPARSEABLE_TRAILER_SUMMARY);
@@ -534,7 +553,8 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
 });
 
 describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
-  test("a worker pane with zero output sixty seconds after dispatch is classified as a dead channel immediately rather than waiting for the full stall window", async () => {
+  // Shared scenario: channel 1's pane never prints a byte, channel 2 recovers the task.
+  async function runEarlyDeadScenario(runId: string, slow?: (d: ExecutorDriver) => ExecutorDriver) {
     setEarlyLaunchLivenessMsForTests(50);
     try {
       const { repo, fake } = setupRepo(
@@ -546,10 +566,9 @@ describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
         },
         "taskTimeoutMinutes: 5\nvisibility:\n  worker: interactive\n",
       );
-      const started = Date.now();
       const inner = new SubprocessDriver();
       let workerRuns = 0;
-      const driver = idriver({
+      let driver = idriver({
         slot: inner.slot.bind(inner),
         run: async (slot: Slot, cmd: string) => {
           if (slot.name.includes("-worker-")) workerRuns++;
@@ -566,17 +585,42 @@ describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
         close: inner.close.bind(inner),
         worktree: inner.worktree.bind(inner),
       });
-      const s = await runDaemon(repo, { adapters: [fake], runId: "run-early-dead", driver });
-      expect(Date.now() - started).toBeLessThan(5_000);
-      expect(s.done).toEqual(["T1"]);
-      const evs = Journal.open(repo, "run-early-dead").read();
-      expect(evs.some((e) => e.event === "dead-channel-failover")).toBe(true);
-      expect(evs.some((e) => e.event === "channel-exclusion" && e.data.kind === "dead-channel")).toBe(true);
-      expect(evs.some((e) => e.event === "consult-verdict")).toBe(false);
+      if (slow) driver = slow(driver);
+      const s = await runDaemon(repo, { adapters: [fake], runId, driver });
+      return { s, evs: Journal.open(repo, runId).read() };
     } finally {
       resetEarlyLaunchLivenessMsForTests();
     }
+  }
+
+  test("a worker pane with zero output sixty seconds after dispatch is classified as a dead channel immediately rather than waiting for the full stall window", async () => {
+    // OBS-147: the old proof of "immediately" was an upper bound on real elapsed run time, and it
+    // flaked the v1.78 tip-verify at 5334ms under full-suite load. "Immediately rather than the
+    // full stall window" needs no stopwatch: the stall window is 5 MINUTES against a 30s test
+    // budget, so completing at all means the wait was short-circuited, and the journal pins that
+    // the liveness classifier — not a stall timeout or a consult — is what fired.
+    const { s, evs } = await runEarlyDeadScenario("run-early-dead");
+    expect(s.done).toEqual(["T1"]);
+    expect(evs.some((e) => e.event === "dead-channel-failover")).toBe(true);
+    expect(evs.some((e) => e.event === "channel-exclusion" && e.data.kind === "dead-channel")).toBe(true);
+    expect(evs.some((e) => e.event === "consult-verdict")).toBe(false);
   }, 30_000);
+
+  test("test: the liveness scenario that flaked release verification passes deterministically under an artificially slowed environment", async () => {
+    // Every driver interaction pays a fixed injected latency — the starved-runner condition that
+    // produced the 5334ms flake, made deterministic. No assert races the added latency, so the
+    // scenario passes at any load; a genuine liveness regression still fails loudly: a silent
+    // pane would burn the 5-minute stall window, far past the test budget, and the dead-channel
+    // journal events below would never appear. 100ms is 2× the 50ms liveness window — every
+    // driver call is slower than the window it must not defeat — while keeping calm-load cost
+    // ~2.5s, so the 120s budget holds ~50× starvation headroom (the OBS-116/148 IPC-starvation
+    // fingerprint the gate runner is prone to under concurrent full suites).
+    const { s, evs } = await runEarlyDeadScenario("run-early-dead-slowed", (d) => withInjectedLatency(d, 100));
+    expect(s.done).toEqual(["T1"]);
+    expect(evs.some((e) => e.event === "dead-channel-failover")).toBe(true);
+    expect(evs.some((e) => e.event === "channel-exclusion" && e.data.kind === "dead-channel")).toBe(true);
+    expect(evs.some((e) => e.event === "consult-verdict")).toBe(false);
+  }, 120_000);
 
   test("a worker pane that produces any output before sixty seconds elapses continues through the normal stall-window wait unaffected", async () => {
     setEarlyLaunchLivenessMsForTests(2_000);
@@ -615,4 +659,28 @@ describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
       resetEarlyLaunchLivenessMsForTests();
     }
   }, 30_000);
+});
+
+// v1.79 T3 / OBS-147: the OBS-143 authoring law, enforced backward over the swept suites. An
+// UPPER bound asserted on a Date.now() delta races the runner's load — the 5s liveness bound
+// here measured 5334ms under tip-verify load and flaked the v1.78 release. Lower bounds stay
+// legal: load only grows elapsed time, so a floor the test's own scripted sleeps and configured
+// windows guarantee is load-proof by construction.
+describe("v1.79 T3 legacy wall-clock bound sweep (OBS-147)", () => {
+  test("test: no touched suite retains an assertion across a real-time bound it does not control", () => {
+    const sweptSuites = [
+      new URL(import.meta.url),
+      new URL("../cli/approve.test.ts", import.meta.url),
+      new URL("../cli/greenness-exit.test.ts", import.meta.url),
+    ];
+    // The exact assert shape that flaked: an upper bound over an elapsed-time delta. The regex's
+    // own escaped source cannot match itself, so this file scans clean.
+    const upperBoundOnElapsed = /expect\(\s*Date\.now\(\)\s*-\s*[\w$]+\s*\)\s*\.\s*toBeLessThan/;
+    for (const suite of sweptSuites) {
+      expect(
+        upperBoundOnElapsed.test(readFileSync(suite, "utf8")),
+        `${suite.pathname} retains an upper bound on real elapsed time (OBS-143/147 class)`,
+      ).toBe(false);
+    }
+  });
 });

@@ -161,6 +161,12 @@ Files exercising `route()`/gates redefine their own `mkTask` with tailored defau
 - `T(id, over?)` — minimal single-task factory for daemon-level tests
 - `COMMIT` — the shared `git add -A && git commit --no-gpg-sign -m` string, spliced into `FakeAdapter` scripts' `shell` steps
 
+**AUTHORING LAW — a fixture standing in for an external surface must be a verbatim capture, never hand-typed.** TUI frames, CLI stdout, adapter transcripts, banner text: commit the bytes that surface actually produced, as data, and derive any variant from that capture by slicing it. A hand-drawn fixture encodes the author's *mental model* of the surface, so it agrees with the matcher that was written from the same mental model — the test passes and the live path stays broken, with no failing test anywhere to say so.
+
+This is not hypothetical. `KIMI_INPUT_BOX`'s recognizer was written against a hand-typed flush-left box (`"╭────╮\n│ >    │\n╰────╯"`), but kimi indents its whole TUI one column. The `^`-anchored row regexes could never match reality. The synthetic fixture passed for four versions while every live readiness check scored a fully-painted, interactive editor box as absent (OBS-152); the sibling banner matchers failed the same way and, worse, failed *open* (OBS-153). It was diagnosable only because the driver journalled the real frame. `tests/fixtures/kimi-editor-readiness/frame-0*.txt` are those captures — one per kimi version, indentation asserted explicitly so a future un-indent fails loudly instead of silently re-blinding the matcher.
+
+Practical rules: capture through the **production read path** (`tests/fixtures/codex-mcp-spinner/capture.ts` reads via `HerdrDriver.read`, the exact call the daemon consumes) so the bytes carry the rendered form, not a raw-pty transcript; assert a distinguishing property of the capture (the leading indent, a version line) so a later "tidy-up" of the file fails the test; and when a needed state is not capturable, slice it from a real frame and say so in a comment rather than inventing it. A fixture pair whose positive case is real and whose negative case is imagined is only half-fixed.
+
 **Static file fixtures** (not graphs — those are always built in-code via `validateGraph`) live under `fixtures/` at the repo root: `fixtures/sample.prd.md`, `fixtures/speckit-sample/tasks.md`, `fixtures/gsd-sample/07-live-check/*-PLAN.md`. Used by compiler tests (`tests/compile/*.test.ts`) and `tests/cli/cli.test.ts` to exercise the real markdown/YAML parsing paths end to end.
 
 ## Coverage

@@ -71,6 +71,24 @@ const phaseStart = (taskId: string, phase: string, at: string): JournalEvent => 
   taskId,
   data: { phase },
 });
+const tipRunStart = (): JournalEvent => ({
+  ...runStart(),
+  data: { ...runStart().data, commands: { test: "npm test" } },
+});
+const completedTaskEvents = (): JournalEvent[] => GRAPH.tasks.flatMap((task, index) => [
+  dispatch(task.id, `fake-${index + 1}`),
+  { ts, event: "task-done", taskId: task.id, data: {} },
+]);
+const tipFailure = (gateName = "test"): JournalEvent => ({
+  ts,
+  event: "tip-verify-failed",
+  data: { gate: gateName, fingerprints: ["timeout:1", "timeout:2"] },
+});
+const failedTipRunEnd = (): JournalEvent => ({
+  ts,
+  event: "run-end",
+  data: { done: GRAPH.tasks.map((task) => task.id), failed: [], human: [], blocked: [], pending: [], tipVerify: "failed", lastMergedTask: "T3" },
+});
 
 const withTty = async (fn: () => Promise<void>) => {
   const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -313,6 +331,92 @@ describe("status checklist rendering", () => {
     });
   });
 
+  test("test: a journal whose last run-end carries a failed tip verification renders the failed gate by name in the status header", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      tipRunStart(),
+      ...completedTaskEvents(),
+      { ts, event: "merge", taskId: "T3", data: {} },
+      tipFailure("test"),
+      failedTipRunEnd(),
+    ]);
+
+    const header = (await status([], repo)).split("\n")[0]!;
+    expect(strip(header)).toContain("tip-verify: FAILED (test)");
+    expect(strip(header)).toContain("2 fingerprints");
+  });
+
+  test("test: a resume in progress after a failed tip verification renders as a re-verification in progress rather than a completed run", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      tipRunStart(),
+      ...completedTaskEvents(),
+      { ts, event: "merge", taskId: "T3", data: {} },
+      tipFailure("test"),
+      failedTipRunEnd(),
+      { ts, event: "run-resume", data: { pid: process.pid } },
+    ]);
+
+    await withTty(async () => {
+      const header = (await status(["--watch"], repo, { iterations: 1, sleep: async () => {} })).split("\n")[0]!;
+      expect(strip(header)).toContain("tip-verify: FAILED (test) → re-verifying (attempt 2)");
+      expect(strip(header)).not.toContain("3/3 done");
+    });
+  });
+
+  test("test: the done-count presentation never reads as terminal success while tip verification is failed or pending", async () => {
+    const failedRepo = mkRepo();
+    seed(failedRepo, [
+      tipRunStart(),
+      ...completedTaskEvents(),
+      { ts, event: "merge", taskId: "T3", data: {} },
+      tipFailure("test"),
+      failedTipRunEnd(),
+    ]);
+    const pendingRepo = mkRepo();
+    seed(pendingRepo, [
+      tipRunStart(),
+      ...completedTaskEvents(),
+      { ts, event: "merge", taskId: "T3", data: {} },
+    ]);
+
+    await withTty(async () => {
+      for (const [repo, phase] of [[failedRepo, "FAILED (test)"], [pendingRepo, "pending"]] as const) {
+        const header = (await status([], repo)).split("\n").find((line) => line.includes("run run-watch"))!;
+        expect(strip(header)).toContain(`tip-verify: ${phase}`);
+        expect(strip(header)).toContain("3/3 tasks done · run not verified");
+        expect(strip(header)).not.toContain("3/3 done");
+        expect(header).not.toContain("\x1b[32m██████████");
+        expect(header).not.toContain("\x1b[32m3/3");
+      }
+    });
+  });
+
+  test("test: a run whose tip verification passed renders exactly as today", async () => {
+    const legacyRepo = mkRepo();
+    const passedRepo = mkRepo();
+    const baseEvents = [
+      tipRunStart(),
+      ...completedTaskEvents(),
+      { ts, event: "merge", taskId: "T3", data: {} },
+    ];
+    const endData = { done: GRAPH.tasks.map((task) => task.id), failed: [], human: [], blocked: [], pending: [] };
+    seed(legacyRepo, [...baseEvents, { ts, event: "run-end", data: endData }]);
+    seed(passedRepo, [
+      ...baseEvents,
+      { ts, event: "tip-verify", data: { gate: "test", pass: true } },
+      { ts, event: "run-end", data: { ...endData, tipVerify: "passed" } },
+    ]);
+
+    await withTty(async () => {
+      const legacy = await status([], legacyRepo, { now: () => Date.parse(ts) });
+      const passed = await status([], passedRepo, { now: () => Date.parse(ts) });
+      expect(passed).toBe(legacy);
+      expect(strip(passed)).toContain("3/3 done");
+      expect(strip(passed)).not.toContain("tip-verify:");
+    });
+  });
+
   // v1.65 T4 (OBS-104): the cockpit carries a run-level now line so the operator can tell
   // dispatching from gating from merging without tailing the journal.
   test("the surface carries a run-level line naming the most recent journal event", async () => {
@@ -507,5 +611,100 @@ describe("status checklist rendering", () => {
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;
     }
+  });
+
+  test("test: a required human decision emits one machine-readable event carrying the exact approval command and an evidence pointer", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      {
+        ts,
+        event: "task-human",
+        taskId: "T1",
+        data: { kind: "human-gate", reason: "operator approval required" },
+      },
+    ]);
+
+    const out = await status(["--watch", "--events"], repo, {
+      iterations: 1,
+      sleep: async () => {},
+    });
+    const events = out.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      version: 1,
+      sequence: 2,
+      type: "human-decision-required",
+      tier: "decision",
+      runId: "run-watch",
+      taskId: "T1",
+      approvalCommand: "tickmarkr approve run-watch T1",
+      evidence: ".tickmarkr/runs/run-watch/journal.jsonl#L2",
+    });
+  });
+
+  test("test: the stream replays identically from the same journal so a reconnecting consumer reaches the same state", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      phaseStart("T2", "worker", ts),
+      gate("T2", "build", false),
+      { ts, event: "escalation", taskId: "T2", data: { step: "consult", attempt: 2 } },
+      { ts, event: "task-human", taskId: "T2", data: { kind: "gate-fail", reason: "review evidence" } },
+      { ts, event: "run-end", data: { done: ["T1"], failed: [], human: ["T2"], blocked: ["T3"], pending: [] } },
+    ]);
+
+    const connect = () => status(["--watch", "--events"], repo, {
+      iterations: 1,
+      sleep: async () => {},
+    });
+    const first = await connect();
+    const replay = await connect();
+
+    expect(replay).toBe(first);
+    expect(first.trim().split("\n").map((line) => JSON.parse(line).type)).toEqual([
+      "phase-change",
+      "gate-verdict",
+      "escalation",
+      "human-decision-required",
+      "run-end",
+    ]);
+  });
+
+  test("test: a configured webhook sink receives decision-tier events and its failure never affects the run or the stream", async () => {
+    const repo = mkRepo();
+    seed(repo, [
+      runStart(),
+      phaseStart("T2", "worker", ts),
+      gate("T2", "build", true),
+      gate("T2", "test", false),
+      { ts, event: "escalation", taskId: "T2", data: { step: "consult", attempt: 2 } },
+      { ts, event: "task-human", taskId: "T2", data: { kind: "gate-fail", reason: "review evidence" } },
+      { ts, event: "run-end", data: { done: ["T1"], failed: [], human: ["T2"], blocked: ["T3"], pending: [] } },
+    ]);
+    const delivered: { url: string; type: string }[] = [];
+
+    const baseline = await status(["--watch", "--events"], repo, {
+      iterations: 1,
+      sleep: async () => {},
+    });
+    const withWebhook = await status(["--watch", "--events", "--webhook", "https://hooks.example.test/tickmarkr"], repo, {
+      iterations: 1,
+      sleep: async () => {},
+      postWebhook: async (url, event) => {
+        delivered.push({ url, type: event.type });
+        throw new Error("offline");
+      },
+    });
+    await Promise.resolve();
+
+    expect(withWebhook).toBe(baseline);
+    expect(delivered).toEqual([
+      { url: "https://hooks.example.test/tickmarkr", type: "gate-verdict" },
+      { url: "https://hooks.example.test/tickmarkr", type: "escalation" },
+      { url: "https://hooks.example.test/tickmarkr", type: "human-decision-required" },
+      { url: "https://hooks.example.test/tickmarkr", type: "run-end" },
+    ]);
   });
 });

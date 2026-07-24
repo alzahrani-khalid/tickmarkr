@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readAutoPrefer, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
@@ -18,6 +19,7 @@ const attentionRow = (text: string) => `  ${statusRow("warn", text)}`;
 export type DoctorOpts = {
   banner?: boolean;
   kimiTurnProbe?: (cwd: string) => Promise<KimiDoctorTurnResult>;
+  resolveClaudeAliasIdentity?: (cwd: string, alias: ClaudeAlias) => string | undefined;
 };
 
 export async function doctor(
@@ -123,6 +125,28 @@ export async function doctor(
   // v1.65 T3: hardcoded-flag drift — advisory warn rows only. Runs AFTER writeDoctor so the verdicts
   // can never leak into doctor.json, and discoverChannels/routing never read them.
   rows.push(...flagDriftWarnings(adapters, health).map(attentionRow));
+  // OBS-145: resolved-identity drift is the same class of display-only doctor warning. Stamps live
+  // beside the alias-owning adapter; the comparison runs only for configured floating aliases and
+  // never enters health/doctor.json, config, channel discovery, learned profiles, or route().
+  const identityResolver = opts.resolveClaudeAliasIdentity
+    ?? (adapters.includes(claudeCode) ? resolveClaudeAliasIdentity : undefined);
+  if (identityResolver && health["claude-code"]?.installed) {
+    const configured = cfg.tiers["claude-code"]?.models ?? {};
+    for (const [alias, stampedIdentity] of Object.entries(CLAUDE_ALIAS_IDENTITY_STAMPS) as [ClaudeAlias, string][]) {
+      if (!(alias in configured)) continue;
+      let resolvedIdentity: string | undefined;
+      try {
+        resolvedIdentity = identityResolver(cwd, alias);
+      } catch {
+        continue; // advisory source failure is unknown, never a doctor failure
+      }
+      if (resolvedIdentity && resolvedIdentity !== stampedIdentity) {
+        rows.push(attentionRow(
+          `resolved-identity drift: claude-code:${alias} resolved to ${resolvedIdentity}, stamped identity ${stampedIdentity} — reclassify per benchmark policy (advisory — routing unchanged)`,
+        ));
+      }
+    }
+  }
   // MODEL-05/06: print-only drift fragment; advisory, whole-line-commented additions, tickmarkr NEVER applies it.
   // TTY gets a one-line summary + the fragment as a file (the full dump drowned everything else,
   // v1.33.1 onboarding); machine/CI surface keeps the inline dump — layout is pinned by tests.

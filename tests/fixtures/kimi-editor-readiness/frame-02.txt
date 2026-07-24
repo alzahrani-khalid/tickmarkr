@@ -1,0 +1,29 @@
+cd ~/Desktop/CodingSpace/tkr-probe6 && kimi -y -m 'kimi-code/kimi-for-coding'
+➜  tickmarkr cd ~/Desktop/CodingSpace/tkr-probe6 && kimi -y -m 'kimi-code/kimi-for-coding'
+Kimi Code updated to v0.29.1
+Changelog: https://moonshotai.github.io/kimi-code/en/release-notes/changelog.html
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                  │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                  │
+ │  ▐█████▌  Send /help for help information.                                                                       │
+ │                                                                                                                  │
+ │  Directory: /Users/khalidalzahrani/Desktop/CodingSpace/tkr-probe6                                                │
+ │  Session:   session_b5a231fe-4c56-4c65-8ed1-20451330b380                                                         │
+ │  Model:     K2.7 Coding                                                                                          │
+ │  Version:   0.29.1                                                                                               │
+ │                                                                                                                  │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+
+ ✨ clear && kimi -y -m 'kimi-code/kimi-for-coding'
+
+  🌑 · Tip: ask Kimi to schedule tasks, e.g. "remind me at 5pm"
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ yolo  K2.7 Coding thinking  …/Desktop/CodingSpace/tkr-probe6  probe  /sessions to browse and resume earlier sessions
+                                                                                                 context: 0% (0/256k)

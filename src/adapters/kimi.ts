@@ -108,11 +108,28 @@ export async function probeKimiDoctorTurn(cwd: string): Promise<KimiDoctorTurnRe
 // Prefer a banner Session line when present so seed-mode captures the id from the launch banner
 // itself rather than waiting for a completion-time resume trailer (which the TUI may never emit).
 const RESUME_TRAILER_RE = /^\s*To resume this session: kimi -r (session_[0-9a-f-]+)\s*$/;
-const BANNER_SESSION_LINE_RE = /^\s*Session:\s*(session_[0-9a-f-]+)\s*$/;
+const BANNER_SESSION_RE = /^Session:\s*(session_[0-9a-f-]+)$/;
+const BANNER_MODEL_RE = /^Model:\s*(.+)$/;
+
+function kimiBannerLines(banner: string): string[] {
+  // The live TUI renders banner fields as indented rows inside `│ ... │`. Strip only that
+  // per-line margin/chrome, following prompt.ts's pane-text precedent; preserve field content.
+  return banner.split("\n")
+    .map((line) => line.replace(/^[\s│|]+/, "").replace(/[\s│|]+$/, ""));
+}
+
+function kimiBannerPrintedModel(banner: string): string | undefined {
+  for (const line of kimiBannerLines(banner)) {
+    const printedModel = BANNER_MODEL_RE.exec(line)?.[1]?.trim();
+    if (printedModel) return printedModel;
+  }
+  return undefined;
+}
+
 export function kimiSessionId(output: string): string | undefined {
   let id: string | undefined;
-  for (const line of output.split("\n")) {
-    const banner = BANNER_SESSION_LINE_RE.exec(line);
+  for (const line of kimiBannerLines(output)) {
+    const banner = BANNER_SESSION_RE.exec(line);
     if (banner) {
       id = banner[1];
       continue;
@@ -125,32 +142,55 @@ export function kimiSessionId(output: string): string | undefined {
 
 // v1.69 T7: the cold-start banner prints the model alias and session id. Parse them from the
 // banner text already captured for the readiness match — no new probe, no extra dispatch. Kimi
-// 0.29.0 may print either the full config key or its display suffix; normalize both idempotently
-// to the full channel identifier routing uses.
-const BANNER_MODEL_RE = /^Model:\s*(.+)$/m;
-const BANNER_SESSION_RE = /^Session:\s*(session_[0-9a-f-]+)$/m;
+// may print a display name, the full config key, or its legacy suffix. Resolve only names with a
+// known channel mapping: inventing `kimi-code/<future display>` would turn unknown into mismatch.
+const KIMI_BANNER_MODEL_CHANNELS = new Map<string, string>([
+  ["K3", "kimi-code/k3"],
+  ["k3", "kimi-code/k3"],
+  ["kimi-code/k3", "kimi-code/k3"],
+  ["K2.7 Coding", "kimi-code/kimi-for-coding"],
+  ["kimi-for-coding", "kimi-code/kimi-for-coding"],
+  ["kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding"],
+  ["K2.7 Coding Highspeed", "kimi-code/kimi-for-coding-highspeed"],
+  ["kimi-for-coding-highspeed", "kimi-code/kimi-for-coding-highspeed"],
+  ["kimi-code/kimi-for-coding-highspeed", "kimi-code/kimi-for-coding-highspeed"],
+]);
+
 export function kimiBannerModel(banner: string): string | undefined {
-  const m = BANNER_MODEL_RE.exec(banner);
-  if (!m) return undefined;
-  const printedModel = m[1].trim();
-  if (!printedModel) return undefined;
-  return printedModel.startsWith("kimi-code/") ? printedModel : `kimi-code/${printedModel}`;
+  const printedModel = kimiBannerPrintedModel(banner);
+  return printedModel === undefined ? undefined : KIMI_BANNER_MODEL_CHANNELS.get(printedModel);
 }
+
 export function kimiBannerSessionId(banner: string): string | undefined {
-  return BANNER_SESSION_RE.exec(banner)?.[1];
+  for (const line of kimiBannerLines(banner)) {
+    const sessionId = BANNER_SESSION_RE.exec(line)?.[1];
+    if (sessionId) return sessionId;
+  }
+  return undefined;
 }
 
 export type KimiBannerConfirm =
-  | { ok: true; sessionId?: string }
-  | { ok: false; error: string };
+  | { ok: true; status: "confirmed"; sessionId?: string }
+  | { status: "unknown"; printedModel?: string; sessionId?: string }
+  | { ok: false; status: "mismatch"; error: string };
 
-// Fail closed on a named-model mismatch; a missing Model line is not a mismatch (banner partial).
+// Fail closed on a mapped-model mismatch. Unknown/missing names remain non-blocking for forward
+// compatibility, but carry an explicit unknown status rather than masquerading as confirmation.
 export function confirmKimiSeedBanner(banner: string, assignedModel: string): KimiBannerConfirm {
+  const sessionId = kimiBannerSessionId(banner);
+  const printedModel = kimiBannerPrintedModel(banner);
   const saw = kimiBannerModel(banner);
-  if (saw !== undefined && saw !== assignedModel) {
-    return { ok: false, error: `model mismatch: expected ${assignedModel}, saw ${saw}` };
+  if (printedModel === undefined || saw === undefined) {
+    return {
+      status: "unknown",
+      ...(printedModel === undefined ? {} : { printedModel }),
+      ...(sessionId === undefined ? {} : { sessionId }),
+    };
   }
-  return { ok: true, sessionId: kimiBannerSessionId(banner) };
+  if (saw !== assignedModel) {
+    return { ok: false, status: "mismatch", error: `model mismatch: expected ${assignedModel}, saw ${saw}` };
+  }
+  return { ok: true, status: "confirmed", ...(sessionId === undefined ? {} : { sessionId }) };
 }
 
 export interface KimiInteractiveSeedResult {
@@ -170,7 +210,11 @@ const KIMI_EDITOR_EMPTY_RE = /^│ > +│$/;
 const KIMI_EDITOR_BOTTOM_RE = /^╰─+╯$/;
 
 function matchesKimiEditorBox(paneText: string, empty: boolean): boolean {
-  const lines = paneText.replace(KIMI_ANSI_SGR_RE, "").split("\n");
+  // OBS-152: kimi renders its whole TUI indented one column, so `^`-anchored row matches never fire
+  // on a LIVE editor box — probe 6 timed out readiness against a frame whose box was fully painted
+  // and interactive. Trim per line: the left margin is chrome, and what actually distinguishes the
+  // editor from the welcome panel (also a bordered box) is the three-row adjacency asserted below.
+  const lines = paneText.replace(KIMI_ANSI_SGR_RE, "").split("\n").map((line) => line.trim());
   const input = empty ? KIMI_EDITOR_EMPTY_RE : KIMI_EDITOR_INPUT_RE;
   return lines.some((line, index) =>
     input.test(line)
@@ -199,7 +243,14 @@ const KIMI_SEED: InteractiveSeed = {
   launch: kimiTuiLaunch,
   readinessMatch: "Send /help for help information.",
   seedLine: (promptFile: string) => `Read ${promptFile} and do exactly what it says.`,
-  confirmBanner: confirmKimiSeedBanner,
+  confirmBanner: (banner, assignedModel) => {
+    const confirmation = confirmKimiSeedBanner(banner, assignedModel);
+    // The generic seed contract is binary: unknown display names remain admissible while the
+    // Kimi-specific result above truthfully keeps them distinct from a confirmed identity.
+    return confirmation.status === "unknown"
+      ? { ok: true, status: confirmation.status, sessionId: confirmation.sessionId }
+      : confirmation;
+  },
 };
 
 // v1.69 T7 / v1.71 T2: thin wrapper over the daemon's generic dispatch path for kimi-only tests.

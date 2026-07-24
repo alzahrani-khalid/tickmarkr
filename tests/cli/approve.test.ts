@@ -12,6 +12,10 @@ import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 const countApproved = (dir: string, runId: string): number =>
   Journal.open(dir, runId).read().filter((e) => e.event === "task-approved").length;
 
+// OBS-147 (v1.79 T3): every test that dispatches a real daemon run carries the same explicit
+// 120s load-proof budget the resume round-trip already needed — the vitest default timeout is
+// a real-time bound this suite does not control, and a starved release runner exceeded it on
+// healthy runs. Journal-only tests keep the default; they spawn no workers.
 describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-token)", () => {
   test("test: after approval of a gate-fail park a resume proceeds past the approved gate for that task without re-dispatching the worker and without re-judging", async () => {
     const { repo, fake } = setupRepo(
@@ -90,7 +94,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     await runDaemon(repo, { adapters: [fake], runId: "run-a" });
     await expect(approve(["run-a", "T_NOPE"], repo)).rejects.toThrow(/T_NOPE.*no events/);
     expect(countApproved(repo, "run-a")).toBe(0);
-  });
+  }, 120_000);
 
   test("not-parked task is a loud refusal naming the actual status; zero events appended", async () => {
     const { repo, fake } = setupRepo(
@@ -101,7 +105,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     expect(s.done).toEqual(["T1"]); // T1 is done, not parked
     await expect(approve(["run-b", "T1"], repo)).rejects.toThrow(/T1 is done, not a parked human gate/);
     expect(countApproved(repo, "run-b")).toBe(0);
-  });
+  }, 120_000);
 
   test("success appends who/when (default OS user) and prints the next step", async () => {
     const { repo, fake } = setupRepo(
@@ -117,7 +121,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     expect(ev[0].taskId).toBe("T1");
     expect(ev[0].data.by).toBe(userInfo().username);
     expect(Date.parse(ev[0].ts)).toBeGreaterThan(0); // the event's ts is the when
-  });
+  }, 120_000);
 
   test("--by and --reason are recorded verbatim", async () => {
     const { repo, fake } = setupRepo(
@@ -129,7 +133,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     const ev = Journal.open(repo, "run-d").read().find((e) => e.event === "task-approved")!;
     expect(ev.data.by).toBe("orchestrator-on-behalf");
     expect(ev.data.reason).toBe("reviewed diff");
-  });
+  }, 120_000);
 
   test("double-approve is refused (replayed status is now pending, not parked)", async () => {
     const { repo, fake } = setupRepo(
@@ -140,7 +144,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     await approve(["run-e", "T1"], repo); // first approval — replayed status is now "pending"
     await expect(approve(["run-e", "T1"], repo)).rejects.toThrow(/T1 is pending, not a parked human gate/);
     expect(countApproved(repo, "run-e")).toBe(1); // exactly one event — approvals cannot stack
-  });
+  }, 120_000);
 
   test("missing positionals is a loud usage refusal", async () => {
     const { repo } = setupRepo([T("T1", { humanGate: true })], { tasks: {} });
@@ -160,7 +164,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     await approve(["run-e2e", "T1"], repo);
     const s2 = await runDaemon(repo, { adapters: [fake], runId: "run-e2e", resume: true });
     expect(s2.done).toEqual(["T1"]);
-  });
+  }, 120_000);
 
   // v1.24 OBS-18 / GATE-08 non-regression: humanGate parks (attempts 0) stamp NO release field —
   // event shape stays {by, via} (+ optional reason), identical to pre-v1.24.
@@ -175,7 +179,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     expect(ev.data.by).toBe("op");
     expect(ev.data.via).toBe("cli");
     expect(ev.data.release).toBeUndefined(); // no attempt-cap grant on a pre-dispatch humanGate park
-  });
+  }, 120_000);
 
   // v1.24 OBS-18: approve of a task whose last task-human is an attempt-cap park stamps release.
   test("attempt-cap park approve stamps release:attempt-cap", async () => {

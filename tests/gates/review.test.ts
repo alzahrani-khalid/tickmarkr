@@ -328,6 +328,58 @@ describe("reviewGate", () => {
 // v1.70 T5 (review-convergence): the gate classifies findings by severity — only material findings
 // block approval — and carries a deferred concern's rationale into the recorded details.
 describe("reviewGate material/minor classification (v1.70 T5)", () => {
+  test("test: anchored comments never alter the verdict outcome the gate records", async () => {
+    const { repo, base } = repoWithCommit();
+    const comments = [
+      { path: "src/retry.ts", line: 41, body: "Keep the final retry inside the bounded loop." },
+    ];
+    const blocking = await reviewGate(
+      mkTask(),
+      repo,
+      base,
+      author,
+      CH,
+      [fakeWith({ review: {
+        approve: true,
+        findings: [{ note: "the last retry is dropped", severity: "material" }],
+        comments,
+      } })],
+      DEFAULT_CONFIG,
+    );
+    const approving = await reviewGate(
+      mkTask(),
+      repo,
+      base,
+      author,
+      CH,
+      [fakeWith({ review: {
+        approve: false,
+        findings: [{ note: "rename the helper", severity: "minor" }],
+        comments,
+      } })],
+      DEFAULT_CONFIG,
+    );
+
+    expect(blocking.pass).toBe(false);
+    expect(approving.pass).toBe(true);
+    expect(blocking.details).toContain("## Anchored review");
+    expect(blocking.details).toContain("src/retry.ts:41");
+  });
+
+  test("malformed review comments are ignored without changing legacy issue parsing", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: {
+      approve: false,
+      issues: ["off-by-one in retry loop"],
+      comments: [{ path: "", line: 0, body: "" }],
+    } });
+    const r = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+
+    expect(r.pass).toBe(false);
+    expect(r.details).toContain("off-by-one in retry loop");
+    expect(r.details).not.toContain("Anchored review");
+  });
+
   test("a review verdict with only minor findings and no material ones approves the task rather than blocking it", async () => {
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ review: { approve: true, findings: [

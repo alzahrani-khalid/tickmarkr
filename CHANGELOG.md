@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.79 — signal-truth
+
+This signal-truth release makes every operator-facing signal accurate, current, and precisely addressed. Status and watch now render tip-verify as a first-class phase, naming failed gates and re-verify attempts without showing terminal green while verification is failed or pending. Doctor warns on resolved-identity drift when a model alias moves beyond its dated classification, while leaving routing unchanged. The remaining legacy wall-clock bounds use controlled time or load-proof margins. A stable JSONL decision-event stream carries the exact approve command and evidence pointer, with an optional fire-and-forget webhook sink. Verdicts can also carry line-anchored review feedback into retry and consult prompts; malformed optional comments fail open on the extra without weakening the verdict.
+
 ## v1.78 — evidence-literacy
 
 This evidence-literacy release teaches the verifier and its tests to read the legitimate evidence classes reality produces. Launch submission now accepts a prompt-prefixed execution echo as positive shell-stage evidence; once seen, the launch submit window hands responsibility to readiness machinery instead of demanding first paint, while no echo and no paint continue to fail-closed. Driver timing oracles use controlled time through injected settle and clock seams rather than racing wall-clock bounds, and the signal-reaper and build-provisioning tests use controlled time or load-proof deadlines. Test-temp hygiene gets an owner: the shared helper tracks the temp repos it creates, and shared setup reaps tracked temp dirs at suite end, covering the dominant leak classes without a broad migration.

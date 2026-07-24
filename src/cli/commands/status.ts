@@ -1,7 +1,11 @@
 import { BANNER, GLYPHS, type Verdict, dim, fail, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
-import { formatOwnedName } from "../../drivers/types.js";
-import { blockedTasks, graphDefinitionHash, loadGraph } from "../../graph/graph.js";
+import {
+  formatOwnedName,
+  type DecisionEvent,
+  type DecisionWebhookPost,
+} from "../../drivers/types.js";
+import { blockedTasks, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { GATE_NAMES, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
 import { foldActivity } from "../../run/activity.js";
 import {
@@ -29,6 +33,8 @@ export type StatusOpts = {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   readWorkerOutput?: (taskId: string, attempt: number, runId: string) => Promise<string | undefined>;
+  webhookUrl?: string;
+  postWebhook?: DecisionWebhookPost;
 };
 
 export const GATE_KEYS = { build: "B", test: "T", lint: "L", evidence: "E", scope: "S", acceptance: "A", review: "R" } as const;
@@ -36,6 +42,102 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const ASCII_SPINNER = ["|", "/", "-", "\\"] as const;
 const SAVE_TERMINAL_TITLE = "\x1b[22;0t";
 const RESTORE_TERMINAL_TITLE = "\x1b[23;0t";
+
+const decisionEvidence = (stateDir: string, runId: string, sequence: number): string =>
+  `${stateDir}/runs/${runId}/journal.jsonl#L${sequence}`;
+
+// v1.79 T4: a deterministic JSONL projection over journal truth. Sequence/evidence come from the
+// append-only line position, timestamps and claims come from the row, and no watcher-local clock or
+// filesystem write participates. Re-reading the same bytes therefore returns the same event bytes.
+export const decisionEventsFromJournal = (
+  events: JournalEvent[],
+  runId: string,
+  stateDir = ".tickmarkr",
+): DecisionEvent[] => events.flatMap<DecisionEvent>((event, index): DecisionEvent[] => {
+  const sequence = index + 1;
+  const base = {
+    version: 1 as const,
+    sequence,
+    ts: event.ts,
+    runId,
+    evidence: decisionEvidence(stateDir, runId, sequence),
+    ...(event.taskId ? { taskId: event.taskId } : {}),
+  };
+  if (event.event === "phase-start" && typeof event.data.phase === "string") {
+    return [{ ...base, type: "phase-change" as const, tier: "routine" as const, phase: event.data.phase }];
+  }
+  if (event.event === "gate-result" && typeof event.data.gate === "string") {
+    const verdict = event.data.skipped === true
+      ? "skipped" as const
+      : event.data.pass === true
+        ? "passed" as const
+        : event.data.pass === false
+          ? "failed" as const
+          : "unknown" as const;
+    return [{
+      ...base,
+      type: "gate-verdict" as const,
+      tier: verdict === "failed" ? "decision" as const : "routine" as const,
+      gate: event.data.gate,
+      verdict,
+    }];
+  }
+  if (event.event === "escalation") {
+    return [{
+      ...base,
+      type: "escalation" as const,
+      tier: "decision" as const,
+      ...(typeof event.data.step === "string" ? { step: event.data.step } : {}),
+      ...(typeof event.data.attempt === "number" ? { attempt: event.data.attempt } : {}),
+    }];
+  }
+  if (event.event === "task-human" && event.taskId) {
+    return [{
+      ...base,
+      type: "human-decision-required" as const,
+      tier: "decision" as const,
+      approvalCommand: `tickmarkr approve ${runId} ${event.taskId}`,
+      ...(typeof event.data.kind === "string" ? { kind: event.data.kind } : {}),
+      ...(typeof event.data.reason === "string" ? { reason: event.data.reason } : {}),
+    }];
+  }
+  if (event.event === "run-end") {
+    return [{
+      ...base,
+      type: "run-end" as const,
+      tier: "decision" as const,
+      summary: event.data,
+    }];
+  }
+  return [];
+});
+
+const optionValue = (argv: string[], name: string): string | undefined => {
+  const inline = argv.find((arg) => arg.startsWith(`${name}=`));
+  if (inline) return inline.slice(name.length + 1) || undefined;
+  const index = argv.indexOf(name);
+  const value = index >= 0 ? argv[index + 1] : undefined;
+  return value && !value.startsWith("-") ? value : undefined;
+};
+
+const defaultPostWebhook: DecisionWebhookPost = (url, event) =>
+  fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(event),
+  }).then(() => undefined);
+
+const postWebhookFireAndForget = (
+  post: DecisionWebhookPost,
+  url: string,
+  event: DecisionEvent,
+): void => {
+  try {
+    void Promise.resolve(post(url, event)).catch(() => undefined);
+  } catch {
+    // Webhooks are observational. A synchronous bridge failure is as inert as a rejected request.
+  }
+};
 
 type LivePhase = {
   taskId: string;
@@ -250,6 +352,99 @@ const terminalFailureCause = (events: JournalEvent[]): string | undefined => {
   return undefined;
 };
 
+type TipVerifyPhase = {
+  state: "failed" | "re-verifying" | "pending";
+  gates: string[];
+  fingerprints?: number;
+  attempt?: number;
+};
+
+type TipFailureEvidence = Pick<TipVerifyPhase, "gates" | "fingerprints">;
+
+const tipFailureEvidence = (events: JournalEvent[], start: number, end: number): TipFailureEvidence => {
+  const gates = new Set<string>();
+  let fingerprints = 0;
+  let hasFingerprintCount = false;
+  for (let i = start; i <= end; i++) {
+    const event = events[i]!;
+    if (event.event !== "tip-verify-failed") continue;
+    if (typeof event.data.gate === "string" && event.data.gate.trim()) gates.add(event.data.gate.trim());
+    if (Array.isArray(event.data.fingerprints)) {
+      fingerprints += event.data.fingerprints.length;
+      hasFingerprintCount = true;
+    }
+  }
+  return { gates: [...gates], ...(hasFingerprintCount ? { fingerprints } : {}) };
+};
+
+const priorLifecycleIndex = (events: JournalEvent[], end: number): number => {
+  for (let i = end; i >= 0; i--) {
+    if (events[i]!.event === "run-start" || events[i]!.event === "run-resume") return i;
+  }
+  return 0;
+};
+
+// OBS-146: tip verification is a run phase, folded exclusively from append-only journal facts.
+// A completed run-end owns passed/failed; a later resume keeps the prior failure visible while
+// recording a re-verification attempt; an active run becomes pending only after a recorded merge
+// and recorded non-empty command set make a tip verification applicable. Unknown evidence stays
+// unknown rather than borrowing optimistic state from graph.json.
+const tipVerifyPhase = (events: JournalEvent[]): TipVerifyPhase | undefined => {
+  let lastRunEnd = -1;
+  let lastLifecycle = -1;
+  let attempts = 0;
+  let hasCommands = false;
+  let hasMerge = false;
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i]!;
+    if (event.event === "run-start" || event.event === "run-resume") {
+      lastLifecycle = i;
+      attempts++;
+      if (event.event === "run-start" && typeof event.data.commands === "object" && event.data.commands !== null
+        && !Array.isArray(event.data.commands) && Object.keys(event.data.commands).length > 0) {
+        hasCommands = true;
+      }
+    } else if (event.event === "run-end") {
+      lastRunEnd = i;
+    } else if (event.event === "merge") {
+      hasMerge = true;
+    }
+  }
+
+  if (lastRunEnd >= 0 && events[lastRunEnd]!.data.tipVerify === "failed") {
+    const failureStart = priorLifecycleIndex(events, lastRunEnd);
+    const priorFailure = tipFailureEvidence(events, failureStart, lastRunEnd);
+    if (lastLifecycle > lastRunEnd) {
+      const currentFailure = tipFailureEvidence(events, lastLifecycle, events.length - 1);
+      if (currentFailure.gates.length > 0 || currentFailure.fingerprints !== undefined) {
+        return { state: "failed", ...currentFailure };
+      }
+      return { state: "re-verifying", ...priorFailure, attempt: Math.max(2, attempts) };
+    }
+    return { state: "failed", ...priorFailure };
+  }
+
+  if (lastLifecycle > lastRunEnd) {
+    const currentFailure = tipFailureEvidence(events, lastLifecycle, events.length - 1);
+    if (currentFailure.gates.length > 0 || currentFailure.fingerprints !== undefined) {
+      return { state: "failed", ...currentFailure };
+    }
+    if (hasCommands && hasMerge) return { state: "pending", gates: [] };
+  }
+  return undefined;
+};
+
+const tipVerifyText = (phase: TipVerifyPhase): string => {
+  if (phase.state === "pending") return "tip-verify: pending";
+  const gates = phase.gates.length ? phase.gates.join(", ") : "gate unknown";
+  const failed = `tip-verify: FAILED (${gates})`;
+  const reverify = phase.state === "re-verifying" ? ` → re-verifying (attempt ${phase.attempt})` : "";
+  const fingerprints = phase.fingerprints === undefined
+    ? ""
+    : ` · ${phase.fingerprints} fingerprint${phase.fingerprints === 1 ? "" : "s"}`;
+  return `${failed}${reverify}${fingerprints}`;
+};
+
 const liveness = (events: JournalEvent[], now = Date.now()): string => {
   const last = events.at(-1);
   if (!last) return "last event unknown · daemon pid unknown";
@@ -345,6 +540,7 @@ const renderFrame = (
   const width = process.stdout.columns ?? 120;
   const done = effective.tasks.filter((t) => t.status === "done").length;
   const ended = comparable && runHasEnded(events);
+  const tipPhase = comparable ? tipVerifyPhase(events) : undefined;
   const taskIds = new Set(g.tasks.map((task) => task.id));
   const phases = comparable ? livePhases(events) : new Map<string, LivePhase>();
   for (const taskId of phases.keys()) if (!taskIds.has(taskId)) phases.delete(taskId);
@@ -384,7 +580,7 @@ const renderFrame = (
       return `${prefix}${shortGoal(t.goal, Math.max(0, width - prefix.length - suffix.length))}${suffix}`;
     });
     const header = runId
-      ? `tickmarkr status${divider}run ${runId}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, now).replaceAll(" · ", divider)}${divider}${done}/${g.tasks.length} done`
+      ? `tickmarkr status${divider}run ${runId}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, now).replaceAll(" · ", divider)}${tipPhase ? `${divider}${tipVerifyText(tipPhase)}` : ""}${divider}${tipPhase ? `${done}/${g.tasks.length} tasks done${divider}run not verified` : `${done}/${g.tasks.length} done`}`
       : `tickmarkr status${divider}no runs yet${divider}${done}/${g.tasks.length} done`;
     const legendLine = `  gates: ${GATE_NAMES.map((gate) => `${GATE_KEYS[gate]} ${gate}`).join(divider)}`;
     return {
@@ -403,18 +599,25 @@ const renderFrame = (
   const anyFailed = cells.some((c) => c.redTier);
   const gaugeCells = 10;
   const fill = g.tasks.length ? Math.round((done / g.tasks.length) * gaugeCells) : 0;
-  const gauge = (fill ? (anyFailed ? fail : ok)("█".repeat(fill)) : "") + (fill < gaugeCells ? dim("░".repeat(gaugeCells - fill)) : "");
+  const tipFailed = tipPhase?.state === "failed";
+  const progressTone = anyFailed || tipFailed ? fail : tipPhase ? warn : ok;
+  const gauge = (fill ? progressTone("█".repeat(fill)) : "") + (fill < gaugeCells ? dim("░".repeat(gaugeCells - fill)) : "");
   const live = liveness(events, now)
     .replace(/\bdead\b/, fail("dead"))
     .replace(/\bfinished\b/, dim("finished"))
     .replace(/\balive\b/, ok("alive"))
     .replaceAll(" · ", dot);
-  const tally = `${done}/${g.tasks.length} done`;
+  const tally = tipPhase
+    ? `${progressTone(`${done}/${g.tasks.length} tasks done`)}${dot}${progressTone("run not verified")}`
+    : `${done}/${g.tasks.length} done`;
+  const tipStatus = tipPhase
+    ? `${tipFailed ? fail(tipVerifyText(tipPhase)) : warn(tipVerifyText(tipPhase))}${dot}`
+    : "";
   const header = ` ${title(runId ? `run ${runId}` : "tickmarkr")}${dot}` +
     (runId
-      ? `${supersededBy ? `${warn(`superseded by ${supersededBy}`)}${dot}` : ""}${!comparable ? `${warn(NOT_COMPARABLE_NOTICE)}${dot}` : ""}${live}${dot}`
+      ? `${supersededBy ? `${warn(`superseded by ${supersededBy}`)}${dot}` : ""}${!comparable ? `${warn(NOT_COMPARABLE_NOTICE)}${dot}` : ""}${live}${dot}${tipStatus}`
       : `no runs yet${dot}`) +
-    `${gauge} ${done === g.tasks.length && g.tasks.length > 0 ? ok(tally) : tally}`;
+    `${gauge} ${tipPhase ? tally : done === g.tasks.length && g.tasks.length > 0 ? ok(tally) : tally}`;
   const hr = rule(Math.min(width, 100));
   // OBS-104 run-level now line: names the most recent journal event. TTY frame only — the non-TTY
   // machine surface is byte-pinned (status-brand golden) and must not drift. Rendered BELOW the task
@@ -481,15 +684,21 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     return visual() ? BANNER + content : content;
   }
 
+  const eventStream = argv.some((arg) => arg === "--events" || arg === "--jsonl" || arg === "--decision-events");
+  const webhookUrl = opts.webhookUrl
+    ?? optionValue(argv, "--webhook")
+    ?? process.env.TICKMARKR_DECISION_WEBHOOK;
+  const postWebhook = opts.postWebhook ?? defaultPostWebhook;
   const iterations = opts.iterations ?? Infinity;
   const sleep = opts.sleep ?? defaultSleep;
   const now = opts.now ?? Date.now;
   const bounded = Number.isFinite(iterations);
   const frames: string[] = [];
+  const eventLines: string[] = [];
   const sep = "\n---\n";
-  const tty = visual();
+  const tty = !eventStream && visual();
   const workerLiveness = new Map<string, WorkerLiveness>();
-  const herdr = HerdrDriver.available() ? new HerdrDriver() : undefined;
+  const herdr = !eventStream && HerdrDriver.available() ? new HerdrDriver() : undefined;
   const readWorkerOutput = opts.readWorkerOutput ?? (herdr
     ? async (taskId: string, attempt: number, runId: string) => {
         const name = formatOwnedName({ role: "worker", taskId, attempt, runId });
@@ -526,6 +735,27 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
       prior.snapshot = snapshot;
     }));
   };
+  let decisionRunId: string | undefined;
+  let journalCursor = 0;
+  const consumeDecisionEvents = (): DecisionEvent[] => {
+    const runId = Journal.latestRunId(cwd, { withJournal: true });
+    if (!runId) return [];
+    if (decisionRunId !== runId) {
+      decisionRunId = runId;
+      journalCursor = 0;
+    }
+    const journalEvents = Journal.open(cwd, runId).read();
+    if (journalEvents.length < journalCursor) journalCursor = 0;
+    const fresh = decisionEventsFromJournal(journalEvents, runId, stateDirName(cwd))
+      .filter((event) => event.sequence > journalCursor);
+    journalCursor = journalEvents.length;
+    if (webhookUrl) {
+      for (const event of fresh) {
+        if (event.tier === "decision") postWebhookFireAndForget(postWebhook, webhookUrl, event);
+      }
+    }
+    return fresh;
+  };
   let titleSaved = false;
   const restoreTitle = () => {
     if (!titleSaved) return;
@@ -551,16 +781,26 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   try {
     for (let i = 0; i < iterations; i++) {
       const nowMs = now();
-      const frame = renderFrame(cwd, nowMs, i, workerLiveness);
-      if (tty) {
-        updateTitle(frame.hotPhase, nowMs);
-        process.stdout.write(`\x1b[2J\x1b[H${BANNER}${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);
+      const decisionEvents = eventStream || webhookUrl ? consumeDecisionEvents() : [];
+      let frame: RenderedFrame | undefined;
+      if (eventStream) {
+        for (const event of decisionEvents) {
+          const line = JSON.stringify(event);
+          process.stdout.write(line + "\n");
+          if (bounded) eventLines.push(line);
+        }
       } else {
-        process.stdout.write(frame.content + sep);
+        frame = renderFrame(cwd, nowMs, i, workerLiveness);
+        if (tty) {
+          updateTitle(frame.hotPhase, nowMs);
+          process.stdout.write(`\x1b[2J\x1b[H${BANNER}${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);
+        } else {
+          process.stdout.write(frame.content + sep);
+        }
+        if (bounded) frames.push(frame.content);
       }
-      if (bounded) frames.push(frame.content);
       if (i + 1 < iterations) {
-        await observeWorkerOutput(frame.workerPhases, frame.runId, nowMs);
+        if (frame) await observeWorkerOutput(frame.workerPhases, frame.runId, nowMs);
         await sleep(REFRESH_MS);
       }
     }
@@ -570,5 +810,5 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
       restoreTitle();
     }
   }
-  return bounded ? frames.join(sep) : "";
+  return bounded ? eventStream ? eventLines.join("\n") : frames.join(sep) : "";
 }

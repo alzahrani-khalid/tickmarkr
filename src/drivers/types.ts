@@ -1,7 +1,38 @@
 // group: role-tab consolidation (VIS-04) — same-group slots share one ref-counted tab (herdr only)
 export interface Slot { id: string; name: string; cwd: string; tabId?: string; group?: string }
-export type NotifyTier = "routine" | "attention";
+export type NotifyTier = "routine" | "attention" | "decision";
 export interface NotifyOpts { tier?: NotifyTier; sound?: "none" | "done" | "request" }
+
+export type DecisionEventType =
+  | "phase-change"
+  | "gate-verdict"
+  | "escalation"
+  | "human-decision-required"
+  | "run-end";
+
+// Stable transport shape for `status --watch --events`. Every field is projected from one journal
+// row plus its line number; the watch owns no cursor outside its process and persists nothing.
+export interface DecisionEvent {
+  version: 1;
+  sequence: number;
+  type: DecisionEventType;
+  tier: "routine" | "decision";
+  ts: string;
+  runId: string;
+  taskId?: string;
+  evidence: string;
+  phase?: string;
+  gate?: string;
+  verdict?: "passed" | "failed" | "skipped" | "unknown";
+  step?: string;
+  attempt?: number;
+  kind?: string;
+  reason?: string;
+  approvalCommand?: string;
+  summary?: Record<string, unknown>;
+}
+
+export type DecisionWebhookPost = (url: string, event: DecisionEvent) => void | Promise<unknown>;
 // group → shared ref-counted stage tab (workers); label → dedicated role tab (SUP-01). herdr-only visuals.
 // owned → explicit ownership-contract identity (T1). When omitted, the driver derives one from `name`
 // via canonicalizeLegacyName so every pane it actually creates still gets a contract-compliant name —

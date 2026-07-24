@@ -223,7 +223,12 @@ const MODEL_PROBE_PROMPT = "Reply with exactly OK and nothing else.";
 // 60s: a healthy MCP-free codex probe measured 29.9s round-trip (2026-07-15) — 30s had zero headroom.
 const MODEL_PROBE_TIMEOUT_MS = 60000;
 // Auth-words only match when tied to a failure word; bare "auth"/"OAuth"/"authored" never fail (v1.27 T2).
-const AUTH_FAILURE_RE = /\b4\d\d\b|\bauth(?:entication|orization)?\s+(?:error|failed|failure|denied)|unauthori[sz]ed|forbidden|access denied|credit(?:s)?\s+(?:exhausted|error|denied)/i;
+// OBS-150: the 4xx alternative must refuse digit-group context. Bare `\b4\d\d\b` matched "485" inside the
+// token footer "tokens used 26,485" and failed a HEALTHY probe closed — a ~1-in-10 dice roll on EVERY model
+// probe of any adapter that prints a comma-grouped token count. Lookarounds reject a group that is part of a
+// larger number (26,485 · 1.400 · 400.5) while keeping real bare codes (401 · "error 429" · "403 Forbidden."
+// — trailing sentence punctuation still matches, only a following DIGIT means "decimal, not status code").
+const AUTH_FAILURE_RE = /\b(?<![\d.,])4\d\d\b(?![.,]\d)|\bauth(?:entication|orization)?\s+(?:error|failed|failure|denied)|unauthori[sz]ed|forbidden|access denied|credit(?:s)?\s+(?:exhausted|error|denied)/i;
 
 const PROBE_REASON_CAP = 240;
 
