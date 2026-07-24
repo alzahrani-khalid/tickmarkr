@@ -33,7 +33,12 @@ jobs:
       - run: npm run lint
       # full suite, coverage-gated — includes the export-boundary manifest suite, which in the
       # public tree validates the current git index and never skips
+      # OBS-156: serialize on the 2-core hosted runner. OBS-148 fixed release.yml only, so this
+      # job starved a different load-sensitive test on every release (v1.78 herdr READINESS,
+      # v1.79 daemon tip-verify artifact) while Release passed on the identical commit.
       - run: npm run test:coverage
+        env:
+          VITEST_MAX_FORKS: "1"
 
   test-macos:
     if: github.repository == 'alzahrani-khalid/tickmarkr'
@@ -47,4 +52,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
+      # OBS-156: same serialization as the ubuntu job — macos hosted runners are 2-core too
       - run: npm run test:coverage
+        env:
+          VITEST_MAX_FORKS: "1"
