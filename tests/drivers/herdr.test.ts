@@ -664,7 +664,11 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
     const { time } = steppedTimeSource();
     const d = new HerdrDriver(bin, 3, time);
 
-    await expect(d.run(await readinessSlot(d, cwd, "T2"), "echo hi")).rejects.toThrow(/READINESS.*never became interactive/i);
+    // OBS-142 acceptance: the error names READINESS rather than submission. On a loaded runner a
+    // single stub read can exceed its own bound INSIDE the readiness window, which surfaces the
+    // bounded-read readiness error instead of the window-expired one — both carry the readiness
+    // identity, and pinning one message races real time (the OBS-143/147 class; CI red ×2 on v1.78.0).
+    await expect(d.run(await readinessSlot(d, cwd, "T2"), "echo hi")).rejects.toThrow(/readiness/i);
 
     const calls = readFileSync(log, "utf8");
     expect(calls).not.toContain("pane send-text w1:p9 echo hi");
