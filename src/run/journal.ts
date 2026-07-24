@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
@@ -173,8 +174,39 @@ export const TelemetryRowSchema = z.object({
   // v1.46 additive (T5): gate-signal quality for routing hygiene — OPTIONAL, absent = legacy (0.25 at fold).
   signalQuality: z.union([z.literal(0), z.literal(0.25), z.literal(0.5), z.literal(0.75), z.literal(1)]).optional(),
   signalBasis: z.enum(["proved", "review-agree", "judge-only", "legacy", "vacuous", "skipped"]).optional(),
+  // OBS-132 additive judge invocation rows. Absent means the legacy per-task row. Judge rows reuse the
+  // required v1.5 envelope so per-run raw readers stay source-compatible, while readAllTelemetry filters
+  // them before profile derivation: verdict production must be observable without becoming worker reward.
+  kind: z.literal("judge").optional(),
+  judgeOutcome: z.enum(["parseable", "unparseable"]).optional(),
 });
 export type TelemetryRow = z.infer<typeof TelemetryRowSchema>;
+
+export interface JudgeInvocationEvidence {
+  taskId: string;
+  channel: string;
+  outcome: "done" | "failed";
+  judgeOutcome: "parseable" | "unparseable";
+  durationMs: number;
+  transcript?: string;
+}
+
+interface JudgePersistenceContext {
+  invocations: JudgeInvocationEvidence[];
+  written: boolean;
+}
+
+const judgePersistence = new AsyncLocalStorage<JudgePersistenceContext>();
+
+// run-gates scopes this context around the existing daemon onGate callback. Journal.append therefore
+// remains the sole persistence boundary: it can enrich the existing judge-retry row and write invocation
+// telemetry without requiring a parallel daemon callback or changing healthy gate-result payloads.
+export function withJudgeInvocationEvidence<T>(
+  invocations: JudgeInvocationEvidence[],
+  persist: () => Promise<T>,
+): Promise<T> {
+  return judgePersistence.run({ invocations, written: false }, persist);
+}
 
 // v1.46 T5 (Sol signal telemetry): gate-result rows carry explicit signalQuality so future defect windows
 // are identifiable without forensics. Basis is the provenance claim; quality is the dyadic h-fold weight.
@@ -297,7 +329,7 @@ export function readAllTelemetry(repoRoot: string, lastK: number, opts: { after?
   for (const runId of runIds) {
     for (const raw of readJsonl(join(dir, runId, "telemetry.jsonl"))) {
       const r = TelemetryRowSchema.safeParse(raw);
-      if (r.success) out.push({ ...r.data, runId });
+      if (r.success && r.data.kind !== "judge") out.push({ ...r.data, runId });
     }
   }
   return out;
@@ -398,7 +430,18 @@ export class Journal {
   }
 
   append(event: string, taskId?: string, data: Record<string, unknown> = {}): void {
-    const row: JournalEvent = { ts: new Date().toISOString(), event, ...(taskId ? { taskId } : {}), data };
+    const evidence = judgePersistence.getStore();
+    const failed = evidence?.invocations.filter((invocation) => invocation.transcript !== undefined) ?? [];
+    const persistedData = event === "judge-retry" && failed.length > 0
+      ? {
+          ...data,
+          transcript: failed[0]!.transcript,
+          ...(failed[1] ? { retryTranscript: failed[1].transcript } : {}),
+        }
+      : data;
+    const row: JournalEvent = {
+      ts: new Date().toISOString(), event, ...(taskId ? { taskId } : {}), data: persistedData,
+    };
     // T3 secret redaction: only the persisted bytes are masked — the caller's data stays untouched in
     // memory. The narrator receives the persisted (masked) row so a pane sink never shows a credential.
     const line = redactSecrets(JSON.stringify(row));
@@ -407,6 +450,26 @@ export class Journal {
       this.narrate?.(JSON.parse(line) as JournalEvent);
     } catch {
       // narration is observational; a broken sink must not affect the journal or run
+    }
+    if (evidence && !evidence.written && (event === "judge-retry" || event === "gate-result")) {
+      evidence.written = true;
+      for (const invocation of evidence.invocations) {
+        const colon = invocation.channel.indexOf(":");
+        const adapter = colon === -1 ? invocation.channel : invocation.channel.slice(0, colon);
+        const model = colon === -1 ? "" : invocation.channel.slice(colon + 1);
+        this.telemetry({
+          kind: "judge",
+          taskId: invocation.taskId,
+          shape: "judge",
+          adapter,
+          model,
+          channel: invocation.channel,
+          attempts: 1,
+          outcome: invocation.outcome,
+          durationMs: invocation.durationMs,
+          judgeOutcome: invocation.judgeOutcome,
+        });
+      }
     }
   }
 
@@ -534,8 +597,16 @@ export class Journal {
     appendFileSync(join(this.dir, "telemetry.jsonl"), redactSecrets(JSON.stringify(row)) + "\n");
   }
 
-  // Per-run, raw (NOT schema-validated) — report.ts reads v1.5 core fields; stays byte-compatible.
+  // Per-run task rows stay byte-compatible for legacy readers (report and task-level test helpers).
+  // Judge rows share telemetry.jsonl but have a dedicated reader so their earlier gate-time ordering
+  // cannot make a find(taskId) caller mistake invocation evidence for the later terminal task row.
   readTelemetry(): TelemetryRow[] {
-    return readJsonl(join(this.dir, "telemetry.jsonl")) as TelemetryRow[];
+    return readJsonl(join(this.dir, "telemetry.jsonl"))
+      .filter((row) => !(row && typeof row === "object" && "kind" in row && row.kind === "judge")) as TelemetryRow[];
+  }
+
+  readJudgeTelemetry(): TelemetryRow[] {
+    return readJsonl(join(this.dir, "telemetry.jsonl"))
+      .filter((row) => row && typeof row === "object" && "kind" in row && row.kind === "judge") as TelemetryRow[];
   }
 }

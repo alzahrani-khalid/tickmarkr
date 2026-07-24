@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -104,6 +105,18 @@ export interface GateVia {
   labelFor: (role: "judge" | "review") => string; // role-tab label, mirrors nameFor (SUP-01)
 }
 
+const llmOutputCapture = new AsyncLocalStorage<string[]>();
+
+// OBS-132: acceptance.ts owns verdict parsing and is deliberately byte-untouched. This async-scoped
+// recorder lets run-gates observe the exact output that acceptance parsed without changing runLlm's
+// return value or leaking concurrent tasks into one another. Callers retain output only when the
+// resulting verdict is a production failure; healthy output is discarded in memory.
+export async function captureLlmOutput<T>(run: () => Promise<T>): Promise<{ value: T; outputs: string[] }> {
+  const outputs: string[] = [];
+  const value = await llmOutputCapture.run(outputs, run);
+  return { value, outputs };
+}
+
 export async function runHeadless(
   adapter: WorkerAdapter,
   model: string,
@@ -154,7 +167,7 @@ export async function runViaDriver(
   return out;
 }
 
-export function runLlm(
+export async function runLlm(
   adapter: WorkerAdapter,
   model: string,
   prompt: string,
@@ -162,9 +175,11 @@ export function runLlm(
   via?: LlmVia,
   timeoutMs = 300000,
 ): Promise<string> {
-  return via
+  const out = await (via
     ? runViaDriver(adapter, model, prompt, cwd, via, timeoutMs)
-    : runHeadless(adapter, model, prompt, cwd, timeoutMs);
+    : runHeadless(adapter, model, prompt, cwd, timeoutMs));
+  llmOutputCapture.getStore()?.push(out);
+  return out;
 }
 
 export function extractJson<T>(raw: string): T | null {

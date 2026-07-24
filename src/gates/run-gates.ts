@@ -5,11 +5,12 @@ import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate } from "./acceptance.js";
 import { type Baseline, compareToBaseline } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
-import type { GateVia } from "./llm.js";
+import { captureLlmOutput, type GateVia } from "./llm.js";
 import { marginalCostRank } from "../route/router.js";
 import { reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
 import type { GateResult } from "./types.js";
+import { type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 
 export type GateEvent =
   | { phase: "start"; gate: GateName; index: number; total: number }
@@ -92,7 +93,39 @@ export async function runGates(
       : undefined;
     // v1.19 (T2): testCmd threads the detected test runner to the gate so named-test oracles run
     // deterministically (filtered via -t) before any LLM judge dispatch.
-    let a = await acceptanceGate(task, ctx.worktree, ctx.baseRef, { adapter: judgeAdapter, model: ctx.cfg.judge.model }, jvia, { testCmd: ctx.commands.test, diffCap: ctx.cfg.gates.diffCap });
+    const invocations: JudgeInvocationEvidence[] = [];
+    const invokeJudge = async (
+      adapter: WorkerAdapter,
+      model: string,
+      via: typeof jvia,
+    ): Promise<GateResult> => {
+      const started = Date.now();
+      const captured = await captureLlmOutput(() =>
+        acceptanceGate(
+          task,
+          ctx.worktree,
+          ctx.baseRef,
+          { adapter, model },
+          via,
+          { testCmd: ctx.commands.test, diffCap: ctx.cfg.gates.diffCap },
+        ));
+      const channel = channelKey({ adapter: adapter.id, model });
+      const unparseable = captured.value.meta?.unparseable === true;
+      // acceptanceGate has exactly one runLlm call. Keep the map shape so a future deterministic early
+      // return (zero outputs) stays telemetry-free instead of manufacturing a judge invocation.
+      for (const output of captured.outputs) {
+        invocations.push({
+          taskId: task.id,
+          channel,
+          outcome: unparseable ? "failed" : "done",
+          judgeOutcome: unparseable ? "unparseable" : "parseable",
+          durationMs: Date.now() - started,
+          ...(unparseable ? { transcript: output } : {}),
+        });
+      }
+      return captured.value;
+    };
+    let a = await invokeJudge(judgeAdapter, ctx.cfg.judge.model, jvia);
     // GATE-09: an unparseable judge verdict retries the JUDGE exactly once on a failover channel — never
     // the worker (run-20260711-185020 P43-03 L70-72 billed a judge flake as a worker attempt). The flaked
     // first verdict NEVER enters results (no false gate-result journal event, no operator notify, no stale
@@ -125,10 +158,10 @@ export async function runGates(
         ? { driver: ctx.via.driver, keep: ctx.via.keep, onSlot: ctx.via.onSlot, name: ctx.via.nameFor("judge", retryAdapter.id) + "-r1", label: ctx.via.labelFor("judge") }
         : undefined;
       // the retry IS a second acceptanceGate call: one code path, one parser, zero new parse leniency.
-      a = await acceptanceGate(task, ctx.worktree, ctx.baseRef, { adapter: retryAdapter, model: retry.model }, retryJvia, { testCmd: ctx.commands.test, diffCap: ctx.cfg.gates.diffCap });
+      a = await invokeJudge(retryAdapter, retry.model, retryJvia);
       a = { ...a, meta: { ...a.meta, judgeRetry: { flaked: flakedKey, retried: channelKey({ adapter: retry.adapter, model: retry.model }) } } };
     }
-    await record(a);
+    await withJudgeInvocationEvidence(invocations, () => record(a));
     if (failed()) return { results, commits };
   }
 

@@ -5,6 +5,8 @@
 // This test reproduces the shape in-suite through the REAL runDaemon (zero tokens, FakeAdapter):
 // a garbage-then-good judge script. ON UNFIXED HEAD: two task-dispatches + an escalation event;
 // AFTER THE FIX: one dispatch, zero escalations, task-done — the judge was retried, the worker never billed.
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { Journal } from "../../src/run/journal.js";
 import { runDaemon } from "../../src/run/daemon.js";
@@ -44,7 +46,12 @@ describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero toke
     const jr = evs.filter((e) => e.event === "judge-retry" && e.taskId === "T1");
     expect(jr).toHaveLength(1);
     // no secondUnparseable: the retry produced a parseable pass (only double-garbage sets the flag)
-    expect(jr[0].data).toEqual({ gate: "acceptance", flaked: "fake:fake-1", retried: "fake:fake-2" });
+    expect(jr[0].data).toMatchObject({
+      gate: "acceptance",
+      flaked: "fake:fake-1",
+      retried: "fake:fake-2",
+      transcript: expect.stringContaining("judge output garbage — not a verdict"),
+    });
     // ordering pin: attribution precedes the verdict in the stream (judge-retry BEFORE acceptance gate-result)
     const jrIdx = evs.findIndex((e) => e.event === "judge-retry" && e.taskId === "T1");
     const accIdx = evs.findIndex((e) => e.event === "gate-result" && (e.data as { gate?: string }).gate === "acceptance");
@@ -115,5 +122,74 @@ describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero toke
     const ps = await runDaemon(pf.repo, { adapters: [pf.fake], runId: "run-g09-pfail" });
     expect(ps.human).toEqual(["T1"]);
     expect(Journal.open(pf.repo, "run-g09-pfail").read().filter((e) => e.event === "judge-retry")).toHaveLength(0);
+  });
+
+  test("a verdict that fails to parse journals the redacted judge transcript alongside the flake record", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      {
+        judge: ["judge emitted prose instead of a verdict", { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r" }] }],
+        review: { approve: true, issues: [] },
+        tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] },
+      },
+    );
+    await runDaemon(repo, { adapters: [fake], runId: "run-judge-transcript" });
+
+    const flake = Journal.open(repo, "run-judge-transcript").read()
+      .find((e) => e.event === "judge-retry" && e.taskId === "T1");
+    expect(flake?.data.transcript).toContain("judge emitted prose instead of a verdict");
+  });
+
+  test("a parseable verdict captures no transcript so a healthy run grows no journal weight", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      {
+        judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r" }] },
+        review: { approve: true, issues: [] },
+        tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] },
+      },
+    );
+    await runDaemon(repo, { adapters: [fake], runId: "run-judge-healthy" });
+
+    const journal = Journal.open(repo, "run-judge-healthy");
+    expect(JSON.stringify(journal.read())).not.toContain("transcript");
+  });
+
+  test("a captured transcript passes through the existing redaction seam before touching disk", async () => {
+    const secret = "sk-ant-api03-AbCd1234EfGh5678IjKl";
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      {
+        judge: [`judge leaked ANTHROPIC_API_KEY=${secret}`, { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r" }] }],
+        review: { approve: true, issues: [] },
+        tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] },
+      },
+    );
+    await runDaemon(repo, { adapters: [fake], runId: "run-judge-redacted" });
+
+    const journal = Journal.open(repo, "run-judge-redacted");
+    const persisted = readFileSync(join(journal.dir, "journal.jsonl"), "utf8");
+    expect(persisted).not.toContain(secret);
+    expect(persisted).toContain("sk-ant-[REDACTED]");
+    expect(journal.read().find((e) => e.event === "judge-retry")?.data.transcript)
+      .toContain("sk-ant-[REDACTED]");
+  });
+
+  test("telemetry gains a row for each judge invocation naming its channel and outcome", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      {
+        judge: ["judge output garbage", { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r" }] }],
+        review: { approve: true, issues: [] },
+        tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] },
+      },
+    );
+    await runDaemon(repo, { adapters: [fake], runId: "run-judge-telemetry" });
+
+    const rows = Journal.open(repo, "run-judge-telemetry").readJudgeTelemetry();
+    expect(rows).toEqual([
+      expect.objectContaining({ taskId: "T1", channel: "fake:fake-1", outcome: "failed" }),
+      expect.objectContaining({ taskId: "T1", channel: "fake:fake-2", outcome: "done" }),
+    ]);
   });
 }, 120000);

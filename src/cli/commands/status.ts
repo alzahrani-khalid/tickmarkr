@@ -17,7 +17,8 @@ import { normalizeStallSnapshot } from "../../run/stall.js";
 
 // ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
 const REFRESH_MS = 2000;
-const NOT_COMPARABLE_NOTICE = "graph recompiled since this run — task states not comparable; run `tickmarkr run` to execute";
+const NOT_COMPARABLE_NOTICE = "graph recompiled since this run — task states not comparable; resume with `--graph-changed` to audit this recompile";
+const PRIOR_GRAPH_MARKER = "prior graph";
 
 // The timer must keep the process ALIVE: an unref'd timer here let the event loop drain after the
 // first frame, so a live `--watch` printed once and exited 0 (OBS-11). Never unref this.
@@ -157,19 +158,31 @@ export type GateState = "open" | "pass" | "fail" | "skip";
 export const defaultGateStates = (task: Task): GateState[] =>
   GATE_NAMES.map((gate) => task.gates.includes(gate) ? "open" : "skip");
 
-export const gateStates = (task: Task, events: JournalEvent[]): GateState[] => {
-  const outcomes = new Map<string, "pass" | "fail" | "skip">();
+type GateSnapshot = {
+  states: GateState[];
+  priorGraph: boolean;
+};
+
+const gateSnapshot = (task: Task, events: JournalEvent[], rehashAt?: number): GateSnapshot => {
+  const outcomes = new Map<string, { state: "pass" | "fail" | "skip"; eventIndex: number }>();
   const start = attemptStartIdx(events, task.id);
   if (start >= 0) {
-    for (const e of events.slice(start)) {
+    for (let eventIndex = start; eventIndex < events.length; eventIndex++) {
+      const e = events[eventIndex]!;
       if (e.taskId !== task.id || e.event !== "gate-result" || typeof e.data.gate !== "string") continue;
-      if (e.data.skipped === true) outcomes.set(e.data.gate, "skip");
-      else if (e.data.pass === true) outcomes.set(e.data.gate, "pass");
-      else if (e.data.pass === false) outcomes.set(e.data.gate, "fail");
+      if (e.data.skipped === true) outcomes.set(e.data.gate, { state: "skip", eventIndex });
+      else if (e.data.pass === true) outcomes.set(e.data.gate, { state: "pass", eventIndex });
+      else if (e.data.pass === false) outcomes.set(e.data.gate, { state: "fail", eventIndex });
     }
   }
-  return GATE_NAMES.map((gate) => task.gates.includes(gate) ? outcomes.get(gate) ?? "open" : "skip");
+  return {
+    states: GATE_NAMES.map((gate) => task.gates.includes(gate) ? outcomes.get(gate)?.state ?? "open" : "skip"),
+    priorGraph: rehashAt !== undefined && [...outcomes.values()].some((outcome) => outcome.eventIndex < rehashAt),
+  };
 };
+
+export const gateStates = (task: Task, events: JournalEvent[]): GateState[] =>
+  gateSnapshot(task, events).states;
 
 // verdict semantics only: pass brand green, fail red, skip/open dim chrome — everything else stays quiet
 const GATE_STATE_TOKEN: Record<GateState, (s: string) => string> = { pass: ok, fail, skip: dim, open: dim };
@@ -260,6 +273,29 @@ type RenderedFrame = {
   workerPhases: LivePhase[];
 };
 
+type StatusEngagement = {
+  comparable: boolean;
+  rehashAt?: number;
+};
+
+// Resume's shared comparator remains the fail-closed baseline. Status may additionally accept the
+// daemon's audited graph-rehash release, but only when its `from` names that baseline identity (or
+// null for an explicitly released legacy journal) and its `to` names the graph loaded now.
+const statusEngagement = (events: JournalEvent[], loadedHash: string): StatusEngagement => {
+  const baseline = engagementComparable(events, loadedHash);
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    if (event.event !== "graph-rehash") continue;
+    const auditsBaseline = baseline.comparable || baseline.reason === "mismatch"
+      ? event.data.from === baseline.recorded
+      : event.data.from === null;
+    return event.data.to === loadedHash && auditsBaseline
+      ? { comparable: true, rehashAt: i }
+      : { comparable: false };
+  }
+  return { comparable: baseline.comparable };
+};
+
 const renderFrame = (
   cwd: string,
   now = Date.now(),
@@ -273,16 +309,18 @@ const renderFrame = (
   let events: JournalEvent[] = [];
   const contexts = new Map<string, number>();
   let comparable = false;
+  let rehashAt: number | undefined;
   let supersededBy: string | undefined; // v1.53 T5: this run is dead — a newer run replaced it
   if (runId) {
     const j = Journal.open(cwd, runId);
     events = j.read();
     const sup = [...events].reverse().find((e) => e.event === "superseded" && typeof e.data.by === "string");
     supersededBy = sup?.data.by as string | undefined;
-    // T3 (Sol #2 / Fable F2): the SAME comparator resume uses (engagementComparable) — one decision,
-    // two consumers. graphDefinitionHash (compiled task definitions only) survives status/evidence
-    // mutation but changes when a task definition changes, so a recompiled graph is detected here too.
-    comparable = engagementComparable(events, graphDefinitionHash(g)).comparable;
+    // The resume comparator is the fail-closed baseline; a matching graph-rehash is the daemon's
+    // append-only audit that authorizes this status replay after stop-amend-resume.
+    const engagement = statusEngagement(events, graphDefinitionHash(g));
+    comparable = engagement.comparable;
+    rehashAt = engagement.rehashAt;
     if (comparable) {
       replayed = j.replayStatuses();
       for (const e of events) {
@@ -330,16 +368,19 @@ const renderFrame = (
     const channel = assignments.get(t.id) ?? "-";
     const ctx = contexts.get(t.id);
     const assignCol = ctx !== undefined ? `${channel}${divider}ctx ${ctx}` : channel;
-    return { t, st, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, states: comparable ? gateStates(t, events) : defaultGateStates(t) };
+    const gates = comparable
+      ? gateSnapshot(t, events, rehashAt)
+      : { states: defaultGateStates(t), priorGraph: false };
+    return { t, st, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, ...gates };
   });
 
   if (!unicode) {
     // machine/CI surface — journals without phase-start stay byte-identical; new phase-aware frames
     // use an ASCII spinner so pipes never receive terminal-only braille/ANSI.
-    const rows = cells.map(({ t, st, label, assignCol, livePhase, states }) => {
+    const rows = cells.map(({ t, st, label, assignCol, livePhase, states, priorGraph }) => {
       const chain = gateChain(states, false);
       const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${taskBox(st)} ${t.id} `;
-      const suffix = `  ${chain}  ${livePhase ? "running" : String(st)}${label}  ${assignCol}`;
+      const suffix = `  ${chain}${priorGraph ? ` ${PRIOR_GRAPH_MARKER}` : ""}  ${livePhase ? "running" : String(st)}${label}  ${assignCol}`;
       return `${prefix}${shortGoal(t.goal, Math.max(0, width - prefix.length - suffix.length))}${suffix}`;
     });
     const header = runId
@@ -399,7 +440,7 @@ const renderFrame = (
   const goalW = Math.max(8, ...goals.map((s) => s.length));
   const indent = " ".repeat(idW + 5); // line 2 starts under the goal column
   const rows = cells.map((c, i) => {
-    const { t, st, failureKind, redTier, states, isStarved, phrase, channel, ctx, livePhase } = c;
+    const { t, st, failureKind, redTier, states, priorGraph, isStarved, phrase, channel, ctx, livePhase } = c;
     const word = statusWord(c);
     const staleWorker = livePhase?.phase === "worker"
       && workerOutputAge(livePhase, now, workerLiveness.get(t.id)) >= 60_000;
@@ -417,6 +458,7 @@ const renderFrame = (
       : `  ${statusRow(taskVerdict(c), taskLabel)}`;
     // activity already names its channel for in-flight attempts — never repeat it
     const detail = [
+      ...(priorGraph ? [PRIOR_GRAPH_MARKER] : []),
       ...(phrase ? [phrase, ...(phrase.includes(channel) || channel === "-" ? [] : [channel])] : [channel]),
       ...(failureKind && !phrase?.includes(failureKind) ? [failureKind] : []),
       ...(ctx !== undefined ? [`ctx ${ctx}`] : []),

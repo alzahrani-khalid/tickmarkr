@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -31,6 +31,21 @@ function scatteredSweepRepo(fileCount: number, lineLen: number): { repo: string;
     writeFileSync(join(repo, `docs/f${i}.md`), content);
   }
   execSync("git add -A && git commit --no-gpg-sign -m sweep", { cwd: repo });
+  return { repo, base };
+}
+
+function deletionHeavyRepo(): { repo: string; base: string } {
+  const retiredBody = (label: string) =>
+    Array.from({ length: 120 }, (_, i) => `export const ${label}_${i} = "${"x".repeat(80)}";`).join("\n") + "\n";
+  const repo = makeRepo({
+    "retired/alpha.ts": retiredBody("alpha"),
+    "retired/beta.ts": retiredBody("beta"),
+    "kept.ts": "export const kept = 'before';\n",
+  });
+  const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+  rmSync(join(repo, "retired"), { recursive: true });
+  writeFileSync(join(repo, "kept.ts"), "export const kept = 'after';\n");
+  execSync("git add -A && git commit --no-gpg-sign -m retire", { cwd: repo });
   return { repo, base };
 }
 
@@ -72,7 +87,7 @@ describe("diff cap — OBS-48 zero-context metric", () => {
     expect(calls).toBe(1);
   });
 
-  test("oversized -U0 diff fails closed before any judge call", async () => {
+  test("a diff whose added and modified content alone exceeds the cap still fails closed with the same guidance as before", async () => {
     const { repo, base } = scatteredSweepRepo(400, 280);
     const { forCap } = await fetchTaskDiff(repo, base);
     expect(forCap.length).toBeGreaterThan(CAP);
@@ -88,6 +103,27 @@ describe("diff cap — OBS-48 zero-context metric", () => {
     expect(r.details).toMatch(/diff exceeds verifiable cap/i);
     expect(calls).toBe(0);
     expect(isDiffCapPark(r)).toBe(true);
+    const prior = checkDiffCap("acceptance", forCap.length, CAP)!;
+    expect(r.details.endsWith(prior.details)).toBe(true);
+    expect(r.meta).toEqual(prior.meta);
+  });
+});
+
+describe("diff cap — OBS-134 deletion facts", () => {
+  test("a diff dominated by whole-file deletions passes the cap when its added and modified content is under the limit", async () => {
+    const { repo, base } = deletionHeavyRepo();
+    const { forCap } = await fetchTaskDiff(repo, base);
+    const cap = 1_000;
+    expect(forCap.length).toBeGreaterThan(cap);
+
+    const fake = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "retired" }] } });
+    let calls = 0;
+    const cmd = fake.headlessCommand.bind(fake);
+    fake.headlessCommand = (...args) => { calls++; return cmd(...args); };
+
+    const r = await acceptanceGate(judgeTask, repo, base, { adapter: fake, model: "fake-1" }, undefined, { diffCap: cap });
+    expect(r.pass).toBe(true);
+    expect(calls).toBe(1);
   });
 });
 

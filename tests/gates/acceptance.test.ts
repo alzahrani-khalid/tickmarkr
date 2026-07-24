@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -508,6 +508,32 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
     await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(capturedPrompt).toMatch(/Citable evidence lines/i);
     expect(capturedPrompt).toMatch(/greet\.js: 1\b/);
+  });
+
+  test("the judge context represents each deleted file as a file-level fact rather than its full deleted body", async () => {
+    const repo = makeRepo({
+      "retired/alpha.ts": "ALPHA_DELETED_BODY\n".repeat(200),
+      "retired/beta.ts": "BETA_DELETED_BODY\n".repeat(200),
+      "kept.ts": "export const kept = 'before';\n",
+    });
+    const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    rmSync(join(repo, "retired"), { recursive: true });
+    writeFileSync(join(repo, "kept.ts"), "export const kept = 'after';\n");
+    execSync("git add -A && git commit -m retire --no-gpg-sign", { cwd: repo });
+
+    let capturedPrompt = "";
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "retired" }] });
+    const orig = fake.headlessCommand.bind(fake);
+    fake.headlessCommand = (promptFile, model) => {
+      capturedPrompt = readFileSync(promptFile, "utf8");
+      return orig(promptFile, model);
+    };
+
+    await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
+    expect(capturedPrompt).toContain("deleted file: retired/alpha.ts");
+    expect(capturedPrompt).toContain("deleted file: retired/beta.ts");
+    expect(capturedPrompt).not.toContain("ALPHA_DELETED_BODY");
+    expect(capturedPrompt).not.toContain("BETA_DELETED_BODY");
   });
 });
 

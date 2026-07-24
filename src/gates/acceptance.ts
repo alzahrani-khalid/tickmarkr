@@ -187,6 +187,21 @@ function compressLines(lines: number[]): string {
   return parts.join(", ");
 }
 
+// OBS-134: whole-file deletions are already fully described by their path. Sending every removed line
+// spends the cap and judge context on content that cannot exist after the change. Added and modified
+// sections pass through byte-for-byte, so their anti-flooding budget is unchanged.
+function judgeRelevantDiff(diff: string): string {
+  return diff.split(/(?=^diff --git )/m).map((section) => {
+    if (!/^deleted file mode /m.test(section)) return section;
+    const oldPath = /^--- (.+)$/m.exec(section)?.[1]
+      ?? /^Binary files (.+) and \/dev\/null differ$/m.exec(section)?.[1];
+    if (!oldPath || oldPath === "/dev/null") return section;
+    const unquoted = oldPath.startsWith('"') && oldPath.endsWith('"') ? oldPath.slice(1, -1) : oldPath;
+    const path = unquoted.replace(/^a\//, "");
+    return `deleted file: ${path}\n`;
+  }).join("");
+}
+
 // A citation is valid evidence iff the cited line falls inside a changed hunk of the cited file (OBS-129:
 // changed-hunk span, not exact-added-line). A legacy free-text quote (string) keeps v1.64's substring
 // check — non-empty and present somewhere in the diff.
@@ -256,7 +271,9 @@ export async function acceptanceGate(
     ? "WARNING: only judge oracles — no deterministic command/test oracle guards this task (deterministic preferred, spec §2).\n"
     : "";
 
-  const { full: diff, forCap } = await fetchTaskDiff(worktree, baseRef);
+  const fetched = await fetchTaskDiff(worktree, baseRef);
+  const diff = judgeRelevantDiff(fetched.full);
+  const forCap = judgeRelevantDiff(fetched.forCap);
   const diffCap = opts.diffCap ?? DEFAULT_DIFF_CAP;
   const capFail = checkDiffCap("acceptance", forCap.length, diffCap, warn + detBlock);
   if (capFail) return capFail;

@@ -12,6 +12,8 @@ export const TRAILER_WIDTH_MARGIN = 2; // cols below (floor + margin) refuse a r
 export const DELIVERY_ATTEMPTS = 3;
 const DELIVERY_VERIFY_TIMEOUT_MS = 2000; // per attempt — a paste that hasn't rendered in 2s is retyped
 const DELIVERY_READ_LINES = 80;
+const DELIVERY_SETTLE_READ_ATTEMPTS = 6;
+const DELIVERY_SETTLE_POLL_MS = 100;
 
 /** First-generation join direction from measured trailer-safe floor (43-MEASUREMENT.md). */
 export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILER_SAFE_FLOOR_COLS, margin = TRAILER_WIDTH_MARGIN): "right" | "down" {
@@ -400,8 +402,17 @@ export class HerdrDriver implements ExecutorDriver {
     let transcript = "";
     for (let attempt = 0; attempt < DELIVERY_ATTEMPTS; attempt++) {
       if (attempt > 0) {
-        // clear the corrupted input line before retyping; a failed clear must NOT be retyped onto —
-        // corrupt-prefix + clean-retype would concatenate and false-verify by containment
+        // A TUI may still be painting while the failed delivery is captured (OBS-135). Judge the
+        // line only after two consecutive pane reads agree; an already-stable frame returns on the
+        // first fresh read without a timer. A changing pane is bounded and preserves OBS-85's
+        // fail-closed error instead of guessing from an adapter fingerprint.
+        const settled = await this.settleDeliveryLine(pane, slot.cwd, transcript);
+        transcript = settled.transcript;
+        if (!settled.ok) {
+          throw new Error(`herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85); pane transcript:\n${transcript}`);
+        }
+        // Clear the corrupted input line before retyping; a failed clear must NOT be retyped onto —
+        // corrupt-prefix + clean-retype would concatenate and false-verify by containment.
         const cleared = await this.herdr(`pane send-keys ${shq(pane)} C-u`, slot.cwd);
         if (cleared.code !== 0) throw new Error(`herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85); pane transcript:\n${transcript}`);
       }
@@ -421,6 +432,27 @@ export class HerdrDriver implements ExecutorDriver {
       transcript = (await this.herdr(`pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`, slot.cwd)).stdout;
     }
     throw new Error(`herdr delivery corrupted after ${DELIVERY_ATTEMPTS} attempts — enter never pressed (OBS-85); pane transcript:\n${transcript}`);
+  }
+
+  private async settleDeliveryLine(
+    pane: string,
+    cwd: string,
+    initialTranscript: string,
+  ): Promise<{ ok: boolean; transcript: string }> {
+    let transcript = initialTranscript;
+    for (let readAttempt = 0; readAttempt < DELIVERY_SETTLE_READ_ATTEMPTS; readAttempt++) {
+      const read = await this.herdr(
+        `pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`,
+        cwd,
+      );
+      if (read.code !== 0) return { ok: false, transcript: read.stdout || transcript };
+      if (read.stdout === transcript) return { ok: true, transcript };
+      transcript = read.stdout;
+      if (readAttempt < DELIVERY_SETTLE_READ_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, DELIVERY_SETTLE_POLL_MS));
+      }
+    }
+    return { ok: false, transcript };
   }
 
   private async deliveryReadMatches(pane: string, cmd: string, cwd: string): Promise<boolean> {

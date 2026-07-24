@@ -1,12 +1,12 @@
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { DELIVERY_ATTEMPTS, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string } }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; changingPaneRead?: boolean; clearFailsThroughRead?: number }
 
 // OBS-85 fixture text: what the incident panes actually showed instead of the typed dispatch line.
 const CORRUPT_READ = `printf "git: 'rev-parseprintf' is not a git command\\n"`;
@@ -19,6 +19,7 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const panes = join(dir, "panes.txt");
   const ctr = join(dir, "tabctr.txt"); // incTabs: distinct tab ids (t1,t2,…) so coexisting tabs are distinguishable
   const verctr = join(dir, "verctr.txt"); // corrupt:"once" — first delivery verify fails, later ones match
+  const readctr = join(dir, "readctr.txt"); // staged pane paints + clear guard timing
   const inflight = join(dir, "inflight.txt"); // contendDelivery: pane ids with an active delivery
   const bin = join(dir, "herdr");
   const cwd = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-cwd-"));
@@ -64,9 +65,17 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
       : opts.corrupt === "once"
         ? `n=$(cat '${verctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${verctr}'; [ $n -le 1 ] && exit 1; exit 0`
         : `exit ${waitExit}`;
-  const paneRead = opts.corrupt ? CORRUPT_READ : opts.wrappedCmd
-    ? `printf '> ${opts.wrappedCmd.slice(0, 20)}\\n${opts.wrappedCmd.slice(20)}\\n'`
-    : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
+  const stagedReads = opts.paneReadFrames?.map(
+    (frame, i) => `${i + 1}) printf '%s\\n' '${frame.replaceAll("'", "'\\''")}' ;;`,
+  ).join(" ");
+  const lastStagedRead = opts.paneReadFrames?.at(-1)?.replaceAll("'", "'\\''");
+  const paneRead = opts.changingPaneRead
+    ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; printf 'painting-frame-%s\\n' "$n"`
+    : opts.paneReadFrames?.length
+      ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; case "$n" in ${stagedReads} *) printf '%s\\n' '${lastStagedRead}' ;; esac`
+      : opts.corrupt ? CORRUPT_READ : opts.wrappedCmd
+        ? `printf '> ${opts.wrappedCmd.slice(0, 20)}\\n${opts.wrappedCmd.slice(20)}\\n'`
+        : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
   const deliveryContend = opts.contendDelivery
     ? `
 delivery_pane() { for a in "$@"; do case "$a" in w1:p*) echo "$a"; return;; esac; done; }
@@ -77,11 +86,15 @@ pane_send_keys() { if [[ "$*" == *C-u* ]]; then delivery_clear "$@"; elif [[ "$*
 `
     : "";
   const sendText = opts.contendDelivery ? `delivery_begin "$@"; echo '{}'` : "echo '{}'";
+  const clearResult = opts.clearFailsThroughRead === undefined
+    ? `echo '{}'`
+    : `n=$(cat '${readctr}' 2>/dev/null || echo 0); [ "$n" -le ${opts.clearFailsThroughRead} ] && exit 1; echo '{}'`;
+  const enterResult = opts.rebindAfterDelivery
+    ? `if [[ "$*" == *Enter* ]]; then grep -v " ${opts.rebindAfterDelivery.name}$" '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; printf '%s %s\\n' '${opts.rebindAfterDelivery.pane}' '${opts.rebindAfterDelivery.name}' >> '${panes}'; fi; echo '{}'`
+    : `echo '{}'`;
   const sendKeys = opts.contendDelivery
     ? `pane_send_keys "$@"`
-    : opts.rebindAfterDelivery
-      ? `if [[ "$*" == *Enter* ]]; then grep -v " ${opts.rebindAfterDelivery.name}$" '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; printf '%s %s\\n' '${opts.rebindAfterDelivery.pane}' '${opts.rebindAfterDelivery.name}' >> '${panes}'; fi; echo '{}'`
-      : `echo '{}'`;
+    : `if [[ "$*" == *C-u* ]]; then ${clearResult}; else ${enterResult}; fi`;
   writeFileSync(
     bin,
     `#!/usr/bin/env bash
@@ -365,6 +378,68 @@ describe("HerdrDriver delivery serialization and narrow-pane read-back (OBS-119 
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/^pane send-keys w1:p42 C-u/gm)?.length ?? 0).toBeGreaterThan(0);
     expect(calls).not.toMatch(/pane send-keys w1:p42 Enter/);
+  });
+});
+
+describe("HerdrDriver delivery clear settling (OBS-135)", () => {
+  test("test: a pane still painting its welcome frame at first read settles and receives its delivery with no refusal", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      corrupt: "once",
+      paneReadFrames: ["welcome-frame-top", "welcome-frame-bottom", "ready-prompt", "ready-prompt"],
+      clearFailsThroughRead: 3,
+    });
+    const d = new HerdrDriver(bin);
+
+    await d.run({ id: "w1:p42", name: "painting", cwd }, "echo hi");
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane read /gm)).toHaveLength(4);
+    expect(calls).toContain("pane send-keys w1:p42 C-u");
+    expect(calls).toContain("pane send-keys w1:p42 Enter");
+  });
+
+  test("test: a pane whose line is still corrupted after the bounded settle window refuses fail-closed with the same error as before", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      corrupt: "always",
+      changingPaneRead: true,
+      clearFailsThroughRead: 100,
+    });
+    const d = new HerdrDriver(bin);
+
+    await expect(d.run({ id: "w1:p42", name: "corrupted", cwd }, "echo hi")).rejects.toThrow(
+      "herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85)",
+    );
+
+    const calls = readFileSync(log, "utf8");
+    const reads = calls.match(/^pane read /gm)?.length ?? 0;
+    expect(reads).toBeGreaterThan(2);
+    expect(reads).toBeLessThanOrEqual(10);
+    expect(calls.match(/^pane send-text /gm)).toHaveLength(1);
+    expect(calls).not.toContain("pane send-keys w1:p42 Enter");
+  });
+
+  test("test: a pane already stable at first read incurs no added settle delay", async () => {
+    const { bin, log, cwd } = makeStub(0, {
+      corrupt: "once",
+      paneReadFrames: ["ready-prompt"],
+      clearFailsThroughRead: 2,
+    });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    let usedShortTimer = false;
+    try {
+      const d = new HerdrDriver(bin);
+      await d.run({ id: "w1:p42", name: "stable", cwd }, "echo hi");
+      usedShortTimer = timers.mock.calls.some(
+        ([, delay]) => typeof delay === "number" && delay > 0 && delay <= 1000,
+      );
+    } finally {
+      timers.mockRestore();
+    }
+
+    const calls = readFileSync(log, "utf8");
+    expect(calls.match(/^pane read /gm)).toHaveLength(3);
+    expect(calls).toContain("pane send-keys w1:p42 Enter");
+    expect(usedShortTimer).toBe(false);
   });
 });
 

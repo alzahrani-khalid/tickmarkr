@@ -1,9 +1,10 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import { TokenUsageSchema } from "../../src/adapters/types.js";
-import { TelemetryRowSchema } from "../../src/run/journal.js";
+import { Journal, readAllTelemetry, TelemetryRowSchema } from "../../src/run/journal.js";
 
 // TEL-01 (structural pin): the worker's TICKMARKR_RESULT self-report must never reach the reward signal.
 // A behavioral test proves the reward is clean for the scripted path; this grep proves it for EVERY path.
@@ -57,6 +58,19 @@ describe("TEL-01 grep-assertion: no telemetry call site trusts the worker traile
     expect(telemLines.length).toBeGreaterThanOrEqual(3); // vacuity guard
     for (const l of telemLines) expect(l).not.toMatch(/tokens\s*:/); // `meteredAttempts: tokens ?` has no `tokens:`
   });
+});
+
+test("judge telemetry stays observable per run without entering worker routing telemetry", () => {
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-judge-telemetry-"));
+  const journal = Journal.create(repo, "run-judge");
+  journal.telemetry({
+    kind: "judge", taskId: "T1", shape: "judge", adapter: "fake", model: "fake-1",
+    channel: "fake:fake-1", attempts: 1, outcome: "failed", durationMs: 12,
+  } as Parameters<typeof journal.telemetry>[0]);
+
+  expect(journal.readTelemetry()).toEqual([]);
+  expect(journal.readJudgeTelemetry()[0]).toMatchObject({ kind: "judge", channel: "fake:fake-1", outcome: "failed" });
+  expect(readAllTelemetry(repo, 50)).toEqual([]);
 });
 
 // ── v1.7 Phase 17 spend-metering pins (SPEND-01/03/06) ──

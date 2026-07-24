@@ -39,6 +39,164 @@ const runStart = (graphDefinitionHash?: string, extra: Record<string, unknown> =
 });
 
 describe("OBS-52 status graph-hash join guard", () => {
+  test("test: after a journaled graph-rehash matching the compiled graph the header renders no recompile warning and no advice to start a new run", async () => {
+    const repo = mkRepo();
+    const g = graph(GRAPH_HASH, ["T1"]);
+    saveGraph(repo, g);
+    seedJournal(repo, "run-audited", [
+      runStart(OTHER_HASH),
+      {
+        ts: new Date().toISOString(),
+        event: "graph-rehash",
+        data: { from: OTHER_HASH, to: graphDefinitionHash(g) },
+      },
+      { ts: new Date().toISOString(), event: "run-resume", data: { pid: process.pid } },
+    ]);
+
+    const snapshots = [
+      await status([], repo),
+      await status(["--watch"], repo, { iterations: 1, sleep: async () => {} }),
+    ];
+    for (const out of snapshots) {
+      const header = out.split("\n")[0]!;
+      expect(header).not.toContain("graph recompiled");
+      expect(header).not.toContain("not comparable");
+      expect(header).not.toContain("tickmarkr run");
+    }
+  });
+
+  test("test: a recompile with no journaled rehash still renders the not-comparable warning and its guidance names resuming or auditing rather than starting a new run", async () => {
+    const repo = mkRepo();
+    saveGraph(repo, graph(GRAPH_HASH, ["T1"]));
+    seedJournal(repo, "run-unaudited", [runStart(OTHER_HASH)]);
+
+    const header = (await status([], repo)).split("\n")[0]!;
+    expect(header).toContain("graph recompiled since this run — task states not comparable");
+    expect(header).toMatch(/resum|audit/i);
+    expect(header).not.toContain("tickmarkr run");
+  });
+
+  test("test: gate results recorded before an audited rehash render with a prior-graph marker and their channel attribution intact rather than as absent", async () => {
+    const repo = mkRepo();
+    const g = graph(GRAPH_HASH, ["T1"]);
+    saveGraph(repo, g);
+    seedJournal(repo, "run-prior-gates", [
+      runStart(OTHER_HASH),
+      {
+        ts: new Date().toISOString(), event: "task-dispatch", taskId: "T1",
+        data: { assignment: { adapter: "codex", model: "prior-model", channel: "sub", tier: "mid" }, attempt: 0 },
+      },
+      { ts: new Date().toISOString(), event: "gate-result", taskId: "T1", data: { gate: "build", pass: true } },
+      { ts: new Date().toISOString(), event: "gate-result", taskId: "T1", data: { gate: "test", pass: true } },
+      {
+        ts: new Date().toISOString(),
+        event: "graph-rehash",
+        data: { from: OTHER_HASH, to: graphDefinitionHash(g) },
+      },
+      { ts: new Date().toISOString(), event: "run-resume", data: { pid: process.pid } },
+    ]);
+
+    const taskRow = row(await status([], repo), "T1");
+    expect(taskRow).toContain("B[x]");
+    expect(taskRow).toContain("T[x]");
+    expect(taskRow).toContain("prior graph");
+    expect(taskRow).toContain("codex:prior-model");
+  });
+
+  test("test: a task merged before an audited rehash keeps its done verdict and its gate detail visible after it", async () => {
+    const repo = mkRepo();
+    const g = graph(GRAPH_HASH, ["T1"]);
+    saveGraph(repo, g);
+    seedJournal(repo, "run-prior-merge", [
+      runStart(OTHER_HASH),
+      {
+        ts: new Date().toISOString(), event: "task-dispatch", taskId: "T1",
+        data: { assignment: { adapter: "codex", model: "prior-model", channel: "sub", tier: "mid" }, attempt: 0 },
+      },
+      { ts: new Date().toISOString(), event: "gate-result", taskId: "T1", data: { gate: "build", pass: true, details: "exit 0" } },
+      { ts: new Date().toISOString(), event: "task-done", taskId: "T1", data: { attempts: 1 } },
+      { ts: new Date().toISOString(), event: "merge", taskId: "T1", data: { commit: "abc123" } },
+      {
+        ts: new Date().toISOString(),
+        event: "graph-rehash",
+        data: { from: OTHER_HASH, to: graphDefinitionHash(g) },
+      },
+      { ts: new Date().toISOString(), event: "run-resume", data: { pid: process.pid } },
+    ]);
+
+    const out = await status([], repo);
+    expect(out).toContain("1/1 done");
+    expect(row(out, "T1")).toContain("[x] T1");
+    expect(row(out, "T1")).toContain("B[x]");
+    expect(row(out, "T1")).toContain("done");
+  });
+
+  test("the not-comparable guard ignores a graph-rehash that does not audit the loaded graph", async () => {
+    const repo = mkRepo();
+    const g = graph(GRAPH_HASH, ["T1"]);
+    saveGraph(repo, g);
+    seedJournal(repo, "run-wrong-rehash", [
+      runStart(OTHER_HASH),
+      {
+        ts: new Date().toISOString(),
+        event: "graph-rehash",
+        data: { from: "unrelated-hash", to: graphDefinitionHash(g) },
+      },
+      { ts: new Date().toISOString(), event: "task-done", taskId: "T1", data: {} },
+    ]);
+
+    const out = await status([], repo);
+    expect(out).toContain("not comparable");
+    expect(out).toContain("0/1 done");
+    expect(row(out, "T1")).not.toContain("[x]");
+  });
+
+  test("the newest graph-rehash stays authoritative when an older audit happens to match the loaded graph", async () => {
+    const repo = mkRepo();
+    const g = graph(GRAPH_HASH, ["T1"]);
+    saveGraph(repo, g);
+    seedJournal(repo, "run-stale-audit", [
+      runStart(OTHER_HASH),
+      {
+        ts: new Date().toISOString(),
+        event: "graph-rehash",
+        data: { from: OTHER_HASH, to: graphDefinitionHash(g) },
+      },
+      {
+        ts: new Date().toISOString(),
+        event: "graph-rehash",
+        data: { from: OTHER_HASH, to: "newer-compiled-graph" },
+      },
+      { ts: new Date().toISOString(), event: "task-done", taskId: "T1", data: {} },
+    ]);
+
+    const out = await status([], repo);
+    expect(out).toContain("not comparable");
+    expect(out).toContain("0/1 done");
+    expect(row(out, "T1")).not.toContain("[x]");
+  });
+
+  test("a graph-rehash stays authoritative when the loaded graph later matches the original run-start hash again", async () => {
+    const repo = mkRepo();
+    const g = graph(GRAPH_HASH, ["T1"]);
+    const loadedHash = graphDefinitionHash(g);
+    saveGraph(repo, g);
+    seedJournal(repo, "run-original-hash", [
+      runStart(loadedHash),
+      {
+        ts: new Date().toISOString(),
+        event: "graph-rehash",
+        data: { from: loadedHash, to: "newer-compiled-graph" },
+      },
+      { ts: new Date().toISOString(), event: "task-done", taskId: "T1", data: {} },
+    ]);
+
+    const out = await status([], repo);
+    expect(out).toContain("not comparable");
+    expect(out).toContain("0/1 done");
+    expect(row(out, "T1")).not.toContain("[x]");
+  });
+
   test("a freshly compiled graph plus a stale journal from a different graph renders every task not-yet-run with the not-comparable notice and never a done checkmark", async () => {
     const repo = mkRepo();
     saveGraph(repo, graph(GRAPH_HASH, ["T1", "T2", "T3", "T4"]));
