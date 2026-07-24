@@ -601,6 +601,17 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
     });
   }
 
+  // OBS-143: the slow-interface SUCCESS path gets its own adapter with a bound that dwarfs
+  // worst-case stub spawn latency on loaded CI runners — the shared 1200ms bound exists for
+  // the timeout test and loses a real-time race here (each frame costs one stub process spawn).
+  const slowReadinessAdapterId = "readiness-slow-test";
+  declareInputBox(slowReadinessAdapterId, {
+    fingerprint: "Send /help for help information.",
+    match: matchesEditorBox,
+    emptyMatch: matchesEmptyEditorBox,
+    readinessTimeoutMs: 30_000,
+  });
+
   test("test: delivery into a pane whose adapter declares an input box types nothing until the box is painted and stable", async () => {
     const paintingBox1 = inputBox.replace("│ >          │", "│ > paint-1  │");
     const paintingBox2 = inputBox.replace("│ >          │", "│ > paint-2  │");
@@ -674,7 +685,11 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
     });
     const d = new HerdrDriver(bin);
 
-    await d.run(await readinessSlot(d, cwd, "T5"), "echo hi");
+    const slowSlot = await d.slot(cwd, `T5-worker-${slowReadinessAdapterId}-a0-readiness`, {
+      group: "workers",
+      owned: { role: "worker", taskId: "T5", attempt: 0, runId: "run-readiness" },
+    });
+    await d.run(slowSlot, "echo hi");
 
     const calls = readFileSync(log, "utf8");
     expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
