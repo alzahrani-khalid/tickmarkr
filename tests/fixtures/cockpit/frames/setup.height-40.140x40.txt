@@ -1,0 +1,38 @@
+              ▄▄████                                                                                                      v1.80.0 · binary ✓
+          ▄▄████▀▀                                                                                                          setup · step 2/6
+████▄▄▄▄████▀▀     tickmarkr
+  ▀▀████▀▀         spec in, verified work out.
+╭──────────────╮ ╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗ ╭──────────────╮
+│ SETUP        │ ║ ❯ HARNESSES                                                                                            ║ │ KEYS         │
+│   Detect     │ ║ ╭───────────────────────────────╮ ╭────────────────────────────────╮ ╭───────────────────────────────╮ ║ │ ↑↓ Move      │
+│ ❯ Harnesses  │ ║ │ FOUND                         │ │ AUTHENTICATED                  │ │ ROUTABLE                      │ ║ │ ⏎ Next       │
+│   Fleet      │ ║ │ 7                             │ │ 6                              │ │ 6                             │ ║ │ ← Back       │
+│   Gates      │ ║ │ ▁                             │ │ ▁                              │ │ ▁                             │ ║ │ Tab Panel    │
+│   Consults   │ ║ ╰───────────────────────────────╯ ╰────────────────────────────────╯ ╰───────────────────────────────╯ ║ │ ? Help       │
+│   Reviewers  │ ║ ╭────────────────────────────────────────────────────────────────────────────────────────────────────╮ ║ │ q Quit       │
+│   Review     │ ║ │ DETECTED                                                                                           │ ║ │ ␣ Toggle     │
+│              │ ║ │ ✓ authed · claude-code · 2.1.219 (Claude Code) · 5 models                                          │ ║ │ a All        │
+│              │ ║ │ ✓ authed · codex · codex-cli 0.145.0 · 7 models                                                    │ ║ │ r Re-probe   │
+│              │ ║ │ ✓ authed · cursor-agent · 2026.07.23-e383d2b · 190 models                                          │ ║ │ s Save       │
+│              │ ║ │ ○ missing · opencode · not installed · 0 models                                                    │ ║ │ n Next       │
+│              │ ║ │ ✓ authed · pi · 0.80.10 · 37 models                                                                │ ║ │ p Prev       │
+│              │ ║ │ ✓ authed · grok · grok 0.2.111 (94172f2aa4e5) · 2 models                                           │ ║ │              │
+│              │ ║ │ ✓ authed · kimi · 0.29.1 · 4 models                                                                │ ║ │              │
+│              │ ║ │ ✗ denied · grok:grok-composer-2.5-fast — Invalid params: "unknown model id"                        │ ║ │              │
+│              │ ║ ╰────────────────────────────────────────────────────────────────────────────────────────────────────╯ ║ │              │
+│              │ ║ ╭─────────────────────────────────────────────────╮ ╭────────────────────────────────────────────────╮ ║ │              │
+│              │ ║ │ CONSULTS                                        │ │ REVIEWERS                                      │ ║ │              │
+│              │ ║ │ seat claude-code:fable                          │ │ required true                                  │ ║ │              │
+│              │ ║ │ stall 15 minutes                                │ │ complexity threshold 7                         │ ║ │              │
+│              │ ║ │ prefer claude-code:claude-opus-5                │ │ prefer claude-code:claude-opus-5               │ ║ │              │
+│              │ ║ │ prefer codex:gpt-5.6-sol                        │ │ prefer codex:gpt-5.6-sol                       │ ║ │              │
+│              │ ║ ╰─────────────────────────────────────────────────╯ ╰────────────────────────────────────────────────╯ ║ │              │
+│              │ ║ ╭────────────────────────────────────────────────────────────────────────────────────────────────────╮ ║ │              │
+│              │ ║ │ REVIEW                                                                                             │ ║ │              │
+│              │ ║ │ 21:43:07 ✓ T2 attempt 4 claude-code:opus pass done                                                 │ ║ │              │
+│              │ ║ │ 21:43:07 ✓ pass · tip-verify                                                                       │ ║ │              │
+│              │ ║ │ 21:43:07 ✓ pass · tip-verify                                                                       │ ║ │              │
+│              │ ║ ╰────────────────────────────────────────────────────────────────────────────────────────────────────╯ ║ │              │
+╰──────────────╯ ╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝ ╰──────────────╯
+- overlay config.repo.yaml · ✓ base untouched · ! 20 changes unsaved
+↑↓ Move · ⏎ Next · ← Back · Tab Panel · ? Help · q Quit · ␣ Toggle · a All · r Re-probe · s Save · n Next · p Prev

@@ -207,21 +207,34 @@ const KIMI_ANSI_SGR_RE = /\u001B\[[0-9;]*m/g;
 const KIMI_EDITOR_TOP_RE = /^╭─+╮$/;
 const KIMI_EDITOR_INPUT_RE = /^│ > .*│$/;
 const KIMI_EDITOR_EMPTY_RE = /^│ > +│$/;
+// OBS-181: any interior row of the box. An editor carrying a prompt renders one or more blank
+// continuation rows beneath it, so the bottom border is not always the very next line.
+const KIMI_EDITOR_ROW_RE = /^│.*│$/;
 const KIMI_EDITOR_BOTTOM_RE = /^╰─+╯$/;
 
 function matchesKimiEditorBox(paneText: string, empty: boolean): boolean {
   // OBS-152: kimi renders its whole TUI indented one column, so `^`-anchored row matches never fire
   // on a LIVE editor box — probe 6 timed out readiness against a frame whose box was fully painted
   // and interactive. Trim per line: the left margin is chrome, and what actually distinguishes the
-  // editor from the welcome panel (also a bordered box) is the three-row adjacency asserted below.
+  // editor from the welcome panel (also a bordered box) is the border adjacency asserted below.
+  //
+  // `match` means THE EDITOR BOX IS PAINTED (readiness), and is deliberately true for an empty box.
+  // `emptyMatch` is the stricter "painted AND carrying nothing". Callers deciding submission must
+  // therefore test emptyMatch FIRST — see HerdrDriver.submissionRegistered.
+  //
+  // OBS-181: the adjacency used to demand the bottom border on the line directly below the prompt.
+  // A wedged worker pane rendered FOUR rows — top, prompt, a blank continuation row, bottom — so
+  // NEITHER matcher fired, and the driver's submission check fell through to a fallback that always
+  // answers "delivered". Walk the interior to the border instead of assuming a three-row box.
   const lines = paneText.replace(KIMI_ANSI_SGR_RE, "").split("\n").map((line) => line.trim());
   const input = empty ? KIMI_EDITOR_EMPTY_RE : KIMI_EDITOR_INPUT_RE;
-  return lines.some((line, index) =>
-    input.test(line)
-    && index > 0
-    && index + 1 < lines.length
-    && KIMI_EDITOR_TOP_RE.test(lines[index - 1])
-    && KIMI_EDITOR_BOTTOM_RE.test(lines[index + 1]));
+  return lines.some((line, index) => {
+    if (!input.test(line)) return false;
+    if (index === 0 || !KIMI_EDITOR_TOP_RE.test(lines[index - 1])) return false;
+    let below = index + 1;
+    while (below < lines.length && KIMI_EDITOR_ROW_RE.test(lines[below])) below++;
+    return below < lines.length && KIMI_EDITOR_BOTTOM_RE.test(lines[below]);
+  });
 }
 
 // v1.75 T1 / OBS-136: Kimi's actual editor is a three-line bordered box whose content row starts

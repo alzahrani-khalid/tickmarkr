@@ -1,0 +1,24 @@
+              ▄▄████                                                              v1.80.0 · binary ✓
+          ▄▄████▀▀                                                                  setup · step 2/6
+████▄▄▄▄████▀▀     tickmarkr
+  ▀▀████▀▀         spec in, verified work out.
+╭──────────╮ ╔════════════════════════════════════════════════════════════════════════╗ ╭──────────╮
+│ SETUP    │ ║ ❯ HARNESSES                                                            ║ │ KEYS     │
+│   Detect │ ║ ╭─────────────────────╮ ╭────────────────────╮ ╭─────────────────────╮ ║ │ ↑↓ Move  │
+│ ❯ Harnes │ ║ │ FOUND               │ │ AUTHENTICATED      │ │ ROUTABLE            │ ║ │ ⏎ Next   │
+│ ses      │ ║ │ 7                   │ │ 6                  │ │ 6                   │ ║ │ ← Back   │
+│   Fleet  │ ║ │ ▁                   │ │ ▁                  │ │ ▁                   │ ║ │ Ta Panel │
+│   Gates  │ ║ ╰─────────────────────╯ ╰────────────────────╯ ╰─────────────────────╯ ║ │          │
+│          │ ║ ╭────────────────────────────────────────────────────────────────────╮ ║ │ ? Help   │
+│ Consults │ ║ │ REVIEW                                                             │ ║ │ q Quit   │
+│   Review │ ║ │ 21:43:07 ✓ T2 attempt 4 claude-code:opus pass done                 │ ║ │ ␣ Toggle │
+│ ers      │ ║ │ 21:43:07 ✓ pass · tip-verify                                       │ ║ │ a All    │
+│   Review │ ║ │ 21:43:07 ✓ pass · tip-verify                                       │ ║ │          │
+│          │ ║ ╰────────────────────────────────────────────────────────────────────╯ ║ │ Re-probe │
+│          │ ║                                                                        ║ │          │
+│          │ ║                                                                        ║ │ s Save   │
+│          │ ║                                                                        ║ │ n Next   │
+│          │ ║                                                                        ║ │ p Prev   │
+╰──────────╯ ╚════════════════════════════════════════════════════════════════════════╝ ╰──────────╯
+- overlay config.repo.yaml · ✓ base untouched · ! 20 changes unsaved
+↑↓ Move · ⏎ Next · ← Back · Tab Panel · ? Help · q Quit · ␣ Toggle · a All · r Re-probe · s Save · n

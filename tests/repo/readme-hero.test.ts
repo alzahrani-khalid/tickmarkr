@@ -57,16 +57,17 @@ describe("T4 README hero is the ASCII-identical logo", () => {
     }).not.toThrow();
   });
 
-  test("the block art duplication scan ignores files under the planning tree", () => {
+  test("the logo duplication scan continues to report only the two permitted homes for the mark", () => {
     const needle = PLAIN_BANNER.split("\n").find((l) => l.includes("\u2584\u2584"))!;
-    const allowed = new Set([BRAND, README].map((p) => relative(REPO, p)));
+    const permittedHomes = new Set([BRAND, README].map((p) => relative(REPO, p)));
     const dupes: string[] = [];
     for (const abs of listFiles(REPO)) {
       const rel = relative(REPO, abs).split("\\").join("/");
-      if (allowed.has(rel) || !existsSync(abs)) continue;
+      if (permittedHomes.has(rel) || !existsSync(abs)) continue;
       const text = readFileSync(abs, "utf8");
       if (text.includes(needle)) dupes.push(rel);
     }
+    expect([...permittedHomes].sort()).toEqual(["README.md", "src/brand.ts"]);
     expect(dupes, `block art duplicated outside brand.ts/README.md:\n${dupes.join("\n")}`).toEqual([]);
   });
 });

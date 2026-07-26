@@ -16,6 +16,12 @@ export const BANNER = [
 /** ANSI-stripped, trailing-space-trimmed twin of BANNER — README hero and other plain surfaces. */
 export const PLAIN_BANNER = BANNER.replace(/\x1b\[[0-9;]*m/g, "").replace(/[ \t]+$/gm, "");
 
+/** Two-line run-cockpit lockup, sliced from BANNER so its mark and product name cannot drift. */
+export const COMPACT_LOCKUP = BANNER.split("\n").slice(1, 3).join("\n");
+/** ANSI-stripped, trailing-space-trimmed twin of COMPACT_LOCKUP for colourless surfaces. */
+export const PLAIN_COMPACT_LOCKUP =
+  COMPACT_LOCKUP.replace(/\x1b\[[0-9;]*m/g, "").replace(/[ \t]+$/gm, "");
+
 // T5: the pane identity every visible pane announces under the logo. HerdrDriver seeds this env var
 // into each pane shell at slot() time (paneIdentityLine of the pane's T1 owned name); the banner's
 // identity line reads it at pane runtime, so every role — worker/judge/review/consult — wears the

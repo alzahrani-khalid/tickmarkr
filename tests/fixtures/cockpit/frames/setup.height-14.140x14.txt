@@ -1,0 +1,13 @@
+              ▄▄████                                                                                                      v1.80.0 · binary ✓
+╭──────────────╮ ╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗ ╭──────────────╮
+│ SETUP        │ ║ ❯ HARNESSES                                                                                            ║ │ KEYS         │
+│   Detect     │ ║ found 7 · authenticated 6 · routable 6                                                                 ║ │ ␣ Toggle     │
+│ ❯ Harnesses  │ ║ ╭────────────────────────────────────────────────────────────────────────────────────────────────────╮ ║ │ a All        │
+│   Fleet      │ ║ │ REVIEW                                                                                             │ ║ │ r Re-probe   │
+│   Gates      │ ║ │ 21:43:07 ✓ T2 attempt 4 claude-code:opus pass done                                                 │ ║ │ s Save       │
+│   Consults   │ ║ ╰────────────────────────────────────────────────────────────────────────────────────────────────────╯ ║ │ n Next       │
+│   Reviewers  │ ║                                                                                                        ║ │ p Prev       │
+│   Review     │ ║                                                                                                        ║ │              │
+╰──────────────╯ ╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝ ╰──────────────╯
+- overlay config.repo.yaml · ✓ base untouched · ! 20 changes unsaved
+↑↓ Move · ⏎ Next · ← Back · Tab Panel · ? Help · q Quit · ␣ Toggle · a All · r Re-probe · s Save · n Next · p Prev

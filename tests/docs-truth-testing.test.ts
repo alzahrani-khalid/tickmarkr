@@ -46,6 +46,22 @@ const DESIGN_CITED_FILES = [
   "src/brand.ts",
 ];
 
+/**
+ * Clauses the v1.80 amendment (OBS-164) added to the AUTHORING LAW in TESTING.md.
+ * Removing the law from the guide fails every test that reads this map.
+ */
+const AMENDED_LAW_CLAUSES = {
+  productionRenderPath: /captured through the production render path/i,
+  equivalenceAsserted: /equivalence to that path asserted, not assumed/i,
+  equivalencePrimary: /Equivalence is the primary oracle/i,
+  provenanceInsufficient: /Provenance and stability together are insufficient/i,
+  regenerationCircular: /compares a capture against itself and therefore proves nothing/i,
+  positiveForm: /State positively what only the production tree can produce/i,
+  namedStructure: /bordered panel enclosing its own content across more than one row/i,
+  incident: /OBS-164/,
+  whyWordingFailed: /put the whole burden on the word \*\*real\*\*, which no test can enforce/i,
+} as const;
+
 function countTestFiles(dir: string): number {
   return readdirSync(dir).filter((f) => f.endsWith(".test.ts")).length;
 }
@@ -77,7 +93,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
     }
   });
 
-  test("test: the testing page does not contradict the test scripts and configuration", () => {
+  test("test: every claim the guide already made that the documentation-truth check verifies continues to hold", () => {
     const testingPath = join(codebaseDocs, "TESTING.md");
     const vitestPath = join(repoRoot, "vitest.config.ts");
     const pkgPath = join(repoRoot, "package.json");
@@ -148,6 +164,62 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
     expect(testing).toContain("Unit tests");
     expect(testing).toContain("Integration tests");
     expect(testing).toContain("E2E tests");
+  });
+
+  test("test: the shipped testing guide states that a fixture standing in for the product's own rendered surface must be captured through the production render path and that equivalence with it is asserted, not assumed", () => {
+    const testing = readFileSync(join(codebaseDocs, "TESTING.md"), "utf8");
+    expect(testing).toMatch(/a fixture standing in for the product's \*own\* rendered surface/i);
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.productionRenderPath);
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.equivalenceAsserted);
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.equivalencePrimary);
+    // the requirement is byte identity against the production path, not a structural import check
+    expect(testing).toMatch(/identical to the production path's bytes for the same data at the same dimensions/i);
+    expect(testing).toMatch(/\*imports\* the product's components is structural/i);
+  });
+
+  test("test: the guide states that provenance and stability together are insufficient, and that a regeneration check comparing a capture against itself proves nothing", () => {
+    const testing = readFileSync(join(codebaseDocs, "TESTING.md"), "utf8");
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.provenanceInsufficient);
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.regenerationCircular);
+    expect(testing).toMatch(/both true of a second renderer built for capture/i);
+  });
+
+  test("test: the guide requires the positive form, naming at least one structure only the production tree can produce, rather than only forbidding hand-authoring", () => {
+    const testing = readFileSync(join(codebaseDocs, "TESTING.md"), "utf8");
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.positiveForm);
+    expect(testing).toMatch(/rather than only forbidding hand-authoring/i);
+    const namedStructures = [
+      AMENDED_LAW_CLAUSES.namedStructure,
+      /stat tile whose value and whose series both sit inside the tile's own border/i,
+      /journal rows inside a border rather than as bare lines/i,
+    ];
+    expect(namedStructures.filter((s) => s.test(testing)).length).toBeGreaterThanOrEqual(1);
+    // and it says why naming one works: a flat-line renderer cannot produce it
+    expect(testing).toMatch(/A flat-line renderer cannot counterfeit those/i);
+  });
+
+  test("test: the guide records the incident that motivated the amendment, so a future reader learns why the earlier wording failed rather than only what replaced it", () => {
+    const testing = readFileSync(join(codebaseDocs, "TESTING.md"), "utf8");
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.incident);
+    // the incident, not just the rule: what the corpus depicted and how the gates passed
+    expect(testing).toMatch(/golden corpus/i);
+    expect(testing).toMatch(/used zero times/i);
+    expect(testing).toMatch(/Every gate passed honestly/i);
+    // and why the earlier wording failed, not only what replaced it
+    expect(testing).toMatch(/captured verbatim from the real surface/i);
+    expect(testing).toMatch(AMENDED_LAW_CLAUSES.whyWordingFailed);
+    expect(testing).toMatch(/it was never violated/i);
+  });
+
+  test("test: the documentation-truth check asserts the amended law's presence, so removing it fails a test rather than passing a review", () => {
+    const testing = readFileSync(join(codebaseDocs, "TESTING.md"), "utf8");
+    // the law is one block, not two competing statements
+    expect(testing.match(/\*\*AUTHORING LAW/g)?.length).toBe(1);
+    const law = testing.slice(testing.indexOf("**AUTHORING LAW"), testing.indexOf("**Static file fixtures**"));
+    expect(law).not.toBe("");
+    for (const [name, clause] of Object.entries(AMENDED_LAW_CLAUSES)) {
+      expect(clause.test(law), `AUTHORING LAW lost its ${name} clause`).toBe(true);
+    }
   });
 
   test("test: the cli design page does not contradict the brand module design contract", () => {

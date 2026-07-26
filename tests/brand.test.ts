@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
-  BANNER, GLYPHS, PLAIN_BANNER, TOKENS,
+  BANNER, COMPACT_LOCKUP, GLYPHS, PLAIN_BANNER, PLAIN_COMPACT_LOCKUP, TOKENS,
   kvRow, legend, paneDispatchCommand, rule, statusRow, title, toggleActive, toggleInactive,
 } from "../src/brand.js";
 
@@ -28,6 +28,33 @@ const BANNER_PINNED = [
   "",
 ].join("\n");
 const PLAIN_PINNED = BANNER_PINNED.replace(/\x1b\[[0-9;]*m/g, "").replace(/[ \t]+$/gm, "");
+
+describe("compact brand lockup", () => {
+  test("the compact lockup renders as exactly two lines and carries the product name", () => {
+    expect(COMPACT_LOCKUP.split("\n")).toHaveLength(2);
+    expect(COMPACT_LOCKUP).toContain("tickmarkr");
+  });
+
+  test("every non-blank character the compact lockup draws also occurs in the full banner, so no glyph is invented", () => {
+    const stripAnsi = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+    const fullCharacters = new Set(stripAnsi(BANNER).replace(/\s/g, ""));
+    for (const character of stripAnsi(COMPACT_LOCKUP).replace(/\s/g, "")) {
+      expect(fullCharacters.has(character), `invented character: ${character}`).toBe(true);
+    }
+  });
+
+  test("the brand module declares the compact lockup as an expression over the full banner constant rather than as its own literal art", () => {
+    const brandSrc = readFileSync(join(import.meta.dirname, "../src/brand.ts"), "utf8");
+    expect(brandSrc).toMatch(/export const COMPACT_LOCKUP\s*=\s*BANNER\s*\./);
+  });
+
+  test("the lockup degrades to unstyled characters when colour is disabled, exactly as the plain twin does", () => {
+    expect(PLAIN_COMPACT_LOCKUP).toBe(
+      COMPACT_LOCKUP.replace(/\x1b\[[0-9;]*m/g, "").replace(/[ \t]+$/gm, ""),
+    );
+    expect(PLAIN_COMPACT_LOCKUP).not.toContain("\x1b");
+  });
+});
 
 describe("pane dispatch", () => {
   test("paneDispatchCommand shell-quotes a script path containing a space", () => {

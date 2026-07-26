@@ -1,0 +1,75 @@
+# tickmarkr config overlay — merges over built-in defaults (repo beats global beats defaults)
+# concurrency: 3
+# driver: auto            # auto | herdr | subprocess
+# taskTimeoutMinutes: 30
+# contextWarnTokens: 170000   # v1.23: journal+notify once per attempt when live worker context crosses this (status shows the sample)
+# setup: npm ci --prefer-offline   # run in each fresh task worktree before dispatch
+# routing:
+#   mode: risk-based      # v1.51: partner-led | risk-based | staff-led — a preset compiled into floors at
+#                         # load (partner-led: every shape frontier + explore off; staff-led: implement/refactor
+#                         # cheap; integrity set plan/spec/migration/ui never resolves below frontier under any
+#                         # mode). Absent = risk-based = byte-identical routing. Explicit floors below beat mode deltas (linted).
+#   map:                  # per-shape preferences/pins; band policy lives in routing.floors
+#     implement: { prefer: [cursor-agent, codex] }
+#     migration: { pin: { via: claude-code, model: fable } }
+#     tests: { tier: null }   # tombstone: null removes a legacy map tier (a real tier value now fails config load — move the band to routing.floors.tests)
+#   floors:               # tier authority — advisory minimum bands; 'tickmarkr plan' lints violations
+#     migration: frontier
+#   learned: on            # default ON (ROUTE-14); cold profile = exact v1.5 static routing, warms per workspace. Set 'off' to pin static routing; preview with 'tickmarkr plan'
+#   learnedTuning: { halfLifeRuns: 5, availWeight: 0.05 }  # optional; defaults byte-identical
+#   explore: { mode: on, excludeShapes: [], excludeComplexityAtOrAbove: null, cap: 5 }  # optional; absent ⇒ byte-identical
+#   sla: { implement: 15 }  # optional per-shape minutes — advisory plan lint only; absent ⇒ no lint
+#   allow: { adapters: [claude-code, codex] }   # optional fleet allowlist; presence activates even if empty (fail-closed)
+#   deny:                                      # optional fleet denylist; deny beats allow on conflict
+#     models:
+#       - pi:zai/glm-5.2  # OBS-57: pi passes run-start probe but hangs at finish without TICKMARKR_RESULT — remove after no-trailer demotion ships (v1.46 provider-outage taxonomy)
+#     workers:                                  # optional worker-only deny; flat adapters/models still deny every role
+#       models: [kimi:kimi-code/k3]
+#   # incident-born deny/pin entries MUST name OBS id + root cause + removal condition (see docs/codebase/CONVENTIONS.md)
+#   # entry grammar: adapter id | model id | adapter:model (entries in either list accept all three forms)
+#   # a hint pinning a denied channel FAILS at plan time (RoutingError) — never silent reroute
+#   # tombstone: deny: null in a repo overlay removes a global deny (arrays replace wholesale, never merge)
+# tiers:                  # model → capability band; extend when new models ship
+#   claude-code: { vendor: anthropic, channel: sub, models: { fable: frontier } }
+#   codex: { models: { gpt-5.2-codex: null } }   # null = tombstone: removes a stale seed id
+# visibility:
+#   llm: headless         # headless (default): judge/review/consult run silently | pane: visible agents
+#   keepPanes: run        # run (default): ephemeral judge/review/consult panes close when read; a merged task's worker pane closes on done; other worker panes persist until run end | attempt | forever (keep everything for debugging)
+#   worker: interactive   # interactive (default): workers run the real agent TUI | print
+#   workersPerTab: 3      # cap concurrent worker panes per WORKERS tab; overflow opens WORKERS-2 (VIS-09). Default 3
+# scope:
+#   allowDeviations: []    # globs an operator permits out-of-scope edits into, e.g. ["package-lock.json"]
+# gates:                  # override auto-detected commands; per-shape participation may only skip LLM gates
+#   diffCap: 60000         # fail closed before an LLM gate; split the task or raise this positive integer
+#   test: npm test
+#   byShape:
+#     docs: { acceptance: false, review: false }  # baseline, evidence, and scope are mandatory
+# review: { complexityThreshold: 7, required: true, prefer: [codex:gpt-5.6-sol, kimi] }
+#                         # prefer: ordered reviewer seat preference (adapter | adapter:model); ranks
+#                         # diversity-eligible channels only — never admits a same-vendor/same-model reviewer
+# consult: { adapter: claude-code, model: fable, stallMinutes: 15, prefer: [codex:gpt-5.6-sol, kimi:kimi-code/k3] }
+#                         # prefer: ranked consult seat failover — entries are adapter:model ONLY (a
+#                         # consult seat has no channel to inherit a model from). The seat walks the
+#                         # list to the first live adapter; a failed seat or unparseable verdict falls
+#                         # to the next entry; the pinned adapter/model above is always the final seat
+# cost:                   # v1.20 REC-02 — OPTIONAL price table for the usage/cost report. Absent ⇒ every
+#                         # channel reports "not measurable" (never a crash or a fake $0). Two economics,
+#                         # never conflated: API = tokens × per-Mtok rate; sub = flat plan amortized over a
+#                         # windows/month range, plus an API-equivalent counterfactual when the model has a rate.
+#   models:               # per-Mtok API rates by model id. Copy from LiteLLM's
+#                         # model_prices_and_context_window.json (github.com/BerriAI/litellm) — the de-facto
+#                         # price table ccusage/tokonomics consume. Stamp rateDate; refresh on vendor changes.
+#     opus:   { inPerMtok: 5.0,  outPerMtok: 25.0, cacheReadPerMtok: 0.5, rateDate: 2026-07-13 }
+#     sonnet: { inPerMtok: 3.0,  outPerMtok: 15.0, rateDate: 2026-07-13 }
+#   subs:                 # subscription plans by adapter id (plans are per-account, not per-token).
+#                         # windowsPerMonthLow/High is a RANGE (time-varying quotas, e.g. GLM peak 3×).
+#     claude-code: { planMonthly: 200, windowsPerMonthLow: 400, windowsPerMonthHigh: 1200 }
+# NOTE: claude workers/judges run with --strict-mcp-config --mcp-config '{"mcpServers":{}}' — project
+# .mcp.json servers (e.g. supabase) are UNAVAILABLE in worktrees. Deliberate: prevents the MCP-enable
+# dialog stalling unattended HEADLESS runs (live-verified on claude 2.1.205). Interactive TUIs still
+# show a first-entry dialog — but it is the workspace TRUST dialog, not MCP config loading (live-drilled
+# claude 2.1.206, 2026-07-10). There is NO CLI flag to pre-accept trust; the only store is claude's global
+# ~/.claude.json keyed on the EXACT worktree path. tickmarkr does NOT write it (HYG-03 won't-fix, decision B:
+# claude's own last-writer-wins persistence races any seed). Cost is ~one dismissal per worktree path,
+# ever — tickmarkr reuses stable worktree paths so the accept persists across runs; blocked-pane paging
+# surfaces each first-time dialog.

@@ -1,0 +1,21 @@
+              ▄▄████                                          v1.80.0 · binary ✓
+          ▄▄████▀▀                                              setup · step 2/6
+████▄▄▄▄████▀▀     tickmarkr
+  ▀▀████▀▀         spec in, verified work out.
+╭─────────╮ ╔══════════════════════════════════════════════════════╗ ╭─────────╮
+│ SETUP   │ ║ ❯ HARNESSES                                          ║ │ KEYS    │
+│         │ ║ ╭───────────────╮ ╭──────────────╮ ╭───────────────╮ ║ │ ␣ Toggl │
+│ Detect  │ ║ │ FOUND         │ │ AUTHENTICATE │ │ ROUTABLE      │ ║ │ a All   │
+│ ❯ Harne │ ║ │ 7             │ │ D            │ │ 6             │ ║ │ r Re-pr │
+│ sses    │ ║ │ ▁             │ │ 6            │ │ ▁             │ ║ │ s Save  │
+│   Fleet │ ║ │               │ │ ▁            │ │               │ ║ │ n Next  │
+│   Gates │ ║ ╰───────────────╯ ╰──────────────╯ ╰───────────────╯ ║ │ p Prev  │
+│   Consu │ ║ ╭──────────────────────────────────────────────────╮ ║ │         │
+│ lts     │ ║ │ REVIEW                                           │ ║ │         │
+│   Revie │ ║ │ 21:43:0 ✓ T2 attempt 4 claude-code:opus pass     │ ║ │         │
+│ wers    │ ║ │ 21:43:07 ✓ pass · tip-verify                     │ ║ │         │
+│         │ ║ │ 21:43:07 ✓ pass · tip-verify                     │ ║ │         │
+│ Review  │ ║ ╰──────────────────────────────────────────────────╯ ║ │         │
+╰─────────╯ ╚══════════════════════════════════════════════════════╝ ╰─────────╯
+- overlay config.repo.yaml · ✓ base untouched · ! 20 changes unsaved
+↑↓ Move · ⏎ Next · ← Back · Tab Panel · ? Help · q Quit · ␣ Toggle · a All · r R

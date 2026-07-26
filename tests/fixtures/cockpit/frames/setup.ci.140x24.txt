@@ -1,0 +1,13 @@
+tickmarkr v1.80.0
+setup 7 found 6 authed 6 routable
+✓ authed claude-code
+✓ authed codex
+✓ authed cursor-agent
+○ missing opencode
+✓ authed pi
+✓ authed grok
+✓ authed kimi
+✗ denied grok:grok-composer-2.5-fast - Invalid params: "unknown model id"
+✓ base untouched
+! 20 changes unsaved
+keys ↑↓ Move · ⏎ Next · ← Back · Tab Panel · ? Help · q Quit · ␣ Toggle · a All · r Re-probe · s Save · n Next · p Prev

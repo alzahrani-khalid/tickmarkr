@@ -85,6 +85,30 @@ async function openRuns(data: RunsCockpitData, clock = Date.now) {
 }
 
 describe("studio app", () => {
+  test("ui --demo selects the committed-capture cockpit before the live Studio runtime", async () => {
+    const command = readFileSync(new URL("../../src/cli/commands/ui.ts", import.meta.url), "utf8");
+    expect(command).toContain('argv.includes("--demo")');
+    expect(command).toContain('await import("../../tui/cockpit/demo.js")');
+
+    const demo = makeInkStreams();
+    demo.output.columns = 140;
+    const done = ui(["--demo"], {
+      input: demo.input,
+      output: demo.output,
+    });
+    await wait(100);
+
+    const frame = stripAnsi(demo.writes.join(""));
+    expect(frame).toContain("VIEWS");
+    expect(frame).toContain("RUN");
+    expect(frame).toContain("tip-verify");
+    expect(frame).not.toContain("Fleet view");
+
+    demo.input.write("q");
+    await expect(done).resolves.toBe("ui: closed");
+    expect(demo.raw()).toBe(false);
+  });
+
   test("launching the studio without a terminal prints the existing line-mode guidance and renders no interactive frame", async () => {
     const input = new PassThrough() as InputStream;
     input.isTTY = false;

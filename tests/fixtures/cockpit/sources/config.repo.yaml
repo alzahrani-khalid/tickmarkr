@@ -1,0 +1,106 @@
+gates:
+  test: npm test
+  # diffCap 130000 RESTORED post-run (2026-07-24): the mid-run 300000 raise (T7 engine
+  # retirement, 247KB deletion-heavy diff) was never exercised — T7 attempt-3 passed under
+  # 130000 with a consolidated diff. Strict verifiability guard stands; the deletion-byte
+  # measurement question is OBS-134.
+  diffCap: 130000
+judge:
+  # OBS-132 (2026-07-23, operator-directed mid-run run-20260723-225532): k3 verdicts
+  # unparseable 3/3 — every verdict came from the one-shot fable retry. Repinned to fable.
+  # Post-run probe 2026-07-24: k3 HEADLESS verdict production is GREEN (clean nonce trailer)
+  # — the defect is in the PANE-mode path (production or extraction), output never captured
+  # (OBS-132 observability facet). Keep fable until the pane path is instrumented and a
+  # PANE-mode probe passes; a headless-only green does not clear the restore condition.
+  adapter: claude-code
+  # operator-directed 2026-07-24 (session close): stand-in judge re-seated fable -> claude-opus-5
+  # (EXPLICIT id, not the floating `opus` alias — OBS-145).
+  # 2026-07-25 — k3's restore condition IS NOW MET (green PANE-mode probe, run-20260724-225440,
+  # zero judge-retries), and the kimi deny has been lifted for worker channels. The operator
+  # nonetheless chose to KEEP claude-opus-5 as judge rather than restore k3: the judge is the
+  # harness's last line of defence, claude-opus-5 had just judged a 7/7 run with zero retries,
+  # and moving two variables at once immediately after a four-fix night is the riskier read.
+  # This is a deliberate hold, NOT an unmet condition — restoring k3 needs only a decision now.
+  model: claude-opus-5
+# steering (operator-directed 2026-07-24, supersedes 2026-07-22): Opus 5 first, sol second
+review:
+  prefer:
+    - claude-code:claude-opus-5
+    - codex:gpt-5.6-sol
+consult:
+  prefer:
+    - claude-code:claude-opus-5
+    - codex:gpt-5.6-sol
+routing:
+  mode: partner-led
+  deny:
+    adapters: null
+    models:
+      # claude-code:fable — operator-directed 2026-07-24 (after the v1.79 launch): replaced by
+      # claude-opus-5, which is classified frontier at materially lower cost. Evidence is the
+      # claude-opus-5 tier entry below (CursorBench 3.2 within 0.5% of Fable 5 at half the cost,
+      # OSWorld 2.0 surpassing Fable 5's best at ~1/3 cost, $5/$25 per Mtok, rateDate 2026-07-24),
+      # so fable earns no frontier work that claude-opus-5 cannot do as well and cheaper.
+      # Fable's only remaining ACTIVE role was the judge-retry rescue channel (it rescued the
+      # acceptance gate in the k3 probe run-20260724-224703); retries now fall to the remaining
+      # prefer chain. Restore by deleting this line if a task class ever shows fable strictly
+      # ahead of claude-opus-5 on dated evidence.
+      - claude-code:fable
+      - codex:gpt-5.5
+      # KIMI DENY LIFTED 2026-07-25 (operator-directed). All three kimi entries removed —
+      # kimi:kimi-code/kimi-for-coding, kimi-for-coding-highspeed, and k3 — after the
+      # operator's standing conditional was satisfied on BOTH of its conditions:
+      #   1. probe 6 (K2.7 delivery) GREEN — run-20260724-224451: single dispatch to
+      #      kimi/kimi-for-coding, task-done attempts 1, ZERO escalations, zero readiness
+      #      failures, tip-verify passed; artifact verified on the integration branch.
+      #      First end-to-end K2.7 delivery.
+      #   2. k3 pane-judge re-probe GREEN — run-20260724-225440: ZERO judge-retries,
+      #      acceptance resolved on k3's own verdict read from the PANE path. OBS-132's
+      #      restore condition met on its own terms for the first time.
+      #   3. OBS-153 (the fail-OPEN model-confirmation guard) CLOSED — shipped as v1.79 T7,
+      #      verified behaviourally, not on the gate's word: correct model confirms, WRONG
+      #      model returns ok:false, unknown maps safely.
+      # The six-layer arc (OBS-136 -> 140 -> 141 -> 142 -> 144 -> 152/154/155) contains ZERO
+      # confirmed kimi defects. Every layer was tickmarkr failing to READ a bordered,
+      # indented, or wrapped TUI frame. "kimi is broken" was six versions of our own blindness.
+      # NOTE: the judge pin deliberately STAYS claude-code:claude-opus-5 (operator decision
+      # 2026-07-25) even though k3's restore condition is now met — see the judge block.
+      - pi:openai-codex/gpt-5.5
+      - pi:openai-codex/gpt-5.6-luna
+      - pi:openai-codex/gpt-5.6-sol
+      - pi:openai-codex/gpt-5.6-terra
+  map:
+    implement:
+      tier: null
+      prefer:
+        - cursor-agent
+        - codex
+    ui:
+      prefer:
+        - codex
+    tests:
+      tier: null
+  floors:
+    ui: frontier
+tiers:
+  claude-code:
+    models:
+      # claude-opus-5: EXPLICIT pinned identity for the model released 2026-07-24
+      # (anthropic.com/news/claude-opus-5). Classified frontier per benchmark policy:
+      # announcement cites CursorBench 3.2 within 0.5% of Fable 5 at half the cost,
+      # Frontier-Bench v0.1 >2x Opus 4.8, OSWorld 2.0 surpassing Fable 5's best at ~1/3
+      # cost; pricing unchanged vs 4.8 ($5/$25 per Mtok, rateDate 2026-07-24). Servability
+      # live-probed on claude CLI 2.1.218 same day. NOTE (OBS-145): the floating `opus`
+      # alias re-pointed 4.8 -> 5 silently mid-drill 2026-07-24 (before/after probes
+      # captured); alias channels inherit this entry's era going forward — reclassify BOTH
+      # on the next Opus release.
+      claude-opus-5: frontier
+  pi:
+    models:
+      openai-codex/gpt-5.6-sol: frontier
+      openai-codex/gpt-5.5: frontier
+      openai-codex/gpt-5.6-terra: mid
+      openai-codex/gpt-5.6-luna: cheap
+  kimi:
+    windows:
+      kimi-code/k3: 1000000

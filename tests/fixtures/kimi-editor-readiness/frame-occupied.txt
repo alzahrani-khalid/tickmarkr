@@ -1,0 +1,23 @@
+➜  tickmarkr git:(spec/v1.80-journal-fidelity) ✗ kimi -y -m 'kimi-code/k3'
+
+ ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                                                                                                       │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                                                                                                       │
+ │  ▐█████▌  Send /help for help information.                                                                                                                                                                            │
+ │                                                                                                                                                                                                                       │
+ │  Directory: /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr                                                                                                                                                      │
+ │  Session:   session_f990f17f-e1a8-40f8-a592-7d9a6352ed17                                                                                                                                                              │
+ │  Model:     K3                                                                                                                                                                                                        │
+ │  Version:   0.29.1                                                                                                                                                                                                    │
+ │                                                                                                                                                                                                                       │
+ ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+
+ ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > Read /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/runs/run-20260725-224156/prompts/T1-a0.md and do exactly what it says.                                                                         │
+ ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ yolo  K3 thinking: high  …/Desktop/CodingSpace/tickmarkr  spec/v1.80-journal-fidelity [+134 -25]                                     /tasks to check progress and status for background tasks | /init: generate AGENTS.md
+                                                                                                                                                                                                        context: 0% (0/1M)

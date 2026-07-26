@@ -2,6 +2,10 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.80 — surface-truth
+
+This surface-truth release gives tickmarkr a studio cockpit and then makes that cockpit honest about the run it draws. The run and setup surfaces render from real captured journals through a frozen appearance pin, and every committed frame is a verbatim capture of a run that actually happened. Content now fills the container it was given: the journal draws as much history as its panel has rows rather than a fixed three, detail bands are sized by what they carry instead of fixed widths, and no wrapped line opens with a bare separator. Journal rows carry the outcome of the event they name rather than inheriting their task's final verdict, so a failure inside a task that later succeeded reads as a failure instead of a green pass — the surface can no longer claim work went well while the evidence says otherwise. Verified delivery gained the ability to see an occupied input box: a submit check that could not recognise a multi-row editor previously fell through to positional evidence that is always true for an interface drawing status chrome beneath its prompt, so a prompt that was typed but never submitted read as delivered.
+
 ## v1.79 — signal-truth
 
 This signal-truth release makes every operator-facing signal accurate, current, and precisely addressed. Status and watch now render tip-verify as a first-class phase, naming failed gates and re-verify attempts without showing terminal green while verification is failed or pending. Doctor warns on resolved-identity drift when a model alias moves beyond its dated classification, while leaving routing unchanged. The remaining legacy wall-clock bounds use controlled time or load-proof margins. A stable JSONL decision-event stream carries the exact approve command and evidence pointer, with an optional fire-and-forget webhook sink. Verdicts can also carry line-anchored review feedback into retry and consult prompts; malformed optional comments fail open on the extra without weakening the verdict.

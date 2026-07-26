@@ -181,9 +181,28 @@ export class HerdrDriver implements ExecutorDriver {
     if (needle.length === 0) return false;
     if (inputBox?.launchCommand?.(cmd) === true && this.shellExecutionEchoed(transcript, cmd)) return true;
     if (promptAt < 0) return inputBox !== undefined && matchesEmptyInputBox(transcript, inputBox);
-    if (inputBox && matchesInputBox(transcript, inputBox)) {
-      return hay.lastIndexOf(norm(inputBox.fingerprint)) > promptAt;
+    if (inputBox) {
+      // OBS-181: an EMPTY declared input box is positive evidence of submission even while the
+      // prompt is still visible above as the echoed user turn — which is exactly how every TUI
+      // renders the moment after Enter lands. Test it FIRST: `match` means "the box is painted" and
+      // is deliberately true for an empty box, so asking `match` first cannot decide submission.
+      if (matchesEmptyInputBox(transcript, inputBox)) return true;
+      // The box is painted and is NOT empty: the prompt is still sitting in it. Only a fingerprint
+      // appearing AFTER the prompt — a fresh input line below the submitted text — counts.
+      //
+      // This is the branch a wedged kimi pane belongs in, and could not reach: its occupied editor
+      // renders a blank continuation row, the matcher demanded the bottom border immediately below
+      // the prompt, so NEITHER matcher fired and the positional fallback below answered "delivered"
+      // for a pane that had processed nothing. The matcher fix (adapters/kimi.ts) is what routes it
+      // here; keeping the fallback unreachable for a painted box is what stops the next one.
+      if (matchesInputBox(transcript, inputBox)) {
+        return hay.lastIndexOf(norm(inputBox.fingerprint)) > promptAt;
+      }
     }
+    // No declared box, or the box is not on screen at all (it may have scrolled out of the read
+    // window). Positional evidence only — weaker, and unsound for any surface that paints chrome
+    // below its prompt, which is why a declared box must be able to recognise its own OCCUPIED
+    // state. Every adapter declaring an inputBox needs a captured occupied frame in its tests.
     return promptAt + needle.length < hay.length;
   }
 

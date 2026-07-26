@@ -4,10 +4,12 @@ import { join } from "node:path";
 import {
   confirmKimiSeedBanner,
   kimi,
+  KIMI_INPUT_BOX,
   kimiBannerModel,
   kimiBannerSessionId,
   runKimiInteractiveSeed,
 } from "../../src/adapters/kimi.js";
+import { matchesEmptyInputBox, matchesInputBox } from "../../src/adapters/types.js";
 import type { Assignment } from "../../src/adapters/types.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 
@@ -222,5 +224,51 @@ describe("kimi TUI seed banner checks", () => {
     expect(kimiBannerSessionId(banner)).toBe(sessionId);
     expect(kimi.sessionIdFrom!(banner)).toBe(sessionId);
     expect(confirmKimiSeedBanner(banner, ASSIGNMENT.model)).toEqual({ ok: true, status: "confirmed", sessionId });
+  });
+});
+
+// OBS-181: the submit verifier fails OPEN whenever an adapter's input-box matcher misses, because
+// the driver's fallback ("is there any text after the prompt?") is always true for a TUI that paints
+// chrome below its editor. kimi's status footer made every wedged dispatch read as delivered while
+// the pane sat untouched and the stall clock ran.
+//
+// `match` deliberately means "the editor box is PAINTED" (readiness) and is true for an empty box;
+// `emptyMatch` is the stricter "painted and carrying nothing". The defect was that a box with blank
+// continuation rows satisfied NEITHER, because the matcher demanded the bottom border on the line
+// directly below the prompt. It had never been exercised against an occupied box at all.
+describe("kimi editor box matching with continuation rows (OBS-181)", () => {
+  const frame = (name: string) =>
+    readFileSync(join(import.meta.dirname, `../fixtures/kimi-editor-readiness/${name}.txt`), "utf8");
+
+  test("test: an occupied editor box is painted and NOT empty, so an unsubmitted prompt is visible to the submit verifier", () => {
+    const occupied = frame("frame-occupied");
+    expect(matchesInputBox(occupied, KIMI_INPUT_BOX)).toBe(true);
+    expect(matchesEmptyInputBox(occupied, KIMI_INPUT_BOX)).toBe(false);
+  });
+
+  test("test: an empty editor box is painted AND empty, so a submitted pane is positively recognised rather than inferred", () => {
+    for (const name of ["frame-01", "frame-02"]) {
+      expect(matchesInputBox(frame(name), KIMI_INPUT_BOX), `${name} painted`).toBe(true);
+      expect(matchesEmptyInputBox(frame(name), KIMI_INPUT_BOX), `${name} empty`).toBe(true);
+    }
+  });
+
+  test("test: a box carrying blank continuation rows still matches, so a multi-row editor does not blind the matcher", () => {
+    // The wedged worker pane rendered four rows — top, prompt, a blank continuation row, bottom.
+    // Asserted by inserting interior rows into a real capture rather than hand-authoring a frame.
+    const lines = frame("frame-occupied").split("\n");
+    const promptAt = lines.findIndex((line) => line.trim().startsWith("│ > "));
+    expect(promptAt).toBeGreaterThan(-1);
+    const width = Math.max(2, lines[promptAt].trim().length);
+    const blank = `│${" ".repeat(width - 2)}│`;
+    for (const extra of [1, 2, 5]) {
+      const widened = [
+        ...lines.slice(0, promptAt + 1),
+        ...Array.from({ length: extra }, () => blank),
+        ...lines.slice(promptAt + 1),
+      ].join("\n");
+      expect(matchesInputBox(widened, KIMI_INPUT_BOX), `${extra} continuation row(s)`).toBe(true);
+      expect(matchesEmptyInputBox(widened, KIMI_INPUT_BOX), `${extra} continuation row(s)`).toBe(false);
+    }
   });
 });
