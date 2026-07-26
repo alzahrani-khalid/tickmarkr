@@ -9,6 +9,7 @@ import {
 } from "./theme.js";
 import { SPARKLINE_BUCKET_WINDOW } from "./derive.js";
 export { SPARKLINE_BUCKET_WINDOW } from "./derive.js";
+import { keybarEntries, RUN_KEY_BINDINGS } from "./keys.js";
 
 const SPARKLINE_GLYPHS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
 const BAND_GAP_COLUMNS = 1;
@@ -43,16 +44,9 @@ export type KeybarItem = {
   readonly label: string;
 };
 
-const RUN_KEYS = [
-  { key: "↑↓", label: "Move" },
-  { key: "⏎", label: "Open" },
-  { key: "←", label: "Back" },
-  { key: "Tab", label: "Panel" },
-  { key: "?", label: "Help" },
-  { key: "q", label: "Quit" },
-  { key: "f", label: "Follow" },
-  { key: "/", label: "Filter" },
-] as const satisfies readonly KeybarItem[];
+// The run keybar is generated from the registered handlers (keys.ts), so a
+// key with no handler cannot be advertised here.
+const RUN_KEYS = keybarEntries(RUN_KEY_BINDINGS);
 
 const SETUP_ADDITIONAL_KEYS = [
   { key: "␣", label: "Toggle" },
@@ -614,11 +608,14 @@ export function JournalRowPanel({
   width,
   focused,
   title = "JOURNAL",
+  selection,
 }: {
   rows: readonly JournalRow[];
   width?: number | string;
   focused?: boolean;
   title?: string;
+  /** Index of the row the pointer marks; undefined draws no pointer. */
+  selection?: number;
 }): ReactElement {
   return (
     <Panel title={title} focused={focused} width={width}>
@@ -633,7 +630,11 @@ export function JournalRowPanel({
           <BodyText emphasis="dim">{row.time}</BodyText>
           <BodyText> </BodyText>
           <StateGlyph state={row.state} />
-          <BodyText> {row.text}</BodyText>
+          <BodyText> </BodyText>
+          {index === selection && (
+            <BodyText emphasis="strong">{GLYPHS.pointer} </BodyText>
+          )}
+          <BodyText>{row.text}</BodyText>
         </Box>
       ))}
     </Panel>

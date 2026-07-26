@@ -27,8 +27,6 @@ import {
   CockpitGrid,
   composeBandLine,
   JournalRowPanel,
-  KEYBAR_KEYS,
-  Keybar,
   measureBandRows,
   Panel,
   StateGlyph,
@@ -37,6 +35,7 @@ import {
   type BandColumnContent,
   type ComponentState,
   type JournalRow,
+  type StatusStripItem,
 } from "./components.js";
 import type { DemoCaptures } from "./demo.js";
 import {
@@ -50,6 +49,14 @@ import {
   panelRows,
   wrappedRows,
 } from "./run-cockpit.js";
+import {
+  initialSetupInteractionState,
+  keybarEntries,
+  SETUP_PANEL_FOCUS_ORDER,
+  SURFACE_KEY_BINDINGS,
+  type SetupInteractionState,
+  type SetupKeyBinding,
+} from "./keys.js";
 
 export type SetupCockpitData = {
   readonly binaryVersion: string;
@@ -77,6 +84,11 @@ export type SetupCockpitData = {
 };
 
 const APPROVED_SIDE_RAIL_COLUMN_FLOOR = 80;
+
+const setupAdditionalBindings = (bindings: readonly SetupKeyBinding[]) =>
+  bindings.filter((binding) =>
+    !SURFACE_KEY_BINDINGS.run.some((runBinding) => runBinding.key === binding.key)
+  );
 
 type CapturedModelHealth = {
   readonly authed?: boolean;
@@ -288,19 +300,27 @@ function identityBannerLines(): readonly string[] {
   ).trimEnd().split("\n");
 }
 
-function identityVersionLines(data: SetupCockpitData): readonly string[] {
-  return [`v${data.binaryVersion} · binary ${GLYPHS.pass}`, "setup · step 2/6"];
+function identityVersionLines(
+  data: SetupCockpitData,
+  interaction?: SetupInteractionState,
+): readonly string[] {
+  return [
+    `v${data.binaryVersion} · binary ${GLYPHS.pass}`,
+    `setup · step ${interaction?.step ?? 2}/6`,
+  ];
 }
 
 function IdentityHeader({
   data,
   secondary = true,
+  interaction,
 }: {
   data: SetupCockpitData;
   secondary?: boolean;
+  interaction?: SetupInteractionState;
 }): ReactElement {
   const mark = identityBannerLines();
-  const [version, step] = identityVersionLines(data);
+  const [version, step] = identityVersionLines(data, interaction);
   return (
     <Box justifyContent="space-between">
       <Box flexDirection="column">
@@ -319,42 +339,62 @@ function IdentityHeader({
 function NavigationPanel({
   width = 16,
   compact = false,
+  step = 2,
+  focused = false,
 }: {
   width?: number;
   compact?: boolean;
+  step?: number;
+  focused?: boolean;
 }): ReactElement {
+  const entries = [
+    "Detect",
+    "Harnesses",
+    "Fleet",
+    "Gates",
+    "Consults",
+    "Reviewers",
+    "Review",
+  ] as const;
   if (!compact) {
     return (
-      <Panel title="SETUP" width={width}>
-        <BodyText>  Detect</BodyText>
-        <BodyText emphasis="strong">{GLYPHS.pointer} Harnesses</BodyText>
-        <BodyText>  Fleet</BodyText>
-        <BodyText>  Gates</BodyText>
-        <BodyText>  Consults</BodyText>
-        <BodyText>  Reviewers</BodyText>
-        <BodyText>  Review</BodyText>
+      <Panel title="SETUP" width={width} focused={focused}>
+        {entries.map((entry, index) => (
+          <BodyText
+            key={entry}
+            emphasis={index + 1 === step ? "strong" : "normal"}
+          >
+            {index + 1 === step ? `${GLYPHS.pointer} ` : "  "}{entry}
+          </BodyText>
+        ))}
       </Panel>
     );
   }
   return (
-    <Panel title="SETUP" width={width}>
-      <Box height={1} overflow="hidden"><BodyText>  Detect</BodyText></Box>
-      <Box height={1} overflow="hidden">
-        <BodyText emphasis="strong">{GLYPHS.pointer} Harnesses</BodyText>
-      </Box>
-      <Box height={1} overflow="hidden"><BodyText>  Fleet</BodyText></Box>
-      <Box height={1} overflow="hidden"><BodyText>  Gates</BodyText></Box>
-      <Box height={1} overflow="hidden"><BodyText>  Consults</BodyText></Box>
-      <Box height={1} overflow="hidden"><BodyText>  Reviewers</BodyText></Box>
-      <Box height={1} overflow="hidden"><BodyText>  Review</BodyText></Box>
+    <Panel title="SETUP" width={width} focused={focused}>
+      {entries.map((entry, index) => (
+        <Box key={entry} height={1} overflow="hidden">
+          <BodyText emphasis={index + 1 === step ? "strong" : "normal"}>
+            {index + 1 === step ? `${GLYPHS.pointer} ` : "  "}{entry}
+          </BodyText>
+        </Box>
+      ))}
     </Panel>
   );
 }
 
-function KeysPanel({ width = 16 }: { width?: number }): ReactElement {
+function KeysPanel({
+  bindings,
+  width = 16,
+  focused = false,
+}: {
+  bindings: readonly SetupKeyBinding[];
+  width?: number;
+  focused?: boolean;
+}): ReactElement {
   return (
-    <Panel title="KEYS" width={width}>
-      {KEYBAR_KEYS.setup.map((item) => (
+    <Panel title="KEYS" width={width} focused={focused}>
+      {keybarEntries(bindings).map((item) => (
         <Box key={item.key}>
           <BodyText emphasis="strong">{item.key}</BodyText>
           <BodyText> {item.label}</BodyText>
@@ -364,11 +404,19 @@ function KeysPanel({ width = 16 }: { width?: number }): ReactElement {
   );
 }
 
-function CompactKeysPanel({ width = 16 }: { width?: number }): ReactElement {
+function CompactKeysPanel({
+  bindings,
+  width = 16,
+  focused = false,
+}: {
+  bindings: readonly SetupKeyBinding[];
+  width?: number;
+  focused?: boolean;
+}): ReactElement {
   const contentColumns = Math.max(1, width - 4);
   return (
-    <Panel title="KEYS" width={width}>
-      {KEYBAR_KEYS.setupAdditional.map((item) => (
+    <Panel title="KEYS" width={width} focused={focused}>
+      {keybarEntries(setupAdditionalBindings(bindings)).map((item) => (
         <Box
           key={item.key}
           flexDirection="row"
@@ -389,11 +437,98 @@ function CompactKeysPanel({ width = 16 }: { width?: number }): ReactElement {
   );
 }
 
+function SetupKeybar({
+  bindings,
+  width,
+}: {
+  bindings: readonly SetupKeyBinding[];
+  width: number;
+}): ReactElement {
+  return (
+    <Box
+      flexDirection="row"
+      flexWrap="nowrap"
+      width={width}
+      height={1}
+      overflow="hidden"
+      aria-label="setup cockpit keys"
+    >
+      {keybarEntries(bindings).map((item, index) => (
+        <Box key={item.key} flexShrink={0}>
+          {index > 0 && <BodyText emphasis="dim"> · </BodyText>}
+          <BodyText emphasis="strong">{item.key}</BodyText>
+          <BodyText emphasis="dim"> {item.label}</BodyText>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+function SetupInteractionPanel({
+  data,
+  interaction,
+  bindings,
+}: {
+  data: SetupCockpitData;
+  interaction?: SetupInteractionState;
+  bindings: readonly SetupKeyBinding[];
+}): ReactElement | null {
+  if (interaction?.savePrompt === true) {
+    return (
+      <LinePanel
+        title="SAVE"
+        lines={["confirm save · y yes · n cancel", ...overlayDiffLines(data)]}
+        columns={72}
+      />
+    );
+  }
+  if (interaction?.help === true) {
+    return (
+      <LinePanel
+        title="HELP"
+        lines={keybarEntries(bindings).map((item) => `${item.key} ${item.label}`)}
+        columns={72}
+      />
+    );
+  }
+  return null;
+}
+
+function setupStatusItems(
+  data: SetupCockpitData,
+  interaction?: SetupInteractionState,
+): readonly StatusStripItem[] {
+  const items: StatusStripItem[] = [
+    { state: "neutral", text: `overlay ${data.overlayTarget}` },
+    { state: "pass", text: "base untouched" },
+    interaction?.saved === true
+      ? { state: "active", text: "changes saved" }
+      : { state: "warn", text: `${data.stagedChanges.length} changes unsaved` },
+  ];
+  if (interaction !== undefined) {
+    if (interaction.all) items.push({ state: "active", text: "all selected" });
+    else if (interaction.selected.length > 0) {
+      items.push({ state: "active", text: "selection selected" });
+    } else if (interaction.selection >= 0) {
+      items.push({ state: "neutral", text: `selection ${interaction.selection + 1}` });
+    }
+    if (interaction.probeRevision > 0) {
+      items.push({ state: "pass", text: `re-probed ${interaction.probeRevision}` });
+    }
+    if (interaction.panel !== 1) {
+      const panel = SETUP_PANEL_FOCUS_ORDER[interaction.panel] ?? "HARNESSES";
+      items.push({ state: "neutral", text: `panel ${panel}` });
+    }
+  }
+  return items;
+}
+
 function fullKeysFit(
   rows: number,
   layout: FrameCockpitLayout,
   data: SetupCockpitData,
   columns: number,
+  bindings: readonly SetupKeyBinding[],
 ): boolean {
   if (!layout.elements.secondaryHeader) return false;
   const wrappedKeyRows = {
@@ -401,7 +536,7 @@ function fullKeysFit(
     "folded-keys": 2,
     stacked: 4,
   }[layout.arrangement];
-  const panelRows = KEYBAR_KEYS.setup.length
+  const panelRows = bindings.length
     + wrappedKeyRows
     + 3; // panel borders and title row
   return headerRowsFor(layout, data, columns) + 2 + panelRows <= Math.floor(rows);
@@ -811,11 +946,17 @@ function LadderSetupPanel({
   layout,
   columns,
   rows,
+  interaction,
+  bindings,
+  focused = true,
 }: {
   data: SetupCockpitData;
   layout: FrameCockpitLayout;
   columns: number;
   rows: number;
+  interaction?: SetupInteractionState;
+  bindings: readonly SetupKeyBinding[];
+  focused?: boolean;
 }): ReactElement {
   const inner = contentInnerWidth(columns, layout);
   const preferredReviewRows = Math.min(FULL_JOURNAL_ROWS, layout.journalRows);
@@ -827,9 +968,12 @@ function LadderSetupPanel({
   const visibleReviewRows = details.complete
     ? spare
     : Math.min(preferredReviewRows, spare);
+  const interactionPanel = SetupInteractionPanel({ data, interaction, bindings });
 
   return (
-    <Panel title="HARNESSES" focused flexGrow={1}>
+    <Panel title="HARNESSES" focused={focused} flexGrow={1}>
+      {interactionPanel ?? (
+        <>
       <SetupStats data={data} mode={layout.stats.mode} />
       {details.retained.has("detected") && (
         <HarnessRows rows={details.detected} columns={Math.max(1, inner - 6)} />
@@ -864,6 +1008,8 @@ function LadderSetupPanel({
         rows={data.reviewRows}
         bodyRows={visibleReviewRows}
       />
+        </>
+      )}
     </Panel>
   );
 }
@@ -871,12 +1017,21 @@ function LadderSetupPanel({
 function SetupPanel({
   data,
   inner,
+  interaction,
+  bindings,
+  focused = true,
 }: {
   data: SetupCockpitData;
   inner: number;
+  interaction?: SetupInteractionState;
+  bindings: readonly SetupKeyBinding[];
+  focused?: boolean;
 }): ReactElement {
+  const interactionPanel = SetupInteractionPanel({ data, interaction, bindings });
   return (
-    <Panel title="HARNESSES" focused flexGrow={1}>
+    <Panel title="HARNESSES" focused={focused} flexGrow={1}>
+      {interactionPanel ?? (
+        <>
       <CockpitGrid>
         <StatTile
           label="FOUND"
@@ -922,6 +1077,8 @@ function SetupPanel({
         rows={data.reviewRows}
         bodyRows={data.reviewRows.length}
       />
+        </>
+      )}
     </Panel>
   );
 }
@@ -930,33 +1087,42 @@ export function SetupCockpitFrame({
   data,
   columns,
   rows,
+  interaction,
+  bindings = SURFACE_KEY_BINDINGS.setup,
 }: {
   data: SetupCockpitData;
   columns: number;
   rows?: number;
+  interaction?: SetupInteractionState;
+  bindings?: readonly SetupKeyBinding[];
 }): ReactElement {
+  const currentInteraction = interaction ?? initialSetupInteractionState();
+  const focusedPanel = SETUP_PANEL_FOCUS_ORDER[currentInteraction.panel]
+    ?? "HARNESSES";
   if (rows === undefined) {
     const inner = Math.max(1, Math.floor(columns) - (2 * 16) - 2 - 4);
     return (
       <Box flexDirection="column" width={columns}>
-        <IdentityHeader data={data} />
+        <IdentityHeader data={data} interaction={currentInteraction} />
         <Box flexDirection="row" gap={1}>
-          <NavigationPanel />
-          <SetupPanel data={data} inner={inner} />
-          <KeysPanel />
+          <NavigationPanel
+            step={currentInteraction.step}
+            focused={focusedPanel === "SETUP"}
+          />
+          <SetupPanel
+            data={data}
+            inner={inner}
+            interaction={currentInteraction}
+            bindings={bindings}
+            focused={focusedPanel === "HARNESSES"}
+          />
+          <KeysPanel bindings={bindings} focused={focusedPanel === "KEYS"} />
         </Box>
         <StatusStrip
           width={columns}
-          items={[
-            { state: "neutral", text: `overlay ${data.overlayTarget}` },
-            { state: "pass", text: "base untouched" },
-            {
-              state: "warn",
-              text: `${data.stagedChanges.length} changes unsaved`,
-            },
-          ]}
+          items={setupStatusItems(data, currentInteraction)}
         />
-        <Keybar surface="setup" width={columns} />
+        <SetupKeybar bindings={bindings} width={columns} />
       </Box>
     );
   }
@@ -969,7 +1135,13 @@ export function SetupCockpitFrame({
       ...layout,
       stats: { ...layout.stats, mode: "summary", rows: 1 },
     };
-  const showFullSidePanels = fullKeysFit(rows, contentLayout, data, columns);
+  const showFullSidePanels = fullKeysFit(
+    rows,
+    contentLayout,
+    data,
+    columns,
+    bindings,
+  );
   const resolvedSidePanelWidth = sidePanelWidth(contentLayout);
 
   return (
@@ -977,6 +1149,7 @@ export function SetupCockpitFrame({
       <IdentityHeader
         data={data}
         secondary={layout.elements.secondaryHeader}
+        interaction={currentInteraction}
       />
       <Box flexDirection="row" gap={showSideRails ? 1 : 0}>
         {showSideRails && (
@@ -984,6 +1157,8 @@ export function SetupCockpitFrame({
             <NavigationPanel
               width={resolvedSidePanelWidth}
               compact={!contentLayout.elements.secondaryHeader}
+              step={currentInteraction.step}
+              focused={focusedPanel === "SETUP"}
             />
           </Box>
         )}
@@ -992,31 +1167,35 @@ export function SetupCockpitFrame({
           layout={contentLayout}
           columns={columns}
           rows={rows}
+          interaction={currentInteraction}
+          bindings={bindings}
+          focused={focusedPanel === "HARNESSES"}
         />
         {showSideRails && (showFullSidePanels
           ? (
             <Box width={resolvedSidePanelWidth} flexShrink={0}>
-              <KeysPanel width={resolvedSidePanelWidth} />
+              <KeysPanel
+                bindings={bindings}
+                width={resolvedSidePanelWidth}
+                focused={focusedPanel === "KEYS"}
+              />
             </Box>
           )
           : (
             <Box width={resolvedSidePanelWidth} flexShrink={0}>
-              <CompactKeysPanel width={resolvedSidePanelWidth} />
+              <CompactKeysPanel
+                bindings={bindings}
+                width={resolvedSidePanelWidth}
+                focused={focusedPanel === "KEYS"}
+              />
             </Box>
           ))}
       </Box>
       <StatusStrip
         width={columns}
-        items={[
-          { state: "neutral", text: `overlay ${data.overlayTarget}` },
-          { state: "pass", text: "base untouched" },
-          {
-            state: "warn",
-            text: `${data.stagedChanges.length} changes unsaved`,
-          },
-        ]}
+        items={setupStatusItems(data, currentInteraction)}
       />
-      <Keybar surface="setup" width={columns} />
+      <SetupKeybar bindings={bindings} width={columns} />
     </Box>
   );
 }

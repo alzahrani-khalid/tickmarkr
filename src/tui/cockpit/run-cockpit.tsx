@@ -27,6 +27,11 @@ import {
 } from "./components.js";
 import type { RunCockpitData } from "./derive.js";
 import {
+  RUN_PANEL_FOCUS_ORDER,
+  RUN_KEY_BINDINGS,
+  type RunInteractionState,
+} from "./keys.js";
+import {
   resolveCockpitLayout,
   type FrameCockpitLayout,
 } from "./layout.js";
@@ -186,9 +191,9 @@ function NarrowHeaderBand({
   );
 }
 
-function NavigationPanel(): ReactElement {
+function NavigationPanel({ focused = false }: { focused?: boolean }): ReactElement {
   return (
-    <Panel title="VIEWS" width={16}>
+    <Panel title="VIEWS" width={16} focused={focused}>
       <BodyText emphasis="strong">{GLYPHS.pointer} Run</BodyText>
       <BodyText>  Tasks</BodyText>
       <BodyText>  Gates</BodyText>
@@ -198,9 +203,9 @@ function NavigationPanel(): ReactElement {
   );
 }
 
-function KeysPanel(): ReactElement {
+function KeysPanel({ focused = false }: { focused?: boolean }): ReactElement {
   return (
-    <Panel title="KEYS" width={16}>
+    <Panel title="KEYS" width={16} focused={focused}>
       {KEYBAR_KEYS.run.map((item) => (
         <Box key={item.key}>
           <BodyText emphasis="strong">{item.key}</BodyText>
@@ -211,22 +216,111 @@ function KeysPanel(): ReactElement {
   );
 }
 
+/** The journal rows an interaction state leaves visible. */
+function visibleJournalRows(
+  rows: readonly JournalRow[],
+  interaction: RunInteractionState | undefined,
+): readonly JournalRow[] {
+  const query = interaction?.filterQuery.trim().toLowerCase() ?? "";
+  if (query === "") return rows;
+  return rows.filter((row) => row.text.toLowerCase().includes(query));
+}
+
 function SizedJournalPanel({
   rows,
   bodyRows,
+  title,
+  selection,
 }: {
   rows: readonly JournalRow[];
   bodyRows: number;
+  title?: string;
+  selection?: number;
 }): ReactElement {
   const visible = rows.slice(0, bodyRows);
   const emptyRows = Math.max(0, bodyRows - visible.length);
-  const journal = JournalRowPanel({ rows: visible });
+  const journal = JournalRowPanel({ rows: visible, title, selection });
   const journalProps = journal.props as { readonly children?: ReactNode };
   return cloneElement(
     journal,
     {},
     journalProps.children,
     emptyRows > 0 ? <Box key="journal-space" height={emptyRows} /> : null,
+  );
+}
+
+/** A body panel (help overlay, opened event) padded to the journal's rows. */
+function SizedLinesPanel({
+  title,
+  lines,
+  bodyRows,
+}: {
+  title: string;
+  lines: readonly string[];
+  bodyRows: number;
+}): ReactElement {
+  const visible = lines.slice(0, bodyRows);
+  const emptyRows = Math.max(0, bodyRows - visible.length);
+  return (
+    <Panel title={title}>
+      {visible.map((line, index) => (
+        <BodyText key={`${index}:${line}`}>{line}</BodyText>
+      ))}
+      {emptyRows > 0 && <Box height={emptyRows} />}
+    </Panel>
+  );
+}
+
+/** The lines the help overlay draws: every advertised key and its promise. */
+function helpLines(): readonly string[] {
+  return RUN_KEY_BINDINGS.map((binding) => `${binding.key} ${binding.label}`);
+}
+
+/** The lines the opened-event view draws for one journal row. */
+function eventLines(row: JournalRow): readonly string[] {
+  return [`${row.time} · ${row.state}`, row.text];
+}
+
+/**
+ * What the journal's slot of the RUN panel draws under an interaction state:
+ * the help overlay while ? is up, the opened event while ⏎'s choice stands,
+ * otherwise the journal itself — narrowed by the filter, marked at the
+ * selection, titled with the open / prompt.
+ */
+function JournalBody({
+  data,
+  interaction,
+  bodyRows,
+}: {
+  data: RunCockpitData;
+  interaction?: RunInteractionState;
+  bodyRows: number;
+}): ReactElement {
+  const rows = visibleJournalRows(data.journalRows, interaction);
+  if (interaction?.help === true) {
+    return <SizedLinesPanel title="HELP" lines={helpLines()} bodyRows={bodyRows} />;
+  }
+  const opened = interaction?.opened ?? null;
+  if (opened !== null && opened < rows.length) {
+    return (
+      <SizedLinesPanel
+        title="EVENT"
+        lines={eventLines(rows[opened]!)}
+        bodyRows={bodyRows}
+      />
+    );
+  }
+  return (
+    <SizedJournalPanel
+      rows={rows}
+      bodyRows={bodyRows}
+      title={interaction?.filterPrompt === true
+        ? `JOURNAL /${interaction.filterQuery}`
+        : undefined}
+      selection={interaction === undefined || interaction.selection < 0
+        ? undefined
+        : interaction.selection}
+    />
   );
 }
 
@@ -383,12 +477,16 @@ function LadderRunPanel({
   columns,
   rows,
   compactMeterWidth,
+  interaction,
+  focused = true,
 }: {
   data: RunCockpitData;
   layout: FrameCockpitLayout;
   columns: number;
   rows: number;
   compactMeterWidth?: number;
+  interaction?: RunInteractionState;
+  focused?: boolean;
 }): ReactElement {
   const compactBodyRows = compactJournalRows(rows, layout, data, columns);
   // The approved bordered progress panel has the same meter/caption as the
@@ -406,7 +504,7 @@ function LadderRunPanel({
     : compactBodyRows;
 
   return (
-    <Panel title="RUN" focused flexGrow={1}>
+    <Panel title="RUN" focused={focused} flexGrow={1}>
       <RunStats data={data} mode={layout.stats.mode} />
       {layout.elements.progressBar && (
         approvedArrangement
@@ -424,23 +522,37 @@ function LadderRunPanel({
             />
           )
       )}
-      <SizedJournalPanel
-        rows={data.journalRows}
+      <JournalBody
+        data={data}
+        interaction={interaction}
         bodyRows={journalBodyRows}
       />
     </Panel>
   );
 }
 
-function LegacyRunPanel({ data }: { data: RunCockpitData }): ReactElement {
+function LegacyRunPanel({
+  data,
+  interaction,
+  focused = true,
+}: {
+  data: RunCockpitData;
+  interaction?: RunInteractionState;
+  focused?: boolean;
+}): ReactElement {
+  const rows = visibleJournalRows(data.journalRows, interaction);
   return (
-    <Panel title="RUN" focused flexGrow={1}>
+    <Panel title="RUN" focused={focused} flexGrow={1}>
       <RunStats data={data} mode="tiles" />
       <Panel title="PROGRESS">
         <ProgressMeter value={data.progress} width={28} />
         <BodyText emphasis="dim">{data.progressCaption}</BodyText>
       </Panel>
-      <JournalRowPanel rows={data.journalRows} />
+      <JournalBody
+        data={data}
+        interaction={interaction}
+        bodyRows={rows.length}
+      />
     </Panel>
   );
 }
@@ -449,21 +561,42 @@ export function RunCockpitFrame({
   data,
   columns,
   rows,
+  interaction,
 }: {
   data: RunCockpitData;
   columns: number;
   rows?: number;
+  /**
+   * The run surface's interaction state. Omitted — or at its initial value —
+   * the frame is byte-identical to the pinned appearance; every transition a
+   * binding makes is drawn from it.
+   */
+  interaction?: RunInteractionState;
 }): ReactElement {
+  const focus = interaction === undefined
+    ? 0
+    : interaction.panel % RUN_PANEL_FOCUS_ORDER.length;
+  const focusedPanel = RUN_PANEL_FOCUS_ORDER[focus] ?? "RUN";
+  // Follow mode reports its on state as a status-strip item carrying the
+  // brand's reserved active-toggle glyph; off it draws nothing, so the pinned
+  // frame is untouched.
+  const statusItems = interaction?.follow === true
+    ? [...data.statusItems, { state: "active" as const, text: "Follow" }]
+    : data.statusItems;
   if (rows === undefined) {
     return (
       <Box flexDirection="column" width={columns}>
         <IdentityHeader data={data} columns={columns} />
         <Box flexDirection="row" gap={1}>
-          <NavigationPanel />
-          <LegacyRunPanel data={data} />
-          <KeysPanel />
+          <NavigationPanel focused={focusedPanel === "VIEWS"} />
+          <LegacyRunPanel
+            data={data}
+            interaction={interaction}
+            focused={focusedPanel === "RUN"}
+          />
+          <KeysPanel focused={focusedPanel === "KEYS"} />
         </Box>
-        <StatusStrip items={data.statusItems} width={columns} />
+        <StatusStrip items={statusItems} width={columns} />
         <Keybar surface="run" width={columns} />
       </Box>
     );
@@ -486,17 +619,19 @@ export function RunCockpitFrame({
         secondary={layout.elements.secondaryHeader}
       />
       <Box flexDirection="row" gap={showSideRails ? 1 : 0}>
-        {showSideRails && <NavigationPanel />}
+        {showSideRails && <NavigationPanel focused={focusedPanel === "VIEWS"} />}
         <LadderRunPanel
           data={data}
           layout={contentLayout}
           columns={columns}
           rows={rows}
           compactMeterWidth={showSideRails ? undefined : 24}
+          interaction={interaction}
+          focused={focusedPanel === "RUN"}
         />
-        {showSideRails && <KeysPanel />}
+        {showSideRails && <KeysPanel focused={focusedPanel === "KEYS"} />}
       </Box>
-      <StatusStrip items={data.statusItems} width={columns} />
+      <StatusStrip items={statusItems} width={columns} />
       <Keybar surface="run" width={columns} />
     </Box>
   );

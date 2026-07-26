@@ -1,4 +1,4 @@
-              ▄▄████                                                              v1.80.0 · binary ✓
+              ▄▄████                                                              v1.81.0 · binary ✓
           ▄▄████▀▀                                                                  setup · step 2/6
 ████▄▄▄▄████▀▀     tickmarkr
   ▀▀████▀▀         spec in, verified work out.

@@ -1,5 +1,4 @@
 import { describe, expect, test } from "vitest";
-import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { ui } from "../../src/cli/commands/ui.js";
 import {
@@ -85,11 +84,7 @@ async function openRuns(data: RunsCockpitData, clock = Date.now) {
 }
 
 describe("studio app", () => {
-  test("ui --demo selects the committed-capture cockpit before the live Studio runtime", async () => {
-    const command = readFileSync(new URL("../../src/cli/commands/ui.ts", import.meta.url), "utf8");
-    expect(command).toContain('argv.includes("--demo")');
-    expect(command).toContain('await import("../../tui/cockpit/demo.js")');
-
+  test("test: the path that draws from a committed capture is asserted by running the command and observing what it draws, rather than by reading the command's own source text", async () => {
     const demo = makeInkStreams();
     demo.output.columns = 140;
     const done = ui(["--demo"], {
@@ -102,6 +97,8 @@ describe("studio app", () => {
     expect(frame).toContain("VIEWS");
     expect(frame).toContain("RUN");
     expect(frame).toContain("tip-verify");
+    // the demo's default committed capture, observed in the drawn header
+    expect(frame).toContain("run-20260724-231138");
     expect(frame).not.toContain("Fleet view");
 
     demo.input.write("q");
@@ -126,15 +123,13 @@ describe("studio app", () => {
     const result = await ui([], { input, output });
 
     expect(result).toEqual({
-      out: "tickmarkr ui: studio requires a TTY — use `tickmarkr fleet --print` or `tickmarkr status --watch` for line-mode output",
+      out: "tickmarkr ui: the cockpit requires a TTY — use `tickmarkr fleet --print` or `tickmarkr status --watch` for line-mode output",
       code: 1,
     });
     expect(writes).toEqual([]);
   });
 
   test("the shell switches between views with the same key bindings the previous shell used", async () => {
-    const command = readFileSync(new URL("../../src/cli/commands/ui.ts", import.meta.url), "utf8");
-    expect(command).toContain('await import("../../tui/ink/studio-app.js")');
     const { input, output, writes } = makeInkStreams();
     const done = runStudioInk({ input, output, views: inkViews, debug: true });
     await wait();

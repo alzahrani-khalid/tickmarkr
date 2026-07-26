@@ -26,6 +26,16 @@ import {
   SetupCockpitFrame,
 } from "../../src/tui/cockpit/setup-cockpit.js";
 import { loadDemoCaptures } from "../../src/tui/cockpit/demo.js";
+import {
+  applySetupPromptInput,
+  initialSetupInteractionState,
+  keybarEntries,
+  resolveSetupKeyBinding,
+  SURFACE_KEY_BINDINGS,
+  type SetupInteractionState,
+  type SetupKeyBinding,
+  type RunKeyEvent,
+} from "../../src/tui/cockpit/keys.js";
 
 const SOURCES = join(import.meta.dirname, "../fixtures/cockpit/sources");
 const CAPTURE_FILES = readdirSync(SOURCES)
@@ -66,14 +76,132 @@ async function renderComponent(node: ReactNode, columns = 150): Promise<string> 
   return frame;
 }
 
-async function loadFrame(binaryVersion = "9.8.7") {
+async function loadFrame(
+  binaryVersion = "9.8.7",
+  interaction?: SetupInteractionState,
+  bindings: readonly SetupKeyBinding[] = SURFACE_KEY_BINDINGS.setup,
+) {
   const captures = loadDemoCaptures();
   const data = deriveSetupCockpitData(captures, binaryVersion);
   const frame = await renderComponent(createElement(SetupCockpitFrame, {
     data,
     columns: 150,
+    interaction,
+    bindings,
   }));
   return { captures, data, frame };
+}
+
+const SETUP_EVENTS = {
+  move: { input: "", key: { downArrow: true } },
+  next: { input: "", key: { return: true } },
+  back: { input: "", key: { leftArrow: true } },
+  panel: { input: "", key: { tab: true } },
+  help: { input: "?", key: {} },
+  quit: { input: "q", key: {} },
+  toggle: { input: " ", key: {} },
+  all: { input: "a", key: {} },
+  reprobe: { input: "r", key: {} },
+  save: { input: "s", key: {} },
+  stepNext: { input: "n", key: {} },
+  stepPrevious: { input: "p", key: {} },
+} as const satisfies Record<string, RunKeyEvent>;
+
+function mustResolveSetup(
+  bindings: readonly SetupKeyBinding[],
+  event: RunKeyEvent,
+): SetupKeyBinding {
+  const binding = resolveSetupKeyBinding(bindings, event);
+  if (binding === undefined) {
+    throw new Error(`no registered setup handler owns ${JSON.stringify(event)}`);
+  }
+  return binding;
+}
+
+async function drawSetupInteraction(
+  interaction?: SetupInteractionState,
+  bindings: readonly SetupKeyBinding[] = SURFACE_KEY_BINDINGS.setup,
+): Promise<string> {
+  return (await loadFrame("9.8.7", interaction, bindings)).frame;
+}
+
+async function expectEveryAdvertisedSetupKeyBehaves(
+  bindings: readonly SetupKeyBinding[],
+): Promise<void> {
+  const initial = initialSetupInteractionState();
+  const initialFrame = await drawSetupInteraction(initial, bindings);
+  expect(initialFrame).toBe(await drawSetupInteraction(undefined, bindings));
+
+  const move = mustResolveSetup(bindings, SETUP_EVENTS.move);
+  expect(move.label).toBe("Move");
+  const moved = move.apply(initial, SETUP_EVENTS.move);
+  expect(moved.selection).toBe(0);
+  const movedFrame = await drawSetupInteraction(moved, bindings);
+  expect(movedFrame).not.toBe(initialFrame);
+  expect(movedFrame).toContain("selection 1");
+
+  const next = mustResolveSetup(bindings, SETUP_EVENTS.next);
+  expect(next.label).toBe("Next");
+  const advanced = next.apply(initial, SETUP_EVENTS.next);
+  expect(advanced.step).toBe(3);
+  expect(await drawSetupInteraction(advanced, bindings)).toContain("setup · step 3/6");
+
+  const back = mustResolveSetup(bindings, SETUP_EVENTS.back);
+  expect(back.label).toBe("Back");
+  const backed = back.apply(initial, SETUP_EVENTS.back);
+  expect(backed.step).toBe(1);
+  expect(await drawSetupInteraction(backed, bindings)).toContain("setup · step 1/6");
+
+  const panel = mustResolveSetup(bindings, SETUP_EVENTS.panel);
+  expect(panel.label).toBe("Panel");
+  const panelled = panel.apply(initial, SETUP_EVENTS.panel);
+  expect(panelled.panel).not.toBe(initial.panel);
+  expect(await drawSetupInteraction(panelled, bindings)).toContain("panel KEYS");
+
+  const help = mustResolveSetup(bindings, SETUP_EVENTS.help);
+  expect(help.label).toBe("Help");
+  const helping = help.apply(initial, SETUP_EVENTS.help);
+  expect(helping.help).toBe(true);
+  expect(await drawSetupInteraction(helping, bindings)).toContain("HELP");
+
+  const quit = mustResolveSetup(bindings, SETUP_EVENTS.quit);
+  expect(quit.label).toBe("Quit");
+  expect(quit.apply(initial, SETUP_EVENTS.quit).quit).toBe(true);
+
+  const toggle = mustResolveSetup(bindings, SETUP_EVENTS.toggle);
+  expect(toggle.label).toBe("Toggle");
+  const toggled = toggle.apply(initial, SETUP_EVENTS.toggle);
+  expect(toggled.selected).toEqual([0]);
+  expect(await drawSetupInteraction(toggled, bindings)).toContain("selection selected");
+
+  const all = mustResolveSetup(bindings, SETUP_EVENTS.all);
+  expect(all.label).toBe("All");
+  const selectedAll = all.apply(initial, SETUP_EVENTS.all);
+  expect(selectedAll.all).toBe(true);
+  expect(await drawSetupInteraction(selectedAll, bindings)).toContain("all selected");
+
+  const reprobe = mustResolveSetup(bindings, SETUP_EVENTS.reprobe);
+  expect(reprobe.label).toBe("Re-probe");
+  const reprobed = reprobe.apply(initial, SETUP_EVENTS.reprobe);
+  expect(reprobed.probeRevision).toBe(1);
+  expect(await drawSetupInteraction(reprobed, bindings)).toContain("re-probed 1");
+
+  const save = mustResolveSetup(bindings, SETUP_EVENTS.save);
+  expect(save.label).toBe("Save");
+  const saving = save.apply(initial, SETUP_EVENTS.save);
+  expect(saving.savePrompt).toBe(true);
+  const savingFrame = await drawSetupInteraction(saving, bindings);
+  expect(savingFrame).not.toBe(initialFrame);
+  expect(savingFrame).toContain("SAVE");
+  expect(savingFrame).toContain("confirm save");
+
+  const stepNext = mustResolveSetup(bindings, SETUP_EVENTS.stepNext);
+  expect(stepNext.label).toBe("Next");
+  expect(stepNext.apply(initial, SETUP_EVENTS.stepNext).step).toBe(3);
+
+  const stepPrevious = mustResolveSetup(bindings, SETUP_EVENTS.stepPrevious);
+  expect(stepPrevious.label).toBe("Prev");
+  expect(stepPrevious.apply(initial, SETUP_EVENTS.stepPrevious).step).toBe(1);
 }
 
 function independentlyResolvedConfig() {
@@ -240,6 +368,114 @@ describe("setup cockpit capture-backed surface", () => {
     }
     expect(frame).toMatch(/❯\s+Harnesses/);
     expect(frame).toMatch(/\bsetup · step 2\/6\b/);
+  });
+
+  test("test: the setup surface draws its keybar from the same registry the other surface uses rather than from a second list", async () => {
+    const entries = keybarEntries(SURFACE_KEY_BINDINGS.setup);
+    const expected = entries.map((entry) => `${entry.key} ${entry.label}`).join(" · ");
+    const { frame } = await loadFrame();
+
+    expect(frame).toContain(expected);
+
+    const withoutSave = SURFACE_KEY_BINDINGS.setup.filter(
+      (binding) => binding.label !== "Save",
+    );
+    expect(await drawSetupInteraction(undefined, withoutSave)).not.toContain("s Save");
+  });
+
+  test("test: each advertised key of the setup surface changes observable state when it is sent", async () => {
+    expect(keybarEntries(SURFACE_KEY_BINDINGS.setup).map((item) => item.key)).toEqual([
+      "↑↓",
+      "⏎",
+      "←",
+      "Tab",
+      "?",
+      "q",
+      "␣",
+      "a",
+      "r",
+      "s",
+      "n",
+      "p",
+    ]);
+    await expectEveryAdvertisedSetupKeyBehaves(SURFACE_KEY_BINDINGS.setup);
+  });
+
+  test("test: removing a handler makes that key's behaviour assertion fail, so a key that stops working cannot pass", async () => {
+    await expect(expectEveryAdvertisedSetupKeyBehaves(SURFACE_KEY_BINDINGS.setup))
+      .resolves.toBeUndefined();
+
+    const removed = SURFACE_KEY_BINDINGS.setup.filter(
+      (binding) => binding.label !== "Save",
+    );
+    await expect(expectEveryAdvertisedSetupKeyBehaves(removed)).rejects.toThrow();
+
+    const dead: readonly SetupKeyBinding[] = SURFACE_KEY_BINDINGS.setup.map(
+      (binding) => binding.label === "Save"
+        ? { ...binding, apply: (state: SetupInteractionState) => state }
+        : binding,
+    );
+    await expect(expectEveryAdvertisedSetupKeyBehaves(dead)).rejects.toThrow();
+  });
+
+  test("test: a key advertised on one surface and not the other is registered for the surface that advertises it and is absent from the other", () => {
+    const runKeys = new Set(SURFACE_KEY_BINDINGS.run.map((binding) => binding.key));
+    const setupKeys = new Set(SURFACE_KEY_BINDINGS.setup.map((binding) => binding.key));
+
+    expect([...runKeys].filter((key) => !setupKeys.has(key))).toEqual(["f", "/"]);
+    expect([...setupKeys].filter((key) => !runKeys.has(key))).toEqual([
+      "␣",
+      "a",
+      "r",
+      "s",
+      "n",
+      "p",
+    ]);
+    for (const key of ["f", "/"]) {
+      expect(SURFACE_KEY_BINDINGS.run.some((binding) => binding.key === key)).toBe(true);
+      expect(SURFACE_KEY_BINDINGS.setup.some((binding) => binding.key === key)).toBe(false);
+    }
+    for (const key of ["␣", "a", "r", "s", "n", "p"]) {
+      expect(SURFACE_KEY_BINDINGS.setup.some((binding) => binding.key === key)).toBe(true);
+      expect(SURFACE_KEY_BINDINGS.run.some((binding) => binding.key === key)).toBe(false);
+    }
+  });
+
+  test("test: the key that reports a saved or unsaved state uses the reserved toggle glyphs, and bracket toggles appear nowhere", async () => {
+    const save = SURFACE_KEY_BINDINGS.setup.find((binding) => binding.label === "Save");
+    expect(save?.report).toBeDefined();
+
+    const initial = initialSetupInteractionState();
+    const unsaved = save!.report!(initial);
+    const saving = save!.apply(initial, SETUP_EVENTS.save);
+    const savedState = applySetupPromptInput(
+      { input: "y", key: {} },
+      saving,
+    );
+    expect(savedState).toBeDefined();
+    const saved = save!.report!(savedState!);
+
+    expect(unsaved).toContain(GLYPHS.toggleInactive);
+    expect(unsaved).not.toContain(GLYPHS.toggleActive);
+    expect(saved).toContain(GLYPHS.toggleActive);
+    expect(saved).not.toContain(GLYPHS.toggleInactive);
+
+    const bracketToggle = /\[(?:x|X| |on|off)\]/;
+    for (const text of [
+      unsaved,
+      saved,
+      await drawSetupInteraction(),
+      ...SURFACE_KEY_BINDINGS.setup.map((binding) => `${binding.key} ${binding.label}`),
+    ]) {
+      expect(text).not.toMatch(bracketToggle);
+      expect(text).not.toContain("[");
+    }
+  });
+
+  test("test: the drawn keybar carries the same entries in the same order as before this task", async () => {
+    expect(await drawSetupInteraction()).toContain(
+      "↑↓ Move · ⏎ Next · ← Back · Tab Panel · ? Help · q Quit · ␣ Toggle · a All · r Re-probe · s Save · n Next · p Prev",
+    );
   });
 
   test("the setup surface writes no configuration and re-probes nothing", async () => {
