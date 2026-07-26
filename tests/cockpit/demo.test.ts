@@ -96,8 +96,28 @@ async function openDemo(columns = 140, rows = 60) {
       }
       return stripAnsi(io.writes.at(-1) ?? "");
     },
+    // The quit key is the only thing that ends the Ink app, so an unbounded `await done` turns any
+    // missed keystroke into a bare 20s vitest timeout that says nothing about why. Bound it,
+    // escalate to ending stdin, and if it still will not exit, fail with a diagnosis, not a
+    // stopwatch:
+    // a hang and a slow runner look identical in the timeout message, and they need opposite fixes.
     async close() {
-      io.input.write(DEMO_KEYS.quit);
+      let exited = false;
+      const settled = done.then(() => { exited = true; });
+      for (let attempt = 0; !exited && attempt < 60; attempt += 1) {
+        io.input.write(DEMO_KEYS.quit);
+        await Promise.race([settled, wait(50)]);
+      }
+      if (!exited) {
+        io.input.end();
+        await Promise.race([settled, wait(2000)]);
+      }
+      if (!exited) {
+        throw new Error(
+          `demo did not exit after 60 quit keys and an stdin end — writes=${io.writes.length}, `
+          + `lastFrameChars=${(io.writes.at(-1) ?? "").length}`,
+        );
+      }
       await done;
     },
   };

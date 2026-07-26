@@ -30,7 +30,8 @@
     "fixtures"
   ],
   "scripts": {
-    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json",
+    "build:clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && npm run build",
     "lint": "oxlint src tests scripts",
     "pretest": "npm run build",
     "test": "vitest run",
