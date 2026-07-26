@@ -434,6 +434,10 @@ describe("cockpit frame-owned height ladder", () => {
     }
   });
 
+  // ~140 full frame renders (2 surfaces x 71 widths x every height tier). It comfortably fits the
+  // default 20s locally and comfortably does not on a 2-core CI runner, where it timed out at
+  // 20132ms during the v1.80.0 release. The work is the point of the test, so give it room rather
+  // than thinning the sweep.
   test("test: no rendered line anywhere in either surface begins with a separator glyph", async () => {
     for (const cockpit of ["run", "setup"] as const) {
       for (
@@ -446,7 +450,7 @@ describe("cockpit frame-owned height ladder", () => {
         }
       }
     }
-  });
+  }, 180_000);
 
   test("test: composing a line whose separator falls exactly at a wrap boundary makes the preceding check fail, so the guard rejects the case it exists for", () => {
     const data = "12345678 · next item";
