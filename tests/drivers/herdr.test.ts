@@ -7,7 +7,7 @@ import { DELIVERY_ATTEMPTS, DeliveryReadinessError, HerdrDriver } from "../../sr
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; boxWrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo"; submitAfterReads?: number }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; boxWrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; paneReadHangsAfter?: number; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo"; submitAfterReads?: number }
 
 function steppedTimeSource() {
   let nowMs = 0;
@@ -131,7 +131,9 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
     ? `printf 'pane read protocol failure\\n'; exit 1`
     : opts.paneReadHangs
       ? `sleep 2; printf 'late pane read\\n'`
-      : `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then ${postSubmitPaneRead}; else ${preSubmitPaneRead}; fi`;
+      : opts.paneReadHangsAfter !== undefined
+        ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; if [ "$n" -gt ${opts.paneReadHangsAfter} ]; then sleep 2; fi; printf 'restless-frame-%s\\n' "$n"`
+        : `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then ${postSubmitPaneRead}; else ${preSubmitPaneRead}; fi`;
   const deliveryContend = opts.contendDelivery
     ? `
 delivery_pane() { for a in "$@"; do case "$a" in w1:p*) echo "$a"; return;; esac; done; }
@@ -774,6 +776,30 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
 
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(DeliveryReadinessError);
+  });
+
+  // A non-first read is given exactly the remaining readiness budget as its real subprocess
+  // timeout, so it timing out IS the bounded window expiring — the classification must not also
+  // require the injected clock to have reached the bound, because the injected clock does not
+  // advance during a real read. On a slow runner the last read's real budget shrinks below spawn
+  // latency and this path fires deterministically (the two release-run reds of 2026-07-26).
+  test("a timed-out read after an observed frame carries the READINESS identity even when the injected clock has not reached the bound", async () => {
+    const lateHangAdapterId = "late-hang-readiness-test";
+    declareInputBox(lateHangAdapterId, {
+      fingerprint: "editor-box",
+      readinessTimeoutMs: 500,
+    });
+    const { bin, cwd } = makeStub(0, { paneReadHangsAfter: 2 });
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
+    const slot = await d.slot(cwd, `T8-worker-${lateHangAdapterId}-a0-late-hang`, {
+      group: "workers",
+      owned: { role: "worker", taskId: "T8", attempt: 0, runId: "run-late-hang" },
+    });
+    const error = await d.run(slot, "echo hi").catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(DeliveryReadinessError);
+    expect(String(error)).toMatch(/READINESS/);
   });
 });
 

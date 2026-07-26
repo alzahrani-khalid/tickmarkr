@@ -664,10 +664,12 @@ export class HerdrDriver implements ExecutorDriver {
       transcript = read.stdout || transcript;
       const waitedMs = this.time.now() - started;
       if (read.code !== 0) {
-        // Once at least one valid frame has been observed, a read that consumes the remainder of
-        // the readiness budget is the bounded window expiring, not a new submission/protocol
-        // identity. A first-read timeout and every non-timeout read failure remain structural.
-        if (read.timedOut && previous !== undefined && waitedMs >= timeoutMs) {
+        // Once at least one valid frame has been observed, a timed-out read IS the bounded window
+        // expiring: the read was given exactly the remaining readiness budget as its real timeout,
+        // so real time genuinely elapsed even when an injected clock has not advanced (an injected
+        // clock never moves during a read, so a wall-clock comparison here can never hold under
+        // one). A first-read timeout and every non-timeout read failure remain structural.
+        if (read.timedOut && previous !== undefined) {
           throw new DeliveryReadinessError(waitedMs, transcript);
         }
         const detail = read.stderr || read.stdout || `exit ${read.code}`;
