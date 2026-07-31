@@ -1,12 +1,14 @@
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, test } from "vitest";
+import * as brandModule from "../../src/brand.js";
 import { BANNER, PLAIN_BANNER } from "../../src/brand.js";
 
 const REPO = join(import.meta.dirname, "../..");
 const README = join(REPO, "README.md");
 const BRAND = join(REPO, "src/brand.ts");
+const PLAIN_MARK = (brandModule as { readonly PLAIN_MARK?: string }).PLAIN_MARK;
 
 /** First fenced ``` block in README (the hero). */
 function readmeHeroBlock(md: string): string {
@@ -38,6 +40,28 @@ function listFiles(dir: string): string[] {
   return out;
 }
 
+function markHomes(planted: Readonly<Record<string, string>> = {}): string[] {
+  const permittedHomes = [BRAND, README].map((path) => relative(REPO, path));
+  const needle = PLAIN_MARK!.split("\n").toSorted((left, right) =>
+    right.replaceAll(" ", "").length - left.replaceAll(" ", "").length
+  )[0]!.trimEnd();
+  const candidates = [
+    ...listFiles(REPO).map((path) => [relative(REPO, path), readFileSync(path, "utf8")] as const),
+    ...Object.entries(planted),
+  ];
+  const unexpected = candidates.flatMap(([path, text]) =>
+    !permittedHomes.includes(path) && text.includes(needle) ? [path] : []
+  );
+  return [...permittedHomes, ...unexpected].sort();
+}
+
+function assertPermittedMarkHomes(planted: Readonly<Record<string, string>> = {}): void {
+  expect(markHomes(planted), "mark art duplicated outside brand.ts/README.md").toEqual([
+    "README.md",
+    "src/brand.ts",
+  ]);
+}
+
 describe("T4 README hero is the ASCII-identical logo", () => {
   test("README's hero code block equals PLAIN_BANNER exactly (the drift pin)", () => {
     const readme = readFileSync(README, "utf8");
@@ -57,17 +81,11 @@ describe("T4 README hero is the ASCII-identical logo", () => {
     }).not.toThrow();
   });
 
-  test("the logo duplication scan continues to report only the two permitted homes for the mark", () => {
-    const needle = PLAIN_BANNER.split("\n").find((l) => l.includes("\u2584\u2584"))!;
-    const permittedHomes = new Set([BRAND, README].map((p) => relative(REPO, p)));
-    const dupes: string[] = [];
-    for (const abs of listFiles(REPO)) {
-      const rel = relative(REPO, abs).split("\\").join("/");
-      if (permittedHomes.has(rel) || !existsSync(abs)) continue;
-      const text = readFileSync(abs, "utf8");
-      if (text.includes(needle)) dupes.push(rel);
-    }
-    expect([...permittedHomes].sort()).toEqual(["README.md", "src/brand.ts"]);
-    expect(dupes, `block art duplicated outside brand.ts/README.md:\n${dupes.join("\n")}`).toEqual([]);
+  test("test: the duplication scan still reports exactly the two permitted homes for the mark, and it fails when the art is planted in a third file", () => {
+    expect(PLAIN_MARK).toBeTypeOf("string");
+    assertPermittedMarkHomes();
+    expect(() => assertPermittedMarkHomes({ "planted-third-file.txt": PLAIN_MARK! })).toThrowError(
+      /mark art duplicated outside brand\.ts\/README\.md/,
+    );
   });
 });

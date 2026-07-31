@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import * as brandModule from "../src/brand.js";
 import {
-  BANNER, COMPACT_LOCKUP, GLYPHS, PLAIN_BANNER, PLAIN_COMPACT_LOCKUP, TOKENS,
+  BANNER, COMPACT_LOCKUP, GLYPHS, PLAIN_COMPACT_LOCKUP, TOKENS,
   kvRow, legend, paneDispatchCommand, rule, statusRow, title, toggleActive, toggleInactive,
 } from "../src/brand.js";
 
@@ -19,15 +20,101 @@ afterEach(() => {
   else process.env.NO_COLOR = noColor0;
 });
 
-// exact bytes of the exports as they were before the design-system change
-const BANNER_PINNED = [
-  "              \x1b[38;5;84m▄▄████\x1b[0m",
-  "          \x1b[38;5;78m▄▄████▀▀\x1b[0m",
-  "\x1b[38;5;41m████▄▄▄▄████▀▀\x1b[0m     \x1b[1mtickmarkr\x1b[0m",
-  "  \x1b[38;5;35m▀▀████▀▀\x1b[0m         spec in, verified work out.",
-  "",
-].join("\n");
-const PLAIN_PINNED = BANNER_PINNED.replace(/\x1b\[[0-9;]*m/g, "").replace(/[ \t]+$/gm, "");
+type MarkContract = {
+  readonly MARK_BITMAP?: readonly string[];
+  readonly MARK?: string;
+  readonly PLAIN_MARK?: string;
+};
+
+const markContract = brandModule as MarkContract;
+const stripAnsi = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+const QUADRANTS = [
+  " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
+  "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+] as const;
+
+function packBitmap(bitmap: readonly string[]): string {
+  const rows: string[] = [];
+  for (let y = 0; y < bitmap.length; y += 2) {
+    let row = "";
+    for (let x = 0; x < bitmap[y]!.length; x += 2) {
+      const mask = (bitmap[y]![x] === "#" ? 1 : 0)
+        | (bitmap[y]![x + 1] === "#" ? 2 : 0)
+        | (bitmap[y + 1]![x] === "#" ? 4 : 0)
+        | (bitmap[y + 1]![x + 1] === "#" ? 8 : 0);
+      row += QUADRANTS[mask];
+    }
+    rows.push(row);
+  }
+  return rows.join("\n");
+}
+
+describe("ruled product mark", () => {
+  test("test: the mark the product prints is the ruled bitmap packed two pixels by two pixels into each cell, asserted against the bitmap rather than against a copy of the art", () => {
+    expect(markContract.MARK_BITMAP).toHaveLength(10);
+    expect(markContract.MARK_BITMAP!.every((row) => row.length === 18)).toBe(true);
+    expect(markContract.PLAIN_MARK).toBe(packBitmap(markContract.MARK_BITMAP!));
+    expect(markContract.PLAIN_MARK!.split("\n")).toHaveLength(5);
+    expect(markContract.PLAIN_MARK!.split("\n").every((row) => [...row].length === 9)).toBe(true);
+  });
+
+  test("test: the mark draws ink on a solid tile, so its colours are the ruled tile and the ruled ink and no other pair", () => {
+    expect(markContract.MARK).toBeTypeOf("string");
+    const rows = markContract.MARK!.split("\n");
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      const painted = row.match(/^\x1b\[38;5;(\d+);48;5;(\d+)m([\s\S]{9})\x1b\[0m$/u);
+      expect(painted).not.toBeNull();
+      expect([Number(painted![1]), Number(painted![2])]).toEqual([233, 41]);
+    }
+    expect(new Set(markContract.MARK!.match(/\x1b\[[0-9;]*m/g))).toEqual(
+      new Set(["\x1b[38;5;233;48;5;41m", "\x1b[0m"]),
+    );
+  });
+
+  test("test: with colour stripped the mark is still a legible silhouette rather than blank space", () => {
+    expect(markContract.MARK).toBeTypeOf("string");
+    expect(stripAnsi(markContract.MARK!)).toBe(markContract.PLAIN_MARK);
+    const silhouette = markContract.PLAIN_MARK!.replaceAll(" ", "").replaceAll("\n", "");
+    expect(silhouette.length).toBeGreaterThan(0);
+    expect(new Set(silhouette).size).toBeGreaterThan(3);
+  });
+
+  test("test: the image twin is generated from the same bitmap, so a pixel present in one is present in the other", () => {
+    expect(markContract.MARK_BITMAP).toHaveLength(10);
+    const expectedPixels = new Set(markContract.MARK_BITMAP!.flatMap((row, y) =>
+      [...row].flatMap((pixel, x) => pixel === "#" ? [`${x},${y}`] : []),
+    ));
+    const svg = readFileSync(join(import.meta.dirname, "../assets/mark.svg"), "utf8");
+    const imagePixels = new Set([...svg.matchAll(
+      /<rect class="ink" x="(\d+)" y="(\d+)" width="1" height="1"\/>/g,
+    )].map((match) => `${match[1]},${match[2]}`));
+
+    expect(svg).toContain('viewBox="0 0 18 10"');
+    expect(imagePixels).toEqual(expectedPixels);
+  });
+
+  test("test: the legacy mark is gone from the product, asserted by rendering rather than by searching the source for its name", () => {
+    expect(markContract.PLAIN_MARK).toBeTypeOf("string");
+    const rendered = stripAnsi(BANNER);
+    expect(rendered).toContain(markContract.PLAIN_MARK!.split("\n")[2]!.trimEnd());
+    expect(rendered).not.toContain("████▄▄▄▄████▀▀");
+    expect(rendered).not.toContain("▀▀████▀▀");
+  });
+
+  test("test: the compact lockup the run surface draws is still sliced from the mark rather than written beside it", () => {
+    expect(markContract.PLAIN_MARK).toBeTypeOf("string");
+    expect(COMPACT_LOCKUP).toBe(BANNER.split("\n").slice(1, 3).join("\n"));
+    expect(PLAIN_COMPACT_LOCKUP).toBe(stripAnsi(COMPACT_LOCKUP).replace(/[ \t]+$/gm, ""));
+    const frame = readFileSync(
+      join(import.meta.dirname, "fixtures/cockpit/frames/run.height-24.140x24.txt"),
+      "utf8",
+    );
+    for (const line of PLAIN_COMPACT_LOCKUP.split("\n")) {
+      expect(frame).toContain(line.trimEnd());
+    }
+  });
+});
 
 describe("compact brand lockup", () => {
   test("the compact lockup renders as exactly two lines and carries the product name", () => {
@@ -36,7 +123,6 @@ describe("compact brand lockup", () => {
   });
 
   test("every non-blank character the compact lockup draws also occurs in the full banner, so no glyph is invented", () => {
-    const stripAnsi = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
     const fullCharacters = new Set(stripAnsi(BANNER).replace(/\s/g, ""));
     for (const character of stripAnsi(COMPACT_LOCKUP).replace(/\s/g, "")) {
       expect(fullCharacters.has(character), `invented character: ${character}`).toBe(true);
@@ -161,16 +247,6 @@ describe("design system — helpers", () => {
   test("kvRow aligns the key before styling so columns hold", () => {
     setTTY(false);
     expect(kvRow("worktree", "clean", 10)).toBe("  worktree   clean");
-  });
-});
-
-describe("design system — legacy exports byte-pinned", () => {
-  test("the banner export is byte-identical to before this change", () => {
-    expect(BANNER).toBe(BANNER_PINNED);
-  });
-
-  test("the plain banner export is byte-identical to before this change", () => {
-    expect(PLAIN_BANNER).toBe(PLAIN_PINNED);
   });
 });
 

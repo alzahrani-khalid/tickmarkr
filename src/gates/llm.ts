@@ -221,23 +221,37 @@ export async function runViaDriver(
 export function dewrapPaneVerdict(out: string, nonce: string): string {
   if (!out.includes(nonce)) return out;
   const lines = out.split("\n");
-  const start = lines.findIndex((line) => /^\s*(?:[•*-]\s+)?\{/.test(line));
-  if (start < 0) return out;
-  for (let end = start; end < lines.length; end++) {
-    const joined = lines
-      .slice(start, end + 1)
-      .map((line, i) => (i === 0 ? line.replace(/^\s*(?:[•*-]\s+)?/, "") : line.replace(/^\s+/, "")))
-      .join("")
-      .trimEnd();
-    if (!joined.endsWith("}")) continue;
-    try {
-      const parsed: unknown = JSON.parse(joined);
-      // the nonce IS the acceptance test — never reconstruct a verdict this call did not ask for
-      if (parsed && typeof parsed === "object" && (parsed as { nonce?: unknown }).nonce === nonce) {
-        return `${out}\n${joined}`;
+  // OBS-209: EVERY brace-start is a candidate, scanned newest-first. findIndex took only the first,
+  // so any earlier line beginning with `{` — a quoted snippet, a lone brace in the reviewer's own
+  // reasoning — captured the scan, and the real verdict below it was unreachable no matter how far
+  // the join extended. Measured on run-20260728-110135 T1: kimi's nonce-bound APPROVAL sat at line
+  // 382 behind a bare `{` at line 189, so a passing review was recorded `malformed-verdict` and
+  // parked the task. Newest-first matches extractJson, which takes the LAST balanced object.
+  const starts: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*(?:[•*-]\s+)?\{/.test(lines[i]!)) starts.push(i);
+  }
+  for (let si = starts.length - 1; si >= 0; si--) {
+    const start = starts[si]!;
+    for (let end = start; end < lines.length; end++) {
+      const joined = lines
+        .slice(start, end + 1)
+        .map((line, i) => (i === 0 ? line.replace(/^\s*(?:[•*-]\s+)?/, "") : line.replace(/^\s+/, "")))
+        .join("")
+        .trimEnd();
+      // ponytail: no verdict is a megabyte; abandon a runaway candidate rather than rejoin the
+      // whole transcript once per brace-start. Raise the ceiling if a real verdict ever exceeds it.
+      if (joined.length > 1_000_000) break;
+      if (!joined.endsWith("}")) continue;
+      try {
+        const parsed: unknown = JSON.parse(joined);
+        // the nonce IS the acceptance test — never reconstruct a verdict this call did not ask for
+        if (parsed && typeof parsed === "object" && (parsed as { nonce?: unknown }).nonce === nonce) {
+          return `${out}\n${joined}`;
+        }
+      } catch {
+        /* not yet a complete object — keep extending within the bounded region */
       }
-    } catch {
-      /* not yet a complete object — keep extending within the bounded region */
     }
   }
   return out;

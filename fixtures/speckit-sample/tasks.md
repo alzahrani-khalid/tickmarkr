@@ -10,11 +10,11 @@
 - [ ] T002 [P] Implement token refresh in src/auth/refresh.ts
   - acceptance: expired token triggers exactly one refresh attempt
   - acceptance: refresh failure surfaces a typed error
-  - files: src/auth/**
+  - files: src/auth/refresh.ts
   - complexity: 7
 - [ ] T003 [P] Implement session store in src/auth/store.ts
   - acceptance: sessions persist across restarts
-  - files: src/auth/**
+  - files: src/auth/store.ts
 - [ ] T004 Write integration tests for auth flow
   - acceptance: happy path and refresh-failure path covered
   - files: tests/**

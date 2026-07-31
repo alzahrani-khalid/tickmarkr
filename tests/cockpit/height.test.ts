@@ -21,7 +21,9 @@ import { loadDemoCaptures } from "../../src/tui/cockpit/demo.js";
 import {
   COCKPIT_COLUMN_FLOOR,
   COCKPIT_ROW_FLOOR,
+  planFrame,
   resolveCockpitLayout,
+  SIDEBAR_COLUMN_FLOOR,
 } from "../../src/tui/cockpit/layout.js";
 import {
   deriveRunCockpitData,
@@ -210,26 +212,11 @@ function retainedRunElements(output: string): boolean[] {
   return [
     output.includes("Move"),
     output.includes("tip-verify"),
-    output.includes(`v${binaryVersion}`),
+    output.includes(`tickmarkr ${binaryVersion}`),
     output.includes(`${data.progress}%`),
     output.includes("JOURNAL"),
-    output.includes(data.progressCaption),
-    output.includes("TASKS"),
-    output.includes(data.branch),
+    output.includes(`tasks ${data.tasks.done}/${data.tasks.total}`),
   ];
-}
-
-function retainedRunElementsAtWidth(output: string): boolean[] {
-  const data = deriveRunCockpitData(eventfulJournal, binaryVersion);
-  const retained = retainedRunElements(output);
-  retained[5] = output.includes(
-    data.progressCaption.split(" · ").slice(0, 2).join(" · "),
-  );
-  retained[6] = retained[6] || output.includes(
-    `tasks ${data.tasks.done}/${data.tasks.total}`,
-  );
-  retained[7] = output.includes(data.runId);
-  return retained;
 }
 
 function assertNoLeadingSeparator(output: string): void {
@@ -383,14 +370,17 @@ describe("cockpit frame-owned height ladder", () => {
       deriveSetupCockpitData(captures, binaryVersion).reviewRows.length,
     );
 
-    for (const file of ["run-cockpit.tsx", "setup-cockpit.tsx"]) {
-      const source = readFileSync(join(SOURCE_DIRECTORY, file), "utf8");
-      expect(source, file).toContain("resolveCockpitLayout");
-    }
     const runSource = readFileSync(
       join(SOURCE_DIRECTORY, "run-cockpit.tsx"),
       "utf8",
     );
+    const setupSource = readFileSync(
+      join(SOURCE_DIRECTORY, "setup-cockpit.tsx"),
+      "utf8",
+    );
+    expect(runSource).toContain("planFrame");
+    expect(runSource).not.toContain("resolveCockpitLayout");
+    expect(setupSource).toContain("resolveCockpitLayout");
     expect(runSource).not.toMatch(/\brows\s*>=\s*\d+/);
     expect(runSource).not.toMatch(
       /sourceRows\s*\+\s*Math\.floor\(rows\)\s*-\s*\d+/,
@@ -480,20 +470,17 @@ describe("cockpit frame-owned height ladder", () => {
           ).toBeLessThanOrEqual(columns);
         }
 
-        const retained = retainedRunElementsAtWidth(
-          await renderFrame("run", columns, rows),
-        );
-        const layout = resolveCockpitLayout(columns, rows);
-        if (layout.renderer !== "frame") throw new Error("expected frame layout");
-        expect(retained, `${columns}x${rows}`).toEqual([
+        expect(
+          retainedRunElements(await renderFrame("run", columns, rows)),
+          `${columns}x${rows}`,
+        ).toEqual([
           true,
           true,
           true,
-          layout.elements.progressBar,
           true,
-          layout.elements.progressCaption,
           true,
-          layout.elements.secondaryHeader,
+          // The summary surrenders whole at the strip band's row floor, where the journal's chrome is granted first.
+          columns >= SIDEBAR_COLUMN_FLOOR || rows > COCKPIT_ROW_FLOOR,
         ]);
       }
     }
@@ -514,18 +501,26 @@ describe("cockpit frame-owned height ladder", () => {
   });
 
   test("test: as height decreases, elements are surrendered in the contracted priority order, and no higher-priority element is missing while a lower-priority one is still drawn", async () => {
+    const data = deriveRunCockpitData(eventfulJournal, binaryVersion);
+    const captionCells = stringWidth(
+      `${data.runId} · ${data.branch} · ${data.status} · ${data.elapsed}`,
+    );
     for (let rows = 24; rows >= COCKPIT_ROW_FLOOR; rows -= 1) {
-      const retained = retainedRunElements(
-        await renderFrame("run", 140, rows),
+      const frame = await renderFrame("run", 140, rows);
+      const plan = planFrame(
+        { columns: 140, rows },
+        "run",
+        { captionCells },
       );
-      for (let lower = 1; lower < retained.length; lower += 1) {
-        if (retained[lower]) {
-          expect(
-            retained.slice(0, lower).every(Boolean),
-            `${rows} rows: ${retained.join(",")}`,
-          ).toBe(true);
-        }
-      }
+      if (plan.kind !== "frame") throw new Error("expected frame plan");
+      expect(retainedRunElements(frame), `${rows} fixed bands`)
+        .toEqual([true, true, true, true, true, true]);
+      const caption = plan.regions.some((region) => region.id === "caption");
+      const tail = plan.regions.some((region) => region.id === "tail");
+      // Caption is first in the declared surrender order, so a lower-priority
+      // tail cannot outlive it.
+      if (tail) expect(caption, `${rows} caption before tail`).toBe(true);
+      expect(tail, `${rows} tail tier`).toBe(rows >= 16);
     }
   });
 
@@ -533,7 +528,9 @@ describe("cockpit frame-owned height ladder", () => {
     for (const cockpit of ["run", "setup"] as const) {
       for (let rows = COCKPIT_ROW_FLOOR; rows <= 40; rows += 1) {
         const frame = await renderFrame(cockpit, 140, rows);
-        expect(frame, `${cockpit} ${rows} version`).toContain(`v${binaryVersion}`);
+        expect(frame, `${cockpit} ${rows} version`).toContain(
+          cockpit === "run" ? `tickmarkr ${binaryVersion}` : `v${binaryVersion}`,
+        );
         expect(frame, `${cockpit} ${rows} keybar`).toContain(
           cockpit === "run" ? "Move" : "Toggle",
         );

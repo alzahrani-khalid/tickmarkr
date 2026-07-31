@@ -51,9 +51,14 @@ export async function plan(argv: string[], cwd = process.cwd(), adapters: Worker
   const health = cached ?? (await probeAll(adapters));
   const channels = discoverChannels(cfg, adapters, health);
   // VIS-04 trust ramp (VALIDATION 13-01-11): preview:true bypasses the routing.learned:off short-circuit so
-  // the static-vs-learned column renders even when the daemon's learned routing is off. Cold ⇒ undefined ⇒
+  // the static-vs-learned comparison renders even when the daemon's learned routing is off. Cold ⇒ undefined ⇒
   // output byte-identical to today.
   const profile = loadRoutingProfile(cwd, cfg, { preview: true });
+  // T10: the headline row names the channel the run would actually DISPATCH. The daemon builds its profile
+  // without preview, so routing.learned: off means it dispatches the static pick — the preview profile may
+  // only feed the "learned would pick" comparison line below, never the row itself. Scoped to the switch:
+  // with learned on, dispatchProfile === profile and the surface is byte-identical to before.
+  const dispatchProfile = cfg.routing.learned === "off" ? undefined : profile;
   let deviations = 0;
   // v1.51 T4: the mode is never invisible — the header names the resolved mode, its winning
   // source, and the explore posture; each task row carries a floor-derivation line below.
@@ -124,7 +129,7 @@ export async function plan(argv: string[], cwd = process.cwd(), adapters: Worker
   const routed: RoutedAssignment[] = [];
   for (const t of g.tasks) {
     try {
-      const r = route(t, cfg, channels, profile);
+      const r = route(t, cfg, channels, dispatchProfile);
       routed.push({ taskId: t.id, adapter: r.assignment.adapter, model: r.assignment.model });
       for (const l of r.lints) {
         const suf = exclusionReason(l);
@@ -141,6 +146,15 @@ export async function plan(argv: string[], cwd = process.cwd(), adapters: Worker
         deviations++;
         const d = r.deviation;
         lines.push(`    ⇄ static would pick ${d.static} — learned picked ${d.chosen} (score ${d.score.toFixed(3)} n=${d.n} vs ${d.staticScore.toFixed(3)})`);
+      } else if (dispatchProfile !== profile && profile) {
+        // learned off: the row above already names the static dispatch pick; the preview keeps its
+        // value by naming what learned routing WOULD have picked instead (same scores, same shape).
+        const pv = route(t, cfg, channels, profile);
+        if (pv.deviation) {
+          deviations++;
+          const d = pv.deviation;
+          lines.push(`    ⇄ learned would pick ${d.chosen} (score ${d.score.toFixed(3)} n=${d.n} vs ${d.staticScore.toFixed(3)}) — routing.learned: off keeps the static pick`);
+        }
       }
     } catch (e) {
       if (!(e instanceof RoutingError)) throw e;

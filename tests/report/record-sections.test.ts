@@ -82,6 +82,38 @@ describe("tickmarkr report --md against v1.17–v1.19 run fixtures", () => {
     expect(out).toMatch(/\*\*pi:zai\/glm-5\.2\*\*[^\n]*windows: 3[^\n]*price: \$0\.250000–\$0\.750000 amortized[^\n]*API-equivalent: \$30\.000000/);
   });
 
+  // T11: this fixture predates the `skipped` field — its four below-threshold reviews carry the
+  // decline only in the details prefix, and pass:true. A reader counting passes in the record must
+  // not count them. T3's review genuinely ran and its body happens to mention skipping, so the
+  // prefix anchor is what keeps that one a pass; an unanchored match would misreport it.
+  test("a reader counting passes in the record cannot count a legacy gate that never ran", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    const runId = "run-20260713-093803-declined";
+    installRun(repo, "old-run", runId);
+
+    const isDecline = (e: FixtureEvent): boolean => /^skipped\b/.test(String(e.data?.details ?? ""));
+    const reviews = readJournal("old-run").filter((e) => e.event === "gate-result" && e.data?.gate === "review");
+    const declined = reviews.filter(isDecline);
+    const ran = reviews.filter((e) => !isDecline(e));
+    expect(declined.length).toBe(4);
+    expect(declined.every((e) => e.data?.skipped === undefined && e.data?.pass === true)).toBe(true);
+    expect(ran.length).toBe(1);
+    expect(String(ran[0].data?.details)).toContain("skipped"); // mid-body mention, not a decline
+
+    const out = await report([runId, "--md"], repo);
+    const tickmarks = out.split("\n").filter((line) => line.startsWith("  - review: "));
+    expect(tickmarks.filter((line) => line.startsWith("  - review: declined")).length).toBe(declined.length);
+    expect(tickmarks.filter((line) => line.startsWith("  - review: pass")).length).toBe(ran.length);
+    expect(out).toMatch(/review: declined — skipped — complexity \d+ < threshold 7/);
+
+    // the text surface agrees: declines out of the rate base, counted separately
+    const gates = readJournal("old-run").filter((e) => e.event === "gate-result");
+    const ranGates = gates.filter((e) => !isDecline(e));
+    const passed = ranGates.filter((e) => e.data?.pass === true);
+    const text = await report([runId], repo);
+    expect(text).toContain(`(${passed.length}/${ranGates.length}) · declined: ${declined.length}`);
+  });
+
   test("the task routing line preserves the fixture journal provenance exactly", async () => {
     const repo = makeRepo({ "keep.txt": "x\n" });
     const runId = "run-20260713-093803-routing";

@@ -17,7 +17,7 @@ import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../s
 import { validateGraph } from "../../src/graph/schema.js";
 import { EARLY_LAUNCH_LIVENESS_MS, runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../src/run/git.js";
-import { Journal } from "../../src/run/journal.js";
+import { Journal, recordedTaskFailureKind } from "../../src/run/journal.js";
 import { COMMIT, authedModels, setupRepo, T } from "../helpers/tmprepo.js";
 
 const addGateScripts = (repo: string, testCmd: string) => {
@@ -875,10 +875,14 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
   });
 
   test("v1.1: retried gates get attempt-unique pane names (herdr agent_name_taken regression)", async () => {
+    // OBS-189 (park-economics patch): review rejections now converge via forced same-channel retries
+    // and park at the engagement round cap WITHOUT consulting — so this test's consult-label guard
+    // (WR-01) rides a judge rejection instead, which still walks retry → escalate → consult → park.
     const { repo, fake } = setupRepo(
       [T("T1", { complexity: 8 })],
       {
-        review: { approve: false, issues: ["not good enough"] }, // legitimate rejection every attempt
+        judge: { pass: false, criteria: [{ criterion: "a", met: false, reason: "not met" }] }, // rejection every attempt
+        review: { approve: true, issues: [] }, // unreached — acceptance fails first
         consult: { action: "human", notes: "stop" },
         tasks: { T1: [{ shell: `echo v >> f.txt && ${COMMIT} v`, result: { ok: true, summary: "v" } }] },
       },
@@ -910,7 +914,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     };
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-uniq", driver });
     expect(s.failed).toEqual([]); // a name collision would crash the task into "failed"
-    expect(s.human).toEqual(["T1"]); // the legitimate path: review rejections → consult → park
+    expect(s.human).toEqual(["T1"]); // the legitimate path: judge rejections → consult → park
     // D-07: judge panes self-clean between attempts — canonical names reuse safely (no agent_name_taken)
     expect(names.filter((n) => n === formatOwnedName({ role: "judge", taskId: "T1", attempt: 0, runId: "run-uniq" })).length).toBeGreaterThanOrEqual(2);
     expect(names).toContain(gatePaneName("consult", "T1")); // consult pane named + kept too
@@ -919,17 +923,18 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(slotOpts.find((o) => o.name === gatePaneName("consult", "T1"))?.opts).toEqual({ label: "CONSULT T1", owned: { role: "consult", taskId: "T1", attempt: 0, runId: "run-uniq" } });
   });
 
-  // v1.70 T5 (review-convergence): a task whose review keeps drawing material findings must not cycle
-  // through review rounds forever. With consult answering "retry" the escalation ladder would loop until
-  // the global attempt cap; the review round cap stops it far earlier and parks for a human decision.
+  // v1.70 T5 (review-convergence) + OBS-189 (park-economics patch): a task whose review keeps drawing
+  // material findings converges via forced same-channel fix retries (no ladder, no consult) and parks
+  // at the engagement round cap with BOTH human decisions named — accept the diff, or uphold and fund
+  // one fixed attempt.
   test("a task that has already reached the review round cap is parked for a human decision instead of dispatching another review round", async () => {
     const { repo, fake } = setupRepo(
       // deterministic command oracle for acceptance: the review gate is the one under test, so this
-      // isolates it and avoids spawning a fake-judge subprocess on every one of the (up to 4) rounds.
+      // isolates it and avoids spawning a fake-judge subprocess on every round.
       [T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
       {
         review: { approve: false, findings: [{ note: "blocking bug", severity: "material" }] }, // material every round
-        consult: { action: "retry", notes: "keep going" }, // never parks via consult — only the cap can stop it
+        consult: { action: "retry", notes: "keep going" }, // must never fire — review-fix retries bypass the ladder
         tasks: { T1: [{ shell: `echo v >> f.txt && ${COMMIT} v`, result: { ok: true, summary: "v" } }] },
       },
     );
@@ -938,13 +943,17 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     const evs = Journal.open(repo, "run-revcap").read();
     const humanEv = evs.find((e) => e.event === "task-human" && e.taskId === "T1");
     expect(String(humanEv?.data.reason)).toMatch(/review round cap/i);
-    // exactly REVIEW_ROUND_CAP failing review rounds ran, then the cap parked it before a 4th round
+    expect(String(humanEv?.data.reason)).toMatch(/--uphold/); // both verbs offered at the park
+    // exactly REVIEW_ROUND_CAP failing review rounds ran, then the cap parked it before another round
     const reviewRounds = evs.filter((e) =>
       e.event === "gate-result" &&
       (e.data as { gate?: string }).gate === "review" &&
       (e.data as { pass?: boolean }).pass === false,
     ).length;
-    expect(reviewRounds).toBe(3);
+    expect(reviewRounds).toBe(2);
+    // OBS-189/G3: the fix attempts were forced same-channel retries — no ladder rung, no consult
+    expect(evs.filter((e) => e.event === "escalation" && e.data.reviewFix === true).length).toBeGreaterThanOrEqual(1);
+    expect(evs.some((e) => e.event === "consult-verdict")).toBe(false);
     // parked by the review round cap, NOT the global attempt cap (10) — review non-convergence is caught early
     expect(evs.some((e) => e.event === "task-human" && /attempt cap/.test(String(e.data.reason ?? "")))).toBe(false);
   });
@@ -1184,6 +1193,47 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(event.data).toMatchObject({ kind: "dispatch", attempts: 0 });
     expect(events.filter((e) => e.event === "task-dispatch")).toHaveLength(1);
     expect(events.some((e) => e.event === "escalation")).toBe(false);
+  });
+
+  // OBS-206: a failed gate in an EARLIER attempt must not relabel this attempt's infra death. The
+  // whole-history scan made every task that ever failed one gate permanently ineligible for
+  // `resume --retry-failed` (which releases kind === "dispatch" only) — measured on
+  // run-20260728-110135, where T1 attempt 6 died on delivery corruption having run no gate at all.
+  test("test: a dispatch death after an earlier gate failure is recorded as dispatch, not gate-fail", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [
+        { shell: "true", result: { ok: true, summary: "lied — committed nothing" } }, // evidence gate kills attempt 1
+        { shell: "true", result: { ok: true, summary: "never runs — delivery dies first" } },
+      ] } },
+    );
+    const inner = new SubprocessDriver();
+    let runs = 0;
+    const driver = {
+      id: "late-dispatch-refusal",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      async run(...args: Parameters<SubprocessDriver["run"]>) {
+        if (++runs > 1) throw new Error("delivery corrupted after 2 submit attempts");
+        return inner.run(...args);
+      },
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+    };
+
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-late-dispatch", driver });
+
+    expect(s.failed).toEqual(["T1"]);
+    const events = Journal.open(repo, "run-late-dispatch").read();
+    // the earlier attempt really did fail a gate — that is the condition that used to poison the label
+    expect(events.some((e) => e.event === "gate-result" && e.data.pass === false)).toBe(true);
+    expect(events.find((e) => e.event === "task-failed")!.data).toMatchObject({ kind: "dispatch" });
+    expect(recordedTaskFailureKind(events, "T1")).toBe("dispatch");
   });
 
   test("test: a readiness failure journals how long delivery waited and what the pane showed", async () => {

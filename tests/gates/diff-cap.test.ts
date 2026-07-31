@@ -1,17 +1,19 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { dirname, join } from "node:path";
+import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, DEFAULT_DIFF_CAP } from "../../src/config/config.js";
 import { acceptanceGate } from "../../src/gates/acceptance.js";
+import * as llm from "../../src/gates/llm.js";
 import {
   checkDiffCap,
   diffCapParkReason,
   fetchTaskDiff,
   isDiffCapPark,
+  REGENERABLE_CAPTURE_PATHS,
   reviewGate,
 } from "../../src/gates/review.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -177,3 +179,427 @@ describe("diff cap — park('human') policy", () => {
     expect(stepsTaken).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.82 T1 — the verifiable cap measures what a READER MUST READ, not what a run
+// must write. The regenerable frame corpora are asserted byte-for-byte by the
+// corpus tests and never read, so counting them is a category error. The frozen
+// appearance anchors and the captured engagement journals are reviewed evidence
+// and keep counting, under every shape.
+// ---------------------------------------------------------------------------
+
+const CAPTURES = REGENERABLE_CAPTURE_PATHS;
+const FRAME_CAPTURE = CAPTURES.find((p) => p.startsWith("tests/fixtures/cockpit/frames/"))!;
+const COLOUR_CAPTURE = CAPTURES.find((p) => p.startsWith("tests/fixtures/cockpit/colour/"))!;
+const SPARE_CAPTURES = CAPTURES.filter((p) => p !== FRAME_CAPTURE && p !== COLOUR_CAPTURE);
+// deliberately the SAME BASENAME as a manifest frame: only the full path separates the frozen
+// oracle from its regenerable twin, so a shape-based membership rule would swallow it.
+const ANCHOR = `tests/fixtures/cockpit/anchors/${FRAME_CAPTURE.split("/").at(-1)}`;
+const JOURNAL = "tests/fixtures/cockpit/sources/run-20260724-231138.journal.jsonl";
+const COLOUR_JOURNAL = "tests/fixtures/cockpit/colour/sources/run-20260718-000943.journal.jsonl";
+const UNMANIFESTED = "tests/fixtures/cockpit/frames/scratch-not-in-manifest.txt";
+// pinned from the receipt itself: the withheld headers + hunk of a one-line box-drawing capture.
+const EXACT_WITHHELD_BYTES = 187;
+
+// box-drawing rows: the bytes a real captured frame is made of, and the reason a UTF-16 code-unit
+// count and a UTF-8 byte count disagree about their size.
+const frameBody = (label: string, rows = 60) =>
+  Array.from({ length: rows }, (_, i) => `│ ${label} row ${i} ${"─".repeat(60)} │`).join("\n") + "\n";
+
+const everyCapture = (label: string) =>
+  Object.fromEntries(CAPTURES.map((p) => [p, frameBody(label)])) as Record<string, string>;
+
+function applyChange(repo: string, after: Record<string, string | null>): void {
+  for (const [p, content] of Object.entries(after)) {
+    const full = join(repo, p);
+    if (content === null) { rmSync(full); continue; }
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, content);
+  }
+}
+
+function repoWithChange(
+  before: Record<string, string>,
+  after: Record<string, string | null>,
+  extra?: (repo: string) => void,
+): { repo: string; base: string } {
+  const repo = makeRepo(before);
+  const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+  applyChange(repo, after);
+  extra?.(repo);
+  execSync("git add -A && git commit --no-gpg-sign -m change", { cwd: repo });
+  return { repo, base };
+}
+
+// the diff as it was BEFORE this task existed — no exclusion applied, the size that parked the run.
+const rawU0 = (repo: string, base: string) =>
+  execSync(`git diff -U0 ${base}..HEAD`, { cwd: repo, encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
+const rawFull = (repo: string, base: string) =>
+  execSync(`git diff ${base}..HEAD`, { cwd: repo, encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
+
+function capturingFake(script: Record<string, unknown>): { fake: FakeAdapter; prompts: string[] } {
+  const fake = fakeWith(script);
+  const prompts: string[] = [];
+  const orig = fake.headlessCommand.bind(fake);
+  fake.headlessCommand = (promptFile, model) => {
+    prompts.push(readFileSync(promptFile, "utf8"));
+    return orig(promptFile, model);
+  };
+  return { fake, prompts };
+}
+
+const CHANNELS = [
+  { adapter: "fake", vendor: "a", model: "fake-1", channel: "sub" as const, tier: "frontier" as const },
+  { adapter: "fake", vendor: "b", model: "fake-2", channel: "api" as const, tier: "frontier" as const },
+];
+const AUTHOR = { adapter: "fake", model: "fake-1", channel: "sub" as const, tier: "frontier" as const };
+
+function reviewCfg(cap: number) {
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.judge.adapter = "fake";
+  cfg.gates.diffCap = cap;
+  return cfg;
+}
+
+// structured {path, line} evidence, never the fake seam's free-text quote (clause 8).
+const citing = (path: string, line: number) => ({
+  pass: true,
+  criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path, line } }],
+});
+
+const runAcceptance = (repo: string, base: string, fake: FakeAdapter, diffCap: number) =>
+  acceptanceGate(judgeTask, repo, base, { adapter: fake, model: "fake-1" }, undefined, { diffCap });
+
+const runReview = (repo: string, base: string, fake: FakeAdapter, cap: number) =>
+  reviewGate(reviewTask, repo, base, AUTHOR, CHANNELS, [fake], reviewCfg(cap));
+
+describe("diff cap — v1.82 T1 regenerable capture boundary", () => {
+  // Clause 1's other half: the gate's member list is the SHIPPED manifest, not a hand-kept guess. The
+  // gate cannot import this module (it is the Ink renderer, and dragging the TUI into every gate's
+  // module graph memoises chalk's colour level and turns the fleet suite red), so the equality is
+  // asserted here instead — add, rename or drop a frame case and this goes red until the gate matches.
+  test("the gate's member list is exactly the shipped capture manifest, and every member exists", async () => {
+    const { COLOUR_FRAME_CASES, GOLDEN_FRAME_CASES } = await import("../../src/tui/cockpit/capture.js");
+    expect([...CAPTURES].sort()).toEqual([
+      ...GOLDEN_FRAME_CASES.map((c) => `tests/fixtures/cockpit/frames/${c.fixture}`),
+      ...COLOUR_FRAME_CASES.map((c) => `tests/fixtures/cockpit/colour/${c.fixture}`),
+    ].sort());
+    // and the directories are the real ones: a member that does not exist would silently discount nothing
+    const repoRoot = new URL("../../", import.meta.url).pathname;
+    expect(CAPTURES.filter((p) => !existsSync(join(repoRoot, p)))).toEqual([]);
+  });
+
+  test("test: a change confined to the regenerable frame corpora no longer counts toward the verifiable cap at either gate that measures it", async () => {
+    const { repo, base } = repoWithChange(
+      { "src/keep.ts": "export const keep = 1;\n", ...everyCapture("before") },
+      everyCapture("after"),
+    );
+    const small = 20_000;
+    const { forCap } = await fetchTaskDiff(repo, base);
+    expect(rawU0(repo, base).length).toBeGreaterThan(small);
+    expect(forCap.length).toBeLessThanOrEqual(small);
+
+    const { fake: judge } = capturingFake({ judge: citing(FRAME_CAPTURE, 0) });
+    const accepted = await runAcceptance(repo, base, judge, small);
+    expect(accepted.pass).toBe(true);
+
+    const reviewed = await runReview(repo, base, fakeWith({ review: { approve: true, issues: [] } }), small);
+    expect(isDiffCapPark(reviewed)).toBe(false);
+    expect(reviewed.pass).toBe(true);
+  });
+
+  test("test: a corpus regeneration large enough to have parked the task before now passes both measuring gates", async () => {
+    const { repo, base } = repoWithChange(everyCapture("before"), everyCapture("after"));
+    // the wall this task removes: the same regeneration, measured the old way, parked for a human.
+    const raw = rawU0(repo, base);
+    expect(raw.length).toBeGreaterThan(DEFAULT_DIFF_CAP);
+    expect(isDiffCapPark(checkDiffCap("acceptance", raw.length, DEFAULT_DIFF_CAP)!)).toBe(true);
+
+    const accepted = await runAcceptance(repo, base, fakeWith({ judge: citing(FRAME_CAPTURE, 0) }), DEFAULT_DIFF_CAP);
+    expect(accepted.pass).toBe(true);
+    const reviewed = await runReview(repo, base, fakeWith({ review: { approve: true, issues: [] } }), DEFAULT_DIFF_CAP);
+    expect(reviewed.pass).toBe(true);
+  });
+
+  test("test: a source change of the same size still counts, so the exclusion is scoped to what is regenerable rather than to size", async () => {
+    // byte-for-byte the same bodies as the regeneration above, written to source paths instead.
+    const sourcePath = (p: string) => `src/generated/${p.split("/").at(-1)}`;
+    const before = Object.fromEntries(CAPTURES.map((p) => [sourcePath(p), frameBody("before")]));
+    const after = Object.fromEntries(CAPTURES.map((p) => [sourcePath(p), frameBody("after")]));
+    const { repo, base } = repoWithChange(before, after);
+    const { forCap } = await fetchTaskDiff(repo, base);
+    expect(forCap.length).toBeGreaterThan(DEFAULT_DIFF_CAP);
+
+    const accepted = await runAcceptance(repo, base, fakeWith({ judge: citing(FRAME_CAPTURE, 0) }), DEFAULT_DIFF_CAP);
+    expect(isDiffCapPark(accepted)).toBe(true);
+    const reviewed = await runReview(repo, base, fakeWith({ review: { approve: true, issues: [] } }), DEFAULT_DIFF_CAP);
+    expect(isDiffCapPark(reviewed)).toBe(true);
+  });
+
+  test("test: only a member of the shipped capture manifest is set aside, asserted by placing an unmanifested file beside real captures and observing it measured and shown in full", async () => {
+    const stranger = frameBody("stranger", 80);
+    const { repo, base } = repoWithChange(
+      { [FRAME_CAPTURE]: frameBody("before"), [UNMANIFESTED]: frameBody("before") },
+      { [FRAME_CAPTURE]: frameBody("after"), [UNMANIFESTED]: stranger },
+    );
+    const { full, forCap } = await fetchTaskDiff(repo, base);
+    // same directory, same extension, same shape — and it is measured and shown in full anyway
+    expect(dirname(UNMANIFESTED)).toBe(dirname(FRAME_CAPTURE));
+    expect(full).toContain("│ stranger row 0 ");
+    expect(forCap).toContain("│ stranger row 0 ");
+    expect(full).not.toContain("│ after row 0 ");
+    expect(forCap.length).toBeGreaterThan(stranger.length);
+
+    const { fake, prompts } = capturingFake({ judge: citing(UNMANIFESTED, 1) });
+    const r = await runAcceptance(repo, base, fake, DEFAULT_DIFF_CAP);
+    expect(r.pass).toBe(true);
+    expect(prompts.join("")).toContain("│ stranger row 0 ");
+    // and its bytes alone still trip a cap below them: it was never discounted
+    expect(isDiffCapPark(await runAcceptance(repo, base, fakeWith({ judge: citing(UNMANIFESTED, 1) }), 2_000))).toBe(true);
+  });
+
+  test("test: a change to the frozen appearance oracle counts in full and reaches a reader with its bytes intact, and one large enough to exceed a small cap still parks both gates", async () => {
+    const { repo, base } = repoWithChange(
+      { [ANCHOR]: frameBody("frozen"), [FRAME_CAPTURE]: frameBody("before") },
+      { [ANCHOR]: frameBody("moved"), [FRAME_CAPTURE]: frameBody("after") },
+    );
+    const { full, forCap } = await fetchTaskDiff(repo, base);
+    // the anchor shares its basename with a manifest frame — membership is the PATH, not the shape
+    expect(ANCHOR.split("/").at(-1)).toBe(FRAME_CAPTURE.split("/").at(-1));
+    expect(full).toContain("│ moved row 0 ");
+    expect(forCap).toContain("│ moved row 0 ");
+    expect(full).toContain("set aside: regenerable capture " + FRAME_CAPTURE);
+
+    const { fake, prompts } = capturingFake({ judge: citing(ANCHOR, 1) });
+    expect(isDiffCapPark(await runAcceptance(repo, base, fake, DEFAULT_DIFF_CAP))).toBe(false);
+    expect(prompts.join("")).toContain("│ moved row 0 ");
+
+    const small = 1_000;
+    expect(isDiffCapPark(await runAcceptance(repo, base, fakeWith({ judge: citing(ANCHOR, 1) }), small))).toBe(true);
+    expect(isDiffCapPark(await runReview(repo, base, fakeWith({ review: { approve: true, issues: [] } }), small))).toBe(true);
+
+    // and REMOVING an anchor is a change too: the whole-file-removal collapse would have shrunk it to a
+    // single line and let it slip under the same cap, so protected evidence bypasses that filter as well.
+    const gone = repoWithChange({ [ANCHOR]: frameBody("frozen", 200) }, { [ANCHOR]: null });
+    expect(isDiffCapPark(await runAcceptance(gone.repo, gone.base, fakeWith({ judge: citing(ANCHOR, 0) }), small))).toBe(true);
+    expect(isDiffCapPark(await runReview(gone.repo, gone.base, fakeWith({ review: { approve: true, issues: [] } }), small))).toBe(true);
+  });
+
+  test("test: a change to a captured engagement journal counts in full and reaches a reader with its bytes intact", async () => {
+    const line = (label: string) => `{"event":"${label}","note":"│ engagement ─ capture │"}\n`;
+    const { repo, base } = repoWithChange(
+      { [JOURNAL]: line("before"), [COLOUR_JOURNAL]: line("before"), [COLOUR_CAPTURE]: frameBody("before") },
+      { [JOURNAL]: line("after"), [COLOUR_JOURNAL]: line("after"), [COLOUR_CAPTURE]: frameBody("after") },
+    );
+    const { full, forCap } = await fetchTaskDiff(repo, base);
+    expect(full).toContain(line("after").trim());
+    expect(forCap).toContain(line("after").trim());
+    // the colour journals live INSIDE the colour corpus directory and are still not members
+    expect(dirname(COLOUR_JOURNAL).startsWith(dirname(COLOUR_CAPTURE))).toBe(true);
+    expect(full).toContain("set aside: regenerable capture " + COLOUR_CAPTURE);
+
+    const { fake, prompts } = capturingFake({ judge: citing(JOURNAL, 1) });
+    const r = await runAcceptance(repo, base, fake, DEFAULT_DIFF_CAP);
+    expect(r.pass).toBe(true);
+    expect(prompts.join("")).toContain(line("after").trim());
+  });
+
+  test("test: a rename that crosses the boundary in either direction is measured and shown whole, including the line naming where it came from", async () => {
+    const inbound = "src/tui/cockpit/inbound.txt";
+    const outbound = "src/tui/cockpit/outbound.txt";
+    const [intoCorpus, outOfCorpus] = SPARE_CAPTURES;
+    const { repo, base } = repoWithChange(
+      { [inbound]: frameBody("inbound"), [outOfCorpus!]: frameBody("outbound"), "src/keep.ts": "export const keep = 1;\n" },
+      // one line changes on each side so both sections carry a content hunk; similarity stays high
+      // enough that git still reports the rename.
+      {
+        [inbound]: null,
+        [intoCorpus!]: frameBody("inbound").replace("row 0", "row 0 edited"),
+        [outOfCorpus!]: null,
+        [outbound]: frameBody("outbound").replace("row 0", "row 0 edited"),
+      },
+    );
+    const { full, forCap } = await fetchTaskDiff(repo, base);
+    for (const [from, to] of [[inbound, intoCorpus!], [outOfCorpus!, outbound]]) {
+      expect(full).toContain(`rename from ${from}`);
+      expect(full).toContain(`rename to ${to}`);
+      expect(forCap).toContain(`rename from ${from}`);
+    }
+    // both crossings keep their content: one real side is not a member, so neither is set aside
+    expect(full).toContain("row 0 edited");
+    expect(full).not.toContain("set aside: regenerable capture");
+    expect(forCap).not.toContain("set aside: regenerable capture");
+  });
+
+  test("test: a newly added capture and a removed capture are each set aside with what happened to them still legible to a reader", async () => {
+    const [added, removed] = SPARE_CAPTURES;
+    const { repo, base } = repoWithChange(
+      { [removed!]: frameBody("removed"), "src/keep.ts": "export const keep = 1;\n" },
+      { [added!]: frameBody("added"), [removed!]: null },
+    );
+    const { full } = await fetchTaskDiff(repo, base);
+    expect(full).toContain(`new file mode`);
+    expect(full).toContain(`deleted file mode`);
+    expect(full).toContain(`set aside: regenerable capture ${added}`);
+    expect(full).toContain(`set aside: regenerable capture ${removed}`);
+    // content is gone; the account of what happened is not
+    expect(full).not.toContain("│ added row 0 ");
+    expect(full).not.toContain("│ removed row 0 ");
+    // the deletion is never presented as a file that still exists
+    const removedSection = full.split(/(?=^diff --git )/m).find((s) => s.includes(`a/${removed} `))!;
+    expect(removedSection).toMatch(/^deleted file mode /m);
+    expect(removedSection).not.toMatch(/^new file mode /m);
+  });
+
+  test("test: a capture whose mode or kind changed without any content change is left exactly as it was rather than given a receipt", async () => {
+    const [chmodded, renamedFrom, renamedTo, kindOnly, retargeted] = SPARE_CAPTURES;
+    // spelled relative to the capture's own directory, so a regular file holding exactly this string
+    // and a symlink pointing at it are the SAME blob: the kind changes, the content does not.
+    const linkTarget = (p: string) => "../".repeat(p.split("/").length - 1) + "src/target.txt";
+    const { repo, base } = repoWithChange(
+      {
+        [chmodded!]: frameBody("mode"),
+        [renamedFrom!]: frameBody("pure-rename"),
+        [kindOnly!]: linkTarget(kindOnly!),
+        [retargeted!]: frameBody("kind"),
+        "src/target.txt": "target\n",
+      },
+      { [renamedFrom!]: null, [renamedTo!]: frameBody("pure-rename"), [kindOnly!]: null, [retargeted!]: null },
+      (repo) => {
+        execSync(`chmod +x ${shq(join(repo, chmodded!))}`);
+        symlinkSync(linkTarget(kindOnly!), join(repo, kindOnly!));
+        symlinkSync(linkTarget(retargeted!), join(repo, retargeted!));
+      },
+    );
+    const { full } = await fetchTaskDiff(repo, base);
+    const sectionsOf = (diff: string, path: string) =>
+      diff.split(/(?=^diff --git )/m).filter((s) => s.startsWith(`diff --git a/${path} `)).join("");
+    const sections = (path: string) => sectionsOf(full, path);
+
+    // mode-only: no content hunk, so nothing was withheld and no receipt is manufactured
+    expect(sections(chmodded!)).toMatch(/^old mode /m);
+    expect(sections(chmodded!)).toMatch(/^new mode /m);
+    expect(sections(chmodded!)).not.toContain("set aside: regenerable capture");
+    // pure rename between two members: also no content hunk, also untouched
+    expect(sections(renamedFrom!)).toContain(`rename to ${renamedTo}`);
+    expect(sections(renamedFrom!)).not.toContain("set aside: regenerable capture");
+    // kind-only: git spells regular-file-to-symlink as a removal plus a creation, each carrying a hunk
+    // — and when the file's bytes ARE the link target, those two hunks are identical. A hunk is
+    // therefore not proof of a content change: nothing was withheld, so both halves survive
+    // byte-for-byte against raw git and neither is handed a receipt.
+    const kind = sections(kindOnly!);
+    expect(kind).toMatch(/^deleted file mode 100644$/m);
+    expect(kind).toMatch(/^new file mode 120000$/m);
+    expect(kind).toContain(`-${linkTarget(kindOnly!)}`);
+    expect(kind).toContain(`+${linkTarget(kindOnly!)}`);
+    expect(kind).not.toContain("set aside: regenerable capture");
+    expect(kind).toBe(sectionsOf(rawFull(repo, base), kindOnly!));
+    // the boundary that proves the rule is about CONTENT and not about the kind lines: the same
+    // regular-file-to-symlink change that DID move bytes is an ordinary content change, set aside like
+    // any other — and a reader can still name each operation.
+    const moved = sections(retargeted!);
+    expect(moved).toMatch(/^deleted file mode 100644$/m);
+    expect(moved).toMatch(/^new file mode 120000$/m);
+    expect(moved.match(new RegExp(`set aside: regenerable capture ${retargeted}`, "g"))).toHaveLength(2);
+    expect(moved).not.toContain("│ kind row 0 ");
+  });
+
+  test("test: the replacement text a reader receives counts toward the measurement, so many set-aside captures cannot measure as nothing", async () => {
+    const one = repoWithChange({ [FRAME_CAPTURE]: frameBody("before") }, { [FRAME_CAPTURE]: frameBody("after") });
+    const many = repoWithChange(everyCapture("before"), everyCapture("after"));
+    const oneMeasured = (await fetchTaskDiff(one.repo, one.base)).forCap.length;
+    const manyMeasured = (await fetchTaskDiff(many.repo, many.base)).forCap.length;
+    expect(oneMeasured).toBeGreaterThan(0);
+    expect(manyMeasured).toBeGreaterThan(oneMeasured * (CAPTURES.length - 1));
+
+    // a cap under the receipts' own volume still parks: N set-aside sections never measure as zero
+    const r = await runAcceptance(many.repo, many.base, fakeWith({ judge: citing(FRAME_CAPTURE, 0) }), Math.floor(manyMeasured / 2));
+    expect(isDiffCapPark(r)).toBe(true);
+  });
+
+  test("test: the size a receipt claims is the byte count of what was withheld, asserted to an exact value on a capture whose characters make a code-unit count disagree with a byte count", async () => {
+    const { repo, base } = repoWithChange(
+      { [FRAME_CAPTURE]: "│ before ─ row │\n" },
+      { [FRAME_CAPTURE]: "│ after ─ row │\n" },
+    );
+    const raw = rawU0(repo, base);
+    const withheld = raw.slice(raw.indexOf("--- "));
+    expect(Buffer.byteLength(withheld, "utf8")).not.toBe(withheld.length); // UTF-8 ≠ UTF-16 here
+    const { forCap } = await fetchTaskDiff(repo, base);
+    const claimed = Number(/ — (\d+) bytes withheld/.exec(forCap)![1]);
+    expect(claimed).toBe(Buffer.byteLength(withheld, "utf8"));
+    expect(claimed).toBe(EXACT_WITHHELD_BYTES);
+    expect(claimed).not.toBe(withheld.length);
+  });
+
+  test("test: a set-aside capture is not reduced a second time by the filter that shortens whole-file removals, so its receipt still reaches a reader", async () => {
+    const { repo, base } = repoWithChange(
+      { [FRAME_CAPTURE]: frameBody("doomed"), "src/keep.ts": "export const keep = 1;\n" },
+      { [FRAME_CAPTURE]: null },
+    );
+    const { fake, prompts } = capturingFake({ judge: citing(FRAME_CAPTURE, 0) });
+    const r = await runAcceptance(repo, base, fake, DEFAULT_DIFF_CAP);
+    expect(r.pass).toBe(true);
+    const prompt = prompts.join("");
+    expect(prompt).toContain(`set aside: regenerable capture ${FRAME_CAPTURE}`);
+    expect(prompt).toContain("deleted file mode");
+    // the whole-file-removal collapse would have replaced the receipt with this one line
+    expect(prompt).not.toContain(`deleted file: ${FRAME_CAPTURE}`);
+  });
+
+  test("test: a change made only of set-aside captures produces a verdict a reader can parse, from evidence citing a location the change index knows", async () => {
+    const { repo, base } = repoWithChange(everyCapture("before"), everyCapture("after"));
+    const { prompt, result } = await judgeCiting(repo, base, FRAME_CAPTURE, 0);
+    expect(prompt).toContain(`- ${FRAME_CAPTURE}: 0`);
+    expect(result.pass).toBe(true);
+    expect(result.meta?.unparseable).toBeUndefined();
+    expect(result.details).toContain("c1");
+  });
+
+  test("test: a change that only removes protected evidence produces a verdict a reader can parse, from evidence citing a location the change index knows", async () => {
+    const { repo, base } = repoWithChange({ [ANCHOR]: frameBody("frozen", 4) }, { [ANCHOR]: null });
+    const { prompt, result } = await judgeCiting(repo, base, ANCHOR, 0);
+    // exempt from the whole-file-removal collapse (clause 5), so its bytes reach the judge whole
+    expect(prompt).toContain("│ frozen row 0 ");
+    expect(prompt).not.toContain(`deleted file: ${ANCHOR}`);
+    expect(prompt).toContain(`- ${ANCHOR}: 0`);
+    expect(result.pass).toBe(true);
+    expect(result.meta?.unparseable).toBeUndefined();
+  });
+
+  test("test: every citation assertion here supplies a structured location rather than free text, and still passes when the older free-text path is out of the test's reach", async () => {
+    const setAside = repoWithChange(everyCapture("before"), everyCapture("after"));
+    const removed = repoWithChange({ [ANCHOR]: frameBody("frozen", 4) }, { [ANCHOR]: null });
+    for (const [{ repo, base }, path] of [[setAside, FRAME_CAPTURE], [removed, ANCHOR]] as const) {
+      const { result, servedLegacyEvidence } = await judgeCiting(repo, base, path, 0);
+      expect(result.pass).toBe(true);
+      // the fake's free-text evidence-injection seam was never invoked: only the structured citation
+      // could have carried these verdicts through the validator.
+      expect(servedLegacyEvidence).toBe(false);
+    }
+    // and the structure is load-bearing: the same shape with an uncited line is still rejected
+    const { result: fabricated } = await judgeCiting(setAside.repo, setAside.base, FRAME_CAPTURE, 7);
+    expect(fabricated.pass).toBe(false);
+    expect(fabricated.details).toMatch(/evidence absent from the judged diff/i);
+  });
+});
+
+// The judge run for every citation assertion above: runLlm is replaced, so the fake adapter — and with
+// it llm.ts's legacy free-text evidence injection — is out of the test's reach entirely. Only a
+// structured {path, line} the change index knows can carry the verdict.
+async function judgeCiting(repo: string, base: string, path: string, line: number) {
+  let prompt = "";
+  let servedLegacyEvidence = false;
+  const fake = fakeWith({});
+  fake.headlessCommand = () => { servedLegacyEvidence = true; return "true"; };
+  const spy = vi.spyOn(llm, "runLlm").mockImplementation(async (_a, _m, p) => {
+    prompt = p;
+    return JSON.stringify({ nonce: llm.extractPromptNonce(p)!, ...citing(path, line) });
+  });
+  try {
+    const result = await runAcceptance(repo, base, fake, DEFAULT_DIFF_CAP);
+    return { prompt, result, servedLegacyEvidence };
+  } finally {
+    spy.mockRestore();
+  }
+}

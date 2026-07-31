@@ -1,4 +1,4 @@
-tickmarkr v1.81.0
+tickmarkr v1.83.0
 setup 7 found 6 authed 6 routable
 ✓ authed claude-code
 ✓ authed codex

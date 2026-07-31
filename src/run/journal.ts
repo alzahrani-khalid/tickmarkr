@@ -52,6 +52,9 @@ export interface ResumeState {
   attempts: number;
   tried: string[];
   lastAssignment?: Assignment;
+  // OBS-189: set by a task-approved{release:review-upheld} replay — the upheld reviewer's findings,
+  // carried into the next dispatch as the retry brief so the fix attempt knows what to fix.
+  upheldFeedback?: string;
 }
 
 // v1.71 OBS-119: run-wide channel exclusions derived from journal events — companion to
@@ -66,6 +69,30 @@ export const ATTEMPT_CAP_RELEASE = "attempt-cap" as const;
 // OBS-130: task-approved carries the exact failed gate the operator satisfied. The release tag keeps
 // ordinary humanGate and attempt-cap approvals byte-compatible while making this authority explicit.
 export const GATE_SATISFIED_RELEASE = "gate-satisfied" as const;
+// OBS-189: the second human decision a review park needs. `approve` (gate-satisfied) accepts the diff
+// the reviewer rejected; `approve --uphold` sides WITH the reviewer and funds one fixed worker attempt
+// carrying the findings — a park costs an attempt, never a fresh run that re-executes green tasks.
+export const REVIEW_UPHELD_RELEASE = "review-upheld" as const;
+// OBS-203: the third decision a gate-fail park needs. Plain approve WAIVES the failed gate (and every
+// gate before it — daemon.ts remainingGates), which is wrong when the gate failed against a stale task
+// DECLARATION rather than a bad diff: amend the spec's files[], recompile, and the gate now passes
+// honestly. This release re-dispatches with the whole gate suite intact and no gate marked satisfied,
+// so the corrected declaration is the thing that earns the green. Budget semantics match attempt-cap
+// (fresh attempts, tried survives) because the park cost the task its remaining budget.
+export const RECHECK_RELEASE = "recheck" as const;
+
+// OBS-189: review rounds are scoped to the current ENGAGEMENT — the stretch since the newest operator
+// approval for the task. A whole-journal count re-parks an upheld task before its funded attempt can
+// dispatch (measured live on run-20260726-213539), making a fresh journal the only escape.
+export function reviewRoundsSinceApproval(events: JournalEvent[], taskId: string): number {
+  let rounds = 0;
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "task-approved") rounds = 0;
+    else if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false) rounds++;
+  }
+  return rounds;
+}
 
 // Fail-closed shape for a dispatched assignment (journal.ts:75-90 posture): a malformed assignment in
 // one dispatch degrades that single task toward today's behavior — counts toward attempts, contributes
@@ -96,12 +123,34 @@ export function isQualityFailureParkKind(kind: ParkKind): boolean {
   }) === 0;
 }
 
+// OBS-206: ONE classification rule, called at write time by the daemon's failure handler and at read
+// time by `resume --retry-failed`, so the two can never drift and a label written by an older binary
+// can never outvote the evidence sitting in the same journal. `taskEvents` is this task's events up to
+// (not including) the failure. The gate evidence is scoped to the CURRENT attempt: a whole-history
+// scan asks "did this task EVER fail a gate", which mislabels an infra death as a verified failure for
+// any task that ever failed one gate — and, since only "dispatch" is retryable, locks it out forever.
+export function classifyTaskFailure(taskEvents: JournalEvent[]): ParkKind {
+  let dispatchIdx = -1;
+  for (let i = taskEvents.length - 1; i >= 0; i--) {
+    if (taskEvents[i]!.event === "task-dispatch") { dispatchIdx = i; break; }
+  }
+  if (dispatchIdx < 0) return "infra"; // never dispatched — nothing to retry
+  return taskEvents.slice(dispatchIdx + 1)
+    .some((e) => e.event === "gate-result" && e.data.pass === false) ? "gate-fail" : "dispatch";
+}
+
 // The newest terminal event owns the cause. Unknown/malformed kinds fail toward undefined so a
 // task-failed row keeps the legacy red treatment instead of being mistaken for recoverable noise.
 export function recordedTaskFailureKind(events: JournalEvent[], taskId: string): ParkKind | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]!;
     if (e.taskId !== taskId || (e.event !== "task-human" && e.event !== "task-failed")) continue;
+    // A park kind is a daemon DECISION and is read exactly as recorded. A failure kind is a
+    // CLASSIFICATION over evidence that is still in this journal, so it is re-derived (OBS-206) —
+    // recomputation agrees with every correctly-written label and repairs the wrong ones in place.
+    if (e.event === "task-failed") {
+      return classifyTaskFailure(events.slice(0, i).filter((x) => x.taskId === taskId));
+    }
     return typeof e.data.kind === "string" && (PARK_KINDS as readonly string[]).includes(e.data.kind)
       ? e.data.kind as ParkKind
       : undefined;
@@ -515,8 +564,13 @@ export class Journal {
   replayResumeState(): Map<string, ResumeState> {
     const m = new Map<string, ResumeState>();
     const pendingReroute = new Set<string>(); // reroute verdicts not yet cleared by a later dispatch
+    const lastReviewFail = new Map<string, string>(); // OBS-189: newest failed review details per task
     for (const e of this.read()) {
       if (!e.taskId) continue;
+      if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
+          && typeof e.data.details === "string") {
+        lastReviewFail.set(e.taskId, e.data.details);
+      }
       if (e.event === "task-dispatch") {
         // A subsequent dispatch clears the pending reroute — the reroute was acted on pre-kill.
         pendingReroute.delete(e.taskId);
@@ -536,7 +590,8 @@ export class Journal {
       } else if (e.event === "consult-verdict" && e.data.action === "reroute") {
         // A reroute bans the in-force channel; retry/decompose/human verdicts ban nothing (D-03).
         pendingReroute.add(e.taskId);
-      } else if (e.event === "task-approved" && e.data.release === ATTEMPT_CAP_RELEASE) {
+      } else if (e.event === "task-approved"
+                 && (e.data.release === ATTEMPT_CAP_RELEASE || e.data.release === RECHECK_RELEASE)) {
         // v1.24 OBS-18: operator released an attempt-cap park. Pre-v1.24 task-approved events have no
         // `release` key ⇒ this branch never fires (corpus criterion: identical statuses + resume state).
         // attempts reset to 0 so the daemon's attempt-cap check does not re-park in the same tick;
@@ -547,6 +602,17 @@ export class Journal {
         if (st) {
           st.attempts = 0;
           st.lastAssignment = undefined;
+        }
+      } else if (e.event === "task-approved" && e.data.release === REVIEW_UPHELD_RELEASE) {
+        // OBS-189: the operator upheld the reviewer. Same budget semantics as the attempt-cap release
+        // (fresh attempts, tried survives, no burned-channel restore) PLUS the findings carry: the
+        // newest failed review's details ride into the funded attempt as its retry brief.
+        const st = m.get(e.taskId);
+        if (st) {
+          st.attempts = 0;
+          st.lastAssignment = undefined;
+          const details = lastReviewFail.get(e.taskId);
+          if (details) st.upheldFeedback = details;
         }
       }
     }

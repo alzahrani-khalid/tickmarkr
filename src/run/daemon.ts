@@ -24,7 +24,8 @@ import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } 
 import { runEnvironment } from "./environment.js";
 import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, phaseForGate, recordedTaskFailureKind, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { classifyTaskFailure, classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, phaseForGate, recordedTaskFailureKind, reviewRoundsSinceApproval, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { isDiffCapPark } from "../gates/review.js";
 import { acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
 import { nextChannel, route } from "../route/router.js";
@@ -135,7 +136,10 @@ const MAX_ATTEMPTS = 10; // ponytail: hard cap so a pathological ladder can neve
 // v1.70 T5: request-changes review rounds a single task may draw before it parks for a human decision
 // instead of cycling. Well below MAX_ATTEMPTS so review non-convergence is caught long before the
 // global cap. ponytail: literal constant; lift to cfg.review.roundCap only if a second knob-turner appears.
-const REVIEW_ROUND_CAP = 3;
+// OBS-189 (park-economics patch): 3 → 2, counted per ENGAGEMENT (since the newest operator approval,
+// reviewRoundsSinceApproval) — a park is now cheap (approve/--uphold both cost one decision, never a
+// run), so non-convergence parks earlier and an upheld task re-enters with a fresh round budget.
+const REVIEW_ROUND_CAP = 2;
 const BLOCKED_POLL_MS = 30_000; // between trailer-wait slices, check whether the pane is blocked on a prompt
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
@@ -151,6 +155,32 @@ export function setEarlyLaunchLivenessMsForTests(ms: number): void {
 }
 export function resetEarlyLaunchLivenessMsForTests(): void {
   earlyLaunchLivenessMs = EARLY_LAUNCH_LIVENESS_MS;
+}
+
+// OBS-201: the liveness nudge — the daemon's ACTIVE response to an idle worker holding no trailer,
+// replacing page-a-human-then-burn-the-window (289 of 692 worker-minutes in one measured day).
+// Gate: herdr classifies the pane idle AND the monotonic tracker has seen nothing for
+// NUDGE_AFTER_SILENT_MS (a worker grinding inside a tool run is `working` and never reaches the
+// gate). One nudge per attempt; if the grace passes still idle with no progress, the wait concludes
+// as a stall NOW and the consult sees the un-answered nudge instead of an hour of silence.
+// Allowlist: claude-code first (steering path proven, OBS-122); widen per adapter only with a
+// captured occupied-frame fixture (OBS-181 scar). The message builder takes no nonce — the
+// self-reference guard holds by construction, an echoed bare token can never match the wait regex.
+export const NUDGEABLE_ADAPTERS = new Set(["claude-code"]);
+export const WORKER_NUDGE_MESSAGE =
+  "tickmarkr liveness check: if the task is complete, print your TICKMARKR_RESULT completion trailer exactly as specified in your prompt now. If not, state your next concrete action and continue working.";
+const NUDGE_AFTER_SILENT_MS = 3 * 60_000;
+const WORKER_NUDGE_GRACE_MS = 4 * 60_000;
+let nudgeAfterSilentMs = NUDGE_AFTER_SILENT_MS;
+let workerNudgeGraceMs = WORKER_NUDGE_GRACE_MS;
+/** Test seam — shrink the nudge gate and grace without minute-long sleeps. */
+export function setNudgeTimingForTests(silentMs: number, graceMs: number): void {
+  nudgeAfterSilentMs = silentMs;
+  workerNudgeGraceMs = graceMs;
+}
+export function resetNudgeTimingForTests(): void {
+  nudgeAfterSilentMs = NUDGE_AFTER_SILENT_MS;
+  workerNudgeGraceMs = WORKER_NUDGE_GRACE_MS;
 }
 
 async function commitsAheadOf(base: string, wt: string): Promise<string[]> {
@@ -235,6 +265,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     status: (s) => driver.status(s),
     read: (s, n) => driver.read(s, n),
     ...(driver.sendKey ? { sendKey: driver.sendKey.bind(driver) } : {}),
+    ...(driver.nudge ? { nudge: driver.nudge.bind(driver) } : {}),
     notify: (m, o) => driver.notify(m, o),
     close: closeSlot,
     worktree: (r, b, base) => driver.worktree(r, b, base),
@@ -508,16 +539,26 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const badReviewers: string[] = []; // v1.1: reviewer channels that produced unparseable output for this task
     // v1.70 T5 (review-convergence): failed review rounds this task has drawn, counted from the per-task
     // review history already in the journal — the SAME review gate-result stream onGate reads to grow the
-    // reviewer-exclusion list (badReviewers), never a second parallel counter. request-changes rounds do
-    // not exclude their reviewer (a fix is re-checked by the same seat), so their count lives here in the
-    // shared history rather than in badReviewers' garbage-only exclusion subset.
-    const reviewRoundsDrawn = () =>
-      journal.read().filter((e) =>
-        e.taskId === t.id && e.event === "gate-result" &&
-        (e.data as { gate?: string }).gate === "review" &&
-        (e.data as { pass?: boolean }).pass === false,
-      ).length;
-    let feedback = "";
+    // reviewer-exclusion list (badReviewers), never a second parallel counter. OBS-189: scoped to the
+    // current engagement — an operator approval (uphold or accept) resets the round budget, so an upheld
+    // task can dispatch its funded attempt instead of re-parking against the whole journal's history.
+    const reviewRoundsDrawn = () => reviewRoundsSinceApproval(journal.read(), t.id);
+    // OBS-193: journal the in-gate review retry (mirrors judge-retry) and exclude the flaked seat from
+    // later attempts' reviewer picks. One helper, called from both onGate sites (satisfied-gate + main).
+    const noteReviewRetry = (g: GateResult) => {
+      const rr = g.meta?.reviewRetry as { flaked?: unknown; retried?: unknown } | undefined;
+      if (g.gate === "review" && rr && typeof rr.flaked === "string" && typeof rr.retried === "string") {
+        journal.append("review-retry", t.id, {
+          gate: "review", flaked: rr.flaked, retried: rr.retried,
+          ...(g.meta?.unparseable === true ? { secondUnparseable: true } : {}),
+        });
+        badReviewers.push(rr.flaked);
+      }
+    };
+    // OBS-189: the operator upheld the reviewer — the findings ARE the brief for this funded attempt.
+    let feedback = rs?.upheldFeedback
+      ? `The operator UPHELD the reviewer's findings — address them without discarding landed work.\nreview: ${rs.upheldFeedback}`
+      : "";
     let ladderIdx = 0;
     let modeFallbackNoted = false; // v1.2: journal the interactive→print fallback once per task, not per attempt
     let gateFails = 0; // TEL-02: incremented ONLY where feedback is built from failing gates — never derived from attempts (quota failovers bump attempts too, Pitfall 6)
@@ -542,6 +583,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
       }
       return next;
+    };
+
+    // OBS-202 (operator law: "you can spawn as many as you want"): channels are session FACTORIES,
+    // not consumed seats — a tried channel can always host a fresh worker session, and a fresh
+    // session carries none of the failed attempt's baggage. When the untried pool is empty, recycle
+    // the best LIVE channel (preferring a different seat than the current one) instead of parking
+    // on artificial scarcity; MAX_ATTEMPTS and the review round cap are the real bounds. Only a
+    // fleet whose every channel is DEMOTED (verified dead: auth/setup/provider outage) has nothing
+    // left to spawn — that case alone still parks.
+    const failoverOrRecycle = (site: "consult-reroute" | "dead-channel"): Assignment | null => {
+      const next = failover(site);
+      if (next) return next;
+      const recycled = nextChannel(assignment, t, cfg, channels, [channelKey(assignment)], profile, demotedChannels)
+        ?? (demotedChannels.has(channelKey(assignment)) ? null : assignment);
+      if (recycled) journal.append("channel-recycle", t.id, { site, channel: channelKey(recycled) });
+      return recycled;
     };
 
     const runConsult = (trigger: string, transcript: string, diffOrFeedback: string, gates: GateResult[]) => {
@@ -590,13 +647,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
           }
         }
-        const next = failover("consult-reroute");
+        const next = failoverOrRecycle("consult-reroute");
         if (next) {
           assignment = next;
-          tried.push(channelKey(next));
+          const k = channelKey(next);
+          if (!tried.includes(k)) tried.push(k);
           return true;
         }
-        await park(t, "consult said reroute but every channel is exhausted", "reroute-exhausted", assignment, attempts, startMs, gateFails, consults, tokens, metered, retryMode);
+        await park(t, "consult said reroute but every channel is demoted (verified dead) — nothing left to spawn", "reroute-exhausted", assignment, attempts, startMs, gateFails, consults, tokens, metered, retryMode);
         return false;
       }
       await park(t, `consult verdict: ${v.action} — ${v.notes}`, trigger, assignment, attempts, startMs, gateFails, consults, tokens, metered, retryMode); // decompose|human
@@ -618,6 +676,25 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const wt = await driver.worktree(repoRoot, taskBranch, taskBase);
       const carriedCommits = await cherryPickCommits(wt, commitsToCarry);
       journal.append("worktree-recreation", t.id, { attempted: commitsToCarry, carried: carriedCommits });
+      // OBS-212: same fail-closed rule as the dispatch path — but this path is worse, because it runs
+      // ONLY the gates after the approved one and then MERGES. T3 took it on run-20260728-110135:
+      // approved past review at 11:22, recreated at 12:50, and phase-start{gates} / phase-start{merge}
+      // landed in the same second with zero gate-result events. Work missing here is merged unverified.
+      {
+        const present = new Set(carriedCommits);
+        for (const h of commitsToCarry) {
+          if (!present.has(h) && (await shGit(`git merge-base --is-ancestor ${shq(h)} HEAD`, wt)).code === 0) {
+            present.add(h);
+          }
+        }
+        const lost = commitsToCarry.filter((h) => !present.has(h));
+        if (lost.length > 0) {
+          await park(t,
+            `carry lost ${lost.length} of ${commitsToCarry.length} verified commit(s) recreating the worktree for approved gate ${satisfiedGate} (first missing: ${lost[0]!.slice(0, 10)}) — refusing to merge a tree that is missing landed work`,
+            "infra", assignment, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+      }
       if (!linkNodeModules(repoRoot, wt, { force: true })) {
         await park(t, "environmental: node_modules link could not be re-asserted before gates (OBS-47)", "setup",
           assignment, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
@@ -652,7 +729,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         journal.phaseStart(t.id, "gates");
         const { results } = await runGates(resumedTask, {
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
-          commands, baseline, channels, adapters, cfg,
+          commands, baseline, channels, adapters, cfg, artifactDir: journal.dir,
           via: cfg.visibility.llm === "pane"
             ? {
                 driver: trackedDriver,
@@ -673,6 +750,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               gate: g.gate, pass: g.pass, details: g.details,
               ...(g.meta?.skipped === true ? { skipped: true } : {}),
             });
+            noteReviewRetry(g);
             if (g.gate === "review" && !g.pass && /unparseable/.test(g.details)
                 && typeof g.meta?.reviewer === "string") {
               badReviewers.push(g.meta.reviewer);
@@ -740,11 +818,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
       // v1.70 T5: a task that has already drawn REVIEW_ROUND_CAP request-changes review rounds parks for
       // a human decision instead of dispatching another round. Condition on the review history (data),
-      // never the code path — and let an operator's approval (the human decision the cap asked for)
-      // release it, mirroring the humanGate guard's condition-on-approval precedent. Rounds only accrue
-      // after attempt 0, so the guard skips the journal read on the happy path.
-      if (attempt > 0 && !approved.has(t.id) && reviewRoundsDrawn() >= REVIEW_ROUND_CAP) {
-        await park(t, `review round cap (${REVIEW_ROUND_CAP}) reached — request-changes reviews not converging; a human should decide`, "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
+      // never the code path. OBS-189: the count is engagement-scoped — any operator approval resets it
+      // by construction (reviewRoundsSinceApproval), so the old blanket approved-task exemption is gone
+      // and an upheld task that STILL cannot converge re-parks after another full round budget.
+      if (attempt > 0 && reviewRoundsDrawn() >= REVIEW_ROUND_CAP) {
+        await park(t, `review round cap (${REVIEW_ROUND_CAP}) reached this engagement — \`tickmarkr approve\` accepts the diff past review; \`tickmarkr approve --uphold\` funds one fixed attempt carrying the findings`, "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       // OBS-57: a demoted channel must not be re-dispatched on consult retry or provider requeue.
@@ -806,6 +884,29 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (!presentCommits.has(h) && (await shGit(`git merge-base --is-ancestor ${shq(h)} HEAD`, wt)).code === 0) {
           presentCommits.add(h);
         }
+      }
+      // OBS-212: losing carried work is WORK DESTRUCTION, never an ordinary continue. Every commit in
+      // commitsToCarry is one a prior attempt landed and the gates verified. If a commit is neither
+      // cherry-picked nor already an ancestor of the new base, dispatching a worker onto this tree
+      // silently makes it re-buy verified work — the failure this cherry-pick exists to prevent
+      // (OBS-58, comment above) happening silently inside the mechanism itself. Measured on
+      // run-20260728-110135: T2 carried 0 of 17 at 17:07 and T1 carried 0 of 15 at 21:37, twenty
+      // minutes after T2's merge advanced the integration tip. Nothing failed and nothing parked;
+      // the run simply re-paid for the work. Fail closed instead — a visible park beats a silent loss.
+      // On the DISPATCH path a drop is not always a defect: a human can re-pend a task with new
+      // intent, and the superseded commit then SHOULD be left behind (pinned by the worktree-cleanup
+      // resume test, where T1 and T2 both write shared.txt and the loser is re-scripted). We cannot
+      // tell supersession from destruction here, so this path stays loud rather than fail-closed —
+      // the harm that cost this run ~9 hours was the SILENCE, not the drop. The merge path, where a
+      // drop is never legitimate, does fail closed (see the satisfied-gate site above).
+      const lostCommits = commitsToCarry.filter((h) => !presentCommits.has(h));
+      if (lostCommits.length > 0) {
+        journal.append("work-loss", t.id, {
+          site: "dispatch", base: taskBase, attempted: commitsToCarry, carried: carriedCommits, lost: lostCommits,
+        });
+        await driver.notify(
+          `tickmarkr ${runId}: ${t.id} lost ${lostCommits.length} of ${commitsToCarry.length} landed commit(s) recreating its worktree — it will re-do that work`,
+          { tier: "attention" });
       }
       if (feedback || priorNamed.length > 0) {
         feedback = augmentRetryBrief(feedback, { attempted: commitsToCarry, carried: carriedCommits, present: presentCommits });
@@ -970,6 +1071,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
           // Any other blocked/idle dialog still pages the operator (paged latch below).
           let trustAnswered = false;
+          // OBS-201: one liveness nudge per attempt; the grace deadline is its OWN timer, never the
+          // stall window (the nudge's pane echo is absorbed before it starts, or the echo itself
+          // would reset the window and make the early conclusion unreachable).
+          let nudged = false;
+          let nudgeDeadline: number | undefined;
           finished = false;
           exitCode = null;
           // OBS-54: reaping keys on new pane output, not dispatch wall clock. Poll at least twice per
@@ -1037,9 +1143,50 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                   /* read/send failed — fall through to page the operator */
                 }
               }
-              paged = true; // page once — the visible pane is the operator's to unblock; task timeout is the backstop
-              const why = st === "blocked" ? "is blocked on a prompt — approve in its pane" : "looks idle without finishing — check its pane";
-              await driver.notify(`tickmarkr ${runId}: ${slot.name} ${why}`, { tier: "attention" });
+              // OBS-201: the daemon ACTS on an idle pane before paging anyone. Gate: idle AND the
+              // monotonic tracker silent ≥ the nudge threshold (a worker inside a tool run reads as
+              // `working` and never gets here; a briefly-settling TUI hasn't been silent long enough).
+              const nudgeable = st === "idle" && !!driver.nudge && NUDGEABLE_ADAPTERS.has(adapter.id);
+              if (nudgeable && !nudged) {
+                if (Date.now() - lastProgressAt >= nudgeAfterSilentMs) {
+                  nudged = true;
+                  if (await driver.nudge!(slot, WORKER_NUDGE_MESSAGE)) {
+                    // absorb the nudge's own echo BEFORE arming the grace timer — post-nudge progress
+                    // is measured against this baseline, not against the echo.
+                    const echo = await driver.read(slot, 1000);
+                    stallProgress.observe({ paneText: echo, contextTokens });
+                    nudgeDeadline = Date.now() + workerNudgeGraceMs;
+                    journal.append("worker-nudge", t.id, { slot: slot.name, attempt });
+                  } else {
+                    journal.append("worker-nudge-failed", t.id, { slot: slot.name, attempt });
+                    // nudge undeliverable — fall back to today's behavior: page once, window backstop
+                    paged = true;
+                    await driver.notify(`tickmarkr ${runId}: ${slot.name} looks idle without finishing — check its pane`, { tier: "attention" });
+                  }
+                }
+                // idle but not yet silent past the threshold: neither nudge nor page this slice
+              } else if (nudgeable && nudged && nudgeDeadline !== undefined) {
+                if (Date.now() >= nudgeDeadline && Date.now() - lastProgressAt >= workerNudgeGraceMs) {
+                  // grace spent, still idle, no post-nudge progress: re-harvest once (the trailer may
+                  // have landed between polls), then conclude the wait as a stall NOW — the consult
+                  // sees the un-answered nudge instead of the remainder of the window.
+                  nudgeDeadline = undefined;
+                  output = await driver.read(slot, 1000);
+                  finished = new RegExp(trailerPattern(nonce)).test(output);
+                  const exit = exitRe.exec(output);
+                  if (finished || exit) {
+                    exitCode = exit ? Number(exit[1]) : null;
+                    await sampleContext();
+                    break;
+                  }
+                  journal.append("worker-nudge-expired", t.id, { slot: slot.name, attempt, graceMs: workerNudgeGraceMs });
+                  lastProgressAt = Date.now() - stallWindowMs; // the existing harvest/classify tail runs unmodified
+                }
+              } else {
+                paged = true; // page once — the visible pane is the operator's to unblock; task timeout is the backstop
+                const why = st === "blocked" ? "is blocked on a prompt — approve in its pane" : "looks idle without finishing — check its pane";
+                await driver.notify(`tickmarkr ${runId}: ${slot.name} ${why}`, { tier: "attention" });
+              }
             }
             // a dead pane or a false-positive marker display returns fast — sleep the unspent slice, never hot-spin
             const spent = Date.now() - sliceStart;
@@ -1213,7 +1360,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const from = channelKey(assignment);
         demotedChannels.add(from); // excluded for later attempts AND later tasks in this run
         journal.append("channel-exclusion", t.id, { channel: from, reason: dead, kind: "dead-channel" });
-        const next = failover("dead-channel");
+        const next = failoverOrRecycle("dead-channel");
         journal.append("dead-channel-failover", t.id, { reason: dead, from, to: next ? channelKey(next) : null });
         if (next) {
           await driver.notify(`tickmarkr ${runId}: ${t.id} dead channel (${dead}) failover`, { tier: "attention" });
@@ -1298,6 +1445,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
         }
         journal.append("gate-result", t.id, { gate: g.gate, pass: g.pass, details: g.details, ...(g.meta?.skipped === true ? { skipped: true } : {}) });
+        noteReviewRetry(g);
         // v1.1 failover: never re-ask a reviewer channel that produced garbage for this task
         if (g.gate === "review" && !g.pass && /unparseable/.test(g.details) && typeof g.meta?.reviewer === "string") {
           badReviewers.push(g.meta.reviewer);
@@ -1310,7 +1458,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         journal.phaseStart(t.id, "gates");
         ({ results, commits } = await runGates(t, {
           worktree: wt, baseRef: taskBase, result, author: assignment,
-          commands, baseline, channels, adapters, cfg,
+          commands, baseline, channels, adapters, cfg, artifactDir: journal.dir,
           via: cfg.visibility.llm === "pane"
             ? {
                 driver: trackedDriver,
@@ -1378,8 +1526,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // trailer) over the harness slot name; absent hook or no capture keeps today's slot-name id.
       retrySession = { channel: channelKey(assignment), id: adapter.sessionIdFrom?.(output) ?? sessionId, contextTokens };
       feedback = results.filter((g) => !g.pass).map((g) => `${g.gate}: ${g.details}`).join("\n\n");
-      const step = r.ladder[Math.min(ladderIdx++, r.ladder.length - 1)];
-      journal.append("escalation", t.id, { step, attempt: attempt + 1 });
+      // OBS-189/G3 (park-economics patch): a request-changes review is a findings brief, not a worker
+      // defect — the fix attempt stays on the same channel with the findings as feedback and consumes
+      // no escalation-ladder rung. Bounded by the engagement round cap at the top of this loop.
+      // Unparseable verdicts (already retried in-gate, OBS-193) and diff-cap trips (the diff cannot
+      // shrink by retrying, OBS-48) fall through to the ladder unchanged. Review runs last, so a
+      // failed review with every other gate green is exactly "the work landed, the reviewer objects".
+      const reviewFail = results.find((g) => g.gate === "review" && !g.pass);
+      const reviewFixRetry = reviewFail !== undefined
+        && reviewFail.meta?.unparseable !== true
+        && !isDiffCapPark(reviewFail)
+        && results.every((g) => g.pass || g.gate === "review");
+      const step = reviewFixRetry ? "retry" : r.ladder[Math.min(ladderIdx++, r.ladder.length - 1)];
+      journal.append("escalation", t.id, { step, attempt: attempt + 1, ...(reviewFixRetry ? { reviewFix: true } : {}) });
       await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${step}`, { tier: "attention" });
 
       if (step === "retry") continue;
@@ -1416,8 +1575,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         .catch(async (err) => {
           const taskEvents = journal.read().filter((e) => e.taskId === t.id);
           const dispatch = [...taskEvents].reverse().find((e) => e.event === "task-dispatch");
-          const verifiedFailure = taskEvents.some((e) => e.event === "gate-result" && e.data.pass === false);
-          const kind: ParkKind = verifiedFailure ? "gate-fail" : dispatch ? "dispatch" : "infra";
+          // OBS-206: shared rule with `resume --retry-failed` — see classifyTaskFailure.
+          const kind: ParkKind = classifyTaskFailure(taskEvents);
           const attempts = dispatch && Number.isInteger(dispatch.data.attempt) ? dispatch.data.attempt as number : 0;
           graph = setStatus(graph, t.id, "failed");
           saveGraph(repoRoot, graph);

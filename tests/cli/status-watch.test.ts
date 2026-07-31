@@ -295,6 +295,10 @@ describe("status checklist rendering", () => {
     const repo = mkRepo();
     seed(repo, [
       runStart(),
+      // OBS-206: a "dispatch" failure requires the dispatch that died — without it the journal
+      // describes a task that failed delivery while never having been delivered, which the daemon
+      // classifies (and now re-derives) as infra. Fixtures must be journals the daemon can write.
+      dispatch("T2", "fake-2"),
       { ts, event: "task-failed", taskId: "T2", data: { error: "delivery refused", kind: "dispatch", attempts: 0 } },
     ]);
 
@@ -311,6 +315,7 @@ describe("status checklist rendering", () => {
       runStart(),
       dispatch("T1", "fake-1"),
       { ts, event: "task-done", taskId: "T1", data: {} },
+      dispatch("T2", "fake-2"), // OBS-206: the dispatch that died — see the cause-word test above
       { ts, event: "task-failed", taskId: "T2", data: { error: "delivery refused", kind: "dispatch", attempts: 0 } },
       dispatch("T3", "fake-3"),
     ]);

@@ -1,10 +1,21 @@
-import { Box } from "ink";
+import { Box, render, useApp, useInput, useStdout } from "ink";
+import { userInfo } from "node:os";
+import { join } from "node:path";
 import {
   cloneElement,
+  createElement,
+  useState,
   type ReactElement,
   type ReactNode,
 } from "react";
 import { parse } from "yaml";
+import { approve } from "../../cli/commands/approve.js";
+import {
+  ATTEMPT_CAP_RELEASE,
+  GATE_SATISFIED_RELEASE,
+  Journal,
+  REVIEW_UPHELD_RELEASE,
+} from "../../run/journal.js";
 import {
   BANNER,
   GLYPHS,
@@ -19,7 +30,8 @@ import {
   type Tier,
   type TickmarkrConfig,
 } from "../../config/config.js";
-import { SHAPES } from "../../graph/schema.js";
+import { GATE_NAMES, SHAPES } from "../../graph/schema.js";
+import { stateDirName } from "../../graph/graph.js";
 import {
   allocateBandColumns,
   BandLines,
@@ -54,9 +66,18 @@ import {
   keybarEntries,
   SETUP_PANEL_FOCUS_ORDER,
   SURFACE_KEY_BINDINGS,
+  type RunKeyEvent,
   type SetupInteractionState,
   type SetupKeyBinding,
 } from "./keys.js";
+import {
+  DECISIONS_TAB_HINT,
+  DECISIONS_TAB_TITLE,
+} from "./views.js";
+// Split across two statements because `setup.test.ts` pins the clipping import
+// by its exact text, proving the rows are drawn through the width module.
+import { fitCells } from "./width.js";
+import { cellWidth } from "./width.js";
 
 export type SetupCockpitData = {
   readonly binaryVersion: string;
@@ -428,7 +449,7 @@ function CompactKeysPanel({
           <BodyText>
             {" "}{item.label.slice(
               0,
-              Math.max(0, contentColumns - [...item.key].length - 1),
+              Math.max(0, contentColumns - cellWidth(item.key) - 1),
             )}
           </BodyText>
         </Box>
@@ -893,7 +914,7 @@ function setupDetailPlan(
 
 function versionColumnWidth(data: SetupCockpitData): number {
   return Math.max(
-    ...identityVersionLines(data).map((line) => [...line].length),
+    ...identityVersionLines(data).map((line) => cellWidth(line)),
   );
 }
 
@@ -1198,4 +1219,548 @@ export function SetupCockpitFrame({
       <SetupKeybar bindings={bindings} width={columns} />
     </Box>
   );
+}
+
+/* ------------------------------------------------------------------------ */
+/* The setup tab's one write: human decisions through the production path.   */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * One parked task awaiting a human decision, derived from the journal alone.
+ * The graph is never consulted: a recompile can never make a parked task read
+ * as anything but parked on this surface.
+ */
+export type ParkedDecision = {
+  readonly taskId: string;
+  /** The daemon-recorded park kind (task-human data.kind), never inferred prose. */
+  readonly kind: string;
+  readonly reason: string | undefined;
+  /** UTC HH:MM:SS sliced from the newest task-human event's ISO ts, or "unknown". */
+  readonly parkedAt: string;
+  /** Count of recorded task-dispatch events — never max(attempt)+1. */
+  readonly attempts: number;
+  /**
+   * The newest failed gate-result before the newest task-human, derived with
+   * the same rule the production approve command applies. It decides what the
+   * confirm inset may promise: uphold exists only when this is "review", and a
+   * gate-fail approve records this gate as satisfied.
+   */
+  readonly failedGate: string | undefined;
+  /**
+   * A park that is permanent by design: an id the spec retains only so the
+   * engagement can resume, gated so it never dispatches. Nothing releases it,
+   * so it is drawn read-only and neither verb is offered on it.
+   */
+  readonly tombstone: boolean;
+};
+
+/**
+ * There is no closed park kind for a declaration-shaped retirement, so the
+ * evidence read here is the one the daemon recorded: a pre-dispatch human-gate
+ * park whose reason carries the task's own title, and that title is where the
+ * spec declares the tombstone. Read narrowly on purpose — every other park kind
+ * is actionable no matter what its prose says.
+ */
+function isTombstonePark(kind: string, reason: string | undefined): boolean {
+  return kind === "human-gate" && /\btombstone\b/iu.test(reason ?? "");
+}
+
+/** The parks a verb can release — the rows the surface draws live verbs on. */
+export function actionableDecisions(
+  decisions: readonly ParkedDecision[],
+): readonly ParkedDecision[] {
+  return decisions.filter((decision) => !decision.tombstone);
+}
+
+/**
+ * The decisions section's rows: one per task the journal's own status replay
+ * leaves parked on a human, in the order the journal first named them. The
+ * replay is the production one (`Journal.replayStatuses`) so this surface and
+ * `tickmarkr status` can never disagree about what is parked.
+ */
+export function deriveParkedDecisions(
+  journal: Journal,
+): readonly ParkedDecision[] {
+  const statuses = journal.replayStatuses();
+  const events = journal.read();
+  const decisions: ParkedDecision[] = [];
+  for (const [taskId, status] of statuses) {
+    if (status !== "human") continue;
+    let parkedIndex = -1;
+    let attempts = 0;
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index]!;
+      if (event.taskId !== taskId) continue;
+      if (event.event === "task-dispatch") attempts += 1;
+      else if (event.event === "task-human") parkedIndex = index;
+    }
+    const parked = parkedIndex >= 0 ? events[parkedIndex] : undefined;
+    // The same rule the production approve command applies: the newest failed
+    // gate-result before the newest task-human controls what approve records
+    // and whether uphold exists at all. Never inferred from the park's prose.
+    const failedGate = events.slice(0, Math.max(0, parkedIndex)).reverse().find((event) =>
+      event.event === "gate-result" && event.taskId === taskId && event.data.pass === false
+      && typeof event.data.gate === "string"
+      && (GATE_NAMES as readonly string[]).includes(event.data.gate)
+    )?.data.gate as string | undefined;
+    const kind = typeof parked?.data.kind === "string" ? parked.data.kind : "human-gate";
+    const reason = typeof parked?.data.reason === "string" ? parked.data.reason : undefined;
+    decisions.push({
+      taskId,
+      kind,
+      reason,
+      parkedAt: typeof parked?.ts === "string" && parked.ts.length >= 19
+        ? parked.ts.slice(11, 19)
+        : "unknown",
+      attempts,
+      failedGate,
+      tombstone: isTombstonePark(kind, reason),
+    });
+  }
+  return decisions;
+}
+
+/** The two decisions a parked task offers — the production command's two verbs. */
+export type SetupDecisionVerb = "approve" | "uphold";
+
+/** A decision the operator has named but not yet confirmed. */
+export type SetupDecisionCommand = {
+  readonly verb: SetupDecisionVerb;
+  readonly taskId: string;
+};
+
+/** What the journal file gained this session — one entry per confirmed write. */
+export type SetupDecisionWrite = {
+  readonly taskId: string;
+  readonly verb: SetupDecisionVerb;
+  /** The release marker read back from the recorded task-approved event. */
+  readonly release: string | undefined;
+  readonly by: string;
+};
+
+/**
+ * The observable state of the decisions surface. Every field is drawn, so a
+ * state the surface cannot show is not expressible: the confirm inset is
+ * `confirming`, the verbatim command output is `notice`, and the pending
+ * writes region is `writes`.
+ */
+export type SetupDecisionsSession = {
+  readonly selection: number;
+  readonly confirming: SetupDecisionCommand | null;
+  readonly writes: readonly SetupDecisionWrite[];
+  readonly notice: string | null;
+};
+
+export function initialSetupDecisionsSession(): SetupDecisionsSession {
+  return { selection: 0, confirming: null, writes: [], notice: null };
+}
+
+export type SetupDecisionsKeyResult = {
+  readonly session: SetupDecisionsSession;
+  /** Present only when the confirm key landed — the one moment a write may happen. */
+  readonly command?: SetupDecisionCommand;
+  readonly quit?: boolean;
+};
+
+/**
+ * Uphold exists only where the production command honours it: the newest
+ * failed gate before the park is the review gate. Everywhere else the key is
+ * inert and the keybar does not advertise it — the surface never promises a
+ * decision the command must refuse.
+ */
+export function upholdAvailable(decision: ParkedDecision): boolean {
+  return decision.failedGate === "review";
+}
+
+/**
+ * The decisions surface's whole key grammar: ↑↓ move, a approve, u uphold,
+ * y confirm, n/Esc cancel, q quit. The reducer never writes — it can only
+ * *name* a command, and only on the confirm key, so a write the operator did
+ * not predict cannot happen. a/u are inert when nothing actionable is parked,
+ * and u is inert on a park the command would refuse, matching the keybar, which
+ * then does not advertise them. Tombstone parks sit outside the grammar: the
+ * pointer never reaches one, so no key can name a decision on it.
+ */
+export function applySetupDecisionsKey(
+  session: SetupDecisionsSession,
+  event: RunKeyEvent,
+  parked: readonly ParkedDecision[],
+): SetupDecisionsKeyResult {
+  const decisions = actionableDecisions(parked);
+  if (session.confirming !== null) {
+    if (event.input === "y") {
+      return {
+        session: { ...session, confirming: null },
+        command: session.confirming,
+      };
+    }
+    if (event.input === "n" || event.key.escape === true) {
+      return { session: { ...session, confirming: null } };
+    }
+    return { session };
+  }
+  if (event.input === "q") return { session, quit: true };
+  const selection = Math.min(session.selection, Math.max(0, decisions.length - 1));
+  if (event.key.upArrow === true || event.key.downArrow === true) {
+    if (decisions.length === 0) return { session };
+    const delta = event.key.upArrow === true ? -1 : 1;
+    return {
+      session: {
+        ...session,
+        selection: Math.max(0, Math.min(decisions.length - 1, selection + delta)),
+      },
+    };
+  }
+  if (event.input === "a" || event.input === "u") {
+    const decision = decisions[selection];
+    if (decision === undefined) return { session };
+    if (event.input === "u" && !upholdAvailable(decision)) return { session };
+    return {
+      session: {
+        ...session,
+        selection,
+        confirming: {
+          verb: event.input === "a" ? "approve" : "uphold",
+          taskId: decision.taskId,
+        },
+      },
+    };
+  }
+  return { session };
+}
+
+export type SetupDecisionOutcome =
+  | {
+    readonly ok: true;
+    readonly command: SetupDecisionCommand;
+    /** The exact string the production command returned. */
+    readonly message: string;
+    readonly write: SetupDecisionWrite;
+  }
+  | {
+    readonly ok: false;
+    readonly command: SetupDecisionCommand;
+    /** The exact string the production command threw. */
+    readonly refusal: string;
+  };
+
+/**
+ * THE write. It calls the production `approve` command — validation, fail-closed
+ * refusals and the journal append are inherited, never re-implemented — and then
+ * reads the file back so the session records the release the journal actually
+ * gained. A refusal is the command's own message, verbatim, and appends nothing.
+ */
+export async function executeSetupDecision(
+  command: SetupDecisionCommand,
+  { cwd, runId, by }: { cwd: string; runId: string; by: string },
+): Promise<SetupDecisionOutcome> {
+  try {
+    const message = await approve(
+      [
+        runId,
+        command.taskId,
+        ...(command.verb === "uphold" ? ["--uphold"] : []),
+        "--by",
+        by,
+      ],
+      cwd,
+    );
+    const events = Journal.open(cwd, runId).read();
+    let release: string | undefined;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]!;
+      if (event.event === "task-approved" && event.taskId === command.taskId) {
+        release = typeof event.data.release === "string" ? event.data.release : undefined;
+        break;
+      }
+    }
+    return {
+      ok: true,
+      command,
+      message,
+      write: { taskId: command.taskId, verb: command.verb, release, by },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      command,
+      refusal: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/** Fold an executed command's outcome into the session the surface draws. */
+export function recordSetupDecisionOutcome(
+  session: SetupDecisionsSession,
+  outcome: SetupDecisionOutcome,
+): SetupDecisionsSession {
+  return outcome.ok
+    ? { ...session, notice: outcome.message, writes: [...session.writes, outcome.write] }
+    : { ...session, notice: outcome.refusal };
+}
+
+/** The text of one decisions row — measured and clipped only by the width module. */
+function decisionRowText(decision: ParkedDecision): string {
+  return `${decision.taskId} · ${decision.kind} · parked ${decision.parkedAt}`
+    + ` · attempt ${decision.attempts}`
+    + (decision.reason === undefined ? "" : ` · ${decision.reason}`);
+}
+
+/**
+ * The effect the confirmed write will actually have, derived from the park
+ * kind and the failed gate the same way the production command derives its
+ * append — the release markers are the command's own constants, so this text
+ * cannot drift from the write. An effect the operator cannot read here is an
+ * effect this surface does not have.
+ */
+function decisionEffectLines(
+  command: SetupDecisionCommand,
+  decision: ParkedDecision | undefined,
+): readonly string[] {
+  if (command.verb === "uphold") {
+    return [
+      `effect appends one task-approved event with release ${REVIEW_UPHELD_RELEASE};`
+        + " the next resume funds one fixed attempt carrying the findings",
+      "it does NOT mark the task done or pass any gate",
+    ];
+  }
+  if (decision?.kind === "gate-fail") {
+    if (decision.failedGate === undefined) {
+      // The command's own refusal, predicted: no write is promised here.
+      return [
+        "effect none — the command refuses: parked on gate-fail"
+          + " but no failed gate result is recorded",
+      ];
+    }
+    const gate = decision.failedGate;
+    return [
+      `effect appends one task-approved event with release ${GATE_SATISFIED_RELEASE}`
+        + ` for gate ${gate}; the next resume continues past the approved gate`,
+      `it marks gate ${gate} satisfied; it does NOT mark the task done`,
+    ];
+  }
+  if (decision?.kind === ATTEMPT_CAP_RELEASE) {
+    return [
+      `effect appends one task-approved event with release ${ATTEMPT_CAP_RELEASE};`
+        + ` the next resume dispatches ${command.taskId} with a fresh attempt budget`,
+      "it does NOT mark the task done or pass any gate",
+    ];
+  }
+  return [
+    "effect appends one task-approved event with no release;"
+      + ` the next resume dispatches ${command.taskId}`,
+    "it does NOT mark the task done or pass any gate",
+  ];
+}
+
+/**
+ * The confirm inset's lines: the task, the actor, the effect and the file,
+ * stated before the single key that can write.
+ */
+export function setupDecisionConfirmLines(
+  command: SetupDecisionCommand,
+  decision: ParkedDecision | undefined,
+  actor: string,
+  journalFile: string,
+): readonly string[] {
+  return [
+    `task   ${command.taskId}${decision === undefined ? "" : ` · ${decision.kind} · attempt ${decision.attempts}`}`,
+    `actor  ${actor}`,
+    ...decisionEffectLines(command, decision),
+    `file   ${journalFile} · append only`,
+    `y ${command.verb} · n cancel`,
+  ];
+}
+
+/** The keybar the surface's state can actually honour — nothing else is drawn. */
+function setupDecisionsKeybar(
+  session: SetupDecisionsSession,
+  decisions: readonly ParkedDecision[],
+): string {
+  if (session.confirming !== null) return "y Confirm · n Cancel";
+  if (decisions.length === 0) return "q Quit";
+  const selected = Math.min(session.selection, decisions.length - 1);
+  const uphold = upholdAvailable(decisions[selected]!) ? " · u Uphold" : "";
+  return `↑↓ Move · a Approve${uphold} · q Quit`;
+}
+
+/**
+ * What the tab is, drawn on the tab it names. The operator's v1.83 UAT read
+ * "Setup" as configuration; this surface configures nothing, so it says what it
+ * does and what it may write, from the one constant the tab strip and the
+ * keybar hint also draw.
+ */
+const DECISIONS_TAB_LINE =
+  `tab ${DECISIONS_TAB_HINT} · journal-parked human decisions`
+  + " · approve and uphold are its only writes";
+
+/**
+ * What the section says when no park needs the operator. It names its own
+ * trigger and both verbs, so an operator who arrives at a quiet surface learns
+ * what would put a row here rather than reading the quiet as unfinished work.
+ */
+const DECISIONS_EMPTY_STATE = [
+  "nothing needs you now — no task is parked on a human gate",
+  "a task that parks on one appears here with its two decisions —"
+    + " approve releases it, uphold sides with the reviewer",
+] as const;
+
+/**
+ * The decisions surface. Every row it draws — decisions, the confirm inset,
+ * the pending writes region — is measured and clipped through the width
+ * module alone (`fitCells`), so a task name carrying a ZWJ grapheme can
+ * neither overflow its row nor be cut mid-cluster. The one unclipped element
+ * is `notice`: the production command's own words, verbatim.
+ */
+export function SetupDecisionsSurface({
+  decisions,
+  session,
+  columns,
+  actor,
+  journalFile,
+}: {
+  decisions: readonly ParkedDecision[];
+  session: SetupDecisionsSession;
+  columns: number;
+  actor: string;
+  journalFile: string;
+}): ReactElement {
+  const inner = Math.max(1, Math.floor(columns) - 4);
+  const actionable = actionableDecisions(decisions);
+  const tombstones = decisions.filter((decision) => decision.tombstone);
+  const selected = Math.min(session.selection, Math.max(0, actionable.length - 1));
+  const confirming = session.confirming;
+  return (
+    <Box flexDirection="column" width={columns}>
+      <Panel title={`${DECISIONS_TAB_TITLE} · ${decisions.length} parked`} focused>
+        <BodyText emphasis="dim">{fitCells(DECISIONS_TAB_LINE, inner)}</BodyText>
+        {actionable.map((decision, index) => (
+          <BodyText
+            key={decision.taskId}
+            emphasis={index === selected ? "strong" : "normal"}
+          >
+            {fitCells(
+              `${index === selected ? `${GLYPHS.pointer} ` : "  "}${decisionRowText(decision)}`,
+              inner,
+            )}
+          </BodyText>
+        ))}
+        {actionable.length === 0 && DECISIONS_EMPTY_STATE.map((line) => (
+          <BodyText key={line}>{fitCells(line, inner)}</BodyText>
+        ))}
+        {/* Permanent by design: drawn so the roster stays honest about what the
+            journal holds, never as a row a verb could be aimed at. The class
+            leads the row — a park's reason runs long, and a marker clipped off
+            the end is a marker the operator never reads. */}
+        {tombstones.map((decision) => (
+          <BodyText key={decision.taskId} emphasis="dim">
+            {fitCells(
+              `  read-only · permanent by design · ${decisionRowText(decision)}`,
+              inner,
+            )}
+          </BodyText>
+        ))}
+      </Panel>
+      {confirming !== null && (
+        <Panel title={`CONFIRM ${confirming.verb.toUpperCase()}`} focused>
+          {setupDecisionConfirmLines(
+            confirming,
+            decisions.find((decision) => decision.taskId === confirming.taskId),
+            actor,
+            journalFile,
+          ).map((line) => (
+            <BodyText key={line}>{fitCells(line, inner)}</BodyText>
+          ))}
+        </Panel>
+      )}
+      {session.notice !== null && <BodyText>{session.notice}</BodyText>}
+      <Panel title="PENDING WRITES">
+        {session.writes.length === 0
+          ? <BodyText>{fitCells("nothing written this session", inner)}</BodyText>
+          : session.writes.map((write) => (
+            <BodyText key={`${write.verb}:${write.taskId}`}>
+              {fitCells(
+                `${write.verb} ${write.taskId} · release ${write.release ?? "none"} · by ${write.by}`,
+                inner,
+              )}
+            </BodyText>
+          ))}
+      </Panel>
+      <BodyText emphasis="dim">
+        {fitCells(setupDecisionsKeybar(session, actionable), Math.max(1, Math.floor(columns)))}
+      </BodyText>
+    </Box>
+  );
+}
+
+function SetupDecisionsApp({
+  cwd,
+  runId,
+  actor,
+}: {
+  cwd: string;
+  runId: string;
+  actor: string;
+}): ReactElement {
+  const { exit } = useApp();
+  const { stdout } = useStdout();
+  const readDecisions = () => deriveParkedDecisions(Journal.open(cwd, runId));
+  const [decisions, setDecisions] = useState(readDecisions);
+  const [session, setSession] = useState(initialSetupDecisionsSession);
+  useInput((input, key) => {
+    if (key.ctrl && input === "c") {
+      exit();
+      return;
+    }
+    const result = applySetupDecisionsKey(session, { input, key }, decisions);
+    setSession(result.session);
+    if (result.quit === true) exit();
+    if (result.command !== undefined) {
+      const command = result.command;
+      void executeSetupDecision(command, { cwd, runId, by: actor }).then((outcome) => {
+        setSession((current) => recordSetupDecisionOutcome(current, outcome));
+        // Re-derive from the file the write landed in: the released task's row
+        // leaves the section because the journal says so, not because we say so.
+        setDecisions(readDecisions());
+      });
+    }
+  });
+  return (
+    <SetupDecisionsSurface
+      decisions={decisions}
+      session={session}
+      columns={stdout.columns ?? 80}
+      actor={actor}
+      journalFile={join(stateDirName(cwd), "runs", runId, "journal.jsonl")}
+    />
+  );
+}
+
+/**
+ * The setup decisions surface on a live engagement. This is the only cockpit
+ * surface that writes, and it writes exactly one way: a confirmed approve or
+ * uphold through the production command path.
+ */
+export async function runSetupDecisionsCockpit({
+  input,
+  output,
+  cwd,
+  runId,
+  actor = userInfo().username,
+}: {
+  input: NodeJS.ReadStream;
+  output: NodeJS.WriteStream;
+  cwd: string;
+  runId: string;
+  actor?: string;
+}): Promise<void> {
+  const app = render(
+    createElement(SetupDecisionsApp, { cwd, runId, actor }),
+    { stdin: input, stdout: output, exitOnCtrlC: false, patchConsole: false },
+  );
+  try {
+    await app.waitUntilExit();
+  } finally {
+    app.unmount();
+  }
 }

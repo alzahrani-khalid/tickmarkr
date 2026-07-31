@@ -135,6 +135,36 @@ async function openDemo(columns = 140, rows = 60) {
   };
 }
 
+function journalEvents(raw: string): { event: string; data: Record<string, unknown> }[] {
+  return raw
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+}
+
+/**
+ * The demo rotates through three committed captures, and under latest-cycle semantics none of them
+ * has a failed LATEST cycle: 231138 passed, 194619 recovered, 025004 never verified at all. The
+ * drawn FAILED state is therefore proved from a fourth source journal — the recovery capture cut at
+ * the run-end that closed its first cycle, which is byte-for-byte the file the daemon had on disk
+ * at that moment. Captured bytes, cut at a real boundary; nothing here is hand-authored.
+ */
+function failedTipCycleSource(): { fileName: string; raw: string } {
+  const recovered = loadDemoCaptures().journals.find((journal) =>
+    journal.fileName === "run-20260724-194619.journal.jsonl"
+  );
+  if (!recovered) throw new Error("recovery cockpit capture is missing");
+  const lines = recovered.raw.trimEnd().split("\n");
+  const firstRunEnd = lines.findIndex((line) =>
+    (JSON.parse(line) as { event: string }).event === "run-end"
+  );
+  if (firstRunEnd < 0) throw new Error("recovery capture records no run-end");
+  return {
+    fileName: recovered.fileName,
+    raw: `${lines.slice(0, firstRunEnd + 1).join("\n")}\n`,
+  };
+}
+
 function committedGoldenFrames(): Map<string, string> {
   const directory = join(import.meta.dirname, "../fixtures/cockpit/frames");
   return new Map(
@@ -188,6 +218,7 @@ async function loadFrame(binaryVersion = "9.8.7") {
   const frame = await renderComponent(createElement(cockpit.RunCockpitFrame, {
     data,
     columns: 140,
+    rows: 24,
   }));
   return { cockpit, captures, data, demo, frame, source };
 }
@@ -240,7 +271,7 @@ describe("cockpit demo captures", () => {
     for (const rows of [14, 18, 24, 40]) {
       const demo = await openDemo(140, rows);
       const frame = demo.frame();
-      expect(frame).toContain("v9.8.7");
+      expect(frame).toContain("tickmarkr 9.8.7");
       expect(frame.split("\n").length).toBeLessThanOrEqual(rows);
       frames.push(frame);
       await demo.close();
@@ -324,12 +355,43 @@ describe("cockpit demo captures", () => {
     await demo.close();
   });
 
-  test("test: the capture whose two tip verification sources disagree renders that verification as failed on the demo path, not only in isolation", async () => {
+  test("test: the demo path draws the failed strip from a source journal whose latest tip-verify cycle failed", async () => {
+    const cockpit = await import("../../src/tui/cockpit/run-cockpit.js");
+    const source = failedTipCycleSource();
+    const events = journalEvents(source.raw);
+
+    // The journal this draws from IS the recovery engagement — its own bytes as the daemon had
+    // written them at the run-end that closed its FIRST verification cycle. That cycle recorded a
+    // failed command and a `failed` verdict, so it is a source journal whose latest tip-verify
+    // cycle failed, not one authored to be red.
+    expect(events.at(-1)).toMatchObject({
+      event: "run-end",
+      data: { tipVerify: "failed" },
+    });
+    expect(events.some((event) => event.event === "tip-verify-failed")).toBe(true);
+
+    const frame = await renderComponent(createElement(cockpit.RunCockpitFrame, {
+      data: cockpit.deriveRunCockpitData(source, "9.8.7", {
+        isDaemonAlive: () => false,
+      }),
+      columns: 140,
+      rows: 24,
+    }));
+
+    expect(frame).toMatch(/✗\s+tip-verify FAILED/u);
+    expect(frame).not.toContain("tip-verify passed");
+  });
+
+  test("test: the recovered capture's strip reads passed on the demo path while its journal still draws the failures it recovered from", async () => {
     const demo = await openDemo();
     await demo.press(DEMO_KEYS.capture);
-    const failed = await demo.press(DEMO_KEYS.capture);
+    const recovered = await demo.press(DEMO_KEYS.capture);
 
-    expect(failed).toContain("tip-verify FAILED");
+    expect(recovered).toContain("tip-verify passed");
+    // A stale pass must never visually mask a genuine failure: the strip reports the latest
+    // verdict, the log keeps every failure the engagement recorded.
+    expect(recovered).toMatch(/✗\s+fail · tip-verify-failed/u);
+    expect(recovered).toMatch(/✗\s+fail · run-end/u);
     await demo.close();
   });
 
@@ -392,12 +454,10 @@ describe("cockpit demo captures", () => {
     for (const region of [
       "VIEWS",
       "RUN",
-      "TASKS",
-      "GATES",
-      "PASS RATE",
+      "tasks 7/7",
+      "gates 59/64",
       "PROGRESS",
       "JOURNAL",
-      "KEYS",
       "tip-verify",
       "Move",
     ]) {
@@ -405,12 +465,11 @@ describe("cockpit demo captures", () => {
     }
     for (const component of [
       "BodyText",
-      "CockpitGrid",
       "JournalRowPanel",
-      "Keybar",
+      "keyRosterLines",
       "Panel",
       "ProgressMeter",
-      "StatTile",
+      "Sparkline",
       "StatusStrip",
     ]) {
       expect(source).toContain(component);
@@ -424,8 +483,9 @@ describe("cockpit demo captures", () => {
       readFileSync(join(import.meta.dirname, "../../package.json"), "utf8"),
     ).version as string;
 
-    expect(frame).toContain("v9.8.7 · binary ✓");
-    expect(frame).not.toContain(`v${repositoryVersion} · binary ✓`);
+    expect(frame).toContain("tickmarkr 9.8.7");
+    expect(frame).toContain("tip-verify passed");
+    expect(frame).not.toContain(`tickmarkr ${repositoryVersion}`);
   });
 
   test("test: the run reference and the spec branch the header identifies itself with equal the values independently derived from the captured source rather than read from any summary line it contains", async () => {

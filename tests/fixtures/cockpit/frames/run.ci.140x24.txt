@@ -1,8 +1,8 @@
-tickmarkr v1.81.0
+tickmarkr v1.83.0
 run-20260724-231138 done 01:29:14
 ✓ tip-verify passed
 ✓ done 7
 - failed 0
 - human 0
 ! escalated 5
-keys ↑↓ Move · ⏎ Open · ← Back · Tab Panel · ? Help · q Quit · f Follow · / Filter
+keys Tab Decisions · ? Help · q Quit · f Follow ○ · 1–5 Move

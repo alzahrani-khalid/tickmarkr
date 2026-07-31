@@ -6,11 +6,13 @@ import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { renderMarkdownRecord } from "../../src/cli/commands/report.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { pickReviewer, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
 import { extractJson } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
+import type { JournalEvent } from "../../src/run/journal.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -213,6 +215,28 @@ describe("reviewGate", () => {
     expect(r.pass).toBe(true);
     expect(r.details).toMatch(/skipped/i);
     expect(r.meta).toEqual({ skipped: true });
+  });
+
+  // T11: the below-threshold review never ran, so the engagement record must say "declined" —
+  // pass:true is the enforcement signal (declined ≠ failed), never a reported pass.
+  test("test: a gate that declined because it was below its threshold is reported as declined rather than as passed", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({});
+    const r = await reviewGate(mkTask({ complexity: 3 }), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+    expect(r.pass).toBe(true);
+    // Journaled exactly as the daemon maps a GateResult (src/run/daemon.ts: meta.skipped → skipped field).
+    const events: JournalEvent[] = [
+      { ts: "2026-07-27T00:00:00.000Z", event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1" } } },
+      {
+        ts: "2026-07-27T00:01:00.000Z",
+        event: "gate-result",
+        taskId: "T1",
+        data: { gate: r.gate, pass: r.pass, details: r.details, ...(r.meta?.skipped === true ? { skipped: true } : {}) },
+      },
+    ];
+    const md = renderMarkdownRecord("run-declined-review", events);
+    expect(md).toContain("review: declined");
+    expect(md).not.toContain("review: pass");
   });
 
   // v1.64 gate-integrity: the cross-vendor review prompt carries the same completion-faking checklist
@@ -475,7 +499,8 @@ describe("v1.1 reviewer failover", () => {
     const bad = fakeWith({ review: "gibberish — not a verdict" });
     const r = await reviewGate(mkTask(), repo, base, author, CH, [bad], DEFAULT_CONFIG);
     expect(r.pass).toBe(false);
-    expect(r.meta).toEqual({ reviewer: "fake:fake-2" });
+    // OBS-193/196: meta additionally marks unparseable (typed retry detection) and names the cause
+    expect(r.meta).toEqual({ reviewer: "fake:fake-2", unparseable: true, cause: "no-verdict" });
   });
 
   test("excludeReviewers reaches reviewGate: excluded vendor → no-reviewer path", async () => {

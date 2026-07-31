@@ -30,15 +30,15 @@ There is no separate watch-mode script in `package.json`; run `npx vitest` direc
 tests/
 ├── adapters/       21 *.test.ts files (fake, registry, prompt, per-vendor auth/usage, kimi TUI seed, etc.)
 ├── brand.test.ts   byte-pinned brand exports
-├── cli/            32 *.test.ts files (init, plan, status, fleet, approve, doctor, report-*, mode-*, etc.)
-├── compile/        6 *.test.ts files (gsd, prd, speckit, native, collateral, scope-seam)
+├── cli/            34 *.test.ts files (init, plan, status, fleet, approve-*, doctor, report-*, mode-*, etc.)
+├── compile/        7 *.test.ts files (gsd, prd, speckit, native, collateral, scope-seam, task-unit-contract)
 ├── config/         4 *.test.ts files
 ├── docs-*.test.ts  export-guarded docs-truth suites (codebase, concerns, stack, testing)
 ├── drivers/        6 *.test.ts files (herdr, subprocess, env-seal, trailer-width, etc.)
 ├── e2e/            real-cli.test.ts          (gated, spends tokens — see below)
 ├── eval/           1 *.test.ts file          (fixture harness tests for the eval lab)
 ├── fixtures/       codex-mcp-spinner/capture.ts (non-*.test.ts capture helper)
-├── gates/          12 *.test.ts files
+├── gates/          13 *.test.ts files
 ├── graph/          4 *.test.ts files
 ├── helpers/        tmprepo.ts                (shared repo/graph fixtures, not a *.test.ts file)
 ├── hygiene/        2 *.test.ts files (brand-sweep, live-fixture-guard)
@@ -48,7 +48,7 @@ tests/
 ├── repo/           9 *.test.ts files (export fixtures/manifest, readme + contact + community boundaries, build provisioning, release docs)
 ├── report/         4 *.test.ts files
 ├── route/          16 *.test.ts files (router, explore, failover, profile, etc.)
-├── run/            27 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, environment, etc.)
+├── run/            29 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, environment, etc.)
 ├── scripts/        probe-rig.test.ts
 ├── tui/            app active; legacy suites retired
 ├── setup.ts        (setupFiles in vitest.config.ts — global env seal, not a *.test.ts file)

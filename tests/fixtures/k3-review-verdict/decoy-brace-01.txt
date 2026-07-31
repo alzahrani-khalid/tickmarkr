@@ -1,0 +1,211 @@
+  Wait, one more: `keybarRows = min(measuredKeybarRows, max(help?0:1, plannedRows - STATUS_ROWS - MINIMUM_FRAME_BODY_ROWS - 1))`. If measured keybar rows is large, it's clamped — but does
+  the drawn RunKeybar actually occupy exactly keybarRows? It's wrapped in PlannedRegion with overflow hidden ✓.
+
+  10. Check react version for useInsertionEffect.^19.2.8 ^6.8.0 undefined
+{
+ "deps": {
+  "@types/react": "^19.2.17",
+  "ink": "^6.8.0",
+  "picomatch": "^4.0.2",
+  "react": "^19.2.8",
+  "yaml": "^2.5.0",
+  "zod": "^4.0.0"
+ }
+}
+node_modules/string-width/package.json
+node:internal/modules/cjs/loader:671
+      throw e;
+      ^
+
+Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './package.json' is not defined by "exports" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260728-110135--T1/node_modules/string-width/package.json
+    at exportsNotFound (node:internal/modules/esm/resolve:314:10)
+    at packageExportsResolve (node:internal/modules/esm/resolve:661:9)
+    at resolveExports (node:internal/modules/cjs/loader:664:36)
+    at Function._findPath (node:internal/modules/cjs/loader:731:31)
+    at Function._resolveFilename (node:internal/modules/cjs/loader:1415:27)
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1040:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1045:22)
+    at Function._load (node:internal/modules/cjs/loader:1216:25)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:254:19)
+    at Module.require (node:internal/modules/cjs/loader:1527:12) {
+  code: 'ERR_PACKAGE_PATH_NOT_EXPORTED'
+}
+
+Node.js v22.23.1
+string-width is not a declared dependency — it's present in node_modules (transitively, via ink). The diff imports `string-width` directly
+  in src/tui/cockpit/layout.ts and tests. That's an undeclared dependency: works today because ink hoists it, but it's not in package.json dependencies. Is that material? It's a real packa
+  ging defect risk (if the package is published/bundled, npm doesn't guarantee transitive deps). Let me check: is string-width in package-lock as a direct or transitive dep? And does the p
+  roject publish dist (there's a dist/ dir)? Check whether other src files already import string-width.package-lock.json:587:        "string-width": "^5.1.2",
+package-lock.json:1710:        "string-width": "^8.2.0"
+package-lock.json:2109:        "string-width": "^8.1.1",
+package-lock.json:2169:        "string-width": "^7.0.0",
+package-lock.json:2829:      "name": "string-width",
+package-lock.json:3311:        "string-width": "^8.1.0"
+package-lock.json:3344:        "string-width": "^5.0.1",
+package-lock.json:3363:        "string-width": "^4.1.0",
+3:      "version": "8.2.2",
+`string-width` was already imported by `src/tui/cockpit/components.tsx` before this d
+  iff — so the undeclared-dependency pattern pre-exists and isn't introduced by this diff. Not a finding against this change (pre-existing condition).
+
+  Now wait for the full cockpit suite. Meanwhile, a few more skeptical checks:
+
+  1. The `assertFrameConformance` production guard in `RunCockpitFrameFromPlan` uses `useInsertionEffect` + monkey-patching stdout.write. One concern: it only validates the first visible w
+  rite of each paint — but the bigger question is whether the interceptor could break legitimate production output if Ink writes the frame in multiple chunks (e.g., first visible chunk is
+  only part of the frame). Then `lines.length !== plannedRows` → throw in production → crash. Ink 6 writes... Ink renders output via its `renderer` which returns the full frame string, wri
+  tten via log-update in one write typically. The test through real render (with the guard on) passed, which exercises this. Fine.
+
+  2. Test criterion: "resizing the terminal mid-session redraws the frame at the new size" — verified green in live.test.ts.
+
+  3. Let me double check one potential issue in `useSyncExternalStore`: `getSnapshot` returns `${output.columns ?? 80}:${output.rows ?? 24}` — but the subscription only fires on 'resize'.
+  If output.columns changes without a resize event... TTY always emits resize. Fine.
+
+  4. `const [columns, rows] = measuredSize.split(":").map(...)` — NaN guard: Math.floor(Number(part)) → if NaN, Math.max(0, NaN) = NaN. But part always numeric string. Fine.
+
+  5. `planFrame` alias `resolveCockpitLayout = planFrame` — old callers pass (columns, rows) both defined → same behavior except now returns richer object. Plain branch now includes viewpo
+  rt — tests updated. Any other consumers of resolveCockpitLayout that did exact-equality checks on plain layout? The layout.test.ts old tests were updated. Other consumers (capture.ts) —
+  full suite will reveal.
+
+  6. Completion-faking checklist review:
+  - hardcoded-result: no; plans are computed.
+  - test-weakening: the frames.test.ts changes declare moved regions — but with load-bearing proofs and the regenerable corpus still asserting bytes. The `pinnedProjection` blanks declared
+   regions at one fixture; compensating tests verify declarations are load-bearing. This is anchor maintenance, documented, and the byte pin moves to the corpus. Borderline but justified a
+  nd tested. Not test-weakening in the prohibited sense since every declaration is proved necessary.
+  - vacuous-assertion: mutation test counts exercised boundaries and asserts exact counts. Good.
+  - The `NODE_ENV !== "test"` guard: partial check-bypass of the production conformance path in tests, but explicitly re-enabled in one test and the assertion is directly tested everywhere
+  . I'll record as a minor with defer, since the acceptance criterion (mutation fails at every presentation) is met via direct assertions.
+
+  7. One more potential material issue: `assertFrameConformance` is called synchronously inside `stdout.write` and throws — in production an uncaught throw inside a write callback could le
+  ave stdout.write... they restore before asserting ✓.
+
+  8. `keybarRows` clamp when help: `Math.max(0, ...)` — keybarRows=0 → rowSpans omits keybar ✓ and draw omits ✓ (RunKeybar not rendered when rowSpans.keybar undefined... wait, in the draw:
+   `{layout.rowSpans.keybar && (<PlannedRegion ...><RunKeybar .../>)}` ✓. But in help mode old code drew RunKeybar with help — new code omits keybar entirely in help. Behavior change: prev
+  iously help overlay drew the keybar (RunKeybar entries help). Hmm — the plan says keybarRows = 0 when help. And measuredKeybarRows = 0 when help. Old code always drew `<RunKeybar entries
+   help={help}>` after StatusStrip. New code drops it in help mode. Is that an intentional design change? The tiling test asserts row regions equal [body, header, status] when help. This i
+  s a presentation change but internally consistent and pinned by tests. The acceptance criteria don't demand keybar in help. Not a defect per the contract.
+
+  9. `frameColumnSpans` — keysDivider offset: `span(navigation + navigationDivider + title, keysDivider)` and keys at `columns - keys` — consistent tiling ✓ (test sweeps confirm).
+
+  10. Concern: `headerPlan` wide mode uses `runSideRailVisible(columns)` — but the draw's IdentityHeader uses plan mode ✓.
+
+  11. `runSideRailVisible(plannedColumns)` for navigation — and keysVisible requires navigationVisible ✓.
+
+  12. Edge: columns exactly at rail floor vs header mode — consistent since both use runSideRailVisible.
+
+  Let me also verify no other test files in the repo use `wrappedRows`/`panelRows` from run-cockpit expecting old code-point behavior... those are re-exported. Behavior changed (stringWidt
+  h vs code points) intentionally.
+
+  Also check tests outside tests/cockpit referencing RunCockpitFrame/resolveCockpitLayout — e.g., tests/cli or e2e. The full cockpit suite is running; maybe also run the full test suite? T
+  hat's big. Let's at least grep for imports of these modules elsewhere.
+
+• While the suite finishes, I'll check for consumers of the changed APIs outside the cockpit tests.
+
+• `resolveCockpitLayout(columns, rows)` is used in setup-cockpit.tsx:1129, demo.ts:185, capture.ts:413 — signature compatible. The full cockpit suite will cover height.test.ts, keys.test.t
+  s, colour.test.ts, views.test.ts which use these APIs heavily.
+
+  Wait for the background suite result. Meanwhile let me think about the remaining completion-faking checklist items once more:
+
+  - The conformance guard bypass under NODE_ENV=test: I'll classify as minor/deferred with rationale — the acceptance mutation criterion is proven by direct assertions across every present
+  ation, and one test re-enables the production path.
+  - `delivery.key` default MAX_SAFE_INTEGER matches the pre-existing UNMEASURED_COLUMNS convention in keys.ts — not a finding, maybe not even worth a minor.
+  - The whole-panel declarations at 80x24 in frames.test.ts — backed by load-bearing proofs and byte-for-byte corpus pin; acceptable.
+
+  One more check — `assertFrameConformance` strips ANSI but what about OSC hyperlinks or other escape sequences? The regex only handles CSI sequences. Ink uses CSI only typically. Fine.
+
+  Potential real bug to double-check: in `assertNestedPanelSpan`, `left = plan.columnSpans.title.offset + 2` and `right = ...title.offset + title.span - 3`. This assumes the nested panel i
+  s inset by 2 cells from the outer panel (border + padding = 2 each side). Panel chrome horizontal = 4 total ✓ consistent with PANEL_CHROME_COLUMNS=4.
+
+  Also `fullWidth` param always true at call sites (progress panel, journal). Fine.
+
+  Another check — `drawRunCockpitFrameFromPlan` plain branch: there's a weird fragment `<>...</>` with identical branches: `activeView === "run" ? ... : ...` inside a fragment — harmless.
+
+  Another: `RunCockpitFrameFromPlan`'s effect deps `[layout, stdout]` — new layout object every render → patch/unpatch churn each render. Minor perf, not correctness.
+
+  One thing worth verifying: does the production guard break Ink's alternate-screen / cursor behavior by swallowing writes? It passes through all writes ✓.
+
+  And the guard only checks the FIRST visible write per effect run — subsequent writes in the same paint unchecked. Ink 6 default writes the whole frame in one write. Acceptable.
+
+  Now the frames.test.ts change — one more careful look at a possible test-weakening: the test "the journal panel's top border row and its title row are inside that comparison" now filters
+   out fixtures where RUN frame moved (only the 80x24 fixture). And the corpus still byte-pins everything. OK.
+
+  Also `mutateRow`, `replaceColumn`, `findGoldenFrameMismatches`, `fixtureBytes` — pre-existing helpers presumably. The suite passed, so they exist.
+
+  Let me wait for the full cockpit suite result.Full cockpit suite: 241 passed, 12 files. tsc clean, oxlint clean.
+
+  Remaining evaluation of findings:
+
+  1. `NODE_ENV !== "test"` bypass of the production conformance guard — disclosed, and the guard path is explicitly re-enabled and tested once; the conformance assertion itself is directly
+   tested across all presentations. The acceptance criterion ("mutating a planned span makes the drawn frame fail its conformance assertion at every presentation") is satisfied by direct a
+  ssertions. This is not test-weakening of the criterion. However, a skeptical reviewer should note it: the "fail closed on every drawing path" claim is only partially true — under tests i
+  t's open. But tests are not production. I'll log it as minor, defer.
+
+  2. The interceptor only checks the first visible write per layout — subsequent paints with the same layout aren't re-verified... actually effect re-runs each render since layout is a fre
+  sh object. Fine.
+
+  3. `delivery.key` default MAX_SAFE_INTEGER — matches pre-existing UNMEASURED_COLUMNS convention in keys.ts. Not a finding.
+
+  4. string-width undeclared — pre-existing (components.tsx already imported it). Not introduced here.
+
+  5. frames.test.ts declared-region widening — compensated by load-bearing proofs and byte-for-byte corpus. Not test-weakening.
+
+  One last skeptical probe: the criterion "the renderer draws the plan and computes nothing" — the renderer (drawRunCockpitFrameFromPlan and children) still contains some geometry-ish logi
+  c: `interactionStatusItems` (content, fine), `SetupTabPanel` receives bodyRows/bodyColumns from plan ✓, `JournalBody` receives bodyRows ✓. IdentityHeader builds content strings (content,
+   not geometry). RunStats picks tiles vs summary from plan ✓. Meter width from plan ✓. Caption lines from plan ✓. Nothing recomputes spans/wraps. Satisfied.
+
+  Also check: `LadderRunPanel` help branch renders `JournalBody` with `bodyRows={layout.presentation.journalRows}` — but for help, does JournalBody actually draw a bordered JOURNAL panel?
+  The conformance nested branch asserts journal panel borders. The run-help presentation is covered in VIEW_STATES mutation tests which passed — so yes it draws the borders.
+
+  Edge concern on `wrappedRows` correctness vs Ink's actual wrapping — validated by the swept conformance tests across the domain with wide glyphs and combining marks, and they pass.
+
+  One more potential material issue I should sanity check: `useSyncExternalStore` in LiveApp — the subscribe function references `output` prop; fine.
+
+  Also `live.ts` removed `columns` param from createLiveCockpitDelivery — but `runPanelFocusOrder(columns)` was previously used where? The focus order now computed inside planRunCockpitFra
+  me with measured columns ✓.
+
+  I'm fairly satisfied. One genuine minor: the `key` default silently assumes the widest layout when callers omit columns, which can misroute keys for narrow terminals in any future consum
+  er that forgets the argument — but it matches the file's existing UNMEASURED_COLUMNS convention, so defer as minor.
+
+  Another minor: the conformance guard disabled under NODE_ENV=test means the "fail closed on every drawing path" is not exercised except in the single opt-in test — defer with rationale s
+  ince direct assertions cover the criterion.
+
+  Actually, let me reconsider whether either is material. The checklist demands naming a shortcut when a criterion fails. Do any criteria fail?
+
+  1. Tiling — swept test, passes. ✓
+  2. Resize — live test, passes. ✓
+  3. Row count conformance — swept, passes. ✓
+  4. One flexible element per axis — tested on plan and bytes. ✓
+  5. Fallback below floor — tested. ✓
+  6. Mutation fails at every presentation — tested incl. production component with guard on. ✓
+  7. No negative/zero spans incl. production caption surrender — swept with two caption shapes. ✓
+  8. Renderer draws plan, computes nothing — by inspection, geometry comes from plan. ✓
+
+  No criterion fails. Approve with two deferred minor findings.
+
+• All verification is done: the full cockpit suite (12 files, 241 tests) passes, `tsc --noEmit` is clean, and oxlint reports zero warnings. My independent checks of the suspicious spots re
+  solved as follows:
+
+  - **`delivery.key` defaulting to `Number.MAX_SAFE_INTEGER`** looked like invented geometry, but `keys.ts:145` already defines `UNMEASURED_COLUMNS = Number.MAX_SAFE_INTEGER` as the dispat
+  ch layer's standing convention for "no width known" — the diff matches existing behavior, and all in-repo callers either pass the measured width or run at 140 columns where routing is id
+  entical.
+  - **`string-width` import** is not a declared dependency, but `src/tui/cockpit/components.tsx:3` already imported it before this diff — pre-existing condition, not introduced here.
+  - **The widened `CONTRACT_MOVED_PANELS` declarations** in `frames.test.ts` are compensated: each declaration is proven load-bearing by withdrawing it, the regenerable corpus still pins e
+  very row byte-for-byte, and gap columns plus row count remain in the frozen comparison. Not test-weakening.
+  - The acceptance tests are non-vacuous (boundary-move counts are asserted exactly: `{rowSpans: 3, columnSpans: 4, bodySpans: 2}`), the surrender ladder is exercised with two caption shap
+  es (unbreakable token and word-wrapped), and the production fail-closed path is executed once with the guard explicitly re-enabled.
+
+  Two minor observations I am not blocking on:
+
+  ```json
+  {"nonce": "c9194ce4", "approve": true, "findings": [{"note": "RunCockpitFrameFromPlan's production conformance guard is disabled whenever NODE_ENV=test (src/tui/cockpit/run-cockpit.tsx:9
+  33), so the fail-closed paint path is open during the entire test run except one opt-in render via TICKMARKR_ASSERT_FRAME_CONFORMANCE=1. The acceptance criterion is still met — assertFra
+  meConformance is invoked directly against drawn frames for every presentation in VIEW_STATES and the production component path is proven in the explicitly re-enabled test — so this is a
+  disclosed throughput tradeoff, not check-bypass of the criterion.", "severity": "minor", "defer": true, "rationale": "Criterion proven by direct assertions across all presentations plus
+  one guard-enabled production render; bypass is disclosed and only affects test throughput."}, {"note": "delivery.key defaults columns to Number.MAX_SAFE_INTEGER when callers omit it (src
+  /tui/cockpit/live.ts:255), which routes keys as if all side rails were visible; a future consumer that forgets the argument on a narrow terminal would misroute rail/body keys. It matches
+   the pre-existing UNMEASURED_COLUMNS convention in keys.ts:145 and every current caller either passes the measured width or runs at 140 columns where routing is identical.", "severity":
+  "minor", "defer": true, "rationale": "Matches the dispatch layer's existing unmeasured-width convention; no current caller can observe the difference."}], "comments": [{"path": "src/tui/
+  cockpit/run-cockpit.tsx", "line": 933, "body": "Consider keying the guard bypass on an explicit opt-out (e.g. TICKMARKR_ASSERT_FRAME_CONFORMANCE=0) rather than NODE_ENV=test, so the fail
+  -closed paint path stays exercised by default in tests; the throughput cost would then be a deliberate choice at the call site."}]}
+
+To resume this session: kimi -r session_9e2c4364-e556-4621-9799-7e69956dced4
+
+TICKMARKR_EXIT_c9194ce4:0

@@ -4,7 +4,7 @@ import { ttyVisual } from "../../adapters/model-lints.js";
 import { addUsage, type TokenUsage } from "../../adapters/types.js";
 import { dim, rule, title } from "../../brand.js";
 import { loadConfig } from "../../config/config.js";
-import { buildProofBundle } from "../../report/bundle.js";
+import { buildProofBundle, gateDeclined } from "../../report/bundle.js";
 import { compareRuns } from "../../report/compare.js";
 import { estimateCosts, type ChannelCost } from "../../report/cost.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
@@ -93,6 +93,13 @@ const wallClock = (start?: JournalEvent, end?: JournalEvent): string => {
 };
 
 const detail = (value: unknown): string => typeof value === "string" || typeof value === "number" ? String(value) : EM;
+
+// T11: a gate that declined never ran. Drop those before the comparison metrics so the pass rate
+// counts only gates that actually ran — a declined gate is never a pass and never pads the base.
+// Declines are pass:true, so the gate-failure count is untouched. Reporting only: the unfiltered
+// events still feed the record and the proof bundle, and no gate outcome changes.
+const ranGatesOnly = (events: JournalEvent[]): JournalEvent[] =>
+  events.filter((e) => e.event !== "gate-result" || !gateDeclined(e.data));
 
 // v1.53 T5: supersession is derived from the run's OWN journal only — `superseded by` from the
 // appended superseded event (last wins), `supersedes` from the run-start stamp. No cross-run scan.
@@ -204,7 +211,8 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     lines.push("- **tickmarks:**");
     if (gates.length) {
       for (const g of gates) {
-        const pass = g.data.pass === true ? "pass" : g.data.pass === false ? "fail" : EM;
+        // T11: a declined gate never ran — report it as declined, never as a pass.
+        const pass = gateDeclined(g.data) ? "declined" : g.data.pass === true ? "pass" : g.data.pass === false ? "fail" : EM;
         const gate = typeof g.data.gate === "string" ? g.data.gate : EM;
         lines.push(`  - ${gate}: ${pass} — ${firstLine(g.data.details)}`);
       }
@@ -272,7 +280,10 @@ function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[],
       });
 
   const gateResults = events.filter((e) => e.event === "gate-result");
-  const gatePass = gateResults.filter((e) => e.data.pass).length;
+  // T11: gates that declined never ran — out of both the pass count and the rate base.
+  const declinedCount = gateResults.filter((e) => gateDeclined(e.data)).length;
+  const gateRan = gateResults.length - declinedCount;
+  const gatePass = gateResults.filter((e) => e.data.pass && !gateDeclined(e.data)).length;
   const escalations = events.filter((e) => e.event === "escalation").length;
   const consults = events.filter((e) => e.event === "consult-verdict").length;
   const failovers = events.filter((e) => e.event === "quota-failover").length;
@@ -288,7 +299,7 @@ function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[],
       `  ${k.padEnd(30)} tasks ${g.rows.length}, attempts ${g.rows.reduce((s, r) => s + r.attempts, 0)}, done ${g.rows.filter((r) => r.outcome === "done").length}`,
     ),
     "",
-    `tickmark rate: ${gateResults.length ? Math.round((100 * gatePass) / gateResults.length) : 0}% (${gatePass}/${gateResults.length})`,
+    `tickmark rate: ${gateRan ? Math.round((100 * gatePass) / gateRan) : 0}% (${gatePass}/${gateRan})${declinedCount ? ` · declined: ${declinedCount}` : ""}`,
     `escalations: ${escalations} · National Office consults: ${consults} · quota failovers: ${failovers}`,
     "",
     "spend — tokens (measured where observed):",
@@ -347,8 +358,8 @@ export async function report(argv: string[], cwd = process.cwd()): Promise<strin
     const outcome = compareRuns({
       runId,
       baselineRunId,
-      events,
-      baselineEvents: baseline.read(),
+      events: ranGatesOnly(events),
+      baselineEvents: ranGatesOnly(baseline.read()),
       rows,
       baselineRows: baseline.readTelemetry(),
       cost: cfg.cost,

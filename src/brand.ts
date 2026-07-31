@@ -1,15 +1,60 @@
 import { shq } from "./adapters/types.js";
 import type { OwnedName } from "./drivers/types.js";
 
-// TTY-only pixel-tick logo (assets/mark.svg is the image twin — same block geometry).
+// TTY-only pixel-tick logo (assets/mark.svg is generated as the image twin of this bitmap).
 // Never printed to pipes — the non-TTY stdout surface is byte-pinned by tests and consumed by machines.
 const B = "\x1b[1m", R = "\x1b[0m";
-const g = (n: number, s: string) => `\x1b[38;5;${n}m${s}${R}`; // 256-color green ramp, bright → deep
+export const MARK_BITMAP = [
+  "..................",
+  "..............###.",
+  "............####..",
+  "..........####....",
+  "........####......",
+  ".###..####........",
+  "...#####..........",
+  "....###...........",
+  "..................",
+  "..................",
+] as const;
+
+const QUADRANTS = [
+  " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
+  "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+] as const;
+
+function packMark(bitmap: readonly string[]): string {
+  const rows: string[] = [];
+  for (let y = 0; y < bitmap.length; y += 2) {
+    let row = "";
+    for (let x = 0; x < bitmap[y]!.length; x += 2) {
+      const mask = (bitmap[y]![x] === "#" ? 1 : 0)
+        | (bitmap[y]![x + 1] === "#" ? 2 : 0)
+        | (bitmap[y + 1]![x] === "#" ? 4 : 0)
+        | (bitmap[y + 1]![x + 1] === "#" ? 8 : 0);
+      row += QUADRANTS[mask]!;
+    }
+    rows.push(row);
+  }
+  return rows.join("\n");
+}
+
+// The ruled silhouette, packed from the 18x10 bitmap into a 9x5 quadrant-cell grid.
+export const PLAIN_MARK = packMark(MARK_BITMAP);
+// Near-black ANSI 233 knockout ink on the solid ANSI 41 brand tile.
+export const MARK = PLAIN_MARK.split("\n")
+  .map((row) => `\x1b[38;5;233;48;5;41m${row}${R}`)
+  .join("\n");
+
+// Retain the reviewed 28-column compact row so narrow-header copy wraps unchanged.
+const BANNER_COPY_GAP = " ".repeat(10);
 export const BANNER = [
-  `              ${g(84, "▄▄████")}`,
-  `          ${g(78, "▄▄████▀▀")}`,
-  `${g(41, "████▄▄▄▄████▀▀")}     ${B}tickmarkr${R}`,
-  `  ${g(35, "▀▀████▀▀")}         spec in, verified work out.`,
+  // The fifth packed row is tile-only padding; the composed header stays four rows
+  // so setup retains every detected state at the contracted 24-row height.
+  ...MARK.split("\n").slice(0, -1).map((row, index) =>
+    index === 2 ? `${row}${BANNER_COPY_GAP}${B}tickmarkr${R}`
+      : index === 3 ? `${row}${BANNER_COPY_GAP}spec in, verified work out.`
+        : row
+  ),
   "",
 ].join("\n");
 
@@ -60,7 +105,7 @@ export function paneDispatchCommand(scriptPath: string): string {
 // on a real TTY with NO_COLOR unset; otherwise output is the plain text itself
 // (non-TTY surfaces stay byte-pinned and machine-consumable).
 
-/** The settled brand green ramp (256-color), bright → deep — the BANNER hues. */
+/** The settled brand green ramp (256-color), bright → deep. */
 export const BRAND_RAMP = [84, 78, 41, 35] as const;
 
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;

@@ -1,8 +1,10 @@
+import { channelKey } from "../../adapters/types.js";
 import type {
   ComponentState,
   JournalRow,
   StatusStripItem,
 } from "./components.js";
+import type { RunViewId } from "./views.js";
 
 export const SPARKLINE_BUCKET_WINDOW = 12;
 const MINUTE_MS = 60_000;
@@ -58,6 +60,9 @@ export type RunCockpitData = {
   readonly progress: number;
   readonly progressCaption: string;
   readonly journalRows: readonly JournalRow[];
+  readonly taskRows: readonly TaskRow[];
+  readonly gateRows: readonly GateRow[];
+  readonly fleetRows: readonly FleetRow[];
   readonly statusItems: readonly StatusStripItem[];
 };
 
@@ -68,6 +73,75 @@ export type RunCockpitSource = {
 
 export type RunCockpitDeriveOptions = {
   readonly isDaemonAlive?: (pid: number) => boolean;
+  /** The compiled graph, when the engagement has one. Identity only — see CockpitGraph. */
+  readonly graph?: CockpitGraph;
+};
+
+/**
+ * What the compiled graph lends the cockpit: which tasks exist, in what order,
+ * and what each is called. `status` is named here only to state that it is
+ * deliberately unread — the journal owns state, so a recompile can never
+ * repaint a parked task green.
+ */
+export type CockpitGraph = {
+  readonly tasks: readonly {
+    readonly id: string;
+    readonly title?: string;
+    readonly status?: string;
+  }[];
+};
+
+/** How an unrecorded field draws: the engagement said nothing, so the row says nothing. */
+export const ABSENT_FIELD = "-";
+
+/**
+ * One reading of a row field. An absent field is a fact about the engagement —
+ * it never recorded this — and never collapses into an empty string or a zero
+ * that reads like a measurement.
+ */
+export function fieldReading(value: string | number | undefined): string {
+  return value === undefined ? ABSENT_FIELD : String(value);
+}
+
+/**
+ * One task of the compiled graph, wearing only what the journal recorded about
+ * it. A task the journal never mentions still draws a row; its state, attempts,
+ * actor and last event time are absent rather than invented — including the
+ * state, because "pending" is a thing the engagement would have to have
+ * recorded, not a thing a row may assume about silence.
+ *
+ * `attempts` is a count of recorded dispatches, never the newest dispatch's
+ * `attempt` label: labels restart at zero on resume, so the label of the last
+ * dispatch understates a task the engagement resumed into.
+ */
+export type TaskRow = {
+  readonly id: string;
+  readonly taskId: string;
+  readonly state?: TaskState;
+  readonly attempts?: number;
+  readonly actor?: string;
+  readonly lastEventTime?: string;
+  readonly title?: string;
+};
+
+/** One recorded gate result. `details` is the record's own text, verbatim. */
+export type GateRow = {
+  readonly id: string;
+  readonly time: string;
+  readonly state: ComponentState;
+  readonly gate?: string;
+  readonly taskId?: string;
+  readonly pass?: boolean;
+  readonly details?: string;
+};
+
+/** One channel the engagement recorded, dispatched to or merely named. */
+export type FleetRow = {
+  readonly id: string;
+  readonly adapter: string;
+  readonly model: string;
+  readonly dispatches?: number;
+  readonly lastEventTime?: string;
 };
 
 type CaptureEvent = {
@@ -95,13 +169,14 @@ type DispatchFact = {
   readonly assignment?: Assignment;
 };
 
-type TaskState = "done" | "failed" | "human" | "pending" | "running" | "interrupted";
+export type TaskState = "done" | "failed" | "human" | "pending" | "running" | "interrupted";
 type RunLifecycle = "active" | "completed" | "superseded";
 
 type TaskFact = {
   readonly id: string;
   readonly dispatches: DispatchFact[];
-  state: TaskState;
+  /** Undefined until an event records a state — silence is not "pending". */
+  state: TaskState | undefined;
   lastIndex: number;
   lastTs: string;
   phase: string;
@@ -209,7 +284,7 @@ function deriveTasks(
     const created: TaskFact = {
       id: taskId,
       dispatches: [],
-      state: "pending",
+      state: undefined,
       lastIndex: index,
       lastTs: ts,
       phase: "pending",
@@ -260,14 +335,36 @@ function deriveTasks(
 
   if (interrupted) {
     for (const fact of tasks.values()) {
-      if (fact.state === "running" || fact.state === "pending") {
-        fact.state = "interrupted";
-      }
+      // Only a task the journal recorded as running. `task-dispatch` recorded
+      // that it started; no event records how it ended; the daemon that would
+      // have recorded that ending is gone. So the recorded state cannot still
+      // be true, and its interruption is a reading of that record — not an
+      // invention on top of silence.
+      //
+      // Silence stays silent. A task the engagement mentioned without ever
+      // recording a state keeps none: the run's stopping is a fact about the
+      // run, and lending it to a task would be exactly the assumption an absent
+      // field exists to refuse.
+      //
+      // A state the journal did record otherwise is never overwritten —
+      // `pending` is what `task-approved` recorded, and it says the task was
+      // released back to the pool to await a dispatch, not that a dispatch was
+      // cut short. In the real post-run approval sequence (run-end, then the
+      // operator approves) that approval is the newest thing the engagement
+      // recorded about the task, so reporting it as interrupted would be the
+      // run's stopping overruling the journal. The journal wins.
+      if (fact.state === "running") fact.state = "interrupted";
     }
   }
   return tasks;
 }
 
+/**
+ * The label the engagement gave the attempt now standing — which is what the
+ * spotlight caption is naming ("attempt 3 of 4", the ladder's own numbering).
+ * Not a count of attempts: labels restart at zero on resume. Rows that mean
+ * "how many times was this tried" count dispatches instead — see TaskRow.
+ */
 function taskAttempt(fact: TaskFact): number {
   return fact.dispatches.at(-1)?.attempt ?? Math.max(1, fact.dispatches.length);
 }
@@ -334,9 +431,10 @@ function recordsSuccess(event: CaptureEvent): boolean {
 
 /**
  * A row depicts the event it names: the event's own recorded outcome decides
- * the state, never the state its task reached later. Only a task with no
- * terminal event in a run whose daemon is gone lends its interruption, because
- * no event records that ending — the interruption is the run's present truth.
+ * the state, never the state its task reached later. Only a task the journal
+ * recorded as running, in a run whose daemon is gone, lends its interruption:
+ * a dispatch was recorded, no event records how it ended, and the process that
+ * would have recorded that ending is no longer there.
  * Every state carries its word, so meaning never rides on hue alone.
  */
 function eventPresentation(
@@ -391,6 +489,166 @@ function journalRows(
     historyRow(event, tasks, spotlight, index === 0, runStatus)
   );
   return [...[...defects].reverse().map(defectRow), ...history];
+}
+
+/**
+ * The tasks the engagement owns, in the compiled graph's order: the graph
+ * supplies identity and nothing else, so a task the journal never mentions
+ * still draws a row. Every other field is read off recorded events — the
+ * graph's own `status` is never consulted, which is what keeps a recompiled
+ * graph from repainting a parked task green.
+ */
+function taskRows(
+  events: readonly CaptureEvent[],
+  tasks: ReadonlyMap<string, TaskFact>,
+  graph: CockpitGraph | undefined,
+): TaskRow[] {
+  const lastSeen = new Map<string, string>();
+  for (const event of events) {
+    if (event.taskId !== undefined) lastSeen.set(event.taskId, event.ts);
+  }
+  const identities = graph !== undefined
+    ? graph.tasks.map((task) => ({ id: task.id, title: task.title }))
+    // Without a graph the engagement's own records are the only identities there are.
+    : [...new Set([...tasks.keys(), ...lastSeen.keys()])].map((id) => ({
+      id,
+      title: undefined as string | undefined,
+    }));
+
+  return identities.map(({ id, title }) => {
+    const fact = tasks.get(id);
+    const assignment = fact?.dispatches.at(-1)?.assignment;
+    const lastTs = lastSeen.get(id);
+    // Counted, not read off the newest dispatch's label: the label restarts at
+    // zero when a run resumes, so a task dispatched 0,1,0 was tried three times
+    // and reporting its last label would say one.
+    const attempts = fact?.dispatches.length ?? 0;
+    return {
+      id: `task:${id}`,
+      taskId: id,
+      ...(fact?.state === undefined ? {} : { state: fact.state }),
+      ...(attempts === 0 ? {} : { attempts }),
+      ...(assignment === undefined ? {} : { actor: channelKey(assignment) }),
+      ...(lastTs === undefined ? {} : { lastEventTime: eventTime(lastTs) }),
+      ...(title === undefined ? {} : { title }),
+    };
+  });
+}
+
+/**
+ * One row per recorded gate result, newest first. The recorded details ride
+ * through untouched — the operator reads the reviewer's findings and the
+ * failing test names as the gate wrote them, never a rephrasing.
+ */
+function gateRows(events: readonly CaptureEvent[]): GateRow[] {
+  const rows = events.flatMap((event): GateRow[] => {
+    if (event.event !== "gate-result") return [];
+    const pass = typeof event.data.pass === "boolean" ? event.data.pass : undefined;
+    return [{
+      id: `gate:${event.line}`,
+      time: eventTime(event.ts),
+      state: pass === true ? "pass" : pass === false ? "fail" : "neutral",
+      ...(typeof event.data.gate === "string" ? { gate: event.data.gate } : {}),
+      ...(event.taskId === undefined ? {} : { taskId: event.taskId }),
+      ...(pass === undefined ? {} : { pass }),
+      ...(typeof event.data.details === "string" ? { details: event.data.details } : {}),
+    }];
+  });
+  return rows.reverse();
+}
+
+/** An `adapter:model` channel key back into its parts, or nothing if it is not one. */
+function splitChannelKey(
+  key: string,
+): { readonly adapter: string; readonly model: string } | undefined {
+  const separator = key.indexOf(":");
+  if (separator <= 0 || separator >= key.length - 1) return undefined;
+  return { adapter: key.slice(0, separator), model: key.slice(separator + 1) };
+}
+
+/**
+ * One row per channel the engagement recorded, in the order it first named
+ * them — starting with the roster it recorded at run-start, which is the whole
+ * fleet it could have dispatched to, then any channel a later event named that
+ * the roster did not. A channel it named without dispatching — a roster seat it
+ * never used, or the static choice a failover passed over — carries no dispatch
+ * count at all, because zero dispatches is something the engagement never
+ * measured, not a measurement of zero.
+ */
+function fleetRows(events: readonly CaptureEvent[]): FleetRow[] {
+  type Channel = {
+    adapter: string;
+    model: string;
+    dispatches: number;
+    lastTs: string;
+  };
+  const channels = new Map<string, Channel>();
+  const note = (
+    channel: { readonly adapter: string; readonly model: string },
+    ts: string,
+    dispatched: boolean,
+  ): void => {
+    const key = channelKey(channel);
+    const existing = channels.get(key)
+      ?? { adapter: channel.adapter, model: channel.model, dispatches: 0, lastTs: ts };
+    channels.set(key, {
+      ...existing,
+      dispatches: existing.dispatches + (dispatched ? 1 : 0),
+      lastTs: ts,
+    });
+  };
+
+  const noteKeys = (recorded: readonly unknown[], ts: string): void => {
+    for (const key of recorded) {
+      const channel = typeof key === "string" ? splitChannelKey(key) : undefined;
+      if (channel) note(channel, ts, false);
+    }
+  };
+
+  for (const event of events) {
+    if (event.event === "run-start" && Array.isArray(event.data.channels)) {
+      noteKeys(event.data.channels, event.ts);
+      continue;
+    }
+    if (event.event === "task-dispatch") {
+      const assignment = assignmentFrom(event.data.assignment);
+      if (assignment) note(assignment, event.ts, true);
+      continue;
+    }
+    if (event.event === "failover-deviation") {
+      noteKeys([event.data.static, event.data.chosen], event.ts);
+    }
+  }
+
+  return [...channels.entries()].map(([key, channel]) => ({
+    id: `channel:${key}`,
+    adapter: channel.adapter,
+    model: channel.model,
+    ...(channel.dispatches === 0 ? {} : { dispatches: channel.dispatches }),
+    lastEventTime: eventTime(channel.lastTs),
+  }));
+}
+
+/**
+ * The source identities the named view's rows carry, in draw order. Selection
+ * is repaired against these, so it follows a row across a refresh instead of
+ * following the index the row happened to occupy.
+ */
+export function runViewRowIdentities(
+  data: RunCockpitData,
+  viewId: RunViewId,
+  // ponytail: the filter is the journal's, as it has always been; the promoted
+  // views gain one when a criterion asks for it.
+  filterQuery = "",
+): readonly string[] {
+  if (viewId === "tasks") return data.taskRows.map((row) => row.id);
+  if (viewId === "gates") return data.gateRows.map((row) => row.id);
+  if (viewId === "fleet") return data.fleetRows.map((row) => row.id);
+  if (viewId !== "journal") return [];
+  const query = filterQuery.trim().toLowerCase();
+  return data.journalRows
+    .filter((row) => query === "" || row.text.toLowerCase().includes(query))
+    .map((row) => row.id);
 }
 
 function bucketedMetricSamples(events: readonly CaptureEvent[]): {
@@ -453,21 +711,40 @@ function bucketedMetricSamples(events: readonly CaptureEvent[]): {
   };
 }
 
-function tipVerificationPassed(events: readonly CaptureEvent[]): boolean {
-  const eventVerdicts = events.flatMap((event) => {
+// OBS-244: the strip reports the LATEST verification cycle, never the whole journal conjoined.
+// The daemon runs the integration-tip commands and appends `run-end` in one breath (daemon.ts
+// finishRun), so a cycle is the tip-verify events recorded since the previous run-end together
+// with the verdict on the run-end that closes them — a mid-run failure a later cycle recovered is
+// no longer permanent red. `undefined` means nothing was verified: drawn absent, never passed.
+// Fail-closed everywhere else — a cycle with no closing verdict, or a verdict with no events, is
+// a failure, because a claim tickmarkr cannot corroborate is not a pass.
+function tipVerificationPassed(
+  events: readonly CaptureEvent[],
+): boolean | undefined {
+  const runEnds = events.flatMap((event, index) =>
+    event.event === "run-end" ? [index] : []
+  );
+  const lastRunEnd = runEnds.at(-1);
+  const cycle = events.slice(
+    (runEnds.at(-2) ?? -1) + 1,
+    lastRunEnd === undefined ? events.length : lastRunEnd + 1,
+  );
+  const cycleVerdicts = cycle.flatMap((event) => {
     if (event.event === "tip-verify-failed") return [false];
     if (event.event === "tip-verify") return [event.data.pass === true];
     return [];
   });
-  const endVerdicts = events.flatMap((event) =>
-    event.event === "run-end" && typeof event.data.tipVerify === "string"
-      ? [event.data.tipVerify === "passed"]
-      : []
-  );
-  return eventVerdicts.length > 0
-    && endVerdicts.length > 0
-    && eventVerdicts.every(Boolean)
-    && endVerdicts.every(Boolean);
+  const closing = lastRunEnd === undefined
+    ? undefined
+    : events[lastRunEnd]!.data.tipVerify;
+  const endVerdict = typeof closing === "string"
+    ? closing === "passed"
+    : undefined;
+
+  if (cycleVerdicts.length === 0 && endVerdict === undefined) return undefined;
+  return endVerdict === true
+    && cycleVerdicts.length > 0
+    && cycleVerdicts.every(Boolean);
 }
 
 export function deriveRunCockpitData(
@@ -535,8 +812,14 @@ export function deriveRunCockpitData(
       ? `${spotlight.id} · ${spotlight.phase} · attempt ${taskAttempt(spotlight)} · ${taskActor(spotlight)}`
       : "- · pending · attempt 1 · unassigned",
     journalRows: journalRows(events, tasks, defects, runStatus),
+    taskRows: taskRows(events, tasks, options.graph),
+    gateRows: gateRows(events),
+    fleetRows: fleetRows(events),
     statusItems: [
-      { state: tipPassed ? "pass" : "fail", text: `tip-verify ${tipPassed ? "passed" : "FAILED"}` },
+      {
+        state: tipPassed === undefined ? "neutral" : tipPassed ? "pass" : "fail",
+        text: `tip-verify ${tipPassed === undefined ? ABSENT_FIELD : tipPassed ? "passed" : "FAILED"}`,
+      },
       { state: "pass", text: `done ${done}` },
       { state: failed > 0 ? "fail" : "neutral", text: `failed ${failed}` },
       { state: human > 0 ? "warn" : "neutral", text: `human ${human}` },

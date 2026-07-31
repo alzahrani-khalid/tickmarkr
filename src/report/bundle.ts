@@ -10,7 +10,17 @@ import { redactSecrets } from "../run/redact.js";
 import { recordedEnvironment } from "./compare.js";
 
 // Bump when the packet shape changes in a way a future reader must branch on before parsing.
-export const BUNDLE_SCHEMA_VERSION = 1;
+// 2 (T11): gates gained `declined`, and `pass` narrowed from "the gate did not fail" to "the gate
+// ran and passed" — a schema-1 reader would read a decline as a plain failure.
+export const BUNDLE_SCHEMA_VERSION = 2;
+
+// T11: the one predicate every decline surface shares — the record, the text tickmark rate, the
+// comparison metrics and this packet must agree on what "never ran" means. Modern runs journal
+// `skipped: true`; runs from before that field carry the same decline only in the details prefix
+// ("skipped — complexity 4 < threshold 7"). The ^ anchor is load-bearing: a review that genuinely
+// ran can mention a skipped something mid-body, and that gate is a pass.
+export const gateDeclined = (data: Record<string, unknown>): boolean =>
+  data.skipped === true || /^skipped\b/.test(String(data.details ?? ""));
 
 // Plain-language known limits — the packet is a journal snapshot, not an unconditional proof.
 export const KNOWN_LIMITS: readonly string[] = [
@@ -32,7 +42,11 @@ export interface BundleJudgeCriterion {
 
 export interface BundleGateResult {
   gate: string;
+  /** true only when the gate actually ran and passed — a declined gate is never counted as passed. */
   pass: boolean;
+  /** T11: true when the gate declined to run (journaled skipped:true, e.g. review below its
+   * complexity threshold) — neither a pass nor a fail; the details carry the reason. */
+  declined?: boolean;
   details: string;
 }
 
@@ -167,9 +181,11 @@ export function buildProofBundle(runId: string, events: JournalEvent[]): ProofBu
     const judgeCriteria: BundleJudgeCriterion[] = [];
     for (const g of gateEvents) {
       const gate = typeof g.data.gate === "string" ? g.data.gate : "unknown";
-      const pass = g.data.pass === true;
+      // T11: a declined gate never ran — flagged declined, never a pass.
+      const declined = gateDeclined(g.data);
+      const pass = g.data.pass === true && !declined;
       const details = typeof g.data.details === "string" ? g.data.details : "";
-      gates.push({ gate, pass, details });
+      gates.push({ gate, pass, ...(declined ? { declined: true } : {}), details });
       if (gate === "acceptance") {
         for (const c of parseJudgeCriteria(g.data)) judgeCriteria.push(c);
       }

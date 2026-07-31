@@ -206,11 +206,14 @@ describe("native spec compiler", () => {
     for (const file of marked) {
       // OBS-97: pre-lint archives (read-only history, never amended) may trip the collectable-home
       // lint; that exact rejection is tolerated here — any other failure still fails this test.
+      // OBS-212/214: the task unit contract is a NEWER bar than most of these archives, which were
+      // authored when unordered tasks could share files and a task could carry any number of
+      // criteria. Same tolerance, same reason — these specs are history and are never re-run.
       try {
         expect(compileSource(join("specs", file)).spec.source).toBe("native");
       } catch (error) {
         expect(error).toBeInstanceOf(CompileError);
-        expect((error as Error).message).toMatch(/OBS-97/);
+        expect((error as Error).message).toMatch(/OBS-97|task unit contract/);
       }
     }
   });

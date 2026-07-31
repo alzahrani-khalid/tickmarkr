@@ -228,3 +228,101 @@ export function sourceScopeLints(
   }
   return [...newDirLints, ...lines];
 }
+
+// ── Task Unit Contract (OBS-212 / OBS-214) ────────────────────────────────────────────────────
+// These are ERRORS, not advisories. Everything above this line is a plan-time warning the author
+// may ignore; a graph that violates the rules below is not a graph the harness can run honestly.
+
+/** Max acceptance items per task. Consult-converged (copus/csol/cfable R2). */
+export const MAX_ACCEPTANCE_ITEMS = 6;
+/** Max files[] patterns per task. */
+export const MAX_FILES_PATTERNS = 8;
+
+/** Tasks reachable from `id` through deps (transitive). */
+function reachable(id: string, byId: Map<string, ReadonlyArray<string>>): Set<string> {
+  const seen = new Set<string>();
+  const stack = [...(byId.get(id) ?? [])];
+  while (stack.length) {
+    const next = stack.pop()!;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    stack.push(...(byId.get(next) ?? []));
+  }
+  return seen;
+}
+
+// Conservative overlap: identical patterns, or a glob that matches the other's literal path. Two
+// globs that merely COULD intersect are not flagged — false negatives are acceptable here, false
+// positives would reject legitimate graphs.
+function overlappingPatterns(a: ReadonlyArray<string>, b: ReadonlyArray<string>): string[] {
+  const hits = new Set<string>();
+  const isGlob = (p: string) => /[*?[\]{}]/.test(p);
+  for (const pa of a) {
+    for (const pb of b) {
+      if (pa === pb) { hits.add(pa); continue; }
+      if (isGlob(pa) && !isGlob(pb) && picomatch(pa)(pb)) hits.add(`${pb} ⊂ ${pa}`);
+      else if (isGlob(pb) && !isGlob(pa) && picomatch(pb)(pa)) hits.add(`${pa} ⊂ ${pb}`);
+    }
+  }
+  return [...hits].sort();
+}
+
+/**
+ * OBS-212: two tasks with no dependency path between them may run concurrently and are recreated
+ * onto a moving integration tip. If they write the same file, the graph's independence claim is
+ * false — and it comes due in the carry plumbing, which resets the task branch to the advanced tip
+ * and silently drops whatever will not cherry-pick. run-20260728-110135 lost 32 verified commits in
+ * two events that way (T2 17/17, T1 15/15), each after a sibling that shared its files merged.
+ */
+export function separabilityErrors(
+  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>,
+): string[] {
+  const byId = new Map(tasks.map((t) => [t.id, t.deps ?? []] as const));
+  const errors: string[] = [];
+  for (let i = 0; i < tasks.length; i++) {
+    for (let j = i + 1; j < tasks.length; j++) {
+      const a = tasks[i]!, b = tasks[j]!;
+      if (reachable(a.id, byId).has(b.id) || reachable(b.id, byId).has(a.id)) continue; // ordered
+      const shared = overlappingPatterns(a.files ?? [], b.files ?? []);
+      if (shared.length > 0) {
+        errors.push(
+          `${a.id} and ${b.id} both write ${shared.join(", ")} but neither depends on the other — `
+          + `add a dependency edge to order them, or split the shared path out. Concurrent tasks that `
+          + `write the same file are not independent, and the loser's committed work is silently `
+          + `dropped when the integration tip advances (OBS-212).`,
+        );
+      }
+    }
+  }
+  return errors;
+}
+
+/**
+ * OBS-214: a task too large to converge is not a task. T1 of v1.83 carried 8 acceptance items and a
+ * diff at the 130k cap; it took 28 dispatches and never passed review, while T3 (4 items) took 5.
+ */
+export function taskBudgetErrors(
+  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "acceptance">>,
+): string[] {
+  const errors: string[] = [];
+  for (const t of tasks) {
+    const items = t.acceptance?.length ?? 0;
+    if (items > MAX_ACCEPTANCE_ITEMS) {
+      errors.push(`${t.id} declares ${items} acceptance items (max ${MAX_ACCEPTANCE_ITEMS}) — split it. `
+        + `Every item is a thing one worker must satisfy at once and one reviewer must verify in one pass.`);
+    }
+    const files = t.files?.length ?? 0;
+    if (files > MAX_FILES_PATTERNS) {
+      errors.push(`${t.id} declares ${files} files[] patterns (max ${MAX_FILES_PATTERNS}) — split it. `
+        + `A wide write surface is what makes tasks collide and diffs exceed the review cap.`);
+    }
+  }
+  return errors;
+}
+
+/** Every Task Unit Contract violation in one pass, ready to throw. */
+export function taskUnitContractErrors(
+  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps" | "acceptance">>,
+): string[] {
+  return [...separabilityErrors(tasks), ...taskBudgetErrors(tasks)];
+}

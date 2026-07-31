@@ -50,7 +50,7 @@ usage: tickmarkr <command>
   profile       show learned routing profile (profile reset = forget history via cursor, keeps telemetry)
   ui            open the Fleet Studio TUI (full-screen tabbed cockpit)
   unlock        remove a stale/garbage run lock (refuses if the holder is alive)
-  approve <id> <task>  approve a parked human gate (--by <name> --reason <text>); takes effect on resume`;
+  approve <id> <task>  release a park (--uphold sides with the reviewer and funds a fixed attempt; --by <name> --reason <text>); takes effect on resume`;
 
 // pure, testable dispatcher: resolves a command, forwards argv, shapes the result — no side effects.
 // unknown/missing cmd → USAGE (exit 1 if a cmd was typed, 0 for bare `tickmarkr`); a handler throw becomes

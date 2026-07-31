@@ -549,6 +549,24 @@ export class HerdrDriver implements ExecutorDriver {
   // The narrator launches a perpetual shell watch, not an adapter-backed input interface. Keep
   // OBS-85's readiness + paste read-back and the historical single Enter, while worker/gate runs
   // continue through positive post-Enter evidence in submitVerifiedDelivery.
+  // OBS-201: liveness nudge — deliver one message into the live worker TUI through the exact
+  // pincer every dispatch uses (readiness stable-frame, type-without-Enter, read-back, C-u clear
+  // on corruption, verified submit), serialized on the deliveryQueue so it can never interleave
+  // with a concurrent dispatch's paste. Targets ONLY the pinned delivered pane: the pin exists so
+  // liveness cannot drift to a label rebound onto another pane (herdr.ts paneId contract) — if no
+  // pin exists the dispatch never verifiably landed, and nudging a resolved-by-label pane would
+  // reopen that hole. Best-effort: false on any failure, never a throw.
+  async nudge(slot: Slot, message: string): Promise<boolean> {
+    const pinned = this.deliveredPanes.get(slot);
+    if (!pinned) return false;
+    try {
+      await this.deliveryQueue(() => this.deliver(slot, message, pinned));
+      return true;
+    } catch {
+      return false; // the daemon journals worker-nudge-failed and falls back to the stall window
+    }
+  }
+
   private async deliverPersistentShellCommand(slot: Slot, cmd: string): Promise<void> {
     return this.deliveryQueue(async () => {
       const pane = await this.paneId(slot);

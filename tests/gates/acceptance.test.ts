@@ -7,7 +7,7 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq } from "../../src/adapters/types.js";
 import { acceptanceGate } from "../../src/gates/acceptance.js";
 import * as llm from "../../src/gates/llm.js";
-import { dewrapPaneVerdict, extractJson, runHeadless } from "../../src/gates/llm.js";
+import { dewrapPaneVerdict, extractJson, extractVerdictJson, runHeadless } from "../../src/gates/llm.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -87,6 +87,51 @@ describe("dewrapPaneVerdict (OBS-155)", () => {
 
   test("output with no verdict at all is left alone", () => {
     expect(dewrapPaneVerdict("just prose, no braces", NONCE)).toBe("just prose, no braces");
+  });
+});
+
+// OBS-209 regression. The fixture is the VERBATIM raw the review gate captured and scored
+// `malformed-verdict` on run-20260728-110135 T1 — kimi's verdict was a complete, nonce-bound
+// APPROVAL, but a bare `{` earlier in its own reasoning captured dewrap's findIndex scan, so the
+// real verdict below was unreachable and a passing review parked the task instead.
+describe("dewrapPaneVerdict — a decoy brace must not capture the scan (OBS-209)", () => {
+  const NONCE = "c9194ce4";
+  const capture = readFileSync(
+    join(import.meta.dirname, "../fixtures/k3-review-verdict/decoy-brace-01.txt"), "utf8",
+  );
+
+  test("the decoy is real: an earlier brace-start line precedes the verdict and cannot parse", () => {
+    // guard the fixture — if this shape is ever tidied away the regression stops being tested
+    const braceLines = capture.split("\n")
+      .map((line, i) => (line.trimStart().startsWith("{") ? i : -1)).filter((i) => i >= 0);
+    expect(braceLines.length).toBeGreaterThanOrEqual(2);
+    expect(capture.split("\n")[braceLines[0]!]!.trim()).toBe("{"); // the decoy: a lone brace
+    expect(capture).toContain(`TICKMARKR_EXIT_${NONCE}:0`);
+  });
+
+  test("the approval is recovered, so a passing review is no longer scored malformed", () => {
+    // the gate's own path is nonce-gated, and on the raw bytes it returns null — that null IS the
+    // defect: it became `malformed-verdict` and parked a task the reviewer had approved
+    expect(extractVerdictJson(capture, NONCE)).toBeNull();
+
+    const verdict = extractVerdictJson<{ approve: boolean; findings: { defer?: boolean }[] }>(
+      dewrapPaneVerdict(capture, NONCE), NONCE,
+    );
+    expect(verdict?.approve).toBe(true);
+    // both findings were minor and deferred — this verdict never justified a park
+    expect(verdict?.findings.every((f) => f.defer)).toBe(true);
+  });
+
+  test("nonce-binding is why an unrelated object in the transcript cannot pose as the verdict", () => {
+    // extractJson happily returns a package-deps blob the reviewer quoted mid-transcript; only the
+    // nonce-gated path rejects it. This is the property that makes de-wrapping safe to widen.
+    expect(extractJson(capture)).not.toBeNull();
+    expect(extractVerdictJson(capture, "deadbeef")).toBeNull();
+  });
+
+  test("fail-closed survives: a verdict this call did not ask for is still never reconstructed", () => {
+    expect(dewrapPaneVerdict(capture, "deadbeef")).toBe(capture);
+    expect(extractVerdictJson(dewrapPaneVerdict(capture, "deadbeef"), "deadbeef")).toBeNull();
   });
 });
 

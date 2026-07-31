@@ -14,6 +14,7 @@ import { describe, expect, test } from "vitest";
 import {
   BANNER,
   GLYPHS,
+  MARK_BITMAP,
   PLAIN_BANNER,
 } from "../../src/brand.js";
 import {
@@ -21,15 +22,41 @@ import {
   unifiedYamlDiff,
 } from "../../src/config/config.js";
 import { JournalRowPanel } from "../../src/tui/cockpit/components.js";
+import { approve } from "../../src/cli/commands/approve.js";
+import { Journal } from "../../src/run/journal.js";
 import {
+  applySetupDecisionsKey,
+  deriveParkedDecisions,
   deriveSetupCockpitData,
+  executeSetupDecision,
+  initialSetupDecisionsSession,
+  recordSetupDecisionOutcome,
   SetupCockpitFrame,
+  SetupDecisionsSurface,
+  type ParkedDecision,
+  type SetupDecisionCommand,
 } from "../../src/tui/cockpit/setup-cockpit.js";
+import { cellWidth } from "../../src/tui/cockpit/width.js";
 import { loadDemoCaptures } from "../../src/tui/cockpit/demo.js";
+import {
+  captureRendererOutput,
+  HEIGHT_TIER_BOUNDARIES,
+  regenerateGoldenFrames,
+  WIDTH_BAND_CASES,
+} from "../../src/tui/cockpit/capture.js";
+import {
+  deriveRunCockpitData,
+  RunCockpitFrame,
+} from "../../src/tui/cockpit/run-cockpit.js";
+import {
+  DECISIONS_TAB_HINT,
+  DECISIONS_TAB_TITLE,
+} from "../../src/tui/cockpit/views.js";
 import {
   applySetupPromptInput,
   initialSetupInteractionState,
   keybarEntries,
+  openingRunInteractionState,
   resolveSetupKeyBinding,
   SURFACE_KEY_BINDINGS,
   type SetupInteractionState,
@@ -262,13 +289,13 @@ describe("setup cockpit capture-backed surface", () => {
     expect(frame).toMatch(/\bsetup · step 2\/6\b/);
   });
 
-  test("test: the setup surface heads itself with the full four-line mark taken from the brand module, matching that module's constant for the colour mode in force rather than the compact lockup or art drawn in the surface", async () => {
+  test("test: the setup surface heads itself with the full ruled mark taken from the brand module, matching that module's constant for the colour mode in force rather than the compact lockup or art drawn in the surface", async () => {
     const { frame } = await loadFrame();
-    const fullMark = stripAnsi(BANNER).trimEnd();
+    const fullMark = stripAnsi(BANNER).replace(/[ \t]+$/gm, "").trimEnd();
 
     expect(fullMark).toBe(PLAIN_BANNER.trimEnd());
-    expect(fullMark.split("\n")).toHaveLength(4);
-    for (const line of fullMark.split("\n")) expect(frame).toContain(line);
+    expect(fullMark.split("\n")).toHaveLength(MARK_BITMAP.length / 2 - 1);
+    for (const line of fullMark.split("\n")) expect(frame).toContain(line.trimEnd());
   });
 
   test("test: each detected harness renders its state as a glyph together with a word, and a denied channel renders its reason inline", async () => {
@@ -509,5 +536,496 @@ describe("setup cockpit capture-backed surface", () => {
     expect(source).toContain("JournalRowPanel");
     expect(source.match(/JournalRowPanel/g)?.length).toBe(2);
     expect(source).not.toMatch(/function\s+\w*Journal\w*Panel/);
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* The setup tab's decisions surface: parked rows, confirm, the one write.   */
+/* ------------------------------------------------------------------------ */
+
+const DECISION_ASSIGNMENT = {
+  adapter: "fake",
+  model: "fake-1",
+  channel: "sub",
+  tier: "frontier",
+} as const;
+
+function decisionsRepo(runId: string): { root: string; journalPath: string } {
+  const root = mkdtempSync(join(tmpdir(), "tickmarkr-setup-decisions-"));
+  return { root, journalPath: join(root, ".tickmarkr", "runs", runId, "journal.jsonl") };
+}
+
+function parkOnReview(journal: Journal, taskId: string): void {
+  journal.append("task-dispatch", taskId, { assignment: DECISION_ASSIGNMENT, attempt: 0 });
+  journal.append("gate-result", taskId, {
+    gate: "review",
+    pass: false,
+    details: "requested changes",
+  });
+  journal.append("task-human", taskId, {
+    kind: "gate-fail",
+    reason: "review round cap reached this engagement",
+  });
+}
+
+function journalEvents(journalPath: string): {
+  event: string;
+  taskId?: string;
+  data: Record<string, unknown>;
+}[] {
+  return readFileSync(journalPath, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line));
+}
+
+async function drawDecisions(
+  decisions: readonly ParkedDecision[],
+  session = initialSetupDecisionsSession(),
+  columns = 140,
+  journalFile = ".tickmarkr/runs/run-decisions/journal.jsonl",
+): Promise<string> {
+  return renderComponent(createElement(SetupDecisionsSurface, {
+    decisions,
+    session,
+    columns,
+    actor: "operator",
+    journalFile,
+  }), columns);
+}
+
+describe("setup tab decisions surface", () => {
+  test("test: the decisions section draws one row per parked task from the journal and a truthful empty state when nothing is parked, and setup-cockpit.tsx measures those rows through the width module alone, so a task name carrying a ZWJ grapheme neither overflows the row nor truncates mid-cluster", async () => {
+    const { root } = decisionsRepo("run-decisions-rows");
+    const journal = Journal.create(root, "run-decisions-rows");
+    parkOnReview(journal, "T1");
+    journal.append("task-dispatch", "T2", { assignment: DECISION_ASSIGNMENT, attempt: 0 });
+    journal.append("task-human", "T2", { kind: "attempt-cap" });
+    journal.append("task-dispatch", "T3", { assignment: DECISION_ASSIGNMENT, attempt: 0 });
+    journal.append("task-done", "T3", { attempts: 1 });
+
+    const decisions = deriveParkedDecisions(Journal.open(root, "run-decisions-rows"));
+    expect(decisions.map((decision) => decision.taskId)).toEqual(["T1", "T2"]);
+
+    const frame = await drawDecisions(decisions);
+    expect(frame).toContain("DECISIONS · 2 parked");
+    // one row per parked task: two pointer-column rows, and the done task owns none
+    expect(frame).toContain("T1 · gate-fail");
+    expect(frame).toContain("T2 · attempt-cap");
+    expect(frame).not.toContain("T3 ·");
+    // a surface that can write advertises only what it has: both verbs, named
+    // (the selected row is T1, a review park, where uphold exists)
+    expect(frame).toContain("a Approve · u Uphold");
+
+    // On a park whose last failed gate is not review the command must refuse
+    // uphold, so the verb leaves the keybar and the key is inert.
+    const moved = applySetupDecisionsKey(
+      initialSetupDecisionsSession(),
+      { input: "", key: { downArrow: true } },
+      decisions,
+    );
+    expect(moved.session.selection).toBe(1);
+    expect(decisions[1]!.failedGate).toBeUndefined();
+    const movedFrame = await drawDecisions(decisions, moved.session);
+    expect(movedFrame).toContain("a Approve");
+    expect(movedFrame).not.toContain("Uphold");
+    const upheld = applySetupDecisionsKey(moved.session, { input: "u", key: {} }, decisions);
+    expect(upheld.session.confirming).toBeNull();
+    expect(upheld.command).toBeUndefined();
+
+    const empty = Journal.create(root, "run-decisions-empty");
+    empty.append("run-start", undefined, { graphDefinitionHash: "abc" });
+    const noDecisions = deriveParkedDecisions(Journal.open(root, "run-decisions-empty"));
+    expect(noDecisions).toEqual([]);
+    const emptyFrame = await drawDecisions(noDecisions);
+    expect(emptyFrame).toContain("DECISIONS · 0 parked");
+    expect(emptyFrame).toContain("nothing needs you now");
+    // nothing parked ⇒ the write KEYS are not advertised, however the empty
+    // state describes the two decisions a future park would carry
+    expect(emptyFrame).not.toContain("a Approve");
+    expect(emptyFrame).not.toContain("u Uphold");
+
+    // Rows are measured through the width module alone: a task name carrying a
+    // ZWJ grapheme is drawn whole or dropped whole, and no line overflows.
+    const source = readFileSync(
+      join(import.meta.dirname, "../../src/tui/cockpit/setup-cockpit.tsx"),
+      "utf8",
+    );
+    expect(source).toMatch(/import \{ fitCells \} from "\.\/width\.js"/);
+    const zwj = "👨‍👩‍👧";
+    const zwjTask = `T-wider-than-the-row-${zwj}`;
+    const zwjJournal = Journal.create(root, "run-decisions-zwj");
+    parkOnReview(zwjJournal, zwjTask);
+    const zwjDecisions = deriveParkedDecisions(Journal.open(root, "run-decisions-zwj"));
+    for (const columns of [24, 120]) {
+      const zwjFrame = await drawDecisions(zwjDecisions, initialSetupDecisionsSession(), columns);
+      for (const line of zwjFrame.split("\n")) {
+        expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+      }
+      expect(zwjFrame.includes("👨")).toBe(zwjFrame.includes(zwjTask));
+    }
+    expect((await drawDecisions(zwjDecisions, initialSetupDecisionsSession(), 24)).includes(zwj)).toBe(false);
+    expect((await drawDecisions(zwjDecisions, initialSetupDecisionsSession(), 120)).includes(zwjTask)).toBe(true);
+  });
+
+  test("test: the approve key on a parked row opens a confirm inset naming the task, the actor, the file and the effect, and the journal file stays byte-identical until the confirm key", async () => {
+    const { root, journalPath } = decisionsRepo("run-decisions-confirm");
+    parkOnReview(Journal.create(root, "run-decisions-confirm"), "T4");
+    const journalFile = ".tickmarkr/runs/run-decisions-confirm/journal.jsonl";
+    const decisions = deriveParkedDecisions(Journal.open(root, "run-decisions-confirm"));
+
+    const before = readFileSync(journalPath, "utf8");
+    const opened = applySetupDecisionsKey(
+      initialSetupDecisionsSession(),
+      { input: "a", key: {} },
+      decisions,
+    );
+    expect(opened.command).toBeUndefined();
+    expect(opened.session.confirming).toEqual({ verb: "approve", taskId: "T4" });
+
+    const frame = await drawDecisions(decisions, opened.session, 140, journalFile);
+    expect(frame).toContain("CONFIRM APPROVE");
+    expect(frame).toContain("task   T4");
+    expect(frame).toContain("actor  operator");
+    expect(frame).toContain(`file   ${journalFile}`);
+    expect(frame).toContain("y approve · n cancel");
+    expect(readFileSync(journalPath, "utf8")).toBe(before);
+
+    // Even the confirm key itself only names the write; nothing touches the file.
+    const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
+    expect(confirmed.command).toEqual({ verb: "approve", taskId: "T4" });
+    expect(confirmed.session.confirming).toBeNull();
+    expect(readFileSync(journalPath, "utf8")).toBe(before);
+
+    // The inset's stated effect is checked against the write it names, not
+    // against itself: confirm for real and read back what the journal gained.
+    const outcome = await executeSetupDecision(
+      confirmed.command as SetupDecisionCommand,
+      { cwd: root, runId: "run-decisions-confirm", by: "operator" },
+    );
+    expect(outcome.ok).toBe(true);
+    const recorded = journalEvents(journalPath).find(
+      (event) => event.event === "task-approved" && event.taskId === "T4",
+    );
+    expect(recorded).toBeDefined();
+    // this park is gate-fail on review: the write satisfies the gate, and the
+    // inset said so — never the opposite
+    expect(recorded!.data.release).toBe("gate-satisfied");
+    expect(recorded!.data.gate).toBe("review");
+    expect(frame).toContain(
+      `effect appends one task-approved event with release ${String(recorded!.data.release)}`
+        + ` for gate ${String(recorded!.data.gate)}`,
+    );
+    expect(frame).toContain(`it marks gate ${String(recorded!.data.gate)} satisfied`);
+    expect(frame).not.toContain("does NOT mark the task done or pass any gate");
+  });
+
+  test("test: confirming appends the approval to the journal file, verified by reading the file back and finding the recorded release, and a refusal from the command renders on the surface as the exact string the command produced", async () => {
+    const { root, journalPath } = decisionsRepo("run-decisions-approve");
+    parkOnReview(Journal.create(root, "run-decisions-approve"), "T4");
+    const journalFile = ".tickmarkr/runs/run-decisions-approve/journal.jsonl";
+    const decisions = deriveParkedDecisions(Journal.open(root, "run-decisions-approve"));
+    const opened = applySetupDecisionsKey(
+      initialSetupDecisionsSession(),
+      { input: "a", key: {} },
+      decisions,
+    );
+    const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
+    const command = confirmed.command as SetupDecisionCommand;
+
+    const outcome = await executeSetupDecision(command, { cwd: root, runId: "run-decisions-approve", by: "operator" });
+    expect(outcome.ok).toBe(true);
+    // read the file back: the recorded release is there
+    const approvals = journalEvents(journalPath).filter(
+      (event) => event.event === "task-approved" && event.taskId === "T4",
+    );
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]!.data.release).toBe("gate-satisfied");
+    expect(approvals[0]!.data.by).toBe("operator");
+    if (outcome.ok) expect(outcome.write.release).toBe("gate-satisfied");
+
+    const written = recordSetupDecisionOutcome(initialSetupDecisionsSession(), outcome);
+    const writtenFrame = await drawDecisions(decisions, written, 140, journalFile);
+    if (outcome.ok) expect(writtenFrame).toContain(outcome.message);
+
+    // the second approve is refused by the production command; the surface draws
+    // the command's own string, exactly
+    const expected = await approve(["run-decisions-approve", "T4", "--by", "operator"], root)
+      .then(
+        () => {
+          throw new Error("expected the command to refuse");
+        },
+        (error: Error) => error.message,
+      );
+    const refusal = await executeSetupDecision(command, { cwd: root, runId: "run-decisions-approve", by: "operator" });
+    expect(refusal.ok).toBe(false);
+    if (!refusal.ok) expect(refusal.refusal).toBe(expected);
+    const refused = recordSetupDecisionOutcome(written, refusal);
+    const refusedFrame = await drawDecisions(decisions, refused, 140, journalFile);
+    expect(refusedFrame).toContain(expected);
+    // the refusal appended nothing
+    expect(
+      journalEvents(journalPath).filter(
+        (event) => event.event === "task-approved" && event.taskId === "T4",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("test: the uphold key appends the uphold release to the journal file the same way, verified by reading the file back, and the pending writes region draws what the file gained this session", async () => {
+    const { root, journalPath } = decisionsRepo("run-decisions-uphold");
+    parkOnReview(Journal.create(root, "run-decisions-uphold"), "T7");
+    const journalFile = ".tickmarkr/runs/run-decisions-uphold/journal.jsonl";
+    const decisions = deriveParkedDecisions(Journal.open(root, "run-decisions-uphold"));
+
+    const opened = applySetupDecisionsKey(
+      initialSetupDecisionsSession(),
+      { input: "u", key: {} },
+      decisions,
+    );
+    expect(opened.session.confirming).toEqual({ verb: "uphold", taskId: "T7" });
+    const confirmFrame = await drawDecisions(decisions, opened.session, 140, journalFile);
+    expect(confirmFrame).toContain("CONFIRM UPHOLD");
+    expect(confirmFrame).toContain("release review-upheld");
+
+    const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
+    const outcome = await executeSetupDecision(
+      confirmed.command as SetupDecisionCommand,
+      { cwd: root, runId: "run-decisions-uphold", by: "operator" },
+    );
+    expect(outcome.ok).toBe(true);
+
+    const approvals = journalEvents(journalPath).filter(
+      (event) => event.event === "task-approved" && event.taskId === "T7",
+    );
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]!.data.release).toBe("review-upheld");
+    // the inset promised exactly the release the file gained
+    expect(confirmFrame).toContain(`release ${String(approvals[0]!.data.release)}`);
+
+    const session = recordSetupDecisionOutcome(initialSetupDecisionsSession(), outcome);
+    expect(session.writes).toHaveLength(1);
+    const frame = await drawDecisions(decisions, session, 140, journalFile);
+    expect(frame).toContain("PENDING WRITES");
+    expect(frame).toContain("uphold T7 · release review-upheld · by operator");
+    expect(frame).not.toContain("nothing written this session");
+  });
+
+  test("test: with no actionable park, the decisions section draws the empty state naming approve and uphold and that nothing needs the operator", async () => {
+    const { root } = decisionsRepo("run-decisions-quiet");
+    const quiet = Journal.create(root, "run-decisions-quiet");
+    quiet.append("run-start", undefined, { graphDefinitionHash: "abc" });
+    quiet.append("task-dispatch", "T1", { assignment: DECISION_ASSIGNMENT, attempt: 0 });
+    quiet.append("task-done", "T1", { attempts: 1 });
+    const none = deriveParkedDecisions(Journal.open(root, "run-decisions-quiet"));
+    expect(none).toEqual([]);
+
+    const quietFrame = await drawDecisions(none);
+    expect(quietFrame).toContain("nothing needs you now — no task is parked on a human gate");
+    expect(quietFrame).toContain("approve releases it");
+    expect(quietFrame).toContain("uphold sides with the reviewer");
+
+    // "no ACTIONABLE park" is the trigger, not "no park": a journal holding
+    // only tombstone parks is still a surface nothing needs the operator for.
+    const tombstoned = Journal.create(root, "run-decisions-quiet-tombstone");
+    tombstoned.append("task-human", "T13", {
+      kind: "human-gate",
+      reason: 'humanGate: "SUPERSEDED BY T14 — tombstone, never dispatched"'
+        + " requires approval before dispatch",
+    });
+    const onlyTombstones = deriveParkedDecisions(
+      Journal.open(root, "run-decisions-quiet-tombstone"),
+    );
+    expect(onlyTombstones.map((decision) => decision.tombstone)).toEqual([true]);
+    const tombstoneFrame = await drawDecisions(onlyTombstones);
+    expect(tombstoneFrame).toContain("nothing needs you now — no task is parked on a human gate");
+    expect(tombstoneFrame).toContain("approve releases it");
+    expect(tombstoneFrame).toContain("uphold sides with the reviewer");
+
+    // an actionable park displaces the empty state rather than joining it
+    const parked = Journal.create(root, "run-decisions-quiet-parked");
+    parkOnReview(parked, "T2");
+    const actionable = deriveParkedDecisions(
+      Journal.open(root, "run-decisions-quiet-parked"),
+    );
+    const busyFrame = await drawDecisions(actionable);
+    expect(busyFrame).toContain("T2 · gate-fail");
+    expect(busyFrame).not.toContain("nothing needs you now");
+  });
+
+  test("test: a tombstone park draws as read-only with no live verb, while an actionable park draws its approve and uphold verbs", async () => {
+    const { root, journalPath } = decisionsRepo("run-decisions-tombstone");
+    const journal = Journal.create(root, "run-decisions-tombstone");
+    journal.append("task-human", "T13", {
+      kind: "human-gate",
+      reason: 'humanGate: "SUPERSEDED BY T14+T15+T16 — tombstone, never dispatched"'
+        + " requires approval before dispatch",
+    });
+    parkOnReview(journal, "T14");
+
+    const decisions = deriveParkedDecisions(Journal.open(root, "run-decisions-tombstone"));
+    expect(decisions.map((decision) => [decision.taskId, decision.tombstone])).toEqual([
+      ["T13", true],
+      ["T14", false],
+    ]);
+
+    const frame = await drawDecisions(decisions);
+    // both parks are drawn — the roster stays honest about what the journal holds
+    expect(frame).toContain("T13 · human-gate");
+    expect(frame).toContain("T14 · gate-fail");
+    // the tombstone row says what it is, and carries neither pointer nor verb
+    const tombstoneRow = frame.split("\n").find((line) => line.includes("T13 ·"))!;
+    expect(tombstoneRow).toContain("read-only · permanent by design");
+    expect(tombstoneRow).not.toContain(GLYPHS.pointer);
+    // the pointer and both verbs belong to the actionable park instead
+    const actionableRow = frame.split("\n").find((line) => line.includes("T14 ·"))!;
+    expect(actionableRow).toContain(GLYPHS.pointer);
+    expect(frame).toContain("a Approve · u Uphold");
+
+    // no key reaches the tombstone: the pointer cannot move onto it, and the
+    // verbs name the actionable park no matter how far the pointer is pushed
+    let session = initialSetupDecisionsSession();
+    for (let press = 0; press < 4; press += 1) {
+      session = applySetupDecisionsKey(
+        session,
+        { input: "", key: { downArrow: true } },
+        decisions,
+      ).session;
+    }
+    const before = readFileSync(journalPath, "utf8");
+    for (const verb of ["a", "u"] as const) {
+      const named = applySetupDecisionsKey(session, { input: verb, key: {} }, decisions);
+      expect(named.session.confirming?.taskId).toBe("T14");
+      const confirmed = applySetupDecisionsKey(
+        named.session,
+        { input: "y", key: {} },
+        decisions,
+      );
+      expect(confirmed.command?.taskId).toBe("T14");
+    }
+    expect(readFileSync(journalPath, "utf8")).toBe(before);
+
+    // and the production command agrees: it refuses the tombstone's id outright
+    await expect(
+      approve(["run-decisions-tombstone", "T13", "--uphold", "--by", "operator"], root),
+    ).rejects.toThrow(/--uphold applies to a review rejection/);
+  });
+
+  test("test: cancelling the confirm leaves the journal byte-identical, asserted on the file", async () => {
+    const { root, journalPath } = decisionsRepo("run-decisions-cancel");
+    parkOnReview(Journal.create(root, "run-decisions-cancel"), "T5");
+    const decisions = deriveParkedDecisions(Journal.open(root, "run-decisions-cancel"));
+
+    const before = readFileSync(journalPath, "utf8");
+    const opened = applySetupDecisionsKey(
+      initialSetupDecisionsSession(),
+      { input: "a", key: {} },
+      decisions,
+    );
+    expect(opened.session.confirming).not.toBeNull();
+
+    const cancelled = applySetupDecisionsKey(opened.session, { input: "n", key: {} }, decisions);
+    expect(cancelled.command).toBeUndefined();
+    expect(cancelled.session.confirming).toBeNull();
+    expect(readFileSync(journalPath, "utf8")).toBe(before);
+
+    const reopened = applySetupDecisionsKey(cancelled.session, { input: "u", key: {} }, decisions);
+    const escaped = applySetupDecisionsKey(reopened.session, { input: "", key: { escape: true } }, decisions);
+    expect(escaped.command).toBeUndefined();
+    expect(escaped.session.confirming).toBeNull();
+    expect(readFileSync(journalPath, "utf8")).toBe(before);
+  });
+});
+
+/**
+ * The tab's own name, drawn. The operator's v1.83 UAT read "Setup" as
+ * configuration; these assert on rendered bytes at every contracted size, so
+ * the rename is proved where an operator would read it rather than in source.
+ */
+describe("the decisions tab's drawn name", () => {
+  const CAPTURES = loadDemoCaptures();
+  const RUN_SOURCE = CAPTURES.journals.find((capture) =>
+    capture.fileName === "run-20260724-231138.journal.jsonl"
+  )!;
+  /** The word wherever it is drawn, in either case the surface uses. */
+  const SETUP_LABEL = /\bSetup\b|\bSETUP\b/u;
+
+  const drawTab = (
+    tab: "watch" | "setup",
+    columns: number,
+    rows: number,
+  ): Promise<string> =>
+    captureRendererOutput(
+      createElement(RunCockpitFrame, {
+        data: deriveRunCockpitData(RUN_SOURCE, "9.8.7"),
+        columns,
+        rows,
+        interaction: openingRunInteractionState(tab),
+      }),
+      { columns, rows, colour: false },
+    );
+
+  test("test: the decisions surface draws DECISIONS in its header and the tab hint, and no drawn frame of the decisions tab shows the label Setup", async () => {
+    expect(DECISIONS_TAB_TITLE).toBe("DECISIONS");
+    expect(DECISIONS_TAB_HINT).toBe("Decisions");
+
+    // The header marks the tab it draws, from the constant, and the panel under
+    // it titles itself with the same word — two lines carry the name, no more.
+    const decisions = stripAnsi(await drawTab("setup", 140, 24));
+    expect(decisions).toContain(`[ ${DECISIONS_TAB_TITLE} ]`);
+    expect(decisions.split("\n").filter((line) => line.includes(DECISIONS_TAB_TITLE)))
+      .toHaveLength(2);
+    // And it names the tab Tab draws next, which from here is the watch tab.
+    expect(decisions).toContain("Tab Watch");
+
+    // The tab strip names it from the watch side too, in the same bytes.
+    const watch = stripAnsi(await drawTab("watch", 140, 24));
+    expect(watch).toContain(`[ WATCH ]   ${DECISIONS_TAB_TITLE}`);
+
+    // The surface's own tab hint — what the tab is and what it may write —
+    // carries the name in the keybar's case, from the same pair of constants.
+    const section = stripAnsi(await drawDecisions([]));
+    expect(section).toContain(`${DECISIONS_TAB_TITLE} · 0 parked`);
+    expect(section).toContain(`tab ${DECISIONS_TAB_HINT} · `);
+    expect(section).not.toMatch(SETUP_LABEL);
+
+    // And nowhere the decisions tab draws, at any contracted size, does the old
+    // label survive — not in the header, the rail, the body or the keybar.
+    for (const { columns } of WIDTH_BAND_CASES) {
+      for (const rows of HEIGHT_TIER_BOUNDARIES) {
+        const frame = stripAnsi(await drawTab("setup", columns, rows));
+        const offenders = frame.split("\n").filter((line) => SETUP_LABEL.test(line));
+
+        expect(offenders, `decisions tab at ${columns}x${rows}`).toEqual([]);
+        expect(frame, `decisions tab at ${columns}x${rows}`)
+          .toMatch(new RegExp(DECISIONS_TAB_TITLE, "u"));
+      }
+    }
+  });
+
+  test("test: the machine-surface anchors byte-match what the renderer draws with the DECISIONS label, so the frozen tier is current", async () => {
+    const anchors = join(import.meta.dirname, "../fixtures/cockpit/anchors");
+    const generated = await regenerateGoldenFrames();
+
+    // The renderer the tier is frozen against is the renamed one: the tab strip
+    // it draws today carries DECISIONS, from whichever tab is in front.
+    for (const tab of ["watch", "setup"] as const) {
+      expect(stripAnsi(await drawTab(tab, 140, 24)), tab)
+        .toContain(DECISIONS_TAB_TITLE);
+    }
+
+    for (
+      const fixture of ["run.ci.140x24.txt", "run.non-tty.140x24.txt"] as const
+    ) {
+      const rendered = generated.find((frame) => frame.fixture === fixture);
+      if (!rendered) throw new Error(`the manifest drew no ${fixture}`);
+      const frozen = readFileSync(join(anchors, fixture), "utf8");
+
+      // Current to the last byte, keys line included — nothing here is exempted
+      // or normalised, so the tier falling behind the renamed renderer fails
+      // here rather than being absorbed.
+      expect(frozen, fixture).toBe(rendered.output);
+      expect(frozen.split("\n").at(-2), `${fixture} keys line`)
+        .toBe(rendered.output.split("\n").at(-2));
+    }
   });
 });

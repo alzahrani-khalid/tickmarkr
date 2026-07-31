@@ -3,7 +3,7 @@ import { channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
 import { DEFAULT_DIFF_CAP } from "../config/config.js";
 import { renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { sh } from "../run/git.js";
-import { checkDiffCap, fetchTaskDiff } from "./review.js";
+import { checkDiffCap, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 
@@ -188,19 +188,48 @@ function compressLines(lines: number[]): string {
   return parts.join(", ");
 }
 
+const DIFF_SECTIONS = /(?=^diff --git )/m;
+
+// the a-side path of a whole-file deletion section, or null if this section is not one.
+function deletedPath(section: string): string | null {
+  if (!/^deleted file mode /m.test(section)) return null;
+  const oldPath = /^--- (.+)$/m.exec(section)?.[1]
+    ?? /^Binary files (.+) and \/dev\/null differ$/m.exec(section)?.[1];
+  if (!oldPath || oldPath === "/dev/null") return null;
+  const unquoted = oldPath.startsWith('"') && oldPath.endsWith('"') ? oldPath.slice(1, -1) : oldPath;
+  return unquoted.replace(/^a\//, "");
+}
+
 // OBS-134: whole-file deletions are already fully described by their path. Sending every removed line
 // spends the cap and judge context on content that cannot exist after the change. Added and modified
 // sections pass through byte-for-byte, so their anti-flooding budget is unchanged.
+// v1.82 T1 clause 5: two exemptions, because this filter triggers on the very `deleted file mode` line
+// the set-aside preserves. Protected evidence (the frozen anchors, the captured journals) bypasses the
+// collapse so its deletion half reaches the measured text and the judge complete; and a section already
+// set aside is never reduced a second time, or this filter would erase the receipt that replaced it.
 function judgeRelevantDiff(diff: string): string {
-  return diff.split(/(?=^diff --git )/m).map((section) => {
-    if (!/^deleted file mode /m.test(section)) return section;
-    const oldPath = /^--- (.+)$/m.exec(section)?.[1]
-      ?? /^Binary files (.+) and \/dev\/null differ$/m.exec(section)?.[1];
-    if (!oldPath || oldPath === "/dev/null") return section;
-    const unquoted = oldPath.startsWith('"') && oldPath.endsWith('"') ? oldPath.slice(1, -1) : oldPath;
-    const path = unquoted.replace(/^a\//, "");
+  return diff.split(DIFF_SECTIONS).map((section) => {
+    if (setAsideReceiptPath(section)) return section;
+    const path = deletedPath(section);
+    if (!path || isProtectedEvidence(path)) return section;
     return `deleted file: ${path}\n`;
   }).join("");
+}
+
+// v1.82 T1 clause 7: the two shapes this task creates carry no changed hunk, so a judge asked to cite a
+// changed line has nothing to cite — three review rounds died here. Each yields ONE citable operation
+// fact, `{path, line: 0}`, read back from the judged text itself. Only these RECORDED facts make line 0
+// citable; a zero line on any other path is still rejected as fabricated. Ordinary whole-file deletions
+// stay uncitable deliberately: the relevance filter collapses them before this runs, and repairing that
+// pre-existing limitation is outside this contract.
+const OPERATION_FACT_LINE = 0;
+function operationFactPaths(diff: string): string[] {
+  return diff.split(DIFF_SECTIONS).flatMap((section) => {
+    const receipt = setAsideReceiptPath(section);
+    if (receipt) return [receipt];
+    const path = deletedPath(section);
+    return path && isProtectedEvidence(path) ? [path] : [];
+  });
 }
 
 // A citation is valid evidence iff the cited line falls inside a changed hunk of the cited file (OBS-129:
@@ -282,6 +311,13 @@ export async function acceptanceGate(
   // OBS-129: give the judge the exact citable new-file line numbers per changed file, so it grounds each
   // citation in a real changed line instead of miscounting. Validated below against this same `changed`.
   const changed = changedLinesByFile(diff);
+  // clause 7: fold the recorded operation facts into the same index the validator checks, so a change
+  // made only of set-aside captures or removed protected evidence still yields citable evidence.
+  for (const path of operationFactPaths(diff)) {
+    let set = changed.get(path);
+    if (!set) { set = new Set(); changed.set(path, set); }
+    set.add(OPERATION_FACT_LINE);
+  }
   const citable = [...changed.entries()].map(([p, set]) => `- ${p}: ${compressLines([...set])}`).join("\n");
   const nonce = generateVerdictNonce();
   const prompt = `TICKMARKR-JUDGE
@@ -304,6 +340,9 @@ ${diff}
 
 ## Citable evidence lines (new-file line numbers inside the changed hunks above)
 ${citable || "(the diff changes no lines)"}
+Line 0 is a recorded file-operation fact, not a hunk line: the diff states what happened to that file
+(a set-aside regenerable capture, or a removed protected file) without carrying its content. Cite it as
+{"path": "<that path>", "line": 0} when a criterion is about that file.
 
 ${verdictNonceLine(nonce)}
 

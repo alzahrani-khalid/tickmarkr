@@ -1,6 +1,13 @@
 const NON_TTY_MSG =
   "tickmarkr ui: the cockpit requires a TTY — use `tickmarkr fleet --print` or `tickmarkr status --watch` for line-mode output";
 
+/**
+ * The setup surface's own flag. `tickmarkr ui --setup [run-id]` opens the one
+ * surface that writes — parked human decisions, approved or upheld through the
+ * production command path behind an explicit confirm.
+ */
+const SETUP_FLAG = "--setup";
+
 type StudioIO = {
   input: NodeJS.ReadStream;
   output: NodeJS.WriteStream;
@@ -29,7 +36,8 @@ export async function ui(
     return "ui: closed";
   }
 
-  const unknownFlag = argv.find((arg) => arg.startsWith("-"));
+  const setup = argv.includes(SETUP_FLAG);
+  const unknownFlag = argv.find((arg) => arg.startsWith("-") && arg !== SETUP_FLAG);
   if (unknownFlag) {
     return { out: `tickmarkr ui: unknown flag ${unknownFlag}`, code: 1 };
   }
@@ -61,6 +69,12 @@ export async function ui(
       out: `tickmarkr ui: cannot read engagement ${runId}: ${(error as Error).message}`,
       code: 1,
     };
+  }
+
+  if (setup) {
+    const { runSetupDecisionsCockpit } = await import("../../tui/cockpit/setup-cockpit.js");
+    await runSetupDecisionsCockpit({ input, output, cwd, runId });
+    return "ui: closed";
   }
 
   await live.runLiveCockpit({ input, output, cwd, runId, binaryVersion });

@@ -144,6 +144,14 @@ export interface ExecutorDriver {
   // via `pane send-keys`. The daemon auto-answers a fingerprint-matched trust dialog once per slot
   // only when this is present; any other blocked dialog still pages the operator.
   sendKey?(slot: Slot, key: string): Promise<void>;
+  // OBS-201: one latched liveness nudge into a live worker TUI — the daemon's ACTIVE response to an
+  // idle pane holding no trailer (the passive stall window burned 289 min in one day). Optional —
+  // subprocess workers are headless and cannot be nudged; herdr routes it through the SAME
+  // verified-delivery pincer as dispatch (OBS-85 readiness/read-back, OBS-140 verified submit) at
+  // the PINNED delivered pane, never a fresh label resolution. Returns delivered-or-not; a false
+  // or a throw are the same to the caller (journal + fall back to the window). Best-effort by
+  // contract: a nudge must never fail a run.
+  nudge?(slot: Slot, message: string): Promise<boolean>;
   notify(msg: string, opts?: NotifyOpts): Promise<void>;
   close(slot: Slot): Promise<void>;
   worktree(repo: string, branch: string, baseRef: string): Promise<string>;

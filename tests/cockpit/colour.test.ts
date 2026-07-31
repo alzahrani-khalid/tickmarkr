@@ -25,6 +25,13 @@ const LAYOUT_FIXTURES = join(
   import.meta.dirname,
   "../fixtures/cockpit/frames",
 );
+/**
+ * The committed capture corpus. Not a colour case — read here only for the one
+ * source in the repository that RECORDS a failure the renderer still draws, so
+ * the reserved failure ink keeps a genuine failure behind it.
+ */
+const CAPTURE_SOURCES = join(import.meta.dirname, "../fixtures/cockpit/sources");
+const RECOVERED_CAPTURE = "run-20260724-194619.journal.jsonl";
 const CAPTURE_SOURCE = join(
   import.meta.dirname,
   "../../src/tui/cockpit/capture.ts",
@@ -152,13 +159,31 @@ function assertHealthyInkContract(frame: string): void {
   expect(inkIndexes(frame)).not.toContain(FAILURE_INK);
 }
 
-function assertWarningFailureInkContract(frame: string): void {
-  assertOnlyApprovedInks(frame);
-  const plain = frame.replace(ANSI, "");
-  expect(frame).toContain(`\x1b[38;5;${WARNING_INK}m!\x1b[39m`);
-  expect(plain).toMatch(/!\s+T\d+ interrupted/u);
-  expect(frame).toContain(`\x1b[38;5;${FAILURE_INK}m✗\x1b[39m`);
-  expect(plain).toMatch(/✗\s+tip-verify FAILED/u);
+/**
+ * Both reserved inks, each with its glyph and its word.
+ *
+ * OBS-244 moved where the failure ink comes from. The interrupted capture never
+ * ran a verification, and the strip used to draw that silence `✗ tip-verify
+ * FAILED` — so the ink was proved by a failure the engagement never recorded.
+ * It now draws the item absent, and the failure ink is proved on the recovered
+ * capture, whose journal records a failed tip verification and the run-end that
+ * closed that cycle. Both frames are the live renderer's, from named sources
+ * committed verbatim.
+ */
+function assertWarningFailureInkContract(
+  warningFrame: string,
+  failureFrame: string,
+): void {
+  assertOnlyApprovedInks(warningFrame);
+  assertOnlyApprovedInks(failureFrame);
+  expect(warningFrame).toContain(`\x1b[38;5;${WARNING_INK}m!\x1b[39m`);
+  expect(warningFrame.replace(ANSI, "")).toMatch(/!\s+T\d+ interrupted/u);
+  // The verification that never ran carries its own word, not a bare hue, and
+  // is emphatically not drawn as a failure.
+  expect(warningFrame.replace(ANSI, "")).toMatch(/-\s+tip-verify -/u);
+  expect(inkIndexes(warningFrame)).not.toContain(FAILURE_INK);
+  expect(failureFrame).toContain(`\x1b[38;5;${FAILURE_INK}m✗\x1b[39m`);
+  expect(failureFrame.replace(ANSI, "")).toMatch(/✗\s+fail · tip-verify-failed/u);
 }
 
 function assertWordParity(coloured: string, colourless: string): void {
@@ -169,6 +194,26 @@ function assertWordParity(coloured: string, colourless: string): void {
 let generatedOnce: ReturnType<typeof regenerateColourFrames> | undefined;
 const generatedFrames = () =>
   (generatedOnce ??= regenerateColourFrames());
+
+/**
+ * The recovered capture drawn tall enough to reach the cycle it recovered from:
+ * its earlier tip verification failed, a later one passed, and the strip reports
+ * the latest verdict while the journal keeps every failure it recorded.
+ */
+async function recoveredCaptureFrame(): Promise<string> {
+  const data = deriveRunCockpitData(
+    {
+      fileName: RECOVERED_CAPTURE,
+      raw: readFileSync(join(CAPTURE_SOURCES, RECOVERED_CAPTURE), "utf8"),
+    },
+    await version(),
+    { isDaemonAlive: () => false },
+  );
+  return captureRendererOutput(
+    createElement(RunCockpitFrame, { data, columns: 140, rows: 40 }),
+    { columns: 140, rows: 40, colour: true },
+  );
+}
 
 async function frameById(id: string): Promise<string> {
   const generated = await generatedFrames();
@@ -206,13 +251,21 @@ describe("cockpit committed colour corpus", () => {
       );
     }
 
+    // The run appearance moved, so these stay live renderer oracles whose
+    // committed bytes are RETIRED: manifested and on disk, holding the
+    // superseded appearance, never re-stamped before operator UAT.
     const committed = committedColourFrames();
     expect([...committed.keys()].sort()).toEqual(
-      COLOUR_FRAME_CASES.map((item) => item.fixture).sort(),
+      COLOUR_FRAME_CASES.map((colourCase) => colourCase.fixture).sort(),
     );
     for (const frame of generated) {
       expect(frame.emitted, frame.fixture).toBe(frame.output);
-      expect(committed.get(frame.fixture), frame.fixture).toBe(frame.output);
+      const retiredBytes = committed.get(frame.fixture);
+      expect(retiredBytes, frame.fixture).toBeDefined();
+      // Not re-stamped: the retired bytes draw the deleted KEYS rail, and they
+      // are not the frame the renderer paints from the same source today.
+      expect(retiredBytes, frame.fixture).toContain("KEYS");
+      expect(retiredBytes, frame.fixture).not.toBe(frame.output);
     }
   });
 
@@ -270,6 +323,7 @@ describe("cockpit committed colour corpus", () => {
 
     assertWarningFailureInkContract(
       await frameById("warning-failure-colour"),
+      await recoveredCaptureFrame(),
     );
   });
 
@@ -294,11 +348,16 @@ describe("cockpit committed colour corpus", () => {
 
   test("test: stripping the ink from the frame carrying warning and failure states makes the oracle fail, so a frame that lost its ink cannot pass", async () => {
     const warningFailure = await frameById("warning-failure-colour");
-    assertWarningFailureInkContract(warningFailure);
-    const stripped = warningFailure.replace(ANSI, "");
+    const recovered = await recoveredCaptureFrame();
+    assertWarningFailureInkContract(warningFailure, recovered);
 
-    expect(stripped).not.toBe(warningFailure);
-    expect(() => assertWarningFailureInkContract(stripped)).toThrow();
+    for (const [warning, failure] of [
+      [warningFailure.replace(ANSI, ""), recovered],
+      [warningFailure, recovered.replace(ANSI, "")],
+    ] as const) {
+      expect([warning, failure]).not.toEqual([warningFailure, recovered]);
+      expect(() => assertWarningFailureInkContract(warning, failure)).toThrow();
+    }
   });
 
   test("test: breaking word parity between a coloured frame and its colourless twin makes the oracle fail, so meaning carried by hue alone cannot pass", async () => {
@@ -311,16 +370,30 @@ describe("cockpit committed colour corpus", () => {
     expect(() => assertWordParity(coloured, broken)).toThrow();
   });
 
-  test("test: the committed colour frames use only the approved green ramp together with the two reserved inks, and neither deliberately excluded value appears anywhere in them", () => {
-    const committed = committedColourFrames();
+  test("test: the committed colour frames use only the approved green ramp together with the two reserved inks, and neither deliberately excluded value appears anywhere in them", async () => {
+    // The contract retired the committed run frames; the colour law stays on
+    // the same renderer-drawn cases without pinning their new appearance. The
+    // retired bytes are evidence on disk, not the oracle.
+    expect([...committedColourFrames().keys()].sort()).toEqual(
+      COLOUR_FRAME_CASES.map((colourCase) => colourCase.fixture).sort(),
+    );
+    const generated = await generatedFrames();
     const allIndexes = new Set<number>();
 
     for (const colourCase of COLOUR_FRAME_CASES.filter((item) => item.colour)) {
-      const frame = committed.get(colourCase.fixture);
-      if (!frame) throw new Error(`missing colour fixture: ${colourCase.fixture}`);
+      const frame = generated.find((candidate) => candidate.id === colourCase.id)
+        ?.output;
+      if (!frame) throw new Error(`missing generated colour case: ${colourCase.id}`);
       assertOnlyApprovedInks(frame);
       for (const ink of inkIndexes(frame)) allIndexes.add(ink);
     }
+    // OBS-244: no committed colour source records a failure any more — the one
+    // failure the corpus used to draw was a verification that never ran. The
+    // reserved ink stays proved against a capture whose journal DID record one,
+    // so the reachability half of this law never rests on a defect.
+    const recovered = await recoveredCaptureFrame();
+    assertOnlyApprovedInks(recovered);
+    for (const ink of inkIndexes(recovered)) allIndexes.add(ink);
     expect([...allIndexes].filter((ink) => !APPROVED_INKS.has(ink))).toEqual([]);
     expect([...allIndexes].some((ink) =>
       APPROVED_GREEN_RAMP.includes(

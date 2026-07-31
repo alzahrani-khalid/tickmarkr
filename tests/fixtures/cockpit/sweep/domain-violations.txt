@@ -1,0 +1,29 @@
+# The whole-domain appearance sweep's baseline: every property violation the
+# shipped renderer still draws over the contract domain, frozen here before the
+# renderer tasks of the watch/setup contract move it.
+#
+# One line per violation band — <property> <columns> <rows> — where each side is
+# a single size or an inclusive lo-hi range, and either may list comma-separated
+# ranges. A band expands to one entry per violating (property, columns, rows)
+# triple, and the sweep compares the expanded sets by subset: a renderer fix
+# that clears part of the domain shrinks the observed set and stays green, while
+# a violation this file does not name is a regression and fails.
+#
+# Bands rather than one line per triple, for one measured reason: the expansion
+# is 33510 triples and committing them verbatim is some 600KB of fixture — past
+# the verifiable diff cap every gate on this run measures. The comparison is
+# per-violation either way; only the storage is folded.
+#
+# The two header bands are the renderer's, not the oracle's: below 19 rows the
+# header row is surrendered outright, and between 93 and 96 columns the brand
+# word is overrun by the run id and paints as "tickmarkrun-…". The signature is
+# counted at any indentation, so the inset header every wider frame draws is
+# read as the one header it is.
+tiles 40-220 14-50
+header 40-92,97-220 14-18
+header 93-96 14-50
+mark 40-220 14-50
+keybar 40-220 14-50
+sidebar-content 64-220 14-50
+sidebar-gutter 64-220 14-50
+sidebar-focus 40-63 19-50

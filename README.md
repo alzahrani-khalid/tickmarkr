@@ -1,8 +1,8 @@
 ```
-              ▄▄████
-          ▄▄████▀▀
-████▄▄▄▄████▀▀     tickmarkr
-  ▀▀████▀▀         spec in, verified work out.
+       ▄▖
+     ▄█▀
+▗▄ ▄█▀             tickmarkr
+ ▝█▛               spec in, verified work out.
 ```
 
 # tickmarkr

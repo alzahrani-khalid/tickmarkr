@@ -28,7 +28,10 @@ describe("compileSpecKit", () => {
     expect(t1.shape).toBe("chore");         // explicit beats inference
     expect(t2.complexity).toBe(7);
     expect(t2.acceptance).toHaveLength(2);
-    expect(t3.files).toEqual(["src/auth/**"]);
+    // OBS-212: the fixture used to give T002 and T003 the same `src/auth/**` glob while their titles
+    // named different files. Two [P] siblings sharing a write scope is the collision the separability
+    // rule now rejects — the fixture declares what each task actually touches.
+    expect(t3.files).toEqual(["src/auth/store.ts"]);
     expect(t4.shape).toBe("tests");         // inferred
     expect(t4.goal).toBe("Write integration tests for auth flow"); // goal defaults to title
   });

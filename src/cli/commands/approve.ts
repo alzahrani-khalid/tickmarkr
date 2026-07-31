@@ -1,6 +1,6 @@
 import { userInfo } from "node:os";
 import { GATE_NAMES } from "../../graph/schema.js";
-import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal } from "../../run/journal.js";
+import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE } from "../../run/journal.js";
 
 // GATE-08 (v1.12): approve a parked human gate so the next `tickmarkr resume <runId>` dispatches it.
 //
@@ -19,8 +19,12 @@ import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal } from "../../run/
 //
 // Who/when is truthful, not dressed-up auth (D-03): default actor os.userInfo().username; --by overrides
 // for delegated approval; optional --reason; the event's ts (stamped by Journal.append) is the when.
+// OBS-189: `--uphold` is the second decision a review park offers. Plain approve accepts the diff the
+// reviewer rejected (gate-satisfied); --uphold sides WITH the reviewer and funds ONE fixed worker
+// attempt carrying the findings — the park costs an attempt, never the run.
 export async function approve(argv: string[], cwd = process.cwd()): Promise<string> {
-  const { runId, taskId, by, reason } = parseArgs(argv);
+  const { runId, taskId, by, reason, uphold, recheck } = parseArgs(argv);
+  if (uphold && recheck) throw new Error("--uphold and --recheck are different decisions — pass one");
 
   // Journal.open throws `no journal for <runId> at <dir>` on an unknown run — that IS the refusal.
   const journal = Journal.open(cwd, runId);
@@ -45,8 +49,41 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     }
   }
   const lastHuman = events[lastHumanIndex];
+  if (uphold) {
+    // Fail-closed on the DATA: uphold applies only when the newest failed gate is the review gate —
+    // any other gate has no reviewer to uphold. Never inferred from the park's prose.
+    const lastFailed = events.slice(0, lastHumanIndex).reverse().find((e) =>
+      e.event === "gate-result" && e.taskId === taskId && e.data.pass === false
+      && typeof e.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(e.data.gate),
+    )?.data.gate as string | undefined;
+    if (lastFailed !== "review") {
+      throw new Error(`--uphold applies to a review rejection; ${taskId}'s last failed gate is ${lastFailed ?? "none"} — refusing`);
+    }
+    journal.append("task-approved", taskId, {
+      by,
+      ...(reason ? { reason } : {}),
+      via: "cli",
+      release: REVIEW_UPHELD_RELEASE,
+      gate: "review",
+    });
+    return `upheld the reviewer for ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to dispatch a fixed attempt carrying the findings`;
+  }
   const capPark = lastHuman?.data.kind === ATTEMPT_CAP_RELEASE;
   const gateFailPark = lastHuman?.data.kind === "gate-fail";
+  if (recheck) {
+    // OBS-203: fail-closed on the PARK KIND — only a gate-fail park has a gate to re-run. Refusing
+    // elsewhere keeps --recheck from becoming a silent budget reset on a pre-dispatch human gate.
+    if (!gateFailPark) {
+      throw new Error(`--recheck applies to a gate-fail park; ${taskId}'s park kind is ${lastHuman?.data.kind ?? "none"} — refusing`);
+    }
+    journal.append("task-approved", taskId, {
+      by,
+      ...(reason ? { reason } : {}),
+      via: "cli",
+      release: RECHECK_RELEASE,
+    });
+    return `re-checking ${taskId} in ${runId} — by ${by}; no gate marked satisfied, run \`tickmarkr resume ${runId}\` to re-dispatch against the full gate suite`;
+  }
   const failedGate = gateFailPark
     ? events.slice(0, lastHumanIndex).reverse().find((e) =>
         e.event === "gate-result" && e.taskId === taskId && e.data.pass === false
@@ -72,29 +109,39 @@ interface ParsedArgs {
   taskId: string;
   by: string;
   reason?: string;
+  uphold: boolean;
+  recheck: boolean;
 }
 
-// hand-parsed argv — no CLI framework (house style). Flags --by <name> and --reason <text>; positionals
-// are runId then taskId. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
+const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--uphold|--recheck] [--by <name>] [--reason <text>]";
+
+// hand-parsed argv — no CLI framework (house style). Flags --uphold, --by <name>, --reason <text>;
+// positionals are runId then taskId. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   let by: string | undefined;
   let reason: string | undefined;
+  let uphold = false;
+  let recheck = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--by") {
       by = argv[++i];
-      if (!by) throw new Error("usage: tickmarkr approve <run-id> <task-id> [--by <name>] [--reason <text>]");
+      if (!by) throw new Error(USAGE);
     } else if (a === "--reason") {
       reason = argv[++i];
-      if (!reason) throw new Error("usage: tickmarkr approve <run-id> <task-id> [--by <name>] [--reason <text>]");
+      if (!reason) throw new Error(USAGE);
+    } else if (a === "--uphold") {
+      uphold = true;
+    } else if (a === "--recheck") {
+      recheck = true;
     } else {
       positionals.push(a);
     }
   }
   const [runId, taskId] = positionals;
   if (!runId || !taskId) {
-    throw new Error("usage: tickmarkr approve <run-id> <task-id> [--by <name>] [--reason <text>]");
+    throw new Error(USAGE);
   }
-  return { runId, taskId, by: by ?? userInfo().username, reason };
+  return { runId, taskId, by: by ?? userInfo().username, reason, uphold, recheck };
 }

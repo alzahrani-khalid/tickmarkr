@@ -1,6 +1,5 @@
 import { Box, Text } from "ink";
 import { Children, type ReactElement, type ReactNode } from "react";
-import stringWidth from "string-width";
 import { GLYPHS } from "../../brand.js";
 import {
   COCKPIT_DATA_RAMP,
@@ -9,7 +8,22 @@ import {
 } from "./theme.js";
 import { SPARKLINE_BUCKET_WINDOW } from "./derive.js";
 export { SPARKLINE_BUCKET_WINDOW } from "./derive.js";
-import { keybarEntries, RUN_KEY_BINDINGS } from "./keys.js";
+import {
+  formatKeybarEntries,
+  keybarEntries,
+  SETUP_KEY_BINDINGS,
+} from "./keys.js";
+/**
+ * Measurement and cutting come from the cockpit's one width authority; this
+ * file owns no width table and counts no code points of its own. The local
+ * name stays `stringWidth` because `keys.test.ts`'s branch ledger proves the
+ * roster's fit branch by naming that line of this file verbatim and watching
+ * the named test fail without it — renaming the call would leave the ledger
+ * reporting a missing anchor instead of a covered branch. The name is the
+ * ledger's; the measurement is `cellWidth`, and `string-width` the package is
+ * no longer imported here.
+ */
+import { cellWidth as stringWidth, sliceCells } from "./width.js";
 
 const SPARKLINE_GLYPHS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
 const BAND_GAP_COLUMNS = 1;
@@ -38,43 +52,21 @@ export type ComponentState =
   | "warn"
   | "neutral";
 
-export type KeybarSurface = "run" | "setup";
 export type KeybarItem = {
   readonly key: string;
   readonly label: string;
 };
 
-// The run keybar is generated from the registered handlers (keys.ts), so a
-// key with no handler cannot be advertised here.
-const RUN_KEYS = keybarEntries(RUN_KEY_BINDINGS);
-
-const SETUP_ADDITIONAL_KEYS = [
-  { key: "␣", label: "Toggle" },
-  { key: "a", label: "All" },
-  { key: "r", label: "Re-probe" },
-  { key: "s", label: "Save" },
-  { key: "n", label: "Next" },
-  { key: "p", label: "Prev" },
-] as const satisfies readonly KeybarItem[];
-
-const SETUP_KEYS = [
-  RUN_KEYS[0],
-  { key: RUN_KEYS[1].key, label: "Next" },
-  RUN_KEYS[2],
-  RUN_KEYS[3],
-  RUN_KEYS[4],
-  RUN_KEYS[5],
-  ...SETUP_ADDITIONAL_KEYS,
-] as const satisfies readonly KeybarItem[];
+const SETUP_KEYS = keybarEntries(SETUP_KEY_BINDINGS);
+const SETUP_ADDITIONAL_KEYS = SETUP_KEYS.slice(6);
 
 export const KEYBAR_KEYS = {
-  run: RUN_KEYS,
   setup: SETUP_KEYS,
   setupAdditional: SETUP_ADDITIONAL_KEYS,
 } as const;
 
 export type JournalRow = {
-  readonly id?: string;
+  readonly id: string;
   readonly time: string;
   readonly state: ComponentState;
   readonly text: string;
@@ -190,28 +182,6 @@ export function allocateBandColumns(
   return base.map((value, index) => value + shares[index]!);
 }
 
-function takeDisplayColumns(value: string, columns: number): [string, string] {
-  const characters = [...value];
-  let used = 0;
-  let taken = 0;
-  while (taken < characters.length) {
-    const width = stringWidth(characters[taken]!);
-    if (taken > 0 && used + width > columns) break;
-    if (taken === 0 && width > columns) {
-      taken = 1;
-      break;
-    }
-    used += width;
-    taken += 1;
-  }
-  const concatenate = (items: readonly string[]) =>
-    items.reduce((result, character) => result + character, "");
-  return [
-    concatenate(characters.slice(0, taken)),
-    concatenate(characters.slice(taken)),
-  ];
-}
-
 /**
  * Compose one data line into visible rows. A fitting line is byte-for-byte
  * untouched. Every wrapped row carries a continuation marker before any
@@ -250,7 +220,7 @@ export function composeBandLine(text: string, columns: number): readonly string[
       }
 
       const available = Math.max(1, width - stringWidth(current));
-      const [head, tail] = takeDisplayColumns(word, available);
+      const { head, tail } = sliceCells(word, available);
       current += head;
       word = tail;
       if (word.length === 0) break;
@@ -558,23 +528,53 @@ function OneLineItems({
   );
 }
 
-export function Keybar({
-  surface,
+/**
+ * Wrap a projected roster without losing a byte. Unlike prose wrapping, these
+ * rows are exact consecutive slices: stripping continuation markers and
+ * joining the slices reconstructs the registry projection byte for byte.
+ */
+export function keyRosterLines(
+  entries: readonly KeybarItem[],
+  columns: number,
+): readonly string[] {
+  const width = Math.max(1, Math.floor(columns));
+  const formatted = formatKeybarEntries(entries);
+  if (stringWidth(formatted) <= width) return [formatted];
+
+  const rendered: string[] = [];
+  let remaining = formatted;
+  let first = true;
+  while (remaining.length > 0) {
+    const prefix = first ? "" : BAND_CONTINUATION_PREFIX;
+    const available = Math.max(1, width - stringWidth(prefix));
+    const { head: slice, tail } = sliceCells(remaining, available);
+    // Ink trims terminal-row trailing spaces. Carry them to the next slice so
+    // the painted representation still reconstructs the formatted roster.
+    const trailingSpace = slice.match(/\s+$/u)?.[0] ?? "";
+    const head = trailingSpace.length === 0
+      ? slice
+      : slice.slice(0, -trailingSpace.length);
+    rendered.push(`${prefix}${head}`);
+    remaining = trailingSpace + tail;
+    first = false;
+  }
+  return rendered;
+}
+
+/** The lossless, width-safe rendering of one projected key roster. */
+export function KeyRoster({
+  entries,
   width,
 }: {
-  surface: KeybarSurface;
+  entries: readonly KeybarItem[];
   width: number;
 }): ReactElement {
   return (
-    <OneLineItems width={width} label={`${surface} cockpit keys`}>
-      {KEYBAR_KEYS[surface].map((item, index) => (
-        <Box key={item.key} flexShrink={0}>
-          {index > 0 && <BodyText emphasis="dim"> · </BodyText>}
-          <BodyText emphasis="strong">{item.key}</BodyText>
-          <BodyText emphasis="dim"> {item.label}</BodyText>
-        </Box>
+    <Box flexDirection="column" width={width} aria-label="run cockpit keys">
+      {keyRosterLines(entries, width).map((line, index) => (
+        <BodyText key={`${index}:${line}`} emphasis="dim">{line}</BodyText>
       ))}
-    </OneLineItems>
+    </Box>
   );
 }
 
@@ -621,7 +621,7 @@ export function JournalRowPanel({
     <Panel title={title} focused={focused} width={width}>
       {rows.map((row, index) => (
         <Box
-          key={row.id ?? `${row.time}:${row.state}:${index}`}
+          key={row.id}
           flexDirection="row"
           flexWrap="nowrap"
           height={1}

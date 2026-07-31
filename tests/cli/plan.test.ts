@@ -46,12 +46,12 @@ const withOverlay = (repo: string, yaml: string) => {
 describe("VIS-04 plan-diff preview", () => {
   test("warm + explicit learned:off: preview column still renders (VALIDATION 13-01-11)", async () => {
     // ROUTE-14 flipped the DEFAULT to on (2026-07-11); the off-path preview marker is now pinned via an explicit overlay.
+    // T10: the off-case headline names the static dispatch pick; the preview line names what learned WOULD pick.
     const repo = mkRepo();
     seedWarm(repo);
     withOverlay(repo, "routing: { learned: off }\n");
     const out = await plan([], repo);
-    expect(out).toContain("static would pick claude-code:haiku");
-    expect(out).toContain("learned picked codex:gpt-5.6-luna");
+    expect(out).toContain("learned would pick codex:gpt-5.6-luna");
     expect(out).toMatch(/learned routing \(preview/);
   });
 
@@ -73,6 +73,54 @@ describe("VIS-04 plan-diff preview", () => {
     expect(outA).toBe(outB);
     expect(outA).not.toContain("static would pick");
     expect(outA).not.toMatch(/learned routing/);
+  });
+});
+
+describe("T10 plan headline names the dispatched channel", () => {
+  const taskRow = (out: string) => out.split("\n").find((l) => /^\s+T1\s+chore/.test(l) && l.includes("→"))!;
+
+  test("with learned routing off the headline names the statically routed channel and credits the reason the static router gave", async () => {
+    const repo = mkRepo();
+    seedWarm(repo);
+    withOverlay(repo, "routing: { learned: off }\n");
+    const out = await plan([], repo);
+    const row = taskRow(out);
+    // the run (no preview profile) would dispatch the static pick — the headline must name it, with the static reason
+    expect(row).toContain("claude-code:haiku");
+    expect(row).toContain("cheapest sufficient tier");
+    expect(row).not.toContain("gpt-5.6-luna");
+  });
+
+  test("with learned routing off the preview line states what learned routing would have picked instead", async () => {
+    const repo = mkRepo();
+    seedWarm(repo);
+    withOverlay(repo, "routing: { learned: off }\n");
+    const out = await plan([], repo);
+    expect(out).toContain("⇄ learned would pick codex:gpt-5.6-luna");
+    expect(out).toContain("routing.learned: off keeps the static pick");
+    expect(out).toMatch(/learned routing \(preview — currently OFF\): 1\/1 tasks would deviate from static/);
+  });
+
+  test("with learned routing on the headline names the learned pick, so the fix is scoped to the switch rather than to the surface", async () => {
+    const repo = mkRepo();
+    seedWarm(repo);
+    withOverlay(repo, "routing: { learned: on }\n");
+    const out = await plan([], repo);
+    const row = taskRow(out);
+    expect(row).toContain("codex:gpt-5.6-luna");
+    expect(row).toContain("via learned score");
+    expect(out).toContain("⇄ static would pick claude-code:haiku — learned picked codex:gpt-5.6-luna");
+  });
+
+  test("with learned routing off and no profile present the headline is unchanged from what it draws today", async () => {
+    const off = mkRepo();
+    withOverlay(off, "routing: { learned: off }\n");
+    const dflt = mkRepo(); // cold profile, default config (learned: on) — what plan draws today
+    const outOff = await plan([], off);
+    const outDflt = await plan([], dflt);
+    expect(outOff).toBe(outDflt);
+    expect(taskRow(outOff)).toContain("claude-code:haiku");
+    expect(outOff).not.toContain("⇄");
   });
 });
 

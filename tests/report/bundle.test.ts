@@ -171,6 +171,79 @@ describe("report --bundle proof packet (v1.70 T4)", () => {
     expect(onDisk.schemaVersion).toBe(BUNDLE_SCHEMA_VERSION);
   });
 
+  // T11: a declined gate (journaled skipped:true) never ran — the packet flags it declined and
+  // never counts it as a pass, while a gate that ran and passed keeps exactly today's shape.
+  test("a declined gate is bundled as declined and never as a pass, with its reason intact", () => {
+    const source: JournalEvent[] = [
+      { ts: "2026-07-27T00:00:00.000Z", event: "run-start", data: { baseRef: "abc" } },
+      {
+        ts: "2026-07-27T00:00:10.000Z",
+        event: "task-dispatch",
+        taskId: "T1",
+        data: { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "cheap" } },
+      },
+      { ts: "2026-07-27T00:00:20.000Z", event: "gate-result", taskId: "T1", data: { gate: "build", pass: true, details: "exit 0" } },
+      {
+        ts: "2026-07-27T00:00:30.000Z",
+        event: "gate-result",
+        taskId: "T1",
+        data: { gate: "review", pass: true, details: "skipped — complexity 1 < threshold 4", skipped: true },
+      },
+      { ts: "2026-07-27T00:01:00.000Z", event: "task-done", taskId: "T1", data: { summary: "done" } },
+      { ts: "2026-07-27T00:01:30.000Z", event: "run-end", data: { done: ["T1"], failed: [], human: [] } },
+    ];
+    const packet = buildProofBundle("run-bundle-declined", source);
+    const task = packet.tasks.find((t) => t.taskId === "T1");
+    expect(task).toBeDefined();
+    expect(task!.outcome).toBe("done"); // declined ≠ failed — green stays green
+    const review = task!.gates.find((g) => g.gate === "review");
+    expect(review).toBeDefined();
+    expect(review!.declined).toBe(true);
+    expect(review!.pass).toBe(false); // reported as declined, rather than as passed
+    expect(review!.details).toContain("complexity 1 < threshold 4");
+    // a gate that ran and passed is bundled exactly as today — no declined key
+    const build = task!.gates.find((g) => g.gate === "build");
+    expect(build).toEqual({ gate: "build", pass: true, details: "exit 0" });
+    // a reader counting passes in the packet cannot count the gate that never ran
+    expect(task!.gates.filter((g) => g.pass).length).toBe(1);
+  });
+
+  // T11: `pass` narrowed from "did not fail" to "ran and passed" and gates gained `declined`, so a
+  // schema-1 reader would read a decline as a failure — the version must have moved past 1.
+  test("the schema version moved past 1 when the gate wire shape changed meaning", () => {
+    expect(BUNDLE_SCHEMA_VERSION).toBeGreaterThan(1);
+  });
+
+  // T11: runs from before the `skipped` field carry the decline only in the details prefix. The
+  // packet must recognise those too — and must not mistake a review that ran for a decline just
+  // because its body mentions skipping.
+  test("a legacy decline with no skipped flag is bundled as declined, and a mid-body mention is not", () => {
+    const source: JournalEvent[] = [
+      { ts: "2026-07-27T00:00:00.000Z", event: "run-start", data: { baseRef: "abc" } },
+      {
+        ts: "2026-07-27T00:00:20.000Z",
+        event: "gate-result",
+        taskId: "T1",
+        data: { gate: "review", pass: true, details: "skipped — complexity 6 < threshold 7" },
+      },
+      {
+        ts: "2026-07-27T00:00:30.000Z",
+        event: "gate-result",
+        taskId: "T2",
+        data: { gate: "review", pass: true, details: "reviewer claude-code:fable: approved\n- a skipped number silently marks the row" },
+      },
+      { ts: "2026-07-27T00:01:30.000Z", event: "run-end", data: { done: ["T1", "T2"], failed: [], human: [] } },
+    ];
+    const packet = buildProofBundle("run-bundle-legacy-declined", source);
+    const legacy = packet.tasks.find((t) => t.taskId === "T1")!.gates[0];
+    expect(legacy.declined).toBe(true);
+    expect(legacy.pass).toBe(false);
+    expect(legacy.details).toContain("complexity 6 < threshold 7");
+    const ran = packet.tasks.find((t) => t.taskId === "T2")!.gates[0];
+    expect(ran.declined).toBeUndefined();
+    expect(ran.pass).toBe(true);
+  });
+
   // Judge pin: known limits are plain language, not an unconditional correctness claim.
   test("the bundle states its own known limits in plain language rather than presenting the packet as an unconditional proof of correctness", () => {
     const packet = buildProofBundle("run-bundle-limits", eventsWithJudge());

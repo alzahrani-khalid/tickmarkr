@@ -28,6 +28,7 @@ export interface GateContext {
   cfg: TickmarkrConfig;
   via?: GateVia; // v1.1: present → judge/review run as visible named agents through the driver
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
+  artifactDir?: string; // OBS-196: run dir for raw reviewer-output persistence on unparseable verdicts
   onGate?: (e: GateEvent) => void | Promise<void>;
 }
 
@@ -168,9 +169,27 @@ export async function runGates(
   // 5. cross-vendor review
   if (enabled("review")) {
     await emitStart("review");
-    await record(
-      await reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, ctx.adapters, ctx.cfg, ctx.via, ctx.excludeReviewers),
-    );
+    let rv = await reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, ctx.adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir);
+    // OBS-193: an unparseable review verdict retries the REVIEW exactly once on a different reviewer —
+    // never the worker (GATE-09's judge-retry shape: straight-line single `if`, meta-only detection,
+    // the flaked verdict never enters results). The exclusion rides reviewGate's own excludeReviewers
+    // parameter, so pickReviewer's diversity rules still govern the retry seat; a fleet with no second
+    // eligible seat keeps the ORIGINAL result so the recorded cause stays truthful (OBS-196).
+    if (rv.meta?.unparseable === true && typeof rv.meta.reviewer === "string") {
+      const flaked = rv.meta.reviewer;
+      const retryVia = ctx.via
+        ? { ...ctx.via, nameFor: (role: "judge" | "review", adapter: string) => ctx.via!.nameFor(role, adapter) + "-r1" }
+        : undefined;
+      const second = await reviewGate(
+        task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, ctx.adapters, ctx.cfg,
+        retryVia, [...(ctx.excludeReviewers ?? []), flaked], ctx.artifactDir,
+      );
+      if (second.meta?.noEligibleReviewer !== true) {
+        const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
+        rv = { ...second, meta: { ...second.meta, reviewRetry: { flaked, retried } } };
+      }
+    }
+    await record(rv);
   }
   return { results, commits };
 }

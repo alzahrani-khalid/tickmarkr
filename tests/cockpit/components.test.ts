@@ -14,7 +14,7 @@ import {
   CockpitGrid,
   JournalRowPanel,
   KEYBAR_KEYS,
-  Keybar,
+  KeyRoster,
   Panel,
   ProgressMeter,
   SPARKLINE_BUCKET_WINDOW,
@@ -301,12 +301,8 @@ describe("cockpit component vocabulary", () => {
     expect(frame).toContain("50%");
   });
 
-  test("test: the keybar and the status strip each render as a single line at every width they are given", async () => {
+  test("test: the status strip renders as a single line at every width it is given", async () => {
     for (const width of [8, 16, 40, 80]) {
-      const keybar = await renderComponent(createElement(Keybar, {
-        surface: "run",
-        width,
-      }), width);
       const strip = await renderComponent(createElement(StatusStrip, {
         width,
         items: [
@@ -315,39 +311,31 @@ describe("cockpit component vocabulary", () => {
         ],
       }), width);
 
-      expect(linesOf(keybar)).toHaveLength(1);
       expect(linesOf(strip)).toHaveLength(1);
     }
   });
 
-  test("test: the keybar displays the contracted key glyphs for the surface it serves, the run surface's set and the setup surface's additional ones alike, rather than an arbitrary selection that happens to fit", async () => {
-    const run = await renderComponent(createElement(Keybar, {
-      surface: "run",
-      width: 120,
-    }), 120);
-    const setup = await renderComponent(createElement(Keybar, {
-      surface: "setup",
+  test("test: the setup key roster displays every setup binding rather than an arbitrary selection that happens to fit", async () => {
+    const setup = await renderComponent(createElement(KeyRoster, {
+      entries: KEYBAR_KEYS.setup,
       width: 120,
     }), 120);
 
-    expect(KEYBAR_KEYS.run.map((item) => item.key))
-      .toEqual(["↑↓", "⏎", "←", "Tab", "?", "q", "f", "/"]);
     expect(KEYBAR_KEYS.setupAdditional.map((item) => item.key))
       .toEqual(["␣", "a", "r", "s", "n", "p"]);
     expect(KEYBAR_KEYS.setup.map((item) => item.key)).toEqual([
-      ...KEYBAR_KEYS.run.slice(0, 6).map((item) => item.key),
+      "↑↓", "⏎", "←", "Tab", "?", "q",
       ...KEYBAR_KEYS.setupAdditional.map((item) => item.key),
     ]);
-    for (const item of KEYBAR_KEYS.run) expect(run).toContain(item.key);
     for (const item of KEYBAR_KEYS.setup) expect(setup).toContain(item.key);
     for (const item of KEYBAR_KEYS.setupAdditional) expect(setup).toContain(item.key);
   });
 
   test("test: the journal row panel renders one row per supplied event carrying its time, its state glyph and its text, and takes those rows as input rather than reading any source itself", async () => {
     const rows = [
-      { time: "22:23:47", state: "pass" as const, text: "T1 merge complete" },
-      { time: "22:23:24", state: "warn" as const, text: "T1 escalated" },
-      { time: "22:23:08", state: "fail" as const, text: "T1 readiness failed" },
+      { id: "event-1", time: "22:23:47", state: "pass" as const, text: "T1 merge complete" },
+      { id: "event-2", time: "22:23:24", state: "warn" as const, text: "T1 escalated" },
+      { id: "event-3", time: "22:23:08", state: "fail" as const, text: "T1 readiness failed" },
     ];
     const frame = await renderComponent(createElement(JournalRowPanel, {
       rows,
