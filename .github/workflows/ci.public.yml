@@ -39,6 +39,7 @@ jobs:
       - run: npm run test:coverage
         env:
           VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
 
   test-macos:
     if: github.repository == 'alzahrani-khalid/tickmarkr'
@@ -56,3 +57,4 @@ jobs:
       - run: npm run test:coverage
         env:
           VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"

@@ -652,7 +652,7 @@ describe("run cockpit draw-time frame plan", () => {
           .not.toThrow();
       }
     }
-  }, 240_000);
+  }, Number(process.env.TICKMARKR_SWEEP_TIMEOUT_MS ?? 240_000));
 
   /** Proven mechanically: the plan is deep-frozen before it enters the production paint. */
   test("test: the plan is consumed unmodified — nothing rewrites its size, region offsets, spans or rowSpans", async () => {

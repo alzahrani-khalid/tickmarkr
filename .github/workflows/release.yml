@@ -32,5 +32,6 @@ jobs:
       # context is always green. The product already honors this env (FORK_CAP_ENV).
       - run: npm test
         env:
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
           VITEST_MAX_FORKS: "1"
       - run: npm publish --provenance --access public
