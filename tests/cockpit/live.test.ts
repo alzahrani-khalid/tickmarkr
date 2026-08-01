@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { render } from "ink";
 import { createElement } from "react";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { GLYPHS } from "../../src/brand.js";
 import { PLAIN_COMPACT_LOCKUP } from "../../src/brand.js";
 import { ui } from "../../src/cli/commands/ui.js";
@@ -20,11 +20,19 @@ import type { JournalEvent } from "../../src/run/journal.js";
 import { runViewRowIdentities } from "../../src/tui/cockpit/derive.js";
 import {
   deriveLiveRunCockpitData,
+  liveRunPointerSurface,
   loadEngagementSource,
   runLiveCockpit,
   selectEngagementRunId,
   type LiveCockpitDelivery,
 } from "../../src/tui/cockpit/live.js";
+import {
+  POINTER_RELEASE_SIGNALS,
+  POINTER_TRACKING_OFF,
+  POINTER_TRACKING_ON,
+  resolvePointerTarget,
+} from "../../src/tui/cockpit/pointer.js";
+import { RUN_VIEWS } from "../../src/tui/cockpit/views.js";
 import {
   assertFrameConformance,
   planRunCockpitFrame,
@@ -35,6 +43,7 @@ import {
 } from "../../src/tui/cockpit/run-cockpit.js";
 import {
   FRAME_CONTRACT_DOMAIN,
+  FRAME_NESTED_ROW_BANDS,
   planFrame,
   type PlannedFrame,
 } from "../../src/tui/cockpit/layout.js";
@@ -49,6 +58,20 @@ import {
   isRetiredGoldenFrame,
 } from "../../src/tui/cockpit/capture.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
+
+const inkMount = vi.hoisted(() => ({ failure: null as Error | null }));
+vi.mock("ink", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("ink")>();
+  return {
+    ...actual,
+    render: (...args: Parameters<typeof actual.render>) => {
+      const failure = inkMount.failure;
+      inkMount.failure = null;
+      if (failure !== null) throw failure;
+      return actual.render(...args);
+    },
+  };
+});
 
 /** A run id that exists only in committed captures, never in a live journal. */
 const COMMITTED_CAPTURE_ID = "run-20260724-231138";
@@ -484,22 +507,36 @@ async function paintRefusal(app: ReturnType<typeof render>): Promise<string | un
   ]);
 }
 
-/** Move one planned row from the body band into the header band, internally tiled. */
+/**
+ * Move one planned row from the body band into the header band, internally
+ * tiled — the body's nested item rows shortening with it, so the mutated plan
+ * is self-consistent and only the DRAWN frame can catch the redistribution.
+ */
 function redistributedSpans(plan: PlannedFrame): PlannedFrame {
   if (plan.kind !== "frame") throw new Error("expected a frame plan");
   const rowSpans = {
     ...plan.rowSpans,
     header: plan.rowSpans.header! + 1,
     body: plan.rowSpans.body! - 1,
+    items: plan.rowSpans.items! - 1,
   };
   const bands = new Map<string, { row: number; rows: number }>();
   let row = 0;
   for (const [id, span] of Object.entries(rowSpans)) {
+    if (FRAME_NESTED_ROW_BANDS[id as keyof typeof FRAME_NESTED_ROW_BANDS] !== undefined) {
+      continue;
+    }
     bands.set(id, { row, rows: span });
     row += span;
   }
   const body = bands.get("body")!;
   const header = bands.get("header")!;
+  const items = plan.regions.find((region) => region.id === "items")!;
+  const bodyBefore = plan.regions.find((region) => region.id === "body")!;
+  bands.set("items", {
+    row: body.row + (items.row - bodyBefore.row),
+    rows: rowSpans.items,
+  });
   return {
     ...plan,
     regions: plan.regions.map((region) => {
@@ -693,8 +730,21 @@ describe("run cockpit draw-time frame plan", () => {
       for (const [id, span] of Object.entries(plan.rowSpans)) {
         const band = plan.regions.find((region) => region.id === id);
         if (band === undefined) throw new Error(`${at} ${id} unplanned`);
-        expect(band.row, `${at} ${id} offset`).toBe(tiled);
         expect(band.rows, `${at} ${id} span`).toBe(span);
+        const host = FRAME_NESTED_ROW_BANDS[
+          id as keyof typeof FRAME_NESTED_ROW_BANDS
+        ];
+        if (host !== undefined) {
+          // A nested band refines the band that hosts it rather than tiling
+          // beside it, so it advances no row cursor and is held to that extent.
+          const within = plan.regions.find((region) => region.id === host)!;
+          expect(band.row, `${at} ${id} offset`)
+            .toBeGreaterThanOrEqual(within.row);
+          expect(band.row + band.rows, `${at} ${id} extent`)
+            .toBeLessThanOrEqual(within.row + within.rows);
+          continue;
+        }
+        expect(band.row, `${at} ${id} offset`).toBe(tiled);
         tiled += span;
       }
       expect(tiled, `${at} tiled height`).toBe(plan.size.rows);
@@ -1199,6 +1249,595 @@ describe("run cockpit draw-time frame plan", () => {
 });
 
 describe("ui command (live cockpit)", () => {
+  test("test: the live surface routes input at the width it is measured at, so a terminal too narrow for the rail moves the view itself rather than a rail it never drew", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-090000";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    // 50 columns: the plan draws the view strip, not the rail. A delivery that
+    // assumed a width would route this arrow to a sidebar nothing painted.
+    const io = makeInkStreams(50, 20);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes("RUN"), "the narrow frame");
+      const planned = planRunCockpitFrame({
+        data: delivery.snapshot().data,
+        columns: 50,
+        rows: 20,
+        interaction: delivery.snapshot().interaction,
+      }).plan;
+      if (planned.kind !== "frame") throw new Error("50x20 planned plain output");
+      expect(planned.band).toBe("strip");
+
+      delivery.key({ input: "", key: { downArrow: true } });
+      expect(delivery.snapshot().interaction.activeView).toBe("tasks");
+      await waitForLastFrame(
+        io,
+        (frame) => frame.includes(`${GLYPHS.pointer} TASKS`),
+        "the Tasks view the arrow opened",
+      );
+    } finally {
+      delivery.key({ input: "q", key: {} });
+      await done;
+    }
+  });
+
+  test("a pointer report split across stream chunks acts when its last byte arrives, drawing the view the click named", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-090500";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes("RUN"), "the opening frame");
+      const surface = liveRunPointerSurface(
+        delivery.snapshot().data,
+        delivery.snapshot().interaction,
+        { columns: 140, rows: 24 },
+      );
+      if (surface === undefined) throw new Error("140x24 planned plain output");
+      const rail = surface.plan.regions.find((region) => region.id === "rail");
+      if (rail === undefined || surface.plan.sidebar === null) {
+        throw new Error("the plan drew no rail at 140 columns");
+      }
+      // The Gates row of the rail the plan drew, reported in the terminal's own
+      // one-based cells.
+      const column = rail.column + 3;
+      const row = rail.row + (surface.plan.sidebar.menuRows - RUN_VIEWS.length)
+        + RUN_VIEWS.findIndex((view) => view.id === "gates") + 1;
+
+      // The terminal writes bytes, not messages: this one report arrives in two
+      // chunks. Half a report acts on nothing.
+      io.input.write(`\x1b[<0;${column};`);
+      await wait(60);
+      expect(delivery.snapshot().interaction.activeView).toBe("run");
+
+      io.input.write(`${row}M`);
+      await waitForLastFrame(
+        io,
+        (frame) => frame.includes(`${GLYPHS.pointer} GATES`),
+        "the Gates view the split report clicked",
+      );
+      expect(delivery.snapshot().interaction.activeView).toBe("gates");
+    } finally {
+      delivery.key({ input: "q", key: {} });
+      await done;
+    }
+  });
+
+  test("a click delivered with the filter prompt open draws the view it named rather than being typed into the query", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-091500";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes("RUN"), "the opening frame");
+      // The Gates view with its own / prompt open: the scope in which a digit
+      // is filter text and ⏎ applies a filter.
+      delivery.key({ input: "3", key: {} });
+      await waitForLastFrame(
+        io,
+        (frame) => frame.includes(`${GLYPHS.pointer} GATES`),
+        "the Gates view",
+      );
+      delivery.key({ input: "/", key: {} });
+      expect(delivery.snapshot().interaction.filterPrompt).toBe(true);
+
+      const surface = liveRunPointerSurface(
+        delivery.snapshot().data,
+        delivery.snapshot().interaction,
+        { columns: 140, rows: 24 },
+      );
+      if (surface === undefined) throw new Error("140x24 planned plain output");
+      const rail = surface.plan.regions.find((region) => region.id === "rail");
+      if (rail === undefined || surface.plan.sidebar === null) {
+        throw new Error("the plan drew no rail at 140 columns");
+      }
+      // The Tasks row of the rail the plan drew, in the terminal's own cells.
+      const column = rail.column + 3;
+      const row = rail.row + (surface.plan.sidebar.menuRows - RUN_VIEWS.length)
+        + RUN_VIEWS.findIndex((view) => view.id === "tasks") + 1;
+      io.input.write(`\x1b[<0;${column};${row}M`);
+
+      await waitForLastFrame(
+        io,
+        (frame) => frame.includes(`${GLYPHS.pointer} TASKS`),
+        "the Tasks view the click named",
+      );
+      const interaction = delivery.snapshot().interaction;
+      expect(interaction.activeView).toBe("tasks");
+      // The click was never read as text: no digit reached the query, and the
+      // prompt it retired is closed rather than left holding the input.
+      expect(interaction.filterQuery).toBe("");
+      expect(interaction.filterPrompt).toBe(false);
+    } finally {
+      delivery.key({ input: "q", key: {} });
+      await done;
+    }
+  });
+
+  test("a double click arriving as one batch of adjacent reports opens the row it was drawn on, on a list longer than the item rows the plan draws", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-093000";
+    // More gate rows than the plan draws item rows, so the drawn window is a
+    // scrolled slice of the list and moving the selection moves that slice.
+    const seeded = Array.from({ length: 24 }, (_, index) =>
+      ev(
+        "gate-result",
+        { gate: `gate-${String(index).padStart(2, "0")}`, pass: true },
+        `2026-07-31T09:30:${String(index + 1).padStart(2, "0")}.000Z`,
+        "T1",
+      ));
+    seedJournal(repo, runId, rawOf([
+      ev(
+        "run-start",
+        { branch: "spec/live-double-click", pid: process.pid },
+        "2026-07-31T09:30:00.000Z",
+      ),
+      ...seeded,
+    ]));
+    const io = makeInkStreams(140, 24);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes(runId), "the opening frame");
+      delivery.key({ input: "3", key: {} });
+      // Walk the selection to the oldest row, which scrolls the drawn window
+      // off the head of the list.
+      for (let step = 0; step < seeded.length; step += 1) {
+        delivery.key({ input: "", key: { downArrow: true } });
+      }
+      await waitForLastFrame(
+        io,
+        (frame) => selectedLine(frame, "gate-00") !== undefined,
+        "the scrolled window with the oldest gate selected",
+      );
+
+      const scrolled = liveRunPointerSurface(
+        delivery.snapshot().data,
+        delivery.snapshot().interaction,
+        { columns: 140, rows: 24 },
+      );
+      if (scrolled === undefined) throw new Error("140x24 planned plain output");
+      const items = scrolled.plan.regions.find((region) => region.id === "items");
+      if (items === undefined) throw new Error("the plan planned no item rows");
+      // The window really is a slice: the row drawn at the top of the panel is
+      // not the view's first row, so a selection change moves what is drawn.
+      expect(scrolled.rowIds.length).toBeGreaterThan(scrolled.drawnRowIds.length);
+      expect(scrolled.drawnRowIds[0]).not.toBe(scrolled.rowIds[0]);
+      const drawnFirst = scrolled.drawnRowIds[0];
+
+      // One chunk, the way a terminal delivers a double click: press, release,
+      // press, release, with no redraw between them. Both presses name the same
+      // still-drawn cell, so the second is that row opening — not whichever row
+      // a window re-planned around the first press would have slid under it.
+      const cell = `${items.column + 5};${items.row + 1}`;
+      io.input.write(
+        `\x1b[<0;${cell}M\x1b[<0;${cell}m\x1b[<0;${cell}M\x1b[<0;${cell}m`,
+      );
+
+      await waitForLastFrame(
+        io,
+        (frame) => frame.includes("GATE DETAIL"),
+        "the detail of the row the double click was drawn on",
+      );
+      const interaction = delivery.snapshot().interaction;
+      expect(interaction.opened).toBe(drawnFirst);
+      expect(interaction.selection).toBe(drawnFirst);
+    } finally {
+      delivery.key({ input: "q", key: {} });
+      await done;
+    }
+  });
+
+  test("a key transition that has not been painted yet does not move the pointer's target: the click resolves through the frame the paint committed", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-095500";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes("RUN"), "the opening frame");
+      const size = { columns: 140, rows: 24 };
+      // The frame on the screen is the RUN view: its body draws no selectable
+      // rows at all.
+      const opening = delivery.snapshot();
+      const drawn = liveRunPointerSurface(
+        opening.data,
+        opening.interaction,
+        size,
+      );
+      if (drawn === undefined) throw new Error("140x24 planned plain output");
+      expect(drawn.drawnRowIds).toEqual([]);
+
+      // The key switches the state to Gates now, but the paint lags it: the
+      // screen still shows the RUN frame, so that frame owns every hit.
+      delivery.key({ input: "3", key: {} });
+      expect(delivery.snapshot().interaction.activeView).toBe("gates");
+
+      // The cell the UNPAINTED Gates plan would put on its first drawn gate
+      // row (zero-based, as PointerReport counts cells). An input path that
+      // planned for itself would select that row here.
+      const switched = delivery.snapshot();
+      const unpainted = liveRunPointerSurface(
+        switched.data,
+        switched.interaction,
+        size,
+      );
+      if (unpainted === undefined) throw new Error("140x24 planned plain output");
+      const items = unpainted.plan.regions.find((region) => region.id === "items");
+      if (items === undefined) throw new Error("the plan planned no item rows");
+      const cell = { column: items.column + 5, row: items.row };
+      expect(resolvePointerTarget(unpainted.plan, cell)?.region.id).toBe("items");
+      expect(unpainted.drawnRowIds[0]).toBeDefined();
+
+      // Delivered before the paint, the same report selects nothing: the
+      // committed RUN frame owns no row there. And the unpainted view switch
+      // the click followed is not clobbered back either.
+      delivery.pointer({ action: "press", ...cell });
+      expect(delivery.snapshot().interaction.selection).toBe(null);
+      expect(delivery.snapshot().interaction.activeView).toBe("gates");
+
+      // Once the Gates frame is painted, the same cell acts on it.
+      await waitForLastFrame(
+        io,
+        (frame) => frame.includes(`${GLYPHS.pointer} GATES`),
+        "the painted Gates view",
+      );
+      delivery.pointer({ action: "press", ...cell });
+      expect(delivery.snapshot().interaction.selection)
+        .toBe(unpainted.drawnRowIds[0]);
+    } finally {
+      delivery.key({ input: "q", key: {} });
+      await done;
+    }
+  });
+
+  test("a bare Escape from live stdin reaches the open filter prompt's cancel binding", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-092000";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes("RUN"), "the opening frame");
+      delivery.key({ input: "3", key: {} });
+      delivery.key({ input: "/", key: {} });
+      delivery.key({ input: "x", key: {} });
+      expect(delivery.snapshot().interaction).toMatchObject({
+        filterPrompt: true,
+        filterQuery: "x",
+      });
+
+      io.input.write("\x1b");
+      for (let attempts = 0; attempts < 20; attempts += 1) {
+        if (!delivery.snapshot().interaction.filterPrompt) break;
+        await wait(10);
+      }
+      expect(delivery.snapshot().interaction).toMatchObject({
+        filterPrompt: false,
+        filterQuery: "",
+        quit: false,
+      });
+    } finally {
+      delivery.key({ input: "", key: { escape: true } });
+      delivery.key({ input: "q", key: {} });
+      await done;
+    }
+  });
+
+  test("a key before a click in one stdin chunk acts before that click", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-092500";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes("RUN"), "the opening frame");
+      delivery.key({ input: "3", key: {} });
+      delivery.key({ input: "/", key: {} });
+      const surface = liveRunPointerSurface(
+        delivery.snapshot().data,
+        delivery.snapshot().interaction,
+        { columns: 140, rows: 24 },
+      );
+      if (surface === undefined) throw new Error("140x24 planned plain output");
+      const body = surface.plan.regions.find((region) => region.id === "body");
+      if (body === undefined) throw new Error("the plan drew no body panel");
+
+      // q belongs to the prompt while it is open. The click follows it in the
+      // same terminal chunk, so q must grow the query before the click retires
+      // the prompt. Reversing them makes q quit the surface. The panel chrome
+      // stays present after q filters the item rows away, so the target itself
+      // cannot disappear between these two ordered tokens.
+      io.input.write(
+        `q\x1b[<0;${body.column + 1};${body.row + 1}M`,
+      );
+      for (let attempts = 0; attempts < 20; attempts += 1) {
+        if (!delivery.snapshot().interaction.filterPrompt) break;
+        await wait(10);
+      }
+      expect(delivery.snapshot().interaction).toMatchObject({
+        filterPrompt: false,
+        filterQuery: "q",
+        quit: false,
+      });
+    } finally {
+      io.input.write("\u0003");
+      await done;
+    }
+  });
+
+  test("test: pointer reporting is on only for an interactive terminal and off again on every exit, including a failing one", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-093000";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const baseline = POINTER_RELEASE_SIGNALS.map((signal) =>
+      process.rawListeners(signal)
+    );
+    let rosterWhenAsked: readonly (readonly Function[])[] | undefined;
+    const write = io.output.write.bind(io.output);
+    io.output.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+      const bytes = typeof chunk === "string"
+        ? chunk
+        : Buffer.from(chunk).toString("utf8");
+      if (bytes.includes(POINTER_TRACKING_ON)) {
+        rosterWhenAsked = POINTER_RELEASE_SIGNALS.map((signal) =>
+          process.rawListeners(signal)
+        );
+      }
+      return Reflect.apply(write, io.output, [chunk, ...args]) as boolean;
+    }) as typeof io.output.write;
+    // The shipped path, not the debug one: a terminal reports no pointer at all
+    // until it is asked to, so without these bytes every click and wheel notch
+    // an operator makes produces nothing and the pointer layer is unreachable.
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: false,
+    });
+    try {
+      // The shipped path interleaves bare escapes with the writes that carry
+      // cells, so the drawn frame is the last write that has any.
+      for (let attempts = 0; attempts < 100; attempts += 1) {
+        if (lastShippedFrame(io).includes("RUN")) break;
+        await wait(20);
+      }
+      expect(lastShippedFrame(io)).toContain("RUN");
+      const asked = io.writes.findIndex((bytes) => bytes.includes("\x1b[?1000h"));
+      const painted = io.writes.findIndex((bytes) =>
+        stripAnsi(bytes).trim().length > 0
+      );
+      expect(asked).toBeGreaterThanOrEqual(0);
+      // Normal tracking is asked for in SGR encoding — the one grammar the
+      // reader parses, and the only one that can state a cell past column 223.
+      expect(io.writes[asked]).toContain("\x1b[?1006h");
+      expect(painted).toBeGreaterThan(asked);
+      // The live lifecycle is the one owner: every signal repayment stands
+      // before the ask, and mounting the frame adds no second owner afterward.
+      expect(rosterWhenAsked).toBeDefined();
+      POINTER_RELEASE_SIGNALS.forEach((signal, index) => {
+        expect(rosterWhenAsked?.[index], `${signal} stood before the ask`)
+          .toHaveLength(baseline[index]!.length + 1);
+      });
+      // Ink may install its own SIGINT listener while mounted. Pointer mode
+      // itself still has exactly one owner, proven by the one enable write.
+      expect(io.writes.join("").split(POINTER_TRACKING_ON)).toHaveLength(2);
+      // And tracking is still on while the surface is drawn.
+      expect(io.writes.join("")).not.toContain("\x1b[?1000l");
+    } finally {
+      io.input.write("\u0003");
+      await done;
+    }
+    // A terminal left tracking writes reports into whatever runs next.
+    expect(io.writes.join("")).toContain(POINTER_TRACKING_OFF);
+    POINTER_RELEASE_SIGNALS.forEach((signal, index) => {
+      const borrowed = rosterWhenAsked?.[index].filter((listener) =>
+        !baseline[index]!.includes(listener)
+      ) ?? [];
+      expect(borrowed, `${signal} had one repayment`).toHaveLength(1);
+      expect(process.rawListeners(signal), `${signal} repayment was handed back`)
+        .not.toContain(borrowed[0]);
+    });
+  });
+
+  test("a synchronous mount failure turns pointer tracking off and removes the resize listener", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-093500";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const resizeListeners = io.output.listenerCount("resize");
+    inkMount.failure = new Error("synchronous mount failure");
+    try {
+      await expect(runLiveCockpit({
+        input: io.input,
+        output: io.output,
+        cwd: repo,
+        runId,
+        binaryVersion: "9.8.7",
+        refreshMs: 60_000,
+        debug: false,
+      })).rejects.toThrow("synchronous mount failure");
+    } finally {
+      inkMount.failure = null;
+    }
+
+    const bytes = io.writes.join("");
+    expect(bytes).toContain("\x1b[?1000h\x1b[?1006h");
+    expect(bytes).toContain("\x1b[?1006l\x1b[?1000l");
+    expect(io.output.listenerCount("resize")).toBe(resizeListeners);
+  });
+
+  test("an off-focus wheel report split across chunks reaches no key handler and cannot manufacture a mouse-only frame", async () => {
+    const repo = mkRepo();
+    const runId = "run-20260731-094500";
+    seedJournal(repo, runId, PLANNED_FRAME_RAW);
+    const io = makeInkStreams(140, 24);
+    const seam = deliveryPromise();
+    const done = runLiveCockpit({
+      input: io.input,
+      output: io.output,
+      cwd: repo,
+      runId,
+      binaryVersion: "9.8.7",
+      refreshMs: 60_000,
+      debug: true,
+      onDelivery: seam.accept,
+    });
+    const delivery = await seam.ready;
+    try {
+      await waitForLastFrame(io, (frame) => frame.includes("RUN"), "the opening frame");
+      // The Gates view with its own / prompt open: the scope in which a digit is
+      // filter text.
+      delivery.key({ input: "3", key: {} });
+      await waitForLastFrame(
+        io,
+        (frame) => frame.includes(`${GLYPHS.pointer} GATES`),
+        "the Gates view",
+      );
+      delivery.key({ input: "/", key: {} });
+      const before = delivery.snapshot().interaction;
+      expect(before.filterPrompt).toBe(true);
+
+      const surface = liveRunPointerSurface(
+        delivery.snapshot().data,
+        before,
+        { columns: 140, rows: 24 },
+      );
+      if (surface === undefined) throw new Error("140x24 planned plain output");
+      const rail = surface.plan.regions.find((region) => region.id === "rail");
+      if (rail === undefined) throw new Error("the plan drew no rail at 140 columns");
+      // A rail cell the plan itself confirms, reported in the terminal's
+      // one-based cells so its column is the bare digit 3 — the fragment a
+      // terminal is free to leave in a chunk of its own, and a live key in both
+      // rosters: a view key with no prompt open, filter text with one.
+      const row = rail.row + 2;
+      expect(resolvePointerTarget(surface.plan, { column: 2, row: row - 1 })?.region.id)
+        .toBe("rail");
+
+      // One wheel-down report, in three chunks, the middle one that bare digit.
+      io.input.write("\x1b[<65;");
+      await wait(40);
+      io.input.write("3");
+      await wait(40);
+      expect(delivery.snapshot().interaction.filterQuery).toBe("");
+      io.input.write(`;${row}M`);
+
+      await wait(40);
+      const after = delivery.snapshot().interaction;
+      // The rail is not focused and ↓ is not in the prompt's advertised
+      // roster. The wheel therefore has no transition: it neither fabricates
+      // rail focus nor leaks any report fragment into the prompt.
+      expect(after).toEqual(before);
+    } finally {
+      // ctrl-C, not q: the prompt this test leaves open is the scope in which q
+      // is filter text.
+      io.input.write("\u0003");
+      await done;
+    }
+  });
+
   test("test: two back-to-back moves delivered before any redraw advance the selection twice, driven through the live surface rather than a helper that waits between keys", async () => {
     const repo = mkRepo();
     const runId = "run-20260727-150001";

@@ -1,3 +1,4 @@
+import { PANEL_CHROME_ROWS, READABLE_PANEL_COLUMNS } from "./components.js";
 import { cellWidth } from "./width.js";
 
 export const COCKPIT_ROW_FLOOR = 14;
@@ -126,12 +127,53 @@ export interface FrameState {
   detail?: boolean;
   /** Header caption, pre-measured in terminal cells by the caller. */
   captionCells?: number;
+  /**
+   * The session's panel resize override: the rail columns the operator dragged
+   * the boundary to. An INPUT to the plan, never a bypass of it — the plan
+   * recomputes from the measured size plus this override and the renderer
+   * draws the recomputed plan unmodified. It lives only in the running
+   * process: nothing writes it anywhere, and a relaunch plans the default
+   * layout. The plan clamps it at both panels' readable floors — see
+   * `planRailColumns`.
+   */
+  railColumns?: number;
 }
 
 export const FRAME_WIDTH_FLOOR = COCKPIT_COLUMN_FLOOR;
 export const FRAME_HEIGHT_FLOOR = COCKPIT_ROW_FLOOR;
 export const SIDEBAR_COLUMN_FLOOR = 64;
 export const RAIL_COLUMNS = 15;
+/**
+ * The narrowest rail that still reads: the selection marker, one space and the
+ * longest view name, whole — the name measured in display cells by the width
+ * authority, never String length, so a name that ever gains a wide glyph moves
+ * the floor with it. A drag never takes the rail below it — below the floor
+ * the element stands at the floor, surrendered whole per the contract, never
+ * collapsed.
+ */
+export const RAIL_READABLE_FLOOR_COLUMNS =
+  Math.max(...FRAME_VIEWS.map((view) => cellWidth(view))) + 2;
+
+/**
+ * The rail width the plan draws for a session resize override, clamped at both
+ * panels' readable floors: the rail never narrows past its own floor, and
+ * never widens past what leaves the body its readable floor
+ * (`READABLE_PANEL_COLUMNS`). The clamp is the plan's — the override is a
+ * request, the floors are the contract, and an element is surrendered whole or
+ * not at all, never collapsed by a drag. No override is the contract's
+ * constant rail.
+ */
+export function planRailColumns(columns: number, override?: number): number {
+  if (override === undefined || !Number.isFinite(override)) return RAIL_COLUMNS;
+  const ceiling = Math.max(
+    RAIL_READABLE_FLOOR_COLUMNS,
+    Math.floor(columns) - READABLE_PANEL_COLUMNS,
+  );
+  return Math.min(
+    ceiling,
+    Math.max(RAIL_READABLE_FLOOR_COLUMNS, Math.floor(override)),
+  );
+}
 export const STANDARD_TAIL_HEIGHT = 16;
 export const FULL_TAIL_HEIGHT = 24;
 export const TAIL_STANDARD_ROWS = 1;
@@ -191,11 +233,33 @@ export type FrameRegionId =
   | "strip"
   | "rail"
   | "body"
+  | "items"
   | "rule2"
   | "tail"
   | "status"
   | "keybar"
   | "caption";
+
+/**
+ * Border plus horizontal padding the drawn panel charges around its body —
+ * half of it on each side. The plan owns this because the plan owns the item
+ * rows: the paint draws its list into the region planned below, and nothing
+ * downstream subtracts chrome of its own to find it again.
+ */
+export const RUN_PANEL_HORIZONTAL_CHROME = 4;
+
+/**
+ * Row bands drawn INSIDE another band rather than beside it, mapped to the band
+ * that hosts them. A nested band refines its host's rows, so the band walk skips
+ * it when tiling the height and asserts containment instead. It is no less a
+ * member of `rowSpans` for that: the oracle pins its span against the planned
+ * region, and demands the paint register a node at exactly that rectangle —
+ * which is precisely what a parallel field beside the plan could never be held
+ * to.
+ */
+export const FRAME_NESTED_ROW_BANDS: Readonly<
+  Partial<Record<FrameRegionId, FrameRegionId>>
+> = { items: "body" };
 
 /* ------------------------------------------------------------------ */
 /* The sidebar band's composition: the menu at the rail's top, the     */
@@ -218,6 +282,13 @@ export interface SidebarPlan {
   /** Rows the menu block occupies at the rail's top: the five views, plus the label row when it fits. */
   menuRows: number;
   /**
+   * The frame row each view's name is drawn on. The plan does the menu's
+   * arithmetic once, here, where the label row is decided — so a rail hit is a
+   * lookup in the plan's own rows rather than a second reconstruction of the
+   * menu's shape from `menuRows`.
+   */
+  viewRows: Readonly<Record<FrameView, number>>;
+  /**
    * Blank rows between the last menu row and the first vitals row. Never zero
    * while any vitals element draws — a short rail surrenders whole vitals
    * elements rather than closing the gap.
@@ -236,17 +307,30 @@ export interface SidebarPlan {
  * one gap row is the vitals budget, spent on the full two-row block when it
  * fits whole, else on the one-row elements, surrendered from the top of the
  * block with the meter surrendered last. An element draws whole or not at all.
+ * `railRow` is the frame row the rail band starts at, so the view rows the plan
+ * reports are frame rows a reported cell is compared against directly. It is
+ * required for that reason: a default here would answer rail-relative rows in a
+ * field documented as frame rows — the same defaulted-measurement defect the key
+ * delivery carried, and this one would land in the rows a rail hit resolves
+ * through.
  */
-export function planSidebar(railRows: number): SidebarPlan {
+export function planSidebar(railRows: number, railRow: number): SidebarPlan {
   const menuRows = railRows >= SIDEBAR_MENU_LABEL_ROWS
     ? 1 + FRAME_VIEWS.length
     : FRAME_VIEWS.length;
+  // The views occupy the menu block's last rows: whatever the block exceeds
+  // them by is the label row the plan funded above them.
+  const firstViewRow = railRow + (menuRows - FRAME_VIEWS.length);
+  const viewRows = Object.fromEntries(
+    FRAME_VIEWS.map((view, index) => [view, firstViewRow + index]),
+  ) as Record<FrameView, number>;
   const fullRows = SIDEBAR_VITALS_ORDER.length * SIDEBAR_VITALS_FULL_ELEMENT_ROWS;
   // The gap is funded before the vitals are: the budget is what remains after it.
   const budget = railRows - menuRows - 1;
   if (budget >= fullRows) {
     return {
       menuRows,
+      viewRows,
       gapRows: railRows - menuRows - fullRows,
       vitalsMode: "full",
       vitals: SIDEBAR_VITALS_ORDER,
@@ -258,6 +342,7 @@ export function planSidebar(railRows: number): SidebarPlan {
   );
   return {
     menuRows,
+    viewRows,
     gapRows: kept > 0 ? railRows - menuRows - kept : 0,
     vitalsMode: "compact",
     vitals: SIDEBAR_VITALS_ORDER.slice(SIDEBAR_VITALS_ORDER.length - kept),
@@ -289,8 +374,11 @@ export interface PlannedFrame {
   content: FrameBandContent;
   regions: readonly FrameRegion[];
   /**
-   * Row bands, top to bottom; their spans tile the height exactly. A band
-   * map: the nested caption sub-region is deliberately excluded.
+   * Row bands, top to bottom. `items` is nested inside the body band and so
+   * refines it rather than tiling beside it (see FRAME_NESTED_ROW_BANDS); the
+   * remaining spans tile the height exactly. The caption is excluded: it adds
+   * no row extent of its own, being the header's own row refined on the column
+   * axis, and the column map already carries no row.
    */
   rowSpans: Readonly<Record<string, number>>;
   /**
@@ -317,6 +405,24 @@ export interface PlainFallbackPlan {
 
 export type FramePlan = PlannedFrame | PlainFallbackPlan;
 
+/**
+ * The item rows of a body band: the band less the chrome the drawn panel puts
+ * around its list — the border row and the title row above the first item, the
+ * border row below it, and a bordered padded column on each side. THE ONE
+ * PLACE that subtraction happens, and it happens in the plan: paint and hit
+ * resolution alike consume this region rather than deriving it again.
+ */
+function planItemRows(body: FrameRegion): FrameRegion {
+  const heading = PANEL_CHROME_ROWS - 1; // border row, then the title row
+  return {
+    id: "items",
+    row: body.row + heading,
+    rows: Math.max(1, body.rows - PANEL_CHROME_ROWS),
+    column: body.column + RUN_PANEL_HORIZONTAL_CHROME / 2,
+    columns: Math.max(1, body.columns - RUN_PANEL_HORIZONTAL_CHROME),
+  };
+}
+
 function tailRowsFor(rows: number): number {
   if (rows >= FULL_TAIL_HEIGHT) return TAIL_FULL_ROWS;
   if (rows >= STANDARD_TAIL_HEIGHT) return TAIL_STANDARD_ROWS;
@@ -330,7 +436,9 @@ function tailRowsFor(rows: number): number {
  * height exactly — header, rule, the view strip (40–63 columns), the body
  * band, a second rule, the journal tail surrendered whole by height tier,
  * status, keybar — and, at ≥64 columns, column bands that tile the width
- * exactly: the constant 15-column rail beside the body. The body is the sole
+ * exactly: the rail beside the body, at the constant 15 columns or at the
+ * session's dragged override clamped to both panels' readable floors
+ * (`planRailColumns`). The body is the sole
  * flexible element on both axes. The view and state decide what the flexible
  * bands draw (the Journal view is the full-height tail; SETUP turns the tail
  * into PENDING WRITES; an open detail owns the body) without moving any
@@ -344,7 +452,12 @@ function tailRowsFor(rows: number): number {
  * of the block, the meter last, rather than closing the gap. rowSpans and
  * columnSpans are band maps: they deliberately exclude the nested caption,
  * and column bands are reported for the body band only, so each map's spans
- * sum to the full height and width respectively.
+ * sum to the full height and width respectively. The body band's item rows are
+ * a band of the plan in their own right — a region in `regions` and a span in
+ * `rowSpans`, nested inside the body band rather than tiling beside it — so the
+ * region the paint draws its list into and the region a pointer resolves a row
+ * through are the one thing the oracle pins, and neither subtracts the drawn
+ * panel's chrome for itself.
  */
 export function planFrame(
   size: MeasuredSize,
@@ -364,6 +477,9 @@ export function planFrame(
 
   const tab: FrameTab = state.tab ?? "watch";
   const band = columns >= SIDEBAR_COLUMN_FLOOR ? "sidebar" : "strip";
+  // The one panel the session can resize: the rail, at the operator's dragged
+  // override clamped to the readable floors, or the contract's constant rail.
+  const railColumns = planRailColumns(columns, state.railColumns);
   const stripRows = band === "strip" ? 1 : 0;
   const tailRows = tailRowsFor(rows);
   // Fixed chrome is five rows: header, rule, a second rule below the body
@@ -412,24 +528,21 @@ export function planFrame(
       row: bodyRow,
       rows: bodyRows,
       column: 0,
-      columns: RAIL_COLUMNS,
-    });
-    regions.push({
-      id: "body",
-      row: bodyRow,
-      rows: bodyRows,
-      column: RAIL_COLUMNS,
-      columns: columns - RAIL_COLUMNS,
-    });
-  } else {
-    regions.push({
-      id: "body",
-      row: bodyRow,
-      rows: bodyRows,
-      column: 0,
-      columns,
+      columns: railColumns,
     });
   }
+  const bodyRegion: FrameRegion = band === "sidebar"
+    ? {
+      id: "body",
+      row: bodyRow,
+      rows: bodyRows,
+      column: railColumns,
+      columns: columns - railColumns,
+    }
+    : { id: "body", row: bodyRow, rows: bodyRows, column: 0, columns };
+  regions.push(bodyRegion);
+  const itemsRegion = planItemRows(bodyRegion);
+  regions.push(itemsRegion);
   if (captionFits) {
     regions.push({
       id: "caption",
@@ -443,6 +556,7 @@ export function planFrame(
   const rowSpans: Record<string, number> = { header: 1, rule: 1 };
   if (stripRows > 0) rowSpans.strip = stripRows;
   rowSpans.body = bodyRows;
+  rowSpans.items = itemsRegion.rows;
   rowSpans.rule2 = 1;
   if (tailRows > 0) rowSpans.tail = tailRows;
   rowSpans.status = 1;
@@ -450,7 +564,7 @@ export function planFrame(
 
   const columnSpans: Record<string, number> =
     band === "sidebar"
-      ? { rail: RAIL_COLUMNS, body: columns - RAIL_COLUMNS }
+      ? { rail: railColumns, body: columns - railColumns }
       : { body: columns };
 
   return {
@@ -467,7 +581,7 @@ export function planFrame(
     rowSpans,
     columnSpans,
     flexible: { row: "body", column: "body" },
-    sidebar: band === "sidebar" ? planSidebar(bodyRows) : null,
+    sidebar: band === "sidebar" ? planSidebar(bodyRows, bodyRow) : null,
     surrendered,
   };
 }

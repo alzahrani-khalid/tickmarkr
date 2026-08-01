@@ -13,7 +13,9 @@ import {
   FRAME_CONTRACT_DOMAIN,
   FRAME_HEADER_GAP,
   FRAME_HEADER_PARTS,
+  FRAME_NESTED_ROW_BANDS,
   FRAME_SURRENDER_ORDER,
+  FRAME_VIEWS,
   FULL_LAYOUT_ROWS,
   FULL_JOURNAL_ROWS,
   HEADER_FIXED_CELLS,
@@ -46,6 +48,13 @@ function planned(columns: number, rows: number, captionCells = 0): PlannedFrame 
     throw new Error(`expected a frame plan at ${columns}x${rows}`);
   }
   return plan;
+}
+
+/** The row bands that tile the height: every span but the ones nested inside another band. */
+function tilingRowSpans(plan: PlannedFrame): [string, number][] {
+  return Object.entries(plan.rowSpans).filter(
+    ([id]) => FRAME_NESTED_ROW_BANDS[id as keyof typeof FRAME_NESTED_ROW_BANDS] === undefined,
+  );
 }
 
 function* contractDomain() {
@@ -211,11 +220,21 @@ describe("planFrame — the pure frame plan over the whole contract domain", () 
   test("the planned row spans of every region sum to the height and no planned column exceeds the width, at every width and height in the contract domain", () => {
     for (const { columns, rows } of contractDomain()) {
       const plan = planned(columns, rows);
-      const rowTotal = Object.values(plan.rowSpans).reduce(
-        (sum, span) => sum + span,
+      // The bands tile the height; a nested band refines one of them instead,
+      // so it is held to its host's extent rather than counted beside it.
+      const rowTotal = tilingRowSpans(plan).reduce(
+        (sum, [, span]) => sum + span,
         0,
       );
       expect(rowTotal).toBe(rows);
+      for (const [id, host] of Object.entries(FRAME_NESTED_ROW_BANDS)) {
+        const nested = plan.regions.find((region) => region.id === id)!;
+        const within = plan.regions.find((region) => region.id === host)!;
+        expect(plan.rowSpans[id], `${columns}x${rows} ${id}`).toBe(nested.rows);
+        expect(nested.row).toBeGreaterThanOrEqual(within.row);
+        expect(nested.row + nested.rows)
+          .toBeLessThanOrEqual(within.row + within.rows);
+      }
       const columnTotal = Object.values(plan.columnSpans).reduce(
         (sum, span) => sum + span,
         0,
@@ -301,9 +320,12 @@ describe("planFrame — the pure frame plan over the whole contract domain", () 
       if (rows < FRAME_CONTRACT_DOMAIN.maxRows && heightTier(rows + 1) === heightTier(rows)) {
         const taller = planned(columns, rows + 1);
         for (const [id, span] of Object.entries(taller.rowSpans)) {
-          expect(span).toBe(
-            plan.rowSpans[id] + (id === plan.flexible.row ? 1 : 0),
-          );
+          // A band nested in the flexible one absorbs the same row it does:
+          // the item rows are the body's own rows less the panel's chrome.
+          const flexes = id === plan.flexible.row
+            || FRAME_NESTED_ROW_BANDS[id as keyof typeof FRAME_NESTED_ROW_BANDS]
+              === plan.flexible.row;
+          expect(span).toBe(plan.rowSpans[id] + (flexes ? 1 : 0));
         }
         expect(taller.columnSpans).toEqual(plan.columnSpans);
       }
@@ -316,14 +338,48 @@ describe("planFrame — the pure frame plan over the whole contract domain", () 
         const tailGrowth = (taller.rowSpans.tail ?? 0) - (plan.rowSpans.tail ?? 0);
         expect(tailGrowth).toBeGreaterThan(0);
         expect(taller.rowSpans.body - plan.rowSpans.body + tailGrowth).toBe(1);
+        // The item rows follow the body they are nested in, so they move with it.
+        expect(taller.rowSpans.items - plan.rowSpans.items)
+          .toBe(taller.rowSpans.body - plan.rowSpans.body);
         for (const [id, span] of Object.entries(taller.rowSpans)) {
-          if (id !== "body" && id !== "tail") {
+          if (id !== "body" && id !== "tail" && id !== "items") {
             expect(span).toBe(plan.rowSpans[id]);
           }
         }
         expect(taller.columnSpans).toEqual(plan.columnSpans);
       }
     }
+  });
+
+  test("the plan owns the body band's item rows, so no reader downstream subtracts the drawn panel's chrome to find where the list starts", () => {
+    for (const { columns, rows } of contractDomain()) {
+      const plan = planned(columns, rows);
+      const items = plan.regions.find((region) => region.id === "items")!;
+      const body = plan.regions.find((region) => region.id === "body")!;
+      const at = `${columns}x${rows}`;
+      // A band of the plan in its own right: a member of `regions`, which is
+      // the roster the paint must register a drawn node for, and of `rowSpans`,
+      // which the oracle holds that span to.
+      expect(items, at).toBeDefined();
+      expect(plan.rowSpans.items, at).toBe(items.rows);
+      expect(FRAME_NESTED_ROW_BANDS.items, at).toBe("body");
+      // Inside the body band on both axes, and never a zero or negative span.
+      expect(items.rows, at).toBeGreaterThanOrEqual(1);
+      expect(items.columns, at).toBeGreaterThanOrEqual(1);
+      expect(items.row, at).toBeGreaterThan(body.row);
+      expect(items.column, at).toBeGreaterThan(body.column);
+      expect(items.row + items.rows, at)
+        .toBeLessThanOrEqual(body.row + body.rows);
+      expect(items.column + items.columns, at)
+        .toBeLessThanOrEqual(body.column + body.columns);
+    }
+    // The item rows follow the body band the plan drew: widening moves them
+    // with the body's own column, and a taller frame lengthens them by its row.
+    const itemsOf = (columns: number, rows: number) =>
+      planned(columns, rows).regions.find((region) => region.id === "items")!;
+    const items = itemsOf(140, 24);
+    expect(itemsOf(141, 24).columns).toBe(items.columns + 1);
+    expect(itemsOf(140, 25).rows).toBe(items.rows + 1);
   });
 
   test("below the width floor or the height floor the plan is the plain fallback rather than a frame", () => {
@@ -398,6 +454,9 @@ describe("planFrame — the pure frame plan over the whole contract domain", () 
       header: 1,
       rule: 1,
       body: 16,
+      // The body's list, nested in it: the 16 rows less the drawn panel's
+      // border, title and closing border.
+      items: 13,
       rule2: 1,
       tail: 3,
       status: 1,
@@ -563,7 +622,7 @@ describe("planFrame — the sidebar's planned composition", () => {
     // the block — the meter is surrendered last — and the gap is never what
     // closes. The kept elements are always a suffix of the block order.
     for (let railRows = 0; railRows <= 30; railRows += 1) {
-      const sidebar = planSidebar(railRows);
+      const sidebar = planSidebar(railRows, 0);
       expect(sidebar.vitals, `rail ${railRows}`).toEqual(
         SIDEBAR_VITALS_ORDER.slice(
           SIDEBAR_VITALS_ORDER.length - sidebar.vitals.length,
@@ -582,26 +641,64 @@ describe("planFrame — the sidebar's planned composition", () => {
     // The short-rail sequence, pinned: 9 rows keeps every element compact,
     // then tasks goes, then gates, and the meter stands alone before the gap
     // is ever traded away.
-    expect(planSidebar(9).vitals).toEqual(["tasks", "gates", "meter"]);
-    expect(planSidebar(9).gapRows).toBe(1);
-    expect(planSidebar(8)).toEqual({
+    expect(planSidebar(9, 0).vitals).toEqual(["tasks", "gates", "meter"]);
+    expect(planSidebar(9, 0).gapRows).toBe(1);
+    // A rail too short for the label row starts the views at its own first row.
+    const unlabelledViewRows = {
+      run: 0,
+      tasks: 1,
+      gates: 2,
+      journal: 3,
+      fleet: 4,
+    };
+    expect(planSidebar(8, 0)).toEqual({
       menuRows: 5,
+      viewRows: unlabelledViewRows,
       gapRows: 1,
       vitalsMode: "compact",
       vitals: ["gates", "meter"],
     });
-    expect(planSidebar(7)).toEqual({
+    expect(planSidebar(7, 0)).toEqual({
       menuRows: 5,
+      viewRows: unlabelledViewRows,
       gapRows: 1,
       vitalsMode: "compact",
       vitals: ["meter"],
     });
-    expect(planSidebar(6)).toEqual({
+    expect(planSidebar(6, 0)).toEqual({
       menuRows: 5,
+      viewRows: unlabelledViewRows,
       gapRows: 0,
       vitalsMode: "compact",
       vitals: [],
     });
+  });
+
+  test("test: the plan states the frame row each view name is drawn on, so the menu's label row is accounted for once, where it is decided", () => {
+    for (const { columns, rows } of contractDomain()) {
+      if (columns < 64) continue;
+      const plan = planned(columns, rows);
+      const rail = plan.regions.find((region) => region.id === "rail")!;
+      const sidebar = plan.sidebar!;
+      const at = `${columns}x${rows}`;
+      // Frame rows, consecutive, in jump-key order, and the menu block's last
+      // rows — whatever it exceeds them by is the label row it funded above.
+      const drawn = FRAME_VIEWS.map((view) => sidebar.viewRows[view]);
+      expect(drawn, at).toEqual(
+        FRAME_VIEWS.map(
+          (_, index) => rail.row + sidebar.menuRows - FRAME_VIEWS.length + index,
+        ),
+      );
+      for (const row of drawn) {
+        expect(row, at).toBeGreaterThanOrEqual(rail.row);
+        expect(row, at).toBeLessThan(rail.row + sidebar.menuRows);
+      }
+    }
+    // A rail tall enough for the label row draws the first view below it.
+    const labelled = planned(140, 24).sidebar!;
+    expect(labelled.menuRows).toBe(FRAME_VIEWS.length + 1);
+    expect(labelled.viewRows.run - planned(140, 24).regions
+      .find((region) => region.id === "rail")!.row).toBe(1);
   });
 
   test("test: the machine-surface anchors byte-match what the renderer draws with the separated sidebar, so the frozen tier is current", async () => {

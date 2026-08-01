@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { render, useApp, useInput } from "ink";
-import { createElement, useEffect, useRef, useSyncExternalStore } from "react";
+import { createElement, useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { graphPath, loadGraph, stateDirName } from "../../graph/graph.js";
 import { Journal, parseRunId } from "../../run/journal.js";
 import type {
@@ -10,7 +10,14 @@ import type {
   RunCockpitSource,
 } from "./derive.js";
 import { deriveRunCockpitData } from "./derive.js";
-import { deriveRunViewRows, runKeyColumns, RunCockpitFrame } from "./run-cockpit.js";
+import {
+  deriveRunViewRows,
+  drawnRunViewRowIds,
+  planRunCockpitFrame,
+  runKeyColumns,
+  RunCockpitFrame,
+  type PlannedRunCockpitFrame,
+} from "./run-cockpit.js";
 import {
   dispatchRunSurfaceKey,
   openingRunSurfaceState,
@@ -20,6 +27,14 @@ import {
   type RunInteractionState,
   type RunKeyEvent,
 } from "./keys.js";
+import {
+  applyPointerReport,
+  borrowPointerTracking,
+  createPointerReportReader,
+  type PointerInputToken,
+  type PointerReport,
+  type PointerSurface,
+} from "./pointer.js";
 
 // ponytail: fixed 2s re-derive cadence, matching `status --watch`; promote to a
 // config knob only if an operator asks.
@@ -139,6 +154,59 @@ export function liveRunViewRowIds(
   );
 }
 
+/**
+ * The pointer surface a committed frame carries: the plan the paint drew and
+ * the rows drawn into its body, both read off the renderer's own output. This
+ * is the only composition the live input path resolves through — it holds no
+ * planner and no geometry of its own, so a hit can never land on bands or
+ * rows the operator has not seen.
+ */
+function committedRunPointerSurface(
+  planned: PlannedRunCockpitFrame,
+  data: RunCockpitData,
+): PointerSurface | undefined {
+  if (planned.plan.kind !== "frame" || planned.content === undefined) {
+    return undefined;
+  }
+  return {
+    interaction: planned.interaction,
+    // The plan is the whole geometry the pointer receives: the item rows it
+    // resolves a hit through are the plan's own `items` band, the same region
+    // the paint draws its list into, so there is no second reading of where the
+    // list starts.
+    plan: planned.plan,
+    drawnRowIds: drawnRunViewRowIds(
+      data,
+      planned.interaction,
+      planned.content.items.rows,
+    ),
+    rowIds: liveRunViewRowIds(planned.interaction, data),
+  };
+}
+
+/**
+ * The suite's own planning of the surface a frame at this data, state and
+ * measured size commits — the same composition the renderer publishes through
+ * its commit seam, so a hit is tested against the frame production actually
+ * painted. The live input path never calls this: it resolves through the
+ * committed frame, and what nothing has painted yet has no geometry.
+ */
+export function liveRunPointerSurface(
+  data: RunCockpitData,
+  interaction: RunInteractionState,
+  size: { readonly columns: number; readonly rows: number },
+): PointerSurface | undefined {
+  return committedRunPointerSurface(
+    planRunCockpitFrame({
+      data,
+      columns: size.columns,
+      rows: size.rows,
+      interaction,
+    }),
+    data,
+  );
+}
+
 export type LiveCockpitSurface = {
   readonly data: RunCockpitData;
   readonly interaction: RunInteractionState;
@@ -156,12 +224,19 @@ export type LiveCockpitSurface = {
 export type LiveCockpitDelivery = {
   readonly snapshot: () => LiveCockpitSurface;
   readonly refresh: () => boolean;
-  readonly key: (event: RunKeyEvent, columns?: number) => boolean;
+  readonly key: (event: RunKeyEvent) => boolean;
+  readonly pointer: (report: PointerReport) => boolean;
   readonly batch: <Result>(deliver: () => Result) => Result;
 };
 
 type InternalLiveCockpitDelivery = LiveCockpitDelivery & {
   readonly subscribe: (listener: () => void) => () => void;
+  /**
+   * The renderer's commit seam: the frame the paint just drew becomes the
+   * surface pointer reports resolve against. Only the renderer writes here —
+   * the input path reads.
+   */
+  readonly commitPointerSurface: (surface: PointerSurface | undefined) => void;
 };
 
 function createLiveCockpitDelivery({
@@ -169,11 +244,17 @@ function createLiveCockpitDelivery({
   runId,
   binaryVersion,
   now,
+  size,
 }: {
   cwd: string;
   runId: string;
   binaryVersion: string;
   now: () => number;
+  /**
+   * The size the surface is drawn at, read at delivery time. Input is routed
+   * against the bands the frame really has, never against an assumed width.
+   */
+  size: () => { readonly columns: number; readonly rows: number };
 }): InternalLiveCockpitDelivery {
   // Both sources are read every refresh: a recompile between refreshes changes
   // which tasks exist, and the surface must draw the graph the repository has
@@ -194,6 +275,15 @@ function createLiveCockpitDelivery({
   const listeners = new Set<() => void>();
   let batchDepth = 0;
   let pendingDraw = false;
+  /**
+   * The frame on the screen, published by the renderer each time it commits
+   * one. Pointer reports resolve through this and only this: the input path
+   * plans nothing and caches no geometry, so a refresh, resize or key that
+   * nothing has painted yet cannot move a hit — the target set is the bands
+   * and rows the operator is actually looking at, until the paint replaces
+   * them.
+   */
+  let committedPointerSurface: PointerSurface | undefined;
 
   const publish = (): void => {
     if (batchDepth > 0) {
@@ -225,6 +315,9 @@ function createLiveCockpitDelivery({
       } finally {
         batchDepth -= 1;
         if (batchDepth === 0 && pendingDraw) {
+          // The batch ends and the surface is drawn again; the renderer's
+          // commit of that draw publishes the frame the next report resolves
+          // through.
           pendingDraw = false;
           publish();
         }
@@ -251,14 +344,16 @@ function createLiveCockpitDelivery({
     // can be in. The prompt is a scope inside that registry rather than an
     // owner in front of it, so a global key — Tab above all — reaches its
     // handler with a prompt open exactly as it does without one.
-    key: (event, columns = Number.MAX_SAFE_INTEGER) => transition((current) => {
+    key: (event) => transition((current) => {
       const next = dispatchRunSurfaceKey(
         event,
         { interaction: current.interaction, stashed: current.stashed },
         RUN_INPUT_BINDINGS,
         liveRunViewRowIds(current.interaction, current.data),
-        // The dispatcher decides on rail visibility, and the plan owns that.
-        runKeyColumns(columns),
+        // The dispatcher decides on rail visibility from the width the surface
+        // is measured at. A default here routed every key as if the rail were
+        // drawn, at widths where the plan draws no rail at all.
+        runKeyColumns(size().columns),
       );
       if (next === undefined) return current;
       const interaction = reconcileLiveRunInteraction(next.interaction, current.data);
@@ -266,8 +361,42 @@ function createLiveCockpitDelivery({
         ? current
         : { ...current, interaction, stashed: next.stashed };
     }),
+    // A pointer report resolves through the committed frame — the plan and
+    // the drawn rows the paint has on the screen, and nothing the input path
+    // derives for itself. Adjacent reports — a double click above all —
+    // arrive in one batch, which defers the redraw: they all resolve through
+    // the ONE committed frame still on the screen, and only the state each
+    // transition is dispatched FROM moves. The first press's own new scroll
+    // window cannot slide the list under the second press, because that
+    // window does not exist until the paint draws it.
+    pointer: (report) => transition((current) => {
+      const drawn = committedPointerSurface;
+      if (drawn === undefined) return current;
+      const next = applyPointerReport(report, {
+        ...drawn,
+        interaction: current.interaction,
+      });
+      if (next === undefined) return current;
+      const interaction = reconcileLiveRunInteraction(next, current.data);
+      return interaction === current.interaction
+        ? current
+        : { ...current, interaction };
+    }),
+    commitPointerSurface: (surface) => {
+      committedPointerSurface = surface;
+    },
   };
   return delivery;
+}
+
+/** The measured size a snapshot states, in the whole cells a plan is made of. */
+function parseMeasuredSize(
+  snapshot: string,
+): { readonly columns: number; readonly rows: number } {
+  const [columns, rows] = snapshot.split(":").map((part) =>
+    Math.max(0, Math.floor(Number(part)))
+  ) as [number, number];
+  return { columns, rows };
 }
 
 /** A draw-time terminal measurement and the stream Ink paints through. */
@@ -327,6 +456,81 @@ function measureOutput(output: NodeJS.WriteStream): MeasuredSize {
   };
 }
 
+/**
+ * The stdin the surface's keyboard reads: the real stream with every pointer
+ * report taken out of it. Reports and keys arrive interleaved on one stream, and
+ * a reader beside Ink's would not be enough — Ink would still see the report
+ * bytes and read a whole one as an unnameable escape sequence, or half of one as
+ * the single character its chunk happens to end on, dispatching either into
+ * whatever scope is live. So the split sits in the pull Ink already does
+ * (`read()` under its `readable` listener): reports are handed to the pointer
+ * boundary, and only what was left is ever read as a keystroke. A chunk that was
+ * nothing but reports reads as no input at all rather than as empty input.
+ */
+function pointerFilteredInput(
+  input: NodeJS.ReadStream,
+  deliver: (reports: readonly PointerReport[]) => void,
+): { readonly stdin: NodeJS.ReadStream; readonly close: () => void } {
+  const reader = createPointerReportReader();
+  const tokens: PointerInputToken[] = [];
+  let pendingEscape: NodeJS.Immediate | undefined;
+
+  const clearPendingEscape = (): void => {
+    if (pendingEscape === undefined) return;
+    clearImmediate(pendingEscape);
+    pendingEscape = undefined;
+  };
+  const wake = (): void => {
+    input.emit("readable");
+  };
+  const schedulePendingEscape = (): void => {
+    clearPendingEscape();
+    // The same next-turn grace Ink gives an ambiguous ESC: a continuation that
+    // arrives first completes the report; otherwise ESC becomes keyboard input.
+    if (reader.pending() !== "\x1b") return;
+    pendingEscape = setImmediate(() => {
+      pendingEscape = undefined;
+      tokens.push(...reader.flush().tokens);
+      wake();
+    });
+  };
+
+  const read = (...args: readonly unknown[]): string | null => {
+    while (true) {
+      const token = tokens.shift();
+      if (token?.type === "pointer") {
+        const reports = [token.report];
+        while (tokens[0]?.type === "pointer") {
+          const adjacent = tokens.shift();
+          if (adjacent?.type === "pointer") reports.push(adjacent.report);
+        }
+        deliver(reports);
+        continue;
+      }
+      if (token?.type === "keys") return token.bytes;
+
+      const chunk = (input.read as (...rest: readonly unknown[]) => unknown)(
+        ...args,
+      );
+      if (chunk === null || chunk === undefined) return null;
+      clearPendingEscape();
+      const readout = reader(String(chunk));
+      tokens.push(...readout.tokens);
+      schedulePendingEscape();
+    }
+  };
+  const stdin = new Proxy(input, {
+    get(target, property) {
+      if (property === "read") return read;
+      const value = Reflect.get(target, property);
+      return typeof value === "function" && !Object.hasOwn(target, property)
+        ? value.bind(target)
+        : value;
+    },
+  }) as NodeJS.ReadStream;
+  return { stdin, close: clearPendingEscape };
+}
+
 function LiveApp({
   delivery,
   size,
@@ -347,9 +551,7 @@ function LiveApp({
     size.snapshot,
     size.snapshot,
   );
-  const [columns, rows] = measuredSize.split(":").map((part) =>
-    Math.max(0, Math.floor(Number(part)))
-  ) as [number, number];
+  const { columns, rows } = parseMeasuredSize(measuredSize);
   const drawnSize = useRef(measuredSize);
   useEffect(() => {
     if (drawnSize.current === measuredSize) return;
@@ -368,13 +570,25 @@ function LiveApp({
       exit();
       return;
     }
-    delivery.key({ input, key }, columns);
+    delivery.key({ input, key });
   });
+  // Every frame the renderer commits is published to the delivery, so a
+  // pointer report resolves against the plan and the drawn rows of the frame
+  // on the screen — the input path never plans one of its own.
+  const commitFrame = useCallback(
+    (planned: PlannedRunCockpitFrame, frameData: RunCockpitData): void => {
+      delivery.commitPointerSurface(
+        committedRunPointerSurface(planned, frameData),
+      );
+    },
+    [delivery],
+  );
   return createElement(RunCockpitFrame, {
     data: surface.data,
     columns,
     rows,
     interaction: surface.interaction,
+    onCommittedFrame: commitFrame,
   });
 }
 
@@ -401,31 +615,59 @@ export async function runLiveCockpit({
   /** Observe and control the production delivery boundary. */
   onDelivery?: (delivery: LiveCockpitDelivery) => void;
 }): Promise<void> {
-  const delivery = createLiveCockpitDelivery({
-    cwd,
-    runId,
-    binaryVersion,
-    now,
-  });
-  onDelivery?.(delivery);
   // Subscribe before Ink mounts so no stale-size repaint can overtake the
-  // surface's newly planned frame.
+  // surface's newly planned frame — and before the delivery exists, which
+  // routes every input against this measurement.
   const size = measureOutput(output);
-  const app = render(createElement(LiveApp, {
-    delivery,
-    size,
-    refreshMs,
-  }), {
-    stdin: input,
-    stdout: size.stdout,
-    debug,
-    exitOnCtrlC: false,
-    patchConsole: false,
-  });
+  let app: ReturnType<typeof render> | undefined;
+  let filteredInput: ReturnType<typeof pointerFilteredInput> | undefined;
+  let releasePointerTracking: (() => void) | undefined;
   try {
+    const delivery = createLiveCockpitDelivery({
+      cwd,
+      runId,
+      binaryVersion,
+      now,
+      size: () => parseMeasuredSize(size.snapshot()),
+    });
+    onDelivery?.(delivery);
+    // Pointer reports are their own input class: they are taken off the stream
+    // before the keyboard reads it and delivered to the pointer boundary, never
+    // handed to a key handler. A batch keeps adjacent reports to one redraw.
+    filteredInput = pointerFilteredInput(input, (reports) => {
+      delivery.batch(() => {
+        for (const report of reports) delivery.pointer(report);
+      });
+    });
+    // One loan owns the complete live lifecycle. Its signal repayments stand
+    // before the ask, then remain installed through mount, paint, input and
+    // unmount. Non-tty output borrows nothing and writes nothing.
+    releasePointerTracking = borrowPointerTracking(output);
+    app = render(createElement(LiveApp, {
+      delivery,
+      size,
+      refreshMs,
+    }), {
+      stdin: filteredInput.stdin,
+      stdout: size.stdout,
+      debug,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    });
     await app.waitUntilExit();
   } finally {
-    size.close();
-    app.unmount();
+    try {
+      filteredInput?.close();
+    } finally {
+      try {
+        app?.unmount();
+      } finally {
+        try {
+          releasePointerTracking?.();
+        } finally {
+          size.close();
+        }
+      }
+    }
   }
 }

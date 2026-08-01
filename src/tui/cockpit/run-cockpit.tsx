@@ -1,11 +1,15 @@
 import { Box, useApp, useStdout, type DOMElement } from "ink";
 import {
   cloneElement,
+  createContext,
   type ReactElement,
   type ReactNode,
+  useContext,
+  useEffect,
   useInsertionEffect,
   useMemo,
   useRef,
+  useSyncExternalStore,
 } from "react";
 import {
   GLYPHS,
@@ -51,8 +55,10 @@ import {
 } from "./views.js";
 import {
   FRAME_HEADER_GAP,
+  FRAME_NESTED_ROW_BANDS,
   FULL_JOURNAL_ROWS,
   planFrame,
+  RUN_PANEL_HORIZONTAL_CHROME,
   SIDEBAR_COLUMN_FLOOR,
   type FramePlan,
   type FrameRegion,
@@ -64,12 +70,23 @@ import {
   type SidebarPlan,
   type SidebarVitalsElement,
 } from "./layout.js";
+import {
+  pointerHoverRow,
+  pointerRestingCell,
+  sessionRailOverride,
+  watchPointerRest,
+  watchSessionRailOverride,
+} from "./pointer.js";
 import { cellWidth, fitCells, wrapCells } from "./width.js";
 export { deriveRunCockpitData } from "./derive.js";
 export type { RunCockpitData } from "./derive.js";
 export { PANEL_CHROME_ROWS } from "./components.js";
 
-/** The width focus and key routing resolve at. */
+/**
+ * The width focus and key routing resolve at, from a measured width — the form
+ * used before a plan exists. Once one does, `plannedKeyColumns` (pointer.ts)
+ * reads the same answer off the bands the plan actually drew.
+ */
 export function runKeyColumns(columns: number): number {
   return columns >= SIDEBAR_COLUMN_FLOOR
     ? Math.max(columns, RUN_SIDE_RAIL_COLUMN_FLOOR)
@@ -194,8 +211,6 @@ function NarrowHeaderBand({
 }
 
 const RUN_SIDE_RAIL_WIDTH = 16;
-/** Border plus horizontal padding charged by Panel around its body. */
-const RUN_PANEL_HORIZONTAL_CHROME = 4;
 
 /** The header caption: the run's identity line, planned as the header's refinable sub-region. */
 function frameCaption(data: RunCockpitData): string {
@@ -312,6 +327,54 @@ function setupSectionLines(
   const parked = data.taskRows.filter((row) => row.state === "human");
   if (parked.length === 0) return ["No parked decisions in this engagement"];
   return parked.map((row) => `${row.taskId} · parked · attempt ${row.attempts ?? 0}`);
+}
+
+/**
+ * The plan's item rows, and the ref the frame registers their painted node
+ * through. Every body panel draws its list into this one box, so the rectangle
+ * the conformance oracle measures off the paint is the rectangle planFrame
+ * planned — which is exactly the pin a field standing beside the plan could
+ * never carry. Absent on the unsized legacy surface, which has no plan.
+ */
+const ItemRowsBand = createContext<
+  | {
+    readonly region: FrameRegion;
+    readonly regionRef?: (node: DOMElement | null) => void;
+  }
+  | undefined
+>(undefined);
+
+/**
+ * The identity of the row a live pointer is resting on, or none. It is drawn
+ * state and only drawn state: nothing reads it back, no interaction state
+ * carries it, and the one provider is fed by a `hover` prop the frame's own
+ * callers supply. A capture supplies none — `capture.ts` builds this frame from
+ * data, size and interaction alone — so every golden, anchor and colour capture
+ * records the pointerless appearance by construction rather than by a guard
+ * stripping a highlight back out afterwards.
+ */
+const HoveredRow = createContext<string | null>(null);
+
+/**
+ * A body panel's list, drawn into the plan's own item rows and nowhere else.
+ * The band is consumed by the outermost panel that asks for it — a panel nested
+ * inside that one (the RUN view's own journal) is part of the list, not a second
+ * claim on the region, so the band is cleared for everything below.
+ */
+function ItemRows({ children }: { children: ReactNode }): ReactElement {
+  const band = useContext(ItemRowsBand);
+  if (band === undefined) return <>{children}</>;
+  return (
+    <Box
+      ref={band.regionRef}
+      flexDirection="column"
+      height={band.region.rows}
+      width={band.region.columns}
+      flexShrink={0}
+    >
+      <ItemRowsBand.Provider value={undefined}>{children}</ItemRowsBand.Provider>
+    </Box>
+  );
 }
 
 /**
@@ -460,6 +523,36 @@ function windowedRows(
   };
 }
 
+/**
+ * The identities the body's rows carry in the order the body draws them — the
+ * same window `SizedJournalPanel` paints, so a hit on a body row resolves to
+ * the row an operator is looking at rather than to a position in a collection
+ * the frame scrolled past. A body that draws no selectable list (the overview,
+ * the journal tail, an open detail, the help overlay, the decisions tab) owns
+ * no rows here.
+ */
+export function drawnRunViewRowIds(
+  data: RunCockpitData,
+  interaction: RunInteractionState,
+  bodyRows: number,
+): readonly string[] {
+  if (
+    interaction.tab === "setup"
+    || interaction.activeView === "run"
+    || interaction.opened !== null
+    || interaction.help
+  ) return [];
+  const rows = deriveRunViewRows(
+    data,
+    interaction.activeView,
+    interaction.filterQuery,
+  );
+  return selectableRunViewRowIds(
+    interaction.activeView,
+    windowedRows(rows, bodyRows, interaction.selection).rows.map((row) => row.id),
+  );
+}
+
 function SizedJournalPanel({
   rows,
   bodyRows,
@@ -474,19 +567,31 @@ function SizedJournalPanel({
   focused?: boolean;
 }): ReactElement {
   const window = windowedRows(rows, bodyRows, selection);
+  // The hovered row is carried as its identity, never as a screen row: it was
+  // resolved through the plan once, and this panel finds it in the very window
+  // it is about to paint or does not draw it at all. A list this pointer cell
+  // acts on nothing in — the passive overview tail, the journal's unselectable
+  // rows — finds nothing here, so no row is decorated for being passed over.
+  const hovered = useContext(HoveredRow);
+  const hover = hovered === null
+    ? -1
+    : window.rows.findIndex((row) => row.id === hovered);
   const emptyRows = Math.max(0, bodyRows - window.rows.length);
   const journal = JournalRowPanel({
     rows: window.rows,
     title,
     selection: window.selection,
     focused,
+    ...(hover < 0 ? {} : { hover }),
   });
   const journalProps = journal.props as { readonly children?: ReactNode };
   return cloneElement(
     journal,
     {},
-    journalProps.children,
-    emptyRows > 0 ? <Box key="journal-space" height={emptyRows} /> : null,
+    <ItemRows key="items">
+      {journalProps.children}
+      {emptyRows > 0 ? <Box key="journal-space" height={emptyRows} /> : null}
+    </ItemRows>,
   );
 }
 
@@ -513,12 +618,14 @@ function SizedLinesPanel({
   const emptyRows = Math.max(0, bodyRows - visible.length);
   return (
     <Panel title={title} focused={focused} flexGrow={flexGrow}>
-      {visible.map((line, index) => (
-        <Box key={`${index}:${line}`} height={1} overflow="hidden">
-          <BodyText>{line}</BodyText>
-        </Box>
-      ))}
-      {emptyRows > 0 && <Box height={emptyRows} />}
+      <ItemRows>
+        {visible.map((line, index) => (
+          <Box key={`${index}:${line}`} height={1} overflow="hidden">
+            <BodyText>{line}</BodyText>
+          </Box>
+        ))}
+        {emptyRows > 0 && <Box height={emptyRows} />}
+      </ItemRows>
     </Panel>
   );
 }
@@ -561,7 +668,9 @@ function RunViewPanel({
   if (interaction.help) {
     return (
       <Panel title="HELP" focused={focused} flexGrow={1}>
-        {helpLines(keyEntries).map((line) => <BodyText key={line}>{line}</BodyText>)}
+        <ItemRows>
+          {helpLines(keyEntries).map((line) => <BodyText key={line}>{line}</BodyText>)}
+        </ItemRows>
       </Panel>
     );
   }
@@ -583,7 +692,9 @@ function RunViewPanel({
   if (rows.length === 0) {
     return (
       <Panel title={view.title} focused={focused} flexGrow={1}>
-        <BodyText emphasis="dim">No {view.id} in this engagement</BodyText>
+        <ItemRows>
+          <BodyText emphasis="dim">No {view.id} in this engagement</BodyText>
+        </ItemRows>
       </Panel>
     );
   }
@@ -961,9 +1072,14 @@ function CompactProgress({
 
 /** What each drawn region draws: the resolved budgets its panels consume. */
 export type RegionContent = {
-  readonly body: number;
+  /**
+   * Where the body band's item rows are drawn and how many there are: the
+   * plan's own `items` region, carried here unmodified. This file subtracts no
+   * chrome to obtain it — planFrame plans it, the paint draws its list at it,
+   * and hit resolution (pointer.ts) reads the same region off the same plan.
+   */
+  readonly items: FrameRegion;
   readonly journal: number;
-  readonly bodyColumns: number;
   readonly sideRails: boolean;
   readonly stats: FrameCockpitLayout["stats"]["mode"] | "none";
   readonly progressBar: boolean;
@@ -1023,15 +1139,13 @@ function resolveRegionContent(
   data: RunCockpitData,
   interaction: RunInteractionState,
 ): RegionContent {
-  const bodyRegion = requiredRegion(plan, "body");
-  const bodySpan = bodyRegion.rows;
+  const bodySpan = requiredRegion(plan, "body").rows;
   const sideRails = plan.band === "sidebar";
-  const body = Math.max(1, bodySpan - PANEL_CHROME_ROWS);
-  const bodyColumns = Math.max(
-    1,
-    bodyRegion.columns - RUN_PANEL_HORIZONTAL_CHROME,
-  );
-  const common = { body, bodyColumns, sideRails } as const;
+  // The plan's own item rows, consumed unmodified: the paint draws its list at
+  // this region and the pointer resolves a hit through it — one geometry.
+  const items = requiredRegion(plan, "items");
+  const bodyColumns = items.columns;
+  const common = { items, sideRails } as const;
 
   if (interaction.tab !== "setup" && interaction.activeView === "run") {
     return {
@@ -1079,8 +1193,8 @@ function LadderRunPanel({
       <SizedLinesPanel
         title="HELP"
         lines={helpLines(keyEntries)}
-        bodyRows={content.body}
-        wrapColumns={content.bodyColumns}
+        bodyRows={content.items.rows}
+        wrapColumns={content.items.columns}
         focused={focused}
         flexGrow={1}
       />
@@ -1088,26 +1202,28 @@ function LadderRunPanel({
   }
   return (
     <Panel title="RUN" focused={focused} flexGrow={1}>
-      <RunStats data={data} mode={content.stats} />
-      {content.progressBar && (
-        content.approvedProgress
-          ? <ApprovedProgress data={data} caption={content.progressCaption} />
-          : (
-            <CompactProgress
-              data={data}
-              caption={content.progressCaption}
-              meterWidth={compactMeterWidth}
-            />
-          )
-      )}
-      {content.journal > 0 && (
-        <JournalBody
-          data={data}
-          interaction={interaction}
-          bodyRows={content.journal}
-          keyEntries={keyEntries}
-        />
-      )}
+      <ItemRows>
+        <RunStats data={data} mode={content.stats} />
+        {content.progressBar && (
+          content.approvedProgress
+            ? <ApprovedProgress data={data} caption={content.progressCaption} />
+            : (
+              <CompactProgress
+                data={data}
+                caption={content.progressCaption}
+                meterWidth={compactMeterWidth}
+              />
+            )
+        )}
+        {content.journal > 0 && (
+          <JournalBody
+            data={data}
+            interaction={interaction}
+            bodyRows={content.journal}
+            keyEntries={keyEntries}
+          />
+        )}
+      </ItemRows>
     </Panel>
   );
 }
@@ -1401,7 +1517,10 @@ function RunCockpitPaint({
           flexDirection="column"
           overflow="hidden"
         >
-          {setup
+          <ItemRowsBand.Provider
+            value={{ region: content.items, regionRef: regionRef("items") }}
+          >
+            {setup
             ? (
               <SetupTabPanel
                 data={data}
@@ -1409,8 +1528,8 @@ function RunCockpitPaint({
                 focused={contentFocused}
                 keyEntries={keyEntries}
                 help={currentInteraction.help}
-                bodyRows={content.body}
-                bodyColumns={content.bodyColumns}
+                bodyRows={content.items.rows}
+                bodyColumns={content.items.columns}
               />
             )
             : activeView === "run"
@@ -1431,10 +1550,11 @@ function RunCockpitPaint({
                 interaction={currentInteraction}
                 focused={contentFocused}
                 keyEntries={keyEntries}
-                bodyRows={content.body}
-                bodyColumns={content.bodyColumns}
+                bodyRows={content.items.rows}
+                bodyColumns={content.items.columns}
               />
             )}
+          </ItemRowsBand.Provider>
         </Box>
       </FrameBand>
       <FrameBand rows={requiredRegion(plan, "rule2").rows} regionRef={regionRef("rule2")}>
@@ -1489,12 +1609,19 @@ export function planRunCockpitFrame({
   rows,
   interaction,
   keyProjection = projectRunKeyEntries,
+  railColumns,
 }: {
   data: RunCockpitData;
   columns: number;
   rows?: number;
   interaction?: RunInteractionState;
   keyProjection?: RunKeyProjection;
+  /**
+   * The session's panel resize override, handed to planFrame as an input —
+   * never a bypass of it: the plan recomputes from the measured size plus this
+   * override and what is drawn is what the plan returns.
+   */
+  railColumns?: number;
 }): PlannedRunCockpitFrame {
   const suppliedInteraction = interaction ?? initialRunInteractionState();
   const suppliedRows = deriveRunViewRows(
@@ -1515,6 +1642,7 @@ export function planRunCockpitFrame({
     tab: repaired.tab,
     detail: repaired.opened !== null,
     captionCells: cellWidth(frameCaption(data)),
+    ...(railColumns === undefined ? {} : { railColumns }),
   };
   const plan = planFrame(size, view, state);
   const content = rows === undefined || plan.kind !== "frame"
@@ -1540,13 +1668,34 @@ export function RunCockpitFrame({
   rows,
   interaction,
   keyProjection = projectRunKeyEntries,
+  onCommittedFrame,
 }: {
   data: RunCockpitData;
   columns: number;
   rows?: number;
   interaction?: RunInteractionState;
   keyProjection?: RunKeyProjection;
+  /**
+   * The renderer's commit seam: once this frame is committed, the exact plan
+   * and inputs it was drawn from are handed back, so an input surface can
+   * resolve its hits against the frame on the screen rather than against a
+   * plan it derived for itself. What nothing has painted yet has no geometry.
+   */
+  onCommittedFrame?: (
+    planned: PlannedRunCockpitFrame,
+    data: RunCockpitData,
+  ) => void;
 }): ReactElement {
+  // The session's panel resize override, read from the pointer layer the live
+  // drag feeds and redrawn when the boundary moves. It enters the frame only
+  // as an input to this planning call — the drawn frame is the recomputed
+  // plan, so a resize can never paint beside the plan. Nothing persists it: a
+  // relaunch plans the default layout.
+  const railOverride = useSyncExternalStore(
+    watchSessionRailOverride,
+    sessionRailOverride,
+    sessionRailOverride,
+  );
   const plannedFrame = useMemo(
     () =>
       planRunCockpitFrame({
@@ -1555,14 +1704,66 @@ export function RunCockpitFrame({
         rows,
         interaction,
         keyProjection,
+        railColumns: railOverride ?? undefined,
       }),
-    [data, columns, rows, interaction, keyProjection],
+    [data, columns, rows, interaction, keyProjection, railOverride],
   );
+  useEffect(() => {
+    onCommittedFrame?.(plannedFrame, data);
+  }, [plannedFrame, data, onCommittedFrame]);
+  // Where the pointer is resting, read from the pointer layer that the live
+  // input path feeds and redrawn when it moves. There is no prop beside it: a
+  // hover cannot be handed to this frame at all, only reported to the terminal.
+  const resting = useSyncExternalStore(
+    watchPointerRest,
+    pointerRestingCell,
+    pointerRestingCell,
+  );
+  // And only a frame that publishes its geometry for hit testing can be hovered
+  // — publishing it is what makes a pointer report resolve against this frame
+  // at all. A capture publishes none and resolves none, so no golden, anchor or
+  // colour capture can carry a highlight however the pointer came to rest: the
+  // pointerless appearance is what that path draws by construction, not what a
+  // guard strips back out of it.
+  const hover = onCommittedFrame === undefined ? null : resting;
+  const hoveredRow = useMemo(() => {
+    const plan = plannedFrame.plan;
+    if (
+      hover === null || plan.kind !== "frame"
+      || plannedFrame.content === undefined
+    ) return null;
+    const interaction = plannedFrame.interaction;
+    // The whole surface a click resolves through, not only the geometry: what a
+    // click at this cell ACTS ON is the highlight's answer, and that route
+    // passes through the focus the frame is drawn with and the rows a key may
+    // stand on. Deriving the highlight from the row lookup alone would advertise
+    // a row of the drawn view while the rail marker stands on another — where
+    // the click opens the marked view and selects nothing.
+    return pointerHoverRow(
+      {
+        plan,
+        interaction,
+        drawnRowIds: drawnRunViewRowIds(
+          data,
+          interaction,
+          plannedFrame.content.items.rows,
+        ),
+        rowIds: selectableRunViewRowIds(
+          interaction.activeView,
+          deriveRunViewRows(data, interaction.activeView, interaction.filterQuery)
+            .map((row) => row.id),
+        ),
+      },
+      hover,
+    ) ?? null;
+  }, [plannedFrame, data, hover]);
   return (
-    <RunCockpitFrameFromPlan
-      data={data}
-      plannedFrame={plannedFrame}
-    />
+    <HoveredRow.Provider value={hoveredRow}>
+      <RunCockpitFrameFromPlan
+        data={data}
+        plannedFrame={plannedFrame}
+      />
+    </HoveredRow.Provider>
   );
 }
 
@@ -1583,6 +1784,25 @@ function assertPlanSpans(plan: PlannedFrame): void {
   let nextRow = 0;
   for (const [id, span] of Object.entries(plan.rowSpans)) {
     const region = requiredRegion(plan, id as FrameRegion["id"]);
+    const host = FRAME_NESTED_ROW_BANDS[id as FrameRegion["id"]];
+    if (host !== undefined) {
+      // A nested band refines its host's rows rather than tiling beside them,
+      // so it advances no row cursor — and is held to its span and to staying
+      // inside the band that hosts it.
+      const within = requiredRegion(plan, host);
+      if (
+        region.rows !== span ||
+        region.row < within.row ||
+        region.row + region.rows > within.row + within.rows ||
+        region.column < within.column ||
+        region.column + region.columns > within.column + within.columns
+      ) {
+        throw new Error(
+          `planned row region ${id} has offset/span ${region.row}/${region.rows} column ${region.column}/${region.columns}, expected span ${span} inside ${host} at ${within.row}/${within.rows} column ${within.column}/${within.columns}`,
+        );
+      }
+      continue;
+    }
     const fullWidth = id !== "body";
     if (
       region.row !== nextRow ||

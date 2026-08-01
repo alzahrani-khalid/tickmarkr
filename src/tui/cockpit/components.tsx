@@ -26,9 +26,24 @@ import {
 import { cellWidth as stringWidth, sliceCells } from "./width.js";
 
 const SPARKLINE_GLYPHS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
+
+/**
+ * The hover highlight's non-colour half: one cell wide, drawn in the separator
+ * the row already spends, from the block family the cockpit already draws with.
+ * Colour is the other half and the louder one, but Chalk suppresses inverse and
+ * colour together at level 0, so a highlight made of ink alone does not exist
+ * under `NO_COLOR` or a colourless TTY. This is a character; it always does.
+ */
+export const HOVER_MARKER = "▌";
 const BAND_GAP_COLUMNS = 1;
 const PANEL_HORIZONTAL_CHROME = 4;
-const READABLE_PANEL_COLUMNS = 20;
+/**
+ * The columns below which a bordered panel no longer reads — the floor a band
+ * allocation defends, and the floor planFrame's session resize override clamps
+ * the body panel at: a drag surrenders an element whole or not at all, it
+ * never collapses one below what reads.
+ */
+export const READABLE_PANEL_COLUMNS = 20;
 
 export const PANEL_CHROME_ROWS = 3;
 export const BAND_CONTINUATION_PREFIX = "↳ ";
@@ -609,6 +624,7 @@ export function JournalRowPanel({
   focused,
   title = "JOURNAL",
   selection,
+  hover,
 }: {
   rows: readonly JournalRow[];
   width?: number | string;
@@ -616,6 +632,18 @@ export function JournalRowPanel({
   title?: string;
   /** Index of the row the pointer marks; undefined draws no pointer. */
   selection?: number;
+  /**
+   * Index of the row a live pointer is resting on; undefined draws no
+   * highlight, which is every surface nobody is pointing at — a capture above
+   * all. The highlight is ink AND shape: the brightest step of the existing
+   * data ramp worn inverted, plus {@link HOVER_MARKER} standing in the one
+   * separator cell the row already spends between its state glyph and its text.
+   * Ink alone would be no highlight at all under `NO_COLOR` or a colourless
+   * TTY, where Chalk suppresses inverse and colour alike; the marker is a drawn
+   * character, so it survives every colour level. It costs the row no cell it
+   * did not already own, so a hover shifts nothing an operator was reading.
+   */
+  hover?: number;
 }): ReactElement {
   return (
     <Panel title={title} focused={focused} width={width}>
@@ -630,11 +658,19 @@ export function JournalRowPanel({
           <BodyText emphasis="dim">{row.time}</BodyText>
           <BodyText> </BodyText>
           <StateGlyph state={row.state} />
-          <BodyText> </BodyText>
+          <BodyText emphasis={index === hover ? "strong" : "normal"}>
+            {index === hover ? HOVER_MARKER : " "}
+          </BodyText>
           {index === selection && (
             <BodyText emphasis="strong">{GLYPHS.pointer} </BodyText>
           )}
-          <BodyText>{row.text}</BodyText>
+          {index === hover
+            ? (
+              <Text inverse color={`ansi256(${COCKPIT_DATA_RAMP[0].xterm})`}>
+                {row.text}
+              </Text>
+            )
+            : <BodyText>{row.text}</BodyText>}
         </Box>
       ))}
     </Panel>
