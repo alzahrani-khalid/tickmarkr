@@ -459,7 +459,7 @@ describe("R3 review participation is path-keyed", () => {
     // calibration corpus byte-identical. A new lint that quietly changed what the pinned corpus
     // reports would be indistinguishable from a regression in the lints it joined.
     const root = process.cwd();
-    const v184 = compileNative("specs/v1.84-pointer.spec.md");
+    const v184 = compileNative("tests/fixtures/compile/v1.84-pointer.spec.md");
     const t1 = v184.tasks.find((t) => t.id === "T1")!;
     const originalT1 = { ...t1, files: t1.files.filter((f) => f !== "src/tui/cockpit/layout.ts" && f !== "tests/cockpit/layout.test.ts") };
     const withParticipation = taskUnitContractErrors([originalT1], root, active);
@@ -471,7 +471,7 @@ describe("R3 review participation is path-keyed", () => {
     expect(lintsOnly).toHaveLength(2); // the corpus's pinned rejections: surface + symbol ownership
     expect(withParticipation).toEqual(lintsOnly); // …and participation adds nothing to them
     // the corpus's PASSING half stays passing under the merged lints, participation included
-    const v179 = compileNative("specs/v1.79-signal-truth.spec.md");
+    const v179 = compileNative("tests/fixtures/compile/v1.79-signal-truth.spec.md");
     expect(v179.tasks.length).toBeGreaterThan(0);
     expect(taskUnitContractErrors(v179.tasks, root, active)).toEqual([]);
     expect(reviewParticipationErrors(v179.tasks, active)).toEqual([]);

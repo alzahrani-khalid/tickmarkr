@@ -324,7 +324,7 @@ describe("R2 calibration corpus", () => {
     const root = process.cwd();
     // The corpus pins the pre-amendment T1: commits 5b00ec54 (OBS-248) and b4274d6f later added
     // layout.ts and its test to T1's files[] — removing them reproduces the original task exactly.
-    const v184 = compileNative("specs/v1.84-pointer.spec.md");
+    const v184 = compileNative("tests/fixtures/compile/v1.84-pointer.spec.md");
     const t1 = v184.tasks.find((t) => t.id === "T1")!;
     const original = {
       ...t1,
@@ -351,7 +351,7 @@ describe("R2 calibration corpus", () => {
     expect(goalWords).toBe(287);
     expect(goalDensityErrors([original])).toEqual([]);
 
-    const v179 = compileNative("specs/v1.79-signal-truth.spec.md");
+    const v179 = compileNative("tests/fixtures/compile/v1.79-signal-truth.spec.md");
     expect(v179.tasks.length).toBeGreaterThan(0);
     expect(surfaceErrors(v179.tasks)).toEqual([]);
     expect(goalDensityErrors(v179.tasks)).toEqual([]);
