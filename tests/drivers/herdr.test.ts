@@ -1,13 +1,16 @@
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { declareInputBox } from "../../src/adapters/types.js";
-import { DELIVERY_ATTEMPTS, DeliveryReadinessError, HerdrDriver } from "../../src/drivers/herdr.js";
+import { DELIVERY_ATTEMPTS, DISPATCH_START_PREFIX, DeliveryReadinessError, HerdrDriver } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { classifyTaskFailure, Journal, type JournalEvent } from "../../src/run/journal.js";
+import { runDaemon } from "../../src/run/daemon.js";
+import { setupRepo, T } from "../helpers/tmprepo.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once"; contendDelivery?: boolean; wrappedCmd?: string; boxWrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; paneReadHangsAfter?: number; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo"; submitAfterReads?: number }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once" | "p9-only"; contendDelivery?: boolean; wrappedCmd?: string; boxWrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; paneReadHangsAfter?: number; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo" | "looks-successful"; submitAfterReads?: number; dispatchAck?: "never" | "fresh-only"; dispatchEcho?: boolean; ackWatchBlind?: boolean; ackWriteFails?: boolean; paneCloseFails?: boolean }
 
 function steppedTimeSource() {
   let nowMs = 0;
@@ -41,6 +44,7 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const enterctr = join(dir, "enterctr.txt"); // submission verification: bounded Enter presses
   const submitreadctr = join(dir, "submitreadctr.txt"); // slow-submit fixture: reads before registration
   const typed = join(dir, "typed.txt"); // the currently typed delivery prompt
+  const paneOut = join(dir, "paneout"); // per-pane stdout of the lines this pane's shell actually ran
   const bin = join(dir, "herdr");
   const cwd = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-cwd-"));
   // DEFECT-01: a prior (killed) attempt's kept pane still carries the durable label — a stale pane-list
@@ -73,7 +77,7 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const tabRename = opts.tabRenameFails ? "exit 1" : "echo '{}'";
   // pane close <pane>: drop its registry line (frees the label) unless paneCloseNoop (the reclaim
   // fail-closed fixture — a close that never frees the name must make the driver reject).
-  const paneClose = opts.paneCloseNoop ? `echo '{}'` : `grep -v "^$3 " '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; echo '{}'`;
+  const paneClose = opts.paneCloseFails ? `exit 1` : opts.paneCloseNoop ? `echo '{}'` : `grep -v "^$3 " '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; echo '{}'`;
   // OBS-85: the delivery read-back rides `pane wait-output --match <cmd>` (exit 0 = pane echoed the typed
   // command). corrupt:"always" never matches; corrupt:"once" fails the first verify then matches —
   // the cleared-and-retyped path. pane read then serves the corrupted-transcript capture.
@@ -82,6 +86,9 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
       ? "exit 1"
       : opts.corrupt === "always"
       ? "exit 1"
+      // a wedged pane: the typed read-back never lands there, while a fresh sibling takes it normally
+      : opts.corrupt === "p9-only"
+      ? `[ "$3" = 'w1:p9' ] && exit 1; exit 0`
       : opts.corrupt === "once"
         ? `n=$(cat '${verctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${verctr}'; [ $n -le 1 ] && exit 1; exit 0`
         : `exit ${waitExit}`;
@@ -89,7 +96,14 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
     (frame, i) => `${i + 1}) printf '%s\\n' '${frame.replaceAll("'", "'\\''")}' ;;`,
   ).join(" ");
   const lastStagedRead = opts.paneReadFrames?.at(-1)?.replaceAll("'", "'\\''");
-  const preSubmitPaneRead = opts.changingPaneRead
+  // v1.85 T5: the pane ECHOES the entire dispatched line beneath a shell prompt, with worker output
+  // and a fresh prompt below it — the exact shape the deleted shell-execution-echo reader (OBS-144)
+  // read as "the shell ran this". The nonce is mangled on the way in (below), so it was never
+  // PRINTED: a perfect lookalike carrying no causal evidence.
+  const dispatchEchoRead = `printf '➜  worker git:(task) ✗ %s\\nworker-output\\n➜  worker git:(task) ✗ \\n' "$(cat '${typed}' 2>/dev/null)"`;
+  const preSubmitPaneRead = opts.dispatchEcho
+    ? dispatchEchoRead
+    : opts.changingPaneRead
     ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; printf 'painting-frame-%s\\n' "$n"`
     : opts.paneReadFrames?.length
       ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; case "$n" in ${stagedReads} *) printf '%s\\n' '${lastStagedRead}' ;; esac`
@@ -104,7 +118,9 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
           ? `printf '╭────────────╮\\n│ >          │\\n╰────────────╯\\n'`
         : `printf 'line1\\nTICKMARKR_EXIT:0\\n'`;
   const stuckSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '╭────────────╮\\n│ > %s │\\n╰────────────╯\\n' "$cmd"`;
-  const completedSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '%s\\nworker-output\\nSend /help for help information.\\n> \\n' "$cmd"`;
+  const completedSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '%s\\nworker-output\\nSend /help for help information.\\n╭────────────╮\\n│ >          │\\n╰────────────╯\\n' "$cmd"`;
+  // v1.85 T5: the same frame WITHOUT the fresh empty box — a transcript that merely looks successful.
+  const looksSuccessfulSubmission = `cmd=$(cat '${typed}' 2>/dev/null); printf '%s\\nworker-output\\nSend /help for help information.\\n> \\n' "$cmd"`;
   const absentSubmission = `printf 'worker-output\\n> \\n'`;
   const bannerOnlySubmission = `printf 'Welcome to Kimi Code!\\nSend /help for help information.\\n'`;
   const emptyBoxSubmission = `printf '╭────────────╮\\n│ >          │\\n╰────────────╯\\n'`;
@@ -122,6 +138,8 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
       ? bareCommandSubmission
     : opts.submission === "execution-echo"
       ? executionEchoSubmission
+    : opts.submission === "looks-successful"
+      ? looksSuccessfulSubmission
     : opts.submission === "second"
       ? `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -ge 2 ]; then ${completedSubmission}; else ${stuckSubmission}; fi`
       : opts.submission === "slow" || opts.submission === "scaled"
@@ -133,7 +151,7 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
       ? `sleep 2; printf 'late pane read\\n'`
       : opts.paneReadHangsAfter !== undefined
         ? `n=$(cat '${readctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${readctr}'; if [ "$n" -gt ${opts.paneReadHangsAfter} ]; then sleep 2; fi; printf 'restless-frame-%s\\n' "$n"`
-        : `n=$(cat '${enterctr}' 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then ${postSubmitPaneRead}; else ${preSubmitPaneRead}; fi`;
+        : `n=$(cat '${enterctr}-'"$3" 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then ${postSubmitPaneRead}; else ${preSubmitPaneRead}; fi`;
   const deliveryContend = opts.contendDelivery
     ? `
 delivery_pane() { for a in "$@"; do case "$a" in w1:p*) echo "$a"; return;; esac; done; }
@@ -149,10 +167,33 @@ pane_send_keys() { if [[ "$*" == *C-u* ]]; then delivery_clear "$@"; elif [[ "$*
   const clearResult = opts.clearFailsThroughRead === undefined
     ? `echo '{}'`
     : `n=$(cat '${readctr}' 2>/dev/null || echo 0); [ "$n" -le ${opts.clearFailsThroughRead} ] && exit 1; echo '{}'`;
-  const enterResult = opts.rebindAfterDelivery
-    ? `if [[ "$*" == *Enter* ]]; then grep -v " ${opts.rebindAfterDelivery.name}$" '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; printf '%s %s\\n' '${opts.rebindAfterDelivery.pane}' '${opts.rebindAfterDelivery.name}' >> '${panes}'; fi; echo '{}'`
-    : `echo '{}'`;
-  const countEnter = `if [[ "$*" == *Enter* ]]; then n=$(cat '${enterctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${enterctr}'; fi`;
+  const rebind = opts.rebindAfterDelivery
+    ? `grep -v " ${opts.rebindAfterDelivery.name}$" '${panes}' > '${panes}.tmp' 2>/dev/null || :; mv '${panes}.tmp' '${panes}' 2>/dev/null || :; printf '%s %s\\n' '${opts.rebindAfterDelivery.pane}' '${opts.rebindAfterDelivery.name}' >> '${panes}';`
+    : "";
+  const enterResult = opts.rebindAfterDelivery ? `if [[ "$*" == *Enter* ]]; then ${rebind} fi; echo '{}'` : `echo '{}'`;
+  // dispatchEcho: keep the delivered line so `pane read` can echo it back, but break the marker so
+  // the pane never carries a joined nonce — the shell here echoes without ever running.
+  const recordDispatch = opts.dispatchEcho ? `printf '%s' "$4" | sed 's/TICKMARKR_START_/TICKMARKR_ECHOED_/g' > '${typed}'; ` : "";
+  // v1.85 T5: `pane run` hands the delivered line to a REAL shell, the way a live pane does. Nothing
+  // in this fixture writes an acknowledgment — the marker exists only if the shell executed the line
+  // the driver composed, which is the whole claim under test. PATH is emptied and the shell invoked
+  // by absolute path, so the line's builtins (printf, redirection) run while the agent command it
+  // launches cannot: a unit test executes the dispatch protocol, never an agent CLI.
+  const execDispatch = `PATH='' /bin/bash -c "$4" >> '${paneOut}-'"$3" 2>/dev/null || :`;
+  // dispatchAck fixtures are wedged panes: the herdr request is accepted and the line never runs.
+  const ackDispatch =
+    opts.dispatchAck === "never" ? ":"
+    : opts.dispatchAck === "fresh-only" ? `if [ "$3" != 'w1:p9' ]; then ${execDispatch}; fi`
+    : execDispatch;
+  // ackWriteFails: the pane's shell cannot write the acknowledgment the driver opened for it — the
+  // path is replaced by a DIRECTORY, so the line's `>` redirection fails for a reason no privilege
+  // level bypasses. Nothing else about the pane is disturbed: the shell below still really runs.
+  const breakAck = opts.ackWriteFails
+    ? `p=$(printf '%s' "$4" | grep -o "/[^']*tickmarkr-dispatch-[^']*\\.ack" | head -1); if [ -n "$p" ]; then rm -f "$p"; mkdir -p "$p"; fi; `
+    : "";
+  // the atomic dispatch verb: with no Enter following it, a label rebind now races THIS call
+  const paneRun = `${recordDispatch}${breakAck}${opts.rebindAfterDelivery ? `if [[ "$*" == *TICKMARKR_START_* ]]; then ${rebind} fi; ` : ""}${ackDispatch}; echo '{}'`;
+  const countEnter = `if [[ "$*" == *Enter* ]]; then n=$(cat '${enterctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${enterctr}'; m=$(cat '${enterctr}-'"$3" 2>/dev/null || echo 0); m=$((m+1)); echo $m > '${enterctr}-'"$3"; fi`;
   const sendKeys = opts.contendDelivery
     ? `${countEnter}; pane_send_keys "$@"`
     : `${countEnter}; if [[ "$*" == *C-u* ]]; then ${clearResult}; else ${enterResult}; fi`;
@@ -182,11 +223,18 @@ case "$1 $2" in
   "pane split") ${paneSplit} ;;
   "pane layout") ${paneLayout} ;;
   "pane close") ${paneClose} ;;
-  "pane wait-output") ${waitOutput} ;;
+  # a START-nonce wait is answered from what this pane's shell actually PRINTED, never from the
+  # pattern it was asked about: a fixture that answered the question by reading the question would
+  # prove nothing about the driver (v1.85 T5)
+  "pane wait-output") case "$5" in
+    TICKMARKR_START_*) ${opts.ackWatchBlind ? "exit 1" : `grep -q -- "$5" '${paneOut}-'"$3" 2>/dev/null && exit 0 || exit 1`} ;;
+    *) ${waitOutput} ;;
+  esac ;;
   "agent wait") exit 0 ;;
   "notification show") echo '{}' ;;
   "pane send-text") ${sendText} ;;
   "pane send-keys") ${sendKeys} ;;
+  "pane run")    ${paneRun} ;;
   "pane read")   ${paneRead} ;;
   *) echo '{}' ;;
 esac
@@ -231,12 +279,11 @@ describe("HerdrDriver (stubbed binary)", () => {
     const d = new HerdrDriver(bin);
     const slot = await d.slot(cwd, "n1");
     await d.run(slot, "echo hi");
-    expect(await d.read(slot, 50)).toContain("worker-output");
+    expect(await d.read(slot, 50)).toContain("TICKMARKR_EXIT:0");
     await d.close(slot);
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("pane list"); // re-resolution reads the label back (never a cached id)
-    expect(calls).toContain("pane send-text w1:p9 echo hi"); // resolved fresh from the label
-    expect(calls).toContain("pane send-keys w1:p9 Enter"); // delivery verified, then entered (OBS-85)
+    expect(calls).toContain("pane run w1:p9 printf"); // atomic delivery, resolved fresh from the label
     expect(calls).toContain("pane read w1:p9 --source recent-unwrapped --lines 50");
     expect(calls).toContain("tab close w1:t1"); // slot now carries a tabId → close reaps the whole tab
   });
@@ -320,308 +367,422 @@ esac
   });
 });
 
-// OBS-85: pane paste corrupted the codex dispatch line twice across two runs (v1.58 T2, v1.61 T10) —
-// `pane run` pressed Enter on a line nobody had verified. run() now types (send-text, NO enter),
-// reads the pane's own transcript back, and presses Enter only when it contains the typed command;
-// a corrupted paste is cleared (C-u) and retyped, bounded, then fails closed with the transcript.
-describe("HerdrDriver verified delivery (OBS-85)", () => {
-  test("a verified delivery types the command reads the pane back and only then presses enter", async () => {
+// v1.85 T5 (OBS-140/253). OBS-85 hardened the TYPED path — type, read back, then Enter — because
+// `pane run` had pressed Enter on a line nobody had verified. Ten dispatch corruptions across seven
+// runs later, the diagnosis inverted: the seam between "text landed" and "Enter registered" is the
+// defect, and no amount of read-back inference closes it. A shell or bootstrap dispatch now goes out
+// through the atomic verb and is acknowledged by a START nonce the delivered line PRINTS, which no
+// pane can produce by echoing what it was handed. Typed delivery survives only where a real TUI turn
+// needs it, licensed by the adapter's own declared input states.
+// The declared box for the positional-inference oracle: painted (readiness) before submission, and
+// absent from the lookalike frame the pane shows afterwards.
+const looksSuccessfulAdapterId = "looks-successful-test";
+declareInputBox(looksSuccessfulAdapterId, {
+  fingerprint: "│ >",
+  match: (paneText: string) => paneText.includes("│ >"),
+  emptyMatch: (paneText: string) => paneText.includes("│ >          │"),
+  launchCommand: () => false,
+  readinessTimeoutMs: 500,
+});
+
+describe("HerdrDriver atomic shell dispatch (OBS-140/253)", () => {
+  test("test: a shell dispatch is delivered by pane-run and its START nonce appears before the agent launches, with no typed-text verification path taken", async () => {
+    // The stub's `pane run` hands this line to a real shell, so the dispatch below is acknowledged
+    // only because the marker statements actually EXECUTED — nothing in the fixture answers "ok".
     const { bin, log, cwd } = makeStub();
     const d = new HerdrDriver(bin);
-    await d.run(await d.slot(cwd, "n1"), "echo hi");
+
+    await d.run(await d.slot(cwd, "n1"), "bash dispatch.sh");
+
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const send = lines.findIndex((l) => l === "pane send-text w1:p9 echo hi");
-    const read = lines.findIndex((l, i) => i > send && l.startsWith("pane wait-output w1:p9 --match echo hi"));
-    const enter = lines.findIndex((l) => l === "pane send-keys w1:p9 Enter");
-    expect(send).toBeGreaterThanOrEqual(0);
-    expect(read).toBeGreaterThan(send); // read-back (transcript match for the typed command) after typing…
-    expect(enter).toBeGreaterThan(read); // …and Enter only after the read-back verified
-    expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(1); // clean first try — no retype
-    // the command never rides the atomic text+enter verb (slot()'s env seed legitimately still does)
-    expect(lines.some((l) => l.startsWith("pane run ") && l.includes("echo hi"))).toBe(false);
+    const delivered = lines.find((l) => l.startsWith("pane run w1:p9 printf"))!;
+    expect(delivered).toBeDefined();
+    // the nonce is PRINTED by the line, from two separate printf arguments, so the joined marker
+    // cannot exist anywhere unless the shell ran it — and both statements run before the agent is
+    // launched: first to the private file the driver waits on, which GATES the launch, then to the
+    // pane for the operator (v1.85 T5 review — a pane marker printed ahead of a failed ack write
+    // would satisfy the event watch for a command that never started)
+    expect(delivered).toContain(`printf '%s%s\\n' '${DISPATCH_START_PREFIX}'`);
+    expect(delivered).toMatch(
+      /printf '%s%s\\n' 'TICKMARKR_START_' '\S+' > '\S+\.ack' \|\| exit 1; printf '%s%s\\n' 'TICKMARKR_START_' '\S+'; bash dispatch\.sh$/,
+    );
+    expect(delivered.indexOf(DISPATCH_START_PREFIX)).toBeLessThan(delivered.indexOf("bash dispatch.sh"));
+    expect(delivered).not.toContain(`${DISPATCH_START_PREFIX}'; bash`); // never pre-joined in the text
+
+    // no typed-text verification path is taken anywhere on this dispatch
+    expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(0);
+    expect(lines.filter((l) => /^pane send-keys \S+ Enter$/.test(l))).toHaveLength(0);
+    expect(lines.filter((l) => l.includes("--match bash dispatch.sh"))).toHaveLength(0);
+    // the acknowledgment is causal in both halves: herdr's event watch on the nonce the shell
+    // PRINTED, backed by the file that same line wrote. No pane snapshot is consulted, so a
+    // successful launch cannot be read as corrupt just because it painted over its own first line.
+    const ack = lines.find((l) => l.includes(`--match ${DISPATCH_START_PREFIX}`))!;
+    expect(ack).toContain("pane wait-output w1:p9");
+    expect(lines.indexOf(ack)).toBeGreaterThan(lines.indexOf(delivered));
+    expect(lines.filter((l) => l.startsWith("pane read "))).toHaveLength(0);
   });
 
-  test("a delivery whose read back lacks the typed command is cleared and retyped", async () => {
-    const { bin, log, cwd } = makeStub(0, { corrupt: "once" });
-    const d = new HerdrDriver(bin);
-    await d.run(await d.slot(cwd, "n1"), "echo hi"); // resolves — second attempt reads back faithfully
+  // The duplication half of OBS-253: the pane watch subscribes AFTER the request, so a fast or
+  // full-screen launch can repaint over the very line it is watching for. Here the shell really ran
+  // the line — the ack the line wrote for itself proves it — and the watch saw nothing. A driver
+  // that trusted the watch alone would call this successful launch corrupt and launch it AGAIN.
+  test("a launch whose printed nonce the pane watch never sees is still acknowledged by the line's own durable ack, and is never dispatched twice", async () => {
+    const { bin, log, cwd } = makeStub(0, { ackWatchBlind: true });
+    const d = new HerdrDriver(bin, 3, steppedTimeSource().time, () => {});
+
+    await expect(d.run(await d.slot(cwd, "n1"), "bash dispatch.sh")).resolves.toBeUndefined();
+
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const sends = lines.flatMap((l, i) => (l === "pane send-text w1:p9 echo hi" ? [i] : []));
-    const clear = lines.findIndex((l) => l === "pane send-keys w1:p9 C-u");
-    const enter = lines.findIndex((l) => l === "pane send-keys w1:p9 Enter");
-    expect(sends).toHaveLength(2); // typed, corrupted read-back, retyped
-    expect(clear).toBeGreaterThan(sends[0]); // the corrupted line is cleared…
-    expect(clear).toBeLessThan(sends[1]); // …before the retype
-    expect(enter).toBeGreaterThan(sends[1]); // Enter only for the verified retype
+    expect(lines.filter((l) => l.includes(`--match ${DISPATCH_START_PREFIX}`))).toHaveLength(1); // the watch was asked, and missed
+    expect(lines.filter((l) => l.startsWith("pane run w1:p9 printf"))).toHaveLength(1); // delivered exactly once
+    expect(lines.filter((l) => l.startsWith("pane split "))).toHaveLength(0); // no fresh pane, no second agent
   });
 
-  test("a delivery that stays corrupted after bounded retries throws without ever pressing enter", async () => {
-    const { bin, log, cwd } = makeStub(0, { corrupt: "always" });
-    const d = new HerdrDriver(bin);
-    await expect(d.run(await d.slot(cwd, "n1"), "echo hi")).rejects.toThrow(/corrupted after 3 attempts/);
+  // The other half of that duplication, and the one the `;` separator left open: the pane RAN the
+  // line but could not write the acknowledgment. From the driver's side that is indistinguishable
+  // from a line that never ran — so the command ran, the miss bought a fresh pane, and one task got
+  // TWO live agents. The ack now gates the launch (v1.85 T5 review, src/drivers/herdr.ts ~579).
+  test("a dispatch whose acknowledgment the pane cannot write never launches its command — not on the wedged pane, and not on the fresh pane it is retried onto", async () => {
+    const repo = setupRepo([T("T1")], { tasks: { T1: [{ shell: "true" }] } });
+    Journal.create(repo.repo, "run-ack-gate").append("task-dispatch", "T1", { attempt: 0 });
+    const { bin, log, cwd } = makeStub(0, { ackWriteFails: true, ackWatchBlind: true });
+    const sentinel = join(cwd, "launched.txt");
+    const d = new HerdrDriver(bin, 3, steppedTimeSource().time);
+    const wt = await d.worktree(repo.repo, "tickmarkr/run-ack-gate--T1", "HEAD");
+    const slot = await d.slot(wt, "n1", {
+      owned: { role: "worker", taskId: "T1", attempt: 0, runId: "run-ack-gate" },
+    });
+
+    await expect(d.run(slot, `printf 'LAUNCHED\\n' > ${sentinel}`)).rejects.toThrow(/never ran/);
+
+    // the dispatched command is a shell builtin writing an absolute path, so it leaves this file
+    // behind the instant it runs on EITHER pane. It is absent because the failed ack aborted the
+    // line before the command — twice — and neither pane ever started an agent.
+    expect(existsSync(sentinel)).toBe(false);
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    expect(lines.filter((l) => l.startsWith("pane run w1:p9 printf"))).toHaveLength(1);
+    expect(lines.filter((l) => l.startsWith("pane run w1:p7 printf"))).toHaveLength(1); // retried, and launched nothing there either
+    for (const p of lines.flatMap((l) => l.match(/\/[^' ]+\.ack/) ?? [])) rmSync(p, { recursive: true, force: true });
+  });
+
+  // Same channel, one step earlier: an ack path THIS process cannot open is a broken host, not a
+  // wedged pane. The fresh-pane retry would fail there for the identical reason, so the failure is
+  // not a DeliveryCorruptedError and the retry is never spent on it.
+  test("an unopenable acknowledgment channel fails the dispatch before any pane is spent, and is never retried onto a fresh one", async () => {
+    const { bin, log, cwd } = makeStub();
+    const d = new HerdrDriver(bin, 3, steppedTimeSource().time);
+    const slot = await d.slot(cwd, "n1");
+    const prevTmp = process.env.TMPDIR;
+    process.env.TMPDIR = join(mkdtempSync(join(tmpdir(), "tickmarkr-noack-")), "does-not-exist");
+    try {
+      await expect(d.run(slot, "bash dispatch.sh")).rejects.toThrow(/acknowledgment channel unavailable/);
+    } finally {
+      if (prevTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = prevTmp;
+    }
+
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane send-text /gm)).toHaveLength(DELIVERY_ATTEMPTS); // bounded, never looped
-    expect(calls).not.toMatch(/pane send-keys \S+ Enter/); // enter never pressed
+    expect(calls).not.toContain("bash dispatch.sh"); // never delivered, so never launched
+    expect(calls).not.toContain("pane split"); // and no fresh pane bought for a host-level fault
   });
 
-  test("the corruption error carries the captured pane transcript", async () => {
-    const { bin, cwd } = makeStub(0, { corrupt: "always" });
+  // OBS-253's fresh pane inherits the slot's durable label from the pane it replaces. A close that
+  // fails — or that returns success and frees nothing — leaves two panes answering to one name, and
+  // `pane list` then resolves the slot by whichever it reports first. The replacement is not
+  // renamed, seeded or dispatched until that name is provably free (v1.85 T5 review, ~636).
+  test("a fresh pane is never renamed, seeded or dispatched while the pane it replaces still holds the slot's durable label", async () => {
+    const fixtures = [
+      { label: "a close that reports failure", opts: { paneCloseFails: true } },
+      { label: "a close that reports success and frees nothing", opts: { paneCloseNoop: true } },
+    ];
+    for (const [i, fixture] of fixtures.entries()) {
+      const runId = `run-stale-label-${i}`;
+      const repo = setupRepo([T("T1")], { tasks: { T1: [{ shell: "true" }] } });
+      Journal.create(repo.repo, runId).append("task-dispatch", "T1", { attempt: 0 });
+      const { bin, log } = makeStub(0, { dispatchAck: "fresh-only", ...fixture.opts });
+      const d = new HerdrDriver(bin, 3, steppedTimeSource().time);
+      const wt = await d.worktree(repo.repo, `tickmarkr/${runId}--T1`, "HEAD");
+      const slot = await d.slot(wt, "n1", { owned: { role: "worker", taskId: "T1", attempt: 0, runId } });
+
+      await expect(d.run(slot, "bash dispatch.sh")).rejects.toThrow(/never ran/); // fixture: ${fixture.label}
+
+      const calls = readFileSync(log, "utf8");
+      expect(calls, fixture.label).toContain("pane close w1:p9"); // the reap was attempted
+      expect(calls, fixture.label).not.toContain(`pane rename w1:p7 ${slot.name}`); // and never claimed the contested name
+      expect(calls, fixture.label).not.toContain("pane run w1:p7 export"); // never seeded
+      expect(calls, fixture.label).not.toContain("pane run w1:p7 printf"); // never dispatched
+      expect(calls, fixture.label).toContain("pane close w1:p7"); // the unusable replacement is reaped
+    }
+  });
+
+  test("test: an adapter without declared input states cannot receive typed delivery — the dispatch fails closed naming the missing declaration", async () => {
+    // Case 1: the adapter declared a box but not the states a submission is judged by.
+    const undeclaredId = "undeclared-states-test";
+    declareInputBox(undeclaredId, {
+      fingerprint: "│ >",
+      launchCommand: () => false, // every delivery to this adapter is a real TUI turn
+    });
+    const { bin, log, cwd } = makeStub();
     const d = new HerdrDriver(bin);
-    // the stub's corrupted read-back is the OBS-85 incident text — the error must quote it
-    await expect(d.run(await d.slot(cwd, "n1"), "echo hi")).rejects.toThrow(/rev-parseprintf/);
+    const slot = await d.slot(cwd, `T1-worker-${undeclaredId}-a0-undeclared`, {
+      owned: { role: "worker", taskId: "T1", attempt: 0, runId: "run-undeclared" },
+    });
+
+    await expect(d.run(slot, "seed the prompt")).rejects.toThrow(
+      /has not declared its input states \(missing: emptyMatch, occupiedMatch\)/,
+    );
+
+    // fail CLOSED: nothing was typed, nothing was submitted, and it was not silently shell-executed
+    const calls = readFileSync(log, "utf8");
+    expect(calls).not.toContain("pane send-text");
+    expect(calls).not.toMatch(/pane send-keys \S+ Enter/);
+    expect(calls).not.toContain("pane run w1:p9 printf");
+
+    // Case 2: the adapter declared NOTHING. Its launch is an ordinary shell dispatch, but the seed
+    // turn that follows is a turn into whatever that launch started — an interface this driver has
+    // no declaration for. The dangerous answer here is "shell": it would hand a prompt written for
+    // a TUI to bash. The pane's own history is the evidence, and it fails closed naming inputBox.
+    const bare = makeStub();
+    const d2 = new HerdrDriver(bare.bin);
+    const bareSlot = await d2.slot(bare.cwd, "T2-worker-no-declaration-test-a0-bare", {
+      owned: { role: "worker", taskId: "T2", attempt: 0, runId: "run-bare" },
+    });
+    await d2.run(bareSlot, "some-tui --interactive"); // the bootstrap: a shell line, delivered atomically
+    await expect(d2.run(bareSlot, "Read /prompts/T2.md and do exactly what it says.")).rejects.toThrow(
+      /has not declared its input states \(missing: inputBox\)/,
+    );
+
+    const bareCalls = readFileSync(bare.log, "utf8");
+    expect(bareCalls).toContain("some-tui --interactive"); // the launch went out
+    expect(bareCalls).not.toContain("Read /prompts/T2.md"); // the seed reached neither a shell nor the TUI
+    expect(bareCalls).not.toContain("pane send-text");
   });
 
-  test("no code path presses enter on a delivery whose read back verification did not contain the typed command", async () => {
-    // corrupt-once: two delivery read-backs, only ONE of them verified → exactly one Enter
-    const once = makeStub(0, { corrupt: "once" });
-    const d1 = new HerdrDriver(once.bin);
-    await d1.run(await d1.slot(once.cwd, "n1"), "echo hi");
+  test("test: a first dispatch corruption retries once on a fresh pane and journals dispatch-retry; a second consecutive corruption parks", async () => {
+    // No journal spy: these drivers keep their DEFAULT handle, which opens the daemon's own run
+    // ledger from the slot's owned name and the repo bound by worktree(). Everything asserted below
+    // is the persisted JSONL that runDaemon and `resume --retry-failed` read back.
+    const ledger = (repo: string, runId: string) => {
+      const journal = Journal.create(repo, runId);
+      journal.append("task-dispatch", "T1", { attempt: 0 }); // the dispatch the corruption interrupts
+      return join(journal.dir, "journal.jsonl");
+    };
+    const events = (path: string) =>
+      readFileSync(path, "utf8").trim().split("\n").map((l) => JSON.parse(l) as JournalEvent);
+    const ownedSlot = (d: HerdrDriver, cwd: string, runId: string) =>
+      d.slot(cwd, "n1", { owned: { role: "worker", taskId: "T1", attempt: 0, runId } });
+
+    // First corruption: the original pane never runs the line, the retry pane does. worktree() is
+    // the production seam by which the daemon binds this driver to its repo; the suite still launches
+    // outside that repo, proving the event is not accidentally written to the launch directory.
+    const recovered = setupRepo([T("T1")], { tasks: { T1: [{ shell: "true" }] } });
+    const recoveredLedger = ledger(recovered.repo, "run-dispatch-recovered");
+    const once = makeStub(0, { dispatchAck: "fresh-only" });
+    const d1 = new HerdrDriver(once.bin, 3, steppedTimeSource().time);
+    const recoveredWt = await d1.worktree(recovered.repo, "tickmarkr/run-dispatch-recovered--T1", "HEAD");
+    await d1.run(await ownedSlot(d1, recoveredWt, "run-dispatch-recovered"), "bash dispatch.sh");
+
+    const retries = events(recoveredLedger).filter((e) => e.event === "dispatch-retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]!.taskId).toBe("T1");
+    expect(retries[0]!.data.wedgedPane).toBe("w1:p9");
     const lines = readFileSync(once.log, "utf8").trim().split("\n");
-    expect(lines.filter((l) => l.startsWith("pane wait-output w1:p9 --match echo hi"))).toHaveLength(2);
-    expect(lines.filter((l) => l === "pane send-keys w1:p9 Enter")).toHaveLength(1);
-    // corrupt-always: zero verified read-backs → zero Enters, anywhere
-    const never = makeStub(0, { corrupt: "always" });
-    const d2 = new HerdrDriver(never.bin);
-    await expect(d2.run(await d2.slot(never.cwd, "n2"), "echo hi")).rejects.toThrow();
-    expect(readFileSync(never.log, "utf8")).not.toMatch(/pane send-keys \S+ Enter/);
+    expect(lines).toContain("pane split w1:p9 --direction down --no-focus --cwd " + recoveredWt);
+    expect(lines).toContain("pane close w1:p9"); // the wedged pane is reaped, never re-pressed
+    expect(lines.filter((l) => l.startsWith("pane run w1:p9 printf"))).toHaveLength(1);
+    expect(lines.filter((l) => l.startsWith("pane run w1:p7 printf"))).toHaveLength(1);
+
+    // Second consecutive corruption: exercise the complete daemon terminal path, not merely the
+    // driver's rejection or a classifier call. The daemon owns this Journal and persists both the
+    // one retry and the terminal dispatch park in the same ledger.
+    const parkedRepo = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "never launches" } }] } },
+    );
+    const never = makeStub(0, { dispatchAck: "never" });
+    const d2 = new HerdrDriver(never.bin, 3, steppedTimeSource().time);
+    const summary = await runDaemon(parkedRepo.repo, {
+      adapters: [parkedRepo.fake],
+      runId: "run-dispatch-parked",
+      driver: d2,
+    });
+
+    expect(summary.failed).toEqual(["T1"]);
+    const parked = Journal.open(parkedRepo.repo, "run-dispatch-parked").read();
+    expect(parked.filter((e) => e.event === "dispatch-retry")).toHaveLength(1); // one recovery, then it stops
+    expect(parked.find((e) => e.event === "task-failed")?.data).toMatchObject({
+      kind: "dispatch",
+      attempts: 0,
+    });
+    expect(classifyTaskFailure(parked.filter((e) => e.taskId === "T1"))).toBe("dispatch");
+    const failed = readFileSync(never.log, "utf8").trim().split("\n");
+    expect(failed.filter((l) => l.startsWith("pane run w1:p9 printf") && l.includes("T1-a0.sh"))).toHaveLength(1);
+    expect(failed.filter((l) => l.startsWith("pane run w1:p7 printf") && l.includes("T1-a0.sh"))).toHaveLength(1);
   });
 
-  test("every existing driver run call site keeps working under the verified delivery sequence", async () => {
-    // the two run() shapes call sites dispatch today: a worker/gate command into a task slot, and
-    // narrator()'s watch command into its split pane — both must deliver (type→verify→enter) end to end
-    const { bin, log, cwd } = makeStub();
-    const d = new HerdrDriver(bin);
-    await d.run(await d.slot(cwd, "T1-worker-fake-a0-tag"), "bash dispatch.sh");
-    await d.narrator(cwd, "tickmarkr status --watch", "run-x");
+  test("a recovery that cannot be journaled is not taken — no pane is swapped off the record", async () => {
+    // The slot carries no run identity, so the driver's default journal handle has nowhere to write
+    // the required dispatch-retry event. The recovery is abandoned rather than performed unrecorded:
+    // the corruption propagates exactly as it did before this recovery existed.
+    const { bin, log, cwd } = makeStub(0, { dispatchAck: "fresh-only" });
+    const d = new HerdrDriver(bin, 3, steppedTimeSource().time);
+
+    await expect(d.run(await d.slot(cwd, "legacy-unowned-name"), "bash dispatch.sh")).rejects.toThrow(
+      /cannot journal dispatch-retry: slot legacy-unowned-name carries no run identity/,
+    );
+
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane send-text w1:p9 bash dispatch.sh");
-    expect(calls).toContain("pane send-keys w1:p9 Enter");
-    expect(calls).toContain("pane send-text w1:p7 tickmarkr status --watch");
-    expect(calls).toContain("pane send-keys w1:p7 Enter");
+    expect(calls).not.toContain("pane split w1:p9"); // no fresh pane, and the wedged one is left as evidence
+    expect(calls).not.toContain("pane close w1:p9");
   });
 
-  test("narrator preserves verified one-shot shell submission when persistent watch output does not echo its launch command", async () => {
-    const { bin, log, cwd } = makeStub(0, { submission: "absent" });
-    const d = new HerdrDriver(bin);
+  test("test: the positional-transcript success inference is gone — a transcript that merely looks successful no longer acknowledges delivery", async () => {
+    // The deleted rule: prompt found in the transcript, bytes present after it ⇒ "delivered". This
+    // pane shows exactly that shape — the command echoed, worker output and a plain prompt below it
+    // — while the adapter's declared box is nowhere on screen. Under the old inference this passed.
+    const { bin, log, cwd } = makeStub(0, { submission: "looks-successful" });
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
+    const slot = await d.slot(cwd, `T1-worker-${looksSuccessfulAdapterId}-a0-inference`, {
+      owned: { role: "worker", taskId: "T1", attempt: 0, runId: "run-inference" },
+    });
 
-    await d.narrator(cwd, "tickmarkr status --watch", "run-watch-shell");
+    await expect(d.run(slot, "echo hi")).rejects.toThrow(/submission never registered/);
 
-    const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane wait-output w1:p7 --match tickmarkr status --watch");
-    expect(calls.match(/^pane send-keys w1:p7 Enter$/gm)).toHaveLength(1);
+    // and it refused without ever accepting the lookalike as evidence
+    expect(readFileSync(log, "utf8")).not.toContain("worker-output-accepted");
+  });
+
+  // The whole class in one place. Both delivery kinds now own a CAUSAL acknowledgment — the shell
+  // dispatch's printed START nonce, the TUI turn's adapter-declared empty box — and neither will
+  // take a lookalike instead. Asserted in both directions, because a driver that simply refused
+  // everything would satisfy half of this and deliver nothing.
+  test("no delivery is acknowledged by inference where a causal acknowledgment exists", async () => {
+    const owned = (runId: string) => ({ owned: { role: "worker" as const, taskId: "T1", attempt: 0, runId } });
+
+    // Kind 1, lookalike: the pane echoes the entire dispatched line under a shell prompt with output
+    // below it — what the deleted execution-echo reader called proof — but never printed the nonce.
+    const shellFake = makeStub(0, { dispatchAck: "never", dispatchEcho: true });
+    const d1 = new HerdrDriver(shellFake.bin, 3, steppedTimeSource().time, () => {});
+    const refused = await d1
+      .run(await d1.slot(shellFake.cwd, "n1"), "bash dispatch.sh")
+      .then(() => null, (e: Error) => e);
+    expect(refused?.message).toMatch(/START nonce TICKMARKR_START_\S+ never appeared/);
+    // it SAW the lookalike and still refused — the transcript it captured is the echo itself
+    expect(refused?.message).toContain("➜  worker git:(task) ✗ ");
+    expect(refused?.message).toContain("bash dispatch.sh");
+
+    // Kind 1, causal: the same dispatch against a pane whose shell actually RUNS the line is
+    // delivered — on the real clock, because a line that ran acknowledges itself immediately.
+    const shellReal = makeStub();
+    const d2 = new HerdrDriver(shellReal.bin, 3, undefined, () => {});
+    await expect(d2.run(await d2.slot(shellReal.cwd, "n1"), "bash dispatch.sh")).resolves.toBeUndefined();
+
+    // Kind 2, lookalike: prompt echoed, worker output, a plain prompt below — and no declared box.
+    const tuiFake = makeStub(0, { submission: "looks-successful" });
+    const d3 = new HerdrDriver(tuiFake.bin, 3, steppedTimeSource().time);
+    await expect(
+      d3.run(await d3.slot(tuiFake.cwd, `T1-worker-${looksSuccessfulAdapterId}-a0-fake`, owned("run-fake")), "echo hi"),
+    ).rejects.toThrow(/submission never registered/);
+
+    // Kind 2, causal: the same turn against a pane whose declared box comes back EMPTY is delivered.
+    const tuiReal = makeStub(0, { submission: "first" });
+    const d4 = new HerdrDriver(tuiReal.bin, 3, steppedTimeSource().time);
+    await expect(
+      d4.run(await d4.slot(tuiReal.cwd, `T1-worker-${looksSuccessfulAdapterId}-a0-real`, owned("run-real")), "echo hi"),
+    ).resolves.toBeUndefined();
   });
 });
 
-// OBS-119 T3: concurrent interactiveSeed deliveries contend on herdr's shared send path unless
-// serialized; narrow panes hard-wrap the input line so wait-output --match false-positives as corrupt.
-describe("HerdrDriver delivery serialization and narrow-pane read-back (OBS-119 T3)", () => {
-  test("two deliveries dispatched to different panes at the same instant both complete rather than one failing closed on a delivery-clear error", async () => {
-    const { bin, log, cwd } = makeStub(1, { contendDelivery: true, corrupt: "once", paneIds: { "pane-a": "w1:p1", "pane-b": "w1:p2" } });
-    const d = new HerdrDriver(bin);
-    const a = { id: "w1:p1", name: "pane-a", cwd };
-    const b = { id: "w1:p2", name: "pane-b", cwd };
-    await Promise.all([d.run(a, "echo one"), d.run(b, "echo two")]);
-    const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane send-keys w1:p1 Enter");
-    expect(calls).toContain("pane send-keys w1:p2 Enter");
-    expect(calls).not.toMatch(/delivery clear failed/);
+// Typed delivery — the ONLY surviving typed path — still owes OBS-85's read-back pincer and OBS-154's
+// box-chrome tolerance, because a real TUI re-wraps a long turn across its own bordered rows.
+describe("HerdrDriver typed TUI-turn delivery (OBS-85/154)", () => {
+  const typedAdapterId = "typed-turn-test";
+  declareInputBox(typedAdapterId, {
+    fingerprint: "│ > ",
+    match: (paneText: string) => paneText.includes("│ >"),
+    emptyMatch: (paneText: string) => /│ >\s+│/.test(paneText),
+    launchCommand: () => false,
+    readinessTimeoutMs: 500,
   });
+  const typedSlot = (d: HerdrDriver, cwd: string, taskId: string) =>
+    d.slot(cwd, `${taskId}-worker-${typedAdapterId}-a0-typed`, {
+      owned: { role: "worker", taskId, attempt: 0, runId: "run-typed" },
+    });
 
-  test("a delivery whose read-back is line-wrapped by a narrow pane width is still recognized as matching the typed command", async () => {
-    const cmd = "read /very/long/path/to/prompt.md";
-    const { bin, log, cwd } = makeStub(0, { wrappedCmd: cmd });
-    const d = new HerdrDriver(bin);
-    await d.run({ id: "w1:p42", name: "narrow", cwd }, cmd);
-    const lines = readFileSync(log, "utf8").trim().split("\n");
-    const send = lines.findIndex((l) => l === `pane send-text w1:p42 ${cmd}`);
-    const read = lines.findIndex((l, i) => i > send && l.startsWith("pane read w1:p42"));
-    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
-    expect(send).toBeGreaterThanOrEqual(0);
-    expect(read).toBeGreaterThan(send);
-    expect(enter).toBeGreaterThan(read);
-    expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(1);
-    expect(lines.filter((l) => l === "pane send-keys w1:p42 C-u")).toHaveLength(0);
-  });
-
-  // OBS-154 regression. Probe 6b: kimi accepted the seed text perfectly and rendered it across three
-  // rows of its own bordered editor box; the read-back normalized whitespace but not `│`, so the
-  // needle was uncontainable, delivery "failed" verification, and the OBS-85 guard refused to retype
-  // onto a line that was in fact pristine. The shape here is the captured one — a long path-bearing
-  // command re-wrapped inside box chrome. Fails closed the moment the chrome guard is removed.
   test("a delivery re-wrapped inside a TUI's own bordered editor rows is still recognized as matching the typed command", async () => {
     const cmd = "Read /Users/probe/.tickmarkr/runs/run-1/prompts/T1-a0.md and do exactly what it says.";
     const { bin, log, cwd } = makeStub(0, { boxWrappedCmd: cmd });
-    const d = new HerdrDriver(bin);
-    await d.run({ id: "w1:p42", name: "boxed", cwd }, cmd);
+    const { time } = steppedTimeSource();
+    const d = new HerdrDriver(bin, 3, time);
+
+    await d.run(await typedSlot(d, cwd, "T1"), cmd);
+
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const send = lines.findIndex((l) => l === `pane send-text w1:p42 ${cmd}`);
-    const read = lines.findIndex((l, i) => i > send && l.startsWith("pane read w1:p42"));
-    const enter = lines.findIndex((l) => l === "pane send-keys w1:p42 Enter");
+    const send = lines.findIndex((l) => l === `pane send-text w1:p9 ${cmd}`);
+    const read = lines.findIndex((l, i) => i > send && l.startsWith("pane read w1:p9"));
+    const enter = lines.findIndex((l) => l === "pane send-keys w1:p9 Enter");
     expect(send).toBeGreaterThanOrEqual(0);
     expect(read).toBeGreaterThan(send);
     expect(enter).toBeGreaterThan(read);
-    // the whole point: one typing, and never a clear — the line was never corrupt
+    // one typing, and never a clear — the line was never corrupt, only re-wrapped by box chrome
     expect(lines.filter((l) => l.startsWith("pane send-text "))).toHaveLength(1);
-    expect(lines.filter((l) => l === "pane send-keys w1:p42 C-u")).toHaveLength(0);
+    expect(lines.filter((l) => l === "pane send-keys w1:p9 C-u")).toHaveLength(0);
   });
 
-  test("a delivery that is genuinely corrupted still fails closed with the captured transcript after a clean clear", async () => {
-    const { bin, log, cwd } = makeStub(0, { corrupt: "always" });
-    const d = new HerdrDriver(bin);
-    await expect(d.run({ id: "w1:p42", name: "bad", cwd }, "echo hi")).rejects.toThrow(/rev-parseprintf/);
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane send-keys w1:p42 C-u/gm)?.length ?? 0).toBeGreaterThan(0);
-    expect(calls).not.toMatch(/pane send-keys w1:p42 Enter/);
-  });
-});
-
-describe("HerdrDriver delivery clear settling (OBS-135)", () => {
-  test("test: a pane still painting its welcome frame at first read settles and receives its delivery with no refusal", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      corrupt: "once",
-      paneReadFrames: ["welcome-frame-top", "welcome-frame-bottom", "ready-prompt", "ready-prompt"],
-      clearFailsThroughRead: 3,
-    });
+  test("a typed turn whose read-back never contains the command fails closed as a dispatch corruption", async () => {
+    const { bin, log, cwd } = makeStub(0, { corrupt: "always", paneReadFrames: ["│ >       │"] });
     const { time } = steppedTimeSource();
-    const d = new HerdrDriver(bin, 3, time);
+    // an accepting journal, so what stops the retry below is the missing bootstrap and nothing else
+    const d = new HerdrDriver(bin, 3, time, () => {});
 
-    await d.run({ id: "w1:p42", name: "painting", cwd }, "echo hi");
-
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)).toHaveLength(8); // readiness + clear settle + post-Enter verification
-    expect(calls).toContain("pane send-keys w1:p42 C-u");
-    expect(calls).toContain("pane send-keys w1:p42 Enter");
-  });
-
-  test("test: a pane whose line is still corrupted after the bounded settle window refuses fail-closed with the same error as before", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      corrupt: "always",
-      changingPaneRead: true,
-      clearFailsThroughRead: 100,
-    });
-    const { time } = steppedTimeSource();
-    const d = new HerdrDriver(bin, 3, time);
-
-    await expect(d.run({ id: "w1:p42", name: "corrupted", cwd }, "echo hi")).rejects.toThrow(/READINESS/);
+    await expect(d.run(await typedSlot(d, cwd, "T2"), "echo hi")).rejects.toThrow(/enter never pressed/);
 
     const calls = readFileSync(log, "utf8");
-    const reads = calls.match(/^pane read /gm)?.length ?? 0;
-    expect(reads).toBeGreaterThan(2);
-    expect(reads).toBeLessThanOrEqual(15);
-    expect(calls.match(/^pane send-text /gm) ?? []).toHaveLength(0);
-    expect(calls).not.toContain("pane send-keys w1:p42 Enter");
+    // bounded, and Enter is never pressed on an unverified line
+    expect(calls.match(/^pane send-text /gm)).toHaveLength(DELIVERY_ATTEMPTS);
+    expect(calls).not.toMatch(/pane send-keys \S+ Enter/);
+    // no fresh pane either: this slot delivered no bootstrap, so a bare sibling shell has nothing to
+    // type into. Retyping there would buy a guaranteed second failure, not a recovery.
+    expect(calls).not.toContain("pane split w1:p9");
   });
 
-  test("test: a pane already stable at first read incurs no added settle delay", async () => {
+  // OBS-253's recovery is only real if it works for the delivery kind that actually wedges a TUI.
+  // A fresh pane is a bare shell, so the turn cannot simply be retyped there — the interface has to
+  // be relaunched first, from the bootstrap this slot already delivered and had acknowledged.
+  test("a corrupted TUI turn is recovered by relaunching the adapter's bootstrap on the fresh pane before retyping", async () => {
+    const relaunchAdapterId = "relaunch-turn-test";
+    declareInputBox(relaunchAdapterId, {
+      fingerprint: "│ >",
+      match: (paneText: string) => paneText.includes("│ >"),
+      emptyMatch: (paneText: string) => paneText.includes("│ >          │"),
+      launchCommand: (command: string) => command.startsWith("some-tui --interactive"),
+      readinessTimeoutMs: 500,
+    });
+    const box = "╭────────────╮\n│ >          │\n╰────────────╯";
     const { bin, log, cwd } = makeStub(0, {
-      corrupt: "once",
-      paneReadFrames: ["ready-prompt"],
-      clearFailsThroughRead: 2,
+      corrupt: "p9-only", // the wedged pane never echoes the turn; its fresh sibling takes it normally
+      paneReadFrames: [box, box],
+      submission: "first",
     });
-    const { time, sleeps } = steppedTimeSource();
-    const d = new HerdrDriver(bin, 3, time);
-    await d.run({ id: "w1:p42", name: "stable", cwd }, "echo hi");
-
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)).toHaveLength(6); // readiness + clear settle + post-Enter verification
-    expect(calls).toContain("pane send-keys w1:p42 Enter");
-    expect(sleeps).toHaveLength(0);
-  });
-});
-
-describe("HerdrDriver adapter-declared input-box delivery (OBS-136)", () => {
-  const inputBox = [
-    "╭────────────────────────────────────────╮",
-    "│ Welcome to Kimi Code CLI!              │",
-    "│ Send /help for help information.       │",
-    "╰────────────────────────────────────────╯",
-  ].join("\n");
-
-  const inputBoxAdapterId = "declared-box-test";
-  declareInputBox(inputBoxAdapterId, {
-    fingerprint: "Send /help for help information.",
-    readinessTimeoutMs: 500,
-  });
-
-  async function declaredBoxSlot(d: HerdrDriver, cwd: string, taskId: string) {
-    return d.slot(cwd, `${taskId}-worker-${inputBoxAdapterId}-a0-input-box`, {
-      group: "workers",
-      owned: { role: "worker", taskId, attempt: 0, runId: "run-input-box" },
-    });
-  }
-
-  test("test: a pane presenting its adapter's declared input box in steady state receives its delivery with no refusal", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      corrupt: "once",
-      paneReadFrames: [inputBox],
-      clearFailsThroughRead: 100,
-    });
-    const d = new HerdrDriver(bin);
-
-    await d.run(await declaredBoxSlot(d, cwd, "T1"), "echo hi");
-
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane send-text /gm)).toHaveLength(2);
-    expect(calls).not.toContain("pane send-keys w1:p9 C-u");
-    expect(calls).toContain("pane send-keys w1:p9 Enter");
-  });
-
-  test("test: an adapter with no declaration keeps the current line model and a corrupted line still refuses fail-closed after the bounded settle window", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      corrupt: "always",
-      changingPaneRead: true,
-      clearFailsThroughRead: 100,
-    });
-    const { time } = steppedTimeSource();
-    const d = new HerdrDriver(bin, 3, time);
-    const slot = await d.slot(cwd, "T2-worker-fake-a0-no-input-box", {
-      group: "workers",
-      owned: { role: "worker", taskId: "T2", attempt: 0, runId: "run-input-box" },
+    const retried: { event: string; data: Record<string, unknown> }[] = [];
+    const d = new HerdrDriver(bin, 3, steppedTimeSource().time, (event, _slot, data) => retried.push({ event, data }));
+    const slot = await d.slot(cwd, `T3-worker-${relaunchAdapterId}-a0-relaunch`, {
+      owned: { role: "worker", taskId: "T3", attempt: 0, runId: "run-relaunch" },
     });
 
-    await expect(d.run(slot, "echo hi")).rejects.toThrow(/READINESS/);
+    await d.run(slot, "some-tui --interactive"); // bootstrap: a shell line, delivered atomically
+    await d.run(slot, "Read /prompts/T3.md and do exactly what it says."); // the turn that wedges, then recovers
 
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read /gm)?.length ?? 0).toBeGreaterThan(2);
-    expect(calls.match(/^pane send-text /gm) ?? []).toHaveLength(0);
-    expect(calls).not.toContain("pane send-keys w1:p9 Enter");
-  });
-
-  test("test: a pane whose content matches neither a clean line nor the declared input box still refuses fail-closed with the same error as before", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      corrupt: "always",
-      paneReadFrames: ["printf \"git: 'rev-parseprintf' is not a git command\\n\""],
-      clearFailsThroughRead: 100,
-    });
-    const d = new HerdrDriver(bin);
-
-    await expect(d.run(await declaredBoxSlot(d, cwd, "T3"), "echo hi")).rejects.toThrow(/READINESS/);
-
-    const calls = readFileSync(log, "utf8");
-    expect(calls).not.toContain("pane send-keys w1:p9 C-u");
-    expect(calls.match(/^pane send-text /gm) ?? []).toHaveLength(0);
-    expect(calls).not.toContain("pane send-keys w1:p9 Enter");
-  });
-
-  test("test: delivery into a recognized input box still verifies by read-back that the typed command landed before submission", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      corrupt: "once",
-      paneReadFrames: [inputBox],
-      clearFailsThroughRead: 100,
-    });
-    const d = new HerdrDriver(bin);
-
-    await d.run(await declaredBoxSlot(d, cwd, "T4"), "echo hi");
-
+    expect(retried.map((r) => r.event)).toEqual(["dispatch-retry"]);
+    expect(retried[0]!.data.wedgedPane).toBe("w1:p9");
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const secondSend = lines.findLastIndex((line) => line === "pane send-text w1:p9 echo hi");
-    const readBack = lines.findIndex(
-      (line, index) => index > secondSend && line.startsWith("pane wait-output w1:p9 --match echo hi"),
-    );
-    const enter = lines.findIndex((line) => line === "pane send-keys w1:p9 Enter");
-    expect(secondSend).toBeGreaterThanOrEqual(0);
-    expect(readBack).toBeGreaterThan(secondSend);
-    expect(enter).toBeGreaterThan(readBack);
+    const relaunched = lines.findIndex((l) => l.startsWith("pane run w1:p7 printf") && l.includes("some-tui --interactive"));
+    const retyped = lines.findIndex((l) => l === "pane send-text w1:p7 Read /prompts/T3.md and do exactly what it says.");
+    expect(relaunched).toBeGreaterThanOrEqual(0); // the interface is put back before anything is typed
+    expect(retyped).toBeGreaterThan(relaunched);
+    expect(lines).toContain("pane close w1:p9"); // the wedged pane is reaped, never re-pressed
+    expect(lines.filter((l) => l === "pane send-keys w1:p7 Enter")).toHaveLength(1);
   });
 });
 
@@ -724,12 +885,12 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
     const { time } = steppedTimeSource();
     const d = new HerdrDriver(bin, 3, time);
 
-    await expect(d.run({ id: "w1:p42", name: "plain-shell", cwd }, "echo hi")).rejects.toThrow(
+    await expect(d.run(await readinessSlot(d, cwd, "T9"), "echo hi")).rejects.toThrow(
       /submission never registered/,
     );
 
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane send-keys w1:p42 Enter$/gm)).toHaveLength(2);
+    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(2);
   });
 
   test("test: an interface that became interactive slowly is granted a commensurately scaled submission window and a slow but successful submit is never pressed twice", async () => {
@@ -764,6 +925,8 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
     const hungAdapterId = "hung-readiness-test";
     declareInputBox(hungAdapterId, {
       fingerprint: "editor-box",
+      match: (paneText: string) => paneText.includes("editor-box"),
+      emptyMatch: (paneText: string) => paneText.includes("editor-box"),
       readinessTimeoutMs: 250,
     });
     const { bin, cwd } = makeStub(0, { paneReadHangs: true });
@@ -787,6 +950,8 @@ describe("HerdrDriver interactive-readiness delivery gate (OBS-142)", () => {
     const lateHangAdapterId = "late-hang-readiness-test";
     declareInputBox(lateHangAdapterId, {
       fingerprint: "editor-box",
+      match: (paneText: string) => paneText.includes("editor-box"),
+      emptyMatch: (paneText: string) => paneText.includes("editor-box"),
       readinessTimeoutMs: 500,
     });
     const { bin, cwd } = makeStub(0, { paneReadHangsAfter: 2 });
@@ -853,7 +1018,7 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
     const d = new HerdrDriver(bin, 3, time);
 
     await expect(d.run(await submissionSlot(d, cwd, "T3"), "echo hi")).rejects.toThrow(
-      /herdr delivery corrupted after .* submission never registered/,
+      /delivery corrupted on pane .* submission never registered/,
     );
 
     const calls = readFileSync(log, "utf8");
@@ -905,89 +1070,6 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
   });
 });
 
-describe("HerdrDriver launch execution-echo evidence (OBS-144)", () => {
-  const inputBox = "╭────────────╮\n│ >          │\n╰────────────╯";
-  const launchCommand = "launch-agent --model test";
-  const adapterId = "launch-echo-test";
-  declareInputBox(adapterId, {
-    fingerprint: "│ >",
-    match: (paneText: string) => paneText.includes("│ >"),
-    emptyMatch: (paneText: string) => paneText.includes("│ >          │"),
-    launchCommand: (command: string) => command === launchCommand,
-    readinessTimeoutMs: 500,
-  });
-
-  async function launchSlot(d: HerdrDriver, cwd: string, taskId: string) {
-    return d.slot(cwd, `${taskId}-worker-${adapterId}-a0-launch`, {
-      group: "workers",
-      owned: { role: "worker", taskId, attempt: 0, runId: "run-launch-echo" },
-    });
-  }
-
-  test("test: a launch whose command is prompt-echoed by the shell verifies as submitted even when the launched interface has painted nothing yet", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      paneReadFrames: ["➜  worker git:(task) ✗"],
-      submission: "execution-echo",
-    });
-    const d = new HerdrDriver(bin);
-
-    await expect(d.run(await launchSlot(d, cwd, "T1"), launchCommand)).resolves.toBeUndefined();
-
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane read w1:p9/gm)).toHaveLength(3); // two shell-readiness frames + the execution echo
-    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
-  });
-
-  test("test: after an echo-verified launch the readiness gate owns the wait for the interface and no submit re-press is sent", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      paneReadFrames: ["$"],
-      submission: "execution-echo",
-    });
-    const d = new HerdrDriver(bin);
-    const slot = await launchSlot(d, cwd, "T2");
-
-    await d.run(slot, launchCommand);
-    await expect(d.waitOutput(slot, "interface-ready", 5_000)).resolves.toBe(true);
-
-    const lines = readFileSync(log, "utf8").trim().split("\n");
-    const enter = lines.findIndex((line) => line === "pane send-keys w1:p9 Enter");
-    const readinessWait = lines.findIndex((line) =>
-      line.startsWith("pane wait-output w1:p9 --match interface-ready"));
-    expect(lines.filter((line) => line === "pane send-keys w1:p9 Enter")).toHaveLength(1);
-    expect(readinessWait).toBeGreaterThan(enter);
-  });
-
-  test("test: a delivery showing neither an execution echo nor an empty declared input box within its bounds still refuses fail-closed with the existing error identity", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      paneReadFrames: ["$"],
-      submission: "bare-command",
-    });
-    const { time } = steppedTimeSource();
-    const d = new HerdrDriver(bin, 3, time);
-
-    await expect(d.run(await launchSlot(d, cwd, "T3"), launchCommand)).rejects.toThrow(
-      /herdr delivery corrupted after 2 submit attempts — submission never registered \(OBS-140\)/,
-    );
-
-    expect(readFileSync(log, "utf8").match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(2);
-  });
-
-  test("test: a seed delivery into a painted input box keeps its current verification behavior unchanged", async () => {
-    const { bin, log, cwd } = makeStub(0, {
-      paneReadFrames: [inputBox],
-      submission: "empty-box",
-    });
-    const d = new HerdrDriver(bin);
-    const seedCommand = "read the task prompt";
-
-    await d.run(await launchSlot(d, cwd, "T4"), seedCommand);
-
-    const calls = readFileSync(log, "utf8");
-    expect(calls.match(/^pane send-text w1:p9 read the task prompt$/gm)).toHaveLength(1);
-    expect(calls.match(/^pane send-keys w1:p9 Enter$/gm)).toHaveLength(1);
-  });
-});
-
 describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
   test("test: two simultaneous dispatches allocate distinct panes and each delivery lands in the pane bound to its own task", async () => {
     const { bin, log, cwd } = makeStub();
@@ -1011,11 +1093,11 @@ describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
 
     expect(first.id).not.toBe(second.id);
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const firstDelivery = lines.indexOf("pane send-text w1:p9 echo task-one");
+    const firstDelivery = lines.findIndex((l) => l.startsWith("pane run w1:p9 printf") && l.endsWith("echo task-one"));
     const secondAllocation = lines.indexOf("pane split w1:p9 --direction right --no-focus --cwd " + cwd);
     expect(firstDelivery).toBeGreaterThanOrEqual(0);
     expect(secondAllocation).toBeGreaterThan(firstDelivery);
-    expect(lines).toContain("pane send-text w1:p7 echo task-two");
+    expect(lines.some((l) => l.startsWith("pane run w1:p7 printf") && l.endsWith("echo task-two"))).toBe(true);
   });
 
   test("test: a pane-identity binding that fails verification fails that dispatch rather than typing into another task's pane", async () => {
@@ -1032,6 +1114,7 @@ describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
 
     await expect(dispatch()).rejects.toThrow(/identity binding/i);
     expect(readFileSync(log, "utf8")).not.toContain("pane send-text");
+    expect(readFileSync(log, "utf8")).not.toContain("pane run w1:p9 printf");
   });
 
   test("test: the early liveness check watches the pane its task's delivery actually landed in", async () => {
@@ -1049,7 +1132,7 @@ describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
     await d.read(slot, 500);
 
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane send-text w1:p9 echo launched");
+    expect(calls).toContain("pane run w1:p9 printf");
     expect(calls).toContain("pane read w1:p9 --source recent-unwrapped --lines 500");
     expect(calls).not.toContain("pane read w1:pOTHER --source recent-unwrapped --lines 500");
   });
@@ -1442,8 +1525,9 @@ describe("HerdrDriver narrator pane (T2)", () => {
     expect(calls).toContain("pane rename w1:p7 tickmarkr:watch:run:0:run-watch");
     expect(calls).not.toContain("tab create");
     expect(calls.match(/pane split /g)).toHaveLength(1);
-    expect(calls.match(/pane send-text w1:p7 tickmarkr status --watch/g)).toHaveLength(1); // OBS-85 verified delivery
-    expect(calls.match(/pane send-keys w1:p7 Enter/g)).toHaveLength(1);
+    // the watch is a shell dispatch like any other: atomic, nonce-acknowledged, never typed
+    expect(calls.match(/pane run w1:p7 printf .*tickmarkr status --watch/g)).toHaveLength(1);
+    expect(calls).not.toMatch(/pane send-keys w1:p7 Enter/);
     expect(second).toEqual(first);
     expect(first.tabId).toBeUndefined();
     await d.close(first);

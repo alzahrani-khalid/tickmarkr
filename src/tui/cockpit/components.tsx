@@ -83,6 +83,8 @@ export const KEYBAR_KEYS = {
 export type JournalRow = {
   readonly id: string;
   readonly time: string;
+  /** The complete recorded instant behind `time`; absent only on non-event/legacy rows. */
+  readonly timestamp?: string;
   readonly state: ComponentState;
   readonly text: string;
 };

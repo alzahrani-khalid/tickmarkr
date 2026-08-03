@@ -2,23 +2,65 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFi
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { execSync, spawn } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { kimiSessionId } from "../../src/adapters/kimi.js";
 import { type BillingChannel, shq } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
+import { renderMarkdownRecord } from "../../src/cli/commands/report.js";
 import { DEFAULT_CONFIG, TIER_RANK, type Tier } from "../../src/config/config.js";
 import { DeliveryReadinessError } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
-import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
-import { gatePaneName } from "../../src/gates/llm.js";
+import { formatOwnedName, type ExecutorDriver, type Slot } from "../../src/drivers/types.js";
+import { captureBaseline } from "../../src/gates/baseline.js";
+import { extractPromptNonce, gatePaneName } from "../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { EARLY_LAUNCH_LIVENESS_MS, runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
+import { NO_TRAILER_SUMMARY } from "../../src/adapters/prompt.js";
+import { EARLY_LAUNCH_LIVENESS_MS, HARVESTED_RESULT_SUMMARY, harvestCpuFlatWindowMs, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE, workerTreeCpuMs } from "../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../src/run/git.js";
-import { Journal, recordedTaskFailureKind } from "../../src/run/journal.js";
-import { COMMIT, authedModels, setupRepo, T } from "../helpers/tmprepo.js";
+import { activeRetryBan, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, pendingRepairFindings, recordedTaskFailureKind, reviewRoundsSinceApproval, structuredFindings, UNIDENTIFIED, type JournalEvent } from "../../src/run/journal.js";
+import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests } from "../../src/run/stall.js";
+import { COMMIT, authedModels, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
+
+/**
+ * A FakeAdapter wearing another adapter's id and vendor, so a fixture fleet can carry a second vendor
+ * without a second script format. One definition, three call sites (it was copied three times).
+ *
+ * NONCE (OBS-186 collateral): llm.ts binds a scripted fake verdict to the call nonce only when
+ * `adapter.id === "fake"` (augmentFakeVerdictOutput) — and a renamed fake is a different adapter to
+ * that guard, so its review verdict arrived UNBOUND and every gate reaching it failed closed on
+ * cause `no-verdict`. Path-keyed participation is what routes real reviews here for the first time.
+ * The fix is the FIXTURE's, not the check's: this adapter emits its own VERDICT_NONCE-bound copy,
+ * exactly as a real reviewer CLI does. Widening llm.ts's guard to `instanceof FakeAdapter` was
+ * measured and turns tests/gates/review-retry.test.ts red — that suite uses the same rename to
+ * produce a nonce-less verdict ON PURPOSE. Review only: a judge verdict served this way would miss
+ * the per-criterion evidence injectFakeEvidence adds, and no fixture routes a judge to a NamedFake.
+ */
+class NamedFake extends FakeAdapter {
+  constructor(private sp: string, public id: string, private models: string[], public vendor: string, private ch: "sub" | "api") {
+    super(sp);
+  }
+  async probe() {
+    return { installed: true, authed: true, version: "fake", models: this.models, modelAuth: authedModels(this.models) };
+  }
+  channels() {
+    return this.models.map((model) => ({
+      adapter: this.id, vendor: this.vendor, model, channel: this.ch, tier: "frontier" as const,
+    }));
+  }
+  headlessCommand(promptFile: string, model: string): string {
+    const base = super.headlessCommand(promptFile, model);
+    const prompt = readFileSync(promptFile, "utf8");
+    const nonce = extractPromptNonce(prompt);
+    if (!nonce || !/TICKMARKR-REVIEW/.test(prompt)) return base;
+    const scripted = (JSON.parse(readFileSync(this.sp, "utf8")) as { review?: unknown }).review;
+    if (!scripted || typeof scripted !== "object") return base;
+    return `${base}; echo ${shq(JSON.stringify({ ...scripted, nonce }))}`;
+  }
+}
 
 const addGateScripts = (repo: string, testCmd: string) => {
   writeFileSync(join(repo, "package.json"), JSON.stringify({ scripts: { test: testCmd } }));
@@ -47,6 +89,115 @@ const interactiveDriver = () => {
     worktree: inner.worktree.bind(inner),
   };
 };
+
+async function seedGateSatisfiedResume(
+  runId: string,
+  opts: {
+    gates: string[];
+    priorResults: Array<{ gate: string; pass: boolean; fullSuite?: boolean; selectedTests?: string[] }>;
+    script: object;
+  },
+) {
+  const suiteLog = join(makeTestTempDir("tickmarkr-approved-suite-"), "suite.log");
+  const testCmd = `printf 'argc=%s args=%s\\n' "$#" "$*" >> ${shq(suiteLog)}`;
+  const { repo, fake } = setupRepo(
+    [T("T1", { complexity: 8, files: ["**"], gates: opts.gates })],
+    { tasks: {}, ...opts.script },
+    `gates: { test: ${JSON.stringify(testCmd)} }\n`,
+  );
+  const baseRef = await gitHead(repo);
+  const branch = `tickmarkr/${runId}`;
+  const taskBranch = `${branch}--T1`;
+  const driver = new SubprocessDriver();
+  const priorWt = await driver.worktree(repo, taskBranch, baseRef);
+  writeFileSync(join(priorWt, "work.txt"), "landed\n");
+  await shOk("git add work.txt && git commit --no-gpg-sign -m work", priorWt);
+
+  const commands = { test: testCmd };
+  const baseline = await captureBaseline(repo, commands);
+  writeFileSync(suiteLog, ""); // baseline execution is not part of the resumed gate round
+  const journal = Journal.create(repo, runId);
+  journal.append("run-start", undefined, {
+    baseRef, commands, branch, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
+  });
+  journal.append("task-dispatch", "T1", {
+    assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    attempt: 0,
+  });
+  journal.append("worker-result", "T1", { ok: true, summary: "landed", deviations: [] });
+  journal.phaseStart("T1", "gates");
+  for (const result of opts.priorResults) {
+    journal.append("gate-result", "T1", {
+      gate: result.gate, pass: result.pass, details: result.pass ? "passed" : "failed",
+      ...(result.fullSuite === undefined ? {} : { fullSuite: result.fullSuite }),
+      ...(result.selectedTests === undefined ? {} : { selectedTests: result.selectedTests }),
+    });
+  }
+  journal.append("task-human", "T1", { reason: "gate failed", kind: "gate-fail" });
+  writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline));
+  await approve([runId, "T1", "--by", "test"], repo);
+  return { repo, fake, suiteLog };
+}
+
+describe("v1.85 gate-satisfied resume preserves parallel AND and full-suite authority", () => {
+  test("approving review re-runs an unapproved failed acceptance sibling and cannot merge it", async () => {
+    const runId = "run-approved-parallel-red";
+    const { repo, fake, suiteLog } = await seedGateSatisfiedResume(runId, {
+      gates: ["build", "test", "lint", "evidence", "scope", "acceptance", "review"],
+      // The selected test screen passed, then BOTH parallel verdicts failed. Plain approval satisfies
+      // the last one (review) only; acceptance remains red and must be asked again.
+      priorResults: [
+        { gate: "test", pass: true, selectedTests: ["tests/a.test.ts"] },
+        { gate: "acceptance", pass: false },
+        { gate: "review", pass: false },
+      ],
+      script: {
+        judge: { pass: false, criteria: [{ criterion: "done", met: false, reason: "still red" }] },
+        review: { approve: true, issues: [] },
+      },
+    });
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(summary.done).not.toContain("T1");
+    expect(summary.human).toContain("T1");
+    const events = Journal.open(repo, runId).read();
+    const resumeAt = events.findLastIndex((e) => e.event === "run-resume");
+    const post = events.slice(resumeAt + 1);
+    expect(post.some((e) => e.event === "gate-result" && e.taskId === "T1"
+      && e.data.gate === "acceptance" && e.data.pass === false)).toBe(true);
+    expect(post.some((e) => e.event === "merge" && e.taskId === "T1")).toBe(false);
+    expect(readFileSync(suiteLog, "utf8").trim().split("\n")).toContain("argc=0 args=");
+  }, 60_000);
+
+  test("approving acceptance after a selected-only screen forces a full test gate before merge", async () => {
+    const runId = "run-approved-selected-screen";
+    const { repo, fake, suiteLog } = await seedGateSatisfiedResume(runId, {
+      gates: ["build", "test", "lint", "evidence", "scope", "acceptance", "review"],
+      priorResults: [
+        { gate: "test", pass: true, selectedTests: ["tests/a.test.ts"] },
+        { gate: "acceptance", pass: false },
+        { gate: "review", pass: true },
+      ],
+      script: { review: { approve: true, issues: [] } },
+    });
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(summary.done).toContain("T1");
+    const events = Journal.open(repo, runId).read();
+    const resumeAt = events.findLastIndex((e) => e.event === "run-resume");
+    const post = events.slice(resumeAt + 1);
+    const testAt = post.findIndex((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "test");
+    const mergeAt = post.findIndex((e) => e.event === "merge" && e.taskId === "T1");
+    expect(testAt).toBeGreaterThanOrEqual(0);
+    expect(mergeAt).toBeGreaterThan(testAt);
+    expect(post[testAt]!.data.pass).toBe(true);
+    // One full gate run plus the strict integration-tip verify. No filtered argv can appear here.
+    expect(readFileSync(suiteLog, "utf8").trim().split("\n")).toEqual([
+      "argc=0 args=",
+      "argc=0 args=",
+    ]);
+  }, 60_000);
+});
 
 const readinessFailingDriver = (failures: number, waitedMs = 875, transcript = "cold pane still painting") => {
   const inner = new SubprocessDriver();
@@ -279,11 +430,16 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
   test("two gate fails → escalate switches channel fresh after a same-channel resume", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
-      { tasks: { T1: [
-        { shell: "true", result: { ok: true, summary: "nothing 1" } },
-        { shell: "true", result: { ok: true, summary: "nothing 2" } },
-        { shell: `echo third > f.txt && ${COMMIT} third`, result: { ok: true, summary: "third time lucky" } },
-      ] } },
+      {
+        // This fixture tests a recoverable escalation. Make that verdict explicit: an absent or
+        // unparseable consult verdict is terminal and must not be used to reach attempt three.
+        consult: { action: "retry", notes: "the next channel may recover" },
+        tasks: { T1: [
+          { shell: "true", result: { ok: true, summary: "nothing 1" } },
+          { shell: "true", result: { ok: true, summary: "nothing 2" } },
+          { shell: `echo third > f.txt && ${COMMIT} third`, result: { ok: true, summary: "third time lucky" } },
+        ] },
+      },
     );
     fake.contextUsage = () => ({ tokens: 500 });
     const originalResume = fake.resumeCommand.bind(fake);
@@ -767,7 +923,10 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     const s = await runDaemon(repo, { adapters: [fake, fake2, fake3], runId: "run-consult-channels" });
     expect(s.done).toEqual(["T1"]);
     expect(s.human).toEqual([]);
-    expect(fake2.consultModels).toEqual(["fake-9"]); // the live prefer seat answered, with its entry's model
+    // every consult this run drew — the fingerprint cap forces one of its own when the same failure
+    // repeats — reached the live prefer seat, with its entry's model, and only that seat.
+    expect(fake2.consultModels.length).toBeGreaterThan(0);
+    expect(new Set(fake2.consultModels)).toEqual(new Set(["fake-9"]));
     expect(fake3.consultModels).toEqual([]); // doctor-filtered seat skipped without an invocation
     const verdict = Journal.open(repo, "run-consult-channels").read().find((e) => e.event === "consult-verdict")!;
     expect(verdict.data.action).toBe("retry");
@@ -994,9 +1153,11 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(row.consults).toBe(0);
   });
 
-  test("TEL-02 consult path: gate-fails reach the consult step, retry verdict → pass writes consults:1", async () => {
+  test("TEL-02 consult path: gate-fails reach the consult step, retry verdict → pass writes the consult count", async () => {
     // ladder [retry, escalate, consult, human]: three gate-fails walk to the consult step, whose retry
-    // verdict feeds a fourth passing attempt. One consult ⇒ consults:1 on the done row.
+    // verdict feeds a fourth passing attempt. Every consult drawn on the way — the ladder's own, plus
+    // the one the fingerprint cap forces when these three identical evidence failures repeat — is
+    // counted and persisted onto the done row.
     const { repo, fake } = setupRepo(
       [T("T1")],
       {
@@ -1013,7 +1174,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(s.done).toEqual(["T1"]);
     const row = telem(repo, "run-tel-consult").find((r) => r.taskId === "T1")!;
     expect(row.outcome).toBe("done");
-    expect(row.consults).toBe(1); // one consult across the attempt loop, persisted onto the done row
+    expect(row.consults).toBe(2); // every consult across the attempt loop, persisted onto the done row
     expect(row.gateFails).toBe(3); // three gate-failed attempts before the consult-fed pass
     expect(row.firstAttemptOk).toBe(false);
   });
@@ -2167,20 +2328,6 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
 
     // cursor models are both `sub` so channel-level nextChannel prefers composer-2.5 over fake (`api`)
     // — that is the OBS-20 failure mode the exclusion must prevent.
-    class NamedFake extends FakeAdapter {
-      constructor(sp: string, public id: string, private models: string[], public vendor: string, private ch: "sub" | "api") {
-        super(sp);
-      }
-      async probe() {
-        return { installed: true, authed: true, version: "fake", models: this.models, modelAuth: authedModels(this.models) };
-      }
-      channels() {
-        return this.models.map((model) => ({
-          adapter: this.id, vendor: this.vendor, model, channel: this.ch, tier: "frontier" as const,
-        }));
-      }
-    }
-
     const cursor = new NamedFake(scriptPath, "cursor-agent", ["composer", "composer-2.5"], "cursor", "sub");
     const fake = new NamedFake(fakeScript, "fake", ["fake-1"], "fake-a", "api");
     const s = await runDaemon(repo, { adapters: [cursor, fake], runId: "run-obs20-excl" });
@@ -2234,20 +2381,6 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
       },
     }));
 
-    class NamedFake extends FakeAdapter {
-      constructor(sp: string, public id: string, private models: string[], public vendor: string, private ch: "sub" | "api") {
-        super(sp);
-      }
-      async probe() {
-        return { installed: true, authed: true, version: "fake", models: this.models, modelAuth: authedModels(this.models) };
-      }
-      channels() {
-        return this.models.map((model) => ({
-          adapter: this.id, vendor: this.vendor, model, channel: this.ch, tier: "frontier" as const,
-        }));
-      }
-    }
-
     const cursor = new NamedFake(scriptPath, "cursor-agent", ["composer", "composer-2.5"], "cursor", "sub");
     const fake = new NamedFake(fakeScript, "fake", ["fake-1"], "fake-a", "api");
     const s = await runDaemon(repo, { adapters: [cursor, fake], runId: "run-excl-scope", concurrency: 1 });
@@ -2287,20 +2420,6 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
       consult: { action: "reroute", notes: "typo'd adapter", excludeAdapter: "not-a-real-adapter" },
       tasks: { T1: [{ shell: "true", result: { ok: true, summary: "unused" } }] },
     }));
-
-    class NamedFake extends FakeAdapter {
-      constructor(sp: string, public id: string, private models: string[], public vendor: string, private ch: "sub" | "api") {
-        super(sp);
-      }
-      async probe() {
-        return { installed: true, authed: true, version: "fake", models: this.models, modelAuth: authedModels(this.models) };
-      }
-      channels() {
-        return this.models.map((model) => ({
-          adapter: this.id, vendor: this.vendor, model, channel: this.ch, tier: "frontier" as const,
-        }));
-      }
-    }
 
     const cursor = new NamedFake(scriptPath, "cursor-agent", ["composer", "composer-2.5"], "cursor", "sub");
     const fake = new NamedFake(fakeScript, "fake", ["fake-1"], "fake-a", "api");
@@ -3131,4 +3250,2388 @@ describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
     expect(src).toMatch(/!everHadOutput && Date\.now\(\) - attemptStart >= earlyLaunchLivenessMs/);
     expect(src).not.toMatch(/setTimeout\([^)]*earlyLaunch/);
   });
+});
+
+// T1 (OBS-262/263, speed-spec §2): stall detection notices a dead or silent worker in minutes.
+// Interactive-driver integration tests over the scripted fake adapter — zero tokens, real worktrees.
+describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
+  // a stalled interactive TUI: prints once (early-launch liveness passes), never emits a trailer
+  const STALLED = {
+    consult: { action: "human", notes: "stalled worker" },
+    tasks: { T1: [{ shell: "echo working-on-it" }] },
+  };
+  const idriver = (overrides: Record<string, unknown> = {}): ExecutorDriver => {
+    const inner = new SubprocessDriver();
+    return {
+      id: "t1-stall-fake",
+      interactive: true,
+      slot: inner.slot.bind(inner),
+      run: inner.run.bind(inner),
+      waitOutput: async () => { await new Promise((r) => setTimeout(r, 50)); return false; },
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: async () => "working-on-it",
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+      status: async () => "working",
+      ...overrides,
+    } as ExecutorDriver;
+  };
+
+  test("test: a worker silent on the monotonic tracker for ten minutes is nudged even while its herdr status reads working, and the nudge is journaled", async () => {
+    NUDGEABLE_ADAPTERS.add("fake");
+    setNudgeTimingForTests(200, 400); // seam for the 10m gate / 4m grace — behavior under test is status-blindness
+    // Both seams scale TOGETHER so the ordering is what is proven: the fast-kill window sits BELOW
+    // the nudge gate (its shipped 5m is below the nudge's 10m too), and a nudgeable pane must still
+    // be nudged first — the kill holds while the daemon has an action of its own pending.
+    setDeadChannelFastKillMsForTests(50);
+    try {
+      const nudges: string[] = [];
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED);
+      const driver = idriver({
+        status: async () => "working", // the reading that used to hold the nudge gate hostage
+        nudge: async (_slot: unknown, message: string) => { nudges.push(message); return true; },
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-nudge-working", driver });
+      expect(s.human).toEqual(["T1"]); // unanswered nudge → grace expiry → stall consult parks human
+      expect(nudges).toEqual([WORKER_NUDGE_MESSAGE]); // one nudge per attempt, fired under "working"
+      const evs = Journal.open(repo, "run-t1-nudge-working").read();
+      expect(evs.filter((e) => e.event === "worker-nudge" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-nudge-expired" && e.taskId === "T1")).toHaveLength(1);
+      // the fast-kill seam expired long before the nudge gate — and never fired: the nudge got first crack
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
+      // status is journaled on change (T1 review — per-slice appends flooded the live surface),
+      // and every journaled sample read "working"
+      const samples = evs.filter((e) => e.event === "worker-status" && e.taskId === "T1");
+      expect(samples.length).toBeGreaterThan(0);
+      expect(samples.every((e) => e.data.status === "working")).toBe(true);
+    } finally {
+      NUDGEABLE_ADAPTERS.delete("fake");
+      resetNudgeTimingForTests();
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  test("test: a second page fires after a first — deleting the paged latch is proven by two journaled pages in one attempt", async () => {
+    // adapter "fake" is NOT nudge-allowlisted and the driver has no nudge surface: an idle pane is
+    // the operator's to unblock, so the page fires — journaled every slice AND delivered again on
+    // the repeat cadence. The status never changes here, so a status latch would deliver once.
+    setPageRepeatMsForTests(500); // seam for the 2m operator-spam cadence (shipped 2m sits below the 5m fast-kill)
+    try {
+      const notifies: string[] = [];
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED);
+      const driver = idriver({
+        status: async () => "idle",
+        notify: async (msg: string) => { notifies.push(msg); },
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-pages", driver });
+      expect(s.human).toEqual(["T1"]);
+      const pages = Journal.open(repo, "run-t1-pages").read()
+        .filter((e) => e.event === "operator-page" && e.taskId === "T1");
+      expect(pages.length).toBeGreaterThanOrEqual(2); // a second page fired after a first …
+      expect(new Set(pages.map((e) => e.data.attempt)).size).toBe(1); // … within ONE attempt
+      // … and the second page reached the operator, not just the journal (the latch is gone)
+      expect(notifies.filter((m) => /looks idle without finishing/.test(m)).length).toBeGreaterThanOrEqual(2);
+    } finally {
+      resetPageRepeatMsForTests();
+    }
+  }, 120_000);
+
+  test("test: a quota banner matched on two consecutive slices with three minutes of tracker silence fails the attempt over without waiting out the window", async () => {
+    setQuotaBannerSilentMsForTests(1_500); // seam for the 3m silence gate
+    try {
+      const { repo, fake } = setupRepo(
+        [T("T1", { timeoutMinutes: 5 })], // a 5m window: finishing inside the 120s test timeout proves the window was NOT waited out
+        { tasks: { T1: [
+          { shell: "echo 'usage limit reached for this model'" }, // channel A: quota banner, no trailer
+          { shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "recovered on B" } },
+        ] } },
+      );
+      const inner = new SubprocessDriver();
+      let workerRuns = 0;
+      let bannerReads = 0;
+      const driver = {
+        id: "t1-quota-fake",
+        interactive: true,
+        slot: inner.slot.bind(inner),
+        run: async (slot: Slot, cmd: string) => {
+          if (slot.name.includes("-worker-")) workerRuns++;
+          return inner.run(slot, cmd);
+        },
+        waitOutput: async (slot: Slot, pattern: string, ms: number, opts?: { regex?: boolean }) =>
+          workerRuns > 1 ? inner.waitOutput(slot, pattern, ms, opts) : false,
+        waitAgentStatus: inner.waitAgentStatus.bind(inner),
+        read: (slot: Slot, lines?: number) => {
+          // the banner printed AFTER a benign launch frame classifies; the mirror test below
+          // proves arrival order no longer matters — chrome is filtered by identity, not novelty
+          if (slot.name.includes("-worker-") && workerRuns === 1) {
+            bannerReads++;
+            return Promise.resolve(bannerReads <= 2
+              ? "composing a plan for the task"
+              : "claude ai usage limit reached for this model\nresets at 5pm"); // the banner IS output
+          }
+          return inner.read(slot, lines);
+        },
+        notify: inner.notify.bind(inner),
+        close: inner.close.bind(inner),
+        worktree: inner.worktree.bind(inner),
+        status: async () => "working",
+      };
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-quota", driver });
+      expect(s.done).toEqual(["T1"]); // channel B carried it to done — A failed over, not consulted
+      const evs = Journal.open(repo, "run-t1-quota").read();
+      expect(evs.filter((e) => e.event === "quota-banner" && e.taskId === "T1")).toHaveLength(1);
+      const failover = evs.find((e) => e.event === "quota-failover" && e.taskId === "T1");
+      expect(failover).toBeDefined();
+      expect(failover!.data.from).not.toBe(failover!.data.to);
+    } finally {
+      resetQuotaBannerSilentMsForTests();
+    }
+  }, 120_000);
+
+  // Mirror of the criterion above (T1 review, material): the banner is on screen from the FIRST
+  // read the daemon ever makes — a channel throttled at launch paints it before the first poll.
+  // A novelty baseline anchored on that first frame exculpated exactly this case forever (proven
+  // by execution: this driver shape yields {done:["T1"], quotaFailover:1} on shipped 843328b0 and
+  // {human:["T1"], quotaFailover:0} under the baseline). Chrome is filtered by identity now, so
+  // the banner classifies however early it arrived — quota failover is free and never waits the
+  // rolling window out (criterion 6).
+  test("a quota banner present from the first loop read fails the attempt over — the launch-time-throttle mirror", async () => {
+    setQuotaBannerSilentMsForTests(1_500); // seam for the 3m silence gate
+    try {
+      const { repo, fake } = setupRepo(
+        [T("T1", { timeoutMinutes: 5 })], // 5m window: finishing inside the 120s timeout proves it was NOT waited out
+        { tasks: { T1: [
+          { shell: "echo 'usage limit reached for this model'" }, // channel A: throttled at launch, no trailer
+          { shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "recovered on B" } },
+        ] } },
+      );
+      const inner = new SubprocessDriver();
+      let workerRuns = 0;
+      const driver = {
+        id: "t1-quota-launch-fake",
+        interactive: true,
+        slot: inner.slot.bind(inner),
+        run: async (slot: Slot, cmd: string) => {
+          if (slot.name.includes("-worker-")) workerRuns++;
+          return inner.run(slot, cmd);
+        },
+        waitOutput: async (slot: Slot, pattern: string, ms: number, opts?: { regex?: boolean }) =>
+          workerRuns > 1 ? inner.waitOutput(slot, pattern, ms, opts) : false,
+        waitAgentStatus: inner.waitAgentStatus.bind(inner),
+        read: (slot: Slot, lines?: number) =>
+          // the banner IS the launch frame and every frame after — the exact shape a baseline
+          // anchored on the first rendered frame swallowed
+          slot.name.includes("-worker-") && workerRuns === 1
+            ? Promise.resolve("claude ai usage limit reached for this model\nresets at 5pm")
+            : inner.read(slot, lines),
+        notify: inner.notify.bind(inner),
+        close: inner.close.bind(inner),
+        worktree: inner.worktree.bind(inner),
+        status: async () => "working",
+      };
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-quota-launch", driver });
+      expect(s.done).toEqual(["T1"]); // channel B carried it to done — the shipped behavior the baseline regressed
+      const evs = Journal.open(repo, "run-t1-quota-launch").read();
+      expect(evs.filter((e) => e.event === "quota-banner" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.some((e) => e.event === "quota-failover" && e.taskId === "T1")).toBe(true);
+      expect(Journal.open(repo, "run-t1-quota-launch").readTelemetry().filter((r) => r.quotaFailover === true)).toHaveLength(1);
+    } finally {
+      resetQuotaBannerSilentMsForTests();
+    }
+  }, 120_000);
+
+  test("test: a worker with no trailer, no worktree delta and no output growth for five minutes is concluded dead and journaled as such", async () => {
+    setDeadChannelFastKillMsForTests(1_500); // seam for the 5m fast-kill window
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], STALLED); // 5m window; the 120s test timeout proves the kill was fast
+      const driver = idriver({ status: async () => "working" }); // constant pane text: zero output growth
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-dead", driver });
+      expect(s.human).toEqual(["T1"]); // concluded dead → stall consult parks human
+      const evs = Journal.open(repo, "run-t1-dead").read();
+      const dead = evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1");
+      expect(dead).toHaveLength(1);
+      expect(dead[0]!.data.attempt).toBe(0);
+      // the dead conclusion precedes the worker-result harvest in the stream
+      expect(evs.findIndex((e) => e.event === "worker-dead" && e.taskId === "T1"))
+        .toBeLessThan(evs.findIndex((e) => e.event === "worker-result" && e.taskId === "T1"));
+    } finally {
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // The fast-kill's growth signal is the monotonic tracker, never raw pane bytes. This is the
+  // exact OBS-262 blindness in miniature: the pane below is FROZEN — its only change per slice is
+  // the elapsed counter ticking inside one repainting row, which lengthens the raw read while the
+  // transcript occupies no new rows. A fast-kill clocked on raw pane length would read that tick
+  // as growth and hold the window open forever; the tracker normalizes the elapsed token away and
+  // condemns it. Behavioral on purpose — a source grep pins the spelling, not the property.
+  test("a pane whose only change is a ticking elapsed counter is still fast-killed — raw byte growth is not progress", async () => {
+    setDeadChannelFastKillMsForTests(1_500);
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], STALLED); // 5m window; the kill lands in seconds
+      let tick = 0;
+      const driver = idriver({
+        status: async () => "working",
+        // one row, same width class, strictly longer bytes each read: "⠋ thinking (9s)" → "(10s)" → …
+        read: async () => `⠋ thinking (${9 + tick++}s • esc to interrupt)`,
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-tick", driver });
+      expect(s.human).toEqual(["T1"]);
+      const evs = Journal.open(repo, "run-t1-tick").read();
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(1);
+      expect(tick).toBeGreaterThan(1); // the pane really did repaint a longer line between slices
+    } finally {
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // The dead-channel triad has no status exemption. A `blocked` reading is exactly the status a
+  // wedged TUI scrapes as, so exempting it would let the worst stall class wait the rolling window
+  // out on a status reading — the blindness T1 exists to delete. The operator is still paged; the
+  // page and the kill are not alternatives.
+  test("a blocked pane holding the dead-channel triad is fast-killed too, and paged on the way out", async () => {
+    setDeadChannelFastKillMsForTests(1_500);
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], STALLED); // 5m window; the kill lands in seconds
+      const driver = idriver({ status: async () => "blocked", notify: async () => {} });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-blocked", driver });
+      expect(s.human).toEqual(["T1"]);
+      const evs = Journal.open(repo, "run-t1-blocked").read();
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(1);
+      const pages = evs.filter((e) => e.event === "operator-page" && e.taskId === "T1");
+      expect(pages.length).toBeGreaterThan(0);
+      expect(pages.every((e) => e.data.status === "blocked")).toBe(true);
+    } finally {
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // T1 review (read-ceiling blindness): the tracker's row signal saturates once a sample FILLS
+  // the bounded read on RAW lines (blanks and chrome-only rows included) — past that, a flat
+  // tracker means "unmeasurable", not "dead". For UNMETERED adapters (no contextUsage: codex,
+  // cursor-agent, grok, opencode — the exact non-nudgeable set this kill governs) rows are the
+  // only liveness signal, so a live worker past the ceiling would be concluded dead mid-work.
+  // The kill must stand down on a saturated row signal (journaled once) and let the rolling
+  // window own the pane, as pre-T1.
+  test("a saturated row signal stands the fast-kill down — a live pane past the read ceiling is never concluded dead", async () => {
+    setDeadChannelFastKillMsForTests(1_500); // kill seam far below the 6s window: without the stand-down, worker-dead fires
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED);
+      // a constant FULL read window in the shape a production `read(slot, PANE_READ_ROWS)`
+      // actually returns: exactly PANE_READ_ROWS raw lines, blank rows included (measured
+      // 730 non-empty of 1000 on the codex-mcp-spinner fixture). Frozen-looking to the row
+      // high-water, but only because the signal is blind — and the non-empty count sits BELOW
+      // the ceiling, so only a raw-window saturation check can stand the kill down here.
+      const saturatedPane = Array.from({ length: PANE_READ_ROWS }, (_, i) =>
+        i % 4 === 3 ? "" : `exploring module ${i}`).join("\n");
+      const driver = idriver({ status: async () => "working", read: async () => saturatedPane });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-saturated", driver });
+      expect(s.human).toEqual(["T1"]); // the rolling window concluded it — the stall consult parks human
+      const evs = Journal.open(repo, "run-t1-saturated").read();
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0); // never killed on a blind signal
+      const held = evs.filter((e) => e.event === "worker-dead-held" && e.taskId === "T1");
+      expect(held).toHaveLength(1); // the stand-down is journaled exactly once per attempt
+      expect(held[0]!.data.reason).toBe("row-signal-saturated");
+    } finally {
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // Adversarial pair to the quota criterion: the classifier must fire on a live banner and stay
+  // silent on a transcript that merely QUOTES one. Same silence, same two slices, same regex —
+  // only the banner's position in the transcript differs. The quoting text is printed AFTER a
+  // benign launch frame, so it is genuinely NEW output — novelty cannot be what saves it; only
+  // its place above the tail can.
+  test("a quota mention above the transcript tail is not a banner and never fails the attempt over", async () => {
+    setQuotaBannerSilentMsForTests(500);
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED);
+      const harmless = [
+        "$ git diff",
+        "+  // handle the provider rate limit banner: usage limit reached → failover",
+        "+  if (QUOTA_RE.test(out)) return quotaFailover();",
+        ...Array.from({ length: 14 }, (_, i) => `  reading src/run/module-${i}.ts`),
+      ].join("\n");
+      let reads = 0;
+      const driver = idriver({
+        status: async () => "working",
+        read: async () => (++reads <= 2 ? "composing a plan for the task" : harmless),
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-quota-mention", driver });
+      expect(s.human).toEqual(["T1"]); // window expiry → stall consult …
+      const evs = Journal.open(repo, "run-t1-quota-mention").read();
+      expect(evs.filter((e) => e.event === "quota-banner" && e.taskId === "T1")).toHaveLength(0);
+      expect(evs.filter((e) => e.event === "quota-failover" && e.taskId === "T1")).toHaveLength(0); // … never a failover
+    } finally {
+      resetQuotaBannerSilentMsForTests();
+    }
+  }, 120_000);
+
+  // T1 review (material, fixture-overfit class): codex pins "• You have 3 usage limit resets
+  // available." in the composer chrome of EVERY rendered frame (tests/fixtures/codex-mcp-spinner),
+  // so a raw-tail QUOTA_RE match fails a wedged worker over for a quota it never hit. The daemon
+  // filters that KNOWN chrome by identity — never by novelty against an anchor frame, which is
+  // what swallowed the launch-time banner (see the mirror test above). This test feeds the daemon
+  // the hostile shape: a pre-render launch read (a shell pane holding the dispatch line — what
+  // driver.run() + an immediate read produce for every adapter without interactiveSeed), then the
+  // captured wedged-MCP frames — tracker-silent, chrome pinned inside the tail.
+  test("codex welcome chrome painted after a pre-render launch read is never classified as a quota banner", async () => {
+    setQuotaBannerSilentMsForTests(500); // the silence gate passes quickly — only the chrome filter can save the pane
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED);
+      const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "codex-mcp-spinner");
+      const frames = readdirSync(fixtureDir)
+        .filter((f) => /^frame-\d+\.txt$/.test(f))
+        .sort()
+        .map((f) => readFileSync(join(fixtureDir, f), "utf8"));
+      expect(frames.length).toBeGreaterThanOrEqual(8);
+      let reads = 0;
+      const driver = idriver({
+        status: async () => "working",
+        // read #1 is the daemon's launch read: the pre-render shell pane. Every later read is a
+        // rendered frame from the wedged-MCP capture — chrome pinned in the tail, zero progress.
+        read: async () => (++reads === 1
+          ? "$ bash /tmp/tickmarkr-dispatch-T1.sh"
+          : frames[(reads - 2) % frames.length]),
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-quota-chrome", driver });
+      expect(s.human).toEqual(["T1"]); // window expiry → stall consult: the pane was wedged, not throttled
+      const evs = Journal.open(repo, "run-t1-quota-chrome").read();
+      expect(reads).toBeGreaterThan(3); // the loop really polled rendered frames past the launch read
+      expect(evs.filter((e) => e.event === "quota-banner" && e.taskId === "T1")).toHaveLength(0);
+      expect(evs.filter((e) => e.event === "quota-failover" && e.taskId === "T1")).toHaveLength(0);
+    } finally {
+      resetQuotaBannerSilentMsForTests();
+    }
+  }, 120_000);
+
+  // Criterion 6: a nudge that could not be DELIVERED is itself a signal that condemned the worker.
+  // The worst case is exactly this driver: status "working" (never pageable) plus a worktree delta
+  // (which otherwise disables the fast-kill), leaving the 30m window as the only bound. An
+  // unreachable pane no longer buys the rest of that window with work it did before it froze.
+  // "Could not be delivered" means BOTH attempts failed — one in-slice retry (T1 review) filters a
+  // driver flake, so a single false return never reaches this path.
+  test("an undeliverable nudge condemns the pane on the silence gate alone — a stale worktree delta no longer buys the window", async () => {
+    NUDGEABLE_ADAPTERS.add("fake");
+    setNudgeTimingForTests(200, 400);
+    setDeadChannelFastKillMsForTests(1_500);
+    try {
+      const { repo, fake } = setupRepo(
+        [T("T1", { timeoutMinutes: 30 })], // 30m window; the 120s test timeout proves it was not waited out
+        { consult: { action: "human", notes: "stalled worker" },
+          tasks: { T1: [{ shell: "echo scratch > scratch.txt && echo working-on-it" }] } }, // uncommitted delta
+      );
+      const driver = idriver({
+        status: async () => "working", // never pageable
+        nudge: async () => false, // the pane cannot be reached
+        notify: async () => {}, // keep expected consult/page delivery inside this fixture, not suite stdout
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-nudge-fail", driver });
+      expect(s.human).toEqual(["T1"]);
+      const evs = Journal.open(repo, "run-t1-nudge-fail").read();
+      expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(1);
+      // the failed nudge is what unlocked it: the same delta with no nudge attempt keeps the pane alive
+      expect(evs.findIndex((e) => e.event === "worker-nudge-failed" && e.taskId === "T1"))
+        .toBeLessThan(evs.findIndex((e) => e.event === "worker-dead" && e.taskId === "T1"));
+    } finally {
+      NUDGEABLE_ADAPTERS.delete("fake");
+      resetNudgeTimingForTests();
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // T1 review: a false return from driver.nudge is a driver-delivery outcome (missing pin,
+  // readiness timeout, read-back hiccup), not proof of an unreachable channel — so ONE failed
+  // delivery must not condemn a pane holding uncommitted work. The daemon retries once in-slice;
+  // here the first delivery flakes and the retry lands, and the pane must live to see its grace.
+  test("a nudge that fails once then delivers does not condemn the pane — one driver flake is not a dead channel", async () => {
+    NUDGEABLE_ADAPTERS.add("fake");
+    setNudgeTimingForTests(200, 400);
+    setDeadChannelFastKillMsForTests(1_500); // below the window: if the flake latched, the kill would fire
+    try {
+      const { repo, fake } = setupRepo(
+        [T("T1", { timeoutMinutes: 30 })], // 30m window; the 120s test timeout proves it was not waited out
+        { consult: { action: "human", notes: "stalled worker" },
+          tasks: { T1: [{ shell: "echo scratch > scratch.txt && echo working-on-it" }] } }, // uncommitted delta
+      );
+      let calls = 0;
+      const driver = idriver({
+        status: async () => "working", // never pageable — the kill is the only path that could condemn
+        nudge: async () => ++calls >= 2, // first delivery flakes, the in-slice retry lands
+        notify: async () => {},
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-nudge-flake", driver });
+      expect(s.human).toEqual(["T1"]); // delivered-but-unanswered nudge → grace expiry → stall consult
+      expect(calls).toBe(2); // the retry really happened, inside the same nudge sequence
+      const evs = Journal.open(repo, "run-t1-nudge-flake").read();
+      expect(evs.filter((e) => e.event === "worker-nudge" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(0);
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0); // the flake never condemned it
+      expect(evs.filter((e) => e.event === "worker-nudge-expired" && e.taskId === "T1")).toHaveLength(1);
+    } finally {
+      NUDGEABLE_ADAPTERS.delete("fake");
+      resetNudgeTimingForTests();
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // The other half of that claim: with the nudge never attempted (adapter off the allowlist), the
+  // same worktree delta still protects the pane for the whole window — the delta clause is intact.
+  test("a worktree delta still disables the fast-kill when no nudge has failed", async () => {
+    setDeadChannelFastKillMsForTests(1_500);
+    try {
+      const { repo, fake } = setupRepo(
+        [T("T1", { timeoutMinutes: 0.1 })], // 6s window — the whole of it elapses without a kill
+        { consult: { action: "human", notes: "stalled worker" },
+          tasks: { T1: [{ shell: "echo scratch > scratch.txt && echo working-on-it" }] } },
+      );
+      const driver = idriver({ status: async () => "working", notify: async () => {} });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-delta-alive", driver });
+      expect(s.human).toEqual(["T1"]); // window expiry → stall consult, not a dead-channel kill
+      const evs = Journal.open(repo, "run-t1-delta-alive").read();
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
+    } finally {
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // T1 review fix (material): the nudge grace deadline used to arm once and never disarm — a
+  // worker that ANSWERED the nudge and resumed was force-concluded at its next quiet patch ≥ the
+  // grace (measured off the rolling lastProgressAt), journaled worker-nudge-expired as if it had
+  // ignored the nudge. Post-nudge progress must disarm the deadline and hand the pane back to the
+  // rolling window. Here: silence → nudge → the worker replies (real new rows) → a quiet patch
+  // longer than the grace → the attempt ends on the WINDOW, never on worker-nudge-expired.
+  test("a worker that answers the nudge and resumes disarms the grace deadline — the next quiet patch is owned by the rolling window", async () => {
+    NUDGEABLE_ADAPTERS.add("fake");
+    setNudgeTimingForTests(200, 400); // 200ms silence → nudge; 400ms grace
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.05 })], STALLED); // 3s window — the conclusion must be the window's
+      let nudged = false;
+      let replyRows = 0;
+      const driver = idriver({
+        status: async () => "working",
+        nudge: async () => { nudged = true; return true; },
+        read: async () => {
+          // once the nudge lands the worker replies and resumes: real new transcript rows for a
+          // few slices (post-nudge progress), then a quiet patch far longer than the grace
+          if (nudged && replyRows < 3) replyRows++;
+          return ["working-on-it", ...Array.from({ length: replyRows + 1 }, (_, i) => `resumed row ${i}`)].join("\n");
+        },
+        notify: async () => {},
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-nudge-answered", driver });
+      expect(s.human).toEqual(["T1"]); // the rolling window concluded it — stall consult parks human
+      const evs = Journal.open(repo, "run-t1-nudge-answered").read();
+      expect(evs.filter((e) => e.event === "worker-nudge" && e.taskId === "T1")).toHaveLength(1);
+      // the answer was seen and disarmed the grace …
+      expect(evs.filter((e) => e.event === "worker-nudge-answered" && e.taskId === "T1")).toHaveLength(1);
+      // … so the false "ignored the nudge" conclusion never fires
+      expect(evs.filter((e) => e.event === "worker-nudge-expired" && e.taskId === "T1")).toHaveLength(0);
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
+    } finally {
+      NUDGEABLE_ADAPTERS.delete("fake");
+      resetNudgeTimingForTests();
+    }
+  }, 120_000);
+
+  // T1 review (answer-then-die, criterion 6): the disarm test above proves the answered pane
+  // survives to the window; this one proves it does not survive UNWATCHED. The fast-kill hold used
+  // to key on `nudgeable` — a per-slice adapter/status property — so once a worker answered the
+  // nudge and then froze, the one-per-attempt nudge latch, the disarmed expiry branch, and the
+  // nudgeable-gated kill and page left it with NO watchdog at all: the dead-channel triad was met
+  // at the fast-kill window and the pane still rode the whole rolling window in silence. The hold
+  // is on a PENDING daemon action now (un-nudged, or grace armed), so the kill owns this pane.
+  test("a worker that answers the nudge and then freezes with no delta is fast-killed — the rolling window does not own it", async () => {
+    NUDGEABLE_ADAPTERS.add("fake");
+    setNudgeTimingForTests(200, 400); // 200ms silence → nudge; 400ms grace
+    setDeadChannelFastKillMsForTests(1_500); // kill seam far below the 30m window: the kill owns the conclusion
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 30 })], STALLED); // 30m window, no worktree delta
+      let nudged = false;
+      let replyRows = 0;
+      const driver = idriver({
+        status: async () => "working", // never pageable — the kill is the only watchdog left
+        nudge: async () => { nudged = true; return true; },
+        read: async () => {
+          // the worker answers the nudge (real new rows — the grace disarms), then freezes for good
+          if (nudged && replyRows < 3) replyRows++;
+          return ["working-on-it", ...Array.from({ length: replyRows + 1 }, (_, i) => `resumed row ${i}`)].join("\n");
+        },
+        notify: async () => {},
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-answer-die", driver });
+      expect(s.human).toEqual(["T1"]); // concluded dead → stall consult parks human
+      const evs = Journal.open(repo, "run-t1-answer-die").read();
+      expect(evs.filter((e) => e.event === "worker-nudge" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-nudge-answered" && e.taskId === "T1")).toHaveLength(1);
+      // the answer was genuine, so the "ignored the nudge" conclusion never fires …
+      expect(evs.filter((e) => e.event === "worker-nudge-expired" && e.taskId === "T1")).toHaveLength(0);
+      // … but the subsequent freeze meets the dead-channel triad and is killed on the fast-kill
+      // window — seconds into a 30m rolling window, not at the end of it
+      const dead = evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1");
+      expect(dead).toHaveLength(1);
+      expect(evs.findIndex((e) => e.event === "worker-nudge-answered" && e.taskId === "T1"))
+        .toBeLessThan(evs.findIndex((e) => e.event === "worker-dead" && e.taskId === "T1"));
+    } finally {
+      NUDGEABLE_ADAPTERS.delete("fake");
+      resetNudgeTimingForTests();
+      resetDeadChannelFastKillMsForTests();
+    }
+  }, 120_000);
+
+  // T1 review fix (material): the fast-kill's "no output growth" leg used to clock off
+  // lastProgressAt, which the flat-token rule deliberately suppresses — and contextTokens is
+  // sticky across read misses. A METERED, non-nudgeable adapter (pi's shape: contextUsage present,
+  // off the nudge allowlist) streaming rows under a stale counter was journaled worker-dead while
+  // its pane was visibly printing. The kill now reads the tracker's raw row-growth clock: rows
+  // advancing is output growth, suppressed or not.
+  test("a metered non-nudgeable worker streaming rows under a flat token counter is never fast-killed", async () => {
+    setDeadChannelFastKillMsForTests(300); // kill seam far below the 6s window: the old composition kills in ~1s
+    setRowRearmTokenFlatMsForTests(200); // seam for the 15m flat-token cap: suppression engages mid-test
+    try {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED); // the 6s window owns the conclusion
+      fake.contextUsage = () => ({ tokens: 500 }); // metered — and permanently FLAT (the sticky counter)
+      let reads = 0;
+      const driver = idriver({
+        status: async () => "working", // never pageable; "fake" is not nudge-allowlisted → the kill is the only early exit
+        read: async () => ["working-on-it", ...Array.from({ length: Math.min(reads++, 50) }, (_, i) => `suite output row ${i}`)].join("\n"),
+        notify: async () => {},
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-flat-tokens", driver });
+      expect(s.human).toEqual(["T1"]); // the rolling window concluded it, not the kill
+      const evs = Journal.open(repo, "run-t1-flat-tokens").read();
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0); // streaming rows ARE output growth
+      expect(reads).toBeGreaterThan(2); // the pane really did keep streaming past the suppression point
+    } finally {
+      resetDeadChannelFastKillMsForTests();
+      resetRowRearmTokenFlatMsForTests();
+    }
+  }, 120_000);
+});
+
+// ── T2 (OBS-264): finished work is harvested, never redone ─────────────────────────────────────
+// Every case here rides a worker that COMMITS and then goes quiet without a trailer — the exact
+// shape of all 18 observed stalls, each of which carried 2-33 commits that the next attempt then
+// re-bought at full price. The pane is frozen by construction (constant text, no exit marker ever
+// seen), so the only thing that can end a wait early is the liveness triad itself.
+// Lives here rather than in its own tests/run/ file: the shipped testing guide states the per
+// directory *.test.ts counts and docs-truth-testing.test.ts asserts them, so a new file under
+// tests/run/ is a documentation change this task's file scope does not cover.
+describe("harvest: finished work is gated, never redispatched (OBS-264)", () => {
+  const hdriver = (overrides: Record<string, unknown> = {}): ExecutorDriver => {
+    const inner = new SubprocessDriver();
+    const { useRealRead = false, ...driverOverrides } = overrides;
+    return {
+      id: "harvest-fake",
+      interactive: true,
+      slot: inner.slot.bind(inner),
+      run: inner.run.bind(inner),
+      waitOutput: async () => { await new Promise((r) => setTimeout(r, 50)); return false; },
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: useRealRead ? inner.read.bind(inner) : async () => "working-on-it",
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+      status: async () => "working",
+      ...driverOverrides,
+    } as ExecutorDriver;
+  };
+
+  const evsOf = (repo: string, runId: string) => Journal.open(repo, runId).read();
+
+  // A worker that keeps burning CPU at `dutyPct` of one core. BOUNDED and self-terminating: a
+  // spinner that outlives the test run it was spawned for is an orphan pegging a core forever, so
+  // the burn carries its own deadline instead of trusting anything to kill it (the daemon's
+  // closeSlot SIGKILLs the process group too — the deadline is the belt to that suspenders).
+  // It is a GRANDCHILD of the dispatch script — the matched root's own CPU time never moves, so
+  // only the probe's descendant walk can see it. Sleeping between bursts is Atomics.wait, not a
+  // child `sleep`: a spawned sleep would be another process in the very tree under measurement.
+  const burnFor = (ms: number, dutyPct = 100) => `node -e ${shq(
+    `const idle = new Int32Array(new SharedArrayBuffer(4)), end = Date.now() + ${ms};`
+    + ` while (Date.now() < end) { const s = Date.now(); while (Date.now() - s < 10) { /* burn */ }`
+    + ` if (${dutyPct} < 100) Atomics.wait(idle, 0, 0, 10 * (100 - ${dutyPct}) / ${dutyPct}); }`,
+  )}`;
+
+  // Review regression: the worker's persistent shell stays almost idle while each CPU-heavy tool
+  // is a short-lived child. The 800ms gaps line up with the daemon's sparse harvest observations,
+  // so summing only processes alive in those observations reads flat even though a new burner runs
+  // between them. A retained descendant ledger sees the CPU before each child exits.
+  const burnInShortChildren = (iterations = 12) =>
+    `for i in {1..${iterations}}; do node -e ${shq("const end = Date.now() + 120; while (Date.now() < end) { /* burn */ }")}; sleep 0.8; done`;
+
+  // The managed macOS test sandbox denies `ps` even to child processes. Production and ordinary CI
+  // use the live process tree; only that named environmental gap gets a deterministic snapshot
+  // source with the same shape: a persistent root plus 120ms child burners that disappear between
+  // the daemon's ~1s observations. The fast accountant's 100ms samples see and retain them.
+  const cpuProbeFallback = async (repo: string, runId: string, mode: "flat" | "bursty" = "bursty"): Promise<() => void> => {
+    if (await workerTreeCpuMs("tickmarkr-cpu-probe-capability", repo) !== undefined) return () => {};
+    const dir = makeTestTempDir("tickmarkr-ps-fallback-");
+    const script = join(dir, "ps.mjs");
+    const bashEnv = join(dir, "bash-env");
+    const state = join(dir, "state");
+    const marker = join(tickmarkrDir(repo), "runs", runId, "prompts", "T1-a0.sh");
+    writeFileSync(script, [
+      'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+      'const now = Date.now();',
+      'const started = existsSync(process.env.TICKMARKR_TEST_PS_STATE) ? Number(readFileSync(process.env.TICKMARKR_TEST_PS_STATE, "utf8")) : now;',
+      'writeFileSync(process.env.TICKMARKR_TEST_PS_STATE, String(started));',
+      'const phase = (now - started) % 1000;',
+      mode === "bursty"
+        ? 'const rows = [`100 1 0:00.00 ${process.env.TICKMARKR_TEST_PS_MARKER}`, "101 100 0:00.00 fake-agent"];'
+        : 'const rows = ["999 1 0:00.00 unrelated-process"];',
+      mode === "bursty"
+        ? 'if (phase >= 400 && phase <= 700) rows.push("102 101 0:00.20 short-lived-burner");'
+        : "",
+      'process.stdout.write(rows.join("\\n") + "\\n");',
+    ].join("\n"));
+    writeFileSync(bashEnv, `ps() { node ${shq(script)}; }\n`);
+    const prior = {
+      bashEnv: process.env.BASH_ENV,
+      marker: process.env.TICKMARKR_TEST_PS_MARKER,
+      state: process.env.TICKMARKR_TEST_PS_STATE,
+    };
+    process.env.BASH_ENV = bashEnv;
+    process.env.TICKMARKR_TEST_PS_MARKER = marker;
+    process.env.TICKMARKR_TEST_PS_STATE = state;
+    return () => {
+      const restore = (key: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      restore("BASH_ENV", prior.bashEnv);
+      restore("TICKMARKR_TEST_PS_MARKER", prior.marker);
+      restore("TICKMARKR_TEST_PS_STATE", prior.state);
+    };
+  };
+
+  // Both harvest seams at once. Tests that assert a CONCLUSION pin the flat window so they need not
+  // sit through a real one; tests that assert a worker is NOT concluded leave it at its real,
+  // resolution-derived value — pinning it there would be the fixture answering its own question.
+  const withSeams = async (silentMs: number, flatMs: number | undefined, body: () => Promise<void>) => {
+    setHarvestSilentMsForTests(silentMs);
+    if (flatMs !== undefined) setHarvestCpuFlatMsForTests(flatMs);
+    try {
+      await body();
+    } finally {
+      resetHarvestSilentMsForTests();
+      resetHarvestCpuFlatMsForTests();
+    }
+  };
+
+  test("the flat-CPU window is sized against the host's own CPU-clock quantum", () => {
+    // darwin `ps` prints hundredths, linux whole seconds. Equality across a window shorter than the
+    // quantum is not evidence: a throttled worker accrues less than one tick per sample and reads
+    // flat while working. 30 ticks of the clock in use, floored — never a fixed two seconds.
+    expect(harvestCpuFlatWindowMs(10)).toBe(3_000);
+    expect(harvestCpuFlatWindowMs(1_000)).toBe(30_000);
+    expect(harvestCpuFlatWindowMs(1_000)).toBeGreaterThan(harvestCpuFlatWindowMs(10));
+  });
+
+  test("an absent process tree reads as zero CPU, never as an unreadable snapshot", async () => {
+    // The probe's two "no number" readings are opposites, and the triad turns on telling them
+    // apart: 0 means nothing of this worker is running — the strongest at-rest signal there is, and
+    // what every concluded harvest actually sees — while undefined means UNMEASURABLE and is
+    // journaled rather than concluded on. A marker matching no process must produce the first; were
+    // it ever to produce undefined, the triad would fall silent on exactly the finished, exited
+    // workers OBS-264 is about, and the feature would be gone with only a journal line to say so.
+    const restoreProbe = await cpuProbeFallback(process.cwd(), "unused", "flat");
+    let cpu: Awaited<ReturnType<typeof workerTreeCpuMs>>;
+    try {
+      const marker = `tickmarkr-no-live-process-${randomBytes(16).toString("hex")}`;
+      cpu = await workerTreeCpuMs(marker, process.cwd());
+    } finally {
+      restoreProbe();
+    }
+    expect(cpu).toBeDefined();
+    expect(cpu!.ms).toBe(0);
+    expect([10, 1_000]).toContain(cpu!.resolutionMs); // the quantum is read off the rows, not assumed
+  });
+
+  test("test: a silent worker with commits ahead of base and a flat CPU delta is concluded and its worktree goes to gates without a redispatch", async () => {
+    await withSeams(500, 200, async () => {
+      // 5m stall window: if the triad did not conclude this wait, the 120s test budget would expire
+      // long before the window did. The worker commits, prints no trailer, and exits — flat CPU.
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], {
+        consult: { action: "human", notes: "a harvested attempt must never reach a consult" },
+        tasks: { T1: [{ shell: `echo harvested > h.txt && ${COMMIT} h` }] },
+      });
+      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-ok", "flat");
+      let s: Awaited<ReturnType<typeof runDaemon>>;
+      try {
+        s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-ok", driver: hdriver() });
+      } finally {
+        restoreProbe();
+      }
+
+      expect(s.done).toEqual(["T1"]); // gated and merged on the harvested worktree
+      const evs = evsOf(repo, "run-harvest-ok");
+      const concluded = evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1");
+      expect(concluded).toHaveLength(1); // the triad ended the wait, not the window
+      expect(concluded[0]!.data.commits).toBe(1);
+      expect(concluded[0]!.data.cpuMs).toBe(0); // the worker's process tree was gone
+      // the carried worktree went to gates on THIS attempt — one dispatch, no fresh worker
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.some((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "evidence" && e.data.pass === true)).toBe(true);
+      expect(evs.some((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "acceptance" && e.data.pass === true)).toBe(true);
+      expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0); // no stall consult was bought
+      expect(evs.findIndex((e) => e.event === "worker-harvest"))
+        .toBeLessThan(evs.findIndex((e) => e.event === "gate-result"));
+    });
+  }, 120_000);
+
+  test("test: a concluded harvest with failing gates falls into the existing retry ladder exactly as a trailered failure does", async () => {
+    await withSeams(500, 200, async () => {
+      // Same task, same red judge, same worker diff — the ONLY difference is whether the worker
+      // emitted a trailer. The transcript must stay CLEAN of every pre-gate routing signature
+      // (quota banner, provider outage, CLI-death text): a committed attempt whose tail carries
+      // one now routes BEFORE gates by design — that precedence is pinned by the dedicated
+      // routing tests below, and seeding a signature here would reroute instead of laddering.
+      const red = {
+        judge: { pass: false, criteria: [{ criterion: "done", met: false, reason: "not met" }] },
+        consult: { action: "human", notes: "gates stayed red" },
+      };
+      const shell = `node -e ${shq('require("fs").appendFileSync("w.txt", `${Date.now()}-${process.pid}\\n`)')} && ${COMMIT} w`;
+
+      const trailered = setupRepo([T("T1", { timeoutMinutes: 0.02 })], {
+        ...red, tasks: { T1: [{ shell, result: { ok: true, summary: "claimed" } }] },
+      });
+      const claimed = await runDaemon(trailered.repo, { adapters: [trailered.fake], runId: "run-ladder-claimed" });
+
+      const silent = setupRepo([T("T1", { timeoutMinutes: 0.02 })], {
+        ...red, tasks: { T1: [{ shell }] }, // no trailer — harvested
+      });
+      const harvested = await runDaemon(silent.repo, { adapters: [silent.fake], runId: "run-ladder-harvested", driver: hdriver({ useRealRead: true }) });
+
+      const ladder = (repo: string, runId: string) =>
+        evsOf(repo, runId).filter((e) => e.event === "escalation").map((e) => e.data.step);
+      expect(ladder(silent.repo, "run-ladder-harvested")).toEqual(ladder(trailered.repo, "run-ladder-claimed"));
+      expect(ladder(silent.repo, "run-ladder-harvested")).toEqual(["retry", "escalate", "consult"]);
+      expect(harvested.human).toEqual(claimed.human); // same terminal decision
+      expect(harvested.human).toEqual(["T1"]);
+      const parks = (repo: string, runId: string) =>
+        evsOf(repo, runId).filter((e) => e.event === "task-human").map((e) => e.data.kind);
+      expect(parks(silent.repo, "run-ladder-harvested")).toEqual(parks(trailered.repo, "run-ladder-claimed"));
+      // every harvested attempt really was harvested — none of them was a stall consult
+      expect(evsOf(silent.repo, "run-ladder-harvested").filter((e) => e.event === "worker-result-harvested")).toHaveLength(3);
+      expect(evsOf(trailered.repo, "run-ladder-claimed").filter((e) => e.event === "worker-result-harvested")).toHaveLength(0);
+      const assignments = (repo: string, runId: string) => evsOf(repo, runId)
+        .filter((e) => e.event === "task-dispatch")
+        .map((e) => e.data.assignment);
+      expect(assignments(silent.repo, "run-ladder-harvested"))
+        .toEqual(assignments(trailered.repo, "run-ladder-claimed"));
+    });
+  }, 180_000);
+
+  test("a committed attempt that walls on quota still fails over — its commits ride the carry-forward, not a gate run", async () => {
+    // T2 review (material, routing precedence): the harvest synthesis used to set ok:true and
+    // finished:true BEFORE the quota branch, and the branch's `!finished` guard then made quota
+    // failover unreachable for ANY harvested attempt — including one the loop already broke on a
+    // journaled quota-banner. A worker that committed partial work and hit the wall bought a full
+    // gate run (baseline+evidence+scope+judge+review) on throttled work, burned a ladder step
+    // spec §4 says quota must not consume, and retried on the same throttled channel. The branch
+    // now classifies the PRE-HARVEST outcome (workerFinished + the pre-synthesis parse): the
+    // walled attempt fails over exactly like a commit-less one, and its commits survive via the
+    // existing commitsToCarry/cherryPickCommits carry-forward into the next attempt's worktree.
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.02 })], {
+      consult: { action: "human", notes: "a quota-routed attempt must never reach a consult" },
+      tasks: { T1: [
+        { shell: `echo partial > p.txt && ${COMMIT} p && printf '%s\\n' 'usage limit reached for this model'` }, // commits, then walls — no trailer
+        { shell: "test -f p.txt", result: { ok: true, summary: "carried work verified" } },
+      ] },
+    });
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-quota-route", driver: hdriver({ useRealRead: true }) });
+
+    expect(s.done).toEqual(["T1"]); // the other channel carried it to done
+    const evs = evsOf(repo, "run-harvest-quota-route");
+    // the walled attempt's commits WERE recognized — harvest journaling is not the defect — …
+    expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+    // … but the attempt routed on its PRE-HARVEST outcome instead of buying a gate run
+    const failover = evs.filter((e) => e.event === "quota-failover" && e.taskId === "T1");
+    expect(failover).toHaveLength(1);
+    expect(failover[0]!.data.from).not.toBe(failover[0]!.data.to);
+    expect(evs.findIndex((e) => e.event === "gate-result"))
+      .toBeGreaterThan(evs.findIndex((e) => e.event === "quota-failover")); // gates ran only on the failover attempt
+    expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(2);
+    // the landed commit survived the reroute through the existing carry-forward — never re-earned
+    const recreations = evs.filter((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+    expect(recreations).toHaveLength(1);
+    expect((recreations[0]!.data.attempted as string[]).length).toBe(1);
+    expect(recreations[0]!.data.carried).toEqual(recreations[0]!.data.attempted);
+    expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0);
+  }, 120_000);
+
+  test("a committed attempt on a dead channel is excluded and failed over — the synthesis cannot swallow auth-required", async () => {
+    // Same precedence defect, dead-channel leg: classifyDeadChannel bails on any ok:true result,
+    // so reading the SYNTHESIZED harvest result swallowed auth-required / setup-required /
+    // provider-outage for every committed-but-walled attempt in BOTH modes — the channel stayed
+    // eligible and the next attempt retried on a CLI that could never answer. Classification now
+    // reads the pre-harvest parse, so the dead channel demotes and fails over while the commits
+    // ride the same carry-forward as the quota case above.
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.02 })], {
+      consult: { action: "human", notes: "a dead-channel-routed attempt must never reach a consult" },
+      tasks: { T1: [
+        { shell: `echo partial > p.txt && ${COMMIT} p && printf '%s\\n' 'Please run /login'` }, // commits, then the CLI reports it is dead — no trailer
+        { shell: "test -f p.txt", result: { ok: true, summary: "carried work verified" } },
+      ] },
+    });
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-dead-route", driver: hdriver({ useRealRead: true }) });
+
+    expect(s.done).toEqual(["T1"]);
+    const evs = evsOf(repo, "run-harvest-dead-route");
+    expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+    expect(evs.filter((e) => e.event === "channel-exclusion" && e.data.reason === "auth-required")).toHaveLength(1);
+    const failover = evs.filter((e) => e.event === "dead-channel-failover" && e.data.reason === "auth-required");
+    expect(failover).toHaveLength(1);
+    expect(failover[0]!.data.from).not.toBe(failover[0]!.data.to);
+    expect(evs.findIndex((e) => e.event === "gate-result"))
+      .toBeGreaterThan(evs.findIndex((e) => e.event === "dead-channel-failover"));
+    expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(2);
+    const recreations = evs.filter((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+    expect(recreations).toHaveLength(1);
+    expect((recreations[0]!.data.attempted as string[]).length).toBe(1);
+    expect(recreations[0]!.data.carried).toEqual(recreations[0]!.data.attempted);
+    expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0);
+  }, 120_000);
+
+  test("a committed attempt that then dies on a provider outage still requeues in place — the harvest cannot null the routing signature", async () => {
+    await withSeams(500, 200, async () => {
+      // T2 review (material, third routing branch): the harvest synthesis used to null the
+      // pre-harvest cause for ANY harvested attempt, which made the v1.46 same-channel requeue
+      // unreachable whenever commits landed — control fell through to classifyDeadChannel, whose
+      // OUTAGE_RE matched the same banner and demoted the channel for every later attempt AND
+      // every later task in the run, breaking the documented "a transient blip still recovers in
+      // place" invariant. Every existing provider-death fixture exits, so workerFinished is true
+      // and the harvest never fires — this worker COMMITS, prints the outage banner, and HANGS
+      // (no exit, no trailer), the exact OBS-264 shape. The cause must survive synthesis: the
+      // capped same-channel requeue fires, the channel is never demoted, and the commits ride
+      // the carry-forward into the requeued attempt. The free requeue does not burn the attempt
+      // counter, so the SAME scripted step replays — p.txt's presence in the recreated worktree
+      // (carried forward) is what turns the replay into a trailer-emitting finisher.
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.05 })], {
+        consult: { action: "human", notes: "a provider-death requeue must never reach a consult" },
+        tasks: { T1: [
+          { shell: `if [ -f p.txt ]; then test -s p.txt; else echo partial > p.txt && ${COMMIT} p && printf '%s\\n' 'Unable to reach the model provider' && sleep 60; fi`, result: { ok: true, summary: "carried work verified" } },
+        ] },
+      });
+      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-provider-death", "flat");
+      let s: Awaited<ReturnType<typeof runDaemon>>;
+      try {
+        s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-provider-death", driver: hdriver({ useRealRead: true }) });
+      } finally {
+        restoreProbe();
+      }
+
+      expect(s.done).toEqual(["T1"]); // the free same-channel requeue carried it to done
+      const evs = evsOf(repo, "run-harvest-provider-death");
+      // the harvest still recognized and journaled the committed work — recognition is not the defect
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+      // the worker's OWN outcome keeps its provider-death signature through the synthesis …
+      expect(evs.filter((e) => e.event === "worker-result" && e.data.cause === "provider-death")).toHaveLength(1);
+      // … so the capped same-channel requeue fires BEFORE any gate run …
+      const requeues = evs.filter((e) => e.event === "provider-death-requeue" && e.taskId === "T1");
+      expect(requeues).toHaveLength(1);
+      expect(evs.findIndex((e) => e.event === "gate-result"))
+        .toBeGreaterThan(evs.findIndex((e) => e.event === "provider-death-requeue"));
+      // … and the transient blip never demotes the channel — no dead-channel classification at all
+      expect(evs.filter((e) => e.event === "channel-exclusion")).toHaveLength(0);
+      expect(evs.filter((e) => e.event === "dead-channel-failover")).toHaveLength(0);
+      // the requeue kept the same assignment and did not burn the attempt counter
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(2);
+      const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+      expect(dispatches[1]!.data.assignment).toEqual(dispatches[0]!.data.assignment);
+      // the landed commit survived the requeue through the existing carry-forward — never re-earned
+      const recreations = evs.filter((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+      expect(recreations).toHaveLength(1);
+      expect((recreations[0]!.data.attempted as string[]).length).toBe(1);
+      expect(recreations[0]!.data.carried).toEqual(recreations[0]!.data.attempted);
+      expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0);
+    });
+  }, 120_000);
+
+  test("a silent retry that only carries a prior attempt's commits is gated on the spot, never redispatched to re-earn them", async () => {
+    // T2 review (material): harvest eligibility was measured against THIS attempt's post-carry
+    // HEAD, so a retry that produced nothing of its own — while its worktree already held the
+    // entire deliverable, cherry-picked forward — was invisible to both the triad and the
+    // synthesis. Reproduced exactly: attempt 0 commits and walls on quota; attempt 1 receives that
+    // commit and goes silent WITHOUT COMMITTING ANYTHING ITSELF. Before the fix the journal showed
+    // worktree-recreation, then a stall consult, with no gate-result and no worker-result-harvested
+    // — finished work sitting unverified in a worktree that was eligible to be bought again. The
+    // commit-less retry is the whole point of this fixture: every other harvest case here lands a
+    // fresh commit, which is exactly what hid this defect.
+    await withSeams(300, 200, async () => {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.05 })], {
+        consult: { action: "human", notes: "a carried-only retry must never reach a stall consult" },
+        tasks: { T1: [
+          { shell: `echo carried > c.txt && ${COMMIT} c && printf '%s\\n' 'usage limit reached for this model'` },
+          { shell: "sleep 30" }, // silent, flat CPU, and not one commit of its own
+        ] },
+      });
+      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-carried-only", "flat");
+      let s: Awaited<ReturnType<typeof runDaemon>>;
+      try {
+        s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-carried-only", driver: hdriver({ useRealRead: true }) });
+      } finally {
+        restoreProbe();
+      }
+
+      expect(s.done).toEqual(["T1"]);
+      const evs = evsOf(repo, "run-harvest-carried-only");
+      // attempt 0 routed on quota, as its own dedicated case pins …
+      expect(evs.filter((e) => e.event === "quota-failover" && e.taskId === "T1")).toHaveLength(1);
+      // … and its commit rode the carry-forward into attempt 1's recreated worktree
+      const recreations = evs.filter((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+      expect(recreations).toHaveLength(1);
+      expect(recreations[0]!.data.carried).toEqual(recreations[0]!.data.attempted);
+      expect((recreations[0]!.data.carried as string[]).length).toBe(1);
+      // the carried-only retry was harvested and GATED — the assertion that was red before the fix
+      const harvested = evs.filter((e) => e.event === "worker-result-harvested" && e.data.attempt === 1);
+      expect(harvested).toHaveLength(1);
+      expect((harvested[0]!.data.commits as string[]).length).toBe(1); // the carried one; the worker made none
+      const from = evs.indexOf(harvested[0]!);
+      expect(evs.slice(from).some((e) => e.event === "gate-result" && e.taskId === "T1")).toBe(true);
+      // and nothing was redispatched to re-produce work the worktree already held
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(2);
+      expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0);
+    });
+  }, 120_000);
+
+  test("a carried-only silent retry on a dead channel still routes first — the harvest gates a worktree, it never certifies a channel", async () => {
+    // The same carried-only retry, with a routing signature on it. Recognizing carried work must
+    // not cost the pre-harvest routing precedence the closed-set constraint pins: attempt 1 lands
+    // no commit of its own, is harvestable purely on the carry-forward, and STILL fails its dead
+    // channel over before any gate runs on it. Both features are live in this one fixture — the
+    // harvested event proves the harvest fired, the exclusion proves routing outranked it.
+    await withSeams(100, 100, async () => {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.01 })], {
+        judge: [
+          { pass: false, criteria: [{ criterion: "done", met: false, reason: "retry once" }] },
+          { pass: true, criteria: [{ criterion: "done", met: true, reason: "carried work is valid" }] },
+        ],
+        consult: { action: "human", notes: "unexpected gate failure" },
+        tasks: { T1: [
+          { shell: `echo landed > landed.txt && ${COMMIT} landed`, result: { ok: true, summary: "landed" } },
+          { shell: "printf '%s\\n' 'Please run /login'; sleep 2" },
+          { shell: "true", result: { ok: true, summary: "verified carried work" } },
+        ] },
+      });
+
+      await runDaemon(repo, {
+        adapters: [fake],
+        runId: "run-harvest-attempt-base",
+        driver: hdriver({ useRealRead: true }),
+      });
+      const evs = evsOf(repo, "run-harvest-attempt-base");
+
+      const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+      expect(dispatches.length).toBeGreaterThanOrEqual(3);
+      // the carried-only retry IS recognized as holding work …
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.data.attempt === 1)).toHaveLength(1);
+      // … and still routes on its PRE-HARVEST outcome, before any gate sees that worktree
+      expect(evs.filter((e) => e.event === "channel-exclusion" && e.data.reason === "auth-required")).toHaveLength(1);
+      const failover = evs.filter((e) => e.event === "dead-channel-failover" && e.data.reason === "auth-required");
+      expect(failover).toHaveLength(1);
+      const attempt1 = evs.indexOf(dispatches[1]!);
+      const attempt2 = evs.indexOf(dispatches[2]!);
+      const window = evs.slice(attempt1, attempt2);
+      expect(window.some((e) => e.event === "dead-channel-failover")).toBe(true);
+      expect(window.some((e) => e.event === "gate-result")).toBe(false);
+      const recreations = evs.filter((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+      expect(recreations.length).toBeGreaterThanOrEqual(2);
+      expect(recreations.every((e) => (e.data.carried as string[]).length === 1)).toBe(true);
+    });
+  }, 120_000);
+
+  test("a wait-loop exception always stops the worker CPU accountant", async () => {
+    const probeDir = makeTestTempDir("tickmarkr-accountant-cleanup-");
+    const probe = join(probeDir, "probe.ts");
+    const daemonUrl = new URL("../../src/run/daemon.ts", import.meta.url).href;
+    const driverUrl = new URL("../../src/drivers/subprocess.ts", import.meta.url).href;
+    const helperUrl = new URL("../helpers/tmprepo.ts", import.meta.url).href;
+    writeFileSync(probe, [
+      `import { runDaemon, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests } from ${JSON.stringify(daemonUrl)};`,
+      `import { SubprocessDriver } from ${JSON.stringify(driverUrl)};`,
+      `import { COMMIT, setupRepo, T } from ${JSON.stringify(helperUrl)};`,
+      "async function main() {",
+      'const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], { tasks: { T1: [{ shell: `echo landed > landed.txt && ${COMMIT} landed` }] } });',
+      "const inner = new SubprocessDriver();",
+      "let reads = 0;",
+      "const driver = {",
+      '  id: "accountant-cleanup-probe", interactive: true,',
+      "  slot: inner.slot.bind(inner), run: inner.run.bind(inner),",
+      "  waitOutput: async () => { await new Promise((resolve) => setTimeout(resolve, 50)); return false; },",
+      '  read: async () => { if (++reads >= 3) throw new Error("probe read failure"); return "working-on-it"; },',
+      '  waitAgentStatus: inner.waitAgentStatus.bind(inner), status: async () => "working",',
+      "  notify: inner.notify.bind(inner), close: inner.close.bind(inner), worktree: inner.worktree.bind(inner),",
+      "};",
+      "setHarvestSilentMsForTests(0); setHarvestCpuFlatMsForTests(60_000);",
+      "try {",
+      '  const summary = await runDaemon(repo, { adapters: [fake], runId: "run-accountant-cleanup", driver });',
+      '  if (!summary.failed.includes("T1")) throw new Error(`unexpected summary: ${JSON.stringify(summary)}`);',
+      "} finally { resetHarvestSilentMsForTests(); resetHarvestCpuFlatMsForTests(); }",
+      'process.stdout.write("accountant-cleanup-settled\\n");',
+      "}",
+      "main().catch((error) => { console.error(error); process.exitCode = 1; });",
+    ].join("\n"));
+
+    const child = spawn(process.execPath, ["--import", "tsx", probe], {
+      cwd: dirname(fileURLToPath(import.meta.url)),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    let killedForLeak = false;
+    const exitCode = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => {
+        killedForLeak = true;
+        child.kill("SIGKILL");
+      }, 4_000);
+      child.once("close", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+
+    expect(killedForLeak, stderr).toBe(false);
+    expect(exitCode, stderr).toBe(0);
+    expect(stdout).toContain("accountant-cleanup-settled");
+  }, 15_000);
+
+  test("test: a worker still burning CPU is not concluded however silent its tracker is", async () => {
+    // Pin three seconds, not one sparse observation: the window crosses three complete burner/gap
+    // cycles on both CPU-clock resolutions, so only retained exited-child CPU can hold it open.
+    await withSeams(300, 3_000, async () => {
+      // Commits ahead of base AND a frozen tracker: two of the three legs are satisfied from the
+      // first slice. The worker then burns, so the CPU leg alone must hold the wait open.
+      // The persistent worker launches CPU-heavy tool children for 120ms, then waits 800ms. Every
+      // child exits before the next sparse daemon observation; the persistent shell itself is idle.
+      const runId = "run-harvest-busy";
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.12 })], {
+        consult: { action: "human", notes: "stalled" },
+        tasks: { T1: [{ shell: `echo busy > b.txt && ${COMMIT} b && ${burnInShortChildren()}` }] },
+      });
+      const restoreProbe = await cpuProbeFallback(repo, runId);
+      let s: Awaited<ReturnType<typeof runDaemon>>;
+      let waited = 0;
+      try {
+        const startedAt = Date.now();
+        s = await runDaemon(repo, { adapters: [fake], runId, driver: hdriver() });
+        waited = Date.now() - startedAt;
+      } finally {
+        restoreProbe();
+      }
+
+      const evs = evsOf(repo, "run-harvest-busy");
+      // the triad never concluded this wait — the CPU leg alone held it, since the other two were
+      // satisfied from the first slice
+      expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0); // nor killed
+      expect(waited).toBeGreaterThanOrEqual(7_200); // it rode the whole 0.12m window out
+      expect(evs.find((e) => e.event === "worker-result" && e.taskId === "T1")!.data.cause).toBe("stall-timeout");
+      // The CPU leg governs WHEN a wait ends, never whether landed work is gated: once the window
+      // itself expired, the same carried worktree was still gated rather than redispatched — a busy
+      // worker buys the full window it is entitled to, and not one redundant attempt after it.
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+      expect(s.done).toEqual(["T1"]);
+    });
+  }, 120_000);
+
+  test("test: the synthesized no-trailer result is journaled as harvested, distinct from a worker-claimed ok", async () => {
+    await withSeams(500, 200, async () => {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], {
+        tasks: { T1: [{ shell: `echo silent > s.txt && ${COMMIT} s` }] },
+      });
+      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-journal", "flat");
+      try {
+        await runDaemon(repo, { adapters: [fake], runId: "run-harvest-journal", driver: hdriver() });
+      } finally {
+        restoreProbe();
+      }
+      const evs = evsOf(repo, "run-harvest-journal");
+
+      // the parsed truth is recorded first and stays truthful: the worker claimed nothing
+      const parsed = evs.filter((e) => e.event === "worker-result" && e.taskId === "T1");
+      expect(parsed).toHaveLength(1);
+      expect(parsed[0]!.data.ok).toBe(false);
+      expect(parsed[0]!.data.finished).toBe(false);
+      expect(parsed[0]!.data.summary).toBe(NO_TRAILER_SUMMARY);
+      // the synthesis is its OWN event — a worker-claimed ok can never produce this row
+      const synthesized = evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1");
+      expect(synthesized).toHaveLength(1);
+      expect(synthesized[0]!.data.source).toBe("harvest");
+      expect(synthesized[0]!.data.summary).toBe(HARVESTED_RESULT_SUMMARY);
+      expect((synthesized[0]!.data.commits as string[]).length).toBe(1);
+      expect(evs.findIndex((e) => e.event === "worker-result"))
+        .toBeLessThan(evs.findIndex((e) => e.event === "worker-result-harvested"));
+
+      // and a genuine worker-claimed ok never mints one
+      const claimed = setupRepo([T("T1")], {
+        tasks: { T1: [{ shell: `echo claimed > c.txt && ${COMMIT} c`, result: { ok: true, summary: "claimed" } }] },
+      });
+      await runDaemon(claimed.repo, { adapters: [claimed.fake], runId: "run-claimed-journal" });
+      const claimedEvs = evsOf(claimed.repo, "run-claimed-journal");
+      expect(claimedEvs.filter((e) => e.event === "worker-result-harvested")).toHaveLength(0);
+      expect(claimedEvs.some((e) => e.event === "worker-result" && e.data.ok === true && e.data.finished === true)).toBe(true);
+    });
+  }, 120_000);
+
+  test("no attempt whose worktree already carries the work is redispatched from scratch", async () => {
+    await withSeams(500, 200, async () => {
+      // A permanently red gate, so the ladder runs its full length and every attempt is a silent
+      // worker that has already landed a commit. The invariant under test is per-attempt: whatever
+      // the ladder decides next, the attempt that HOLDS the work is the attempt that gets verified.
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], {
+        judge: { pass: false, criteria: [{ criterion: "done", met: false, reason: "not met" }] },
+        consult: { action: "human", notes: "gates stayed red" },
+        tasks: { T1: [{ shell: `echo work >> w.txt && ${COMMIT} w` }] },
+      });
+      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-never-redone", "flat");
+      try {
+        await runDaemon(repo, { adapters: [fake], runId: "run-harvest-never-redone", driver: hdriver() });
+      } finally {
+        restoreProbe();
+      }
+      const evs = evsOf(repo, "run-harvest-never-redone");
+
+      const harvests = evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1");
+      expect(harvests.length).toBeGreaterThan(1); // several attempts, every one of them carrying work
+      // every harvest reaches gates BEFORE any next dispatch: the carried worktree is what got
+      // verified, so no attempt was ever spent re-producing work the worktree already held.
+      for (const h of harvests) {
+        const from = evs.indexOf(h);
+        const next = evs.findIndex((e, i) => i > from && e.event === "task-dispatch");
+        const window = evs.slice(from, next === -1 ? evs.length : next);
+        expect(window.some((e) => e.event === "gate-result")).toBe(true);
+      }
+      // one harvest per attempt: no attempt ended in the stall consult that buys a fresh worker
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(harvests.length);
+      // and the landed commits ride every worktree recreation intact — nothing is ever re-earned
+      const recreations = evs.filter((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+      expect(recreations.length).toBeGreaterThan(0);
+      for (const r of recreations) {
+        expect((r.data.attempted as string[]).length).toBeGreaterThan(0);
+        expect(r.data.carried).toEqual(r.data.attempted);
+      }
+    });
+  }, 180_000);
+
+  test("a burning seeded worker is never concluded: its launch is outside the probed tree, so it has no CPU leg at all", async () => {
+    // Review finding: interactiveSeed adapters (kimi) are launched by runInteractiveSeed, NOT by the
+    // dispatch script — so a probe keyed to the script found nothing, read 0, called it FLAT, and
+    // could harvest a worker that was mid-turn. tickmarkr does not own that launch line (the adapter
+    // does, and it must be delivered verbatim), so the seeded path has no measurable CPU leg and is
+    // never concluded by the triad; it keeps the no-redispatch half of OBS-264 through the tail.
+    // Both seams are pinned SHORT on purpose: that removes "the window was too long" as an
+    // explanation, so a probe that trusted its own zero would conclude this worker within seconds.
+    await withSeams(300, 200, async () => {
+      const { repo, scriptPath } = setupRepo([T("T1", { timeoutMinutes: 0.15 })], {
+        consult: { action: "human", notes: "stalled" },
+        tasks: { T1: [{ shell: "unused — the seed launch is the dispatch" }] },
+      });
+      const ready = "SEED-READY";
+      // a tenth of a core, not a whole one: what this case needs is a worker that is ALIVE and
+      // quiet with commits landed, and the suite runs test files in parallel forks — every
+      // core-second here is charged to whatever else is running (tests/cockpit/live.test.ts sweeps
+      // the frame-contract domain single-threaded and sits ~3% under its own timeout).
+      const seedLaunch = `echo ${ready} && echo seeded > s.txt && ${COMMIT} s && ${burnFor(12_000, 10)}`;
+      const fake = new FakeAdapter(scriptPath) as FakeAdapter & { interactiveSeed?: unknown };
+      fake.interactiveCommand = () => null; // kimi's shape: no argv-seeding surface at all
+      fake.interactiveSeed = {
+        launch: () => seedLaunch,
+        readinessMatch: ready,
+        seedLine: (promptFile: string) => `Read ${promptFile} and do exactly what it says.`,
+      };
+
+      // Only the FIRST delivery spawns: a real seeded TUI receives the seed line as typed input, so
+      // spawning a second process for it would both lie about the tree and drop the launch's handle.
+      let launched: string | undefined;
+      const inner = new SubprocessDriver();
+      const driver = hdriver({
+        waitOutput: inner.waitOutput.bind(inner), // real: readiness must be genuinely observed
+        read: inner.read.bind(inner),
+        run: async (slot: Slot, cmd: string) => {
+          if (launched !== undefined) return;
+          launched = cmd;
+          await inner.run(slot, cmd);
+        },
+        slot: inner.slot.bind(inner), close: inner.close.bind(inner), worktree: inner.worktree.bind(inner),
+      });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-seeded", driver });
+
+      // the burning seeded worker was NOT concluded — the assertion that goes red the moment the
+      // probe treats "my marker matched nothing" as "this worker is at rest"
+      const evs = evsOf(repo, "run-harvest-seeded");
+      expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
+      // the launch really did bypass the dispatch script (the gap is structural, not incidental)
+      // and the daemon says so out loud rather than leaving a silent hole in the feature
+      expect(launched).toBe(seedLaunch);
+      const unmeasurable = evs.filter((e) => e.event === "worker-harvest-unmeasurable" && e.taskId === "T1");
+      expect(unmeasurable).toHaveLength(1); // once per attempt, not once per slice
+      expect(unmeasurable[0]!.data.reason).toContain("interactive-seed");
+      // and the other half of OBS-264 still holds on this path: the window expiry gates the commits
+      // the seeded worker landed instead of buying a fresh worker to re-produce them
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+      expect(s.done).toEqual(["T1"]); // and the window expiry still gates the work it landed
+    });
+  }, 120_000);
+
+  test("a headless worker that committed and went quiet is harvested without riding out its window", async () => {
+    // Review finding: the triad lived only in the interactive wait loop, so a print-mode worker —
+    // the fallback EVERY adapter without a TUI surface lands in — still paid the full stall window.
+    // A real SubprocessDriver (runDaemon's default), a real 5m window, and a worker that commits and
+    // then sleeps: alive, zero CPU, silent. It must be concluded in seconds, not minutes.
+    await withSeams(500, 200, async () => {
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], {
+        consult: { action: "human", notes: "a harvested attempt must never reach a consult" },
+        tasks: { T1: [{ shell: `echo headless > h.txt && ${COMMIT} h && sleep 20` }] },
+      });
+      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-headless", "flat");
+      const startedAt = Date.now();
+      let s: Awaited<ReturnType<typeof runDaemon>>;
+      try {
+        s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-headless" });
+      } finally {
+        restoreProbe();
+      }
+      const waited = Date.now() - startedAt;
+
+      expect(s.done).toEqual(["T1"]);
+      expect(waited).toBeLessThan(60_000); // the 5m window was never ridden out
+      const evs = evsOf(repo, "run-harvest-headless");
+      const concluded = evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1");
+      expect(concluded).toHaveLength(1);
+      expect(concluded[0]!.data.commits).toBe(1);
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0);
+    });
+  }, 120_000);
+
+  test("a headless worker that commits and exits cleanly without a trailer is harvested, never counted as completion", async () => {
+    // T2 review (material): print mode set `finished` from the EXIT MARKER, so a worker that
+    // committed and exited normally without a trailer entered the tail as finished:true — the
+    // synthesis is gated on !workerFinished, so it never fired: gates ran on the worker's own
+    // ok:false with no HARVESTED_RESULT_SUMMARY and no worker-result-harvested row. That is the
+    // natural exit path every headless adapter takes; the other headless case here keeps its
+    // process alive until the triad breaks the loop, which is exactly what hid this. `finished`
+    // now means the trailer in BOTH modes, and the cause taxonomy's "clean-exit-no-trailer" —
+    // unreachable in print mode until now — names the shape.
+    const shell = `echo exited > e.txt && ${COMMIT} e`; // exits immediately; no trailer at all
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], {
+      consult: { action: "human", notes: "a harvested attempt must never reach a consult" },
+      tasks: { T1: [{ shell }] },
+    });
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-print-exit" });
+
+    expect(s.done).toEqual(["T1"]);
+    const evs = evsOf(repo, "run-harvest-print-exit");
+    // the exit marker ended the wait — the triad never ran, so this is the natural-exit path
+    expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
+    // the parsed worker truth stays truthful: it exited, it claimed nothing
+    const parsed = evs.filter((e) => e.event === "worker-result" && e.taskId === "T1");
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]!.data.finished).toBe(false);
+    expect(parsed[0]!.data.exitCode).toBe(0);
+    expect(parsed[0]!.data.summary).toBe(NO_TRAILER_SUMMARY);
+    expect(parsed[0]!.data.cause).toBe("clean-exit-no-trailer");
+    // and the committed worktree reached gates through the synthesis, on this same attempt
+    const synthesized = evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1");
+    expect(synthesized).toHaveLength(1);
+    expect(synthesized[0]!.data.summary).toBe(HARVESTED_RESULT_SUMMARY);
+    expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+    expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0);
+
+    // the SAME shell with a trailer is a worker-claimed completion — no synthesis, finished:true.
+    // Both outcomes are reachable in this fixture; only the trailer differs.
+    const claimed = setupRepo([T("T1", { timeoutMinutes: 5 })], {
+      tasks: { T1: [{ shell, result: { ok: true, summary: "claimed" } }] },
+    });
+    await runDaemon(claimed.repo, { adapters: [claimed.fake], runId: "run-harvest-print-claimed" });
+    const claimedEvs = evsOf(claimed.repo, "run-harvest-print-claimed");
+    expect(claimedEvs.filter((e) => e.event === "worker-result-harvested")).toHaveLength(0);
+    expect(claimedEvs.some((e) => e.event === "worker-result" && e.data.finished === true && e.data.ok === true)).toBe(true);
+  }, 120_000);
+
+  test("an unreadable ps stops the CPU accountant instead of forking one every 100ms for the rest of the window", async () => {
+    // T2 review (material): the accountant samples at 10Hz and each sample forks bash + ps. Where
+    // ps is unsupported or DENIED — the managed-sandbox class, and the named fail-open path — every
+    // sample fails, so it kept forking for the remainder of the stall window: tens of thousands of
+    // processes per silent attempt, multiplied by daemon concurrency, for a probe that can never
+    // conclude anything. Persistent failure is structural, so the sampler stops. This shims `ps`
+    // itself (a bash function via BASH_ENV, the same seam the sandbox fallback uses) to fail and
+    // COUNT its calls, then measures the count against a window long enough that an unbounded
+    // sampler would have forked ~90 times.
+    const dir = makeTestTempDir("tickmarkr-ps-denied-");
+    const counter = join(dir, "calls");
+    const bashEnv = join(dir, "bash-env");
+    writeFileSync(counter, "");
+    writeFileSync(bashEnv, 'ps() { printf x >> "$TICKMARKR_TEST_PS_CALLS"; return 1; }\n');
+    const prior = { bashEnv: process.env.BASH_ENV, calls: process.env.TICKMARKR_TEST_PS_CALLS };
+
+    await withSeams(200, 200, async () => {
+      // commits, then stays alive and silent for the whole 9s window — the accountant's own
+      // population, and the one it must not keep forking through
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.15 })], {
+        consult: { action: "human", notes: "an unmeasurable probe must never reach a consult" },
+        tasks: { T1: [{ shell: `echo denied > d.txt && ${COMMIT} d && sleep 20` }] },
+      });
+      let s: Awaited<ReturnType<typeof runDaemon>>;
+      process.env.BASH_ENV = bashEnv;
+      process.env.TICKMARKR_TEST_PS_CALLS = counter;
+      try {
+        s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-ps-denied", driver: hdriver() });
+      } finally {
+        if (prior.bashEnv === undefined) delete process.env.BASH_ENV;
+        else process.env.BASH_ENV = prior.bashEnv;
+        if (prior.calls === undefined) delete process.env.TICKMARKR_TEST_PS_CALLS;
+        else process.env.TICKMARKR_TEST_PS_CALLS = prior.calls;
+      }
+
+      const calls = readFileSync(counter, "utf8").length;
+      expect(calls).toBeGreaterThan(0); // the accountant really did start — otherwise this proves nothing
+      expect(calls).toBeLessThanOrEqual(25); // bounded by the cap, NOT by the 9s window
+      const evs = evsOf(repo, "run-harvest-ps-denied");
+      // it fails open exactly as before: nothing is concluded on an unreadable snapshot, the gap is
+      // named once, and the window expiry still gates the work the worker landed
+      expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
+      const unmeasurable = evs.filter((e) => e.event === "worker-harvest-unmeasurable" && e.taskId === "T1");
+      expect(unmeasurable).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+      expect(s.done).toEqual(["T1"]);
+    });
+  }, 120_000);
+
+  // ── the harvest's precedence over every sibling guard in the wait loop ───────────────────────
+  // The closed set is: the routing branches (quota + dead-channel classification — the two cases
+  // above), the dead-channel fast-kill, the liveness nudge, and the noTrailerStreak accounting.
+  // Each member below gets a fixture in which BOTH the harvest and that member can genuinely fire:
+  // a fixture where only one of them is reachable proves precedence for neither, so every case
+  // here carries a second run of the SAME fixture, differing only in the seam that decides which
+  // member wins, and asserts the other one really was live in it.
+
+  // Member: the liveness nudge (T1/OBS-262). A worker that COMMITS and goes quiet is harvestable
+  // from the first slice, at seams pinned BELOW the nudge gate exactly as the shipped harvest 5m
+  // sits below the shipped nudge 10m — and the adapter here is on the nudge allowlist, claude-code's
+  // shape and the only member of it. Before the hold, the harvest concluded such an attempt at the
+  // harvest gate and closed its slot, so the nudge was unreachable for every committed claude-code
+  // worker: the CPU leg cannot tell "idle because finished" from "idle while holding an unsubmitted
+  // turn in the input box" — both read flat CPU under a silent tracker — and the nudge is the one
+  // signal that can. Holding concludes at nudge+grace instead of the whole window, and the landed
+  // commits still go to gates through the same synthesis.
+  test("a committed worker on a nudgeable adapter is nudged first — the harvest holds, then gates the same work", async () => {
+    const fixture = (runId: string) => setupRepo([T("T1", { timeoutMinutes: 5 })], {
+      consult: { action: "human", notes: `${runId}: a harvested attempt must never reach a consult` },
+      tasks: { T1: [{ shell: `echo nudgeable > n.txt && ${COMMIT} n` }] }, // commits, then exits: flat CPU, silent tracker
+    });
+    await withSeams(200, 200, async () => {
+      setNudgeTimingForTests(1_500, 600); // harvest gate (200ms) strictly below the nudge gate, as 5m < 10m
+      try {
+        // 1) the nudgeable run: the harvest is eligible from the first slice and must NOT take it
+        const held = fixture("run-harvest-nudge-held");
+        NUDGEABLE_ADAPTERS.add("fake");
+        let nudges = 0;
+        let s: Awaited<ReturnType<typeof runDaemon>>;
+        let waited = 0;
+        const restoreProbe = await cpuProbeFallback(held.repo, "run-harvest-nudge-held", "flat");
+        try {
+          const startedAt = Date.now();
+          s = await runDaemon(held.repo, {
+            adapters: [held.fake], runId: "run-harvest-nudge-held",
+            driver: hdriver({ nudge: async () => { nudges++; return true; }, notify: async () => {} }),
+          });
+          waited = Date.now() - startedAt;
+        } finally {
+          NUDGEABLE_ADAPTERS.delete("fake");
+          restoreProbe();
+        }
+        const evs = evsOf(held.repo, "run-harvest-nudge-held");
+        // the rescue was reachable: it fired, and the harvest never preempted it
+        expect(nudges).toBe(1);
+        expect(evs.filter((e) => e.event === "worker-nudge" && e.taskId === "T1")).toHaveLength(1);
+        expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
+        // the hold is bounded by the nudge's own grace, never by the 5m window
+        expect(evs.filter((e) => e.event === "worker-nudge-expired" && e.taskId === "T1")).toHaveLength(1);
+        expect(waited).toBeLessThan(60_000);
+        // and the OBS-264 win survives the hold: the committed work is still gated on THIS attempt
+        expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+        expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+        expect(evs.filter((e) => e.event === "consult-verdict")).toHaveLength(0);
+        expect(s.done).toEqual(["T1"]);
+
+        // 2) the SAME fixture with the adapter off the allowlist — nothing else changed. It
+        // harvests at these very seams, which is what makes run 1's silence a HOLD rather than a
+        // fixture in which the triad could never have concluded anything.
+        const free = fixture("run-harvest-nudge-free");
+        const restoreFree = await cpuProbeFallback(free.repo, "run-harvest-nudge-free", "flat");
+        try {
+          await runDaemon(free.repo, {
+            adapters: [free.fake], runId: "run-harvest-nudge-free",
+            driver: hdriver({ nudge: async () => true, notify: async () => {} }),
+          });
+        } finally {
+          restoreFree();
+        }
+        const freeEvs = evsOf(free.repo, "run-harvest-nudge-free");
+        expect(freeEvs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
+        expect(freeEvs.filter((e) => e.event === "worker-nudge" && e.taskId === "T1")).toHaveLength(0);
+      } finally {
+        resetNudgeTimingForTests();
+      }
+    });
+  }, 120_000);
+
+  // Member: the dead-channel fast-kill. Its delta clause makes it and the harvest mutually
+  // exclusive by construction — committed work IS a delta — EXCEPT once a nudge has failed to
+  // deliver twice, which drops that clause. That is the one fixture where both can fire, so it is
+  // the fixture this case uses: an unreachable pane holding commits. The kill's whole purpose is
+  // that such a pane must not buy the rest of its window with past work, and the harvest sitting
+  // above it must not quietly grant exactly that.
+  test("an unreachable pane holding commits is still condemned on the fast-kill window, and its work still gated", async () => {
+    const fixture = () => setupRepo([T("T1", { timeoutMinutes: 30 })], { // 30m window: the 120s budget proves it was never ridden
+      consult: { action: "human", notes: "an unreachable pane must never reach a consult" },
+      tasks: { T1: [{ shell: `echo unreachable > u.txt && ${COMMIT} u` }] },
+    });
+    await withSeams(300, 200, async () => {
+      NUDGEABLE_ADAPTERS.add("fake");
+      setNudgeTimingForTests(300, 400);
+      try {
+        // 1) both members eligible on the same slice; the kill still fires on schedule
+        const killed = fixture();
+        const restoreProbe = await cpuProbeFallback(killed.repo, "run-harvest-unreachable", "flat");
+        setDeadChannelFastKillMsForTests(1_500);
+        let s: Awaited<ReturnType<typeof runDaemon>>;
+        let waited = 0;
+        try {
+          const startedAt = Date.now();
+          s = await runDaemon(killed.repo, {
+            adapters: [killed.fake], runId: "run-harvest-unreachable",
+            driver: hdriver({ nudge: async () => false, notify: async () => {} }), // both deliveries fail → nudgeFailed
+          });
+          waited = Date.now() - startedAt;
+        } finally {
+          restoreProbe();
+        }
+        const evs = evsOf(killed.repo, "run-harvest-unreachable");
+        expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(1);
+        expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(1);
+        expect(waited).toBeLessThan(60_000); // seconds into a 30m window — the commits bought nothing
+        // the conclusion is still not a redispatch: the same worktree went to gates
+        expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
+        expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+        expect(s.done).toEqual(["T1"]);
+
+        // 2) the SAME fixture with the kill window out of reach — the triad concludes it instead,
+        // so run 1 really was a race between two live members, not a blind fixture.
+        const harvested = fixture();
+        const restoreHarvest = await cpuProbeFallback(harvested.repo, "run-harvest-unreachable-triad", "flat");
+        setDeadChannelFastKillMsForTests(10 * 60_000);
+        try {
+          await runDaemon(harvested.repo, {
+            adapters: [harvested.fake], runId: "run-harvest-unreachable-triad",
+            driver: hdriver({ nudge: async () => false, notify: async () => {} }),
+          });
+        } finally {
+          restoreHarvest();
+        }
+        const triadEvs = evsOf(harvested.repo, "run-harvest-unreachable-triad");
+        expect(triadEvs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
+        expect(triadEvs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
+      } finally {
+        NUDGEABLE_ADAPTERS.delete("fake");
+        resetNudgeTimingForTests();
+        resetDeadChannelFastKillMsForTests();
+      }
+    });
+  }, 120_000);
+
+  // Member: the noTrailerStreak accounting (OBS-57). A harvested attempt is a no-trailer window —
+  // gates are the truth about its WORKTREE, never about its CHANNEL. Reading the synthesized
+  // ok/finished here reset the streak on every harvest, so a CLI that produces commits and swallows
+  // every trailer was immune to the two-window demotion and stayed first pick for the whole run.
+  test("a harvested attempt still burns a no-trailer window — the channel is demoted, never certified", async () => {
+    const red = {
+      judge: { pass: false, criteria: [{ criterion: "done", met: false, reason: "not met" }] },
+      consult: { action: "human", notes: "gates stayed red" },
+    };
+    const shell = `echo work >> w.txt && ${COMMIT} w`;
+    await withSeams(300, 200, async () => {
+      // 1) silent worker, red gates: every attempt is harvested, and the channel demotes on the second
+      const silent = setupRepo([T("T1", { timeoutMinutes: 5 })], { ...red, tasks: { T1: [{ shell }] } });
+      const restoreProbe = await cpuProbeFallback(silent.repo, "run-harvest-streak", "flat");
+      try {
+        await runDaemon(silent.repo, { adapters: [silent.fake], runId: "run-harvest-streak", driver: hdriver() });
+      } finally {
+        restoreProbe();
+      }
+      const evs = evsOf(silent.repo, "run-harvest-streak");
+      const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+      const key = (a: unknown) => `${(a as { adapter: string }).adapter}:${(a as { model: string }).model}`;
+
+      // both features live in this one fixture: the attempts really were harvested and gated …
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1").length).toBeGreaterThanOrEqual(2);
+      expect(evs.some((e) => e.event === "gate-result" && e.taskId === "T1")).toBe(true);
+      // … and the missing trailers still accumulated into the OBS-57 demotion
+      const demotions = evs.filter((e) => e.event === "channel-demotion" && e.taskId === "T1");
+      expect(demotions).toHaveLength(1);
+      expect(demotions[0]!.data.streak).toBe(2);
+      expect(demotions[0]!.data.channel).toBe(key(dispatches[0]!.data.assignment));
+      // the demotion is not cosmetic: no later attempt was dispatched back onto that channel
+      const after = evs.slice(evs.indexOf(demotions[0]!)).filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+      expect(after.length).toBeGreaterThan(0);
+      expect(after.every((e) => key(e.data.assignment) !== demotions[0]!.data.channel)).toBe(true);
+
+      // 2) the SAME fixture, same red gates, same diff — the worker merely emits a trailer. No
+      // demotion, so run 1's demotion came from the missing trailers and not from the red ladder.
+      const trailered = setupRepo([T("T1", { timeoutMinutes: 5 })], {
+        ...red, tasks: { T1: [{ shell, result: { ok: true, summary: "claimed" } }] },
+      });
+      await runDaemon(trailered.repo, { adapters: [trailered.fake], runId: "run-harvest-streak-claimed" });
+      const claimedEvs = evsOf(trailered.repo, "run-harvest-streak-claimed");
+      expect(claimedEvs.filter((e) => e.event === "worker-result-harvested")).toHaveLength(0);
+      expect(claimedEvs.filter((e) => e.event === "channel-demotion")).toHaveLength(0);
+    });
+  }, 180_000);
+
+  // ── v1.85 T3: the repair seam, composed with this suite's own fixture ────────────────────────
+  // The repair decision reads `commits` and `lostCommits` from an attempt the HARVEST concluded, so
+  // it is proven here rather than beside a trailer-emitting worker: the same run must show T1's
+  // liveness nudge firing on a worker holding commits ahead of base BEFORE anything concludes it,
+  // and the review-only failure that follows must buy a repair instead of a fresh re-onboarding.
+  test("test: a review-only failure with fully carried commits dispatches a repair attempt whose prompt carries the diff content and the findings verbatim, and in the same composed fixture a nudge-eligible worker with commits ahead of base still receives the merged liveness nudge before any conclude", async () => {
+    const { repo, fake } = setupRepo(
+      // complexity 8 puts the task above review.complexityThreshold; the command oracle keeps
+      // acceptance deterministic so REVIEW is the only gate that can fail.
+      [T("T1", { complexity: 8, timeoutMinutes: 5, acceptance: [{ oracle: "command", command: "true" }] })],
+      {
+        review: {
+          approve: false,
+          findings: [{ note: "`renderRow` in src/ui/row.ts drops the last column", severity: "material" }],
+          comments: [{ path: "src/ui/row.ts", line: 88, body: "off-by-one in `renderRow`" }],
+        },
+        consult: { action: "human", notes: "a repair fixture must never reach a consult" },
+        // commits, then goes quiet without a trailer — the OBS-264 shape, carrying real work
+        tasks: { T1: [{ shell: `echo carried > repairable.txt && ${COMMIT} carried` }] },
+      },
+    );
+    await withSeams(200, 200, async () => {
+      setNudgeTimingForTests(1_500, 600); // harvest gate (200ms) strictly below the nudge gate, as 5m < 10m
+      NUDGEABLE_ADAPTERS.add("fake");
+      let nudges = 0;
+      const restoreProbe = await cpuProbeFallback(repo, "run-repair-review", "flat");
+      try {
+        await runDaemon(repo, {
+          adapters: [fake], runId: "run-repair-review",
+          driver: hdriver({ nudge: async () => { nudges++; return true; }, notify: async () => {} }),
+        });
+      } finally {
+        NUDGEABLE_ADAPTERS.delete("fake");
+        resetNudgeTimingForTests();
+        restoreProbe();
+      }
+      const evs = evsOf(repo, "run-repair-review");
+
+      // ── the merged liveness nudge still runs, and still runs FIRST ──
+      expect(nudges).toBeGreaterThanOrEqual(1);
+      const firstNudge = evs.findIndex((e) => e.event === "worker-nudge" && e.taskId === "T1");
+      expect(firstNudge).toBeGreaterThanOrEqual(0);
+      const concludes = ["worker-harvest", "worker-result-harvested", "worker-result"];
+      const firstConclude = evs.findIndex((e) => concludes.includes(e.event) && e.taskId === "T1");
+      expect(firstConclude).toBeGreaterThan(firstNudge); // nudged before any conclude, never after
+      // the worker really did hold commits ahead of base, and that work reached the gates
+      expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1").length).toBeGreaterThanOrEqual(1);
+
+      // ── review-only failure over fully carried commits → a REPAIR attempt ──
+      const reviewFail = evs.find((e) => e.event === "gate-result" && e.taskId === "T1"
+        && e.data.gate === "review" && e.data.pass === false)!;
+      expect(reviewFail).toBeDefined();
+      // both review rounds this engagement earned a repair (the budget is 2); the second one's
+      // dispatch never happens because the review round cap parks the task first.
+      const repairs = evs.filter((e) => e.event === "repair-attempt" && e.taskId === "T1");
+      expect(repairs.length).toBeGreaterThanOrEqual(1);
+      expect(repairs[0]!.data.gates).toEqual(["review"]);
+      expect(String(repairs[0]!.data.findings)).toContain("renderRow"); // the findings ride the ledger
+      const sent = evs.filter((e) => e.event === "repair-dispatch" && e.taskId === "T1");
+      expect(Number(sent[0]!.data.diffBytes)).toBeGreaterThan(0);
+      const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+      expect(dispatches.length).toBeGreaterThanOrEqual(2);
+      expect(dispatches[1]!.data.retryMode).toBe("repair"); // not a fresh re-onboarding
+
+      // ── the repair prompt carries the diff CONTENT and the findings VERBATIM ──
+      const prompt = readFileSync(join(tickmarkrDir(repo), "runs", "run-repair-review", "prompts", "T1-a1.md"), "utf8");
+      expect(prompt).toContain("## Repair attempt — fix ONLY what these findings name");
+      expect(prompt).toContain(String(reviewFail.data.details)); // the journal's own bytes, unabridged
+      expect(prompt).toContain("`renderRow` in src/ui/row.ts drops the last column");
+      expect(prompt).toContain("diff --git"); // real diff content, not a hash manifest
+      expect(prompt).toContain("+carried");
+    });
+  }, 240_000);
+
+});
+
+
+// ── v1.85 T3 (speed dive): retries repair with the findings in hand ────────────────────────────
+// Measured losses this suite pins: 62 of 68 re-dispatches were FRESH (~20m of onboarding re-bought
+// each time) and ~663m across 5 runs went to loops of normalized-identical failures. Lives beside
+// the rest of the daemon suite rather than in its own tests/run/ file: the shipped testing guide
+// states the per-directory *.test.ts counts and docs-truth-testing.test.ts asserts them, so a new
+// file under tests/run/ is a documentation change this task's file scope does not cover.
+describe("T3 retry economics (fake adapter, zero tokens)", () => {
+  const evsOf = (repo: string, runId: string) => Journal.open(repo, runId).read();
+  const promptOf = (repo: string, runId: string, attempt: number) =>
+    readFileSync(join(tickmarkrDir(repo), "runs", runId, "prompts", `T1-a${attempt}.md`), "utf8");
+
+  // a driver whose WORKER dispatch never registers — the OBS-253 shape: the pane wedges before the
+  // agent ever runs, so the attempt dies with no worker-result at all.
+  const dispatchDeathDriver = (): ExecutorDriver => {
+    const inner = new SubprocessDriver();
+    return {
+      id: "dispatch-death",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      async run(slot: Slot, cmd: string) {
+        if (slot.name.startsWith("tickmarkr:worker:") || slot.name.includes("-worker-")) {
+          throw new Error("pane wedged: dispatch never registered");
+        }
+        await inner.run(slot, cmd);
+      },
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+    } as ExecutorDriver;
+  };
+
+  test("test: the third repair-eligible failure in one engagement falls back to the fresh ladder", async () => {
+    // The budget is spent on the deterministic oracle, and the THIRD repair-eligible failure is a
+    // REVIEW-only one — the case with its own same-channel fix retry (OBS-189). That retry is exactly
+    // the round the spent budget declared too expensive to repeat, so the ladder must own it: a
+    // fixture made only of oracle failures would leave that override untested.
+    // Each round's failure carries different assertion content, so the failures stay repair-eligible
+    // without tripping the normalized-identical fingerprint cap (the other half of this seam, below).
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "cat marker.txt; test -f pass.txt" }] })],
+      {
+        review: {
+          approve: false,
+          findings: [{ note: "`applyMarker` in src/mark.ts writes the wrong column", severity: "material" }],
+        },
+        consult: { action: "human", notes: "the ladder ran out" },
+        tasks: { T1: [
+          { shell: `echo one > marker.txt && ${COMMIT} m1`, result: { ok: true, summary: "a0" } },
+          { shell: `echo two > marker.txt && ${COMMIT} m2`, result: { ok: true, summary: "a1" } },
+          // the oracle is satisfied from here on, so REVIEW becomes the only failing gate
+          { shell: `echo three > marker.txt && touch pass.txt && ${COMMIT} m3`, result: { ok: true, summary: "a2" } },
+          { shell: `echo four > marker.txt && ${COMMIT} m4`, result: { ok: true, summary: "a3" } },
+          { shell: `echo five > marker.txt && ${COMMIT} m5`, result: { ok: true, summary: "a4" } },
+        ] },
+      },
+    );
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-repair-budget" });
+    expect(s.human).toEqual(["T1"]);
+    const evs = evsOf(repo, "run-repair-budget");
+
+    // the first two failures really were repair-eligible (same narrow battery, work carried)
+    const oracleFails = evs.filter((e) => e.event === "gate-result" && e.taskId === "T1"
+      && e.data.gate === "acceptance" && e.data.pass === false);
+    expect(oracleFails).toHaveLength(2);
+    // …and no two of them were normalized-identical, so nothing here is the fingerprint cap acting
+    const shapes = new Set(oracleFails.map((e) => normalizeGateFailure(String(e.data.details))));
+    expect(shapes.size).toBe(oracleFails.length);
+
+    // exactly two repairs were funded, and exactly two dispatches carried the repair mode
+    expect(evs.filter((e) => e.event === "repair-attempt" && e.taskId === "T1")).toHaveLength(2);
+    const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+    expect(dispatches.filter((e) => e.data.retryMode === "repair")).toHaveLength(2);
+    expect(dispatches[1]!.data.retryMode).toBe("repair");
+    expect(dispatches[2]!.data.retryMode).toBe("repair");
+
+    // the THIRD repair-eligible failure — review-only, the case that has its own fix retry — is
+    // refused a repair AND refused that retry: the fresh ladder takes the rung instead.
+    const exhausted = evs.filter((e) => e.event === "repair-exhausted" && e.taskId === "T1");
+    expect(exhausted.length).toBeGreaterThanOrEqual(1);
+    expect(exhausted[0]!.data.gates).toEqual(["review"]);      // …and it is the review round
+    const escalations = evs.filter((e) => e.event === "escalation" && e.taskId === "T1");
+    expect(escalations[0]!.data.repair).toBe(1);
+    expect(escalations[1]!.data.repair).toBe(2);
+    expect(escalations[2]!.data.repair).toBeUndefined();       // the fresh ladder owns this one
+    expect(escalations[2]!.data.reviewFix).toBeUndefined();    // NOT the free same-channel review round
+    expect(escalations[2]!.data.step).toBe("retry");           // ladder rung 0 …
+    // … which it really did CONSUME: a review-fix round would have left the ladder standing at rung
+    // 0 and drawn another free same-channel round instead of walking on.
+    expect(escalations[3]!.data.step).toBe("escalate");
+
+    // the ladder attempt is a FRESH brief: no diff content, no fix-only contract
+    expect(promptOf(repo, "run-repair-budget", 1)).toContain("## Repair attempt");
+    expect(promptOf(repo, "run-repair-budget", 2)).toContain("## Repair attempt");
+    expect(promptOf(repo, "run-repair-budget", 3)).not.toContain("## Repair attempt");
+    expect(promptOf(repo, "run-repair-budget", 3)).not.toContain("diff --git");
+    expect(dispatches[3]!.data.retryMode).not.toBe("repair");
+    // …and it still carries WHY the last attempt failed — a ladder rung is not an amnesia rung
+    expect(promptOf(repo, "run-repair-budget", 3)).toContain("applyMarker");
+  }, 180_000);
+
+  test("a single failing test gate over landed commits earns a repair, though the evidence gate never ran", async () => {
+    // runGates returns at the first red gate, so a failing test gate never reaches the evidence
+    // stage and its commit list comes back empty. The repair decision must measure the landed work
+    // itself, or the ruling's own test/lint case is unreachable by construction.
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      {
+        consult: { action: "human", notes: "unused" },
+        tasks: { T1: [
+          { shell: `echo boom > broken.txt && ${COMMIT} b1`, result: { ok: true, summary: "a0" } },
+          { shell: `echo ok > fixed.txt && git rm -q broken.txt && ${COMMIT} b2`, result: { ok: true, summary: "a1" } },
+        ] },
+      },
+      "gates: { test: 'test ! -f broken.txt' }\n",
+    );
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-repair-test-gate" });
+    expect(s.done).toEqual(["T1"]);
+    const evs = evsOf(repo, "run-repair-test-gate");
+
+    const testFail = evs.find((e) => e.event === "gate-result" && e.taskId === "T1"
+      && e.data.gate === "test" && e.data.pass === false)!;
+    expect(testFail).toBeDefined();
+    const repairs = evs.filter((e) => e.event === "repair-attempt" && e.taskId === "T1");
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]!.data.gates).toEqual(["test"]);
+    expect(repairs[0]!.data.commits).toBe(1); // measured from the worktree, not from runGates' output
+    const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+    expect(dispatches[1]!.data.retryMode).toBe("repair");
+    const prompt = promptOf(repo, "run-repair-test-gate", 1);
+    expect(prompt).toContain("## Repair attempt — fix ONLY what these findings name");
+    expect(prompt).toContain("diff --git");
+    expect(prompt).toContain("+boom");
+  }, 180_000);
+
+  test("a funded repair and a retry ban are read back from the journal, so the next dispatch keeps them across a stop", () => {
+    // Both decisions govern exactly one dispatch: the next one. They are therefore journal-derived
+    // rather than process-local — a stop between the decision and the dispatch (OBS-254's shape one
+    // layer up) must not send a normal prompt with the findings gone, or re-run a banned assignment.
+    const ev = (event: string, data: Record<string, unknown> = {}, taskId = "T1"): JournalEvent =>
+      ({ ts: "2026-08-01T00:00:00.000Z", event, taskId, data });
+    const funded = [ev("gate-result", { gate: "review", pass: false }), ev("repair-attempt", { findings: "review: the cap is never applied" })];
+    expect(pendingRepairFindings(funded, "T1")).toBe("review: the cap is never applied");
+    expect(pendingRepairFindings(funded, "T2")).toBeUndefined();                     // task-scoped
+    expect(pendingRepairFindings([...funded, ev("task-dispatch")], "T1")).toBe("review: the cap is never applied"); // a dispatch that never launched keeps it
+    expect(pendingRepairFindings([...funded, ev("worker-launch")], "T1")).toBeUndefined(); // spent at launch
+
+    const capped = [ev("gate-fingerprint-cap", { gate: "acceptance", channel: "fake:fake-1" })];
+    expect(activeRetryBan(capped, "T1", "fake:fake-1")).toBe("acceptance");
+    expect(activeRetryBan(capped, "T1", "other:model-2")).toBeUndefined();           // channel-bound
+    // and never latched: once the worker it governed has LAUNCHED, a later unrelated failure — a
+    // stall, a merge conflict, a different fingerprint — is not refused under a stale ban. Expiry
+    // hangs off the launch, not the pre-launch task-dispatch event: a dispatch that dies before the
+    // worker starts has spent nothing, so the decision must still be there for the retry.
+    expect(activeRetryBan([...capped, ev("task-dispatch")], "T1", "fake:fake-1")).toBe("acceptance");
+    expect(activeRetryBan([...capped, ev("worker-launch")], "T1", "fake:fake-1")).toBeUndefined();
+
+    // The ordinary gate-fail brief expires on the same event, for the same reason: a dispatch that
+    // dies BETWEEN task-dispatch and worker-launch (readiness, setup, slot allocation) has shown the
+    // worker nothing, so `--retry-failed` must still carry why the last attempt failed — and the
+    // dead dispatch is itself part of that answer, not a reason to forget the rest of it.
+    const gated = [
+      ev("gate-result", { gate: "test", pass: false, details: "1 failed | 3 passed" }),
+      ev("gate-result", { gate: "review", pass: true, details: "approved" }),
+      ev("task-dispatch"),
+      ev("delivery-readiness-failed", { waitedMs: 9000, transcript: "pane never came up" }),
+    ];
+    expect(journaledFailureBrief(gated, "T1")).toEqual([
+      "test: 1 failed | 3 passed",
+      "dispatch: delivery readiness failed after 9000ms; pane transcript:\npane never came up",
+    ]);
+    expect(journaledFailureBrief(gated, "T2")).toEqual([]);                       // task-scoped
+    expect(journaledFailureBrief([...gated, ev("worker-launch")], "T1")).toEqual([]); // spent at launch
+    expect(journaledFailureBrief([...gated, ev("task-approved")], "T1")).toEqual([]); // and by an approval
+
+    // The ONE pre-launch invariant covers the terminal exception path too: task-dispatch does not
+    // spend information, task-failed contributes its exact dispatch error, and only an actual launch
+    // spends it. A non-dispatch task failure is not manufactured into dispatch guidance.
+    const dispatchError = "Error: pane wedged: dispatch never registered";
+    const died = [
+      ev("task-dispatch"),
+      ev("task-failed", { kind: "dispatch", error: dispatchError }),
+    ];
+    expect(journaledFailureBrief(died, "T1")).toEqual([`dispatch: ${dispatchError}`]);
+    expect(journaledFailureBrief([...died, ev("worker-launch")], "T1")).toEqual([]);
+    expect(journaledFailureBrief([
+      ev("task-dispatch"),
+      ev("task-failed", { kind: "gate-fail", error: dispatchError }),
+    ], "T1")).toEqual([]);
+  });
+
+  test("test: every blocking review and judge result journals structured findings with class, path and symbol", async () => {
+    // 1) a blocking JUDGE verdict
+    const judged = setupRepo([T("T1")], {
+      judge: {
+        pass: false,
+        criteria: [{ criterion: "c1", met: false, reason: "src/a.ts must define `parseThing`" }],
+        comments: [{ path: "src/a.ts", line: 12, body: "`parseThing` is missing" }],
+      },
+      consult: { action: "human", notes: "judge rejected" },
+      tasks: { T1: [{ shell: `echo x > x.txt && ${COMMIT} x`, result: { ok: true, summary: "x" } }] },
+    });
+    await runDaemon(judged.repo, { adapters: [judged.fake], runId: "run-findings-judge" });
+    const judgeFail = evsOf(judged.repo, "run-findings-judge").find((e) => e.event === "gate-result"
+      && e.taskId === "T1" && e.data.gate === "acceptance" && e.data.pass === false)!;
+    expect(judgeFail).toBeDefined();
+    const judgeFindings = judgeFail.data.findings as Array<Record<string, string>>;
+    // exact identities, never "a string is present": class, path and symbol each name something real
+    expect(judgeFindings.map((f) => f.fingerprint)).toEqual([
+      "acceptance:unmet|src/a.ts|parseThing",
+      "acceptance:anchored|src/a.ts|parseThing",
+    ]);
+    for (const f of judgeFindings) expect(f.note.length).toBeGreaterThan(0); // the judge's own bytes survive
+
+    // 2) a blocking REVIEW verdict
+    const reviewed = setupRepo([T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })], {
+      review: {
+        approve: false,
+        findings: [{ note: "`renderRow` in src/ui/row.ts drops the last column", severity: "material" }],
+        comments: [{ path: "src/ui/row.ts", line: 88, body: "off-by-one in `renderRow`" }],
+      },
+      consult: { action: "human", notes: "review rejected" },
+      tasks: { T1: [{ shell: `echo y > y.txt && ${COMMIT} y`, result: { ok: true, summary: "y" } }] },
+    });
+    await runDaemon(reviewed.repo, { adapters: [reviewed.fake], runId: "run-findings-review" });
+    const reviewFail = evsOf(reviewed.repo, "run-findings-review").find((e) => e.event === "gate-result"
+      && e.taskId === "T1" && e.data.gate === "review" && e.data.pass === false)!;
+    expect(reviewFail).toBeDefined();
+    const reviewFindings = reviewFail.data.findings as Array<Record<string, string>>;
+    expect(reviewFindings.map((f) => f.fingerprint)).toEqual([
+      "review:material|src/ui/row.ts|renderRow",
+      "review:anchored|src/ui/row.ts|renderRow",
+    ]);
+    for (const f of reviewFindings) expect(f.note.length).toBeGreaterThan(0); // the reviewer's own bytes survive
+
+    // a PASSING result carries no findings — the structure exists to describe blocking ones
+    const passed = evsOf(reviewed.repo, "run-findings-review").find((e) => e.event === "gate-result"
+      && e.taskId === "T1" && e.data.pass === true)!;
+    expect(passed.data.findings).toBeUndefined();
+
+    // Rule: a finding's path is its OWN evidence path. An inline path therefore resolves; an anchor
+    // belonging to another finding and the task's declared scope never substitute for a pathless row.
+    // The latter fails closed as the explicit non-empty UNIDENTIFIED sentinel.
+    const pathless = "✗ c2: the brief is never carried\njudge verdict pass=false";
+    expect(structuredFindings("acceptance", "✗ c2: src/a.ts never carries the brief")[0])
+      .toMatchObject({ class: "acceptance:unmet", path: "src/a.ts", symbol: "c2" });
+    const unrelatedEvidence = structuredFindings("acceptance",
+      `${pathless}\n\n## Anchored review\n- src/b.ts:42 — another finding in \`renderB\``, ["src/a.ts", "src/b.ts"]);
+    expect(unrelatedEvidence.find((f) => f.class === "acceptance:unmet"))
+      .toMatchObject({ path: UNIDENTIFIED, symbol: "c2" });
+    expect(unrelatedEvidence.filter((f) => f.class === "acceptance:unmet")).toHaveLength(1);
+    expect(unrelatedEvidence.find((f) => f.class === "acceptance:anchored"))
+      .toMatchObject({ path: "src/b.ts", symbol: "renderB" });
+    // a review note naming no code identity still gets a stable symbol of its own — its own words,
+    // volatile tokens swept out, so the same note one line lower is still the same finding
+    const bare = (line: number) => structuredFindings("review",
+      `- [material] this silently drops the operator's brief, see src/run/daemon.ts:${line}`, ["src/run/daemon.ts"])[0]!;
+    expect(bare(42).path).toBe("src/run/daemon.ts");
+    expect(bare(42).symbol).not.toBe(UNIDENTIFIED);
+    expect(bare(42).fingerprint).toBe(bare(913).fingerprint);
+    // UNIDENTIFIED survives for the one residual it describes: nothing, anywhere, names a file
+    expect(structuredFindings("acceptance", pathless)[0]!.path).toBe(UNIDENTIFIED);
+    // the criterion id survives a rephrased reason — the same unmet criterion is the same finding
+    expect(structuredFindings("acceptance", "✗ c2: put another way, nothing carries the brief", ["src/a.ts"])[0]!.fingerprint)
+      .toBe(structuredFindings("acceptance", pathless, ["src/a.ts"])[0]!.fingerprint);
+
+    // R4 identity: line numbers are EVIDENCE, not identity — the same finding one line lower keeps
+    // its fingerprint, while a different symbol in the same file is a different finding.
+    const at = (line: number, symbol = "renderRow") => structuredFindings("review", [
+      "reviewer x:y (v): requested changes (1 material)",
+      `- [material] \`${symbol}\` in src/ui/row.ts drops the last column`,
+      "",
+      "## Anchored review",
+      `- src/ui/row.ts:${line} — off-by-one in \`${symbol}\``,
+    ].join("\n"));
+    expect(at(88).map((f) => f.fingerprint)).toEqual(at(412).map((f) => f.fingerprint));
+    expect(at(88, "renderCell").map((f) => f.fingerprint)).not.toEqual(at(88).map((f) => f.fingerprint));
+  }, 180_000);
+
+  test("test: two normalized-identical failures of one gate on one task force a consult and ban an identical retry, with normalization proven across a fixture corpus of >=6 volatile-token classes — absolute and tmp paths, line and column numbers, durations and timestamps, ANSI styling, run and worktree identifiers, memory addresses — and a failure differing in assertion content never normalizing identical", async () => {
+    // ── part 1: the corpus. Each pair differs ONLY in one class of volatile token. ──
+    const corpus: Array<{ volatile: string; a: string; b: string }> = [
+      {
+        volatile: "absolute and tmp paths",
+        a: "AssertionError: expected true to be false at /private/var/folders/9j/T/tickmarkr-repo-Ab3xY/src/run/daemon.ts",
+        b: "AssertionError: expected true to be false at /tmp/tickmarkr-repo-Zq7Kd/src/run/daemon.ts",
+      },
+      {
+        volatile: "line and column numbers",
+        a: "FAIL tests/run/daemon.test.ts:412:9 — expected 3 to be 4",
+        b: "FAIL tests/run/daemon.test.ts:87:31 — expected 3 to be 4",
+      },
+      {
+        volatile: "durations",
+        a: "Tests 1 failed | 146 passed (147) in 7.41s",
+        b: "Tests 1 failed | 146 passed (147) in 12.02s",
+      },
+      {
+        volatile: "timestamps",
+        a: "worker-result 2026-08-01T12:21:55.109Z — no trailer",
+        b: "worker-result 2026-07-31T19:29:21.884Z — no trailer",
+      },
+      {
+        volatile: "quoted ordinary diagnostic paths",
+        a: "ENOENT: no such file, open '/tmp/wt-a/src/a.ts'",
+        b: "ENOENT: no such file, open '/tmp/wt-b/src/a.ts'",
+      },
+      {
+        volatile: "absolute paths outside marker roots with the same file",
+        a: "ENOENT: no such file, open '/Users/k/repo/lib/parse.js'",
+        b: "ENOENT: no such file, open '/home/runner/project/pkg/parse.js'",
+      },
+      {
+        volatile: "quoted ordinary diagnostic timestamps with offsets",
+        a: "worker died at '2026-08-01T12:21:55.109+03:00' before launch",
+        b: "worker died at '2026-07-31T19:29:21.884-04:00' before launch",
+      },
+      {
+        volatile: "ANSI styling",
+        a: "\u001b[31mFAIL\u001b[39m evidence: worker committed nothing",
+        b: "FAIL evidence: worker committed nothing",
+      },
+      {
+        volatile: "run and worktree identifiers",
+        a: "ran in /w/tickmarkr-run-20260801-122155--T1 for run-20260801-122155 at 4d48a1163fce",
+        b: "ran in /w/tickmarkr-run-20260731-192921--T1 for run-20260731-192921 at 27cf0685aa91",
+      },
+      {
+        volatile: "memory addresses",
+        a: "Segmentation fault at 0x00007ffee3b2a180 while linking node_modules",
+        b: "Segmentation fault at 0x00007fb41c0e9d40 while linking node_modules",
+      },
+    ];
+    expect(corpus.length).toBeGreaterThanOrEqual(6);
+    for (const { volatile, a, b } of corpus) {
+      expect(normalizeGateFailure(a), volatile).toBe(normalizeGateFailure(b));
+    }
+    // the guard on the other side: assertion CONTENT is never normalized away — including content
+    // that is itself path-shaped or line-shaped, which is where a naive volatile-token sweep turns
+    // two different defects into one and bans a retry that was never redundant.
+    const differs: Array<[string, string, string]> = [
+      ["numbers", "AssertionError: expected 3 to be 4", "AssertionError: expected 3 to be 5"],
+      ["exit codes", "oracle failed: $ npm test (exit 1)", "oracle failed: $ npm test (exit 2)"],
+      ["symbols", "- [material] `renderRow` drops the last column", "- [material] `renderCell` drops the last column"],
+      ["path-VALUED assertions", "AssertionError: expected '/api/v1/users' to be '/api/v2/orders'", "AssertionError: expected '/api/v3/carts' to be '/api/v4/items'"],
+      ["unquoted path-valued assertions", "expected /api/v1/users to be /api/v2/orders", "expected /api/v3/carts to be /api/v4/items"],
+      ["line-VALUED assertions", "AssertionError: expected 'src/a.ts:12' to be 'src/a.ts:34'", "AssertionError: expected 'src/a.ts:56' to be 'src/a.ts:78'"],
+      ["quoted absolute paths asserted as payload",
+        "AssertionError: expected '/tmp/actual-a/src/a.ts' to be '/tmp/want/src/a.ts'",
+        "AssertionError: expected '/tmp/actual-b/src/a.ts' to be '/tmp/want/src/a.ts'"],
+      ["which file failed", "FAIL tests/run/daemon.test.ts:412 — expected 3 to be 4", "FAIL tests/run/journal.test.ts:412 — expected 3 to be 4"],
+      ["absolute paths outside the marker roots",
+        "ENOENT: no such file or directory, open '/Users/k/repo/lib/parse.js'",
+        "ENOENT: no such file or directory, open '/Users/k/repo/lib/render.js'"],
+      // whitespace INSIDE a payload is asserted content: a collapse applied to the whole line erased
+      // it, so a formatter defect and an alignment defect became one identity and banned a retry
+      ["whitespace inside an asserted value", 'expected "a  b" to be "c"', 'expected "a b" to be "c"'],
+      ["asserted indentation", "expected '  indented' to equal '\tindented'", "expected ' indented' to equal '\tindented'"],
+    ];
+    for (const [what, a, b] of differs) {
+      expect(normalizeGateFailure(a), what).not.toBe(normalizeGateFailure(b));
+    }
+    // …and an English contraction does not open a quoted span that swallows the volatile half
+    expect(normalizeGateFailure("the worker's diff at /tmp/wt-aaa/src/a.ts and the judge's verdict"))
+      .toBe(normalizeGateFailure("the worker's diff at /tmp/wt-bbb/src/a.ts and the judge's verdict"));
+
+    // ── part 2: the live seam. The same defect twice, wearing different volatile tokens. ──
+    const { repo, fake } = setupRepo(
+      [T("T1", { acceptance: [{ oracle: "command", command: "cat boom.txt; exit 1" }] })],
+      {
+        consult: { action: "retry", notes: "try that again" }, // a retry verdict the ban must refuse
+        tasks: { T1: [
+          // attempt 0 commits nothing: the evidence gate fails and the LADDER spends its rung 0, so
+          // the identical pair below is judged from a rung the ladder has already walked past — the
+          // cap tests the shape of the next move, never which rung the task happens to stand on.
+          { shell: "true", result: { ok: true, summary: "nothing" } },
+          { shell: `printf 'expected true at /tmp/wt-1111/src/a.ts:12:3 in 1.1s\\n' > boom.txt && ${COMMIT} b1`, result: { ok: true, summary: "a1" } },
+          { shell: `printf 'expected true at /tmp/wt-2222/src/a.ts:99:7 in 9.9s\\n' > boom.txt && ${COMMIT} b2`, result: { ok: true, summary: "a2" } },
+        ] },
+      },
+    );
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-fingerprint-cap" });
+    expect(s.human).toEqual(["T1"]);
+    const evs = evsOf(repo, "run-fingerprint-cap");
+
+    const fails = evs.filter((e) => e.event === "gate-result" && e.taskId === "T1"
+      && e.data.gate === "acceptance" && e.data.pass === false);
+    expect(fails.length).toBeGreaterThanOrEqual(2);
+    // the raw bytes really did differ — otherwise this fixture proves nothing about normalization
+    expect(String(fails[0]!.data.details)).not.toBe(String(fails[1]!.data.details));
+    expect(normalizeGateFailure(String(fails[0]!.data.details)))
+      .toBe(normalizeGateFailure(String(fails[1]!.data.details)));
+
+    // the cap fired on the second identical one, taking the round the ladder was about to buy
+    const cap = evs.filter((e) => e.event === "gate-fingerprint-cap" && e.taskId === "T1");
+    expect(cap).toHaveLength(1);
+    expect(cap[0]!.data.gate).toBe("acceptance");
+    expect(cap[0]!.data.occurrences).toBe(GATE_FINGERPRINT_CAP);
+    expect(cap[0]!.data.retrySameBanned).toBe(true);
+    // it forced a consult of its own, immediately, and that consult's retry verdict was refused:
+    // escalation (the rung the cap spent) → consult-verdict → retry-same-banned, back to back.
+    const capAt = evs.indexOf(cap[0]!);
+    expect(evs.slice(capAt + 1, capAt + 4).map((e) => e.event))
+      .toEqual(["escalation", "consult-verdict", "retry-same-banned"]);
+    expect(evs[capAt + 2]!.data.action).toBe("retry");   // the consult DID say retry …
+
+    // … and the ban refused an identical one: the next dispatch is a different channel, never the
+    // same channel on the same brief.
+    const banned = evs.filter((e) => e.event === "retry-same-banned" && e.taskId === "T1");
+    expect(banned).toHaveLength(cap.length);            // every cap banned exactly one identical retry
+    expect(banned.every((e) => e.data.gate === "acceptance")).toBe(true);
+    expect(banned[0]!.data.to).not.toBe(banned[0]!.data.from);
+    const afterBan = evs.slice(evs.indexOf(banned[0]!)).find((e) => e.event === "task-dispatch" && e.taskId === "T1")!;
+    const key = (a: unknown) => `${(a as { adapter: string }).adapter}:${(a as { model: string }).model}`;
+    expect(key(afterBan.data.assignment)).toBe(banned[0]!.data.to);
+
+    // The cap SPENDS the rung the ladder would have spent rather than skipping it, so a task that
+    // cannot converge still reaches exhaustion on exactly the budget it always had — the cap can
+    // never hand a stuck task extra rounds. Rung 0 went to the evidence failure before any of this,
+    // so the cap fired from rung 1: a mid-ladder position, not the ladder's starting one.
+    const rungs = evs.filter((e) => e.event === "escalation" && e.taskId === "T1");
+    expect(rungs.map((e) => e.data.step)).toEqual(["retry", "retry", "escalate", "retry", "consult", "human"]);
+    expect(rungs[0]!.data.repair).toBeUndefined();       // ladder rung 0 (the evidence failure)
+    expect(rungs[1]!.data.repair).toBe(1);               // a repair — it consumes no rung
+    expect(rungs[2]!.data.fingerprintCap).toBe(true);    // the cap took rung 1 (escalate) and spent it
+    expect(rungs[3]!.data.repair).toBe(2);               // the second and last funded repair
+    // then the ladder's own end, on its own budget — the cap bought nothing extra
+    expect(evs.filter((e) => e.taskId === "T1").at(-1)!.event).toBe("task-human");
+
+    // ── and the rerouted retry still knows WHY the last attempt failed ──
+    // The consult's guidance is ADDED to the brief the journal already holds, never swapped for it:
+    // no retry discards information the journal already holds about the previous failure.
+    const rerouted = promptOf(repo, "run-fingerprint-cap", 3);
+    expect(rerouted).toContain("## Previous attempt failed gates — fix these specifically");
+    expect(rerouted).toContain(String(fails[1]!.data.details));  // the journalled failure bytes …
+    expect(rerouted).toContain("try that again");                // … alongside the consult guidance
+  }, 180_000);
+
+  test("a terminal cap consult vetoes an identical retry but not a rung that already changes channel", async () => {
+    // Rule: a terminal cap consult vetoes a same-channel retry, but it cannot veto an `escalate`
+    // rung that already satisfies the cap's ban by changing channel. These two fixtures assert both
+    // directions at the boundary: retry parks; escalate continues on a different assignment.
+    const { repo, fake } = setupRepo(
+      [T("T1", { acceptance: [{ oracle: "command", command: "cat boom.txt; exit 1" }] })],
+      {
+        consult: { action: "human", notes: "cannot adjudicate" }, // terminal: neither retry nor reroute
+        tasks: { T1: [
+          { shell: `printf 'expected true at /tmp/wt-1111/src/a.ts:12:3 in 1.1s\\n' > boom.txt && ${COMMIT} b1`, result: { ok: true, summary: "a0" } },
+          { shell: `printf 'expected true at /tmp/wt-2222/src/a.ts:99:7 in 9.9s\\n' > boom.txt && ${COMMIT} b2`, result: { ok: true, summary: "a1" } },
+        ] },
+      },
+    );
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-cap-terminal" });
+    expect(s.human).toEqual(["T1"]);
+    const evs = evsOf(repo, "run-cap-terminal");
+
+    const cap = evs.filter((e) => e.event === "gate-fingerprint-cap" && e.taskId === "T1");
+    expect(cap).toHaveLength(1);
+    const capAt = evs.indexOf(cap[0]!);
+    // The dangerous shape really is the one under test: rung `retry`, then a TERMINAL verdict.
+    expect(evs[capAt + 1]!.data.step).toBe("retry");
+    expect(evs[capAt + 1]!.data.fingerprintCap).toBe(true);
+    expect(evs[capAt + 2]!.event).toBe("consult-verdict");
+    expect(evs[capAt + 2]!.data.action).toBe("human");
+    expect(evs[capAt + 2]!.data.capAdvisory).toBeUndefined();
+    expect(evs[capAt + 3]!.event).toBe("task-human");
+    expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(2);
+    expect(evs.slice(capAt).some((e) => e.event === "retry-same-banned" && e.taskId === "T1")).toBe(false);
+
+    const escalated = setupRepo(
+      [T("T1")],
+      {
+        consult: { action: "human", notes: "cannot adjudicate" },
+        tasks: { T1: [
+          { shell: "true", result: { ok: true, summary: "no commit one" } },
+          { shell: "true", result: { ok: true, summary: "no commit two" } },
+          { shell: `echo fixed > fixed.txt && ${COMMIT} fixed`, result: { ok: true, summary: "different channel fixed it" } },
+        ] },
+      },
+    );
+    const moved = await runDaemon(escalated.repo, { adapters: [escalated.fake], runId: "run-cap-terminal-escalate" });
+    expect(moved.done).toEqual(["T1"]);
+    const movedEvents = evsOf(escalated.repo, "run-cap-terminal-escalate");
+    const movedCap = movedEvents.find((e) => e.event === "gate-fingerprint-cap" && e.taskId === "T1")!;
+    const movedCapAt = movedEvents.indexOf(movedCap);
+    expect(movedEvents[movedCapAt + 1]!.data.step).toBe("escalate");
+    expect(movedEvents[movedCapAt + 2]).toMatchObject({
+      event: "consult-verdict",
+      data: { action: "human", capAdvisory: true },
+    });
+    expect(movedEvents.slice(movedCapAt).some((e) => e.event === "task-human" && e.taskId === "T1")).toBe(false);
+    const movedDispatches = movedEvents.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+    expect(movedDispatches).toHaveLength(3);
+    const assignmentKey = (e: JournalEvent) => {
+      const a = e.data.assignment as { adapter: string; model: string };
+      return `${a.adapter}:${a.model}`;
+    };
+    expect(assignmentKey(movedDispatches[2]!)).not.toBe(assignmentKey(movedDispatches[1]!));
+  }, 180_000);
+
+  test("a repair is cancelled when the recreated worktree loses the commits it was funded on", async () => {
+    // Repair eligibility is decided one attempt BEFORE the carry that has to hold it. When the
+    // recreation drops a landed commit — a concurrently advanced integration tip, a cherry-pick
+    // conflict — a fix-only contract would quote a diff whose implementation is missing and forbid
+    // the worker from rebuilding the rest. The precondition is therefore re-validated after the
+    // carry, and the fresh ladder owns that dispatch instead.
+    const { repo, fake } = setupRepo(
+      [T("T1", { acceptance: [{ oracle: "command", command: "test -f pass.txt" }] })],
+      {
+        consult: { action: "human", notes: "a cancelled repair must not need a consult" },
+        tasks: { T1: [
+          { shell: `echo impl > impl.txt && ${COMMIT} impl`, result: { ok: true, summary: "a0" } },
+          { shell: `touch pass.txt && ${COMMIT} pass`, result: { ok: true, summary: "a1" } },
+        ] },
+      },
+    );
+    const inner = new SubprocessDriver();
+    let recreations = 0;
+    const carryLosingDriver = {
+      id: "carry-loss",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      run: inner.run.bind(inner),
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      async worktree(root: string, branch: string, base: string) {
+        const wt = await inner.worktree(root, branch, base);
+        // the RETRY's recreation lands a conflicting commit first, so cherry-picking attempt 0's
+        // landed work onto it fails — the OBS-212 shape, reproduced deterministically
+        if (branch.endsWith("--T1") && recreations++ === 1) {
+          execSync("printf 'clobber\\n' > impl.txt && git add -A && git commit -q --no-gpg-sign -m clobber", { cwd: wt });
+        }
+        return wt;
+      },
+    } as unknown as ExecutorDriver;
+
+    await runDaemon(repo, { adapters: [fake], runId: "run-repair-carry-loss", driver: carryLosingDriver });
+    const evs = evsOf(repo, "run-repair-carry-loss");
+
+    // the repair really was funded, and the carry really did lose the commit it was funded on
+    expect(evs.filter((e) => e.event === "repair-attempt" && e.taskId === "T1")).toHaveLength(1);
+    const loss = evs.find((e) => e.event === "work-loss" && e.taskId === "T1")!;
+    expect(loss).toBeDefined();
+    expect((loss.data.lost as string[]).length).toBeGreaterThan(0);
+
+    // …so no fix-only prompt was built over the incomplete tree
+    const cancelled = evs.filter((e) => e.event === "repair-cancelled" && e.taskId === "T1");
+    expect(cancelled).toHaveLength(1);
+    expect(cancelled[0]!.data.lost).toEqual(loss.data.lost);
+    expect(evs.filter((e) => e.event === "repair-dispatch" && e.taskId === "T1")).toHaveLength(0);
+    const prompt = promptOf(repo, "run-repair-carry-loss", 1);
+    expect(prompt).not.toContain("## Repair attempt");
+    expect(prompt).not.toContain("### The work under review");
+    // the launch event names what the worker actually received, not the mode intended before the carry
+    const launch = evs.filter((e) => e.event === "worker-launch" && e.taskId === "T1");
+    expect(launch[1]!.data.retryMode).toBe("fresh");
+    // …and the retry still knows why the last attempt failed — cancelling a repair is not amnesia
+    expect(prompt).toContain("## Previous attempt failed gates — fix these specifically");
+    expect(prompt).toContain("oracle failed");
+  }, 180_000);
+
+  test("no retry discards information the journal already holds about why the last attempt failed", async () => {
+    // One run that walks EVERY kind of re-dispatch this seam can produce — repair, repair, the fresh
+    // ladder's retry, an escalate onto another channel, and a consult verdict of retry — and asserts
+    // the same thing of each: the prompt reproduces the gate-result bytes the journal already holds
+    // for the attempt before it. The consult round is the one that used to lose them, by replacing
+    // the brief with its own guidance rather than adding to it.
+    const { repo, fake } = setupRepo(
+      [T("T1", { acceptance: [{ oracle: "command", command: "cat marker.txt; test -f pass.txt" }] })],
+      {
+        consult: { action: "retry", notes: "commit the marker file this time" },
+        tasks: { T1: [
+          { shell: `echo one > marker.txt && ${COMMIT} m1`, result: { ok: true, summary: "a0" } },
+          { shell: `echo two > marker.txt && ${COMMIT} m2`, result: { ok: true, summary: "a1" } },
+          { shell: `echo three > marker.txt && ${COMMIT} m3`, result: { ok: true, summary: "a2" } },
+          { shell: `echo four > marker.txt && ${COMMIT} m4`, result: { ok: true, summary: "a3" } },
+          { shell: `echo five > marker.txt && ${COMMIT} m5`, result: { ok: true, summary: "a4" } },
+          { shell: `touch pass.txt && ${COMMIT} pass`, result: { ok: true, summary: "a5" } },
+        ] },
+      },
+    );
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-no-amnesia" });
+    expect(s.done).toEqual(["T1"]);
+    const evs = evsOf(repo, "run-no-amnesia");
+
+    // every kind of re-dispatch really did occur in this one run
+    const modes = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").map((e) => e.data.retryMode);
+    expect(modes.slice(1, 3)).toEqual(["repair", "repair"]);
+    const steps = evs.filter((e) => e.event === "escalation" && e.taskId === "T1").map((e) => e.data.step);
+    expect(steps).toEqual(["retry", "retry", "retry", "escalate", "consult"]);
+    expect(evs.filter((e) => e.event === "consult-verdict" && e.data.action === "retry")).toHaveLength(1);
+
+    // …and not one of them dropped the failure bytes the journal was already holding
+    const fails = evs.filter((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.pass === false);
+    expect(fails).toHaveLength(5);
+    fails.forEach((f, i) => {
+      expect(promptOf(repo, "run-no-amnesia", i + 1), `attempt ${i + 1}`).toContain(String(f.data.details));
+    });
+    // the consult round carries its guidance ON TOP of them, never instead of them
+    expect(promptOf(repo, "run-no-amnesia", 5)).toContain("commit the marker file this time");
+  }, 180_000);
+
+  test("test: a dispatch death before worker-result followed by retry-failed reproduces the upheld finding bytes exactly", async () => {
+    const runId = "run-obs254";
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
+      {
+        review: {
+          approve: false,
+          findings: [{ note: "`applyBudget` in src/run/budget.ts ignores the configured cap", severity: "material" }],
+          comments: [{ path: "src/run/budget.ts", line: 42, body: "cap is read but never applied in `applyBudget`" }],
+        },
+        consult: { action: "human", notes: "review park" },
+        tasks: { T1: [{ shell: `echo v > v.txt && ${COMMIT} v`, result: { ok: true, summary: "v" } }] },
+      },
+    );
+    // 1) the reviewer requests changes until the engagement's round cap parks the task
+    const first = await runDaemon(repo, { adapters: [fake], runId });
+    expect(first.human).toEqual(["T1"]);
+    const upheldDetails = String([...evsOf(repo, runId)].reverse().find((e) => e.event === "gate-result"
+      && e.taskId === "T1" && e.data.gate === "review" && e.data.pass === false)!.data.details);
+    expect(upheldDetails).toContain("applyBudget");
+
+    // This is also where an identically-repeating REVIEW failure lands, and why the fingerprint cap
+    // leaves that one gate to REVIEW_ROUND_CAP: the rounds here are normalized-identical, so an
+    // uncapped review WOULD be the loop the cap exists to stop — but the round cap already stopped it
+    // in two, and stopped it at the OPERATOR rather than at a consult. Pre-empting a strictly tighter
+    // bound would trade a human decision for an LLM round, which is the trade backwards.
+    const reviewFails = evsOf(repo, runId).filter((e) => e.event === "gate-result"
+      && e.taskId === "T1" && e.data.gate === "review" && e.data.pass === false);
+    expect(reviewFails).toHaveLength(2); // REVIEW_ROUND_CAP
+    expect(new Set(reviewFails.map((e) => normalizeGateFailure(String(e.data.details)))).size).toBe(1);
+    expect(evsOf(repo, runId).some((e) => e.event === "gate-fingerprint-cap")).toBe(false);
+
+    // 2) the operator sides WITH the reviewer and funds one fixed attempt
+    await approve([runId, "T1", "--by", "test", "--uphold"], repo);
+
+    // 3) that funded attempt dies at dispatch — the dangerous case: BEFORE any worker-result
+    await runDaemon(repo, { adapters: [fake], runId, resume: true, driver: dispatchDeathDriver() });
+    const afterDeath = evsOf(repo, runId);
+    expect(recordedTaskFailureKind(afterDeath, "T1")).toBe("dispatch");
+    const lastDispatch = afterDeath.map((e) => e.event).lastIndexOf("task-dispatch");
+    expect(afterDeath.slice(lastDispatch).some((e) => e.event === "worker-result")).toBe(false);
+
+    // a stale prompt must not be able to answer for the retry
+    const promptPath = join(tickmarkrDir(repo), "runs", runId, "prompts", "T1-a0.md");
+    writeFileSync(promptPath, "STALE — no dispatch happened\n");
+    const dispatchesBefore = afterDeath.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").length;
+
+    // 4) the prescribed recovery
+    await runDaemon(repo, { adapters: [fake], runId, resume: true, retryFailed: true });
+    const evs = evsOf(repo, runId);
+    expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").length).toBeGreaterThan(dispatchesBefore);
+
+    // the retry reproduces the upheld finding BYTES — never a heading over an empty section
+    const prompt = readFileSync(promptPath, "utf8");
+    expect(prompt).not.toContain("STALE");
+    expect(prompt).toContain("## Previous attempt failed gates — fix these specifically");
+    expect(prompt).toContain("The operator UPHELD the reviewer's findings");
+    expect(prompt).toContain(upheldDetails);
+    expect(prompt).toContain("`applyBudget` in src/run/budget.ts ignores the configured cap");
+    const dispatchError = String([...afterDeath].reverse().find((e) => e.event === "task-failed"
+      && e.taskId === "T1")!.data.error);
+    expect(dispatchError).toBe("Error: pane wedged: dispatch never registered");
+    expect(prompt).toContain(`dispatch: ${dispatchError}`);
+  }, 240_000);
+});
+
+// ── R3 (OBS-186): a declined review is journal truth, and an honest decline is not a failed gate ──
+// The retired branch returned `pass: true` on a complexity comparison, so a review that never ran was
+// indistinguishable in the ledger from one that ran and approved. Participation is path-keyed now, the
+// decline says so, and the merge decision had to learn that an unrun gate is not a red one — otherwise
+// honesty alone would have parked every judge-only task at the merge it was never asked to review.
+
+/** A task whose declared paths are ALL leaf-class, and whose one commit stays inside that class. */
+const leafTaskRepo = () => setupRepo(
+  [T("T1", { files: ["docs/**", "CHANGELOG.md"] })],
+  { tasks: { T1: [{
+    shell: `mkdir -p docs && echo '# guide' > docs/guide.md && ${COMMIT} docs`,
+    result: { ok: true, summary: "documented the thing" },
+  }] } },
+);
+
+describe("R3 declined review — journal truth and merge (OBS-186)", () => {
+  test("test: a skipped review journals verdict skipped with a policy id and never pass true", async () => {
+    const { repo, fake } = leafTaskRepo();
+    await runDaemon(repo, { adapters: [fake], runId: "run-r3-journal" });
+
+    const evs = Journal.open(repo, "run-r3-journal").read();
+    const review = evs.filter((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "review");
+    expect(review).toHaveLength(1);
+    const data = review[0]!.data;
+    expect(data.pass).not.toBe(true); // a gate that never ran cannot claim a pass
+    expect(data.skipped).toBe(true);
+    expect(data.verdict).toBe("skipped");
+    expect(data.policy).toBe("judge-only"); // the policy id that declined it
+    expect(String(data.reason)).toMatch(/leaf/i); // …and why
+    expect(String(data.details)).toMatch(/^skipped\b/);
+    // the row is legible without the details prose: policy + reason are structured fields
+    expect(Object.keys(data)).toEqual(expect.arrayContaining(["verdict", "policy", "reason", "skipped"]));
+
+    // …and it does not claim a FAILURE either. `pass:false` for a decline is one boolean, but it is
+    // the boolean five folds outside the daemon key on, and none of them can see `skipped`: the
+    // engagement round budget, the operator's failed-gate list, the record's gate-failure total, the
+    // retry brief. Assert the REAL consumers on the REAL journal, not a hand-built row.
+    expect(data.pass).toBeUndefined(); // the ledger states no verdict it does not have
+    expect(reviewRoundsSinceApproval(evs, "T1")).toBe(0); // a skip never spends a review round
+    expect(journaledFailureBrief(evs, "T1")).toEqual([]); // …and never becomes "fix this" feedback
+    expect(evs.filter((e) => e.event === "gate-result" && e.data.pass === false)).toEqual([]);
+    // …and structured findings are never synthesised from a decline's prose
+    expect(data.findings).toBeUndefined();
+
+    // the engagement record: declined is its own state, counted in neither total
+    const md = renderMarkdownRecord("run-r3-journal", evs);
+    expect(md).toContain("review: declined");
+    expect(md).not.toContain("review: pass");
+    expect(md).not.toContain("review: fail");
+    expect(md).toMatch(/\*\*gate failures:\*\* none recorded/);
+  }, 60_000);
+
+  test("test: merge treats a review verdict of pass false with skipped true as non-failure and the task can merge", async () => {
+    const { repo, fake } = leafTaskRepo();
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-r3-merge" });
+
+    expect(s.done).toEqual(["T1"]); // the honest decline did not park the task
+    expect(s.human).toEqual([]);
+    const evs = Journal.open(repo, "run-r3-merge").read();
+    const review = evs.find((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "review")!;
+    // the exact shape the merge predicate has to accept: a GateResult carrying pass:false AND
+    // skipped:true (the ledger row drops the verdict it does not have — see the journal test above).
+    expect(review.data.skipped).toBe(true);
+    expect(review.data.pass).not.toBe(true);
+    expect(evs.some((e) => e.event === "merge" && e.taskId === "T1")).toBe(true);
+    expect(evs.some((e) => e.event === "task-done" && e.taskId === "T1")).toBe(true);
+    // …and it is the SKIP that is forgiven, never a red verdict: a review that RAN and failed still
+    // blocks, so the predicate cannot be read as "review no longer gates".
+    const { repo: red, fake: redFake } = setupRepo(
+      [T("T2", { files: ["src/run/daemon.ts"] })],
+      {
+        consult: { action: "human", notes: "reviewer blocked it" },
+        review: { approve: false, issues: ["the retry loop drops its last iteration"] },
+        tasks: { T2: [{ shell: `mkdir -p src/run && echo 'export const x = 1;' > src/run/daemon.ts && ${COMMIT} src`, result: { ok: true, summary: "changed source" } }] },
+      },
+    );
+    const blocked = await runDaemon(red, { adapters: [redFake], runId: "run-r3-red" });
+    expect(blocked.done).toEqual([]);
+    const redEvs = Journal.open(red, "run-r3-red").read();
+    const redReview = redEvs.find((e) => e.event === "gate-result" && e.taskId === "T2" && e.data.gate === "review")!;
+    expect(redReview.data.pass).toBe(false);
+    expect(redReview.data.skipped).toBeUndefined(); // a verdict, not a decline
+    expect(redEvs.some((e) => e.event === "merge" && e.taskId === "T2")).toBe(false);
+  }, 120_000);
 });

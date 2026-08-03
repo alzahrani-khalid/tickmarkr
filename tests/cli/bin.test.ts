@@ -9,6 +9,20 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ENTRY = join(ROOT, "dist/cli/index.js");
 const BINS = ["tickmarkr", "tkr"];
 const retiredBanner = `${["dro", "vr"].join("")} —`;
+const CONSUMER_SKILLS = ["skills/tickmarkr-loop/SKILL.md", "skills/tickmarkr-auto/SKILL.md"];
+const OVERSEER_SKILLS = ["skills/tickmarkr-overseer/SKILL.md", "skills/tickmarkr-overseer/scripts/watch-panes.sh"];
+
+// npm 11 prints `[{ files }]`; npm 12 prints `{ "<pkg>": { files } }`. Both reduce to one path list.
+const packFiles = (json: string): string[] => {
+  const parsed = JSON.parse(json) as unknown;
+  const [pack] = (Array.isArray(parsed) ? parsed : Object.values(parsed as object)) as { files: { path: string }[] }[];
+  return pack.files.map((file) => file.path);
+};
+
+const packedPaths = (): string[] => packFiles(execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: ROOT, encoding: "utf8" }));
+
+const asArrayShape = (paths: string[]) => JSON.stringify([{ files: paths.map((path) => ({ path })) }]);
+const asObjectShape = (paths: string[]) => JSON.stringify({ tickmarkr: { files: paths.map((path) => ({ path })) } });
 
 describe("package bins", () => {
   test("declares only tickmarkr and tkr", () => {
@@ -19,18 +33,26 @@ describe("package bins", () => {
   });
 
   test("packs consumer skills", () => {
-    const [pack] = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: ROOT, encoding: "utf8" })) as [{ files: { path: string }[] }];
-    expect(pack.files.map((file) => file.path)).toEqual(expect.arrayContaining(["skills/tickmarkr-loop/SKILL.md", "skills/tickmarkr-auto/SKILL.md"]));
+    expect(packedPaths()).toEqual(expect.arrayContaining(CONSUMER_SKILLS));
   });
 
   test("the packaged distribution includes the overseer skill and its pane watcher script alongside the existing driving skills", () => {
-    const [pack] = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: ROOT, encoding: "utf8" })) as [{ files: { path: string }[] }];
-    expect(pack.files.map((file) => file.path)).toEqual(expect.arrayContaining([
-      "skills/tickmarkr-overseer/SKILL.md",
-      "skills/tickmarkr-overseer/scripts/watch-panes.sh",
-      "skills/tickmarkr-loop/SKILL.md",
-      "skills/tickmarkr-auto/SKILL.md",
-    ]));
+    expect(packedPaths()).toEqual(expect.arrayContaining([...OVERSEER_SKILLS, ...CONSUMER_SKILLS]));
+  });
+
+  test("the pack assertion parses an npm 11 array fixture and an npm 12 object fixture to the same file list", () => {
+    const paths = [...OVERSEER_SKILLS, ...CONSUMER_SKILLS];
+    expect(packFiles(asArrayShape(paths))).toEqual(paths);
+    expect(packFiles(asObjectShape(paths))).toEqual(packFiles(asArrayShape(paths)));
+  });
+
+  test("both package-bin tests pass under whichever npm the host resolves, proven by running them against the normalizer with each fixture shape", () => {
+    const paths = [...OVERSEER_SKILLS, ...CONSUMER_SKILLS];
+    for (const fixture of [asArrayShape(paths), asObjectShape(paths)]) {
+      expect(packFiles(fixture)).toEqual(expect.arrayContaining(CONSUMER_SKILLS));
+      expect(packFiles(fixture)).toEqual(expect.arrayContaining([...OVERSEER_SKILLS, ...CONSUMER_SKILLS]));
+    }
+    expect(packedPaths()).toEqual(expect.arrayContaining([...OVERSEER_SKILLS, ...CONSUMER_SKILLS]));
   });
 
   test("the built CLI responds identically through every bin symlink", () => {

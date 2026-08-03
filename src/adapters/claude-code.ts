@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, MODEL_ID_RE, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
+import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
 // SPEND-01/SPEND-11: claude writes a per-session JSONL to ~/.claude/projects/<slug>/ where slug is the
 // realpath'd cwd with every non-alphanumeric char replaced by "-" (verified 114/114 — 36-DIAGNOSIS.md).
@@ -47,6 +47,61 @@ export const CLAUDE_TRUST_DIALOG: TrustDialog = {
   fingerprint: "Quick safety check: Is this a project you created or one you trust?",
   key: "Enter",
 };
+
+// OBS-201/262 nudge deliverability: claude-code is the ONLY member of NUDGEABLE_ADAPTERS, and the
+// driver's deliverTyped pincer (readiness stable-frame → type → read-back → verified submit) needs a
+// declared input box for any delivery whose command is not the adapter's own launch line — which a
+// nudge never is. Without this declaration `requireInputBox` was false, readiness fell back to
+// "the pane no longer echoes the command", and submission fell through to the positional fallback:
+// the rescue that OBS-262 widened the gate for could not be verifiably delivered to the one adapter
+// allowed to receive it.
+//
+// CAPTURED, not guessed (claude 2.1.220, tmux 120x30, 2026-08-03 — the state-to-PIXELS law):
+//     ────────────────────────────────────────────  ← full-width rule
+//     ❯ You are still assigned this task…       ← caret, NBSP, then the typed turn
+//     ────────────────────────────────────────────  ← full-width rule
+// Two findings the kimi-shaped guess would have got wrong, and both are fatal on their own:
+//   1. claude's editor is NOT a bordered ╭─╮ box — it is one row FENCED BY TWO RULES, so a
+//      `│ > ` fingerprint or a border-adjacency walk never fires.
+//   2. the caret is padded with U+00A0, not a space. A `"❯ "` fingerprint with an ASCII space
+//      matches nothing, ever — the OBS-152 failure mode exactly (six versions of "kimi is broken"
+//      were all anchored matchers meeting a TUI that renders differently than assumed).
+// `match` means THE EDITOR IS PAINTED and is deliberately true for an empty editor (readiness);
+// `emptyMatch` is the stricter "painted AND carrying nothing", which is what proves a submit
+// registered. Callers deciding submission must test emptyMatch first — see submissionRegistered.
+const CLAUDE_ANSI_SGR_RE = /\u001B\[[0-9;]*m/g;
+const CLAUDE_RULE_RE = /^─{8,}$/;
+const CLAUDE_CARET_RE = /^❯\u00A0/;
+const CLAUDE_CARET_EMPTY_RE = /^❯\u00A0\s*$/;
+// A wrapped or multi-line turn grows the editor downward before the closing rule.
+// ponytail: a fixed window, not a parser — raise it if a real capture ever shows a taller editor.
+const CLAUDE_MAX_EDITOR_ROWS = 8;
+
+function matchesClaudeEditor(paneText: string, empty: boolean): boolean {
+  // Trim ASCII margins ONLY: String.trim() eats U+00A0, which would erase the very byte that
+  // distinguishes claude's caret padding from an ordinary prompt line.
+  const lines = paneText.replace(CLAUDE_ANSI_SGR_RE, "").split("\n").map((l) => l.replace(/^[ \t]+|[ \t]+$/g, ""));
+  const caret = empty ? CLAUDE_CARET_EMPTY_RE : CLAUDE_CARET_RE;
+  return lines.some((line, i) => {
+    if (!caret.test(line)) return false;
+    if (i === 0 || !CLAUDE_RULE_RE.test(lines[i - 1])) return false;
+    for (let below = i + 1; below < lines.length && below <= i + CLAUDE_MAX_EDITOR_ROWS; below++) {
+      if (CLAUDE_RULE_RE.test(lines[below])) return true;
+    }
+    return false;
+  });
+}
+
+export const CLAUDE_INPUT_BOX = declareInputBox("claude-code", {
+  fingerprint: "❯\u00A0",
+  match: (paneText: string) => matchesClaudeEditor(paneText, false),
+  emptyMatch: (paneText: string) => matchesClaudeEditor(paneText, true),
+  // The launch line settles on a clean shell line; the editor paints after it. Both interactive
+  // entry points count — a resumed session re-enters the same TUI (OBS-142's launch distinction).
+  launchCommand: (command: string) => command.startsWith("claude --model ") || command.startsWith("claude -r "),
+  // The 2026-08-03 capture reached a painted editor ~10s after the trust answer on a warm install.
+  readinessTimeoutMs: 30_000,
+});
 
 export function claudeSlug(real: string): string {
   return real.replace(/[^A-Za-z0-9]/g, "-");
@@ -178,6 +233,7 @@ export const claudeCode: WorkerAdapter = {
   interactiveCommand: (promptFile: string, model: string) =>
     `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   trustDialog: CLAUDE_TRUST_DIALOG,
+  inputBox: CLAUDE_INPUT_BOX,
   resumeCommand: (sessionId: string, promptFile: string, model: string) =>
     `claude -r ${shq(sessionId)} --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {

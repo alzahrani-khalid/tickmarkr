@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { BANNER, GLYPHS, type Verdict, dim, fail, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import {
@@ -18,11 +20,70 @@ import {
   type TaskPhase,
 } from "../../run/journal.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
+import {
+  deriveRunCockpitData,
+  type RunCockpitData,
+  type TaskRow,
+} from "../../tui/cockpit/derive.js";
 
 // ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
 const REFRESH_MS = 2000;
 const NOT_COMPARABLE_NOTICE = "graph recompiled since this run — task states not comparable; resume with `--graph-changed` to audit this recompile";
 const PRIOR_GRAPH_MARKER = "prior graph";
+
+// One compact host-zone label per screen. Each event below is still converted from its own
+// complete UTC instant, so the zone's historical rules — including a transition within one frame
+// — stay intact rather than being rendered through this label's single sampled offset.
+const localZoneLabel = (reference = new Date()): string => {
+  const offset = -reference.getTimezoneOffset();
+  if (offset === 0) return "UTC";
+  const sign = offset < 0 ? "-" : "+";
+  const hours = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+  const minutes = Math.abs(offset) % 60;
+  return minutes === 0
+    ? `${sign}${hours}`
+    : `${sign}${hours}:${String(minutes).padStart(2, "0")}`;
+};
+
+const localClockText = (content: string, reference = new Date()): string => {
+  return content.replace(/\b([01]\d|2[0-3]):([0-5]\d):([0-5]\d)\b/gu, (_whole, h, m, s) => {
+    const instant = new Date(Date.UTC(
+      reference.getUTCFullYear(),
+      reference.getUTCMonth(),
+      reference.getUTCDate(),
+      Number(h),
+      Number(m),
+      Number(s),
+    ));
+    return [instant.getHours(), instant.getMinutes(), instant.getSeconds()]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":");
+  });
+};
+
+/** The complete journal instant behind a folded clock phrase, not a screen-wide offset sample. */
+const taskClockReference = (
+  events: readonly JournalEvent[],
+  taskId: string,
+  content: string,
+  fallback: Date,
+): Date => {
+  const utcClock = content.match(/\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\b/u)?.[0];
+  if (utcClock === undefined) return fallback;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.taskId !== taskId || event.ts.slice(11, 19) !== utcClock) continue;
+    const instant = new Date(event.ts);
+    if (Number.isFinite(instant.getTime())) return instant;
+  }
+  return fallback;
+};
+
+// Every attempt number a cell phrase carries is the engagement's own ladder (foldActivity counts
+// dispatch labels from 1). Name that ruler wherever a bare one appears, not only in the one phrase
+// shipping today — a phrase added upstream must not reach the operator unruled.
+const labelAttemptRuler = (text: string): string =>
+  text.replace(/(?<!engagement |run )\battempt (?=\d)/gu, "engagement attempt ");
 
 // The timer must keep the process ALIVE: an unref'd timer here let the event loop drain after the
 // first frame, so a live `--watch` printed once and exited 0 (OBS-11). Never unref this.
@@ -247,6 +308,25 @@ export const taskBox = (status: TaskStatus): string => {
   return "[ ]";
 };
 
+type SurfaceTaskState = TaskStatus | NonNullable<TaskRow["state"]>;
+
+const graphTaskStatus = (state: SurfaceTaskState | undefined, fallback: TaskStatus): TaskStatus => {
+  if (state === "completed" || state === "done") return "done";
+  if (state === "interrupted") return "failed";
+  return state ?? fallback;
+};
+
+const surfaceStatusWord = (state: SurfaceTaskState): string => {
+  if (state === "human") return "parked";
+  return state;
+};
+
+const surfaceTaskBox = (state: SurfaceTaskState, merged: boolean): string => {
+  if (merged) return "[x]";
+  if (state === "failed" || state === "human") return "[!]";
+  return "[ ]";
+};
+
 export const gateBox = (state: "open" | "pass" | "fail" | "skip", unicode: boolean): string => {
   if (unicode) {
     // shared glyph vocabulary: pass/fail verdicts, dash for skip, dim circle for not-yet-run
@@ -438,7 +518,7 @@ const tipVerifyText = (phase: TipVerifyPhase): string => {
   if (phase.state === "pending") return "tip-verify: pending";
   const gates = phase.gates.length ? phase.gates.join(", ") : "gate unknown";
   const failed = `tip-verify: FAILED (${gates})`;
-  const reverify = phase.state === "re-verifying" ? ` → re-verifying (attempt ${phase.attempt})` : "";
+  const reverify = phase.state === "re-verifying" ? ` → re-verifying (run attempt ${phase.attempt})` : "";
   const fingerprints = phase.fingerprints === undefined
     ? ""
     : ` · ${phase.fingerprints} fingerprint${phase.fingerprints === 1 ? "" : "s"}`;
@@ -491,16 +571,30 @@ const statusEngagement = (events: JournalEvent[], loadedHash: string): StatusEng
   return { comparable: baseline.comparable };
 };
 
+// The journal's own reader rule (src/run/journal.ts readJsonl), applied to bytes already in hand:
+// skip blanks, drop a line that will not parse (a torn trailing write after a crash), keep the rest.
+const parseJournalSnapshot = (raw: string): JournalEvent[] =>
+  raw.split("\n").flatMap((line) => {
+    if (!line.trim()) return [];
+    try {
+      return [JSON.parse(line) as JournalEvent];
+    } catch {
+      return [];
+    }
+  });
+
 const renderFrame = (
   cwd: string,
   now = Date.now(),
   animationFrame = 0,
   workerLiveness = new Map<string, WorkerLiveness>(),
+  journalRowsOnly = false,
 ): RenderedFrame => {
   const g = loadGraph(cwd);
   const runId = Journal.latestRunId(cwd, { withJournal: true });
   const assignments = new Map<string, string>();
   let replayed: Map<string, TaskStatus> | null = null;
+  let cockpit: RunCockpitData | undefined;
   let events: JournalEvent[] = [];
   const contexts = new Map<string, number>();
   let comparable = false;
@@ -508,7 +602,23 @@ const renderFrame = (
   let supersededBy: string | undefined; // v1.53 T5: this run is dead — a newer run replaced it
   if (runId) {
     const j = Journal.open(cwd, runId);
-    events = j.read();
+    // ONE byte snapshot per frame. The cockpit fold and every decoration below — foldActivity,
+    // livePhases, tipVerifyPhase, gateSnapshot, the failure and liveness readings — fold THESE
+    // bytes and nothing else, so a line the daemon appends mid-frame can never pair newer task
+    // rows against older activity, phases, gates or tip state. `Journal.open` refuses a run
+    // without a journal, so the file is there to read.
+    const raw = readFileSync(join(j.dir, "journal.jsonl"), "utf8");
+    events = parseJournalSnapshot(raw);
+    // The daemon creates journal.jsonl with lock-reclaimed before run-start and a reader may also
+    // catch an empty/torn first write. Those snapshots own no task fold yet; once run-start exists,
+    // however, a fold failure is unexpected and must surface instead of becoming a false empty run.
+    if (journalRowsOnly && events.some((event) => event.event === "run-start")) {
+      cockpit = deriveRunCockpitData(
+        { fileName: `${runId}.journal.jsonl`, raw },
+        "status",
+        { graph: g },
+      );
+    }
     const sup = [...events].reverse().find((e) => e.event === "superseded" && typeof e.data.by === "string");
     supersededBy = sup?.data.by as string | undefined;
     // The resume comparator is the fail-closed baseline; a matching graph-rehash is the daemon's
@@ -517,11 +627,13 @@ const renderFrame = (
     comparable = engagement.comparable;
     rehashAt = engagement.rehashAt;
     if (comparable) {
-      replayed = j.replayStatuses();
+      if (!journalRowsOnly) replayed = j.replayStatuses();
       for (const e of events) {
-        if (e.event === "task-dispatch" && e.taskId) {
+        if (!journalRowsOnly && e.event === "task-dispatch" && e.taskId) {
           const a = e.data.assignment as { adapter?: string; model?: string };
-          if (typeof a.adapter === "string" && typeof a.model === "string") assignments.set(e.taskId, `${a.adapter}:${a.model}`);
+          if (typeof a.adapter === "string" && typeof a.model === "string") {
+            assignments.set(e.taskId, `${a.adapter}:${a.model}`);
+          }
         }
         if (e.event === "context-sample" && e.taskId && typeof e.data.tokens === "number" && Number.isFinite(e.data.tokens)) {
           contexts.set(e.taskId, e.data.tokens as number); // last write wins
@@ -529,7 +641,36 @@ const renderFrame = (
       }
     }
   }
-  const effective: RunGraph = { ...g, tasks: g.tasks.map((t) => ({ ...t, status: replayed?.get(t.id) ?? t.status })) };
+  const taskRows = new Map(cockpit?.taskRows.map((row) => [row.taskId, row]) ?? []);
+  const clockFallback = new Date(now);
+  const recordedClock = new Date(events.at(-1)?.ts ?? now);
+  const zoneReference = Number.isFinite(recordedClock.getTime()) ? recordedClock : clockFallback;
+  const effective: RunGraph = {
+    ...g,
+    tasks: g.tasks.map((task) => ({
+      ...task,
+      status: comparable
+        ? journalRowsOnly
+          ? graphTaskStatus(taskRows.get(task.id)?.state, task.status)
+          : replayed?.get(task.id) ?? task.status
+        : task.status,
+    })),
+  };
+  const renderedTasks = journalRowsOnly
+    ? cockpit !== undefined && comparable
+      ? g.tasks.filter((task) => {
+        const row = taskRows.get(task.id);
+        return row !== undefined && (
+          row.state !== undefined
+          || row.lastEventTime !== undefined
+          || row.attempts !== undefined
+          || row.actor !== undefined
+          || row.merged === true
+          || row.parkKind !== undefined
+        );
+      })
+      : []
+    : g.tasks;
   const starved = new Set(blockedTasks(effective).map((t) => t.id));
   // OBS-104: ONE activity fold feeds both surfaces — never re-derived here. Comparable events only
   // (a recompiled graph's journal must not animate the wrong tasks); with no or stale journal the
@@ -538,7 +679,10 @@ const renderFrame = (
   const unicode = visual();
   const divider = unicode ? " · " : " / ";
   const width = process.stdout.columns ?? 120;
-  const done = effective.tasks.filter((t) => t.status === "done").length;
+  const done = journalRowsOnly
+    ? renderedTasks.filter((task) => graphTaskStatus(taskRows.get(task.id)?.state, task.status) === "done").length
+    : effective.tasks.filter((task) => task.status === "done").length;
+  const total = g.tasks.length;
   const ended = comparable && runHasEnded(events);
   const tipPhase = comparable ? tipVerifyPhase(events) : undefined;
   const taskIds = new Set(g.tasks.map((task) => task.id));
@@ -546,8 +690,10 @@ const renderFrame = (
   for (const taskId of phases.keys()) if (!taskIds.has(taskId)) phases.delete(taskId);
   const hotPhase = [...phases.values()].sort((a, b) => a.order - b.order).at(-1);
 
-  const cells = g.tasks.map((t) => {
-    const st = replayed?.get(t.id) ?? t.status;
+  const cells = renderedTasks.map((t) => {
+    const folded = journalRowsOnly && comparable ? taskRows.get(t.id) : undefined;
+    const st: SurfaceTaskState = folded?.state ?? replayed?.get(t.id) ?? t.status;
+    const merged = journalRowsOnly ? folded?.merged === true : st === "done" || st === "completed";
     const failureKind = comparable ? recordedTaskFailureKind(events, t.id) : undefined;
     const terminal = st === "failed" || st === "human";
     // Unknown legacy task-failed events stay red. Typed availability noise is warn-tier only while
@@ -559,29 +705,38 @@ const renderFrame = (
     );
     const livePhase = phases.get(t.id);
     const isStarved = !livePhase && starved.has(t.id);
-    const phrase = livePhase ? phaseDetail(livePhase, now, workerLiveness.get(t.id)) : isStarved ? undefined : activity.cells.get(t.id);
+    const rawPhrase = livePhase ? phaseDetail(livePhase, now, workerLiveness.get(t.id)) : isStarved ? undefined : activity.cells.get(t.id);
+    const phrase = rawPhrase === undefined
+      ? undefined
+      : journalRowsOnly
+        ? labelAttemptRuler(localClockText(
+          rawPhrase,
+          taskClockReference(events, t.id, rawPhrase, clockFallback),
+        ))
+        : rawPhrase;
     const label = isStarved ? " starved" : phrase ? ` ${phrase}` : "";
-    const channel = assignments.get(t.id) ?? "-";
+    const channel = journalRowsOnly ? folded?.actor ?? "-" : assignments.get(t.id) ?? "-";
     const ctx = contexts.get(t.id);
     const assignCol = ctx !== undefined ? `${channel}${divider}ctx ${ctx}` : channel;
     const gates = comparable
       ? gateSnapshot(t, events, rehashAt)
       : { states: defaultGateStates(t), priorGraph: false };
-    return { t, st, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, ...gates };
+    return { t, st, merged, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, ...gates };
   });
 
   if (!unicode) {
     // machine/CI surface — journals without phase-start stay byte-identical; new phase-aware frames
     // use an ASCII spinner so pipes never receive terminal-only braille/ANSI.
-    const rows = cells.map(({ t, st, label, assignCol, livePhase, states, priorGraph }) => {
+    const rows = cells.map(({ t, st, merged, label, assignCol, livePhase, states, priorGraph }) => {
       const chain = gateChain(states, false);
-      const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${taskBox(st)} ${t.id} `;
-      const suffix = `  ${chain}${priorGraph ? ` ${PRIOR_GRAPH_MARKER}` : ""}  ${livePhase ? "running" : String(st)}${label}  ${assignCol}`;
+      const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${surfaceTaskBox(st, merged)} ${t.id} `;
+      const suffix = `  ${chain}${priorGraph ? ` ${PRIOR_GRAPH_MARKER}` : ""}  ${livePhase ? "running" : surfaceStatusWord(st)}${label}  ${assignCol}`;
       return `${prefix}${shortGoal(t.goal, Math.max(0, width - prefix.length - suffix.length))}${suffix}`;
     });
+    const zone = journalRowsOnly ? `${divider}zone ${localZoneLabel(zoneReference)}` : "";
     const header = runId
-      ? `tickmarkr status${divider}run ${runId}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, now).replaceAll(" · ", divider)}${tipPhase ? `${divider}${tipVerifyText(tipPhase)}` : ""}${divider}${tipPhase ? `${done}/${g.tasks.length} tasks done${divider}run not verified` : `${done}/${g.tasks.length} done`}`
-      : `tickmarkr status${divider}no runs yet${divider}${done}/${g.tasks.length} done`;
+      ? `tickmarkr status${divider}run ${runId}${zone}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, now).replaceAll(" · ", divider)}${tipPhase ? `${divider}${tipVerifyText(tipPhase)}` : ""}${divider}${tipPhase ? `${done}/${total} tasks done${divider}run not verified` : `${done}/${total} done`}`
+      : `tickmarkr status${zone}${divider}no runs yet${divider}${done}/${total} done`;
     const legendLine = `  gates: ${GATE_NAMES.map((gate) => `${GATE_KEYS[gate]} ${gate}`).join(divider)}`;
     return {
       content: [header, legendLine, ...rows].join("\n"),
@@ -598,7 +753,7 @@ const renderFrame = (
   const dot = dim(" · ");
   const anyFailed = cells.some((c) => c.redTier);
   const gaugeCells = 10;
-  const fill = g.tasks.length ? Math.round((done / g.tasks.length) * gaugeCells) : 0;
+  const fill = total ? Math.round((done / total) * gaugeCells) : 0;
   const tipFailed = tipPhase?.state === "failed";
   const progressTone = anyFailed || tipFailed ? fail : tipPhase ? warn : ok;
   const gauge = (fill ? progressTone("█".repeat(fill)) : "") + (fill < gaugeCells ? dim("░".repeat(gaugeCells - fill)) : "");
@@ -608,16 +763,17 @@ const renderFrame = (
     .replace(/\balive\b/, ok("alive"))
     .replaceAll(" · ", dot);
   const tally = tipPhase
-    ? `${progressTone(`${done}/${g.tasks.length} tasks done`)}${dot}${progressTone("run not verified")}`
-    : `${done}/${g.tasks.length} done`;
+    ? `${progressTone(`${done}/${total} tasks done`)}${dot}${progressTone("run not verified")}`
+    : `${done}/${total} done`;
   const tipStatus = tipPhase
     ? `${tipFailed ? fail(tipVerifyText(tipPhase)) : warn(tipVerifyText(tipPhase))}${dot}`
     : "";
-  const header = ` ${title(runId ? `run ${runId}` : "tickmarkr")}${dot}` +
+  const zone = journalRowsOnly ? `zone ${localZoneLabel(zoneReference)}${dot}` : "";
+  const header = ` ${title(runId ? `run ${runId}` : "tickmarkr")}${dot}${zone}` +
     (runId
       ? `${supersededBy ? `${warn(`superseded by ${supersededBy}`)}${dot}` : ""}${!comparable ? `${warn(NOT_COMPARABLE_NOTICE)}${dot}` : ""}${live}${dot}${tipStatus}`
       : `no runs yet${dot}`) +
-    `${gauge} ${tipPhase ? tally : done === g.tasks.length && g.tasks.length > 0 ? ok(tally) : tally}`;
+    `${gauge} ${tipPhase ? tally : done === total && total > 0 ? ok(tally) : tally}`;
   const hr = rule(Math.min(width, 100));
   // OBS-104 run-level now line: names the most recent journal event. TTY frame only — the non-TTY
   // machine surface is byte-pinned (status-brand golden) and must not drift. Rendered BELOW the task
@@ -630,27 +786,28 @@ const renderFrame = (
   // aligned under the goal: gate chain, live activity phrase (or channel), ctx. Long channel names
   // and activity phrases live on line 2 only, so they can never squeeze the goal or wrap line 1.
   const taskVerdict = (c: (typeof cells)[number]): Verdict =>
-    c.st === "done" ? "pass" : c.redTier ? "fail" : c.st === "failed" || c.st === "human" ? "warn" : "neutral";
+    c.merged ? "pass" : c.redTier ? "fail" : c.st === "failed" || c.st === "human" ? "warn" : "neutral";
   const statusWord = (c: (typeof cells)[number]): string =>
-    c.livePhase ? "running" : c.redTier ? "failed" : c.st === "failed" ? "warn" : String(c.st);
+    c.livePhase ? "running" : c.redTier ? "failed" : c.st === "failed" ? "warn" : surfaceStatusWord(c.st);
   const idW = Math.max(...cells.map((c) => c.t.id.length), 2);
   // plain-text status suffixes for width math only — starved / failed gate names / approval hint
   const suffixPlain = (c: (typeof cells)[number]): string =>
-    (c.isStarved ? " · starved" : "") + failedSuffix(c.states) + humanGateSuffix(c.t, c.st, c.states);
+    (c.isStarved ? " · starved" : "") + failedSuffix(c.states)
+    + humanGateSuffix(c.t, graphTaskStatus(c.st, c.t.status), c.states);
   const stW = Math.max(...cells.map((c) => statusWord(c).length + suffixPlain(c).length));
   const avail = Math.max(8, width - (5 + idW) - 2 - stW);
   const goals = cells.map((c) => shortGoal(c.t.goal, avail));
   const goalW = Math.max(8, ...goals.map((s) => s.length));
   const indent = " ".repeat(idW + 5); // line 2 starts under the goal column
   const rows = cells.map((c, i) => {
-    const { t, st, failureKind, redTier, states, priorGraph, isStarved, phrase, channel, ctx, livePhase } = c;
+    const { t, st, merged, failureKind, redTier, states, priorGraph, isStarved, phrase, channel, ctx, livePhase } = c;
     const word = statusWord(c);
     const staleWorker = livePhase?.phase === "worker"
       && workerOutputAge(livePhase, now, workerLiveness.get(t.id)) >= 60_000;
-    const stWord = staleWorker ? warn(word) : st === "done" ? ok(word) : redTier ? fail(word) : st === "failed" || st === "human" ? warn(word) : word;
+    const stWord = staleWorker ? warn(word) : merged ? ok(word) : redTier ? fail(word) : st === "failed" || st === "human" ? warn(word) : word;
     // a fail names its gate in words right here — the one moment gate identity is needed on a row
     const f = failedGates(states);
-    const human = humanGateSuffix(t, st, states);
+    const human = humanGateSuffix(t, graphTaskStatus(st, t.status), states);
     const statusCell = stWord +
       (isStarved ? dot + fail("starved") : "") +
       (f.length ? dot + fail(f.join(", ")) : "") +
@@ -790,7 +947,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
           if (bounded) eventLines.push(line);
         }
       } else {
-        frame = renderFrame(cwd, nowMs, i, workerLiveness);
+        frame = renderFrame(cwd, nowMs, i, workerLiveness, true);
         if (tty) {
           updateTitle(frame.hotPhase, nowMs);
           process.stdout.write(`\x1b[2J\x1b[H${BANNER}${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);

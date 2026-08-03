@@ -1,7 +1,11 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Assignment, type BillingChannel, channelKey, type WorkerAdapter } from "../adapters/types.js";
-import { DEFAULT_DIFF_CAP, type TickmarkrConfig, TIER_RANK } from "../config/config.js";
+import { type Assignment, type BillingChannel, channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
+import {
+  criticalPathHits, DEFAULT_DIFF_CAP, DEFAULT_REVIEW_CRITICAL_PATHS, declaredReviewPolicy,
+  isReviewLeafPath, raiseReviewPolicy, type ReviewPolicy, REVIEW_VERSION_MIRRORS,
+  type TickmarkrConfig, TIER_RANK,
+} from "../config/config.js";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
@@ -236,6 +240,36 @@ export function setAsideRegenerableCaptures(diff: string): string {
   return sections.map((s) => setAsideSection(s, kindOnly)).join("");
 }
 
+/**
+ * The paths this task's diff ACTUALLY touched. `-z` so a path carrying spaces or non-ASCII bytes is
+ * never mangled by git's quoting, `--no-renames` so a rename reports BOTH sides: a file renamed OUT of
+ * the leaf class must be visible to the promotion test, and rename detection would hide the old side.
+ */
+export async function changedPaths(worktree: string, baseRef: string): Promise<string[]> {
+  const out = await shOk(`git diff --name-only --no-renames -z '${baseRef}..HEAD'`, worktree);
+  return [...new Set(out.split("\0").map((p) => p.trim()).filter(Boolean))].sort();
+}
+
+/**
+ * A root manifest is a version MIRROR only when the bump is all it changed. `package.json` carries the
+ * gate commands and the dependency set, so a diff that moves `scripts` or `dependencies` is executable
+ * behaviour wearing a leaf-class path — the one thing a path predicate can never see for itself. Every
+ * added or removed line must be a `"version":` line (a lockfile bump rewrites several of them); a
+ * manifest whose diff cannot be read at all fails closed, out of the class.
+ */
+const VERSION_FIELD_LINE_RE = /^[+-]\s*"version":\s*"[^"]*",?\s*$/;
+
+export async function mirrorsVersionOnly(worktree: string, baseRef: string, path: string): Promise<boolean> {
+  let diff: string;
+  try {
+    diff = await shOk(`git diff -U0 '${baseRef}..HEAD' -- ${shq(path)}`, worktree);
+  } catch {
+    return false;
+  }
+  const changed = diff.split("\n").filter((l) => /^[+-]/.test(l) && !/^(?:\+\+\+|---)/.test(l));
+  return changed.length > 0 && changed.every((l) => VERSION_FIELD_LINE_RE.test(l));
+}
+
 export async function fetchTaskDiff(worktree: string, baseRef: string): Promise<{ full: string; forCap: string }> {
   const full = setAsideRegenerableCaptures(await shOk(`git diff '${baseRef}..HEAD'`, worktree));
   const forCap = setAsideRegenerableCaptures(await shOk(`git diff -U0 '${baseRef}..HEAD'`, worktree));
@@ -320,9 +354,79 @@ export async function reviewGate(
   // direct tests) skips persistence and changes nothing else.
   artifactDir?: string,
 ): Promise<GateResult> {
-  if (task.complexity < cfg.review.complexityThreshold) {
-    return { gate: "review", pass: true, details: `skipped — complexity ${task.complexity} < threshold ${cfg.review.complexityThreshold}`, meta: { skipped: true } };
+  // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
+  // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
+  // retired — the branch that returned a green skip on a complexity comparison is gone, and with it the
+  // "a law caps complexity at 3, the gate starts at 7" unreachability OBS-186 measured.
+  //
+  // COLLATERAL this rescoped task closed: the run-gates/daemon participation assertions are rewritten
+  // path-keyed, the NamedFake review fixtures carry their own nonce trailer (llm.ts's injection is
+  // scoped to adapter id "fake" and a renamed fake is a different adapter to it — the check is not
+  // weakened, the fixture is fixed), the merge decision reads `gateSatisfied`, and the daemon writes a
+  // parallel round's gate-result rows in GATE_NAMES order (src/run/daemon.ts).
+  //
+  // That last one is why: retiring the switch makes fixtures that used to SKIP review journal TWO
+  // verdict rows per round instead of one, and judge ‖ review publish in COMPLETION order — so the
+  // three journal-determinism oracles (tests/run/narration.test.ts's byte comparison and its
+  // throwing-sink event-order check, tests/run/notify-identity.test.ts's two-run equality, and this
+  // repo's own phase-start/gate-result pairing in tests/run/daemon.test.ts) start seeing a race.
+  // LATENT, not introduced: the operator's config has run `complexityThreshold: 0` since 2026-07-31,
+  // so production rounds have journaled both siblings all along — only the fixtures were blind to it.
+  // Fixed in the ledger rather than in the oracles, because determinism run-to-run is a property of
+  // the journal, not of three test files that happen to assert it.
+  const declaredPolicy = declaredReviewPolicy(task.files);
+  const policy = raiseReviewPolicy(declaredPolicy, cfg.review.policy);
+  // PROMOTION: the declared assignment is a claim about paths, and the diff is the evidence. A
+  // judge-only task whose diff left the leaf class is reviewed in full — the claim never outranks
+  // what actually happened, and an empty diff promotes too (a skip earned by an absence is not earned).
+  let promotedBy: string[] | null = null;
+  if (policy === "judge-only") {
+    const touched = await changedPaths(worktree, baseRef);
+    // Two ways a path leaves the leaf class. It is not a member (`docs/tool.ts`, `docs/Makefile`) — or
+    // it is a root version mirror whose diff moved more than the version field, which no path predicate
+    // can see. `package.json` carries the gate commands, so a scripts edit hiding behind a leaf-class
+    // path is exactly the promotion this buys.
+    const nonMembers = touched.filter((p) => !isReviewLeafPath(p));
+    const impostorMirrors = (await Promise.all(
+      touched.filter((p) => REVIEW_VERSION_MIRRORS.has(p))
+        .map(async (p) => await mirrorsVersionOnly(worktree, baseRef, p) ? null : p),
+    )).filter((p): p is string => p !== null);
+    // The fail-closed backstop for the compile lint. reviewParticipationErrors runs at a repo root the
+    // compile seam cannot always name (collateral.ts); THIS gate is handed the run's real config, so a
+    // critical path that reached dispatch is reviewed here whatever the lint saw. The shipped defaults
+    // are unioned in for the same reason they are there: a config that names none still has a floor.
+    const criticalHits = criticalPathHits(
+      [...task.files, ...touched],
+      [...new Set([...DEFAULT_REVIEW_CRITICAL_PATHS, ...(cfg.review.criticalPaths ?? [])])],
+    );
+    const escaped = [...new Set([...nonMembers, ...impostorMirrors, ...criticalHits])].sort();
+    if (touched.length > 0 && escaped.length === 0) {
+      // A declined review makes NO green claim. types.ts's T11 note ("pass stays true so enforcement is
+      // unchanged") describes the baseline skips — a build/test/lint command the repo never configured.
+      // R3 overrules it here: a cross-vendor review that did not run cannot report a pass, so the record
+      // carries verdict "skipped" with the policy that declined it and the reason, and pass is never
+      // true. The merge-predicate seam this opens is named in the collateral note above.
+      return {
+        gate: "review",
+        pass: false,
+        details: `skipped — reviewPolicy judge-only: every declared path is docs/CHANGELOG/RELEASING/version-mirror leaf work and the diff stayed in that class (${touched.join(", ")})`,
+        meta: {
+          skipped: true,
+          verdict: "skipped",
+          policy: "judge-only" satisfies ReviewPolicy,
+          reason: "every declared path and every path this diff touched is provably leaf-class work",
+          paths: touched,
+        },
+      };
+    }
+    promotedBy = escaped.length > 0 ? escaped : [];
   }
+  // Every verdict this gate reports from here on was produced under `full` — either declared full, or
+  // promoted here. `promotedBy` names the paths that bought the promotion, so the record shows WHY.
+  const policyMeta: Record<string, unknown> = {
+    policy: "full" satisfies ReviewPolicy,
+    ...(promotedBy ? { promotedFrom: declaredPolicy, promotedBy } : {}),
+  };
   const reviewer = pickReviewer(author, channels, excludeReviewers ?? [], cfg.review.prefer ?? []);
   if (!reviewer) {
     // meta.noEligibleReviewer lets run-gates' review-retry keep the ORIGINAL unparseable result when
@@ -398,7 +502,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
       gate: "review",
       pass: false,
       details: `review output unparseable (reviewer ${reviewer.adapter}:${reviewer.model}; cause: ${cause}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
-      meta: { reviewer: channelKey(reviewer), unparseable: true, cause },
+      meta: { ...policyMeta, reviewer: channelKey(reviewer), unparseable: true, cause },
     };
   }
   const decided = findings !== null
@@ -409,6 +513,6 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     gate: "review",
     pass: decided.pass,
     details: appendAnchoredReview(prose, v),
-    meta: { reviewer: channelKey(reviewer) },
+    meta: { ...policyMeta, reviewer: channelKey(reviewer) },
   };
 }

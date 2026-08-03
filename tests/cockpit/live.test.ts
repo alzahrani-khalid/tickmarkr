@@ -15,11 +15,15 @@ import { createElement } from "react";
 import { describe, expect, test, vi } from "vitest";
 import { GLYPHS } from "../../src/brand.js";
 import { PLAIN_COMPACT_LOCKUP } from "../../src/brand.js";
+import { status } from "../../src/cli/commands/status.js";
 import { ui } from "../../src/cli/commands/ui.js";
+import { graphDefinitionHash, saveGraph } from "../../src/graph/graph.js";
+import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 import { runViewRowIdentities } from "../../src/tui/cockpit/derive.js";
 import {
   deriveLiveRunCockpitData,
+  liveRunViewRowIds,
   liveRunPointerSurface,
   loadEngagementSource,
   runLiveCockpit,
@@ -35,6 +39,7 @@ import {
 import { RUN_VIEWS } from "../../src/tui/cockpit/views.js";
 import {
   assertFrameConformance,
+  deriveRunViewRows,
   planRunCockpitFrame,
   RunCockpitFrame,
   RunCockpitFrameFromPlan,
@@ -89,7 +94,54 @@ const rawOf = (events: readonly JournalEvent[]): string =>
 const stripAnsi = (value: string): string =>
   value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 
-async function frameFor(raw: string, now?: () => number): Promise<string> {
+/** Independent host-zone oracle: a fixed UTC instant converted by a named IANA rule set. */
+const clockInZone = (iso: string, timeZone: string): string =>
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date(iso));
+
+/** Every attempt number a surface prints without saying which ruler counted it. */
+const bareAttemptReadings = (text: string): string[] =>
+  [...text.matchAll(/(?<!engagement |run )\battempts? \d+/gu)].map(([reading]) => reading);
+
+/** The numbers a surface reports on one named ruler, in order and deduplicated. */
+const attemptReadings = (text: string, ruler: "engagement" | "run"): string[] => [
+  ...new Set(
+    [...text.matchAll(new RegExp(String.raw`\b${ruler} attempts? (\d+)`, "gu"))]
+      .map(([, count]) => count as string),
+  ),
+];
+
+/** The text of the counters the ui composes itself, as opposed to the fold records it surrenders. */
+const taskRowText = (data: RunCockpitData): string =>
+  deriveRunViewRows(data, "tasks").map((row) => row.text).join("\n");
+
+/** The attempt the fold's newest record names for a task — the engagement's own label. */
+const foldedEngagementAttempt = (data: RunCockpitData, taskId: string): string | undefined =>
+  deriveRunViewRows(data, "journal")[0]?.text
+    .match(new RegExp(String.raw`^${taskId} attempt (\d+)\b`, "u"))?.[1];
+
+const hostZoneLabel = (): string => {
+  const offset = -new Date().getTimezoneOffset();
+  if (offset === 0) return "UTC";
+  const sign = offset < 0 ? "-" : "+";
+  const hours = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+  const minutes = Math.abs(offset) % 60;
+  return minutes === 0
+    ? `${sign}${hours}`
+    : `${sign}${hours}:${String(minutes).padStart(2, "0")}`;
+};
+
+async function frameFor(
+  raw: string,
+  now?: () => number,
+  fileName = "run-live-test.journal.jsonl",
+  graph?: Parameters<typeof deriveLiveRunCockpitData>[3],
+): Promise<string> {
   const output = new PassThrough() as PassThrough & {
     isTTY: boolean;
     columns: number;
@@ -110,11 +162,7 @@ async function frameFor(raw: string, now?: () => number): Promise<string> {
     painted = resolve;
   });
   const app = render(createElement(RunCockpitFrame, {
-    data: deriveLiveRunCockpitData(
-      { fileName: "run-live-test.journal.jsonl", raw },
-      "9.8.7",
-      now,
-    ),
+    data: deriveLiveRunCockpitData({ fileName, raw }, "9.8.7", now, graph),
     columns: 140,
     rows: 40,
   }), {
@@ -134,6 +182,7 @@ async function plannedFrameAt(
   columns: number,
   rows: number,
   interaction: RunInteractionState = initialRunInteractionState(),
+  graph?: Parameters<typeof deriveLiveRunCockpitData>[3],
 ): Promise<{
   readonly frame: string;
   readonly plan: PlannedFrame;
@@ -156,6 +205,8 @@ async function plannedFrameAt(
   const data = deriveLiveRunCockpitData(
     { fileName: "run-planned-frame.journal.jsonl", raw },
     "9.8.7",
+    Date.now,
+    graph,
   );
   const plannedFrame = planRunCockpitFrame({
     data,
@@ -199,6 +250,300 @@ function seedJournal(repo: string, runId: string, raw: string): void {
 }
 
 describe("live cockpit", () => {
+  test("test: an attempt counter names its ruler and the two surfaces agree when showing the same task", async () => {
+    const repo = mkRepo();
+    const graph = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: ["T1", "T2", "T3"].map((id) => ({
+        id,
+        title: id,
+        goal: `Render ${id}.`,
+        shape: "implement" as const,
+        complexity: 3,
+        acceptance: ["recorded"],
+      })),
+    });
+    const at = (second: number) => `2026-07-28T09:00:${String(second).padStart(2, "0")}.000Z`;
+    // T2 is on its SECOND dispatch: both surfaces consume T8's authoritative folded caption and
+    // task row, then name the distinct engagement and run rulers they display.
+    const events = [
+      ev("run-start", { branch: "spec/rulers", pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) }, at(0)),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "old" }, attempt: 0 }, at(1), "T1"),
+      ev("task-done", {}, at(8), "T1"),
+      ev("merge", {}, at(9), "T1"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "single" }, attempt: 0 }, at(10), "T3"),
+      ev("task-done", {}, at(11), "T3"),
+      ev("merge", {}, at(12), "T3"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "current" }, attempt: 0 }, at(13), "T2"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "current" }, attempt: 1 }, at(14), "T2"),
+    ];
+    const raw = rawOf(events);
+    saveGraph(repo, graph);
+    seedJournal(repo, "run-20260728-090001", raw);
+
+    const watch = await status(["--watch"], repo, { iterations: 1 });
+    const uiFrame = await frameFor(raw);
+    const data = deriveLiveRunCockpitData(
+      { fileName: "run-20260728-090001.journal.jsonl", raw },
+      "9.8.7",
+    );
+    const taskRows = deriveRunViewRows(data, "tasks");
+
+    expect(watch).toContain("T2");
+    expect(watch).toContain("engagement attempt 2");
+    expect(watch).not.toContain("engagement attempt 1");
+    expect(uiFrame).toContain("T2 · worker · engagement attempt 2 · fake:current");
+    expect(uiFrame).not.toContain("T1 · worker · engagement attempt 1 · fake:old");
+    expect(taskRows.find((row) => row.id === "task:T1")?.text).toContain("run attempt 1");
+    expect(taskRows.find((row) => row.id === "task:T2")?.text).toContain("run attempts 2");
+    expect(taskRows.find((row) => row.id === "task:T3")?.text).toContain("run attempt 1");
+    // Every attempt number these surfaces COMPOSE says which ruler counted it. (The journal view
+    // is excluded on purpose: it surrenders the fold's records untouched, wording included.)
+    expect(bareAttemptReadings(stripAnsi(watch))).toEqual([]);
+    expect(bareAttemptReadings(taskRowText(data))).toEqual([]);
+
+    // A RESUME restarts the engagement's attempt label while the run's dispatch count keeps
+    // climbing, so the two readings part company without the surface replacing the fold's caption.
+    const rt = (second: number) => `2026-07-29T09:00:${String(second).padStart(2, "0")}.000Z`;
+    const resumedRaw = rawOf([
+      ev("run-start", { branch: "spec/rulers", pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) }, rt(0)),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "old" }, attempt: 0 }, rt(1), "T1"),
+      ev("task-done", {}, rt(4), "T1"),
+      ev("merge", {}, rt(5), "T1"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "current" }, attempt: 0 }, rt(6), "T2"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "current" }, attempt: 1 }, rt(7), "T2"),
+      // the resume: the daemon restarts and redispatches T2 at label 0 — its THIRD dispatch
+      ev("run-start", { branch: "spec/rulers", pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) }, rt(8)),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "current" }, attempt: 0 }, rt(9), "T2"),
+    ]);
+    const resumedRepo = mkRepo();
+    saveGraph(resumedRepo, graph);
+    seedJournal(resumedRepo, "run-20260729-090001", resumedRaw);
+
+    const resumedWatch = stripAnsi(await status(["--watch"], resumedRepo, { iterations: 1 }));
+    const resumedFrame = await frameFor(resumedRaw);
+    const resumedData = deriveLiveRunCockpitData(
+      { fileName: "run-20260729-090001.journal.jsonl", raw: resumedRaw },
+      "9.8.7",
+    );
+    // Watch reads the engagement's own label; the caption reads the run's dispatch count. Neither
+    // borrows the other's ruler, so 1 and 3 can stand side by side without contradicting.
+    expect(resumedWatch).toContain("engagement attempt 1 in flight on fake:current");
+    expect(resumedFrame).toContain("T2 · worker · engagement attempt 1 · fake:current");
+    expect(resumedFrame).not.toContain("engagement attempt 3");
+    expect(deriveRunViewRows(resumedData, "tasks").find((row) => row.id === "task:T2")?.text)
+      .toContain("run attempts 3");
+    expect(bareAttemptReadings(resumedWatch)).toEqual([]);
+    expect(bareAttemptReadings(taskRowText(resumedData))).toEqual([]);
+    // And the engagement's own label — the one reading both surfaces do carry for T2 — is the same
+    // 1 on each. The ui's 3 is a different ruler, not a different answer to the same question.
+    expect(attemptReadings(resumedWatch, "engagement")).toEqual(["1"]);
+    expect(foldedEngagementAttempt(resumedData, "T2")).toBe("1");
+  });
+
+  test("progress renders the fold's authoritative same-second caption without graph-order re-derivation", async () => {
+    const sameSecond = "2026-07-28T10:00:01.000Z";
+    const graph = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      // Deliberately opposite journal order. TaskRow clocks tie at second precision, so a surface
+      // ranking these rows chooses T1 even though the fold's full event order names T2.
+      tasks: ["T2", "T1"].map((id) => ({
+        id,
+        title: id,
+        goal: `Render ${id}.`,
+        shape: "implement" as const,
+        complexity: 3,
+        acceptance: ["recorded"],
+      })),
+    });
+    const raw = rawOf([
+      ev("run-start", { branch: "spec/concurrent", pid: process.pid }, "2026-07-28T10:00:00.000Z"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "first" }, attempt: 0 }, sameSecond, "T1"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "second" }, attempt: 0 }, sameSecond, "T2"),
+    ]);
+    const data = deriveLiveRunCockpitData(
+      { fileName: "run-20260728-100000.journal.jsonl", raw },
+      "9.8.7",
+      Date.now,
+      graph,
+    );
+
+    expect(data.progressCaption).toMatch(/^T2 ·/u);
+    const frame = await frameFor(raw, undefined, "run-20260728-100000.journal.jsonl", graph);
+    expect(frame).toContain("T2 · worker · engagement attempt 1 · fake:second");
+    expect(frame).not.toContain("T1 · running");
+  });
+
+  test("the Tasks view and its selection identities omit graph-only placeholder rows", async () => {
+    const graph = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: ["T1", "T2"].map((id) => ({
+        id,
+        title: id,
+        goal: `Render ${id}.`,
+        shape: "implement" as const,
+        complexity: 3,
+        acceptance: ["recorded"],
+      })),
+    });
+    const raw = rawOf([
+      ev("run-start", { branch: "spec/rows", pid: process.pid }, "2026-07-28T10:00:00.000Z"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "recorded" }, attempt: 0 }, "2026-07-28T10:00:01.000Z", "T1"),
+    ]);
+    const data = deriveLiveRunCockpitData(
+      { fileName: "run-20260728-100000.journal.jsonl", raw },
+      "9.8.7",
+      Date.now,
+      graph,
+    );
+    const interaction = { ...initialRunInteractionState(), activeView: "tasks" as const };
+
+    expect(deriveRunViewRows(data, "tasks").map((row) => row.id)).toEqual(["task:T1"]);
+    expect(liveRunViewRowIds(interaction, data)).toEqual(["task:T1"]);
+    const tasks = await plannedFrameAt(raw, 140, 40, interaction, graph);
+    expect(tasks.frame).toContain("T1 · running · run attempt 1 · fake:recorded");
+    expect(tasks.frame).not.toContain("T2 · - · run attempts - · -");
+  });
+
+  test("test: an unmerged task-done renders unchecked on the Tasks view; only a merged task renders a checked pass", () => {
+    const raw = rawOf([
+      ev("run-start", { branch: "spec/landing", pid: process.pid }, "2026-07-28T09:00:00.000Z"),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "fake" }, attempt: 0 }, "2026-07-28T09:00:01.000Z", "T1"),
+      ev("task-done", {}, "2026-07-28T09:00:02.000Z", "T1"),
+    ]);
+    const completed = deriveLiveRunCockpitData(
+      { fileName: "run-landing.journal.jsonl", raw },
+      "9.8.7",
+    );
+    const foldedDoneWithoutLanding: RunCockpitData = {
+      ...completed,
+      taskRows: completed.taskRows.map((row) => ({ ...row, state: "done" as const })),
+    };
+    const landed: RunCockpitData = {
+      ...foldedDoneWithoutLanding,
+      taskRows: foldedDoneWithoutLanding.taskRows.map((row) => ({ ...row, merged: true as const })),
+    };
+
+    expect(deriveRunViewRows(completed, "tasks")[0]?.state).toBe("neutral");
+    expect(deriveRunViewRows(foldedDoneWithoutLanding, "tasks")[0]?.state).toBe("neutral");
+    expect(deriveRunViewRows(landed, "tasks")[0]?.state).toBe("pass");
+  });
+
+  test("the ui renders journal times in the host zone and names that zone once", async () => {
+    const previous = process.env.TZ;
+    process.env.TZ = "Asia/Riyadh";
+    try {
+      const start = "2026-07-14T08:00:00.000Z";
+      const gate = "2026-07-14T08:00:01.000Z";
+      const raw = rawOf([
+        ev("run-start", { branch: "spec/local-clock", pid: process.pid }, start),
+        ev("gate-result", { gate: "test", pass: true }, gate, "T1"),
+      ]);
+
+      const frame = await frameFor(raw);
+      const tasks = await plannedFrameAt(raw, 140, 40, {
+        ...initialRunInteractionState(),
+        activeView: "tasks",
+      });
+
+      expect(frame).toContain(clockInZone(gate, "Asia/Riyadh"));
+      expect(frame).not.toContain("08:00:01");
+      expect(frame.match(/zone \+03/gu)).toHaveLength(1);
+      expect(tasks.frame).toContain(clockInZone(gate, "Asia/Riyadh"));
+      expect(tasks.frame).not.toContain("14:00:01");
+      expect(tasks.frame.match(/zone \+03/gu)).toHaveLength(1);
+      expect(raw).toContain("2026-07-14T08:00:01.000Z");
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
+
+  // Same independent oracle as watch: complete instants plus a fixed IANA rule set. The compact
+  // screen label is not used to derive an expected clock or any other asserted output bytes.
+  test("the ui screen names the host zone once and converts every complete instant under its daylight-saving rules", async () => {
+    const previous = process.env.TZ;
+    process.env.TZ = "America/New_York";
+    try {
+      // The UTC clocks rise from 06:00 to 08:00 across a three-day gap, so source order plus
+      // HH:mm:ss cannot recover the omitted dates. Only the complete instants can select EST for
+      // the first row and EDT for the second.
+      const before = "2026-03-06T06:00:00.000Z"; // 01:00 EST — before the jump
+      const after = "2026-03-09T08:00:00.000Z"; // 04:00 EDT — after the jump
+      const raw = rawOf([
+        ev("run-start", { branch: "spec/dst", pid: process.pid }, before),
+        ev("gate-result", { gate: "test", pass: true }, after, "T1"),
+      ]);
+
+      const frame = await frameFor(raw, undefined, "run-20260306-010000.journal.jsonl");
+
+      expect(frame.match(/zone (?:UTC|[+-]\d{2}(?::\d{2})?)/gu)).toHaveLength(1);
+      expect(frame).toContain(clockInZone(before, "America/New_York"));
+      expect(frame).toContain(clockInZone(after, "America/New_York"));
+      expect(raw).toContain(before);
+      expect(raw).toContain(after);
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
+
+  test("test: the merged fold layer's public shape stays additive — its existing consumers pass unchanged against this task's tree in a composed fixture exercising this task's surface changes", async () => {
+    const previous = process.env.TZ;
+    process.env.TZ = "Asia/Riyadh";
+    try {
+      const start = "2026-07-28T09:00:00.000Z";
+      const dispatch = "2026-07-28T09:00:01.000Z";
+      const done = "2026-07-28T09:00:02.000Z";
+      const merged = "2026-07-28T09:00:03.000Z";
+      const raw = rawOf([
+        ev("run-start", { branch: "spec/composed", pid: process.pid }, start),
+        ev("task-dispatch", { assignment: { adapter: "fake", model: "worker" }, attempt: 0 }, dispatch, "T1"),
+        ev("task-done", {}, done, "T1"),
+        ev("merge", {}, merged, "T1"),
+      ]);
+      const data = deriveLiveRunCockpitData(
+        { fileName: "run-20260728-120000.journal.jsonl", raw },
+        "9.8.7",
+      );
+
+      // The pre-existing consumer reads only the original public fields. The fold's complete
+      // instant is extra information: the old projection and row identity remain untouched.
+      const existingConsumer = (row: (typeof data.journalRows)[number]) => ({
+        id: row.id,
+        time: row.time,
+        state: row.state,
+        text: row.text,
+      });
+      expect(deriveRunViewRows(data, "journal")).toBe(data.journalRows);
+      expect(data.journalRows.map(existingConsumer)).toEqual([
+        { id: "event:4", time: "09:00:03", state: "pass", text: "T1 attempt 1 fake:worker pass running" },
+        { id: "event:3", time: "09:00:02", state: "neutral", text: "T1 done · task-done" },
+        { id: "event:2", time: "09:00:01", state: "neutral", text: "T1 neutral · task-dispatch" },
+        { id: "event:1", time: "09:00:00", state: "neutral", text: "neutral · run-start" },
+      ]);
+      expect(data.journalRows.map((row) => row.timestamp)).toEqual([
+        merged,
+        done,
+        dispatch,
+        start,
+      ]);
+
+      const task = deriveRunViewRows(data, "tasks")[0];
+      expect(task).toMatchObject({ state: "pass", timestamp: merged });
+      expect(task?.text).toContain("run attempt 1");
+      const frame = await frameFor(raw, undefined, "run-20260728-120000.journal.jsonl");
+      expect(frame).toContain(clockInZone(merged, "Asia/Riyadh"));
+      expect(frame.match(/zone \+03/gu)).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
+
   test("test: an engagement whose daemon is alive renders as running, and one whose daemon is gone renders as interrupted rather than as running", async () => {
     const start = Date.parse("2026-07-26T12:00:00.000Z");
     const at = (seconds: number) => new Date(start + seconds * 1_000).toISOString();
@@ -660,36 +1005,158 @@ async function shippedPathConforms(
   expect(refusal).toBeUndefined();
 }
 
+type FrameContractSweepMode = "sampled" | "exhaustive";
+
+interface FrameContractSize {
+  readonly columns: number;
+  readonly rows: number;
+}
+
+const stridedAxis = (minimum: number, maximum: number, stride: number): number[] => {
+  const values: number[] = [];
+  for (let value = minimum; value <= maximum; value += stride) values.push(value);
+  if (values.at(-1) !== maximum) values.push(maximum);
+  return values;
+};
+
+/** One selector owns both breadths; sampled mode changes only the axis strides. */
+function frameContractSweepSizes(mode: FrameContractSweepMode): FrameContractSize[] {
+  const exhaustive = mode === "exhaustive";
+  const columns = stridedAxis(
+    FRAME_CONTRACT_DOMAIN.minColumns,
+    FRAME_CONTRACT_DOMAIN.maxColumns,
+    exhaustive ? 1 : 15,
+  );
+  const rows = stridedAxis(
+    FRAME_CONTRACT_DOMAIN.minRows,
+    FRAME_CONTRACT_DOMAIN.maxRows,
+    exhaustive ? 1 : 4,
+  );
+  return columns.flatMap((column) =>
+    rows.map((row) => ({ columns: column, rows: row })),
+  );
+}
+
+/** Every selected size, regardless of breadth, passes through this one production oracle. */
+async function expectFrameContractSize({
+  columns,
+  rows,
+}: FrameContractSize): Promise<void> {
+  const { frame, plan } = await plannedFrameAt(
+    PLANNED_FRAME_RAW,
+    columns,
+    rows,
+  ).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${columns}x${rows}: ${message}`);
+  });
+  expect(plan.kind, `${columns}x${rows}`).toBe("frame");
+  if (plan.kind !== "frame") throw new Error("contract size planned plain output");
+  expect(frame.split("\n"), `${columns}x${rows} row count`)
+    .toHaveLength(plan.size.rows);
+  expect(() => assertFrameConformance(plan, frame), `${columns}x${rows} regions`)
+    .not.toThrow();
+}
+
+async function expectFrameContractSweep(sizes: readonly FrameContractSize[]): Promise<void> {
+  let previousColumns: number | undefined;
+  for (const size of sizes) {
+    if (size.columns !== previousColumns) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      previousColumns = size.columns;
+    }
+    await expectFrameContractSize(size);
+  }
+}
+
 describe("run cockpit draw-time frame plan", () => {
-  test("test: every planned region is drawn at its planned offset and span, at every size in the contract domain", async () => {
+  test("test: the default sweep plans at most 150 sizes including all four domain corners and both extremes of each axis, and holds every planned size to the frame contract", async () => {
+    const planned = frameContractSweepSizes("sampled");
+    const keys = new Set(planned.map(({ columns, rows }) => `${columns}x${rows}`));
+    const {
+      minColumns,
+      maxColumns,
+      minRows,
+      maxRows,
+    } = FRAME_CONTRACT_DOMAIN;
+
+    expect(planned.length).toBeLessThanOrEqual(150);
+    for (const key of [
+      `${minColumns}x${minRows}`,
+      `${minColumns}x${maxRows}`,
+      `${maxColumns}x${minRows}`,
+      `${maxColumns}x${maxRows}`,
+    ]) expect(keys.has(key), key).toBe(true);
+    expect(planned.map(({ columns }) => columns))
+      .toEqual(expect.arrayContaining([minColumns, maxColumns]));
+    expect(planned.map(({ rows }) => rows))
+      .toEqual(expect.arrayContaining([minRows, maxRows]));
+    expect(planned.some(({ columns, rows }) =>
+      columns > minColumns
+      && columns < maxColumns
+      && rows > minRows
+      && rows < maxRows,
+    )).toBe(true);
+
+    await expectFrameContractSweep(planned);
+  });
+
+  test("test: with the exhaustive opt-in set the planned size list is exactly the full contract domain, and both modes select sizes through the same list function", () => {
+    const expected = [];
     for (
       let columns = FRAME_CONTRACT_DOMAIN.minColumns;
       columns <= FRAME_CONTRACT_DOMAIN.maxColumns;
       columns += 1
     ) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
       for (
         let rows = FRAME_CONTRACT_DOMAIN.minRows;
         rows <= FRAME_CONTRACT_DOMAIN.maxRows;
         rows += 1
-      ) {
-          const { frame, plan } = await plannedFrameAt(
-          PLANNED_FRAME_RAW,
-          columns,
-          rows,
-        ).catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          throw new Error(`${columns}x${rows}: ${message}`);
-        });
-        expect(plan.kind, `${columns}x${rows}`).toBe("frame");
-        if (plan.kind !== "frame") throw new Error("contract size planned plain output");
-        expect(frame.split("\n"), `${columns}x${rows} row count`)
-          .toHaveLength(plan.size.rows);
-        expect(() => assertFrameConformance(plan, frame), `${columns}x${rows} regions`)
-          .not.toThrow();
-      }
+      ) expected.push({ columns, rows });
     }
-  }, Number(process.env.TICKMARKR_SWEEP_TIMEOUT_MS ?? 240_000));
+
+    const sampled = frameContractSweepSizes("sampled");
+    expect(frameContractSweepSizes("exhaustive")).toEqual(expected);
+    expect(expected).toEqual(expect.arrayContaining(sampled));
+  });
+
+  test("the default suite's sweep cost is bounded by its sample size rather than a raised timeout — no per-test timeout override remains on the default path, and the per-size conformance assertions are identical between the sampled and exhaustive paths", () => {
+    expect(frameContractSweepSizes("sampled").length)
+      .toBeLessThan(frameContractSweepSizes("exhaustive").length);
+    const source = readFileSync(import.meta.filename, "utf8");
+    const defaultStart = source.indexOf(
+      'test("test: the default sweep plans at most 150 sizes',
+    );
+    const defaultPath = source.slice(
+      defaultStart,
+      source.indexOf("\n  });", defaultStart),
+    );
+    const exhaustiveStart = source.lastIndexOf(
+      '"test: every planned region is drawn at its planned offset',
+    );
+    const exhaustivePath = source.slice(
+      exhaustiveStart,
+      source.indexOf("\n  );", exhaustiveStart),
+    );
+    expect(defaultPath).not.toContain("TICKMARKR_SWEEP_TIMEOUT_MS");
+    expect(defaultPath).toContain("await expectFrameContractSweep(planned)");
+    expect(exhaustivePath).toContain("await expectFrameContractSweep(");
+    expect(exhaustivePath).toContain('frameContractSweepSizes("exhaustive")');
+  });
+
+  test.skipIf(process.env.TICKMARKR_EXHAUSTIVE_SWEEP !== "1")(
+    "test: every planned region is drawn at its planned offset and span, at every size in the contract domain",
+    async () => {
+      await expectFrameContractSweep(
+        frameContractSweepSizes("exhaustive"),
+      );
+      // OBS-143 load-margin reasoning: the sweep renders every contract size through ink, so a
+      // full-suite run under parallel-fork contention measured 249s against the old 240s guard —
+      // a load flake, not a runaway. 600s is a load-proof budget over the slowest observed pass;
+      // the conformance assertions remain the oracle, this is only the runaway guard.
+    },
+    Number(process.env.TICKMARKR_SWEEP_TIMEOUT_MS ?? 600_000),
+  );
 
   /** Proven mechanically: the plan is deep-frozen before it enters the production paint. */
   test("test: the plan is consumed unmodified — nothing rewrites its size, region offsets, spans or rowSpans", async () => {
@@ -708,7 +1175,7 @@ describe("run cockpit draw-time frame plan", () => {
       }
 
       const caption =
-        `${data.runId} · ${data.branch} · ${data.status} · ${data.elapsed}`;
+        `${data.runId} · ${data.branch} · ${data.status} · ${data.elapsed} · zone ${hostZoneLabel()}`;
       const authoritative = planFrame({ columns: columns!, rows: rows! }, plan.view, {
         tab: plan.tab,
         detail: planned.interaction.opened !== null,
@@ -835,6 +1302,10 @@ describe("run cockpit draw-time frame plan", () => {
       expect(signatures[0]!.row, `${at} header row`).toBe(header.row);
       expect(regionCells(frame, header)[0], `${at} header is plain`)
         .not.toMatch(BORDER_GLYPHS);
+      expect(regionCells(frame, header)[0], `${at} watch tab`).toContain("WATCH");
+      expect(regionCells(frame, header)[0], `${at} decisions tab`).toContain("DECISIONS");
+      expect(frame.match(/zone (?:UTC|[+-]\d{2}(?::\d{2})?)/gu), `${at} zone label`)
+        .toHaveLength(1);
 
       expect(
         lines.flatMap((line) => [...line.matchAll(MARK_GLYPHS)]).length,
@@ -868,6 +1339,7 @@ describe("run cockpit draw-time frame plan", () => {
     const lines = frame.replace(/\n+$/u, "").split("\n");
     expect(lines.length).toBeLessThanOrEqual(13);
     expect(frame).toContain("tickmarkr");
+    expect(frame.match(/zone (?:UTC|[+-]\d{2}(?::\d{2})?)/gu)).toHaveLength(1);
     expect(frame).not.toContain("VIEWS");
     expect(frame).not.toMatch(BORDER_GLYPHS);
   });
@@ -879,6 +1351,11 @@ describe("run cockpit draw-time frame plan", () => {
     const drawn = regionCells(frame, body);
     // Journal and panel each close with an intact border row; a forced element would overwrite one.
     expect(drawn.filter((line) => /[╰╚]/u.test(line)).length).toBe(2);
+    const header = regionCells(frame, plan.regions.find((region) => region.id === "header")!)[0]!;
+    expect(header).toContain("WATCH");
+    expect(header).toContain("DECISIONS");
+    expect(header).toContain("9.8.7");
+    expect(frame.match(/zone (?:UTC|[+-]\d{2}(?::\d{2})?)/gu)).toHaveLength(1);
   });
 
   test("test: the journal tail rides, shrinks and disappears by height tier, and opening a row draws its detail in the body", async () => {
@@ -2658,6 +3135,10 @@ describe("live cockpit row identity", () => {
           ev("withdrawn-row", {}, "2026-07-28T09:00:02.000Z", "T1"),
           ev("gate-result", { gate: "prepended-row" }, "2026-07-28T09:00:03.000Z", "T1"),
           ev("gate-result", { gate: "completed-row" }, "2026-07-28T09:00:04.000Z", "T1"),
+          ev("task-dispatch", { assignment: { adapter: "fake", model: "two" }, attempt: 0 }, "2026-07-28T09:00:05.000Z", "T2"),
+          ev("task-done", {}, "2026-07-28T09:00:06.000Z", "T2"),
+          ev("task-dispatch", { assignment: { adapter: "fake", model: "three" }, attempt: 0 }, "2026-07-28T09:00:07.000Z", "T3"),
+          ev("task-done", {}, "2026-07-28T09:00:08.000Z", "T3"),
         ]),
       );
       expect(delivery.refresh()).toBe(true);
@@ -2677,7 +3158,7 @@ describe("live cockpit row identity", () => {
       expect(selectedLine(completed, "older-row")).toBeUndefined();
       expect(pointedRows(completed)).toEqual([]);
 
-      // ── The same reconciliation over the tasks view's graph-backed rows ─────
+      // ── The same reconciliation over the Tasks view's recorded rows ─────────
       // Selecting the middle row — index 1, identity task:T2.
       delivery.key({ input: "2", key: {} });
       delivery.key({ input: "", key: { downArrow: true } });
@@ -2685,7 +3166,8 @@ describe("live cockpit row identity", () => {
       expect(delivery.snapshot().interaction.activeView).toBe("tasks");
       expect(delivery.snapshot().interaction.selection).toBe("task:T2");
 
-      // A recompile prepends a task: every index shifts, the identity does not.
+      // A recompile prepends a graph-only task. The fold still carries that placeholder, but the
+      // surface neither renders nor selects it, so the recorded identity remains standing.
       seedGraph(repo, ["T0", "T1", "T2", "T3"]);
       expect(delivery.refresh()).toBe(true);
       const prepended = delivery.snapshot();
@@ -2695,7 +3177,10 @@ describe("live cockpit row identity", () => {
         "task:T2",
         "task:T3",
       ]);
-      expect(identities("tasks").indexOf("task:T2")).toBe(2);
+      expect(liveRunViewRowIds({
+        ...prepended.interaction,
+        activeView: "tasks",
+      }, prepended.data).indexOf("task:T2")).toBe(1);
       expect(prepended.interaction.selection).toBe("task:T2");
 
       // A graph caught mid-recompile is a fault, not an engagement that dropped

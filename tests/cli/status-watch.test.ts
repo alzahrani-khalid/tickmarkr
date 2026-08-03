@@ -1,11 +1,36 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
+
+// Counts the journal reads one frame performs. The wrapper calls straight through, so every other
+// test in this file sees the real filesystem — only the tally is added.
+const journalReads = vi.hoisted(() => ({ count: 0 }));
+const foldFailure = vi.hoisted(() => ({ enabled: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const counted = ((path: unknown, ...rest: unknown[]) => {
+    if (typeof path === "string" && path.endsWith("journal.jsonl")) journalReads.count += 1;
+    return (actual.readFileSync as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof actual.readFileSync;
+  return { ...actual, default: { ...actual, readFileSync: counted }, readFileSync: counted };
+});
+vi.mock("../../src/tui/cockpit/derive.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/tui/cockpit/derive.js")>();
+  return {
+    ...actual,
+    deriveRunCockpitData: (...args: Parameters<typeof actual.deriveRunCockpitData>) => {
+      if (foldFailure.enabled) throw new Error("unexpected cockpit fold failure");
+      return actual.deriveRunCockpitData(...args);
+    },
+  };
+});
 
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-repo-"));
 const mandatoryGates = ["build", "test", "lint", "evidence", "scope"];
@@ -40,6 +65,53 @@ const seed = (repo: string, events: JournalEvent[], graph = GRAPH) => {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
 };
+
+const v184Journal = (): string => {
+  const source = readFileSync(
+    fileURLToPath(new URL("../cockpit/derive.test.ts", import.meta.url)),
+    "utf8",
+  );
+  const encoded = source.match(/const V184_GZIP_BASE64 = `([\s\S]*?)`;/u)?.[1];
+  if (encoded === undefined) throw new Error("v1.84 fixture capture is missing");
+  return gunzipSync(Buffer.from(encoded.replace(/\s+/gu, ""), "base64")).toString("utf8");
+};
+
+const graphForEvents = (events: readonly JournalEvent[]) => validateGraph({
+  version: 1,
+  spec: { source: "prd", paths: ["p"], hash: "h" },
+  tasks: [...new Set(events.flatMap((event) => {
+    const summaryIds = [event.data.done, event.data.failed, event.data.human]
+      .flatMap((value) => Array.isArray(value) ? value : [])
+      .filter((value): value is string => typeof value === "string");
+    return [...(event.taskId === undefined ? [] : [event.taskId]), ...summaryIds];
+  }))].map((id) => ({
+    id,
+    title: id,
+    goal: `Render recorded task ${id}.`,
+    shape: "implement" as const,
+    complexity: 3,
+    acceptance: ["recorded"],
+    gates: mandatoryGates,
+  })),
+});
+
+const seedRaw = (repo: string, raw: string, graph: ReturnType<typeof graphForEvents>): string => {
+  saveGraph(repo, graph);
+  const path = join(tickmarkrDir(repo), "runs", "run-watch", "journal.jsonl");
+  mkdirSync(join(tickmarkrDir(repo), "runs", "run-watch"), { recursive: true });
+  writeFileSync(path, raw);
+  return path;
+};
+
+/** Independent host-zone oracle: a fixed UTC instant converted by a named IANA rule set. */
+const clockInZone = (iso: string, timeZone: string): string =>
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date(iso));
 
 const row = (out: string, taskId: string) => out.split("\n").find((line) => new RegExp(`\\b${taskId}\\b`).test(line))!;
 // v1.67: the TTY frame renders each task as a two-line card — line 1 identity+verdict, line 2
@@ -106,6 +178,280 @@ const withTty = async (fn: () => Promise<void>) => {
 };
 
 describe("status checklist rendering", () => {
+  test("test: every rendered row on the watch surface maps to a journal line when rendering the v1.84 fixture journal", async () => {
+    const repo = mkRepo();
+    const fixtureEvents = v184Journal().trimEnd().split("\n")
+      .map((line) => JSON.parse(line) as JournalEvent);
+    const recordedGraph = graphForEvents(fixtureEvents);
+    const graph = validateGraph({
+      ...recordedGraph,
+      tasks: [
+        ...recordedGraph.tasks,
+        {
+          id: "T999",
+          title: "silent graph task",
+          goal: "Never author a row from graph silence.",
+          shape: "implement",
+          complexity: 3,
+          acceptance: ["recorded"],
+          gates: mandatoryGates,
+        },
+      ],
+    });
+    // The committed fixture predates this synthetic graph. Append the same audited graph-rehash
+    // release the daemon records after an operator-authorized recompile, so the watch is consuming
+    // a usable fold instead of exercising the forbidden non-comparable fallback.
+    const recordedHash = fixtureEvents.find((event) => event.event === "run-start")
+      ?.data.graphDefinitionHash;
+    const events = [
+      ...fixtureEvents,
+      {
+        ts: fixtureEvents.at(-1)!.ts,
+        event: "graph-rehash",
+        data: { from: recordedHash, to: graphDefinitionHash(graph) },
+      },
+    ] satisfies JournalEvent[];
+    const raw = events.map((event) => JSON.stringify(event)).join("\n") + "\n";
+    seedRaw(repo, raw, graph);
+
+    const out = await status(["--watch"], repo, { iterations: 1 });
+    const renderedTaskIds = out.split("\n").flatMap((line) => {
+      const match = line.match(/^\s+(?:\[[x! ]\]|[|/\\-])\s+(T\d+)\b/u);
+      return match?.[1] === undefined ? [] : [match[1]];
+    });
+    const recordedTaskIds = new Set(events.flatMap((event) => {
+      const summaryIds = [event.data.done, event.data.failed, event.data.human]
+        .flatMap((value) => Array.isArray(value) ? value : [])
+        .filter((value): value is string => typeof value === "string");
+      return [...(event.taskId === undefined ? [] : [event.taskId]), ...summaryIds];
+    }));
+
+    expect(renderedTaskIds.length).toBeGreaterThan(0);
+    for (const taskId of renderedTaskIds) expect(recordedTaskIds, taskId).toContain(taskId);
+  });
+
+  test("watch renders no task row without a usable comparable journal fold", async () => {
+    const withoutRun = mkRepo();
+    saveGraph(withoutRun, GRAPH);
+
+    const empty = await status(["--watch"], withoutRun, { iterations: 1 });
+    expect(GRAPH.tasks.some((task) => row(empty, task.id) !== undefined)).toBe(false);
+
+    const nonComparable = mkRepo();
+    seed(nonComparable, [runStart(), dispatch("T1", "recorded")]);
+    const changed = validateGraph({
+      ...GRAPH,
+      spec: { ...GRAPH.spec, hash: "changed-after-recording" },
+      tasks: GRAPH.tasks.map((task, index) => ({
+        ...task,
+        status: index === 0 ? "done" as const : task.status,
+      })),
+    });
+    saveGraph(nonComparable, changed);
+
+    const stale = await status(["--watch"], nonComparable, { iterations: 1 });
+    expect(stale).toContain("task states not comparable");
+    expect(stale).toContain("0/3 done");
+    expect(stale).not.toContain("1/3 done");
+    expect(row(stale, "T1")).toBeUndefined();
+  });
+
+  test("watch keeps rendering while the daemon-owned journal is empty, torn, or still precedes run-start", async () => {
+    const snapshots = [
+      "",
+      '{"ts":"2026-07-14T08:00:00.000Z","event":"run-',
+      `${JSON.stringify({
+        ts: "2026-07-14T08:00:00.000Z",
+        event: "lock-reclaimed",
+        data: { priorPid: 123 },
+      })}\n`,
+    ];
+
+    for (const raw of snapshots) {
+      const repo = mkRepo();
+      seedRaw(repo, raw, GRAPH);
+
+      const out = await status(["--watch"], repo, { iterations: 1 });
+
+      expect(out).toContain("0/3 done");
+      for (const task of GRAPH.tasks) expect(row(out, task.id)).toBeUndefined();
+    }
+  });
+
+  test("watch lets unexpected cockpit fold failures surface", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), dispatch("T1", "recorded")]);
+    foldFailure.enabled = true;
+    try {
+      await expect(status(["--watch"], repo, { iterations: 1 }))
+        .rejects.toThrow("unexpected cockpit fold failure");
+    } finally {
+      foldFailure.enabled = false;
+    }
+  });
+
+  test("watch tally counts the whole compiled graph while rows remain journal-backed", async () => {
+    const repo = mkRepo();
+    const graph = validateGraph({
+      ...GRAPH,
+      tasks: [
+        ...GRAPH.tasks,
+        { id: "T4", title: "planned four", goal: "Wait for a later wave.", shape: "implement", complexity: 3, acceptance: ["a"], gates: mandatoryGates },
+        { id: "T5", title: "planned five", goal: "Wait for a later wave.", shape: "implement", complexity: 3, acceptance: ["a"], gates: mandatoryGates },
+      ],
+    });
+    const start: JournalEvent = {
+      ...runStart(),
+      data: { ...runStart().data, graphDefinitionHash: graphDefinitionHash(graph) },
+    };
+    seed(repo, [
+      start,
+      dispatch("T1", "recorded-1"),
+      { ts, event: "task-done", taskId: "T1", data: {} },
+      { ts, event: "merge", taskId: "T1", data: {} },
+      dispatch("T2", "recorded-2"),
+      { ts, event: "task-done", taskId: "T2", data: {} },
+    ], graph);
+
+    const out = strip(await status(["--watch"], repo, { iterations: 1 }));
+
+    expect(out).toContain("2/5 done");
+    expect(row(out, "T1")).toBeDefined();
+    expect(row(out, "T2")).toMatch(/\bcompleted\b/u);
+    expect(row(out, "T2")).not.toMatch(/\bdone\b/u);
+    for (const taskId of ["T3", "T4", "T5"]) expect(row(out, taskId)).toBeUndefined();
+  });
+
+  test("watch leaves task-done unchecked until the journal records a merge", async () => {
+    const unmergedRepo = mkRepo();
+    const mergedRepo = mkRepo();
+    const completed: JournalEvent[] = [
+      runStart(),
+      dispatch("T1", "recorded"),
+      { ts, event: "task-done", taskId: "T1", data: {} },
+    ];
+    seed(unmergedRepo, completed);
+    seed(mergedRepo, [...completed, { ts, event: "merge", taskId: "T1", data: {} }]);
+
+    const unmergedMachine = await status(["--watch"], unmergedRepo, { iterations: 1 });
+    const mergedMachine = await status(["--watch"], mergedRepo, { iterations: 1 });
+    expect(row(unmergedMachine, "T1")).toContain("[ ] T1");
+    expect(row(unmergedMachine, "T1")).toMatch(/\bcompleted\b/u);
+    expect(row(mergedMachine, "T1")).toContain("[x] T1");
+
+    await withTty(async () => {
+      const unmergedTty = strip(await status(["--watch"], unmergedRepo, { iterations: 1 }));
+      const mergedTty = strip(await status(["--watch"], mergedRepo, { iterations: 1 }));
+      expect(row(unmergedTty, "T1")).not.toContain("✓");
+      expect(row(mergedTty, "T1")).toContain("✓");
+    });
+  });
+
+  test("test: timestamps render in the host zone with the zone named once per screen, and the journal file bytes remain UTC", async () => {
+    const repo = mkRepo();
+    const previous = process.env.TZ;
+    process.env.TZ = "Asia/Riyadh";
+    try {
+      const instant = "2026-07-14T08:00:00.000Z";
+      const events = [
+        runStart(),
+        {
+          ts: instant,
+          event: "task-dispatch",
+          taskId: "T1",
+          data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0 },
+        },
+      ] satisfies JournalEvent[];
+      const raw = events.map((event) => JSON.stringify(event)).join("\n") + "\n";
+      const path = seedRaw(repo, raw, GRAPH);
+
+      const out = await status(["--watch"], repo, { iterations: 1 });
+
+      expect(out).toContain(clockInZone(instant, "Asia/Riyadh"));
+      expect(out).not.toContain("since 08:00:00");
+      expect(out.match(/zone \+03/gu)).toHaveLength(1);
+      expect(readFileSync(path, "utf8")).toBe(raw);
+      expect(readFileSync(path, "utf8")).toContain("2026-07-14T08:00:00.000Z");
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
+
+  // Each event keeps its complete UTC instant and is independently converted under the named host
+  // zone. The expected clocks come from Intl's named-zone rules, never from a label or offset the
+  // surface emitted.
+  test("a screen names the host zone once and converts every complete instant under its daylight-saving rules", async () => {
+    const repo = mkRepo();
+    const previous = process.env.TZ;
+    process.env.TZ = "America/New_York";
+    try {
+      const before = "2026-03-08T06:00:00.000Z"; // 01:00 EST — before the 02:00 local jump
+      const after = "2026-03-08T18:00:00.000Z"; // 14:00 EDT — after it
+      const events = [
+        { ts: before, event: "run-start", data: { pid: process.pid, graphDefinitionHash: DEF_HASH } },
+        { ts: before, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0 } },
+        { ts: after, event: "task-dispatch", taskId: "T2", data: { assignment: { adapter: "fake", model: "fake-2" }, attempt: 0 } },
+      ] satisfies JournalEvent[];
+      const raw = events.map((event) => JSON.stringify(event)).join("\n") + "\n";
+      const path = seedRaw(repo, raw, GRAPH);
+
+      const out = await status(["--watch"], repo, { iterations: 1 });
+
+      expect(out.match(/zone -04/gu)).toHaveLength(1);
+      expect(out).toContain(`since ${clockInZone(before, "America/New_York")}`);
+      expect(out).toContain(`since ${clockInZone(after, "America/New_York")}`);
+      expect(readFileSync(path, "utf8")).toBe(raw);
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
+
+  test("surfaces render folds they did not author and re-derive nothing", async () => {
+    const repo = mkRepo();
+    const graph = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{
+        id: "T1",
+        title: "graph says done",
+        goal: "Keep the journal authoritative.",
+        shape: "implement",
+        complexity: 3,
+        acceptance: ["recorded"],
+        gates: mandatoryGates,
+        status: "done",
+      }],
+    });
+    const events = [
+      {
+        ts,
+        event: "run-start",
+        data: { pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) },
+      },
+      {
+        ts,
+        event: "run-end",
+        data: { done: [], failed: [], human: ["T1"], blocked: [], pending: [] },
+      },
+    ] satisfies JournalEvent[];
+    seed(repo, events, graph);
+
+    journalReads.count = 0;
+    const out = await status(["--watch"], repo, { iterations: 1 });
+    const task = row(out, "T1");
+
+    expect(task).toContain("parked");
+    expect(task).toContain("[!]");
+    expect(task).not.toContain("[x]");
+    expect(task).not.toContain(" done ");
+    // ONE byte snapshot per frame. A second read is what lets a line the daemon appends mid-frame
+    // pair newer folded task rows against older activity, phase, gate and tip readings; with a
+    // single read that pairing cannot happen at all.
+    expect(journalReads.count).toBe(1);
+  });
+
   test("renders mixed gate outcomes in order and a channel once", async () => {
     const repo = mkRepo();
     seed(repo, [
@@ -170,6 +516,7 @@ describe("status checklist rendering", () => {
         const out = await status([], repo);
         expect(out).not.toMatch(/\x1b\[/);
         expect(out).not.toMatch(/[☐✓✗⏸]/);
+        expect(out.split("\n")[0]).not.toContain("zone ");
         expect(row(out, "T1")).toContain("[x] T1");
         expect(row(out, "T2")).toContain("[!] T2");
         expect(row(out, "T3")).toContain("[ ] T3");
@@ -237,7 +584,7 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       const out = await status([], repo);
       // v1.67 cards: the verdict line carries the approval hint; the park kind is line-2 machinery
-      expect(strip(row(out, "T1"))).toContain("human · awaiting approval");
+      expect(strip(row(out, "T1"))).toContain("parked · awaiting approval");
       expect(strip(card(out, "T1"))).toContain("parked (human-gate)");
     });
   });
@@ -364,7 +711,7 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const header = (await status(["--watch"], repo, { iterations: 1, sleep: async () => {} })).split("\n")[0]!;
-      expect(strip(header)).toContain("tip-verify: FAILED (test) → re-verifying (attempt 2)");
+      expect(strip(header)).toContain("tip-verify: FAILED (test) → re-verifying (run attempt 2)");
       expect(strip(header)).not.toContain("3/3 done");
     });
   });
@@ -520,7 +867,7 @@ describe("status checklist rendering", () => {
     expect(restored).toBeGreaterThan(titled);
   });
 
-  test("test: watching a journal that contains no phase-start events renders the frame content the watcher rendered before this change", async () => {
+  test("watching a journal without phase-start events still omits graph-only rows", async () => {
     const repo = mkRepo();
     seed(repo, [runStart(), dispatch("T2", "fake-2")]);
     const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -533,7 +880,11 @@ describe("status checklist rendering", () => {
         sleep: async () => {},
         now: () => Date.parse(ts),
       });
-      expect(watched).toBe(before);
+      expect(watched).toContain("T2");
+      expect(watched).not.toContain("T1");
+      expect(watched).not.toContain("T3");
+      expect(before).toContain("T1");
+      expect(before).toContain("T3");
     } finally {
       spy.mockRestore();
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
@@ -558,10 +909,9 @@ describe("status checklist rendering", () => {
     });
   });
 
-  test("non-TTY and NO_COLOR output is byte-identical to its pre-redesign form", async () => {
-    const repo = mkRepo();
-    // deterministic fixture: events backdated exactly 10 minutes (age renders "10m"), a garbage
-    // pid (renders "unknown", never probes), fixed 120 columns — the status-brand golden idiom
+  // deterministic fixture: events backdated exactly 10 minutes (age renders "10m"), a garbage
+  // pid (renders "unknown", never probes), fixed 120 columns — the status-brand golden idiom
+  const seedGoldenFixture = (repo: string): void => {
     const old = new Date(Date.now() - 600_000).toISOString();
     const at = (e: JournalEvent): JournalEvent => ({ ...e, ts: old });
     seed(repo, [
@@ -569,13 +919,16 @@ describe("status checklist rendering", () => {
       at(dispatch("T1", "fake-1")), at(gate("T1", "build", true)), at(gate("T1", "test", true)), { ts: old, event: "task-done", taskId: "T1", data: {} },
       at(dispatch("T2", "fake-2")), at(gate("T2", "build", true)), at(gate("T2", "test", false)), { ts: old, event: "task-failed", taskId: "T2", data: {} },
     ]);
-    // golden literal captured from the pre-redesign implementation over this exact fixture — it must never drift
-    const golden =
-      "tickmarkr status / run run-watch / last event 10m ago / daemon pid unknown / 1/3 done\n" +
-      "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
-      "  [x] T1 Finish report  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
-      "  [!] T2 Run mixed gates  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
-      "  [ ] T3 Queue the undispatched follow-up  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
+  };
+
+  // Both surfaces are pinned over the SAME fixture: the plain one to its byte golden, the watch
+  // one to agreement across the tty/NO_COLOR pair. Neither pin substitutes for the other.
+  const overGoldenFixture = async (
+    render: (repo: string) => Promise<string>,
+    check: (out: string) => void,
+  ): Promise<void> => {
+    const repo = mkRepo();
+    seedGoldenFixture(repo);
     const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
     const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
     const noColor = process.env.NO_COLOR;
@@ -585,7 +938,7 @@ describe("status checklist rendering", () => {
         Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: ttyValue });
         if (noColorValue === undefined) delete process.env.NO_COLOR;
         else process.env.NO_COLOR = noColorValue;
-        expect(await status([], repo)).toBe(golden);
+        check(await render(repo));
       }
     } finally {
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
@@ -595,6 +948,34 @@ describe("status checklist rendering", () => {
       if (noColor === undefined) delete process.env.NO_COLOR;
       else process.env.NO_COLOR = noColor;
     }
+  };
+
+  test("non-TTY and NO_COLOR output is byte-identical to its pre-redesign form", async () => {
+    // golden literal captured from the pre-redesign implementation over this exact fixture — it must never drift
+    const golden =
+      "tickmarkr status / run run-watch / last event 10m ago / daemon pid unknown / 1/3 done\n" +
+      "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
+      "  [x] T1 Finish report  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
+      "  [!] T2 Run mixed gates  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
+      "  [ ] T3 Queue the undispatched follow-up  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
+    await overGoldenFixture(
+      (repo) => status([], repo),
+      (out) => expect(out).toBe(golden),
+    );
+  });
+
+  test("non-TTY and NO_COLOR --watch output agree on the local-time journal fold", async () => {
+    const frames: string[] = [];
+    await overGoldenFixture(
+      (repo) => status(["--watch"], repo, { iterations: 1 }),
+      (out) => {
+        frames.push(out);
+        expect(out.match(/zone (?:UTC|[+-]\d{2}(?::\d{2})?)/gu)).toHaveLength(1);
+        expect(row(out, "T1")).toContain("[ ] T1");
+      },
+    );
+    expect(frames).toHaveLength(2);
+    expect(frames[1]).toBe(frames[0]);
   });
 
   test("bounded --watch returns every frame and streams non-TTY output", async () => {
@@ -610,7 +991,8 @@ describe("status checklist rendering", () => {
     try {
       const out = await status(["--watch"], repo, { iterations: 2, sleep: async () => {} });
       expect(out.split("\n---\n")).toHaveLength(2);
-      expect(writes.join("")).toContain("[ ] T3");
+      expect(writes.join("")).toContain("[ ] T2");
+      expect(writes.join("")).not.toContain("[ ] T3");
     } finally {
       spy.mockRestore();
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);

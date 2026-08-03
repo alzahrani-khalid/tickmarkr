@@ -1,6 +1,11 @@
-import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, shq, type InputBox } from "../adapters/types.js";
+import { randomUUID } from "node:crypto";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, matchesOccupiedInputBox, missingInputStateDeclarations, shq, type InputBox } from "../adapters/types.js";
 import { PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
+import { Journal } from "../run/journal.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
 import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
@@ -16,6 +21,15 @@ const DELIVERY_READ_LINES = 80;
 const DELIVERY_SETTLE_READ_ATTEMPTS = 6;
 const DELIVERY_SETTLE_POLL_MS = 100;
 const DELIVERY_READINESS_TIMEOUT_MS = 1_000;
+// OBS-140/253: a shell or bootstrap dispatch is acknowledged by a START nonce the delivered line
+// PRINTS as its first statement. The printf splits the nonce across two arguments, so the joined
+// marker exists only after the shell actually ran the line — a pane that merely echoed the text it
+// was given never produces it. The marker is written to a private file as well as the pane, because
+// a pane snapshot is not a channel: a full-screen TUI or a noisy launch can scroll a printed nonce
+// out of any bounded read, and a successful dispatch read as corrupt is dispatched TWICE.
+export const DISPATCH_START_PREFIX = "TICKMARKR_START_";
+const DISPATCH_ACK_TIMEOUT_MS = 15_000;
+const DISPATCH_ACK_POLL_MS = 100;
 
 interface DeliveryReadinessEvidence {
   waitedMs: number;
@@ -48,6 +62,25 @@ export class DeliveryReadinessError extends Error {
   }
 }
 
+// OBS-253: the dispatch-corruption class, typed so the driver's own one-shot recovery can recognise
+// it and the daemon can keep classifying an unrecovered one as `kind: dispatch`. A dispatch that
+// never registered produced no output to trust, so a fresh-pane retry risks nothing a first dispatch
+// does not already risk — the second consecutive one is what parks the task.
+export class DeliveryCorruptedError extends Error {
+  readonly phase = "DISPATCH";
+
+  constructor(
+    readonly pane: string,
+    reason: string,
+    readonly transcript: string,
+  ) {
+    super(`herdr delivery corrupted on pane ${pane} — ${reason} (OBS-140/253); pane transcript:\n${transcript}`);
+    this.name = "DeliveryCorruptedError";
+  }
+}
+
+export type DriverJournal = (event: string, slotName: string, data: Record<string, unknown>) => void;
+
 /** First-generation join direction from measured trailer-safe floor (43-MEASUREMENT.md). */
 export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILER_SAFE_FLOOR_COLS, margin = TRAILER_WIDTH_MARGIN): "right" | "down" {
   if (paneCols == null || paneCols <= 0) return "down";
@@ -78,6 +111,14 @@ export class HerdrDriver implements ExecutorDriver {
   private dispatchLeases = new WeakMap<Slot, DispatchLease>();
   private deliveredPanes = new WeakMap<Slot, string>();
   private inputBoxes = new WeakMap<Slot, InputBox>();
+  // OBS-253: the adapter-declared bootstrap this slot has already delivered. A fresh pane is a bare
+  // shell, so it is the only thing that can put a TUI back under a typed turn that has to move.
+  private bootstraps = new WeakMap<Slot, string>();
+  // runDaemon gives the driver the authoritative repo root at its worktree seam before it allocates
+  // that task's slot. Keep the binding by cwd so a dispatch retry opens THAT run's Journal even when
+  // the caller launched tickmarkr elsewhere (process.cwd is not run identity). The repo itself is
+  // also bound for judge/review/consult slots whose cwd is the root rather than a task worktree.
+  private journalRoots = new Map<string, string>();
 
   // VIS-10: the run's workspace id, captured once at construction (the daemon inherits it from the
   // operator's env before the driver is built). Required at slot() time, never in the constructor —
@@ -90,7 +131,27 @@ export class HerdrDriver implements ExecutorDriver {
     private bin = "herdr",
     private workersPerTab = 3,
     private time: HerdrTimeSource = SYSTEM_TIME,
+    private journal?: DriverJournal,
   ) {}
+
+  // The dispatch-retry record is mandatory: it is the only durable fact left by a recovered pane
+  // swap. Tests may inject a sink, while production resolves the daemon's real Journal from the
+  // worktree binding plus the canonical slot name. Every resolution/open/append failure propagates;
+  // an unjournaled recovery is never performed and its audit failure is never hidden by the original
+  // corruption error.
+  private appendDispatchRetry(slot: Slot, data: Record<string, unknown>): void {
+    if (this.journal) {
+      this.journal("dispatch-retry", slot.name, data);
+      return;
+    }
+    const owned = parseOwnedName(slot.name);
+    if (!owned) throw new Error(`cannot journal dispatch-retry: slot ${slot.name} carries no run identity`);
+    const repoRoot = this.journalRoots.get(slot.cwd);
+    if (!repoRoot) {
+      throw new Error(`cannot journal dispatch-retry: slot ${slot.name} has no daemon repo binding for ${slot.cwd}`);
+    }
+    Journal.open(repoRoot, owned.runId).append("dispatch-retry", owned.taskId, data);
+  }
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.groupSerial.then(fn, fn);
@@ -154,56 +215,17 @@ export class HerdrDriver implements ExecutorDriver {
     return needle.length > 0 && hay.includes(needle);
   }
 
-  private shellExecutionEchoed(transcript: string, cmd: string): boolean {
-    const norm = (s: string) => s.replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\s+/g, " ").trim();
-    const needle = norm(cmd);
-    if (!needle) return false;
-    return transcript.split("\n").some((rawLine) => {
-      const line = norm(rawLine);
-      if (line === needle || !line.endsWith(needle)) return false;
-      const prefix = line.slice(0, -needle.length).trimEnd();
-      if (/[│┃╭╰┌└]/.test(prefix)) return false;
-      return /^(?:[$%#>]|[➜❯❱›»λ])(?:\s|$)/.test(prefix)
-        || /[$%#>✗❯❱›»λ]$/.test(prefix);
-    });
-  }
-
-  // Submission requires positive post-Enter evidence. A prompt echoed above a fresh input target
-  // proves registration; a declared box that is visibly empty after the verified paste also proves
-  // it consumed the prompt. At the launch stage, a structurally prompt-prefixed shell execution echo
-  // is stronger evidence than waiting for first paint from the launched interface (OBS-144).
-  // Prompt absence alone is never success (OBS-142).
-  private submissionRegistered(transcript: string, cmd: string, inputBox?: InputBox): boolean {
-    const norm = (s: string) => s.replace(/\s+/g, "");
-    const hay = norm(transcript);
-    const needle = norm(cmd);
-    const promptAt = hay.lastIndexOf(needle);
-    if (needle.length === 0) return false;
-    if (inputBox?.launchCommand?.(cmd) === true && this.shellExecutionEchoed(transcript, cmd)) return true;
-    if (promptAt < 0) return inputBox !== undefined && matchesEmptyInputBox(transcript, inputBox);
-    if (inputBox) {
-      // OBS-181: an EMPTY declared input box is positive evidence of submission even while the
-      // prompt is still visible above as the echoed user turn — which is exactly how every TUI
-      // renders the moment after Enter lands. Test it FIRST: `match` means "the box is painted" and
-      // is deliberately true for an empty box, so asking `match` first cannot decide submission.
-      if (matchesEmptyInputBox(transcript, inputBox)) return true;
-      // The box is painted and is NOT empty: the prompt is still sitting in it. Only a fingerprint
-      // appearing AFTER the prompt — a fresh input line below the submitted text — counts.
-      //
-      // This is the branch a wedged kimi pane belongs in, and could not reach: its occupied editor
-      // renders a blank continuation row, the matcher demanded the bottom border immediately below
-      // the prompt, so NEITHER matcher fired and the positional fallback below answered "delivered"
-      // for a pane that had processed nothing. The matcher fix (adapters/kimi.ts) is what routes it
-      // here; keeping the fallback unreachable for a painted box is what stops the next one.
-      if (matchesInputBox(transcript, inputBox)) {
-        return hay.lastIndexOf(norm(inputBox.fingerprint)) > promptAt;
-      }
-    }
-    // No declared box, or the box is not on screen at all (it may have scrolled out of the read
-    // window). Positional evidence only — weaker, and unsound for any surface that paints chrome
-    // below its prompt, which is why a declared box must be able to recognise its own OCCUPIED
-    // state. Every adapter declaring an inputBox needs a captured occupied frame in its tests.
-    return promptAt + needle.length < hay.length;
+  // v1.85 T5: submission is acknowledged CAUSALLY or not at all. The adapter's declared OCCUPIED
+  // state means the prompt is still sitting in the box — never submitted; its declared EMPTY state
+  // means the box consumed it. Nothing else counts: the positional-transcript fallback this used to
+  // end with (prompt found, bytes exist after it ⇒ "delivered") answered yes for panes that had
+  // processed nothing (OBS-181), and it is DELETED. A box that is off-screen or unrecognisable is an
+  // absence of evidence, which fails closed — the same posture every gate takes. The launch-stage
+  // shell-echo reader is gone with it: a bootstrap line is now delivered atomically and acknowledged
+  // by its own START nonce, so there is no echo left to read (OBS-144 closed by construction).
+  private submissionRegistered(transcript: string, inputBox: InputBox): boolean {
+    if (matchesOccupiedInputBox(transcript, inputBox)) return false;
+    return matchesEmptyInputBox(transcript, inputBox);
   }
 
   static available(): boolean {
@@ -304,8 +326,6 @@ export class HerdrDriver implements ExecutorDriver {
     const id = res?.root_pane?.pane_id; // the tab's root shell pane, already in cwd — this run's worker pane
     if (typeof tabId !== "string" || !tabId) throw new Error(`herdr tab create returned no tab_id (refusing untargeted placement): ${t.stdout}`);
     if (typeof id !== "string" || !id) throw new Error(`herdr tab create returned no root pane id (refusing untargeted placement): ${t.stdout}`);
-    // T5: the banner's pane identity line, derived from the T1 owned name (legacy names pass through).
-    const identity = shq(paneIdentityLine(canonicalizeLegacyName(name, "")));
     // durable identity: label the PANE (resolution + reconcile read it back via `pane list`); fail closed
     // and reap the tab we just made if the rename fails (no orphan tab).
     const rn = await this.herdr(`pane rename ${shq(id)} ${shq(name)}`);
@@ -323,7 +343,7 @@ export class HerdrDriver implements ExecutorDriver {
     // v1.22 T3 / OBS-17: also strip HERDR_ENV + socket path so the worker cannot open/mutate panes in
     // the operator's session. Daemon-side this.herdr() calls keep process.env (unsealed).
     const seed = await this.herdr(
-      `pane run ${shq(id)} ${shq(`export HERDR_WORKSPACE_ID=${shq(this.ws)}; export ${PANE_IDENTITY_ENV}=${identity}; ${herdrSealShellPrefix()}`)}`,
+      `pane run ${shq(id)} ${shq(`export HERDR_WORKSPACE_ID=${shq(this.ws)}; export ${PANE_IDENTITY_ENV}=${shq(paneIdentityLine(canonicalizeLegacyName(name, "")))}; ${herdrSealShellPrefix()}`)}`,
     );
     if (seed.code !== 0) throw new Error(`herdr workspace-id seed failed (refusing untargeted pane): ${seed.stderr || seed.stdout}`);
     return { id, name, cwd, tabId };
@@ -469,36 +489,208 @@ export class HerdrDriver implements ExecutorDriver {
     return { id: pane, name, cwd, tabId: entry.tabId, group };
   }
 
-  // OBS-85 verified delivery: a pane paste can interleave a long dispatch line with itself (codex
-  // `$(git rev-parse…)` mashed into its trailing printf — v1.58 T2 attempts 2-4, v1.61 T10). Never
-  // the atomic `pane run` (text+Enter in one request, uninspectable between the two): type WITHOUT
-  // enter, read the pane back — `wait output --match` checks the same unwrapped transcript pane
-  // read exposes, event-driven so wrap and render timing can't race the check — and press Enter
-  // only when that read-back contains the typed command. A corrupted paste is captured (pane read),
-  // cleared (C-u), and retyped, bounded; persistent corruption fails closed WITH the captured
-  // transcript — the dispatch-time pincer the ledger asks for, not post-hoc `git:` archaeology.
+  // v1.85 T5 (OBS-140/253): every dispatch is routed by what the target actually IS. A shell or
+  // bootstrap line goes out atomically through `pane run` and is acknowledged by its own START
+  // nonce; only a real TUI turn — an adapter-declared input box, and not that adapter's own launch
+  // command — earns the typed pincer. One dispatch corruption is then retried in-process against a
+  // FRESH pane before anything is reported as a failure.
   async run(slot: Slot, cmd: string): Promise<void> {
     const lease = this.dispatchLeases.get(slot);
     if (lease) {
       this.dispatchLeases.delete(slot);
       try {
         const paneId = await this.verifyPaneIdentityBinding(slot);
-        await this.deliver(slot, cmd, paneId);
-        this.deliveredPanes.set(slot, paneId);
+        await this.dispatchWithRetry(slot, cmd, paneId);
       } finally {
         lease.release();
       }
       return;
     }
     return this.deliveryQueue(async () => {
-      const paneId = await this.paneId(slot);
-      await this.deliver(slot, cmd, paneId);
-      this.deliveredPanes.set(slot, paneId);
+      await this.dispatchWithRetry(slot, cmd, await this.paneId(slot));
     });
   }
 
-  private async deliver(slot: Slot, cmd: string, pane: string, verifySubmission = true): Promise<void> {
-    const readiness = await this.awaitDeliveryReadiness(slot, cmd, pane);
+  // OBS-253: dispatch corruption is self-clearing — all ten recorded occurrences cleared on a fresh
+  // pane and a fresh submit, and every one of them cost an operator `resume --retry-failed`. Retry
+  // ONCE here against a pane that has never seen this delivery; the wedged pane is closed, never
+  // re-pressed. A second consecutive corruption propagates, and the daemon parks the task on it.
+  private async dispatchWithRetry(slot: Slot, cmd: string, pane: string): Promise<void> {
+    try {
+      await this.dispatch(slot, cmd, pane);
+      this.deliveredPanes.set(slot, pane);
+      return;
+    } catch (error) {
+      if (!(error instanceof DeliveryCorruptedError)) throw error;
+      // A fresh pane is a bare shell. A shell dispatch is simply re-run on it; a typed turn first
+      // needs its interface back, which is possible only where the adapter declared the bootstrap
+      // this slot already delivered. Retyping a turn into a bare shell would guarantee the second
+      // failure rather than recover from the first, so without a replayable bootstrap the
+      // corruption propagates untouched.
+      const typedTurn = this.isTuiTurn(slot, cmd);
+      const relaunch = typedTurn ? this.bootstraps.get(slot) : undefined;
+      if (typedTurn && relaunch === undefined) throw error;
+      // Record BEFORE acting: a retry that cannot be written to the run's ledger is not taken at all,
+      // because an unrecorded pane swap is exactly the silence OBS-253 cost ten times. The journal
+      // failure itself propagates visibly; the original corruption then remains terminal rather than
+      // triggering an off-record recovery.
+      this.appendDispatchRetry(slot, { wedgedPane: pane, reason: error.message });
+      const fresh = await this.freshPane(slot, pane);
+      if (fresh === null) throw error;
+      if (relaunch !== undefined) await this.deliverAtomic(slot, relaunch, fresh);
+      await this.dispatch(slot, cmd, fresh);
+      this.deliveredPanes.set(slot, fresh);
+    }
+  }
+
+  // Is this delivery a turn TYPED into a running interface, rather than a line a shell runs? The
+  // adapter's declaration decides it wherever there is one: `launchCommand` names the bootstrap,
+  // everything else is a turn. With NO declaration the only evidence is the slot's own history — a
+  // pane that already accepted a delivery is running whatever that delivery started, so a second
+  // delivery is a turn into it. Answering "shell" there is what would run an adapter's seed prompt
+  // as a shell command; answering "turn" routes it to deliverTyped, which refuses it by name
+  // because the adapter declared no input box (fail closed, never a guess).
+  private isTuiTurn(slot: Slot, cmd: string): boolean {
+    const inputBox = this.inputBoxes.get(slot);
+    return inputBox ? inputBox.launchCommand?.(cmd) !== true : this.deliveredPanes.has(slot);
+  }
+
+  private dispatch(slot: Slot, cmd: string, pane: string): Promise<void> {
+    if (this.isTuiTurn(slot, cmd)) return this.deliverTyped(slot, cmd, pane);
+    // An adapter-declared bootstrap is the one command that can restore this slot's interface on a
+    // fresh pane, so remember it for the recovery above.
+    if (this.inputBoxes.get(slot)?.launchCommand?.(cmd) === true) this.bootstraps.set(slot, cmd);
+    return this.deliverAtomic(slot, cmd, pane);
+  }
+
+  // The OBS-140 class dies here. `pane run` puts text and Enter in ONE herdr request, so there is no
+  // seam in which a swallowed Enter can leave a verified-but-unsubmitted prompt, and nothing about
+  // the delivery is inferred from typed-text read-back. The line's first two statements print a
+  // per-dispatch START nonce assembled from two printf arguments — once to a file whose name only
+  // this process knows, then once to the pane for the operator. The joined marker cannot exist
+  // unless the shell RAN our line, so the acknowledgment is causal; and because the file is written
+  // before the agent the line launches produces a byte, no amount of later output can hide it. Both
+  // statements are shell builtins: the ack cannot fail for want of a binary on the pane's PATH.
+  //
+  // v1.85 T5 review: the durable half GATES the launch, and goes FIRST. A dispatch whose ack the
+  // pane could not write is indistinguishable, from here, from a line that never ran — so if the
+  // command ran anyway, the miss buys a fresh pane and a SECOND live agent for the same task. The
+  // `|| exit 1` makes that impossible: no ack, no command. Ordering carries the same weight in the
+  // other direction — a pane-visible marker printed before a failed ack write would satisfy the
+  // event watch and report a launch that never happened.
+  private async deliverAtomic(slot: Slot, cmd: string, pane: string): Promise<void> {
+    const suffix = randomUUID(); // unguessable: nothing the delivered command runs can forge the ack
+    const nonce = `${DISPATCH_START_PREFIX}${suffix}`;
+    const ackPath = join(tmpdir(), `tickmarkr-dispatch-${suffix}.ack`);
+    // Open the channel before spending a pane on it: an ack path this process cannot write is a
+    // broken host, not a wedged pane, and the fresh-pane retry would fail there for the same reason.
+    // Throwing something other than DeliveryCorruptedError is what keeps that retry unspent.
+    try {
+      writeFileSync(ackPath, ""); // empty: only the delivered line may ever put the nonce here
+    } catch (error) {
+      throw new Error(`dispatch acknowledgment channel unavailable (${ackPath}): ${(error as Error).message}`);
+    }
+    const marker = `printf '%s%s\\n' ${shq(DISPATCH_START_PREFIX)} ${shq(suffix)}`;
+    const line = `${marker} > ${shq(ackPath)} || exit 1; ${marker}; ${cmd}`;
+    const deadline = this.time.now() + DISPATCH_ACK_TIMEOUT_MS;
+    try {
+      const sent = await this.herdr(`pane run ${shq(pane)} ${shq(line)}`, slot.cwd);
+      if (sent.code !== 0) {
+        throw new DeliveryCorruptedError(pane, `pane run failed: ${sent.stderr || sent.stdout}`, "");
+      }
+      // Fast path: herdr's own event-driven watch on the pane's output. A match is causal — the pane
+      // cannot emit the joined marker without having RUN the line. A MISS is not evidence of
+      // anything: this watch subscribes after the request, and a full-screen repaint can swallow the
+      // very line it is watching for, which is how a successful launch got dispatched twice. So a
+      // miss falls through to the channel the line wrote for itself, which nothing can repaint.
+      const seen = await this.herdr(
+        `pane wait-output ${shq(pane)} --match ${shq(nonce)} --timeout ${DISPATCH_ACK_TIMEOUT_MS}`,
+        slot.cwd,
+        DISPATCH_ACK_TIMEOUT_MS + 15_000,
+      );
+      if (this.waitOk(seen.code, seen.stdout)) return;
+      if (await this.awaitDispatchAck(ackPath, nonce, deadline)) return;
+      // Only now, and only as evidence for the operator: the transcript explains the failure, it
+      // never decides one. A pane that looks like it ran the line but never wrote the ack did not.
+      const transcript = (await this.herdr(`pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`, slot.cwd)).stdout;
+      throw new DeliveryCorruptedError(pane, `START nonce ${nonce} never appeared — the line never ran`, transcript);
+    } finally {
+      try { unlinkSync(ackPath); } catch { /* never written, or already reaped — nothing to clean */ }
+    }
+  }
+
+  // The durable half of the acknowledgment: the file the delivered line wrote before it launched
+  // anything. Checked at least once even when the shared dispatch deadline has already passed, so a
+  // watch that spent the whole window missing the line still gets the truth from the line itself.
+  private async awaitDispatchAck(ackPath: string, nonce: string, deadline: number): Promise<boolean> {
+    for (;;) {
+      try {
+        if (readFileSync(ackPath, "utf8").includes(nonce)) return true;
+      } catch {
+        /* the line has not reached the marker yet — or never will, which the deadline decides */
+      }
+      if (this.time.now() >= deadline) return false;
+      await this.time.sleep(DISPATCH_ACK_POLL_MS);
+    }
+  }
+
+  // OBS-253: a fresh pane is a SIBLING inside this slot's own tab. Split first so the tab can never
+  // empty, then close the wedged pane and take its durable label — every other driver call addresses
+  // this slot through that label or the delivered-pane pin, so no caller observes the swap.
+  private async freshPane(slot: Slot, wedged: string): Promise<string | null> {
+    if (!this.ws) return null;
+    const sp = await this.herdr(`pane split ${shq(wedged)} --direction down --no-focus --cwd ${shq(slot.cwd)}`);
+    if (sp.code !== 0) return null;
+    let pane: string | undefined;
+    try {
+      pane = JSON.parse(sp.stdout).result?.pane?.pane_id ?? undefined;
+    } catch {
+      return null;
+    }
+    if (typeof pane !== "string" || !pane) return null;
+    // The wedged pane is never re-pressed, only reaped — and the reap is a POSTCONDITION, not a
+    // best-effort. It still carries this slot's durable label, so a close that fails (or succeeds
+    // and frees nothing) leaves two panes answering to one name and `pane list` resolving it by
+    // whichever comes first. Verify the name is free BEFORE the replacement is renamed, seeded or
+    // dispatched: a fresh pane that is only PROBABLY the slot is not a fresh pane (v1.85 T5 review).
+    const closed = await this.herdr(`pane close ${shq(wedged)}`);
+    if (closed.code !== 0 || (await this.staleLabelPanes(slot.name, pane)).length > 0) {
+      await this.herdr(`pane close ${shq(pane)}`);
+      return null;
+    }
+    const rn = await this.herdr(`pane rename ${shq(pane)} ${shq(slot.name)}`);
+    if (rn.code !== 0 || (await this.namedPaneId(slot.name)) !== pane) {
+      await this.herdr(`pane close ${shq(pane)}`);
+      return null;
+    }
+    // VIS-10 hole 3: a split pane is a bare shell with FRESH env, so it is untargeted until seeded.
+    const seed = await this.herdr(
+      `pane run ${shq(pane)} ${shq(`export HERDR_WORKSPACE_ID=${shq(this.ws)}; export ${PANE_IDENTITY_ENV}=${shq(paneIdentityLine(canonicalizeLegacyName(slot.name, "")))}; ${herdrSealShellPrefix()}`)}`,
+      slot.cwd,
+    );
+    if (seed.code !== 0) {
+      await this.herdr(`pane close ${shq(pane)}`);
+      return null;
+    }
+    return pane;
+  }
+
+  // OBS-85 typed delivery, now reserved for real TUI turns: type WITHOUT enter, read the pane back
+  // — `wait output --match` checks the same unwrapped transcript pane read exposes, event-driven so
+  // wrap and render timing can't race the check — and press Enter only when that read-back contains
+  // the typed command. A corrupted paste is captured (pane read), cleared (C-u), and retyped,
+  // bounded; persistent corruption fails closed WITH the captured transcript.
+  private async deliverTyped(slot: Slot, cmd: string, pane: string): Promise<void> {
+    const inputBox = this.inputBoxes.get(slot);
+    const missing = missingInputStateDeclarations(inputBox);
+    if (missing.length > 0) {
+      throw new Error(
+        `herdr refuses typed delivery to ${slot.name}: the adapter has not declared its input states `
+          + `(missing: ${missing.join(", ")}) — only a declared box can acknowledge a submission, and `
+          + `nothing else may stand in for it (OBS-140)`,
+      );
+    }
+    const readiness = await this.awaitDeliveryReadiness(slot, cmd, pane, inputBox!);
     let transcript = "";
     for (let attempt = 0; attempt < DELIVERY_ATTEMPTS; attempt++) {
       if (attempt > 0) {
@@ -506,12 +698,7 @@ export class HerdrDriver implements ExecutorDriver {
         // line only after two consecutive pane reads agree; an already-stable frame returns on the
         // first fresh read without a timer. A changing pane is bounded and preserves OBS-85's
         // fail-closed error instead of guessing from an adapter fingerprint.
-        const settled = await this.settleDeliveryLine(
-          pane,
-          slot.cwd,
-          transcript,
-          this.inputBoxes.get(slot),
-        );
+        const settled = await this.settleDeliveryLine(pane, slot.cwd, transcript, inputBox);
         transcript = settled.transcript;
         if (!settled.ok) {
           throw new Error(`herdr delivery clear failed — refusing to retype onto a corrupted line (OBS-85); pane transcript:\n${transcript}`);
@@ -532,23 +719,15 @@ export class HerdrDriver implements ExecutorDriver {
         DELIVERY_VERIFY_TIMEOUT_MS + 15_000,
       );
       if (this.waitOk(back.code, back.stdout) || await this.deliveryReadMatches(pane, cmd, slot.cwd)) {
-        if (verifySubmission) {
-          await this.submitVerifiedDelivery(slot, cmd, pane, readiness);
-        } else {
-          const enter = await this.herdr(`pane send-keys ${shq(pane)} Enter`, slot.cwd);
-          if (enter.code !== 0) throw new Error(`herdr pane send-keys Enter failed: ${enter.stderr || enter.stdout}`);
-        }
+        await this.submitVerifiedDelivery(slot, pane, inputBox!, readiness);
         return;
       }
       // capture the corrupted delivery BEFORE clearing it — the OBS-85 byte-level evidence
       transcript = (await this.herdr(`pane read ${shq(pane)} --source recent-unwrapped --lines ${DELIVERY_READ_LINES}`, slot.cwd)).stdout;
     }
-    throw new Error(`herdr delivery corrupted after ${DELIVERY_ATTEMPTS} attempts — enter never pressed (OBS-85); pane transcript:\n${transcript}`);
+    throw new DeliveryCorruptedError(pane, `${DELIVERY_ATTEMPTS} typed attempts — enter never pressed (OBS-85)`, transcript);
   }
 
-  // The narrator launches a perpetual shell watch, not an adapter-backed input interface. Keep
-  // OBS-85's readiness + paste read-back and the historical single Enter, while worker/gate runs
-  // continue through positive post-Enter evidence in submitVerifiedDelivery.
   // OBS-201: liveness nudge — deliver one message into the live worker TUI through the exact
   // pincer every dispatch uses (readiness stable-frame, type-without-Enter, read-back, C-u clear
   // on corruption, verified submit), serialized on the deliveryQueue so it can never interleave
@@ -560,29 +739,30 @@ export class HerdrDriver implements ExecutorDriver {
     const pinned = this.deliveredPanes.get(slot);
     if (!pinned) return false;
     try {
-      await this.deliveryQueue(() => this.deliver(slot, message, pinned));
+      await this.deliveryQueue(() => this.deliverTyped(slot, message, pinned));
       return true;
     } catch {
       return false; // the daemon journals worker-nudge-failed and falls back to the stall window
     }
   }
 
+  // The narrator launches a perpetual shell watch, not an adapter-backed input interface — a shell
+  // dispatch like any other, delivered atomically and acknowledged by its own START nonce.
   private async deliverPersistentShellCommand(slot: Slot, cmd: string): Promise<void> {
     return this.deliveryQueue(async () => {
       const pane = await this.paneId(slot);
-      await this.deliver(slot, cmd, pane, false);
+      await this.deliverAtomic(slot, cmd, pane);
       this.deliveredPanes.set(slot, pane);
     });
   }
 
   private async submitVerifiedDelivery(
     slot: Slot,
-    cmd: string,
     pane: string,
+    inputBox: InputBox,
     readiness: DeliveryReadinessEvidence,
   ): Promise<void> {
     let transcript = "";
-    const inputBox = this.inputBoxes.get(slot);
     // The base window preserves OBS-140's bounded behavior. A slow readiness observation grants
     // the same measured time once more for submit paint, capped by the readiness bound itself.
     const baseVerifyMs = (DELIVERY_SETTLE_READ_ATTEMPTS - 1) * DELIVERY_SETTLE_POLL_MS;
@@ -602,18 +782,16 @@ export class HerdrDriver implements ExecutorDriver {
         slot.cwd,
         transcript,
         inputBox,
-        (candidate) => this.submissionRegistered(candidate, cmd, inputBox),
+        (candidate) => this.submissionRegistered(candidate, inputBox),
         verifyWindowMs,
       );
       transcript = settled.transcript;
       if (settled.ok) return;
       if (settled.readFailed) {
-        throw new Error(`herdr delivery corrupted — submission verification failed, refusing to re-press Enter (OBS-140); pane transcript:\n${transcript}`);
+        throw new DeliveryCorruptedError(pane, "submission verification read failed, refusing to re-press Enter (OBS-140)", transcript);
       }
     }
-    throw new Error(
-      `herdr delivery corrupted after ${DELIVERY_SUBMIT_ATTEMPTS} submit attempts — submission never registered (OBS-140); pane transcript:\n${transcript}`,
-    );
+    throw new DeliveryCorruptedError(pane, `${DELIVERY_SUBMIT_ATTEMPTS} submit attempts — submission never registered (OBS-140)`, transcript);
   }
 
   private async settleDeliveryLine(
@@ -656,14 +834,16 @@ export class HerdrDriver implements ExecutorDriver {
     return { ok: false, transcript, recognizedInputBox: false };
   }
 
+  // Readiness now serves typed delivery only, so the target is always the adapter's declared box:
+  // the "no declared box, so assume ready when the pane doesn't already show our command" branch is
+  // gone with the rest of the typed-text inference (v1.85 T5).
   private async awaitDeliveryReadiness(
     slot: Slot,
     cmd: string,
     pane: string,
+    inputBox: InputBox,
   ): Promise<DeliveryReadinessEvidence> {
-    const inputBox = this.inputBoxes.get(slot);
-    const requireInputBox = inputBox !== undefined && inputBox.launchCommand?.(cmd) !== true;
-    const timeoutMs = inputBox?.readinessTimeoutMs ?? DELIVERY_READINESS_TIMEOUT_MS;
+    const timeoutMs = inputBox.readinessTimeoutMs ?? DELIVERY_READINESS_TIMEOUT_MS;
     const started = this.time.now();
     let previous: string | undefined;
     let transcript = "";
@@ -696,10 +876,9 @@ export class HerdrDriver implements ExecutorDriver {
 
       if (previous !== undefined) {
         const stableFrame = read.stdout === previous;
-        const targetReady = stableFrame && (requireInputBox
-          ? matchesInputBox(previous, inputBox!) && matchesInputBox(read.stdout, inputBox!)
-          : !this.deliveryMatches(read.stdout, cmd));
-        if (targetReady) return { waitedMs, timeoutMs, transcript: read.stdout };
+        if (stableFrame && matchesInputBox(previous, inputBox) && matchesInputBox(read.stdout, inputBox)) {
+          return { waitedMs, timeoutMs, transcript: read.stdout };
+        }
       }
       previous = read.stdout;
 
@@ -958,7 +1137,10 @@ export class HerdrDriver implements ExecutorDriver {
     }
   }
 
-  worktree(repo: string, branch: string, baseRef: string): Promise<string> {
-    return createWorktree(repo, branch, baseRef);
+  async worktree(repo: string, branch: string, baseRef: string): Promise<string> {
+    const worktree = await createWorktree(repo, branch, baseRef);
+    this.journalRoots.set(repo, repo);
+    this.journalRoots.set(worktree, repo);
+    return worktree;
   }
 }

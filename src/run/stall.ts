@@ -29,6 +29,67 @@ export interface StallProgressSample {
   contextTokens?: number;
 }
 
+// T1 (OBS-262): the rescue nudge's adapter scope — claude-code only (steering path proven,
+// OBS-122). Widening it is a future fixture-capture chore (an occupied-frame capture per adapter,
+// OBS-181 scar), never a drive-by edit. Lives in the stall module so the watchdog's policy and its
+// scope constant cannot drift apart.
+export const NUDGEABLE_ADAPTERS = new Set(["claude-code"]);
+
+// T1 (OBS-263): a LIVE provider banner is the last thing the pane printed — the worker stopped
+// underneath it. A "quota"/"rate limit" mention inside the task prompt, a diff hunk, or earlier
+// output sits ABOVE the transcript tail and must never fail an attempt over, so the in-loop quota
+// classifier reads only this many trailing non-empty rows instead of the whole retained snapshot.
+// ponytail: rows, not a banner grammar — the ceiling is a worker frozen with a quota mention as its
+// literal last output; the two-consecutive-slices + tracker-silence gates bound that cost to one
+// failover within the routing floor. Upgrade path is a per-adapter banner fixture if it ever bites.
+export const QUOTA_BANNER_TAIL_ROWS = 12;
+export function stallSnapshotTail(text: string, rows: number = QUOTA_BANNER_TAIL_ROWS): string {
+  return normalizeStallSnapshot(text)
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .slice(-rows)
+    .join("\n");
+}
+
+// T1 review (chrome-blind-matcher class, OBS-152/155): the tail of a RENDERED TUI frame is not
+// "what the pane printed last" — its bottom rows are fixed composer/welcome chrome. Codex pins
+// "• You have 3 usage limit resets available." there, so a raw-tail QUOTA_RE match fires on every
+// frame of a wedged pane (verified against all 8 frames of tests/fixtures/codex-mcp-spinner) and
+// would fail a live worker over mid-work. Filter the KNOWN chrome instead of everything on screen
+// at some anchor: a novelty baseline cannot distinguish "chrome that was already there" from "a
+// real banner the CLI printed before the first poll read" — a channel throttled at launch paints
+// its banner inside the first BLOCKED_POLL_MS slice, so the banner BECOMES the baseline and is
+// exculpated forever (proven by execution: banner-from-the-first-loop-read fails over on shipped
+// 843328b0, parks human under the baseline). This line is semantically the opposite of exhaustion
+// — resets AVAILABLE — so matching it out can never hide a real banner. Closed allowlist, same
+// philosophy as the normalizer's: a new adapter's quota-flavored chrome is a fixture-capture
+// chore, never a drive-by edit.
+const QUOTA_CHROME_RE = /usage limit resets? available/i;
+export function stallSnapshotBannerRows(text: string, rows: number = QUOTA_BANNER_TAIL_ROWS): string {
+  return stallSnapshotTail(text, rows)
+    .split("\n")
+    .filter((line) => !QUOTA_CHROME_RE.test(line))
+    .join("\n");
+}
+
+// T1 (OBS-262/263, speed-spec §2): past fifteen minutes with a FLAT token-usage counter, row
+// growth alone no longer re-arms the inactivity window — cosmetic repaint rows are not paid work.
+// Token usage is the paid-work signal the tracker already samples; token growth always re-arms.
+export const ROW_REARM_TOKEN_FLAT_MS = 15 * 60_000;
+// Test seam, same pattern as the daemon's timing seams: production reads the constant.
+let rowRearmTokenFlatMs = ROW_REARM_TOKEN_FLAT_MS;
+export function setRowRearmTokenFlatMsForTests(ms: number): void {
+  rowRearmTokenFlatMs = ms;
+}
+export function resetRowRearmTokenFlatMsForTests(): void {
+  rowRearmTokenFlatMs = ROW_REARM_TOKEN_FLAT_MS;
+}
+
+// T1 review (read-ceiling blindness): the daemon samples panes through `driver.read(slot, N)` —
+// a bounded window. This constant IS that N, and the daemon's pane reads must use it (never a
+// literal) so the tracker's saturation check below cannot drift away from the real read depth.
+export const PANE_READ_ROWS = 1000;
+
 /**
  * Monotonic worker-progress measure for the stall watchdog.
  *
@@ -36,32 +97,84 @@ export interface StallProgressSample {
  * evidence of work. A rendered transcript is only known to have grown when it occupies more
  * non-empty rows than any prior sample. Same-row rewrites are deliberately ambiguous and do not
  * advance the clock: a recoverable early consult is safer than silencing the watchdog forever.
+ *
+ * CEILING: `transcriptRows` is a monotone high-water over the daemon's bounded pane read
+ * (PANE_READ_ROWS lines), so it is a one-way ratchet whose signal goes blind once the pane's
+ * content exceeds the read window — the same full window slides and `observe()` can never
+ * report row growth again. Past that point a `false` return means "unmeasurable", not "no
+ * output" — consumers making a kill decision (the dead-channel fast-kill) must check
+ * `rowSignalSaturated` and stand down on it.
  */
 export class StallProgressTracker {
-  private transcriptRows = 0;
+  private transcriptRows = 0; // non-empty high-water over the bounded read — the growth signal
+  private rawWindowLines = 0; // raw-line high-water — the SATURATION signal (see the getter)
   private seedSubmitted = false;
   private contextTokens: number | undefined;
+  private lastTokenGrowthAt: number | undefined; // undefined until the first token sample anchors the flat-clock
+  private rowGrowthAt: number | undefined; // raw row-growth clock — NEVER suppressed by the flat-token rule
 
-  observe(sample: StallProgressSample): boolean {
-    let advanced = false;
+  /** True once a sample FILLED the bounded read window on RAW lines (blanks and chrome-only
+   * rows included): the pane's real extent is then unknown — genuinely new content scrolls out
+   * of the read and the row high-water can never advance again — so a flat tracker is blindness,
+   * not silence. The raw window is the saturation signal, NOT the normalized non-empty count: a
+   * production `read(slot, PANE_READ_ROWS)` returns at most PANE_READ_ROWS lines including blank
+   * and chrome-only rows (measured 730 non-empty of 1000 on the codex-mcp-spinner fixture), so
+   * comparing the non-empty high-water against PANE_READ_ROWS could never engage and the
+   * fast-kill's stand-down was unreachable. Sticky by construction (the high-water never
+   * decreases). */
+  get rowSignalSaturated(): boolean {
+    return this.rawWindowLines >= PANE_READ_ROWS;
+  }
+
+  /** Raw row-growth clock: the last observe() that advanced the row high-water, recorded even
+   * when the flat-token rule suppresses the progress REPORT (observe returns false). T1 review:
+   * the dead-channel fast-kill's "no output growth" leg must read this, not the suppressed
+   * progress clock — a metered adapter whose sticky token counter freezes the report while the
+   * pane keeps streaming rows is alive, and only this clock sees it. */
+  get lastRowGrowthAt(): number | undefined {
+    return this.rowGrowthAt;
+  }
+
+  observe(sample: StallProgressSample, now: number = Date.now()): boolean {
+    let rowsAdvanced = false;
+    // raw window high-water first — this is the saturation signal (rowSignalSaturated), and it
+    // must see the sample exactly as the bounded read returned it, blanks and chrome included.
+    const rawLines = sample.paneText.split("\n").length;
+    if (rawLines > this.rawWindowLines) this.rawWindowLines = rawLines;
     const rows = normalizeStallSnapshot(sample.paneText)
       .split("\n")
       .filter((line) => line.trim().length > 0)
       .length;
     if (rows > this.transcriptRows) {
       this.transcriptRows = rows;
-      advanced = true;
+      rowsAdvanced = true;
+      this.rowGrowthAt = now; // raw signal — advances even when the report below is suppressed
     }
+    let seedAdvanced = false;
     if (sample.seedSubmitted && !this.seedSubmitted) {
       this.seedSubmitted = true;
-      advanced = true;
+      seedAdvanced = true;
     }
+    let tokensAdvanced = false;
     const tokens = sample.contextTokens;
     if (tokens !== undefined && Number.isFinite(tokens)) {
-      if (tokens > (this.contextTokens ?? 0)) advanced = true;
-      this.contextTokens = Math.max(this.contextTokens ?? 0, tokens);
+      if (tokens > (this.contextTokens ?? 0)) tokensAdvanced = true;
+      // T1 review: ANY movement re-anchors the flat-clock, not just a new high-water mark — a
+      // context compaction drops the counter, and the climb back below the old peak is still paid
+      // work. A high-water comparison would freeze the anchor forever on the first decrease. (The
+      // first token sample always counts as movement: contextTokens starts undefined.)
+      if (tokens !== this.contextTokens) this.lastTokenGrowthAt = now;
+      this.contextTokens = tokens;
     }
-    return advanced;
+    if (tokensAdvanced || seedAdvanced) return true;
+    if (rowsAdvanced) {
+      // T1: row growth past the flat-token cap is cosmetic — the paid-work counter has not moved,
+      // so the inactivity window must NOT re-arm on it. A tracker that never sees a token sample
+      // (unmetered adapter) keeps the old row-growth behavior.
+      if (this.lastTokenGrowthAt !== undefined && now - this.lastTokenGrowthAt >= rowRearmTokenFlatMs) return false;
+      return true;
+    }
+    return false;
   }
 }
 

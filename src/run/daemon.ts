@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,7 +9,7 @@ import { allAdapters, discoverChannels, getAdapter, probeAll, readDoctor } from 
 import { type Assignment, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import {
-  globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
+  DEFAULT_DIFF_CAP, globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
 } from "../config/config.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
@@ -24,13 +24,13 @@ import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } 
 import { runEnvironment } from "./environment.js";
 import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { classifyTaskFailure, classifyWorkerResultCause, engagementComparable, Journal, loadRoutingProfile, newRunId, phaseForGate, recordedTaskFailureKind, reviewRoundsSinceApproval, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, GATE_FINGERPRINT_CAP, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, pendingRepairFindings, phaseForGate, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, structuredFindings, upheldFeedbackByTask, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
 import { acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
 import { nextChannel, route } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
-import { StallProgressTracker } from "./stall.js";
+import { NUDGEABLE_ADAPTERS, PANE_READ_ROWS, StallProgressTracker, stallSnapshotBannerRows } from "./stall.js";
 
 export interface RunOptions {
   runId?: string;
@@ -133,6 +133,105 @@ export function formatSummary(s: RunSummary): string {
 }
 
 const MAX_ATTEMPTS = 10; // ponytail: hard cap so a pathological ladder can never loop forever
+
+// v1.85 T3 (retry economics): two repairs per engagement, then the fresh ladder. A repair re-uses the
+// findings and the landed diff instead of re-buying onboarding; when two of them have not closed the
+// battery, the cheaper next move is the ladder's channel change, not a third fix-only pass.
+const MAX_REPAIRS = 2;
+
+/** A named oracle decided this acceptance failure — deterministic, unlike an LLM judge verdict. */
+const isOracleFailure = (g: GateResult) => g.details.startsWith("oracle failed:");
+
+/**
+ * R3 (OBS-186): a gate that DECLINED to run is not a gate that failed. The review gate's skip branch
+ * no longer forges `pass: true` to buy passage, so the merge decision has to read the same predicate
+ * the run surfaces already read (src/run/activity.ts): pass, or an honest declared skip. Without this
+ * the honesty change would silently park every judge-only task at merge — an unrun gate blocking work
+ * it was never asked to review. `skipped` is set only by a gate that says so about ITSELF; a red
+ * verdict from a review that actually ran still fails here, exactly as before.
+ *
+ * ONE pair of predicates, every fold. `!g.pass` was correct only while the sole `pass:false` producer
+ * was a gate that actually failed; the moment a decline can be recorded red, every `!g.pass` in this
+ * file — the retry feedback brief, the review-fix eligibility test, the failing-battery list the
+ * ladder and the fingerprint cap are scored on, the structured findings attached to a blocking
+ * verdict — reads an unrun gate as a defect. `gateFailed` is the seam they now share, and the journal
+ * write below is the seam every OUT-of-file fold shares.
+ */
+const gateSatisfied = (g: GateResult) => g.pass || g.meta?.skipped === true;
+const gateFailed = (g: GateResult) => !gateSatisfied(g);
+
+// v1.85 T3: the gates whose failure IS a deterministic measurement — a machine re-ran a command over a
+// tree and printed the same bytes. Those are the failures the fingerprint cap governs (the ruling names
+// it a "deterministic-gate" cap): a third identical answer to a question already answered twice is the
+// ~663m-across-5-runs loop, whatever rung the ladder happens to stand on. An LLM verdict is a different
+// object — two reviewers, or a judge asked twice, can restate one another without the question being
+// closed — and each already carries a tighter bound of its own: REVIEW_ROUND_CAP parks review at the
+// OPERATOR in two rounds, and a judge verdict rides the ladder and the attempt cap. The boundary is a
+// property of the GATE, never of the ladder rung or of the move that would follow the failure.
+const DETERMINISTIC_GATES = new Set<string>(["build", "test", "lint", "evidence", "scope"]);
+const isDeterministicFailure = (g: GateResult) =>
+  DETERMINISTIC_GATES.has(g.gate) || (g.gate === "acceptance" && isOracleFailure(g));
+
+/**
+ * Is the failing battery narrow enough that a fix-only pass can close it? The ruling's three cases:
+ * review-only, a single deterministic test/lint gate, or acceptance decided by a named oracle.
+ * Unparseable verdicts and diff-cap trips are excluded exactly as they are from the review-fix retry —
+ * neither names anything a worker can fix.
+ */
+function narrowRepairBattery(failing: GateResult[]): boolean {
+  if (failing.length !== 1) return false;
+  const g = failing[0]!;
+  if (g.gate === "review") return g.meta?.unparseable !== true && !isDiffCapPark(g);
+  if (g.gate === "test" || g.gate === "lint") return true;
+  if (g.gate === "acceptance") return isOracleFailure(g) && g.meta?.unparseable !== true;
+  return false;
+}
+
+/**
+ * T4 (OBS-265): the journal with the review objections a round did NOT hinge on removed. Judge and
+ * review are now launched together, so a round can journal a failed review that the serial walk would
+ * never have asked for — it returned at the judge. Those verdicts stay on the record (they are real,
+ * and the retry brief carries them), but they must not spend the OPERATOR-facing review round budget:
+ * otherwise concurrency alone parks a task rounds early for objections the old pipeline never bought.
+ * A round is the gate-result span opened by each `gates` phase-start, per task.
+ */
+export function decisiveReviewRounds(events: JournalEvent[]): JournalEvent[] {
+  const open = new Map<string, JournalEvent[]>();
+  const spent = new Set<JournalEvent>();
+  const close = (taskId: string) => {
+    const round = open.get(taskId) ?? [];
+    if (round.some((e) => e.data.gate !== "review" && e.data.pass === false)) {
+      for (const e of round) if (e.data.gate === "review" && e.data.pass === false) spent.add(e);
+    }
+    open.delete(taskId);
+  };
+  for (const e of events) {
+    if (!e.taskId) continue;
+    if (e.event === "phase-start" && e.data.phase === "gates") close(e.taskId);
+    else if (e.event === "gate-result") open.set(e.taskId, [...(open.get(e.taskId) ?? []), e]);
+  }
+  for (const taskId of open.keys()) close(taskId); // Map iteration tolerates deleting the current key
+  return events.filter((e) => !spent.has(e));
+}
+
+/** The fix-only contract: the findings verbatim, then the diff content of the work already landed. */
+function repairBrief(findings: string, diff: string, baseRef: string): string {
+  const repair = { findings, diff };
+  return [
+    "## Repair attempt — fix ONLY what these findings name",
+    "The commits from your prior attempt are already in this worktree and their diff is reproduced"
+    + " below. Do NOT re-implement that work, do not start over, and do not revert it: make the"
+    + " smallest change that resolves every finding, then commit.",
+    "",
+    "### Failing gate findings (verbatim)",
+    repair.findings,
+    "",
+    `### The work under review (git diff ${baseRef.slice(0, 12)}..HEAD)`,
+    "```diff",
+    repair.diff,
+    "```",
+  ].join("\n");
+}
 // v1.70 T5: request-changes review rounds a single task may draw before it parks for a human decision
 // instead of cycling. Well below MAX_ATTEMPTS so review non-convergence is caught long before the
 // global cap. ponytail: literal constant; lift to cfg.review.roundCap only if a second knob-turner appears.
@@ -157,20 +256,24 @@ export function resetEarlyLaunchLivenessMsForTests(): void {
   earlyLaunchLivenessMs = EARLY_LAUNCH_LIVENESS_MS;
 }
 
-// OBS-201: the liveness nudge — the daemon's ACTIVE response to an idle worker holding no trailer,
-// replacing page-a-human-then-burn-the-window (289 of 692 worker-minutes in one measured day).
-// Gate: herdr classifies the pane idle AND the monotonic tracker has seen nothing for
-// NUDGE_AFTER_SILENT_MS (a worker grinding inside a tool run is `working` and never reaches the
-// gate). One nudge per attempt; if the grace passes still idle with no progress, the wait concludes
-// as a stall NOW and the consult sees the un-answered nudge instead of an hour of silence.
-// Allowlist: claude-code first (steering path proven, OBS-122); widen per adapter only with a
-// captured occupied-frame fixture (OBS-181 scar). The message builder takes no nonce — the
+// OBS-201 + T1 (OBS-262): the liveness nudge — the daemon's ACTIVE response to a worker holding no
+// trailer, replacing page-a-human-then-burn-the-window (289 of 692 worker-minutes in one measured
+// day). Gate: NUDGE_AFTER_SILENT_MS of monotonic-tracker silence, regardless of the herdr status
+// reading (unknown/working no longer suppress it — a wedged TUI often scrapes as either); a
+// `blocked` pane still pages instead, since nudging a dialog prompt can't help. One nudge per
+// attempt; if the grace passes with no progress, the wait concludes as a stall NOW and the consult
+// sees the un-answered nudge instead of an hour of silence. Scope allowlist lives in stall.ts
+// (claude-code only; widening is a fixture-capture chore). The message builder takes no nonce — the
 // self-reference guard holds by construction, an echoed bare token can never match the wait regex.
-export const NUDGEABLE_ADAPTERS = new Set(["claude-code"]);
+export { NUDGEABLE_ADAPTERS } from "./stall.js";
 export const WORKER_NUDGE_MESSAGE =
   "tickmarkr liveness check: if the task is complete, print your TICKMARKR_RESULT completion trailer exactly as specified in your prompt now. If not, state your next concrete action and continue working.";
-const NUDGE_AFTER_SILENT_MS = 3 * 60_000;
+const NUDGE_AFTER_SILENT_MS = 10 * 60_000; // T1 (OBS-262): >=10m tracker silence — was 3m behind an unreachable status gate
 const WORKER_NUDGE_GRACE_MS = 4 * 60_000;
+// T1 review: a false return from driver.nudge is a DELIVERY outcome (missing pin, readiness
+// stable-frame timeout, read-back hiccup), not proof of an unreachable channel — so one failure
+// is retried once in-slice after this settle, and only a failed retry latches nudgeFailed.
+const NUDGE_REDELIVER_MS = 2_000;
 let nudgeAfterSilentMs = NUDGE_AFTER_SILENT_MS;
 let workerNudgeGraceMs = WORKER_NUDGE_GRACE_MS;
 /** Test seam — shrink the nudge gate and grace without minute-long sleeps. */
@@ -183,12 +286,402 @@ export function resetNudgeTimingForTests(): void {
   workerNudgeGraceMs = WORKER_NUDGE_GRACE_MS;
 }
 
+// T1 (OBS-263): in-loop quota-banner classification — the banner IS output, so the empty-output
+// rules can never catch it and the post-loop QUOTA_RE check only runs after the full window. Two
+// consecutive matching slices plus this much monotonic-tracker silence classify (a worker whose
+// diff merely quotes "rate limit" keeps working undisturbed).
+const QUOTA_BANNER_SILENT_MS = 3 * 60_000;
+let quotaBannerSilentMs = QUOTA_BANNER_SILENT_MS;
+/** Test seam — shrink the quota-banner silence gate without minute-long sleeps. */
+export function setQuotaBannerSilentMsForTests(ms: number): void {
+  quotaBannerSilentMs = ms;
+}
+export function resetQuotaBannerSilentMsForTests(): void {
+  quotaBannerSilentMs = QUOTA_BANNER_SILENT_MS;
+}
+
+// T1 (OBS-262): the operator page is UNLATCHED — every eligible slice journals a page, and the
+// notification is delivered again on a status change or once this cadence elapses. The cadence is
+// an operator-spam guard only; it can no longer turn a stall into a single page forever. It sits
+// BELOW the dead-channel fast-kill window on purpose (T1 review): at 5m == 5m the second delivery
+// raced the kill on the same slice boundary, so an idle non-nudgeable pane holding no delta — the
+// exact class the repeat exists for — got exactly one page in production.
+const PAGE_REPEAT_MS = 2 * 60_000;
+let pageRepeatMs = PAGE_REPEAT_MS;
+/** Test seam — shrink the repeat-page cadence without minute-long sleeps. */
+export function setPageRepeatMsForTests(ms: number): void {
+  pageRepeatMs = ms;
+}
+export function resetPageRepeatMsForTests(): void {
+  pageRepeatMs = PAGE_REPEAT_MS;
+}
+
+// T1 (R1 dead-channel fast-kill): a worker with no trailer, no worktree delta, and no output
+// growth for this long is dead — conclude immediately instead of burning the rolling window.
+// Per-task timeoutMinutes stays the escape valve for slow-but-live workers.
+const DEAD_CHANNEL_FAST_KILL_MS = 5 * 60_000;
+let deadChannelFastKillMs = DEAD_CHANNEL_FAST_KILL_MS;
+/** Test seam — shrink the fast-kill window without minute-long sleeps. */
+export function setDeadChannelFastKillMsForTests(ms: number): void {
+  deadChannelFastKillMs = ms;
+}
+export function resetDeadChannelFastKillMsForTests(): void {
+  deadChannelFastKillMs = DEAD_CHANNEL_FAST_KILL_MS;
+}
+
+// T2 (OBS-264): finished work is harvested, never redone. 18 of 18 observed stalls carried 2-33
+// commits, and the redispatch then re-bought verification of work that had already landed. The
+// liveness triad — commits made by this attempt, a FLAT worker-tree CPU delta, and this much
+// monotonic-tracker silence — CONCLUDES the wait. Conclude, never kill: the pane is harvested by
+// the same tail a window expiry uses, and the carried worktree goes straight to gates. Set at the
+// fast-kill's window on purpose (the OBS-264 arithmetic is "a ~36m stall + ~15m redo becomes a
+// ~5m gate pass"); a worker that is merely thinking still burns CPU and is never concluded here.
+const HARVEST_SILENT_MS = 5 * 60_000;
+let harvestSilentMs = HARVEST_SILENT_MS;
+/** Test seam — shrink the harvest silence gate without minute-long sleeps. */
+export function setHarvestSilentMsForTests(ms: number): void {
+  harvestSilentMs = ms;
+}
+export function resetHarvestSilentMsForTests(): void {
+  harvestSilentMs = HARVEST_SILENT_MS;
+}
+// A CPU delta needs two samples separated in WALL CLOCK, and the CPU clock is QUANTIZED: darwin's
+// `ps` prints hundredths ("0:00.03"), linux's prints whole seconds ("00:00:01"). Equality across a
+// window shorter than the quantum is not evidence of anything — a worker throttled to a low duty
+// cycle accrues less than one tick per sample and reads flat while genuinely working. So the flat
+// observation must span the LARGER of a floor and this many ticks of the clock actually in use:
+// crossing 30 ticks means the tree burned <1 tick in 30, i.e. under ~3% of one core. On a
+// hundredths host that is a 3s window; on a whole-second host it is 30s — still nothing against the
+// ~15m redispatch it replaces. Resolution is read off the sampled rows, never assumed.
+const HARVEST_CPU_FLAT_MS = 3_000;
+const HARVEST_CPU_FLAT_TICKS = 30;
+// Once the flat window opens, retain descendants often enough to observe brief tool processes that
+// can start and exit between the daemon's ordinary wait slices. This sampler exists only during an
+// eligible silence window; it is stopped on progress or as soon as the worker wait concludes.
+const HARVEST_CPU_ACCOUNTING_POLL_MS = 100;
+// T2 review (material): that 100ms cadence forks a shell plus `ps` ten times a second, and on a host
+// where `ps` is unsupported or denied (the managed-sandbox class) EVERY sample fails — tens of
+// thousands of processes per silent attempt, multiplied by daemon concurrency, for a probe that can
+// never conclude anything. Persistent failure is structural, not transient, so the sampler STOPS
+// after this many consecutive unreadable snapshots. It stays stopped for the silence window it was
+// started for: read() then reports no CPU, the triad refuses to conclude and journals the gap, and a
+// later window (after real progress clears the accountant) starts a fresh one that pays the same
+// bounded probe again.
+const HARVEST_CPU_UNMEASURABLE_SAMPLE_CAP = 20;
+let harvestCpuFlatMs: number | undefined;
+export function harvestCpuFlatWindowMs(resolutionMs: number): number {
+  return harvestCpuFlatMs ?? Math.max(HARVEST_CPU_FLAT_MS, resolutionMs * HARVEST_CPU_FLAT_TICKS);
+}
+/** Test seam — pin the flat window so a probe case need not sit through a real one. */
+export function setHarvestCpuFlatMsForTests(ms: number): void {
+  harvestCpuFlatMs = ms;
+}
+export function resetHarvestCpuFlatMsForTests(): void {
+  harvestCpuFlatMs = undefined;
+}
+// Once the silence gate is met the CPU probe owns the poll cadence: the trailer-wait slice is 30s,
+// so two samples would otherwise cost a minute of wall clock apiece. Below the gate the only rule
+// is not to sleep PAST it — at the shipped 5m gate that changes no slice a worker sees today.
+const HARVEST_POLL_MS = 2_000;
+function harvestSliceMs(silentMs: number): number {
+  return Math.max(100, silentMs >= harvestSilentMs ? HARVEST_POLL_MS : harvestSilentMs - silentMs);
+}
+
+// The synthesized result a carried no-trailer harvest hands to the gates. Distinct from anything a
+// worker can claim: it never comes from adapter.parse, and it is journaled under its own event.
+export const HARVESTED_RESULT_SUMMARY = "harvested: the worktree carries committed work; the worker emitted no TICKMARKR_RESULT trailer";
+
+/** T4 (OBS-266): identity of the command SET a tip verify ran — a changed command is a different verify. */
+export function commandsHash(commands: Record<string, string>): string {
+  return createHash("sha256").update(JSON.stringify(Object.entries(commands).sort())).digest("hex").slice(0, 12);
+}
+
+/**
+ * T4 (OBS-266): the journal's LAST verification cycle — the (tip, cmdHash) pair the most recent run
+ * of the verify commands spoke for, the gates it got a pass from, and whether anything failed in it.
+ *
+ * The LAST one, never a history of every pair ever green. "The last GREEN verified SHA" is what the
+ * spec licenses a skip against, and only the last cycle is a statement about the state the run is in
+ * now: after A→B→A the tip really moved, and after commands A→B→A the last thing that ran on this
+ * SHA was command set B — both re-verify. A cycle is the contiguous run of events sharing one pair,
+ * so a cycle cut short by a killed process is missing gates and can never satisfy the caller. A
+ * legacy event (no tip/cmdHash) is unattributable and breaks the chain outright.
+ */
+function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string; gates: Set<string>; failed: boolean } | undefined {
+  let cur: { tip: string; cmdHash: string; gates: Set<string>; failed: boolean } | undefined;
+  let afterRunEnd = false;
+  for (const e of events) {
+    // New journals delimit every attempt explicitly. run-end is the legacy delimiter: it starts a
+    // new cycle only when another verify event follows, while preserving the just-closed cycle as
+    // the cache candidate for an otherwise unmoved next run-end.
+    if (e.event === "tip-verify-start") {
+      const { tip, cmdHash } = e.data;
+      cur = typeof tip === "string" && typeof cmdHash === "string"
+        ? { tip, cmdHash, gates: new Set(), failed: false }
+        : undefined;
+      afterRunEnd = false;
+      continue;
+    }
+    if (e.event === "run-end") {
+      afterRunEnd = true;
+      continue;
+    }
+    if (e.event !== "tip-verify" && e.event !== "tip-verify-failed") continue;
+    const { tip, gate, cmdHash } = e.data;
+    if (typeof tip !== "string" || typeof gate !== "string" || typeof cmdHash !== "string") {
+      cur = undefined;
+      afterRunEnd = false;
+      continue;
+    }
+    if (!cur || afterRunEnd || cur.tip !== tip || cur.cmdHash !== cmdHash) {
+      cur = { tip, cmdHash, gates: new Set(), failed: false };
+    }
+    afterRunEnd = false;
+    if (e.event === "tip-verify-failed") cur.failed = true;
+    else cur.gates.add(gate);
+  }
+  return cur;
+}
+
+/**
+ * OBS-34's strict tip verify, but it stops re-paying for an unmoved tip (~334m corpus-wide; 69.5m in
+ * one park-heavy run whose 18 resume cycles merged nothing new). The verify journals the SHA it
+ * verified and the hash of the command set, so a later run-end can recognize the same verified state:
+ * head equals the LAST green verified SHA, commands unchanged, tree clean → journal
+ * `tip-verify-cached` and skip. ANY doubt — moved head, changed commands, dirty tree, a gate missing
+ * from that cycle's green set, a failure recorded in it, a cycle older than the last one — runs the
+ * full verify. The tip-verify-before-green law is untouched: a cached green is a verified green OF
+ * THAT EXACT COMMIT, established by the most recent real run of the same commands.
+ * Returns whether the tip is failing.
+ */
+export async function verifyIntegrationTipCached(
+  intWt: string,
+  commands: Record<string, string>,
+  journal: Journal,
+  opts: { lastMergedTask?: string } = {},
+): Promise<boolean> {
+  const cmdHash = commandsHash(commands);
+  const tip = await gitHead(intWt);
+  const porcelain = await shGit("git status --porcelain", intWt);
+  const clean = porcelain.code === 0 && porcelain.stdout.trim() === "";
+  const last = lastVerifyCycle(journal.read());
+  const cached = last !== undefined && !last.failed && last.tip === tip && last.cmdHash === cmdHash
+    && Object.keys(commands).every((g) => last.gates.has(g));
+  // A pair can be verified red and then green without either SHA or command hash changing (for
+  // example, an external service or ignored fixture recovers). Delimit attempts explicitly so that
+  // the earlier red cannot remain latched into the later complete green cycle.
+  journal.append("tip-verify-start", undefined, { tip, cmdHash, gates: Object.keys(commands), cached: clean && cached });
+  if (clean && cached) {
+    journal.append("tip-verify-cached", undefined, { tip, cmdHash, gates: Object.keys(commands) });
+    // The skip must not read as a red. Every surface derives the tip's verdict from this cycle's
+    // `tip-verify` events (cockpit derive.ts tipVerificationPassed: a run-end claiming "passed" with
+    // ZERO events is fail-closed to FALSE), so a carried-forward green still journals its per-gate
+    // pass — `cached: true` keeps it honest about not having re-run the command.
+    for (const gate of Object.keys(commands)) {
+      journal.append("tip-verify", undefined, { gate, cmd: commands[gate], pass: true, exitCode: 0, cached: true, tip, cmdHash });
+    }
+    return false;
+  }
+  let tipFailed = false;
+  for (const r of await verifyIntegrationTip(intWt, commands, journal.dir)) {
+    if (r.pass) {
+      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, tip, cmdHash });
+    } else {
+      journal.append("tip-verify-failed", undefined, {
+        gate: r.gate,
+        cmd: r.cmd,
+        exitCode: r.exitCode,
+        fingerprints: r.fingerprints,
+        artifact: r.artifact,
+        lastMergedTask: opts.lastMergedTask,
+        tip,
+        cmdHash,
+      });
+      tipFailed = true;
+    }
+  }
+  return tipFailed;
+}
+
+// `ps` CPU time: "[[dd-]hh:]mm:ss[.frac]" (darwin prints "0:00.03", linux "00:00:01", both print
+// "1-02:03:04" past a day). Anything else is a header or a row this parser must not guess at.
+// `frac` reports whether THIS host prints sub-second digits — the quantum the flat window is sized
+// against, measured rather than assumed (a darwin sample is 10ms, a linux one 1000ms).
+function parsePsCpu(raw: string): { ms: number; frac: boolean } | undefined {
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$/.exec(raw);
+  if (!m) return undefined;
+  const ms = ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60_000 + Math.round(Number(m[4]!) * 1000);
+  return { ms, frac: m[4]!.includes(".") };
+}
+
+interface WorkerTreeCpuSnapshot {
+  processes: Map<string, number>;
+  resolutionMs: number;
+}
+
+let linuxClockTickMs: Promise<number | undefined> | undefined;
+function linuxProcessCpuMs(pid: string, cwd: string): Promise<{ ms: number; resolutionMs: number } | undefined> {
+  if (!existsSync("/proc/self/stat")) return Promise.resolve(undefined);
+  // shGit, not sh: the accountant samples this path at a 100ms cadence, and a LOGIN shell would
+  // re-run the operator's profile (nvm/pyenv/direnv side effects included) on every sample.
+  linuxClockTickMs ??= shGit("getconf CLK_TCK", cwd, 15_000).then((r) => {
+    const ticks = r.code === 0 ? Number(r.stdout.trim()) : Number.NaN;
+    return Number.isFinite(ticks) && ticks > 0 ? 1_000 / ticks : undefined;
+  });
+  return linuxClockTickMs.then((resolutionMs) => {
+    if (resolutionMs === undefined) return undefined;
+    try {
+      // `/proc/<pid>/stat` fields 14-17 are user/system jiffies for the process and its waited-for
+      // children. The child totals retain tools that start and exit wholly between live-tree polls.
+      // Split after the LAST ')' because comm may contain spaces or parentheses; field 3 is rest[0].
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      const ticks = Number(fields[11]) + Number(fields[12]) + Number(fields[13]) + Number(fields[14]);
+      return Number.isFinite(ticks) ? { ms: ticks * resolutionMs, resolutionMs } : undefined;
+    } catch {
+      return undefined; // process exited between ps ancestry capture and the precise CPU read
+    }
+  });
+}
+
+// T2 (OBS-264): the triad's CPU leg. Every non-seeded process of an attempt descends from that
+// attempt's own dispatch script, whose path is unique — print, argv-interactive and resume launches
+// all start there. (interactive-seed is intentionally fail-open below because its adapter-owned
+// launch bypasses this script.) ONE `ps` snapshot finds the root and all current descendants:
+// the agent CLI is a CHILD of the script's shell, so the root's own TIME never moves while the CLI
+// thinks. `resolutionMs` is the sampled clock's quantum, which sizes the caller's flat window.
+// Returns 0 when nothing matches: a worker whose process tree is gone is the strongest possible
+// "not working". Returns undefined when the snapshot itself failed or parsed to nothing —
+// unmeasurable CPU is never evidence a worker stopped, and the caller refuses to conclude on it.
+async function workerTreeCpuSnapshot(marker: string, cwd: string): Promise<WorkerTreeCpuSnapshot | undefined> {
+  // shGit, not sh: same login-shell cost as the CLK_TCK probe above — `ps` needs no profile.
+  const snapshot = await shGit("ps -Awwo pid=,ppid=,time=,command=", cwd, 15_000);
+  if (snapshot.code !== 0) return undefined;
+  const rows: { pid: string; ppid: string; cpuMs: number; frac: boolean; cmd: string }[] = [];
+  for (const line of snapshot.stdout.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const cpu = parsePsCpu(m[3]!);
+    if (cpu !== undefined) rows.push({ pid: m[1]!, ppid: m[2]!, cpuMs: cpu.ms, frac: cpu.frac, cmd: m[4]! });
+  }
+  if (rows.length === 0) return undefined;
+  const tree = new Set(rows.filter((p) => p.cmd.includes(marker)).map((p) => p.pid));
+  // `ps` output is not topologically ordered — relax the parent→child closure until it stops growing.
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const p of rows) {
+      if (!tree.has(p.pid) && tree.has(p.ppid)) { tree.add(p.pid); grew = true; }
+    }
+  }
+  const precise = new Map<string, number>();
+  let preciseResolutionMs: number | undefined;
+  for (const p of rows) {
+    if (!tree.has(p.pid)) continue;
+    const cpu = await linuxProcessCpuMs(p.pid, cwd);
+    precise.set(p.pid, cpu?.ms ?? p.cpuMs);
+    if (cpu !== undefined) preciseResolutionMs = cpu.resolutionMs;
+  }
+  // Even an empty worker tree needs the host's actual measurement quantum: on Linux the /proc
+  // jiffy clock remains available after the worker exits, while `ps time` only prints whole seconds.
+  if (preciseResolutionMs === undefined && existsSync("/proc/self/stat")) {
+    preciseResolutionMs = (await linuxProcessCpuMs(String(process.pid), cwd))?.resolutionMs;
+  }
+  return {
+    processes: precise,
+    resolutionMs: preciseResolutionMs ?? (rows.some((p) => p.frac) ? 10 : 1_000),
+  };
+}
+
+export async function workerTreeCpuMs(marker: string, cwd: string): Promise<{ ms: number; resolutionMs: number } | undefined> {
+  const snapshot = await workerTreeCpuSnapshot(marker, cwd);
+  if (snapshot === undefined) return undefined;
+  return {
+    ms: [...snapshot.processes.values()].reduce((sum, cpuMs) => sum + cpuMs, 0),
+    resolutionMs: snapshot.resolutionMs,
+  };
+}
+
+// Sparse live-tree totals forget a tool's CPU as soon as that tool exits. This attempt-local
+// accountant instead adds each observed process's CPU DELTA to a monotonic total and replaces only
+// the live-PID cursor on each sample. When a PID disappears, its contribution stays in `totalMs`;
+// if that PID is later reused, its fresh total is added from zero because it left `live` in between.
+class WorkerTreeCpuAccountant {
+  private active = false;
+  private loop: Promise<void> | undefined;
+  private live = new Map<string, number>();
+  private totalMs = 0;
+  private gaps = 0;
+  private consecutiveGaps = 0;
+  private latest: { ms: number; resolutionMs: number } | undefined;
+
+  constructor(private marker: string, private cwd: string) {}
+
+  private async sample(): Promise<void> {
+    const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd);
+    if (snapshot === undefined) {
+      this.gaps++;
+      this.live.clear();
+      this.latest = undefined;
+      // Stop forking `ps` at 10Hz once the host has proved it cannot answer — see the cap's comment.
+      if (++this.consecutiveGaps >= HARVEST_CPU_UNMEASURABLE_SAMPLE_CAP) this.active = false;
+      return;
+    }
+    this.consecutiveGaps = 0;
+    for (const [pid, cpuMs] of snapshot.processes) {
+      const prior = this.live.get(pid);
+      this.totalMs += prior === undefined || cpuMs < prior ? cpuMs : cpuMs - prior;
+    }
+    this.live = snapshot.processes;
+    this.latest = { ms: this.totalMs, resolutionMs: snapshot.resolutionMs };
+  }
+
+  async start(): Promise<void> {
+    if (this.active) return;
+    this.active = true;
+    await this.sample();
+    this.loop = (async () => {
+      while (this.active) {
+        await new Promise((resolve) => setTimeout(resolve, HARVEST_CPU_ACCOUNTING_POLL_MS));
+        if (this.active) await this.sample();
+      }
+    })();
+  }
+
+  read(): { cpu: { ms: number; resolutionMs: number } | undefined; gaps: number } {
+    return { cpu: this.latest, gaps: this.gaps };
+  }
+
+  async stop(): Promise<void> {
+    this.active = false;
+    await this.loop;
+  }
+}
+
 async function commitsAheadOf(base: string, wt: string): Promise<string[]> {
   const head = await gitHead(wt);
   if (head === base) return [];
   const r = await shGit(`git log --reverse --format=%H ${shq(base)}..${shq(head)}`, wt);
   if (r.code !== 0) return [];
   return r.stdout.trim().split("\n").filter(Boolean);
+}
+
+// T1 (R1 fast-kill): worktree delta = commits ahead of the task base OR any uncommitted change.
+// The fast-kill may only run once the ABSENCE of work has been positively established, so every
+// probe fails OPEN toward "delta": a throwing rev-parse, a non-zero `git log`, and a non-zero
+// `git status` all report delta. commitsAheadOf() is deliberately NOT reused here — it converts a
+// failed log into an empty list, which reads as "no commits" and would kill a live worker.
+async function worktreeHasDelta(wt: string, base: string): Promise<boolean> {
+  try {
+    const head = await gitHead(wt);
+    if (head !== base) {
+      const log = await shGit(`git log --reverse --format=%H ${shq(base)}..${shq(head)}`, wt);
+      if (log.code !== 0 || log.stdout.trim().length > 0) return true;
+    }
+    const r = await shGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain", wt);
+    return r.code !== 0 || r.stdout.trim().length > 0;
+  } catch {
+    return true; // an unreadable worktree is never evidence that the worker did nothing
+  }
 }
 
 async function cherryPickCommits(wt: string, commits: string[]): Promise<string[]> {
@@ -357,7 +850,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     for (const [id, st] of journal.replayStatuses()) {
       if (opts.retryFailed && st === "failed" && recordedTaskFailureKind(replayEvents, id) === "dispatch") {
         graph = setStatus(graph, id, "pending");
-        resume.delete(id);
+        // OBS-254: clear ATTEMPT AND CHANNEL STATE ONLY. Deleting the whole entry also deleted
+        // upheldFeedback — the operator's funded brief — and the next dispatch advertised an empty
+        // "fix these specifically" heading. A dispatch that died before worker-result then re-ran the
+        // worker with the uphold's findings silently gone.
+        const prior = resume.get(id);
+        resume.set(id, { attempts: 0, tried: [], ...(prior?.upheldFeedback ? { upheldFeedback: prior.upheldFeedback } : {}) });
         continue;
       }
       // operator release: a graph.json edit back to "pending" beats a replayed human/failed park (locked decision 12)
@@ -542,7 +1040,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // reviewer-exclusion list (badReviewers), never a second parallel counter. OBS-189: scoped to the
     // current engagement — an operator approval (uphold or accept) resets the round budget, so an upheld
     // task can dispatch its funded attempt instead of re-parking against the whole journal's history.
-    const reviewRoundsDrawn = () => reviewRoundsSinceApproval(journal.read(), t.id);
+    const reviewRoundsDrawn = () => reviewRoundsSinceApproval(decisiveReviewRounds(journal.read()), t.id);
     // OBS-193: journal the in-gate review retry (mirrors judge-retry) and exclude the flaked seat from
     // later attempts' reviewer picks. One helper, called from both onGate sites (satisfied-gate + main).
     const noteReviewRetry = (g: GateResult) => {
@@ -555,9 +1053,84 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         badReviewers.push(rr.flaked);
       }
     };
+    // v1.85 T3 (ruling R4): every BLOCKING review/judge result lands its findings in the journal
+    // structured — class + canonical path + stable symbol — so a retry, a consult or an auto-uphold
+    // decision reads identity instead of re-parsing prose, and line-number churn is not a new finding.
+    // One helper, both onGate sites (satisfied-gate resume + main attempt loop).
+    const journalGateResult = (g: GateResult) => {
+      const blocking = gateFailed(g) && (g.gate === "review" || g.gate === "acceptance");
+      // R3 (OBS-186): a gate that DECLINED has no verdict to state, and this row is the ONE seam every
+      // fold outside this file shares. Writing `pass: false` for a decline is what turned a skip into
+      // a failure at all of them at once — the engagement round budget (reviewRoundsSinceApproval,
+      // journal.ts), the operator's failed-gate list (cli/commands/approve.ts), the record's
+      // gate-failure total (cli/commands/report.ts), the cockpit's gate rows (tui/cockpit/derive.ts).
+      // Each keys on `pass === false`; none of them is reachable from this task's file scope, and
+      // patching five copies of the same question would be the wrong fix even if they were. So the
+      // ledger simply does not claim a verdict it does not have.
+      // The legacy baseline declines (a build command the repo never configured) have always written
+      // `pass: true` beside `skipped: true` and every consumer already reads them right, so their row
+      // is untouched: only a decline that would otherwise be recorded RED changes shape here.
+      const unverdicted = g.meta?.skipped === true && !g.pass;
+      journal.append("gate-result", t.id, {
+        gate: g.gate, ...(unverdicted ? {} : { pass: g.pass }), details: g.details,
+        ...(g.meta?.skipped === true ? { skipped: true } : {}),
+        // R3 (OBS-186): a declined review is journal truth, not an absence. `skipped: true` alone
+        // says a gate did not run; these say WHICH policy declined it and WHY, so a reader of the
+        // ledger never has to infer participation from a details string. The green-skip branch that
+        // made this row indistinguishable from a pass is gone (src/gates/review.ts).
+        ...(g.meta?.verdict === "skipped"
+          ? { verdict: "skipped", policy: g.meta.policy, reason: g.meta.reason }
+          : {}),
+        // T4 (OBS-265): a test verdict says WHICH suite spoke. A round runs the selected subset as a
+        // screen and the full suite as the verdict, so without these two the journal would carry a
+        // `test` row whose scope no consumer could recover.
+        ...(Array.isArray(g.meta?.selectedTests) ? { selectedTests: g.meta.selectedTests } : {}),
+        ...(g.meta?.fullSuite === true ? { fullSuite: true } : {}),
+        // A finding's path is its own evidence path. Do not pass task scope here: a declaration says
+        // where work is allowed, not where this verdict found the defect.
+        ...(blocking ? { findings: structuredFindings(g.gate, g.details) } : {}),
+      });
+    };
+    // R3 (OBS-186): judge ‖ review are launched together and publish in COMPLETION order
+    // (run-gates.ts) — a race. Three oracles assert the opposite: a scripted run's journal is
+    // byte-identical run to run (tests/run/narration.test.ts, tests/run/notify-identity.test.ts), and
+    // a round's gate-result order matches its phase-start order (tests/run/daemon.test.ts). Retiring
+    // complexityThreshold is what REACHES this, not what introduces it: those fixtures used to skip
+    // review and journal ONE verdict row per round, so the pair's order was never exercised — and the
+    // operator's config has run `complexityThreshold: 0` since 2026-07-31, so production rounds have
+    // journaled both siblings all along.
+    //
+    // Ordering is the LEDGER's job, not the pipeline's. run-gates still reports each completion the
+    // instant it happens; the daemon writes its ledger in GATE_NAMES order. Only the LATER gate is
+    // ever held, and only while an earlier sibling is still in flight — a review that finishes first
+    // waits for acceptance, never the reverse. That keeps T4's durability where it pays (the first
+    // verdict to land is still published immediately) and bounds the exposure to one row for the
+    // remainder of one already-running gate. A gate that THROWS kills the round before merge, so a
+    // row held behind it is lost with the round it belonged to — not a verdict that could have merged.
+    const parallelPending = new Set<GateName>();
+    let heldParallel: (() => void) | undefined;
+    const notePhaseStart = (e: Extract<GateEvent, { phase: "start" }>) => {
+      if (e.parentAt !== undefined) parallelPending.add(e.gate);
+    };
+    const inParallelOrder = (gate: GateName, publish: () => void) => {
+      parallelPending.delete(gate);
+      const rank = GATE_NAMES.indexOf(gate);
+      if ([...parallelPending].some((p) => GATE_NAMES.indexOf(p) < rank)) {
+        heldParallel = publish;
+        return;
+      }
+      publish();
+      const held = heldParallel;
+      heldParallel = undefined;
+      held?.();
+    };
     // OBS-189: the operator upheld the reviewer — the findings ARE the brief for this funded attempt.
-    let feedback = rs?.upheldFeedback
-      ? `The operator UPHELD the reviewer's findings — address them without discarding landed work.\nreview: ${rs.upheldFeedback}`
+    // OBS-254: RE-DERIVED from the journal here, at prompt-build time, rather than trusted to survive
+    // in resume state. The journal already holds the upheld review's bytes; no reset of attempt or
+    // channel state can take them away, on any path, including `resume --retry-failed`.
+    const upheldFeedback = upheldFeedbackByTask(journal.read()).get(t.id) ?? rs?.upheldFeedback;
+    let feedback = upheldFeedback
+      ? `The operator UPHELD the reviewer's findings — address them without discarding landed work.\nreview: ${upheldFeedback}`
       : "";
     let ladderIdx = 0;
     let modeFallbackNoted = false; // v1.2: journal the interactive→print fallback once per task, not per attempt
@@ -566,6 +1139,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     let tokens: TokenUsage | undefined; // SPEND-02: accumulated across attempts — parked spend is still spend
     let metered = 0; // SPEND-02: attempts that returned a usage record; distinguishes unmetered from measured-zero
     let tipMoves = 0; // OBS-15: one re-gate allowance per task, never reset by a worker retry
+    // T4 (OBS-265): a task whose test gate has failed once stops selecting tests for good — the
+    // selector already proved it cannot speak for this diff, so every later round runs full. SEEDED
+    // FROM THE JOURNAL, not from process memory: a park, a `resume`, or a daemon restart must not
+    // hand the selector a clean slate it did not earn, and the journal is the only state that
+    // survives all three (same read as upheldFeedbackByTask above).
+    let testGateFailed = journal.read().some((e) =>
+      e.event === "gate-result" && e.taskId === t.id && e.data.gate === "test" && e.data.pass === false);
     let retryMode: RetryMode = "fresh";
     let lastContextTokens: number | undefined; // v1.23 reset signal, including stalled/quota attempts
     // v1.29: only a gate-failed attempt can seed same-session retry. The next attempt consumes this
@@ -630,7 +1210,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       });
       await driver.notify(`tickmarkr ${runId}: ${t.id} consult verdict: ${v.action}`, { tier: "attention" });
       if (v.action === "retry") {
-        feedback = renderRetryGuidance(v) || feedback;
+        // The guidance is ADDED to the brief, never swapped for it: the failure bytes the journal
+        // already holds are the one thing the next attempt cannot rediscover for free. The
+        // fingerprint cap's ban on an identical retry is NOT enforced here — a verdict is only one
+        // of several ways this task reaches a re-dispatch, so the ban is enforced at the dispatch
+        // seam every one of them passes through (see enforceRetryBan).
+        const guidance = renderRetryGuidance(v);
+        if (guidance && !feedback.includes(guidance)) feedback = feedback ? `${feedback}\n\n${guidance}` : guidance;
         return true;
       }
       if (v.action === "reroute") {
@@ -721,7 +1307,34 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       };
       const gateAuthor = rs?.lastAssignment ?? assignment;
       const satisfiedIndex = GATE_NAMES.indexOf(satisfiedGate);
-      const remainingGates = t.gates.filter((gate) => GATE_NAMES.indexOf(gate) > satisfiedIndex);
+      // The serial pipeline could have at most one blocking result, so "everything after the
+      // approved gate" was enough. v1.85 can record both verdict siblings red in one round, and a
+      // selected test screen can be green without a complete suite. Approval waives exactly its
+      // named gate: every other red from that round is re-run, and test is forced unless the prior
+      // journal proves a full suite completed.
+      const priorEvents = journal.read();
+      let priorRoundStart = -1;
+      for (let i = priorEvents.length - 1; i >= 0; i--) {
+        const e = priorEvents[i]!;
+        if (e.event === "phase-start" && e.taskId === t.id && e.data.phase === "gates") {
+          priorRoundStart = i;
+          break;
+        }
+      }
+      const priorResults = new Map<GateName, JournalEvent>();
+      for (const e of priorEvents.slice(priorRoundStart + 1)) {
+        if (e.event !== "gate-result" || e.taskId !== t.id || typeof e.data.gate !== "string"
+            || !(GATE_NAMES as readonly string[]).includes(e.data.gate)) continue;
+        priorResults.set(e.data.gate as GateName, e);
+      }
+      const remainingGates = t.gates.filter((gate) => {
+        if (gate === satisfiedGate) return false;
+        const prior = priorResults.get(gate)?.data;
+        const followsApproved = GATE_NAMES.indexOf(gate) > satisfiedIndex;
+        const otherRed = prior?.pass === false;
+        const needsFullSuite = gate === "test" && prior?.fullSuite !== true;
+        return followsApproved || otherRed || needsFullSuite;
+      });
       const resumedTask = { ...t, gates: remainingGates };
 
       gateLoop: while (true) {
@@ -730,6 +1343,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const { results } = await runGates(resumedTask, {
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
           commands, baseline, channels, adapters, cfg, artifactDir: journal.dir,
+          // a recheck re-verifies a human's release: it never selects tests down, it runs the suite.
+          pipeline: "v185",
           via: cfg.visibility.llm === "pane"
             ? {
                 driver: trackedDriver,
@@ -742,25 +1357,25 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           excludeReviewers: badReviewers,
           onGate: async (e) => {
             if (e.phase === "start") {
-              journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total });
+              notePhaseStart(e);
+              journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total, ...(e.parentAt === undefined ? {} : { parallel: true }) });
               return;
             }
             const g = e.result;
-            journal.append("gate-result", t.id, {
-              gate: g.gate, pass: g.pass, details: g.details,
-              ...(g.meta?.skipped === true ? { skipped: true } : {}),
+            inParallelOrder(g.gate as GateName, () => {
+              journalGateResult(g);
+              noteReviewRetry(g);
+              if (g.gate === "review" && !g.pass && /unparseable/.test(g.details)
+                  && typeof g.meta?.reviewer === "string") {
+                badReviewers.push(g.meta.reviewer);
+              }
             });
-            noteReviewRetry(g);
-            if (g.gate === "review" && !g.pass && /unparseable/.test(g.details)
-                && typeof g.meta?.reviewer === "string") {
-              badReviewers.push(g.meta.reviewer);
-            }
           },
         });
         const approvedCommits = await commitsAheadOf(taskBase, wt);
         graph = addEvidence(graph, t.id, { commits: approvedCommits, gateResults: results });
         saveGraph(repoRoot, graph);
-        if (!results.every((g) => g.pass)) {
+        if (!results.every(gateSatisfied)) {
           gateFails++;
           await park(t, "post-approval gate failed", "gate-fail", gateAuthor, rs?.attempts ?? 0,
             startMs, gateFails, consults, tokens, metered, retryMode);
@@ -841,8 +1456,51 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // over-threshold context still forces fresh, and the escalation ladder bounds the chain.
       const priorSession = retrySession;
       retrySession = undefined;
+      // v1.85 T3: the fingerprint cap banned an IDENTICAL retry — this task+gate already produced the
+      // same failure bytes twice, so re-running the same channel on the same brief is a paid
+      // re-measurement of an answer the journal already holds. Enforced HERE, at the one seam every
+      // re-dispatch passes through, and NOT at the consult verdict that set it: a terminal verdict
+      // falling through to the cap's own `retry` rung, a review-fix round and the ladder itself all
+      // reach a dispatch without ever consulting again, and worker-launch below would then expire a
+      // ban nothing had honoured. Bound to the channel the cap fired on, so a move that already went
+      // elsewhere is not refused for a ban that was never about it; with no untried channel left the
+      // task parks naming the ban rather than buying a third round.
+      const banned = activeRetryBan(journal.read(), t.id, channelKey(assignment));
+      if (banned) {
+        const next = failover("escalate");
+        journal.append("retry-same-banned", t.id, {
+          gate: banned, from: channelKey(assignment), to: next ? channelKey(next) : null,
+        });
+        if (!next) {
+          await park(t, `identical ${banned} failure twice this engagement — an identical retry is banned and no untried channel is left`,
+            "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+        assignment = next;
+        if (!tried.includes(channelKey(next))) tried.push(channelKey(next));
+      }
       const retryAdapter = adapters.find((a) => a.id === assignment.adapter);
-      retryMode = priorSession
+      // v1.85 T3: a repair attempt is dispatched FRESH by construction — the whole point is that the
+      // brief, not a surviving session, carries the findings and the diff. It therefore outranks the
+      // session-resume choice, and the mode is journaled so the ledger can price repairs against
+      // fresh re-dispatches. Read from the JOURNAL, before this dispatch's own event lands: a run that
+      // stopped between funding the repair and sending it resumes still carrying the findings.
+      const journaledSoFar = journal.read(); // read BEFORE this dispatch's own event lands
+      let repairFindings = pendingRepairFindings(journaledSoFar, t.id);
+      // OBS-254, one layer below the upheld brief: the ordinary gate-fail brief was loop-local, so any
+      // path that rebuilt this task's state (a resume, `--retry-failed`, a fresh daemon) dispatched a
+      // retry that had forgotten why it was retrying. Re-derived from the journal here, at prompt-build
+      // time, and MERGED rather than substituted — a retry never discards what the journal already
+      // holds. Row-wise, because the live brief may already quote one of them (a delivery-readiness
+      // failure the loop just wrote) and repeating it helps no worker.
+      const journaledRows = journaledFailureBrief(journaledSoFar, t.id).filter((row) => !feedback.includes(row));
+      if (journaledRows.length > 0) {
+        const brief = journaledRows.join("\n\n");
+        feedback = feedback ? `${brief}\n\n${feedback}` : brief;
+      }
+      retryMode = repairFindings
+        ? "repair"
+        : priorSession
         && priorSession.channel === channelKey(assignment)
         && (priorSession.contextTokens !== undefined
           ? priorSession.contextTokens < cfg.contextWarnTokens
@@ -878,6 +1536,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         carriedCommits = await cherryPickCommits(wt, commitsToCarry);
         journal.append("worktree-recreation", t.id, { attempted: commitsToCarry, carried: carriedCommits });
       }
+      // T2 review (material): harvest eligibility is "does this WORKTREE carry unverified work",
+      // measured against taskBase — the same base the fast-kill's delta probe and the gates
+      // themselves use. It was measured against this attempt's post-carry HEAD, which excluded
+      // every commit cherry-picked forward: attempt 0 commits and walls, attempt 1 receives that
+      // commit and goes silent, and the silent retry — whose worktree already held the whole
+      // deliverable — was NOT harvested, took the stall consult, and could be redispatched to
+      // re-produce it. The routing branches that "starting HEAD" was protecting no longer need it:
+      // quota, dead-channel and provider-death all classify the PRE-HARVEST outcome below and fire
+      // BEFORE the synthesis, so carried-only work reaches gates without bypassing any failover.
       const priorNamed = [...new Set([...commitsToCarry, ...carriedCommits])];
       const presentCommits = new Set(carriedCommits);
       for (const h of commitsToCarry) {
@@ -907,6 +1574,36 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await driver.notify(
           `tickmarkr ${runId}: ${t.id} lost ${lostCommits.length} of ${commitsToCarry.length} landed commit(s) recreating its worktree — it will re-do that work`,
           { tier: "attention" });
+      }
+      // v1.85 T3: "fully carried commits" is a repair PRECONDITION, and it is re-validated here —
+      // the eligibility test ran one attempt ago, but the carry that decides it happens above, on
+      // this dispatch. A tree that lost part of the prior attempt's work cannot be repaired: a
+      // fix-only contract ("do NOT re-implement that work") over a diff whose implementation is
+      // missing would have the worker patch an incomplete tree and forbid it from rebuilding the
+      // rest. The fresh ladder owns this dispatch instead. `retryMode` is corrected before
+      // worker-launch records it, so the ledger's launch event names what the worker actually got.
+      if (repairFindings !== undefined && lostCommits.length > 0) {
+        journal.append("repair-cancelled", t.id, { reason: "carry incomplete", attempted: commitsToCarry, lost: lostCommits });
+        repairFindings = undefined;
+        retryMode = "fresh";
+      }
+      // v1.85 T3: a repair dispatch replaces the bare gate-fail brief with a fix-only contract that
+      // carries the failing findings VERBATIM and the diff CONTENT of the work already in this
+      // worktree. The measured loss it removes: 62 of 68 re-dispatches were fresh, each re-buying
+      // ~20m of onboarding to rediscover a diff and a finding the journal already held.
+      // The diff is measured HERE, from the worktree the worker will actually open, after the carry —
+      // never from the pre-recreation tree, so what the brief quotes is what the worker has.
+      if (repairFindings) {
+        const raw = await shGit(`git diff ${shq(taskBase)}..HEAD`, wt);
+        const cap = cfg.gates.diffCap ?? DEFAULT_DIFF_CAP; // same fallback the measuring gates use
+        const diff = raw.stdout.length > cap
+          ? `${raw.stdout.slice(0, cap)}\n… diff truncated at gates.diffCap (${cap} bytes)`
+          : raw.stdout;
+        const brief = repairBrief(repairFindings, diff, taskBase);
+        // anything the live brief holds beyond the journaled findings (a consult's guidance) is kept:
+        // a repair adds the diff and the fix-only contract, it never subtracts what was already known.
+        feedback = feedback && !brief.includes(feedback) ? `${brief}\n\n${feedback}` : brief;
+        journal.append("repair-dispatch", t.id, { diffBytes: diff.length, capped: raw.stdout.length > cap });
       }
       if (feedback || priorNamed.length > 0) {
         feedback = augmentRetryBrief(feedback, { attempted: commitsToCarry, carried: carriedCommits, present: presentCommits });
@@ -966,6 +1663,87 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         workerCmd,
         exitMarkerCmd,
       ].join("\n"));
+      // T2 (OBS-264): the liveness triad, shared by BOTH wait loops (a headless worker stalls on
+      // finished work exactly as a visible one does — and rode the whole window before this). It
+      // sits ABOVE the fast-kill and the nudge because the population it governs is the opposite
+      // one: the kill condemns a pane holding NOTHING, while every one of the 18 observed stalls
+      // held 2-33 commits that the redispatch then re-bought. Concluding is not killing — the
+      // post-loop tail harvests this attempt exactly as a window expiry does, and the carried
+      // worktree goes to gates. The probe runs only once the tracker is ALREADY silent, so a
+      // working worker never pays for it, and an unreadable snapshot RESETS the observation:
+      // unmeasurable CPU is never evidence a worker stopped.
+      // v1.85 T3: the prompt has now actually reached a worker. The journal-derived retry decisions (a
+      // funded repair's findings, an identical-retry ban) expire HERE and nowhere earlier: everything
+      // between task-dispatch and this line — worktree recreation, setup, prompt write, slot allocation,
+      // the launch itself — can still die with no worker having seen the brief, and `--retry-failed`
+      // must then re-send that same brief rather than a fresh prompt on a possibly banned channel.
+      const noteLaunched = () => journal.append("worker-launch", t.id, { attempt, retryMode });
+      let cpuFlat: { ms: number; since: number } | undefined;
+      let cpuAccountant: WorkerTreeCpuAccountant | undefined;
+      let cpuGapCount = 0;
+      let unmeasurableNoted = false;
+      // One line per attempt, whichever way the CPU leg turns out to be unmeasurable. A triad that
+      // can never conclude is this feature silently ABSENT — on a host whose `ps` the probe cannot
+      // read, every stall would ride its whole window out again with nothing saying why. Named once
+      // per attempt, not per slice: the condition is structural, and a per-slice line would bury it.
+      const noteUnmeasurable = (reason: string) => {
+        if (unmeasurableNoted) return;
+        unmeasurableNoted = true;
+        journal.append("worker-harvest-unmeasurable", t.id, { slot: slot.name, attempt, reason });
+      };
+      const harvestConcludes = async (silentMs: number): Promise<boolean> => {
+        if (silentMs < harvestSilentMs) {
+          await cpuAccountant?.stop();
+          cpuAccountant = undefined;
+          cpuFlat = undefined;
+          cpuGapCount = 0;
+          return false;
+        }
+        // The CPU leg needs a marker in the worker's own argv, and every launch path puts this
+        // attempt's dispatch script there EXCEPT interactiveSeed: runInteractiveSeed launches the
+        // TUI directly, by a command the ADAPTER owns (seed.launch(model)) which tickmarkr cannot
+        // make attempt-unique and must deliver verbatim. A marker that matches nothing reads as
+        // zero CPU — precisely the false "flat" that would harvest a worker mid-turn — so a seeded
+        // attempt has no measurable CPU leg and the triad never concludes it. The other half of
+        // OBS-264 is untouched there: when its window does expire with commits on the worktree, the
+        // no-trailer tail gates them instead of buying a fresh worker to re-produce them.
+        if (hasSeed) {
+          noteUnmeasurable("interactive-seed launch is not in the probed process tree");
+          return false;
+        }
+        if (cpuAccountant === undefined) {
+          cpuAccountant = new WorkerTreeCpuAccountant(dispatchScript, wt);
+          await cpuAccountant.start();
+        }
+        const observation = cpuAccountant.read();
+        if (observation.gaps !== cpuGapCount) {
+          cpuGapCount = observation.gaps;
+          cpuFlat = undefined;
+          noteUnmeasurable("one or more worker process snapshots could not be read");
+        }
+        const cpu = observation.cpu;
+        if (cpu === undefined) {
+          // Unmeasurable CPU is never evidence a worker stopped: RESET the observation rather than
+          // conclude on it, and name the gap — a probe whose snapshot never parses is the same
+          // structural hole as the seeded launch, and must not be the one that stays silent.
+          cpuFlat = undefined;
+          noteUnmeasurable("the worker process snapshot could not be read");
+          return false;
+        }
+        const now = Date.now();
+        if (cpu.ms !== cpuFlat?.ms) {
+          cpuFlat = { ms: cpu.ms, since: now };
+          return false;
+        }
+        if (now - cpuFlat.since < harvestCpuFlatWindowMs(cpu.resolutionMs)) return false;
+        const carried = await commitsAheadOf(taskBase, wt);
+        if (carried.length === 0) return false; // nothing landed: not this branch's population
+        journal.append("worker-harvest", t.id, {
+          slot: slot.name, attempt, commits: carried.length,
+          silentMs, cpuMs: cpu.ms, cpuResolutionMs: cpu.resolutionMs,
+        });
+        return true;
+      };
       // SPEND-01: this attempt's dispatch wall-clock — the usage collect cursor. Captured once here, the
       // single site, so a test can reason about it; keep Date.now() out of profile.ts (still pure) and
       // out of adapter module scope (the cursor is a parameter, threaded from the daemon).
@@ -1004,6 +1782,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let output: string;
       let exitCode: number | null;
       let timedOut = false;
+      // T2 review: print mode's "the exit marker appeared". Kept apart from `finished` (the
+      // trailer) but still needed by the keepPanes decision below, whose contract is about a
+      // subprocess tree that REACHED its exit marker, not about what the worker claimed.
+      let processExited = false;
       let earlyLaunchDead = false;
       let settleParsed: WorkerResult | undefined;
       let seedResult: InteractiveSeedResult | undefined;
@@ -1037,6 +1819,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await park(t, "escalation ladder exhausted", "ladder-exhausted", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
         return false;
       };
+      try {
       if (interactive) {
         // v1.2 interactive: the TUI doesn't exit on completion — the trailer is the finish line.
         // The exit wrapper still fires if the TUI dies (crash/quit): fast-fail instead of burning the timeout.
@@ -1053,6 +1836,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             if (await handleDeliveryReadiness(error)) continue attempts;
             return;
           }
+          noteLaunched();
           output = seedResult.output;
         } else {
           try {
@@ -1062,20 +1846,31 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             if (await handleDeliveryReadiness(error)) continue attempts;
             return;
           }
-          output = await driver.read(slot, 1000);
+          noteLaunched();
+          output = await driver.read(slot, PANE_READ_ROWS);
         }
         if (seedResult?.seedFailed) {
           finished = false;
         } else {
-          let paged = false;
           // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
-          // Any other blocked/idle dialog still pages the operator (paged latch below).
+          // Any other blocked/idle dialog pages the operator (unlatched since T1 — see below).
           let trustAnswered = false;
           // OBS-201: one liveness nudge per attempt; the grace deadline is its OWN timer, never the
           // stall window (the nudge's pane echo is absorbed before it starts, or the echo itself
           // would reset the window and make the early conclusion unreachable).
           let nudged = false;
+          let nudgeFailed = false; // T1: an undeliverable nudge — the operator, not the daemon, is the actor
           let nudgeDeadline: number | undefined;
+          // T1: page cadence, NOT a latch — a second page fires on a status change or once
+          // pageRepeatMs elapses, so an operator who missed the first one is paged again.
+          let lastPagedStatus: string | undefined;
+          let lastPagedAt = 0;
+          // T1 review: worker-status is journaled on CHANGE, not per slice — every journal append
+          // is narrated to the run's live surface (cli/commands/run.ts) and feeds activity.ts's
+          // `now:` cell, so a per-slice append wrote a status line per worker per ~30s slice and
+          // pinned `now` to worker-status. On-change keeps post-hoc analysis at a fraction of the
+          // volume while still recording which gate held.
+          let lastStatus: string | undefined;
           finished = false;
           exitCode = null;
           // OBS-54: reaping keys on new pane output, not dispatch wall clock. Poll at least twice per
@@ -1087,6 +1882,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           const stallProgress = new StallProgressTracker();
           stallProgress.observe({ paneText: output, seedSubmitted: true, contextTokens });
           let lastProgressAt = Date.now();
+          // T1: in-loop detector state — consecutive quota-banner slices. The dead-channel fast-kill
+          // reads the tracker's RAW row-growth clock (lastRowGrowthAt), not the re-arm-suppressed
+          // lastProgressAt — see the kill below.
+          let quotaStreak = 0;
+          let rowSaturationHeld = false; // journaled once per attempt when the kill stands down
           while (Date.now() - lastProgressAt < stallWindowMs) {
             const sliceStart = Date.now();
             const remaining = stallWindowMs - (sliceStart - lastProgressAt);
@@ -1095,11 +1895,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               const earlyLeft = earlyLaunchLivenessMs - (sliceStart - attemptStart);
               if (earlyLeft > 0) slice = Math.min(slice, earlyLeft);
             }
+            // T2 (OBS-264): never sleep PAST the instant the harvest probe becomes eligible, and past
+            // it let the probe own the cadence (HARVEST_POLL_MS) — a 30s trailer slice would
+            // otherwise cost a minute per pair of CPU samples. At the shipped 5m gate this leaves
+            // every slice before the gate exactly as long as it already was.
+            slice = Math.min(slice, harvestSliceMs(sliceStart - lastProgressAt));
             if (await driver.waitOutput(slot, `(${trailerPattern(nonce)})|TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true })) {
               // verify before accepting: a worker that merely DISPLAYS a marker (e.g. editing tickmarkr's
               // own source, where "TICKMARKR_EXIT:" is a string literal) must not end the wait. Only a
               // parseable trailer or a digit-suffixed exit marker in the harvest is completion.
-              output = await driver.read(slot, 1000); // TUI transcripts carry chrome — read deeper than print's 500
+              output = await driver.read(slot, PANE_READ_ROWS); // TUI transcripts carry chrome — read deeper than print's 500
               finished = new RegExp(trailerPattern(nonce)).test(output);
               const exit = exitRe.exec(output);
               if (finished || exit) {
@@ -1108,7 +1913,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 break;
               }
             }
-            const paneText = await driver.read(slot, 1000);
+            const paneText = await driver.read(slot, PANE_READ_ROWS);
             if (paneText.length > 0) everHadOutput = true;
             // OBS-117 (v1.71 T6): zero raw output by the early-launch deadline is a dead channel now.
             if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
@@ -1118,12 +1923,47 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
             // v1.23 T2: piggyback on this poll slice — same cadence as blocked/idle checks, no new timer.
             await sampleContext();
-            if (stallProgress.observe({ paneText, contextTokens })) lastProgressAt = Date.now();
-            // page on "idle" too: herdr's blocked-scrape is strict and proved flaky for TUI dialogs
-            // (live check: cursor's trust dialog scraped as idle). "unknown" never pages — that's just
-            // a pane the scraper can't read (subprocess, dead pane); the task timeout covers those.
-            const st = paged ? "" : await driver.status(slot);
-            if (!paged && (st === "blocked" || st === "idle")) {
+            if (stallProgress.observe({ paneText, contextTokens })) {
+              lastProgressAt = Date.now();
+              // T1 review fix: progress AFTER a delivered nudge means the worker answered it —
+              // disarm the grace deadline. Without this the expiry below fires at the next
+              // quiet patch ≥ the grace (4m) measured from the rolling lastProgressAt, so the
+              // exact population the nudge rescued (workers prone to long silences, e.g. a 6m
+              // test run) was force-concluded as if it had ignored the nudge. The answered
+              // worker returns to the full rolling window, and the consult sees the truth.
+              if (nudged && nudgeDeadline !== undefined) {
+                nudgeDeadline = undefined;
+                journal.append("worker-nudge-answered", t.id, { slot: slot.name, attempt });
+              }
+            }
+            const sliceNow = Date.now();
+            // T1 (OBS-263): quota banners are classified IN-LOOP — two consecutive matching slices
+            // plus >=3m tracker silence — then the post-loop quota failover runs NOW, not after the
+            // window. The match reads the chrome-filtered tail: the bottom of a rendered TUI frame
+            // is fixed composer/welcome chrome (codex pins a "usage limit resets available" line
+            // there — it matched every frame of the wedged-MCP fixture), so the known chrome is
+            // filtered by identity, never by novelty — a banner already on screen at launch
+            // classifies exactly like one printed mid-attempt (T1 review: a novelty baseline
+            // exculpated the launch-throttle case forever).
+            if (QUOTA_RE.test(stallSnapshotBannerRows(paneText))) quotaStreak++;
+            else quotaStreak = 0;
+            if (quotaStreak >= 2 && sliceNow - lastProgressAt >= quotaBannerSilentMs) {
+              // no `output =` here: the post-loop no-trailer tail re-reads the pane anyway, so an
+              // assignment would only split the classification read from the verdict read.
+              journal.append("quota-banner", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastProgressAt });
+              break;
+            }
+            // T1 (OBS-262): the `paged` latch is deleted — status is sampled EVERY slice (and
+            // journaled on change — see lastStatus above), so post-hoc analysis can see which
+            // gate held. page on "idle" too: herdr's blocked-scrape is strict and proved flaky
+            // for TUI dialogs (live check: cursor's trust dialog scraped as idle).
+            // "unknown"/"working" never page.
+            const st = await driver.status(slot);
+            if (st !== lastStatus) {
+              lastStatus = st;
+              journal.append("worker-status", t.id, { slot: slot.name, status: st, attempt });
+            }
+            if (st === "blocked" || st === "idle") {
               // T5: once-per-slot auto-answer when the adapter declares a trust dialog and the pane
               // text matches. tickmarkr created the worktree from the operator's own repo — safe by construction.
               if (!trustAnswered && adapter.trustDialog && driver.sendKey) {
@@ -1143,47 +1983,144 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                   /* read/send failed — fall through to page the operator */
                 }
               }
-              // OBS-201: the daemon ACTS on an idle pane before paging anyone. Gate: idle AND the
-              // monotonic tracker silent ≥ the nudge threshold (a worker inside a tool run reads as
-              // `working` and never gets here; a briefly-settling TUI hasn't been silent long enough).
-              const nudgeable = st === "idle" && !!driver.nudge && NUDGEABLE_ADAPTERS.has(adapter.id);
-              if (nudgeable && !nudged) {
-                if (Date.now() - lastProgressAt >= nudgeAfterSilentMs) {
-                  nudged = true;
-                  if (await driver.nudge!(slot, WORKER_NUDGE_MESSAGE)) {
-                    // absorb the nudge's own echo BEFORE arming the grace timer — post-nudge progress
-                    // is measured against this baseline, not against the echo.
-                    const echo = await driver.read(slot, 1000);
-                    stallProgress.observe({ paneText: echo, contextTokens });
-                    nudgeDeadline = Date.now() + workerNudgeGraceMs;
-                    journal.append("worker-nudge", t.id, { slot: slot.name, attempt });
-                  } else {
-                    journal.append("worker-nudge-failed", t.id, { slot: slot.name, attempt });
-                    // nudge undeliverable — fall back to today's behavior: page once, window backstop
-                    paged = true;
-                    await driver.notify(`tickmarkr ${runId}: ${slot.name} looks idle without finishing — check its pane`, { tier: "attention" });
-                  }
-                }
-                // idle but not yet silent past the threshold: neither nudge nor page this slice
-              } else if (nudgeable && nudged && nudgeDeadline !== undefined) {
-                if (Date.now() >= nudgeDeadline && Date.now() - lastProgressAt >= workerNudgeGraceMs) {
-                  // grace spent, still idle, no post-nudge progress: re-harvest once (the trailer may
-                  // have landed between polls), then conclude the wait as a stall NOW — the consult
-                  // sees the un-answered nudge instead of the remainder of the window.
-                  nudgeDeadline = undefined;
-                  output = await driver.read(slot, 1000);
-                  finished = new RegExp(trailerPattern(nonce)).test(output);
-                  const exit = exitRe.exec(output);
-                  if (finished || exit) {
-                    exitCode = exit ? Number(exit[1]) : null;
-                    await sampleContext();
-                    break;
-                  }
-                  journal.append("worker-nudge-expired", t.id, { slot: slot.name, attempt, graceMs: workerNudgeGraceMs });
-                  lastProgressAt = Date.now() - stallWindowMs; // the existing harvest/classify tail runs unmodified
-                }
+            }
+            // T1 (OBS-262): the daemon ACTS on a silent worker before paging anyone. Gate: monotonic
+            // tracker silent ≥ the nudge threshold — the herdr status reading (idle/unknown/working)
+            // no longer holds the gate hostage; only `blocked` stays page-only (nudging a dialog
+            // prompt can't help). One nudge per attempt, then the grace timer owns the conclusion.
+            const nudgeable = st !== "blocked" && !!driver.nudge && NUDGEABLE_ADAPTERS.has(adapter.id);
+            // T1 review (answer-then-die): `nudgeable` is a per-slice property of the adapter and
+            // status — it is NOT "a daemon action is pending". An action is pending only while the
+            // nudge can still fire (un-nudged) or its grace window is armed; once the worker
+            // ANSWERS, the disarm above clears nudgeDeadline while `nudged` stays latched, and the
+            // daemon has nothing left to do — the pane falls back under the fast-kill and page
+            // watchdogs like any other, instead of riding the whole rolling window untended.
+            const nudgePending = nudgeable && (!nudged || nudgeDeadline !== undefined);
+            // T2 (OBS-264): the liveness triad CONCLUDES the wait on finished work — commits ahead
+            // of the task base (this attempt's own AND any carried forward — see the eligibility
+            // comment at the dispatch site), a flat worker-tree CPU delta, and >= harvestSilentMs
+            // of monotonic tracker silence (defined once, above, and run identically by the print loop).
+            // T2 review (material): it carries the SAME nudge hold as the fast-kill below, by the
+            // same clause and for the same reason. The CPU leg cannot tell "idle because finished"
+            // from "idle because holding an unsubmitted turn in its input box" — both read flat CPU
+            // under a silent tracker — and the nudge is the one signal that can. Under the shipped
+            // constants (harvest 5m < nudge 10m) an unheld harvest concluded every committed
+            // claude-code worker before the rescue could fire, leaving T1's nudge dead code for
+            // exactly the committed-and-stalled population OBS-264 is about. Holding concludes at
+            // ~14m (nudge + grace) rather than ~36m — nearly all of the OBS-264 win, and a worker
+            // that only needed a submit answers with a full trailer instead of partial work. An
+            // ANSWERED or twice-undeliverable nudge leaves nothing pending, so the triad governs
+            // again; the hold is on a pending daemon ACTION, never on the adapter being nudgeable.
+            if ((!nudgePending || nudgeFailed) && await harvestConcludes(sliceNow - lastProgressAt)) break;
+            // T1 (R1 dead-channel fast-kill): no trailer, no worktree delta, and no output growth
+            // for the fast-kill window — the channel is dead, so conclude NOW
+            // (journaled) and let the existing no-trailer tail classify and route the attempt.
+            // The tracker is the growth signal on purpose: raw pane bytes grow on cosmetic repaint
+            // (an elapsed "9s"→"10s" lengthens the read and would hide a frozen pane). But the
+            // tracker SHARES the read window's ceiling: its row signal saturates once a sample
+            // FILLS a PANE_READ_ROWS read on raw lines (blanks/chrome included — see stall.ts),
+            // and past that point a flat tracker means "unmeasurable", not "dead". For unmetered
+            // adapters (codex, cursor-agent, grok, opencode — no contextUsage, so the token signal
+            // never fires) rows are the ONLY
+            // signal, and those are exactly the non-nudgeable adapters this kill governs — a live
+            // worker past the ceiling would be concluded dead mid-work. So the kill STANDS DOWN on
+            // a saturated row signal (journaled once per attempt); the rolling window still owns
+            // that pane, exactly as pre-T1. Token growth counts as life either way, so a metered
+            // worker thinking through a long tool run survives.
+            // The triad has NO status exemption: a pane that herdr reports as blocked, idle, working
+            // or unknown dies alike once it holds no trailer, no delta and no growth — waiting the
+            // rolling window out on a status reading is exactly the blindness T1 removes. A matched
+            // trust dialog is auto-answered above and `continue`s before ever reaching here.
+            // The NUDGE gets first crack at a nudgeable pane: the fast-kill holds while the daemon
+            // still has an action of its own pending (un-nudged, or inside the grace window) —
+            // under the shipped constants (kill 5m < nudge 10m) a delta-less pane would otherwise
+            // die before the rescue could ever fire. An ANSWERED nudge leaves nothing pending, so
+            // the hold lifts and the triad governs again. Once a nudge has failed to deliver TWICE
+            // (one in-slice retry filters a driver flake — see below), the delta clause drops too:
+            // a delta is past work, and a pane no signal can reach must not buy the rest of the
+            // window with it (a `working` pane can't be paged either, so this is the only bound
+            // that path has).
+            if (stallProgress.rowSignalSaturated && !rowSaturationHeld) {
+              rowSaturationHeld = true;
+              journal.append("worker-dead-held", t.id, { slot: slot.name, attempt, reason: "row-signal-saturated" });
+            }
+            // T1 review fix: the kill's "no output growth" leg clocks off the RAW growth signals,
+            // never lastProgressAt alone — the flat-token rule (stall.ts) deliberately suppresses
+            // the re-arm report on row growth once tokens stick, and contextTokens is sticky across
+            // read misses, so a metered non-nudgeable adapter (pi) streaming rows under a stale
+            // counter presented a frozen lastProgressAt and was killed mid-work. lastRowGrowthAt is
+            // recorded on every high-water advance, suppressed or not; token growth already rides
+            // lastProgressAt. Either one advancing is output growth.
+            const lastOutputGrowthAt = Math.max(stallProgress.lastRowGrowthAt ?? 0, lastProgressAt);
+            if (!stallProgress.rowSignalSaturated
+              && (!nudgePending || nudgeFailed)
+              && sliceNow - lastOutputGrowthAt >= deadChannelFastKillMs
+              && (nudgeFailed || !(await worktreeHasDelta(wt, taskBase)))) {
+              journal.append("worker-dead", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastOutputGrowthAt });
+              break;
+            }
+            if (nudgeable && !nudged && sliceNow - lastProgressAt >= nudgeAfterSilentMs) {
+              nudged = true;
+              // T1 review: a false return is a driver-delivery outcome (missing pin, readiness
+              // stable-frame timeout, read-back hiccup), not proof of an unreachable channel — so
+              // one failure is a flake class, retried once in-slice after a short settle. Only a
+              // failed RETRY condemns the channel. Both failures happen inside this slice, so the
+              // latch stays immediate and exactly one failure is journaled per attempt.
+              let delivered = await driver.nudge!(slot, WORKER_NUDGE_MESSAGE);
+              if (!delivered) {
+                await new Promise((r) => setTimeout(r, NUDGE_REDELIVER_MS));
+                delivered = await driver.nudge!(slot, WORKER_NUDGE_MESSAGE);
+              }
+              if (delivered) {
+                // absorb the nudge's own echo BEFORE arming the grace timer — post-nudge progress
+                // is measured against this baseline, not against the echo.
+                const echo = await driver.read(slot, PANE_READ_ROWS);
+                stallProgress.observe({ paneText: echo, contextTokens });
+                nudgeDeadline = Date.now() + workerNudgeGraceMs;
+                journal.append("worker-nudge", t.id, { slot: slot.name, attempt });
               } else {
-                paged = true; // page once — the visible pane is the operator's to unblock; task timeout is the backstop
+                // T1: an undeliverable nudge is itself a condemnation — the channel is unreachable,
+                // so the fast-kill above stops requiring a clean worktree for THIS pane (see there).
+                // A blocked/idle pane is still paged below; a `working`/`unknown` one cannot be, and
+                // for it the conclusion's own escalation is what notifies. Nothing here waits the
+                // rolling window out.
+                nudgeFailed = true;
+                journal.append("worker-nudge-failed", t.id, { slot: slot.name, attempt });
+              }
+            }
+            if (nudged && nudgeDeadline !== undefined && sliceNow >= nudgeDeadline && sliceNow - lastProgressAt >= workerNudgeGraceMs) {
+              // grace spent, still no post-nudge progress: re-harvest once (the trailer may have
+              // landed between polls), then conclude the wait as a stall NOW — the consult sees the
+              // un-answered nudge instead of the remainder of the window.
+              nudgeDeadline = undefined;
+              output = await driver.read(slot, PANE_READ_ROWS);
+              finished = new RegExp(trailerPattern(nonce)).test(output);
+              const exit = exitRe.exec(output);
+              if (finished || exit) {
+                exitCode = exit ? Number(exit[1]) : null;
+                await sampleContext();
+                break;
+              }
+              journal.append("worker-nudge-expired", t.id, { slot: slot.name, attempt, graceMs: workerNudgeGraceMs });
+              lastProgressAt = Date.now() - stallWindowMs; // the existing harvest/classify tail runs unmodified
+              continue; // conclude via the loop condition — never page over an acted-on nudge
+            }
+            // Unlatched page (T1): the page DECISION fires and is journaled every slice the
+            // operator is the right actor — i.e. the nudge path doesn't own it (non-allowlisted
+            // adapter, no nudge surface, or a blocked dialog) or the nudge was attempted and
+            // FAILED. A nudgeable worker below the silence threshold waits for its nudge; a
+            // DELIVERED nudge's pending grace suppresses the page — the daemon already acted. An
+            // ANSWERED nudge has no action pending (the disarm cleared the deadline), so a pane
+            // that then reads blocked/idle is the operator's again.
+            // Delivery is unlatched too: the operator is notified again on a status change or
+            // once pageRepeatMs elapses, so a missed first page is not the last one.
+            const pageable = (st === "blocked" || st === "idle")
+              && (!nudgePending || nudgeFailed);
+            if (pageable) {
+              journal.append("operator-page", t.id, { slot: slot.name, attempt, status: st });
+              if (st !== lastPagedStatus || sliceNow - lastPagedAt >= pageRepeatMs) {
+                lastPagedStatus = st;
+                lastPagedAt = sliceNow;
                 const why = st === "blocked" ? "is blocked on a prompt — approve in its pane" : "looks idle without finishing — check its pane";
                 await driver.notify(`tickmarkr ${runId}: ${slot.name} ${why}`, { tier: "attention" });
               }
@@ -1195,14 +2132,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (!finished && exitCode === null) {
             // timed out (or only ever saw false positives): harvest whatever the pane holds now
             timedOut = Date.now() - lastProgressAt >= stallWindowMs;
-            output = await driver.read(slot, 1000);
+            output = await driver.read(slot, PANE_READ_ROWS);
             finished = new RegExp(trailerPattern(nonce)).test(output);
             const exit = exitRe.exec(output);
             exitCode = exit ? Number(exit[1]) : null;
           }
           if (finished) {
             await driver.waitAgentStatus(slot, "idle", 5_000); // settle, then re-harvest the final render
-            output = await driver.read(slot, 1000);
+            output = await driver.read(slot, PANE_READ_ROWS);
           }
           // T5 / OBS-111: an interactive harvest can race the TUI's final paint. When the pane
           // contains the nonce token but the JSON hasn't balanced yet, settle and re-read through
@@ -1218,7 +2155,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               const remaining = settleDeadline - Date.now();
               if (remaining <= 0) break;
               await new Promise((r) => setTimeout(r, Math.min(settleDelayMs, remaining)));
-              output = await driver.read(slot, 1000);
+              output = await driver.read(slot, PANE_READ_ROWS);
               settleParsed = adapter.parse(output, nonce);
               settleTries++;
             }
@@ -1235,6 +2172,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (await handleDeliveryReadiness(error)) continue attempts;
           return;
         }
+        noteLaunched();
         // OBS-54: headless workers have the same output-inactivity budget as visible panes.
         // v1.76: same monotonic-progress measure as the interactive site; harvest stays raw.
         const stallWindowMs = taskTimeoutMinutes * 60_000;
@@ -1244,6 +2182,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         stallProgress.observe({ paneText: initialPane, seedSubmitted: true, contextTokens });
         let lastProgressAt = Date.now();
         finished = false;
+        // T2 review (material): the exit marker proves the PROCESS EXITED, never that the worker
+        // emitted a trailer — the two were the same flag here, so a headless worker that committed
+        // and exited cleanly without one entered the tail as finished:true, skipping the harvest
+        // synthesis entirely and reaching gates with the worker's own ok:false and no
+        // worker-result-harvested row. The interactive site has always kept them apart (`finished`
+        // there is the trailer regex; the exit marker only sets exitCode), and the cause taxonomy
+        // already names this shape "clean-exit-no-trailer" — unreachable in print mode until now.
         while (Date.now() - lastProgressAt < stallWindowMs) {
           const remaining = stallWindowMs - (Date.now() - lastProgressAt);
           let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
@@ -1251,8 +2196,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             const earlyLeft = earlyLaunchLivenessMs - (Date.now() - attemptStart);
             if (earlyLeft > 0) slice = Math.min(slice, earlyLeft);
           }
+          // T2 (OBS-264): same probe cadence the interactive loop uses — see harvestSliceMs.
+          slice = Math.min(slice, harvestSliceMs(Date.now() - lastProgressAt));
           if (await driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true })) {
-            finished = true;
+            processExited = true;
             break;
           }
           const paneText = await driver.read(slot, 500);
@@ -1263,10 +2210,25 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           await sampleContext();
           if (stallProgress.observe({ paneText, contextTokens })) lastProgressAt = Date.now();
+          // T2 (OBS-264): the same liveness triad the interactive loop runs. A headless worker that
+          // committed and went quiet is finished work too, and before this it rode the entire
+          // window out before anything looked at its commits.
+          // No nudge hold here, deliberately: print mode has no nudge surface at all (no pane to
+          // steer, driver.nudge is never consulted on this path), so there is no pending daemon
+          // action for the triad to preempt — the asymmetry with the interactive call site above is
+          // the absence of the thing being held for, not an oversight.
+          if (await harvestConcludes(Date.now() - lastProgressAt)) break;
         }
         output = await driver.read(slot, 500);
         exitCode = Number(exitRe.exec(output)?.[1] ?? 1);
-        timedOut = !finished && Date.now() - lastProgressAt >= stallWindowMs;
+        // Completion is the trailer, exactly as in the interactive loop. A process that exited
+        // without one is finished:false with a non-null exitCode — the harvest synthesis then owns
+        // it when the worktree carries work, and classifyWorkerResultCause names it otherwise.
+        finished = new RegExp(trailerPattern(nonce)).test(output);
+        timedOut = !processExited && !finished && Date.now() - lastProgressAt >= stallWindowMs;
+      }
+      } finally {
+        await cpuAccountant?.stop();
       }
       // SPEND-01 interactive metering race: the harvest loop breaks on the trailer, but the worker
       // shell may still be running post-trailer bookkeeping (session-store flush, fake usage stamp,
@@ -1278,7 +2240,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
       // keepPanes retains visible context, not a timed-out subprocess tree. Close before consult/retry
       // can recreate the worktree; Herdr and subprocesses that reached their exit marker stay unchanged.
-      if (keepOpen && (finished || driver.id !== "subprocess")) keptSlots.push(slot);
+      if (keepOpen && (finished || processExited || driver.id !== "subprocess")) keptSlots.push(slot);
       else await closeSlot(slot);
       // SPEND-01: usage from the harness's own cwd-keyed structured store, read POST-HOC from disk —
       // `wt` is this task's private worktree, so the path is unique; the read is sliced to records
@@ -1288,14 +2250,50 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // an absent record leaves `tokens`/`metered` untouched (never a materialized zero).
       const attemptUsage = adapter.collectUsage?.(wt, attemptStart);
       if (attemptUsage) { tokens = addUsage(tokens, attemptUsage); metered++; }
-      const result = settleParsed ?? adapter.parse(output, nonce);
-      const cause = classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut });
+      let result = settleParsed ?? adapter.parse(output, nonce);
+      const workerFinished = finished;
+      const workerCause = classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut });
       journal.append("worker-result", t.id, {
-        ok: result.ok, summary: result.summary, deviations: result.deviations, finished, exitCode,
-        mode: interactive ? "interactive" : "print", ...(cause ? { cause } : {}),
+        ok: result.ok, summary: result.summary, deviations: result.deviations, finished: workerFinished, exitCode,
+        mode: interactive ? "interactive" : "print", ...(workerCause ? { cause: workerCause } : {}),
       });
-      if (result.ok && finished) noTrailerStreak.set(channelKey(assignment), 0);
-      else if (!finished && cause !== "provider-death") {
+      // T2 review (routing precedence): provider-death, quota and dead-channel classification
+      // derive from ONE rule — the worker's OWN outcome, workerFinished and this PRE-HARVEST
+      // parse — never from the synthesized result below. A worker that committed and then walled
+      // (provider outage, quota banner, dead CLI) must still route; the harvest synthesis only
+      // decides whether THIS attempt's worktree goes to gates, and when routing wins instead, the
+      // commits survive via the existing commitsToCarry/cherryPickCommits carry-forward.
+      const preHarvestResult = result;
+      // T2 (OBS-264): recognize committed no-trailer work BEFORE any no-trailer streak, provider,
+      // quota or dead-channel routing. Gates never trusted the trailer, so this successful synthesis
+      // must enter exactly where a worker-claimed ok enters. Preserve the parsed worker truth in the
+      // worker-result row above and name the synthesized gate input in its own harvested event.
+      let harvestedCommits: string[] = [];
+      if (!workerFinished) {
+        harvestedCommits = await commitsAheadOf(taskBase, wt);
+        if (harvestedCommits.length > 0) {
+          result = { ok: true, summary: HARVESTED_RESULT_SUMMARY, deviations: [], raw: output };
+          finished = true;
+          journal.append("worker-result-harvested", t.id, {
+            attempt, commits: harvestedCommits, summary: HARVESTED_RESULT_SUMMARY, source: "harvest",
+          });
+        }
+      }
+      // T2 review: provider-death is the THIRD routing branch that must read the pre-harvest
+      // outcome — the synthesis must not null it. A worker that committed and then printed the
+      // outage banner without exiting (workerFinished false, so the harvest fires) still takes
+      // the capped same-channel requeue below; nulling the cause here would skip that branch and
+      // let classifyDeadChannel(preHarvestResult) demote the channel run-wide on a transient blip.
+      const cause = harvestedCommits.length > 0 && workerCause !== "provider-death" ? undefined : workerCause;
+      // T2 review (family): the no-trailer streak is accounted on the SAME ONE rule the routing
+      // branches above use — workerFinished and the PRE-HARVEST parse — never the synthesized
+      // result. A channel that commits but never emits a parseable trailer still burned a
+      // no-trailer window (OBS-57): the synthesis decides whether THIS worktree goes to gates, it
+      // never certifies the channel. Reading the synthesized `finished`/`ok` here reset the streak
+      // on every harvest, so a CLI that produces commits and swallows every trailer was immune to
+      // the two-window demotion and stayed first pick for the rest of the run.
+      if (preHarvestResult.ok && workerFinished) noTrailerStreak.set(channelKey(assignment), 0);
+      else if (!workerFinished && cause !== "provider-death") {
         const ck = channelKey(assignment);
         const streak = (noTrailerStreak.get(ck) ?? 0) + 1;
         noTrailerStreak.set(ck, streak);
@@ -1317,8 +2315,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
       // quota exhaustion → failover within floor; does NOT consume the ladder (spec §4)
       // print: guarded on exit code — exit-0 output that merely MENTIONS "rate limit" must not failover
-      // interactive: a harvested trailer beats quota mentions; without one, quota text fails over (spec v1.2 §2)
-      const quotaHit = (interactive ? !finished : exitCode !== 0) && QUOTA_RE.test(output);
+      // interactive: a worker-CLAIMED trailer beats quota mentions; without one, quota text fails over
+      // (spec v1.2 §2) — matched on the chrome-filtered tail, the exact discrimination the in-loop
+      // classifier makes, so the two can never disagree. A TUI harvest is the whole retained pane:
+      // an unscoped match failed a worker over for quoting "rate limit" in its own diff (tail
+      // scoping kills that — the mention sits ABOVE the tail), and a raw-tail match fires on fixed
+      // chrome (codex's welcome line — filtered by identity, so a launch-time banner this backstop
+      // exists to catch is never exculpated). Print output keeps the exit-code guard.
+      // T2 review: the gate is `workerFinished`, not the harvest-synthesized `finished` — a
+      // committed-but-quota-walled attempt routes here FIRST (its commits ride the carry-forward
+      // into the next attempt's recreated worktree), it never buys a gate run on throttled work.
+      const quotaHit = interactive
+        ? !workerFinished && QUOTA_RE.test(stallSnapshotBannerRows(output))
+        : exitCode !== 0 && QUOTA_RE.test(output);
       if (quotaHit) {
         const next = failover("quota-failover");
         journal.append("quota-failover", t.id, { from: channelKey(assignment), to: next ? channelKey(next) : null });
@@ -1355,7 +2364,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // cap above is spent, so a transient blip still recovers in place.
       // OBS-117 (v1.71 T6): a silent launch failure has no CLI signature to parse — the same
       // setup-required typed dead-channel path a late-harvest "command not found" would take.
-      const dead = classifyDeadChannel(result) ?? (earlyLaunchDead ? "setup-required" : undefined);
+      // T2 review: classify the PRE-HARVEST parse — classifyDeadChannel bails on any ok:true
+      // result, so reading the synthesized harvest result would swallow auth-required /
+      // setup-required / provider-outage for every committed-but-walled attempt (in both modes).
+      const dead = classifyDeadChannel(preHarvestResult) ?? (earlyLaunchDead ? "setup-required" : undefined);
       if (dead) {
         const from = channelKey(assignment);
         demotedChannels.add(from); // excluded for later attempts AND later tasks in this run
@@ -1423,33 +2435,36 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
       const onGate = async (e: GateEvent) => {
         if (e.phase === "start") {
-          journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total });
+          notePhaseStart(e);
+          journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total, ...(e.parentAt === undefined ? {} : { parallel: true }) });
           return;
         }
         const g = e.result;
-        // GATE-09 (ROADMAP SC-4): journal every judge retry as an attributable event — which gate flaked,
-        // which channel flaked, which channel retried — so `tickmarkr journal`/report can distinguish "judge
-        // flaked, retried" from "worker failed" (run-20260711-185020 P43-03 L70-72 billed a judge flake as
-        // a worker attempt; 47-01 fixed WHO retries, this closes the audit-trail half). The condition is
-        // META-ONLY (D-03): gate === "acceptance" + typeof-shape guards on meta.judgeRetry — never a
-        // details-regex. The v1.1 review regex below is grandfathered, not precedent. Appended BEFORE the
-        // gate-result so attribution precedes the verdict in the stream. secondUnparseable is derived from
-        // the final result's meta.unparseable (set by run-gates when the retry ALSO flaked — double-garbage).
-        if (g.gate === "acceptance" && typeof g.meta?.judgeRetry === "object" && g.meta.judgeRetry !== null) {
-          const jr = g.meta.judgeRetry as Record<string, unknown>;
-          if (typeof jr.flaked === "string" && typeof jr.retried === "string") {
-            journal.append("judge-retry", t.id, {
-              gate: "acceptance", flaked: jr.flaked, retried: jr.retried,
-              ...(g.meta.unparseable === true ? { secondUnparseable: true } : {}),
-            });
+        inParallelOrder(g.gate as GateName, () => {
+          // GATE-09 (ROADMAP SC-4): journal every judge retry as an attributable event — which gate flaked,
+          // which channel flaked, which channel retried — so `tickmarkr journal`/report can distinguish "judge
+          // flaked, retried" from "worker failed" (run-20260711-185020 P43-03 L70-72 billed a judge flake as
+          // a worker attempt; 47-01 fixed WHO retries, this closes the audit-trail half). The condition is
+          // META-ONLY (D-03): gate === "acceptance" + typeof-shape guards on meta.judgeRetry — never a
+          // details-regex. The v1.1 review regex below is grandfathered, not precedent. Appended BEFORE the
+          // gate-result so attribution precedes the verdict in the stream. secondUnparseable is derived from
+          // the final result's meta.unparseable (set by run-gates when the retry ALSO flaked — double-garbage).
+          if (g.gate === "acceptance" && typeof g.meta?.judgeRetry === "object" && g.meta.judgeRetry !== null) {
+            const jr = g.meta.judgeRetry as Record<string, unknown>;
+            if (typeof jr.flaked === "string" && typeof jr.retried === "string") {
+              journal.append("judge-retry", t.id, {
+                gate: "acceptance", flaked: jr.flaked, retried: jr.retried,
+                ...(g.meta.unparseable === true ? { secondUnparseable: true } : {}),
+              });
+            }
           }
-        }
-        journal.append("gate-result", t.id, { gate: g.gate, pass: g.pass, details: g.details, ...(g.meta?.skipped === true ? { skipped: true } : {}) });
-        noteReviewRetry(g);
-        // v1.1 failover: never re-ask a reviewer channel that produced garbage for this task
-        if (g.gate === "review" && !g.pass && /unparseable/.test(g.details) && typeof g.meta?.reviewer === "string") {
-          badReviewers.push(g.meta.reviewer);
-        }
+          journalGateResult(g);
+          noteReviewRetry(g);
+          // v1.1 failover: never re-ask a reviewer channel that produced garbage for this task
+          if (g.gate === "review" && !g.pass && /unparseable/.test(g.details) && typeof g.meta?.reviewer === "string") {
+            badReviewers.push(g.meta.reviewer);
+          }
+        });
       };
       let results: GateResult[] = [];
       let commits: string[] = [];
@@ -1459,6 +2474,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         ({ results, commits } = await runGates(t, {
           worktree: wt, baseRef: taskBase, result, author: assignment,
           commands, baseline, channels, adapters, cfg, artifactDir: journal.dir,
+          pipeline: "v185", selectTests: !testGateFailed,
           via: cfg.visibility.llm === "pane"
             ? {
                 driver: trackedDriver,
@@ -1480,8 +2496,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }));
         graph = addEvidence(graph, t.id, { commits, gateResults: results, artifacts: [promptFile] });
         saveGraph(repoRoot, graph);
+        if (results.some((g) => g.gate === "test" && !g.pass)) testGateFailed = true;
 
-        if (results.every((g) => g.pass)) {
+        if (results.every(gateSatisfied)) {
           const m = await mergeSerial(taskBranch, t, gated);
           if (m.tipMoved) {
             journal.append("tip-moved", t.id, m.tipMoved);
@@ -1525,21 +2542,115 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // v1.53 T3: prefer the CLI's own session id captured from this attempt's output (kimi's resume
       // trailer) over the harness slot name; absent hook or no capture keeps today's slot-name id.
       retrySession = { channel: channelKey(assignment), id: adapter.sessionIdFrom?.(output) ?? sessionId, contextTokens };
-      feedback = results.filter((g) => !g.pass).map((g) => `${g.gate}: ${g.details}`).join("\n\n");
+      feedback = results.filter(gateFailed).map((g) => `${g.gate}: ${g.details}`).join("\n\n");
       // OBS-189/G3 (park-economics patch): a request-changes review is a findings brief, not a worker
       // defect — the fix attempt stays on the same channel with the findings as feedback and consumes
       // no escalation-ladder rung. Bounded by the engagement round cap at the top of this loop.
       // Unparseable verdicts (already retried in-gate, OBS-193) and diff-cap trips (the diff cannot
       // shrink by retrying, OBS-48) fall through to the ladder unchanged. Review runs last, so a
       // failed review with every other gate green is exactly "the work landed, the reviewer objects".
-      const reviewFail = results.find((g) => g.gate === "review" && !g.pass);
+      const reviewFail = results.find((g) => g.gate === "review" && gateFailed(g));
       const reviewFixRetry = reviewFail !== undefined
         && reviewFail.meta?.unparseable !== true
         && !isDiffCapPark(reviewFail)
-        && results.every((g) => g.pass || g.gate === "review");
-      const step = reviewFixRetry ? "retry" : r.ladder[Math.min(ladderIdx++, r.ladder.length - 1)];
-      journal.append("escalation", t.id, { step, attempt: attempt + 1, ...(reviewFixRetry ? { reviewFix: true } : {}) });
-      await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${step}`, { tier: "attention" });
+        && results.every((g) => gateSatisfied(g) || g.gate === "review");
+      const failing = results.filter(gateFailed);
+      // Decided before the cap, because the cap's question is whether the NEXT move would re-buy a
+      // measurement already made — and a funded repair is one of the moves that would.
+      const landed = await commitsAheadOf(taskBase, wt);
+      // T4 (OBS-265): judge and review are now ONE round, so a round can report both failing where the
+      // serial walk returned at the judge and review never ran. Eligibility is scored on the battery
+      // the serial contract would have surfaced — review only speaks for a round nothing else failed —
+      // so removing the waiting does not re-price the ladder. The journal below still names every
+      // failing gate, and `feedback` still carries every one of them to the next attempt.
+      const repairBattery = failing.some((g) => g.gate !== "review") ? failing.filter((g) => g.gate !== "review") : failing;
+      const repairable = narrowRepairBattery(repairBattery) && lostCommits.length === 0 && landed.length > 0;
+      const repairsDrawn = repairsSinceApproval(journal.read(), t.id);
+      const repair = repairable && repairsDrawn < MAX_REPAIRS;
+
+      // v1.85 T3: the fingerprint cap. Two normalized-identical failures of one DETERMINISTIC gate on
+      // one task (volatile tokens — worktree prefixes, line refs, durations, run ids — are not
+      // information) mean the round about to be bought is a re-measurement: ~663m across 5 runs went to
+      // exactly this loop. The threshold is a property of the FAILURE, never of the move that would
+      // follow it, so it is evaluated on EVERY such gate at EVERY ladder position — including a rung
+      // that would change channel, and including a review-fix round. Conditioning it on the next rung
+      // was the first shape of this and let a second identical failure buy an escalate/consult round
+      // the criterion says it may not buy. What the cap does NOT reach is an LLM verdict, which is a
+      // different object with its own tighter bound (see isDeterministicFailure).
+      //
+      // It fires on the CROSSING, not as a latch: the consult it forces and the ban it sets govern the
+      // next move, so re-firing on the third identical failure would only re-buy the round it just paid
+      // for — and the ladder, whose rung this failure still spends, bounds the rest.
+      const repeated = failing.find((g) => isDeterministicFailure(g)
+        && identicalGateFailures(journal.read(), t.id, g.gate, normalizeGateFailure(g.details)) === GATE_FINGERPRINT_CAP);
+      // The rung the cap spent, when it fired — the move below executes THIS instead of drawing a
+      // second one, so a cap costs exactly the rung the failure would have cost anyway.
+      let capStep: (typeof r.ladder)[number] | undefined;
+      if (repeated) {
+        const normalized = normalizeGateFailure(repeated.details);
+        journal.append("gate-fingerprint-cap", t.id, {
+          gate: repeated.gate,
+          occurrences: GATE_FINGERPRINT_CAP,
+          fingerprint: normalized.slice(0, 500),
+          retrySameBanned: true,
+          channel: channelKey(assignment), // the ban is bound to the channel that produced the repeat
+          attempt: attempt + 1,
+        });
+        await driver.notify(`tickmarkr ${runId}: ${t.id} ${repeated.gate} failed identically twice — consulting, identical retry banned`, { tier: "attention" });
+        // The cap takes the ladder's MOVE, never its accounting: this failure still spends the rung it
+        // would have spent, so a task that cannot converge still reaches ladder exhaustion on exactly
+        // the budget it always had and the cap can never hand a stuck task extra rounds.
+        capStep = r.ladder[Math.min(ladderIdx++, r.ladder.length - 1)];
+        journal.append("escalation", t.id, { step: capStep, attempt: attempt + 1, fingerprintCap: true });
+        await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${capStep}`, { tier: "attention" });
+        const v = await runConsult("gate-fail-repeat", output, feedback, results);
+        // Rule: a terminal cap consult vetoes a same-channel retry, but cannot veto an `escalate`
+        // rung that already satisfies retry-same-banned by changing channel. Thus terminal+retry
+        // parks through the shared verdict boundary, while terminal+escalate records the consult as
+        // advisory and executes the already-spent rung below. Recoverable verdicts still control the
+        // move directly. The paired fixture asserts both directions of this boundary.
+        const recoverable = v.action === "retry" || v.action === "reroute";
+        if (recoverable || capStep !== "escalate") {
+          if (await applyVerdict(v, attempt + 1, "gate-fail")) continue;
+          return;
+        }
+        journal.append("consult-verdict", t.id, { action: v.action, notes: v.notes, capAdvisory: true });
+      }
+
+      // v1.85 T3: a narrow battery over fully carried commits earns a REPAIR (decided above) — the
+      // next dispatch carries the findings verbatim and the diff content instead of re-onboarding a
+      // fresh worker. Budget is engagement-scoped and journal-derived, so a resume inherits it rather
+      // than refunding it; the third repair-eligible failure falls back to the fresh ladder.
+      //
+      // `landed` is measured from the worktree rather than read from runGates: runGates returns at
+      // the first failure, so a red test or lint gate never reaches the evidence stage and its
+      // `commits` come back empty — reading them would make the ruling's test/lint case unreachable.
+      //
+      // Budget spent means the FRESH LADDER owns this failure — including a review-only one, whose
+      // same-channel fix retry is exactly the round the budget just declared too expensive to repeat.
+      const repairExhausted = repairable && !repair;
+
+      if (repair && !capStep) {
+        journal.append("repair-attempt", t.id, {
+          repair: repairsDrawn + 1, of: MAX_REPAIRS, gates: failing.map((g) => g.gate),
+          commits: landed.length,
+          findings: feedback, // the failure bytes this repair must carry, replayable across a resume
+        });
+      } else if (repairExhausted && !capStep) {
+        journal.append("repair-exhausted", t.id, { repairs: repairsDrawn, of: MAX_REPAIRS, gates: failing.map((g) => g.gate) });
+      }
+
+      const step = capStep ?? (repair || (reviewFixRetry && !repairExhausted)
+        ? "retry"
+        : r.ladder[Math.min(ladderIdx++, r.ladder.length - 1)]);
+      if (!capStep) { // a capped failure already journaled and announced the rung it spent
+        journal.append("escalation", t.id, {
+          step, attempt: attempt + 1,
+          ...(reviewFixRetry && !repairExhausted ? { reviewFix: true } : {}),
+          ...(repair ? { repair: repairsDrawn + 1 } : {}),
+        });
+        await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${step}`, { tier: "attention" });
+      }
 
       if (step === "retry") continue;
       if (step === "escalate") {
@@ -1615,23 +2726,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
   const lastMergedTask = [...journal.read()].reverse().find((e) => e.event === "merge" && e.taskId)?.taskId;
   if (summary.done.length > 0 && Object.keys(commands).length > 0) {
-    const tipResults = await verifyIntegrationTip(intWt, commands, journal.dir);
-    let tipFailed = false;
-    for (const r of tipResults) {
-      if (r.pass) {
-        journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details });
-      } else {
-        journal.append("tip-verify-failed", undefined, {
-          gate: r.gate,
-          cmd: r.cmd,
-          exitCode: r.exitCode,
-          fingerprints: r.fingerprints,
-          artifact: r.artifact,
-          lastMergedTask,
-        });
-        tipFailed = true;
-      }
-    }
+    const tipFailed = await verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask });
     summary.tipVerify = tipFailed ? "failed" : "passed";
     if (tipFailed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
   }

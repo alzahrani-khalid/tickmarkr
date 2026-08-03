@@ -110,10 +110,15 @@ export function matchesTrustDialog(paneText: string, dialog: TrustDialog): boole
 // v1.77 / OBS-142: launchCommand identifies the adapter-owned bootstrap command that necessarily
 // precedes the box; that command settles on a clean shell line, while every other delivery waits
 // for the declared box itself. readinessTimeoutMs bounds that evidence loop per adapter.
+// v1.85 T5 / OBS-140: typed delivery is licensed by DECLARED states, never by transcript shape.
+// `match` is the box painted, `emptyMatch` the box carrying nothing, `occupiedMatch` the box still
+// holding a prompt. An adapter may pin `occupiedMatch` directly, or leave it derived from the other
+// two — but an adapter that declares neither cannot acknowledge a submission and is refused.
 export interface InputBox {
   fingerprint: string;
   match?(paneText: string): boolean;
   emptyMatch?(paneText: string): boolean;
+  occupiedMatch?(paneText: string): boolean;
   launchCommand?(command: string): boolean;
   readinessTimeoutMs?: number;
 }
@@ -136,6 +141,25 @@ export function matchesInputBox(paneText: string, inputBox: InputBox): boolean {
 
 export function matchesEmptyInputBox(paneText: string, inputBox: InputBox): boolean {
   return inputBox.emptyMatch?.(paneText) === true;
+}
+
+// The OCCUPIED state: the adapter's own pin when it has one, else painted-and-not-empty, which two
+// adapter declarations decide between them. Either way the answer comes from the adapter, never from
+// where the prompt happens to sit in the transcript.
+export function matchesOccupiedInputBox(paneText: string, inputBox: InputBox): boolean {
+  if (inputBox.occupiedMatch) return inputBox.occupiedMatch(paneText) === true;
+  return matchesInputBox(paneText, inputBox) && !matchesEmptyInputBox(paneText, inputBox);
+}
+
+// v1.85 T5: which input-state declarations a typed delivery needs and this adapter has not made.
+// Empty is always required (it is the only positive submission evidence); occupied needs either its
+// own matcher or the `match` that derives it. A non-empty result is a fail-closed refusal, named.
+export function missingInputStateDeclarations(inputBox: InputBox | undefined): string[] {
+  if (!inputBox) return ["inputBox"];
+  const missing: string[] = [];
+  if (!inputBox.emptyMatch) missing.push("emptyMatch");
+  if (!inputBox.occupiedMatch && !inputBox.match) missing.push("occupiedMatch");
+  return missing;
 }
 
 export interface WorkerAdapter {

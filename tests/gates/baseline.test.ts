@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { captureBaseline, compareToBaseline, detectGateCommands, detectVacuousOracles, fingerprint } from "../../src/gates/baseline.js";
+import { captureBaseline, compareToBaseline, detectGateCommands, detectVacuousOracles, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -26,6 +26,27 @@ describe("fingerprint", () => {
       "[tickmarkr] tickmarkr run-tip: 1 done, 1 failed, 0 awaiting human, 0 blocked, 0 pending",
       " FAIL  tests/run/tip.test.ts > tip verify > writes diagnostics 42",
     ].join("\n"))).toEqual(["FAIL tests/run/tip.test.ts > tip verify > writes diagnostics #"]);
+  });
+
+  test("test: a rendered status line containing the words error or failed does not enter the fingerprint set unless it is failure-shaped", () => {
+    // the cockpit's own run strip, the same strip stripped of every glyph, and plain narration: no
+    // failure shape, so no line of any of them enters the set — glyphs are not what makes a line safe
+    const strip = "│ ✗ tip-verify FAILED · zone +3 · run attempt 2 · 1 failed · last error attempt 1 │";
+    for (const rendered of [strip, "gate-result — T1 — evidence failed", "tip verify: 2 failed, 1 error"]) {
+      // the marker records THAT the command failed; it carries no text off the line
+      expect(fingerprint(rendered)).toEqual([UNRECOGNIZED_FAILURE]);
+      expect(fingerprint(rendered).join("\n")).not.toMatch(/zone|attempt|gate-result|tip.verify/i);
+    }
+    // …and beside a real failure the shape is the whole set — the drawn line still contributes nothing
+    expect(fingerprint([strip, " FAIL  tests/a.test.ts > boom 7", " Tests  1 failed | 9 passed (10)"].join("\n")))
+      .toEqual(["FAIL tests/a.test.ts > boom #", "Tests # failed | # passed (#)"]);
+  });
+
+  test("the unrecognized-output marker is constant, so narration can never differ between attempts", () => {
+    const attempt = (zone: number, attemptNo: number) =>
+      fingerprint(`renderer error budget exceeded\nzone +${zone} · run attempt ${attemptNo} · 1 failed`);
+    expect(attempt(3, 2)).toEqual(attempt(9, 7));
+    expect(fingerprint("")).toEqual([]); // no output at all is not a failure to record
   });
 
   // old-format stored baselines (pre-hardening) carry digit-normalized ANSI ("\x1b[#m") — compare must renormalize
@@ -185,6 +206,294 @@ describe("baseline forgiveness", () => {
     const legacyBaseline = { commands: { test: { exitCode: 1, fingerprints: ["FAIL tests/a.test.ts > old failure"] } } };
 
     expect((await compareToBaseline(repo, { test: "bash run.sh" }, legacyBaseline, ["test"]))[0].pass).toBe(true);
+  });
+
+  test("test: a fresh fingerprint set containing zero failure-shaped lines passes the gate", async () => {
+    // an unrecognized runner: nothing it prints is failure-shaped, so nothing it prints is a verdict
+    const repo = makeRepo({ "out.txt": "checker error in module a\n", "run.sh": "cat out.txt; exit 1\n" });
+    const commands = { test: "bash run.sh" };
+    const baseline = await captureBaseline(repo, commands);
+    expect(baseline.commands.test.fingerprints).toEqual([UNRECOGNIZED_FAILURE]);
+    writeFileSync(join(repo, "out.txt"), "checker error in module a\nrun attempt 2 failed to reach the zone\n");
+
+    const result = (await compareToBaseline(repo, commands, baseline, ["test"]))[0];
+    expect(result).toMatchObject({ gate: "test", pass: true });
+    expect(result.details).toMatch(/pre-existing/i);
+    // …but the pass says what it rests on: forgiveness here is unread output, not a verified green
+    expect(result.details).toMatch(/no failure shape recognized/i);
+
+    // and where the fresh set is genuinely non-empty yet holds no failure shape — an already-red
+    // baseline of recognized failures whose command now fails unrecognizably — the same holds: the
+    // marker is fresh, and being no shape it decides nothing
+    const shapedBaseline = { commands: { test: { exitCode: 1, fingerprints: ["FAIL tests/a.test.ts > old failure"] } } };
+    const marked = (await compareToBaseline(repo, commands, shapedBaseline, ["test"]))[0];
+    expect(fingerprint("checker error in module a")).toEqual([UNRECOGNIZED_FAILURE]); // fresh vs that baseline
+    expect(marked).toMatchObject({ gate: "test", pass: true });
+  });
+
+  test("the fingerprint heuristic cannot reject an implementation for rendering vocabulary its surfaces are chartered to render", async () => {
+    const repo = makeRepo({
+      "out.txt": " FAIL  tests/a.test.ts > old failure\n",
+      "run.sh": "cat out.txt; exit 1\n",
+    });
+    const commands = { test: "bash run.sh" };
+    const baseline = await captureBaseline(repo, commands);
+    // the task under gate adds a run-status surface: every drawn line below is vocabulary the baseline
+    // has never seen, and the only real failure is the pre-existing one
+    writeFileSync(join(repo, "out.txt"), [
+      "stdout | tests/cockpit/run.test.ts > run strip",
+      "┌────────────────────────────────┐",
+      "│ ✗ tip-verify FAILED · zone +3  │",
+      "│ run attempt 2 · 1 failed       │",
+      "│ last error: attempt 1 timed out│",
+      "└────────────────────────────────┘",
+      " FAIL  tests/a.test.ts > old failure",
+      "",
+    ].join("\n"));
+
+    expect((await compareToBaseline(repo, commands, baseline, ["test"]))[0]).toMatchObject({ gate: "test", pass: true });
+  });
+
+  test("test: a genuinely new failing test still fails the gate and its fingerprint is reported", async () => {
+    const repo = makeRepo({
+      "out.txt": " FAIL  tests/a.test.ts > old failure\n",
+      "run.sh": "cat out.txt; exit 1\n",
+    });
+    const commands = { test: "bash run.sh" };
+    const baseline = await captureBaseline(repo, commands);
+    writeFileSync(
+      join(repo, "out.txt"),
+      "zone +3 · run attempt 2 · 1 failed · last error on attempt 1\n FAIL  tests/a.test.ts > old failure\n FAIL  tests/new.test.ts > real regression 42\n",
+    );
+
+    const result = (await compareToBaseline(repo, commands, baseline, ["test"]))[0];
+    expect(result.pass).toBe(false);
+    expect(result.details).toContain(
+      "new failure fingerprints vs baseline (secondary):\nFAIL tests/new.test.ts > real regression #",
+    );
+
+    // …and not only for Vitest's FAIL prefix: an already-red pytest, go or TAP repo must still block a
+    // new failing test, or "shape, not vocabulary" would forgive every runner we did not fixture.
+    for (const [old_, added] of [
+      ["FAILED tests/test_old.py::test_a - AssertionError: nope", "FAILED tests/test_new.py::test_b - AssertionError: nope"],
+      ["--- FAIL: TestOld (0.00s)", "--- FAIL: TestNew (0.01s)"],
+      ["not ok 1 - old failure", "not ok 2 - new failure"],
+      // trailing-verdict runners (cargo/libtest, and the same shape with the other separator): the
+      // verdict ends the line after the runner's own separator, which no drawn strip does
+      ["test tests::old_failure ... FAILED", "test tests::genuinely_new_failure ... FAILED"],
+      ["tests::old_failure --- FAILED", "tests::genuinely_new_failure --- FAILED"],
+    ]) {
+      const runner = makeRepo({ "out.txt": `${old_}\n`, "run.sh": "cat out.txt; exit 1\n" });
+      const base = await captureBaseline(runner, commands);
+      expect(base.commands.test.exitCode).toBe(1);
+
+      // the old failure alone is still forgiven…
+      expect((await compareToBaseline(runner, commands, base, ["test"]))[0].pass).toBe(true);
+
+      // …the new one blocks, and names itself in the details
+      writeFileSync(join(runner, "out.txt"), `${old_}\n${added}\n`);
+      const r = (await compareToBaseline(runner, commands, base, ["test"]))[0];
+      expect(r.pass).toBe(false);
+      expect(r.details).toContain(added);
+      expect(r.meta?.failingTests).toContain(added);
+    }
+  });
+
+  // T13 round 3, reviewer's Cargo reproduction: cargo puts the verdict LAST, so the leading-verdict
+  // shapes read none of it — a one-failing-test baseline fingerprinted as <unrecognized failure output>
+  // and a second genuinely failing test came back pass:true. Both blobs below are VERBATIM captures of
+  // `cargo test --offline` on cargo 1.95.0 (2026-08-02), only the crate's absolute path neutralized.
+  test("an already-red cargo baseline still blocks a newly failing cargo test and names it", async () => {
+    const CARGO_HEAD = [
+      "   Compiling fixture v0.1.0 (/tmp/fixture)",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s",
+      "     Running unittests src/lib.rs (target/debug/deps/fixture-6b5074602f5d8170)",
+      "",
+    ];
+    const baselineOut = [
+      ...CARGO_HEAD,
+      "running 2 tests",
+      "test tests::passes ... ok",
+      "test tests::old_failure ... FAILED",
+      "",
+      "failures:",
+      "",
+      "---- tests::old_failure stdout ----",
+      "",
+      "thread 'tests::old_failure' (81651804) panicked at src/lib.rs:7:24:",
+      "assertion `left == right` failed",
+      "  left: 2",
+      " right: 3",
+      "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+      "",
+      "",
+      "failures:",
+      "    tests::old_failure",
+      "",
+      "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "",
+      "error: test failed, to rerun pass `--lib`",
+      "",
+    ].join("\n");
+    const regressedOut = [
+      ...CARGO_HEAD,
+      "running 3 tests",
+      "test tests::passes ... ok",
+      "test tests::genuinely_new_failure ... FAILED",
+      "test tests::old_failure ... FAILED",
+      "",
+      "failures:",
+      "",
+      "---- tests::genuinely_new_failure stdout ----",
+      "",
+      "thread 'tests::genuinely_new_failure' (81652742) panicked at src/lib.rs:11:34:",
+      "assertion `left == right` failed",
+      "  left: 4",
+      " right: 5",
+      "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+      "",
+      "---- tests::old_failure stdout ----",
+      "",
+      "thread 'tests::old_failure' (81652743) panicked at src/lib.rs:7:24:",
+      "assertion `left == right` failed",
+      "  left: 2",
+      " right: 3",
+      "",
+      "",
+      "failures:",
+      "    tests::genuinely_new_failure",
+      "    tests::old_failure",
+      "",
+      "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "",
+      "error: test failed, to rerun pass `--lib`",
+      "",
+    ].join("\n");
+
+    const repo = makeRepo({ "out.txt": baselineOut, "run.sh": "cat out.txt; exit 101\n" });
+    const commands = { test: "bash run.sh" };
+    const baseline = await captureBaseline(repo, commands);
+
+    // the red baseline is READ, not shrugged at: the marker would erase the distinction between
+    // "one test fails here" and "two do"
+    expect(baseline.commands.test.fingerprints).not.toContain(UNRECOGNIZED_FAILURE);
+    expect(baseline.commands.test.fingerprints).toContain("test tests::old_failure ... FAILED");
+
+    // the same red run is still forgiven…
+    expect((await compareToBaseline(repo, commands, baseline, ["test"]))[0]).toMatchObject({ pass: true });
+
+    // …and the second genuinely failing test blocks, named in details and in meta
+    writeFileSync(join(repo, "out.txt"), regressedOut);
+    const r = (await compareToBaseline(repo, commands, baseline, ["test"]))[0];
+    expect(r.pass).toBe(false);
+    expect(r.details).toContain("test tests::genuinely_new_failure ... FAILED");
+    expect(r.meta?.failingTests).toContain("test tests::genuinely_new_failure ... FAILED");
+    // the pre-existing one is not reported as new
+    expect(r.details).not.toContain("new failure fingerprints vs baseline (secondary):\ntest tests::old_failure");
+  });
+
+  // T13 round 2, reviewer's end-to-end reproduction: with only Vitest/pytest/go fixtured, a real
+  // already-red node:test (TAP) baseline forgave a second genuinely failing test — pass:true, and its
+  // fingerprint absent from the report. No fixture here: the runner is spawned for real.
+  test("an already-red node:test TAP baseline still blocks a newly failing TAP test and names it", async () => {
+    const failingTest = (name: string) => [
+      'const { test } = require("node:test");',
+      'const assert = require("node:assert");',
+      `test(${JSON.stringify(name)}, () => { assert.strictEqual(1, 2); });`,
+      "",
+    ].join("\n");
+    const repo = makeRepo({ "old.test.js": failingTest("old failure") });
+    const commands = { test: "node --test --test-reporter=tap" };
+
+    const baseline = await captureBaseline(repo, commands);
+    expect(baseline.commands.test.exitCode).not.toBe(0);
+    expect(baseline.commands.test.fingerprints).toContain("not ok # - old failure");
+
+    // the same red run is forgiven…
+    expect((await compareToBaseline(repo, commands, baseline, ["test"]))[0]).toMatchObject({ pass: true });
+
+    // …and a second genuinely failing TAP test blocks, named in details and in meta
+    writeFileSync(join(repo, "new.test.js"), failingTest("new failure"));
+    const r = (await compareToBaseline(repo, commands, baseline, ["test"]))[0];
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/not ok \d+ - new failure/);
+    expect(r.details).toContain("not ok # - new failure"); // the fresh fingerprint itself is reported
+    expect(r.meta?.failingTests?.some((l) => /not ok \d+ - new failure/.test(l))).toBe(true);
+  });
+
+  // T13 round 4, anchored review (codex:gpt-5.6-sol, upheld): Node v22's spec reporter
+  // (`--test-reporter=spec`) speaks glyphs — `✖ old failure (0.585875ms)` per failure, `ℹ fail 1`
+  // in the totals — which no fixtured shape read: a one-failure spec baseline fingerprinted as
+  // <unrecognized failure output>, so a second genuinely failing test came back pass:true with its
+  // fingerprint unreported. No fixture here either: the runner is spawned for real.
+  test("an already-red node:test spec baseline still blocks a newly failing spec test and names it", async () => {
+    const failingTest = (name: string) => [
+      'const { test } = require("node:test");',
+      'const assert = require("node:assert");',
+      `test(${JSON.stringify(name)}, () => { assert.strictEqual(1, 2); });`,
+      "",
+    ].join("\n");
+    const repo = makeRepo({ "old.test.js": failingTest("old failure") });
+    const commands = { test: "node --test --test-reporter=spec" };
+
+    const baseline = await captureBaseline(repo, commands);
+    expect(baseline.commands.test.exitCode).not.toBe(0);
+    // the red baseline is READ, not shrugged at: the marker would erase the distinction between
+    // "one test fails here" and "two do"
+    expect(baseline.commands.test.fingerprints).not.toContain(UNRECOGNIZED_FAILURE);
+    expect(baseline.commands.test.fingerprints).toContain("✖ old failure (#.#ms)");
+
+    // the same red run is still forgiven…
+    expect((await compareToBaseline(repo, commands, baseline, ["test"]))[0]).toMatchObject({ pass: true });
+
+    // …and a second genuinely failing spec test blocks, named in details and in meta
+    writeFileSync(join(repo, "new.test.js"), failingTest("new failure"));
+    const r = (await compareToBaseline(repo, commands, baseline, ["test"]))[0];
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/✖ new failure \(/);
+    expect(r.details).toContain("✖ new failure (#.#ms)"); // the fresh fingerprint itself is reported
+    expect(r.meta?.failingTests?.some((l) => /✖ new failure \(/.test(l))).toBe(true);
+  });
+
+  // T13 round 5, anchored review (claude-opus-5, material): python unittest -v emits BOTH position
+  // rules — `FAIL: test_x (mod.Class.test_x)` (leading verdict + identifier) and
+  // `test_x (mod.Class.test_x) ... FAIL` (identifier + runner separator + trailing verdict) — and each
+  // missed the fixtured shapes by one character, so a one-failure baseline fingerprinted only its
+  // AssertionError body line and a second genuinely failing test came back pass:true. No fixture here
+  // either: the runner is spawned for real.
+  test("an already-red python unittest baseline still blocks a newly failing unittest test and names it", async () => {
+    const failingTest = (cls: string, name: string) => [
+      "import unittest",
+      "",
+      `class ${cls}(unittest.TestCase):`,
+      `    def ${name}(self):`,
+      "        self.assertEqual(1, 2)",
+      "",
+    ].join("\n");
+    const repo = makeRepo({ "test_a.py": failingTest("TestA", "test_old") });
+    const commands = { test: "python3 -m unittest -v" };
+
+    const baseline = await captureBaseline(repo, commands);
+    expect(baseline.commands.test.exitCode).not.toBe(0);
+    // the red baseline is READ, not shrugged at: the marker would erase the distinction between
+    // "one test fails here" and "two do" — both unittest position rules name the failing test.
+    // (python <3.11 prints the qualified name as `(test_a.TestA)`, 3.11+ as `(test_a.TestA.test_old)`)
+    const fps = baseline.commands.test.fingerprints;
+    expect(fps).not.toContain(UNRECOGNIZED_FAILURE);
+    expect(fps.some((f) => /^test_old \(test_a\.TestA(?:\.test_old)?\) \.\.\. FAIL$/.test(f))).toBe(true);
+    expect(fps.some((f) => /^FAIL: test_old \(test_a\.TestA(?:\.test_old)?\)$/.test(f))).toBe(true);
+
+    // the same red run is forgiven…
+    expect((await compareToBaseline(repo, commands, baseline, ["test"]))[0]).toMatchObject({ pass: true });
+
+    // …and a second genuinely failing unittest test blocks, named in details and in meta
+    writeFileSync(join(repo, "test_b.py"), failingTest("TestB", "test_new"));
+    const r = (await compareToBaseline(repo, commands, baseline, ["test"]))[0];
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/FAIL: test_new \(test_b\.TestB(?:\.test_new)?\)/);
+    expect(r.details).toMatch(/test_new \(test_b\.TestB(?:\.test_new)?\) \.\.\. FAIL/);
+    expect(r.meta?.failingTests?.some((l) => /FAIL: test_new \(test_b\.TestB(?:\.test_new)?\)/.test(l))).toBe(true);
+    expect(r.meta?.failingTests?.some((l) => /test_new \(test_b\.TestB(?:\.test_new)?\) \.\.\. FAIL/.test(l))).toBe(true);
   });
 });
 

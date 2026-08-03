@@ -143,7 +143,7 @@ function IdentityHeader({
       {
         title: "",
         lines: [
-          `${data.runId} · ${data.branch}  ${data.status} · ${data.elapsed}`,
+          frameCaption(data),
         ],
       },
     ] as const satisfies readonly [BandColumnContent, BandColumnContent];
@@ -166,7 +166,7 @@ function IdentityHeader({
         <Box justifyContent="space-between">
           <BodyText emphasis="strong">{lockup[1] ?? "tickmarkr"}</BodyText>
           <BodyText>
-            {data.runId} · {data.branch}  {data.status} · {data.elapsed}
+            {frameCaption(data)}
           </BodyText>
         </Box>
       )}
@@ -212,17 +212,105 @@ function NarrowHeaderBand({
 
 const RUN_SIDE_RAIL_WIDTH = 16;
 
+function runInstant(runId: string): Date {
+  const match = runId.match(/\brun-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/u);
+  return match === null
+    ? new Date()
+    : new Date(
+        Number(match[1]),
+        Number(match[2]) - 1,
+        Number(match[3]),
+        Number(match[4]),
+        Number(match[5]),
+        Number(match[6]),
+      );
+}
+
+function utcClock(value: string): readonly [number, number, number] | undefined {
+  const match = value.match(/^([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$/u);
+  return match === null
+    ? undefined
+    : [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function localZoneLabel(data: RunCockpitData): string {
+  const newestTimestamp = data.journalRows.find((row) => row.timestamp !== undefined)?.timestamp;
+  const recorded = newestTimestamp === undefined ? undefined : new Date(newestTimestamp);
+  const reference = recorded !== undefined && Number.isFinite(recorded.getTime())
+    ? recorded
+    : runInstant(data.runId);
+  const offset = -reference.getTimezoneOffset();
+  if (offset === 0) return "UTC";
+  const sign = offset < 0 ? "-" : "+";
+  const hours = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+  const minutes = Math.abs(offset) % 60;
+  return minutes === 0
+    ? `${sign}${hours}`
+    : `${sign}${hours}:${String(minutes).padStart(2, "0")}`;
+}
+
+function localClockTime(value: string, timestamp?: string): string {
+  if (utcClock(value) === undefined) return value;
+  if (timestamp === undefined) return value;
+  const completeInstant = new Date(timestamp);
+  if (!Number.isFinite(completeInstant.getTime())) return value;
+  const hours = String(completeInstant.getHours()).padStart(2, "0");
+  const minutes = String(completeInstant.getMinutes()).padStart(2, "0");
+  const seconds = String(completeInstant.getSeconds()).padStart(2, "0");
+  return `${hours}:${minutes}:${seconds}`;
+}
+
+/** Name the ruler an already-built caption's bare attempt number is counted on. */
+function nameAttemptRuler(caption: string): string {
+  return caption.replace(/(?<!engagement |run )\battempt (?=\d)/gu, "engagement attempt ");
+}
+
+/**
+ * The fold owns active-task identity and full event order. This surface only names the attempt
+ * ruler and fits that authoritative caption; TaskRows are never ranked into a competing answer.
+ */
+function engagementProgressCaption(
+  data: RunCockpitData,
+  columns = Number.POSITIVE_INFINITY,
+): string {
+  const caption = nameAttemptRuler(data.progressCaption);
+  if (cellWidth(caption) <= columns) return caption;
+  const actorSeparator = caption.lastIndexOf(" · ");
+  return actorSeparator < 0
+    ? caption
+    : `${caption.slice(0, actorSeparator)} ${caption.slice(actorSeparator + 3)}`;
+}
+
+function runAttemptLabel(attempts: number | undefined): string {
+  return attempts === 1
+    ? "run attempt 1"
+    : `run attempts ${fieldReading(attempts)}`;
+}
+
 /** The header caption: the run's identity line, planned as the header's refinable sub-region. */
 function frameCaption(data: RunCockpitData): string {
-  return `${data.runId} · ${data.branch} · ${data.status} · ${data.elapsed}`;
+  return `${data.runId} · ${data.branch} · ${data.status} · ${data.elapsed} · zone ${localZoneLabel(data)}`;
 }
 
 /** The header's fixed left part: brand, version and the two tab labels. */
-function headerLead(data: RunCockpitData, plan: PlannedFrame): string {
+function headerLead(data: RunCockpitData, plan: PlannedFrame, columns: number): string {
   const tabs = plan.tab === "watch"
     ? `[ WATCH ]${FRAME_HEADER_GAP}${DECISIONS_TAB_TITLE}`
     : `WATCH${FRAME_HEADER_GAP}[ ${DECISIONS_TAB_TITLE} ]`;
-  return `tickmarkr ${data.binaryVersion}${FRAME_HEADER_GAP}${tabs}`;
+  if (plan.regions.some((region) => region.id === "caption")) {
+    return `tickmarkr ${data.binaryVersion}${FRAME_HEADER_GAP}${tabs}`;
+  }
+  const withVersion = `tickmarkr ${data.binaryVersion}${FRAME_HEADER_GAP}${tabs} · zone ${localZoneLabel(data)}`;
+  const compactTabs = plan.tab === "watch"
+    ? `[WATCH]${DECISIONS_TAB_TITLE}`
+    : `WATCH[${DECISIONS_TAB_TITLE}]`;
+  const compact = `tickmarkr ${data.binaryVersion}${compactTabs} zone ${localZoneLabel(data)}`;
+  if (cellWidth(withVersion) <= columns) return withVersion;
+  if (cellWidth(compact) <= columns) return compact;
+  const markedTabs = plan.tab === "watch"
+    ? `>WATCH${DECISIONS_TAB_TITLE}`
+    : `WATCH>${DECISIONS_TAB_TITLE}`;
+  return `tickmarkr ${data.binaryVersion}${markedTabs} zone ${localZoneLabel(data)}`;
 }
 
 /** The one plain header line: brand, version and the two tab labels, the active one marked. */
@@ -237,7 +325,7 @@ function PlannedHeader({
 }): ReactElement {
   return (
     <BodyText emphasis="strong">
-      {fitCells(headerLead(data, plan), Math.max(1, columns))}
+      {fitCells(headerLead(data, plan, columns), Math.max(1, columns))}
     </BodyText>
   );
 }
@@ -326,7 +414,7 @@ function setupSectionLines(
   }
   const parked = data.taskRows.filter((row) => row.state === "human");
   if (parked.length === 0) return ["No parked decisions in this engagement"];
-  return parked.map((row) => `${row.taskId} · parked · attempt ${row.attempts ?? 0}`);
+  return parked.map((row) => `${row.taskId} · parked · ${runAttemptLabel(row.attempts)}`);
 }
 
 /**
@@ -463,21 +551,27 @@ function promotedViewRows(
   data: RunCockpitData,
   viewId: RunViewId,
 ): readonly JournalRow[] {
+  // Surrendered by identity, never rebuilt: the journal view shows the fold's own records, and
+  // rewriting their text here — even to name the ruler its attempt is counted on — would be this
+  // surface authoring a row. The counters the surface DOES compose (the caption, the task rows)
+  // name their rulers below.
   if (viewId === "journal") return data.journalRows;
   if (viewId === "tasks") {
-    return data.taskRows.map((row) => ({
+    return data.taskRows.filter(recordedTaskRow).map((row) => ({
       id: row.id,
       time: fieldReading(row.lastEventTime),
-      state: taskRowState(row.state),
-      text: `${row.taskId} · ${fieldReading(row.state)} · attempt ${
-        fieldReading(row.attempts)
-      } · ${fieldReading(row.actor)}${row.title === undefined ? "" : ` · ${row.title}`}`,
+      ...(row.lastEventTimestamp === undefined ? {} : { timestamp: row.lastEventTimestamp }),
+      state: taskRowState(row),
+      text: `${row.taskId} · ${fieldReading(row.state)} · ${runAttemptLabel(row.attempts)} · ${
+        fieldReading(row.actor)
+      }${row.title === undefined ? "" : ` · ${row.title}`}`,
     }));
   }
   if (viewId === "gates") {
     return data.gateRows.map((row) => ({
       id: row.id,
       time: row.time,
+      ...(row.timestamp === undefined ? {} : { timestamp: row.timestamp }),
       state: row.state,
       text: `${fieldReading(row.taskId)} · ${fieldReading(row.gate)} · ${
         row.pass === undefined ? fieldReading(undefined) : row.pass ? "pass" : "fail"
@@ -488,6 +582,7 @@ function promotedViewRows(
     return data.fleetRows.map((row) => ({
       id: row.id,
       time: fieldReading(row.lastEventTime),
+      ...(row.lastEventTimestamp === undefined ? {} : { timestamp: row.lastEventTimestamp }),
       state: "neutral" as const,
       text: `${row.adapter} · ${row.model} · dispatches ${
         fieldReading(row.dispatches)
@@ -497,11 +592,21 @@ function promotedViewRows(
   return [];
 }
 
+/** A task row exists on an operator surface only when the journal fold recorded a task fact. */
+function recordedTaskRow(row: TaskRow): boolean {
+  return row.state !== undefined
+    || row.lastEventTime !== undefined
+    || row.attempts !== undefined
+    || row.actor !== undefined
+    || row.merged === true
+    || row.parkKind !== undefined;
+}
+
 /** A task's recorded state read as the component vocabulary the rows draw in. */
-function taskRowState(state: TaskRow["state"]): JournalRow["state"] {
-  if (state === "done") return "pass";
-  if (state === "failed") return "fail";
-  if (state === "running" || state === "human") return "active";
+function taskRowState(row: TaskRow): JournalRow["state"] {
+  if (row.state === "done" && row.merged === true) return "pass";
+  if (row.state === "failed") return "fail";
+  if (row.state === "running" || row.state === "human") return "active";
   return "neutral";
 }
 
@@ -578,7 +683,10 @@ function SizedJournalPanel({
     : window.rows.findIndex((row) => row.id === hovered);
   const emptyRows = Math.max(0, bodyRows - window.rows.length);
   const journal = JournalRowPanel({
-    rows: window.rows,
+    rows: window.rows.map((row) => ({
+      ...row,
+      time: localClockTime(row.time, row.timestamp),
+    })),
     title,
     selection: window.selection,
     focused,
@@ -637,7 +745,7 @@ function helpLines(entries: readonly KeybarEntry[]): readonly string[] {
 
 /** The lines the opened-event view draws for one journal row. */
 function eventLines(row: JournalRow): readonly string[] {
-  return [`${row.time} · ${row.state}`, row.text];
+  return [`${localClockTime(row.time, row.timestamp)} · ${row.state}`, row.text];
 }
 
 /**
@@ -1020,7 +1128,7 @@ function TailBand({
     ? ["PENDING WRITES · none"]
     : deriveRunViewRows(data, "journal")
       .slice(-rows)
-      .map((row) => `${row.time} ${row.text}`);
+      .map((row) => `${localClockTime(row.time, row.timestamp)} ${row.text}`);
   // A styled blank cell differs with colour on and off; these rows carry no dim style.
   return (
     <Box flexDirection="column" height={rows} overflow="hidden">
@@ -1036,14 +1144,16 @@ function TailBand({
 function ApprovedProgress({
   data,
   caption,
+  columns,
 }: {
   data: RunCockpitData;
   caption: boolean;
+  columns?: number;
 }): ReactElement {
   return (
     <Panel title="PROGRESS">
       <ProgressMeter value={data.progress} width={28} />
-      {caption && <BodyText emphasis="dim">{data.progressCaption}</BodyText>}
+      {caption && <BodyText emphasis="dim">{engagementProgressCaption(data, columns)}</BodyText>}
     </Panel>
   );
 }
@@ -1052,10 +1162,12 @@ function CompactProgress({
   data,
   caption,
   meterWidth = 28,
+  columns,
 }: {
   data: RunCockpitData;
   caption: boolean;
   meterWidth?: number;
+  columns?: number;
 }): ReactElement {
   return (
     <Box flexDirection="column">
@@ -1063,7 +1175,7 @@ function CompactProgress({
         <BodyText emphasis="strong">PROGRESS </BodyText>
         <ProgressMeter value={data.progress} width={meterWidth} />
       </Box>
-      {caption && <BodyText emphasis="dim">{data.progressCaption}</BodyText>}
+      {caption && <BodyText emphasis="dim">{engagementProgressCaption(data, columns)}</BodyText>}
     </Box>
   );
 }
@@ -1113,8 +1225,12 @@ function resolveRunViewContent(
     : 0;
   journal += tail;
   available -= tail;
+  const progressCaptionColumns = Math.max(1, bodyColumns - RUN_PANEL_HORIZONTAL_CHROME);
   const captionRows = progressBar
-    ? wrapCells(data.progressCaption, Math.max(1, bodyColumns)).length
+    ? wrapCells(
+        engagementProgressCaption(data, progressCaptionColumns),
+        progressCaptionColumns,
+      ).length
     : 0;
   const progressCaption = captionRows > 0 && available >= captionRows;
   if (progressCaption) available -= captionRows;
@@ -1206,12 +1322,25 @@ function LadderRunPanel({
         <RunStats data={data} mode={content.stats} />
         {content.progressBar && (
           content.approvedProgress
-            ? <ApprovedProgress data={data} caption={content.progressCaption} />
+            ? (
+              <ApprovedProgress
+                data={data}
+                caption={content.progressCaption}
+                columns={Math.max(
+                  1,
+                  content.items.columns - RUN_PANEL_HORIZONTAL_CHROME,
+                )}
+              />
+            )
             : (
               <CompactProgress
                 data={data}
                 caption={content.progressCaption}
                 meterWidth={compactMeterWidth}
+                columns={Math.max(
+                  1,
+                  content.items.columns - RUN_PANEL_HORIZONTAL_CHROME,
+                )}
               />
             )
         )}
@@ -1245,7 +1374,7 @@ function LegacyRunPanel({
       <RunStats data={data} mode="tiles" />
       <Panel title="PROGRESS">
         <ProgressMeter value={data.progress} width={28} />
-        <BodyText emphasis="dim">{data.progressCaption}</BodyText>
+        <BodyText emphasis="dim">{engagementProgressCaption(data)}</BodyText>
       </Panel>
       <JournalBody
         data={data}
@@ -1301,8 +1430,11 @@ function PlainFallbackPaint({
   size: MeasuredSize;
 }): ReactElement {
   const columns = Math.max(1, size.columns);
+  // This is an operator surface, so it names its zone once like every other one.
+  // The run.ci/run.non-tty machine anchors are drawn by capture.ts's
+  // defaultPlainRenderer, not by this component, so the label does not move them.
   const lines = [
-    `tickmarkr ${data.binaryVersion}`,
+    `tickmarkr ${data.binaryVersion} · zone ${localZoneLabel(data)}`,
     `${data.runId} ${data.status} ${data.elapsed}`,
     ...data.statusItems.map((item) => item.text),
   ];
@@ -1537,7 +1669,7 @@ function RunCockpitPaint({
               <LadderRunPanel
                 data={data}
                 content={content}
-                compactMeterWidth={content.sideRails ? undefined : 24}
+                compactMeterWidth={24}
                 interaction={currentInteraction}
                 keyEntries={keyEntries}
                 focused={contentFocused}

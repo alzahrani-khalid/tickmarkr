@@ -56,13 +56,21 @@ export class FakeAdapter implements WorkerAdapter {
     // contains TICKMARKR-JUDGE — a review/consult prompt never touches it (research Pitfall 3).
     let prompt = "";
     let isJudge = false;
+    // v1.85 T4: the role THIS prompt is, when it can be told. The three scratch files are shared per
+    // script path, so a build that writes a role it is not can clobber a concurrently-dispatched
+    // sibling's file between that sibling's build and its `cat` — which is exactly what a round that
+    // launches judge and review together does. Writing only the matching role removes the race: the
+    // other roles' `grep` guards below can never fire for this prompt, so their files are never read.
+    let role: "judge" | "review" | "consult" | undefined;
     try {
       prompt = readFileSync(promptFile, "utf8");
       isJudge = /TICKMARKR-(?:JUDGE|SCOPE)/.test(prompt);
+      role = isJudge ? "judge" : /TICKMARKR-REVIEW/.test(prompt) ? "review" : /TICKMARKR-CONSULT/.test(prompt) ? "consult" : undefined;
     } catch {
       // unreadable promptFile: can't detect role; serve static values (legacy headless-call behavior)
     }
     const serve = (key: "judge" | "review" | "consult") => {
+      if (role !== undefined && key !== role) return join(dirname(this.scriptPath), `${key}.json`);
       let val = this.script[key];
       if (key === "judge" && isJudge && Array.isArray(val)) {
         // array served sequentially per judge prompt, clamped to last (steps[min(n,len-1)] idiom)

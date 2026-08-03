@@ -29,17 +29,80 @@ const PASS_LINE_RE = /^\s*(?:(?:[\w@./-]+:\s*)*[✓✔]|(?:\[tickmarkr\]\s+)?(?:
 // output to headline it. \s is fine in a TS regex — the BSD [[:space:]] rule binds shell grep only.
 // OBS-42: vitest's diagnostic failure headings are shared anchors for baseline and tip verification.
 const FAIL_ANCHOR_RE = /^\s*(?:FAIL\s+|[^\w]*(?:Unhandled Errors|Uncaught Exception)\b)/;
-const SUMMARY_FAIL_RE = /^\s*Tests?\s+(?:Files?\s+)?\d+\s+failed/; // " Tests  N failed | M passed (T)"
+// OBS-278: a failure fingerprint is a SHAPE — the way a runner reports a failure — never error/fail
+// vocabulary. A status surface that draws those words (zone +N, run attempt N, "1 failed") used to
+// fingerprint as a fresh failure on every attempt, rejecting a task for rendering what it was chartered
+// to render. Digits are written (?:\d+|#) so a shape matches both raw and digit-normalized lines.
+// Run summaries: " Tests  N failed | M passed (T)" (vitest), "# fail N" (TAP / node:test),
+// "ℹ fail N" (node:test's spec reporter) and "test result: FAILED. …" (cargo / libtest).
+const SUMMARY_FAIL_RE = /^\s*(?:Tests?\s+(?:Files?\s+)?(?:\d+|#)\s+failed|#\s+fail\s+(?!0\b)(?:\d+|#)\b|ℹ\s+fail\s+(?!0\b)(?:\d+|#)\b|test result:\s+FAILED\b)/;
+const ERROR_ANCHOR_RE = /^\s*(?:Error|[A-Za-z_$][\w$]*Error):\s+\S/;
+const TSC_ERROR_RE = /^\s*\S.*\((?:\d+|#),(?:\d+|#)\):\s+error\s+[A-Z]+(?:\d+|#):/i; // tsc
+const LINTER_ERROR_RE = /^\s*(?:\d+|#):(?:\d+|#)\s+error\s+\S/; // eslint stylish
+// The failure shapes non-Vitest runners name their tests with: pytest's short summary
+// (`FAILED tests/t.py::test_x - AssertionError`, `ERROR tests/t.py::fixture`), go test
+// (`--- FAIL: TestFoo (0.00s)`), TAP / node:test (`not ok 1 - name`, whose summary line lands in
+// SUMMARY_FAIL_RE) and python unittest's failure-block header (`FAIL: test_x (mod.Class.test_x)`,
+// verbatim capture, python3 -m unittest -v). Each anchors the runner's token at line START; the
+// pytest/go forms also require a file/test identifier after it (`::`, a path separator, or an
+// extension) — so a surface drawing "FAILED" mid-line, or a plain sentence like "FAILED to reach
+// the zone", still matches nothing. Without these a genuinely new pytest/go/TAP/unittest failure on
+// an already-red baseline was forgiven as pre-existing, because only shaped lines can reject.
+const RUNNER_FAIL_RE = /^\s*(?:(?:FAILED|ERROR)\s+\S*(?:::|[/\\]|\.[A-Za-z]\w*\b)|FAIL:\s+\S|---\s+FAIL:\s+\S|not ok\b)/;
+// The other half of the position rule: runners that put the verdict LAST. cargo/libtest names each
+// failing test as `test tests::name ... FAILED` (verbatim capture, cargo 1.95.0) and details it with
+// `thread 'tests::name' (81651804) panicked at src/lib.rs:7:24:`; python unittest -v writes
+// `test_x (mod.Class.test_x) ... FAIL` (and `... ERROR`) — the same rule with the runner's
+// qualified-name token between identifier and separator, and the short verdict spelling (verbatim
+// capture, python3 -m unittest -v). Recognition is positional, not a vendor name: an identifier, the
+// runner's own separator, then the verdict ENDING the line. A drawn status strip ("│ ✗ tip-verify
+// FAILED · zone +3 │") has the verdict mid-line inside chrome, so it matches nothing here — which is
+// why this can generalize without re-opening OBS-278.
+const TRAILING_FAIL_RE = /^\s*(?:test\s+)?\S+(?:\s+\([^)]*\))?\s+(?:\.{3}|-{3,})\s+(?:FAIL(?:ED)?|ERROR)\s*$|^\s*thread\s+'[^']*'\s+.*panicked at\s+\S/;
+// node:test's spec reporter speaks glyphs, not words: a failure is named by a leading ✖ (verbatim
+// capture, Node v22 `--test-reporter=spec`: `✖ old failure (0.585875ms)`, totalled as `ℹ fail 1` in
+// SUMMARY_FAIL_RE) — the exact counterpart of the ✓/✔ pass markers PASS_LINE_RE drops, with the same
+// optional label prefixes. Recognition is positional — the runner's own marker at line start — so any
+// runner sharing the glyph protocol is read without being enumerated; a status strip drawing ✖
+// mid-line inside chrome matches nothing, the same position rule as the other shapes.
+const GLYPH_FAIL_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)✖\s+\S/;
+// Lines that NAME a failing test — the ones worth headlining to the operator. One list, so recognition
+// and reporting cannot drift apart (a shape that blocks but never gets named cost 3 attempts once).
+const namesFailure = (l: string) => FAIL_ANCHOR_RE.test(l) || RUNNER_FAIL_RE.test(l) || TRAILING_FAIL_RE.test(l) || GLYPH_FAIL_RE.test(l);
+const isFailureShaped = (l: string) =>
+  namesFailure(l) || SUMMARY_FAIL_RE.test(l) || ERROR_ANCHOR_RE.test(l)
+  || TSC_ERROR_RE.test(l) || LINTER_ERROR_RE.test(l);
+const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 const normalizeLine = (l: string) => l.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 
+// A failing command whose output holds no shape any runner here names. The marker is content-free and
+// constant: downstream consumers (tip verify journals fingerprint counts) still see that the command
+// failed, while no line of the output — narration, status strip, stack trace — can enter the set. Being
+// constant it is identical on every attempt, so it can never surface as a fresh fingerprint either.
+export const UNRECOGNIZED_FAILURE = "<unrecognized failure output>";
+
+// OBS-278 dies here: only a failure SHAPE is fingerprintable. Vocabulary is not a shape — a surface that
+// renders "zone +3 · run attempt 2 · 1 failed" (what T9 is chartered to draw) contributes nothing, with
+// or without box glyphs, so it cannot manufacture a fresh-fingerprint rejection on any future attempt.
 export function fingerprint(output: string): string[] {
   const lines = output
     .split("\n")
     .map((l) => l.replace(ANSI_RE, ""))
-    .filter((l) => !PASS_LINE_RE.test(l) && (FAIL_ANCHOR_RE.test(l) || /\b(error|fail(ed|ure|ing)?)\b/i.test(l)))
-    .map(normalizeLine);
-  return [...new Set(lines)];
+    .filter((l) => !PASS_LINE_RE.test(l));
+  const shaped = lines.filter(isFailureShaped);
+  if (!shaped.length) return lines.some((l) => l.trim()) ? [UNRECOGNIZED_FAILURE] : [];
+  return [...new Set(shaped.map(normalizeLine))];
 }
+
+// The diagnostic channel for a runner we cannot read: raw output lines, never fingerprints, never a
+// verdict. They exist so the operator sees SOMETHING when a green command turns red unrecognizably.
+const unrecognizedEvidence = (raw: string): string =>
+  raw
+    .split("\n")
+    .map((l) => l.replace(ANSI_RE, "").trimEnd())
+    .filter((l) => VOCAB_RE.test(l))
+    .slice(0, 10)
+    .join("\n");
 
 // stored baselines may predate ANSI/pass-marker hardening — renormalize at compare time so existing
 // on-disk baseline.json files stay comparable without recapture (compat invariant, CLAUDE.md)
@@ -84,7 +147,9 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
     base.commands[name] = {
       exitCode: r.code,
-      fingerprints: fingerprint((r.stdout + "\n" + r.stderr).split(cwd).join("")),
+      // a command that exits 0 has no failures to fingerprint — recording any would be a lie the
+      // compare step then has to forgive
+      fingerprints: r.code === 0 ? [] : fingerprint((r.stdout + "\n" + r.stderr).split(cwd).join("")),
       missingCommand: missingConfiguredCommand(cmd, r),
     };
   }
@@ -145,11 +210,11 @@ function headlineDetails(raw: string, fresh: string[]): { details: string; meta?
   const headlines = raw
     .split("\n")
     .map((l) => l.replace(ANSI_RE, ""))
-    .filter((l) => FAIL_ANCHOR_RE.test(l) || SUMMARY_FAIL_RE.test(l));
+    .filter((l) => namesFailure(l) || SUMMARY_FAIL_RE.test(l));
   if (!headlines.length) return { details: `new failures vs baseline:\n${fresh.join("\n")}` };
   return {
     details: `failing tests:\n${headlines.join("\n")}\n\nnew failure fingerprints vs baseline (secondary):\n${fresh.join("\n")}`,
-    meta: { failingTests: headlines.filter((l) => FAIL_ANCHOR_RE.test(l)) },
+    meta: { failingTests: headlines.filter(namesFailure) },
   };
 }
 
@@ -176,21 +241,39 @@ export async function compareToBaseline(
     const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
     const known = new Set((baseline.commands[name]?.fingerprints ?? []).map(renormalize));
     // OBS-42: diagnostic headings enrich fingerprints but cannot invalidate legacy baselines.
-    const fresh = fingerprint(raw).filter(
+    const current = fingerprint(raw);
+    const fresh = current.filter(
       (f) => !known.has(f) && (!FAIL_ANCHOR_RE.test(f) || f.startsWith("FAIL ")),
     );
-    if (!fresh.length && (baseline.commands[name]?.exitCode ?? 1) === 0) {
+    // OBS-278: only a failure SHAPE is a verdict — everything fingerprint() keeps is one, except the
+    // unrecognized-output marker, which is evidence for the operator and never grounds to reject.
+    // ponytail: ceiling — a runner whose failure output holds no shape above and whose baseline is
+    // already red has its new failures forgiven, so forgiveness that rests on the marker SAYS so
+    // below rather than reading as a verified green. Raise the ceiling by teaching isFailureShaped
+    // that runner's position rule (leading verdict + identifier, or identifier + separator + trailing
+    // verdict); loosening back to vocabulary re-opens OBS-278.
+    const unreadable = current.includes(UNRECOGNIZED_FAILURE);
+    const failing = fresh.filter((f) => f !== UNRECOGNIZED_FAILURE);
+    if (!failing.length && (baseline.commands[name]?.exitCode ?? 1) === 0) {
+      const closed = `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`;
+      const evidence = unrecognizedEvidence(raw);
       results.push({
         gate: name,
         pass: false,
-        details: `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`,
+        details: evidence ? `${closed}\nunrecognized output:\n${evidence}` : closed,
       });
       continue;
     }
     results.push(
-      fresh.length
-        ? { gate: name, pass: false, ...headlineDetails(raw, fresh) }
-        : { gate: name, pass: true, details: `exit ${r.code} but only pre-existing failures (forgiven)` },
+      failing.length
+        ? { gate: name, pass: false, ...headlineDetails(raw, failing) }
+        : {
+          gate: name,
+          pass: true,
+          details: `exit ${r.code} but only pre-existing failures (forgiven)${
+            unreadable ? " — no failure shape recognized in this output, so a new failure from this runner is invisible to the baseline gate" : ""
+          }`,
+        },
     );
   }
   return results;

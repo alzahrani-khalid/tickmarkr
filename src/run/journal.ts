@@ -94,6 +94,284 @@ export function reviewRoundsSinceApproval(events: JournalEvent[], taskId: string
   return rounds;
 }
 
+// OBS-189/OBS-254: the uphold brief is the operator's funded decision, not attempt state. ONE fold,
+// two consumers — replayResumeState seeds it, and the daemon re-derives it from the journal at
+// prompt-build time so no reset of attempt/channel state can take the findings with it (OBS-254 deleted
+// the whole resume entry and dispatched a funded attempt with an empty "fix these specifically" heading).
+export function upheldFeedbackByTask(events: JournalEvent[]): Map<string, string> {
+  const upheld = new Map<string, string>();
+  const lastReviewFail = new Map<string, string>(); // newest failed review details per task
+  for (const e of events) {
+    if (!e.taskId) continue;
+    if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
+        && typeof e.data.details === "string") {
+      lastReviewFail.set(e.taskId, e.data.details);
+    } else if (e.event === "task-approved") {
+      // any later approval supersedes: a plain accept-the-diff approval retires the uphold brief.
+      if (e.data.release === REVIEW_UPHELD_RELEASE) {
+        const details = lastReviewFail.get(e.taskId);
+        if (details) upheld.set(e.taskId, details);
+        else upheld.delete(e.taskId);
+      } else {
+        upheld.delete(e.taskId);
+      }
+    }
+  }
+  return upheld;
+}
+
+// v1.85 T3 (ruling R4 identity): one blocking finding, identified by CLASS + canonical PATH + stable
+// SYMBOL. Line numbers are evidence, never identity — the same defect one line lower is the same
+// finding. `note` keeps the reviewer's/judge's own bytes so the structure is additive, never lossy.
+export interface StructuredFinding {
+  class: string;
+  path: string;
+  symbol: string;
+  note: string;
+  fingerprint: string;
+}
+
+// Reserved for a finding whose OWN evidence names no path. Reporting a blank path a reader would take
+// for a resolved one is the silent-lie shape the gates exist to refuse, so the field says so outright.
+export const UNIDENTIFIED = "<unidentified>";
+
+const ANCHORED_RE = /^- (\S+?):(\d+) — (.*)$/;        // "## Anchored review" rows (llm.ts)
+const REVIEW_ROW_RE = /^- \[([^\]]+)\] (.*)$/;         // "- [material] …" (review.ts)
+const JUDGE_ROW_RE = /^✗ ([\w.-]+): (.*)$/;            // "✗ c1: …" (acceptance.ts) — id, then reason
+const PATH_RE = /\b((?:[\w.@~+-]+\/)+[\w.@~+-]+\.\w{1,6})\b/;
+const LINE_REF_RE = /(:\d+(?::\d+)?\b)|(\bline \d+\b)/gi;
+
+// ponytail: repo-relative tail from the first known top-level directory — enough to make an absolute
+// worktree path and its repo-relative twin the same identity. Widen the marker list if a run ever
+// names findings outside these roots.
+function canonicalPath(raw: string): string {
+  const cleaned = raw.replace(/^["'`(]+/, "").replace(/["'`),.]+$/, "").replace(/^\.\//, "");
+  const m = /(?:^|\/)((?:src|tests|scripts|docs|fixtures|specs|schema|skills|assets)\/.+)$/.exec(cleaned);
+  return m ? m[1]! : cleaned;
+}
+
+// The code identity a finding names, if it names one: a backticked identifier, then a call/member
+// expression. Line references are stripped first so no identity can carry one. "" means the prose
+// named no symbol — the caller decides what stands in, rather than this guessing from prose.
+function identifierIn(note: string): string {
+  const text = note.replace(LINE_REF_RE, " ");
+  const ticked = /`([^`]{1,80})`/.exec(text);
+  if (ticked) return ticked[1]!.trim();
+  // no whitespace before the paren: "the brief (see …)" is prose, not a call expression, and a prose
+  // word standing in for a symbol is the guessing this function exists to refuse.
+  const call = /\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\(/.exec(text);
+  return call ? call[1]! : "";
+}
+
+// The SYMBOL of last resort. R4 admits "stable symbol/test title" — a finding whose prose names no
+// code identity still has one stable identity of its own: its own words, with the volatile tokens
+// swept out so line/path churn cannot mint a new symbol for the same finding. It is the reviewer's
+// own bytes, never a guess, and it can never fuse two different findings into one.
+function toFinding(cls: string, note: string, path: string, symbol: string): StructuredFinding {
+  const p = path || UNIDENTIFIED;
+  const s = symbol || normalizeGateFailure(note) || UNIDENTIFIED;
+  return { class: cls, path: p, symbol: s, note, fingerprint: `${cls}|${p}|${s}` };
+}
+
+/**
+ * Structured findings for a BLOCKING review/judge gate result, parsed from the details the gate
+ * already writes (D-03: no gate-module change, so an older gate's prose degrades to one unclassified
+ * finding rather than to none). Never empty for a blocking result — a finding the journal cannot
+ * classify is still a finding the next retry must not lose.
+ *
+ * Rule: a finding's path is its verdict row's own evidence path. An inline path and an anchored row's
+ * path therefore resolve; a different anchor or the task's declared scope never substitutes for a
+ * pathless finding. That row fails closed as UNIDENTIFIED instead of manufacturing an R4 identity.
+ * A symbol the row's own prose does not name falls back to the criterion id, then to the row's own
+ * normalized words (see toFinding).
+ */
+export function structuredFindings(gate: string, details: string, _scopeFiles: string[] = []): StructuredFinding[] {
+  const lines = details.split("\n");
+  const rows: StructuredFinding[] = [];
+  const push = (cls: string, note: string, ownPath: string, fallbackSymbol = "") => {
+    const own = canonicalPath(ownPath || PATH_RE.exec(note)?.[1] || "");
+    const sym = identifierIn(note) || fallbackSymbol;
+    rows.push(toFinding(cls, note, own, sym));
+  };
+  for (const line of lines) {
+    const a = ANCHORED_RE.exec(line);
+    if (a) { push(`${gate}:anchored`, a[3]!, a[1]!); continue; }
+    if (gate === "review") {
+      const r = REVIEW_ROW_RE.exec(line);
+      if (r) { push(`review:${r[1]!}`, r[2]!, ""); continue; }
+    }
+    if (gate === "acceptance") {
+      const j = JUDGE_ROW_RE.exec(line);
+      // the criterion id IS a stable symbol for an unmet acceptance criterion — the same criterion is
+      // the same finding however the judge rephrases its reason — so it backs the prose-derived one.
+      if (j) { push("acceptance:unmet", j[2]!, "", j[1]!); continue; }
+    }
+  }
+  if (rows.length === 0) {
+    const head = lines.map((l) => l.trim()).find(Boolean) ?? "";
+    push(`${gate}:unclassified`, head, "");
+  }
+  return rows;
+}
+
+// v1.85 T3: volatile tokens carry no information about WHY a gate failed — ~663m across 5 runs went to
+// re-dispatching against failures that differed only in these. Every rule below erases a token PROVEN
+// to be a diagnostic location or a clock reading; nothing erases a value the failure asserts ABOUT.
+// Ordered: styling, then timestamps (they contain colon-digits), then paths (they end before a :line),
+// then line refs, durations, long hex.
+const VOLATILE_TOKENS: Array<[RegExp, string]> = [
+  [/\u001b\[[0-9;]*[a-zA-Z]/g, ""],                                            // ANSI styling
+  [/\b\d{4}-\d{2}-\d{2}[T ][\d:]+(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/g, "<ts>"], // timestamps
+  [/\brun-\d{8}-\d{6}\b/g, "<run>"],                                            // run identifiers
+  [/\b0x[0-9a-fA-F]+\b/g, "<addr>"],                                            // memory addresses
+  // An absolute path INTO the repo keeps its repo-relative tail — that tail IS identity (a defect in
+  // daemon.ts is not a defect in journal.ts); only the machine/worktree prefix ahead of it is volatile.
+  [/\/(?:[\w.@~+%-]+\/)*((?:src|tests|scripts|docs|fixtures|specs|schema|skills|assets)\/[\w.@~+%/-]+)/g, "<path>/$1"],
+  // Rule: an absolute diagnostic path's machine/worktree prefix is volatile, but its named file is
+  // identity. Therefore paths outside the repo-marker set keep their final segment: two machines
+  // naming parse.js normalize together, while parse.js and render.js can never spend one another's
+  // retry budget. A path-shaped VALUE ("/api/v1/users") is rooted nowhere real and survives.
+  [/\/(?:tmp|private|var|Users|home|opt|workspace|w)(?:\/[\w.@~+%-]+)*\/([\w.@~+%-]+)\/?/g, "<path>/$1"],
+  // A line[:col] ref counts as one only when it hangs off a file-ish token (a dot or a slash in it):
+  // R4 says the line number is evidence, not identity. "exit 1" and "expected 3" are neither.
+  [/([\w.@~+%-]*[./][\w.@~+%-]*):\d+(?::\d+)?\b/g, "$1:<line>"],
+  [/\bline \d+\b/gi, "line <line>"],
+  [/\b\d+(?:[.,]\d+)?\s?(?:ms|µs|us|ns|s|sec|secs|m|min|mins|h|hrs)\b/g, "<dur>"], // durations
+  [/\b[0-9a-f]{12,40}\b/g, "<hex>"],                                            // sha / worktree ids
+];
+
+// Rule: a quoted span is protected IFF it is assertion payload. Quoting alone is ordinary diagnostic
+// rendering, so paths/timestamps inside ENOENT and worker messages still normalize. A value introduced
+// by an assertion cue is payload whether quoted or bare: `expected /tmp/actual-a to be /tmp/want-a`
+// must not collapse with an assertion about actual-b.
+//
+// The asymmetry is deliberate: a missed cap costs one extra round, a false cap bans a legitimate retry.
+const ASSERTION_CUE = "expected|received|actual|got|to be|to equal|to match|to contain|instead of|but was|but got|but received";
+const PAYLOAD_SPAN = new RegExp(
+  `(?<=\\b(?:${ASSERTION_CUE})[:=]?[ \\t])(?:'[^'\\n]*'|"[^"\\n]*"|\`[^\`\\n]*\`|[^\\s,;)]+)`,
+  "gi",
+);
+
+const eraseVolatile = (text: string) =>
+  VOLATILE_TOKENS.reduce((out, [re, replacement]) => out.replace(re, replacement), text);
+
+// Whitespace RUNS are rendering, so they collapse — but only outside a payload, exactly like every
+// other rule here. Inside one it is part of what the failure asserts: `expected "a  b"` and
+// `expected "a b"` are two different assertions, and collapsing the joined string erased that
+// difference and banned a retry that was never redundant. Newlines survive (payload spans cannot
+// cross one) and the line-wise trim below finishes the job.
+const collapseRuns = (text: string) => text.replace(/[^\S\n]+/g, " ");
+
+/** Normalized identity of a gate failure: the same defect, seen twice, normalizes to the same bytes. */
+export function normalizeGateFailure(details: string): string {
+  let out = "";
+  let last = 0;
+  for (const m of details.matchAll(PAYLOAD_SPAN)) {
+    out += collapseRuns(eraseVolatile(details.slice(last, m.index))) + m[0];
+    last = m.index + m[0].length;
+  }
+  out += collapseRuns(eraseVolatile(details.slice(last)));
+  return out.split("\n").map((l) => l.trim()).filter(Boolean).join("\n");
+}
+
+// Two normalized-identical failures of one gate on one task buy no more rounds (the ladder cannot fix
+// what it already re-ran verbatim). Engagement-scoped exactly like reviewRoundsSinceApproval: an
+// operator approval is a new engagement, and nothing else resets the count.
+export const GATE_FINGERPRINT_CAP = 2;
+
+export function identicalGateFailures(events: JournalEvent[], taskId: string, gate: string, normalized: string): number {
+  let n = 0;
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "task-approved") n = 0;
+    else if (e.event === "gate-result" && e.data.gate === gate && e.data.pass === false
+             && typeof e.data.details === "string"
+             && normalizeGateFailure(e.data.details) === normalized) n++;
+  }
+  return n;
+}
+
+/** Repair attempts this engagement has already funded — journal-derived, so a resume inherits it. */
+export function repairsSinceApproval(events: JournalEvent[], taskId: string): number {
+  let n = 0;
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "task-approved") n = 0;
+    else if (e.event === "repair-attempt") n++;
+  }
+  return n;
+}
+
+// Both retry decisions below govern exactly ONE dispatch: the next one. So both are read back from the
+// journal at the moment that dispatch is built, never carried in a process variable — a stop between
+// the decision and the dispatch (OBS-254's shape, one layer up) would otherwise send a normal prompt
+// with the findings gone, or re-run an assignment that was banned.
+//
+// Rule: retry state is spent iff a worker actually launches. The expiry is `worker-launch`, NOT
+// `task-dispatch`: task-dispatch is journaled before worktree
+// recreation, setup, prompt writing and slot allocation, so spending the decision there hands it to a
+// dispatch that may still die before any worker sees it — and `--retry-failed` would then send a fresh
+// prompt with the repair findings gone, or re-run the banned channel. worker-launch is appended only
+// once the prompt has actually been delivered to a worker, which is the dispatch the decision governs.
+const DECISION_SPENT = "worker-launch";
+
+function decisionForNextDispatch(events: JournalEvent[], taskId: string, event: string): JournalEvent | undefined {
+  let pending: JournalEvent | undefined;
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === event) pending = e;
+    else if (e.event === DECISION_SPENT) pending = undefined;
+  }
+  return pending;
+}
+
+/**
+ * Why the last attempt failed, one row per journaled cause, in the daemon's own `source: details`
+ * shape. The daemon builds that brief in a loop-local variable, which dies with the process: a resumed
+ * or `--retry-failed` run rebuilt the prompt from nothing and dispatched a retry that had lost the
+ * reason it was retrying — OBS-254's class, one layer below the upheld brief. Re-derived here so the
+ * bytes the journal already holds cannot be taken away by any reset of attempt or channel state.
+ *
+ * The same rule governs a dead DISPATCH: its exact task-failed error is retained until
+ * `worker-launch`, never retired at
+ * `task-dispatch`: everything between the two — worktree recreation, setup, prompt write, slot
+ * allocation, the launch itself — can still die with no worker having read a word, and clearing at
+ * task-dispatch meant `--retry-failed` after exactly that death rebuilt the prompt without the gate
+ * failures OR the delivery failure that preceded it. `task-approved` also clears (an operator approval
+ * retires the findings it settled — the uphold case re-derives its own brief separately).
+ */
+export function journaledFailureBrief(events: JournalEvent[], taskId: string): string[] {
+  let rows: string[] = [];
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "worker-launch" || e.event === "task-approved") rows = [];
+    else if (e.event === "gate-result" && e.data.pass === false && e.data.skipped !== true
+             && typeof e.data.details === "string") rows.push(`${e.data.gate}: ${e.data.details}`);
+    else if (e.event === "delivery-readiness-failed" && typeof e.data.transcript === "string") {
+      rows.push(`dispatch: delivery readiness failed after ${e.data.waitedMs}ms; pane transcript:\n${e.data.transcript}`);
+    } else if (e.event === "task-failed" && e.data.kind === "dispatch" && typeof e.data.error === "string") {
+      rows.push(`dispatch: ${e.data.error}`);
+    }
+  }
+  return rows;
+}
+
+/** The findings a funded repair must carry into the next dispatch, or undefined if none is pending. */
+export function pendingRepairFindings(events: JournalEvent[], taskId: string): string | undefined {
+  const e = decisionForNextDispatch(events, taskId, "repair-attempt");
+  return typeof e?.data.findings === "string" ? e.data.findings : undefined;
+}
+
+/**
+ * The gate whose identical failure banned an identical retry of the NEXT dispatch — bound to the
+ * channel that produced it, so a verdict that has already moved the work elsewhere is not refused for
+ * a channel it is no longer using, and a later unrelated failure is not parked under a stale reason.
+ */
+export function activeRetryBan(events: JournalEvent[], taskId: string, channel: string): string | undefined {
+  const e = decisionForNextDispatch(events, taskId, "gate-fingerprint-cap");
+  return e && e.data.channel === channel && typeof e.data.gate === "string" ? e.data.gate : undefined;
+}
+
 // Fail-closed shape for a dispatched assignment (journal.ts:75-90 posture): a malformed assignment in
 // one dispatch degrades that single task toward today's behavior — counts toward attempts, contributes
 // nothing to tried, poisons only lastAssignment — never crashes resume, never poisons other tasks.
@@ -107,7 +385,10 @@ const DispatchAssignmentSchema = z.object({
 export const PARK_KINDS = ["human-gate", "ladder-exhausted", "attempt-cap", "gate-fail", "quota",
   "reroute-exhausted", "setup", "stall", "merge-conflict", "tip-moved", "infra", "dispatch"] as const;
 export type ParkKind = (typeof PARK_KINDS)[number];
-export const RETRY_MODES = ["resume", "fresh"] as const;
+// v1.85 T3: "repair" is a third dispatch mode beside the v1.29 session pair — a fix-only attempt that
+// carries the failing findings and the diff CONTENT of the work already landed, instead of re-buying
+// ~20m of onboarding to rediscover them (62 of 68 measured re-dispatches were fresh).
+export const RETRY_MODES = ["resume", "fresh", "repair"] as const;
 export type RetryMode = (typeof RETRY_MODES)[number];
 
 export const WORKER_RESULT_CAUSES = ["provider-death", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer"] as const;

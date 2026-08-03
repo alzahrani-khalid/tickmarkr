@@ -1,4 +1,4 @@
-tickmarkr v1.84.0
+tickmarkr v1.85.0
 run-20260724-231138 done 01:29:14
 ✓ tip-verify passed
 ✓ done 7

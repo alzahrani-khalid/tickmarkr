@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import picomatch from "picomatch";
 import { parse, stringify } from "yaml";
 import { z } from "zod";
 import { stateDirName } from "../graph/graph.js";
@@ -88,6 +89,162 @@ export const SubPricingSchema = z
   .refine((s) => s.windowsPerMonthLow <= s.windowsPerMonthHigh, "windowsPerMonthLow must be ≤ windowsPerMonthHigh");
 export type SubPricing = z.infer<typeof SubPricingSchema>;
 
+// ── Review participation (R3 of OVERSEER-RULING-20260731-velocity; OBS-186) ────────────────────
+// Participation is keyed on PATHS — what a task DECLARES at compile time and what its diff ACTUALLY
+// touches at gate time — never on complexity. `complexityThreshold` capped participation at a number
+// the authoring law forbade tasks from reaching, so cross-vendor review was unreachable by
+// construction while `required: true` claimed the opposite. Paths cannot drift out from under the
+// gate that way: the same predicate decides both ends.
+
+export const REVIEW_POLICIES = ["full", "judge-only"] as const;
+export type ReviewPolicy = (typeof REVIEW_POLICIES)[number];
+
+/**
+ * The leaf class: work a judge alone can carry because there is no behaviour to review. It is CLOSED
+ * and enumerated here — documentation pages, the changelog, the release runbook, and the version
+ * mirrors a release bump rewrites. Everything else, including tests and scripts, is full-review work.
+ */
+export const REVIEW_LEAF_GLOBS = [
+  "docs/**", "CHANGELOG.md", "RELEASING.md", "package.json", "package-lock.json",
+] as const;
+
+/**
+ * Membership is a POSITIVE rule, not a blacklist. A blacklist of source extensions is a list of the
+ * formats someone thought of, and everything nobody thought of — `docs/widget.vue`, `docs/site.svelte`,
+ * `docs/Makefile`, `docs/package.json`, an extensionless script — falls into the leaf class and skips
+ * its review. That direction of failure is the whole defect OBS-186 names, so the rule is inverted:
+ * under `docs/` a path is leaf work only when its extension is a DOCUMENTATION format. An unknown
+ * format is behaviour until proven otherwise, which is the fail-closed direction.
+ */
+const REVIEW_DOC_EXT_RE = /\.(?:md|mdx|markdown|txt|rst|adoc|asciidoc)$/i;
+
+/**
+ * The version mirrors a release bump rewrites — and ONLY at the repo root: `docs/package.json` is a
+ * real manifest for something, not a mirror. Membership here is still a claim about paths, and a
+ * manifest diff that moves more than the version field leaves the class; the gate re-tests that
+ * against the actual diff content (src/gates/review.ts) because a path cannot say it by itself.
+ */
+export const REVIEW_VERSION_MIRRORS: ReadonlySet<string> = new Set(["package.json", "package-lock.json"]);
+
+/** The changelog and the release runbook, at the repo root, by exact name. */
+const REVIEW_LEAF_FILES: ReadonlySet<string> = new Set(["CHANGELOG.md", "RELEASING.md"]);
+
+/**
+ * Paths whose review may never be skipped (R3): the gate/run/driver/adapter surface — lifecycle,
+ * demux, and everything that reaches a shell. Shipped as the default so the compile lint that
+ * enforces them is live in a repo that never configures anything.
+ */
+export const DEFAULT_REVIEW_CRITICAL_PATHS = [
+  "src/gates/**", "src/run/**", "src/drivers/**", "src/adapters/**",
+] as const;
+
+const GLOB_META_RE = /[*?[\]{}]/;
+const normPath = (p: string) => p.replace(/^\.\//, "").trim();
+
+/**
+ * True when `path` — an ACTUAL path a diff touched — is provably leaf-class work. Enumerated, closed,
+ * and positive: the two named root files, the two root version mirrors, and documentation formats
+ * under `docs/`. Everything else, including a `.vue`/`.svelte`/`Makefile`/`package.json` parked under
+ * `docs/`, is behaviour and draws a full review.
+ */
+export function isReviewLeafPath(path: string): boolean {
+  const p = normPath(path);
+  if (!p.length) return false;
+  if (REVIEW_LEAF_FILES.has(p) || REVIEW_VERSION_MIRRORS.has(p)) return true;
+  return p.startsWith("docs/") && REVIEW_DOC_EXT_RE.test(p);
+}
+
+/**
+ * True when a DECLARED pattern may claim leaf work. A declaration is a claim about a directory, not
+ * a file: `docs/**` is how a documentation task declares itself and has to stay claimable, so a glob
+ * rooted at `docs/` reads leaf here while `docs/tool.ts` does not read leaf above. The claim is never
+ * the last word — reviewGate re-tests it against what the diff actually touched and promotes when the
+ * diff leaves the class. A glob rooted anywhere else can claim nothing.
+ */
+export function isReviewLeafDeclaration(pattern: string): boolean {
+  const p = normPath(pattern);
+  if (!p.length) return false;
+  return isReviewLeafPath(p) || (GLOB_META_RE.test(p) && p.startsWith("docs/"));
+}
+
+/** full beats judge-only. The join is monotone by construction: nothing here can LOWER a policy. */
+export function raiseReviewPolicy(...policies: ReadonlyArray<ReviewPolicy | undefined>): ReviewPolicy {
+  return policies.includes("full") ? "full" : "judge-only";
+}
+
+/**
+ * The compiler's assignment, from the task's DECLARED files[]. judge-only only when EVERY declared
+ * path is provably leaf work — one non-leaf pattern (or an empty files[]) makes it full.
+ */
+export function declaredReviewPolicy(files: ReadonlyArray<string>): ReviewPolicy {
+  const declared = files.map(normPath).filter((f) => f.length > 0);
+  return declared.length > 0 && declared.every(isReviewLeafDeclaration) ? "judge-only" : "full";
+}
+
+/** The declared assignment after the operator's floor is applied — config may raise it, never lower it. */
+export function effectiveReviewPolicy(
+  files: ReadonlyArray<string>,
+  review: { policy?: ReviewPolicy },
+): ReviewPolicy {
+  return raiseReviewPolicy(declaredReviewPolicy(files), review.policy);
+}
+
+/** The literal head of a pattern — everything before its first glob metacharacter. */
+const literalPrefix = (p: string) => {
+  const i = p.search(GLOB_META_RE);
+  return i < 0 ? p : p.slice(0, i);
+};
+/** The literal tail of a pattern — everything after its last glob metacharacter. */
+const literalSuffix = (p: string) => p.replace(/^.*[*?[\]{}]/s, "");
+const eitherWay = (a: string, b: string, rel: (x: string, y: string) => boolean) => rel(a, b) || rel(b, a);
+
+/**
+ * Do two GLOBS have a path in common? Exact glob-vs-glob intersection is undecidable in general, so
+ * this fails CLOSED: the pair is treated as intersecting unless their literal heads or their literal
+ * tails prove they cannot meet. `docs/**\/README.md` vs `docs/security/*.md` share the head `docs/`
+ * and the tail `.md` is a tail of `/README.md`, so `docs/security/README.md` is correctly flagged;
+ * `src/**\/*.ts` vs `src/**\/*.md` share a head but neither tail contains the other, so they are not.
+ */
+const globsMayIntersect = (a: string, b: string) =>
+  eitherWay(literalPrefix(a), literalPrefix(b), (x, y) => x.startsWith(y))
+  && eitherWay(literalSuffix(a), literalSuffix(b), (x, y) => x.endsWith(y));
+
+/**
+ * Declared patterns that intersect a critical path. Directional containment is the certain half — a
+ * critical `src/gates/**` contains a declared `src/gates/review.ts`, and a declared `docs/**` contains
+ * a critical `docs/security/**`. It is NOT intersection: two globs can overlap without either matching
+ * the other as a literal string, which is how a judge-only task declaring `docs/**\/README.md` slipped
+ * past a critical `docs/security/*.md`. When BOTH sides are globs the conservative overlap test above
+ * decides, and it decides toward flagging — an over-flagged task is narrowed by its author, an
+ * under-flagged one skips the only gate that exists for it.
+ */
+export function criticalPathHits(
+  files: ReadonlyArray<string>,
+  criticalPaths: ReadonlyArray<string> = [],
+): string[] {
+  const hits = new Set<string>();
+  for (const raw of files) {
+    const f = normPath(raw);
+    if (!f) continue;
+    for (const rawCritical of criticalPaths) {
+      const critical = normPath(rawCritical);
+      if (!critical) continue;
+      if (f === critical || picomatch(critical, { dot: true })(f) || picomatch(f, { dot: true })(critical)
+          || (GLOB_META_RE.test(f) && GLOB_META_RE.test(critical) && globsMayIntersect(f, critical))) {
+        hits.add(f);
+      }
+    }
+  }
+  return [...hits].sort();
+}
+
+// R3 (OBS-186): `review: false` here is a SECOND participation switch, and unlike review.policy it is
+// not monotone — it can omit the review gate from a task the path rules assigned `full`. Participation
+// is decided by paths, so the two are JOINED at the one seam that can still refuse the graph:
+// reviewParticipationErrors (src/compile/collateral.ts) fails compile when a shape's `review: false`
+// would demote a full-review task or silence a critical path. The key itself stays parseable (a run's
+// own config, the setup cockpit and the shipped template all round-trip it); what it can no longer do
+// is take effect behind the policy's back.
 const ShapeGateParticipationSchema = z
   .object({ acceptance: z.boolean().optional(), review: z.boolean().optional() })
   .passthrough()
@@ -172,7 +329,22 @@ export const TickmarkrConfigSchema = z.object({
   judge: z.object({ adapter: z.string(), model: z.string() }),
   // v1.53 T2: prefer — ordered reviewer preference (entry grammar: adapter | adapter:model, same as
   // routing.map.prefer). Reorders diversity-eligible channels only; never widens or narrows eligibility.
-  review: z.object({ complexityThreshold: z.number(), required: z.boolean(), prefer: z.array(z.string()).optional() }),
+  review: z.object({
+    // RETIRED as a participation switch (R3 / OBS-186, v1.85): review participation is decided by the
+    // paths a task declares and the paths its diff touches — never by complexity. The key survives
+    // because routing hints and the setup cockpit still read it as a complexity landmark; NOTHING in
+    // src/gates/review.ts reads it any more, and a value here can no longer disable a review.
+    complexityThreshold: z.number(),
+    required: z.boolean(),
+    prefer: z.array(z.string()).optional(),
+    // R3: the operator's participation floor. "full" forces a cross-vendor review on every task;
+    // "judge-only" is the neutral floor (it leaves the compiler's per-task assignment standing).
+    // Config may RAISE a task's policy and can never lower one — see raiseReviewPolicy.
+    policy: z.enum(REVIEW_POLICIES).optional(),
+    // R3: globs no task may skip review on (input/demux/lifecycle, gates/run/drivers/adapters, anything
+    // reaching a shell). A judge-only task intersecting one of these fails COMPILE, never silently skips.
+    criticalPaths: z.array(z.string()).optional(),
+  }),
   // v1.54 T1: prefer — ranked consult seat failover. Entries MUST be adapter:model (unlike
   // review.prefer's adapter|adapter:model grammar): a consult seat has no channel to inherit a
   // model from, so a bare adapter is meaningless and fails config load fail-closed. The pinned
@@ -321,7 +493,9 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
   pricing: { cheap: 0.1, mid: 0.5, frontier: 2.5 },
   gates: { diffCap: DEFAULT_DIFF_CAP },
   judge: { adapter: "claude-code", model: "fable" },
-  review: { complexityThreshold: 7, required: true },
+  // R3: no `policy` floor — the neutral floor leaves the compiler's per-task assignment standing, so
+  // the path-keyed rule is reachable out of the box rather than raised to full by construction.
+  review: { complexityThreshold: 7, required: true, criticalPaths: [...DEFAULT_REVIEW_CRITICAL_PATHS] },
   consult: { adapter: "claude-code", model: "fable", stallMinutes: 15 },
   // v1.4: gate LLM calls (judge/review/consult) run headless by default; pane opts back into visible agents.
   // v1.2: workers are the real agent TUI in the pane; "print" restores the -p-rendered-in-pane path.

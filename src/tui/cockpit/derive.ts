@@ -35,7 +35,14 @@ export function selectSparklineBucketWidthMs(elapsedMs: number): number {
 
 type MetricSample = number | null;
 
-export type RunStatus = "done" | "failed" | "interrupted" | "running";
+/**
+ * What the run is, in one word. `parked` is first-class beside the rest because
+ * a run holding an unresolved `human` task owes the operator a verb — it is not
+ * done, and calling it done is the render OBS-252 caught. The task-level word
+ * for the same fact stays `human` (TaskState): that is the event the journal
+ * writes, and `parked` is what the fold of it means for the run.
+ */
+export type RunStatus = "done" | "failed" | "interrupted" | "parked" | "running";
 
 export type RunCockpitData = {
   readonly binaryVersion: string;
@@ -121,13 +128,31 @@ export type TaskRow = {
   readonly attempts?: number;
   readonly actor?: string;
   readonly lastEventTime?: string;
+  /** Complete UTC instant paired with `lastEventTime`; additive for existing consumers. */
+  readonly lastEventTimestamp?: string;
   readonly title?: string;
+  /**
+   * The park the task is standing in right now, as the daemon recorded it
+   * (`task-human` data.kind). A resolved park has no kind at all: the badge
+   * retires with the state it belonged to, so a merged task never wears the
+   * `gate-fail` it was released from an hour earlier (OBS-256).
+   */
+  readonly parkKind?: string;
+  /**
+   * Recorded merged, and only then. A task the journal carried to `done` has
+   * finished its work; a task the journal recorded a `merge` for has landed.
+   * The two are different rows, so a consumer drawing a check-mark has the fact
+   * that earns one rather than having to read `done` as if it were the same.
+   */
+  readonly merged?: true;
 };
 
 /** One recorded gate result. `details` is the record's own text, verbatim. */
 export type GateRow = {
   readonly id: string;
   readonly time: string;
+  /** Complete UTC instant paired with `time`; additive for existing consumers. */
+  readonly timestamp?: string;
   readonly state: ComponentState;
   readonly gate?: string;
   readonly taskId?: string;
@@ -142,6 +167,8 @@ export type FleetRow = {
   readonly model: string;
   readonly dispatches?: number;
   readonly lastEventTime?: string;
+  /** Complete UTC instant paired with `lastEventTime`; additive for existing consumers. */
+  readonly lastEventTimestamp?: string;
 };
 
 type CaptureEvent = {
@@ -169,7 +196,14 @@ type DispatchFact = {
   readonly assignment?: Assignment;
 };
 
-export type TaskState = "done" | "failed" | "human" | "pending" | "running" | "interrupted";
+export type TaskState =
+  | "completed"
+  | "done"
+  | "failed"
+  | "human"
+  | "pending"
+  | "running"
+  | "interrupted";
 type RunLifecycle = "active" | "completed" | "superseded";
 
 type TaskFact = {
@@ -177,6 +211,13 @@ type TaskFact = {
   readonly dispatches: DispatchFact[];
   /** Undefined until an event records a state — silence is not "pending". */
   state: TaskState | undefined;
+  /**
+   * The kind of the park the task stands in now. It is written with the `human`
+   * state and cleared with it, so it can never outlive the park it names.
+   */
+  parkKind: string | undefined;
+  /** Recorded merged. Only this earns a task the check-mark. */
+  merged: boolean;
   lastIndex: number;
   lastTs: string;
   phase: string;
@@ -273,6 +314,77 @@ function daemonPid(events: readonly CaptureEvent[]): number | undefined {
   return undefined;
 }
 
+/**
+ * The state an event writes onto the task it names — the whole list of them, so
+ * "did anything move this task" is asked in one place. `task-dispatch` and
+ * `merge` carry more than a state and are folded by hand below; they are named
+ * here because they move one all the same.
+ *
+ * A Map, because an event name is whatever the journal wrote: an object's own
+ * lookup answers `constructor` and `toString` with something inherited and
+ * truthy, so a line naming one would masquerade as a state transition — writing
+ * a function where a TaskState belongs and releasing a park the run declared.
+ * A Map answers only for the keys stated here.
+ */
+const TASK_STATE_BY_EVENT: ReadonlyMap<string, TaskState> = new Map<string, TaskState>([
+  ["task-dispatch", "running"],
+  ["merge", "done"],
+  ["task-done", "done"],
+  ["task-failed", "failed"],
+  ["task-human", "human"],
+  ["task-approved", "pending"],
+]);
+
+/** Only task identities the summary actually records can enter its fold. */
+function summaryTaskIds(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((id): id is string => typeof id === "string")
+    : [];
+}
+
+/**
+ * The parks the latest `run-end` says the daemon stopped holding, that nothing
+ * since resolved. The summary is the daemon's own closing statement, so a run
+ * whose end names a task in `human` owes the operator a verb whether or not a
+ * `task-human` line happens to precede it — that dependence is what let a run
+ * end read `done` over a parked task (OBS-252).
+ *
+ * "Since" is measured from the summary forward, and only forward. The summary
+ * describes the moment the daemon exited, so a state written *before* it —
+ * the dispatch it parked, the completion of a round it then held for review —
+ * is history the summary already accounts for and cannot answer it. Weighing
+ * the whole-journal fold against it let a line above the summary retire a park
+ * the summary itself declares: `run-start · task-dispatch T1 · run-end
+ * human:[T1]` read `interrupted`, and the same journal with a `task-done T1`
+ * read `done` — OBS-252 again, one line lower.
+ *
+ * So a name is resolved only when a later event moved that task: approved,
+ * redispatched, finished, landed. Nothing later — including a task the record
+ * never mentions at all — leaves the park standing, because an uncorroborated
+ * park is still the run's own claim that it is waiting and withholding `done`
+ * on a claim the surface cannot check is the fail-closed reading. It stays a
+ * reading of the run and of the tasks it names: a summary is a journal event,
+ * so its explicit task outcomes are facts the board must count and draw even
+ * when the more detailed task event is absent.
+ */
+function unresolvedSummaryParks(events: readonly CaptureEvent[]): string[] {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.event !== "run-end") continue;
+    const parked = Array.isArray(event.data.human) ? event.data.human : [];
+    const released = new Map<string, boolean>();
+    for (const later of events.slice(index + 1)) {
+      if (later.taskId === undefined) continue;
+      if (!TASK_STATE_BY_EVENT.has(later.event)) continue;
+      released.set(later.taskId, later.event !== "task-human");
+    }
+    return parked.filter((id): id is string =>
+      typeof id === "string" && released.get(id) !== true
+    );
+  }
+  return [];
+}
+
 function deriveTasks(
   events: readonly CaptureEvent[],
   interrupted: boolean,
@@ -285,6 +397,8 @@ function deriveTasks(
       id: taskId,
       dispatches: [],
       state: undefined,
+      parkKind: undefined,
+      merged: false,
       lastIndex: index,
       lastTs: ts,
       phase: "pending",
@@ -294,6 +408,29 @@ function deriveTasks(
   };
 
   for (const [index, event] of events.entries()) {
+    if (event.event === "run-end") {
+      // The closing summary is a recorded fold, not commentary. Apply all
+      // task outcomes it owns before later resume events get their ordinary
+      // chance to supersede them. Failure comes last so a malformed overlap
+      // fails closed instead of repainting a failed task done.
+      const summaries: readonly (readonly [unknown, TaskState])[] = [
+        [event.data.done, "done"],
+        [event.data.human, "human"],
+        [event.data.failed, "failed"],
+      ];
+      for (const [ids, state] of summaries) {
+        for (const taskId of summaryTaskIds(ids)) {
+          const fact = task(taskId, index, event.ts);
+          fact.state = state;
+          // A summary does not invent a park kind; it preserves one only when
+          // it confirms that the same park still stands.
+          if (state !== "human") fact.parkKind = undefined;
+          fact.lastIndex = index;
+          fact.lastTs = event.ts;
+        }
+      }
+      continue;
+    }
     if (!event.taskId) continue;
     if (event.event === "task-dispatch") {
       const fact = task(event.taskId, index, event.ts);
@@ -307,7 +444,21 @@ function deriveTasks(
         assignment: assignmentFrom(event.data.assignment),
       });
       fact.state = "running";
+      fact.parkKind = undefined;
       fact.phase = "worker";
+      fact.lastIndex = index;
+      fact.lastTs = event.ts;
+      continue;
+    }
+    if (event.event === "merge") {
+      const fact = task(event.taskId, index, event.ts);
+      fact.merged = true;
+      // A merge is a landing, and it is a state the journal recorded: the task
+      // is done, and whatever park it was released from is retired by the merge
+      // itself rather than by whichever event happened to precede it. Nothing
+      // here depends on a `task-done` line arriving first (OBS-256).
+      fact.state = "done";
+      fact.parkKind = undefined;
       fact.lastIndex = index;
       fact.lastTs = event.ts;
       continue;
@@ -319,15 +470,19 @@ function deriveTasks(
       fact.lastTs = event.ts;
       continue;
     }
-    const state = {
-      "task-done": "done",
-      "task-failed": "failed",
-      "task-human": "human",
-      "task-approved": "pending",
-    }[event.event] as TaskState | undefined;
+    // `task-dispatch` and `merge` returned above; the rest write their state and
+    // nothing else. One list, read from one place, so a new state-writing event
+    // cannot move the fold without also moving what resolves a park.
+    const state = TASK_STATE_BY_EVENT.get(event.event);
     if (state) {
       const fact = task(event.taskId, index, event.ts);
       fact.state = state;
+      // The park kind travels with the park: `task-human` records it, and the
+      // next recorded state — approved, done, failed — retires it with the park
+      // it named. A resolved state must not leave its badge behind (OBS-256).
+      fact.parkKind = state === "human" && typeof event.data.kind === "string"
+        ? event.data.kind
+        : undefined;
       fact.lastIndex = index;
       fact.lastTs = event.ts;
     }
@@ -418,15 +573,51 @@ function recordsFailure(event: CaptureEvent): boolean {
     || event.data.pass === false
     || event.data.ok === false
     || (typeof event.data.exitCode === "number" && event.data.exitCode !== 0)
-    || (event.event === "run-end" && event.data.tipVerify === "failed");
+    || (
+      event.event === "run-end"
+      && (
+        event.data.tipVerify === "failed"
+        || summaryTaskIds(event.data.failed).length > 0
+      )
+    );
 }
 
+/**
+ * The outcome an event records as a success. `merge` is here and `task-done` is
+ * not: a merge records the landing, and a completion records only that the
+ * worker stopped working — the gates that judge it and the merge that lands it
+ * come after. A `run-end` counts only when its tip verification reads passed:
+ * an absent verdict is nothing verified, and a check-mark on nothing verified
+ * is the run claiming a pass tickmarkr never corroborated — the same
+ * fail-closed reading the status strip already draws (OBS-244), now on the row.
+ */
 function recordsSuccess(event: CaptureEvent): boolean {
-  return event.event === "task-done"
-    || event.event === "merge"
+  return event.event === "merge"
     || event.data.pass === true
     || event.data.ok === true
-    || (event.event === "run-end" && event.data.tipVerify !== "failed");
+    || (event.event === "run-end" && event.data.tipVerify === "passed");
+}
+
+/** The newest run-end speaks for the run; spotlight is context, not outcome. */
+function runPresentation(
+  runStatus: RunStatus,
+  spotlight: TaskFact | undefined,
+): { readonly state: ComponentState; readonly word: string } {
+  switch (runStatus) {
+    case "failed":
+      return { state: "fail", word: "failed" };
+    case "parked":
+      return { state: "warn", word: "parked" };
+    case "interrupted":
+      return { state: "warn", word: "interrupted" };
+    case "running":
+      return { state: "neutral", word: "running" };
+    case "done":
+      // A task named beside the run still earns a check only from its merge.
+      return spotlight === undefined || spotlight.merged
+        ? { state: "pass", word: "pass" }
+        : { state: "neutral", word: "done" };
+  }
 }
 
 /**
@@ -441,10 +632,23 @@ function eventPresentation(
   event: CaptureEvent,
   task: TaskFact | undefined,
 ): { readonly state: ComponentState; readonly word: string } {
-  if (event.event === "escalation" || event.event === "task-human") {
-    return { state: "warn", word: "warn" };
-  }
+  if (event.event === "escalation") return { state: "warn", word: "warn" };
+  // A park is a state, not a severity: the row says what the engagement is
+  // waiting for, which is the operator.
+  if (event.event === "task-human") return { state: "warn", word: "parked" };
   if (recordsFailure(event)) return { state: "fail", word: "fail" };
+  if (
+    event.event === "run-end"
+    && summaryTaskIds(event.data.human).length > 0
+  ) {
+    return { state: "warn", word: "parked" };
+  }
+  // Work finished is not work landed. `task-done` records the first, so its row
+  // says `done` and carries no check: the check-mark belongs to the `merge` that
+  // records the landing, and until the journal writes one there is nothing to
+  // put it on (OBS-256). This is the same reading `taskPresentation` gives the
+  // task itself, stated here for the event because a row depicts its own event.
+  if (event.event === "task-done") return { state: "neutral", word: "done" };
   if (recordsSuccess(event)) return { state: "pass", word: "pass" };
   if (task?.state === "interrupted") {
     return { state: "warn", word: "interrupted" };
@@ -460,19 +664,29 @@ function historyRow(
   runStatus: RunStatus,
 ): JournalRow {
   const task = event.taskId === undefined ? undefined : tasks.get(event.taskId);
-  const { state, word } = eventPresentation(event, task);
+  // Spotlight is context only for the taskless closing summary. A task-owned
+  // newest event keeps its own identity and outcome: T2's dispatch or failure
+  // cannot become a pass for merged T1 merely because T1 wins the spotlight.
+  const summary = newest && event.event === "run-end"
+    ? runPresentation(runStatus, spotlight)
+    : undefined;
+  const { state, word } = summary ?? eventPresentation(event, task);
+  const displayedTask = newest
+    ? event.taskId === undefined ? spotlight : task
+    : task;
   // The spotlight entry must keep the task, its attempt and its acting adapter
   // inside the narrowest band's width budget — that budget cannot pay for the
   // separators and the event name, so the state word and the run's status
   // (what the newest event recorded) ride after the adapter instead.
-  const text = newest && spotlight !== undefined
-    ? `${spotlight.id} attempt ${taskAttempt(spotlight)} ${taskActor(spotlight)} ${word}${word === runStatus ? "" : ` ${runStatus}`}`
+  const text = newest && displayedTask !== undefined
+    ? `${displayedTask.id} attempt ${taskAttempt(displayedTask)} ${taskActor(displayedTask)} ${word}${word === runStatus ? "" : ` ${runStatus}`}`
     : task !== undefined
       ? `${task.id} ${word} · ${event.event}`
       : `${word} · ${event.event}`;
   return {
     id: `event:${event.line}`,
     time: eventTime(event.ts),
+    timestamp: event.ts,
     state,
     text,
   };
@@ -523,14 +737,28 @@ function taskRows(
     // zero when a run resumes, so a task dispatched 0,1,0 was tried three times
     // and reporting its last label would say one.
     const attempts = fact?.dispatches.length ?? 0;
+    // `task-done` records completion; only `merge` records landing. The fixed
+    // Tasks-view consumer maps `done` to a check, so the derived row must keep
+    // an unmerged completion in the neutral `completed` state and reserve
+    // `done` for a fact whose merge the journal actually carries.
+    const state = fact?.state === "done" && fact.merged !== true
+      ? "completed" as const
+      : fact?.state;
     return {
       id: `task:${id}`,
       taskId: id,
-      ...(fact?.state === undefined ? {} : { state: fact.state }),
+      ...(state === undefined ? {} : { state }),
       ...(attempts === 0 ? {} : { attempts }),
       ...(assignment === undefined ? {} : { actor: channelKey(assignment) }),
       ...(lastTs === undefined ? {} : { lastEventTime: eventTime(lastTs) }),
+      ...(lastTs === undefined ? {} : { lastEventTimestamp: lastTs }),
       ...(title === undefined ? {} : { title }),
+      // Only while the park stands: the fold cleared it the moment the journal
+      // recorded what the park resolved to.
+      ...(fact?.parkKind === undefined ? {} : { parkKind: fact.parkKind }),
+      // Landing is its own fact. `done` is work finished; only a recorded merge
+      // is work landed, and only that earns a check-mark.
+      ...(fact?.merged === true ? { merged: true as const } : {}),
     };
   });
 }
@@ -547,6 +775,7 @@ function gateRows(events: readonly CaptureEvent[]): GateRow[] {
     return [{
       id: `gate:${event.line}`,
       time: eventTime(event.ts),
+      timestamp: event.ts,
       state: pass === true ? "pass" : pass === false ? "fail" : "neutral",
       ...(typeof event.data.gate === "string" ? { gate: event.data.gate } : {}),
       ...(event.taskId === undefined ? {} : { taskId: event.taskId }),
@@ -626,6 +855,7 @@ function fleetRows(events: readonly CaptureEvent[]): FleetRow[] {
     model: channel.model,
     ...(channel.dispatches === 0 ? {} : { dispatches: channel.dispatches }),
     lastEventTime: eventTime(channel.lastTs),
+    lastEventTimestamp: channel.lastTs,
   }));
 }
 
@@ -777,15 +1007,32 @@ export function deriveRunCockpitData(
   const tipPassed = tipVerificationPassed(events);
   const spotlight = spotlightTask(tasks);
   const samples = bucketedMetricSamples(events);
+  // A task the journal carried somewhere other than done — approved and awaiting
+  // the resume that redispatches it, most of all. `done` is a claim about all of
+  // them, so one outstanding task retires it.
+  const outstanding = taskFacts.some((task) =>
+    task.state !== undefined && task.state !== "done"
+  );
+  // Parked outranks every reading but failure: a run holding an unresolved
+  // `human` task owes the operator a verb, and the daemon's exit after a park is
+  // the park's own consequence — not an interruption, and never done. A run that
+  // also failed a task owes a fix first, so failure still leads (OBS-252).
+  //
+  // The word is owed on two readings, not one: the parks the fold holds, and
+  // the parks the latest run-end names and nothing since resolved. The second
+  // is what keeps the reading off the luck of a `task-human` line preceding the
+  // run-end — the run's own closing statement is enough.
   const runStatus: RunStatus = failed > 0
     ? "failed"
-    : lifecycle === "superseded" || hasInterruptedTask
-        ? "interrupted"
-        : lifecycle === "completed"
-          ? "done"
-          : interrupted
-            ? "interrupted"
-            : "running";
+    : human > 0 || unresolvedSummaryParks(events).length > 0
+      ? "parked"
+      : lifecycle === "superseded" || hasInterruptedTask
+          ? "interrupted"
+          : lifecycle === "completed"
+            ? outstanding ? "interrupted" : "done"
+            : interrupted
+              ? "interrupted"
+              : "running";
 
   return {
     binaryVersion,

@@ -1,18 +1,23 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
-import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { renderMarkdownRecord } from "../../src/cli/commands/report.js";
+import {
+  goalDensityErrors, reviewParticipationErrors, surfaceErrors, symbolOwnershipErrors, taskUnitContractErrors,
+} from "../../src/compile/collateral.js";
+import { CompileError } from "../../src/compile/common.js";
+import { compileSource } from "../../src/compile/index.js";
+import { compileNative } from "../../src/compile/native.js";
+import { criticalPathHits, declaredReviewPolicy, DEFAULT_CONFIG, effectiveReviewPolicy, isReviewLeafPath, repoOverlayPath } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { pickReviewer, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
 import { extractJson } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
-import type { JournalEvent } from "../../src/run/journal.js";
+import { deriveSignalBasis } from "../../src/run/journal.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -207,37 +212,310 @@ describe("FLEET-07 judge default pin", () => {
   });
 });
 
-describe("reviewGate", () => {
-  test("skips below complexity threshold", async () => {
-    const { repo, base } = repoWithCommit();
-    const fake = fakeWith({});
-    const r = await reviewGate(mkTask({ complexity: 3 }), repo, base, author, CH, [fake], DEFAULT_CONFIG);
-    expect(r.pass).toBe(true);
-    expect(r.details).toMatch(/skipped/i);
-    expect(r.meta).toEqual({ skipped: true });
-  });
+// ── R3 review participation (OVERSEER-RULING-20260731-velocity; OBS-186) ───────────────────────
+// Participation is keyed on PATHS at both ends: what the task DECLARES (the compiler's assignment)
+// and what its diff ACTUALLY touched (the gate's promotion). complexityThreshold is retired — it
+// capped participation at a number the authoring law forbade tasks from reaching, so the gate was
+// unreachable by construction while `required: true` claimed the opposite.
 
-  // T11: the below-threshold review never ran, so the engagement record must say "declined" —
-  // pass:true is the enforcement signal (declined ≠ failed), never a reported pass.
-  test("test: a gate that declined because it was below its threshold is reported as declined rather than as passed", async () => {
-    const { repo, base } = repoWithCommit();
-    const fake = fakeWith({});
-    const r = await reviewGate(mkTask({ complexity: 3 }), repo, base, author, CH, [fake], DEFAULT_CONFIG);
-    expect(r.pass).toBe(true);
-    // Journaled exactly as the daemon maps a GateResult (src/run/daemon.ts: meta.skipped → skipped field).
-    const events: JournalEvent[] = [
-      { ts: "2026-07-27T00:00:00.000Z", event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1" } } },
-      {
-        ts: "2026-07-27T00:01:00.000Z",
-        event: "gate-result",
-        taskId: "T1",
-        data: { gate: r.gate, pass: r.pass, details: r.details, ...(r.meta?.skipped === true ? { skipped: true } : {}) },
-      },
+/**
+ * A repo whose HEAD commit touches exactly `files`, so the gate's promotion test has real evidence.
+ * `seed` lands in the BASE commit, which is what lets a fixture prove a version MIRROR: a manifest
+ * that already exists and whose diff moves only the version line, versus one that moves more.
+ */
+function repoWithDiff(files: Record<string, string>, seed: Record<string, string> = {}) {
+  const repo = makeRepo({ "seed.txt": "x\n", ...seed });
+  const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+  for (const [rel, body] of Object.entries(files)) {
+    mkdirSync(dirname(join(repo, rel)), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+  }
+  execSync("git add -A && git commit -m work --no-gpg-sign", { cwd: repo });
+  return { repo, base };
+}
+
+/** Counts reviewer dispatches so "no cross-vendor review ran" is proven, never inferred. */
+function countingFake(extra: object): { fake: FakeAdapter; calls: () => number } {
+  const fake = fakeWith(extra);
+  let calls = 0;
+  const command = fake.headlessCommand.bind(fake);
+  fake.headlessCommand = (...args) => { calls++; return command(...args); };
+  return { fake, calls: () => calls };
+}
+
+describe("R3 review participation is path-keyed", () => {
+  test("test: a docs-leaf task is judge-only until its diff touches a source path at which point the gate promotes it to full, and config can promote a judge-only task but never demote a full one, where docs-leaf is the closed class enumerated in the compiler, proven member by member — a markdown fixture, a CHANGELOG fixture, a RELEASING fixture, a version-mirror fixture — plus one adversarial non-member, a source fixture under docs/, that must promote", async () => {
+    // ── the class is CLOSED and enumerated (config.ts REVIEW_LEAF_GLOBS) — walk it member by member,
+    // each as a real committed diff, so membership is proven by the gate and not by reading the list.
+    const MANIFEST = '{\n  "name": "x",\n  "version": "1.0.0",\n  "scripts": { "test": "vitest run" }\n}\n';
+    const BUMPED = MANIFEST.replace("1.0.0", "1.85.0");
+    const MEMBERS: Array<[string, Record<string, string>, Record<string, string>?]> = [
+      ["a markdown page", { "docs/guide.md": "# guide\n" }],
+      ["the changelog", { "CHANGELOG.md": "## next\n" }],
+      ["the release runbook", { "RELEASING.md": "1. tag\n" }],
+      // A MIRROR is a manifest that already existed and whose diff moved only the version line. A
+      // brand-new manifest is not a bump, and neither is one that also moved `scripts`.
+      ["a version mirror", { "package.json": BUMPED }, { "package.json": MANIFEST }],
     ];
-    const md = renderMarkdownRecord("run-declined-review", events);
-    expect(md).toContain("review: declined");
-    expect(md).not.toContain("review: pass");
-  });
+    for (const [what, diff, seed] of MEMBERS) {
+      const declared = Object.keys(diff);
+      expect([what, declaredReviewPolicy(declared)]).toEqual([what, "judge-only"]);
+      const { repo, base } = repoWithDiff(diff, seed);
+      const { fake, calls } = countingFake({ review: { approve: true, issues: [] } });
+      const r = await reviewGate(mkTask({ files: declared, complexity: 9 }), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+      expect([what, calls()]).toEqual([what, 0]);
+      expect([what, r.meta?.verdict]).toEqual([what, "skipped"]);
+    }
+
+    // ── the adversarial non-members. The leaf class is decided POSITIVELY: under docs/ only a
+    // documentation FORMAT is leaf work. A blacklist of source extensions is a list of the formats
+    // someone thought of, and everything else — a component, a build file, a nested manifest, a
+    // shebang script with no extension at all — inherits the skip. Each of these is a real committed
+    // diff under a `docs/**` declaration, and every one of them must draw a reviewer.
+    const NON_MEMBERS: Array<[string, string]> = [
+      ["typescript under docs/", "docs/scripts/build.ts"],
+      ["a vue component under docs/", "docs/widget.vue"],
+      ["a svelte component under docs/", "docs/site.svelte"],
+      ["an extensionless build file under docs/", "docs/Makefile"],
+      ["a nested manifest under docs/", "docs/package.json"],
+    ];
+    for (const [what, path] of NON_MEMBERS) {
+      expect([what, isReviewLeafPath(path)]).toEqual([what, false]);
+      const adversarial = repoWithDiff({ [path]: "export const build = () => 1;\n" });
+      const adv = countingFake({ review: { approve: true, issues: [] } });
+      const advTask = mkTask({ files: ["docs/**"], complexity: 3 });
+      expect([what, declaredReviewPolicy(advTask.files)]).toEqual([what, "judge-only"]); // the CLAIM is still leaf-shaped
+      const promotedFromDocs = await reviewGate(advTask, adversarial.repo, adversarial.base, author, CH, [adv.fake], DEFAULT_CONFIG);
+      expect([what, adv.calls()]).toEqual([what, 1]); // …and the EVIDENCE overrides it
+      expect([what, promotedFromDocs.meta?.policy]).toEqual([what, "full"]);
+      expect([what, promotedFromDocs.meta?.promotedBy]).toEqual([what, [path]]);
+    }
+
+    // ── the adversarial member: a root manifest IS in the class, but only as a version mirror. A
+    // package.json diff that moves `scripts` is the gate command the whole battery runs — executable
+    // configuration wearing a leaf-class path, which no path predicate can see for itself.
+    const scripted = repoWithDiff(
+      { "package.json": MANIFEST.replace("vitest run", "vitest run || true") },
+      { "package.json": MANIFEST },
+    );
+    const s = countingFake({ review: { approve: true, issues: [] } });
+    const scriptTask = mkTask({ files: ["package.json"], complexity: 3 });
+    expect(declaredReviewPolicy(scriptTask.files)).toBe("judge-only"); // the CLAIM is leaf-shaped
+    const promotedFromScripts = await reviewGate(scriptTask, scripted.repo, scripted.base, author, CH, [s.fake], DEFAULT_CONFIG);
+    expect(s.calls()).toBe(1);
+    expect(promotedFromScripts.meta?.policy).toBe("full");
+    expect(promotedFromScripts.meta?.promotedBy).toEqual(["package.json"]);
+
+    // ── the same task, leaf diff vs escaped diff: the claim never outranks what actually happened
+    const task = mkTask({ files: ["docs/**", "CHANGELOG.md"], complexity: 3 });
+    const leaf = repoWithDiff({ "docs/guide.md": "# guide\n", "CHANGELOG.md": "## next\n" });
+    const a = countingFake({ review: { approve: true, issues: [] } });
+    const declined = await reviewGate(task, leaf.repo, leaf.base, author, CH, [a.fake], DEFAULT_CONFIG);
+    expect(a.calls()).toBe(0);
+    expect(declined.meta?.verdict).toBe("skipped");
+
+    const escaped = repoWithDiff({ "docs/guide.md": "# guide\n", "src/run/daemon.ts": "export const x = 1;\n" });
+    const b = countingFake({ review: { approve: true, issues: [] } });
+    const promoted = await reviewGate(task, escaped.repo, escaped.base, author, CH, [b.fake], DEFAULT_CONFIG);
+    expect(b.calls()).toBe(1); // a real cross-vendor reviewer ran
+    expect(promoted.pass).toBe(true);
+    expect(promoted.meta?.verdict).toBeUndefined();
+    expect(promoted.meta?.policy).toBe("full");
+    expect(promoted.meta?.promotedFrom).toBe("judge-only");
+    expect(promoted.meta?.promotedBy).toEqual(["src/run/daemon.ts"]);
+    expect(promoted.meta?.reviewer).toBe("fake:fake-2");
+
+    // ── the operator's floor: monotone. It may RAISE a judge-only task and can never lower a full one.
+    const sourceTask = mkTask({ files: ["src/gates/review.ts", "tests/gates/review.test.ts"] });
+    expect(declaredReviewPolicy(sourceTask.files)).toBe("full");
+    const raised = structuredClone(DEFAULT_CONFIG);
+    raised.review.policy = "full";
+    const lowered = structuredClone(DEFAULT_CONFIG);
+    lowered.review.policy = "judge-only";
+    expect(effectiveReviewPolicy(task.files, raised.review)).toBe("full"); // raised
+    expect(effectiveReviewPolicy(sourceTask.files, lowered.review)).toBe("full"); // never lowered
+    expect(effectiveReviewPolicy(task.files, lowered.review)).toBe("judge-only"); // the floor is neutral
+
+    // …and the raise reaches the GATE: the same leaf-only diff now draws a real cross-vendor reviewer
+    const c = countingFake({ review: { approve: true, issues: [] } });
+    const raisedRun = await reviewGate(task, leaf.repo, leaf.base, author, CH, [c.fake], raised);
+    expect(c.calls()).toBe(1);
+    expect(raisedRun.pass).toBe(true);
+    expect(raisedRun.meta?.policy).toBe("full");
+    expect(raisedRun.meta?.verdict).toBeUndefined();
+
+    // …and the demotion attempt cannot silence the review of a source task
+    const d = countingFake({ review: { approve: true, issues: [] } });
+    const stillFull = await reviewGate(sourceTask, leaf.repo, leaf.base, author, CH, [d.fake], lowered);
+    expect(d.calls()).toBe(1);
+    expect(stillFull.meta?.policy).toBe("full");
+    expect(stillFull.meta?.verdict).toBeUndefined();
+  }, 30_000);
+
+  test("test: a task intersecting criticalPaths that would skip review under the active config fails compile, and the merged compile lints still reject their calibration corpus unchanged", async () => {
+    // A version-bump task: every declared path is version-mirror leaf work, so the compiler assigns
+    // judge-only — and package.json carries the gate commands, so this operator made it critical.
+    const bump = [{ id: "T1", files: ["package.json", "package-lock.json"] }];
+    const active = { ...DEFAULT_CONFIG.review, criticalPaths: ["package.json"] };
+
+    const errors = reviewParticipationErrors(bump, active);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/T1/);
+    expect(errors[0]).toMatch(/package\.json/);
+    expect(errors[0]).toMatch(/judge-only/);
+    expect(errors[0]).toMatch(/review\.criticalPaths/);
+    // the same task is silent when the critical path does not reach it, and when review is full
+    expect(reviewParticipationErrors(bump, { ...DEFAULT_CONFIG.review, criticalPaths: ["src/run/**"] })).toEqual([]);
+    expect(reviewParticipationErrors(bump, { ...active, policy: "full" as const })).toEqual([]);
+
+    // ── INTERSECTION, not containment. Two globs can overlap without either matching the other as a
+    // literal string: `docs/security/README.md` satisfies both of these, and a directional test sees
+    // neither side contain the other — so the task compiled clean and skipped the review of a path the
+    // operator declared critical. The non-containment fixture is the whole point of the pair.
+    const nested = [{ id: "T2", files: ["docs/**/README.md"] }];
+    const overlapping = { ...DEFAULT_CONFIG.review, criticalPaths: ["docs/security/*.md"] };
+    expect(criticalPathHits(["docs/**/README.md"], ["docs/security/*.md"])).toEqual(["docs/**/README.md"]);
+    expect(reviewParticipationErrors(nested, overlapping)).toHaveLength(1);
+    // …and it does not flag a pair whose literal tails prove they cannot meet — over-flagging is the
+    // safe direction, but a lint that flags everything is one an author learns to ignore.
+    expect(criticalPathHits(["docs/**/*.md"], ["src/**/*.ts"])).toEqual([]);
+    expect(criticalPathHits(["docs/**/*.md"], ["docs/**/*.png"])).toEqual([]);
+
+    // ── the SECOND participation switch. `review.policy` is monotone by construction, but
+    // `gates.byShape.<shape>.review: false` omits the review gate outright (src/gates/run-gates.ts
+    // `enabled`) — a demotion arriving through a door the policy join never saw. A source task cannot
+    // be demoted by it, and a judge-only task cannot use it to silence a critical path.
+    const sourceTask = [{ id: "T3", shape: "implement" as const, files: ["src/gates/review.ts"] }];
+    const shapeOff = { ...DEFAULT_CONFIG.review, byShape: { implement: { review: false } } };
+    const demotion = reviewParticipationErrors(sourceTask, shapeOff);
+    expect(demotion).toHaveLength(1);
+    expect(demotion[0]).toMatch(/gates\.byShape\.implement\.review: false/);
+    expect(demotion[0]).toMatch(/never lower one/);
+    expect(reviewParticipationErrors(sourceTask, DEFAULT_CONFIG.review)).toEqual([]); // …without it, silent
+    // a LEAF task under the same override still fails when it reaches a critical path
+    const leafOff = { ...active, byShape: { docs: { review: false } } };
+    expect(reviewParticipationErrors([{ id: "T4", shape: "docs" as const, files: ["package.json"] }], leafOff))
+      .toHaveLength(1);
+
+    // ── the shipped criticalPaths are a FLOOR, not a default a config replaces: this lint resolves its
+    // config from a root the compile seam cannot always name, so a config naming its own critical paths
+    // may never lower enforcement below what tickmarkr ships.
+    expect(reviewParticipationErrors(sourceTask, { ...shapeOff, criticalPaths: ["docs/**"] })).toHaveLength(1);
+
+    // …and it is a COMPILE failure, not a warning: compiled from a repo whose own config declares it.
+    // (The overlay path comes from the product's own resolver — HYG-06 forbids a test naming the
+    // operator state directory beside a live working directory.)
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-crit-"));
+    const overlay = repoOverlayPath(repo);
+    mkdirSync(dirname(overlay), { recursive: true });
+    writeFileSync(overlay, "review:\n  criticalPaths: [package.json]\n");
+    // The root-bearing seam itself, named explicitly — not `process.chdir`. `taskUnitContractErrors`
+    // takes the repo root as an argument, and THAT is what has to resolve the repo's own config.
+    expect(taskUnitContractErrors(bump, repo)).toContain(errors[0]);
+    // …and a root that is NOT this repo does not see this repo's critical paths. KNOWN GAP: the seam
+    // in src/compile/index.ts drops compileSource's `root`, so a programmatic compile from a foreign
+    // cwd lands here. It is bounded, not open: the shipped floor still bites (above), and the review
+    // GATE — handed the run's real config — refuses to skip a critical path itself (below).
+    const foreign = mkdtempSync(join(tmpdir(), "tickmarkr-foreign-"));
+    expect(taskUnitContractErrors(bump, foreign)).toEqual([]);
+
+    // …the backstop that makes that gap bounded. The GATE is handed the run's real config, so a
+    // critical path that reached dispatch is reviewed whatever the compile lint resolved: the same
+    // leaf-class version bump the lint above missed still promotes to a full cross-vendor review here.
+    const MANIFEST = '{\n  "name": "x",\n  "version": "1.0.0"\n}\n';
+    const mirror = repoWithDiff({ "package.json": MANIFEST.replace("1.0.0", "1.85.0") }, { "package.json": MANIFEST });
+    const criticalCfg = structuredClone(DEFAULT_CONFIG);
+    criticalCfg.review.criticalPaths = ["package.json"];
+    const backstop = countingFake({ review: { approve: true, issues: [] } });
+    const gated = await reviewGate(
+      mkTask({ files: ["package.json"] }), mirror.repo, mirror.base, author, CH, [backstop.fake], criticalCfg);
+    expect(backstop.calls()).toBe(1);
+    expect(gated.meta?.policy).toBe("full");
+    expect(gated.meta?.verdict).toBeUndefined();
+    // …and the SHIPPED floor needs no config at all: a diff landing src/run/** never skips
+    const shipped = repoWithDiff({ "docs/guide.md": "# guide\n", "src/run/x.ts": "export const x = 1;\n" });
+    const floor = countingFake({ review: { approve: true, issues: [] } });
+    const onFloor = await reviewGate(
+      mkTask({ files: ["docs/**"] }), shipped.repo, shipped.base, author, CH, [floor.fake], DEFAULT_CONFIG);
+    expect(floor.calls()).toBe(1);
+    expect(onFloor.meta?.policy).toBe("full");
+
+    const spec = join(repo, "bump.spec.md");
+    writeFileSync(
+      spec,
+      "<!-- tickmarkr:spec -->\n## T1: bump the shipped version\n- files: package.json, package-lock.json\n"
+      + "- acceptance:\n  - judge: the shipped version matches the tag\n",
+    );
+    const cwd = process.cwd();
+    try {
+      process.chdir(repo);
+      expect(() => compileSource(spec, "native")).toThrow(CompileError);
+      expect(() => compileSource(spec, "native")).toThrow(/would skip cross-vendor review/);
+    } finally {
+      process.chdir(cwd);
+    }
+
+    // …and MERGING this lint into taskUnitContractErrors left the other lints' verdicts on the R2
+    // calibration corpus byte-identical. A new lint that quietly changed what the pinned corpus
+    // reports would be indistinguishable from a regression in the lints it joined.
+    const root = process.cwd();
+    const v184 = compileNative("specs/v1.84-pointer.spec.md");
+    const t1 = v184.tasks.find((t) => t.id === "T1")!;
+    const originalT1 = { ...t1, files: t1.files.filter((f) => f !== "src/tui/cockpit/layout.ts" && f !== "tests/cockpit/layout.test.ts") };
+    const withParticipation = taskUnitContractErrors([originalT1], root, active);
+    const lintsOnly = [
+      ...surfaceErrors([originalT1]),
+      ...goalDensityErrors([originalT1]),
+      ...symbolOwnershipErrors([originalT1], root),
+    ];
+    expect(lintsOnly).toHaveLength(2); // the corpus's pinned rejections: surface + symbol ownership
+    expect(withParticipation).toEqual(lintsOnly); // …and participation adds nothing to them
+    // the corpus's PASSING half stays passing under the merged lints, participation included
+    const v179 = compileNative("specs/v1.79-signal-truth.spec.md");
+    expect(v179.tasks.length).toBeGreaterThan(0);
+    expect(taskUnitContractErrors(v179.tasks, root, active)).toEqual([]);
+    expect(reviewParticipationErrors(v179.tasks, active)).toEqual([]);
+  }, 30_000);
+
+  test("review participation is decided by declared and actual paths, never by complexity, and skip visibility is journal truth end to end", async () => {
+    const { repo, base } = repoWithDiff({ "docs/guide.md": "# guide\n" });
+    // The retired switch: the two complexities that used to sit either side of the default threshold
+    // now decide nothing — the declared paths do, and they decide the same way for both.
+    for (const complexity of [1, 9]) {
+      const { fake, calls } = countingFake({ review: { approve: true, issues: [] } });
+      const leaf = await reviewGate(mkTask({ files: ["docs/**"], complexity }), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+      expect(leaf.meta?.verdict).toBe("skipped");
+      expect(calls()).toBe(0);
+
+      const src = countingFake({ review: { approve: true, issues: [] } });
+      const full = await reviewGate(mkTask({ files: ["src/run/daemon.ts"], complexity }), repo, base, author, CH, [src.fake], DEFAULT_CONFIG);
+      expect(full.meta?.verdict).toBeUndefined();
+      expect(full.meta?.policy).toBe("full");
+      expect(src.calls()).toBe(1);
+    }
+    // and the retired knob cannot resurrect the skip: below OR above, participation is unchanged
+    const pinned = structuredClone(DEFAULT_CONFIG);
+    pinned.review.complexityThreshold = 99;
+    const { fake, calls } = countingFake({ review: { approve: true, issues: [] } });
+    const r = await reviewGate(mkTask({ files: ["src/run/daemon.ts"], complexity: 1 }), repo, base, author, CH, [fake], pinned);
+    expect(calls()).toBe(1);
+    expect(r.meta?.policy).toBe("full");
+
+    // ── skip VISIBILITY starts at the GATE's own verdict: `pass` is not true and the decline says so
+    // about itself. The retired branch returned pass:true, so a review that never ran read exactly
+    // like one that ran and approved. Journal truth — the row the daemon writes, the review-round
+    // budget, the retry brief and the engagement record — is asserted end to end against a REAL run
+    // in tests/run/daemon.test.ts ("R3 declined review — journal truth and merge"); rebuilding the
+    // ledger row by hand here would only prove this file can copy daemon.ts.
+    const declined = await reviewGate(mkTask({ files: ["docs/**"], complexity: 9 }), repo, base, author, CH,
+      [countingFake({ review: { approve: true, issues: [] } }).fake], DEFAULT_CONFIG);
+    expect(declined.pass).toBe(false); // never a forged green
+    expect(declined.meta).toMatchObject({ skipped: true, verdict: "skipped", policy: "judge-only" });
+    expect(deriveSignalBasis(declined.gate, declined.pass, declined.details, declined.meta ?? {})).toBe("skipped");
+  }, 30_000);
+});
+
+describe("reviewGate", () => {
 
   // v1.64 gate-integrity: the cross-vendor review prompt carries the same completion-faking checklist
   // as the acceptance judge, so reviewers hunt the concrete shortcuts by name.
@@ -333,7 +611,7 @@ describe("reviewGate", () => {
     cfg.review.prefer = ["fake:fake-3"];
     const r = await reviewGate(mkTask(), repo, base, author, pool, [fake], cfg);
     expect(r.pass).toBe(true);
-    expect(r.meta).toEqual({ reviewer: "fake:fake-3" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-3" });
   });
 
   test("no cross-vendor channel: required → fail; not required → pass-with-warning", async () => {
@@ -427,7 +705,7 @@ describe("reviewGate material/minor classification (v1.70 T5)", () => {
     expect(r.pass).toBe(false);
     expect(r.details).toContain("off-by-one drops the last row");
     // fails closed the same way a legacy request-changes verdict does: pass:false + the reviewer channel
-    expect(r.meta).toEqual({ reviewer: "fake:fake-2" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2" });
   });
 
   test("a deferred finding is carried into the gate's recorded details with its rationale rather than silently dropped", async () => {
@@ -500,7 +778,7 @@ describe("v1.1 reviewer failover", () => {
     const r = await reviewGate(mkTask(), repo, base, author, CH, [bad], DEFAULT_CONFIG);
     expect(r.pass).toBe(false);
     // OBS-193/196: meta additionally marks unparseable (typed retry detection) and names the cause
-    expect(r.meta).toEqual({ reviewer: "fake:fake-2", unparseable: true, cause: "no-verdict" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", unparseable: true, cause: "no-verdict" });
   });
 
   test("excludeReviewers reaches reviewGate: excluded vendor → no-reviewer path", async () => {

@@ -130,6 +130,28 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     expect(events.filter((e) => e.phase === "end" && e.gate === "review")).toHaveLength(1); // no false gate event
   });
 
+  // T4 (OBS-265): the round's shape changed, the seam did not. Under the v1.85 pipeline the review is
+  // launched beside the judge instead of after it — an unparseable first seat still costs exactly one
+  // in-gate re-ask, and the flaked verdict still never enters results.
+  test("the retry seam is unchanged when review runs beside the judge", async () => {
+    const worker = new FakeAdapter(scriptWith({}));
+    const garbage = new GarbageReviewer(scriptWith({ review: { approve: true } }));
+    const good = new BindingReviewer(scriptWith({ review: { approve: true, issues: [] } }));
+    const { repo, base } = repoWithCommit();
+    const events: GateEvent[] = [];
+    const ctx = await gateCtx(repo, base, [worker, garbage, good], [chAuthor, chGarbage, chSecond], events);
+    const { results } = await runGates(mkTask(), { ...ctx, pipeline: "v185" as const });
+    const reviews = results.filter((r) => r.gate === "review");
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]!.pass).toBe(true);
+    expect(reviews[0]!.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1" });
+    expect(events.filter((e) => e.phase === "end" && e.gate === "review")).toHaveLength(1);
+    // and the two verdict gates really were one round: same parent, both started before either ended
+    const starts = events.filter((e) => e.phase === "start" && (e.gate === "acceptance" || e.gate === "review"));
+    expect(starts).toHaveLength(2);
+    expect(new Set(starts.map((e) => (e as { parentAt?: number }).parentAt)).size).toBe(1);
+  });
+
   test("double garbage fails closed exactly like today, with the retry attributed", async () => {
     const worker = new FakeAdapter(scriptWith({}));
     const garbage = new GarbageReviewer(scriptWith({ review: { approve: true } }));
