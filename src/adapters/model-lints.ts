@@ -1,9 +1,11 @@
-import { existsSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { buildTaskPrompt } from "./prompt.js";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "./types.js";
+import { resolveCatalogModel, type CatalogModelEvidence, type CatalogReadResult } from "./catalog-remote.js";
 export const SEED_STAMPED = "2026-07-09";
 // knowledge past this age gets a "rerun tickmarkr doctor" nudge (BLOCKED_POLL_MS-style named constant).
 export const MODEL_STALE_DAYS = 30;
@@ -16,38 +18,175 @@ const LINT_CAP = 5;
 const TTY_LINT_CAP = 3;
 const DEFAULT_STATE_DIR = ".tickmarkr";
 const doctorJsonRef = (stateDir: string) => ` — see ${stateDir}/doctor.json`;
+const DECLARED_SEED_PREFER_DISPOSITION = "no declared preference overrides it";
+const LEGACY_DOCTOR_SEED_PREFER_DISPOSITION = "auto-prefer is routing around it";
 
 export const ttyVisual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
 
 // ponytail: chars/4 token heuristic — good enough for advisory plan lint; no tokenizer dep.
 const CHARS_PER_TOKEN = 4;
 
-/** True when any tier entry declares at least one model window. */
-export function hasWindowsConfig(cfg: TickmarkrConfig): boolean {
+export interface CatalogModelAdvisory {
+  coverage: "covered" | "uncovered";
+  evidence?: CatalogModelEvidence;
+  suggestion?: { tier: Tier; kind: "inference"; basis: "intelligence" | "price"; provenanceNote: string };
+  display: string;
+}
+
+const intelligenceTier = (index: number): Tier => index >= 65 ? "frontier" : index >= 40 ? "mid" : "cheap";
+const priceTier = (outputPerMtok: number): Tier => outputPerMtok >= 12 ? "frontier" : outputPerMtok >= 2 ? "mid" : "cheap";
+
+function catalogEvidenceNote(evidence: CatalogModelEvidence, catalog: CatalogReadResult): string {
+  const cost = evidence.inputCostPerMtok !== undefined && evidence.outputCostPerMtok !== undefined
+    ? `$${evidence.inputCostPerMtok}/$${evidence.outputCostPerMtok} per Mtok`
+    : "not reported";
+  const features = evidence.features.length ? evidence.features.join(",") : "none reported";
+  const intelligence = evidence.intelligenceIndex !== undefined
+    ? `; Artificial Analysis Intelligence Index=${evidence.intelligenceIndex}${evidence.intelligenceIndexVersion ? ` (version ${evidence.intelligenceIndexVersion})` : ""}`
+    : "";
+  const freshness = catalog.stale ? `${catalog.source} stale cache` : catalog.source;
+  return `models.dev id=${evidence.modelId}; cost=${cost}; context=${evidence.contextWindow ?? "not reported"}; features=${features}${intelligence}; catalog=${freshness}; fetchedAt=${catalog.catalog.fetchedAt}`;
+}
+
+export function catalogModelAdvisory(
+  cfg: TickmarkrConfig,
+  catalog: CatalogReadResult,
+  adapter: string,
+  model: string,
+  resolvedModel?: string,
+): CatalogModelAdvisory {
+  const entry = cfg.tiers[adapter];
+  const evidence = resolveCatalogModel(catalog.catalog, {
+    // A tier vendor is NULLABLE (config.ts:64) — null means "declared as having none at tier level, so
+    // each model must declare its own". `resolveCatalogModel` takes an optional provider HINT
+    // (catalog-remote.ts:218), and "no hint" is `undefined` there, so null normalizes to undefined rather
+    // than travelling as a third state. Neither T17 nor T19 could see this seam: their files[] are
+    // disjoint, so no ordering edge was derived, they dispatched 7ms apart, and each worktree was cut
+    // before the other's change existed. Both gates passed truthfully; only the merged pair fails to
+    // compile (OBS-371).
+    provider: entry?.vendor ?? undefined,
+    model,
+    ...(resolvedModel ? { resolvedModel } : {}),
+  });
+  if (!evidence) {
+    return {
+      coverage: "uncovered",
+      display: `${model} — uncovered by ${catalog.source === "cache" ? "cached catalogs" : "vendored catalog"}; no tier suggestion`,
+    };
+  }
+
+  const note = catalogEvidenceNote(evidence, catalog);
+  const basis = evidence.intelligenceIndex !== undefined
+    ? { basis: "intelligence" as const, tier: intelligenceTier(evidence.intelligenceIndex) }
+    : entry?.channel === "api" && evidence.outputCostPerMtok !== undefined
+      ? { basis: "price" as const, tier: priceTier(evidence.outputCostPerMtok) }
+      : undefined;
+  if (!basis) {
+    const reason = entry?.channel === "sub" && evidence.outputCostPerMtok !== undefined
+      ? "subscription billing; no price-derived suggestion"
+      : "no tier suggestion from available evidence";
+    return { coverage: "covered", evidence, display: `${model} → ${note}; ${reason}` };
+  }
+
+  const provenanceNote = `SUGGESTED ${basis.tier} (${basis.basis} inference, not a measurement) — ${note}; operator confirmation required`;
+  return {
+    coverage: "covered",
+    evidence,
+    suggestion: { tier: basis.tier, kind: "inference", basis: basis.basis, provenanceNote },
+    display: `${model} → ${note}; ${provenanceNote}`,
+  };
+}
+
+function hasAnyWindows(cfg: TickmarkrConfig): boolean {
   return Object.values(cfg.tiers).some((t) => t.windows && Object.keys(t.windows).length > 0);
+}
+
+/**
+ * Whether the doctor should add its optional window column. Keep non-TTY default output stable for
+ * machine consumers; an interactive seed-only matrix shows T14's fleet windows, and any explicit
+ * non-seed/overridden window keeps the historical operator-configured column behavior.
+ */
+export function hasWindowsConfig(cfg: TickmarkrConfig): boolean {
+  const hasOperatorWindow = Object.entries(cfg.tiers).some(([adapter, entry]) =>
+    Object.entries(entry.windows ?? {}).some(([model, window]) =>
+      DEFAULT_CONFIG.tiers[adapter]?.windows?.[model] !== window,
+    ),
+  );
+  if (hasOperatorWindow) return true;
+  const seedOnly = Object.keys(cfg.tiers).every((adapter) => adapter in DEFAULT_CONFIG.tiers);
+  return ttyVisual() && seedOnly && hasAnyWindows(cfg);
 }
 
 export function declaredModelWindow(cfg: TickmarkrConfig, adapter: string, model: string): number | undefined {
   return cfg.tiers[adapter]?.windows?.[model];
 }
 
-function fileBytes(repoRoot: string, rel: string): number {
-  if (rel.includes("*") || rel.includes("?") || rel.includes("{")) return 0; // glob — not measurable at plan time
-  try {
-    const p = join(repoRoot, rel);
-    if (!existsSync(p)) return 0;
-    return statSync(p).size;
-  } catch {
-    return 0;
-  }
+type BaseTree = { root: string; tracked: ReadonlySet<string> };
+type UnreadableReason = "absent" | "untracked" | "glob" | "directory" | "base-tree-unavailable" | "base-tree-read-failed";
+type FileBytes = { status: "measured"; bytes: number } | { status: "unreadable"; reason: UnreadableReason };
+type UnreadablePayloadPath = { field: "context" | "files"; path: string; reason: UnreadableReason };
+
+const GLOB_CHARS = /[*?{[]/;
+
+// T13's visibility oracle is the committed base tree: workers are created from HEAD, not from the
+// author's checkout or index. Keep --full-tree load-bearing for callers below the repository root.
+function baseTreeAtHead(dir: string): BaseTree | undefined {
+  const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const top = git("rev-parse", "--show-toplevel");
+  const tree = git("ls-tree", "--full-tree", "-r", "--name-only", "HEAD");
+  if (top.status !== 0 || tree.status !== 0 || typeof top.stdout !== "string" || typeof tree.stdout !== "string") return undefined;
+  return { root: top.stdout.trim(), tracked: new Set(tree.stdout.split("\n").filter(Boolean)) };
 }
 
-/** Best-effort plan-time payload estimate: prompt shell + context + files[] byte sizes. */
-export function estimateTaskPayloadTokens(task: Task, repoRoot: string, feedback = ""): number {
+function fileBytes(repoRoot: string, rel: string, tree: BaseTree | undefined = baseTreeAtHead(repoRoot)): FileBytes {
+  if (GLOB_CHARS.test(rel)) return { status: "unreadable", reason: "glob" };
+  if (!tree) return { status: "unreadable", reason: "base-tree-unavailable" };
+  const path = rel.replace(/\/+$/, "");
+  if (!tree.tracked.has(path)) {
+    if ([...tree.tracked].some((tracked) => tracked.startsWith(`${path}/`))) {
+      return { status: "unreadable", reason: "directory" };
+    }
+    return { status: "unreadable", reason: existsSync(join(tree.root, path)) ? "untracked" : "absent" };
+  }
+  // Read the blob size from HEAD too: an unstaged/staged checkout edit is not what the worker receives.
+  const size = spawnSync("git", ["-C", tree.root, "cat-file", "-s", `HEAD:${path}`], { encoding: "utf8" });
+  const bytes = Number.parseInt(typeof size.stdout === "string" ? size.stdout.trim() : "", 10);
+  return size.status === 0 && Number.isSafeInteger(bytes) && bytes >= 0
+    ? { status: "measured", bytes }
+    : { status: "unreadable", reason: "base-tree-read-failed" };
+}
+
+function taskPayloadResolution(task: Task, repoRoot: string, feedback: string): { tokens: number; unreadable: UnreadablePayloadPath[] } {
   let bytes = buildTaskPrompt(task, feedback).length;
-  for (const p of task.context) bytes += fileBytes(repoRoot, p);
-  for (const p of task.files) bytes += fileBytes(repoRoot, p);
-  return Math.ceil(bytes / CHARS_PER_TOKEN);
+  const unreadable: UnreadablePayloadPath[] = [];
+  const tree = baseTreeAtHead(repoRoot);
+  const add = (field: "context" | "files", path: string) => {
+    const measured = fileBytes(repoRoot, path, tree);
+    if (measured.status === "measured") bytes += measured.bytes;
+    else unreadable.push({ field, path, reason: measured.reason });
+  };
+  for (const path of task.context) add("context", path);
+  for (const path of task.files) add("files", path);
+  return { tokens: Math.ceil(bytes / CHARS_PER_TOKEN), unreadable };
+}
+
+/** A numeric estimate exists only when every payload path is measurable from the worker-visible tree. */
+export function estimateTaskPayloadTokens(task: Task, repoRoot: string, feedback = ""): number | undefined {
+  const estimate = taskPayloadResolution(task, repoRoot, feedback);
+  return estimate.unreadable.length === 0 ? estimate.tokens : undefined;
+}
+
+function unreadablePayloadLint(taskId: string, unreadable: UnreadablePayloadPath[]): string {
+  const describe = ({ field, path, reason }: UnreadablePayloadPath) => {
+    const prefix = `${field} ${JSON.stringify(path)}`;
+    if (reason === "untracked") return `${prefix} is present in the checkout but not in the base tree`;
+    if (reason === "absent") return `${prefix} is absent from the base tree and checkout`;
+    if (reason === "glob") return `${prefix} is a glob and cannot be measured`;
+    if (reason === "directory") return `${prefix} is a directory and cannot be measured as one file`;
+    if (reason === "base-tree-unavailable") return `${prefix} cannot be checked because the base tree is unavailable`;
+    return `${prefix} could not be read from the base tree`;
+  };
+  return `${taskId}: payload unreadable — ${unreadable.map(describe).join(", ")}; context-window comparison skipped`;
 }
 
 export type RoutedAssignment = { taskId: string; adapter: string; model: string };
@@ -59,7 +198,7 @@ export function contextWindowLints(
   cfg: TickmarkrConfig,
   repoRoot: string,
 ): string[] {
-  if (!hasWindowsConfig(cfg)) return [];
+  if (!hasAnyWindows(cfg)) return [];
   const byId = new Map(assignments.map((a) => [a.taskId, a]));
   const lints: string[] = [];
   for (const t of tasks) {
@@ -67,9 +206,13 @@ export function contextWindowLints(
     if (!a) continue;
     const window = declaredModelWindow(cfg, a.adapter, a.model);
     if (window === undefined) continue;
-    const est = estimateTaskPayloadTokens(t, repoRoot);
-    if (est > window) {
-      lints.push(`${t.id}: payload ~${est} tokens exceeds ${a.adapter}:${a.model} window ${window}`);
+    const estimate = taskPayloadResolution(t, repoRoot, "");
+    if (estimate.unreadable.length > 0) {
+      lints.push(unreadablePayloadLint(t.id, estimate.unreadable));
+      continue;
+    }
+    if (estimate.tokens > window) {
+      lints.push(`${t.id}: payload ~${estimate.tokens} tokens exceeds ${a.adapter}:${a.model} window ${window}`);
     }
   }
   return lints;
@@ -93,12 +236,12 @@ const adapterHasAuthedChannel = (
   );
 };
 
-// OBS-30 T2: warn when a built-in seed prefer names an adapter with zero authed channels this probe pass.
-export function seedPreferLints(
+function collectSeedPreferLints(
   cfg: TickmarkrConfig,
   health: Record<string, AuthHealth>,
   adapters: WorkerAdapter[],
-  overlayPreferShapes: ReadonlySet<string> = new Set(),
+  overlayPreferShapes: ReadonlySet<string>,
+  disposition: string,
 ): string[] {
   const lints: string[] = [];
   for (const shape of Object.keys(cfg.routing.map)) {
@@ -107,19 +250,30 @@ export function seedPreferLints(
       const adapterId = p.includes(":") ? p.slice(0, p.indexOf(":")) : p;
       if (!cfg.tiers[adapterId]) continue;
       if (!adapterHasAuthedChannel(adapterId, shape, cfg, health, adapters)) {
-        lints.push(`routing seed names dead adapter '${adapterId}' for shape '${shape}' — auto-prefer is routing around it`);
+        lints.push(`routing seed names dead adapter '${adapterId}' for shape '${shape}' — ${disposition}`);
       }
     }
   }
   return lints;
 }
 
+// OBS-30 T2 / v1.86 T3: warn when a built-in seed prefer names an adapter with zero authed
+// channels and no operator-declared preference overrides that seed for the shape.
+export function seedPreferLints(
+  cfg: TickmarkrConfig,
+  health: Record<string, AuthHealth>,
+  adapters: WorkerAdapter[],
+  overlayPreferShapes: ReadonlySet<string> = new Set(),
+): string[] {
+  return collectSeedPreferLints(cfg, health, adapters, overlayPreferShapes, DECLARED_SEED_PREFER_DISPOSITION);
+}
+
 // v1.54 T3: dead-steering sweep — operator prefer entries (routing.map overlay shapes, review.prefer,
 // consult.prefer) that can never match an installed channel are named at plan time; v1.53 T2 pins the
 // no-match case as a silent no-op, which makes a typo invisible. Advisory only: reads config + doctor
-// health (no live probes), never touches routing. Seed map prefers stay seedPreferLints' turf (auto-prefer
-// routes around dead seeds) — mapShapes limits this sweep to operator-authored entries so a bare default
-// fleet isn't double-linted. Entry grammar mirrors preferIndex: adapter | adapter:model (first colon).
+// health (no live probes), never touches routing. Seed map prefers stay seedPreferLints' turf;
+// mapShapes limits this sweep to operator-authored entries so a bare default fleet isn't double-linted.
+// Entry grammar mirrors preferIndex: adapter | adapter:model (first colon).
 export function preferEntryLints(
   cfg: TickmarkrConfig,
   health: Record<string, AuthHealth>,
@@ -144,7 +298,7 @@ export function preferEntryLints(
   return lints;
 }
 
-// Diffs detected models (doctor.json) against configured tiers, both directions, per adapter id in cfg.tiers.
+// Diffs detected models (doctor.json) against configured tiers, both directions, per installed adapter.
 // No `  ! ` prefix here — the consumer (doctor rows / plan lints) owns that. Pre-v1.5 doctor.json (models:[], no
 // modelsDetectedAt) is the compat baseline: `?.`/`?? []` everywhere, no zod (would reject old files).
 export function modelLints(
@@ -156,9 +310,8 @@ export function modelLints(
   const cap = opts?.tty ? TTY_LINT_CAP : LINT_CAP;
   const doctorRef = opts?.tty ? doctorJsonRef(opts.stateDir ?? DEFAULT_STATE_DIR) : "";
   const lints: string[] = [];
-  for (const id of Object.keys(cfg.tiers)) {
-    const adapter = adapters.find((a) => a.id === id);
-    if (!adapter) continue; // fake/overlay-only tier entry with no adapter — nothing to diff against
+  for (const adapter of adapters) {
+    const id = adapter.id;
     if (!adapter.listModels) {
       lints.push(`${id}: no model-list surface — seeds stamped ${SEED_STAMPED}; verify manually`);
       continue;
@@ -169,7 +322,7 @@ export function modelLints(
       if (h?.installed) lints.push(`${id}: no detection data — run tickmarkr doctor`);
       continue; // no data to diff or age
     }
-    const configured = Object.keys(cfg.tiers[id].models);
+    const configured = Object.keys(cfg.tiers[id]?.models ?? {});
     for (const model of configured) {
       if (!detected.includes(model)) {
         lints.push(`${id}: tiers lists ${model} — CLI no longer reports it; tombstone it (${model}: null overlay) or verify the id`);
@@ -187,7 +340,13 @@ export function modelLints(
       if (days >= MODEL_STALE_DAYS) lints.push(`${id}: model knowledge is ${days} days old — rerun tickmarkr doctor`);
     }
   }
-  lints.push(...seedPreferLints(cfg, health, adapters, opts?.overlayPreferShapes));
+  // v1.34 T3 byte-pins non-TTY doctor output. Doctor consumers are the ones that provide stateDir;
+  // keep that machine-facing compatibility surface stable while plan and direct lint callers state
+  // the current declared-preference mechanism truthfully.
+  const seedDisposition = opts?.stateDir !== undefined && opts.tty !== true
+    ? LEGACY_DOCTOR_SEED_PREFER_DISPOSITION
+    : DECLARED_SEED_PREFER_DISPOSITION;
+  lints.push(...collectSeedPreferLints(cfg, health, adapters, opts?.overlayPreferShapes ?? new Set(), seedDisposition));
   return lints;
 }
 
@@ -218,15 +377,19 @@ export function suggestOverlay(
   health: Record<string, AuthHealth>,
   adapters: WorkerAdapter[],
   stateDir: string = DEFAULT_STATE_DIR,
+  opts: {
+    catalog?: CatalogReadResult;
+    resolvedModel?: (adapter: string, model: string) => string | undefined;
+  } = {},
 ): string {
   const blocks: string[] = [];
-  for (const id of Object.keys(cfg.tiers)) {
-    const adapter = adapters.find((a) => a.id === id);
-    if (!adapter?.listModels) continue;      // no adapter / no list surface → nothing to diff (mirror modelLints)
+  for (const adapter of adapters) {
+    const id = adapter.id;
+    if (!adapter.listModels) continue;       // no list surface → nothing to diff (mirror modelLints)
     const h = health[id];
     const detected = h?.models ?? [];
     if (detected.length === 0) continue;     // no detection data → don't guess a delta
-    const configured = Object.keys(cfg.tiers[id].models);
+    const configured = Object.keys(cfg.tiers[id]?.models ?? {});
     const date = h?.modelsDetectedAt?.split("T")[0]; // best-effort day stamp
     const detNote = date ? ` (detected ${date})` : "";
 
@@ -252,8 +415,17 @@ export function suggestOverlay(
     let omitted = 0;
     for (const model of detected) {
       if (configured.includes(model) || !MODEL_ID_RE.test(model) || LINT_VARIANT_RE.test(model)) continue;
-      if (!cfgPrefixes.has(providerPrefix(model)) && !cfgCanon.has(canonical(model))) { omitted++; continue; }
-      lines.push(`      # ${model}: ???   #${date ? ` detected ${date} —` : ""} classify per benchmark policy (AA Index + SWE-bench Pro, dated), then uncomment`);
+      if (configured.length > 0 && !cfgPrefixes.has(providerPrefix(model)) && !cfgCanon.has(canonical(model))) {
+        omitted++;
+        continue;
+      }
+      const advisory = opts.catalog
+        ? catalogModelAdvisory(cfg, opts.catalog, id, model, opts.resolvedModel?.(id, model))
+        : undefined;
+      const guidance = advisory?.suggestion
+        ? `provenance note (operator confirmation required): ${advisory.suggestion.provenanceNote}; choose a tier, then uncomment`
+        : `classify per benchmark policy (AA Index + SWE-bench Pro, dated), then uncomment${advisory ? ` — ${advisory.display}` : ""}`;
+      lines.push(`      # ${model}: ???   #${date ? ` detected ${date} —` : ""} ${guidance}`);
     }
     if (omitted) lines.push(`      # (+${omitted} other detected id${omitted === 1 ? "" : "s"} not related to your configured models — see ${stateDir}/doctor.json)`);
     if (lines.length) blocks.push(`  ${id}:\n    models:\n${lines.join("\n")}`);
@@ -288,12 +460,13 @@ export function fleetUnclassifiedModels(
   adapters: WorkerAdapter[],
 ): { adapter: string; model: string; detectedAt?: string }[] {
   const out: { adapter: string; model: string; detectedAt?: string }[] = [];
-  for (const id of Object.keys(cfg.tiers)) {
-    if (!adapters.some((a) => a.id === id)) continue;
+  for (const adapter of adapters) {
+    const id = adapter.id;
     const h = health[id];
+    if (!h?.installed) continue;
     const detected = h?.models ?? [];
     if (!detected.length) continue;
-    const configured = new Set(Object.keys(cfg.tiers[id].models));
+    const configured = new Set(Object.keys(cfg.tiers[id]?.models ?? {}));
     const date = h?.modelsDetectedAt?.split("T")[0];
     for (const model of detected) {
       if (configured.has(model) || LINT_VARIANT_RE.test(model)) continue;

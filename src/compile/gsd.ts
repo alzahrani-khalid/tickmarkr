@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { TIERS, type RunGraph, validateGraph } from "../graph/schema.js";
+import { AcceptanceItemSchema, TIERS, type AcceptanceItem, type RunGraph, validateGraph } from "../graph/schema.js";
 import { CompileError, assertWriteScope, inferShape, sha256, type WriteDirective } from "./common.js";
 
 // GSD artifact front-end (spec v1.3): one GSD *plan* is one tickmarkr *task* — a plan is
@@ -27,6 +27,76 @@ interface Frontmatter {
 }
 
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
+
+// Cycle-safe by construction: a recursive YAML alias (`&a [*a]`) is a legal value the parser hands
+// back as a circular object, and a bare JSON.stringify throws a native TypeError on it — which would
+// REPLACE the indexed CompileError this module owes the author with an unrelated crash. Every value
+// the YAML parser can produce renders here. (A repeated non-recursive alias also renders [circular];
+// this is a diagnostic string, not a round-trippable encoding.)
+const show = (v: unknown): string => {
+  const seen = new WeakSet<object>();
+  const cycleSafe = (_k: string, x: unknown) => {
+    if (typeof x !== "object" || x === null) return x;
+    if (seen.has(x)) return "[circular]";
+    seen.add(x);
+    return x;
+  };
+  return JSON.stringify(v, cycleSafe) ?? String(v);
+};
+
+// A truth IS an acceptance item, not a string to coerce. strings()' `.map(String)` turned a typed
+// object truth into the literal "[object Object]" — schema-legal in the judge-compat string form, so
+// it passed validateGraph, reached the worker prompt verbatim and became a judge rubric item; a YAML
+// scalar `- 2.0` silently became "2". Nothing downstream catches either. So fail closed (house
+// precedent: the routing block in compileOne) on anything that is not text and not a typed oracle.
+// The CONTAINER is reported, not collapsed: an absent key returns undefined (nothing was declared) and
+// a present-but-empty list returns [] (declared, contributed nothing) — strings() flattened both, plus
+// a non-list, into the same silent []. Only the non-list fails closed; `truths: []` is real producer
+// output whose plan can still be carried by its <done> lines, and compileOne already rejects a task
+// whose acceptance ends up genuinely empty.
+// Parser liberal, template strict: a string truth stays exactly what strings() made of it — the GSD
+// planner template teaches prose-only and lives in another repo, so this parser must never be
+// stricter than the thing that produced its input. A non-string must satisfy AcceptanceItemSchema
+// EXACTLY — accepted with nothing dropped — which is where the dual-key `text:` beside
+// `command:`/`test:` is DECLARED (schema.ts:25-30); being declared is what makes it survive
+// loadGraph's revalidation, so nothing is ever reattached after.
+export function parseTruths(file: string, raw: unknown): AcceptanceItem[] | undefined {
+  if (raw === undefined) return undefined; // key absent: nothing was declared
+  if (!Array.isArray(raw)) {
+    throw new CompileError(
+      `${file} has a must_haves.truths that is not a list (got ${show(raw)}).\n` +
+        `  remedy: write each truth as a "- " list entry, or drop the key.`,
+    );
+  }
+  return raw.map((v, i) => {
+    if (typeof v === "string") return v;
+    const parsed = AcceptanceItemSchema.safeParse(v);
+    if (!parsed.success) {
+      throw new CompileError(
+        `${file} has a must_haves.truths[${i}] that is neither prose nor a typed acceptance oracle: ${show(v)}\n` +
+          `  remedy: write it as plain text, or as {oracle: command, command: <shell>} / {oracle: test, test: <name>} /\n` +
+          `  {oracle: judge, text: <rubric>} — command and test may carry a "text:" beside the oracle.`,
+      );
+    }
+    // A SUCCESSFUL parse is lossy too: z.object strips undeclared keys, so {oracle, command, text,
+    // severity} validates and compiles with `severity` gone — the same silent coercion in the other
+    // direction, and invisible because nothing downstream ever saw the key. Accepting less than the
+    // author supplied is not acceptance, so fail closed on whatever validation dropped.
+    // Object.hasOwn, never `k in`: the YAML parser hands back `constructor`, `toString`,
+    // `hasOwnProperty` and `__proto__` as OWN keys, but `in` finds all four on Object.prototype of the
+    // validated output, so each read as "kept" and was stripped in silence — the exact coercion this
+    // check exists to stop.
+    const dropped = Object.keys(v as object).filter((k) => !Object.hasOwn(parsed.data as object, k));
+    if (dropped.length) {
+      throw new CompileError(
+        `${file} has a must_haves.truths[${i}] carrying key(s) no acceptance oracle declares: ${dropped.join(", ")}\n` +
+          `  remedy: drop ${dropped.length === 1 ? "that key" : "those keys"}, or fold the intent into "text:" — a\n` +
+          `  compile that kept ${dropped.length === 1 ? "it" : "them"} would discard ${dropped.length === 1 ? "it" : "them"} at the next graph load, unread.`,
+      );
+    }
+    return parsed.data;
+  });
+}
 
 const WRITE_DIRECTIVE = /\b(?:Create|Write|Add|Emit|Generate)\s+`([^`\s]+)`/gi;
 const isPathish = (s: string) => /^[\w./*-]+$/.test(s) && /\.[a-z]{2,4}$/i.test(s);
@@ -108,8 +178,8 @@ function compileOne(file: string, storedPath: string) {
   const title = firstSentence || key;
 
   const dones = [...body.matchAll(/<done>\s*([\s\S]*?)\s*<\/done>/g)].map((m) => m[1].replace(/\s+/g, " ").trim());
-  const truths = strings(fm.must_haves?.truths);
-  const acceptance = [...dones, ...truths].filter(Boolean);
+  const truths = parseTruths(file, fm.must_haves?.truths) ?? [];
+  const acceptance: AcceptanceItem[] = [...dones, ...truths].filter(Boolean);
   if (!acceptance.length) {
     throw new CompileError(
       `${file} has no acceptance criteria — every tickmarkr task needs them.\n` +

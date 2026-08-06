@@ -25,6 +25,7 @@ import {
   type RunCockpitData,
   type TaskRow,
 } from "../../tui/cockpit/derive.js";
+import { cellWidth, fitCells } from "../../tui/cockpit/width.js";
 
 // ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
 const REFRESH_MS = 2000;
@@ -179,6 +180,17 @@ const optionValue = (argv: string[], name: string): string | undefined => {
   const index = argv.indexOf(name);
   const value = index >= 0 ? argv[index + 1] : undefined;
   return value && !value.startsWith("-") ? value : undefined;
+};
+
+// The one positional this command takes: an explicit run id. Everything else is a flag or a flag's
+// value (`--webhook <url>`), so the first bare token that is not a --webhook value is the run id.
+const positionalRunId = (argv: string[]): string | undefined => {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--webhook") { i += 1; continue; }
+    if (!arg.startsWith("-")) return arg;
+  }
+  return undefined;
 };
 
 const defaultPostWebhook: DecisionWebhookPost = (url, event) =>
@@ -390,11 +402,20 @@ const failedSuffix = (states: GateState[]): string => {
 export const humanGateSuffix = (t: Task, st: TaskStatus, states: GateState[]): string =>
   st === "human" && t.humanGate && failedGates(states).length === 0 ? " · awaiting approval" : "";
 
+// Task titles are graph-authored data. Remove terminal controls and row-breaking whitespace before
+// either width measurement or rendering so zero-cell ECMA-48 bytes cannot escape the task column.
+const ECMA_48_CONTROL =
+  /(?:\u001B\][\s\S]*?(?:\u0007|\u001B\\)|\u009D[\s\S]*?(?:\u0007|\u009C)|\u001B[P^_X][\s\S]*?\u001B\\|[\u0090\u0098\u009E\u009F][\s\S]*?\u009C|(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]|\u001B[@-_])/gu;
+
+const sanitizeTaskText = (text: string): string =>
+  text.replace(ECMA_48_CONTROL, "").replace(/\p{Cc}/gu, " ").replace(/\s+/gu, " ").trim();
+
 export const shortGoal = (goal: string, max: number): string => {
-  const clause = goal.split(/[,;.?!]/, 1)[0]!.trim();
-  if (clause.length <= max) return clause;
-  if (max <= 3) return clause.slice(0, Math.max(0, max));
-  return `${clause.slice(0, max - 3).trimEnd()}...`;
+  const clause = sanitizeTaskText(goal).split(/[,;.?!]/, 1)[0]!.trim();
+  const cells = Math.max(0, Math.floor(max));
+  if (cellWidth(clause) <= cells) return clause;
+  if (cells <= 3) return fitCells(clause, cells).trimEnd();
+  return `${fitCells(clause, cells - 3).trimEnd()}...`;
 };
 
 // VIS-11 (v1.13): a liveness header for renderFrame — last journal event age + whether the recorded
@@ -589,9 +610,12 @@ const renderFrame = (
   animationFrame = 0,
   workerLiveness = new Map<string, WorkerLiveness>(),
   journalRowsOnly = false,
+  namedRunId?: string,
 ): RenderedFrame => {
   const g = loadGraph(cwd);
-  const runId = Journal.latestRunId(cwd, { withJournal: true });
+  // An explicit <runId> is a resolution, not a hint: Journal.open below refuses an id without a
+  // readable journal, so status fails loudly naming that id instead of rendering any other run.
+  const runId = namedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
   const assignments = new Map<string, string>();
   let replayed: Map<string, TaskStatus> | null = null;
   let cockpit: RunCockpitData | undefined;
@@ -731,7 +755,7 @@ const renderFrame = (
       const chain = gateChain(states, false);
       const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${surfaceTaskBox(st, merged)} ${t.id} `;
       const suffix = `  ${chain}${priorGraph ? ` ${PRIOR_GRAPH_MARKER}` : ""}  ${livePhase ? "running" : surfaceStatusWord(st)}${label}  ${assignCol}`;
-      return `${prefix}${shortGoal(t.goal, Math.max(0, width - prefix.length - suffix.length))}${suffix}`;
+      return `${prefix}${shortGoal(t.title, Math.max(0, width - prefix.length - suffix.length))}${suffix}`;
     });
     const zone = journalRowsOnly ? `${divider}zone ${localZoneLabel(zoneReference)}` : "";
     const header = runId
@@ -782,9 +806,9 @@ const renderFrame = (
   const gatesLegend = legend(`   gates: ${GATE_NAMES.join(" · ")}`);
 
   // Two-line card per task (operator request, v1.67): line 1 carries identity + verdict — glyph,
-  // id, goal at full width, and only SHORT status words. Line 2 carries the machinery, dim and
-  // aligned under the goal: gate chain, live activity phrase (or channel), ctx. Long channel names
-  // and activity phrases live on line 2 only, so they can never squeeze the goal or wrap line 1.
+  // id, title at full width, and only SHORT status words. Line 2 carries the machinery, dim and
+  // aligned under the title: gate chain, live activity phrase (or channel), ctx. Long channel names
+  // and activity phrases live on line 2 only, so they can never squeeze the title or wrap line 1.
   const taskVerdict = (c: (typeof cells)[number]): Verdict =>
     c.merged ? "pass" : c.redTier ? "fail" : c.st === "failed" || c.st === "human" ? "warn" : "neutral";
   const statusWord = (c: (typeof cells)[number]): string =>
@@ -796,9 +820,9 @@ const renderFrame = (
     + humanGateSuffix(c.t, graphTaskStatus(c.st, c.t.status), c.states);
   const stW = Math.max(...cells.map((c) => statusWord(c).length + suffixPlain(c).length));
   const avail = Math.max(8, width - (5 + idW) - 2 - stW);
-  const goals = cells.map((c) => shortGoal(c.t.goal, avail));
-  const goalW = Math.max(8, ...goals.map((s) => s.length));
-  const indent = " ".repeat(idW + 5); // line 2 starts under the goal column
+  const titles = cells.map((c) => shortGoal(c.t.title, avail));
+  const titleW = Math.max(8, ...titles.map(cellWidth));
+  const indent = " ".repeat(idW + 5); // line 2 starts under the title column
   const rows = cells.map((c, i) => {
     const { t, st, merged, failureKind, redTier, states, priorGraph, isStarved, phrase, channel, ctx, livePhase } = c;
     const word = statusWord(c);
@@ -812,7 +836,8 @@ const renderFrame = (
       (isStarved ? dot + fail("starved") : "") +
       (f.length ? dot + fail(f.join(", ")) : "") +
       (human ? dot + warn("awaiting approval") : "");
-    const taskLabel = `${t.id.padEnd(idW)} ${goals[i]!.padEnd(goalW)}  ${statusCell}`;
+    const taskTitle = titles[i]!;
+    const taskLabel = `${t.id.padEnd(idW)} ${taskTitle}${" ".repeat(titleW - cellWidth(taskTitle))}  ${statusCell}`;
     const line1 = livePhase
       ? `  ${(staleWorker ? warn : dim)(SPINNER[animationFrame % SPINNER.length]!)} ${taskLabel}`
       : `  ${statusRow(taskVerdict(c), taskLabel)}`;
@@ -835,9 +860,10 @@ const renderFrame = (
 };
 
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {
+  const namedRunId = positionalRunId(argv);
   // cockpit surface: banner + frame on a TTY (doctor's pattern); pipes get the bare frame
   if (!argv.includes("--watch")) {
-    const { content } = renderFrame(cwd, opts.now?.() ?? Date.now());
+    const { content } = renderFrame(cwd, opts.now?.() ?? Date.now(), 0, undefined, false, namedRunId);
     return visual() ? BANNER + content : content;
   }
 
@@ -895,7 +921,9 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   let decisionRunId: string | undefined;
   let journalCursor = 0;
   const consumeDecisionEvents = (): DecisionEvent[] => {
-    const runId = Journal.latestRunId(cwd, { withJournal: true });
+    // A named run is followed, never re-resolved: --watch <runId> keeps reporting that run even as
+    // newer runs start. Only the no-argument form tracks latest, as before.
+    const runId = namedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
     if (!runId) return [];
     if (decisionRunId !== runId) {
       decisionRunId = runId;
@@ -947,7 +975,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
           if (bounded) eventLines.push(line);
         }
       } else {
-        frame = renderFrame(cwd, nowMs, i, workerLiveness, true);
+        frame = renderFrame(cwd, nowMs, i, workerLiveness, true, namedRunId);
         if (tty) {
           updateTitle(frame.hotPhase, nowMs);
           process.stdout.write(`\x1b[2J\x1b[H${BANNER}${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);

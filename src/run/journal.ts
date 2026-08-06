@@ -222,7 +222,7 @@ export function structuredFindings(gate: string, details: string, _scopeFiles: s
 const VOLATILE_TOKENS: Array<[RegExp, string]> = [
   [/\u001b\[[0-9;]*[a-zA-Z]/g, ""],                                            // ANSI styling
   [/\b\d{4}-\d{2}-\d{2}[T ][\d:]+(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/g, "<ts>"], // timestamps
-  [/\brun-\d{8}-\d{6}\b/g, "<run>"],                                            // run identifiers
+  [/\brun-\d{8}-\d{6}(?:-\d{16})?\b/g, "<run>"],                              // run identifiers
   [/\b0x[0-9a-fA-F]+\b/g, "<addr>"],                                            // memory addresses
   // An absolute path INTO the repo keeps its repo-relative tail — that tail IS identity (a defect in
   // daemon.ts is not a defect in journal.ts); only the machine/worktree prefix ahead of it is volatile.
@@ -262,15 +262,69 @@ const eraseVolatile = (text: string) =>
 // cross one) and the line-wise trim below finishes the job.
 const collapseRuns = (text: string) => text.replace(/[^\S\n]+/g, " ");
 
+// v1.85 T34: the runner's TALLY moves with the base, not with the defect. When another task merges
+// ahead and adds test files, vitest re-counts the suite — `192 passed (197)` becomes `193 passed
+// (198)` — while the FAIL headlines name the same defect in the same order, so a substantively
+// identical gate failure re-fingerprinted and gate-fingerprint-cap never counted the repeat
+// (measured on T21 in run-20260805-164546: details at 17:33:02 and 18:11:01 differ only so).
+//
+// Why provenance AND shape, and why not digits as a class: a blanket \d+ collapse also erases counts
+// that ARE identity — the failed-assertion count, the failing-suite count, an exit status, an error
+// code — and the rule above governs: a missed cap costs one extra round, a false cap bans a
+// legitimate retry. So the mask is gated on PROVENANCE first: only lines inside the `failing tests:`
+// block baseline.ts:209-219 emits (up to its blank-line/`new failure fingerprints` boundary) are
+// eligible, which keeps review prose, quoted diffs and assertion payloads structurally unreachable —
+// and that block's own `FAIL … > test name` headlines are excluded by SHAPE: only a line that starts
+// with the runner's own `Tests`/`Test Files` summary token is a tally line.
+//
+// Masked tally FIELDS, exactly: the passed count, the skipped and todo counts, and the derived
+// parenthesized total immediately following the tally sequence. Deliberately KEPT (a reader uses
+// each of them to tell two failures apart): every `N failed` count on the line (which suites and how
+// many assertions actually broke — the defect's identity), everything after the derived total (an
+// appended `| exit 1`, an appended `(404)` code), and every other number anywhere.
+const RUNNER_TALLY_LINE =
+  /^([ \t]*(?:Test Files|Tests)[ \t]+)((?:\d+ (?:failed|passed|skipped|todo)[ \t]*\|[ \t]*)*\d+ (?:failed|passed|skipped|todo))([ \t]*\(\d+\))?(.*)$/;
+const TALLY_MOVED_FIELD = /\d+ (?=passed|skipped|todo)/g;
+
+const maskTallyLine = (line: string): string => {
+  const m = RUNNER_TALLY_LINE.exec(line);
+  if (!m) return line;
+  const fields = m[2]!.replace(TALLY_MOVED_FIELD, "#");
+  const total = (m[3] ?? "").replace(/\d+/, "#");
+  return m[1]! + fields + total + m[4]!;
+};
+
+// Computed on the FULL details text BEFORE any payload split: every recorded tally-bearing detail
+// carries the `failing tests:` header, so gating on it closes the false-line-start axis (the mask
+// never sees a slice boundary) and the wrong-provenance axis in one place.
+const maskRunnerTallies = (text: string): string => {
+  let inBlock = false;
+  return text
+    .split("\n")
+    .map((line) => {
+      if (!inBlock) {
+        if (line.trim() === "failing tests:") inBlock = true;
+        return line;
+      }
+      if (line.trim() === "" || line.startsWith("new failure fingerprints")) {
+        inBlock = false;
+        return line;
+      }
+      return maskTallyLine(line);
+    })
+    .join("\n");
+};
+
 /** Normalized identity of a gate failure: the same defect, seen twice, normalizes to the same bytes. */
 export function normalizeGateFailure(details: string): string {
+  const masked = maskRunnerTallies(details);
   let out = "";
   let last = 0;
-  for (const m of details.matchAll(PAYLOAD_SPAN)) {
-    out += collapseRuns(eraseVolatile(details.slice(last, m.index))) + m[0];
+  for (const m of masked.matchAll(PAYLOAD_SPAN)) {
+    out += collapseRuns(eraseVolatile(masked.slice(last, m.index))) + m[0];
     last = m.index + m[0].length;
   }
-  out += collapseRuns(eraseVolatile(details.slice(last)));
+  out += collapseRuns(eraseVolatile(masked.slice(last)));
   return out.split("\n").map((l) => l.trim()).filter(Boolean).join("\n");
 }
 
@@ -605,9 +659,37 @@ export function engagementComparable(events: JournalEvent[], loadedHash: string)
   return recorded === loadedHash ? { comparable: true, recorded } : { comparable: false, reason: "mismatch", recorded };
 }
 
+const RUN_SEQUENCE_WIDTH = 16;
+
+// The daemon mints before acquiring graph.lock, and each CLI invocation has fresh module state. Claim
+// a repository-state ticket with mkdir's atomic EEXIST boundary instead: a losing process advances and
+// retries, while the winning directory remains as the durable high-water evidence for later invocations.
+function claimRunSequence(repoRoot = process.cwd()): string {
+  const dir = join(tickmarkrDir(repoRoot), "run-id-sequence");
+  mkdirSync(dir, { recursive: true });
+  const allocated = readdirSync(dir).filter((name) => /^\d{16}$/.test(name));
+  let candidate = allocated.reduce((max, name) => {
+    const value = BigInt(name);
+    return value > max ? value : max;
+  }, 0n) + 1n;
+
+  while (true) {
+    const suffix = candidate.toString().padStart(RUN_SEQUENCE_WIDTH, "0");
+    if (suffix.length > RUN_SEQUENCE_WIDTH) throw new Error("run id sequence exhausted");
+    try {
+      mkdirSync(join(dir, suffix));
+      return suffix;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      candidate += 1n;
+    }
+  }
+}
+
 export function newRunId(now = new Date()): string {
   const p = (n: number, w = 2) => String(n).padStart(w, "0");
-  return `run-${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+  const instant = `${now.getUTCFullYear()}${p(now.getUTCMonth() + 1)}${p(now.getUTCDate())}-${p(now.getUTCHours())}${p(now.getUTCMinutes())}${p(now.getUTCSeconds())}`;
+  return `run-${instant}-${claimRunSequence()}`;
 }
 
 // Sol #4: one strict parser for every journal open/create path — generated run-… ids plus test
@@ -642,7 +724,7 @@ function readJsonl(path: string): unknown[] {
 }
 
 // Cross-run telemetry for Phase-12 profile derivation: the last K runs' rows, each
-// tagged with its runId (runIds are zero-padded run-YYYYMMDD-HHMMSS ⇒ plain .sort() is
+// tagged with its runId (runIds are zero-padded run-UTCYYYYMMDD-HHMMSS-sequence ⇒ plain .sort() is
 // chronological, same as latestRunId). Rows are facts, not classifications — Phase 12
 // owns the quality-denominator/reward policy. A safeParse failure drops that one row
 // (same posture as a torn line); a garbage row must never crash profile derivation.
@@ -652,7 +734,7 @@ export function readAllTelemetry(repoRoot: string, lastK: number, opts: { after?
   const dir = runsDir(repoRoot);
   if (!existsSync(dir)) return [];
   let runIds = readdirSync(dir).filter((d) => d.startsWith("run-")).sort();
-  // VIS-03 reset cursor: runIds are zero-padded run-YYYYMMDD-HHMMSS ⇒ string > is chronological
+  // VIS-03 reset cursor: UTC clock fields and a fixed-width sequence make string > chronological
   if (opts.after) runIds = runIds.filter((id) => id > opts.after!);
   runIds = runIds.slice(-lastK);
   const out: (TelemetryRow & { runId: string })[] = [];

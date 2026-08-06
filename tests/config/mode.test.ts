@@ -101,6 +101,13 @@ describe("v1.51 T1 mode resolution core", () => {
     expect(underMode.mode.lints.join("\n")).toMatch(/floors\.ui: cheap is below integrity minimum frontier/);
   });
 
+  test("the integrity lint emitted during mode resolution states map-pin supremacy, asserted on the string config resolution actually emits, so an unmade edit fails this task rather than a downstream one", () => {
+    const { mode } = load("routing:\n  floors:\n    migration: mid\n");
+    expect(mode.lints).toContain(
+      "floors.migration: mid is below integrity minimum frontier — integrity class plan/spec/migration/ui is advisory to explicit floors and map pins; map pins are supreme",
+    );
+  });
+
   test("partner-led resolves exploration off and staff-led keeps exploration on", () => {
     const p = load("routing:\n  mode: partner-led\n");
     expect(p.cfg.routing.explore?.mode).toBe("off");

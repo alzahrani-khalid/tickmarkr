@@ -5,8 +5,9 @@ import type { WorkerAdapter } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
-import { augmentFakeVerdictOutput, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
+import { extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
+import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
 import { filterLlmTranscript } from "./stall.js";
@@ -91,6 +92,37 @@ export interface Dossier {
 
 const ACTIONS = ["retry", "reroute", "decompose", "human"] as const;
 
+export interface ConsultParseResult {
+  verdict: ConsultVerdict | null;
+  cause?: VerdictUnparseableCause;
+}
+
+export function parseConsultVerdict(out: string, nonce: string): ConsultParseResult {
+  const v = extractVerdictJson<ConsultVerdict>(out, nonce);
+  if (!v) return { verdict: null, cause: classifyVerdictCause(out, nonce, "action") };
+  // A parsed object with an unknown action is a content rejection, not silence. It keeps the existing
+  // null result without manufacturing a classifier cause for a state the classifier never saw.
+  if (!ACTIONS.includes(v.action)) return { verdict: null };
+  // fail-closed exclusion: only a non-empty string survives. Malformed values (number/array/object/
+  // empty) are dropped — the verdict stays a normal channel-level reroute/retry/…, never a crash
+  // and never silently forced to human. Unknown adapter ids pass through; the daemon treats a
+  // zero-match expansion as channel-level reroute.
+  const raw = (v as { excludeAdapter?: unknown }).excludeAdapter;
+  const excludeAdapter = typeof raw === "string" && raw.length > 0 ? raw : undefined;
+  const reason = typeof (v as { reason?: unknown }).reason === "string" ? (v as { reason: string }).reason : undefined;
+  const guidance = typeof (v as { guidance?: unknown }).guidance === "string" ? (v as { guidance: string }).guidance : undefined;
+  const notes = String((v as { notes?: unknown }).notes ?? guidance ?? reason ?? "");
+  return {
+    verdict: {
+      action: v.action,
+      notes,
+      ...(reason ? { reason } : {}),
+      ...(guidance ? { guidance } : {}),
+      ...(excludeAdapter ? { excludeAdapter } : {}),
+    },
+  };
+}
+
 // v1.65 T2: transcript noise (spinner repaints, CR churn, pass-run spam) is squashed at build time —
 // the filtered form is what persists to the consults/ artifact AND what the model reads; fail-open.
 export function buildDossierPrompt(d: Dossier, nonce: string): string {
@@ -152,8 +184,9 @@ export async function consult(
   writeFileSync(promptFile, redactSecrets(buildDossierPrompt(d, nonce)));
 
   // One seat = the WHOLE invoke-and-parse unit, both visibility branches (OBS-69 class: a headless-only
-  // failover would leave the production pane path hard-failing on seat one). null = no parseable verdict.
-  const invokeSeat = async (seatAdapter: string, seatModel: string, seatIdx: number): Promise<ConsultVerdict | null> => {
+  // failover would leave the production pane path hard-failing on seat one). A null verdict retains
+  // the classifier's cause when extraction failed; parsed content rejections deliberately have none.
+  const invokeSeat = async (seatAdapter: string, seatModel: string, seatIdx: number): Promise<ConsultParseResult> => {
     const adapter = getAdapter(seatAdapter, adapters);
     let out: string;
     if (cfg.visibility.llm === "headless") {
@@ -184,26 +217,7 @@ export async function consult(
         if (!opts.keep) await driver.close(slot);
       }
     }
-    out = augmentFakeVerdictOutput(adapter, out, nonce);
-
-    const v = extractVerdictJson<ConsultVerdict>(out, nonce);
-    if (!v || !ACTIONS.includes(v.action)) return null;
-    // fail-closed exclusion: only a non-empty string survives. Malformed values (number/array/object/
-    // empty) are dropped — the verdict stays a normal channel-level reroute/retry/…, never a crash
-    // and never silently forced to human. Unknown adapter ids pass through; the daemon treats a
-    // zero-match expansion as channel-level reroute.
-    const raw = (v as { excludeAdapter?: unknown }).excludeAdapter;
-    const excludeAdapter = typeof raw === "string" && raw.length > 0 ? raw : undefined;
-    const reason = typeof (v as { reason?: unknown }).reason === "string" ? (v as { reason: string }).reason : undefined;
-    const guidance = typeof (v as { guidance?: unknown }).guidance === "string" ? (v as { guidance: string }).guidance : undefined;
-    const notes = String((v as { notes?: unknown }).notes ?? guidance ?? reason ?? "");
-    return {
-      action: v.action,
-      notes,
-      ...(reason ? { reason } : {}),
-      ...(guidance ? { guidance } : {}),
-      ...(excludeAdapter ? { excludeAdapter } : {}),
-    };
+    return parseConsultVerdict(out, nonce);
   };
 
   // v1.54 T1: ranked seat failover. Walk consult.prefer (adapter:model entries) to the first entry
@@ -219,8 +233,8 @@ export async function consult(
 
   for (const [i, seat] of seats.entries()) {
     try {
-      const v = await invokeSeat(seat.adapter, seat.model, i);
-      if (v) return v;
+      const parsed = await invokeSeat(seat.adapter, seat.model, i);
+      if (parsed.verdict) return parsed.verdict;
     } catch {
       // failed seat (unknown adapter, dead driver/pane, shell error) — fall to the next entry
     }

@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { DEFAULT_CONFIG, type TickmarkrConfig } from "../../src/config/config.js
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { buildDossierPrompt, consult, augmentRetryBrief, renderRetryGuidance, type Dossier } from "../../src/run/consult.js";
-import { extractPromptNonce, gateExitTrailer, gatePaneName } from "../../src/gates/llm.js";
+import { extractPromptNonce, extractVerdictJson, gateExitTrailer, gatePaneName } from "../../src/gates/llm.js";
 import { bannerShell } from "../../src/brand.js";
 
 const dossier: Dossier = {
@@ -199,16 +200,20 @@ describe("consult", () => {
 
   test("OBS-50: visible consult pane dispatches a short bash script that includes the brand banner", async () => {
     const captured: string[] = [];
+    let paneOutput = "";
     const stubSlot: Slot = { id: "stub", name: gatePaneName("consult", "T1"), cwd: "/tmp" };
     const stub: ExecutorDriver = {
       id: "stub",
       interactive: false,
       slot: async () => stubSlot,
-      run: async (_s, cmd) => { captured.push(cmd); },
+      run: async (_s, cmd) => {
+        captured.push(cmd);
+        paneOutput = execSync(cmd, { cwd: "/tmp", encoding: "utf8" });
+      },
       waitOutput: async () => true,
       waitAgentStatus: async () => false,
       status: async () => "unknown",
-      read: async () => '{"action":"retry","notes":"pane path"}',
+      read: async () => paneOutput,
       notify: async () => {},
       close: async () => {},
       worktree: async () => "/tmp/wt",
@@ -216,14 +221,16 @@ describe("consult", () => {
     const { cfg, fake, runDir } = setup({ action: "retry", notes: "pane path" });
     cfg.visibility.llm = "pane";
     const v = await consult(dossier, cfg, [fake], stub, "/tmp", runDir);
+    const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!);
+    const nonce = extractPromptNonce(readFileSync(promptFile, "utf8"))!;
+    expect(paneOutput).toContain(`"nonce": "${nonce}"`);
+    expect(extractVerdictJson(paneOutput, nonce)).toMatchObject({ action: "retry", notes: "pane path" });
     expect(v).toEqual({ action: "retry", notes: "pane path" });
     expect(captured).toHaveLength(1);
     expect(captured[0]).toMatch(/^bash ['"]/);
     expect(captured[0]!.length).toBeLessThan(120);
     const scriptPath = captured[0]!.slice(6, -1);
     const script = readFileSync(scriptPath, "utf8");
-    const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!);
-    const nonce = extractPromptNonce(readFileSync(promptFile, "utf8"))!;
     expect(script).toContain(bannerShell());
     expect(script.trimEnd().endsWith(gateExitTrailer(nonce))).toBe(true);
     expect(script).toContain("export BASH_SILENCE_DEPRECATION_WARNING=1");

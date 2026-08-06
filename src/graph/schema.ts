@@ -18,11 +18,14 @@ export type GateName = (typeof GATE_NAMES)[number];
 export type Oracle = (typeof ORACLES)[number];
 
 // Typed acceptance oracle: command carries the thing to run, test the test name, judge free text.
-// Anything else (a typed object naming an unknown oracle) fails validation loudly here.
+// text is OPTIONAL non-empty on command/test (declared prose beside the oracle; judge requires it).
+// Declaring it matters: z.object strips unknown keys, and loadGraph revalidates on every read —
+// an undeclared text would be silently discarded at the next load. Anything else (a typed object
+// naming an unknown oracle, or a text that is not a non-empty string) fails validation loudly here.
 export const AcceptanceItemSchema = z.union([
   z.string().min(1),
-  z.object({ oracle: z.literal("command"), command: z.string().min(1) }),
-  z.object({ oracle: z.literal("test"), test: z.string().min(1) }),
+  z.object({ oracle: z.literal("command"), command: z.string().min(1), text: z.string().min(1).optional() }),
+  z.object({ oracle: z.literal("test"), test: z.string().min(1), text: z.string().min(1).optional() }),
   z.object({ oracle: z.literal("judge"), text: z.string().min(1) }),
 ]);
 export type AcceptanceItem = z.infer<typeof AcceptanceItemSchema>;
@@ -31,8 +34,8 @@ export type AcceptanceItem = z.infer<typeof AcceptanceItemSchema>;
 // review gate) renders typed items as text through THIS helper. Rendering only; oracle execution is T2.
 export function renderAcceptanceItem(item: AcceptanceItem): string {
   if (typeof item === "string") return item;
-  if (item.oracle === "command") return `$ ${item.command}`;
-  if (item.oracle === "test") return `test: ${item.test}`;
+  if (item.oracle === "command") return item.text ?? `$ ${item.command}`;
+  if (item.oracle === "test") return item.text ?? `test: ${item.test}`;
   return item.text; // judge — bare text, byte-identical to a plain-string judge criterion
 }
 

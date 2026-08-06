@@ -38,16 +38,27 @@ const CAPTURE_SOURCE = join(
 );
 
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
-const ANSI_INK = /\x1b\[38;5;(\d+)m/g;
-const APPROVED_GREEN_RAMP = [84, 41, 35, 29] as const;
-const WARNING_INK = 214;
-const FAILURE_INK = 203;
-const APPROVED_INKS = new Set<number>([
+// Fresh frames paint the theme's hex vocabulary as truecolor (38;2;R;G;B);
+// a 38;5 index in a fresh frame is itself a violation and normalizes to an
+// `ansi256:` token no approved set contains. Values are restated here
+// independently of theme.ts on purpose: the oracle must not let the source
+// define its own expectation.
+const ANSI_INK = /\x1b\[38;(?:5;(\d+)|2;(\d+);(\d+);(\d+))m/g;
+const APPROVED_GREEN_RAMP = ["#87d787", "#5bbc5e", "#4f9a51", "#437944"] as const;
+const WARNING_INK = "#ffaf00";
+const FAILURE_INK = "#ff5f5f";
+const APPROVED_INKS = new Set<string>([
   ...APPROVED_GREEN_RAMP,
   WARNING_INK,
   FAILURE_INK,
 ]);
-const EXCLUDED_INKS = [78, 22] as const;
+const EXCLUDED_INKS = ["#5fd787", "#005f00"] as const;
+const inkByte = (hex: string): string => {
+  const match = /^#(..)(..)(..)$/.exec(hex);
+  if (!match) throw new Error(`not a hex ink: ${hex}`);
+  const [r, g, b] = [match[1]!, match[2]!, match[3]!].map((c) => Number.parseInt(c, 16));
+  return `\x1b[38;2;${r};${g};${b}m`;
+};
 
 const EXPECTED_LAYOUT_FIXTURES = [
   "run.ci.140x24.txt",
@@ -140,8 +151,14 @@ async function captureNamedSourceVerbatim(
   );
 }
 
-function inkIndexes(frame: string): number[] {
-  return [...frame.matchAll(ANSI_INK)].map((match) => Number(match[1]));
+function inkIndexes(frame: string): string[] {
+  return [...frame.matchAll(ANSI_INK)].map((match) =>
+    match[1] !== undefined
+      ? `ansi256:${match[1]}`
+      : `#${[match[2]!, match[3]!, match[4]!]
+        .map((channel) => Number(channel).toString(16).padStart(2, "0"))
+        .join("")}`
+  );
 }
 
 function assertOnlyApprovedInks(frame: string): void {
@@ -176,13 +193,13 @@ function assertWarningFailureInkContract(
 ): void {
   assertOnlyApprovedInks(warningFrame);
   assertOnlyApprovedInks(failureFrame);
-  expect(warningFrame).toContain(`\x1b[38;5;${WARNING_INK}m!\x1b[39m`);
+  expect(warningFrame).toContain(`${inkByte(WARNING_INK)}!\x1b[39m`);
   expect(warningFrame.replace(ANSI, "")).toMatch(/!\s+T\d+ interrupted/u);
   // The verification that never ran carries its own word, not a bare hue, and
   // is emphatically not drawn as a failure.
   expect(warningFrame.replace(ANSI, "")).toMatch(/-\s+tip-verify -/u);
   expect(inkIndexes(warningFrame)).not.toContain(FAILURE_INK);
-  expect(failureFrame).toContain(`\x1b[38;5;${FAILURE_INK}m✗\x1b[39m`);
+  expect(failureFrame).toContain(`${inkByte(FAILURE_INK)}✗\x1b[39m`);
   expect(failureFrame.replace(ANSI, "")).toMatch(/✗\s+fail · tip-verify-failed/u);
 }
 
@@ -338,8 +355,8 @@ describe("cockpit committed colour corpus", () => {
     const healthy = await frameById("healthy-colour");
     assertHealthyInkContract(healthy);
     const injected = healthy.replace(
-      "\x1b[38;5;84m",
-      `\x1b[38;5;${WARNING_INK}m`,
+      inkByte(APPROVED_GREEN_RAMP[0]),
+      inkByte(WARNING_INK),
     );
 
     expect(injected).not.toBe(healthy);
@@ -378,7 +395,7 @@ describe("cockpit committed colour corpus", () => {
       COLOUR_FRAME_CASES.map((colourCase) => colourCase.fixture).sort(),
     );
     const generated = await generatedFrames();
-    const allIndexes = new Set<number>();
+    const allIndexes = new Set<string>();
 
     for (const colourCase of COLOUR_FRAME_CASES.filter((item) => item.colour)) {
       const frame = generated.find((candidate) => candidate.id === colourCase.id)

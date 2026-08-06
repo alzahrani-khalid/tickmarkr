@@ -6,6 +6,7 @@ import { sh } from "../run/git.js";
 import { checkDiffCap, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
+import { classifyVerdictCause } from "./verdict-cause.js";
 
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
 const JUDGE_TIMEOUT_MS = 900_000;
@@ -13,8 +14,8 @@ const JUDGE_TIMEOUT_MS = 900_000;
 // v1.70: evidence is a structured {path, line} citation into a line the judged diff actually changed
 // (checked against real hunks below), so a real judge can no longer ground a ruling in an unchanged
 // context line or a coincidental repeat elsewhere in the diff text. A plain string is still accepted as
-// the legacy free-text quote — pre-v1.70 fixtures and the zero-token fake seam (llm.ts injectFakeEvidence,
-// out of this module's scope) still emit one — and keeps v1.64's substring check.
+// the legacy free-text quote — pre-v1.70 fixtures and the zero-token FakeAdapter.headlessCommand
+// producer still emit one — and keeps v1.64's substring check.
 export interface EvidenceCitation { path: string; line: number }
 export interface JudgeVerdict {
   pass: boolean;
@@ -355,12 +356,16 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const raw = await runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS);
   const extracted = extractVerdictJson<JudgeVerdict>(raw, nonce);
   if (!extracted) {
+    const cause = classifyVerdictCause(raw, nonce, "pass");
     // GATE-09: structured meta names the flaked judge channel (mirrors review.ts:99 meta precedent) so
     // run-gates can retry the judge on a failover channel without string-matching details (D-03).
     // The parsed-verdict paths below are untouched — the flake signal is exactly extractJson→null here.
+    const failure = cause === "malformed-verdict"
+      ? "judge output unparseable — failing closed"
+      : "judge dispatch failed — no structurally valid nonce-bound response; output unparseable — failing closed";
     return { gate: "acceptance", pass: false,
-      details: warn + detBlock + "judge output unparseable — failing closed",
-      meta: { unparseable: true, judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
+      details: warn + detBlock + failure,
+      meta: { unparseable: true, cause, judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
   }
   const { verdict: v, inconsistencies } = checkJudgeVerdict(extracted, expectedIds);
   // v1.70 / OBS-129: each citation must fall inside a changed hunk of `diff` (the exact string embedded in

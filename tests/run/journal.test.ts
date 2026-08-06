@@ -1,6 +1,8 @@
+import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
 import { buildDossierPrompt, type Dossier } from "../../src/run/consult.js";
@@ -14,9 +16,98 @@ const midA = (adapter: string, model: string) => ({ adapter, model, channel: "su
 
 const v15row = { taskId: "T1", shape: "implement", adapter: "fake", model: "fake-1", channel: "sub", attempts: 1, outcome: "done", durationMs: 12 };
 
+const withAllocatorRepo = <T>(repoRoot: string, allocate: () => T): T => {
+  const cwd = vi.spyOn(process, "cwd").mockReturnValue(repoRoot);
+  try {
+    return allocate();
+  } finally {
+    cwd.mockRestore();
+  }
+};
+
+const allocateInFreshProcess = (repoRoot: string, instant: string, timezone = "UTC"): string => {
+  const source = pathToFileURL(join(import.meta.dirname, "..", "..", "src", "run", "journal.ts")).href;
+  const script = `import { newRunId } from ${JSON.stringify(source)}; process.stdout.write(newRunId(new Date(${JSON.stringify(instant)})));`;
+  const result = spawnSync(join(import.meta.dirname, "..", "..", "node_modules", ".bin", "tsx"), ["--eval", script], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: { ...process.env, TZ: timezone },
+  });
+  expect(result.status, result.stderr).toBe(0);
+  return result.stdout.trim();
+};
+
 describe("journal", () => {
   test("newRunId shape", () => {
-    expect(newRunId()).toMatch(/^run-\d{8}-\d{6}$/);
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-"));
+    expect(withAllocatorRepo(repo, () => newRunId())).toMatch(/^run-\d{8}-\d{6}-\d{16}$/);
+  });
+
+  test("test: ids sort chronologically across the closed set of clock hazards — a westward-move fixture, an eastward-move fixture, a spring-forward fixture and a fall-back fixture — with no pair out of order and no pair equal", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-hazards-"));
+    const originalTimezone = process.env.TZ;
+    const fixtures = [
+      { hazard: "westward move", instant: "2026-01-15T10:00:00.000Z", timezone: "Asia/Tokyo" },
+      { hazard: "westward move", instant: "2026-01-15T10:00:01.000Z", timezone: "America/Los_Angeles" },
+      { hazard: "eastward move", instant: "2026-02-15T10:00:00.000Z", timezone: "America/Los_Angeles" },
+      { hazard: "eastward move", instant: "2026-02-15T10:00:01.000Z", timezone: "Asia/Tokyo" },
+      { hazard: "spring forward", instant: "2026-03-08T06:59:59.000Z", timezone: "America/New_York" },
+      { hazard: "spring forward", instant: "2026-03-08T07:00:00.000Z", timezone: "America/New_York" },
+      { hazard: "fall back", instant: "2026-11-01T05:30:00.000Z", timezone: "America/New_York" },
+      { hazard: "fall back", instant: "2026-11-01T06:30:00.000Z", timezone: "America/New_York" },
+    ];
+    try {
+      const ids = withAllocatorRepo(repo, () => fixtures.map(({ instant, timezone }) => {
+        process.env.TZ = timezone;
+        return newRunId(new Date(instant));
+      }));
+      expect(ids, fixtures.map(({ hazard }) => hazard).join(", ")).toEqual([...ids].sort());
+      expect(new Set(ids).size).toBe(ids.length);
+      for (let left = 0; left < ids.length; left += 1) {
+        for (let right = left + 1; right < ids.length; right += 1) expect(ids[left]! < ids[right]!).toBe(true);
+      }
+      for (const id of ids) Journal.create(repo, id).append("run-start");
+      expect(Journal.latestRunId(repo, { withJournal: true })).toBe(ids.at(-1));
+    } finally {
+      if (originalTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTimezone;
+    }
+  });
+
+  test("test: two runs minted inside the same second receive distinct ids and the later one sorts later", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-second-"));
+    const [first, second] = withAllocatorRepo(repo, () => [
+      newRunId(new Date("2026-08-05T00:00:00.001Z")),
+      newRunId(new Date("2026-08-05T00:00:00.999Z")),
+    ]);
+    expect(second).not.toBe(first);
+    expect(second > first).toBe(true);
+  });
+
+  test("test: two runs minted at the same instant by SEPARATE allocator invocations sharing no in-memory state, against one repo, receive distinct ids and the second sorts later, so the suffix cannot be a counter that resets when the process does", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-processes-"));
+    const instant = "2026-08-05T00:00:00.000Z";
+    const first = allocateInFreshProcess(repo, instant);
+    const second = allocateInFreshProcess(repo, instant);
+    expect(second).not.toBe(first);
+    expect(second > first).toBe(true);
+  });
+
+  test("test: an id minted at a known instant is identical whatever the host timezone is set to", () => {
+    const instant = "2026-08-05T00:00:00.000Z";
+    const utc = allocateInFreshProcess(mkdtempSync(join(tmpdir(), "tickmarkr-run-id-utc-")), instant, "UTC");
+    const losAngeles = allocateInFreshProcess(mkdtempSync(join(tmpdir(), "tickmarkr-run-id-la-")), instant, "America/Los_Angeles");
+    const tokyo = allocateInFreshProcess(mkdtempSync(join(tmpdir(), "tickmarkr-run-id-tokyo-")), instant, "Asia/Tokyo");
+    expect([losAngeles, tokyo]).toEqual([utc, utc]);
+  });
+
+  test("test: an existing pre-change id still parses and still sorts against new ids without special-casing", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-legacy-"));
+    const legacy = "run-20260804-235959";
+    const current = withAllocatorRepo(repo, () => newRunId(new Date("2026-08-05T00:00:00.000Z")));
+    expect(parseRunId(legacy)).toBe(legacy);
+    expect(parseRunId(current)).toBe(current);
+    expect([current, legacy].sort()).toEqual([legacy, current]);
   });
 
   describe("parseRunId (Sol #4: strict journal path component)", () => {

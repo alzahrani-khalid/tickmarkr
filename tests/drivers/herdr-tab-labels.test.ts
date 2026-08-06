@@ -77,33 +77,37 @@ let _wsPrev: string | undefined;
 beforeEach(() => { _wsPrev = process.env.HERDR_WORKSPACE_ID; process.env.HERDR_WORKSPACE_ID = "wTEST"; });
 afterEach(() => { if (_wsPrev !== undefined) process.env.HERDR_WORKSPACE_ID = _wsPrev; else delete process.env.HERDR_WORKSPACE_ID; });
 
-// Regression lock on VIS-04/22cfc57: live group-tab labels refresh on membership change (the newest
-// live worker's task id) and revert on leave (bare stage when empty), and ONLY the driver-created
-// group tab is ever relabeled — dedicated role tabs and per-slot tabs keep their create-time label.
+// Regression lock on VIS-04/22cfc57, carried forward to ONE TAB PER TASK: a task's tab is labelled
+// with its task id and refreshes on membership change (the newest live worker, plus its state glyph),
+// reverting to the bare task label when empty. ONLY driver-created task tabs are ever relabeled —
+// dedicated role tabs and per-slot tabs keep their create-time label.
+// The `{ group: "workers" }` these tests still pass is deliberate: the daemon passes it too, and a
+// task-bearing name must group by its TASK regardless (derived-wins precedence).
 describe("HerdrDriver live tab labels (regression)", () => {
-  test("join then leave emits tab rename commands with short labels for the tickmarkr-created tab only", async () => {
+  test("join then leave renames only tickmarkr-created task tabs, each carrying its own task id", async () => {
     const { bin, log, cwd } = makeStub({ incTabs: true });
     const d = new HerdrDriver(bin);
-    // the group tab (w1:t1) is the only tickmarkr-created tab the driver may relabel on membership change;
+    // T1's tab (w1:t1) and T2's tab (w1:t4) are the only tickmarkr-created tabs the driver may relabel;
     // a dedicated role tab (w1:t2) and a per-slot tab (w1:t3) are labeled once at create, never renamed.
     const s1 = await d.slot(cwd, "T1-worker-fake-a0-run", { group: "workers" });
     await d.slot(cwd, "T9-consult-1", { label: "OPERATOR T9" }); // dedicated role tab — foreign to rename
     await d.slot(cwd, "solo-agent");                              // per-slot tab — foreign to rename
-    const s2 = await d.slot(cwd, "T2-worker-fake-a0-run", { group: "workers" }); // join → membership change
-    await d.close(s2); // leave one of two → label reverts to the remaining worker
-    await d.close(s1); // leave last → label reverts to bare stage, then tab reaped
+    const s2 = await d.slot(cwd, "T2-worker-fake-a0-run", { group: "workers" }); // a SECOND task
+    expect(s2.tabId).not.toBe(s1.tabId); // a second task never lands in the first task's tab
+    await d.close(s2); // T2's last member leaves → bare task label, then its tab is reaped
+    await d.close(s1);
     const renames = readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith("tab rename "));
-    // exact join/leave sequence: short "STAGE · task" labels (the extracted task id, never the full
-    // agent name), refreshing to the newest live worker on join and reverting on leave.
+    // exact join/leave sequence: short task-id labels (the extracted task id, never the full agent name),
+    // one tab per task rather than one shared stage tab whose label chases whichever worker joined last.
     expect(renames).toEqual([
-      "tab rename w1:t1 WORKERS · T1", // s1 bootstrap (join) — first member seeds the label
-      "tab rename w1:t1 WORKERS · T2", // s2 join — label refreshes to the newest live worker's task id
-      "tab rename w1:t1 WORKERS · T1", // s2 leave — reverts to the remaining live worker
-      "tab rename w1:t1 WORKERS",      // s1 leave — empty generation reverts to the bare stage label
+      "tab rename w1:t1 T1", // s1 bootstrap — the tab is named for its task
+      "tab rename w1:t4 T2", // s2 bootstrap — its OWN tab, NOT a refresh of T1's label
+      "tab rename w1:t4 T2", // s2 leave — empty generation reverts to the bare task label
+      "tab rename w1:t1 T1", // s1 leave
     ]);
-    // tickmarkr-created tab ONLY: every rename targets the group tab; no foreign tab id is ever relabeled.
+    // tickmarkr-created tabs ONLY: every rename targets a task tab; no foreign tab id is ever relabeled.
     const renamedTabs = new Set(renames.map((l) => l.split(" ")[2]));
-    expect(renamedTabs).toEqual(new Set(["w1:t1"]));
+    expect(renamedTabs).toEqual(new Set(["w1:t1", "w1:t4"]));
     // the foreign tabs coexisted (created with their own labels) but the driver never renamed them.
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("tab create --label OPERATOR T9");
@@ -114,9 +118,10 @@ describe("HerdrDriver live tab labels (regression)", () => {
     const { bin, log, cwd } = makeStub({ incTabs: true, tabRenameFails: true });
     const d = new HerdrDriver(bin);
     // join: slot() must resolve despite every `tab rename` exiting non-zero (renameGroupTab retries
-    // once then notes — cosmetic-only, never blocks membership or pane establishment).
+    // once then notes — cosmetic-only, never blocks membership or pane establishment). Two attempts of
+    // ONE task, so both members share that task's tab and the join/leave refcount is exercised.
     const s1 = await d.slot(cwd, "T1-worker-fake-a0-run", { group: "workers" });
-    const s2 = await d.slot(cwd, "T2-worker-fake-a0-run", { group: "workers" });
+    const s2 = await d.slot(cwd, "T1-worker-fake-a1-run", { group: "workers" });
     expect(s1.tabId).toBe("w1:t1");
     expect(s2.tabId).toBe("w1:t1");
     // leave: close() must resolve and the lifecycle must COMPLETE — the last leave still reaps the
@@ -136,7 +141,7 @@ describe("HerdrDriver live tab labels (regression)", () => {
     await d.slot(cwd, "T1-worker-fake-a0-run", { group: "workers" });
     const calls = readFileSync(log, "utf8");
     const renames = calls.split("\n").filter((l) => l.startsWith("tab rename "));
-    expect(renames).toEqual(["tab rename w1:t1 WORKERS · T1", "tab rename w1:t1 WORKERS · T1"]);
+    expect(renames).toEqual(["tab rename w1:t1 T1", "tab rename w1:t1 T1"]);
     expect(calls.match(/^notification show /m)).toBeNull();
   });
 
@@ -148,31 +153,33 @@ describe("HerdrDriver live tab labels (regression)", () => {
     const notes = afterJoin.split("\n").filter((l) => l.startsWith("notification show "));
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain("w1:t1");
-    expect(notes[0]).toContain("WORKERS · T1");
+    expect(notes[0]).toMatch(/→ T1(?: |$)/); // the WHOLE label, so a regressed prefix ("WORKERS · T1") reddens
     await expect(d.close(s1)).resolves.toBeUndefined();
     expect(readFileSync(log, "utf8")).toMatch(/^tab close w1:t1$/m);
   });
 });
 
-// VIS-13 (operator-locked hygiene): the primary generation tab keeps WORKERS + one hot token
-// (exactly as today); overflow generations are "cleanup · <token>"; the token carries ONE state glyph
-// — ↻ for a retry attempt (attempt > 0 parsed from the member name), ✋ when the driver observes the
-// member blocked (queried live at every relabel), bare otherwise; ✋ wins over ↻ (at most one glyph);
-// no tab is ever labeled WORKERS-N. Rename failures stay swallowed and foreign tabs stay untouched.
+// VIS-13 (operator-locked hygiene), under ONE TAB PER TASK: the primary generation tab is the TASK's
+// tab and carries its task id plus one hot token; overflow generations are "cleanup · <token>"; the
+// token carries ONE state glyph — ↻ for a retry attempt (attempt > 0 parsed from the member name), ✋
+// when the driver observes the member blocked (queried live at every relabel), bare otherwise; ✋ wins
+// over ↻ (at most one glyph); no tab is ever given a numeric suffix. Because the tab label already IS
+// the task id, the token is not appended a second time — the glyph rides the existing label.
+// Rename failures stay swallowed and foreign tabs stay untouched.
 describe("HerdrDriver VIS-13 tab hygiene + state glyphs", () => {
-  test("primary tab keeps WORKERS · <token>; a retry attempt (attempt > 0) appends ↻, attempt 0 is bare", async () => {
+  test("a task tab carries its task id once; a retry attempt (attempt > 0) appends ↻, attempt 0 is bare", async () => {
     const { bin, log, cwd } = makeStub({ incTabs: true });
     const d = new HerdrDriver(bin);
     const s0 = await d.slot(cwd, "T0-worker-fake-a0-run", { group: "workers" }); // attempt 0 → bare
-    const s1 = await d.slot(cwd, "T1-worker-fake-a1-run", { group: "workers" }); // attempt 1 → ↻ (newest)
+    const s1 = await d.slot(cwd, "T0-worker-fake-a1-run", { group: "workers" }); // SAME task, attempt 1 → ↻ (newest)
     await d.close(s1); // leave → reverts to the remaining attempt-0 member (bare)
-    await d.close(s0); // empty → bare stage
+    await d.close(s0); // empty → bare task label
     const renames = readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith("tab rename "));
     expect(renames).toEqual([
-      "tab rename w1:t1 WORKERS · T0",  // bootstrap: attempt 0, observed running → bare token
-      "tab rename w1:t1 WORKERS · T1↻", // join: attempt 1 (retry) → ↻ appended
-      "tab rename w1:t1 WORKERS · T0",  // leave: remaining attempt-0 member → bare again
-      "tab rename w1:t1 WORKERS",       // empty → bare stage label
+      "tab rename w1:t1 T0",  // bootstrap: attempt 0, observed running → bare token, printed ONCE
+      "tab rename w1:t1 T0↻", // join: attempt 1 (retry) → ↻ appended, still not "T0 · T0↻"
+      "tab rename w1:t1 T0",  // leave: remaining attempt-0 member → bare again
+      "tab rename w1:t1 T0",  // empty → bare task label
     ]);
   });
 
@@ -180,15 +187,15 @@ describe("HerdrDriver VIS-13 tab hygiene + state glyphs", () => {
     const { bin, log, cwd } = makeStub({ incTabs: true, blockedNames: ["T1-worker-fake-a0-run"] });
     const d = new HerdrDriver(bin);
     const s1 = await d.slot(cwd, "T1-worker-fake-a0-run", { group: "workers" }); // blocked
-    const s2 = await d.slot(cwd, "T2-worker-fake-a0-run", { group: "workers" }); // not blocked → newest
+    const s2 = await d.slot(cwd, "T1-worker-fake-a1-run", { group: "workers" }); // retry, not blocked → newest
     await d.close(s2); // leave → relabel to s1: status re-queried → blocked → ✋
     await d.close(s1);
     const renames = readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith("tab rename "));
     expect(renames).toEqual([
-      "tab rename w1:t1 WORKERS · T1✋", // bootstrap: s1 observed blocked → ✋
-      "tab rename w1:t1 WORKERS · T2",   // join: s2 (not blocked, attempt 0) → bare token
-      "tab rename w1:t1 WORKERS · T1✋", // leave: status re-queried on s1 → ✋ (live, not cached)
-      "tab rename w1:t1 WORKERS",        // empty → bare stage label
+      "tab rename w1:t1 T1✋", // bootstrap: s1 observed blocked → ✋
+      "tab rename w1:t1 T1↻", // join: s2 (not blocked, attempt 1) → the retry glyph
+      "tab rename w1:t1 T1✋", // leave: status re-queried on s1 → ✋ (live, not cached)
+      "tab rename w1:t1 T1",   // empty → bare task label
     ]);
   });
 
@@ -199,30 +206,30 @@ describe("HerdrDriver VIS-13 tab hygiene + state glyphs", () => {
     await d.close(s);
     const renames = readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith("tab rename "));
     expect(renames).toEqual([
-      "tab rename w1:t1 WORKERS · T3✋", // bootstrap: blocked retry → one glyph (✋ wins)
-      "tab rename w1:t1 WORKERS",        // leave → bare stage
+      "tab rename w1:t1 T3✋", // bootstrap: blocked retry → one glyph (✋ wins)
+      "tab rename w1:t1 T3",   // leave → bare task label
     ]);
     expect(renames[0]).not.toMatch(/↻/); // ✋ won — the retry glyph never co-appears
   });
 
-  test("overflow generation tabs are cleanup · <token><glyph>, relabel on leave like the primary; never WORKERS-N", async () => {
+  test("overflow generation tabs are cleanup · <token><glyph>, relabel on leave like the primary; never <task>-N", async () => {
     const { bin, log, cwd } = makeStub({ incTabs: true });
-    const d = new HerdrDriver(bin, 1); // workersPerTab=1 → every 2nd member overflows to a cleanup tab
-    const s1 = await d.slot(cwd, "T1-worker-fake-a0-run", { group: "workers" }); // gen 1 (WORKERS)
-    const s2 = await d.slot(cwd, "T2-worker-fake-a2-run", { group: "workers" }); // gen 2 (cleanup, retry → ↻)
+    const d = new HerdrDriver(bin, 1); // workersPerTab=1 → a 2nd WORKER of the same task overflows
+    const s1 = await d.slot(cwd, "T1-worker-fake-a0-run", { group: "workers" }); // gen 1 (the task tab)
+    const s2 = await d.slot(cwd, "T1-worker-fake-a1-run", { group: "workers" }); // gen 2 (cleanup, retry → ↻)
     await d.close(s2); // overflow gen's last leaves → bare stage, then tab reaped
-    await d.close(s1); // primary gen's last leaves → bare stage, then tab reaped
+    await d.close(s1); // primary gen's last leaves → bare task label, then tab reaped
     const calls = readFileSync(log, "utf8");
-    // primary stays WORKERS; overflow is cleanup — never a WORKERS-N numeric suffix (VIS-13)
-    expect(calls).toContain("--label WORKERS");
+    // primary is the task's own tab; overflow is cleanup — never a numeric suffix (VIS-13)
+    expect(calls).toContain("--label T1");
     expect(calls).toContain("--label cleanup");
-    expect(calls).not.toMatch(/--label WORKERS-\d/);
+    expect(calls).not.toMatch(/--label T1-\d/);
     const renames = calls.split("\n").filter((l) => l.startsWith("tab rename "));
     expect(renames).toEqual([
-      "tab rename w1:t1 WORKERS · T1",   // gen 1 primary bootstrap (attempt 0 → bare token)
-      "tab rename w1:t2 cleanup · T2↻",  // gen 2 overflow bootstrap (attempt 2 → ↻)
+      "tab rename w1:t1 T1",             // gen 1 primary bootstrap (attempt 0 → bare token, printed once)
+      "tab rename w1:t2 cleanup · T1↻",  // gen 2 overflow bootstrap — label ≠ token, so the token IS appended
       "tab rename w1:t2 cleanup",        // gen 2 leave → bare stage (reverts like the primary)
-      "tab rename w1:t1 WORKERS",        // gen 1 leave → bare stage
+      "tab rename w1:t1 T1",             // gen 1 leave → bare task label
     ]);
     // foreign tabs stay untouched: only the two driver-created group tabs were ever renamed
     const renamedTabs = new Set(renames.map((l) => l.split(" ")[2]));

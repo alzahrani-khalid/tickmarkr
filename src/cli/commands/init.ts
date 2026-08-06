@@ -112,6 +112,43 @@ A run is green only when the run-end event exists in the journal AND tip verify 
 ### Verified handoffs
 
 When relaying missions between agents, never use bare send-text (\`herdr agent send\` / pane send-text) — it omits Enter. Use \`herdr pane run <pane> "<message>"\` or \`herdr notification show "<message>"\`. Confirm delivery by reading the target pane afterward; never report "relayed" without read-back.
+
+### Orient before you act — this block may be the ONLY guidance your host loaded
+
+These same bytes are written into EVERY repository guidance file this project has, because hosts disagree
+about which one they read: some load only \`AGENTS.md\`, some also load a repo-level guidance file, some load
+a user-level one instead. **Anything stated in only one file is invisible to some agent.** So do not assume
+you were handed the whole picture — list the repository root, open every guidance file present, and then:
+
+- **Read your host's PROJECT MEMORY before starting.** Hosts that keep one store it under a per-project
+  state directory keyed by the absolute working-directory path; find it and read its index plus every entry
+  whose name concerns METHOD or DISCIPLINE. It holds rules that cost real defects to learn. Entries may
+  predate a project rename, so **search by CONCEPT, not by the current product name.** A memory nobody opens
+  is worse than none: every seat assumes the lesson is recorded somewhere and no seat looks.
+- **The gates are the product.** Seven, defined in \`src/graph/schema.ts\`:
+  \`build test lint evidence scope acceptance review\`. **That is DECLARATION order, not execution order** —
+  the first five run as a battery that stops at its first red, then \`acceptance\` and \`review\` run
+  CONCURRENTLY (\`run-gates.ts:39\`, *"judge ‖ review"*). The first five are MANDATORY; only \`acceptance\` and
+  \`review\` may be omitted per task. Implementations are in \`src/gates/\` — \`baseline.ts\` (build/test/lint,
+  diffed against a recorded baseline so pre-existing failures are forgiven), \`evidence.ts\`, \`scope.ts\`,
+  \`acceptance.ts\` (its judge reads the DIFF and every criterion must cite a changed hunk), \`review.ts\`
+  (cross-vendor). \`run-gates.ts\` drives them. **A declared gate is not a passed gate, and a gate that
+  returned zero findings is not the same as a gate that ran.**
+- **Spec-authoring law ships in the spec template** that \`tickmarkr init\` writes: the hard bounds and which
+  direction each moves, what makes a criterion real, and why an absence or a source-text grep is never a
+  criterion. Read it before authoring or repairing acceptance items.
+- **Editing \`src/gates/\`, \`src/compile/\` or \`src/graph/\`?** Read \`docs/codebase/ARCHITECTURE.md\` first.
+- **EVERY fix gets a ship/no-ship decision, recorded, at the moment it is made.** Ask one question of each
+  one: *does a user hit this defect?* If yes, the fix belongs in \`src/**\` or \`skills/**\` — the only trees
+  the package carries (\`files: [dist, schema, skills, fixtures]\`). A script, overlay, config entry or
+  operator-side workaround that resolves the symptom **locally is not the fix; it is a decision to leave
+  every other user broken**, and it must say so in writing and name the condition that removes it.
+  **The default answer is SHIP.** A local remedy is the exception and carries the burden of proof.
+  Watch for the three shapes this hides in: a fix applied where you happened to be standing rather than
+  where the defect lives; an observation filed with a product fix named in its own text and queued
+  nowhere; and a local tool that quietly grows into a product feature nobody shipped. **A defect and its
+  fix must be recorded in the same place, or the queue silently becomes a list of things everyone assumed
+  someone else had shipped.**
 ${DOCS_END}
 `;
 
@@ -124,6 +161,56 @@ const hostTargets = (cwd: string) => {
     targets.push({ skillsDir: join(cwd, ".claude", "skills"), docPath: join(cwd, "CLAUDE.md") });
   return targets;
 };
+const packagedSkillDir = (skill: string) => fileURLToPath(new URL(`../../../skills/${skill}`, import.meta.url));
+
+// Every file the package ships for a skill, DERIVED from the tree rather than listed. OBS-373: a script
+// was added to the shipped overseer skill long after repos had installed it, and because the SKILL.md
+// that MANDATES that script was already on disk, every existence check reported "installed" while the
+// thing the skill tells you to run was absent. A literal list here would be the same closed-set-restated
+// defect one layer down, so this walks instead.
+function skillFileList(root: string, prefix = ""): string[] {
+  return readdirSync(root, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .flatMap((entry) => {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      return entry.isDirectory() ? skillFileList(join(root, entry.name), rel) : [rel];
+    });
+}
+
+interface SkillDrift { skill: string; dir: string; missing: string[]; modified: string[] }
+
+// Drift is only computed for skills that ARE installed. A skill never installed is not drift — `--agent`
+// installs it and says so, and nagging about it would bury the case this exists for.
+function skillDrift(cwd: string): SkillDrift[] {
+  const drifted: SkillDrift[] = [];
+  for (const { skillsDir } of hostTargets(cwd)) {
+    for (const skill of AGENT_SKILLS) {
+      const dir = join(skillsDir, skill);
+      if (!existsSync(join(dir, "SKILL.md"))) continue;
+      const src = packagedSkillDir(skill);
+      const missing: string[] = [];
+      const modified: string[] = [];
+      for (const rel of skillFileList(src)) {
+        // readFileSync resolves symlinks, so a symlinked mirror compares equal to a copied one.
+        if (!existsSync(join(dir, rel))) missing.push(rel);
+        else if (!readFileSync(join(dir, rel)).equals(readFileSync(join(src, rel)))) modified.push(rel);
+      }
+      if (missing.length || modified.length) drifted.push({ skill, dir, missing, modified });
+    }
+  }
+  return drifted;
+}
+
+// Name what drifted. "stale" alone sends the reader to diff three directories by hand, and the file that
+// matters is usually the one they never knew shipped.
+const describeDrift = (d: SkillDrift) => [
+  d.missing.length ? `missing ${d.missing.join(", ")}` : "",
+  d.modified.length ? `modified ${d.modified.join(", ")}` : "",
+].filter(Boolean).join(", ");
+
+// PRESENCE, deliberately — the wizard's question is "install these?", and a repo that already has them
+// should not be asked again just because a copy drifted. Staleness is a different question with a
+// different answer (`--agent --force`), and it is reported by name on every init path below.
 const skillsInstalled = (cwd: string) =>
   hostTargets(cwd).every((t) => AGENT_SKILLS.every((s) => existsSync(join(t.skillsDir, s, "SKILL.md"))));
 const wizardDriverDefault = (): TickmarkrConfig["driver"] => process.env.HERDR_ENV === "1" ? "herdr" : "auto";
@@ -138,12 +225,20 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
   };
 
   try {
+    const drift = skillDrift(cwd);
     for (const { skillsDir, docPath } of hostTargets(cwd)) {
       for (const skill of AGENT_SKILLS) {
         const dest = join(skillsDir, skill, "SKILL.md");
         const exists = existsSync(dest);
-        if (exists && !force && !(await confirm(`Overwrite ${dest}?`))) {
-          notes.push(`skipped existing ${dest}; pass --force to overwrite it`);
+        const stale = drift.find((d) => d.dir === join(skillsDir, skill));
+        // An install that already matches the package byte for byte needs no prompt and no write. Before
+        // this, every re-init asked to overwrite a current skill and the answer meant nothing either way.
+        if (exists && !stale) {
+          notes.push(`kept current ${dest}`);
+          continue;
+        }
+        if (exists && !force && !(await confirm(`Overwrite ${dest} (${describeDrift(stale!)})?`))) {
+          notes.push(`skipped existing ${dest} — ${describeDrift(stale!)}; pass --force to overwrite it`);
           continue;
         }
         // whole skill dir, not just SKILL.md — the overseer ships its pane-watcher script
@@ -152,9 +247,22 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
       }
 
       const current = existsSync(docPath) ? readFileSync(docPath, "utf8") : "";
-      if (current.includes(DOCS_BEGIN) || current.includes(`<!-- ${LEGACY_PREFIX}:agent-docs begin -->`)
-        || current.includes(DOCS_END) || current.includes(`<!-- ${LEGACY_PREFIX}:agent-docs end -->`)) {
-        notes.push(`kept existing tickmarkr agent docs in ${docPath}`);
+      // The block is CANONICAL guidance ("stated once here, restated nowhere"), so a repo that has
+      // run init once must still be able to receive corrections to it. Before v1.86 this branch only
+      // ever said "kept", with no lever — not even --force, which IS honoured for skills above. So
+      // the block was write-once and every later improvement reached new repos only. Under --force,
+      // replace the marked region in place and leave every human-authored line outside it untouched.
+      const marked = new RegExp(
+        `<!-- (?:tickmarkr|${LEGACY_PREFIX}):agent-docs begin -->[\\s\\S]*?`
+        + `<!-- (?:tickmarkr|${LEGACY_PREFIX}):agent-docs end -->`,
+      );
+      if (marked.test(current)) {
+        if (force) {
+          writeFileSync(docPath, current.replace(marked, AGENT_DOCS.trimEnd()));
+          notes.push(`refreshed tickmarkr agent docs in ${docPath}`);
+        } else {
+          notes.push(`kept existing tickmarkr agent docs in ${docPath}; pass --force to refresh them`);
+        }
       } else if (docs || await confirm(`Append tickmarkr agent docs to ${docPath}?`)) {
         appendFileSync(docPath, `${current ? current.endsWith("\n") ? "\n" : "\n\n" : ""}${AGENT_DOCS}`);
         notes.push(`appended tickmarkr agent docs to ${docPath}`);
@@ -256,6 +364,15 @@ export async function init(argv: string[], cwd = process.cwd()): Promise<string>
     } else {
       writeFileSync(specPath, specTemplate());
       notes.push(`wrote ${specPath}`);
+    }
+  }
+
+  // Say it on EVERY init, not only the --agent path. The upgrade that produced OBS-373 is silent by
+  // shape: the package moves, the installed copy does not, and nothing in the repo changes to hint at it.
+  // --agent reports drift per skill below, so this only speaks when that path will not.
+  if (!values.agent) {
+    for (const d of skillDrift(cwd)) {
+      notes.push(`stale ${join(d.dir, "SKILL.md")} — ${describeDrift(d)}; run tickmarkr init --agent --force to refresh it`);
     }
   }
 

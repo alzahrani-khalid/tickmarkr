@@ -95,9 +95,33 @@ export function paneDispatchScript(body: string[]): string {
   return ["export BASH_SILENCE_DEPRECATION_WARNING=1", ...body, TICKMARKR_EXIT_TRAILER].join("\n");
 }
 
-/** OBS-50: one short herdr pane-run line; bootstrap lives in the script file beside the prompt. */
+// OBS-342: ExecutorDriver.run predates command intent and accepts only a string. Keep that stable API,
+// but pass the builder's launch fact through a linear, same-dispatch handoff rather than encoding a
+// sentinel into the shell bytes. Herdr consumes the token synchronously at run() entry; a non-herdr
+// call or a command merely built for display lets its token expire at the next microtask. Tokens are
+// objects, not command strings, so identical bytes do not acquire identity by having appeared before.
+interface PaneLaunchIntent { readonly kind: "launch" }
+const pendingPaneLaunchIntents: PaneLaunchIntent[] = [];
+
+/** Record that the command being passed directly to ExecutorDriver.run is a daemon-built launch. */
+export function paneLaunchCommand(command: string): string {
+  const intent: PaneLaunchIntent = { kind: "launch" };
+  pendingPaneLaunchIntents.push(intent);
+  queueMicrotask(() => {
+    const index = pendingPaneLaunchIntents.indexOf(intent);
+    if (index >= 0) pendingPaneLaunchIntents.splice(index, 1);
+  });
+  return command;
+}
+
+/** Driver-side half of paneLaunchCommand's one-shot handoff. */
+export function consumePaneLaunchIntent(): boolean {
+  return pendingPaneLaunchIntents.shift()?.kind === "launch";
+}
+
+/** OBS-50/342: one short, intent-bearing pane-run line; bootstrap lives beside the prompt. */
 export function paneDispatchCommand(scriptPath: string): string {
-  return `bash ${shq(scriptPath)}`;
+  return paneLaunchCommand(`bash ${shq(scriptPath)}`);
 }
 
 // ── design system (v1.50) ── contract: docs/codebase/CLI-DESIGN.md ──────────

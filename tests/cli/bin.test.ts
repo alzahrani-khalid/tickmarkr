@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,14 @@ const BINS = ["tickmarkr", "tkr"];
 const retiredBanner = `${["dro", "vr"].join("")} —`;
 const CONSUMER_SKILLS = ["skills/tickmarkr-loop/SKILL.md", "skills/tickmarkr-auto/SKILL.md"];
 const OVERSEER_SKILLS = ["skills/tickmarkr-overseer/SKILL.md", "skills/tickmarkr-overseer/scripts/watch-panes.sh"];
+
+// DERIVED, never listed. The literal pair above could not catch a skill file added after it was written:
+// `watch-artifacts.sh` shipped while this guard stayed green, because a hardcoded closed set only ever
+// proves what its author already knew (OBS-373). Walk the tree the package actually carries.
+const shippedSkillFiles = (rel = "skills"): string[] =>
+  readdirSync(join(ROOT, rel), { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .flatMap((e) => e.isDirectory() ? shippedSkillFiles(`${rel}/${e.name}`) : [`${rel}/${e.name}`]);
 
 // npm 11 prints `[{ files }]`; npm 12 prints `{ "<pkg>": { files } }`. Both reduce to one path list.
 const packFiles = (json: string): string[] => {
@@ -38,6 +46,26 @@ describe("package bins", () => {
 
   test("the packaged distribution includes the overseer skill and its pane watcher script alongside the existing driving skills", () => {
     expect(packedPaths()).toEqual(expect.arrayContaining([...OVERSEER_SKILLS, ...CONSUMER_SKILLS]));
+  });
+
+  test("every file under skills/ reaches the tarball, over the set derived from the tree rather than a list written here", () => {
+    const shipped = shippedSkillFiles();
+    // The derivation must be non-vacuous, and it must cover the file the literal list above missed —
+    // otherwise this test is a walk that happens to agree with nothing.
+    expect(shipped.length).toBeGreaterThan([...OVERSEER_SKILLS, ...CONSUMER_SKILLS].length);
+    expect(shipped).toContain("skills/tickmarkr-overseer/scripts/watch-artifacts.sh");
+    expect(packedPaths()).toEqual(expect.arrayContaining(shipped));
+  });
+
+  test("the packing guard FAILS when a shipped skill file is absent from the tarball, proven against a pack list with exactly one such file removed", () => {
+    const shipped = shippedSkillFiles();
+    const dropped = "skills/tickmarkr-overseer/scripts/watch-artifacts.sh";
+    expect(shipped).toContain(dropped);
+    // The positive control for a guard whose failure mode is silence: the old literal-list assertion
+    // passes on this same input, which is exactly how the real gap went unnoticed.
+    const holed = packFiles(asArrayShape(shipped.filter((p) => p !== dropped)));
+    expect(holed).toEqual(expect.arrayContaining([...OVERSEER_SKILLS, ...CONSUMER_SKILLS]));
+    expect(() => expect(holed).toEqual(expect.arrayContaining(shipped))).toThrow();
   });
 
   test("the pack assertion parses an npm 11 array fixture and an npm 12 object fixture to the same file list", () => {

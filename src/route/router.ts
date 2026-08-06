@@ -9,8 +9,6 @@ export interface RouteDeviation { static: string; chosen: string; score: number;
 export interface Route { assignment: Assignment; ladder: LadderStep[]; lints: string[]; provenance: string; deviation?: RouteDeviation }
 
 export interface RoutingPreferContext {
-  autoPrefer?: { derivedAt: string; [shape: string]: string[] | string };
-  doctorFresh: boolean;
   overlayPreferShapes: ReadonlySet<string>;
 }
 
@@ -39,20 +37,9 @@ const exploreOff = (task: Task, cfg: TickmarkrConfig, exploreCtx?: ExploreContex
   return false;
 };
 
-const autoPreferList = (doc: RoutingPreferContext["autoPrefer"], shape: string): string[] | undefined => {
-  const v = doc?.[shape];
-  return Array.isArray(v) ? v : undefined;
-};
-
-const preferFromAuto = (shape: string, preferCtx?: RoutingPreferContext): boolean =>
-  !!preferCtx?.doctorFresh && !!preferCtx.autoPrefer && !preferCtx.overlayPreferShapes.has(shape) &&
-  autoPreferList(preferCtx.autoPrefer, shape) !== undefined;
-
-const effectivePrefer = (shape: string, entry: { prefer?: string[] } | undefined, preferCtx?: RoutingPreferContext): string[] | undefined => {
-  if (preferCtx?.overlayPreferShapes.has(shape)) return entry?.prefer;
-  if (preferCtx?.doctorFresh && preferCtx.autoPrefer) return autoPreferList(preferCtx.autoPrefer, shape) ?? entry?.prefer;
-  return entry?.prefer;
-};
+// v1.86 T3: autoPrefer is deleted — prefer is operator-declared only. Nothing is ever derived
+// from probe health, tier data, or a machine-built shape table.
+const effectivePrefer = (entry: { prefer?: string[] } | undefined): string[] | undefined => entry?.prefer;
 
 export class RoutingError extends Error {
   constructor(msg: string) {
@@ -161,7 +148,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   // ponytail: sla is plan-time advisory only — never thread into learnedScore (would reroute warm rivals).
   const scoreOpts = { availWeight: cfg.routing.learnedTuning?.availWeight };
   const entry = cfg.routing.map[task.shape];
-  const prefer = effectivePrefer(task.shape, entry, preferCtx);
+  const prefer = effectivePrefer(entry);
   const prefActive = !!(cfg.routing.allow || cfg.routing.deny);
   const disallowedPin = (via: string, model: string, kind: string) => {
     const d = disallowedBy({ adapter: via, model }, cfg.routing);
@@ -201,6 +188,14 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   };
 
   const taskFloor = task.routingHints?.floor;
+  const mapPinFloor = taskFloor && (!advisoryFloor || TIER_RANK[taskFloor] >= TIER_RANK[advisoryFloor])
+    ? { tier: taskFloor, source: "task" }
+    : advisoryFloor ? { tier: advisoryFloor, source: "config" } : undefined;
+  const lintMapPinFloor = (tier: Tier) => {
+    if (mapPinFloor && TIER_RANK[tier] < TIER_RANK[mapPinFloor.tier]) {
+      lints.push(`${task.id} (${task.shape}): map pin routes ${tier}, below ${mapPinFloor.source} floor ${mapPinFloor.tier} — map pins are supreme`);
+    }
+  };
   const source = task.routingHints?.source;
   const src = source ? `, ${source}` : ""; // never interpolate a possibly-undefined source
 
@@ -224,13 +219,14 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   if (entry?.pin) {
     disallowedPin(entry.pin.via, entry.pin.model, "map pin (config routing.map)");
     const c = resolvePin(entry.pin, channels);
-    lintFloor(c.tier, "map pin");
+    lintMapPinFloor(c.tier);
     maybeSlaLint(lints, task, profile, slaMinutes, c);
     return { assignment: toAssignment(c), ladder: ladderFor(task, entry), lints, provenance: `${degraded}pin ${entry.pin.via}:${entry.pin.model} (config routing.map)` };
   }
 
   const baseTier: Tier = floor ?? "cheap";
-  const minTier: Tier = taskFloor && TIER_RANK[taskFloor] > TIER_RANK[baseTier] ? taskFloor : baseTier; // task floor is a hard >= constraint in all paths (D-04)
+  // D-04: a task floor is hard only on floor/auto paths; the map-pin branch above stays supreme.
+  const minTier: Tier = taskFloor && TIER_RANK[taskFloor] > TIER_RANK[baseTier] ? taskFloor : baseTier;
   if (prefActive) for (const p of prefer ?? []) preflightPrefer(p);
   // key order is a contract: prefer > marginal cost > tier (cheapest sufficient) > learned score (v1.6 ROUTE-06)
   // > frontier spread (v1.58) > discovery order (same-tier fairness, D2). The learned score decides only the
@@ -328,13 +324,10 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     "tier cheap (default)";
   // name the key that actually broke the tie: prefer outranks the marginal-cost/tier keys, so if the
   // winner matched a prefer entry, prefer decided it — not "cheapest sufficient tier" (ROUTE-03, WR-01)
-  const preferVia = preferFromAuto(task.shape, preferCtx)
-    ? `via prefer (auto-modernized ${preferCtx!.autoPrefer!.derivedAt.slice(0, 10)})`
-    : "via prefer";
   // a spread-decided winner is never inside a prefer band (the spread skips those runs), so the
   // three arms below are mutually exclusive by construction
   const chosenBy = learnedChosen || (spreadDecided ? "via frontier spread"
-    : prefer && preferIndex(eligible[0], prefer) < prefer.length ? preferVia : "cheapest sufficient tier");
+    : prefer && preferIndex(eligible[0], prefer) < prefer.length ? "via prefer" : "cheapest sufficient tier");
   maybeSlaLint(lints, task, profile, slaMinutes, eligible[0]);
   return { assignment: toAssignment(eligible[0]), ladder: ladderFor(task, entry), lints, provenance: `${degraded}${bound}, marginal-cost auto (${chosenBy})`, ...(deviation ? { deviation } : {}) };
 }

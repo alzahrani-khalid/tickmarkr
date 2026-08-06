@@ -3,14 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { declareInputBox } from "../../src/adapters/types.js";
-import { DELIVERY_ATTEMPTS, DISPATCH_START_PREFIX, DeliveryReadinessError, HerdrDriver } from "../../src/drivers/herdr.js";
+import { DELIVERY_ATTEMPTS, DISPATCH_START_PREFIX, DeliveryReadinessError, HerdrDriver, taskGroupOf } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { classifyTaskFailure, Journal, type JournalEvent } from "../../src/run/journal.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { setupRepo, T } from "../helpers/tmprepo.js";
 
-interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once" | "p9-only"; contendDelivery?: boolean; wrappedCmd?: string; boxWrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; paneReadHangsAfter?: number; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo" | "looks-successful"; submitAfterReads?: number; dispatchAck?: "never" | "fresh-only"; dispatchEcho?: boolean; ackWatchBlind?: boolean; ackWriteFails?: boolean; paneCloseFails?: boolean }
+interface StubOpts { tab?: boolean; splitFails?: boolean; renameFails?: boolean; tabRenameFails?: boolean; incTabs?: boolean; incPanes?: boolean; takenNames?: string[]; paneCloseNoop?: boolean; startFailsOther?: boolean; tabFails?: boolean; tabGarbage?: boolean; tabNoId?: boolean; paneCols?: number; layoutFails?: boolean; survivingWatch?: { name: string; pane: string }; corrupt?: "always" | "once" | "p9-only"; contendDelivery?: boolean; wrappedCmd?: string; boxWrappedCmd?: string; paneIds?: Record<string, string>; dropBindingFor?: string; rebindAfterDelivery?: { name: string; pane: string }; paneReadFrames?: string[]; paneReadFails?: boolean; paneReadHangs?: boolean; paneReadHangsAfter?: number; changingPaneRead?: boolean; clearFailsThroughRead?: number; submission?: "first" | "second" | "never" | "slow" | "absent" | "scaled" | "banner-only" | "empty-box" | "bare-command" | "execution-echo" | "looks-successful"; submitAfterReads?: number; dispatchAck?: "never" | "fresh-only"; dispatchEcho?: boolean; ackWatchBlind?: boolean; ackWriteFails?: boolean; paneCloseFails?: boolean }
 
 function steppedTimeSource() {
   let nowMs = 0;
@@ -60,7 +60,11 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const tabCreate =
     opts.tabFails ? "exit 1" :
     opts.tabGarbage ? "printf 'not json'" :
-    opts.incTabs
+    // incPanes: distinct tab ids AND distinct root pane ids — what real herdr does, and what a
+    // one-tab-per-TASK scenario needs, since two concurrent tasks no longer share one tab's root pane.
+    opts.incPanes
+    ? `n=$(cat '${ctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${ctr}'; echo "{\\"result\\":{\\"tab\\":{\\"tab_id\\":\\"w1:t$n\\"},\\"root_pane\\":{\\"pane_id\\":\\"w1:pR$n\\"}}}"`
+    : opts.incTabs
     ? `n=$(cat '${ctr}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${ctr}'; echo "{\\"result\\":{\\"tab\\":{\\"tab_id\\":\\"w1:t$n\\"},\\"root_pane\\":{\\"pane_id\\":\\"w1:p9\\"}}}"`
     : opts.tabNoId ? `echo '{}'`
     : `echo '{"result":{"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:p9"}}}'`;
@@ -1072,7 +1076,11 @@ describe("HerdrDriver submission-verified delivery (OBS-140)", () => {
 
 describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
   test("test: two simultaneous dispatches allocate distinct panes and each delivery lands in the pane bound to its own task", async () => {
-    const { bin, log, cwd } = makeStub();
+    // ONE TAB PER TASK: the two concurrent dispatches now allocate in tabs of their own, so the stub
+    // hands out a distinct root pane per tab (incPanes) exactly as herdr does. The property under test
+    // is unchanged: the allocation lease is held from slot() through run(), so the second task cannot
+    // allocate while the first delivery is still in flight.
+    const { bin, log, cwd } = makeStub(0, { incPanes: true });
     const d = new HerdrDriver(bin);
     const dispatch = async (taskId: string, command: string) => {
       const slot = await d.slot(cwd, taskId, {
@@ -1093,11 +1101,13 @@ describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
 
     expect(first.id).not.toBe(second.id);
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const firstDelivery = lines.findIndex((l) => l.startsWith("pane run w1:p9 printf") && l.endsWith("echo task-one"));
-    const secondAllocation = lines.indexOf("pane split w1:p9 --direction right --no-focus --cwd " + cwd);
+    const firstDelivery = lines.findIndex((l) => l.startsWith("pane run w1:pR1 printf") && l.endsWith("echo task-one"));
+    // T2's allocation is now its own `tab create`, not a split into T1's tab — the lease still gates it.
+    const secondAllocation = lines.findIndex((l) => l.startsWith("tab create --label T2 "));
     expect(firstDelivery).toBeGreaterThanOrEqual(0);
     expect(secondAllocation).toBeGreaterThan(firstDelivery);
-    expect(lines.some((l) => l.startsWith("pane run w1:p7 printf") && l.endsWith("echo task-two"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("pane run w1:pR2 printf") && l.endsWith("echo task-two"))).toBe(true);
+    expect(first.tabId).not.toBe(second.tabId); // each task's panes live in that task's tab
   });
 
   test("test: a pane-identity binding that fails verification fails that dispatch rather than typing into another task's pane", async () => {
@@ -1201,20 +1211,21 @@ describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
     expect(s3.group).toBe("workers");
   });
 
-  test("renames only the driver-owned group tab with one live worker task id on join and leave", async () => {
+  test("renames only the driver-owned task tab, tracking the newest live worker on join and leave", async () => {
     const { bin, log, cwd } = makeStub(0, { incTabs: true });
     const d = new HerdrDriver(bin);
     const s1 = await d.slot(cwd, "T1-worker-fake-a0-run", { group: "workers" });
     await d.slot(cwd, "T9-consult-1", { label: "OPERATOR T9" });
-    const s2 = await d.slot(cwd, "T2-worker-fake-a0-run", { group: "workers" });
+    const s2 = await d.slot(cwd, "T1-worker-fake-a1-run", { group: "workers" }); // a retry of the SAME task
+    expect(s2.tabId).toBe(s1.tabId); // both attempts of one task share that task's tab
     await d.close(s2);
     await d.close(s1);
     const renames = readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith("tab rename "));
     expect(renames).toEqual([
-      "tab rename w1:t1 WORKERS · T1",
-      "tab rename w1:t1 WORKERS · T2",
-      "tab rename w1:t1 WORKERS · T1",
-      "tab rename w1:t1 WORKERS",
+      "tab rename w1:t1 T1",
+      "tab rename w1:t1 T1↻", // the retry attempt is the newest live worker
+      "tab rename w1:t1 T1",
+      "tab rename w1:t1 T1",
     ]);
     expect(renames).not.toContain("tab rename w1:t2 OPERATOR T9");
   });
@@ -1555,5 +1566,77 @@ describe("HerdrDriver narrator pane (T2)", () => {
     } finally {
       if (prev !== undefined) process.env.HERDR_WORKSPACE_ID = prev;
     }
+  });
+});
+
+// One tab per TASK: a task's worker and every gate pane it earns (judge, review, consult) share that
+// task's tab. Before this, exactly one of three slot() call sites passed a group, so judge/review/
+// consult each opened a tab of their own and a task's panes scattered across the workspace.
+//
+// The integration cases use the LEGACY production name shapes ("T31-worker-…", "judge · T31") rather
+// than canonical `tickmarkr:role:task:n:run` ones on purpose: a canonical name takes a dispatch lease
+// that slot() holds until run(), so opening several in one test would deadlock on the lease, not on
+// grouping. taskGroupOf is unit-tested over BOTH shapes below so the canonical path is not left unproven.
+describe("HerdrDriver per-task tabs", () => {
+  test("test: the task group is derived for every task role and withheld for every non-task name, proven member by member over both name shapes — canonical and legacy", () => {
+    for (const role of ["worker", "judge", "review", "consult"]) {
+      expect(taskGroupOf(`tickmarkr:${role}:T31:0:run-x`)).toBe("T31");
+    }
+    expect(taskGroupOf("T31-worker-fake-a0-abc")).toBe("T31");
+    expect(taskGroupOf("judge \u00b7 T31")).toBe("T31");
+    // withheld: the run watch board is not a task, and an unrecognised name must not become one —
+    // canonicalizeLegacyName returns role "other" with taskId set to the WHOLE string, so keying on
+    // taskId alone would give every one-off pane a group tab. That bug shipped in this change's first cut.
+    expect(taskGroupOf("tickmarkr:watch:run:0:run-x")).toBeUndefined();
+    expect(taskGroupOf("some-name")).toBeUndefined();
+    expect(taskGroupOf("")).toBeUndefined();
+  });
+
+  test("test: a worker and every gate pane for the same task share ONE tab, and a second task gets its own", async () => {
+    const { bin, log, cwd } = makeStub(0, { tab: true, incTabs: true });
+    const d = new HerdrDriver(bin, 3);
+    const w1 = await d.slot(cwd, "T31-worker-fake-a0-abc");
+    const j1 = await d.slot(cwd, "judge \u00b7 T31");
+    const r1 = await d.slot(cwd, "review \u00b7 T31");
+    const c1 = await d.slot(cwd, "consult \u00b7 T31");
+    const w2 = await d.slot(cwd, "T22-worker-fake-a0-abc");
+
+    expect(new Set([w1.tabId, j1.tabId, r1.tabId, c1.tabId]).size).toBe(1);
+    expect(w2.tabId).not.toBe(w1.tabId);
+    expect(readFileSync(log, "utf8").match(/tab create/g)).toHaveLength(2); // one per TASK, not per pane
+    expect(w1.group).toBe("T31");
+    expect(w2.group).toBe("T22");
+  });
+
+  test("test: gate panes do NOT consume workersPerTab, so a task never overflows its own tab", async () => {
+    const { bin, log, cwd } = makeStub(0, { tab: true, incTabs: true });
+    const d = new HerdrDriver(bin, 1); // cap of ONE — the gates must still join
+    const w = await d.slot(cwd, "T34-worker-fake-a0-abc");
+    const j = await d.slot(cwd, "judge \u00b7 T34");
+    const r = await d.slot(cwd, "review \u00b7 T34");
+
+    expect(j.tabId).toBe(w.tabId);
+    expect(r.tabId).toBe(w.tabId);
+    expect(readFileSync(log, "utf8")).not.toContain("--label cleanup");
+  });
+
+  test("test: a NON-gate member still consumes the cap, so explicit stage groups keep overflowing", async () => {
+    // Regression guard for this change's own first cut, which let every role that was merely "not a
+    // worker" bypass the cap — silently disabling overflow for any unrecognised name.
+    const { bin, log, cwd } = makeStub(0, { tab: true, incTabs: true });
+    const d = new HerdrDriver(bin, 2);
+    await d.slot(cwd, "n1", { group: "workers" });
+    await d.slot(cwd, "n2", { group: "workers" });
+    await d.slot(cwd, "n3", { group: "workers" });
+    expect(readFileSync(log, "utf8")).toContain("--label cleanup");
+  });
+
+  test("test: a non-task name keeps its dedicated tab and joins no group", async () => {
+    const { bin, cwd } = makeStub(0, { tab: true, incTabs: true });
+    const d = new HerdrDriver(bin, 3);
+    const watch = await d.slot(cwd, "tickmarkr:watch:run:0:run-x");
+    const bare = await d.slot(cwd, "some-name");
+    for (const s of [watch, bare]) expect(s.group).toBeUndefined();
+    expect(watch.tabId).not.toBe(bare.tabId);
   });
 });

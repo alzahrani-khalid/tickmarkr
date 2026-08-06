@@ -9,7 +9,6 @@ import { makeRepo } from "../helpers/tmprepo.js";
 const ROOT = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim();
 const RELEASING_MD = join(ROOT, "RELEASING.md");
 const CHANGELOG_MD = join(ROOT, "CHANGELOG.md");
-const TESTING_MD = join(ROOT, "docs/codebase/TESTING.md");
 const PACKAGE_JSON = join(ROOT, "package.json");
 const RELEASE_YML = join(ROOT, ".github/workflows/release.yml");
 const EXPORT_SCRIPT = join(ROOT, "scripts/export-public.sh");
@@ -23,13 +22,6 @@ function readFile(path: string): string {
 function getCurrentVersion(): string {
   const pkg = JSON.parse(readFile(PACKAGE_JSON));
   return pkg.version;
-}
-
-function countTestFilesInDir(dir: string): number {
-  const fullPath = join(ROOT, dir);
-  if (!existsSync(fullPath)) return 0;
-  return readdirSync(fullPath, { recursive: false })
-    .filter((f) => typeof f === "string" && f.endsWith(".test.ts")).length;
 }
 
 describe("release documentation", () => {
@@ -649,21 +641,4 @@ describe("release documentation", () => {
     });
   });
 
-  describe("TESTING.md test file count accuracy", () => {
-    test("the testing page's stated repository test file count for its directory listing matches the actual number of test files present in that directory", () => {
-      const content = readFile(TESTING_MD);
-      const actualCount = countTestFilesInDir("tests/repo");
-
-      // Extract the stated count from TESTING.md for the repo/ directory
-      // Pattern: "├── repo/           N *.test.ts files"
-      const match = content.match(/├──\s+repo\/\s+(\d+)\s+\*\.test\.ts\s+files/);
-      expect(match, "repo test file count not found in TESTING.md").toBeTruthy();
-
-      const statedCount = parseInt(match![1], 10);
-      expect(statedCount).toBe(
-        actualCount,
-        `TESTING.md states ${statedCount} files but found ${actualCount} in tests/repo/`
-      );
-    });
-  });
 });

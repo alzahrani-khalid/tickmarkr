@@ -12,6 +12,7 @@ import {
   captureCockpitOutput,
   cockpitFrameContractExpectation,
   findHeaderSignatures,
+  goldenFrameMatchesCommitted,
   inspectCockpitFrameContract,
   isRetiredGoldenFrame,
   regenerateGoldenFrames,
@@ -690,11 +691,9 @@ describe("cockpit frozen anchor tier after the retirement", () => {
       [...declaredRetired, ...machineSurfaces].sort(),
     );
 
-    // And each is what production emits today, byte for byte. The renderer is
-    // asked at the very size and mode the manifest names, carrying the shipped
-    // binary version the anchors were frozen against rather than a stand-in,
-    // and the committed bytes are compared whole — every row, the advertised
-    // keys line included.
+    // And each is what production emits today apart from the release-owned
+    // first-line version token. Every other row and the advertised keys line
+    // remain whole equality evidence.
     const drawn = await regenerateGoldenFrames();
     for (const fixture of machineSurfaces) {
       const rendered = drawn.find((frame) => frame.fixture === fixture);
@@ -702,10 +701,13 @@ describe("cockpit frozen anchor tier after the retirement", () => {
       const bytes = readFileSync(join(ANCHORS, fixture), "utf8");
 
       expect(bytes.length, fixture).toBeGreaterThan(0);
-      expect(bytes, fixture).toBe(rendered.output);
+      expect(goldenFrameMatchesCommitted(rendered, bytes), fixture).toBe(true);
       // A drift is named rather than absorbed: disturb the committed bytes and
       // the comparison that just passed fails.
-      expect(`${bytes}drifted\n`, fixture).not.toBe(rendered.output);
+      expect(
+        goldenFrameMatchesCommitted(rendered, `${bytes}drifted\n`),
+        fixture,
+      ).toBe(false);
     }
   }, 120_000);
 });

@@ -306,24 +306,24 @@ function statePresentation(state: ComponentState): {
     case "active":
       return {
         glyph: GLYPHS.toggleActive,
-        color: `ansi256(${COCKPIT_DATA_RAMP[1].xterm})`,
+        color: COCKPIT_DATA_RAMP[1].hex,
       };
     case "inactive":
       return { glyph: GLYPHS.toggleInactive, dimmed: true };
     case "pass":
       return {
         glyph: GLYPHS.pass,
-        color: `ansi256(${COCKPIT_DATA_RAMP[1].xterm})`,
+        color: COCKPIT_DATA_RAMP[1].hex,
       };
     case "fail":
       return {
         glyph: GLYPHS.fail,
-        color: `ansi256(${COCKPIT_INKS.failure.xterm})`,
+        color: COCKPIT_INKS.failure.hex,
       };
     case "warn":
       return {
         glyph: GLYPHS.attention,
-        color: `ansi256(${COCKPIT_INKS.warning.xterm})`,
+        color: COCKPIT_INKS.warning.hex,
       };
     case "neutral":
       return { glyph: GLYPHS.neutral, dimmed: true };
@@ -365,15 +365,13 @@ export function Panel({
       width={width}
       paddingX={1}
       borderStyle={focused ? "double" : "round"}
-      borderColor={`ansi256(${
-        focused ? COCKPIT_DATA_RAMP[0].xterm : COCKPIT_DATA_RAMP[3].xterm
-      })`}
+      borderColor={focused ? COCKPIT_DATA_RAMP[0].hex : COCKPIT_DATA_RAMP[3].hex}
       borderDimColor={!focused}
     >
       <Box>
         {focused ? (
           <>
-            <Text color={`ansi256(${COCKPIT_DATA_RAMP[0].xterm})`}>
+            <Text color={COCKPIT_DATA_RAMP[0].hex}>
               {GLYPHS.pointer}
             </Text>
             <BodyText emphasis="strong"> {title}</BodyText>
@@ -459,7 +457,7 @@ export function Sparkline({
         return (
           <Text
             key={`${index}:${sample}`}
-            color={`ansi256(${ink.xterm})`}
+            color={ink.hex}
           >
             {SPARKLINE_GLYPHS[level]}
           </Text>
@@ -513,7 +511,7 @@ export function ProgressMeter({
       aria-role="progressbar"
       aria-label={`${valueLabel}% complete`}
     >
-      <Text color={`ansi256(${COCKPIT_DATA_RAMP[0].xterm})`}>
+      <Text color={COCKPIT_DATA_RAMP[0].hex}>
         {"█".repeat(filled)}
       </Text>
       <Text dimColor>{"░".repeat(safeWidth - filled)}</Text>
@@ -668,7 +666,7 @@ export function JournalRowPanel({
           )}
           {index === hover
             ? (
-              <Text inverse color={`ansi256(${COCKPIT_DATA_RAMP[0].xterm})`}>
+              <Text inverse color={COCKPIT_DATA_RAMP[0].hex}>
                 {row.text}
               </Text>
             )

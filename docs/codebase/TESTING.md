@@ -34,9 +34,9 @@ tests/
 ├── compile/        7 *.test.ts files (gsd, prd, speckit, native, collateral, scope-seam, task-unit-contract)
 ├── config/         4 *.test.ts files
 ├── docs-*.test.ts  export-guarded docs-truth suites (codebase, concerns, stack, testing)
-├── drivers/        6 *.test.ts files (herdr, subprocess, env-seal, trailer-width, etc.)
+├── drivers/        7 *.test.ts files (herdr, subprocess, env-seal, trailer-width, etc.)
 ├── e2e/            real-cli.test.ts          (gated, spends tokens — see below)
-├── eval/           1 *.test.ts file          (fixture harness tests for the eval lab)
+├── eval/           5 *.test.ts files         (fixture harness tests for the eval lab)
 ├── fixtures/       codex-mcp-spinner/capture.ts (non-*.test.ts capture helper)
 ├── gates/          13 *.test.ts files
 ├── graph/          4 *.test.ts files

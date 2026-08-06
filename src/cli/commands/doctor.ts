@@ -1,15 +1,16 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readAutoPrefer, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
-import { declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
-import { DEFAULT_CONFIG, loadConfig, overlayPreferShapes } from "../../config/config.js";
+import { catalogModelAdvisory, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
+import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
+import { readCachedCatalog, refreshCatalogCommand, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
 const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value: string) =>
@@ -20,6 +21,8 @@ export type DoctorOpts = {
   banner?: boolean;
   kimiTurnProbe?: (cwd: string) => Promise<KimiDoctorTurnResult>;
   resolveClaudeAliasIdentity?: (cwd: string, alias: ClaudeAlias) => string | undefined;
+  catalog?: CatalogReadResult;
+  catalogNow?: () => Date;
 };
 
 export async function doctor(
@@ -28,7 +31,16 @@ export async function doctor(
   adapters: WorkerAdapter[] = allAdapters(),
   opts: DoctorOpts = {},
 ): Promise<string> {
+  if (_argv.length === 1 && _argv[0] === "--refresh-catalog") {
+    const refreshed = await refreshCatalogCommand({ repoRoot: cwd, now: opts.catalogNow });
+    return refreshed.updated
+      ? `tickmarkr doctor --refresh-catalog: model catalog refreshed${refreshed.warning ? `; ${refreshed.warning}` : ""}`
+      : `tickmarkr doctor --refresh-catalog: catalog refresh unavailable — ${refreshed.warning ?? "unknown failure"}; retained ${refreshed.catalog.source} catalog`;
+  }
   const cfg = loadConfig(cwd);
+  // T17: synchronous/cache-only by operator ruling. The only network-bearing catalog function is the
+  // separately invoked refreshCatalogCommand; ordinary doctor never calls it.
+  const catalog = opts.catalog ?? readCachedCatalog(cwd, { now: opts.catalogNow });
   // banner at START — the logo greets the operator before the ~60s probe wait, never trailing it (operator report 2026-07-17)
   if (opts.banner !== false && visual()) process.stdout.write(BANNER);
   // stderr, live: auth probes are real LLM calls (up to 30s per configured model) and the CLI
@@ -82,9 +94,13 @@ export async function doctor(
     const healthy = h.installed && (a.id !== kimi.id || h.authed);
     return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
   });
-  // v1.48 T1: advisory sweep for known agent CLIs with no adapter — never written to doctor.json health.
-  rows.push(...detectCandidateClis().map(({ binary, version }) =>
-    alignedStatusRow("warn", binary, `detected: ${version ?? "version unknown"} (no tickmarkr adapter — not routable)`),
+  if (catalog.warning) {
+    rows.push(attentionRow(`model catalog cache unreadable — ${catalog.warning}; using vendored fallback (advisory — routing unchanged)`));
+  }
+  // v1.48 T1 / v1.86 T12: advisory sweep for known agent CLIs with no drive contract. Presence is
+  // resolved through the worker's login shell; advisory targets are never executed or written to health.
+  rows.push(...detectCandidateClis({ cwd }).map(({ binary, path }) =>
+    alignedStatusRow("warn", binary, `detected at ${path} (no drive contract — not routable)`),
   ));
   const herdr = HerdrDriver.available();
   rows.push(alignedStatusRow(herdr ? "pass" : "fail", "herdr", herdr ? "driver available (HERDR_ENV=1)" : "not detected — subprocess driver will be used"));
@@ -147,10 +163,21 @@ export async function doctor(
       }
     }
   }
+  const resolvedCatalogModel = (adapter: string, model: string): string | undefined => {
+    if (adapter !== "claude-code" || !identityResolver || !(model in CLAUDE_ALIAS_IDENTITY_STAMPS)) return undefined;
+    try {
+      return identityResolver(cwd, model as ClaudeAlias);
+    } catch {
+      return undefined;
+    }
+  };
   // MODEL-05/06: print-only drift fragment; advisory, whole-line-commented additions, tickmarkr NEVER applies it.
   // TTY gets a one-line summary + the fragment as a file (the full dump drowned everything else,
   // v1.33.1 onboarding); machine/CI surface keeps the inline dump — layout is pinned by tests.
-  const frag = suggestOverlay(cfg, health, adapters, stateDirName(cwd));
+  const frag = suggestOverlay(cfg, health, adapters, stateDirName(cwd), {
+    catalog,
+    resolvedModel: resolvedCatalogModel,
+  });
   let drift = "";
   if (frag) {
     if (visual()) {
@@ -192,21 +219,19 @@ export async function doctor(
         : "";
       rows.push(`    ${m.padEnd(w)} ${classified[m].padEnd(8)}${windowCol} ${auth}  ${dim("denied=")}${denied}  ${dim("prefer=")}${pref}`);
     }
-    if (unclassified.length) rows.push(`    ${dim(`(${unclassified.length} more listed, unclassified)`)}`);
+    if (unclassified.length) {
+      // Keep the historical count as an index, but it is no longer the whole report: every model gets
+      // a cache-backed evidence or explicit uncovered line. Neither branch changes cfg, health, or route().
+      rows.push(`    ${dim(`(${unclassified.length} more listed, unclassified)`)}`);
+      for (const model of unclassified) {
+        const advisory = catalogModelAdvisory(cfg, catalog, a.id, model, resolvedCatalogModel(a.id, model));
+        rows.push(`    ${dim(`catalog · ${advisory.display}`)}`);
+      }
+    }
     return rows;
   });
-  const autoPrefer = readAutoPrefer(cwd);
-  const preferStatus = autoPrefer
-    ? Object.keys(cfg.routing.map).flatMap((shape) => {
-        const auto = autoPrefer[shape];
-        if (!Array.isArray(auto)) return [];
-        const seed = DEFAULT_CONFIG.routing.map[shape]?.prefer ?? [];
-        if (!auto.length && !seed.length) return []; // nothing derived, nothing seeded — an empty line is noise
-        return [`    ${dim(`prefer ${shape} (auto):`)} ${auto.join(" > ")} ${dim("— seed was")} [${seed.join(", ")}]`];
-      })
-    : [];
-  const modelSummary = modelStatus.length || preferStatus.length
-    ? `\n${legend("model status:")}\n${[...modelStatus, ...preferStatus].join("\n")}`
+  const modelSummary = modelStatus.length
+    ? `\n${legend("model status:")}\n${modelStatus.join("\n")}`
     : "";
   const header = visual()
     ? `${statusRow("pass", `${title("tickmarkr doctor")} ${legend("· capability matrix")}`)}\n${rule()}`

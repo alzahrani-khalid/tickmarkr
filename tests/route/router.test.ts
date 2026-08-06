@@ -266,57 +266,42 @@ describe("T2 unauthed-model exclusion (2026-07-13)", () => {
   });
 });
 
-describe("OBS-30 autoPrefer routing", () => {
-  const autoChannels: BillingChannel[] = [
+describe("v1.86 T3 autoPrefer deleted", () => {
+  const fleet: BillingChannel[] = [
     { adapter: "grok", vendor: "xai", model: "grok-4.5", channel: "sub", tier: "mid" },
     { adapter: "cursor-agent", vendor: "cursor", model: "composer-2.5", channel: "sub", tier: "mid" },
     { adapter: "codex", vendor: "openai", model: "gpt-5.6-terra", channel: "sub", tier: "mid" },
     { adapter: "opencode", vendor: "mixed", model: "zai-coding-plan/glm-5.2", channel: "sub", tier: "mid" },
   ];
 
-  const freshAuto: RoutingPreferContext = {
-    doctorFresh: true,
-    overlayPreferShapes: new Set(),
-    autoPrefer: {
-      derivedAt: "2026-07-15T12:00:00.000Z",
-      implement: ["grok", "cursor-agent"],
-      tests: ["pi", "opencode"],
-    },
-  };
+  test("routing resolves without autoPrefer across the closed set of preference states — an explicit-prefer fixture, an empty-prefer fixture, and a no-prefer-key fixture — each naming no channel the operator did not declare", () => {
+    // explicit-prefer fixture: the declared entry wins, and no channel outside it is named
+    const explicit = structuredClone(cfg);
+    explicit.routing.map.implement = { prefer: ["codex"] };
+    const r1 = route(mkTask({ shape: "implement" }), explicit, fleet);
+    expect(r1.assignment).toMatchObject({ adapter: "codex", model: "gpt-5.6-terra" });
+    expect(r1.provenance).toContain("via prefer");
+    expect(r1.provenance).not.toContain("auto-modernized");
 
-  test("autoPrefer for implement orders grok ahead of cursor-agent and omits codex", () => {
-    const r = route(mkTask({ shape: "implement" }), cfg, autoChannels, undefined, freshAuto);
-    expect(r.assignment).toMatchObject({ adapter: "grok", model: "grok-4.5" });
-  });
+    // empty-prefer fixture: no declared preference, so the static cost/tier order decides
+    const empty = structuredClone(cfg);
+    empty.routing.map.implement = { prefer: [] };
+    const r2 = route(mkTask({ shape: "implement" }), empty, fleet);
+    // four mid subs tie on marginal cost and tier → discovery order, never a fabricated preference
+    expect(r2.assignment).toMatchObject({ adapter: "grok", model: "grok-4.5" });
+    expect(r2.provenance).toContain("cheapest sufficient tier");
+    expect(r2.provenance).not.toContain("prefer");
 
-  test("operator overlay prefer suppresses autoPrefer for that shape only", () => {
-    const c2 = structuredClone(cfg);
-    c2.routing.map.implement = { tier: "mid", prefer: ["codex", "cursor-agent"] };
-    const preferCtx: RoutingPreferContext = {
-      ...freshAuto,
-      overlayPreferShapes: new Set(["implement"]),
-    };
-    const implement = route(mkTask({ shape: "implement" }), c2, autoChannels, undefined, preferCtx);
-    expect(implement.assignment).toMatchObject({ adapter: "codex", model: "gpt-5.6-terra" });
-    const tests = route(mkTask({ shape: "tests" }), c2, autoChannels, undefined, preferCtx);
-    expect(tests.assignment.adapter).toBe("opencode");
-  });
+    // no-prefer-key fixture: byte-identical to the empty-prefer fixture
+    const noKey = structuredClone(cfg);
+    noKey.routing.map.implement = {};
+    const r3 = route(mkTask({ shape: "implement" }), noKey, fleet);
+    expect(r3).toEqual(r2);
 
-  test("absent or stale doctor context is byte-identical to seed routing", () => {
-    const seed = route(mkTask({ shape: "implement" }), cfg, CH);
-    const absent = route(mkTask({ shape: "implement" }), cfg, CH, undefined, { doctorFresh: false, overlayPreferShapes: new Set() });
-    const stale = route(mkTask({ shape: "implement" }), cfg, CH, undefined, { doctorFresh: false, overlayPreferShapes: new Set(), autoPrefer: freshAuto.autoPrefer });
-    expect(absent).toEqual(seed);
-    expect(stale).toEqual(seed);
-  });
-
-  test("pins and deny behave exactly as before autoPrefer", () => {
-    const pinned = route(mkTask({ shape: "plan" }), cfg, CH, undefined, freshAuto);
-    expect(pinned.assignment).toMatchObject({ adapter: "claude-code", model: "fable" });
-    const c2 = structuredClone(cfg);
-    c2.routing.deny = { adapters: ["grok"] };
-    expect(() => route(mkTask({ shape: "implement", routingHints: { pin: { via: "grok", model: "grok-4.5" } } }), c2, autoChannels, undefined, freshAuto))
-      .toThrow(/disallowed/);
+    // a prefer context can now carry only overlay declarations — it moves no fixture's pick
+    const preferCtx: RoutingPreferContext = { overlayPreferShapes: new Set(["implement"]) };
+    expect(route(mkTask({ shape: "implement" }), explicit, fleet, undefined, preferCtx)).toEqual(r1);
+    expect(route(mkTask({ shape: "implement" }), noKey, fleet, undefined, preferCtx)).toEqual(r3);
   });
 });
 

@@ -4,7 +4,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { execSync, spawn } from "node:child_process";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { kimiSessionId } from "../../src/adapters/kimi.js";
 import { type BillingChannel, shq } from "../../src/adapters/types.js";
@@ -21,7 +21,7 @@ import { validateGraph } from "../../src/graph/schema.js";
 import { NO_TRAILER_SUMMARY } from "../../src/adapters/prompt.js";
 import { EARLY_LAUNCH_LIVENESS_MS, HARVESTED_RESULT_SUMMARY, harvestCpuFlatWindowMs, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE, workerTreeCpuMs } from "../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../src/run/git.js";
-import { activeRetryBan, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, pendingRepairFindings, recordedTaskFailureKind, reviewRoundsSinceApproval, structuredFindings, UNIDENTIFIED, type JournalEvent } from "../../src/run/journal.js";
+import { activeRetryBan, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, pendingRepairFindings, recordedTaskFailureKind, reviewRoundsSinceApproval, runHasEnded, structuredFindings, UNIDENTIFIED, type JournalEvent } from "../../src/run/journal.js";
 import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests } from "../../src/run/stall.js";
 import { COMMIT, authedModels, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -2737,8 +2737,10 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
         {
           consult: { action: "human", notes: "conflicting edits need a person" },
           tasks: {
-            T1: [{ shell: `sleep 0.3 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
-            T2: [{ shell: `sleep 0.3 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
+            // Keep both worktrees based on the same integration tip, but make the first merge
+            // deterministic under full-suite load so this remains a cleanup oracle, not a race.
+            T1: [{ shell: `sleep 0.2 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
+            T2: [{ shell: `sleep 1.2 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
           },
         },
       );
@@ -5634,4 +5636,222 @@ describe("R3 declined review — journal truth and merge (OBS-186)", () => {
     expect(redReview.data.skipped).toBeUndefined(); // a verdict, not a decline
     expect(redEvs.some((e) => e.event === "merge" && e.taskId === "T2")).toBe(false);
   }, 120_000);
+});
+
+describe("v1.86 T7 the fatal handler cannot eat the error it reports", () => {
+  // A node-style errno exception, as appendFileSync/readFileSync throw them.
+  const fault = (code: string, message: string) => Object.assign(new Error(message), { code });
+
+  // A repo whose run dies in the fatal window (after run-start, before the task loop):
+  // refs/heads/tickmarkr blocks refs/heads/tickmarkr/<runId>, so ensureIntegration throws.
+  const setupFatalRepo = async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    await shOk("git branch tickmarkr", repo);
+    return { repo, fake };
+  };
+  const originalErrorResembles = (runId: string) => new RegExp(`tickmarkr/${runId}|cannot lock ref|command failed`);
+
+  const rejectionOf = async (p: Promise<unknown>): Promise<unknown> =>
+    p.then(
+      () => { throw new Error("expected runDaemon to reject"); },
+      (e) => e,
+    );
+
+  // Faults injected at the journal's only durable sink, scoped to run-end appends so run-start and
+  // the rest of the setup path write normally. Returns the run-end attempt count.
+  const failRunEndAppends = (implant: (call: number, journal: Journal) => void) => {
+    const real = Journal.prototype.append;
+    let calls = 0;
+    vi.spyOn(Journal.prototype, "append").mockImplementation(function (this: Journal, event: string, taskId?: string, data?: Record<string, unknown>) {
+      if (event === "run-end") {
+        calls += 1;
+        implant(calls, this); // throws to simulate the sink fault; returns to write through
+      }
+      return real.call(this, event, taskId, data);
+    });
+    return { count: () => calls };
+  };
+
+  const captureConsoleErrors = () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    return { lines: () => spy.mock.calls.map((args) => args.map(String).join(" ")) };
+  };
+
+  const journalPathOf = (repo: string, runId: string) => join(Journal.open(repo, runId).dir, "journal.jsonl");
+
+  test("test: a failing journal append during fatal handling surfaces both the original error and the append failure, proven member by member over the closed set of append failures — a full-disk fixture, a permission fixture and a closed-handle fixture", async () => {
+    const members = [
+      { name: "full-disk", make: () => fault("ENOSPC", "ENOSPC: no space left on device, write") },
+      { name: "permission", make: () => fault("EACCES", "EACCES: permission denied, open") },
+      { name: "closed-handle", make: () => fault("EBADF", "EBADF: bad file descriptor, write") },
+    ];
+    for (const member of members) {
+      const runId = `run-t7-append-${member.name}`;
+      const { repo, fake } = await setupFatalRepo();
+      const sink = member.make();
+      failRunEndAppends(() => { throw sink; });
+      const consoleErrors = captureConsoleErrors();
+
+      const err = await rejectionOf(runDaemon(repo, { adapters: [fake], runId }));
+      const reported = consoleErrors.lines();
+      vi.restoreAllMocks();
+
+      // the original error reaches the caller — never replaced by the append failure
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBe(sink);
+      expect((err as Error).message).toMatch(originalErrorResembles(runId));
+      expect((err as Error).message).not.toContain(sink.message);
+      // and the append failure is surfaced ALONGSIDE the original error, not instead of it
+      expect(reported.some((line) => line.includes(sink.message) && line.includes((err as Error).message))).toBe(true);
+    }
+  });
+
+  test("test: a journal read that throws inside the fatal handler is reported alongside the original error rather than replacing it, and the original error still reaches the caller when the read and the append fail independently", async () => {
+    const runId = "run-t7-read-fatal";
+    const { repo, fake } = await setupFatalRepo();
+    const readFault = fault("EIO", "EIO: i/o error, read");
+    const realRead = Journal.prototype.read;
+    vi.spyOn(Journal.prototype, "read").mockImplementation(function (this: Journal) {
+      const events = realRead.call(this);
+      // only the fatal handler reads this journal after run-start in this scenario
+      if (events.some((e) => e.event === "run-start")) throw readFault;
+      return events;
+    });
+    const appendFault = fault("ENOSPC", "ENOSPC: no space left on device, write");
+    failRunEndAppends(() => { throw appendFault; });
+    const consoleErrors = captureConsoleErrors();
+
+    const err = await rejectionOf(runDaemon(repo, { adapters: [fake], runId }));
+    const reported = consoleErrors.lines();
+    vi.restoreAllMocks();
+
+    // the original error reaches the caller even with the read and the append failing independently
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(originalErrorResembles(runId));
+    expect((err as Error).message).not.toContain(readFault.message);
+    expect((err as Error).message).not.toContain(appendFault.message);
+    // the read failure is reported alongside the original error, never replacing it
+    expect(reported.some((line) => line.includes(readFault.message) && line.includes((err as Error).message))).toBe(true);
+    // …and the independently-failing append is reported too, naming the journal path
+    expect(reported.some((line) => line.includes(appendFault.message) && line.includes(journalPathOf(repo, runId)))).toBe(true);
+  });
+
+  test("test: an append that fails once and succeeds on retry writes run-end and the journal replays to a terminal state, proven over the closed set of one-shot faults — a transient-EIO fixture, a first-call-throws fixture, and a partial-write fixture that leaves a malformed trailing prefix on disk rather than throwing before any bytes land", async () => {
+    const members: Array<{ name: string; implant: (journal: Journal) => void }> = [
+      { name: "transient-eio", implant: () => { throw fault("EIO", "EIO: i/o error, write"); } },
+      { name: "first-call-throws", implant: () => { throw new Error("simulated first-call failure"); } },
+      {
+        name: "partial-write",
+        implant: (journal) => {
+          // bytes land BEFORE the failure: a torn, malformed fragment with no terminating newline
+          appendFileSync(join(journal.dir, "journal.jsonl"), '{"ts":"TORN-PARTIAL-WRITE');
+          throw fault("EIO", "EIO: i/o error, write");
+        },
+      },
+    ];
+    for (const member of members) {
+      const runId = `run-t7-retry-${member.name}`;
+      const { repo, fake } = await setupFatalRepo();
+      const attempts = failRunEndAppends((call, journal) => {
+        if (call === 1) member.implant(journal);
+      });
+
+      const err = await rejectionOf(runDaemon(repo, { adapters: [fake], runId }));
+      vi.restoreAllMocks();
+
+      expect((err as Error).message).toMatch(originalErrorResembles(runId));
+      expect(attempts.count()).toBe(2); // failed once, retried ONCE, succeeded
+      const events = Journal.open(repo, runId).read();
+      expect(runHasEnded(events)).toBe(true); // the journal replays to a terminal state
+      const runEnds = events.filter((e) => e.event === "run-end");
+      expect(runEnds).toHaveLength(1);
+      expect(runEnds[0]!.data.fatal).toBe(true);
+      expect(runEnds[0]!.data.phase).toBe("setup");
+      expect(runEnds[0]!.data.error).toBe((err as Error).message);
+      if (member.name === "partial-write") {
+        // the torn fragment stays on disk as a dropped malformed line — recovery never truncates
+        expect(readFileSync(journalPathOf(repo, runId), "utf8")).toContain("TORN-PARTIAL-WRITE");
+      }
+    }
+  });
+
+  test("test: a persistently unwritable sink reports a crash carrying no terminal record and naming the journal path, rather than reporting an ended run, proven member by member over the closed set of persistent sinks — a permission-denied fixture, a full-disk fixture and a read-only-filesystem fixture", async () => {
+    const members = [
+      { name: "permission-denied", make: () => fault("EACCES", "EACCES: permission denied, open") },
+      { name: "full-disk", make: () => fault("ENOSPC", "ENOSPC: no space left on device, write") },
+      { name: "read-only-filesystem", make: () => fault("EROFS", "EROFS: read-only file system, open") },
+    ];
+    for (const member of members) {
+      const runId = `run-t7-dead-${member.name}`;
+      const { repo, fake } = await setupFatalRepo();
+      const sink = member.make();
+      const attempts = failRunEndAppends(() => { throw sink; });
+      const consoleErrors = captureConsoleErrors();
+
+      const err = await rejectionOf(runDaemon(repo, { adapters: [fake], runId }));
+      const reported = consoleErrors.lines();
+      vi.restoreAllMocks();
+
+      // the original error reaches the caller
+      expect((err as Error).message).toMatch(originalErrorResembles(runId));
+      expect((err as Error).message).not.toContain(sink.message);
+      // retried ONCE, then fail-closed: no terminal record on evidence the harness could not write
+      expect(attempts.count()).toBe(2);
+      const events = Journal.open(repo, runId).read();
+      expect(events.some((e) => e.event === "run-end")).toBe(false);
+      expect(runHasEnded(events)).toBe(false);
+      // the crash report names the journal path and both failures — and never claims an ended run
+      const crash = reported.find((line) => line.includes(journalPathOf(repo, runId)));
+      expect(crash).toBeDefined();
+      expect(crash!).toContain(sink.message);
+      expect(crash!).toContain((err as Error).message);
+      expect(crash!).not.toMatch(/\brun ended\b/i);
+    }
+  });
+
+  test("test: the original error's message and stack survive verbatim on the thrown object and its cause, while the operator-visible line stays the one-line dispatcher form carrying no raw stack, proven by routing the rejection through the dispatcher", async () => {
+    const runId = "run-t7-verbatim";
+    const { repo, fake } = setupRepo(
+      [T("T1", { humanGate: true })],
+      { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "unreachable" } }] } },
+      "gates:\n  build: definitely-missing-tickmarkr-build\n  test: definitely-missing-tickmarkr-test\n",
+    );
+    const cause = new Error("root cause fixture");
+    const sentinel = new Error("sentinel original failure", { cause });
+    const real = Journal.prototype.append;
+    // missing baseline commands produce baseline-warning appends INSIDE the fatal window (after
+    // run-start, before the task loop); the first one throws our sentinel, becoming the run's fatal
+    vi.spyOn(Journal.prototype, "append").mockImplementation(function (this: Journal, event: string, taskId?: string, data?: Record<string, unknown>) {
+      if (event === "baseline-warning") throw sentinel;
+      return real.call(this, event, taskId, data);
+    });
+
+    const err = await rejectionOf(runDaemon(repo, { adapters: [fake], runId }));
+    vi.restoreAllMocks();
+
+    // the thrown object IS the original error: message, stack and cause survive verbatim
+    expect(err).toBe(sentinel);
+    expect((err as Error).message).toBe("sentinel original failure");
+    expect((err as Error).stack).toBe(sentinel.stack);
+    expect((err as Error).cause).toBe(cause);
+    expect(((err as Error).cause as Error).message).toBe("root cause fixture");
+    expect(((err as Error).cause as Error).stack).toBe(cause.stack);
+    // the fatal run-end still records the original error's message
+    const events = Journal.open(repo, runId).read();
+    expect(events.at(-1)?.event).toBe("run-end");
+    expect(events.at(-1)?.data.error).toBe("sentinel original failure");
+    // routed through the dispatcher, the operator-visible line is the one-line form — no raw stack
+    // Load the eager CLI entrypoint only at the assertion that needs its dispatcher. A static import
+    // makes daemon.test collection load every command (including Ink) while app.test is observing
+    // its first rendered frame, turning that production-path oracle into a suite-load race.
+    const { dispatch } = await import("../../src/cli/index.js");
+    const result = await dispatch("run", [], { run: () => Promise.reject(err) });
+    expect(result.code).toBe(1);
+    expect(result.out).toBe("tickmarkr run: sentinel original failure");
+    expect(result.out).not.toContain("\n");
+    expect(result.out).not.toContain("    at ");
+  });
 });

@@ -69,6 +69,7 @@ export class FakeAdapter implements WorkerAdapter {
     } catch {
       // unreadable promptFile: can't detect role; serve static values (legacy headless-call behavior)
     }
+    const nonce = this.nonceFor(promptFile);
     const serve = (key: "judge" | "review" | "consult") => {
       if (role !== undefined && key !== role) return join(dirname(this.scriptPath), `${key}.json`);
       let val = this.script[key];
@@ -77,7 +78,9 @@ export class FakeAdapter implements WorkerAdapter {
         val = (val as unknown[])[Math.min(this.judgeIdx, (val as unknown[]).length - 1)];
         this.judgeIdx++;
       }
-      if (key === "judge" && isJudge && val && typeof val === "object" && !Array.isArray(val)) {
+      // Legacy zero-token judge scripts may omit per-criterion evidence. Shape that scripted response
+      // here, where the fake authors it, instead of teaching the shared LLM transport about adapter ids.
+      if (key === "judge" && prompt.startsWith("TICKMARKR-JUDGE") && val && typeof val === "object" && !Array.isArray(val)) {
         const verdict = val as { pass?: unknown; criteria?: unknown };
         if (verdict.pass === true && Array.isArray(verdict.criteria) && verdict.criteria.length === 0) {
           const items = prompt.match(/## Acceptance criteria \(judge\)\n([\s\S]*?)\n\n## Diff/)?.[1]
@@ -85,8 +88,32 @@ export class FakeAdapter implements WorkerAdapter {
           val = { ...verdict, criteria: items.map((criterion) => ({ criterion, met: true, reason: "scripted fake pass" })) };
         }
       }
-      const p = join(dirname(this.scriptPath), `${key}.json`);
-      writeFileSync(p, JSON.stringify(val ?? {}, null, 1));
+      if (key === "judge" && isJudge && val && typeof val === "object" && !Array.isArray(val)) {
+        const verdict = val as Record<string, unknown>;
+        const line = /```diff\n([\s\S]*?)```/.exec(prompt)?.[1].split("\n").find((candidate) => candidate.trim());
+        if (line && Array.isArray(verdict.criteria)) {
+          val = {
+            ...verdict,
+            criteria: verdict.criteria.map((row) =>
+              row && typeof row === "object" && !("evidence" in row) ? { ...row, evidence: line } : row),
+          };
+        }
+      }
+      // The configured fake adapter binds the nonce read from this prompt before one object is emitted.
+      // Renamed subclasses model other CLIs and retain their own producer contract. Missing nonces stay
+      // missing so the classifier can distinguish silence from participation.
+      if (this.id === "fake" && nonce && val && typeof val === "object" && !Array.isArray(val)) {
+        const { nonce: _scriptedNonce, ...verdict } = val as Record<string, unknown>;
+        val = { nonce, ...verdict };
+      }
+      // Concurrent gates share one FakeAdapter script. A nonce-specific response path keeps one call's
+      // responder-authored bytes from being replaced by a sibling between command construction and cat.
+      const responseNonce = this.id === "fake" ? nonce : "";
+      const p = join(dirname(this.scriptPath), `${key}${responseNonce ? `-${responseNonce}` : ""}.json`);
+      const json = JSON.stringify(val ?? {}, null, 1)
+        .split("\n").map((line) => line.trim()).join(" ")
+        .replace(/^\{ /, "{").replace(/ \}$/, "}");
+      writeFileSync(p, json);
       return p;
     };
     return `bash -c 'grep -Eq "TICKMARKR-(JUDGE|SCOPE)" ${shq(promptFile)} && cat ${shq(serve("judge"))}; grep -q TICKMARKR-REVIEW ${shq(promptFile)} && cat ${shq(serve("review"))}; grep -q TICKMARKR-CONSULT ${shq(promptFile)} && cat ${shq(serve("consult"))}; true'`;
@@ -142,7 +169,10 @@ export class FakeAdapter implements WorkerAdapter {
   // parseWorkerResult(output, nonce) succeeds exactly as before the nonce existed
   private nonceFor(promptFile: string): string {
     try {
-      return /TICKMARKR_RESULT_([0-9a-z]+)/.exec(readFileSync(promptFile, "utf8"))?.[1] ?? "";
+      const prompt = readFileSync(promptFile, "utf8");
+      return /VERDICT_NONCE:\s*([0-9a-f]+)/i.exec(prompt)?.[1]
+        ?? /TICKMARKR_RESULT_([0-9a-z]+)/.exec(prompt)?.[1]
+        ?? "";
     } catch {
       return "";
     }

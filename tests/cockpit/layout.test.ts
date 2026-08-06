@@ -4,6 +4,7 @@ import { createElement } from "react";
 import { describe, expect, test } from "vitest";
 import {
   captureRendererOutput,
+  goldenFrameMatchesCommitted,
   regenerateGoldenFrames,
 } from "../../src/tui/cockpit/capture.js";
 import { loadDemoCaptures } from "../../src/tui/cockpit/demo.js";
@@ -710,7 +711,7 @@ describe("planFrame — the sidebar's planned composition", () => {
       const rendered = generated.find((frame) => frame.fixture === fixture);
       if (!rendered) throw new Error(`the manifest drew no ${fixture}`);
       const frozen = readFileSync(join(anchors, fixture), "utf8");
-      expect(frozen, fixture).toBe(rendered.output);
+      expect(goldenFrameMatchesCommitted(rendered, frozen), fixture).toBe(true);
     }
   });
 });

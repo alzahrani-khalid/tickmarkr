@@ -1,24 +1,15 @@
 import { describe, expect, test } from "vitest";
 import { PassThrough } from "node:stream";
+import { render } from "ink";
+import { createElement, Fragment, type ReactElement, type ReactNode } from "react";
 import { ui } from "../../src/cli/commands/ui.js";
+import * as componentsHub from "../../src/tui/ink/components.js";
 import {
-  runStudioInk,
-  type RunsCockpitData,
-  type StudioInkView,
-} from "../../src/tui/ink/studio-app.js";
-
-function makeStreams() {
-  const input = new PassThrough() as InputStream;
-  const out = new PassThrough();
-  const output: OutputStream = {
-    ...out,
-    isTTY: true,
-    columns: 80,
-    rows: 24,
-    write: (chunk: string) => out.write(chunk),
-  };
-  return { input, output };
-}
+  FleetListScreen,
+  FleetReviewScreen,
+  TextLines,
+  ToggleMark,
+} from "../../src/tui/ink/components.js";
 
 const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
@@ -58,32 +49,73 @@ function makeInkStreams() {
 }
 
 const stripAnsi = (value: string) => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
-const inkViews: StudioInkView[] = ["Fleet", "Routing", "Preview", "Profile", "Runs"].map((label) => ({
-  id: label.toLowerCase(),
-  label,
-  render: () => [`${label} substance`],
-}));
-const graph = {
-  version: 1,
-  spec: { source: "prd", paths: ["p"], hash: "h" },
-  tasks: [{ id: "T1", goal: "Live task.", status: "running" }],
-} as RunsCockpitData["graph"];
-const journalEvent = (event: string, data: Record<string, unknown>, ts: string) => ({ ts, event, taskId: "T1", data });
-const runs = (
-  events: RunsCockpitData["events"],
-  prompts?: RunsCockpitData["prompts"],
-): RunsCockpitData => ({ runId: "run-test", graph, events, prompts });
 
-async function openRuns(data: RunsCockpitData, clock = Date.now) {
-  const io = makeInkStreams();
-  const done = runStudioInk({ ...io, runsData: data, clock, debug: true });
-  await wait();
-  io.input.write("5");
-  await wait();
-  return { ...io, done, frame: () => stripAnsi(io.writes.at(-1) ?? "") };
+async function drawFrame(node: ReactElement): Promise<string> {
+  const { input, output, writes } = makeInkStreams();
+  const app = render(node, {
+    stdin: input,
+    stdout: output,
+    exitOnCtrlC: false,
+    patchConsole: false,
+    debug: true,
+  });
+  try {
+    await wait();
+    return stripAnsi(writes.join(""));
+  } finally {
+    app.unmount();
+  }
 }
 
 describe("studio app", () => {
+  test("test: the components hub still draws through the production render path with the studio-app, staging and save modules gone, proven member by member over the closed set of its exported surfaces — FleetListScreen, ToggleMark and TextLines — each drawn into a real frame", async () => {
+    // The dead modules are gone: reaching them rejects at module resolution.
+    await expect(import("../../src/tui/staging.js")).rejects.toThrow();
+    await expect(import("../../src/tui/save.js")).rejects.toThrow();
+    await expect(import("../../src/tui/ink/studio-app.js")).rejects.toThrow();
+
+    expect(Object.keys(componentsHub).sort()).toEqual([
+      "FleetListScreen",
+      "FleetReviewScreen",
+      "TextLines",
+      "ToggleMark",
+    ]);
+
+    // Member by member over the closed set, each drawn into a real frame.
+    const list = await drawFrame(createElement(FleetListScreen, {
+      title: "hub list title",
+      legend: "hub list legend",
+      cursor: 0,
+      rows: [{ id: "row-1", content: "hub list row" as ReactNode }],
+    }));
+    expect(list).toContain("hub list title");
+    expect(list).toContain("hub list legend");
+    expect(list).toContain("❯ hub list row");
+
+    const toggles = await drawFrame(createElement(Fragment, null,
+      createElement(ToggleMark, { active: true }),
+      createElement(ToggleMark, { active: false }),
+    ));
+    expect(toggles).toContain("✓");
+    expect(toggles).toContain("○");
+
+    const lines = await drawFrame(createElement(TextLines, {
+      lines: ["hub line one", "hub line two"],
+    }));
+    expect(lines).toContain("hub line one");
+    expect(lines).toContain("hub line two");
+
+    const review = await drawFrame(createElement(FleetReviewScreen, {
+      title: "hub review title",
+      legend: "hub review legend",
+      diff: "-before\n+after",
+    }));
+    expect(review).toContain("hub review title");
+    expect(review).toContain("hub review legend");
+    expect(review).toContain("-before");
+    expect(review).toContain("+after");
+  });
+
   test("test: the path that draws from a committed capture is asserted by running the command and observing what it draws, rather than by reading the command's own source text", async () => {
     const demo = makeInkStreams();
     demo.output.columns = 140;
@@ -91,22 +123,26 @@ describe("studio app", () => {
       input: demo.input,
       output: demo.output,
     });
-    await wait(100);
-
-    const frame = stripAnsi(demo.writes.join(""));
-    expect(frame).toContain("VIEWS");
-    expect(frame).toContain("RUN");
-    expect(frame).toContain("tip-verify");
-    // the demo's default committed capture, observed in the drawn header
-    expect(frame).toContain("run-20260724-231138");
-    expect(frame).not.toContain("Fleet view");
-
-    demo.input.write("q");
-    await expect(done).resolves.toBe("ui: closed");
+    try {
+      await expect.poll(
+        () => stripAnsi(demo.writes.join("")),
+        { interval: 10, timeout: 2_000 },
+      ).toContain("run-20260724-231138");
+      const frame = stripAnsi(demo.writes.join(""));
+      expect(frame).toContain("VIEWS");
+      expect(frame).toContain("RUN");
+      expect(frame).toContain("tip-verify");
+      // the demo's default committed capture, observed in the drawn header
+      expect(frame).toContain("run-20260724-231138");
+      expect(frame).not.toContain("Fleet view");
+    } finally {
+      demo.input.write("q");
+      await expect(done).resolves.toBe("ui: closed");
+    }
     expect(demo.raw()).toBe(false);
   });
 
-  test("launching the studio without a terminal prints the existing line-mode guidance and renders no interactive frame", async () => {
+  test("test: launching the studio without a terminal prints the existing line-mode guidance and renders no interactive frame", async () => {
     const input = new PassThrough() as InputStream;
     input.isTTY = false;
     const writes: string[] = [];
@@ -127,239 +163,5 @@ describe("studio app", () => {
       code: 1,
     });
     expect(writes).toEqual([]);
-  });
-
-  test("the shell switches between views with the same key bindings the previous shell used", async () => {
-    const { input, output, writes } = makeInkStreams();
-    const done = runStudioInk({ input, output, views: inkViews, debug: true });
-    await wait();
-    expect(stripAnsi(writes.at(-1) ?? "")).toContain("Fleet substance");
-
-    input.write("2");
-    await wait();
-    expect(stripAnsi(writes.at(-1) ?? "")).toContain("Routing substance");
-
-    input.write("\t");
-    await wait();
-    expect(stripAnsi(writes.at(-1) ?? "")).toContain("Preview substance");
-
-    input.write("1");
-    await wait();
-    expect(stripAnsi(writes.at(-1) ?? "")).toContain("Fleet substance");
-
-    input.write("q");
-    await done;
-  });
-
-  test("test: the cockpit renders a running task's current phase with an elapsed indication that advances between frames and never an idle presentation for a running task", async () => {
-    let now = Date.parse("2026-07-23T12:00:10.000Z");
-    const runsData = runs([journalEvent(
-      "phase-start", { phase: "gate:test" }, "2026-07-23T12:00:05.000Z",
-    )]);
-    const studio = await openRuns(runsData, () => now);
-    const first = studio.frame();
-    expect(first).toContain("gate:test · 5s");
-    expect(first).not.toMatch(/\bidle\b/);
-
-    now += 2_000;
-    await wait(300);
-    const second = studio.frame();
-    expect(second).toContain("gate:test · 7s");
-    expect(second).not.toBe(first);
-    studio.input.write("q");
-    await studio.done;
-  });
-
-  test("test: the consult dossier stays reachable from the cockpit and renders its substance through the component runtime", async () => {
-    const runsData = runs([journalEvent(
-      "consult-verdict", { action: "retry", reason: "rerun lint" }, "2026-07-23T12:00:02.000Z",
-    )], { T1: ["## Persisted consult\nInspect the failed gate."] });
-    const studio = await openRuns(runsData);
-    expect(studio.frame()).toContain("1 consult verdict");
-    studio.input.write("d");
-    await wait();
-    expect(studio.frame()).toMatch(/Consult dossier — T1[\s\S]*retry — rerun lint[\s\S]*Inspect the failed gate\./);
-    studio.input.write("q");
-    await studio.done;
-  });
-
-  test("test: quitting the studio from any view leaves the terminal usable with no orphaned input listeners", async () => {
-    for (let active = 0; active < inkViews.length; active++) {
-      const { input, output, raw } = makeInkStreams();
-      const done = runStudioInk({ input, output, views: inkViews, debug: true });
-      await wait();
-      if (active > 0) {
-        input.write(String(active + 1));
-        await wait();
-      }
-      input.write("q");
-      await done;
-      expect(raw()).toBe(false);
-      expect(input.listenerCount("data")).toBe(0);
-      expect(input.listenerCount("keypress")).toBe(0);
-    }
-  });
-
-  describe.skip("retired hand-rolled Studio assertions", () => {
-  test("the tab bar names five views including Runs and a number key switches the active view to it", async () => {
-    const { input, output } = makeStreams();
-    const app = new StudioApp({ input, output });
-    app.start();
-    await wait();
-
-    const lines = app.lines;
-    expect(lines[0]).toContain("Fleet");
-    expect(lines[0]).toContain("Routing");
-    expect(lines[0]).toContain("Preview");
-    expect(lines[0]).toContain("Profile");
-    expect(lines[0]).toContain("Runs");
-
-    input.write("5");
-    await wait();
-    expect(app.lines.some((l) => l.includes("no run loaded"))).toBe(true);
-
-    app.stop();
-  });
-
-  test("the studio opens on the fleet view with a tab bar naming all five views", async () => {
-    const { input, output } = makeStreams();
-    const app = new StudioApp({ input, output });
-    app.start();
-    await wait();
-
-    const lines = app.lines;
-    expect(lines[0]).toContain("Fleet");
-    expect(lines[0]).toContain("Routing");
-    expect(lines[0]).toContain("Preview");
-    expect(lines[0]).toContain("Profile");
-    expect(lines[0]).toContain("Runs");
-    expect(lines.some((l) => l.includes("Fleet view"))).toBe(true);
-
-    app.stop();
-  });
-
-  test("number keys and tab cycling switch the active view", async () => {
-    const { input, output } = makeStreams();
-    const app = new StudioApp({ input, output });
-    app.start();
-    await wait();
-
-    input.write("2");
-    await wait();
-    expect(app.lines.some((l) => l.includes("Routing view"))).toBe(true);
-
-    input.write("\t");
-    await wait();
-    expect(app.lines.some((l) => l.includes("Preview view"))).toBe(true);
-
-    input.write("4");
-    await wait();
-    expect(app.lines.some((l) => l.includes("Profile view"))).toBe(true);
-
-    input.write("1");
-    await wait();
-    expect(app.lines.some((l) => l.includes("Fleet view"))).toBe(true);
-
-    app.stop();
-  });
-
-  test("the help overlay lists the bindings and closes on escape", async () => {
-    const { input, output } = makeStreams();
-    const app = new StudioApp({ input, output });
-    app.start();
-    await wait();
-
-    input.write("?");
-    await wait();
-    const helpLines = app.lines;
-    expect(helpLines.some((l) => l.includes("Key bindings"))).toBe(true);
-    expect(helpLines.some((l) => l.includes("1-5"))).toBe(true);
-    expect(helpLines.some((l) => l.includes("tab"))).toBe(true);
-    expect(helpLines.some((l) => l.includes("esc"))).toBe(true);
-
-    input.write("\x1b");
-    await wait();
-    expect(app.lines.some((l) => l.includes("Fleet view"))).toBe(true);
-    expect(app.lines.some((l) => l.includes("Key bindings"))).toBe(false);
-
-    app.stop();
-  });
-
-  test("a mutation key shows the read-only notice instead of changing anything", async () => {
-    const { input, output } = makeStreams();
-    const app = new StudioApp({ input, output });
-    app.start();
-    await wait();
-
-    input.write("r");
-    await wait();
-    expect(app.lines.some((l) => l.includes("read-only"))).toBe(true);
-    expect(app.lines.some((l) => l.includes("Fleet view"))).toBe(true);
-    expect(app.lines.some((l) => l.includes("Routing view"))).toBe(false);
-
-    app.stop();
-  });
-
-  test("each view is a separate module the shell registers so later view work never edits the shell", () => {
-    const { input, output } = makeStreams();
-    const app = new StudioApp({ input, output });
-    app.start();
-    expect(app.viewLabels).toEqual(["Fleet", "Routing", "Preview", "Profile", "Runs"]);
-    app.stop();
-  });
-
-  test("the status bar shows the staged-change count and clears when the buffer is reverted", async () => {
-    const { input, output } = makeStreams();
-    const app = new StudioApp({ input, output });
-    app.start();
-    await wait();
-
-    expect(app.lines.some((l) => l.includes("no staged changes"))).toBe(true);
-
-    app.stageEdit((buffer) => {
-      buffer.denyAdapters.push("grok");
-      buffer.denyAdapters.sort();
-    });
-    await wait();
-    expect(app.lines.some((l) => l.includes("1 staged change"))).toBe(true);
-    expect(app.lines.some((l) => l.includes("no staged changes"))).toBe(false);
-
-    input.write("u");
-    await wait();
-    expect(app.lines.some((l) => l.includes("no staged changes"))).toBe(true);
-    expect(app.lines.some((l) => l.includes("1 staged change"))).toBe(false);
-
-    app.stop();
-  });
-
-  test("quitting with staged changes asks for confirmation and a clean quit exits immediately", async () => {
-    const clean = makeStreams();
-    const cleanApp = new StudioApp({ input: clean.input, output: clean.output });
-    cleanApp.start();
-    await wait();
-    clean.input.write("q");
-    await wait();
-    await expect(cleanApp.exited).resolves.toBeUndefined();
-
-    const dirty = makeStreams();
-    const dirtyApp = new StudioApp({ input: dirty.input, output: dirty.output });
-    dirtyApp.start();
-    await wait();
-
-    dirtyApp.stageEdit((buffer) => {
-      buffer.denyAdapters.push("grok");
-      buffer.denyAdapters.sort();
-    });
-    await wait();
-    expect(dirtyApp.lines.some((l) => l.includes("1 staged change"))).toBe(true);
-
-    dirty.input.write("q");
-    await wait();
-    expect(dirtyApp.lines.some((l) => l.includes("Quit with 1 staged change"))).toBe(true);
-
-    dirty.input.write("y");
-    await wait();
-    await expect(dirtyApp.exited).resolves.toBeUndefined();
-  });
   });
 });

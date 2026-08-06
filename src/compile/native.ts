@@ -1,7 +1,58 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import picomatch from "picomatch";
 import { type AcceptanceItem, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, SHAPES, TIERS, type RunGraph, validateGraph } from "../graph/schema.js";
 import { CompileError, inferShape, sha256 } from "./common.js";
+
+// OBS-170/OBS-184: `context:` is a promise to the worker, and nothing ever checked it could be kept.
+// Workers run in `git worktree add <baseRef>` (run/git.ts:169-176), which materialises the base
+// TREE and copies nothing in — so the oracle is that tree, and NEVER two things that look like it:
+//   · existsSync reads the AUTHOR's checkout. Measured on v1.85: 10 of 16 unreachable entries are
+//     plainly present there (.overseer/ is 21 tracked files out of 480 on disk).
+//   · `git ls-files` reads the INDEX. `git add -f` writes the index, so a staged-uncommitted file
+//     reports present while still being invisible to every worker — the lint would then certify
+//     exactly the failure it exists to catch (RULING 2026-08-03 rider; the absent-vs-empty shape
+//     again, cf. fileBytes). Hence the opt-in is "add AND commit", and the resolver reads HEAD.
+// `ls-tree -r HEAD` enumerates that tree once; per-path `cat-file -e HEAD:<path>` is the same oracle
+// one path at a time, and one spawn beats N.
+function trackedAtHead(dir: string): { root: string; tracked: Set<string> } | undefined {
+  const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const top = git("rev-parse", "--show-toplevel");
+  // --full-tree is load-bearing: without it `ls-tree` scopes to the CWD's subtree and prints paths
+  // relative to it, so a spec in specs/ would see only specs/-relative names and misjudge every
+  // path outside it. Caught only by a fixture whose spec is NOT at the repo root.
+  const r = git("ls-tree", "--full-tree", "-r", "--name-only", "HEAD");
+  // not a repo, or no commits yet — fail open, so non-repo fixtures and fresh inits stay silent
+  if (top.status !== 0 || r.status !== 0 || typeof r.stdout !== "string") return undefined;
+  return { root: top.stdout.trim(), tracked: new Set(r.stdout.split("\n").filter(Boolean)) };
+}
+
+const GLOB_CHARS = /[*?{[]/;
+
+/**
+ * Classify one `context:` entry against the tree a worker's worktree is built from.
+ *   ok        — reachable
+ *   untracked — in the author's checkout, invisible to every worker. WARNS, permanently: per-file
+ *               force-add is the deliberate opt-in, so this is a standing prompt, not a migration.
+ *   missing   — absent from both. FAILS compile; carries a repair when exactly one tracked file
+ *               shares the basename (ambiguous matches suggest nothing rather than guess).
+ * RULING 2026-08-03 (.overseer/OVERSEER-RULING-20260803-context-visibility.md): OBS-170's
+ * fail-closed-on-untracked is retired — oracle upheld, policy overruled (it blocked 11 of 13).
+ */
+export function classifyContextPath(entry: string, tracked: Set<string>, repoDir: string): { kind: "ok" | "untracked" | "missing"; suggestion?: string } {
+  if (GLOB_CHARS.test(entry)) return { kind: "ok" }; // a glob is not a promise about one file
+  const q = entry.replace(/\/+$/, "");
+  if (tracked.has(q)) return { kind: "ok" };
+  for (const t of tracked) if (t.startsWith(`${q}/`)) return { kind: "ok" }; // directory with tracked children
+  if (existsSync(`${repoDir}/${q}`)) return { kind: "untracked" };
+  // Measured: 5 of v1.85's 6 absent entries are a tracked file written without its directory
+  // (`V185-SEEDS.md` for `.overseer/V185-SEEDS.md`) — the opt-in had worked, only the check was
+  // missing. Suggest ONLY on an unambiguous basename: two candidates is a guess, not a repair.
+  const base = basename(q);
+  const hits = [...tracked].filter((t) => basename(t) === base);
+  return hits.length === 1 ? { kind: "missing", suggestion: hits[0] } : { kind: "missing" };
+}
 
 // OBS-97: mirror of the vitest.config.ts suite include — the only path class vitest collects.
 export const COLLECTABLE_TESTS = "tests/**/*.test.ts";
@@ -26,7 +77,7 @@ interface Draft {
   gates: string[];
   hasGates: boolean;
   list: "acceptance" | "gates" | null;
-  goalContinuation: boolean;
+  continuationField: "goal" | "deps" | "files" | "context" | null;
 }
 
 function invalid(task: string, field: string, detail: string): never {
@@ -47,7 +98,7 @@ export function compileNative(file: string): RunGraph {
   for (const line of content.split("\n")) {
     const heading = line.match(HEAD_RE);
     if (heading) {
-      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptance: [], gates: [], hasGates: false, list: null, goalContinuation: false });
+      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptance: [], gates: [], hasGates: false, list: null, continuationField: null });
       continue;
     }
     const draft = drafts.at(-1);
@@ -73,28 +124,41 @@ export function compileNative(file: string): RunGraph {
         if (value) invalid(draft.id, field[1], "must be a nested list");
         draft.list = name;
         if (name === "gates") draft.hasGates = true;
-        draft.goalContinuation = false;
+        draft.continuationField = null;
       } else {
         if (name === "goal" && !value) invalid(draft.id, field[1], "must not be empty");
         draft.fields[name] = value;
-        // OBS-60: carry every indented continuation line after `- goal:` into the compiled goal.
-        draft.goalContinuation = name === "goal";
+        // OBS-60/OBS-308: carry wrapped physical lines for prose and comma-separated fields. A
+        // worker must receive the whole logical field, regardless of the author's editor width.
+        draft.continuationField = name === "goal" || name === "deps" || name === "files" || name === "context"
+          ? name
+          : null;
         draft.list = null;
       }
       continue;
     }
 
-    // OBS-60: multiline goals — indented prose after `- goal:` is appended until the next field.
-    if (draft.goalContinuation) {
+    // OBS-60/OBS-308: indented physical lines continue the preceding logical field until the next
+    // field/list/heading. List continuations join with a space so the existing comma parser sees the
+    // exact same value it would have received on one line.
+    if (draft.continuationField) {
+      const continuation = draft.continuationField;
       if ((line.startsWith(" ") || line.startsWith("\t")) && !NESTED_RE.test(line)) {
-        draft.fields.goal += `\n${line.trim()}`;
-        continue;
+        const value = line.trim();
+        if (continuation === "goal") {
+          draft.fields.goal += `\n${value}`;
+          continue;
+        }
+        if (value) {
+          draft.fields[continuation] += ` ${value}`;
+          continue;
+        }
       }
-      if (!line.trim()) {
+      if (continuation === "goal" && !line.trim()) {
         draft.fields.goal += "\n";
         continue;
       }
-      draft.goalContinuation = false;
+      draft.continuationField = null;
     }
 
     const nested = line.match(NESTED_RE);
@@ -138,23 +202,46 @@ export function compileNative(file: string): RunGraph {
 
   // v1.62 (OBS-97): commas inside {a,b} alternatives are part of one glob entry, not separators —
   // split only at brace depth 0 so a brace glob reaches the lint (and the scope gate) intact.
+  // OBS-170/OBS-184: the same is true of a citation annotation. `.planning/OBSERVATIONS.md (OBS-262,
+  // OBS-263)` split at the inner comma into two bullets, and workers were dispatched a context line
+  // reading `OBS-263)`. Track paren depth alongside brace depth for exactly the OBS-97 reason.
   const splitTop = (value: string): string[] => {
     const parts: string[] = [];
     let depth = 0;
+    let paren = 0;
     let current = "";
     for (const ch of value) {
-      if (ch === "," && depth === 0) {
+      if (ch === "," && depth === 0 && paren === 0) {
         parts.push(current);
         current = "";
         continue;
       }
       if (ch === "{") depth++;
       else if (ch === "}" && depth > 0) depth--;
+      else if (ch === "(") paren++;
+      else if (ch === ")" && paren > 0) paren--;
       current += ch;
     }
     return [...parts, current];
   };
-  const csv = (value?: string) => (value && value.toLowerCase() !== "none" ? splitTop(value).map((item) => item.trim()).filter(Boolean) : []);
+  // Keeping the comma is only half of it: the merged entry still carries the annotation, so it
+  // resolves no better than the fragments did (measured: 24 → 19 unresolvable, zero rescued).
+  // Strip one trailing parenthetical so the entry is the path its author meant.
+  const stripAnnotation = (item: string) => {
+    const trimmed = item.trim();
+    if (!trimmed.endsWith(")")) return trimmed;
+    let paren = 0;
+    for (let i = trimmed.length - 1; i >= 0; i--) {
+      if (trimmed[i] === ")") paren++;
+      else if (trimmed[i] === "(") {
+        paren--;
+        if (paren === 0) return trimmed.slice(0, i).trim();
+      }
+    }
+    return trimmed;
+  };
+  const csv = (value?: string) =>
+    value && value.toLowerCase() !== "none" ? splitTop(value).map((item) => stripAnnotation(item.trim())).filter(Boolean) : [];
 
   // OBS-97: a typed test: oracle needs a collectable home. vitest only collects COLLECTABLE_TESTS
   // paths, so a task whose non-empty files[] cannot host one makes scope-green and acceptance-green
@@ -301,6 +388,36 @@ export function compileNative(file: string): RunGraph {
       }
     }
   }
+  // OBS-170/OBS-184: warn per unreachable context: entry, classified by the action its author must
+  // take. Warn-only by operator ruling (2026-08-03) — fail-closed would have refused to compile the
+  // spec that shipped green. Fails open when git cannot answer, so non-repo fixtures stay silent.
+  const repo = trackedAtHead(dirname(file));
+  if (repo) {
+    const unreachable: string[] = [];
+    for (const t of tasks) {
+      for (const entry of t.context) {
+        const { kind, suggestion } = classifyContextPath(entry, repo.tracked, repo.root);
+        if (kind === "untracked") {
+          // Permanent, by ruling: the per-file force-add IS the opt-in, so this stays a standing
+          // prompt. "and commit" is load-bearing — staging alone leaves it out of the base tree.
+          console.warn(
+            `tickmarkr: OBS-170: task ${t.id} context ${JSON.stringify(entry)} exists in your checkout but is NOT in a worker's worktree. To make it worker context: git add -f ${entry} && git commit. Staging alone is not enough.`,
+          );
+        } else if (kind === "missing") {
+          unreachable.push(
+            `  ${t.id}: ${JSON.stringify(entry)}${suggestion ? `\n      → did you mean ${suggestion} ?` : "\n      → not found in the repository, and not a path."}`,
+          );
+        }
+      }
+    }
+    if (unreachable.length) {
+      throw new CompileError(
+        `context: paths that do not exist in ${file}:\n${unreachable.join("\n")}\n\n` +
+          `A context: entry is a promise the worker can read it. These resolve to nothing in the repository,\n` +
+          `so the worker would be told to read a file that is not there. Fix the paths and recompile.`,
+      );
+    }
+  }
   return result;
 }
 
@@ -340,6 +457,36 @@ acceptance is required on every task (a nested list of observable outcomes).
                  - test: <name>       (oracle: test — named test)
                  - judge: <rubric>    (oracle: judge — LLM-judged, free text)
                  - <plain text>       (compat: compiles as judge oracle, warns)
+
+  HARD BOUNDS — these FAIL the compile, they do not warn:
+    - at most 6 acceptance items per task (no exception path)
+    - at most 8 files[] patterns; a {a,b} brace group counts as ONE pattern
+    - acceptance items x files[] patterns must be <= 24 ("surface")
+    - at most 60 goal words per acceptance criterion ("density")
+    Density is goal words DIVIDED BY items, so REMOVING a criterion RAISES it. Compress the goal in the
+    same edit, or a task that was comfortably inside the bound breaches it while you are tidying up.
+
+  WHAT MAKES A CRITERION REAL:
+    - "test:" must name a real test asserting on recorded state, journal lines, or drawn frames, and its
+      title must match the criterion string verbatim. It also needs a collectable test path in files[].
+    - NO criterion may be satisfiable by an absence, a rename, a source-text grep, or an empty collection.
+      "no file references X" is not a criterion — it passes in a repo where the feature was never built.
+    - "goal:" is NEVER verification. Prose in the goal enforces nothing: every obligation needs an
+      acceptance item, or a NAMED independent gate that actually applies. A gate is not independent of a
+      task that owns both the thing it checks and the fixture it checks against.
+    - A source-only obligation (a comment or doc that a change makes false) has no lawful "test:" — verify
+      it with "judge:", which reads the DIFF and must cite a changed line in a file the task owns.
+
+  ORDERING AND OWNERSHIP:
+    - Every path has exactly ONE owning task. Two tasks writing one file must be ORDERED by deps, or the
+      loser's work is silently dropped when the integration tip advances.
+    - A file one task CREATES cannot be "context:" for another — only deps: carries it, and that extends to
+      the task that PRODUCES a value, not just the file's existence.
+    - Deleting or renaming a symbol is a cross-task contract. Sweep for consumers by symbol AND by what the
+      mechanism DOES for them; the most dangerous consumer is a file no task owns, because nothing fixes it
+      and no edge can order it.
+
+  "timeout:" IS A KILL CEILING, NOT AN ESTIMATE. Never read a sum of timeouts as a predicted duration.
 -->
 
 ## T1: Scaffold the feature

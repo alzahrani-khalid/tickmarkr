@@ -6,7 +6,7 @@
 - shape: implement
 - deps: none
 - files: src/compile/native.ts, src/compile/index.ts
-- context: docs/native.md, src/graph/schema.ts
+- context: docs/codebase/ARCHITECTURE.md, src/graph/schema.ts
 - complexity: 8
 - humanGate: true
 - pin: claude-code opus

@@ -11,7 +11,7 @@ import { grok } from "../../src/adapters/grok.js";
 import { kimi } from "../../src/adapters/kimi.js";
 import { opencode } from "../../src/adapters/opencode.js";
 import { pi } from "../../src/adapters/pi.js";
-import { discoverChannels, flagDriftWarnings, missingDeclaredFlags, modelAuthExclusions, probeAll, probeModels, readAutoPrefer, readDoctor, writeDoctor, deriveAutoPrefer } from "../../src/adapters/registry.js";
+import { discoverChannels, flagDriftWarnings, missingDeclaredFlags, modelAuthExclusions, probeAll, probeModels, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { modelAuthed, type WorkerAdapter } from "../../src/adapters/types.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
@@ -60,8 +60,6 @@ model status:
     zai-coding-plan/glm-5.2 mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=tests#0
   pi
     zai/glm-5.2 mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
-    prefer implement (auto):  — seed was [cursor-agent, codex]
-    prefer tests (auto):  — seed was [opencode]
 wrote .tickmarkr/doctor.json`;
 
 // Intercept only the hang sentinel so probeModels timeout path is zero-token and fast; real sh for everything else.
@@ -722,50 +720,6 @@ describe("OBS-31 probeCwd", () => {
     expect(grok.probeCwd).toBe("neutral");
     expect(codex.probeCwd).toBeUndefined();
     expect(cursorAgent.probeCwd).toBeUndefined();
-  });
-});
-
-describe("OBS-30 autoPrefer", () => {
-  const adapters = [cursorAgent, codex, grok];
-
-  test("deriveAutoPrefer for implement orders grok/cursor ahead and omits codex", () => {
-    const cfg = structuredClone(DEFAULT_CONFIG);
-    const health: Record<string, import("../../src/adapters/types.js").AuthHealth> = {
-      "cursor-agent": {
-        installed: true, authed: true, models: ["composer-2.5"],
-        modelAuth: { "composer-2.5": { authed: true, probedAt: "2026-07-15T00:00:00.000Z", durationMs: 5000 } },
-      },
-      grok: {
-        installed: true, authed: true, models: ["grok-4.5"],
-        modelAuth: { "grok-4.5": { authed: true, probedAt: "2026-07-15T00:00:00.000Z", durationMs: 1000 } },
-      },
-      codex: {
-        installed: true, authed: true, models: ["gpt-5.6-terra"],
-        modelAuth: { "gpt-5.6-terra": { authed: false, reason: "HTTP 403", probedAt: "2026-07-15T00:00:00.000Z", durationMs: 2000 } },
-      },
-    };
-    const autoPrefer = deriveAutoPrefer(cfg, adapters, health);
-    expect(autoPrefer.implement).toEqual(["grok", "cursor-agent"]);
-    expect(autoPrefer.implement).not.toContain("codex");
-    expect(autoPrefer.derivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-  });
-
-  test("probeModels + writeDoctor persist autoPrefer to doctor.json", async () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-autoprefer-"));
-    const script = join(repo, "fake.json");
-    writeFileSync(script, JSON.stringify({ tasks: {} }));
-    const fake = new FakeAdapter(script);
-    vi.spyOn(fake, "headlessCommand").mockReturnValue("printf OK");
-    const cfg = structuredClone(DEFAULT_CONFIG);
-    cfg.routing.map.implement = { tier: "mid", prefer: ["cursor-agent", "codex"] };
-    cfg.tiers.fake = { vendor: "fake", channel: "sub", models: { "fake-1": "mid" } };
-    const health = await probeAll([fake]);
-    await probeModels(cfg, repo, [fake], health);
-    writeDoctor(repo, health);
-    const autoPrefer = readAutoPrefer(repo);
-    expect(autoPrefer?.implement).toContain("fake");
-    expect(autoPrefer?.derivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-    expect(readDoctor(repo)?.fake?.modelAuth?.["fake-1"]?.authed).toBe(true);
   });
 });
 

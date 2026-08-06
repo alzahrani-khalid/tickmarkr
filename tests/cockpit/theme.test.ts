@@ -95,7 +95,7 @@ describe("cockpit colour system", () => {
   test("test: the logo ramp is untouched by the data ramp and remains its own constant", () => {
     expect(LOGO_RAMP).toBe(BRAND_RAMP);
     expect(LOGO_RAMP).toEqual([84, 78, 41, 35]);
-    expect(COCKPIT_DATA_RAMP.map((step) => step.xterm)).toEqual([84, 41, 35, 29]);
+    expect(COCKPIT_DATA_RAMP.map((step) => step.xterm)).toEqual([114, 71, 65, 29]);
     expect(COCKPIT_DATA_RAMP).not.toBe(LOGO_RAMP);
   });
 

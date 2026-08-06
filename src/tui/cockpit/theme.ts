@@ -13,12 +13,18 @@ export const LOGO_RAMP = BRAND_RAMP;
 /** Near-black panel fill against which every data shade must remain legible. */
 export const COCKPIT_SURFACE = "#1a1a19" as const satisfies HexColour;
 
-/** Bright-to-deep, single-hue data ink. Depth communicates magnitude, never tile identity. */
+/**
+ * Bright-to-deep, single-hue data ink. Depth communicates magnitude, never tile identity.
+ * Anchored on xterm 114 (#87d787) — operator-chosen 2026-08-03 — with the hue (OKLab 144.2°)
+ * held constant down the ramp; steps descend in even OKLab lightness (0.094) and were searched
+ * and verified through guardDataRamp below. hex is the rendered ink (truecolor terminals);
+ * xterm is the nearest-distinct 256-colour fallback, documentation not render source.
+ */
 export const COCKPIT_DATA_RAMP = [
-  { xterm: 84, hex: "#5fff5f" },
-  { xterm: 41, hex: "#00d75f" },
-  { xterm: 35, hex: "#00af5f" },
-  { xterm: 29, hex: "#00875f" },
+  { xterm: 114, hex: "#87d787" },
+  { xterm: 71, hex: "#5bbc5e" },
+  { xterm: 65, hex: "#4f9a51" },
+  { xterm: 29, hex: "#437944" },
 ] as const satisfies readonly ColourValue[];
 
 /** Documented near-misses retained as guard fixtures, not special cases in the guard. */

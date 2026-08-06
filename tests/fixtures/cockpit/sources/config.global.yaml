@@ -36,7 +36,7 @@
 #   llm: headless         # headless (default): judge/review/consult run silently | pane: visible agents
 #   keepPanes: run        # run (default): ephemeral judge/review/consult panes close when read; a merged task's worker pane closes on done; other worker panes persist until run end | attempt | forever (keep everything for debugging)
 #   worker: interactive   # interactive (default): workers run the real agent TUI | print
-#   workersPerTab: 3      # cap concurrent worker panes per WORKERS tab; overflow opens WORKERS-2 (VIS-09). Default 3
+#   workersPerTab: 3      # cap worker panes sharing one tab; gate panes ride with their task and never count. Default 3
 # scope:
 #   allowDeviations: []    # globs an operator permits out-of-scope edits into, e.g. ["package-lock.json"]
 # gates:                  # override auto-detected commands; per-shape participation may only skip LLM gates

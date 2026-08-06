@@ -9,8 +9,7 @@ import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 
 // T3 (v1.50): the watch cockpit restyles the TTY frame through src/brand.ts. The non-TTY
-// surface is machine-consumed and byte-pinned: the golden literal below was captured from
-// the pre-change implementation over this exact fixture — it must never drift.
+// surface is machine-consumed and byte-pinned; its task column follows the graph title contract.
 
 const mandatoryGates = ["build", "test", "lint", "evidence", "scope"];
 const GRAPH = validateGraph({
@@ -65,7 +64,7 @@ const withStdout = async (tty: boolean, fn: () => Promise<void>) => {
 };
 
 describe("T3 watch cockpit brand restyle", () => {
-  test("status non-tty output is byte-identical to before this change", async () => {
+  test("status non-tty output remains byte-pinned around the task-title column", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
     seed(repo);
     await withStdout(false, async () => {
@@ -73,9 +72,9 @@ describe("T3 watch cockpit brand restyle", () => {
       expect(out).toBe(
         "tickmarkr status / run run-brand / last event 10m ago / daemon pid unknown / 1/3 done\n" +
         "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
-        "  [x] T1 Finish report  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
-        "  [!] T2 Run mixed gates  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2 / ctx 1234\n" +
-        "  [ ] T3 Queue the undispatched follow-up  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -",
+        "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
+        "  [!] T2 failed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2 / ctx 1234\n" +
+        "  [ ] T3 starved  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -",
       );
     });
   });

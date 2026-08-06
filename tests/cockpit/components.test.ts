@@ -29,6 +29,7 @@ import {
 } from "../../src/tui/cockpit/theme.js";
 import {
   findGoldenFrameMismatches,
+  goldenFrameMatchesCommitted,
   regenerateGoldenFrames,
 } from "../../src/tui/cockpit/capture.js";
 
@@ -431,7 +432,10 @@ describe("cockpit component vocabulary", () => {
 
     expect(findGoldenFrameMismatches(regenerated, committed)).toEqual([]);
     for (const frame of regenerated) {
-      expect(committed.get(frame.fixture)).toBe(frame.emitted);
+      expect(
+        goldenFrameMatchesCommitted(frame, committed.get(frame.fixture)),
+        frame.fixture,
+      ).toBe(true);
     }
   });
 

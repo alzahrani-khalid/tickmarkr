@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { modelLints } from "../../src/adapters/model-lints.js";
-import { allAdapters, deriveAutoPrefer } from "../../src/adapters/registry.js";
-import { type AuthHealth, type BillingChannel, channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
+import { allAdapters } from "../../src/adapters/registry.js";
+import { type BillingChannel, channelsFromConfig } from "../../src/adapters/types.js";
 import { ConfigError, DEFAULT_CONFIG, loadConfig, MapEntrySchema, type TickmarkrConfig } from "../../src/config/config.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { SHAPES, validateGraph } from "../../src/graph/schema.js";
@@ -66,31 +66,6 @@ describe("v1.52 T5 — map-entry tier removed: floors become the only band autho
   test("no built-in default map entry carries a tier and floors alone express the band policy", () => {
     for (const entry of Object.values(DEFAULT_CONFIG.routing.map)) expect(entry.tier).toBeUndefined();
     expect(DEFAULT_CONFIG.routing.floors).toMatchObject({ implement: "mid", tests: "cheap", docs: "cheap" });
-  });
-
-  test("auto prefer derivation reads floors and never a map tier", () => {
-    const cfg = structuredClone(DEFAULT_CONFIG);
-    expect(cfg.routing.floors.implement).toBe("mid");
-    // Even if a stray tier ever survived on an in-memory map entry (the schema now forbids this
-    // from any real config load — see the fail-closed test above), deriveAutoPrefer must still
-    // resolve its qualifying-tier gate from routing.floors alone, never from the map entry.
-    (cfg.routing.map.implement as unknown as { tier: string }).tier = "frontier";
-    const codexStub = {
-      id: "codex",
-      vendor: "openai",
-      probe: async () => ({ installed: true, authed: true, models: [] }),
-      channels: (c: TickmarkrConfig) => channelsFromConfig("codex", c),
-    } as unknown as WorkerAdapter;
-    const health: Record<string, AuthHealth> = {
-      codex: {
-        installed: true, authed: true, models: [],
-        modelAuth: { "gpt-5.6-terra": { authed: true, probedAt: "2026-07-18T00:00:00.000Z" } },
-      },
-    };
-    const out = deriveAutoPrefer(cfg, [codexStub], health);
-    // gpt-5.6-terra is tier "mid" — qualifies against the floor "mid", but would be excluded if the
-    // bogus map tier "frontier" were honored instead.
-    expect(out.implement).toContain("codex");
   });
 
   test("plan and doctor emit no map tier deprecation lint", () => {

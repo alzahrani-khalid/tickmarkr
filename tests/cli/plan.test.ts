@@ -1,16 +1,15 @@
-import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { writeDoctor } from "../../src/adapters/registry.js";
-import type { BillingChannel, WorkerAdapter } from "../../src/adapters/types.js";
-import { DEFAULT_CONFIG, type TickmarkrConfig } from "../../src/config/config.js";
+import type { WorkerAdapter } from "../../src/adapters/types.js";
+import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
 import { run } from "../../src/cli/commands/run.js";
 import { tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { route, type RoutingPreferContext } from "../../src/route/router.js";
 import { authedModels, makeRepo } from "../helpers/tmprepo.js";
 
 const verifiedDefaultModels = (id: string) => authedModels(Object.keys(DEFAULT_CONFIG.tiers[id]?.models ?? {}));
@@ -625,53 +624,50 @@ const DOCTOR_STUB = (id: string) =>
   ({ id, vendor: "x", probe: async () => ({ installed: true, authed: true, models: [] }) }) as unknown as WorkerAdapter;
 const ADAPTERS5_STUB = ["claude-code", "codex", "cursor-agent", "opencode", "pi"].map(DOCTOR_STUB);
 
-const stripT2Doctor = (out: string) => out.replace(/^    prefer \S+ \(auto\):.*\n/gm, "");
+describe("v1.86 T3 autoPrefer deleted — plan and doctor surfaces", () => {
+  test("a plan lint that formerly reported an auto-preferred channel now reports the absence of a declared preference instead, and reports nothing when a preference is declared", async () => {
+    // formerly: any fresh doctor.json carrying the fabricated blob made the surface report
+    // auto-preferred channels ("prefer <shape> (auto): …"). Seed a legacy blob — it is ignored.
+    const docRepo = mkRepo();
+    writeDoctor(docRepo, {
+      ...DOCTOR5,
+      autoPrefer: { derivedAt: "2026-07-15T12:00:00.000Z", chore: ["codex", "pi"], implement: ["grok"] },
+    } as unknown as Parameters<typeof writeDoctor>[1]);
+    const docOut = await doctor(["--"], docRepo, ADAPTERS5_STUB);
+    expect(docOut).not.toMatch(/prefer \S+ \(auto\):/);
+    expect(docOut).not.toContain("seed was");
+    // and the rewrite persists no fabricated preference
+    const written = JSON.parse(readFileSync(join(tickmarkrDir(docRepo), "doctor.json"), "utf8"));
+    expect(written.autoPrefer).toBeUndefined();
 
-describe("OBS-30 T2 routing provenance and doctor surface", () => {
-  const autoChannels: BillingChannel[] = [
-    { adapter: "grok", vendor: "xai", model: "grok-4.5", channel: "sub", tier: "mid" },
-    { adapter: "cursor-agent", vendor: "cursor", model: "composer-2.5", channel: "sub", tier: "mid" },
-    { adapter: "codex", vendor: "openai", model: "gpt-5.6-terra", channel: "sub", tier: "mid" },
-  ];
-  const cfg: TickmarkrConfig = structuredClone(DEFAULT_CONFIG);
-  const mkTask = (over: Record<string, unknown> = {}) =>
-    validateGraph({
-      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
-      tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 5, acceptance: ["a"], ...over }],
-    }).tasks[0];
-  const freshAuto: RoutingPreferContext = {
-    doctorFresh: true,
-    overlayPreferShapes: new Set(),
-    autoPrefer: {
-      derivedAt: "2026-07-15T12:00:00.000Z",
-      implement: ["grok", "cursor-agent"],
-    },
-  };
+    // no declared preference (chore declares none): the row reports the cost/tier decision —
+    // the absence of a declared preference — and names only a channel doctor discovered
+    const repo = mkRepo();
+    const out = await plan([], repo);
+    expect(out).toContain("cheapest sufficient tier");
+    expect(out).not.toContain("via prefer");
+    expect(out).toMatch(/T1.*claude-code:haiku/);
+    expect(out).not.toMatch(/\(auto\)/);
 
-  test("autoPrefer dispatch carries auto-modernized and derivedAt date; seed routing does not", () => {
-    const auto = route(mkTask({ shape: "implement" }), cfg, autoChannels, undefined, freshAuto);
-    expect(auto.provenance).toContain("auto-modernized");
-    expect(auto.provenance).toContain("2026-07-15");
-    expect(auto.provenance).toMatch(/via prefer \(auto-modernized 2026-07-15\)/);
-    const seed = route(mkTask({ shape: "implement" }), cfg, autoChannels);
-    expect(seed.provenance).not.toContain("auto-modernized");
-    expect(seed.provenance).toContain("via prefer");
+    // a declared preference (operator overlay): routing reports the declared prefer, and no lint
+    // reports any preference problem for the shape
+    withOverlay(repo, "routing:\n  map:\n    chore: { prefer: [codex] }\n");
+    const out2 = await plan([], repo);
+    expect(out2).toContain("via prefer");
+    expect(out2).toMatch(/T1.*codex:gpt-5.6-luna/);
+    expect(out2).not.toContain("dead steering");
+    expect(out2).not.toMatch(/\(auto\)/);
   });
 
-  test("non-TTY doctor stdout for a repo with no doctor.json is byte-identical to pre-T2 (golden pins hold)", async () => {
-    const repo = makeRepo({ "keep.txt": "x" });
+  test("non-TTY doctor stdout stays deterministic across repos with no auto-prefer lines (golden pins hold)", async () => {
     const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: false });
     try {
-      const out = await doctor(["--"], repo, ADAPTERS5_STUB);
-      const preT2 = stripT2Doctor(out);
-      expect(preT2).not.toMatch(/prefer \S+ \(auto\):/);
-      expect(out).toMatch(/prefer implement \(auto\):/);
-      expect(out).toContain("seed was [cursor-agent, codex]");
-      // replay on a sibling repo — stripped body is deterministic (pre-T2 surface)
-      const repo2 = makeRepo({ "keep.txt": "x" });
-      const out2 = stripT2Doctor(await doctor(["--"], repo2, ADAPTERS5_STUB));
-      expect(out2).toBe(preT2);
+      const out = await doctor(["--"], makeRepo({ "keep.txt": "x" }), ADAPTERS5_STUB);
+      expect(out).not.toMatch(/prefer \S+ \(auto\):/);
+      expect(out).not.toContain("auto-modernized");
+      const out2 = await doctor(["--"], makeRepo({ "keep.txt": "x" }), ADAPTERS5_STUB);
+      expect(out2).toBe(out);
     } finally {
       if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;

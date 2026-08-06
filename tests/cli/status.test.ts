@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
+import { dispatch as dispatchCommand } from "../../src/cli/index.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph, type RunGraph } from "../../src/graph/schema.js";
@@ -27,6 +28,126 @@ const startFor = (g: RunGraph, extra: Record<string, unknown> = {}): JournalEven
   ts: new Date().toISOString(),
   event: "run-start",
   data: { pid: process.pid, graphDefinitionHash: graphDefinitionHash(g), ...extra },
+});
+
+const stripAnsi = (text: string): string => text.replace(/\x1b\[[0-9;]*m/gu, "");
+
+const withStatusSurface = async <T>(tty: boolean, columns: number, fn: () => Promise<T>): Promise<T> => {
+  const isTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const oldColumns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+  const noColor = process.env.NO_COLOR;
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: tty });
+  Object.defineProperty(process.stdout, "columns", { configurable: true, value: columns });
+  if (tty) delete process.env.NO_COLOR;
+  try {
+    return await fn();
+  } finally {
+    if (isTTY) Object.defineProperty(process.stdout, "isTTY", isTTY);
+    else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    if (oldColumns) Object.defineProperty(process.stdout, "columns", oldColumns);
+    else delete (process.stdout as { columns?: number }).columns;
+    if (noColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = noColor;
+  }
+};
+
+const boardGraph = (tasks: Array<Record<string, unknown>>): RunGraph => validateGraph({
+  version: 1,
+  spec: { source: "prd", paths: ["status-title-fixture"], hash: "status-title-fixture" },
+  tasks: tasks.map((task) => ({
+    shape: "implement",
+    complexity: 3,
+    acceptance: ["status title fixture"],
+    status: "done",
+    ...task,
+  })),
+});
+
+const renderBoard = async (g: RunGraph, tty: boolean, columns: number): Promise<string> => {
+  const repo = mkRepo();
+  saveGraph(repo, g);
+  return withStatusSurface(tty, columns, () => status([], repo));
+};
+
+describe("task titles on the status board", () => {
+  test("every board row renders the task's title rather than its goal, proven member by member over the closed set of row shapes — a short-title fixture, a title-at-the-column-width fixture, a title-over-the-column-width fixture and a long-goal fixture whose goal never appears on the board", async () => {
+    // At 80 columns with two-character ids and four-character `done`, the task column is 67.
+    const taskColumnWidth = 67;
+    const shortTitle = "Short title";
+    const atWidthTitle = "W".repeat(taskColumnWidth);
+    const overWidthTitle = "O".repeat(taskColumnWidth + 1);
+    const longGoal = `LONG_GOAL_MUST_NOT_RENDER ${"paragraph ".repeat(60)}`;
+    const g = boardGraph([
+      { id: "T1", title: shortTitle, goal: "SHORT_GOAL_MUST_NOT_RENDER" },
+      { id: "T2", title: atWidthTitle, goal: "AT_WIDTH_GOAL_MUST_NOT_RENDER" },
+      { id: "T3", title: overWidthTitle, goal: "OVER_WIDTH_GOAL_MUST_NOT_RENDER" },
+      { id: "T4", title: "Long goal has a compact title", goal: longGoal },
+    ]);
+
+    const out = stripAnsi(await renderBoard(g, true, 80));
+    expect(row(out, "T1")).toContain(shortTitle);
+    expect(row(out, "T2")).toContain(atWidthTitle);
+    expect(row(out, "T3")).toContain(`${"O".repeat(taskColumnWidth - 3)}...`);
+    expect(row(out, "T4")).toContain("Long goal has a compact title");
+    for (const task of g.tasks) expect(out).not.toContain(task.goal);
+  });
+
+  test("no row wraps and no done marker appears twice, measured on the same 13-task graph that wraps 6 rows and duplicates the marker before the change", async () => {
+    const width = 120;
+    const tasks = Array.from({ length: 13 }, (_, index) => {
+      const n = index + 1;
+      return {
+        id: `T${n}`,
+        title: `Task ${n.toString().padStart(2, "0")} title ${"t".repeat(28 + index)}`,
+        goal: index < 6
+          ? `WRAPPING_GOAL_${n} ${"paragraph ".repeat(50)}`
+          : `compact goal ${n}. Additional detail is deliberately outside the first clause.`,
+      };
+    });
+    const g = boardGraph(tasks);
+    // Characterize the historical fixture independently: exactly six paragraph clauses exceed
+    // the old 106-character task column, while every schema title fits it naturally.
+    expect(g.tasks.filter((task) => task.goal.split(/[,;.?!]/, 1)[0]!.length > 106)).toHaveLength(6);
+    expect(g.tasks.every((task) => task.title.length < 106)).toBe(true);
+
+    const out = stripAnsi(await renderBoard(g, true, width));
+    const rows = g.tasks.map((task) => row(out, task.id));
+    expect(rows).toHaveLength(13);
+    expect(rows.every((taskRow) => taskRow.length < width)).toBe(true);
+    for (const taskRow of rows) expect(taskRow.match(/\bdone\b/gu)).toHaveLength(1);
+  });
+
+  test("the piped non-TTY bytes change only in the goal-to-title substitution, proven by a byte comparison whose sole diff is that column", async () => {
+    const oldColumn = "legacy task column";
+    const newColumn = "current task title";
+    expect(newColumn).toHaveLength(oldColumn.length);
+    const control = boardGraph([{ id: "T1", title: oldColumn, goal: `${oldColumn}, paragraph detail` }]);
+    const candidate = boardGraph([{ id: "T1", title: newColumn, goal: `${oldColumn}, paragraph detail` }]);
+
+    const before = await renderBoard(control, false, 140);
+    const after = await renderBoard(candidate, false, 140);
+    expect(after).not.toBe(before);
+    expect(after).toBe(before.replace(oldColumn, newColumn));
+  });
+
+  test("the task column renders no field whose shape does not fit the column the board gives it", () => {
+    const source = readFileSync(fileURLToPath(new URL("../../src/cli/commands/status.ts", import.meta.url)), "utf8");
+    const renderSites = [...source.matchAll(/shortGoal\((?:c\.)?t\.(title|goal)/gu)].map((match) => match[1]);
+    expect(renderSites).toEqual(["title", "title"]);
+  });
+
+  test("task titles sanitize tabs and ECMA-48 controls before column measurement", async () => {
+    // The printable form is exactly the 67-cell column. Raw control bytes must neither steal
+    // capacity nor reach a machine-consumed surface.
+    const controlledTitle = `${"S".repeat(32)}\t\x1b[31m${"T".repeat(34)}\x1b[0m`;
+    const printableTitle = `${"S".repeat(32)} ${"T".repeat(34)}`;
+    const g = boardGraph([{ id: "T1", title: controlledTitle, goal: "CONTROL_GOAL_MUST_NOT_RENDER" }]);
+
+    const piped = await renderBoard(g, false, 140);
+    expect(piped).toContain(printableTitle);
+    expect(piped).not.toMatch(/[\t\x1b\u009b]/u);
+    expect(stripAnsi(await renderBoard(g, true, 80))).toContain(printableTitle);
+  });
 });
 
 // VIS-03: tickmarkr status classifies pending tasks dep-waiting vs starved using the SAME
@@ -365,5 +486,122 @@ describe("skipped gate-result renders as skip, not pass or forever-open", () => 
     const t1Row = row(out, "T1");
     expect(t1Row).toContain("B[x]");
     expect(t1Row).toContain("L."); // skip glyph, not L[x] (pass) and not L[ ] (open)
+  });
+});
+
+// T2: `status <runId>` reports the run you named — an explicit id resolves that run's journal or
+// fails loudly naming the id; the no-argument form keeps the latest-run behaviour byte-identical.
+describe("status <runId> reports the run you named", () => {
+  const fixedNow = () => Date.parse("2026-08-01T00:00:00.000Z");
+  const oneTaskRepo = () => {
+    const repo = mkRepo();
+    const g = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "a", goal: "a", shape: "implement", complexity: 3, acceptance: ["a"] }],
+    });
+    saveGraph(repo, g);
+    return { repo, g };
+  };
+
+  test("an explicit runId renders that run's frame and a nonexistent id fails loudly naming the id rather than rendering any frame", async () => {
+    const { repo, g } = oneTaskRepo();
+    seedJournal(repo, "run-20260101-000000", [startFor(g), { ts: "2026-07-31T23:59:00.000Z", event: "task-done", taskId: "T1", data: { attempts: 1 } }]);
+    seedJournal(repo, "run-20260102-000000", [startFor(g)]); // the latest run: T1 still pending
+    const out = await status(["run-20260101-000000"], repo, { now: fixedNow });
+    expect(out).toContain("run run-20260101-000000");
+    expect(out).not.toContain("run-20260102-000000");
+    expect(row(out, "T1")).toMatch(/\bdone\b/); // the NAMED run's journal folded, not the latest's
+    await expect(status(["run-DOESNOTEXIST"], repo, { now: fixedNow })).rejects.toThrow(/run-DOESNOTEXIST/);
+  });
+
+  test("omitting the argument renders the latest run byte-identically to the pre-change output", async () => {
+    const { repo, g } = oneTaskRepo();
+    seedJournal(repo, "run-20260101-000000", [startFor(g)]);
+    seedJournal(repo, "run-20260102-000000", [startFor(g)]);
+    // the pre-change output IS the latest-run resolution: naming that same run explicitly must
+    // reproduce the no-argument frame byte-for-byte, on the plain surface and under --watch.
+    const implicit = await status([], repo, { now: fixedNow });
+    const explicit = await status(["run-20260102-000000"], repo, { now: fixedNow });
+    expect(implicit).toBe(explicit);
+    const implicitWatch = await status(["--watch"], repo, { iterations: 1, now: fixedNow, sleep: async () => {} });
+    const explicitWatch = await status(["--watch", "run-20260102-000000"], repo, { iterations: 1, now: fixedNow, sleep: async () => {} });
+    expect(implicitWatch).toBe(explicitWatch);
+  });
+
+  test("watch mode follows the named run across refreshes and never re-resolves to latest, proven over the closed set of refresh shapes — a newer-run-starting fixture, an ended-run fixture and an unchanged-run fixture", async () => {
+    // shape 1: a newer run starts mid-watch — the frames keep reporting the named run
+    {
+      const { repo, g } = oneTaskRepo();
+      seedJournal(repo, "run-20260101-000000", [startFor(g)]);
+      let seeded = false;
+      const out = await status(["--watch", "run-20260101-000000"], repo, {
+        iterations: 2,
+        now: fixedNow,
+        sleep: async () => {
+          if (seeded) return;
+          seeded = true;
+          seedJournal(repo, "run-20260103-000000", [startFor(g)]); // newer run appears between refreshes
+        },
+      });
+      const frames = out.split("\n---\n");
+      expect(frames).toHaveLength(2);
+      for (const frame of frames) {
+        expect(frame).toContain("run run-20260101-000000");
+        expect(frame).not.toContain("run-20260103-000000");
+      }
+    }
+    // shape 2: the named run ends mid-watch — the refresh re-reads THAT run's journal
+    {
+      const { repo, g } = oneTaskRepo();
+      seedJournal(repo, "run-20260101-000000", [
+        { ts: "2026-07-31T23:59:01.000Z", event: "run-start", data: { pid: process.pid, graphDefinitionHash: graphDefinitionHash(g) } },
+      ]);
+      let ended = false;
+      const out = await status(["--watch", "run-20260101-000000"], repo, {
+        iterations: 2,
+        now: fixedNow,
+        sleep: async () => {
+          if (ended) return;
+          ended = true;
+          appendFileSync(
+            join(tickmarkrDir(repo), "runs", "run-20260101-000000", "journal.jsonl"),
+            JSON.stringify({ ts: "2026-08-01T00:00:00.000Z", event: "run-end", data: {} }) + "\n",
+          );
+        },
+      });
+      const frames = out.split("\n---\n");
+      expect(frames).toHaveLength(2);
+      expect(frames[0]).toContain("run run-20260101-000000");
+      expect(frames[1]).toContain("run run-20260101-000000");
+      expect(frames[0]).toContain("last event 59s ago");
+      expect(frames[1]).toContain("last event 0s ago"); // the same run's newer event, re-read
+    }
+    // shape 3: an unchanged run renders the identical frame on every refresh
+    {
+      const { repo, g } = oneTaskRepo();
+      seedJournal(repo, "run-20260101-000000", [startFor(g)]);
+      const out = await status(["--watch", "run-20260101-000000"], repo, { iterations: 2, now: fixedNow, sleep: async () => {} });
+      const frames = out.split("\n---\n");
+      expect(frames).toHaveLength(2);
+      expect(frames[0]).toContain("run run-20260101-000000");
+      expect(frames[1]).toBe(frames[0]);
+    }
+  });
+
+  test("the exit code distinguishes a resolved run from an unresolvable id, and no unresolvable id exits zero", async () => {
+    const { repo, g } = oneTaskRepo();
+    seedJournal(repo, "run-20260101-000000", [startFor(g)]);
+    mkdirSync(join(tickmarkrDir(repo), "runs", "run-20260101-000100"), { recursive: true }); // run dir without a journal
+    const commands = { status: (argv: string[]) => status(argv, repo, { now: fixedNow }) };
+    const resolved = await dispatchCommand("status", ["run-20260101-000000"], commands);
+    expect(resolved.code).toBe(0);
+    expect(resolved.out).toContain("run run-20260101-000000");
+    const missing = await dispatchCommand("status", ["run-DOESNOTEXIST"], commands);
+    expect(missing.code).not.toBe(0);
+    expect(missing.out).toContain("run-DOESNOTEXIST"); // fails loudly naming the id
+    const journalless = await dispatchCommand("status", ["run-20260101-000100"], commands);
+    expect(journalless.code).not.toBe(0);
+    expect(journalless.out).toContain("run-20260101-000100");
   });
 });

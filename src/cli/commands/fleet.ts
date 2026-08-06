@@ -1,28 +1,26 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, readAutoPrefer } from "../../adapters/registry.js";
+import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse } from "../../adapters/registry.js";
 import { fleetUnclassifiedModels } from "../../adapters/model-lints.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import {
   fleetEditableFromConfig,
   fleetEditableEquals,
-  fleetRepoOverlayFromDelta,
   formatFleetPrint,
   globalConfigDir,
-  harvestFleetProvenance,
   overlayBytesLoadError,
-  overlayPreferShapes,
-  readOverlayFile,
+  renderFleetOverlayWrite,
   repoOverlayPath,
-  repoOverlayYaml,
   ROUTING_MODES,
+  type FleetOverlayWrite,
   type FleetEditable,
   type MapEntry,
   type RoutingMode,
   type Tier,
   unifiedYamlDiff,
 } from "../../config/config.js";
+import { projectFleetWhy, renderFleetWhy, type FleetWhyValue } from "../../config/fleet-why.js";
 import { SHAPES, TIERS, type Shape, type Task } from "../../graph/schema.js";
 import { candidateRow, costSignal, shapeCandidates } from "./fleet-picker.js";
 import { route } from "../../route/router.js";
@@ -79,25 +77,36 @@ function currentRepoOverlayText(repoRoot: string): string {
   return existsSync(p) ? readFileSync(p, "utf8") : "";
 }
 
-function provenanceMap(editable: FleetEditable): Record<string, Record<string, string>> {
-  const out: Record<string, Record<string, string>> = {};
-  for (const [adapter, models] of Object.entries(editable.tiers)) {
-    for (const [model, v] of Object.entries(models)) {
-      if (v?.provenance) {
-        out[adapter] ??= {};
-        out[adapter][model] = v.provenance;
-      }
-    }
-  }
-  return out;
-}
+export type FleetWriteHooks = {
+  readPrior?: (path: string) => string;
+  beforeRename?: () => void;
+};
 
-// v1.51 T4: serializeFleetOverlay predates routing.mode — splice the mode line under routing:
-// so a repo-declared mode survives fleet writes and a mode selection lands as routing.mode.
-function withModeLine(yaml: string, mode: RoutingMode | undefined): string {
-  if (!mode) return yaml;
-  if (/^routing:$/m.test(yaml)) return yaml.replace(/^routing:$/m, `routing:\n  mode: ${mode}`);
-  return `routing:\n  mode: ${mode}\n${yaml}`;
+/** Atomic sibling-temp writer. Reading and serializing happen before `${path}.tmp` exists, and
+ * any pre-rename interruption unlinks only that exact candidate while the original remains intact. */
+export function writeFleetOverlay(
+  path: string,
+  serialize: (priorBytes: string) => string,
+  hooks: FleetWriteHooks = {},
+): void {
+  const prior = hooks.readPrior
+    ? hooks.readPrior(path)
+    : (existsSync(path) ? readFileSync(path, "utf8") : "");
+  const bytes = serialize(prior);
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp`;
+  try {
+    writeFileSync(tmp, bytes);
+    hooks.beforeRename?.();
+    renameSync(tmp, path);
+  } catch (error) {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      // Preserve the write failure; cleanup is constrained to the exact sibling candidate.
+    }
+    throw error;
+  }
 }
 
 function formatFleetSteering(cfg: ResolvedRunMode["cfg"]): string {
@@ -124,12 +133,14 @@ export async function fleet(
     args: argv,
     options: {
       print: { type: "boolean" },
+      why: { type: "boolean" },
       "global-dir": { type: "string" },
       fresh: { type: "boolean" },
     },
   });
   const globalDir = values["global-dir"] ?? globalConfigDir();
   const print = values.print ?? false;
+  const why = values.why ?? false;
   const input = io.input ?? (process.stdin as FleetInput);
   const output = io.output ?? (process.stdout as FleetOutput);
   const interactive = input.isTTY === true && output.isTTY === true;
@@ -145,7 +156,7 @@ export async function fleet(
     return `${body.slice(0, nl)}\n# mode: ${rm.mode.mode} (${rm.source})${body.slice(nl)}${formatFleetSteering(rm.cfg)}`;
   }
 
-  if (!interactive) return { out: NON_TTY_MSG, code: 1 };
+  if (!why && !interactive) return { out: NON_TTY_MSG, code: 1 };
 
   const fresh = values.fresh ?? false;
   const { reuse, health: cached } = initDoctorReuse(cwd, fresh);
@@ -158,10 +169,7 @@ export async function fleet(
 
   const rm = resolveRunMode(cwd, { globalDir });
   const cfg = rm.cfg;
-  // OBS-88: harvest existing `# note` comments from the overlay bytes at session load — the
-  // session must know about every prior note, not only its own edits, or the next write strips them
-  const harvested = harvestFleetProvenance(currentRepoOverlayText(cwd));
-  const initial = fleetEditableFromConfig(cfg, harvested.tiers);
+  const initial = fleetEditableFromConfig(cfg);
   const editable = structuredClone(initial) as FleetEditable;
   const health = cached;
   const modelGroups = adapters
@@ -239,11 +247,29 @@ export async function fleet(
         : ["    (no floor changes)"]),
     ];
   };
-  const autoPrefer = readAutoPrefer(cwd);
-  const overlayShapes = overlayPreferShapes(cwd, { globalDir });
-  const routedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>) =>
-    SHAPES.map((shape) => {
-      let now: string;
+  const whyDeclaration = (
+    shape: Shape,
+    mode: RoutingMode,
+    map: Record<string, MapEntry>,
+    mapProducedValue: boolean,
+  ): Pick<FleetWhyValue, "declaredAt" | "operatorPinned"> => {
+    const mapChanged = JSON.stringify(map[shape] ?? {}) !== JSON.stringify(editable.map[shape] ?? {});
+    if (mapProducedValue) {
+      return mapChanged
+        ? { operatorPinned: true }
+        : { declaredAt: `routing.map.${shape}` };
+    }
+
+    const floorSource = modeCfgs[mode].mode.provenance[shape];
+    if (floorSource === undefined) return {};
+    if (floorSource === "config floors") return { declaredAt: `routing.floors.${shape}` };
+    if (mode !== rm.mode.mode) return { operatorPinned: true };
+    return rm.source === "default"
+      ? { declaredAt: `routing.floors.${shape}` }
+      : { declaredAt: "routing.mode" };
+  };
+  const projectedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>) => {
+    const values: FleetWhyValue<Shape>[] = SHAPES.map((shape) => {
       try {
         const routed = route(
           previewTask(shape),
@@ -255,13 +281,28 @@ export async function fleet(
           PREVIEW_EXPLORE,
         );
         const assignment = routed.assignment;
-        now = `${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier})  ${costSignal(assignment, cfg.pricing)}`;
+        const effective = `${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier})  ${costSignal(assignment, cfg.pricing)}`;
+        const mapProducedValue = map[shape]?.pin !== undefined || routed.provenance.includes("via prefer");
+        return {
+          id: shape,
+          effective,
+          ...whyDeclaration(shape, mode, map, mapProducedValue),
+        };
       } catch (error) {
-        now = (error as Error).message;
+        const mapProducedValue = map[shape]?.pin !== undefined || (map[shape]?.prefer?.length ?? 0) > 0;
+        return {
+          id: shape,
+          effective: (error as Error).message,
+          ...whyDeclaration(shape, mode, map, mapProducedValue),
+          setupCommand: "tickmarkr fleet",
+        };
       }
-      const auto = autoPrefer?.[shape] && !overlayShapes.has(shape) ? "  (auto-prefer active)" : "";
-      return { id: shape, label: `${shape}  →  ${now}${auto}` };
     });
+    return projectFleetWhy(values, { repoRoot: cwd, globalDir });
+  };
+  const routedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>) =>
+    projectedShapeRows(mode, map).map(({ id, label }) => ({ id, label }));
+  if (why) return renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map));
   const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>) =>
     shapeCandidates(previewTask(shape), previewCfg(mode, map), channels, profile).map((candidate) => ({
       id: `${candidate.assignment.adapter}:${candidate.assignment.model}`,
@@ -285,6 +326,7 @@ export async function fleet(
     const discovered = which === "review" ? [...reviewAdapters, ...seats] : seats;
     return [...discovered, ...current.filter((entry) => !discovered.includes(entry))];
   };
+  let pendingWrite: FleetOverlayWrite | null = null;
   const reviewOverlay = (state: FleetEditorState): FleetOverlayReview => {
     const staged = structuredClone(initial) as FleetEditable;
     staged.denyAdapters = state.denyAdapters;
@@ -303,40 +345,26 @@ export async function fleet(
     // the diff and asks for confirmation, but owns neither filesystem access nor a writer.
     const before = currentRepoOverlayText(cwd);
     const path = repoOverlayPath(cwd);
-    const existing = readOverlayFile(path);
     const modeChanged = state.selectedMode !== rm.mode.mode;
-    const writeMode = modeChanged
-      ? state.selectedMode
-      : (existing as { routing?: { mode?: RoutingMode } }).routing?.mode;
-    const merged = fleetEditableEquals(initial, staged)
-      ? (structuredClone(existing) as Record<string, unknown>)
-      : fleetRepoOverlayFromDelta(initial, staged, existing);
-    let steeringChanged = false;
-    for (const key of ["review", "consult"] as const) {
-      if (JSON.stringify(state.steering[key]) === JSON.stringify(initialSteering[key])) continue;
-      steeringChanged = true;
-      const block = { ...(merged[key] as Record<string, unknown> | undefined) };
-      if (state.steering[key]) block.prefer = state.steering[key];
-      else delete block.prefer;
-      if (Object.keys(block).length) merged[key] = block;
-      else delete merged[key];
-    }
-    const tierNotes = structuredClone(harvested.tiers);
-    for (const [adapter, models] of Object.entries(provenanceMap(staged))) {
-      for (const [model, note] of Object.entries(models)) {
-        (tierNotes[adapter] ??= {})[model] = note;
-      }
-    }
-    const after = withModeLine(
-      repoOverlayYaml(merged, tierNotes, {
-        adapters: harvested.denyAdapters,
-        models: harvested.denyModels,
-      }),
-      writeMode,
+    const steeringChanged = (["review", "consult"] as const).some(
+      (key) => JSON.stringify(state.steering[key]) !== JSON.stringify(initialSteering[key]),
     );
-    if ((!modeChanged && !steeringChanged && fleetEditableEquals(initial, staged)) || before === after) {
+    if (!modeChanged && !steeringChanged && fleetEditableEquals(initial, staged)) {
+      pendingWrite = null;
       return { kind: "empty" };
     }
+    const write: FleetOverlayWrite = {
+      initial,
+      edited: staged,
+      ...(modeChanged ? { mode: state.selectedMode } : {}),
+      steering: { initial: initialSteering, edited: state.steering },
+    };
+    const after = renderFleetOverlayWrite(before, write);
+    if (before === after) {
+      pendingWrite = null;
+      return { kind: "empty" };
+    }
+    pendingWrite = write;
     return {
       kind: "diff",
       before,
@@ -410,7 +438,8 @@ export async function fleet(
 
   // The command remains the single config actuator. Every interactive edit reaches this
   // one write only after the component-rendered diff confirm and the production reload guard.
-  mkdirSync(dirname(result.review.path), { recursive: true });
-  writeFileSync(result.review.path, result.review.after);
+  const write = pendingWrite;
+  if (!write) throw new Error("fleet write reached confirmation without a staged overlay mutation");
+  writeFleetOverlay(result.review.path, (prior) => renderFleetOverlayWrite(prior, write));
   return `fleet: wrote ${result.review.path}`;
 }

@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import picomatch from "picomatch";
-import { parse, stringify } from "yaml";
+import { Document, parse } from "yaml";
 import { z } from "zod";
+import { CITED_MODEL_WINDOWS } from "../adapters/model-windows.js";
 import { stateDirName } from "../graph/graph.js";
 import { SHAPES, TIERS } from "../graph/schema.js";
 
@@ -13,6 +14,8 @@ const TierEnum = z.enum(TIERS, {
 export type Tier = z.infer<typeof TierEnum>;
 export const TIER_RANK: Record<Tier, number> = { cheap: 0, mid: 1, frontier: 2 };
 export const DEFAULT_DIFF_CAP = 60_000;
+// This is deliberately only a rejection guard. T20's cited table, not this floor, supplies each claim.
+export const MODEL_WINDOW_PLAUSIBILITY_FLOOR = 1_024;
 
 // v1.51 T1: routing.mode — a preset COMPILED INTO FLOORS at config load. The router never sees the
 // mode; it receives resolved floors only (the structural defense against the quality-silently-loses
@@ -47,12 +50,35 @@ export const MapEntrySchema = z.object({
 });
 export type MapEntry = z.infer<typeof MapEntrySchema>;
 
+const DeclaredVendorSchema = z.string().trim().min(1, "vendor must be nonempty");
+const ModelOverrideSchema = z
+  .object({
+    vendor: DeclaredVendorSchema.optional(),
+    channel: z.enum(["sub", "api"]).optional(),
+  })
+  .refine((override) => override.vendor !== undefined || override.channel !== undefined, {
+    message: "a model override must declare vendor, channel, or both",
+  });
+
 export const TierEntrySchema = z.object({
-  vendor: z.string(),
+  vendor: DeclaredVendorSchema.nullable(),
   channel: z.enum(["sub", "api"]),
   models: z.record(z.string(), TierEnum),
+  // T19: keep model values scalar for existing consumers. Optional sibling metadata resolves before
+  // parent metadata in channelsFromConfig; neither provider prefixes nor adapter ids manufacture it.
+  modelOverrides: z.record(z.string(), ModelOverrideSchema).optional(),
   // v1.47 T3: optional per-model context-window sizes (tokens). Absent block ⇒ no doctor column, no plan lint.
   windows: z.record(z.string(), z.number().int().positive()).optional(),
+}).superRefine((entry, ctx) => {
+  if (entry.vendor !== null) return;
+  for (const model of Object.keys(entry.models)) {
+    if (entry.modelOverrides?.[model]?.vendor) continue;
+    ctx.addIssue({
+      code: "custom",
+      path: ["modelOverrides", model, "vendor"],
+      message: "vendor: null requires every configured model to declare a nonempty vendor override",
+    });
+  }
 });
 export type TierEntry = z.infer<typeof TierEntrySchema>;
 
@@ -378,6 +404,25 @@ export class ConfigError extends Error {
   }
 }
 
+function assertSeededModelWindows(): void {
+  const cited = new Map(CITED_MODEL_WINDOWS.map((claim) => [claim.modelId, claim.window]));
+  for (const [adapter, entry] of Object.entries(DEFAULT_CONFIG.tiers)) {
+    for (const [model, window] of Object.entries(entry.windows ?? {})) {
+      const path = `tiers.${adapter}.windows.${model}`;
+      if (window < MODEL_WINDOW_PLAUSIBILITY_FLOOR) {
+        throw new ConfigError(`${path} declares window ${window}, below plausibility floor ${MODEL_WINDOW_PLAUSIBILITY_FLOOR} (non-authoritative rejection guard)`);
+      }
+      const citedWindow = cited.get(model);
+      if (citedWindow === undefined) {
+        throw new ConfigError(`${path} has no cited model-window entry in T20's vendored table`);
+      }
+      if (window !== citedWindow) {
+        throw new ConfigError(`${path} declares ${window} but does not match cited window ${citedWindow} in T20's vendored table`);
+      }
+    }
+  }
+}
+
 export const DEFAULT_CONFIG: TickmarkrConfig = {
   concurrency: 3,
   driver: "auto",
@@ -411,10 +456,13 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     allowUnverifiedModels: false,
   },
   // Seed table (spec §13). New models = edit this (or your config.yaml), never code.
+  // Windows are copied rather than derived from T20's table so config load can reject disagreement
+  // between two independently owned artifacts instead of letting one side certify itself.
   tiers: {
     "claude-code": {
       vendor: "anthropic", channel: "sub",
       models: { fable: "frontier", opus: "frontier", sonnet: "mid", haiku: "cheap" },
+      windows: { fable: 1_000_000, opus: 1_000_000, sonnet: 1_000_000, haiku: 200_000 },
     },
     // ids verified against installed CLI models_cache.json (codex 0.144.0, fetched 2026-07-09);
     // gpt-5.4 / gpt-5.4-mini removed — OpenAI retirement 2026-07-23; sol=frontier / terra=mid / luna=cheap per OpenAI tier framing.
@@ -426,6 +474,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     codex: {
       vendor: "openai", channel: "sub",
       models: { "gpt-5.6-sol": "frontier", "gpt-5.5": "frontier", "gpt-5.6-terra": "mid", "gpt-5.6-luna": "cheap" },
+      windows: { "gpt-5.6-sol": 1_050_000, "gpt-5.5": 1_050_000, "gpt-5.6-terra": 1_050_000, "gpt-5.6-luna": 1_050_000 },
     },
     // grok-4.5 (xAI, released 2026-07-08) → mid: AA Intelligence 54 (#4), Terminal-Bench 2.1 83.3%
     // (≈ GPT-5.5 83.4, Fable 5 84.3), SWE-bench Pro 64.7%, ~4.2× more token-efficient than Opus 4.8
@@ -446,6 +495,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
         // stop burning its mid. Operator-approved 2026-07-16.
         "composer-2.5-fast": "cheap",
       },
+      windows: { "composer-2.5": 200_000, "composer-2.5-fast": 200_000 },
     },
     // GLM-5.2 → mid per benchmark policy (2026-07): SWE-bench Pro 62.1 (> GPT-5.5 58.6), FrontierSWE 74.4 ≈ Opus 4.8;
     // no independent Terminal-Bench score → conservative mid, overlays may raise.
@@ -456,6 +506,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     opencode: {
       vendor: "mixed", channel: "sub",
       models: { "zai-coding-plan/glm-5.2": "mid" },
+      windows: { "zai-coding-plan/glm-5.2": 1_000_000 },
     },
     // GLM-5.2 via pi/ZAI Coding Plan (sub, flat-rate). mid per benchmark policy (2026-07):
     // SWE-bench Pro 62.1, FrontierSWE 74.4 — same rationale as the opencode glm-5.2 seed above.
@@ -467,6 +518,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     pi: {
       vendor: "zhipu", channel: "sub",
       models: { "zai/glm-5.2": "mid" },
+      windows: { "zai/glm-5.2": 1_000_000 },
     },
     // Native grok CLI (Phase 40). grok-4.5 → mid: same benchmark provenance as the retired cursor-agent
     // grok-4.5-xhigh seed above (AA 54, TB2.1 83.3%, SWE-b Pro 64.7% — researched 2026-07-10).
@@ -476,6 +528,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     grok: {
       vendor: "xai", channel: "sub",
       models: { "grok-4.5": "mid", "grok-composer-2.5-fast": "cheap" },
+      windows: { "grok-4.5": 500_000, "grok-composer-2.5-fast": 200_000 },
     },
     // Native kimi CLI (Phase 48). kimi-code/k3 → frontier: 81.2 FrontierSWE, 88.3 Terminal-Bench 2.1,
     // top-3 across six coding benchmarks (research 2026-07-17, K3 released 2026-07-16).
@@ -487,6 +540,11 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
         "kimi-code/k3": "frontier",
         "kimi-code/kimi-for-coding": "mid",
         "kimi-code/kimi-for-coding-highspeed": "cheap",
+      },
+      windows: {
+        "kimi-code/k3": 1_048_576,
+        "kimi-code/kimi-for-coding": 262_144,
+        "kimi-code/kimi-for-coding-highspeed": 262_144,
       },
     },
   },
@@ -502,7 +560,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
   visibility: { llm: "headless", keepPanes: "run", worker: "interactive", workersPerTab: 3 },
 };
 
-function deepMerge<T>(base: T, over: unknown): T {
+function deepMerge<T>(base: T, over: unknown, path: string[] = []): T {
   if (over === undefined || over === null) return base;
   if (Array.isArray(base) || Array.isArray(over) || typeof base !== "object" || typeof over !== "object" || base === null) {
     return over as T;
@@ -510,12 +568,16 @@ function deepMerge<T>(base: T, over: unknown): T {
   const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
   for (const [k, v] of Object.entries(over as Record<string, unknown>)) {
     if (v === null) {
-      delete out[k]; // v1.1 tombstone: an explicit null in an overlay removes the key (e.g. stale tiers model ids)
+      // T19: null is a declared multi-vendor state only at tiers.<adapter>.vendor. Every other null
+      // remains the v1.1 overlay tombstone (for example a stale tiers model id).
+      if (path.length === 2 && path[0] === "tiers" && k === "vendor") out[k] = null;
+      else delete out[k];
       continue;
     }
     // OBS-75 class: merge fresh-landing objects onto {} so nested tombstone nulls are pruned even when
     // no lower layer set the key (a fleet-cleared deny writes {adapters: null} — the schema rejects raw null)
-    out[k] = k in out ? deepMerge(out[k], v) : deepMerge({} as unknown, v);
+    const childPath = [...path, k];
+    out[k] = k in out ? deepMerge(out[k], v, childPath) : deepMerge({} as unknown, v, childPath);
   }
   return out as T;
 }
@@ -601,7 +663,7 @@ function resolveRoutingMode(cfg: TickmarkrConfig, layers: unknown[]): ModeResolu
         lints.push(`floors.${shape}: ${val} (config floors) overrides mode ${mode} — shadowed delta: ${shape} ${dflt}→${moded}`);
       }
       if (TIER_RANK[val] < TIER_RANK[integrityMin(shape)]) {
-        lints.push(`floors.${shape}: ${val} is below integrity minimum frontier — integrity class ${INTEGRITY_FLOOR_SHAPES.join("/")} holds regardless of mode`);
+        lints.push(`floors.${shape}: ${val} is below integrity minimum frontier — integrity class ${INTEGRITY_FLOOR_SHAPES.join("/")} is advisory to explicit floors and map pins; map pins are supreme`);
       }
       continue;
     }
@@ -632,6 +694,9 @@ export function loadConfigWithMode(
   const merged = deepMerge(deepMerge(structuredClone(DEFAULT_CONFIG), globalCfg), repoCfg);
   const r = TickmarkrConfigSchema.safeParse(merged);
   if (!r.success) throw new ConfigError(z.prettifyError(r.error));
+  // The vendored table attests Tickmarkr's built-in seed artifact. Operator overlays remain free to
+  // declare private/future models and deliberately smaller test windows without pretending T20 cited them.
+  assertSeededModelWindows();
   return { cfg: r.data, mode: resolveRoutingMode(r.data, [globalCfg, repoCfg]) };
 }
 
@@ -696,7 +761,7 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #   llm: headless         # headless (default): judge/review/consult run silently | pane: visible agents
 #   keepPanes: run        # run (default): ephemeral judge/review/consult panes close when read; a merged task's worker pane closes on done; other worker panes persist until run end | attempt | forever (keep everything for debugging)
 #   worker: interactive   # interactive (default): workers run the real agent TUI | print
-#   workersPerTab: 3      # cap concurrent worker panes per WORKERS tab; overflow opens WORKERS-2 (VIS-09). Default 3
+#   workersPerTab: 3      # cap worker panes sharing one tab; gate panes ride with their task and never count. Default 3
 # scope:
 #   allowDeviations: []    # globs an operator permits out-of-scope edits into, e.g. ["package-lock.json"]
 # gates:                  # override auto-detected commands; per-shape participation may only skip LLM gates
@@ -747,18 +812,17 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
   return `${base.slice(0, nl + 1)}${lines.join("\n")}\n${base.slice(nl + 1)}`;
 }
 
-// v1.61 seed 8: the fleet-overlay provenance cluster (harvesting, serialization, diff rendering)
-// moved to fleet-overlay.ts as a pure move — re-exported here so prior import paths keep working.
+// Fleet overlay mutation, legacy serialization, and diff rendering live together in fleet-overlay.ts.
 export {
   FLEET_OVERLAY_KEYS,
   fleetEditableEquals,
   fleetRepoOverlayFromDelta,
-  harvestFleetProvenance,
+  renderFleetOverlayWrite,
   repoOverlayYaml,
   serializeFleetOverlay,
   unifiedYamlDiff,
 } from "./fleet-overlay.js";
-export type { FleetDenyNotes, HarvestedProvenance } from "./fleet-overlay.js";
+export type { FleetOverlayWrite } from "./fleet-overlay.js";
 
 export type FleetTierAssignment = { tier: Tier; provenance?: string };
 
@@ -781,18 +845,12 @@ export function readOverlayFile(path: string): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 
-export function fleetEditableFromConfig(
-  cfg: TickmarkrConfig,
-  provenance: Record<string, Record<string, string>> = {},
-): FleetEditable {
+export function fleetEditableFromConfig(cfg: TickmarkrConfig): FleetEditable {
   const tiers: FleetEditable["tiers"] = {};
   for (const [adapter, entry] of Object.entries(cfg.tiers)) {
     tiers[adapter] = {};
     for (const [model, tier] of Object.entries(entry.models)) {
-      // OBS-88: notes harvested from the overlay ride the session state from load, so a later
-      // write knows about every existing note — not only the ones this session typed itself
-      const note = provenance[adapter]?.[model];
-      tiers[adapter][model] = note ? { tier, provenance: note } : { tier };
+      tiers[adapter][model] = { tier };
     }
   }
   return {
@@ -831,48 +889,20 @@ export function fleetKeyLayer(
 export function formatFleetPrint(repoRoot: string, opts: { globalDir?: string } = {}): string {
   const gdir = opts.globalDir ?? globalConfigDir();
   const effective = loadConfig(repoRoot, { globalDir: gdir });
-  const editable = fleetEditableFromConfig(effective);
-  const lines: string[] = ["# tickmarkr fleet — effective state (repo > global > defaults)"];
-  const annotate = (dotted: string, yaml: string) => `${yaml}  # ${fleetKeyLayer(repoRoot, dotted, opts)}`;
-  const denyAdapters = editable.denyAdapters;
-  const denyModels = editable.denyModels;
-  if (denyAdapters.length || denyModels.length) {
-    lines.push("routing:");
-    lines.push("  deny:");
-    if (denyAdapters.length) lines.push(annotate("routing.deny.adapters", `    adapters: ${stringify(denyAdapters).trim()}`));
-    if (denyModels.length) lines.push(annotate("routing.deny.models", `    models: ${stringify(denyModels).trim()}`));
-  }
-  const mapKeys = Object.keys(editable.map).sort();
-  if (mapKeys.length) {
-    if (!lines.some((l) => l === "routing:")) lines.push("routing:");
-    lines.push("  map:");
-    for (const shape of mapKeys) {
-      const entry = editable.map[shape];
-      const body = stringify(entry, { indent: 4 }).trim().split("\n").map((l) => `    ${l}`).join("\n");
-      lines.push(annotate(`routing.map.${shape}`, `    ${shape}:`));
-      lines.push(body.split("\n").slice(1).join("\n"));
+  const doc = new Document({ routing: effective.routing, tiers: effective.tiers });
+  doc.commentBefore = " tickmarkr fleet — effective state (repo > global > defaults)";
+  const annotate = (path: string[], dotted = path.join(".")) => {
+    const node = doc.getIn(path, true);
+    if (node && typeof node === "object" && "comment" in node) {
+      node.comment = ` ${fleetKeyLayer(repoRoot, dotted, opts)}`;
     }
+  };
+  if (effective.routing.deny?.adapters !== undefined) annotate(["routing", "deny", "adapters"]);
+  if (effective.routing.deny?.models !== undefined) annotate(["routing", "deny", "models"]);
+  for (const shape of Object.keys(effective.routing.map)) annotate(["routing", "map", shape]);
+  annotate(["routing", "floors"]);
+  for (const [adapter, entry] of Object.entries(effective.tiers)) {
+    for (const model of Object.keys(entry.models)) annotate(["tiers", adapter, "models", model]);
   }
-  const floorKeys = Object.keys(editable.floors).sort();
-  if (floorKeys.length) {
-    if (!lines.some((l) => l === "routing:")) lines.push("routing:");
-    lines.push(annotate("routing.floors", `  floors: ${stringify(Object.fromEntries(floorKeys.map((k) => [k, editable.floors[k]]))).trim().replace(/^/gm, "  ")}`));
-  }
-  const tierAdapters = Object.keys(editable.tiers).sort();
-  if (tierAdapters.length) {
-    lines.push("tiers:");
-    for (const adapter of tierAdapters) {
-      const models = editable.tiers[adapter];
-      const modelIds = Object.keys(models).sort();
-      if (!modelIds.length) continue;
-      lines.push(`  ${adapter}:`);
-      lines.push("    models:");
-      for (const model of modelIds) {
-        const v = models[model];
-        if (v === null) lines.push(`      ${model}: null`);
-        else lines.push(annotate(`tiers.${adapter}.models.${model}`, `      ${model}: ${v.tier}`));
-      }
-    }
-  }
-  return `${lines.join("\n")}\n`;
+  return String(doc);
 }

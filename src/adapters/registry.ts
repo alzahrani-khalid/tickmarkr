@@ -1,31 +1,45 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type TickmarkrConfig, overlayPreferShapes, TIER_RANK, type Tier } from "../config/config.js";
+import { type TickmarkrConfig } from "../config/config.js";
 import { modelLints, suggestOverlay } from "./model-lints.js";
 import { HerdrDriver } from "../drivers/herdr.js";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
 import { disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../route/preference.js";
-import { learnedScore, type RoutingProfile } from "../route/profile.js";
-import { marginalCostRank } from "../route/router.js";
 import { sh } from "../run/git.js";
-import { claudeCode } from "./claude-code.js";
-import { codex } from "./codex.js";
-import { cursorAgent } from "./cursor-agent.js";
 import { FakeAdapter } from "./fake.js";
-import { grok } from "./grok.js";
-import { kimi } from "./kimi.js";
-import { opencode } from "./opencode.js";
-import { pi } from "./pi.js";
+import { parseWorkerResult } from "./prompt.js";
 import { sealHerdrEnv } from "../drivers/subprocess.js";
-import { type AuthHealth, type BillingChannel, channelKey, type ModelAuth, modelAuthed, QUOTA_RE, shq, type WorkerAdapter } from "./types.js";
+import {
+  catalogEntries, isNativeCliDrive, projectCliEntries, SHIPPED_CLI_CATALOG,
+  type CatalogEntriesOptions, type CliEntry, type DeclarativeCliDrive,
+} from "./catalog.js";
+import {
+  type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, type ModelAuth,
+  modelAuthed, MODEL_ID_RE, QUOTA_RE, shq, type WorkerAdapter,
+} from "./types.js";
 
-// Agent-CLI binary names with no tickmarkr adapter — doctor sweeps these advisory-only (v1.48 T1).
-export const CANDIDATE_CLI_CATALOG = ["kimi", "gemini", "qwen", "aider", "goose", "amp", "droid", "auggie", "crush"] as const;
+// Compatibility projection for callers/tests that only need shipped advisory names. The literal
+// list is gone: both advisory and routable catalog views derive from SHIPPED_CLI_CATALOG. Native
+// definitions (claudeCode, codex, cursorAgent, opencode, pi, grok, kimi) are owned by catalog.ts;
+// this registry consumes their drive contracts instead of restating their registration order.
+export const CANDIDATE_CLI_CATALOG: readonly string[] = SHIPPED_CLI_CATALOG
+  .filter((entry) => entry.drive === undefined)
+  .map((entry) => entry.binary);
+const SHIPPED_NATIVE_ADAPTERS = new Set(
+  SHIPPED_CLI_CATALOG.flatMap((entry) => isNativeCliDrive(entry.drive) ? [entry.drive.adapter] : []),
+);
 
-// Binaries probed by registered adapters — kept beside the catalog so a test can forbid overlap.
-export const REGISTERED_ADAPTER_BINARIES = ["claude", "codex", "cursor-agent", "opencode", "pi", "grok"] as const;
+const declarativeBinaries = new WeakMap<WorkerAdapter, string>();
+
+// OBS-304: this was a hand-maintained mirror of the registered binaries, and the guard test that
+// forbids catalog overlap checked against IT rather than against the adapters — so when kimi gained
+// an adapter and nobody updated the copy, the guard kept passing on a collision it existed to catch.
+// Derive it. A list that restates another list is the defect, not the entry that fell out of sync.
+export function registeredAdapterBinaries(adapters: WorkerAdapter[] = allAdapters()): string[] {
+  return adapters.map((a) => a.hardcodedFlags?.binary ?? declarativeBinaries.get(a)).filter((b): b is string => !!b);
+}
 
 // OBS-117: worker panes run commands through `bash -lc` (SubprocessDriver + sh()), not bare spawnSync(bin).
 // Doctor must resolve adapter binaries the same way so a shadow install on PATH cannot disagree with dispatch.
@@ -40,9 +54,23 @@ function shellSpawnSync(cmd: string, cwd: string, timeoutMs = 10000): { code: nu
   return { code: r.status ?? 1, stdout: (r.stdout || "").trim(), stderr: (r.stderr || "").trim() };
 }
 
-export function resolveShellBinary(bin: string, cwd = process.cwd()): { resolved?: string; all: string[] } {
-  const r = shellSpawnSync(`type -a ${shq(bin)} 2>/dev/null | sed -n 's/^.* is \\(.*\\)$/\\1/p'`, cwd);
-  const all = r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+export function resolveShellBinary(bin: string, cwd = process.cwd(), pathEnv?: string): { resolved?: string; all: string[] } {
+  // An explicit PATH is a deterministic fixture/operator boundary. The default remains the same
+  // login-shell environment used by dispatched workers (OBS-117).
+  const pathPrefix = pathEnv === undefined ? "" : `export PATH=${shq(pathEnv)}; `;
+  const r = shellSpawnSync(`${pathPrefix}type -a ${shq(bin)} 2>/dev/null | sed -n 's/^.* is \\(.*\\)$/\\1/p'`, cwd);
+  const hits = r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  // OBS-304: a duplicated PATH entry makes `type -a` emit the SAME path twice, which doctor then
+  // reported as "2 installs on PATH — …/claude, …/claude". Count distinct real files, so the real
+  // shadows (codex: homebrew + nvm) stop being buried in noise. realpath resolves symlinked twins.
+  const seen = new Set<string>();
+  const all = hits.filter((p) => {
+    let key = p;
+    try {
+      key = realpathSync(p);
+    } catch { /* unreadable or dangling — fall back to the literal path */ }
+    return seen.has(key) ? false : (seen.add(key), true);
+  });
   return { resolved: all[0], all };
 }
 
@@ -114,42 +142,59 @@ export function modelAliasLine(excluded: { key: string; adapter: string; model: 
   return `model alias: ${excluded.length} channel(s) invalid — ${parts.join(", ")}`;
 }
 
-export type CandidateCliDetection = { binary: string; version: string | undefined };
+export type CandidateCliDetection = { binary: string; path: string };
 
-function candidateOnPath(bin: string, pathEnv: string): boolean {
-  const r = spawnSync("which", [bin], { encoding: "utf8", env: { ...process.env, PATH: pathEnv } });
-  return r.status === 0 && r.stdout.trim().length > 0;
+// Herdr's supported-kind help is nomination data only. Parse the closed token list and discard
+// everything else before any name can reach a shell resolver.
+export function parseHerdrCliNames(help: string): string[] {
+  const body = /\[possible values:\s*([^\]]+)\]/m.exec(help)?.[1] ?? "";
+  return [...new Set(body.split(",").map((name) => name.trim()).filter((name) => /^[a-z0-9-]+$/.test(name)))];
 }
 
-// Fail open: a broken candidate binary never throws and never fails doctor.
-export function probeCandidateVersion(bin: string): string | undefined {
-  try {
-    const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 10000 });
-    if (r.error || r.status !== 0) return undefined;
-    return (r.stdout || r.stderr).trim().split("\n")[0];
-  } catch {
-    return undefined;
+export function herdrNominatedCliNames(cwd = process.cwd(), pathEnv?: string): string[] {
+  // This asks a known driver binary for static help. It is deliberately NOT gated on
+  // HerdrDriver.available(), which reports HERDR_ENV rather than binary presence.
+  const { resolved } = resolveShellBinary("herdr", cwd, pathEnv);
+  if (!resolved) return [];
+  const r = shellSpawnSync(`${shq(resolved)} agent start --help`, cwd);
+  return r.code === 0 ? parseHerdrCliNames(`${r.stdout}\n${r.stderr}`) : [];
+}
+
+export interface DetectCandidateCliOptions extends CatalogEntriesOptions {
+  cwd?: string;
+  pathEnv?: string;
+  entries?: readonly CliEntry[];
+  adapters?: WorkerAdapter[];
+  resolveBinary?: (binary: string) => { resolved?: string; all: string[] };
+}
+
+export function detectCandidateClis(opts: DetectCandidateCliOptions = {}): CandidateCliDetection[] {
+  const cwd = opts.cwd ?? process.cwd();
+  const entries = opts.entries ?? catalogEntries({
+    shipped: opts.shipped,
+    operatorYaml: opts.operatorYaml,
+    operatorPath: opts.operatorPath,
+    herdrNames: opts.herdrNames ?? herdrNominatedCliNames(cwd, opts.pathEnv),
+  });
+  const registered = new Set(registeredAdapterBinaries(opts.adapters ?? allAdapters({ cliEntries: entries })));
+  const advisory = projectCliEntries(entries).advisory.filter((entry) => !registered.has(entry.binary));
+  const resolveBinary = opts.resolveBinary
+    ?? ((binary: string) => resolveShellBinary(binary, cwd, opts.pathEnv));
+  const discovered = [] as CandidateCliDetection[];
+  for (const entry of advisory) {
+    const { resolved } = resolveBinary(entry.binary);
+    if (resolved) discovered.push({ binary: entry.binary, path: resolved });
   }
+  return discovered;
 }
 
-export function detectCandidateClis(opts: { pathEnv?: string } = {}): CandidateCliDetection[] {
-  const pathEnv = opts.pathEnv ?? process.env.PATH ?? "";
-  const out: CandidateCliDetection[] = [];
-  for (const bin of CANDIDATE_CLI_CATALOG) {
-    if (!candidateOnPath(bin, pathEnv)) continue;
-    out.push({ binary: bin, version: probeCandidateVersion(bin) });
-  }
-  return out;
+export function formatCandidateCliRow({ binary, path }: CandidateCliDetection): string {
+  return `  ! ${binary.padEnd(14)} detected at ${path} (no drive contract — not routable)`;
 }
 
-export function formatCandidateCliRow({ binary, version }: CandidateCliDetection): string {
-  const ver = version ?? "version unknown";
-  return `  ! ${binary.padEnd(14)} detected: ${ver} (no tickmarkr adapter — not routable)`;
-}
-
-// v1.65 T3: same guarded spawn pattern as probeCandidateVersion — bounded, error/status-checked,
-// fail-open. undefined = binary unavailable/broken ⇒ no drift verdict (the existing auth reporting
-// already names an uninstalled CLI; drift must never pile on).
+// v1.65 T3: bounded, error/status-checked and fail-open. Unlike candidate detection above, this
+// executes only registered adapter binaries with drive contracts. undefined = unavailable/broken,
+// so no drift verdict piles onto the existing auth report.
 export function probeHelpText(bin: string): string | undefined {
   try {
     const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: 10000 });
@@ -188,11 +233,107 @@ export function flagDriftWarnings(
   return out;
 }
 
-export function allAdapters(opts: { fakeScriptPath?: string } = {}): WorkerAdapter[] {
-  // pi + grok + kimi appended LAST: same-tier ties resolve by discovery order (Phase 6 D2), so
-  // appending keeps the Phase 6 shape→channel matrix byte-identical; inserting anywhere else
-  // silently reassigns shapes on same-tier ties. kimi is appended AFTER grok for the same reason.
-  const real: WorkerAdapter[] = [claudeCode, codex, cursorAgent, opencode, pi, grok, kimi];
+function renderDriveTemplate(template: string, promptFile: string, model: string): string {
+  return template.replaceAll("{promptFile}", shq(promptFile)).replaceAll("{model}", shq(model));
+}
+
+function valueAtPath(value: unknown, path: string | undefined): unknown {
+  if (!path) return value;
+  return path.split(".").reduce<unknown>((cursor, part) => {
+    if (!cursor || typeof cursor !== "object") return undefined;
+    return (cursor as Record<string, unknown>)[part];
+  }, value);
+}
+
+function parseDeclaredModels(raw: string, parser: "lines" | "pi-table" | "json", path?: string): string[] {
+  let values: unknown[];
+  if (parser === "json") {
+    try {
+      const selected = valueAtPath(JSON.parse(raw), path);
+      values = Array.isArray(selected) ? selected : [];
+    } catch {
+      return [];
+    }
+  } else if (parser === "pi-table") {
+    const lines = raw.trim().split("\n");
+    const header = lines.findIndex((line) => /^provider\s+model\b/i.test(line.trim()));
+    values = header === -1 ? [] : lines.slice(header + 1).map((line) => {
+      const [provider, model] = line.trim().split(/\s+/);
+      return provider && model ? `${provider}/${model}` : "";
+    });
+  } else {
+    values = raw.split("\n").map((line) => line.trim());
+  }
+  return [...new Set(values.filter((value): value is string => typeof value === "string" && MODEL_ID_RE.test(value)))];
+}
+
+function declarativeAdapter(entry: CliEntry & { drive: DeclarativeCliDrive }): WorkerAdapter {
+  const drive = entry.drive;
+  const adapter: WorkerAdapter = {
+    id: entry.id,
+    vendor: entry.vendor!,
+    probe: async () => {
+      const health = probeVersionShell(entry.binary);
+      if (!health.installed) return health;
+      const version = health.version ?? "";
+      if (!new RegExp(entry.identity).test(version)) {
+        return {
+          installed: true,
+          authed: false,
+          version,
+          models: [],
+          note: `identity mismatch for ${entry.binary}`,
+          binaryPaths: health.binaryPaths,
+        };
+      }
+      return health;
+    },
+    channels: (cfg) => channelsFromConfig(entry.id, cfg),
+    headlessCommand: (promptFile, model) => renderDriveTemplate(drive.headless, promptFile, model),
+    interactiveCommand: (promptFile, model) => drive.interactive === null
+      ? null
+      : renderDriveTemplate(drive.interactive, promptFile, model),
+    invoke(_task, _cwd, assignment, ctx) {
+      return { command: this.headlessCommand(ctx.promptFile, assignment.model) };
+    },
+    parse: parseWorkerResult,
+    ...(drive.listModels ? {
+      listModels: async () => {
+        const { resolved } = resolveShellBinary(entry.binary);
+        if (!resolved) return [];
+        const cmd = [shq(resolved), ...drive.listModels!.argv.map(shq)].join(" ");
+        const result = shellSpawnSync(cmd, process.cwd(), 15000);
+        return result.code === 0
+          ? parseDeclaredModels(result.stdout, drive.listModels!.parser, drive.listModels!.path)
+          : [];
+      },
+    } : {}),
+  };
+  declarativeBinaries.set(adapter, entry.binary);
+  return adapter;
+}
+
+export function adaptersFromCliEntries(entries: readonly CliEntry[]): WorkerAdapter[] {
+  return projectCliEntries(entries).routable.map((entry) => {
+    if (isNativeCliDrive(entry.drive)) return entry.drive.adapter;
+    return declarativeAdapter(entry as CliEntry & { drive: DeclarativeCliDrive });
+  });
+}
+
+export interface AllAdaptersOptions {
+  fakeScriptPath?: string;
+  cliEntries?: readonly CliEntry[];
+  operatorYaml?: string | null;
+  operatorPath?: string | false;
+}
+
+export function allAdapters(opts: AllAdaptersOptions = {}): WorkerAdapter[] {
+  const entries = opts.cliEntries ?? catalogEntries({
+    operatorYaml: opts.operatorYaml,
+    operatorPath: opts.operatorPath,
+    herdrNames: [],
+  });
+  const real = adaptersFromCliEntries(entries);
   const fakePath = opts.fakeScriptPath ?? process.env.TICKMARKR_FAKE_SCRIPT;
   return fakePath ? [new FakeAdapter(fakePath), ...real] : real;
 }
@@ -263,77 +404,6 @@ function probeFailure(
 export type ProbeModelStatus = "ok" | "timeout" | "failed";
 export type ProbeModelProgress = (adapter: string, model: string, status: ProbeModelStatus, durationMs: number) => void;
 
-export interface AutoPreferDoc {
-  derivedAt: string;
-  [shape: string]: string[] | string;
-}
-
-export const pendingAutoPreferKey = Symbol.for("tickmarkr.pendingAutoPrefer");
-
-type HealthWritePayload = Record<string, AuthHealth> & { [pendingAutoPreferKey]?: AutoPreferDoc };
-
-const median = (xs: number[]) => {
-  const s = [...xs].sort((a, b) => a - b);
-  const m = Math.floor(s.length / 2);
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-};
-
-// ponytail: 24h TTL matches plan.ts staleness — promote to config when an operator asks.
-export const DOCTOR_ROUTING_STALE_MS = 24 * 60 * 60 * 1000;
-
-export function deriveAutoPrefer(
-  cfg: TickmarkrConfig,
-  adapters: WorkerAdapter[],
-  health: Record<string, AuthHealth>,
-  profile?: RoutingProfile,
-): AutoPreferDoc {
-  const derivedAt = new Date().toISOString();
-  const out: AutoPreferDoc = { derivedAt };
-  // v1.52 T5: routing.floors is the only band authority — a map entry can no longer carry a tier.
-  for (const shape of Object.keys(cfg.routing.map)) {
-    const minTier: Tier = cfg.routing.floors[shape] ?? "cheap";
-    const ranked: { adapter: string; mc: number; dur: number; learned: number }[] = [];
-    for (const a of adapters) {
-      const h = health[a.id];
-      if (!h?.installed || !h?.authed || typeof a.channels !== "function") continue;
-      const qualifying = a.channels(cfg).filter((c) => TIER_RANK[c.tier] >= TIER_RANK[minTier] && h.modelAuth?.[c.model]?.authed === true);
-      if (!qualifying.length) continue;
-      const durations = qualifying
-        .map((c) => (h.modelAuth?.[c.model] as { durationMs?: number } | undefined)?.durationMs)
-        .filter((d): d is number => typeof d === "number");
-      ranked.push({
-        adapter: a.id,
-        mc: Math.min(...qualifying.map(marginalCostRank)),
-        dur: durations.length ? median(durations) : Number.POSITIVE_INFINITY,
-        learned: profile ? Math.max(...qualifying.map((c) => learnedScore(profile, shape, channelKey(c), c.channel))) : 0,
-      });
-    }
-    ranked.sort((a, b) => a.mc - b.mc || a.dur - b.dur || b.learned - a.learned);
-    out[shape] = ranked.map((r) => r.adapter);
-  }
-  return out;
-}
-
-export function readAutoPrefer(repoRoot: string): AutoPreferDoc | null {
-  const raw = readDoctorFile(repoRoot);
-  if (!raw || typeof raw.autoPrefer !== "object" || raw.autoPrefer === null) return null;
-  return raw.autoPrefer as AutoPreferDoc;
-}
-
-export function routingPreferContext(
-  repoRoot: string,
-  cfg: TickmarkrConfig,
-  opts: { globalDir?: string } = {},
-): { autoPrefer?: AutoPreferDoc; doctorFresh: boolean; overlayPreferShapes: ReadonlySet<string> } {
-  const age = doctorAgeMs(repoRoot);
-  const doctorFresh = age !== null && age <= DOCTOR_ROUTING_STALE_MS;
-  return {
-    autoPrefer: doctorFresh ? readAutoPrefer(repoRoot) ?? undefined : undefined,
-    doctorFresh,
-    overlayPreferShapes: overlayPreferShapes(repoRoot, opts),
-  };
-}
-
 type ProbedModelAuth = ModelAuth & { durationMs: number };
 
 const probeModelStatus = (v: ProbedModelAuth): ProbeModelStatus =>
@@ -354,7 +424,7 @@ export async function probeModels(
     const h = health[a.id];
     if (!h?.installed) return;
     // Tests inject FakeAdapter; never let an incidental default adapter spend a real token in the suite.
-    if (process.env.VITEST && [claudeCode, codex, cursorAgent, opencode, pi, grok, kimi].includes(a)) return;
+    if (process.env.VITEST && SHIPPED_NATIVE_ADAPTERS.has(a)) return;
     const verdicts: Record<string, ProbedModelAuth> = {};
     const priorModelAuth = priorHealth?.[a.id]?.modelAuth;
     const probeRoot = a.probeCwd === "neutral" ? mkdtempSync(join(tmpdir(), "tickmarkr-probe-")) : repoRoot;
@@ -411,7 +481,6 @@ export async function probeModels(
     }
     h.modelAuth = verdicts;
   }));
-  (health as HealthWritePayload)[pendingAutoPreferKey] = deriveAutoPrefer(cfg, adapters, health);
 }
 
 // T2: caps concurrent probes per adapter at 2 — v1.33.5 regression, 4 concurrent codex exec in one
@@ -443,19 +512,17 @@ function readDoctorFile(repoRoot: string): Record<string, unknown> | null {
 
 export function writeDoctor(repoRoot: string, health: Record<string, AuthHealth>): void {
   tickmarkrDir(repoRoot);
-  const pending = (health as HealthWritePayload)[pendingAutoPreferKey];
-  const payload: Record<string, unknown> = { ...health };
-  delete payload[pendingAutoPreferKey as unknown as string];
-  if (pending) payload.autoPrefer = pending;
   const path = doctorPath(repoRoot);
   const tmp = `${path}.tmp`;
-  writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\n");
+  writeFileSync(tmp, JSON.stringify(health, null, 2) + "\n");
   renameSync(tmp, path);
 }
 
 export function readDoctor(repoRoot: string): Record<string, AuthHealth> | null {
   const raw = readDoctorFile(repoRoot);
   if (!raw) return null;
+  // pre-v1.86 caches may still carry an `autoPrefer` key — strip it; the mechanism is deleted and
+  // the key is never read back into health.
   const { autoPrefer: _, ...health } = raw;
   return health as Record<string, AuthHealth>;
 }

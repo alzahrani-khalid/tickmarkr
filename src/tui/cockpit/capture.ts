@@ -869,6 +869,63 @@ export async function regenerateGoldenFrames(
   return regenerated;
 }
 
+const SEMVER_TOKEN =
+  String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?`;
+const PLAIN_VERSION_HEADER = new RegExp(
+  `^(tickmarkr v)(${SEMVER_TOKEN})$`,
+  "u",
+);
+const FRAME_VERSION_HEADER = new RegExp(
+  `^(.*\\S)( +)v(${SEMVER_TOKEN})( · binary ✓)$`,
+  "u",
+);
+const COMPARISON_VERSION = "<binary-version>";
+
+/**
+ * Canonicalize the one release-owned token in an ACTIVE golden frame.
+ *
+ * The grammar is deliberately positional: plain output owns the whole first
+ * line, while a setup frame owns the right-anchored `v<semver> · binary ✓`
+ * suffix. The latter preserves the suffix's right edge, so a longer version
+ * does not turn renderer padding into drift while any actual alignment change
+ * still does. Retired rendered frames never enter this exception.
+ */
+export function normalizeGoldenFrameVersionForComparison(
+  frame: GoldenFrameCase,
+  bytes: string,
+): string {
+  if (isRetiredGoldenFrame(frame)) return bytes;
+  const lineBreak = bytes.indexOf("\n");
+  const header = lineBreak === -1 ? bytes : bytes.slice(0, lineBreak);
+  const rest = lineBreak === -1 ? "" : bytes.slice(lineBreak);
+  let normalized = header;
+
+  if (!frame.interactive || frame.ci) {
+    normalized = header.replace(
+      PLAIN_VERSION_HEADER,
+      `$1${COMPARISON_VERSION}`,
+    );
+  } else {
+    normalized = header.replace(
+      FRAME_VERSION_HEADER,
+      (_match, prefix: string, gap: string, versionToken: string, suffix: string) =>
+        `${prefix}${" ".repeat(gap.length + versionToken.length)}v${COMPARISON_VERSION}${suffix}`,
+    );
+  }
+
+  return normalized === header ? bytes : `${normalized}${rest}`;
+}
+
+/** An absent committed frame is a mismatch; it is never an empty agreement. */
+export function goldenFrameMatchesCommitted(
+  frame: RegeneratedGoldenFrame,
+  committed: string | undefined,
+): boolean {
+  return committed !== undefined
+    && normalizeGoldenFrameVersionForComparison(frame, committed)
+      === normalizeGoldenFrameVersionForComparison(frame, frame.output);
+}
+
 export function findGoldenFrameMismatches(
   regenerated: readonly RegeneratedGoldenFrame[],
   committed: ReadonlyMap<string, string>,
@@ -879,7 +936,9 @@ export function findGoldenFrameMismatches(
   const expected = new Set(GOLDEN_FRAME_CASES.map((frame) => frame.fixture));
   return [
     ...regenerated.flatMap((frame) =>
-      committed.get(frame.fixture) === frame.output ? [] : [frame.fixture]
+      goldenFrameMatchesCommitted(frame, committed.get(frame.fixture))
+        ? []
+        : [frame.fixture]
     ),
     ...[...committed.keys()].filter((fixture) => !expected.has(fixture)),
   ].sort();

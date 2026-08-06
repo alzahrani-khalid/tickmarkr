@@ -3,7 +3,7 @@ import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, matchesOccupiedInputBox, missingInputStateDeclarations, shq, type InputBox } from "../adapters/types.js";
-import { PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
+import { consumePaneLaunchIntent, PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
 import { Journal } from "../run/journal.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
@@ -91,11 +91,34 @@ export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILE
 // a group holds N generations (WORKERS, cleanup, cleanup, …), each its own tab, cap-bounded. Teardown
 // is refcounted PER GENERATION: each overflow tab closes when its OWN last member leaves (43-02).
 interface GroupEntry { tabId: string; label: string; members: { name: string; paneId: string }[] }
+
+/** The tab a slot belongs to: its TASK — worker, judge, review and consult panes for one task share it.
+ *  Returns undefined for everything else, which keeps those on the dedicated-tab path.
+ *
+ *  The ROLE gate is load-bearing and was added after it bit: `canonicalizeLegacyName` returns
+ *  `role:"other", taskId:"<the whole name>"` for any unrecognised string, so keying on taskId alone
+ *  makes EVERY one-off pane its own "task" and gives it a group tab. `watch` is excluded for the same
+ *  reason in the other direction — its taskId is the literal "run", which is a board, not a task. */
+const TASK_TAB_ROLES = new Set(["worker", "judge", "review", "consult"]);
+export function taskGroupOf(name: string): string | undefined {
+  const { role, taskId } = canonicalizeLegacyName(name, "");
+  if (!TASK_TAB_ROLES.has(role)) return undefined;
+  return taskId && taskId.trim() ? taskId : undefined;
+}
+
+/** Gate panes ride with the task they belong to and never consume the tab cap; everything else does.
+ *  Scoped to the three GATE roles deliberately — an earlier cut of this said "not a worker", which let
+ *  role:"other" members (any unrecognised name) bypass the cap and silently disabled overflow for
+ *  explicit stage groups. The cap still governs every member it governed before. */
+const GATE_ROLES = new Set(["judge", "review", "consult"]);
+const ridesWithTask = (name: string): boolean => GATE_ROLES.has(canonicalizeLegacyName(name, "").role);
+const cappedMembers = (g: GroupEntry): number => g.members.filter((m) => !ridesWithTask(m.name)).length;
 // splitUnsupported is PER GROUP (a herdr that can't split can't split in any tab); `created` is a
 // monotonic generation counter so distinct overflow generations never collide as objects (VIS-13:
 // overflow labels are all "cleanup" — distinguished by their live member token, never a WORKERS-N).
 interface GroupState { generations: GroupEntry[]; created: number; splitUnsupported?: boolean }
 interface DispatchLease { release: () => void }
+interface LifecycleInputBox extends InputBox { firstDeliveryIsLaunch?: true }
 
 export class HerdrDriver implements ExecutorDriver {
   id = "herdr";
@@ -282,8 +305,22 @@ export class HerdrDriver implements ExecutorDriver {
     // reconcile.ts and this driver's own renameGroupTab/glyphFor decode role/taskId/attempt from
     // those shapes without a call-site migration; T2 retires this branch by always passing `owned`.
     const resolved = opts?.owned ? formatOwnedName(opts.owned) : name;
-    const allocate = opts?.group
-      ? () => this.serial(() => this.groupSlot(cwd, resolved, opts.group!))
+    // ONE TAB PER TASK. The group defaults to the task id, derived from the same parser that already
+    // decodes role/taskId for tab labels — so a worker and every gate pane it earns (judge, review,
+    // consult) land in that task's tab instead of scattering. Deriving it HERE rather than at each
+    // call site is the point: the defect this replaces was three call sites of which exactly one
+    // passed a group, so judge/review/consult each opened a tab of their own. A caller may still pass
+    // `group` explicitly to override, and a name with no task id (or an explicit `label`) keeps the
+    // dedicated-tab path unchanged.
+    // PRECEDENCE: a task-bearing name ALWAYS groups by its task; an explicit `group` applies only to
+    // names with no task identity. That direction is deliberate — the invariant is "a task's panes are
+    // never scattered", and a caller passing a stage group (the daemon still passes "workers", which now
+    // serves as the fallback for task-less names) must not be able to override it by omission or habit.
+    // An explicit `label` still wins outright: that is the dedicated-role-tab path, chosen on purpose.
+    const derivedGroup = opts?.label ? undefined : taskGroupOf(resolved);
+    const group = derivedGroup ?? opts?.group;
+    const allocate = group
+      ? () => this.serial(() => this.groupSlot(cwd, resolved, group))
       : () => this.tabSlot(cwd, resolved, opts?.label);
     // Production dispatch names are canonical even when the gate call site supplies the already-
     // formatted name rather than SlotOpts.owned. Hold one lease across slot() → run(); legacy/manual
@@ -385,7 +422,10 @@ export class HerdrDriver implements ExecutorDriver {
     if (state?.splitUnsupported) return this.tabSlot(cwd, name); // D-09: degrade, NOT a shared-tab member
     if (state) {
       const latest = state.generations[state.generations.length - 1];
-      if (latest && latest.members.length < this.workersPerTab) {
+      // A task tab's judge/review/consult panes belong with their worker and must never overflow into a
+      // `cleanup` tab — that would re-scatter exactly what the per-task grouping exists to gather. They
+      // therefore join freely and do not consume `workersPerTab`; every other member still does.
+      if (latest && (ridesWithTask(name) || cappedMembers(latest) < this.workersPerTab)) {
         const joined = await this.joinGroup(cwd, name, group, latest);
         if (joined) return joined;
         state.splitUnsupported = true; // D-09 fail-safe: this and future members degrade to per-slot tabs
@@ -421,7 +461,11 @@ export class HerdrDriver implements ExecutorDriver {
     const newest = [...entry.members].reverse().find((m) => canonicalizeLegacyName(m.name, "").role === "worker");
     const token = newest ? canonicalizeLegacyName(newest.name, "").taskId : undefined;
     const glyph = newest ? await this.glyphFor(newest) : "";
-    const label = token ? `${entry.label} · ${token}${glyph}` : entry.label;
+    // A per-task tab is already labelled with its task id; appending the same token again reads as a
+    // duplicate rather than as state, so the glyph rides the existing label instead.
+    const label = !token ? entry.label
+      : entry.label === token ? `${token}${glyph}`
+      : `${entry.label} · ${token}${glyph}`;
     const cmd = `tab rename ${shq(entry.tabId)} ${shq(label)}`;
     const ok = async () => (await this.herdr(cmd)).code === 0;
     if (await ok() || await ok()) return;
@@ -495,19 +539,23 @@ export class HerdrDriver implements ExecutorDriver {
   // command — earns the typed pincer. One dispatch corruption is then retried in-process against a
   // FRESH pane before anything is reported as a failure.
   async run(slot: Slot, cmd: string): Promise<void> {
+    // paneLaunchCommand is a linear same-call handoff: consume before the first await so concurrent
+    // task dispatches cannot exchange intent. The command remains an ordinary string for every
+    // ExecutorDriver implementation; classification never reads its bytes when the builder spoke.
+    const recordedLaunch = consumePaneLaunchIntent();
     const lease = this.dispatchLeases.get(slot);
     if (lease) {
       this.dispatchLeases.delete(slot);
       try {
         const paneId = await this.verifyPaneIdentityBinding(slot);
-        await this.dispatchWithRetry(slot, cmd, paneId);
+        await this.dispatchWithRetry(slot, cmd, paneId, recordedLaunch);
       } finally {
         lease.release();
       }
       return;
     }
     return this.deliveryQueue(async () => {
-      await this.dispatchWithRetry(slot, cmd, await this.paneId(slot));
+      await this.dispatchWithRetry(slot, cmd, await this.paneId(slot), recordedLaunch);
     });
   }
 
@@ -515,9 +563,9 @@ export class HerdrDriver implements ExecutorDriver {
   // pane and a fresh submit, and every one of them cost an operator `resume --retry-failed`. Retry
   // ONCE here against a pane that has never seen this delivery; the wedged pane is closed, never
   // re-pressed. A second consecutive corruption propagates, and the daemon parks the task on it.
-  private async dispatchWithRetry(slot: Slot, cmd: string, pane: string): Promise<void> {
+  private async dispatchWithRetry(slot: Slot, cmd: string, pane: string, recordedLaunch = false): Promise<void> {
     try {
-      await this.dispatch(slot, cmd, pane);
+      await this.dispatch(slot, cmd, pane, recordedLaunch);
       this.deliveredPanes.set(slot, pane);
       return;
     } catch (error) {
@@ -527,7 +575,7 @@ export class HerdrDriver implements ExecutorDriver {
       // this slot already delivered. Retyping a turn into a bare shell would guarantee the second
       // failure rather than recover from the first, so without a replayable bootstrap the
       // corruption propagates untouched.
-      const typedTurn = this.isTuiTurn(slot, cmd);
+      const typedTurn = this.isTuiTurn(slot, cmd, recordedLaunch);
       const relaunch = typedTurn ? this.bootstraps.get(slot) : undefined;
       if (typedTurn && relaunch === undefined) throw error;
       // Record BEFORE acting: a retry that cannot be written to the run's ledger is not taken at all,
@@ -538,28 +586,31 @@ export class HerdrDriver implements ExecutorDriver {
       const fresh = await this.freshPane(slot, pane);
       if (fresh === null) throw error;
       if (relaunch !== undefined) await this.deliverAtomic(slot, relaunch, fresh);
-      await this.dispatch(slot, cmd, fresh);
+      await this.dispatch(slot, cmd, fresh, recordedLaunch);
       this.deliveredPanes.set(slot, fresh);
     }
   }
 
   // Is this delivery a turn TYPED into a running interface, rather than a line a shell runs? The
-  // adapter's declaration decides it wherever there is one: `launchCommand` names the bootstrap,
-  // everything else is a turn. With NO declaration the only evidence is the slot's own history — a
+  // The builder's recorded fact decides first, regardless of command bytes. For direct driver users,
+  // an adapter may declare the fresh-slot lifecycle rather than a prefix list. Legacy declarations
+  // still decide where neither stronger fact exists. With NO declaration the only evidence is history — a
   // pane that already accepted a delivery is running whatever that delivery started, so a second
   // delivery is a turn into it. Answering "shell" there is what would run an adapter's seed prompt
   // as a shell command; answering "turn" routes it to deliverTyped, which refuses it by name
   // because the adapter declared no input box (fail closed, never a guess).
-  private isTuiTurn(slot: Slot, cmd: string): boolean {
-    const inputBox = this.inputBoxes.get(slot);
+  private isTuiTurn(slot: Slot, cmd: string, recordedLaunch = false): boolean {
+    if (recordedLaunch) return false;
+    const inputBox = this.inputBoxes.get(slot) as LifecycleInputBox | undefined;
+    if (inputBox?.firstDeliveryIsLaunch && !this.deliveredPanes.has(slot)) return false;
     return inputBox ? inputBox.launchCommand?.(cmd) !== true : this.deliveredPanes.has(slot);
   }
 
-  private dispatch(slot: Slot, cmd: string, pane: string): Promise<void> {
-    if (this.isTuiTurn(slot, cmd)) return this.deliverTyped(slot, cmd, pane);
-    // An adapter-declared bootstrap is the one command that can restore this slot's interface on a
-    // fresh pane, so remember it for the recovery above.
-    if (this.inputBoxes.get(slot)?.launchCommand?.(cmd) === true) this.bootstraps.set(slot, cmd);
+  private dispatch(slot: Slot, cmd: string, pane: string, recordedLaunch = false): Promise<void> {
+    if (this.isTuiTurn(slot, cmd, recordedLaunch)) return this.deliverTyped(slot, cmd, pane);
+    // A classified bootstrap is the one command that can restore this slot's interface on a fresh
+    // pane, so remember the fact's command without asking its bytes to prove the classification again.
+    if (this.inputBoxes.has(slot)) this.bootstraps.set(slot, cmd);
     return this.deliverAtomic(slot, cmd, pane);
   }
 

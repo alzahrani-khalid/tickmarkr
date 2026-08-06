@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
+import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
 import type { WorkerResult } from "./types.js";
 
 export function buildTaskPrompt(task: Task, feedback = "", nonce = ""): string {
@@ -46,15 +47,26 @@ function trailerTokenPositions(raw: string, nonce: string): number[] {
   return positions;
 }
 
+// The worker protocol binds participation in the nonce-bearing TICKMARKR_RESULT token outside its
+// JSON object, while judge/review/consult bind it inside the object. Parsing has already rejected every
+// candidate by the time this runs, so canonicalize that token with the `ok` key this boundary requests;
+// the shared classifier still owns the resulting cause and callers cannot infer one from token count.
+function workerVerdictWitness(raw: string, nonce: string, positions: readonly number[]): string {
+  if (positions.length === 0) return raw;
+  return `{"nonce":${JSON.stringify(nonce)},"ok":false,`;
+}
+
 // v1.65 T1: the parse boundary's own no-trailer sentinel summaries. classifyDeadChannel keys on
 // these — a result carrying any other summary is a PARSED trailer, i.e. the worker speaking.
 export const NO_TRAILER_SUMMARY = "worker produced no TICKMARKR_RESULT trailer";
 export const UNPARSEABLE_TRAILER_SUMMARY = "unparseable TICKMARKR_RESULT trailer";
 
-export function parseWorkerResult(raw: string, nonce: string): WorkerResult {
-  const fail = (summary: string) => ({ ok: false, summary, deviations: [], raw });
+export type ClassifiedWorkerResult = WorkerResult & { cause?: VerdictUnparseableCause };
+
+export function parseWorkerResult(raw: string, nonce: string): ClassifiedWorkerResult {
+  const fail = (summary: string, cause: VerdictUnparseableCause): ClassifiedWorkerResult =>
+    ({ ok: false, summary, deviations: [], raw, cause });
   const positions = trailerTokenPositions(raw, nonce);
-  if (positions.length === 0) return fail(NO_TRAILER_SUMMARY);
   // TUIs echo the prompt template, redraw lines, and HARD-wrap the JSON with per-line margins
   // (cursor does; recent-unwrapped can't rejoin hard newlines). Scan occurrences backward — last
   // parseable wins — joining wrapped lines, stripping margin/box chrome, and growing the candidate
@@ -83,7 +95,8 @@ export function parseWorkerResult(raw: string, nonce: string): WorkerResult {
       }
     }
   }
-  return fail(UNPARSEABLE_TRAILER_SUMMARY);
+  const cause = classifyVerdictCause(workerVerdictWitness(raw, nonce, positions), nonce, "ok");
+  return fail(cause === "malformed-verdict" ? UNPARSEABLE_TRAILER_SUMMARY : NO_TRAILER_SUMMARY, cause);
 }
 
 // v1.65 T1: typed dead-channel reasons — CLI-reported terminal failures meaning this channel was

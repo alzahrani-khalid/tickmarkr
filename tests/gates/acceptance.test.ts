@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import { shq } from "../../src/adapters/types.js";
 import { acceptanceGate } from "../../src/gates/acceptance.js";
 import * as llm from "../../src/gates/llm.js";
 import { dewrapPaneVerdict, extractJson, extractVerdictJson, runHeadless } from "../../src/gates/llm.js";
@@ -26,12 +25,6 @@ function fakeWithJudge(judge: unknown): FakeAdapter {
   const p = join(dir, "s.json");
   writeFileSync(p, JSON.stringify({ tasks: {}, judge }));
   return new FakeAdapter(p);
-}
-
-function fakeWithRawJudge(judge: unknown): FakeAdapter {
-  const fake = fakeWithJudge(judge);
-  fake.headlessCommand = () => `printf %s ${shq(JSON.stringify(judge))}`;
-  return fake;
 }
 
 function repoWithDiff(): { repo: string; base: string } {
@@ -175,14 +168,14 @@ describe("acceptanceGate", () => {
       task,
       repo,
       base,
-      { adapter: fakeWithRawJudge(verdict), model: "fake-1" },
+      { adapter: fakeWithJudge(verdict), model: "fake-1" },
     );
     const malformed = await acceptanceGate(
       task,
       repo,
       base,
       {
-        adapter: fakeWithRawJudge({
+        adapter: fakeWithJudge({
           ...verdict,
           comments: [{ path: "greet.js", line: "one", body: "replace the shortcut" }],
         }),
@@ -197,7 +190,7 @@ describe("acceptanceGate", () => {
 
   test("a verdict omitting a criterion id fails closed", async () => {
     const { repo, base } = repoWithDiff();
-    const fake = fakeWithRawJudge({ pass: true, criteria: [] });
+    const fake = fakeWithJudge({ pass: true, criteria: [] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/missing criterion id c1/i);
@@ -206,7 +199,7 @@ describe("acceptanceGate", () => {
 
   test("a verdict whose overall pass contradicts an unmet item fails closed", async () => {
     const { repo, base } = repoWithDiff();
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: false, reason: "missing" }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: false, reason: "missing" }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/pass=true contradicts unmet criterion c1/i);
@@ -215,7 +208,7 @@ describe("acceptanceGate", () => {
 
   test("a verdict with fewer criteria than judge items fails naming the missing id", async () => {
     const { repo, base } = repoWithDiff();
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
     const r = await acceptanceGate(twoCriteria, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/missing criterion id c2/i);
@@ -224,7 +217,7 @@ describe("acceptanceGate", () => {
 
   test("a verdict with a duplicate criterion id fails closed", async () => {
     const { repo, base } = repoWithDiff();
-    const fake = fakeWithRawJudge({
+    const fake = fakeWithJudge({
       pass: true,
       criteria: [
         { criterion: "c1", met: true, reason: "ok" },
@@ -240,7 +233,7 @@ describe("acceptanceGate", () => {
 
   test("a verdict with an unknown criterion id fails closed", async () => {
     const { repo, base } = repoWithDiff();
-    const fake = fakeWithRawJudge({
+    const fake = fakeWithJudge({
       pass: true,
       criteria: [{ criterion: "c9", met: true, reason: "bogus" }],
     });
@@ -253,7 +246,7 @@ describe("acceptanceGate", () => {
 
   test("a verdict with a non-string reason fails closed", async () => {
     const { repo, base } = repoWithDiff();
-    const fake = fakeWithRawJudge({
+    const fake = fakeWithJudge({
       pass: true,
       criteria: [{ criterion: "c1", met: true, reason: 42 }],
     });
@@ -270,7 +263,7 @@ describe("acceptanceGate", () => {
       tasks: [{ id: "T3", title: "t", goal: "g", shape: "implement", complexity: 3,
         acceptance: [{ oracle: "judge", text: "clause one; clause two; clause three" }] }],
     }).tasks[0];
-    const fake = fakeWithRawJudge({
+    const fake = fakeWithJudge({
       pass: true,
       criteria: [
         { criterion: "c1", met: true, reason: "ok" },
@@ -319,7 +312,7 @@ describe("acceptanceGate", () => {
 
   test("diff over the configured cap fails closed before any judge call", async () => {
     const { repo, base } = repoWithDiff();
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
     const command = fake.headlessCommand.bind(fake);
     let calls = 0;
     fake.headlessCommand = (...args) => { calls++; return command(...args); };
@@ -476,12 +469,12 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
   test("a judge verdict quoting evidence present in the diff parses and its verdict stands", async () => {
     const { repo, base } = repoWithDiff();
     // evidence is a verbatim slice of the committed change in repoWithDiff
-    const ok = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "greets by name", evidence: "module.exports = (n) =>" }] });
+    const ok = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "greets by name", evidence: "module.exports = (n) =>" }] });
     const r1 = await acceptanceGate(task, repo, base, { adapter: ok, model: "fake-1" });
     expect(r1).toMatchObject({ gate: "acceptance", pass: true });
     expect(r1.meta?.unparseable).toBeUndefined();
     // a failing verdict with genuine evidence stands too — the parsed verdict decides
-    const bad = fakeWithRawJudge({ pass: false, criteria: [{ criterion: "c1", met: false, reason: "hardcoded-result shortcut", evidence: "module.exports = (n) =>" }] });
+    const bad = fakeWithJudge({ pass: false, criteria: [{ criterion: "c1", met: false, reason: "hardcoded-result shortcut", evidence: "module.exports = (n) =>" }] });
     const r2 = await acceptanceGate(task, repo, base, { adapter: bad, model: "fake-1" });
     expect(r2.pass).toBe(false);
     expect(r2.details).toContain("hardcoded-result");
@@ -495,7 +488,7 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
     const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
     writeFileSync(join(repo, "greet.js"), "module.exports = (n) => 'hi ' + n;\n");
     execSync("git add -A && git commit -m greet --no-gpg-sign", { cwd: repo });
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: "untouched worktree text" }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: "untouched worktree text" }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/evidence absent from the judged diff/i);
@@ -520,7 +513,7 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
   test("an empty evidence string fails closed like an absent quote", async () => {
     const { repo, base } = repoWithDiff();
     // every diff contains the empty string — a vacuous quote must not slip through includes()
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: "  " }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: "  " }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.meta).toMatchObject({ unparseable: true });
@@ -539,7 +532,7 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
     expect(fail.details).toContain("hardcoded");
     expect(fail.meta?.unparseable).toBeUndefined();
     const inconsistent = await acceptanceGate(task, repo, base,
-      { adapter: fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: false, reason: "contradiction" }] }), model: "fake-1" });
+      { adapter: fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: false, reason: "contradiction" }] }), model: "fake-1" });
     expect(inconsistent.pass).toBe(false);
     expect(inconsistent.details).toMatch(/pass=true contradicts unmet criterion c1/i);
   });
@@ -551,7 +544,7 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
 describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
   test("a verdict citing a file and line genuinely changed in the judged diff is accepted as valid evidence for that criterion", async () => {
     const { repo, base } = repoWithDiff(); // repoWithDiff rewrites greet.js line 1 — cite that added line
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "uses n", evidence: { path: "greet.js", line: 1 } }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "uses n", evidence: { path: "greet.js", line: 1 } }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r).toMatchObject({ gate: "acceptance", pass: true });
     expect(r.meta?.unparseable).toBeUndefined();
@@ -563,7 +556,7 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
     const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
     writeFileSync(join(repo, "greet.js"), "module.exports = (n) => 'hi ' + n;\n");
     execSync("git add -A && git commit -m greet --no-gpg-sign", { cwd: repo });
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path: "bystander.txt", line: 1 } }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path: "bystander.txt", line: 1 } }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/evidence absent from the judged diff/i);
@@ -579,7 +572,7 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
     const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
     writeFileSync(join(repo, "big.txt"), lines.replace("line 10\n", "line 10 CHANGED\n"));
     execSync("git add -A && git commit -m edit --no-gpg-sign", { cwd: repo });
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path: "big.txt", line: 1 } }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path: "big.txt", line: 1 } }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/evidence absent from the judged diff/i);
@@ -613,7 +606,7 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
     execSync("git add -A && git commit -m edit --no-gpg-sign", { cwd: repo });
     // line 4 is the `+` line; git's 3-context hunk spans new-file lines 1..7, so line 3 is a context line
     // inside the SAME changed hunk — a near-miss the pre-OBS-129 exact check rejected.
-    const fake = fakeWithRawJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "L4 moved forward", evidence: { path: "consts.ts", line: 3 } }] });
+    const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "L4 moved forward", evidence: { path: "consts.ts", line: 3 } }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r).toMatchObject({ gate: "acceptance", pass: true });
     expect(r.meta?.unparseable).toBeUndefined();

@@ -82,27 +82,6 @@ export function gateExitTrailer(nonce: string): string {
   return `printf '\\nTICKMARKR_''EXIT_${nonce}:%s\\n' $?`;
 }
 
-// v1.64: scripted fake judge verdicts predate the required per-criterion evidence field — quote the
-// first line of the prompt's own diff block into rows lacking one so zero-token fixtures keep their
-// outcomes. Rows scripting an explicit evidence value pass through verbatim (tests exercise both paths).
-function injectFakeEvidence(obj: Record<string, unknown>, prompt: string): Record<string, unknown> {
-  if (!prompt.startsWith("TICKMARKR-JUDGE") || !Array.isArray(obj.criteria)) return obj;
-  const line = /```diff\n([\s\S]*?)```/.exec(prompt)?.[1].split("\n").find((l) => l.trim());
-  if (!line) return obj;
-  const criteria = (obj.criteria as unknown[]).map((row) =>
-    row && typeof row === "object" && !("evidence" in row) ? { ...row, evidence: line } : row);
-  return { ...obj, criteria };
-}
-
-// ponytail: fake adapter serves static verdict JSON without nonce; append a bound copy for zero-token tests.
-export function augmentFakeVerdictOutput(adapter: WorkerAdapter, out: string, nonce: string, prompt = ""): string {
-  if (adapter.id !== "fake") return out;
-  const obj = extractJson<Record<string, unknown>>(out);
-  if (!obj || typeof obj !== "object" || obj.nonce === nonce) return out;
-  if (typeof obj.nonce === "string") return out;
-  return `${out}\n${JSON.stringify(injectFakeEvidence({ ...obj, nonce }, prompt))}`;
-}
-
 export type GatePaneRole = "judge" | "review" | "consult";
 
 /** T8: role-first pane name for fleet visibility — judge · T4, review · T3, consult · T2. */
@@ -165,10 +144,7 @@ export async function runHeadless(
   const pf = join(mkdtempSync(join(tmpdir(), "tickmarkr-llm-")), "prompt.md");
   writeFileSync(pf, prompt);
   const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
-  const nonce = extractPromptNonce(prompt);
-  let out = r.stdout + "\n" + r.stderr;
-  if (nonce) out = augmentFakeVerdictOutput(adapter, out, nonce, prompt);
-  return out;
+  return r.stdout + "\n" + r.stderr;
 }
 
 // v1.1 default path: the same headless CLI call, but dispatched through the driver
@@ -199,9 +175,8 @@ export async function runViaDriver(
   // nonce-suffixed exit only: a displayed bare "TICKMARKR_EXIT:" or another call's marker must not
   // false-complete — same guard the worker path uses (daemon.ts:330-331).
   await via.driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, timeoutMs, { regex: true });
-  let out = await via.driver.read(slot, 400);
+  const out = await via.driver.read(slot, 400);
   if (!via.keep) await via.driver.close(slot);
-  out = augmentFakeVerdictOutput(adapter, out, nonce, prompt);
   return dewrapPaneVerdict(out, nonce);
 }
 
@@ -220,6 +195,8 @@ export async function runViaDriver(
 // the good copy wins while the original rendering survives verbatim for the evidence capture.
 export function dewrapPaneVerdict(out: string, nonce: string): string {
   if (!out.includes(nonce)) return out;
+  // Preserve already-readable responder bytes; only a genuinely wrapped verdict needs reconstruction.
+  if (extractVerdictJson<Record<string, unknown>>(out, nonce)) return out;
   const lines = out.split("\n");
   // OBS-209: EVERY brace-start is a candidate, scanned newest-first. findIndex took only the first,
   // so any earlier line beginning with `{` — a quoted snippet, a lone brace in the reviewer's own

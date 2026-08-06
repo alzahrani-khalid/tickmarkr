@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -147,5 +147,105 @@ describe("tickmarkr init --agent portable docs (T3)", () => {
     expect(section).toMatch(/herdr pane run/);
     expect(section).not.toMatch(/\/tickmarkr-loop/);
     expect(section).not.toMatch(/\.claude/);
+  });
+
+  test("a repo that already has the agent-docs block still receives corrections to it under --force", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    // A repo whose block is STALE, with human-authored prose on both sides of it that must survive.
+    const stale = "# consumer notes\n\nkeep me above\n\n"
+      + "<!-- tickmarkr:agent-docs begin -->\n## tickmarkr\n\nancient guidance\n"
+      + "<!-- tickmarkr:agent-docs end -->\n\nkeep me below\n";
+    const repo = makeRepo({ "AGENTS.md": stale });
+
+    const kept = await runInit(repo, "--agent", "--docs");
+
+    // Without --force the block is preserved, and the note must NAME the lever, or nobody learns it exists.
+    expect(agentDocsSection(repo)).toMatch(/ancient guidance/);
+    expect(kept).toMatch(/--force to refresh/);
+
+    await runInit(repo, "--agent", "--docs", "--force");
+
+    const section = agentDocsSection(repo);
+    expect(section).not.toMatch(/ancient guidance/);
+    expect(section).toMatch(/Never run two tickmarkr runs/);
+    // canonical guidance is only useful if a stale copy can be corrected in place
+    expect(section).toMatch(/Orient before you act/);
+    // ...without collateral damage to the parts a human wrote
+    const text = readFileSync(join(repo, "AGENTS.md"), "utf8");
+    expect(text).toMatch(/keep me above/);
+    expect(text).toMatch(/keep me below/);
+    expect(text.match(/tickmarkr:agent-docs begin/g)).toHaveLength(1);
+  });
+});
+
+// OBS-373: a script was added to the shipped overseer skill after repos had installed it. Every check
+// keyed on SKILL.md EXISTING, so those repos reported "installed" while the script their own SKILL.md
+// tells them to run was absent — and `init` said nothing, on any path. These pin currency, not presence.
+describe("tickmarkr init — an installed skill is current, not merely present (OBS-373)", () => {
+  const overseerDir = ".agents/skills/tickmarkr-overseer";
+  const currentSkill = readFileSync(join(ROOT, "skills/tickmarkr-overseer/SKILL.md"), "utf8");
+  const currentWatcher = readFileSync(join(ROOT, "skills/tickmarkr-overseer/scripts/watch-panes.sh"), "utf8");
+
+  test("test: an install whose SKILL.md is current but whose shipped script is absent is reported stale by name on a plain init", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    // The exact shape that shipped: the mandating SKILL.md is byte-current, one script it names is gone.
+    const repo = makeRepo({
+      [`${overseerDir}/SKILL.md`]: currentSkill,
+      [`${overseerDir}/scripts/watch-panes.sh`]: currentWatcher,
+    });
+
+    const out = await runInit(repo);
+
+    expect(out).toMatch(/stale .*tickmarkr-overseer\/SKILL\.md/);
+    expect(out).toContain("missing scripts/watch-artifacts.sh");
+    expect(out).toContain("tickmarkr init --agent --force");
+  });
+
+  test("test: a byte-identical install is reported current, and the same repo reports stale the moment one shipped file is removed", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+
+    const clean = await runInit(repo, "--agent");
+
+    expect(clean).toMatch(/kept current .*tickmarkr-overseer\/SKILL\.md/);
+    expect(clean).not.toMatch(/stale .*tickmarkr-overseer/);
+    expect(clean).not.toMatch(/skipped existing .*tickmarkr-overseer/);
+
+    // Both directions in one body ON PURPOSE. Asserting only the clean half passes just as happily when
+    // the detector is blind — measured: with skillDrift stubbed to return nothing, the clean half stayed
+    // green while every other test here went red. A control that cannot fail is not one.
+    rmSync(join(repo, overseerDir, "scripts/watch-artifacts.sh"));
+
+    expect(await runInit(repo)).toContain("missing scripts/watch-artifacts.sh");
+  });
+
+  test("test: a missing shipped file and a modified one are distinguished rather than both reported as stale", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({
+      [`${overseerDir}/SKILL.md`]: `${currentSkill}\nlocally appended line\n`,
+      [`${overseerDir}/scripts/watch-panes.sh`]: currentWatcher,
+    });
+
+    const out = await runInit(repo);
+
+    expect(out).toContain("missing scripts/watch-artifacts.sh");
+    expect(out).toContain("modified SKILL.md");
+  });
+
+  test("test: --force refreshes a stale install and the next init reports it current, proven by the drift note disappearing", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({
+      [`${overseerDir}/SKILL.md`]: currentSkill,
+      [`${overseerDir}/scripts/watch-panes.sh`]: currentWatcher,
+    });
+
+    expect(await runInit(repo)).toContain("missing scripts/watch-artifacts.sh");
+    await runInit(repo, "--agent", "--force");
+
+    expect(readFileSync(join(repo, overseerDir, "scripts/watch-artifacts.sh"))).toEqual(
+      readFileSync(join(ROOT, "skills/tickmarkr-overseer/scripts/watch-artifacts.sh")),
+    );
+    expect(await runInit(repo)).not.toMatch(/stale .*tickmarkr-overseer/);
   });
 });

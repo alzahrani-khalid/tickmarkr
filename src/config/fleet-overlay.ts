@@ -1,8 +1,6 @@
-// Fleet-overlay provenance cluster (v1.61 seed 8): harvesting, serialization, and diff rendering
-// for the `tickmarkr fleet` write path. Pure move out of config.ts — prior import paths preserved
-// via re-exports there.
+// Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
 import { isMap, isScalar, isSeq, parseDocument, stringify } from "yaml";
-import type { FleetEditable, MapEntry, Tier } from "./config.js";
+import type { FleetEditable, MapEntry, RoutingMode, Tier } from "./config.js";
 
 /** Fleet-owned overlay keys — the only config surface `tickmarkr fleet` may write. */
 export const FLEET_OVERLAY_KEYS = ["routing", "tiers"] as const;
@@ -19,58 +17,216 @@ function sortedUnique(xs: string[]): string[] {
   return [...new Set(xs)].sort();
 }
 
-/** Trailing `# note` comments on per-entry lines an operator may have hand-written or a prior
- *  fleet write stamped: model tier lines (including null tombstones) and deny list items. */
-export type HarvestedProvenance = {
-  tiers: Record<string, Record<string, string>>;
-  denyAdapters: Record<string, string>;
-  denyModels: Record<string, string>;
+export type FleetOverlayWrite = {
+  initial: FleetEditable;
+  edited: FleetEditable;
+  mode?: RoutingMode;
+  steering?: {
+    initial: { review?: string[]; consult?: string[] };
+    edited: { review?: string[]; consult?: string[] };
+  };
 };
 
-/** OBS-88: harvest existing provenance comments from raw repo-overlay bytes at fleet-session
- *  load. yaml.parse discards comments, so before this every fleet write re-serialized the file
- *  knowing only the current session's own notes and silently stripped all prior ones — a typed
- *  benchmark-provenance note survived exactly one write. Fail-open to empty: an unreadable
- *  overlay is the loader's problem to reject, never the harvester's. */
-export function harvestFleetProvenance(overlayText: string): HarvestedProvenance {
-  const out: HarvestedProvenance = { tiers: {}, denyAdapters: {}, denyModels: {} };
-  if (!overlayText.trim()) return out;
-  const doc = parseDocument(overlayText);
-  const note = (n: unknown): string | undefined => {
-    const c = isScalar(n) ? n.comment : undefined;
-    return typeof c === "string" && c.trim() ? c.trim() : undefined;
-  };
-  const tiers = doc.getIn(["tiers"]);
-  if (isMap(tiers)) {
-    for (const ap of tiers.items) {
-      if (!isScalar(ap.key)) continue;
-      const models = isMap(ap.value) ? ap.value.get("models") : undefined;
-      if (!isMap(models)) continue;
-      for (const mp of models.items) {
-        const n = note(mp.value);
-        if (isScalar(mp.key) && n) (out.tiers[String(ap.key.value)] ??= {})[String(mp.key.value)] = n;
+export type FleetFirstTouch = { vendor: string; channel: "sub" | "api" };
+
+// fleet.ts deliberately remains the sole overlay builder and writer. Its established classification
+// seam copies only `tier` and `note` into FleetEditable, so first-touch entry metadata rides inside a
+// private provenance envelope until this module writes the YAML. The envelope never reaches disk.
+const FIRST_TOUCH_OPEN = "\uE000tickmarkr-fleet-first-touch:";
+const FIRST_TOUCH_CLOSE = "\uE001";
+
+export function fleetFirstTouchProvenance(note: string, firstTouch: FleetFirstTouch): string {
+  return `${FIRST_TOUCH_OPEN}${encodeURIComponent(firstTouch.vendor)}:${firstTouch.channel}${FIRST_TOUCH_CLOSE}${note}`;
+}
+
+function unpackFleetProvenance(provenance?: string): { provenance?: string; firstTouch?: FleetFirstTouch } {
+  if (!provenance?.startsWith(FIRST_TOUCH_OPEN)) return { provenance };
+  const close = provenance.indexOf(FIRST_TOUCH_CLOSE, FIRST_TOUCH_OPEN.length);
+  if (close === -1) return { provenance };
+  const metadata = provenance.slice(FIRST_TOUCH_OPEN.length, close);
+  const colon = metadata.lastIndexOf(":");
+  if (colon === -1) return { provenance };
+  const channel = metadata.slice(colon + 1);
+  if (channel !== "sub" && channel !== "api") return { provenance };
+  try {
+    return {
+      provenance: provenance.slice(close + FIRST_TOUCH_CLOSE.length),
+      firstTouch: { vendor: decodeURIComponent(metadata.slice(0, colon)), channel },
+    };
+  } catch {
+    return { provenance };
+  }
+}
+
+type OverlayDocument = ReturnType<typeof parseDocument>;
+type OverlayPath = readonly string[];
+
+function setScalarPreservingComment(
+  doc: OverlayDocument,
+  path: OverlayPath,
+  value: string | boolean | null,
+  authoredComment?: string,
+): void {
+  const existing = doc.getIn(path, true);
+  if (isScalar(existing)) existing.value = value;
+  else doc.setIn(path, doc.createNode(value));
+  if (authoredComment !== undefined) {
+    const written = doc.getIn(path, true);
+    if (isScalar(written)) written.comment = ` ${authoredComment}`;
+  }
+}
+
+function setStringSequencePreservingComments(
+  doc: OverlayDocument,
+  path: OverlayPath,
+  values: string[] | null,
+): void {
+  const existing = doc.getIn(path, true);
+  if (values === null) {
+    const tombstone = doc.createNode(null);
+    if (isScalar(tombstone) && existing && typeof existing === "object") {
+      // A block sequence's key-line note is stored as commentBefore; on a scalar it must be
+      // inline comment content or YAML expands `key: null` into a nested null value.
+      const comments: string[] = [];
+      if ("commentBefore" in existing && typeof existing.commentBefore === "string") {
+        comments.push(existing.commentBefore);
+      }
+      if ("comment" in existing && typeof existing.comment === "string") {
+        comments.push(existing.comment);
+      }
+      if (comments.length) tombstone.comment = comments.join("\n");
+    }
+    doc.setIn(path, tombstone);
+    return;
+  }
+  if (!isSeq(existing)) {
+    doc.setIn(path, doc.createNode(values));
+    return;
+  }
+  const available = [...existing.items];
+  existing.items = values.map((value) => {
+    const at = available.findIndex((item) => isScalar(item) && String(item.value) === value);
+    if (at >= 0) return available.splice(at, 1)[0];
+    return doc.createNode(value);
+  });
+}
+
+function deleteEmptyMap(doc: OverlayDocument, path: OverlayPath): void {
+  const node = doc.getIn(path, true);
+  if (isMap(node) && node.items.length === 0) doc.deleteIn(path);
+}
+
+/** Apply only fields fleet authored to the parsed YAML document. Untouched nodes retain their
+ * keys, ordering, scalar style, and comments; fresh provenance is written directly on its tier node. */
+export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayWrite): string {
+  const doc = parseDocument(priorBytes);
+  if (doc.errors.length) throw doc.errors[0];
+
+  const { initial, edited } = write;
+  const denyChanged =
+    sortedUnique(initial.denyAdapters).join() !== sortedUnique(edited.denyAdapters).join()
+    || sortedUnique(initial.denyModels).join() !== sortedUnique(edited.denyModels).join();
+  if (denyChanged) {
+    setStringSequencePreservingComments(
+      doc,
+      ["routing", "deny", "adapters"],
+      edited.denyAdapters.length ? sortedUnique(edited.denyAdapters) : null,
+    );
+    setStringSequencePreservingComments(
+      doc,
+      ["routing", "deny", "models"],
+      edited.denyModels.length ? sortedUnique(edited.denyModels) : null,
+    );
+  }
+
+  for (const shape of new Set([...Object.keys(initial.map), ...Object.keys(edited.map)])) {
+    const before = initial.map[shape];
+    const after = edited.map[shape];
+    if (JSON.stringify(before?.pin) !== JSON.stringify(after?.pin)) {
+      if (after?.pin === undefined) doc.deleteIn(["routing", "map", shape, "pin"]);
+      else doc.setIn(["routing", "map", shape, "pin"], doc.createNode(after.pin));
+    }
+    if (JSON.stringify(before?.prefer) !== JSON.stringify(after?.prefer)) {
+      // Clearing a resolved list must mask the lower layer with [], not delete the key and inherit it again.
+      setStringSequencePreservingComments(
+        doc,
+        ["routing", "map", shape, "prefer"],
+        after?.prefer ?? [],
+      );
+    }
+    if (before?.escalate !== after?.escalate) {
+      if (after?.escalate === undefined) doc.deleteIn(["routing", "map", shape, "escalate"]);
+      else setScalarPreservingComment(doc, ["routing", "map", shape, "escalate"], after.escalate);
+    }
+  }
+
+  for (const shape of new Set([...Object.keys(initial.floors), ...Object.keys(edited.floors)])) {
+    if (initial.floors[shape] === edited.floors[shape]) continue;
+    const tier = edited.floors[shape];
+    if (tier === undefined) doc.deleteIn(["routing", "floors", shape]);
+    else setScalarPreservingComment(doc, ["routing", "floors", shape], tier);
+  }
+
+  for (const adapter of new Set([...Object.keys(initial.tiers), ...Object.keys(edited.tiers)])) {
+    const beforeModels = initial.tiers[adapter] ?? {};
+    const afterModels = edited.tiers[adapter] ?? {};
+    let firstTouch: FleetFirstTouch | undefined;
+    for (const model of new Set([...Object.keys(beforeModels), ...Object.keys(afterModels)])) {
+      const before = beforeModels[model];
+      const after = afterModels[model];
+      if (JSON.stringify(before) === JSON.stringify(after) || after === null || after === undefined) continue;
+      firstTouch ??= unpackFleetProvenance(after.provenance).firstTouch;
+    }
+    const ft = firstTouch;
+    if (ft) {
+      if (doc.getIn(["tiers", adapter, "vendor"]) === undefined) {
+        setScalarPreservingComment(doc, ["tiers", adapter, "vendor"], ft.vendor);
+      }
+      if (doc.getIn(["tiers", adapter, "channel"]) === undefined) {
+        setScalarPreservingComment(doc, ["tiers", adapter, "channel"], ft.channel);
+      }
+    }
+    for (const model of new Set([...Object.keys(beforeModels), ...Object.keys(afterModels)])) {
+      const before = beforeModels[model];
+      const after = afterModels[model];
+      if (JSON.stringify(before) === JSON.stringify(after)) continue;
+      const path = ["tiers", adapter, "models", model];
+      if (after === null || after === undefined) setScalarPreservingComment(doc, path, null);
+      else setScalarPreservingComment(doc, path, after.tier, unpackFleetProvenance(after.provenance).provenance);
+    }
+  }
+
+  if (write.mode !== undefined) {
+    setScalarPreservingComment(doc, ["routing", "mode"], write.mode);
+  }
+
+  if (write.steering) {
+    for (const key of ["review", "consult"] as const) {
+      const before = write.steering.initial[key];
+      const after = write.steering.edited[key];
+      if (JSON.stringify(before) === JSON.stringify(after)) continue;
+      if (after === undefined) {
+        doc.deleteIn([key, "prefer"]);
+        deleteEmptyMap(doc, [key]);
+      } else {
+        setStringSequencePreservingComments(doc, [key, "prefer"], after);
       }
     }
   }
-  for (const [key, dest] of [["adapters", out.denyAdapters], ["models", out.denyModels]] as const) {
-    const seq = doc.getIn(["routing", "deny", key]);
-    if (!isSeq(seq)) continue;
-    for (const item of seq.items) {
-      const n = note(item);
-      if (isScalar(item) && n) dest[String(item.value)] = n;
-    }
-  }
-  return out;
-}
 
-/** Harvested deny-entry notes keyed by the exact entry string, re-attached at serialize time. */
-export type FleetDenyNotes = { adapters?: Record<string, string>; models?: Record<string, string> };
+  // Fleet's established note style uses two spaces before `#`; the Document remains the sole
+  // comment writer while preserving that byte-level convention for old and newly-authored notes.
+  return doc.toString({
+    commentString: (comment) => comment.replace(/^(?!$)(?: $)?/gm, " #"),
+  });
+}
 
 /** Build the repo overlay fragment fleet would write for edits since session start. */
 export function fleetRepoOverlayFromDelta(
   initial: FleetEditable,
   edited: FleetEditable,
   existingRepo: Record<string, unknown> = {},
+  firstTouches: Readonly<Record<string, FleetFirstTouch>> = {},
 ): Record<string, unknown> {
   if (fleetEditableEquals(initial, edited)) return {};
   const out = structuredClone(existingRepo) as Record<string, unknown>;
@@ -88,7 +244,13 @@ export function fleetRepoOverlayFromDelta(
   }
   const mapDelta: Record<string, MapEntry> = {};
   for (const shape of new Set([...Object.keys(initial.map), ...Object.keys(edited.map)])) {
-    if (JSON.stringify(initial.map[shape]) !== JSON.stringify(edited.map[shape])) mapDelta[shape] = edited.map[shape];
+    if (JSON.stringify(initial.map[shape]) !== JSON.stringify(edited.map[shape])) {
+      const next = { ...edited.map[shape] };
+      if (initial.map[shape]?.prefer !== undefined && edited.map[shape]?.prefer === undefined) {
+        next.prefer = [];
+      }
+      mapDelta[shape] = next;
+    }
   }
   if (Object.keys(mapDelta).length) {
     routing.map = { ...(routing.map as Record<string, MapEntry> | undefined), ...mapDelta };
@@ -103,8 +265,9 @@ export function fleetRepoOverlayFromDelta(
     routingTouched = true;
   }
   if (routingTouched) out.routing = routing;
-  const tiersOut: Record<string, { models: Record<string, Tier | null> }> = {
-    ...(out.tiers as Record<string, { models: Record<string, Tier | null> }> | undefined),
+  type TierOverlayEntry = Record<string, unknown> & { models?: Record<string, Tier | null> };
+  const tiersOut: Record<string, TierOverlayEntry> = {
+    ...(out.tiers as Record<string, TierOverlayEntry> | undefined),
   };
   let tiersTouched = false;
   const adapters = new Set([...Object.keys(initial.tiers), ...Object.keys(edited.tiers)]);
@@ -122,9 +285,17 @@ export function fleetRepoOverlayFromDelta(
       }
     }
     if (Object.keys(modelDelta).length) {
-      // spread the existing entry so vendor/channel/windows survive the rewrite — dropping them
-      // makes the overlay unloadable for any adapter without a default seed (reload-guard class)
-      tiersOut[adapter] = { ...tiersOut[adapter], models: { ...tiersOut[adapter]?.models, ...modelDelta } };
+      const existingEntry = tiersOut[adapter] ?? {};
+      const firstTouch = firstTouches[adapter];
+      // Spread the whole entry rather than a known-key projection: vendor/channel/windows and sibling
+      // keys introduced by newer schemas all survive. A genuinely new entry receives only facts the
+      // adapter/operator declared; channel is never inferred from the binary.
+      tiersOut[adapter] = {
+        ...existingEntry,
+        ...(existingEntry.vendor === undefined && firstTouch ? { vendor: firstTouch.vendor } : {}),
+        ...(existingEntry.channel === undefined && firstTouch ? { channel: firstTouch.channel } : {}),
+        models: { ...existingEntry.models, ...modelDelta },
+      };
       tiersTouched = true;
     }
   }
@@ -134,12 +305,10 @@ export function fleetRepoOverlayFromDelta(
 
 export function repoOverlayYaml(
   overlay: Record<string, unknown>,
-  provenance: Record<string, Record<string, string>> = {},
-  denyNotes: FleetDenyNotes = {},
 ): string {
   if (!Object.keys(overlay).length) return "";
   const fleet = fleetSubset(overlay);
-  const fleetBody = serializeFleetOverlay(fleet, provenance, denyNotes);
+  const fleetBody = serializeFleetOverlay(fleet);
   const rest = { ...overlay };
   for (const k of FLEET_OVERLAY_KEYS) delete rest[k];
   if (!Object.keys(rest).length) return fleetBody;
@@ -149,8 +318,6 @@ export function repoOverlayYaml(
 
 export function serializeFleetOverlay(
   overlay: Record<string, unknown>,
-  provenance: Record<string, Record<string, string>> = {},
-  denyNotes: FleetDenyNotes = {},
 ): string {
   if (!Object.keys(overlay).length) return "";
   const lines: string[] = [];
@@ -159,16 +326,12 @@ export function serializeFleetOverlay(
   // tombstones/empty collections survive the serialize→parse round-trip.
   const block = (obj: Record<string, unknown>, pad: string): string[] =>
     stringify(obj).trimEnd().split("\n").map((l) => `${pad}${l}`);
-  // deny lists emit item-by-item through the same stringify quoting rules as block(), so a
-  // harvested `# reason` can re-attach to its exact entry (multi-line emissions never take one)
   const denySeq = (key: "adapters" | "models", v: string[] | null | undefined): string[] => {
     if (v === undefined) return [];
     if (v === null || !v.length) return block({ [key]: v }, "    ");
     const out = [`    ${key}:`];
     for (const item of v) {
       const emitted = stringify([item]).trimEnd().split("\n");
-      const n = denyNotes[key]?.[item];
-      if (n && emitted.length === 1) emitted[0] += `  # ${n}`;
       out.push(...emitted.map((l) => `      ${l}`));
     }
     return out;
@@ -185,32 +348,11 @@ export function serializeFleetOverlay(
     if (routing.map) lines.push(...block({ map: routing.map as Record<string, MapEntry> }, "  "));
     if (routing.floors) lines.push(...block({ floors: routing.floors as Record<string, unknown> }, "  "));
   }
-  const tiers = overlay.tiers as
-    | Record<string, { vendor?: string; channel?: string; windows?: Record<string, number>; models?: Record<string, Tier | null> }>
-    | undefined;
+  const tiers = overlay.tiers as Record<string, unknown> | undefined;
   if (tiers && Object.keys(tiers).length) {
     lines.push("tiers:");
     for (const [adapter, entry] of Object.entries(tiers)) {
-      const body: string[] = [];
-      if (entry.vendor) body.push(`    vendor: ${entry.vendor}`);
-      if (entry.channel) body.push(`    channel: ${entry.channel}`);
-      if (entry.windows) body.push(...block({ windows: entry.windows }, "    "));
-      const models = Object.entries(entry.models ?? {});
-      if (models.length) {
-        body.push("    models:");
-        for (const [model, tier] of models) {
-          // OBS-88: notes serialize verbatim (fresh session notes arrive pre-stamped with their
-          // "— fleet <date>" suffix), so a harvested note round-trips byte-for-byte every write
-          const note = provenance[adapter]?.[model];
-          const suffix = note ? `  # ${note}` : "";
-          body.push(`      ${model}: ${tier === null ? "null" : tier}${suffix}`);
-        }
-      } else if (entry.models) {
-        body.push("    models: {}"); // present-but-empty: explicit {} — a childless header parses as null and the loader rejects it
-      }
-      // a bare `adapter:` line parses as a null tombstone and would DELETE the adapter's default seeds on merge
-      if (body.length) lines.push(`  ${adapter}:`, ...body);
-      else lines.push(`  ${adapter}: {}`);
+      lines.push(...block({ [adapter]: entry }, "  "));
     }
   }
   return `${lines.join("\n")}\n`;

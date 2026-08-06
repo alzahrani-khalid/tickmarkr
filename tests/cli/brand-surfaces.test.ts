@@ -108,6 +108,19 @@ const NARRATION_EVENTS: JournalEvent[] = [
 ];
 
 describe("T4 v1.50 brand pass — plan, run narration, report", () => {
+  test("the seed-prefer lint emitted for a dead adapter states the absence of a DECLARED preference, asserted on the string the shipped lint path actually emits and on the regenerated brand-surface golden it feeds, so the corrected text is pinned by production output rather than by any search over source", async () => {
+    setTTY(false);
+    const expected = "routing seed names dead adapter 'cursor-agent' for shape 'implement' — no declared preference overrides it";
+    const output = await plan([], mkLintRepo());
+    const fixture = golden("plan-lints.txt");
+
+    expect(output).toContain(expected);
+    expect(fixture).toContain(expected);
+    expect(output).not.toContain("auto-prefer is routing around it");
+    expect(fixture).not.toContain("auto-prefer is routing around it");
+    expect(output).toBe(fixture);
+  });
+
   test("plan non-tty output is byte-identical to the golden fixture (regenerated for the v1.51 T4 mode header + derivation lines)", async () => {
     setTTY(false);
     expect(await plan([], mkBasicRepo())).toBe(golden("plan-basic.txt"));

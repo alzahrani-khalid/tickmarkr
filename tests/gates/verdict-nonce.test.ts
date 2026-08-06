@@ -27,6 +27,45 @@ const judgeVerdict = { pass: true, criteria: [{ criterion: "c1", met: true, reas
 const reviewVerdict = { approve: true, issues: [] as string[] };
 const consultVerdict = { action: "retry" as const, notes: "try again", reason: "r", guidance: "g" };
 
+type FakeGateRole = "judge" | "review" | "consult";
+
+function fakeGatePrompt(role: FakeGateRole, callNonce?: string): string {
+  const marker = `TICKMARKR-${role.toUpperCase()}`;
+  const shape = role === "judge"
+    ? `{"nonce": "${callNonce ?? "<nonce>"}", "pass": true|false, "criteria": []}`
+    : role === "review"
+      ? `{"nonce": "${callNonce ?? "<nonce>"}", "approve": true|false, "issues": []}`
+      : `{"nonce": "${callNonce ?? "<nonce>"}", "action": "retry" | "reroute" | "decompose" | "human", "notes": "..."}`;
+  return `${marker}\n${callNonce ? `${verdictNonceLine(callNonce)}\n` : ""}Respond with ONLY this JSON:\n${shape}\n`;
+}
+
+function lastJsonObjectBytes(raw: string): string | null {
+  let pos = raw.length - 1;
+  while (pos >= 0) {
+    const end = raw.lastIndexOf("}", pos);
+    if (end === -1) return null;
+    let depth = 1;
+    for (let i = end - 1; i >= 0; i--) {
+      if (raw[i] === "}") depth++;
+      else if (raw[i] === "{") {
+        depth--;
+        if (depth === 0) {
+          const bytes = raw.slice(i, end + 1);
+          try {
+            JSON.parse(bytes);
+            return bytes;
+          } catch {
+            pos = i - 1;
+            break;
+          }
+        }
+      }
+    }
+    if (depth !== 0) return null;
+  }
+  return null;
+}
+
 describe("extractVerdictJson — nonce binding (Fable F3)", () => {
   test("a verdict missing the nonce fails closed", () => {
     expect(extractVerdictJson(JSON.stringify(judgeVerdict), nonce)).toBeNull();
@@ -148,10 +187,83 @@ describe("judge review and consult verdict surfaces all require the nonce", () =
     expect(v.notes).toMatch(/unparseable/i);
   });
 
-  test("augmentFakeVerdictOutput binds scripted fake verdicts using prompt nonce", async () => {
+  test("the scripted fake judge binds its own verdict using the nonce in its prompt file", async () => {
     const fake = fakeScript({ judge: judgeVerdict });
     const prompt = `TICKMARKR-JUDGE\n${verdictNonceLine(nonce)}`;
     const raw = await runHeadless(fake, "fake-1", prompt, "/tmp");
     expect(extractVerdictJson(raw, nonce)).toEqual(judgeVerdict);
+  });
+
+  test("test: the fake adapter emits its own nonce-bound verdict, proven member by member over the closed set of gate role CROSSED WITH TRANSPORT — a headless judge fixture, a headless review fixture, a headless consult fixture, a via-driver judge fixture, a via-driver review fixture and a via-driver consult fixture — each verdict carrying the nonce the fake read from its own prompt file rather than one appended afterwards", async () => {
+    const cases = [
+      { role: "judge", verdict: { pass: false, criteria: [] }, discriminator: "pass" },
+      { role: "review", verdict: { approve: true, issues: [] }, discriminator: "approve" },
+      { role: "consult", verdict: { action: "retry", notes: "again" }, discriminator: "action" },
+    ] as const;
+
+    for (const transport of ["headless", "via-driver"] as const) {
+      for (const [index, fixture] of cases.entries()) {
+        const callNonce = `a11ce${transport === "headless" ? "0" : "1"}${index}`;
+        const fake = fakeScript({ [fixture.role]: fixture.verdict });
+        const prompt = fakeGatePrompt(fixture.role, callNonce);
+        const raw = transport === "headless"
+          ? await runHeadless(fake, "fake-1", prompt, "/tmp")
+          : await runViaDriver(fake, "fake-1", prompt, "/tmp", {
+            driver: new SubprocessDriver(), name: `${fixture.role}-fixture`,
+          });
+
+        expect(extractVerdictJson(raw, callNonce), `${transport} ${fixture.role}`).toEqual(fixture.verdict);
+        expect(raw.match(new RegExp(`"${fixture.discriminator}"`, "g"))?.length, `${transport} ${fixture.role}`).toBe(1);
+      }
+    }
+  });
+
+  test("test: the fake's verdict places this call's nonce, a real discriminator value and its required delimiter CONTIGUOUSLY, in the shape the boundary's own prompt requests, with the value grammar taken from the key — a boolean under the approve key for review and the pass key for judge, and one JSON string under the action key for consult — proven member by member over those three boundaries, so the shape a later classifier must accept is fixed by the producer rather than inferred from it", async () => {
+    const cases = [
+      { role: "judge", verdict: { pass: false, criteria: [] }, discriminator: `"pass": false` },
+      { role: "review", verdict: { approve: true, issues: [] }, discriminator: `"approve": true` },
+      { role: "consult", verdict: { action: "retry", notes: "again" }, discriminator: `"action": "retry"` },
+    ] as const;
+
+    for (const fixture of cases) {
+      const fake = fakeScript({ [fixture.role]: fixture.verdict });
+      const raw = await runHeadless(fake, "fake-1", fakeGatePrompt(fixture.role, nonce), "/tmp");
+      expect(raw, fixture.role).toContain(`{"nonce": "${nonce}", ${fixture.discriminator},`);
+    }
+  });
+
+  test("test: every fake verdict is authored once by the responder and mutated by no harness path afterwards, proven by comparing the bytes the fake emits with the bytes the classifier receives over the closed set of suites that serve a nonce-less static verdict — the verdict-nonce suite, the acceptance suite and the diff-cap suite", async () => {
+    const fixtures = [
+      { suite: "verdict-nonce", verdict: { pass: true, criteria: [] } },
+      { suite: "acceptance", verdict: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "no" }] } },
+      { suite: "diff-cap", verdict: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } },
+    ] as const;
+
+    for (const fixture of fixtures) {
+      const fake = fakeScript({ judge: fixture.verdict });
+      const prompt = fakeGatePrompt("judge", nonce);
+      const dir = mkdtempSync(join(tmpdir(), `tickmarkr-${fixture.suite}-bytes-`));
+      const promptFile = join(dir, "prompt.md");
+      writeFileSync(promptFile, prompt);
+      const emitted = execSync(fake.headlessCommand(promptFile, "fake-1"), { encoding: "utf8" });
+      const received = await runHeadless(fake, "fake-1", prompt, "/tmp");
+      const emittedVerdict = lastJsonObjectBytes(emitted);
+      const receivedVerdict = lastJsonObjectBytes(received);
+
+      expect(receivedVerdict, fixture.suite).toBe(emittedVerdict);
+      expect(JSON.parse(receivedVerdict!), fixture.suite).toMatchObject({ nonce, ...fixture.verdict });
+    }
+  });
+
+  test("test: a fake prompt carrying no nonce yields a verdict the classifier reads as silence rather than one bound to a substituted nonce, so a missing nonce is never manufactured", async () => {
+    const fake = fakeScript({ judge: judgeVerdict });
+    const raw = await runViaDriver(fake, "fake-1", fakeGatePrompt("judge"), "/tmp", {
+      driver: new SubprocessDriver(), name: "nonce-less-fake",
+    });
+    const substituted = /TICKMARKR_EXIT_([0-9a-f]+):/.exec(raw)?.[1];
+
+    expect(substituted).toMatch(/^[0-9a-f]+$/);
+    expect(extractVerdictJson(raw, substituted!)).toBeNull();
+    expect(raw).not.toContain('"nonce"');
   });
 });

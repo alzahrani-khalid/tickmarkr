@@ -40,6 +40,7 @@ import { cellWidth } from "../../src/tui/cockpit/width.js";
 import { loadDemoCaptures } from "../../src/tui/cockpit/demo.js";
 import {
   captureRendererOutput,
+  goldenFrameMatchesCommitted,
   HEIGHT_TIER_BOUNDARIES,
   regenerateGoldenFrames,
   WIDTH_BAND_CASES,
@@ -1020,10 +1021,9 @@ describe("the decisions tab's drawn name", () => {
       if (!rendered) throw new Error(`the manifest drew no ${fixture}`);
       const frozen = readFileSync(join(anchors, fixture), "utf8");
 
-      // Current to the last byte, keys line included — nothing here is exempted
-      // or normalised, so the tier falling behind the renamed renderer fails
-      // here rather than being absorbed.
-      expect(frozen, fixture).toBe(rendered.output);
+      // Current apart from the release-owned first-line version token, keys line
+      // included — the tier falling behind the renamed renderer still fails.
+      expect(goldenFrameMatchesCommitted(rendered, frozen), fixture).toBe(true);
       expect(frozen.split("\n").at(-2), `${fixture} keys line`)
         .toBe(rendered.output.split("\n").at(-2));
     }

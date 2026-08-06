@@ -1,10 +1,11 @@
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execSync } from "node:child_process";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
 import { compileSource } from "../../src/compile/index.js";
-import { TICKMARKR_NATIVE_MARKER, specTemplate } from "../../src/compile/native.js";
+import { classifyContextPath, TICKMARKR_NATIVE_MARKER, specTemplate } from "../../src/compile/native.js";
 import { GraphValidationError, validateGraph } from "../../src/graph/schema.js";
 
 function compileNativeText(body: string, marker = "tickmarkr") {
@@ -96,7 +97,7 @@ describe("native spec compiler", () => {
     expect(t1.shape).toBe("implement");
     expect(t1.deps).toEqual([]);
     expect(t1.files).toEqual(["src/compile/native.ts", "src/compile/index.ts"]);
-    expect(t1.context).toEqual(["docs/native.md", "src/graph/schema.ts"]);
+    expect(t1.context).toEqual(["docs/codebase/ARCHITECTURE.md", "src/graph/schema.ts"]);
     expect(t1.acceptance).toEqual(["every native field reaches the graph", "malformed fields fail loudly"]);
     expect(t1.complexity).toBe(8);
     expect(t1.humanGate).toBe(true);
@@ -209,11 +210,15 @@ describe("native spec compiler", () => {
       // OBS-212/214: the task unit contract is a NEWER bar than most of these archives, which were
       // authored when unordered tasks could share files and a task could carry any number of
       // criteria. Same tolerance, same reason — these specs are history and are never re-run.
+      // OBS-170 (RULING 2026-08-03): dead `context:` paths are the third such bar. The ruling
+      // declined a retroactive sweep — measured, 11 archived specs carry 24 dead entries and none
+      // will be recompiled. The assertion this test actually makes is "no spec fails for an
+      // UNKNOWN reason"; it has never asserted that every archive compiles (65 already do not).
       try {
         expect(compileSource(join("specs", file)).spec.source).toBe("native");
       } catch (error) {
         expect(error).toBeInstanceOf(CompileError);
-        expect((error as Error).message).toMatch(/OBS-97|task unit contract/);
+        expect((error as Error).message).toMatch(/OBS-97|task unit contract|context: paths that do not exist/);
       }
     }
   });
@@ -385,5 +390,161 @@ describe("native spec semicolon-joined judge lint (OBS-51)", () => {
     expect(obs51).toHaveLength(1);
     expect(obs51[0]).toMatch(/task T2/);
     expect(obs51[0]).toMatch(/looks good; smells good/);
+  });
+});
+
+// OBS-170/OBS-184: `context:` entries reached workers split at annotation commas and unvalidated.
+// Measured on specs/v1.85-speed-truth.spec.md before the fix: 37 entries, 24 unresolvable, and
+// workers were dispatched context bullets reading `OBS-263)`.
+describe("context: pointer integrity", () => {
+  test("a citation annotation is one entry, not two, and the annotation is stripped", () => {
+    const g = compileNativeText(
+      "## T1: Cited\n- context: .planning/OBSERVATIONS.md (OBS-262, OBS-263), src/run/journal.ts\n- acceptance:\n  - ok\n",
+    );
+    // before: [".planning/OBSERVATIONS.md (OBS-262", "OBS-263)", "src/run/journal.ts"]
+    expect(g.tasks[0].context).toEqual([".planning/OBSERVATIONS.md", "src/run/journal.ts"]);
+  });
+
+  test("brace globs still survive the comma split (OBS-97 must not regress)", () => {
+    const g = compileNativeText(
+      "## T1: Globbed\n- files: src/{graph,route}/**/*.ts, docs/x.md\n- acceptance:\n  - ok\n",
+    );
+    expect(g.tasks[0].files).toEqual(["src/{graph,route}/**/*.ts", "docs/x.md"]);
+  });
+
+  test("classifyContextPath separates the three author actions", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-ctx-"));
+    writeFileSync(join(dir, "scratch.md"), "present but untracked");
+    const tracked = new Set([".overseer/V185-SEEDS.md", "src/run/journal.ts", "docs/a/deep.md"]);
+
+    // reachable — in the tree the worker's worktree is built from
+    expect(classifyContextPath("src/run/journal.ts", tracked, dir).kind).toBe("ok");
+    // a directory counts as reachable when it has tracked children
+    expect(classifyContextPath("docs/a", tracked, dir).kind).toBe("ok");
+    // globs are not a promise about one file
+    expect(classifyContextPath("src/**/*.ts", tracked, dir).kind).toBe("ok");
+
+    // subclass A: in the author's checkout, invisible to every worker
+    expect(classifyContextPath("scratch.md", tracked, dir).kind).toBe("untracked");
+
+    // subclass B: absent everywhere, but the basename names a tracked file → one-line fix
+    expect(classifyContextPath("V185-SEEDS.md", tracked, dir)).toEqual({
+      kind: "missing",
+      suggestion: ".overseer/V185-SEEDS.md",
+    });
+    // subclass B with nothing to suggest — prose, not a path
+    expect(classifyContextPath("the run-20260731-192921 journal as fixture", tracked, dir)).toEqual({ kind: "missing" });
+  });
+
+  test("an ambiguous basename suggests nothing rather than guessing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-ctx-"));
+    const tracked = new Set(["a/notes.md", "b/notes.md"]);
+    expect(classifyContextPath("notes.md", tracked, dir)).toEqual({ kind: "missing" });
+  });
+
+  test("existsSync is NOT the oracle — an untracked file present on disk is still unreachable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-ctx-"));
+    writeFileSync(join(dir, "ORCH-REPORT.md"), "x");
+    // the whole defect class: the author sees it, the worker never does
+    expect(existsSync(join(dir, "ORCH-REPORT.md"))).toBe(true);
+    expect(classifyContextPath("ORCH-REPORT.md", new Set(["src/a.ts"]), dir).kind).toBe("untracked");
+  });
+});
+
+// RULING 2026-08-03 rider. `git add -f` writes the INDEX; createWorktree materialises the base TREE.
+// A resolver reading `git ls-files` would call a staged-uncommitted file present and certify exactly
+// the failure the lint exists to catch. This test fails if anyone swaps the oracle back to the index.
+describe("context: oracle is the tree, not the index", () => {
+  const git = (repo: string, cmd: string) => execSync(`git -C ${repo} ${cmd}`, { stdio: "pipe" });
+
+  test("a staged-but-uncommitted context file is still unreachable", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-tree-"));
+    git(repo, "init -q");
+    git(repo, "config user.email t@t.t");
+    git(repo, "config user.name t");
+    writeFileSync(join(repo, "seed.md"), "committed");
+    git(repo, "add seed.md");
+    git(repo, "commit -qm base");
+
+    writeFileSync(join(repo, "staged.md"), "staged only");
+    git(repo, "add -f staged.md");
+
+    // the trap: the index says present, the worktree the worker gets does not have it
+    expect(execSync(`git -C ${repo} ls-files staged.md`, { encoding: "utf8" }).trim()).toBe("staged.md");
+    expect(execSync(`git -C ${repo} ls-tree -r --name-only HEAD`, { encoding: "utf8" }).split("\n").filter(Boolean)).toEqual(["seed.md"]);
+
+    const spec = join(repo, "spec.md");
+    writeFileSync(spec, "<!-- tickmarkr:spec -->\n## T1: Staged\n- context: staged.md\n- acceptance:\n  - ok\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    compileSource(spec, "native");
+    const msgs = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("OBS-170"));
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatch(/git add -f staged\.md && git commit/);
+    expect(msgs[0]).toMatch(/Staging alone is not enough/);
+  });
+
+  test("a committed context file is reachable and silent", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-tree-"));
+    git(repo, "init -q");
+    git(repo, "config user.email t@t.t");
+    git(repo, "config user.name t");
+    writeFileSync(join(repo, "seed.md"), "committed");
+    git(repo, "add seed.md");
+    git(repo, "commit -qm base");
+
+    const spec = join(repo, "spec.md");
+    writeFileSync(spec, "<!-- tickmarkr:spec -->\n## T1: Committed\n- context: seed.md\n- acceptance:\n  - ok\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    compileSource(spec, "native");
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("OBS-170"))).toHaveLength(0);
+  });
+
+  test("an absent context path fails compile and names the repair", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-tree-"));
+    git(repo, "init -q");
+    git(repo, "config user.email t@t.t");
+    git(repo, "config user.name t");
+    writeFileSync(join(repo, "SEEDS.md"), "the real one");
+    execSync(`mkdir -p ${join(repo, "notes")}`);
+    writeFileSync(join(repo, "notes", "DEEP.md"), "x");
+    git(repo, "add -A");
+    git(repo, "commit -qm base");
+
+    const spec = join(repo, "spec.md");
+    // written bare, the way 5 of v1.85's 6 subclass-B occurrences were
+    writeFileSync(spec, "<!-- tickmarkr:spec -->\n## T1: Bare\n- context: DEEP.md\n- acceptance:\n  - ok\n");
+    expect(() => compileSource(spec, "native")).toThrow(/did you mean notes\/DEEP\.md/);
+  });
+});
+
+// The bug my own fixtures missed: every test above puts the spec at the repo ROOT, where
+// `git -C <dir> ls-tree -r HEAD` happens to list the whole tree. From a subdirectory it scopes to
+// that subtree and prints paths relative to it — so a spec in specs/ judged every path outside
+// specs/ unreachable. Same fixture-blindness as the doctor guard (OBS-304): the fixture agreed with
+// the code because both were built from the same wrong assumption. This spec lives in a subdir.
+describe("context: resolution from a spec that is not at the repo root", () => {
+  test("paths are judged against the full tree, not the spec directory's subtree", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-sub-"));
+    const git = (cmd: string) => execSync(`git -C ${repo} ${cmd}`, { stdio: "pipe" });
+    git("init -q");
+    git("config user.email t@t.t");
+    git("config user.name t");
+    execSync(`mkdir -p ${join(repo, "specs")} ${join(repo, "src/run")} ${join(repo, "notes")}`);
+    writeFileSync(join(repo, "src/run/journal.ts"), "export {};");
+    writeFileSync(join(repo, "notes", "SEEDS.md"), "seeds");
+    git("add -A");
+    git("commit -qm base");
+
+    const spec = join(repo, "specs", "v1.md");
+    writeFileSync(spec, "<!-- tickmarkr:spec -->\n## T1: Sub\n- context: src/run/journal.ts\n- acceptance:\n  - ok\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // a tracked file outside specs/ must be reachable — silent, not warned, not thrown
+    const g = compileSource(spec, "native");
+    expect(g.tasks[0].context).toEqual(["src/run/journal.ts"]);
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("OBS-170"))).toHaveLength(0);
+
+    // and the basename suggestion must reach outside specs/ too
+    writeFileSync(spec, "<!-- tickmarkr:spec -->\n## T1: Bare\n- context: SEEDS.md\n- acceptance:\n  - ok\n");
+    expect(() => compileSource(spec, "native")).toThrow(/did you mean notes\/SEEDS\.md/);
   });
 });

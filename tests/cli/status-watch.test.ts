@@ -445,7 +445,7 @@ describe("status checklist rendering", () => {
     expect(task).toContain("parked");
     expect(task).toContain("[!]");
     expect(task).not.toContain("[x]");
-    expect(task).not.toContain(" done ");
+    expect(task).not.toContain("  done  ");
     // ONE byte snapshot per frame. A second read is what lets a line the daemon appends mid-frame
     // pair newer folded task rows against older activity, phase, gate and tip readings; with a
     // single read that pairing cannot happen at all.
@@ -469,7 +469,7 @@ describe("status checklist rendering", () => {
     });
   });
 
-  test("lists completed, dep-waiting, and undispatched tasks with tally and goals", async () => {
+  test("lists completed, dep-waiting, and undispatched tasks with tally and titles", async () => {
     const repo = mkRepo();
     seed(repo, [
       runStart(),
@@ -478,19 +478,19 @@ describe("status checklist rendering", () => {
     ]);
 
     // v1.65 T4: T2's live-attempt activity cell widens the status column — give the frame room
-    // so the goal column keeps its full text for this assertion.
+    // so the title column keeps its full text for this assertion.
     const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
     Object.defineProperty(process.stdout, "columns", { configurable: true, value: 180 });
     try {
       await withTty(async () => {
         const out = await status([], repo);
         expect(out).toContain("1/3 done");
-        expect(strip(row(out, "T1"))).toContain("✓ T1 Finish report");
-        expect(strip(row(out, "T2"))).toContain("- T2 Run mixed gates");
-        // machinery lives on the card's second line, never crowding the goal on line 1
+        expect(strip(row(out, "T1"))).toContain("✓ T1 done");
+        expect(strip(row(out, "T2"))).toContain("- T2 mixed");
+        // machinery lives on the card's second line, never crowding the title on line 1
         expect(strip(card(out, "T2"))).toContain("attempt 1 in flight on fake:fake-2 since 08:00:00");
         expect(strip(row(out, "T2"))).not.toContain("attempt 1 in flight");
-        expect(strip(row(out, "T3"))).toContain("- T3 Queue the undispatched follow-up");
+        expect(strip(row(out, "T3"))).toContain("- T3 waiting");
         expect(card(out, "T3")).toContain("dep-waiting on T2"); // the unmet dep is named (OBS-104)
       });
     } finally {
@@ -950,14 +950,14 @@ describe("status checklist rendering", () => {
     }
   };
 
-  test("non-TTY and NO_COLOR output is byte-identical to its pre-redesign form", async () => {
-    // golden literal captured from the pre-redesign implementation over this exact fixture — it must never drift
+  test("non-TTY and NO_COLOR output is byte-pinned around the task-title column", async () => {
+    // The literal pins every machine byte after the deliberate goal-to-title substitution.
     const golden =
       "tickmarkr status / run run-watch / last event 10m ago / daemon pid unknown / 1/3 done\n" +
       "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
-      "  [x] T1 Finish report  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
-      "  [!] T2 Run mixed gates  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
-      "  [ ] T3 Queue the undispatched follow-up  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
+      "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
+      "  [!] T2 mixed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
+      "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
     await overGoldenFixture(
       (repo) => status([], repo),
       (out) => expect(out).toBe(golden),

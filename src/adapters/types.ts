@@ -235,9 +235,20 @@ export interface WorkerAdapter {
 export function channelsFromConfig(adapterId: string, cfg: TickmarkrConfig): BillingChannel[] {
   const e = cfg.tiers[adapterId];
   if (!e) return [];
-  return Object.entries(e.models).map(([model, tier]) => ({
-    adapter: adapterId, vendor: e.vendor, model, channel: e.channel, tier,
-  }));
+  return Object.entries(e.models).flatMap(([model, tier]) => {
+    const override = e.modelOverrides?.[model];
+    const vendor = override?.vendor ?? e.vendor;
+    // Parsed configs guarantee this only occurs for invalid data, but direct callers must fail closed
+    // too: an undeclared vendor is not review diversity and provider prefixes are never provenance.
+    if (!vendor?.trim()) return [];
+    return [{
+      adapter: adapterId,
+      vendor,
+      model,
+      channel: override?.channel ?? e.channel,
+      tier,
+    }];
+  });
 }
 
 export function channelKey(c: { adapter: string; model: string }): string {

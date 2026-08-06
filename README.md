@@ -253,7 +253,9 @@ the frontier-model consult is the *National Office*. The terms below use that vo
 
 ### Tab vocabulary
 
-- **WORKERS**: the primary generation tab showing active field-team tasks. The tab header shows a live token (task ID) plus one state glyph:
+- **`<taskId>`**: one tab per TASK. A task's worker pane and every gate pane it earns — judge, review,
+  consult — live together in that task's tab, so everything happening to one task is in one place. The
+  tab header shows the task token plus one state glyph:
   - ↻ — the member is a retry attempt (attempt > 0)
   - ✋ — the driver detected the member is blocked
   - (bare token) — member is running normally
@@ -288,7 +290,7 @@ This keeps the Partner focused on decisions that require attention, not noise.
 tickmarkr closes exactly what it owns and no longer needs, no matter how any process died.
 
 Every pane and tab tickmarkr creates receives a **parseable ownership name** encoding the pane's role, task, attempt, and run:
-- `WORKERS` — active worker generation tab
+- `<taskId>` — the task's tab, holding its worker and its judge/review/consult panes
 - `cleanup · <taskId>` — teardown generation tab for overflow attempts
 - `watch` — status monitor pane
 - `<role> · <taskId> · A<attempt> · R<runId>` — judge, review, consult, and worker panes (formats like `judge · task-abc123 · A1 · Rrun-20260713-175532`)

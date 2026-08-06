@@ -28,7 +28,7 @@ WORKER="${1:?worker pane id required}"
 ORCH="${2:?orchestrator pane id required}"
 shift 2
 FAST_BLOCKED=false
-CAP=14400
+CAP=240   # a backgrounded Bash job is killed at 300s; a longer cap can never be reached (OBS-325)
 SETTLE=60
 while [ $# -gt 0 ]; do
   case "$1" in

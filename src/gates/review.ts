@@ -13,6 +13,7 @@ import { redactSecrets } from "../run/redact.js";
 import { marginalCostRank } from "../route/router.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
+import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
 
 export type ReviewSeverity = "material" | "minor";
 
@@ -338,7 +339,7 @@ export function pickReviewer(
 // OBS-196: the two observed unparseable causes are different defects — a cutoff/empty output is
 // reviewer infrastructure dying mid-flight; a malformed verdict is a parse defect. Neither is
 // evidence about the WORK, which is why run-gates retries the review, never the worker (OBS-193).
-export type ReviewUnparseableCause = "empty-output" | "no-verdict" | "malformed-verdict";
+export type ReviewUnparseableCause = VerdictUnparseableCause;
 
 export async function reviewGate(
   task: Task,
@@ -360,9 +361,9 @@ export async function reviewGate(
   // "a law caps complexity at 3, the gate starts at 7" unreachability OBS-186 measured.
   //
   // COLLATERAL this rescoped task closed: the run-gates/daemon participation assertions are rewritten
-  // path-keyed, the NamedFake review fixtures carry their own nonce trailer (llm.ts's injection is
-  // scoped to adapter id "fake" and a renamed fake is a different adapter to it — the check is not
-  // weakened, the fixture is fixed), the merge decision reads `gateSatisfied`, and the daemon writes a
+  // path-keyed, the NamedFake review fixtures author their own nonce-bound verdict (a renamed fake is
+  // a distinct responder and does not inherit the registered fake's producer contract — the check is
+  // not weakened, the fixture is fixed), the merge decision reads `gateSatisfied`, and the daemon writes a
   // parallel round's gate-result rows in GATE_NAMES order (src/run/daemon.ts).
   //
   // That last one is why: retiring the switch makes fixtures that used to SKIP review journal TWO
@@ -486,9 +487,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   if (!v || (findings === null && (typeof v.approve !== "boolean" || !Array.isArray(v.issues)))) {
     // OBS-196: name the cause and persist the raw bytes — a ruled-on "unparseable" without its
     // evidence cannot be audited, and a cutoff must never be indistinguishable from a parse defect.
-    const cause: ReviewUnparseableCause = raw.trim().length === 0
-      ? "empty-output"
-      : !raw.includes(nonce) ? "no-verdict" : "malformed-verdict";
+    const cause: ReviewUnparseableCause = classifyVerdictCause(raw, nonce, "approve");
     let saved: string | undefined;
     if (artifactDir) {
       try {
@@ -498,10 +497,13 @@ The top-level comments array is optional. Use it only for actionable line-anchor
         saved = undefined; // persistence is evidence, not a gate input — never fail the gate on it
       }
     }
+    const failure = cause === "malformed-verdict"
+      ? "review output unparseable"
+      : "review dispatch failed — no structurally valid nonce-bound response; output unparseable";
     return {
       gate: "review",
       pass: false,
-      details: `review output unparseable (reviewer ${reviewer.adapter}:${reviewer.model}; cause: ${cause}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
+      details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; cause: ${cause}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
       meta: { ...policyMeta, reviewer: channelKey(reviewer), unparseable: true, cause },
     };
   }

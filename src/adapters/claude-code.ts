@@ -96,12 +96,14 @@ export const CLAUDE_INPUT_BOX = declareInputBox("claude-code", {
   fingerprint: "❯\u00A0",
   match: (paneText: string) => matchesClaudeEditor(paneText, false),
   emptyMatch: (paneText: string) => matchesClaudeEditor(paneText, true),
-  // The launch line settles on a clean shell line; the editor paints after it. Both interactive
-  // entry points count — a resumed session re-enters the same TUI (OBS-142's launch distinction).
-  launchCommand: (command: string) => command.startsWith("claude --model ") || command.startsWith("claude -r "),
+  // OBS-342: daemon-built launches carry intent through paneDispatchCommand; their wrapper bytes are
+  // never re-parsed here. The first-delivery fact keeps direct driver consumers on the same honest
+  // lifecycle: a fresh claude-code worker slot is a shell awaiting its launch, every later delivery
+  // is a TUI turn awaiting this box. Both interactive and resume builders share that contract.
+  firstDeliveryIsLaunch: true,
   // The 2026-08-03 capture reached a painted editor ~10s after the trust answer on a warm install.
   readinessTimeoutMs: 30_000,
-});
+} as Parameters<typeof declareInputBox>[1] & { firstDeliveryIsLaunch: true });
 
 export function claudeSlug(real: string): string {
   return real.replace(/[^A-Za-z0-9]/g, "-");

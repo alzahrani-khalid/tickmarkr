@@ -36,6 +36,7 @@ import {
 import {
   captureCockpitOutput,
   GOLDEN_FRAME_CASES,
+  goldenFrameMatchesCommitted,
   regenerateColourFrames,
   regenerateGoldenFrames,
 } from "../../src/tui/cockpit/capture.js";
@@ -1345,7 +1346,8 @@ describe("run surface keys", () => {
         new URL(frame.fixture, framesDirectory),
         "utf8",
       );
-      expect(committed, frame.fixture).toBe(frame.emitted);
+      expect(goldenFrameMatchesCommitted(frame, committed), frame.fixture)
+        .toBe(true);
     }
     for (const frame of await regenerateColourFrames()) {
       expect(frame.emitted, frame.fixture).toBe(frame.output);

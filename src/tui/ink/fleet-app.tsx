@@ -2,8 +2,9 @@ import { emitKeypressEvents } from "node:readline";
 import { PassThrough } from "node:stream";
 import { render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
-import type { AuthHealth, WorkerAdapter } from "../../adapters/types.js";
+import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
 import type { MapEntry, RoutingMode, Tier } from "../../config/config.js";
+import { fleetFirstTouchProvenance } from "../../config/fleet-overlay.js";
 import { TIERS, type Shape } from "../../graph/schema.js";
 import { FleetListScreen, FleetReviewScreen, ToggleMark, type FleetListRow } from "./components.js";
 
@@ -44,6 +45,7 @@ type AgentCli = {
 
 export type FleetModelGroup = {
   adapter: string;
+  vendor?: string;
   rows: Array<{ model: string; tier?: Tier; detectedAt?: string }>;
 };
 
@@ -52,6 +54,8 @@ export type FleetClassification = {
   model: string;
   tier: Tier;
   note: string;
+  vendor?: string;
+  channel?: "sub" | "api";
 };
 
 export type FleetModeOption = {
@@ -71,6 +75,7 @@ export type FleetCandidateOption = {
 };
 
 const escape = String.fromCharCode(27);
+const CHANNELS = ["sub", "api"] as const;
 const inkBookkeepingWrites = new Set(["", `${escape}[?25l`, `${escape}[?25h`, `${escape}[?2026h`, `${escape}[?2026l`]);
 
 function inkOutput(output: NodeJS.WriteStream): NodeJS.WriteStream {
@@ -204,6 +209,8 @@ export function FleetApp({
     | "probe"
     | "agents"
     | "models"
+    | "add-model"
+    | "channel"
     | "tiers"
     | "provenance"
     | "modes"
@@ -229,6 +236,11 @@ export function FleetApp({
   const [modelGroup, setModelGroup] = useState(0);
   const modelCursorRef = useRef(0);
   const [modelCursor, setModelCursor] = useState(0);
+  const modelIdRef = useRef("");
+  const [modelId, setModelId] = useState("");
+  const channelCursorRef = useRef(0);
+  const [channelCursor, setChannelCursor] = useState(0);
+  const channelByAdapterRef = useRef<Record<string, "sub" | "api">>({});
   const tierCursorRef = useRef(0);
   const [tierCursor, setTierCursor] = useState(0);
   const pendingClassificationRef = useRef<Omit<FleetClassification, "note"> | null>(null);
@@ -272,18 +284,34 @@ export function FleetApp({
   const currentModelRows = () => {
     const group = enabledModelGroups()[modelGroupRef.current];
     if (!group) return [];
-    return group.rows.map((row) => {
+    const rows = group.rows.map((row) => {
       const staged = classificationsRef.current.find(
         (classification) => classification.adapter === group.adapter && classification.model === row.model,
       );
       return staged ? { ...row, tier: staged.tier } : row;
     });
+    const known = new Set(rows.map((row) => row.model));
+    for (const staged of classificationsRef.current) {
+      if (staged.adapter === group.adapter && !known.has(staged.model)) {
+        rows.push({ model: staged.model, tier: staged.tier });
+      }
+    }
+    return rows;
   };
 
   const editorState = (): FleetEditorState => ({
     denyAdapters: [...(denyRef.current ?? [])].sort(),
     denyModels: [...(denyModelsRef.current ?? [])].sort(),
-    classifications: classificationsRef.current,
+    classifications: classificationsRef.current.map((classification) =>
+      classification.vendor && classification.channel
+        ? {
+          ...classification,
+          note: fleetFirstTouchProvenance(classification.note, {
+            vendor: classification.vendor,
+            channel: classification.channel,
+          }),
+        }
+        : classification),
     selectedMode: selectedModeRef.current,
     map: stagedMap(),
     steering: structuredClone(steeringRef.current as Record<FleetSteeringKey, string[] | undefined>),
@@ -304,6 +332,39 @@ export function FleetApp({
     setScreen(next);
   };
 
+  const beginClassification = (group: FleetModelGroup, model: string) => {
+    tierCursorRef.current = 0;
+    setTierCursor(0);
+    const firstTouch = !group.rows.some((row) => row.tier !== undefined);
+    const pending: Omit<FleetClassification, "note"> = {
+      adapter: group.adapter,
+      model,
+      tier: TIERS[0],
+    };
+    if (!firstTouch) {
+      pendingClassificationRef.current = pending;
+      showScreen("tiers");
+      return;
+    }
+    if (!group.vendor) {
+      setNotice(`fleet: ${group.adapter} has no vendor declaration — classification cannot be saved`);
+      return;
+    }
+    pending.vendor = group.vendor;
+    const answered = channelByAdapterRef.current[group.adapter];
+    if (answered) {
+      pending.channel = answered;
+      pendingClassificationRef.current = pending;
+      showScreen("tiers");
+      return;
+    }
+    pendingClassificationRef.current = pending;
+    channelCursorRef.current = 0;
+    setChannelCursor(0);
+    setNotice("");
+    showScreen("channel");
+  };
+
   useInput((input, key) => {
     if (doneRef.current) return;
     if (key.escape && (screenRef.current === "candidates" || screenRef.current === "shape-prefer")) {
@@ -314,7 +375,13 @@ export function FleetApp({
       showScreen("steering");
       return;
     }
-    if (key.escape || (screenRef.current !== "provenance" && input === "q") || (key.ctrl && input === "c")) {
+    if (key.escape && screenRef.current === "add-model") {
+      setNotice("");
+      showScreen("models");
+      return;
+    }
+    const typing = screenRef.current === "provenance" || screenRef.current === "add-model";
+    if (key.escape || (!typing && input === "q") || (key.ctrl && input === "c")) {
       finish({ kind: "quit" });
       return;
     }
@@ -389,14 +456,14 @@ export function FleetApp({
           setNotice("fleet: tier reassignment on classified models is not supported in v1 — edit config directly");
           return;
         }
-        tierCursorRef.current = 0;
-        setTierCursor(0);
-        pendingClassificationRef.current = {
-          adapter: group.adapter,
-          model: row.model,
-          tier: TIERS[0],
-        };
-        showScreen("tiers");
+        beginClassification(group, row.model);
+        return;
+      }
+      if (input === "n" && group) {
+        modelIdRef.current = "";
+        setModelId("");
+        setNotice("");
+        showScreen("add-model");
         return;
       }
       if (key.return) {
@@ -409,6 +476,58 @@ export function FleetApp({
         } else {
           showScreen("modes");
         }
+      }
+      return;
+    }
+
+    if (screenRef.current === "add-model") {
+      if (key.return) {
+        const group = enabledModelGroups()[modelGroupRef.current];
+        const candidate = modelIdRef.current;
+        if (!MODEL_ID_RE.test(candidate)) {
+          setNotice(`fleet: model id must match ${MODEL_ID_RE.source}`);
+          return;
+        }
+        if (currentModelRows().some((row) => row.model === candidate)) {
+          setNotice(`fleet: ${candidate} is already listed for ${group?.adapter ?? "this adapter"}`);
+          return;
+        }
+        if (group) beginClassification(group, candidate);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        const next = modelIdRef.current.slice(0, -1);
+        modelIdRef.current = next;
+        setModelId(next);
+        return;
+      }
+      if (input && !key.ctrl && !key.meta) {
+        const next = modelIdRef.current + input;
+        modelIdRef.current = next;
+        setModelId(next);
+        setNotice("");
+      }
+      return;
+    }
+
+    if (screenRef.current === "channel") {
+      if (key.downArrow || input === "j") {
+        const next = Math.min(channelCursorRef.current + 1, CHANNELS.length - 1);
+        channelCursorRef.current = next;
+        setChannelCursor(next);
+        return;
+      }
+      if (key.upArrow || input === "k") {
+        const next = Math.max(channelCursorRef.current - 1, 0);
+        channelCursorRef.current = next;
+        setChannelCursor(next);
+        return;
+      }
+      if (key.return && pendingClassificationRef.current) {
+        const channel = CHANNELS[channelCursorRef.current];
+        channelByAdapterRef.current[pendingClassificationRef.current.adapter] = channel;
+        pendingClassificationRef.current.channel = channel;
+        showScreen("tiers");
       }
       return;
     }
@@ -743,13 +862,32 @@ export function FleetApp({
     return (
       <FleetListScreen
         title={`step 3/6 · models · ${group?.adapter ?? ""}`}
-        legend="↑↓/jk move · space toggle · t tier · enter next · esc/q quit"
+        legend="↑↓/jk move · space toggle · t tier · n add model · enter next · esc/q quit"
         rows={rows}
         cursor={modelCursor}
         details={notice ? [notice] : []}
       />
     );
   }
+
+  if (screen === "add-model") return (
+    <FleetListScreen
+      title={`add model · ${group?.adapter ?? ""}`}
+      legend="type model id · enter classify · esc cancel"
+      rows={[{ id: "model", content: <Text>{modelId || "model id (required):"}</Text> }]}
+      cursor={0}
+      details={notice ? [notice] : []}
+    />
+  );
+
+  if (screen === "channel") return (
+    <FleetListScreen
+      title={`channel · ${pendingClassificationRef.current?.adapter ?? ""}`}
+      legend="↑↓/jk move · enter select · esc/q quit"
+      rows={CHANNELS.map((channel) => ({ id: channel, content: <Text>{channel}</Text> }))}
+      cursor={channelCursor}
+    />
+  );
 
   if (screen === "tiers") {
     return (
@@ -928,6 +1066,11 @@ export async function runFleetInkEditor({
       authed: state.authed,
     }];
   });
+  const vendors = new Map(adapters.map((adapter) => [adapter.id, adapter.vendor]));
+  const declaredModelGroups = modelGroups.map((group) => ({
+    ...group,
+    vendor: group.vendor ?? vendors.get(group.adapter),
+  }));
   const bridgedInput = inkInput(input, initialInput);
   const legacyOutput = typeof output.on !== "function" || typeof output.off !== "function";
   const app = render(
@@ -936,7 +1079,7 @@ export async function runFleetInkEditor({
       agents={agents}
       initialDenyAdapters={initialDenyAdapters}
       initialDenyModels={initialDenyModels}
-      modelGroups={modelGroups}
+      modelGroups={declaredModelGroups}
       initialMode={initialMode}
       modeOptions={modeOptions}
       initialMap={initialMap}

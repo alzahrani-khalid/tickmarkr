@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -695,6 +695,65 @@ async function cherryPickCommits(wt: string, commits: string[]): Promise<string[
     carried.push(hash);
   }
   return carried;
+}
+
+// T7 (v1.86): a first run-end append that fails AFTER partial bytes landed leaves a torn tail at
+// EOF with no newline; a blind retry would glue the run-end line onto those bytes and readJsonl's
+// torn-line tolerance would drop the retry too — no terminal record despite a successful write.
+// Terminating the torn fragment keeps it on disk (dropped as a malformed line, never truncated) so
+// the retried run-end lands on a line of its own.
+const terminateTornJournalTail = (journalPath: string): void => {
+  if (!existsSync(journalPath)) return;
+  const size = statSync(journalPath).size;
+  if (size === 0) return;
+  const fd = openSync(journalPath, "r");
+  try {
+    const tail = Buffer.alloc(1);
+    if (readSync(fd, tail, 0, 1, size - 1) === 1 && tail[0] !== 0x0a) appendFileSync(journalPath, "\n");
+  } finally {
+    closeSync(fd);
+  }
+};
+
+// T7 (v1.86): the fatal handler must never eat the error it reports. Both journal calls are guarded,
+// so a sink failure is reported ALONGSIDE the original error (console.error — the dispatcher's
+// operator-visible line stays the one-line form), never instead of it: a read failure degrades the
+// duplicate-run-end check to "unknown" and fails toward recording; the append is retried ONCE; and
+// a persistently unwritable sink reports a crash naming the journal path and carrying NO terminal
+// record, rather than fabricating an ended run on evidence the harness could not write. (OBS-313:
+// with the sink dead the crash CAUSE is unrecordable — recorded as an observation, not papered over.)
+function recordFatalRunEnd(journal: Journal, runId: string, branch: string, err: unknown): void {
+  const original = err instanceof Error ? err.message : String(err);
+  try {
+    if (journal.read().some((e) => e.event === "run-end")) return; // already terminal — nothing to add
+  } catch (readErr) {
+    console.error(`tickmarkr ${runId}: journal read failed while recording the fatal run-end (${readErr instanceof Error ? readErr.message : String(readErr)}) — original error: ${original}`);
+  }
+  const record = {
+    runId,
+    branch,
+    done: [],
+    failed: [],
+    human: [],
+    blocked: [],
+    pending: [],
+    phase: "setup",
+    fatal: true,
+    error: original,
+  };
+  try {
+    journal.append("run-end", undefined, record);
+    return;
+  } catch {
+    // one retry below — the first failure is reported only if the retry also fails
+  }
+  const journalPath = join(journal.dir, "journal.jsonl");
+  try {
+    terminateTornJournalTail(journalPath);
+    journal.append("run-end", undefined, record);
+  } catch (retryErr) {
+    console.error(`tickmarkr ${runId}: run crashed — no terminal record written; journal sink unwritable at ${journalPath} (${retryErr instanceof Error ? retryErr.message : String(retryErr)}) — original error: ${original}`);
+  }
 }
 
 export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promise<RunSummary> {
@@ -2754,20 +2813,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   );
   return summary;
   } catch (err) {
-    if (runStarted && !taskLoopStarted && !journal.read().some((e) => e.event === "run-end")) {
-      journal.append("run-end", undefined, {
-        runId,
-        branch,
-        done: [],
-        failed: [],
-        human: [],
-        blocked: [],
-        pending: [],
-        phase: "setup",
-        fatal: true,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    // T7 (v1.86): guarded — a journal read/append failure while recording the fatal run-end is
+    // reported alongside err, never instead of it; recordFatalRunEnd never throws, so the original
+    // error (message, stack, cause) always reaches the caller verbatim.
+    if (runStarted && !taskLoopStarted) recordFatalRunEnd(journal, runId, branch, err);
     throw err;
   } finally {
     // v1.54 T2: deregister on EVERY exit (normal run end, throw, termination unwind) — the daemon

@@ -11,6 +11,7 @@ import {
 } from "react";
 import { describe, expect, test } from "vitest";
 import {
+  COLOUR_FRAME_CASES,
   type CockpitName,
   GOLDEN_FRAME_CASES,
   HEIGHT_TIER_BOUNDARIES,
@@ -20,7 +21,10 @@ import {
   captureCockpitOutput,
   captureRendererOutput,
   findGoldenFrameMismatches,
+  goldenFrameMatchesCommitted,
   isRetiredGoldenFrame,
+  normalizeGoldenFrameVersionForComparison,
+  regenerateColourFrames,
   regenerateGoldenFrames,
 } from "../../src/tui/cockpit/capture.js";
 import {
@@ -39,6 +43,7 @@ import {
 } from "../../src/tui/cockpit/setup-cockpit.js";
 
 const FIXTURES = join(import.meta.dirname, "../fixtures/cockpit/frames");
+const COLOUR_FIXTURES = join(import.meta.dirname, "../fixtures/cockpit/colour");
 /**
  * The frozen appearance oracle. It is a directory of its own, apart from the
  * regenerable working corpus, precisely so that regenerating the corpus cannot
@@ -356,11 +361,12 @@ type PinnedProjection = {
  * Both are located by caption or by declared geometry, never by a line number, so
  * a frame that grows above one of them still excises the right cells. A machine
  * surface opens no panel and draws no header band above one, so neither name
- * reaches run.ci or run.non-tty: they are compared byte for byte, keys line
- * included. Where their frozen tier fell behind production the anchors were
- * re-stamped visibly (RE_STAMP_ATTRIBUTION above) rather than exempted here.
+ * reaches run.ci or run.non-tty: every appearance byte stays compared, keys
+ * line included. The release-owned first-line version token is canonicalized
+ * before this projection. Where their frozen tier fell behind production the
+ * anchors were re-stamped visibly rather than exempted here.
  *
- * Nothing is normalised and nothing is substituted. Every cell either name
+ * No appearance cell is normalised or substituted. Every cell either name
  * reaches is BLANKED WHERE IT STANDS — never rewritten to another glyph, never
  * dropped, never swapped for a roster read from somewhere else — so every row
  * keeps the width it was drawn at, no escape sequence is stripped, no whitespace
@@ -422,7 +428,7 @@ function pinnedProjection(
     cells[column] = glyph;
   };
   // A machine surface opens no panel, so it has no header band above one and no
-  // rail: neither declared name reaches it, and it is compared byte for byte.
+  // rail: neither appearance declaration reaches it.
   const headerRows = regions.length
     ? Math.min(...regions.map((region) => region.top))
     : 0;
@@ -476,7 +482,7 @@ function anchorMismatches(
   declared: ReadonlySet<string> = CONTRACT_MOVED_PANELS,
   onProjection?: (fixture: string) => void,
 ): string[] {
-  const fresh = new Map(generated.map((frame) => [frame.fixture, frame.output]));
+  const fresh = new Map(generated.map((frame) => [frame.fixture, frame]));
   return [...anchors]
     .flatMap(([fixture, frozen]) => {
       const rendered = fresh.get(fixture);
@@ -485,11 +491,17 @@ function anchorMismatches(
       // the frozen fixture's identity, not from its present lack of panel chrome,
       // so adding frame-like geometry tomorrow cannot make a declaration reach it.
       if ((MACHINE_SURFACE_ANCHORS as readonly string[]).includes(fixture)) {
-        return frozen === rendered ? [] : [fixture];
+        return goldenFrameMatchesCommitted(rendered, frozen) ? [] : [fixture];
       }
       onProjection?.(fixture);
-      return pinnedProjection(frozen, declared).text
-          === pinnedProjection(rendered, declared).text
+      return pinnedProjection(
+        normalizeGoldenFrameVersionForComparison(rendered, frozen),
+        declared,
+      ).text
+          === pinnedProjection(
+            normalizeGoldenFrameVersionForComparison(rendered, rendered.output),
+            declared,
+          ).text
         ? []
         : [fixture];
     })
@@ -664,7 +676,10 @@ describe("cockpit renderer-owned golden frames", () => {
       GOLDEN_FRAME_CASES.map((item) => item.fixture).sort(),
     );
     for (const frame of generated) {
-      expect(committed.get(frame.fixture), frame.fixture).toBe(frame.output);
+      expect(
+        goldenFrameMatchesCommitted(frame, committed.get(frame.fixture)),
+        frame.fixture,
+      ).toBe(true);
     }
   });
 
@@ -896,7 +911,10 @@ describe("cockpit renderer-owned golden frames", () => {
       // Every one of them is the renderer's own emitted bytes, not authored text:
       // what the capture path wrote to the stream is what the file holds.
       expect(frame.emitted, frame.fixture).toBe(frame.output);
-      expect(committed.get(frame.fixture), frame.fixture).toBe(frame.emitted);
+      expect(
+        goldenFrameMatchesCommitted(frame, committed.get(frame.fixture)),
+        frame.fixture,
+      ).toBe(true);
       // And each is individually load-bearing: hand-edit that one fixture and the
       // regeneration check names it, so no committed frame can be authored into
       // agreement with an assertion.
@@ -907,6 +925,194 @@ describe("cockpit renderer-owned golden frames", () => {
 
       expect(findGoldenFrameMismatches(generated, edited), frame.fixture)
         .toEqual([frame.fixture]);
+    }
+  });
+
+  test("test: regenerating the corpus at an injected version different from package.json still matches every active committed capture, where the population is the PREDICATE the goal states — every route under tests/cockpit comparing committed bytes to a fresh render — covered one member per ROUTE over the closed set of routes: the golden-frame choke point, the anchor choke point, and a direct compare living inside a suite rather than in either choke point, with the setup members spanning every committed WIDTH tier because the version token sits at a different column in each", async () => {
+    const generated = await regenerateGoldenFrames("987.65.4-rc.2");
+    const committed = fixtureBytes();
+
+    expect(findGoldenFrameMismatches(generated, committed)).toEqual([]);
+    expect(anchorMismatches(generated, anchorBytes())).toEqual([]);
+
+    const setupWidths = generated.filter((frame) =>
+      frame.cockpit === "setup" && frame.axis === "width"
+    );
+    expect(setupWidths.map((frame) => frame.columns)).toEqual(
+      WIDTH_BAND_CASES.map((item) => item.columns),
+    );
+    for (const frame of setupWidths) {
+      expect(
+        goldenFrameMatchesCommitted(frame, committed.get(frame.fixture)),
+        frame.fixture,
+      ).toBe(true);
+    }
+  });
+
+  test("test: retired evidence is excluded from the equality population rather than normalized into agreement, proven member by member over the closed set of retired corpora — a retired rendered run golden, a declared-retired anchor and a colour capture — with the colour corpus still required to differ from what the renderer draws today", async () => {
+    const generated = await regenerateGoldenFrames("987.65.4-rc.2");
+    const retiredGolden = GOLDEN_FRAME_CASES.find((frame) =>
+      frame.fixture === "run.width-three-column.140x24.txt"
+    );
+    if (!retiredGolden) throw new Error("retired rendered run golden is absent");
+    expect(isRetiredGoldenFrame(retiredGolden)).toBe(true);
+    expect(generated.some((frame) => frame.fixture === retiredGolden.fixture))
+      .toBe(false);
+
+    const retiredAnchor = "run.width-three-column.140x24.txt";
+    expect(readFileSync(join(ANCHORS, retiredAnchor), "utf8").length)
+      .toBeGreaterThan(0);
+    expect(anchorBytes().has(retiredAnchor)).toBe(false);
+
+    const colourCase = COLOUR_FRAME_CASES[0];
+    const renderedColour = (await regenerateColourFrames()).find((frame) =>
+      frame.fixture === colourCase.fixture
+    );
+    if (!renderedColour) throw new Error("colour corpus member was not rendered");
+    const committedColour = readFileSync(
+      join(COLOUR_FIXTURES, colourCase.fixture),
+      "utf8",
+    );
+    expect(committedColour).not.toBe(renderedColour.output);
+  });
+
+  test("test: a hand-edited capture still fails the regeneration check, proven over the closed set of tamper shapes — a changed-status fixture, a changed-glyph fixture and an appended-blank-line fixture", async () => {
+    const generated = await regenerateGoldenFrames();
+    const committed = fixtureBytes();
+    const tampered = [
+      {
+        fixture: "run.ci.140x24.txt",
+        bytes: committed.get("run.ci.140x24.txt")!
+          .replace(" done ", " running "),
+      },
+      {
+        fixture: "setup.width-stacked.80x24.txt",
+        bytes: committed.get("setup.width-stacked.80x24.txt")!
+          .replace("binary ✓", "binary ✗"),
+      },
+      {
+        fixture: "setup.height-40.140x40.txt",
+        bytes: `${committed.get("setup.height-40.140x40.txt")}\n`,
+      },
+    ] as const;
+
+    for (const { fixture, bytes } of tampered) {
+      expect(bytes, `${fixture} mutation changed bytes`)
+        .not.toBe(committed.get(fixture));
+      expect(
+        findGoldenFrameMismatches(
+          generated,
+          new Map(committed).set(fixture, bytes),
+        ),
+        fixture,
+      ).toEqual([fixture]);
+    }
+  });
+
+  test("test: within the active equality population normalization reaches only the version token in the two first-line header forms that population uses, and no header form belonging solely to a retired population is normalized at all, proven over the closed set of header mutations — a version-only fixture that matches, and a wrong-position fixture, a second-occurrence fixture and a malformed-header fixture that each mismatch", async () => {
+    const committed = fixtureBytes();
+    const injected = await regenerateGoldenFrames("987.65.4-rc.2");
+    const plain = injected.find((frame) => frame.fixture === "run.ci.140x24.txt");
+    const setup = injected.find((frame) =>
+      frame.fixture === "setup.width-three-column.140x24.txt"
+    );
+    if (!plain || !setup) throw new Error("active header witnesses were not rendered");
+    const plainBytes = committed.get(plain.fixture)!;
+    const setupBytes = committed.get(setup.fixture)!;
+    const mutateHeader = (
+      bytes: string,
+      mutate: (header: string) => string,
+    ): string => {
+      const lines = bytes.split("\n");
+      lines[0] = mutate(lines[0]!);
+      return lines.join("\n");
+    };
+
+    expect(goldenFrameMatchesCommitted(plain, plainBytes)).toBe(true);
+    expect(goldenFrameMatchesCommitted(setup, setupBytes)).toBe(true);
+    expect(
+      goldenFrameMatchesCommitted(plain, mutateHeader(
+        plainBytes,
+        (header) => ` ${header}`,
+      )),
+      "wrong-position fixture",
+    ).toBe(false);
+    expect(
+      goldenFrameMatchesCommitted(setup, mutateHeader(
+        setupBytes,
+        (header) => header.replace(
+          /( +)(v\d+\.\d+\.\d+ · binary ✓)$/u,
+          " v1.85.0$1$2",
+        ),
+      )),
+      "second-occurrence fixture",
+    ).toBe(false);
+    expect(
+      goldenFrameMatchesCommitted(plain, mutateHeader(
+        plainBytes,
+        (header) => header.replace("tickmarkr v", "tickmarkr version "),
+      )),
+      "malformed-header fixture",
+    ).toBe(false);
+
+    const retired = GOLDEN_FRAME_CASES.find((frame) =>
+      frame.fixture === "run.width-three-column.140x24.txt"
+    );
+    if (!retired) throw new Error("retired header witness is absent");
+    const captures = loadDemoCaptures();
+    const retiredCommittedVersion = await captureRendererOutput(
+      interactiveFrameNode(
+        "run",
+        captures,
+        "1.85.0",
+        retired.columns,
+        retired.rows,
+      ),
+      { columns: retired.columns, rows: retired.rows, colour: false },
+    );
+    const retiredInjectedVersion = await captureRendererOutput(
+      interactiveFrameNode(
+        "run",
+        captures,
+        "987.65.4-rc.2",
+        retired.columns,
+        retired.rows,
+      ),
+      { columns: retired.columns, rows: retired.rows, colour: false },
+    );
+    expect(retiredCommittedVersion).toContain("tickmarkr 1.85.0");
+    expect(retiredInjectedVersion).toContain("tickmarkr 987.65.4-rc.2");
+    expect(goldenFrameMatchesCommitted(
+      {
+        ...retired,
+        renderer: "frame",
+        output: retiredInjectedVersion,
+        emitted: retiredInjectedVersion,
+      },
+      retiredCommittedVersion,
+    )).toBe(false);
+  });
+
+  test("test: normalization cannot manufacture agreement, proven by an absent committed capture reporting a mismatch rather than a skip and by every committed capture still carrying a literal version string afterwards rather than a stripped one (OBS-306 question 1 — the absent case must not be representable as agreement)", async () => {
+    const generated = await regenerateGoldenFrames();
+    const committed = fixtureBytes();
+    const absent = generated[0]!;
+    const withoutOne = new Map(committed);
+    withoutOne.delete(absent.fixture);
+
+    expect(goldenFrameMatchesCommitted(absent, undefined)).toBe(false);
+    expect(findGoldenFrameMismatches(generated, withoutOne))
+      .toContain(absent.fixture);
+
+    for (const directory of [FIXTURES, ANCHORS, COLOUR_FIXTURES]) {
+      for (const fixture of readdirSync(directory).filter((name) =>
+        name.endsWith(".txt")
+      )) {
+        expect(
+          readFileSync(join(directory, fixture), "utf8"),
+          `${fixture} literal version`,
+        ).toMatch(/v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\b/u);
+      }
     }
   });
 });
@@ -1041,8 +1247,8 @@ describe("cockpit approved appearance pinned to frozen anchors", () => {
     for (const row of lockupRows) expect(today).not.toContain(row.trimEnd());
     expect(today).not.toContain("KEYS");
 
-    // Not retired, not exempted, not normalised: no declaration reaches a byte
-    // of either, so the comparison reads them whole, keys line included.
+    // Not retired or projected: apart from the release-owned version token, the
+    // comparison reads both machine surfaces whole, keys line included.
     const forbiddenProjection = (): void => {
       throw new Error("a machine-surface anchor entered the projection");
     };
@@ -1054,7 +1260,7 @@ describe("cockpit approved appearance pinned to frozen anchors", () => {
       expect(pinnedProjection(bytes).covered, `${fixture} projected cells`)
         .toEqual([]);
       expect(pinnedProjection(bytes).text, `${fixture} discarded rows`).toBe(bytes);
-      expect(bytes, fixture).toBe(rendered.output);
+      expect(goldenFrameMatchesCommitted(rendered, bytes), fixture).toBe(true);
       expect(
         anchorMismatches(
           generated,
@@ -1449,8 +1655,14 @@ describe("cockpit approved appearance pinned to frozen anchors", () => {
     for (const fixture of MACHINE_SURFACE_ANCHORS) {
       expect(keybarRow(anchors.get(fixture)!).label, fixture)
         .toBe(KEYS_LABEL.length);
-      expect(readFileSync(join(FIXTURES, fixture), "utf8"), `${fixture} twin`)
-        .toBe(generated.find((frame) => frame.fixture === fixture)!.output);
+      const rendered = generated.find((frame) => frame.fixture === fixture)!;
+      expect(
+        goldenFrameMatchesCommitted(
+          rendered,
+          readFileSync(join(FIXTURES, fixture), "utf8"),
+        ),
+        `${fixture} twin`,
+      ).toBe(true);
     }
   });
 
@@ -1463,10 +1675,9 @@ describe("cockpit approved appearance pinned to frozen anchors", () => {
       const rendered = generated.find((frame) => frame.fixture === fixture);
       if (!bytes || !rendered) throw new Error(`missing anchor: ${fixture}`);
 
-      // The whole byte string is the renderer's, keys line included — no
-      // projection reaches a machine surface, so the Decisions hint the
-      // renderer draws is the hint the anchor holds.
-      expect(bytes, fixture).toBe(rendered.output);
+      // No projection reaches a machine surface, so every byte except the
+      // release-owned version token stays pinned, Decisions hint included.
+      expect(goldenFrameMatchesCommitted(rendered, bytes), fixture).toBe(true);
       const keysLine = bytes.split("\n")[keybarRow(bytes).row]!;
       expect(keysLine, fixture).toContain("Tab Decisions");
       expect(bytes, fixture).not.toContain("Tab Setup");

@@ -79,7 +79,6 @@ describe("diff cap — OBS-48 zero-context metric", () => {
     expect(forCap.length).toBeLessThanOrEqual(CAP);
 
     const fake = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } });
-    fake.headlessCommand = () => `printf %s ${shq(JSON.stringify({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }))}`;
     let calls = 0;
     const cmd = fake.headlessCommand.bind(fake);
     fake.headlessCommand = (...args) => { calls++; return cmd(...args); };
@@ -95,7 +94,6 @@ describe("diff cap — OBS-48 zero-context metric", () => {
     expect(forCap.length).toBeGreaterThan(CAP);
 
     const fake = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } });
-    fake.headlessCommand = () => `printf %s ${shq(JSON.stringify({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }))}`;
     let calls = 0;
     const cmd = fake.headlessCommand.bind(fake);
     fake.headlessCommand = (...args) => { calls++; return cmd(...args); };

@@ -1,14 +1,20 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { parse } from "yaml";
 import { allAdapters, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
-import { MODEL_STALE_DAYS, SEED_STAMPED, contextWindowLints, estimateTaskPayloadTokens, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
+import { MODEL_STALE_DAYS, SEED_STAMPED, contextWindowLints, estimateTaskPayloadTokens, hasWindowsConfig, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
+import { CITED_MODEL_WINDOWS } from "../../src/adapters/model-windows.js";
+import { compileSource } from "../../src/compile/index.js";
 import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
+import { readyTasks, setStatus } from "../../src/graph/graph.js";
+import type { RunGraph } from "../../src/graph/schema.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { AuthHealth } from "../../src/adapters/types.js";
+import { makeRepo } from "../helpers/tmprepo.js";
 
 const emptyRepo = () => ({ repo: mkdtempSync(join(tmpdir(), "tickmarkr-ml-r-")), globalDir: mkdtempSync(join(tmpdir(), "tickmarkr-ml-g-")) });
 const cfg = () => {
@@ -254,7 +260,10 @@ describe("OBS-30 T2 seed prefer dead-adapter lint", () => {
       },
     };
     const lints = seedPreferLints(cfg, health, adapters);
-    expect(lints.some((l) => l.includes("routing seed names dead adapter 'codex' for shape 'implement'"))).toBe(true);
+    expect(lints).toContain(
+      "routing seed names dead adapter 'codex' for shape 'implement' — no declared preference overrides it",
+    );
+    expect(lints.some((l) => l.includes("auto-prefer"))).toBe(false);
     expect(lints.some((l) => l.includes("cursor-agent"))).toBe(false);
   });
 
@@ -332,20 +341,21 @@ describe("v1.54 T3 prefer-entry dead-steering sweep", () => {
 });
 
 describe("contextWindowLints — v1.47 T3", () => {
-  const task = validateGraph({
+  const taskWithContext = (id: string, context: string) => validateGraph({
     version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
-    tasks: [{ id: "T1", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], context: ["ctx.txt"] }],
+    tasks: [{ id, title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], context: [context] }],
   }).tasks[0];
+  const task = taskWithContext("T1", "ctx.txt");
 
   test("absent windows config produces no lint", () => {
     const cfg = structuredClone(DEFAULT_CONFIG);
+    for (const entry of Object.values(cfg.tiers)) delete entry.windows;
     const lints = contextWindowLints([task], [{ taskId: "T1", adapter: "claude-code", model: "fable" }], cfg, "/tmp");
     expect(lints).toEqual([]);
   });
 
   test("estimate above declared window produces a lint", () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-cw-"));
-    writeFileSync(join(repo, "ctx.txt"), "x".repeat(20_000));
+    const repo = makeRepo({ "ctx.txt": "x".repeat(20_000) });
     const cfg = structuredClone(DEFAULT_CONFIG);
     cfg.tiers["claude-code"] = { ...cfg.tiers["claude-code"], windows: { fable: 100 } };
     const lints = contextWindowLints([task], [{ taskId: "T1", adapter: "claude-code", model: "fable" }], cfg, repo);
@@ -354,9 +364,274 @@ describe("contextWindowLints — v1.47 T3", () => {
   });
 
   test("estimateTaskPayloadTokens counts prompt shell and context bytes", () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-est-"));
-    writeFileSync(join(repo, "ctx.txt"), "abcd");
+    const repo = makeRepo({ "ctx.txt": "abcd" });
     const est = estimateTaskPayloadTokens(task, repo);
     expect(est).toBeGreaterThan(100);
   });
+
+  test("operator model windows remain configurable without being mistaken for seeded claims", () => {
+    const { repo, globalDir } = emptyRepo();
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+      "tiers:",
+      "  fake:",
+      "    vendor: fake",
+      "    channel: sub",
+      "    models:",
+      "      fake-1: mid",
+      "    windows:",
+      "      fake-1: 500",
+      "",
+    ].join("\n"));
+
+    const loaded = loadConfig(repo, { globalDir });
+    expect(loaded.tiers.fake.windows?.["fake-1"]).toBe(500);
+    expect(hasWindowsConfig(loaded)).toBe(true);
+  });
+
+  test("fileBytes distinguishes absent from empty, proven over the closed set of path states — an absent fixture, a zero-byte tracked fixture, a non-empty tracked fixture, an untracked-but-present fixture, and a glob fixture that stays unmeasurable", () => {
+    const repo = makeRepo({ "zero.txt": "", "full.txt": "x".repeat(400) });
+    writeFileSync(join(repo, "live.txt"), "checkout only");
+
+    const absent = estimateTaskPayloadTokens(taskWithContext("T1", "gone.txt"), repo);
+    const empty = estimateTaskPayloadTokens(taskWithContext("T1", "zero.txt"), repo);
+    const nonEmpty = estimateTaskPayloadTokens(taskWithContext("T1", "full.txt"), repo);
+    const untracked = estimateTaskPayloadTokens(taskWithContext("T1", "live.txt"), repo);
+    const glob = estimateTaskPayloadTokens(taskWithContext("T1", "*.md"), repo);
+
+    expect(absent).toBeUndefined();
+    expect(empty).toBeTypeOf("number");
+    expect(nonEmpty).toBeTypeOf("number");
+    expect(nonEmpty!).toBeGreaterThan(empty!);
+    expect(untracked).toBeUndefined();
+    expect(glob).toBeUndefined();
+  });
+
+  test("every model carrying a tier in the seed config also carries a declared window, proven member by member over the installed fleet — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture and a kimi fixture", () => {
+    const installedFleet = {
+      "claude-code": ["fable", "opus", "sonnet", "haiku"],
+      codex: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"],
+      "cursor-agent": ["composer-2.5", "composer-2.5-fast"],
+      opencode: ["zai-coding-plan/glm-5.2"],
+      pi: ["zai/glm-5.2"],
+      grok: ["grok-4.5", "grok-composer-2.5-fast"],
+      kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
+    } as const;
+
+    for (const [adapter, expectedModels] of Object.entries(installedFleet)) {
+      const entry = DEFAULT_CONFIG.tiers[adapter];
+      expect(Object.keys(entry.models).sort(), `${adapter} tiered models`).toEqual([...expectedModels].sort());
+      expect(Object.keys(entry.windows ?? {}).sort(), `${adapter} declared windows`).toEqual([...expectedModels].sort());
+      for (const model of expectedModels) expect(entry.windows?.[model], `${adapter}:${model}`).toBeTypeOf("number");
+    }
+  });
+
+  test("the context-window lint fires on a task whose measured payload exceeds a declared window and stays silent when the payload fits, with the payload measured against the base tree so an untracked context file contributes zero visible bytes and is reported as unreadable rather than as empty", () => {
+    const repo = makeRepo({
+      "over.txt": "x".repeat(810_000),
+      "fits.txt": "x",
+    });
+    writeFileSync(join(repo, "untracked.txt"), "x".repeat(810_000));
+    const config = structuredClone(DEFAULT_CONFIG);
+    const assignment = (taskId: string) => [{ taskId, adapter: "cursor-agent", model: "composer-2.5" }];
+
+    const over = taskWithContext("T-over", "over.txt");
+    expect(contextWindowLints([over], assignment(over.id), config, repo)).toEqual([
+      expect.stringMatching(/^T-over: payload ~\d+ tokens exceeds cursor-agent:composer-2\.5 window 200000$/),
+    ]);
+
+    const fits = taskWithContext("T-fits", "fits.txt");
+    expect(contextWindowLints([fits], assignment(fits.id), config, repo)).toEqual([]);
+
+    const unreadable = taskWithContext("T-unreadable", "untracked.txt");
+    const lints = contextWindowLints([unreadable], assignment(unreadable.id), config, repo);
+    expect(lints).toHaveLength(1);
+    expect(lints[0]).toContain("payload unreadable");
+    expect(lints[0]).toContain('context "untracked.txt"');
+    expect(lints[0]).toContain("not in the base tree");
+    expect(lints[0]).toContain("context-window comparison skipped");
+    expect(lints[0]).not.toContain("exceeds");
+  });
+
+  test("every seeded window is checked in PRODUCTION against T20's vendored table rather than merely being present, proven member by member over the closed set of rejection shapes — a seeded window with no entry in the table, one disagreeing with its table entry, and one below the plausibility floor — each rejected at config load, while a seeded window matching its table entry is accepted", () => {
+    const loadSeed = () => {
+      const { repo, globalDir } = emptyRepo();
+      return loadConfig(repo, { globalDir });
+    };
+    const matching = CITED_MODEL_WINDOWS.find((claim) => claim.modelId === "fable");
+    expect(matching).toBeDefined();
+
+    const entry = DEFAULT_CONFIG.tiers["claude-code"];
+    const original = structuredClone(entry.windows!);
+    try {
+      const rejectionShapes = [
+        {
+          name: "no table entry",
+          mutate: () => { entry.windows!["uncited-fixture"] = 200_000; },
+          error: /uncited-fixture.*no cited model-window entry/,
+        },
+        {
+          name: "table disagreement",
+          mutate: () => { entry.windows!.fable = 999_999; },
+          error: /fable.*999999.*does not match cited window 1000000/,
+        },
+        {
+          name: "below plausibility floor",
+          mutate: () => { entry.windows!.fable = 1; },
+          error: /fable.*1.*below plausibility floor/,
+        },
+      ] as const;
+      for (const fixture of rejectionShapes) {
+        entry.windows = structuredClone(original);
+        fixture.mutate();
+        expect(() => loadSeed(), fixture.name).toThrow(fixture.error);
+      }
+      entry.windows = structuredClone(original);
+      const accepted = loadSeed();
+      expect(accepted.tiers["claude-code"].windows?.fable).toBe(matching!.window);
+    } finally {
+      entry.windows = original;
+    }
+  });
+});
+
+const ACCEPTANCE = "- acceptance:\n  - command: true\n";
+
+function compileBody(repo: string, body: string): RunGraph {
+  const spec = join(repo, "tickmarkr.spec.md");
+  writeFileSync(spec, `<!-- tickmarkr:spec -->\n${body}`);
+  return compileSource(spec, "native");
+}
+
+function oneTask(repo: string, id: string, field: string): RunGraph {
+  return compileBody(repo, `## ${id}: Context fixture\n${field}\n${ACCEPTANCE}`);
+}
+
+function warningText(): string[] {
+  return vi.mocked(console.warn).mock.calls.map(([message]) => String(message));
+}
+
+afterEach(() => vi.restoreAllMocks());
+
+test("a context entry whose parenthetical annotation contains a comma survives as one entry and resolves to its path, proven over the closed set of annotation shapes — a one-comma fixture, a two-comma fixture, a nested-paren fixture, and a brace-glob fixture whose commas still split as OBS-97 requires", () => {
+  const repo = makeRepo({
+    "ctx/cited.md": "cited\n",
+    "ctx/other.md": "other\n",
+  });
+  const fixtures = [
+    {
+      name: "one comma",
+      value: "ctx/cited.md (OBS-1, OBS-2), ctx/other.md",
+      expected: ["ctx/cited.md", "ctx/other.md"],
+    },
+    {
+      name: "two commas",
+      value: "ctx/cited.md (OBS-1, OBS-2, OBS-3), ctx/other.md",
+      expected: ["ctx/cited.md", "ctx/other.md"],
+    },
+    {
+      name: "nested parens",
+      value: "ctx/cited.md (ruling (OBS-1, OBS-2), section 3), ctx/other.md",
+      expected: ["ctx/cited.md", "ctx/other.md"],
+    },
+    {
+      name: "brace glob",
+      value: "src/{compile,adapters}/**/*.ts (OBS-1, OBS-2), ctx/other.md",
+      expected: ["src/{compile,adapters}/**/*.ts", "ctx/other.md"],
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    const graph = oneTask(repo, "T1", `- context: ${fixture.value}`);
+    expect(graph.tasks[0].context, fixture.name).toEqual(fixture.expected);
+  }
+});
+
+test("every context entry is classified against the base tree rather than the orchestrator checkout, proven member by member over the closed set — an untracked-but-present fixture, a staged-uncommitted fixture, a tracked fixture, and an absent fixture — with the untracked and staged cases both reported invisible", () => {
+  const repo = makeRepo({ "tracked.md": "in HEAD\n" });
+  writeFileSync(join(repo, "untracked.md"), "checkout only\n");
+  writeFileSync(join(repo, "staged.md"), "index only\n");
+  execFileSync("git", ["-C", repo, "add", "-f", "staged.md"]);
+
+  const tree = execFileSync("git", ["-C", repo, "ls-tree", "--full-tree", "-r", "--name-only", "HEAD"], { encoding: "utf8" })
+    .trim().split("\n");
+  expect(tree).toContain("tracked.md");
+  expect(tree).not.toContain("untracked.md");
+  expect(tree).not.toContain("staged.md");
+
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  expect(oneTask(repo, "T1", "- context: untracked.md").tasks[0].context).toEqual(["untracked.md"]);
+  expect(oneTask(repo, "T2", "- context: staged.md").tasks[0].context).toEqual(["staged.md"]);
+  expect(oneTask(repo, "T3", "- context: tracked.md").tasks[0].context).toEqual(["tracked.md"]);
+  expect(() => oneTask(repo, "T4", "- context: absent.md")).toThrow(/T4[\s\S]*absent\.md/);
+
+  const invisible = warningText().filter((line) => line.includes("NOT in a worker's worktree"));
+  expect(invisible).toHaveLength(2);
+  expect(invisible.some((line) => line.includes('context "untracked.md"'))).toBe(true);
+  expect(invisible.some((line) => line.includes('context "staged.md"'))).toBe(true);
+  expect(invisible.some((line) => line.includes('context "tracked.md"'))).toBe(false);
+});
+
+test("the absent-versus-untracked disposition is complete over the closed set of base-tree outcomes — an entry absent everywhere fails compile naming the task and the entry, an entry whose basename matches exactly one tracked path fails compile naming that path as the suggested repair, an untracked-but-present entry warns and never fails compile, and a spec whose only defect is an untracked entry still compiles to a graph", () => {
+  const repo = makeRepo({ "notes/UNIQUE.md": "tracked repair target\n" });
+  writeFileSync(join(repo, "scratch.md"), "present outside HEAD\n");
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  expect(() => oneTask(repo, "T1", "- context: nowhere.md"))
+    .toThrow(/T1[\s\S]*nowhere\.md/);
+  expect(() => oneTask(repo, "T2", "- context: UNIQUE.md"))
+    .toThrow(/T2[\s\S]*UNIQUE\.md[\s\S]*did you mean notes\/UNIQUE\.md/);
+
+  let graph: RunGraph | undefined;
+  expect(() => { graph = oneTask(repo, "T3", "- context: scratch.md"); }).not.toThrow();
+  expect(graph?.tasks.map((task) => task.id)).toEqual(["T3"]);
+  const untracked = warningText().filter((line) => line.includes('context "scratch.md"'));
+  expect(untracked).toHaveLength(1);
+  expect(untracked[0]).toContain("git add -f scratch.md && git commit");
+});
+
+test("a wrapped list is read whole rather than truncated to its first physical line, proven over the closed set of continuation-carrying fields CROSSED WITH wrap depth — files, context and deps, each as a single-line fixture, a two-line-wrapped fixture and a three-line-wrapped fixture — with an absent context entry on a continuation line still failing compile and a continuation-only dependency whose loss would change graph reachability still ordering its task", () => {
+  const repo = makeRepo({
+    "src/a.ts": "export {};\n",
+    "tests/a.test.ts": "export {};\n",
+    "docs/a.md": "docs\n",
+    "ctx/a.md": "a\n",
+    "ctx/b.md": "b\n",
+    "ctx/c.md": "c\n",
+  });
+  const values = {
+    files: ["src/a.ts", "tests/a.test.ts", "docs/a.md"],
+    context: ["ctx/a.md", "ctx/b.md", "ctx/c.md"],
+    deps: ["T1", "T2", "T3"],
+  } as const;
+  const wrapped = (field: keyof typeof values, depth: 1 | 2 | 3): string => {
+    const entries = values[field];
+    if (depth === 1) return `- ${field}: ${entries.join(", ")}`;
+    if (depth === 2) return `- ${field}: ${entries[0]}, ${entries[1]},\n  ${entries[2]}`;
+    return `- ${field}: ${entries[0]},\n  ${entries[1]},\n  ${entries[2]}`;
+  };
+  const dependencyPreamble = ["T1", "T2", "T3"]
+    .map((id) => `## ${id}: Dependency ${id}\n${ACCEPTANCE}`)
+    .join("\n");
+
+  for (const field of ["files", "context", "deps"] as const) {
+    for (const depth of [1, 2, 3] as const) {
+      const prefix = field === "deps" ? dependencyPreamble : "";
+      const graph = compileBody(repo, `${prefix}## T4: ${field} depth ${depth}\n${wrapped(field, depth)}\n${ACCEPTANCE}`);
+      expect(graph.tasks.find((task) => task.id === "T4")?.[field], `${field} depth ${depth}`)
+        .toEqual(values[field]);
+    }
+  }
+
+  expect(() => oneTask(repo, "T5", "- context: ctx/a.md,\n  absent-on-continuation.md"))
+    .toThrow(/T5[\s\S]*absent-on-continuation\.md/);
+
+  const ordered = compileBody(repo, [
+    `## T1: Root\n${ACCEPTANCE}`,
+    `## T2: Middle\n- deps: T1\n${ACCEPTANCE}`,
+    `## T3: Ordered consumer\n- deps: T1,\n  T2\n${ACCEPTANCE}`,
+  ].join("\n"));
+  const afterRoot = setStatus(ordered, "T1", "done");
+  expect(ordered.tasks.find((task) => task.id === "T3")?.deps).toEqual(["T1", "T2"]);
+  expect(readyTasks(afterRoot).map((task) => task.id)).toEqual(["T2"]);
 });

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parse } from "yaml";
-import { ConfigError, DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate, fleetRepoOverlayFromDelta, globalConfigDir, harvestFleetProvenance, loadConfig, ModelPricingSchema, repoOverlayYaml, serializeFleetOverlay, SubPricingSchema, TIER_RANK, unifiedYamlDiff, type FleetEditable } from "../../src/config/config.js";
+import { ConfigError, DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate, fleetRepoOverlayFromDelta, globalConfigDir, loadConfig, ModelPricingSchema, repoOverlayYaml, serializeFleetOverlay, SubPricingSchema, TIER_RANK, unifiedYamlDiff, type FleetEditable } from "../../src/config/config.js";
 
 function repoWithOverlay(yaml: string, globalDir?: string) {
   const gDir = globalDir ?? mkdtempSync(join(tmpdir(), "tickmarkr-cfg-g-"));
@@ -630,7 +630,7 @@ describe("OBS-75 fleet serializer round-trip", () => {
       floors: { implement: "frontier", tests: "cheap" },
     };
     const overlay = fleetRepoOverlayFromDelta(initial, edited);
-    const y = serializeFleetOverlay(overlay, { kimi: { "kimi-code/k3": "probed frontier" } });
+    const y = serializeFleetOverlay(overlay);
     expect(parse(y)).toEqual(overlay);
 
     // clearing both deny lists writes null tombstones that survive the round-trip
@@ -640,7 +640,7 @@ describe("OBS-75 fleet serializer round-trip", () => {
 
   test("the serializer output for any fleet-editable overlay is accepted by the config loader", () => {
     // one overlay carrying all three OBS-75 defect classes at once: deny lists + floors + a
-    // model-less adapter entry — plus tombstones and provenance comments
+    // model-less adapter entry — plus tombstones
     const overlay = {
       routing: {
         deny: { adapters: null, models: ["pi:zai/glm-5.2"] },
@@ -652,7 +652,7 @@ describe("OBS-75 fleet serializer round-trip", () => {
         codex: { models: { "gpt-5.5": "frontier", "gpt-5.6-luna": null } },
       },
     };
-    const y = serializeFleetOverlay(overlay, { codex: { "gpt-5.5": "probed frontier" } });
+    const y = serializeFleetOverlay(overlay);
     const { repo, globalDir } = repoWithOverlay(y);
     const cfg = loadConfig(repo, { globalDir }); // a rejected overlay throws ConfigError here
     expect(cfg.routing.deny?.models).toEqual(["pi:zai/glm-5.2"]);
@@ -661,69 +661,6 @@ describe("OBS-75 fleet serializer round-trip", () => {
     expect("gpt-5.6-luna" in cfg.tiers.codex.models).toBe(false); // null tombstone applied
     expect(cfg.tiers.codex.models["gpt-5.5"]).toBe("frontier");
     expect(cfg.tiers.kimi.models["kimi-code/k3"]).toBe("frontier"); // default seeds survive the model-less entry
-  });
-});
-
-// OBS-88: yaml.parse discards comments, so the write path used to know only the current session's
-// own notes — every prior # note (typed benchmark provenance, hand-written deny reasons) was
-// silently stripped on the next fleet write. harvestFleetProvenance reads them back from the raw
-// overlay bytes at session load; the serializer re-attaches them verbatim.
-describe("OBS-88 provenance harvest", () => {
-  const NOTE = "SWE-bench Pro 62.1 — fleet 2026-07-18";
-
-  test("a fleet session that reassigns a tier without changing its provenance note preserves the original note byte-for-byte", () => {
-    const overlayText = serializeFleetOverlay(
-      { tiers: { fake: { vendor: "fake", channel: "sub", models: { "fake-1": "mid" } } } },
-      { fake: { "fake-1": NOTE } },
-    );
-    expect(overlayText).toContain(`fake-1: mid  # ${NOTE}`);
-    // session load: the harvested note rides the editable state from the start
-    const harvested = harvestFleetProvenance(overlayText);
-    expect(harvested.tiers).toEqual({ fake: { "fake-1": NOTE } });
-    const initial: FleetEditable = {
-      denyAdapters: [], denyModels: [],
-      tiers: { fake: { "fake-1": { tier: "mid", provenance: NOTE } } },
-      map: {}, floors: {},
-    };
-    const edited = structuredClone(initial);
-    edited.tiers.fake["fake-1"] = { tier: "frontier", provenance: NOTE };
-    const out = fleetRepoOverlayFromDelta(initial, edited, parse(overlayText) as Record<string, unknown>);
-    const rewritten = serializeFleetOverlay(out, harvested.tiers);
-    expect(rewritten).toContain(`fake-1: frontier  # ${NOTE}`);
-    // and the note is STILL byte-identical after a second harvest→serialize round trip
-    expect(harvestFleetProvenance(rewritten).tiers.fake["fake-1"]).toBe(NOTE);
-  });
-
-  test("harvest reads notes on tombstones and deny entries and the serializer re-attaches them", () => {
-    const text = [
-      "routing:",
-      "  deny:",
-      "    adapters:",
-      "      - grok  # flaky auth — retry in Aug",
-      "    models:",
-      "      - codex:gpt-5.5  # burned quota",
-      "tiers:",
-      "  codex:",
-      "    models:",
-      "      gpt-old: null  # retired 2026-07",
-      "",
-    ].join("\n");
-    const h = harvestFleetProvenance(text);
-    expect(h.denyAdapters).toEqual({ grok: "flaky auth — retry in Aug" });
-    expect(h.denyModels).toEqual({ "codex:gpt-5.5": "burned quota" });
-    expect(h.tiers).toEqual({ codex: { "gpt-old": "retired 2026-07" } });
-    const y = serializeFleetOverlay(parse(text) as Record<string, unknown>, h.tiers, { adapters: h.denyAdapters, models: h.denyModels });
-    expect(y).toContain("- grok  # flaky auth — retry in Aug");
-    expect(y).toContain("- codex:gpt-5.5  # burned quota");
-    expect(y).toContain("gpt-old: null  # retired 2026-07");
-    expect(parse(y)).toEqual(parse(text)); // comments never change what the loader sees
-  });
-
-  test("harvest fails open to empty on unreadable or comment-free overlays", () => {
-    expect(harvestFleetProvenance("")).toEqual({ tiers: {}, denyAdapters: {}, denyModels: {} });
-    expect(harvestFleetProvenance(": : :")).toEqual({ tiers: {}, denyAdapters: {}, denyModels: {} });
-    expect(harvestFleetProvenance("tiers:\n  fake:\n    models:\n      fake-1: mid\n"))
-      .toEqual({ tiers: {}, denyAdapters: {}, denyModels: {} });
   });
 });
 
