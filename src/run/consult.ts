@@ -8,6 +8,7 @@ import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
+import { disallowedBy } from "../route/preference.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
 import { filterLlmTranscript } from "./stall.js";
@@ -230,8 +231,20 @@ export async function consult(
     .map((entry) => ({ adapter: entry.slice(0, entry.indexOf(":")), model: entry.slice(entry.indexOf(":") + 1) }))
     .filter((s) => live.has(s.adapter));
   seats.push({ adapter: cfg.consult.adapter, model: cfg.consult.model });
+  // v1.87 T2: a consult seat reads the code, so it passes through the operator's policy exactly like
+  // a worker does. The filter runs AFTER the pin is pushed, so the final pinned seat is checked by
+  // the same rule as every prefer entry — and disallowedBy carries the full deny grammar (adapter,
+  // model, or adapter:model), so a model-scoped deny cannot slip past an adapter-id-only read.
+  const allowedSeats = seats.filter((s) => disallowedBy(s, cfg.routing, "consult") === null);
+  if (!allowedSeats.length) {
+    const d = disallowedBy(seats[seats.length - 1]!, cfg.routing, "consult")!;
+    return {
+      action: "human",
+      notes: `every consult seat is disallowed by routing.${d.by} (${d.entry}) — failing safe to human`,
+    };
+  }
 
-  for (const [i, seat] of seats.entries()) {
+  for (const [i, seat] of allowedSeats.entries()) {
     try {
       const parsed = await invokeSeat(seat.adapter, seat.model, i);
       if (parsed.verdict) return parsed.verdict;

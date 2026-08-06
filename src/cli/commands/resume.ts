@@ -1,5 +1,6 @@
 import { loadConfig } from "../../config/config.js";
 import { pickDriver } from "../../drivers/index.js";
+import { loadGraph } from "../../graph/graph.js";
 import { type RunSummary, formatSummary, runDaemon } from "../../run/daemon.js";
 import { formatJournalNarration } from "../../run/journal.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
@@ -17,7 +18,12 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
   const graphChanged = argv.includes("--graph-changed");
   const retryFailed = argv.includes("--retry-failed");
   const cfg = loadConfig(cwd);
-  const collisions = denyPreferCollisions(cfg);
+  // v1.87 T3 (OBS-162, twice-carried workaround): the preflight runs AFTER the graph is read and
+  // sees only the shapes the resumed graph carries. A deny∩prefer collision on a shape no resumed
+  // task uses is a config fact the run would never resolve — it must not refuse the only
+  // crash-recovery path. doctor still walks the whole map.
+  const graph = loadGraph(cwd);
+  const collisions = denyPreferCollisions(cfg, graph.tasks.map((t) => t.shape));
   if (collisions.length) {
     throw new Error(collisions.map(denyPreferCollisionLine).join("; "));
   }

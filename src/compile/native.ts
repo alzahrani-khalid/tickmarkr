@@ -476,6 +476,13 @@ acceptance is required on every task (a nested list of observable outcomes).
       task that owns both the thing it checks and the fixture it checks against.
     - A source-only obligation (a comment or doc that a change makes false) has no lawful "test:" — verify
       it with "judge:", which reads the DIFF and must cite a changed line in a file the task owns.
+    - A criterion that pins the SHAPE of a fix must also pin the CONDITIONS under which it runs, or a
+      correctly-shaped fix that runs SOMETIMES satisfies it. "cleanup is try/finally at all four sites"
+      is satisfied by \`finally { if (cond) cleanup() }\` — the shape is present and the fix is inert in
+      production. Say UNCONDITIONAL, or name the branch that may not exist.
+    - Enumerating one axis exhaustively is what hides the others. A spec that guards PARTIAL coverage
+      site-by-site, member-by-member, can be defeated wholesale by CONDITIONAL coverage, which leaves
+      every enumeration satisfied. After you enumerate, ask what a single flag would do to the whole set.
 
   ORDERING AND OWNERSHIP:
     - Every path has exactly ONE owning task. Two tasks writing one file must be ORDERED by deps, or the

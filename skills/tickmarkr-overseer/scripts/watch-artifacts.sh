@@ -14,6 +14,11 @@
 # wide as however long you stay busy — and you will be busy, because you just spawned work.
 #
 # Prints one wake reason and EXITS. Re-arm after every wake.
+#
+# TKR_CLOSE_PANES="w1:p1,w1:p2" closes those panes when every artifact completes — the answer to panes
+# accumulating because nobody was watching for "this seat is finished". It fires ONLY on completion,
+# never on timeout. Operator-observed 2026-08-06: five consult panes in one tab left each 14 columns
+# wide and unreadable, because closing was a step someone had to remember.
 set -u
 # macOS ships bash 3.2, where `set -u` makes "${arr[@]}" on an EMPTY array a fatal unbound-variable
 # error. Every expansion below therefore uses the ${arr[@]+"${arr[@]}"} guard. Caught by the timeout
@@ -51,6 +56,17 @@ while :; do
   if [ "${#pending[@]}" -eq 0 ]; then
     echo "WAKE: all ${#ready[@]} artifact(s) complete with marker '$MARKER'"
     for f in ${ready[@]+"${ready[@]}"}; do echo "  READY  $(wc -c <"$f" | tr -d ' ') bytes  $f"; done
+    # A seat whose artifact is COMPLETE has nothing left to give: the report is the archive, the pane is
+    # not. Closing here is safe precisely because the marker — not `done`, not a size — is the trigger,
+    # so this can never reap a seat mid-write. Only on the COMPLETE path: on a timeout the seats are
+    # still working and closing one would destroy the work being waited for.
+    if [ -n "${TKR_CLOSE_PANES:-}" ]; then
+      for pane in ${TKR_CLOSE_PANES//,/ }; do
+        # `herdr pane close` exits 0 even for a pane that is already gone, so report the body rather
+        # than the status — an exit code here would claim a close that may never have happened.
+        printf '  CLOSED %s -> %s\n' "$pane" "$(herdr pane close "$pane" 2>&1 | head -c 80)"
+      done
+    fi
     exit 0
   fi
 

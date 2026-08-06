@@ -101,10 +101,16 @@ export function preferEntryDenied(p: string, cfg: TickmarkrConfig): Disallowed |
   }
 }
 
-export function denyPreferCollisions(cfg: TickmarkrConfig): DenyPreferCollision[] {
+// v1.87 T3 (OBS-162): graph-aware walk. `shapes` narrows it to the shapes the caller will actually
+// route — resume hands it the loaded graph's shape set, so a collision on a shape no resumed task
+// uses can no longer refuse the only crash-recovery path. Omitted ⇒ the whole routing map: doctor
+// audits the config itself, which has no graph to be scoped by.
+export function denyPreferCollisions(cfg: TickmarkrConfig, shapes?: Iterable<string>): DenyPreferCollision[] {
   if (!cfg.routing.allow && !cfg.routing.deny) return [];
+  const inGraph = shapes === undefined ? undefined : new Set(shapes);
   const out: DenyPreferCollision[] = [];
   for (const [shape, entry] of Object.entries(cfg.routing.map)) {
+    if (inGraph && !inGraph.has(shape)) continue;
     if (entry.pin) {
       const d = disallowedBy({ adapter: entry.pin.via, model: entry.pin.model }, cfg.routing);
       if (d) {

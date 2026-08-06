@@ -14,11 +14,26 @@ import type { WorkerAdapter } from "./types.js";
 
 export const CLI_NAME_RE = /^[a-z0-9-]+$/;
 
+// `field` names the ONE key projected out of an array of objects — a model id and nothing else.
+// `{"models":[{…}]}` is the normal shape of a modern CLI's --json output, and without a selector the
+// json parser only reads the rarer array-of-bare-strings. The allowlist is the rule, not a comment:
+// `cost` (prices have one authority, catalog-remote.ts) and `provider` (vendor landing is a separate
+// decision) are not id keys, so no config can name them and no parser call can be typed with them —
+// a schema that took any string would let either be harvested as a second source of truth.
+export const MODEL_ID_FIELDS = ["id", "selector", "model"] as const;
+export type ModelIdField = (typeof MODEL_ID_FIELDS)[number];
+
 const ListModelsSchema = z.object({
   argv: z.array(z.string()).min(1),
   parser: z.enum(["lines", "pi-table", "json"]),
   path: z.string().min(1).optional(),
-}).strict();
+  field: z.enum(MODEL_ID_FIELDS).optional(),
+}).strict().superRefine((listModels, ctx) => {
+  // A selector the parser would silently ignore is the same silence this contract exists to end.
+  if (listModels.field !== undefined && listModels.parser !== "json") {
+    ctx.addIssue({ code: "custom", path: ["field"], message: "field is only read by the json parser" });
+  }
+});
 
 export const CliDriveSchema = z.object({
   headless: z.string().min(1),

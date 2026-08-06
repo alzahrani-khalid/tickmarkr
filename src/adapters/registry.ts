@@ -6,14 +6,14 @@ import { type TickmarkrConfig } from "../config/config.js";
 import { modelLints, suggestOverlay } from "./model-lints.js";
 import { HerdrDriver } from "../drivers/herdr.js";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
-import { disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../route/preference.js";
+import { disallowedBy, excludedChannels, exclusionLine, type PreferenceRole, preferRanks } from "../route/preference.js";
 import { sh } from "../run/git.js";
 import { FakeAdapter } from "./fake.js";
 import { parseWorkerResult } from "./prompt.js";
 import { sealHerdrEnv } from "../drivers/subprocess.js";
 import {
   catalogEntries, isNativeCliDrive, projectCliEntries, SHIPPED_CLI_CATALOG,
-  type CatalogEntriesOptions, type CliEntry, type DeclarativeCliDrive,
+  type CatalogEntriesOptions, type CliEntry, type DeclarativeCliDrive, type ModelIdField,
 } from "./catalog.js";
 import {
   type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, type ModelAuth,
@@ -245,14 +245,46 @@ function valueAtPath(value: unknown, path: string | undefined): unknown {
   }, value);
 }
 
-function parseDeclaredModels(raw: string, parser: "lines" | "pi-table" | "json", path?: string): string[] {
+// v1.87 T4: the projection reports WHY it is empty. Malformed JSON, a wrong path, a wrong field and
+// values the id-format filter rejects all used to return one indistinguishable [], so a misspelled
+// selector read exactly like the CLI having no models — the operator cannot tell a typo from a defect.
+export interface DeclaredModels {
+  models: string[];
+  reason?: string;
+}
+
+export function parseDeclaredModels(
+  raw: string,
+  parser: "lines" | "pi-table" | "json",
+  path?: string,
+  field?: ModelIdField,
+): DeclaredModels {
   let values: unknown[];
   if (parser === "json") {
+    let root: unknown;
     try {
-      const selected = valueAtPath(JSON.parse(raw), path);
-      values = Array.isArray(selected) ? selected : [];
+      root = JSON.parse(raw);
     } catch {
-      return [];
+      return { models: [], reason: "malformed JSON: the output did not parse" };
+    }
+    const selected = valueAtPath(root, path);
+    if (!Array.isArray(selected)) {
+      return { models: [], reason: `no array at ${path ? `path "${path}"` : "the JSON root"}` };
+    }
+    // One key per entry, and only the configured one — and `ModelIdField` is an id-key allowlist, so
+    // `cost` and `provider` are not spellable here: no price, no vendor, no whole object.
+    values = field === undefined
+      ? selected
+      : selected.map((entry) => entry && typeof entry === "object" && !Array.isArray(entry)
+        ? (entry as Record<string, unknown>)[field]
+        : undefined);
+    if (selected.length > 0 && !values.some((value) => typeof value === "string")) {
+      return {
+        models: [],
+        reason: field === undefined
+          ? `${selected.length} entries are not id strings and no field is configured`
+          : `no string field "${field}" on any of the ${selected.length} entries`,
+      };
     }
   } else if (parser === "pi-table") {
     const lines = raw.trim().split("\n");
@@ -264,7 +296,14 @@ function parseDeclaredModels(raw: string, parser: "lines" | "pi-table" | "json",
   } else {
     values = raw.split("\n").map((line) => line.trim());
   }
-  return [...new Set(values.filter((value): value is string => typeof value === "string" && MODEL_ID_RE.test(value)))];
+  // Blanks are structural padding in every parser (trailing newline, headerless table row), never a
+  // rejected id — counting them would make "all values rejected" fire on a healthy list.
+  const candidates = values.filter((value): value is string => typeof value === "string" && value.length > 0);
+  const models = [...new Set(candidates.filter((value) => MODEL_ID_RE.test(value)))];
+  if (models.length === 0 && candidates.length > 0) {
+    return { models, reason: `all ${candidates.length} listed values were rejected by the model-id format` };
+  }
+  return { models };
 }
 
 function declarativeAdapter(entry: CliEntry & { drive: DeclarativeCliDrive }): WorkerAdapter {
@@ -303,9 +342,16 @@ function declarativeAdapter(entry: CliEntry & { drive: DeclarativeCliDrive }): W
         if (!resolved) return [];
         const cmd = [shq(resolved), ...drive.listModels!.argv.map(shq)].join(" ");
         const result = shellSpawnSync(cmd, process.cwd(), 15000);
-        return result.code === 0
-          ? parseDeclaredModels(result.stdout, drive.listModels!.parser, drive.listModels!.path)
-          : [];
+        if (result.code !== 0) return [];
+        const { models, reason } = parseDeclaredModels(
+          result.stdout,
+          drive.listModels!.parser,
+          drive.listModels!.path,
+          drive.listModels!.field,
+        );
+        // Listing stays advisory (fail-open to []), but never silently: an empty projection names why.
+        if (models.length === 0 && reason) console.warn(`tickmarkr: ${entry.id} listed no models — ${reason}`);
+        return models;
       },
     } : {}),
   };
@@ -527,10 +573,15 @@ export function readDoctor(repoRoot: string): Record<string, AuthHealth> | null 
   return health as Record<string, AuthHealth>;
 }
 
+// v1.87 T2: `role` is optional and defaults to "worker", so every pre-existing two/three-argument
+// call keeps its exact present behaviour — the worker pool. A non-worker role reads the SAME fleet
+// through its own deny scope: a worker-only deny (routing.deny.workers) benches a channel for
+// dispatch while leaving it eligible to judge, review or consult the work.
 export function discoverChannels(
   cfg: TickmarkrConfig,
   adapters: WorkerAdapter[],
   health: Record<string, AuthHealth>,
+  role: PreferenceRole = "worker",
 ): BillingChannel[] {
   const base = adapters
     .filter((a) => health[a.id]?.installed && health[a.id]?.authed)
@@ -545,7 +596,21 @@ export function discoverChannels(
       return a.channels(cfg).filter((c) => !invalid.has(c.model) && modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)));
     });
   if (!cfg.routing.allow && !cfg.routing.deny) return base;
-  return base.filter((c) => disallowedBy(c, cfg.routing) === null);
+  return base.filter((c) => disallowedBy(c, cfg.routing, role) === null);
+}
+
+// v1.87 T2: the role-scoped pool builder. One doctor probe, one discovery pass per role — so the
+// daemon hands each seat the pool its own policy allows instead of handing everyone the worker list.
+export const PREFERENCE_ROLES = ["worker", "judge", "review", "consult"] as const;
+
+export function rolePools(
+  cfg: TickmarkrConfig,
+  adapters: WorkerAdapter[],
+  health: Record<string, AuthHealth>,
+): Record<PreferenceRole, BillingChannel[]> {
+  return Object.fromEntries(
+    PREFERENCE_ROLES.map((role) => [role, discoverChannels(cfg, adapters, health, role)]),
+  ) as Record<PreferenceRole, BillingChannel[]>;
 }
 
 // HYG-07(a): the channels discoverChannels silently dropped because their model isn't in the adapter's

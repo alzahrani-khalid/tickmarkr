@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
-import { allAdapters, discoverChannels, getAdapter, probeAll, readDoctor } from "../adapters/registry.js";
+import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
 import { type Assignment, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import {
@@ -791,7 +791,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // the route (the final "→ " segment is a pin, not a degraded-to-auto tail) it names the mode it bypassed.
   const dispatchProvenance = (p: string): string =>
     `mode ${rm.mode.mode} (${rm.source})${p.split("→ ").pop()!.startsWith("pin ") ? ` — pin bypasses mode ${rm.mode.mode}` : ""} · ${p}`;
-  const channels = discoverChannels(cfg, adapters, health);
+  // v1.87 T2: one pool per seat role, built once. `channels` stays the WORKER pool — every routing
+  // call below reads it exactly as before — while the judge, review and consult seats each receive
+  // the pool their own deny scope allows, so routing.deny.workers benches a channel for dispatch
+  // without also removing it from the seats that verify the work.
+  const pools = rolePools(cfg, adapters, health);
+  const channels = pools.worker;
   // v1.6 ROUTE-06: build the learned profile ONCE at startup (never per task, never in the comparator).
   // No preview — the daemon honors routing.learned:off and gets undefined; this snapshot is immutable
   // for the run, so this run's own telemetry never feeds back into its own routing.
@@ -1253,7 +1258,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // D-07: consult panes self-clean when the verdict is read (keepLlm) — only "forever" keeps them.
         // v1.54 T1: channels = this run's doctor-filtered live list — consult.prefer seat liveness
         // is judged against it, never rebuilt from config (installed-but-unauthed seats would stall).
-        { keep: keepLlm, onSlot: keepLlm ? (s: Slot) => keptSlots.push(s) : undefined, runId, channels },
+        { keep: keepLlm, onSlot: keepLlm ? (s: Slot) => keptSlots.push(s) : undefined, runId, channels: pools.consult },
       );
     };
 
@@ -1401,7 +1406,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         journal.phaseStart(t.id, "gates");
         const { results } = await runGates(resumedTask, {
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
-          commands, baseline, channels, adapters, cfg, artifactDir: journal.dir,
+          commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
           // a recheck re-verifies a human's release: it never selects tests down, it runs the suite.
           pipeline: "v185",
           via: cfg.visibility.llm === "pane"
@@ -2532,7 +2537,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         journal.phaseStart(t.id, "gates");
         ({ results, commits } = await runGates(t, {
           worktree: wt, baseRef: taskBase, result, author: assignment,
-          commands, baseline, channels, adapters, cfg, artifactDir: journal.dir,
+          commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
           pipeline: "v185", selectTests: !testGateFailed,
           via: cfg.visibility.llm === "pane"
             ? {

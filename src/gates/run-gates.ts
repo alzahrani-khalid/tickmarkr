@@ -8,6 +8,7 @@ import { acceptanceGate } from "./acceptance.js";
 import { type Baseline, compareToBaseline } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
+import { disallowedBy } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
 import { reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
@@ -30,6 +31,9 @@ export interface GateContext {
   commands: Record<string, string>;
   baseline: Baseline;
   channels: BillingChannel[];
+  // v1.87 T2: the judge-role pool for the GATE-09 failover pick. Absent ⇒ `channels`, so every
+  // pre-existing caller keeps its present behaviour; the daemon passes its judge-scoped pool.
+  judgeChannels?: BillingChannel[];
   adapters: WorkerAdapter[];
   cfg: TickmarkrConfig;
   via?: GateVia; // v1.1: present → judge/review run as visible named agents through the driver
@@ -267,6 +271,21 @@ export async function runGates(
 
   // acceptance judge — LLM spend, so everything deterministic has already passed when this runs
   const runAcceptance = async (): Promise<{ result: GateResult; invocations: JudgeInvocationEvidence[] }> => {
+    // v1.87 T2: the judge is a configured seat like any other — check it against the operator's
+    // policy BEFORE spending a dispatch on it. disallowedBy carries the whole deny grammar (adapter,
+    // model, or adapter:model), so a model-scoped deny cannot slip past an adapter-id-only read.
+    const judgeDenied = disallowedBy({ adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model }, ctx.cfg.routing, "judge");
+    if (judgeDenied) {
+      return {
+        result: {
+          gate: "acceptance",
+          pass: false,
+          details: `judge ${channelKey({ adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model })} is disallowed by routing.${judgeDenied.by} (${judgeDenied.entry}) — remove the ${judgeDenied.by} entry or re-point cfg.judge at an allowed channel`,
+          meta: { judgeDisallowed: { by: judgeDenied.by, entry: judgeDenied.entry } },
+        },
+        invocations: [],
+      };
+    }
     const judgeAdapter = getAdapter(ctx.cfg.judge.adapter, ctx.adapters);
     const jvia = ctx.via
       ? { driver: ctx.via.driver, keep: ctx.via.keep, onSlot: ctx.via.onSlot, name: ctx.via.nameFor("judge", judgeAdapter.id), label: ctx.via.labelFor("judge") }
@@ -326,8 +345,11 @@ export async function runGates(
         // pickReviewer's sort (review.ts:37): TIER_RANK desc, marginalCostRank asc — proven ordering; both
         // symbols already imported by a sibling gate file.
         .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y))[0];
-      const crossAdapter = pick(ctx.channels.filter((c) => c.adapter !== flakedAdapter));
-      const sameAdapter = pick(ctx.channels.filter((c) => c.adapter === flakedAdapter && channelKey(c) !== flakedKey));
+      // v1.87 T2: the failover seat obeys the same policy the primary judge just passed — a denied
+      // channel is refused here too, never reached by falling through the exclusion arms below.
+      const judgePool = (ctx.judgeChannels ?? ctx.channels).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
+      const crossAdapter = pick(judgePool.filter((c) => c.adapter !== flakedAdapter));
+      const sameAdapter = pick(judgePool.filter((c) => c.adapter === flakedAdapter && channelKey(c) !== flakedKey));
       // Prefer a different adapter; if the fleet only has one adapter, retry on a different channel of
       // that adapter; if the fleet has only one channel, fall back to the original judge config.
       const retry = crossAdapter ?? sameAdapter ?? { adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model };

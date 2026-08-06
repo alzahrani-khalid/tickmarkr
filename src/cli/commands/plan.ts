@@ -121,7 +121,16 @@ export async function plan(argv: string[], cwd = process.cwd(), adapters: Worker
   lints.push(...modelLints(cfg, health, adapters, { tty: ttyVisual() })); // health may be pre-v1.5/probeAll-fallback — no-detection branch covers both
   // v1.54 T3: dead-steering sweep — advisory only, renders with the routing lints, never alters routing.
   lints.push(...preferEntryLints(cfg, health, overlayPreferShapes(cwd)));
-  if (cfg.review.required && channels.length && !fleetCanCrossVendorReview(channels)) {
+  // The guard here was `channels.length && !fleetCanCrossVendorReview(channels)`, so the review lint went
+  // SILENT at zero channels — the first-run state, where review.required is set and nothing can route at all.
+  // Deleting that clause outright is worse than the silence: it fires "no cross-vendor reviewer pair in fleet"
+  // when there IS no fleet. An empty fleet and a single-vendor fleet are different faults with different
+  // repairs — install or auth ANY adapter vs. add a second VENDOR — so they are two lints, not one clause.
+  // The pair text stays byte-identical: tests/fixtures/brand-surfaces/plan-lints.txt pins it and this task
+  // does not own that fixture, so the pair lint keeps naming the waiver as the repair it can offer inline.
+  if (cfg.review.required && channels.length === 0) {
+    lints.push("review: review.required is set but no channel can route — the fleet is empty; install or authenticate an adapter");
+  } else if (cfg.review.required && !fleetCanCrossVendorReview(channels)) {
     lints.push("review: no cross-vendor reviewer pair in fleet — set review.required: false to waive");
   }
 

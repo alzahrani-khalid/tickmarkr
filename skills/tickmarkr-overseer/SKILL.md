@@ -100,6 +100,18 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
   its death. Liveness comes from the lock's OWN pid (`kill -0`), never a command-name grep. Recovery is
   `tickmarkr resume <runId>` — **the orchestrator's command, not yours** — and note that resume REPLAYS the
   journal's `baseRef`, so a fix landed on the base branch is unreachable by the running run.
+- **SWEEPING A WORKER ORPHANS ITS CLEANUP, NOT JUST ITS WORK — kill the process GROUP.** Measured
+  2026-08-06: a worker running a legitimate load experiment had spawned CPU burners and held a trailing
+  `kill` line. It was SIGTERM'd as an orphan; **the cleanup never ran**, and **59 surviving burner shells
+  drove load to 243** — which then timed out a 2.4-second test at 20 seconds, failed the run's tip-verify,
+  and was initially blamed on an unrelated known defect. Seven workers were swept that day under a rule
+  that treats sweeping as pure hygiene, and nothing in it looks for pending cleanup.
+  **The fix is mechanical, not vigilance:** kill the process GROUP so forked children die with the parent,
+  and identify the target **by PID from a parse — never by name pattern.** A pattern matching a script path
+  also matches any supervisor carrying that path in its own argv, so `pgrep -f <script>` kills the watchdog
+  along with the watched (measured the same day, on the overseer's own dialog watcher).
+  **After any sweep, verify what SURVIVED, not just what died** — the supervisor, the daemon, and the
+  current attempt's worker.
 - **Gate quiet ≠ idle.** Between `worker-result` and the batched `gate-result`s, shell gates plus a
   headless judge/review run with little visible signal. Clock the CURRENT phase: a worker heartbeat is
   stale by design once gates start, and clocking the wrong one makes a healthy gate read as a stalled
@@ -148,9 +160,30 @@ number — an unmeasured budget is not a small budget.
   by bracketed-paste on long payloads. Robust sequence: read the pane (bare prompt required) → send-text →
   sleep 2–3s → send-keys Enter → read back (input empty / agent `working`). Never report "briefed" without
   the read-back. Long content goes in a brief file, never pane text.
+  **PROBE THE READ-BACK WITH THE SHORTEST DISTINCTIVE TOKEN — a commit hash, a pid, an OBS id — NEVER a
+  sentence.** A long phrase crosses the pane's render wrap boundary, so grepping for it returns zero on a
+  message that arrived intact, and **a badly-probed successful send is byte-identical to a truncated one.**
+  Both natural reactions to that false negative are wrong: re-sending duplicates the message into the
+  target's queue, and escalating reports a delivery failure that never happened. Measured 2026-08-06
+  (OBS-396): a grep for the full sentence returned 0 while a grep for one word of the same sentence
+  returned 1. This trap lives *inside* the verification step above, which is why it survives — the rule
+  that is supposed to catch dropped sends is the rule that manufactures the phantom.
 - **Guard-before-Enter** (race-safe prompt answering): chain with `&&` — pane get shows `blocked` && pane
   read shows the expected option under the cursor && only then send-keys. If no longer `blocked`, someone
   already answered; do nothing.
+- **AGENT NAMES ARE GLOBAL ACROSS WORKSPACES — verify a seat you spawned by PANE ID, never by name.**
+  Names must be unique among live agents *everywhere*, not within your workspace, so another workspace can
+  already hold `opus`, `sol`, `reviewer` or `orch`. When it does, your `agent start` **fails**, your pane
+  is left a bare shell, and `agent list` / `agent read` / `agent prompt` for that name then resolve to the
+  **stranger's seat**. Measured 2026-08-06 (OBS-392): a spawn of `fable` collided with a live seat in
+  another workspace; `agent list` reported `fable -> blocked` and it was read as *this* seat coming up
+  blocked. It was an operator research session sitting on a *"Resume full session?"* prompt. One more
+  command would have submitted a brief into it. **Namespace every name you pick** (`fable-v187`, not
+  `fable`), **treat a failed `agent start` as fatal at the call site** rather than inferring it later from
+  a status read — the status read is exactly what the collision corrupts — and print the `workspace_id`
+  and `cwd` columns before dispatching to any name. Same class as the liveness rule: a matcher broader
+  than the thing it names finds things that are not it, and its output is shaped exactly like a right
+  answer.
 - **A dead pane accepts your dispatch and reports success.** `herdr wait agent-status` exits 1 on timeout, 0
   on match — but ALSO 0 (with an error JSON) when the pane is GONE. So does `pane run`: sending to a vanished
   pane prints `{"error":{"code":"pane_not_found"}}` and **still exits 0**, so `pane run … >/dev/null && echo
@@ -173,6 +206,26 @@ Default mode wakes only when both panes are quiet (dropped handoff) or the orche
 orchestrator gets a 90s grace window to handle worker blocks first. For long parked stretches a targeted
 `herdr wait agent-status <pane> --status <s> --timeout <ms>` beats the watcher. When parking a human
 checkpoint, also fire `herdr notification show "HUMAN CHECKPOINT: <gate>" --sound request`.
+
+**⚠ THIS WATCHER KEYS ON `agent_status`, AND `agent_status` IS A PROXY THAT FAILS IN BOTH DIRECTIONS.**
+Measured 2026-08-06 on ONE pane inside TEN MINUTES: a worker wedged behind a CLI's modal trust prompt
+reported **`idle`** (not `blocked`), and the same pane minutes later reported **`done`** while demonstrably
+mid-work — reading files, context climbing. So a status-keyed watcher can both **sleep through a wedged
+worker** and **fire on a working one**, and neither failure announces itself. The bundled watcher inherits
+this; so does any `herdr wait agent-status`. It is still worth arming — it catches vanished panes and real
+blocks — but **never treat its silence as evidence a worker is healthy.**
+Two keys that do not lie, in order of strength:
+- **The daemon's own waiter.** What `herdr pane wait-output` is matching on tells you the phase from the
+  harness's state machine rather than from a status field: a `--match` on a readiness banner means the
+  worker has not launched; a `--regex` on the completion trailer means it is running. That is how a stuck
+  launch was distinguished from a slow one, and it beats reading the pane.
+- **Pane CONTENT.** A rendered prompt pattern is the condition itself; `agent_status` is the harness's
+  opinion about the agent. The repo's own `trust-sweeper` scans content and caught a trust modal at
+  04:40 that a status-keyed dialog watcher missed at 16:04 — same class, same day, same machine.
+**The product fix for the modal case is adapter parity, not a sweeper:** the claude-code adapter passes
+`--strict-mcp-config` precisely so MCP-trust modals cannot stall a worker. An adapter lacking that flag
+will keep producing this stall, and a sweeper that has been running since 04:40 is evidence the gap was
+visible and got swept instead of fixed.
 
 **Every seat you spawn gets an ARTIFACT watcher armed in the SAME call that spawns it** — bundled, and
 keyed on the deliverable rather than the seat:
@@ -229,6 +282,33 @@ orchestrator turn boundary.
     a fresh one, which is the stated-reason exception above. Close consult rounds only once a later round
     has re-derived their findings.
   - Emptied tabs disappear on their own; do not close tabs by hand.
+  - **CLOSE IT AUTOMATICALLY, because remembering is what fails.** `watch-artifacts.sh` already fires on
+    the one signal that means a seat is finished — the artifact plus its terminal marker — so hand it the
+    panes too: `TKR_CLOSE_PANES="w1:p1,w1:p2" watch-artifacts.sh …`. It closes them on completion and
+    **never on timeout**, where the seats are still working. Closing on the marker cannot reap a seat
+    mid-write, which is exactly why `done` would be the wrong trigger.
+
+- **MEASURE BEFORE EVERY SPLIT, AND JOIN *DOWN* WHEN A RIGHT-SPLIT WOULD GO UNDER THE FLOOR.**
+  **Operator-observed 2026-08-06, with a screenshot:** five consult panes in one tab rendered **14 columns
+  wide each** out of 220 — every one unreadable, including the two that had finished hours earlier.
+  **This rule's own earlier wording said to "split the newest pane; the tree stays balanced", and that
+  remedy is wrong** — an OVERSEER followed it the next session and measured `110/55/55`, which is the
+  exact split the old text cited as the *failure*. Corrected, with the measurement:
+  - **Direction is decided by arithmetic, not by which pane you pick.** The driver's floor is real and
+    derived from measurement — `TRAILER_SAFE_FLOOR_COLS = 108` (`src/drivers/herdr.ts:13`, *"narrowest
+    safe 53 → floor 108"*), and it splits right only while `paneWidth/2 ≥ 108 + 2` (`herdr.ts:494`),
+    otherwise **down**. Apply the same test by hand: `herdr pane layout --pane <id>`, halve the width,
+    and if the halves fall under the floor, split `--direction down`.
+  - **Binary splits cannot produce an even 3-column row at any width.** 220 goes to 110/55/55 whichever
+    pane you split. **At a 220-col terminal the width-derived cap is TWO side-by-side panes**; a third
+    seat goes below one of them, or into its own tab. "Three panes" is a *height* heuristic
+    (tickmarkr's own `workersPerTab: 3` assumes ~50 rows) and it does not authorise a third column.
+  - **A finished seat keeps its width.** Panes are a fixed budget — every seat you do not close is taken
+    out of the readability of the ones still working. There is no rebalance command, so the fix is
+    closing, not resizing.
+  **The general lesson, which is why this correction is worth its lines: a prose rule that restates a
+  measurement without carrying the number reproduces the defect at full price.** The floor lives in
+  `src/`; every seat that hand-splits panes is outside it and re-learns this by hand.
 
 ## Non-negotiable rules
 
@@ -325,6 +405,19 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
 6. **Every gate, tool and verdict states what it does NOT establish.** A green gate is a claim about form
    until its negative scope says otherwise. This applies to a *seat's own verdict* as much as to a tool:
    an unchecked cite in a task with no finding is unchecked, not confirmed.
+   **THE PRESENCE OF A ROW IS NOT EVIDENCE THAT THE WORK HAPPENED — READ ITS QUALIFYING FIELDS.** Three
+   instances in one run (2026-08-06), which is what makes it a law and not an anecdote: a `gate-result`
+   for `test` carrying `selectedTests` — a PASS over a 16-test subset, not the suite; a `phase-start` for
+   a gate with no result row at all, where *deferred* and *dropped* are indistinguishable; and a
+   `tip-verify` row with `cached: true`, whose own source comment says it *"keeps it honest about not
+   having re-run the command."* **In the first and third the product had already provided the qualifier
+   and the reader ignored it** — an OVERSEER read per-gate `tip-verify` rows as proof of a real verify
+   while the distinguishing field sat in its own tool output, and was corrected by the ORCHESTRATOR from
+   the same lines. So decompose the blame honestly, because the two halves ship to different places:
+   **rows that are never emitted are a PRODUCT defect; rows misread past their qualifiers are a READER
+   defect**, and no amount of product work fixes the second. Before quoting any row as evidence of an
+   action, ask what field on it would tell you the action was skipped, cached, subsetted or deferred —
+   and if you cannot name the field, you have not read the record, you have counted it.
 7. **Never aggregate per-axis PASSes into "it is clean."** Carrying the PASS and dropping the scope
    manufactures a clean bill nobody issued.
 8. **Never exclude a path from a search whose purpose is to find a counterexample there** — and an
@@ -360,6 +453,23 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     Two corollaries: **re-arm a wake-and-exit watcher as the same turn's LAST act**, not the next turn's
     first — the gap between them is unwatched and its width is however long the seat stays busy; and **a
     handoff that re-arms one tier's watchers must say which tier's it did NOT re-arm.**
+    **That first corollary prescribes DISCIPLINE, and discipline is the wrong fix — measured 2026-08-06.**
+    One orchestrator lapsed its journal tier **31 minutes**, then, after diagnosing it and fully intending
+    to re-arm, lapsed it again for 3 minutes **while actively thinking about watchers**. Its own diagnosis
+    is the durable one: *"I still serialize re-arming behind whatever I am doing."* **A watcher whose
+    liveness depends on its owner being free is not armed, it is SCHEDULED.** The structural fix, which
+    then survived a wake with zero action from the seat: wrap every wake-and-exit watcher in a supervisor
+    that re-execs it, **detached (`ppid 1`) so it outlives the seat and not merely the seat's turn**, and
+    have it write a **heartbeat file** so the supervising tier proves liveness *from disk* instead of
+    asking the seat that owns it. Decouple **coverage** from **notification**: when the notifier later
+    broke, coverage held and nothing was lost — the failure the design was built for.
+    **And never convert instrument silence into a WORLD claim.** *"No watcher has fired since X"* is a
+    statement about your instrument; *"no state change"* is a statement about the run, and they have
+    different truth conditions. A terminal-event watcher is silent through every **non-terminal** change
+    **by design**, so its silence is evidence about a narrow event class and **never** about progress.
+    Measured the same day: an orchestrator reported *"no state change"* while five events, a completed
+    worker and a passing gate sat unread — it had asserted from memory one read-cycle behind a reading
+    that was about to arrive. Say the instrument sentence, or **re-read and then say the world one**.
     **A watcher has TWO failure modes, and the second is invisible from inside: never armed, and
     OUTLIVING ITS TRIGGER.** A watcher aimed at an event that can no longer occur **reads as coverage and
     is worse than none** — the process table shows it alive and the seat that armed it remembers arming
