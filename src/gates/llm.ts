@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkerAdapter } from "../adapters/types.js";
@@ -141,10 +141,15 @@ export async function runHeadless(
   cwd: string,
   timeoutMs = 300000,
 ): Promise<string> {
-  const pf = join(mkdtempSync(join(tmpdir(), "tickmarkr-llm-")), "prompt.md");
-  writeFileSync(pf, prompt);
-  const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
-  return r.stdout + "\n" + r.stderr;
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
+  try {
+    const pf = join(dir, "prompt.md");
+    writeFileSync(pf, prompt);
+    const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
+    return r.stdout + "\n" + r.stderr;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // v1.1 default path: the same headless CLI call, but dispatched through the driver
@@ -158,26 +163,30 @@ export async function runViaDriver(
   timeoutMs = 300000,
 ): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
-  const pf = join(dir, "prompt.md");
-  writeFileSync(pf, prompt);
-  const scriptPath = join(dir, "dispatch.sh");
-  // OBS-50: bootstrap in a script beside the prompt — pane sees one short bash line + banner, not the raw inline command
-  const nonce = extractPromptNonce(prompt) ?? generateVerdictNonce();
-  writeFileSync(scriptPath, [
-    "export BASH_SILENCE_DEPRECATION_WARNING=1",
-    bannerShell(),
-    adapter.headlessCommand(pf, model),
-    gateExitTrailer(nonce),
-  ].join("\n"));
-  const slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
-  via.onSlot?.(slot);
-  await via.driver.run(slot, paneDispatchCommand(scriptPath));
-  // nonce-suffixed exit only: a displayed bare "TICKMARKR_EXIT:" or another call's marker must not
-  // false-complete — same guard the worker path uses (daemon.ts:330-331).
-  await via.driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, timeoutMs, { regex: true });
-  const out = await via.driver.read(slot, 400);
-  if (!via.keep) await via.driver.close(slot);
-  return dewrapPaneVerdict(out, nonce);
+  try {
+    const pf = join(dir, "prompt.md");
+    writeFileSync(pf, prompt);
+    const scriptPath = join(dir, "dispatch.sh");
+    // OBS-50: bootstrap in a script beside the prompt — pane sees one short bash line + banner, not the raw inline command
+    const nonce = extractPromptNonce(prompt) ?? generateVerdictNonce();
+    writeFileSync(scriptPath, [
+      "export BASH_SILENCE_DEPRECATION_WARNING=1",
+      bannerShell(),
+      adapter.headlessCommand(pf, model),
+      gateExitTrailer(nonce),
+    ].join("\n"));
+    const slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
+    via.onSlot?.(slot);
+    await via.driver.run(slot, paneDispatchCommand(scriptPath));
+    // nonce-suffixed exit only: a displayed bare "TICKMARKR_EXIT:" or another call's marker must not
+    // false-complete — same guard the worker path uses (daemon.ts:330-331).
+    await via.driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, timeoutMs, { regex: true });
+    const out = await via.driver.read(slot, 400);
+    if (!via.keep) await via.driver.close(slot);
+    return dewrapPaneVerdict(out, nonce);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // OBS-155: a TUI renders the verdict as a bullet and HARD-wraps it at pane width with a 2-space

@@ -7,6 +7,7 @@ import { describe, expect, test, vi } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
 import { buildDossierPrompt, type Dossier } from "../../src/run/consult.js";
 import { ATTEMPT_CAP_RELEASE, appendProfileDiscount, engagementComparable, formatJournalNarration, gateResultJournalData, Journal, newRunId, parseRunId, readAllTelemetry, readProfileDiscounts, recordedGraphDefinitionHash, TelemetryRowSchema } from "../../src/run/journal.js";
+import { foldPairIntegrity, type DecisionEventWrite } from "../../src/run/protocol.js";
 import { MASK, redactSecrets } from "../../src/run/redact.js";
 
 // Phase 46 (RES-01/RES-02 derivation half): the verbatim vendored incident fixture — a line subset of
@@ -344,6 +345,134 @@ describe("journal", () => {
     appendFileSync(join(j.dir, "telemetry.jsonl"), '{"taskId":"T2"');
     expect(j.readTelemetry()).toHaveLength(1);
   });
+});
+
+// Deliberately top-level and titled verbatim: acceptance selects the full Vitest-visible name.
+test("Journal append validation accepts one schema-valid gate, phase, role-invocation and run terminal row and rejects each corresponding new write after its task, attempt, role, outcome or reason field is removed, while an unrelated historical event with arbitrary data still round-trips opaque, so a fully open record or a fully closed historical reader fails", () => {
+  const root = mkdtempSync(join(tmpdir(), "tickmarkr-protocol-write-"));
+  const journal = Journal.create(root, "run-protocol-write");
+  const writes = {
+    phase: {
+      event: "gate-phase-start", taskId: "T1", data: { attempt: 0, gate: "test" },
+    },
+    gate: {
+      event: "gate-result", taskId: "T1",
+      data: { attempt: 0, gate: "test", outcome: { kind: "passed" } },
+    },
+    role: {
+      event: "role-invocation-terminal", taskId: "T1",
+      data: { attempt: 0, role: "worker", outcome: "completed", reason: "worker returned" },
+    },
+    run: {
+      event: "run-end",
+      data: {
+        outcome: "completed", reason: "all tasks and verification closed",
+        runId: "run-protocol-write", branch: "tickmarkr/run-protocol-write",
+        done: ["T1"], failed: [], human: [], blocked: [], pending: [],
+      },
+    },
+  } as const satisfies Record<string, DecisionEventWrite>;
+
+  for (const write of Object.values(writes)) journal.append(write);
+  const beforeRejects = readFileSync(join(journal.dir, "journal.jsonl"), "utf8");
+
+  const without = (write: DecisionEventWrite, path: readonly string[]): DecisionEventWrite => {
+    const copy = structuredClone(write) as unknown as Record<string, unknown>;
+    let owner = copy;
+    for (const segment of path.slice(0, -1)) owner = owner[segment] as Record<string, unknown>;
+    delete owner[path.at(-1)!];
+    return copy as unknown as DecisionEventWrite;
+  };
+  const malformed = [
+    without(writes.gate, ["taskId"]),
+    without(writes.phase, ["data", "attempt"]),
+    without(writes.role, ["data", "role"]),
+    without(writes.gate, ["data", "outcome"]),
+    without(writes.run, ["data", "reason"]),
+  ];
+  for (const write of malformed) expect(() => journal.append(write)).toThrow();
+  expect(readFileSync(join(journal.dir, "journal.jsonl"), "utf8")).toBe(beforeRejects);
+
+  const arbitrary = { nested: [1, { pass: true, outcome: "looks-clean-but-is-opaque" }], free: null };
+  journal.append("pre-protocol-widget", "T-old", arbitrary);
+  journal.append("phase-start", "T-live", { phase: "worker", attempt: 0, assignment: { adapter: "fake" } });
+  const raw = journal.read();
+  expect(raw).toHaveLength(6);
+  expect(raw[4]?.data).toEqual(arbitrary);
+  const opaque = journal.readTracked().find((row) => row.kind === "historical-unknown"
+    && row.eventType === "pre-protocol-widget");
+  expect(opaque?.rawData).toEqual(arbitrary);
+  expect(journal.readTracked()).toContainEqual(expect.objectContaining({
+    kind: "historical-unknown", eventType: "phase-start", rawData: raw[5]!.data,
+  }));
+});
+
+// Deliberately top-level and titled verbatim: acceptance selects the full Vitest-visible name.
+test("tracked-journal compatibility reader loads pre-protocol fixtures and exposes every malformed known decision row as a protocol issue with source index and raw data, while the same row repaired to a passed or declined GateOutcome becomes interpretable, so dropping malformed rows or defaulting them clean fails", () => {
+  const root = mkdtempSync(join(tmpdir(), "tickmarkr-protocol-read-"));
+  const journal = Journal.create(root, "run-protocol-read");
+  const rows = [
+    { ts: "2026-08-09T10:00:00.000Z", event: "task-dispatch", taskId: "T0", data: { arbitrary: [1, 2, 3] } },
+    // Pre-protocol gate truth is interpreted through T31's legacy normalizer.
+    { ts: "2026-08-09T10:00:01.000Z", event: "gate-result", taskId: "T1", data: { gate: "build", pass: true, details: "exit 0" } },
+    { ts: "2026-08-09T10:00:02.000Z", event: "gate-result", data: { attempt: 0, gate: "test", outcome: { kind: "passed" } } },
+    { ts: "2026-08-09T10:00:03.000Z", event: "gate-phase-start", taskId: "T2", data: { gate: "test" } },
+    { ts: "2026-08-09T10:00:04.000Z", event: "role-invocation-terminal", taskId: "T3", data: { attempt: 0, role: "judge", outcome: "failed" } },
+    { ts: "2026-08-09T10:00:05.000Z", event: "run-end", data: { outcome: "completed" } },
+    { ts: "2026-08-09T10:00:06.000Z", event: "gate-result", taskId: "T4", data: { attempt: 0, gate: "review", outcome: { kind: "declined" } } },
+    { ts: "2026-08-09T10:00:07.000Z", event: "gate-result", taskId: "T4", data: { attempt: 0, gate: "review", outcome: { kind: "passed" } } },
+    { ts: "2026-08-09T10:00:08.000Z", event: "gate-result", taskId: "T4", data: { attempt: 0, gate: "review", outcome: { kind: "declined", reason: "judge-only policy" } } },
+    // A canonical-looking `kind` on the legacy data object used to reach a throwing strict parse.
+    { ts: "2026-08-09T10:00:09.000Z", event: "gate-result", taskId: "T5", data: { gate: "review", kind: "passed" } },
+  ];
+  writeFileSync(join(journal.dir, "journal.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+  // The compatibility pass is additive: not one parsed historical or malformed row disappears from
+  // the ordinary Journal API.
+  expect(journal.read()).toEqual(rows);
+  const trackedRows = journal.readTracked();
+  expect(trackedRows).toHaveLength(rows.length);
+  expect(trackedRows[0]).toMatchObject({ kind: "historical-unknown", sourceIndex: 0 });
+
+  const issues = trackedRows.filter((row) => row.kind === "protocol-issue");
+  expect(issues.map(({ sourceIndex }) => sourceIndex)).toEqual([2, 3, 4, 5, 6, 9]);
+  for (const issue of issues) {
+    expect(issue.raw).toEqual(rows[issue.sourceIndex]);
+    expect(issue.rawData).toEqual(rows[issue.sourceIndex]!.data);
+    expect(issue.issues.length).toBeGreaterThan(0);
+  }
+
+  const decisions = trackedRows.filter((row) => row.kind === "decision");
+  expect(decisions.map(({ sourceIndex }) => sourceIndex)).toEqual([1, 7, 8]);
+  expect(decisions.map(({ event }) => event.event === "gate-result" ? event.data.outcome.kind : "not-gate"))
+    .toEqual(["passed", "passed", "declined"]);
+
+  const fixtureNames = ["run-20260712-193151", "run-20260712-190438", "old-run"] as const;
+  const expectedKnownCounts = [13, 19, 37];
+  for (const [fixtureIndex, fixtureName] of fixtureNames.entries()) {
+    const fixtureText = readFileSync(
+      join(import.meta.dirname, "..", "report", "fixtures", fixtureName, "journal.jsonl"),
+      "utf8",
+    );
+    const fixtureRows = fixtureText.trimEnd().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    const fixtureRoot = mkdtempSync(join(tmpdir(), `tickmarkr-protocol-${fixtureName}-`));
+    const fixtureJournal = Journal.create(fixtureRoot, `run-protocol-${fixtureIndex}`);
+    writeFileSync(join(fixtureJournal.dir, "journal.jsonl"), fixtureText);
+
+    expect(fixtureJournal.read()).toEqual(fixtureRows);
+    const fixtureTracked = fixtureJournal.readTracked();
+    const knownSourceIndexes = fixtureRows.flatMap((row, sourceIndex) =>
+      row.event === "gate-result" || row.event === "run-end" ? [sourceIndex] : []);
+    expect(knownSourceIndexes).toHaveLength(expectedKnownCounts[fixtureIndex]);
+    expect(fixtureTracked.filter((row) => row.kind === "protocol-issue"), fixtureName).toEqual([]);
+    const fixtureDecisions = fixtureTracked.filter((row) => row.kind === "decision");
+    expect(fixtureDecisions.map(({ sourceIndex }) => sourceIndex), fixtureName).toEqual(knownSourceIndexes);
+    expect(foldPairIntegrity(fixtureTracked).pairs.length, fixtureName).toBeGreaterThan(0);
+    expect(fixtureDecisions.filter(({ event }) => event.event === "gate-result")
+      .every(({ event }) => event.event === "gate-result" && event.data.attempt === 0), fixtureName).toBe(true);
+    expect(fixtureDecisions.find(({ event }) => event.event === "run-end")?.event, fixtureName)
+      .toMatchObject({ event: "run-end", data: { outcome: "completed", runId: expect.any(String), branch: expect.any(String) } });
+  }
 });
 
 describe("TelemetryRowSchema (TEL-03: absent ≠ false)", () => {

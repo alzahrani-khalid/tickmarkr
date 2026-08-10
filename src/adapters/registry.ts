@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TickmarkrConfig } from "../config/config.js";
@@ -328,6 +328,9 @@ function declarativeAdapter(entry: CliEntry & { drive: DeclarativeCliDrive }): W
       return health;
     },
     channels: (cfg) => channelsFromConfig(entry.id, cfg),
+    // v1.89 T1 / OBS-414: straight from the validated drive contract — no default and no fallback,
+    // which is the only way this factory cannot reintroduce the optionality the type just removed.
+    trustDialog: drive.trustDialog,
     headlessCommand: (promptFile, model) => renderDriveTemplate(drive.headless, promptFile, model),
     interactiveCommand: (promptFile, model) => drive.interactive === null
       ? null
@@ -471,61 +474,74 @@ export async function probeModels(
     if (!h?.installed) return;
     // Tests inject FakeAdapter; never let an incidental default adapter spend a real token in the suite.
     if (process.env.VITEST && SHIPPED_NATIVE_ADAPTERS.has(a)) return;
-    const verdicts: Record<string, ProbedModelAuth> = {};
     const priorModelAuth = priorHealth?.[a.id]?.modelAuth;
-    const probeRoot = a.probeCwd === "neutral" ? mkdtempSync(join(tmpdir(), "tickmarkr-probe-")) : repoRoot;
-    const store = (model: string, verdict: ProbedModelAuth) => {
-      verdicts[model] = verdict;
-      onProgress?.(a.id, model, probeModelStatus(verdict), verdict.durationMs);
-    };
-    // One bounded probe call. verdict:null = a first-pass failure that earns the one serial retry
-    // (OBS-72: a failure inside the concurrent batch is indistinguishable from adapter self-contention
-    // until re-probed alone); a retry attempt always returns a final verdict.
-    const attempt = async (model: string, retry?: { firstTimedOut: boolean }): Promise<{ verdict: ProbedModelAuth | null; timedOut: boolean }> => {
-      const t0 = Date.now();
-      const probedAt = new Date().toISOString();
-      const v = (authed: boolean, reason?: string): ProbedModelAuth =>
-        ({ authed, ...(reason !== undefined ? { reason } : {}), probedAt, durationMs: Date.now() - t0 });
-      try {
-        if (typeof a.headlessCommand !== "function") return { verdict: v(false, "headless probe unavailable"), timedOut: false };
-        const promptFile = join(mkdtempSync(join(tmpdir(), "tickmarkr-auth-")), "probe.md");
-        writeFileSync(promptFile, MODEL_PROBE_PROMPT);
-        const r = await sh(a.headlessCommand(promptFile, model), probeRoot, MODEL_PROBE_TIMEOUT_MS);
-        // T2 rule unchanged: a prior doctor.json timeout skips the retry — a persistently dead
-        // model (e.g. opencode glm-5.2) costs one attempt instead of two every run.
-        if (r.timedOut && !retry && priorModelAuth?.[model]?.reason?.includes("timed out") === true) {
-          return { verdict: v(false, `probe timed out (repeat — retry skipped) (${MODEL_PROBE_TIMEOUT_MS}ms)`), timedOut: true };
+    const runProbes = async (probeRoot: string) => {
+      const verdicts: Record<string, ProbedModelAuth> = {};
+      const store = (model: string, verdict: ProbedModelAuth) => {
+        verdicts[model] = verdict;
+        onProgress?.(a.id, model, probeModelStatus(verdict), verdict.durationMs);
+      };
+      // One bounded probe call. verdict:null = a first-pass failure that earns the one serial retry
+      // (OBS-72: a failure inside the concurrent batch is indistinguishable from adapter self-contention
+      // until re-probed alone); a retry attempt always returns a final verdict.
+      const attempt = async (model: string, retry?: { firstTimedOut: boolean }): Promise<{ verdict: ProbedModelAuth | null; timedOut: boolean }> => {
+        const t0 = Date.now();
+        const probedAt = new Date().toISOString();
+        const v = (authed: boolean, reason?: string): ProbedModelAuth =>
+          ({ authed, ...(reason !== undefined ? { reason } : {}), probedAt, durationMs: Date.now() - t0 });
+        try {
+          if (typeof a.headlessCommand !== "function") return { verdict: v(false, "headless probe unavailable"), timedOut: false };
+          const promptDir = mkdtempSync(join(tmpdir(), "tickmarkr-auth-"));
+          try {
+            const promptFile = join(promptDir, "probe.md");
+            writeFileSync(promptFile, MODEL_PROBE_PROMPT);
+            const r = await sh(a.headlessCommand(promptFile, model), probeRoot, MODEL_PROBE_TIMEOUT_MS);
+            // T2 rule unchanged: a prior doctor.json timeout skips the retry — a persistently dead
+            // model (e.g. opencode glm-5.2) costs one attempt instead of two every run.
+            if (r.timedOut && !retry && priorModelAuth?.[model]?.reason?.includes("timed out") === true) {
+              return { verdict: v(false, `probe timed out (repeat — retry skipped) (${MODEL_PROBE_TIMEOUT_MS}ms)`), timedOut: true };
+            }
+            const reason = probeFailure(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
+            if (!reason) return { verdict: v(true), timedOut: false };
+            if (!retry) return { verdict: null, timedOut: r.timedOut === true };
+            return {
+              verdict: r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`) : v(false, reason),
+              timedOut: r.timedOut === true,
+            };
+          } finally {
+            rmSync(promptDir, { recursive: true, force: true });
+          }
+        } catch (e) {
+          return { verdict: retry ? v(false, String(e)) : null, timedOut: false };
         }
-        const reason = probeFailure(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
-        if (!reason) return { verdict: v(true), timedOut: false };
-        if (!retry) return { verdict: null, timedOut: r.timedOut === true };
-        return {
-          verdict: r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`) : v(false, reason),
-          timedOut: r.timedOut === true,
-        };
-      } catch (e) {
-        return { verdict: retry ? v(false, String(e)) : null, timedOut: false };
+      };
+      // models probe concurrently too (v1.33.5) — sequential chains made init wall time Σ(models×60s)
+      // on the slowest adapter (measured 96s); each probe is one tiny prompt, safe to overlap.
+      // Capped at MODEL_PROBE_CONCURRENCY per adapter unless the adapter declares its own cap
+      // (codex: 1 — OBS-72, its concurrent probes self-contend in one repo).
+      const retries: { model: string; firstTimedOut: boolean }[] = [];
+      await mapLimit(Object.keys(cfg.tiers[a.id]?.models ?? {}), a.probeConcurrency ?? MODEL_PROBE_CONCURRENCY, async (model) => {
+        const first = await attempt(model);
+        if (first.verdict) store(model, first.verdict);
+        else retries.push({ model, firstTimedOut: first.timedOut });
+      });
+      // OBS-72: re-probe each first-pass failure once with ONE probe in flight, only after the
+      // concurrent batch drained — an in-slot retry still races its concurrency partner. Success here
+      // was contention; a second failure is the real verdict. Successful first-pass probes stored
+      // above and never wait; cost is one extra call per genuinely dead model only.
+      for (const { model, firstTimedOut } of retries) {
+        const second = await attempt(model, { firstTimedOut });
+        if (second.verdict) store(model, second.verdict);
       }
+      h.modelAuth = verdicts;
     };
-    // models probe concurrently too (v1.33.5) — sequential chains made init wall time Σ(models×60s)
-    // on the slowest adapter (measured 96s); each probe is one tiny prompt, safe to overlap.
-    // Capped at MODEL_PROBE_CONCURRENCY per adapter unless the adapter declares its own cap
-    // (codex: 1 — OBS-72, its concurrent probes self-contend in one repo).
-    const retries: { model: string; firstTimedOut: boolean }[] = [];
-    await mapLimit(Object.keys(cfg.tiers[a.id]?.models ?? {}), a.probeConcurrency ?? MODEL_PROBE_CONCURRENCY, async (model) => {
-      const first = await attempt(model);
-      if (first.verdict) store(model, first.verdict);
-      else retries.push({ model, firstTimedOut: first.timedOut });
-    });
-    // OBS-72: re-probe each first-pass failure once with ONE probe in flight, only after the
-    // concurrent batch drained — an in-slot retry still races its concurrency partner. Success here
-    // was contention; a second failure is the real verdict. Successful first-pass probes stored
-    // above and never wait; cost is one extra call per genuinely dead model only.
-    for (const { model, firstTimedOut } of retries) {
-      const second = await attempt(model, { firstTimedOut });
-      if (second.verdict) store(model, second.verdict);
+    if (a.probeCwd !== "neutral") return runProbes(repoRoot);
+    const probeRoot = mkdtempSync(join(tmpdir(), "tickmarkr-probe-"));
+    try {
+      await runProbes(probeRoot);
+    } finally {
+      rmSync(probeRoot, { recursive: true, force: true });
     }
-    h.modelAuth = verdicts;
   }));
 }
 

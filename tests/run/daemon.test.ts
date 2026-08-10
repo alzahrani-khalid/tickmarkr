@@ -3608,19 +3608,18 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
     }
   }, 120_000);
 
-  // Criterion 6: a nudge that could not be DELIVERED is itself a signal that condemned the worker.
-  // The worst case is exactly this driver: status "working" (never pageable) plus a worktree delta
-  // (which otherwise disables the fast-kill), leaving the 30m window as the only bound. An
-  // unreachable pane no longer buys the rest of that window with work it did before it froze.
+  // A nudge that could not be DELIVERED says only that the daemon lost contact. The worker's real
+  // worktree delta remains independent evidence and keeps the fast-kill from condemning the pane;
+  // the short rolling window owns its eventual conclusion instead.
   // "Could not be delivered" means BOTH attempts failed — one in-slice retry (T1 review) filters a
   // driver flake, so a single false return never reaches this path.
-  test("an undeliverable nudge condemns the pane on the silence gate alone — a stale worktree delta no longer buys the window", async () => {
+  test("an undeliverable nudge does not condemn a pane whose worktree changed — delivery failure is not worker evidence", async () => {
     NUDGEABLE_ADAPTERS.add("fake");
     setNudgeTimingForTests(200, 400);
     setDeadChannelFastKillMsForTests(1_500);
     try {
       const { repo, fake } = setupRepo(
-        [T("T1", { timeoutMinutes: 30 })], // 30m window; the 120s test timeout proves it was not waited out
+        [T("T1", { timeoutMinutes: 0.05 })], // 3s window owns the conclusion after the delta is observed
         { consult: { action: "human", notes: "stalled worker" },
           tasks: { T1: [{ shell: "echo scratch > scratch.txt && echo working-on-it" }] } }, // uncommitted delta
       );
@@ -3633,10 +3632,8 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
       expect(s.human).toEqual(["T1"]);
       const evs = Journal.open(repo, "run-t1-nudge-fail").read();
       expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(1);
-      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(1);
-      // the failed nudge is what unlocked it: the same delta with no nudge attempt keeps the pane alive
-      expect(evs.findIndex((e) => e.event === "worker-nudge-failed" && e.taskId === "T1"))
-        .toBeLessThan(evs.findIndex((e) => e.event === "worker-dead" && e.taskId === "T1"));
+      expect(evs.filter((e) => e.event === "worker-contact" && e.data.evidence === "worktree")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
     } finally {
       NUDGEABLE_ADAPTERS.delete("fake");
       resetNudgeTimingForTests();
@@ -4688,13 +4685,11 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     });
   }, 120_000);
 
-  // Member: the dead-channel fast-kill. Its delta clause makes it and the harvest mutually
-  // exclusive by construction — committed work IS a delta — EXCEPT once a nudge has failed to
-  // deliver twice, which drops that clause. That is the one fixture where both can fire, so it is
-  // the fixture this case uses: an unreachable pane holding commits. The kill's whole purpose is
-  // that such a pane must not buy the rest of its window with past work, and the harvest sitting
-  // above it must not quietly grant exactly that.
-  test("an unreachable pane holding commits is still condemned on the fast-kill window, and its work still gated", async () => {
+  // Member: the dead-channel fast-kill. Its worktree clause and the harvest are mutually exclusive
+  // by construction: committed work changes the launch tree, irrespective of whether a nudge can
+  // reach the pane. An unreachable pane holding commits is therefore concluded by the harvest and
+  // its existing work goes straight to gates instead of being misclassified as a dead empty tree.
+  test("an unreachable pane holding commits is harvested rather than condemned by failed delivery, and its work still gated", async () => {
     const fixture = () => setupRepo([T("T1", { timeoutMinutes: 30 })], { // 30m window: the 120s budget proves it was never ridden
       consult: { action: "human", notes: "an unreachable pane must never reach a consult" },
       tasks: { T1: [{ shell: `echo unreachable > u.txt && ${COMMIT} u` }] },
@@ -4703,7 +4698,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       NUDGEABLE_ADAPTERS.add("fake");
       setNudgeTimingForTests(300, 400);
       try {
-        // 1) both members eligible on the same slice; the kill still fires on schedule
+        // 1) failed delivery does not erase the committed tree evidence; the harvest concludes it
         const killed = fixture();
         const restoreProbe = await cpuProbeFallback(killed.repo, "run-harvest-unreachable", "flat");
         setDeadChannelFastKillMsForTests(1_500);
@@ -4721,15 +4716,16 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         }
         const evs = evsOf(killed.repo, "run-harvest-unreachable");
         expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(1);
-        expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(1);
-        expect(waited).toBeLessThan(60_000); // seconds into a 30m window — the commits bought nothing
+        expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
+        expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
+        expect(waited).toBeLessThan(60_000); // seconds into a 30m window — the harvest owns the bound
         // the conclusion is still not a redispatch: the same worktree went to gates
         expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
         expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
         expect(s.done).toEqual(["T1"]);
 
-        // 2) the SAME fixture with the kill window out of reach — the triad concludes it instead,
-        // so run 1 really was a race between two live members, not a blind fixture.
+        // 2) the SAME fixture with the kill window out of reach reaches the identical conclusion,
+        // proving the fast-kill window cannot override worktree evidence after failed delivery.
         const harvested = fixture();
         const restoreHarvest = await cpuProbeFallback(harvested.repo, "run-harvest-unreachable-triad", "flat");
         setDeadChannelFastKillMsForTests(10 * 60_000);

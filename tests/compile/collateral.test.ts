@@ -77,6 +77,48 @@ describe("collateralLints (plan-time OBS-12/21 scan)", () => {
     const lints = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
     expect(lints).toEqual([]);
   });
+
+  test("test: with more matching test files than the display cap, the emitted line names the cap's worth of paths and states the true total, and that total equals the number of files that actually match", () => {
+    const matchingFiles = Object.fromEntries(
+      Array.from({ length: 25 }, (_, i) => [
+        `tests/adapters/codex-${String(i).padStart(2, "0")}.test.ts`,
+        'import "../../src/adapters/codex.js";\n',
+      ]),
+    );
+    const repo = makeRepo({
+      "src/adapters/codex.ts": "export const codex = {};\n",
+      ...matchingFiles,
+      "tests/adapters/unrelated.test.ts": 'import "../../src/adapters/other.js";\n',
+    });
+
+    const [lint] = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
+    const matchingPaths = Object.keys(matchingFiles);
+    const listedPaths = lint?.match(/tests\/adapters\/codex-\d+\.test\.ts/g) ?? [];
+
+    expect(listedPaths).toEqual(matchingPaths.slice(0, 20));
+    expect(lint).toContain(`${matchingPaths.length} total`);
+    expect(lint).toContain("capped");
+  });
+
+  test("test: a matching file ranked past the display cap is counted in the reported total, proving the scan no longer stops at the cap", () => {
+    const firstTwentyMatches = Object.fromEntries(
+      Array.from({ length: 20 }, (_, i) => [
+        `tests/adapters/a-codex-${String(i).padStart(2, "0")}.test.ts`,
+        'import "../../src/adapters/codex.js";\n',
+      ]),
+    );
+    const pastCapPath = "tests/adapters/z-codex-past-cap.test.ts";
+    const repo = makeRepo({
+      "src/adapters/codex.ts": "export const codex = {};\n",
+      ...firstTwentyMatches,
+      [pastCapPath]: 'import "../../src/adapters/codex.js";\n',
+    });
+
+    const [lint] = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
+
+    expect(lint).toContain("21 total");
+    expect(lint).not.toContain(pastCapPath);
+  });
 });
 
 // v1.53 T4 (OBS-76 signature): T5 files[] held the definition site (config) but not the reader

@@ -40,7 +40,17 @@ describe("TEST-01 oracle roster — matrix derives all real adapters", () => {
 
   test("roster pin: channelsOf enumerates every real adapter id", () => {
     const seen = [...new Set(channelsOf(cfg).map((c) => c.adapter))].sort();
-    expect(seen).toEqual([...expectedRoster].sort());
+    // v1.89 T2: the registry-order pin is the registry-INDEPENDENT constant — a literal list, so a
+    // dropped or renamed adapter bites here rather than shrinking both sides of a derived compare.
+    expect(expectedRoster).toEqual([
+      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp",
+    ]);
+    // omp is a gateway: its models come from `omp models ls`, not from a seed tier table, so it
+    // enrolls in the registry without contributing a default channel. Still deep-equal, never a
+    // subset check — the channel set keeps its exact membership.
+    const channelled = expectedRoster.filter((id) => channelsFromConfig(id, cfg).length > 0);
+    expect(channelled).toEqual(expectedRoster.filter((id) => id !== "omp"));
+    expect(seen).toEqual([...channelled].sort());
   });
 
   // Both sides above derive from allAdapters(), so the pin is tautological w.r.t. removal — deleting an

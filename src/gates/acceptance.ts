@@ -1,12 +1,16 @@
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
 import { channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
+import { compileNative } from "../compile/native.js";
 import { DEFAULT_DIFF_CAP } from "../config/config.js";
 import { renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { sh } from "../run/git.js";
-import { checkDiffCap, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
+import { checkTaskDiffCaps, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause } from "./verdict-cause.js";
+import { reviewableLogicDiff } from "./artifact-manifest.js";
 
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
 const JUDGE_TIMEOUT_MS = 900_000;
@@ -100,14 +104,98 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// v1.89 T6: Vitest applies -t to the runner-visible full name (enclosing describe titles and the test
+// title, space-joined). Escaping preserves literal criteria; anchoring makes equality, rather than
+// substring containment, the named-test contract.
+export function testFilterPattern(name: string): string {
+  return `^${escapeRegExp(name)}$`;
+}
+
 // OBS-55: when the base command already contains `--`, append -t after forwarded args — a second `--`
 // makes vitest treat -t as a positional file filter and the name filter is dropped.
 export function testFiltered(testCmd: string, name: string): string {
-  const pattern = escapeRegExp(name);
+  const pattern = testFilterPattern(name);
   const wrapped = /^\s*(npm|yarn|pnpm|npx)\b/.test(testCmd);
   if (wrapped && /\s--\s/.test(testCmd)) return `${testCmd} -t ${shq(pattern)}`;
   const fwd = wrapped ? "-- " : "";
   return `${testCmd} ${fwd}-t ${shq(pattern)}`;
+}
+
+export interface VitestListedTest {
+  name: string;
+  file: string;
+  projectName?: string;
+}
+
+export type AcceptanceCorpusAuditResult =
+  | {
+    specPath: string;
+    status: "parse-failed";
+    error: string;
+  }
+  | {
+    specPath: string;
+    status: "parsed";
+    item: AcceptanceItem;
+    namedTest?: {
+      criterion: string;
+      matches: VitestListedTest[];
+    };
+  };
+
+function corpusSpecPaths(root: string): string[] {
+  const paths: string[] = [];
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile() && entry.name.endsWith(".spec.md")) paths.push(path);
+    }
+  };
+  visit(root);
+  return paths;
+}
+
+// v1.89 T6: mechanically bind the complete spec-corpus denominator to the runner's all-project JSON
+// listing. Every discovered path contributes either all parser-produced acceptance items or one named
+// parse failure; exceptions are evidence, never permission to shrink the corpus silently.
+export function auditAcceptanceCorpus(
+  corpusRoot: string,
+  listedTests: readonly VitestListedTest[],
+): AcceptanceCorpusAuditResult[] {
+  const runnerNames = listedTests.map((listed) => ({
+    listed,
+    fullName: listed.name.split(" > ").join(" "),
+  }));
+  const results: AcceptanceCorpusAuditResult[] = [];
+  for (const specPath of corpusSpecPaths(corpusRoot)) {
+    try {
+      const graph = compileNative(specPath);
+      for (const task of graph.tasks) {
+        for (const item of task.acceptance) {
+          results.push({
+            specPath,
+            status: "parsed",
+            item,
+            ...(typeof item === "object" && item.oracle === "test"
+              ? {
+                namedTest: {
+                  criterion: item.test,
+                  matches: runnerNames
+                    .filter(({ fullName }) => fullName === item.test)
+                    .map(({ listed }) => listed),
+                },
+              }
+              : {}),
+          });
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      results.push({ specPath, status: "parse-failed", error: `${specPath}: ${message}` });
+    }
+  }
+  return results;
 }
 
 // vitest/jest summary: "Tests  N passed | M skipped (T)" — count passed+failed as actually ran.
@@ -201,22 +289,6 @@ function deletedPath(section: string): string | null {
   return unquoted.replace(/^a\//, "");
 }
 
-// OBS-134: whole-file deletions are already fully described by their path. Sending every removed line
-// spends the cap and judge context on content that cannot exist after the change. Added and modified
-// sections pass through byte-for-byte, so their anti-flooding budget is unchanged.
-// v1.82 T1 clause 5: two exemptions, because this filter triggers on the very `deleted file mode` line
-// the set-aside preserves. Protected evidence (the frozen anchors, the captured journals) bypasses the
-// collapse so its deletion half reaches the measured text and the judge complete; and a section already
-// set aside is never reduced a second time, or this filter would erase the receipt that replaced it.
-function judgeRelevantDiff(diff: string): string {
-  return diff.split(DIFF_SECTIONS).map((section) => {
-    if (setAsideReceiptPath(section)) return section;
-    const path = deletedPath(section);
-    if (!path || isProtectedEvidence(path)) return section;
-    return `deleted file: ${path}\n`;
-  }).join("");
-}
-
 // v1.82 T1 clause 7: the two shapes this task creates carry no changed hunk, so a judge asked to cite a
 // changed line has nothing to cite — three review rounds died here. Each yields ONE citable operation
 // fact, `{path, line: 0}`, read back from the judged text itself. Only these RECORDED facts make line 0
@@ -303,10 +375,9 @@ export async function acceptanceGate(
     : "";
 
   const fetched = await fetchTaskDiff(worktree, baseRef);
-  const diff = judgeRelevantDiff(fetched.full);
-  const forCap = judgeRelevantDiff(fetched.forCap);
+  const diff = reviewableLogicDiff(fetched.full);
   const diffCap = opts.diffCap ?? DEFAULT_DIFF_CAP;
-  const capFail = checkDiffCap("acceptance", forCap.length, diffCap, warn + detBlock);
+  const capFail = checkTaskDiffCaps("acceptance", fetched, diffCap, warn + detBlock);
   if (capFail) return capFail;
   const expectedIds = judgeItems.map((_, index) => judgeCriterionId(index));
   // OBS-129: give the judge the exact citable new-file line numbers per changed file, so it grounds each

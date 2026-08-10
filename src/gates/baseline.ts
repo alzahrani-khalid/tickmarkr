@@ -73,6 +73,35 @@ const isFailureShaped = (l: string) =>
   namesFailure(l) || SUMMARY_FAIL_RE.test(l) || ERROR_ANCHOR_RE.test(l)
   || TSC_ERROR_RE.test(l) || LINTER_ERROR_RE.test(l);
 const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
+
+// T9 — the infra/regression discriminator. A runner that died because the MACHINE ran out of
+// processes, file descriptors or memory never finished asking the question, so its nonzero exit is
+// not evidence about the work. But the reverse mistake is the expensive one: a real regression that
+// happens to be printed next to an errno token must never be laundered into "infra" and forgiven.
+// So the errno tokens below classify a line as infra only when NOTHING on that line also names a
+// test-level failure — "AssertionError after spawn EAGAIN" names one and is a regression; "spawn
+// EAGAIN" and "Error: spawn EAGAIN" name none and are infra. One regression line anywhere in the
+// output makes the whole output a regression, whatever else the runner printed.
+const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable/;
+// A named error CLASS ("AssertionError", "TypeError", "MyDomainError") — never bare "Error", which
+// is what an errno report itself is headed with (`Error: spawn EAGAIN`). The prefix is required.
+const ERROR_CLASS_RE = /\b[A-Za-z][A-Za-z0-9]*Error\b/;
+const isInfraLine = (l: string) =>
+  INFRA_RE.test(l) && !ERROR_CLASS_RE.test(l) && !namesFailure(l) && !SUMMARY_FAIL_RE.test(l);
+const namesRegression = (l: string) => (isFailureShaped(l) || ERROR_CLASS_RE.test(l)) && !isInfraLine(l);
+
+export type FailureClassification = "regression" | "infra";
+
+/**
+ * What a nonzero runner exit is evidence OF. `undefined` when the output names neither — the
+ * unreadable-runner case the existing fail-closed path already owns.
+ */
+export function classifyFailureOutput(output: string): FailureClassification | undefined {
+  const lines = output.split("\n").map((l) => l.replace(ANSI_RE, "")).filter((l) => !PASS_LINE_RE.test(l));
+  if (lines.some(namesRegression)) return "regression";
+  return lines.some(isInfraLine) ? "infra" : undefined;
+}
+
 const normalizeLine = (l: string) => l.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 
 // A failing command whose output holds no shape any runner here names. The marker is content-free and
@@ -239,6 +268,21 @@ export async function compareToBaseline(
       continue;
     }
     const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
+    // T9: classify BEFORE the baseline diff, and record it on every nonzero result. An infra-only
+    // exit means the runner never completed a suite, so there is nothing to forgive and nothing
+    // verified — it fails, and `meta.infra` marks it so the merge predicate cannot read it as a
+    // satisfied gate even if some future producer reports it as a pass. Baseline forgiveness stays
+    // exactly where it belongs: on failures the runner actually reported and the baseline already had.
+    const classification = classifyFailureOutput(raw);
+    if (classification === "infra") {
+      results.push({
+        gate: name,
+        pass: false,
+        details: `exit ${r.code} on infrastructure alone — the runner never completed a suite, so this gate verified nothing:\n${unrecognizedEvidence(raw) || raw.trim().split("\n").slice(0, 10).join("\n")}`,
+        meta: { classification, infra: true },
+      });
+      continue;
+    }
     const known = new Set((baseline.commands[name]?.fingerprints ?? []).map(renormalize));
     // OBS-42: diagnostic headings enrich fingerprints but cannot invalidate legacy baselines.
     const current = fingerprint(raw);
@@ -261,20 +305,24 @@ export async function compareToBaseline(
         gate: name,
         pass: false,
         details: evidence ? `${closed}\nunrecognized output:\n${evidence}` : closed,
+        ...(classification ? { meta: { classification } } : {}),
       });
       continue;
     }
-    results.push(
-      failing.length
-        ? { gate: name, pass: false, ...headlineDetails(raw, failing) }
-        : {
-          gate: name,
-          pass: true,
-          details: `exit ${r.code} but only pre-existing failures (forgiven)${
-            unreadable ? " — no failure shape recognized in this output, so a new failure from this runner is invisible to the baseline gate" : ""
-          }`,
-        },
-    );
+    if (failing.length) {
+      const headlined = headlineDetails(raw, failing);
+      const meta = { ...headlined.meta, ...(classification ? { classification } : {}) };
+      results.push({ gate: name, pass: false, details: headlined.details, ...(Object.keys(meta).length ? { meta } : {}) });
+      continue;
+    }
+    results.push({
+      gate: name,
+      pass: true,
+      details: `exit ${r.code} but only pre-existing failures (forgiven)${
+        unreadable ? " — no failure shape recognized in this output, so a new failure from this runner is invisible to the baseline gate" : ""
+      }`,
+      ...(classification ? { meta: { classification } } : {}),
+    });
   }
   return results;
 }

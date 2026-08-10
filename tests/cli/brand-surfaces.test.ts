@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { writeDoctor } from "../../src/adapters/registry.js";
+import { allAdapters, writeDoctor } from "../../src/adapters/registry.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { plan } from "../../src/cli/commands/plan.js";
 import { report } from "../../src/cli/commands/report.js";
@@ -39,6 +39,15 @@ afterEach(() => {
 });
 
 const golden = (name: string) => readFileSync(join(import.meta.dirname, "../fixtures/brand-surfaces", name), "utf8");
+
+// v1.89 T4: plan names the harness that produced the table. An absolute path off THIS machine cannot enter
+// a byte-pinned golden, so the goldens supply the resolver's location instead of letting it read the
+// invoked entrypoint. The supplied path exists on no machine, so it resolves nowhere and the goldens pin
+// the fail-closed rendering — the label a location with nothing to derive from earns. The provenance
+// labels themselves are pinned against real trees in harness.test.ts; what these fix is the surface:
+// where the line sits, what it is prefixed with, and that plan never invents a claim from raw text.
+const PINNED_HARNESS = "/opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js";
+const goldenPlan = (repo: string, argv: string[] = []) => plan(argv, repo, allAdapters(), PINNED_HARNESS);
 
 const verifiedDefaultModels = (id: string) => authedModels(Object.keys(DEFAULT_CONFIG.tiers[id]?.models ?? {}));
 
@@ -111,7 +120,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
   test("the seed-prefer lint emitted for a dead adapter states the absence of a DECLARED preference, asserted on the string the shipped lint path actually emits and on the regenerated brand-surface golden it feeds, so the corrected text is pinned by production output rather than by any search over source", async () => {
     setTTY(false);
     const expected = "routing seed names dead adapter 'cursor-agent' for shape 'implement' — no declared preference overrides it";
-    const output = await plan([], mkLintRepo());
+    const output = await goldenPlan(mkLintRepo());
     const fixture = golden("plan-lints.txt");
 
     expect(output).toContain(expected);
@@ -123,13 +132,13 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
 
   test("plan non-tty output is byte-identical to the golden fixture (regenerated for the v1.51 T4 mode header + derivation lines)", async () => {
     setTTY(false);
-    expect(await plan([], mkBasicRepo())).toBe(golden("plan-basic.txt"));
-    expect(await plan([], mkLintRepo())).toBe(golden("plan-lints.txt"));
+    expect(await goldenPlan(mkBasicRepo())).toBe(golden("plan-basic.txt"));
+    expect(await goldenPlan(mkLintRepo())).toBe(golden("plan-lints.txt"));
   });
 
   test("a plan lint renders the attention glyph on a tty", async () => {
     onTTY();
-    const out = await plan([], mkLintRepo());
+    const out = await goldenPlan(mkLintRepo());
     expect(out.startsWith("\x1b[1mtickmarkr plan — dry run")).toBe(true); // title frame
     expect(out).toContain("\x1b[2m─"); // rule under the title
     expect(out).toContain("\x1b[33m!\x1b[0m T1: unroutable"); // attention glyph, amber, on the lint

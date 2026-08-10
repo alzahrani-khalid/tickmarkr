@@ -14,6 +14,21 @@ import { marginalCostRank } from "../route/router.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlm, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
+import {
+  captureDiffCapFor,
+  measureArtifactDiff,
+  reviewableLogicDiff,
+  type ArtifactDiffMeasurement,
+  type ArtifactDiffSection,
+} from "./artifact-manifest.js";
+
+export {
+  isProtectedEvidence,
+  PROTECTED_EVIDENCE_PREFIXES,
+  REGENERABLE_CAPTURE_PATHS,
+  setAsideReceiptPath,
+  setAsideRegenerableCaptures,
+} from "./artifact-manifest.js";
 
 export type ReviewSeverity = "material" | "minor";
 
@@ -95,152 +110,6 @@ function classifyReviewFindings(findings: unknown[]): ReviewDecision {
 // one-line hunks no longer trip at ~370 diff-bytes per changed line. Full diff still goes to the judge.
 const DIFF_CAP_REMEDY = "split the task, or raise gates.diffCap";
 
-// v1.82 T1 — the cap bounds what a READER MUST READ, not what a run must write. A regeneration of the
-// frame corpora is ~134KB of `-U0` measurement before a source line changes, and nobody reads it: those
-// frames are asserted byte-for-byte by the corpus tests. Counting them is the category error this
-// removes. The two artifacts stay two (OBS-48: the cap measures -U0, the reader receives the full diff);
-// the exclusion is applied to both, identically, right here so BOTH measuring gates inherit it.
-//
-// Clause 1 — membership is an EXACT PATH match against the shipped capture manifest, the same lists the
-// regeneration path itself uses. Location, directory depth and file extension confer nothing: an
-// unmanifested file sitting beside real frames is measured and shown in full. (The anchors deliberately
-// share basenames with the frames; only the full path separates the oracle from its regenerable twin.)
-//
-// The members are LISTED here rather than imported from the manifest module, for one measured reason:
-// that module is the Ink/React renderer, and importing it puts the whole TUI in every gate's module
-// graph — which also memoises chalk's colour level at import time and turns the fleet suite red. A
-// drift test in tests/gates/diff-cap.test.ts asserts this list is exactly GOLDEN_FRAME_CASES +
-// COLOUR_FRAME_CASES and that every entry exists on disk, so it is a copy that cannot drift rather
-// than a second source of truth: add or rename a frame case and that test goes red until this matches.
-export const REGENERABLE_CAPTURE_PATHS: readonly string[] = [
-  "tests/fixtures/cockpit/frames/run.width-stacked.80x24.txt",
-  "tests/fixtures/cockpit/frames/run.width-folded-keys.100x24.txt",
-  "tests/fixtures/cockpit/frames/run.width-three-column.140x24.txt",
-  "tests/fixtures/cockpit/frames/run.height-14.140x14.txt",
-  "tests/fixtures/cockpit/frames/run.height-18.140x18.txt",
-  "tests/fixtures/cockpit/frames/run.height-24.140x24.txt",
-  "tests/fixtures/cockpit/frames/run.height-40.140x40.txt",
-  "tests/fixtures/cockpit/frames/run.no-colour.140x24.txt",
-  "tests/fixtures/cockpit/frames/run.non-tty.140x24.txt",
-  "tests/fixtures/cockpit/frames/run.ci.140x24.txt",
-  "tests/fixtures/cockpit/frames/setup.width-stacked.80x24.txt",
-  "tests/fixtures/cockpit/frames/setup.width-folded-keys.100x24.txt",
-  "tests/fixtures/cockpit/frames/setup.width-three-column.140x24.txt",
-  "tests/fixtures/cockpit/frames/setup.height-14.140x14.txt",
-  "tests/fixtures/cockpit/frames/setup.height-18.140x18.txt",
-  "tests/fixtures/cockpit/frames/setup.height-24.140x24.txt",
-  "tests/fixtures/cockpit/frames/setup.height-40.140x40.txt",
-  "tests/fixtures/cockpit/frames/setup.no-colour.140x24.txt",
-  "tests/fixtures/cockpit/frames/setup.non-tty.140x24.txt",
-  "tests/fixtures/cockpit/frames/setup.ci.140x24.txt",
-  "tests/fixtures/cockpit/colour/run-20260718-000943.colour.140x24.txt",
-  "tests/fixtures/cockpit/colour/run-20260718-000943.no-colour.140x24.txt",
-  "tests/fixtures/cockpit/colour/run-20260725-025004.interrupted.colour.140x24.txt",
-];
-const CAPTURE_MANIFEST: ReadonlySet<string> = new Set(REGENERABLE_CAPTURE_PATHS);
-
-// Clause 2 — the frozen appearance anchors and the captured engagement journals are NEVER set aside and
-// are exempt from every other reduction too (clause 5): they are reviewed, immutable evidence. The
-// anchors are the oracle this milestone declares, and the fixture law bans editing a captured journal to
-// satisfy an assertion — so both keep counting toward the cap and keep reaching a reader verbatim.
-export const PROTECTED_EVIDENCE_PREFIXES = [
-  "tests/fixtures/cockpit/anchors/",
-  "tests/fixtures/cockpit/sources/",
-  "tests/fixtures/cockpit/colour/sources/",
-] as const;
-
-export function isProtectedEvidence(path: string): boolean {
-  return PROTECTED_EVIDENCE_PREFIXES.some((prefix) => path.startsWith(prefix));
-}
-
-const SET_ASIDE_RECEIPT = /^set aside: regenerable capture (.+?) — \d+ bytes withheld\b/m;
-
-/** The `{path}` a set-aside receipt names, or null if this section carries no receipt. */
-export function setAsideReceiptPath(section: string): string | null {
-  return SET_ASIDE_RECEIPT.exec(section)?.[1] ?? null;
-}
-
-// `--- a/x` / `+++ b/x` → "x"; "/dev/null" → null, which is the ABSENCE of a side, not a membership
-// failure (clause 3). git quotes paths carrying specials, so unquote before stripping the a/ b/ prefix.
-function diffSidePath(raw: string): string | null {
-  const v = raw.trim();
-  if (v === "/dev/null") return null;
-  const unquoted = v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
-  return unquoted.replace(/^[ab]\//, "");
-}
-
-interface DiffSection { lines: string[]; minus: number; sides: [string | null, string | null]; body: string[] }
-
-// The `--- a/x` / `+++ b/x` header pair and the hunk lines below it. Clause 4 — null when the section
-// carries NO content hunk at all (a mode-only change, a pure rename, a binary marker): such a section is
-// left exactly as git wrote it rather than handed a manufactured receipt.
-function parseSection(section: string): DiffSection | null {
-  const lines = section.split("\n");
-  const minus = lines.findIndex((l) => l.startsWith("--- "));
-  if (minus === -1 || !lines[minus + 1]?.startsWith("+++ ")) return null;
-  const body = lines.slice(minus + 2);
-  if (!body.some((l) => l.startsWith("@@ "))) return null;
-  return { lines, minus, sides: [diffSidePath(lines[minus]!.slice(4)), diffSidePath(lines[minus + 1]!.slice(4))], body };
-}
-
-// The content a one-sided section carries: its hunk lines with the sign stripped, keeping git's
-// `\ No newline at end of file` markers so a trailing-newline difference still reads as a content
-// difference. Hunk headers are dropped — a delete and an add of the same bytes never share them.
-function hunkPayload(body: string[], sign: "+" | "-"): string {
-  return body.filter((l) => l.startsWith(sign) || l.startsWith("\\")).map((l) => (l[0] === sign ? l.slice(1) : l)).join("\n");
-}
-
-// Clause 4 — a hunk is NOT proof of a content change. Git spells a KIND change (regular file ⇄ symlink)
-// as a delete plus an add of the SAME path, each carrying a hunk, so when the regular file's bytes are
-// exactly the link target both halves carry identical payloads: the kind changed and the content did
-// not. Nothing was withheld, so neither half earns a receipt — and neither half can see the other, so
-// the pairing is found across sections before any one of them is set aside.
-function kindOnlyPaths(sections: string[]): ReadonlySet<string> {
-  const removed = new Map<string, string>();
-  const added = new Map<string, string>();
-  for (const section of sections) {
-    const parsed = parseSection(section);
-    if (!parsed) continue;
-    const [a, b] = parsed.sides;
-    if (a && !b) removed.set(a, hunkPayload(parsed.body, "-"));
-    else if (b && !a) added.set(b, hunkPayload(parsed.body, "+"));
-  }
-  return new Set([...removed].filter(([path, payload]) => added.get(path) === payload).map(([path]) => path));
-}
-
-function setAsideSection(section: string, kindOnly: ReadonlySet<string>): string {
-  const parsed = parseSection(section);
-  if (!parsed) return section;
-  const { lines, minus, sides } = parsed;
-  // Clause 3 — the test is over the sides that name a real file. Requiring BOTH sides to be members
-  // makes every corpus addition (a-side /dev/null) and deletion (b-side /dev/null) ineligible, which is
-  // exactly the frames this milestone adds. A rename crossing the boundary in either direction has two
-  // real sides and one of them is not a member, so it stays whole — `rename from` line included.
-  const named = sides.filter((p): p is string => p !== null);
-  if (!named.length || !named.every((p) => CAPTURE_MANIFEST.has(p))) return section;
-  // Clause 4 — both halves of a content-identical kind change are left exactly as git wrote them. A
-  // kind change that DID move bytes is an ordinary content change and is set aside like any other.
-  if (named.some((p) => kindOnly.has(p))) return section;
-  const withheld = lines.slice(minus).join("\n");
-  // Clause 6 — the claimed size is the UTF-8 BYTE length of what was withheld (the file headers and
-  // hunks this receipt replaces), never a JavaScript string length: box-drawing frames make the two
-  // disagree. And the receipt itself is part of the measured artifact, so N set-aside sections can never
-  // measure as nothing while producing an arbitrarily large reader payload.
-  const receipt = `set aside: regenerable capture ${named.at(-1)} — ${Buffer.byteLength(withheld, "utf8")} bytes withheld (regenerable frame corpus: asserted byte-for-byte by the corpus tests, never read)`;
-  // Clause 4 — everything git said happened survives verbatim: old/new mode, new file mode, deleted file
-  // mode, similarity index, rename from/to, index. Only content is replaced, so a deletion is never
-  // presented as a file that still exists and an addition is never presented as a modification.
-  return `${lines.slice(0, minus).join("\n")}\n${receipt}\n`;
-}
-
-/** Replace the content of every section confined to the regenerable frame corpora with a receipt. */
-export function setAsideRegenerableCaptures(diff: string): string {
-  if (!diff.includes("diff --git ")) return diff;
-  const sections = diff.split(/(?=^diff --git )/m);
-  const kindOnly = kindOnlyPaths(sections);
-  return sections.map((s) => setAsideSection(s, kindOnly)).join("");
-}
-
 /**
  * The paths this task's diff ACTUALLY touched. `-z` so a path carrying spaces or non-ASCII bytes is
  * never mangled by git's quoting, `--no-renames` so a rename reports BOTH sides: a file renamed OUT of
@@ -271,10 +140,34 @@ export async function mirrorsVersionOnly(worktree: string, baseRef: string, path
   return changed.length > 0 && changed.every((l) => VERSION_FIELD_LINE_RE.test(l));
 }
 
-export async function fetchTaskDiff(worktree: string, baseRef: string): Promise<{ full: string; forCap: string }> {
-  const full = setAsideRegenerableCaptures(await shOk(`git diff '${baseRef}..HEAD'`, worktree));
-  const forCap = setAsideRegenerableCaptures(await shOk(`git diff -U0 '${baseRef}..HEAD'`, worktree));
-  return { full, forCap };
+export type TaskDiffMeasurement = {
+  readonly full: string;
+  readonly forCap: string;
+  /** Strict-cap UTF-8 bytes left after capture payloads become receipts. */
+  readonly logicBytes: number;
+  /** UTF-8 bytes withheld by those receipts and charged to the larger cap. */
+  readonly captureBytes: number;
+  readonly classifications: readonly ArtifactDiffSection[];
+  readonly fullMeasurement: ArtifactDiffMeasurement;
+  readonly capMeasurement: ArtifactDiffMeasurement;
+};
+
+export async function fetchTaskDiff(worktree: string, baseRef: string): Promise<TaskDiffMeasurement> {
+  const [rawFull, rawForCap] = await Promise.all([
+    shOk(`git diff '${baseRef}..HEAD'`, worktree),
+    shOk(`git diff -U0 '${baseRef}..HEAD'`, worktree),
+  ]);
+  const fullMeasurement = measureArtifactDiff(rawFull);
+  const capMeasurement = measureArtifactDiff(rawForCap);
+  return {
+    full: fullMeasurement.rendered,
+    forCap: capMeasurement.rendered,
+    logicBytes: Buffer.byteLength(reviewableLogicDiff(capMeasurement.rendered), "utf8"),
+    captureBytes: capMeasurement.captureBytes,
+    classifications: capMeasurement.sections,
+    fullMeasurement,
+    capMeasurement,
+  };
 }
 
 export function checkDiffCap(gate: string, measured: number, cap: number, prefix = ""): GateResult | null {
@@ -288,8 +181,30 @@ export function checkDiffCap(gate: string, measured: number, cap: number, prefix
   };
 }
 
+/** Apply the strict reviewable-logic cap and the finite, larger capture cap independently. */
+export function checkTaskDiffCaps(
+  gate: string,
+  measured: Pick<TaskDiffMeasurement, "logicBytes" | "captureBytes">,
+  logicCap: number,
+  prefix = "",
+): GateResult | null {
+  const logicFail = checkDiffCap(gate, measured.logicBytes, logicCap, prefix);
+  if (logicFail) return logicFail;
+  const captureCap = captureDiffCapFor(logicCap);
+  if (measured.captureBytes <= captureCap) return null;
+  return {
+    gate,
+    pass: false,
+    details: prefix
+      + `captured artifact diff exceeds verifiable capture cap (${measured.captureBytes} > ${captureCap}) — ${DIFF_CAP_REMEDY}`,
+    meta: { park: "human" },
+  };
+}
+
 export function isDiffCapPark(result: GateResult): boolean {
-  return result.pass === false && result.meta?.park === "human" && /diff exceeds verifiable cap/i.test(result.details);
+  return result.pass === false
+    && result.meta?.park === "human"
+    && /diff exceeds verifiable (?:capture )?cap/i.test(result.details);
 }
 
 // ponytail: single policy hook for callers after runGates — skips the escalation ladder on diff-cap trips.
@@ -436,9 +351,12 @@ export async function reviewGate(
       ? { gate: "review", pass: false, details: "no cross-vendor reviewer available (diversity rule); set review.required:false to waive", meta: { noEligibleReviewer: true } }
       : { gate: "review", pass: true, details: "WARNING: no cross-vendor reviewer available — review waived by config", meta: { noEligibleReviewer: true } };
   }
-  const { full: diff, forCap } = await fetchTaskDiff(worktree, baseRef);
+  const measuredDiff = await fetchTaskDiff(worktree, baseRef);
+  // Keep the reader payload identical to the text charged to the strict cap:
+  // whole-file source deletions are represented by their citable operation fact.
+  const diff = reviewableLogicDiff(measuredDiff.full);
   const diffCap = cfg.gates.diffCap ?? DEFAULT_DIFF_CAP;
-  const capFail = checkDiffCap("review", forCap.length, diffCap);
+  const capFail = checkTaskDiffCaps("review", measuredDiff, diffCap);
   if (capFail) return capFail;
   const nonce = generateVerdictNonce();
   const prompt = `TICKMARKR-REVIEW

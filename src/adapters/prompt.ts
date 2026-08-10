@@ -4,6 +4,13 @@ import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
 import type { WorkerResult } from "./types.js";
 
+// v1.87 T5: the scope rule states only what the runtime enforces, and no more. What it enforces:
+// `scope.allowDeviations` comes from the operator's config, is snapshotted and frozen when a gate
+// round starts (run-gates.ts `allowDeviations`), and is never written back — so a worker has no
+// reach into it at all, and the round that judges its work judges against one fixed list. The
+// retired "unless the operator's config allowlists that path" advertised an exemption the worker
+// could neither invoke nor influence. Nothing here names a capability a worker can invoke mid-run,
+// and the allowlist stays exactly as immutable during a run as it was before this text changed.
 export function buildTaskPrompt(task: Task, feedback = "", nonce = ""): string {
   const list = (xs: string[]) => xs.map((x) => `- ${x}`).join("\n");
   return `You are an autonomous coding worker dispatched by tickmarkr into an isolated git worktree.
@@ -17,7 +24,7 @@ ${task.files.length ? `\n## File scope — touch ONLY paths matching:\n${list(ta
 ## Rules
 - Work only inside the current directory (your isolated worktree). Never push. Never switch branches.
 - Make small atomic git commits as you go (git add + git commit, conventional messages).
-- Touch ONLY paths matching the file scope. Out-of-scope edits FAIL the scope gate unless the operator's config allowlists that path — declaring a deviation never passes the gate. If you cannot complete the task without an out-of-scope edit, stop and report ok:false explaining why in "summary". List any out-of-scope paths you did touch, each with a reason, in "deviations" (journaled for the operator's audit).
+- Touch ONLY paths matching the file scope. Out-of-scope edits FAIL the scope gate. The operator's allowlist is fixed when the run starts and nothing you do can change it while your work is judged; declaring a deviation never passes the gate either. If you cannot complete the task without an out-of-scope edit, stop and report ok:false explaining why in "summary". List any out-of-scope paths you did touch, each with a reason, in "deviations" (journaled for the operator's audit).
 - Do not ask questions; you are unattended. Make the smallest correct change.
 ${feedback ? `\n## Previous attempt failed gates — fix these specifically\n${feedback}\n` : ""}
 When finished, end your final message with exactly one line (no code fence):

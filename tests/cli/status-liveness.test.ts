@@ -1,12 +1,18 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
+import {
+  SUPERVISION_STALE_MS,
+  SUPERVISION_TIERS,
+  beatSupervision,
+  supervisionBeatPath,
+} from "../../src/run/supervision.js";
 
 // Phase 48-03 (VIS-11 / SC4): `tickmarkr status` shows the age of the last journal event and whether the
 // recorded daemon pid is alive — honest about unknowns, a pure reader (kill(pid,0) signal probe only).
@@ -131,6 +137,122 @@ describe("VIS-11 status liveness (SC4)", () => {
     const out = await status([], repo);
     expect(out).toContain("alive");
     expect(out).not.toContain("dead");
+  });
+
+  test("test: status renders every known tier including those that never beat, so a tier missing from the output cannot be mistaken for a tier that is healthy", async () => {
+    const repo = mkRepo();
+    seedGraph(repo);
+    seedJournal(repo, [ev("run-start", { pid: process.pid })]);
+    // Exactly ONE tier has ever beaten, and one of the others armed and then died — the surface must
+    // still name all three, because a tier it omitted would be read as one that is fine.
+    beatSupervision(repo, "orchestrator");
+    beatSupervision(repo, "overseer");
+    const dead = new Date(Date.now() - SUPERVISION_STALE_MS - 1_000);
+    utimesSync(supervisionBeatPath(repo, "overseer"), dead, dead);
+
+    const out = await status([], repo);
+
+    for (const tier of SUPERVISION_TIERS) expect(out).toContain(tier);
+    expect(out).toContain("orchestrator ARMED");
+    expect(out).toContain("overseer STALE"); // armed-then-died, not silently folded into never-armed
+    expect(out).toContain("watch ABSENT"); // never beat, and it is SAID rather than omitted
+    // one reading per known tier, and no tier reading is missing from the line
+    const line = out.split("\n").find((l) => l.includes("supervision:"))!;
+    for (const tier of SUPERVISION_TIERS) {
+      expect(line.match(new RegExp(`\\b${tier} (?:ABSENT|STALE|ARMED|UNREADABLE)\\b`, "gu"))).toHaveLength(1);
+    }
+  });
+
+  // ── Pane locators: what the board says an operator can still OPEN, derived from the run's own
+  // record plus the visibility setting that governs when the daemon closes a worker pane.
+  const PANE_RUN = "run-panes";
+  const paneGraph = (repo: string) => {
+    const graph = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: ["T1", "T2", "T3"].map((id) => ({
+        id, title: id, goal: `Work ${id}.`, shape: "implement" as const, complexity: 3,
+        acceptance: ["a"], gates: ["build", "test", "lint", "evidence", "scope"],
+      })),
+    });
+    saveGraph(repo, graph);
+    return graph;
+  };
+  const paneRepo = (keepPanes: "run" | "attempt", events: (hash: string) => JournalEvent[]): string => {
+    const repo = mkRepo();
+    const graph = paneGraph(repo);
+    // The repo overlay is written explicitly in every case: which pane survives is the SETTING's
+    // decision, so neither case may inherit it from whatever the host operator's global config says.
+    writeFileSync(join(tickmarkrDir(repo), "config.yaml"), `visibility:\n  keepPanes: ${keepPanes}\n`);
+    const dir = join(tickmarkrDir(repo), "runs", PANE_RUN);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "journal.jsonl"),
+      events(graphDefinitionHash(graph)).map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
+    return repo;
+  };
+  const at = (n: number) => new Date(Date.parse("2026-08-07T08:00:00.000Z") + n * 1000).toISOString();
+  const paneFrame = async (repo: string, columns: number): Promise<string> => {
+    const isTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const cols = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const noColor = process.env.NO_COLOR;
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    Object.defineProperty(process.stdout, "columns", { configurable: true, value: columns });
+    delete process.env.NO_COLOR;
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      return await status(["--watch"], repo, { iterations: 1, sleep: async () => {}, now: () => Date.parse(at(20)) });
+    } finally {
+      spy.mockRestore();
+      if (isTTY) Object.defineProperty(process.stdout, "isTTY", isTTY);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+      if (cols) Object.defineProperty(process.stdout, "columns", cols);
+      else delete (process.stdout as { columns?: number }).columns;
+      if (noColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = noColor;
+    }
+  };
+  /** Wrapping inserts whitespace and nothing else — a squashed frame reassembles a wrapped locator. */
+  const squash = (frame: string) => frame.replace(/\x1b\[[0-9;]*m/gu, "").replace(/\s+/gu, "");
+
+  test("test: status --watch reads a journal ending at task-dispatch and renders pane location plus engagement 2, and renders a pane locator ONLY for tasks whose pane can still exist, exercised over a dispatched-but-unstarted task, a completed task whose pane the daemon closed on task-done, and a keepPanes=attempt task whose pane closed before gates, so a locator built from dispatch history alone sends an operator to a pane that is gone", async () => {
+    // T2 ran and landed; T1 is on its SECOND engagement and the record stops at that dispatch —
+    // no phase-start has arrived yet, which is exactly the window a fixture that always pairs the
+    // two never enters.
+    const dispatched = paneRepo("run", (hash) => [
+      { ts: at(0), event: "run-start", data: { pid: process.pid, graphDefinitionHash: hash } },
+      { ts: at(1), event: "task-dispatch", taskId: "T2", data: { assignment: { adapter: "fake", model: "fake-2" }, attempt: 0 } },
+      { ts: at(2), event: "worker-result", taskId: "T2", data: { ok: true, finished: true } },
+      { ts: at(3), event: "task-done", taskId: "T2", data: { attempts: 1 } },
+      { ts: at(4), event: "merge", taskId: "T2", data: { commit: "abc123" } },
+      { ts: at(5), event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 1 } },
+    ]);
+    // The SAME dispatch history under each setting: harvested, gates not yet started.
+    const harvested = (hash: string): JournalEvent[] => [
+      { ts: at(0), event: "run-start", data: { pid: process.pid, graphDefinitionHash: hash } },
+      { ts: at(1), event: "task-dispatch", taskId: "T3", data: { assignment: { adapter: "fake", model: "fake-3" }, attempt: 0 } },
+      { ts: at(2), event: "worker-result", taskId: "T3", data: { ok: true, finished: true } },
+    ];
+    const closedPerAttempt = paneRepo("attempt", harvested);
+    const keptForTheRun = paneRepo("run", harvested);
+
+    for (const columns of [55, 120]) {
+      const live = squash(await paneFrame(dispatched, columns));
+      // Where to look, in full, at both widths — half an address is no address.
+      expect(live, `${columns} cols`).toContain(`panetickmarkr:worker:T1:1:${PANE_RUN}`);
+      expect(live, `${columns} cols`).toContain("engagementattempt2");
+      // T2's worker pane closed on task-done; naming it would send the operator to a dead pane.
+      expect(live, `${columns} cols`).not.toContain(`tickmarkr:worker:T2:0:${PANE_RUN}`);
+      expect(live, `${columns} cols`).not.toContain("panetickmarkr:worker:T2");
+
+      // Same journal, different setting: under keepPanes=attempt the pane is gone the moment the
+      // attempt is harvested — before any gate runs — and under keepPanes=run it is still there.
+      expect(squash(await paneFrame(closedPerAttempt, columns)), `${columns} cols`)
+        .not.toContain("panetickmarkr:worker:T3");
+      expect(squash(await paneFrame(keptForTheRun, columns)), `${columns} cols`)
+        .toContain(`panetickmarkr:worker:T3:0:${PANE_RUN}`);
+    }
   });
 
   test("a live worker phase reports its no-output age from the watcher-local clock", async () => {

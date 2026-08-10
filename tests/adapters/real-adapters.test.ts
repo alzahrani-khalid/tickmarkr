@@ -195,8 +195,9 @@ describe("codex mcp suppression — live surface (OBS-82)", () => {
 
 describe("registry + doctor", () => {
   test("getAdapter throws on unknown; fake only present when scripted", () => {
-    // deliberate order assertion — pi+grok registered LAST so the Phase 6 matrix stays byte-identical
-    expect(allAdapters().map((a) => a.id)).toEqual(["claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi"]);
+    // deliberate order assertion — pi+grok registered LAST among the natives so the Phase 6 matrix
+    // stays byte-identical; v1.89 T2: catalog-driven adapters append after them, omp first of those
+    expect(allAdapters().map((a) => a.id)).toEqual(["claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp"]);
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reg-"));
     const sp = join(dir, "s.json");
     writeFileSync(sp, JSON.stringify({ tasks: {} }));

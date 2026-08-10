@@ -7,9 +7,16 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, DEFAULT_DIFF_CAP } from "../../src/config/config.js";
 import { acceptanceGate } from "../../src/gates/acceptance.js";
+import {
+  CAPTURE_ARTIFACT_MANIFEST,
+  captureDiffCapFor,
+  measureArtifactDiff,
+  type CaptureArtifactManifest,
+} from "../../src/gates/artifact-manifest.js";
 import * as llm from "../../src/gates/llm.js";
 import {
   checkDiffCap,
+  checkTaskDiffCaps,
   diffCapParkReason,
   fetchTaskDiff,
   isDiffCapPark,
@@ -176,6 +183,18 @@ describe("diff cap — park('human') policy", () => {
     const stepsTaken = isDiffCapPark(capFail) ? [] : ladder;
     expect(stepsTaken).toEqual([]);
   });
+
+  test("the separate capture cap is finite and uses the same human-park lifecycle", () => {
+    const captureCap = captureDiffCapFor(CAP);
+    const fail = checkTaskDiffCaps(
+      "acceptance",
+      { logicBytes: CAP, captureBytes: captureCap + 1 },
+      CAP,
+    )!;
+    expect(fail.details).toContain(`capture cap (${captureCap + 1} > ${captureCap})`);
+    expect(isDiffCapPark(fail)).toBe(true);
+    expect(diffCapParkReason([fail])).toBe(fail.details);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -244,6 +263,44 @@ function capturingFake(script: Record<string, unknown>): { fake: FakeAdapter; pr
     return orig(promptFile, model);
   };
   return { fake, prompts };
+}
+
+function observedPromptDiff(
+  prompt: string,
+  heading: "## Diff (vs base)" | "## Diff",
+): {
+  rendered: string;
+  logicBytes: number;
+  captureBytes: number;
+  classifications: readonly {
+    readonly kind: "capture" | "logic";
+    readonly path?: string;
+    readonly producer?: string;
+  }[];
+} {
+  const opening = `${heading}\n\`\`\`diff\n`;
+  const start = prompt.indexOf(opening);
+  if (start === -1) throw new Error(`missing ${heading} fence`);
+  const contentStart = start + opening.length;
+  const end = prompt.indexOf("\n```", contentStart);
+  if (end === -1) throw new Error(`unterminated ${heading} fence`);
+  const rendered = prompt.slice(contentStart, end);
+  const sections = rendered.split(/(?=^diff --git )/m).filter(Boolean);
+  const classifications = sections.map((section) => {
+    const receipt = /^set aside: regenerable capture (.+?) — (\d+) bytes withheld \(producer ([^;]+);/m.exec(section);
+    return receipt
+      ? { kind: "capture" as const, path: receipt[1], producer: receipt[3] }
+      : { kind: "logic" as const };
+  });
+  const captureBytes = [...rendered.matchAll(
+    /^set aside: regenerable capture .+? — (\d+) bytes withheld\b/gm,
+  )].reduce((sum, match) => sum + Number(match[1]), 0);
+  return {
+    rendered,
+    logicBytes: Buffer.byteLength(rendered, "utf8"),
+    captureBytes,
+    classifications,
+  };
 }
 
 const CHANNELS = [
@@ -601,3 +658,273 @@ async function judgeCiting(repo: string, base: string, path: string, line: numbe
     spy.mockRestore();
   }
 }
+
+test("test: real-git capture-cap matrix changes a manifest member produced through a registered capture producer beyond the logic cap but within the capture cap, and both acceptanceGate and reviewGate dispatch with one byte-counted citable receipt while an equal-size source change parks both, so one undifferentiated cap or a Cockpit-only producer special case fails", async () => {
+  const capture = CAPTURE_ARTIFACT_MANIFEST.artifacts.find((artifact) =>
+    artifact.producer === "cockpit-colour-frames"
+  )!;
+  const before = frameBody("registered-before", 500);
+  const after = frameBody("registered-after", 500);
+  const logicCap = 10_000;
+  const changedCapture = repoWithChange(
+    { [capture.path]: before },
+    { [capture.path]: after },
+  );
+  const measured = await fetchTaskDiff(changedCapture.repo, changedCapture.base);
+  expect(measured.logicBytes).toBeLessThanOrEqual(logicCap);
+  expect(measured.captureBytes).toBeGreaterThan(logicCap);
+  expect(measured.captureBytes).toBeLessThanOrEqual(captureDiffCapFor(logicCap));
+  expect(measured.classifications).toContainEqual(expect.objectContaining({
+    kind: "capture",
+    producer: capture.producer,
+  }));
+
+  const { fake: judge, prompts: judgePrompts } = capturingFake({ judge: citing(capture.path, 0) });
+  const accepted = await runAcceptance(changedCapture.repo, changedCapture.base, judge, logicCap);
+  expect(accepted.pass).toBe(true);
+  const judgePrompt = judgePrompts.join("");
+  expect(judgePrompt.match(/set aside: regenerable capture/g)).toHaveLength(1);
+  expect(judgePrompt).toContain(`- ${capture.path}: 0`);
+  expect(Number(/— (\d+) bytes withheld/.exec(judgePrompt)![1]))
+    .toBe(measured.fullMeasurement.captureBytes);
+
+  const { fake: reviewer, prompts: reviewPrompts } = capturingFake({ review: { approve: true, issues: [] } });
+  const reviewed = await runReview(changedCapture.repo, changedCapture.base, reviewer, logicCap);
+  expect(reviewed.pass).toBe(true);
+  expect(reviewPrompts.join("").match(/set aside: regenerable capture/g)).toHaveLength(1);
+
+  const sourcePath = "src/generated/equal-size-capture.txt";
+  const changedSource = repoWithChange(
+    { [sourcePath]: before },
+    { [sourcePath]: after },
+  );
+  const sourceMeasured = await fetchTaskDiff(changedSource.repo, changedSource.base);
+  expect(sourceMeasured.captureBytes).toBe(0);
+  expect(sourceMeasured.logicBytes).toBeGreaterThan(logicCap);
+  const { fake: parkedJudge, prompts: parkedJudgePrompts } = capturingFake({ judge: citing(sourcePath, 1) });
+  const { fake: parkedReviewer, prompts: parkedReviewPrompts } = capturingFake({ review: { approve: true, issues: [] } });
+  expect(isDiffCapPark(await runAcceptance(changedSource.repo, changedSource.base, parkedJudge, logicCap))).toBe(true);
+  expect(isDiffCapPark(await runReview(changedSource.repo, changedSource.base, parkedReviewer, logicCap))).toBe(true);
+  expect(parkedJudgePrompts).toEqual([]);
+  expect(parkedReviewPrompts).toEqual([]);
+});
+
+test("test: unmanifested-payload control places hand-authored bytes beside a manifested capture under tests/fixtures and observes the manifested file classified by provenance while the neighbour counts in full and parks both gates, so directory-prefix or extension classification fails", async () => {
+  const capture = CAPTURE_ARTIFACT_MANIFEST.artifacts.find((artifact) =>
+    artifact.producer === "cockpit-colour-frames"
+  )!;
+  const neighbour = `${dirname(capture.path)}/hand-authored-frame.txt`;
+  const logicCap = 8_000;
+  const capturedBody = frameBody("manifested", 240);
+  const neighbourBody = frameBody("hand-authored", 240);
+  const { repo, base } = repoWithChange(
+    { [capture.path]: frameBody("before", 240), [neighbour]: frameBody("before", 240) },
+    { [capture.path]: capturedBody, [neighbour]: neighbourBody },
+  );
+  const measured = await fetchTaskDiff(repo, base);
+  const captureSection = measured.classifications.find((row) => row.paths.includes(capture.path));
+  const neighbourSection = measured.classifications.find((row) => row.paths.includes(neighbour));
+  expect(captureSection).toMatchObject({
+    kind: "capture",
+    reason: "manifest-provenance",
+    producer: capture.producer,
+  });
+  expect(neighbourSection).toMatchObject({ kind: "logic", reason: "unmanifested" });
+  expect(measured.forCap).toContain(`set aside: regenerable capture ${capture.path}`);
+  expect(measured.forCap).toContain("│ hand-authored row 0 ");
+  expect(measured.logicBytes).toBeGreaterThan(logicCap);
+
+  const { fake: judge, prompts: judgePrompts } = capturingFake({ judge: citing(neighbour, 1) });
+  const { fake: reviewer, prompts: reviewPrompts } = capturingFake({ review: { approve: true, issues: [] } });
+  expect(isDiffCapPark(await runAcceptance(repo, base, judge, logicCap))).toBe(true);
+  expect(isDiffCapPark(await runReview(repo, base, reviewer, logicCap))).toBe(true);
+  expect(judgePrompts).toEqual([]);
+  expect(reviewPrompts).toEqual([]);
+});
+
+test("test: protected-evidence matrix changes a frozen anchor and a captured source journal beside a generated frame, where anchor and journal bytes always count at logic rates and the frame gets capture treatment only when its manifest producer and provenance match, so path-only exemption or forged provenance fails", async () => {
+  const logicCap = 10_000;
+  const { repo, base } = repoWithChange(
+    {
+      [ANCHOR]: frameBody("anchor-before", 180),
+      [JOURNAL]: frameBody("journal-before", 180),
+      [FRAME_CAPTURE]: frameBody("frame-before", 180),
+    },
+    {
+      [ANCHOR]: frameBody("anchor-after", 180),
+      [JOURNAL]: frameBody("journal-after", 180),
+      [FRAME_CAPTURE]: frameBody("frame-after", 180),
+    },
+  );
+  const measured = await fetchTaskDiff(repo, base);
+  const classification = (path: string) =>
+    measured.classifications.find((row) => row.paths.includes(path));
+  expect(classification(ANCHOR)).toMatchObject({ kind: "logic", reason: "protected-evidence" });
+  expect(classification(JOURNAL)).toMatchObject({ kind: "logic", reason: "protected-evidence" });
+  expect(classification(FRAME_CAPTURE)).toMatchObject({ kind: "capture", reason: "manifest-provenance" });
+  expect(measured.forCap).toContain("│ anchor-after row 0 ");
+  expect(measured.forCap).toContain("│ journal-after row 0 ");
+  expect(measured.forCap).not.toContain("│ frame-after row 0 ");
+  expect(measured.logicBytes).toBeGreaterThan(logicCap);
+
+  const { fake: judge, prompts: judgePrompts } = capturingFake({ judge: citing(ANCHOR, 1) });
+  const { fake: reviewer, prompts: reviewPrompts } = capturingFake({ review: { approve: true, issues: [] } });
+  expect(isDiffCapPark(await runAcceptance(repo, base, judge, logicCap))).toBe(true);
+  expect(isDiffCapPark(await runReview(repo, base, reviewer, logicCap))).toBe(true);
+  expect(judgePrompts).toEqual([]);
+  expect(reviewPrompts).toEqual([]);
+
+  const frameEntry = CAPTURE_ARTIFACT_MANIFEST.artifacts.find((entry) => entry.path === FRAME_CAPTURE)!;
+  const forgedManifest: CaptureArtifactManifest = {
+    version: 1,
+    producers: CAPTURE_ARTIFACT_MANIFEST.producers,
+    artifacts: [
+      ...CAPTURE_ARTIFACT_MANIFEST.artifacts.map((entry) => entry.path === FRAME_CAPTURE
+        ? { ...entry, provenance: { ...entry.provenance, revision: "forged" } }
+        : entry),
+      { path: ANCHOR, producer: frameEntry.producer, provenance: frameEntry.provenance },
+      { path: JOURNAL, producer: frameEntry.producer, provenance: frameEntry.provenance },
+    ],
+  };
+  const forged = measureArtifactDiff(rawU0(repo, base), forgedManifest);
+  const forgedClassification = (path: string) =>
+    forged.sections.find((row) => row.paths.includes(path));
+  expect(forgedClassification(ANCHOR)).toMatchObject({ kind: "logic", reason: "protected-evidence" });
+  expect(forgedClassification(JOURNAL)).toMatchObject({ kind: "logic", reason: "protected-evidence" });
+  expect(forgedClassification(FRAME_CAPTURE)).toMatchObject({ kind: "logic", reason: "stale-provenance" });
+  expect(forged.captureBytes).toBe(0);
+  expect(forged.logicBytes).toBe(Buffer.byteLength(rawU0(repo, base), "utf8"));
+});
+
+test("test: manifest lifecycle matrix exercises add, modify, delete, rename and mode-only cases through acceptanceGate and reviewGate, requires pairwise-equal classification and byte counts from both gates, and makes a stale manifest entry or missing producer fail closed rather than disappear or measure zero", async () => {
+  const captures = CAPTURE_ARTIFACT_MANIFEST.artifacts
+    .filter((entry) => entry.producer === "cockpit-golden-frames");
+  const [addedPath, modifiedPath, deletedPath, renamedFrom, renamedTo, modePath] =
+    captures.map((entry) => entry.path);
+  const body = frameBody("lifecycle", 100);
+  const control = "src/lifecycle-control.ts";
+  const cases = [
+    {
+      name: "add",
+      repo: repoWithChange({ [control]: "export const state = 'before';\n" }, { [addedPath!]: body }),
+      evidence: addedPath!,
+      line: 0,
+      content: true,
+    },
+    {
+      name: "modify",
+      repo: repoWithChange({ [modifiedPath!]: frameBody("before", 100) }, { [modifiedPath!]: body }),
+      evidence: modifiedPath!,
+      line: 0,
+      content: true,
+    },
+    {
+      name: "delete",
+      repo: repoWithChange(
+        { [deletedPath!]: body, [control]: frameBody("source-deletion", 20) },
+        { [deletedPath!]: null, [control]: null },
+      ),
+      evidence: deletedPath!,
+      line: 0,
+      content: true,
+    },
+    {
+      name: "rename",
+      repo: repoWithChange(
+        { [renamedFrom!]: body },
+        { [renamedFrom!]: null, [renamedTo!]: body.replace("row 0", "row 0 renamed") },
+      ),
+      evidence: renamedTo!,
+      line: 0,
+      content: true,
+    },
+    {
+      name: "mode-only",
+      repo: repoWithChange(
+        { [modePath!]: body, [control]: "export const state = 'before';\n" },
+        { [control]: "export const state = 'after';\n" },
+        (repo) => execSync(`chmod +x ${shq(join(repo, modePath!))}`),
+      ),
+      evidence: control,
+      line: 1,
+      content: false,
+    },
+  ] as const;
+
+  for (const lifecycle of cases) {
+    const measurement = await fetchTaskDiff(lifecycle.repo.repo, lifecycle.repo.base);
+    expect(measurement.classifications.some((row) => row.kind === "capture"), lifecycle.name)
+      .toBe(true);
+    expect(measurement.logicBytes, lifecycle.name).toBeGreaterThan(0);
+    if (lifecycle.content) {
+      expect(measurement.captureBytes, lifecycle.name).toBeGreaterThan(0);
+    } else {
+      expect(measurement.captureBytes, lifecycle.name).toBe(0);
+    }
+
+    const { fake: judge, prompts: judgePrompts } = capturingFake({
+      judge: citing(lifecycle.evidence, lifecycle.line),
+    });
+    const { fake: reviewer, prompts: reviewPrompts } = capturingFake({
+      review: { approve: true, issues: [] },
+    });
+    const accepted = await runAcceptance(
+      lifecycle.repo.repo,
+      lifecycle.repo.base,
+      judge,
+      100_000,
+    );
+    const reviewed = await runReview(
+      lifecycle.repo.repo,
+      lifecycle.repo.base,
+      reviewer,
+      100_000,
+    );
+    expect(accepted.pass, `${lifecycle.name}: ${accepted.details}`).toBe(true);
+    expect(reviewed.pass, `${lifecycle.name}: ${reviewed.details}`).toBe(true);
+    expect(judgePrompts, lifecycle.name).toHaveLength(1);
+    expect(reviewPrompts, lifecycle.name).toHaveLength(1);
+    const acceptanceObserved = observedPromptDiff(judgePrompts[0]!, "## Diff (vs base)");
+    const reviewObserved = observedPromptDiff(reviewPrompts[0]!, "## Diff");
+    expect({
+      classifications: acceptanceObserved.classifications,
+      logicBytes: acceptanceObserved.logicBytes,
+      captureBytes: acceptanceObserved.captureBytes,
+    }, lifecycle.name).toEqual({
+      classifications: reviewObserved.classifications,
+      logicBytes: reviewObserved.logicBytes,
+      captureBytes: reviewObserved.captureBytes,
+    });
+    expect(reviewObserved.rendered, lifecycle.name).toBe(acceptanceObserved.rendered);
+    expect(acceptanceObserved.captureBytes, lifecycle.name)
+      .toBe(measurement.fullMeasurement.captureBytes);
+    if (lifecycle.name === "delete") {
+      expect(acceptanceObserved.rendered).toContain(`deleted file: ${control}`);
+      expect(acceptanceObserved.rendered).not.toContain("source-deletion row 0");
+    }
+  }
+
+  const modified = cases.find((entry) => entry.name === "modify")!.repo;
+  const raw = rawU0(modified.repo, modified.base);
+  const entry = CAPTURE_ARTIFACT_MANIFEST.artifacts.find((artifact) => artifact.path === modifiedPath)!;
+  const missingProducer: CaptureArtifactManifest = {
+    ...CAPTURE_ARTIFACT_MANIFEST,
+    producers: CAPTURE_ARTIFACT_MANIFEST.producers.filter((producer) => producer.id !== entry.producer),
+  };
+  const staleProvenance: CaptureArtifactManifest = {
+    ...CAPTURE_ARTIFACT_MANIFEST,
+    artifacts: CAPTURE_ARTIFACT_MANIFEST.artifacts.map((artifact) => artifact.path === modifiedPath
+      ? { ...artifact, provenance: { ...artifact.provenance, revision: "stale" } }
+      : artifact),
+  };
+  for (const [reason, manifest] of [
+    ["missing-producer", missingProducer],
+    ["stale-provenance", staleProvenance],
+  ] as const) {
+    const failedClosed = measureArtifactDiff(raw, manifest);
+    expect(failedClosed.sections).toContainEqual(expect.objectContaining({ kind: "logic", reason }));
+    expect(failedClosed.captureBytes).toBe(0);
+    expect(failedClosed.logicBytes).toBeGreaterThan(0);
+    expect(failedClosed.rendered).toContain("│ lifecycle row 0 ");
+  }
+});

@@ -10,7 +10,7 @@ import { grok } from "./grok.js";
 import { kimi } from "./kimi.js";
 import { opencode } from "./opencode.js";
 import { pi } from "./pi.js";
-import type { WorkerAdapter } from "./types.js";
+import { TRUST_DIALOG_VARIANTS, TrustDialogSchema, type WorkerAdapter } from "./types.js";
 
 export const CLI_NAME_RE = /^[a-z0-9-]+$/;
 
@@ -35,9 +35,21 @@ const ListModelsSchema = z.object({
   }
 });
 
+// v1.89 T1 / OBS-414: a drive contract declares its trust posture or it is not a drive contract.
+// `declarativeAdapter()` builds every catalog-driven CLI, so a contract without this field would
+// reintroduce the silent opt-out at the one construction site no adapter file covers. Absence gets
+// its own operator sentence; a malformed declaration keeps the union's own diagnosis.
+// Quote-free by construction: a zod issue reaches the operator as a JSON dump, where an embedded
+// double quote is escaped and no longer reads back as the sentence that was written.
+export const DRIVE_TRUST_DIALOG_MESSAGE =
+  "drive contract must declare trustDialog — either the workspace-trust prompt this CLI renders, captured verbatim as {fingerprint, key}, or {kind: none, reason}";
+
 export const CliDriveSchema = z.object({
   headless: z.string().min(1),
   interactive: z.string().min(1).nullable(),
+  trustDialog: z.union(TRUST_DIALOG_VARIANTS, {
+    error: (issue) => (issue.input === undefined ? DRIVE_TRUST_DIALOG_MESSAGE : undefined),
+  }),
   listModels: ListModelsSchema.optional(),
 }).strict().superRefine((drive, ctx) => {
   for (const [field, template] of [["headless", drive.headless], ["interactive", drive.interactive]] as const) {
@@ -94,6 +106,14 @@ function validateCliEntry(entry: CliEntry): CliEntry {
   if (drive.adapter.id !== base.id || drive.adapter.vendor !== base.vendor) {
     throw new Error(`native drive identity mismatch for ${base.id}`);
   }
+  // v1.89 T1 / OBS-414: native adapters carry their declaration in code, so the compiler enforces
+  // PRESENCE — it cannot enforce that the bytes are a real capture. The same schema the drive
+  // contract uses runs here, on the registry's own construction path, so a blank fingerprint or a
+  // prompt that is not a workspace-trust gate is unbuildable from either side of the catalog.
+  const trust = TrustDialogSchema.safeParse(drive.adapter.trustDialog);
+  if (!trust.success) {
+    throw new Error(`invalid trust declaration for ${base.id}: ${trust.error.issues.map((i) => i.message).join("; ")}`);
+  }
   return { ...base, drive };
 }
 
@@ -117,7 +137,31 @@ export const CLI_CATALOG: readonly CliEntry[] = [
   native(pi, "pi"),
   native(grok, "grok"),
   native(kimi, "kimi"),
-  "gemini", "qwen", "aider", "goose", "amp", "droid", "auggie", "crush", "omp",
+  "gemini", "qwen", "aider", "goose", "amp", "droid", "auggie", "crush",
+  {
+    id: "omp",
+    binary: "omp",
+    // PROBE-omp-v189.md, re-recorded by hand 2026-08-07: `omp --version` → `omp/17.2.10`.
+    // A prefix match, so a patch bump does not re-open the identity gate.
+    identity: "^omp/",
+    // omp is a multi-provider gateway; a selected model carries its real vendor in its own prefix.
+    vendor: "mixed",
+    drive: {
+      // The same probe recorded -p as the fail-closed print mode (exit 1 on an unknown model).
+      // interactive deliberately omits it: `interactive` is nullable and `headless` is required, so
+      // the invisible configuration is the easier one to write — this one is written visible.
+      headless: "omp -p --model {model} @{promptFile}",
+      interactive: "omp --model {model} @{promptFile}",
+      trustDialog: {
+        kind: "none",
+        reason: "omp 17.2.10 showed no workspace-trust prompt during the recorded interactive probe (PROBE-omp-v189.md, 2026-08-07)",
+      },
+      // The recorded payload is an OBJECT keyed by models: 370 entries, selector prefixed 370/370
+      // and the neighbouring bare `id` prefixed 0/370. Projecting `id` would return 370 plausible
+      // ids that route to nothing, so the selector is the only id key this contract may name.
+      listModels: { argv: ["models", "ls", "--json"], parser: "json", path: "models", field: "selector" },
+    },
+  } satisfies CliEntry,
 ].flatMap((entry) => typeof entry === "string"
   ? [{ id: entry, binary: entry, identity: ".+", vendor: null } satisfies CliEntry]
   : [entry]);

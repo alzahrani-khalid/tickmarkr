@@ -95,13 +95,141 @@ export type TrustVerdict =
 // The daemon matches a blocked/idle pane once per slot and auto-answers via driver.sendKey — tickmarkr
 // created the worktree from the operator's own repo, so trusting is safe by construction. Any other
 // blocked dialog still pages the operator.
-export interface TrustDialog {
+// v1.89 T1 / OBS-414: the fingerprint is a VERBATIM CAPTURE of the workspace-trust prompt that CLI
+// actually renders. Fixtures must be verbatim captures is this project's law since v1.79; it was
+// never applied to fingerprints, and both prior repairs of this contract died on that gap. `kind`
+// is absent on a capture so the shipped declarations stay byte-identical.
+export interface CapturedTrustDialog {
+  kind?: "dialog";
   fingerprint: string;
   key: string; // herdr pane send-keys token, e.g. "Enter"
 }
 
-export function matchesTrustDialog(paneText: string, dialog: TrustDialog): boolean {
-  return paneText.includes(dialog.fingerprint);
+// v1.89 T1 / OBS-414: an adapter that renders NO workspace-trust prompt says so, with a reason a
+// reviewer can falsify. Optionality let an adapter opt out of stall protection by silence; a bare
+// required capture was worse — it demanded a value where reality had none, and two independent
+// workers invented one (prose matching no pane, then a generic tool-permission prompt whose Enter
+// approves arbitrary execution). See .planning/RULING-v189-T1-reauthor.md.
+export interface NoTrustDialog {
+  kind: "none";
+  reason: string;
+}
+
+export type TrustDialog = CapturedTrustDialog | NoTrustDialog;
+
+export const TRUST_DIALOG_BLANK_MESSAGE =
+  "trust-dialog fingerprint must be verbatim bytes captured from a workspace-trust prompt — a blank or whitespace-only fingerprint matches every pane";
+// v1.89 T1 / OBS-414 round 3 — THE EVIDENCE. The word "trust" is not evidence of a capture: codex's
+// real recorded gate is "Do you trust the contents of this directory?" and the handwritten prose
+// "Do you trust this command?" is one word away, so no regex separates them — only the record does.
+// Round 2 accepted the prose, and the daemon presses Enter on a match, which is auto-approval of an
+// arbitrary tool call. So a fingerprint must be an ENUMERATED capture (APPROVED_TRUST_FINGERPRINTS
+// below), and every pane here is VERBATIM, quoted from the record named beside it — the panes are the
+// evidence each approved entry is checked against, never the acceptance rule themselves.
+//
+// Cost of the posture, stated plainly: an operator adding a CLI through the YAML drive contract
+// cannot declare a trust dialog whose capture is not enumerated here — they declare {kind:"none",
+// reason} and page a human, or contribute the capture. That is deliberate. The alternative is a stall
+// protection that any plausible sentence can turn into a permission auto-approver.
+
+// v1.75 T2 / OBS-137, claude-code 2.1.218 startup gate.
+export const CLAUDE_TRUST_PANE = [
+  "Accessing workspace:",
+  "/tmp/untrusted-project",
+  "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team).",
+  "Yes, I trust this folder",
+].join("\n");
+
+// v1.75 T2 / OBS-137, codex 0.144.6 startup gate.
+export const CODEX_TRUST_PANE = [
+  "Do you trust the contents of this directory?",
+  "Working with untrusted contents comes with higher risk of prompt injection.",
+  "Trusting the directory allows project-local config, hooks, and exec policies to load.",
+  "› 1. Yes, continue",
+  "Press enter to continue",
+].join("\n");
+
+// v1.22 T5 / OBS-19, cursor-agent's per-worktree dialog.
+export const CURSOR_TRUST_PANE = "Workspace Trust Required\nTrust this folder?";
+
+// OBS-358, live pane wW:p2TB of run-20260805-121252 — the dialog that cost 30 minutes — quoted from
+// the record holding all five lines, .overseer/REPAIR-v186/GATE-T28-1.md (OBSERVATIONS.md abridges
+// it to the first three). "← highlighted" is the observer's annotation of the selected row, kept
+// exactly as recorded rather than tidied away.
+export const KIMI_TRUST_PANE = [
+  "Trust this folder?",
+  "  /Users/…/.tickmarkr/worktrees.noindex/tickmarkr-run-20260805-121252--T29",
+  "❯ Trust this folder     ← highlighted",
+  "    Enable project MCP servers. Remembered for this folder.",
+  "  Don't trust",
+].join("\n");
+
+// OBS-406, live pane wW:p32A of run-20260806-121758-…214 T5 — the same gate in its MCP-trust
+// wording, which is why kimi's fingerprint is the cursor+option row both headings share.
+export const KIMI_MCP_TRUST_PANE = [
+  "Kimi Code loads project-level MCP servers (.mcp.json, .kimi-code/mcp.json) only in trusted folders.",
+  " ❯ Trust this folder      /      Don't trust",
+].join("\n");
+
+export const RECORDED_TRUST_PANES: readonly string[] = [
+  CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_TRUST_PANE, KIMI_MCP_TRUST_PANE,
+];
+
+// v1.89 T1 / OBS-414 round 4 — EXACT, not "leading bytes of a recorded line". Round 3 accepted any
+// prefix of a captured line, and every prefix of a trust prompt is also a substring of unrelated
+// panes: `{fingerprint: "Trust"}` passed, then matched a tool-permission pane reading
+// "Trust this command?" and handed the daemon an Enter to press on it — the auto-approval defect,
+// reopened by the check meant to close it. `"Trust this folder"` (kimi's row minus its cursor glyph)
+// passed the same way, and that exact string is the one OBS-406 measured producing 258 false wakes
+// in 25 minutes on supervisor panes with the words on screen as prose.
+//
+// So the approved fingerprints are ENUMERATED, one per shipped capture, each the distinctive bytes
+// of its own pane and nothing shorter. Kimi's carries the selection cursor because a live modal
+// renders one and prose never does. Membership is exact; the corpus check below it keeps a list
+// entry from drifting away from the pane it claims to quote.
+export const APPROVED_TRUST_FINGERPRINTS: readonly string[] = [
+  "Quick safety check: Is this a project you created or one you trust?", // claude-code 2.1.218, OBS-137
+  "Do you trust the contents of this directory?", // codex 0.144.6, OBS-137
+  "Workspace Trust Required", // cursor-agent, OBS-19
+  "❯ Trust this folder", // kimi 0.29.0, OBS-358 + OBS-406 — the cursor glyph is load-bearing
+];
+
+const isApprovedFingerprint = (fingerprint: string): boolean =>
+  APPROVED_TRUST_FINGERPRINTS.includes(fingerprint)
+  && RECORDED_TRUST_PANES.some((pane) => pane.includes(fingerprint));
+
+export const TRUST_DIALOG_UNRECORDED_MESSAGE =
+  "trust-dialog fingerprint is not one of the approved workspace-trust captures — it must be exactly an entry of APPROVED_TRUST_FINGERPRINTS in src/adapters/types.ts (each the distinctive bytes of a recorded pane), not a prefix of one, a substring of one, or a sentence describing the prompt; declare {kind: none, reason} if the CLI renders none";
+
+// The two variants, exported as one tuple so every schema that embeds a trust declaration (the
+// drive contract in catalog.ts) is built from these bytes rather than restating them.
+export const TRUST_DIALOG_VARIANTS = [
+  z.object({
+    kind: z.literal("dialog").optional(),
+    // superRefine, not chained refine(): one failure yields ONE diagnosis, so the operator reads the
+    // reason their declaration was refused instead of every rule it happened to trip.
+    fingerprint: z.string().superRefine((fingerprint, ctx) => {
+      const message = fingerprint.trim().length === 0 ? TRUST_DIALOG_BLANK_MESSAGE
+        : isApprovedFingerprint(fingerprint) ? undefined
+        : TRUST_DIALOG_UNRECORDED_MESSAGE;
+      if (message) ctx.addIssue({ code: "custom", message });
+    }),
+    key: z.string().min(1),
+  }).strict(),
+  z.object({
+    kind: z.literal("none"),
+    reason: z.string().refine((r) => r.trim().length > 0, "a no-dialog declaration must state a falsifiable reason"),
+  }).strict(),
+] as const;
+
+export const TrustDialogSchema = z.union(TRUST_DIALOG_VARIANTS);
+
+// The discrimination lives HERE, at the keypress boundary every caller crosses: a no-dialog
+// declaration never matches, so sendKey is unreachable for it without editing this function. The
+// blank guard is the same fail-closed posture one layer below the schema.
+export function matchesTrustDialog(paneText: string, dialog: TrustDialog): dialog is CapturedTrustDialog {
+  if (dialog.kind === "none") return false;
+  return dialog.fingerprint.trim().length > 0 && paneText.includes(dialog.fingerprint);
 }
 
 // v1.75 T1 / OBS-136: an adapter whose steady-state TUI presents a bordered input box declares
@@ -221,8 +349,11 @@ export interface WorkerAdapter {
   // v1.22 T5: optional trust check-and-seed. doctor only. Absent = n/a (adapter has no trust concept,
   // or already bypasses via a CLI flag like pi --approve). Side-effecting when it seeds a writable store.
   trust?(repoRoot: string): TrustVerdict;
-  // v1.22 T5 / OBS-19: optional trust-dialog fingerprint for runtime auto-answer (see TrustDialog).
-  trustDialog?: TrustDialog;
+  // v1.22 T5 / OBS-19 → v1.89 T1 / OBS-414: REQUIRED trust-dialog declaration for runtime
+  // auto-answer (see TrustDialog). Required-but-honest: a captured dialog, or {kind:"none", reason}.
+  // The `?` here was the silent opt-out that cost run …215 thirty minutes on kimi's folder-trust
+  // prompt — an omission has no line to object to at review.
+  trustDialog: TrustDialog;
   // v1.75 T1 / OBS-136: optional steady-state TUI input-box declaration. The herdr delivery
   // readiness/clear guards consult only this adapter-owned contract, never a driver fingerprint.
   inputBox?: InputBox;

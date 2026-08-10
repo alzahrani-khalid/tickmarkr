@@ -179,13 +179,80 @@ export async function runGates(
       heldTest = undefined;
       await ctx.onGate?.({ phase: "end", gate: "test", result: held });
     }
-    return {
-      results: [...results].sort((a, b) => GATE_NAMES.indexOf(a.gate as GateName) - GATE_NAMES.indexOf(b.gate as GateName)),
-      commits,
-    };
+    const sorted = [...results].sort((a, b) => GATE_NAMES.indexOf(a.gate as GateName) - GATE_NAMES.indexOf(b.gate as GateName));
+    // v1.87 T5: no round returns a MERGEABLE GREEN on a dirty tree. The battery is not the only gate
+    // that executes shell in this worktree — the acceptance gate runs command and named-test oracles
+    // (acceptance.ts:264,275) and both verdict gates dispatch a vendor CLI here — so the last word on
+    // cleanliness has to be the round's last act rather than the battery's. `results` is what the
+    // daemon merges on (daemon.ts `results.every(gateSatisfied)`), so the withdrawal lands there; the
+    // journal keeps both the green and its retraction, the honest record of a verdict that did not
+    // survive its own round.
+    const last = sorted[sorted.length - 1];
+    if (last && sorted.every((r) => r.pass || r.meta?.skipped === true)) {
+      const dirt = await dirtyWorktree();
+      if (dirt) {
+        const refusal = dirtyRoundRefusal(last.gate as GateName, dirt);
+        results[results.indexOf(last)] = refusal;
+        sorted[sorted.length - 1] = refusal;
+        await ctx.onGate?.({ phase: "end", gate: refusal.gate as GateName, result: refusal });
+      }
+    }
+    return { results: sorted, commits };
   };
 
   const toolGates = (["build", "test", "lint"] as const).filter(enabled);
+
+  /**
+   * v1.87 T5: the shell gates run their commands against the WORKING TREE, while evidence, scope,
+   * the judged diff and the merge all read COMMITS. Uncommitted work is therefore visible to
+   * build/test/lint and invisible to everything that decides what ships — a green battery on a dirty
+   * tree certifies a tree nobody will ever merge, and the committed diff it stands for was never run.
+   *
+   * That is not gatable-with-a-caveat, so the battery refuses it rather than gating it and hoping.
+   * An unreadable `git status` is refused on the same rule: a tree that cannot be proven clean is not
+   * proven clean. Returns the dirt (porcelain lines) to name in the refusal, or undefined when clean.
+   *
+   * The one exemption is tickmarkr's OWN droppings — root-level `.tickmarkr-*` (the adapters' usage
+   * record). The harness wrote those, not the worker; they are not work anyone meant to merge, and
+   * refusing a tree for the harness's own litter would fail every metered run. Nothing else is
+   * exempt: an untracked source file is uncommitted work by every reading git offers.
+   */
+  const dirtyWorktree = async (): Promise<string | undefined> => {
+    const r = await shGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain", ctx.worktree);
+    if (r.code !== 0) return `git status failed (exit ${r.code}) — the worktree cannot be proven clean`;
+    const entries = r.stdout
+      .split("\n")
+      .map((l) => l.trimEnd())
+      .filter((l) => l.trim() && !/^.. \.tickmarkr-[^/]*$/.test(l));
+    return entries.length ? entries.join("\n") : undefined;
+  };
+
+  const DIRTY_WHY = `refusing to gate a dirty worktree: the shell gates run against the working tree while `
+    + `evidence, scope and the merge read commits, so these uncommitted changes would be gated `
+    + `and never merged (and the committed diff would never be run)`;
+
+  // `left` names the command that CREATED the dirt when one did; a round-entry refusal has no culprit.
+  const dirtyRefusal = (gate: GateName, dirt: string, left?: string): GateResult => ({
+    gate,
+    pass: false,
+    details: DIRTY_WHY
+      + (left ? `. The ${gate} command (${left}) left them behind, so every gate after it would judge a tree nobody will merge:\n` : `:\n`)
+      + dirt,
+    meta: { dirtyWorktree: true, ...(left ? { dirtiedBy: gate } : {}) },
+  });
+
+  // The round-end withdrawal (see `done`). It blames no command: whatever dirtied the tree ran after
+  // the last cleanliness check, and naming a culprit this function cannot identify would be a worse
+  // record than naming the fact. `gate` is the verdict being withdrawn, not an accusation about who wrote.
+  const dirtyRoundRefusal = (gate: GateName, dirt: string): GateResult => ({
+    gate,
+    pass: false,
+    details: `${DIRTY_WHY}. Every gate of this round was satisfied and the round ended dirty — something after `
+      + `the last cleanliness check (the acceptance gate's command/test oracles, or a verdict gate's `
+      + `vendor CLI) wrote into the worktree — so this mergeable result is withdrawn rather than merged. `
+      + `Uncommitted at round end:\n${dirt}`,
+    meta: { dirtyWorktree: true, dirtyAtRoundEnd: true },
+  });
 
   // build/test/lint vs the shared baseline
   const runBattery = async (commands: Record<string, string>, selected?: string[]): Promise<void> => {
@@ -195,9 +262,15 @@ export async function runGates(
       // not at true execution start. They are collectively sub-second (measured), so the debounce
       // suppresses them anyway; split compareToBaseline only if a tool gate ever gets slow.
       const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, toolGates);
+      // The same refusal AFTER the commands, because a green command can dirty the tree the check
+      // above just proved clean. Batched, legacy cannot say WHICH command did it, so the refusal
+      // lands on the last gate that had one — the round dies there either way. A red battery is
+      // reported as the red it is: the round already ends, and the command output is the better lead.
+      const dirt = toolResults.every((r) => r.pass) ? await dirtyWorktree() : undefined;
+      const blame = dirt ? [...toolGates].reverse().find((g) => commands[g]) : undefined;
       for (const r of toolResults) {
         await emitStart(r.gate as GateName);
-        await record(r);
+        await record(r.gate === blame ? dirtyRefusal(blame!, dirt!, commands[blame!]!) : r);
       }
       return;
     }
@@ -206,6 +279,18 @@ export async function runGates(
     for (const g of toolGates) {
       await emitStart(g);
       const [r] = await compareToBaseline(ctx.worktree, commands, ctx.baseline, [g]);
+      // The pre-battery check proves the tree clean ONCE; a command that exits 0 having rewritten a
+      // tracked file makes it dirty again, and every gate after it — including the next shell gate,
+      // which would then run against bytes HEAD does not hold — inherits that. So re-check after each
+      // command, the last one included, and fail the gate whose command did it. (A red command needs
+      // no check: it already ends the round, and its own output is the truer verdict.)
+      if (r!.pass && commands[g]) {
+        const dirt = await dirtyWorktree();
+        if (dirt) {
+          await record(dirtyRefusal(g, dirt, commands[g]!));
+          return;
+        }
+      }
       if (g === "test" && selected) {
         const screened = { ...r!, meta: { ...r!.meta, selectedTests: selected } };
         // green: held (see heldTest) so the full suite below can supersede it with ONE verdict.
@@ -230,8 +315,25 @@ export async function runGates(
     return { gate: e.gate, pass: e.pass, details: e.details };
   };
 
+  /**
+   * v1.87 T5: the allowlist is read ONCE — at entry, before any gate of this round runs — copied out
+   * of `ctx.cfg` and frozen. Both halves are the enforcement: the copy means a later write to the
+   * daemon's live config object cannot reach the gate mid-round (the screen at line ~296 and the
+   * canonical scope gate below are two separate reads of it), and the freeze means nothing this file
+   * hands to `scopeGate` can be widened in flight either. Nothing anywhere writes it back.
+   *
+   * The boundary, stated rather than implied: this binds the allowlist for the lifetime of a round,
+   * which is the largest unit this function owns. It cannot speak for a `tickmarkr resume`, which is
+   * a new process whose config the daemon resolves afresh (src/run/daemon.ts) — binding an allowlist
+   * across a restart would have to live there, is outside this task's file scope, and is claimed
+   * neither here nor in the worker prompt. What the prompt does claim is what holds: a WORKER has no
+   * way to change this list, mid-round or otherwise.
+   */
+  const allowDeviations = [...(ctx.cfg.scope?.allowDeviations ?? [])];
+  Object.freeze(allowDeviations);
+
   const scopeResult = (): Promise<GateResult> =>
-    scopeGate(ctx.worktree, ctx.baseRef, task.files, ctx.result, ctx.cfg.scope?.allowDeviations ?? []);
+    scopeGate(ctx.worktree, ctx.baseRef, task.files, ctx.result, allowDeviations);
 
   const runGate = async (gate: GateName, compute: () => Promise<GateResult>): Promise<void> => {
     await emitStart(gate);
@@ -391,6 +493,20 @@ export async function runGates(
     return rv;
   };
 
+  // v1.87 T5: the refusal is the FIRST thing a round does, whatever that round is configured to run.
+  // Guarding only the configured build/test/lint commands left the hole this repairs: the battery is
+  // not the only gate that executes shell in this worktree — the acceptance gate runs command and
+  // named-test oracles — so a task with NO tool command configured skipped the check entirely and its
+  // oracles judged uncommitted state, on a commit whose diff nobody had run. One check at the top, and
+  // no shell-executing gate path is reachable on a dirty tree. It lands on the first gate of this
+  // round's sequence: the round dies there, exactly as it does on a red command.
+  const entryDirt = sequence.length ? await dirtyWorktree() : undefined;
+  if (entryDirt) {
+    await emitStart(sequence[0]!);
+    await record(dirtyRefusal(sequence[0]!, entryDirt));
+    return done();
+  }
+
   if (v185 && await screenBlocks()) return done();
 
   // A non-final round may run only the tests covering its own diff; the merge-candidate round below
@@ -456,8 +572,14 @@ export async function runGates(
   // stream, and `fullSuite` says which suite spoke while `selectedTests` keeps what the screen ran.
   if (selected) {
     await emitStart("test");
+    // This is the last shell command a round can run — the judge's named-test oracle (acceptance.ts)
+    // may have run one before it, and every gate between the battery and here reads commits only, so
+    // a clean tree HERE is what makes "the gated commit is the tested tree" true at merge time.
     const [full] = await compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"]);
-    const merged = { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } };
+    const dirt = full!.pass ? await dirtyWorktree() : undefined;
+    const merged = dirt
+      ? dirtyRefusal("test", dirt, ctx.commands.test!)
+      : { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } };
     results[results.findIndex((r) => r.gate === "test")] = merged;
     heldTest = undefined;
     await ctx.onGate?.({ phase: "end", gate: "test", result: merged });

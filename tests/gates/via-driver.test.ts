@@ -143,14 +143,18 @@ describe("v1.1 driver-routed gates", () => {
   // All four headless claude call sites (gates/llm.ts:31,49; run/consult.ts:71,77) route through
   // adapter.headlessCommand(); this pins the runViaDriver path (acceptance.test.ts:42 pins judge routing).
   test("runViaDriver emits the claude adapter's MCP pinning on the gate dispatch command (HYG-02)", async () => {
-    const captured: string[] = [];
+    const captured: { command: string; script: string }[] = [];
     // fully-stubbed driver: run() captures the command, waitOutput resolves immediately,
     // read returns "{}" — nothing is ever executed, zero-token.
     const stub = {
       id: "capture",
       interactive: false,
       async slot(cwd: string, name: string): Promise<Slot> { return { id: name, name, cwd }; },
-      async run(_s: Slot, cmd: string) { captured.push(cmd); },
+      async run(_s: Slot, command: string) {
+        const scriptPath = /^bash ['"](.+)['"]$/.exec(command)?.[1];
+        if (!scriptPath) throw new Error(`unexpected pane dispatch command: ${command}`);
+        captured.push({ command, script: readFileSync(scriptPath, "utf8") });
+      },
       async waitOutput() { return true; },
       async waitAgentStatus() { return true; },
       async status() { return "unknown"; },
@@ -161,9 +165,9 @@ describe("v1.1 driver-routed gates", () => {
     } as unknown as ExecutorDriver;
     const callNonce = generateVerdictNonce();
     await runViaDriver(claudeCode, "fable", `TICKMARKR-JUDGE\n${verdictNonceLine(callNonce)}`, "/w", { driver: stub, name: "t" });
-    expect(captured[0]).toMatch(/^bash ['"]/);
-    expect(captured[0]!.length).toBeLessThan(120);
-    const script = readFileSync(captured[0]!.slice(6, -1), "utf8");
+    expect(captured[0]!.command).toMatch(/^bash ['"]/);
+    expect(captured[0]!.command.length).toBeLessThan(120);
+    const script = captured[0]!.script;
     expect(script).toContain("--strict-mcp-config");
     expect(script).toContain(`--mcp-config '{"mcpServers":{}}'`);
     expect(script.trimEnd().endsWith(gateExitTrailer(callNonce))).toBe(true);

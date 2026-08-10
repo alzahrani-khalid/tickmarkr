@@ -1,6 +1,7 @@
 import { userInfo } from "node:os";
 import { GATE_NAMES } from "../../graph/schema.js";
 import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE } from "../../run/journal.js";
+import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
 
 // GATE-08 (v1.12): approve a parked human gate so the next `tickmarkr resume <runId>` dispatches it.
 //
@@ -22,10 +23,27 @@ import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, 
 // OBS-189: `--uphold` is the second decision a review park offers. Plain approve accepts the diff the
 // reviewer rejected (gate-satisfied); --uphold sides WITH the reviewer and funds ONE fixed worker
 // attempt carrying the findings — the park costs an attempt, never the run.
-export async function approve(argv: string[], cwd = process.cwd()): Promise<string> {
-  const { runId, taskId, by, reason, uphold, recheck } = parseArgs(argv);
-  if (uphold && recheck) throw new Error("--uphold and --recheck are different decisions — pass one");
+//
+// T14: the runtime ACCEPTS an approval against a live daemon exactly as against a finished run —
+// daemon.ts builds its approved set once at startup and never re-reads it (deliberate: replay
+// determinism). So the accepted decision may be inert for that run, and until now the only disclosure
+// was a "run resume" suggestion inside this string, restated nowhere afterwards. The run lock already
+// records the owning pid, so the answer is available and was simply not consulted: every approval now
+// closes on a DISPOSITION drawn from a two-token vocabulary printed in a JSON status line, and the
+// run's completion record names every approval that never reached a dispatch. Liveness comes from
+// lock.ts's runLockOwner — the same
+// inspect() the acquire/unlock decision table uses, never a second `process.kill(pid, 0)` here, and
+// never the lock FILE's presence (a stale lock whose recorded pid is dead is not a live run).
+//
+export type ApprovalStatus = "deferred-live" | "recorded-no-owner";
 
+/** The production command registered in COMMANDS; its returned bytes are what the CLI prints. */
+export async function approve(argv: string[], cwd = process.cwd()): Promise<string> {
+  const { runId, taskId, by, reason, uphold, recheck, reviewRoundCeiling } = parseArgs(argv);
+  if (uphold && recheck) throw new Error("--uphold and --recheck are different decisions — pass one");
+  const serialization = await acquireApprovalSerialization(cwd, runId);
+
+  try {
   // Journal.open throws `no journal for <runId> at <dir>` on an unknown run — that IS the refusal.
   const journal = Journal.open(cwd, runId);
 
@@ -65,8 +83,9 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       via: "cli",
       release: REVIEW_UPHELD_RELEASE,
       gate: "review",
+      ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return `upheld the reviewer for ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to dispatch a fixed attempt carrying the findings`;
+    return disposition(cwd, runId, `upheld the reviewer for ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to dispatch a fixed attempt carrying the findings`, serialization.contended);
   }
   const capPark = lastHuman?.data.kind === ATTEMPT_CAP_RELEASE;
   const gateFailPark = lastHuman?.data.kind === "gate-fail";
@@ -81,8 +100,9 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       ...(reason ? { reason } : {}),
       via: "cli",
       release: RECHECK_RELEASE,
+      ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return `re-checking ${taskId} in ${runId} — by ${by}; no gate marked satisfied, run \`tickmarkr resume ${runId}\` to re-dispatch against the full gate suite`;
+    return disposition(cwd, runId, `re-checking ${taskId} in ${runId} — by ${by}; no gate marked satisfied, run \`tickmarkr resume ${runId}\` to re-dispatch against the full gate suite`, serialization.contended);
   }
   const failedGate = gateFailPark
     ? events.slice(0, lastHumanIndex).reverse().find((e) =>
@@ -98,10 +118,33 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     by,
     ...(reason ? { reason } : {}),
     via: "cli",
+    ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     ...(capPark ? { release: ATTEMPT_CAP_RELEASE } : {}),
     ...(failedGate ? { release: GATE_SATISFIED_RELEASE, gate: failedGate } : {}),
   });
-  return `approved ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to ${failedGate ? "continue past the approved gate" : "dispatch it"}`;
+  return disposition(cwd, runId, `approved ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to ${failedGate ? "continue past the approved gate" : "dispatch it"}`, serialization.contended);
+  } finally {
+    serialization.release();
+  }
+}
+
+// The status is command OUTPUT, not a typed sibling result: the registered approve function returns
+// one primitive string and the dispatcher prints those bytes unchanged. A compact sentinel followed
+// by JSON makes the contract unambiguous to machines without widening the shared command result type.
+// No-lock approvals keep their historical one-line result for the cockpit; a dead recorded owner and
+// a command delayed behind terminalization both emit recorded-no-owner.
+function disposition(cwd: string, runId: string, message: string, contended: boolean): string {
+  const owner = runLockOwner(cwd);
+  const resume = `tickmarkr resume ${runId}`;
+  if (!owner && !contended) return message;
+  const status: ApprovalStatus = owner?.live ? "deferred-live" : "recorded-no-owner";
+  const record = {
+    status,
+    resume,
+    ...(owner?.pid === undefined ? {} : { ownerPid: owner.pid }),
+    ...(owner?.runId === undefined ? {} : { ownerRunId: owner.runId }),
+  };
+  return `${message}\nTICKMARKR_APPROVAL ${JSON.stringify(record)}`;
 }
 
 interface ParsedArgs {
@@ -111,18 +154,20 @@ interface ParsedArgs {
   reason?: string;
   uphold: boolean;
   recheck: boolean;
+  reviewRoundCeiling?: number;
 }
 
-const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--uphold|--recheck] [--by <name>] [--reason <text>]";
+const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
 
-// hand-parsed argv — no CLI framework (house style). Flags --uphold, --by <name>, --reason <text>;
-// positionals are runId then taskId. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
+// hand-parsed argv — no CLI framework (house style). Positionals are runId then taskId; decision,
+// ceiling, actor and reason are flags. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   let by: string | undefined;
   let reason: string | undefined;
   let uphold = false;
   let recheck = false;
+  let reviewRoundCeiling: number | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--by") {
@@ -135,6 +180,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       uphold = true;
     } else if (a === "--recheck") {
       recheck = true;
+    } else if (a === "--review-rounds") {
+      const value = argv[++i];
+      if (value === undefined) throw new Error(USAGE);
+      if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+        throw new Error("--review-rounds must be a positive integer");
+      }
+      reviewRoundCeiling = Number(value);
     } else {
       positionals.push(a);
     }
@@ -143,5 +195,5 @@ function parseArgs(argv: string[]): ParsedArgs {
   if (!runId || !taskId) {
     throw new Error(USAGE);
   }
-  return { runId, taskId, by: by ?? userInfo().username, reason, uphold, recheck };
+  return { runId, taskId, by: by ?? userInfo().username, reason, uphold, recheck, reviewRoundCeiling };
 }

@@ -6,6 +6,7 @@ import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, saveGraph, stateDirName } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
+import { beatSupervision } from "../../src/run/supervision.js";
 
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-repo-"));
 
@@ -100,6 +101,25 @@ describe("VIS-07 status --watch purity (D-02)", () => {
     expect(out.split("\n---\n")[0]).toContain("1s elapsed");
     expect(out.split("\n---\n")[1]).toContain("4s elapsed");
     expect(readFileSync(journal, "utf8")).toBe(bytesBefore);
+    expect(snapshot(repo)).toEqual(before);
+  });
+
+  // SUP-01: reading a tier's status may not create, touch or reap the very files it reports on —
+  // a reader that beat on the watcher's behalf would report every dead tier as healthy forever.
+  test("reading supervision tiers neither beats for an armed tier nor materializes an absent one", async () => {
+    const repo = mkRepo();
+    seed(repo);
+    beatSupervision(repo, "orchestrator"); // one tier armed; the other two have no record at all
+    const before = snapshot(repo);
+    expect(before.paths).toContain("supervision/orchestrator.beat");
+    expect(before.paths).not.toContain("supervision/overseer.beat");
+
+    const out = await status(["--watch"], repo, { iterations: 3, sleep: async () => {} });
+
+    expect(out).toContain("orchestrator ARMED");
+    expect(out).toContain("overseer ABSENT");
+    // identical inode, mtime and path set: the armed beat was not refreshed and no absent tier
+    // gained a file merely by being read three times.
     expect(snapshot(repo)).toEqual(before);
   });
 

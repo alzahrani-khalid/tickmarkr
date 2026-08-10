@@ -103,7 +103,7 @@ Outside multi-agent environments, run the loop directly.
 
 ### Version preflight
 
-Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version\`, read \`package.json\` version, and if the binary is older on major.minor, stop and tell the operator to update. Never proceed on hope — stale binaries silently skip daemon gates.
+Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version\`, read \`package.json\` version, and if the binary is older on major.minor, stop and tell the operator to update. Never proceed on hope — stale binaries silently skip daemon gates. Also verify no run is live before starting one: \`pgrep -f "tickmarkr (run|resume)"\` must be empty — match the process, not one install path (\`dist/cli/index.js\` alone misses global and homebrew installs), and treat a held \`.tickmarkr/graph.lock\` as a live run until its holder pid is proven dead.
 
 ### Tip-verify-before-green
 

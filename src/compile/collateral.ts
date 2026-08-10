@@ -120,12 +120,13 @@ export function collateralLints(tasks: ReadonlyArray<Pick<Task, "id" | "files">>
       const text = read(tf);
       if (text === null) continue;
       if (mentions(text, needles)) hits.push(tf);
-      if (hits.length >= MAX_HITS_PER_TASK) break;
     }
     if (!hits.length) continue;
     // deterministic: walk already sorted; stable list
-    const listed = hits.join(", ");
-    const tail = hits.length >= MAX_HITS_PER_TASK ? " (capped)" : "";
+    const listed = hits.slice(0, MAX_HITS_PER_TASK).join(", ");
+    const tail = hits.length > MAX_HITS_PER_TASK
+      ? ` (${hits.length} total; capped at ${MAX_HITS_PER_TASK} shown)`
+      : "";
     lines.push(`${t.id}: likely collateral tests not in files[]: ${listed}${tail}`);
   }
   return lines;

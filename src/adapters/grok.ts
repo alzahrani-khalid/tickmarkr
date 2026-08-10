@@ -117,6 +117,17 @@ export const grok: WorkerAdapter = {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },
   parse: parseWorkerResult, // prompt.ts — last-valid-trailer, hard-wrap tolerant. No grok fork.
+  // v1.89 T1 / OBS-414: no capture exists, so none is invented. grok 0.2.93 has never been observed
+  // rendering a workspace/folder-trust prompt: it loads the operator's global Claude-Code-compat
+  // config rather than keeping a per-directory trust store, and no grok dispatch in any recorded run
+  // has stalled before launch (OBS-414's own sweep lists grok's gap as MCP suppression, not trust).
+  // FALSIFIER, and it is cheap: dispatch grok into a never-seen worktree and read the pane. One
+  // capture of a trust prompt replaces this with {fingerprint, key} — the capture is the only
+  // admissible evidence, and a guess here would press a key on whatever it happened to match.
+  trustDialog: {
+    kind: "none",
+    reason: "grok 0.2.93 keeps no per-directory trust store and no recorded pane shows it rendering a workspace-trust prompt; falsified by one capture from a fresh worktree",
+  },
   // v1.5 MODEL-01: fail OPEN to [] (advisory detection, unlike gates). Parses the model LIST only —
   // the auth banner on line 1 is ignored BY CONSTRUCTION (parseGrokModels anchors on the header).
   // Advisory/doctor-only — never in the dispatch or auth path (types.ts:56-60).

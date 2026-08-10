@@ -11,6 +11,7 @@ import { staffLedEvidence } from "../../route/profile.js";
 import { route, RoutingError } from "../../route/router.js";
 import { modelId } from "../../gates/review.js";
 import { loadRoutingProfile } from "../../run/journal.js";
+import { harnessLine, resolveHarness } from "../harness.js";
 import type { BillingChannel, WorkerAdapter } from "../../adapters/types.js";
 
 // T4 (v1.50): TTY-only brand pass — the title helper frames the routing table, lint/unroutable
@@ -34,7 +35,17 @@ const fleetCanCrossVendorReview = (channels: BillingChannel[]) => {
   return false;
 };
 
-export async function plan(argv: string[], cwd = process.cwd(), adapters: WorkerAdapter[] = allAdapters()): Promise<string> {
+// v1.89 T4: harnessFrom is the resolver's INPUT — a caller (the byte-pinned goldens) fixes the location
+// and keeps this machine's absolute paths out of a fixture. The default is the INVOKED entrypoint,
+// `process.argv[1]`: the bin symlink a global install puts on PATH, which resolves to dist/cli/index.js.
+// It is NOT `import.meta.url` — that names dist/cli/commands/plan.js, an internal module of the harness
+// rather than the harness that was invoked, so the banner would identify the wrong file entirely.
+export async function plan(
+  argv: string[],
+  cwd = process.cwd(),
+  adapters: WorkerAdapter[] = allAdapters(),
+  harnessFrom: string | undefined = process.argv[1],
+): Promise<string> {
   // ponytail: hardcoded 24h TTL — promote to config when an operator asks. mtime is the signal because
   // doctor.json has no probe timestamp and a schema field would break the existing-files compat invariant.
   const DOCTOR_STALE_MS = 24 * 60 * 60 * 1000;
@@ -62,9 +73,12 @@ export async function plan(argv: string[], cwd = process.cwd(), adapters: Worker
   let deviations = 0;
   // v1.51 T4: the mode is never invisible — the header names the resolved mode, its winning
   // source, and the explore posture; each task row carries a floor-derivation line below.
+  // v1.89 T4: the harness names itself ABOVE the routing table — the table is only as trustworthy as the
+  // binary that produced it, and version equality cannot tell an installed package from a checkout.
   const lines: string[] = [
     `tickmarkr plan — dry run (${channels.length} channels available)`,
     `mode: ${mode.mode} (${source}) · explore ${cfg.routing.explore?.mode ?? "on"}`,
+    harnessLine(resolveHarness(harnessFrom)),
     "",
   ];
   const derivation = (shape: string): string | null => {

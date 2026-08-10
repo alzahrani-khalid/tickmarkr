@@ -626,7 +626,10 @@ describe("HYG-08: failing details name the failing test, not stdout noise", () =
     expect(results[0].pass).toBe(false);
     expect(results[0].details.startsWith("failing tests:")).toBe(false);
     expect(results[0].details.startsWith("new failures vs baseline:")).toBe(true);
-    expect(results[0].meta).toBeUndefined();
+    // no headline meta — the tsc shape names no test. T9 adds the failure classification here and
+    // nothing else: a tsc error is a regression, so the merge predicate must not read it as infra.
+    expect(results[0].meta?.failingTests).toBeUndefined();
+    expect(results[0].meta).toEqual({ classification: "regression" });
   });
 
   test("fingerprint still catches FAIL lines (no regex narrowing)", () => {

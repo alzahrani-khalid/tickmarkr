@@ -1,9 +1,21 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { claudeCode } from "../../src/adapters/claude-code.js";
-import { codex } from "../../src/adapters/codex.js";
+import { claudeCode, CLAUDE_TRUST_DIALOG } from "../../src/adapters/claude-code.js";
+import { codex, CODEX_TRUST_DIALOG } from "../../src/adapters/codex.js";
 import { cursorAgent, CURSOR_TRUST_DIALOG } from "../../src/adapters/cursor-agent.js";
-import { matchesTrustDialog, type TrustDialog } from "../../src/adapters/types.js";
+import { grok } from "../../src/adapters/grok.js";
+import { kimi, KIMI_TRUST_DIALOG } from "../../src/adapters/kimi.js";
+import { opencode } from "../../src/adapters/opencode.js";
+import { pi } from "../../src/adapters/pi.js";
+import type { CliEntry } from "../../src/adapters/catalog.js";
+import { allAdapters, getAdapter } from "../../src/adapters/registry.js";
+import {
+  CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_MCP_TRUST_PANE, KIMI_TRUST_PANE,
+  matchesTrustDialog, RECORDED_TRUST_PANES, TRUST_DIALOG_BLANK_MESSAGE, TRUST_DIALOG_UNRECORDED_MESSAGE,
+  type TrustDialog, type WorkerAdapter,
+} from "../../src/adapters/types.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
@@ -11,22 +23,71 @@ import { setupRepo, T } from "../helpers/tmprepo.js";
 
 // v1.22 T5 / OBS-19: fingerprint-matched trust dialog gets one Enter; anything else pages.
 
-const CLAUDE_TRUST_PANE = [
-  "Accessing workspace:",
-  "/tmp/untrusted-project",
-  "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team).",
-  "Yes, I trust this folder",
-].join("\n");
+// v1.89 T1 / OBS-414 round 3: the recorded panes moved into src — they stopped being test fixtures
+// when the schema started requiring a fingerprint to be bytes one of them contains. Imported, never
+// re-transcribed: a second copy is how a "capture" quietly becomes prose.
 
-const CODEX_TRUST_PANE = [
-  "Do you trust the contents of this directory?",
-  "Working with untrusted contents comes with higher risk of prompt injection.",
-  "Trusting the directory allows project-local config, hooks, and exec policies to load.",
-  "› 1. Yes, continue",
-  "Press enter to continue",
-].join("\n");
+// The capture that must be REFUSED: opencode 1.17.15's tool-permission modal, recorded by the round
+// that declared it as opencode's trust dialog and named a security defect by the review that killed
+// it (.planning/RULING-v189-T1-reauthor.md:11). Enter here selects the highlighted "Allow once" and
+// approves an arbitrary tool call — it is not a workspace-trust prompt. Run 305 then declared its
+// THIRD line, "enter confirm", which its own refusal list did not name: hence a schema that must be
+// positively satisfied rather than a list that must be dodged.
+const OPENCODE_PERMISSION_CAPTURE = "Permission required\nAllow once\nenter confirm";
 
-const CURSOR_TRUST_PANE = "Workspace Trust Required\nTrust this folder?";
+// Every recorded capture, beside the adapter that renders it and the source file that must carry
+// the declaration. A test-only fingerprint cannot satisfy the source check.
+const RECORDED_CAPTURES = [
+  { id: "claude-code", file: "claude-code.ts", dialog: CLAUDE_TRUST_DIALOG, panes: [CLAUDE_TRUST_PANE] },
+  { id: "codex", file: "codex.ts", dialog: CODEX_TRUST_DIALOG, panes: [CODEX_TRUST_PANE] },
+  { id: "cursor-agent", file: "cursor-agent.ts", dialog: CURSOR_TRUST_DIALOG, panes: [CURSOR_TRUST_PANE] },
+  { id: "kimi", file: "kimi.ts", dialog: KIMI_TRUST_DIALOG, panes: [KIMI_TRUST_PANE, KIMI_MCP_TRUST_PANE] },
+] as const;
+
+const NO_DIALOG_ADAPTERS = [
+  { id: "opencode", file: "opencode.ts", adapter: opencode },
+  { id: "pi", file: "pi.ts", adapter: pi },
+  { id: "grok", file: "grok.ts", adapter: grok },
+] as const;
+
+// Resolved from this file, never the working directory — the recorded kimi capture above contains a
+// worktree path, and a cwd-rooted read in the same test would blur which of the two is being read.
+const adapterSource = (file: string) => readFileSync(join(import.meta.dirname, "..", "..", "src", "adapters", file), "utf8");
+
+// A stub carrying everything the registry needs to BUILD an adapter and nothing else, so the only
+// variable across these constructions is the trust declaration under test.
+function nativeEntry(id: string, trustDialog: unknown): CliEntry {
+  const adapter = { ...kimi, id, trustDialog } as unknown as WorkerAdapter;
+  return { id, binary: id, identity: ".+", vendor: kimi.vendor, drive: { adapter } };
+}
+
+// Production construction: the same call `tickmarkr run` makes, with the catalog it is handed.
+const buildThroughRegistry = (id: string, trustDialog: unknown): WorkerAdapter =>
+  getAdapter(id, allAdapters({ cliEntries: [nativeEntry(id, trustDialog)] }));
+
+// The same declaration through the OTHER production path — the operator's YAML drive contract.
+const buildThroughOperatorYaml = (fingerprint: string): WorkerAdapter => getAdapter("yaml-trust-fixture", allAdapters({
+  operatorYaml: `
+clis:
+  - id: yaml-trust-fixture
+    binary: yaml-trust-fixture
+    identity: ".+"
+    vendor: fixture-vendor
+    drive:
+      headless: "yaml-trust-fixture run --model {model} --prompt-file {promptFile}"
+      interactive: null
+      trustDialog:
+        fingerprint: ${JSON.stringify(fingerprint)}
+        key: "Enter"
+`,
+}));
+
+function fakeScriptPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-trust-"));
+  const script = join(dir, "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {} }));
+  return script;
+}
 
 async function runTrustPane(
   paneText: string,
@@ -91,8 +152,9 @@ async function runTrustPane(
 describe("trust-dialog declarations", () => {
   test("a pane showing the claude workspace-trust dialog matches its adapter's declared fingerprint and is answered with its declared key", async () => {
     const dialog = claudeCode.trustDialog;
-    expect(dialog).toBeDefined();
-    if (!dialog) return;
+    // v1.89 T1: the declaration is a union now — a no-dialog value has no key to press.
+    expect(dialog.kind).not.toBe("none");
+    if (dialog.kind === "none") return;
     expect(matchesTrustDialog(CLAUDE_TRUST_PANE, dialog)).toBe(true);
 
     const { keys, notified } = await runTrustPane(CLAUDE_TRUST_PANE, dialog, { unblockOnKey: true });
@@ -102,8 +164,9 @@ describe("trust-dialog declarations", () => {
 
   test("a pane showing the codex trust dialog matches its adapter's declared fingerprint and is answered with its declared key", async () => {
     const dialog = codex.trustDialog;
-    expect(dialog).toBeDefined();
-    if (!dialog) return;
+    // v1.89 T1: the declaration is a union now — a no-dialog value has no key to press.
+    expect(dialog.kind).not.toBe("none");
+    if (dialog.kind === "none") return;
     expect(matchesTrustDialog(CODEX_TRUST_PANE, dialog)).toBe(true);
 
     const { keys, notified } = await runTrustPane(CODEX_TRUST_PANE, dialog, { unblockOnKey: true });
@@ -139,6 +202,9 @@ describe("trust-dialog declarations", () => {
       { name: "claude", dialog: claudeCode.trustDialog, pane: CLAUDE_TRUST_PANE },
       { name: "codex", dialog: codex.trustDialog, pane: CODEX_TRUST_PANE },
       { name: "cursor", dialog: cursorAgent.trustDialog, pane: CURSOR_TRUST_PANE },
+      // v1.89 T1: kimi's capture joins the closed set — its pane says "Trust this folder?" too, so
+      // the cursor glyph in its fingerprint is what keeps the two from answering each other's dialog.
+      { name: "kimi", dialog: kimi.trustDialog, pane: KIMI_TRUST_PANE },
     ];
     const routineOutput = [
       "I reviewed workspace trust handling and the tests pass.",
@@ -147,8 +213,8 @@ describe("trust-dialog declarations", () => {
     ];
 
     for (const entry of declared) {
-      expect(entry.dialog, `${entry.name} declaration`).toBeDefined();
-      if (!entry.dialog) continue;
+      expect(entry.dialog.kind, `${entry.name} declaration`).not.toBe("none");
+      if (entry.dialog.kind === "none") continue;
       expect(matchesTrustDialog(entry.pane, entry.dialog), `${entry.name} own dialog`).toBe(true);
       for (const other of declared.filter((candidate) => candidate !== entry)) {
         expect(matchesTrustDialog(other.pane, entry.dialog), `${entry.name} must not match ${other.name}`).toBe(false);
@@ -160,11 +226,167 @@ describe("trust-dialog declarations", () => {
   });
 
   test("auto-answer remains declaration-gated so no dialog outside the declared set is ever answered", async () => {
-    // This is byte-for-byte a real declared Claude pane, but the dispatched adapter declares
-    // nothing. Runtime must consult only that adapter, never a process-global fingerprint set.
+    // This is byte-for-byte a real declared Claude pane, but the dispatched adapter carries its own
+    // shipped declaration (v1.89 T1: the fake's honest {kind:"none"}). Runtime must consult only
+    // that adapter, never a process-global fingerprint set.
     const { keys, notified, human } = await runTrustPane(CLAUDE_TRUST_PANE, undefined, { unblockOnKey: false });
     expect(keys).toEqual([]);
     expect(notified.filter((m) => /blocked on a prompt/.test(m))).toHaveLength(1);
     expect(human).toEqual(["T1"]);
   }, 30_000);
 });
+
+// v1.89 T1 / OBS-414: the declaration is required, and required-but-honest — a verbatim capture or
+// an explicit no-dialog value with a reason. Both prior rounds of this task are pinned here as
+// negatives: prose that matches no pane, and a tool-permission prompt that matches too much.
+//
+// These four sit at FILE TOP LEVEL and carry the criterion as their whole title on purpose: the
+// acceptance oracle anchors its filter (`^…$`, gates/acceptance.ts:109) against the runner-visible
+// full name, which is every enclosing describe title space-joined with the test title. Wrapped in a
+// describe, or prefixed, the name filter matches zero tests and the oracle fails closed — which is
+// exactly what it did to round 3. Do not nest them.
+
+test("every adapter the registry can build carries a trust declaration that is either a captured dialog with a fingerprint and key or an explicit no-dialog value with a reason, enumerated from the registry's own adapter list so a transcribed name set cannot stay green when a later adapter omits the field", () => {
+  // The enumeration IS the registry's list — nothing here transcribes adapter names, so an
+  // adapter added tomorrow is checked by this test on the day it is added.
+  const adapters = allAdapters({ fakeScriptPath: fakeScriptPath() });
+  expect(adapters.map((adapter) => adapter.id)).toContain("fake");
+  expect(adapters.length).toBeGreaterThanOrEqual(8);
+
+  for (const adapter of adapters) {
+    const declaration = adapter.trustDialog;
+    if (declaration.kind === "none") {
+      expect(declaration.reason.trim().length, adapter.id).toBeGreaterThan(0);
+    } else {
+      expect(declaration.fingerprint.trim().length, adapter.id).toBeGreaterThan(0);
+      expect(declaration.key.length, adapter.id).toBeGreaterThan(0);
+      // A capture is only a capture if it names the gate it claims to answer AND is bytes some
+      // recorded pane actually contains — the corpus, not the word, is the evidence.
+      expect(declaration.fingerprint, adapter.id).toMatch(/trust/i);
+      expect(RECORDED_TRUST_PANES.some((pane) => pane.includes(declaration.fingerprint)), adapter.id).toBe(true);
+    }
+  }
+
+  // And the enumeration is load-bearing rather than decorative: a LATER adapter that omits the
+  // field cannot reach this list at all, so this test cannot stay green while one exists.
+  expect(() => allAdapters({ cliEntries: [nativeEntry("late-adapter", undefined)] }))
+    .toThrow(/trust declaration/i);
+});
+
+test("the trust-dialog schema used by production registry construction rejects fingerprints \"\" and \" \" with the trust-dialog operator message and accepts the recorded kimi capture, constructing all three through the registry path so a length-only schema or test-local validator cannot pass", () => {
+  // `z.string().min(1)` admits " ": the rejection must come from the schema production uses, on
+  // the path production builds adapters with — not from an assertion written beside the test.
+  for (const blank of ["", " "]) {
+    expect(() => buildThroughRegistry("blank-fixture", { fingerprint: blank, key: "Enter" }), JSON.stringify(blank))
+      .toThrow(TRUST_DIALOG_BLANK_MESSAGE);
+    // The operator's own YAML layer reaches the identical schema through the drive contract.
+    expect(() => buildThroughOperatorYaml(blank), `yaml ${JSON.stringify(blank)}`)
+      .toThrow(TRUST_DIALOG_BLANK_MESSAGE);
+  }
+
+  const built = buildThroughRegistry("kimi-fixture", KIMI_TRUST_DIALOG);
+  expect(built.trustDialog).toEqual(KIMI_TRUST_DIALOG);
+  expect(matchesTrustDialog(KIMI_TRUST_PANE, built.trustDialog)).toBe(true);
+  expect(buildThroughOperatorYaml(KIMI_TRUST_DIALOG.fingerprint).trustDialog).toEqual(KIMI_TRUST_DIALOG);
+});
+
+test("split the verbatim three-line OpenCode permission capture \"Permission required\\nAllow once\\nenter confirm\" on newlines and submit the full capture and each of its three non-empty lines through the trust-dialog schema used by production registry construction; all four are rejected, the attempted-line count equals the capture's non-empty-line count, and the recorded kimi folder-trust capture is accepted, so a selected-label subset, transcribed capture or reject-all schema cannot pass", () => {
+  // Run 305's refusal list named the selected LABELS ("Permission required", "Allow once") and
+  // the combined pane, and never tried the third line — so `{fingerprint: "enter confirm"}` built
+  // cleanly and matched this very pane. Every line is submitted here, derived by splitting the
+  // capture rather than transcribed, so no line can be quietly left out of the check.
+  const lines = OPENCODE_PERMISSION_CAPTURE.split("\n").filter((line) => line.trim().length > 0);
+  expect(lines).toEqual(["Permission required", "Allow once", "enter confirm"]);
+
+  const attemptedLines: string[] = [];
+  for (const [index, line] of lines.entries()) {
+    attemptedLines.push(line);
+    expect(() => buildThroughRegistry(`permission-line-${index}`, { fingerprint: line, key: "Enter" }), line).toThrow();
+    expect(() => buildThroughOperatorYaml(line), `yaml ${line}`).toThrow();
+  }
+  expect(attemptedLines.length).toBe(lines.length);
+  expect(() => buildThroughRegistry("permission-capture", { fingerprint: OPENCODE_PERMISSION_CAPTURE, key: "Enter" }))
+    .toThrow();
+  expect(() => buildThroughOperatorYaml(OPENCODE_PERMISSION_CAPTURE)).toThrow();
+
+  // Not reject-all: the recorded folder-trust capture builds, on the same path, in the same test.
+  expect(buildThroughRegistry("kimi-fixture", KIMI_TRUST_DIALOG).trustDialog).toEqual(KIMI_TRUST_DIALOG);
+});
+
+test("production registry construction accepts the recorded kimi folder-trust capture while refusing the permission-pane captures, using exact recorded bytes so reject-all logic and hand-written prose fingerprints both fail", () => {
+  const accepted = buildThroughRegistry("kimi-fixture", KIMI_TRUST_DIALOG).trustDialog;
+  expect(accepted).toEqual(KIMI_TRUST_DIALOG);
+  for (const refused of [OPENCODE_PERMISSION_CAPTURE, ...OPENCODE_PERMISSION_CAPTURE.split("\n")]) {
+    expect(() => buildThroughRegistry("permission-fixture", { fingerprint: refused, key: "Enter" }), refused).toThrow();
+  }
+
+  // Round 2's defect, submitted the way it actually reopens: as the FINGERPRINT, through both
+  // production construction paths — not as pane text against somebody else's capture. Codex's real
+  // recorded gate is "Do you trust the contents of this directory?", one word away from the first
+  // string below, so the word "trust" cannot separate them and no regex ever will; only the record
+  // can. Accepting either would hand the daemon an Enter to press on a tool-permission pane.
+  //
+  // The last three are round 3's bypass: PREFIXES of recorded lines. "Trust" is a prefix of kimi's
+  // and cursor's captured rows and also a substring of a tool-permission pane reading "Trust this
+  // command?"; "Trust this folder" is kimi's row with the selection cursor stripped, the exact
+  // string OBS-406 measured matching 258 supervisor panes that merely discussed the dialog. A
+  // prefix of a capture is not a capture — only an enumerated fingerprint is.
+  for (const prose of [
+    "Do you trust this command?", "Trust this workspace?", "the workspace trust dialog",
+    "Trust", "Trust this folder", "Workspace Trust",
+  ]) {
+    expect(() => buildThroughRegistry("prose-fixture", { fingerprint: prose, key: "Enter" }), prose)
+      .toThrow(TRUST_DIALOG_UNRECORDED_MESSAGE);
+    expect(() => buildThroughOperatorYaml(prose), `yaml ${prose}`).toThrow(TRUST_DIALOG_UNRECORDED_MESSAGE);
+  }
+
+  // The shipped adapters, built through the registry, are the same objects their modules export —
+  // a factory default or construction-site fallback would not be — and every fingerprint is bytes
+  // that appear in a recorded pane. Prose ABOUT a dialog is not the dialog: it matches nothing.
+  const adapters = allAdapters();
+  for (const { id, file, dialog, panes } of RECORDED_CAPTURES) {
+    const built = getAdapter(id, adapters);
+    expect(built.trustDialog, id).toBe(dialog);
+    expect(adapterSource(file).includes(dialog.fingerprint), `${id} capture recorded beside its declaration`).toBe(true);
+    expect(RECORDED_TRUST_PANES.some((pane) => pane.includes(dialog.fingerprint)), `${id} fingerprint is recorded bytes`).toBe(true);
+    for (const pane of panes) expect(matchesTrustDialog(pane, built.trustDialog), `${id} own pane`).toBe(true);
+    expect(matchesTrustDialog(OPENCODE_PERMISSION_CAPTURE, built.trustDialog), `${id} vs permission pane`).toBe(false);
+  }
+  expect(matchesTrustDialog("discussing the Trust this folder dialog with the operator", KIMI_TRUST_DIALOG)).toBe(false);
+
+  for (const { id, file, adapter } of NO_DIALOG_ADAPTERS) {
+    const built = getAdapter(id, adapters);
+    expect(built.trustDialog, id).toBe(adapter.trustDialog);
+    const declaration = built.trustDialog;
+    expect(declaration.kind, id).toBe("none");
+    if (declaration.kind !== "none") continue;
+    // The reason is recorded in the shipped source beside the construction site, and it is
+    // falsifiable: every one names the observation that would replace it with a capture.
+    expect(adapterSource(file).includes(declaration.reason), `${id} reason recorded at its declaration`).toBe(true);
+    expect(declaration.reason, id).toMatch(/falsified|capture/i);
+    // No pane, recorded or otherwise, gets a key from a no-dialog declaration.
+    for (const { panes } of RECORDED_CAPTURES) {
+      for (const pane of panes) expect(matchesTrustDialog(pane, declaration), `${id} vs recorded pane`).toBe(false);
+    }
+  }
+});
+
+test("the daemon keys the same pane bytes only for the captured declaration, never for a no-dialog one", async () => {
+  const noDialog: TrustDialog = { kind: "none", reason: "this adapter renders no workspace-trust prompt" };
+
+  // Same pane bytes, same daemon, only the declaration differs. A presence-only guard would key
+  // both; an always-false guard would key neither.
+  //
+  // SCOPE, so this is not read as more than it is: the dispatched adapter here has no
+  // `interactiveSeed`, so this covers the daemon's post-seed trust loop only. A kimi startup pane
+  // blocks inside runInteractiveSeed's readiness wait, before this loop is entered — see the note
+  // at kimi.ts's `trustDialog`. That path lives in src/run and belongs to T19.
+  const captured = await runTrustPane(KIMI_TRUST_PANE, KIMI_TRUST_DIALOG, { unblockOnKey: true });
+  expect(captured.keys).toEqual([KIMI_TRUST_DIALOG.key]);
+  expect(captured.notified.filter((m) => /blocked on a prompt|looks idle/.test(m))).toHaveLength(0);
+
+  const declined = await runTrustPane(KIMI_TRUST_PANE, noDialog, { unblockOnKey: false });
+  expect(declined.keys).toEqual([]);
+  expect(declined.notified.filter((m) => /blocked on a prompt/.test(m))).toHaveLength(1);
+  expect(declined.human).toEqual(["T1"]);
+}, 60_000);

@@ -34,6 +34,23 @@ export const opencode: WorkerAdapter = {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },
   parse: parseWorkerResult,
+  // v1.89 T1 / OBS-414: opencode 1.17.15 renders no workspace-trust gate, and the prompt it DOES
+  // render must never be declared here. A prior attempt at this contract pointed opencode's
+  // fingerprint at its tool-permission modal — captured verbatim as the three lines
+  //     Permission required
+  //     Allow once
+  //     enter confirm
+  // The daemon answers a match with Enter, which selects "Allow once" and silently approves the
+  // first arbitrary tool request in every slot: stall protection converted into auto-approval
+  // (.planning/RULING-v189-T1-reauthor.md:11). Tool approval and workspace trust are different
+  // gates, and no line of that capture — including the keybar hint that slipped past the first
+  // refusal list — can be declared now: the schema requires a fingerprint that names a trust gate.
+  // FALSIFIER: a captured opencode pane showing a folder/workspace-trust prompt — not a permission
+  // prompt — replaces this with {fingerprint, key}.
+  trustDialog: {
+    kind: "none",
+    reason: "opencode 1.17.15 renders no workspace-trust prompt; its only modal is the tool-permission prompt (Permission required / Allow once), a different gate that must never be auto-answered; falsified by a captured opencode pane showing a folder-trust prompt",
+  },
   // v1.5 MODEL-01: fail OPEN to [] (advisory detection, unlike gates). Plain `models` (NOT --refresh):
   // opencode reads its own cache offline; --refresh adds an avoidable network dependency (RESEARCH
   // anti-pattern). Live-verified 2026-07-10, opencode 1.17.15.

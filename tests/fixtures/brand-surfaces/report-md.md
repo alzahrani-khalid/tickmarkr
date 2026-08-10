@@ -6,6 +6,7 @@
 - **done:** 1
 - **failed:** 0
 - **human:** 0
+- **verification:** absent — no tip verification recorded: neither passed nor failed
 
 ## Usage & efficiency
 

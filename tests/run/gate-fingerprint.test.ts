@@ -155,3 +155,105 @@ describe("gate fingerprint — base-moved runner tally (T34)", () => {
     }
   });
 });
+
+// The mkdtemp root the runtime actually hands out on this platform class: os.tmpdir() resolves to
+// /var/folders/<2>/<30>/T on darwin and /tmp on linux, and mkdtemp appends exactly six characters
+// from [A-Za-z0-9] to the caller's chosen prefix (observed: tickmarkr-demo- + "IwtrdE").
+const DARWIN_TMP = "/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T";
+
+// A gate detail that NAMES the temp directory — once as the path's final segment (an mkdir that
+// failed, so nothing deeper exists to name) and once as the parent of a file inside it. Not phrased
+// with an assertion cue: a payload span is protected from every rule here by design, so a fixture
+// that hid the path inside one would prove nothing about the path rules.
+const tmpDetail = (root: string, dir: string) =>
+  [
+    "failing tests:",
+    " Test Files  1 failed | 192 passed (193)",
+    "      Tests  1 failed | 2962 passed (2963)",
+    " FAIL  |suite| tests/gates/llm.test.ts > llm gate > writes the judge prompt",
+    "",
+    "new failure fingerprints vs baseline (secondary):",
+    `Error: EACCES: permission denied, mkdir '${root}/${dir}'`,
+    `  the judge prompt could not be written to ${root}/${dir}/prompt.md`,
+  ].join("\n");
+
+describe("gate fingerprint — mkdtemp suffix (T3)", () => {
+  test("test: two raw gate-failure details differing only in the random suffix of a mkdtemp directory normalize to identical bytes, with the suffix present in both inputs", () => {
+    const a = tmpDetail(DARWIN_TMP, "tickmarkr-llm-IwtrdE");
+    const b = tmpDetail(DARWIN_TMP, "tickmarkr-llm-kkOtkR");
+
+    // The suffix is IN both raw inputs — the fixture is two real renderings of one defect, not two
+    // texts that were already identical before normalization ran.
+    expect(a).toContain("tickmarkr-llm-IwtrdE");
+    expect(b).toContain("tickmarkr-llm-kkOtkR");
+    expect(a).not.toBe(b);
+
+    expect(normalizeGateFailure(a)).toBe(normalizeGateFailure(b));
+    // …and identical BECAUSE the suffix is gone, not because the whole path collapsed to nothing.
+    expect(normalizeGateFailure(a)).not.toContain("IwtrdE");
+    expect(normalizeGateFailure(b)).not.toContain("kkOtkR");
+    expect(normalizeGateFailure(a)).toContain("tickmarkr-llm-");
+
+    // Same defect under the linux tmp root, and the deeper path inside the directory is unaffected.
+    expect(normalizeGateFailure(tmpDetail("/tmp", "tickmarkr-llm-Ab3xYz")))
+      .toBe(normalizeGateFailure(tmpDetail("/tmp", "tickmarkr-llm-9QmpZ0")));
+    expect(normalizeGateFailure(a)).toContain("prompt.md");
+  });
+
+  test("test: two failures naming different mkdtemp prefixes still normalize apart, so distinct defects cannot spend one another's retry budget", () => {
+    // Every prefix mkdtemp is called with in src/ is a distinct diagnostic location; a pair of them
+    // must never fingerprint together however the suffixes fall.
+    // Same suffix on both sides, so the prefix ALONE has to keep them apart.
+    const prefixes = ["tickmarkr-llm-", "tickmarkr-eval-", "tickmarkr-scope-compile-", "tickmarkr-probe-", "tickmarkr-mode-"];
+    for (const p of prefixes) {
+      for (const q of prefixes) {
+        if (p === q) continue;
+        expect(normalizeGateFailure(tmpDetail(DARWIN_TMP, `${p}IwtrdE`)), `${p} vs ${q}`)
+          .not.toBe(normalizeGateFailure(tmpDetail(DARWIN_TMP, `${q}IwtrdE`)));
+      }
+      // The chosen prefix survives literally — it is the only thing left telling the two apart.
+      expect(normalizeGateFailure(tmpDetail(DARWIN_TMP, `${p}IwtrdE`))).toContain(p);
+    }
+    // The realistic pair of two live leaks: different prefix AND different suffix.
+    expect(normalizeGateFailure(tmpDetail(DARWIN_TMP, "tickmarkr-scope-compile-Xy12Ab")))
+      .not.toBe(normalizeGateFailure(tmpDetail(DARWIN_TMP, "tickmarkr-probe-Q7fPz0")));
+
+    // Nor may the erasure reach past the generated suffix into a chosen name that merely looks like
+    // one: an ordinary six-letter directory under a tmp root stays identity…
+    expect(normalizeGateFailure(tmpDetail("/tmp", "tickmarkr-worker-output")))
+      .not.toBe(normalizeGateFailure(tmpDetail("/tmp", "tickmarkr-worker-stderrs")));
+    expect(normalizeGateFailure(tmpDetail("/tmp", "tickmarkr-worker-output"))).toContain("output");
+    // …and a hyphenated word in ordinary prose, rooted in no temp directory at all, is untouched.
+    expect(normalizeGateFailure("worker left the run-detail marker behind"))
+      .not.toBe(normalizeGateFailure("worker left the run-config marker behind"));
+  });
+
+  test("test: a run of gate-result events carrying the same underlying failure with different mkdtemp suffixes reaches GATE_FINGERPRINT_CAP through identicalGateFailures", () => {
+    // Each dispatch gets a fresh mkdtemp directory, so the cap is only reachable if the suffixes
+    // normalize away — this is the exact call daemon.ts makes at gate-fingerprint-cap.
+    const suffixes = ["IwtrdE", "kkOtkR", "0KtKrj", "87dTKr"].slice(0, GATE_FINGERPRINT_CAP);
+    const events: JournalEvent[] = suffixes.map((s, i) => ({
+      ts: `2026-08-06T1${i}:00:00.000Z`,
+      event: "gate-result",
+      taskId: "T5",
+      data: { gate: "test", pass: false, details: tmpDetail(DARWIN_TMP, `tickmarkr-llm-${s}`) },
+    }));
+    // A DIFFERENT leak journaled in between must not fund this cap.
+    events.splice(1, 0, {
+      ts: "2026-08-06T10:30:00.000Z",
+      event: "gate-result",
+      taskId: "T5",
+      data: { gate: "test", pass: false, details: tmpDetail(DARWIN_TMP, "tickmarkr-mode-Q7fPz0") },
+    });
+    expect(new Set(events.map((e) => String(e.data.details))).size).toBe(GATE_FINGERPRINT_CAP + 1);
+
+    const current = normalizeGateFailure(String(events.at(-1)!.data.details));
+    expect(identicalGateFailures(events, "T5", "test", current)).toBe(GATE_FINGERPRINT_CAP);
+
+    // An operator approval is still a new engagement, and a different prefix still buys its own budget.
+    const approved: JournalEvent[] = [events[0]!, { ts: "2026-08-06T11:30:00.000Z", event: "task-approved", taskId: "T5", data: {} }, events.at(-1)!];
+    expect(identicalGateFailures(approved, "T5", "test", current)).toBe(1);
+    expect(identicalGateFailures(events, "T5", "test", normalizeGateFailure(tmpDetail(DARWIN_TMP, "tickmarkr-eval-IwtrdE")))).toBe(0);
+  });
+});
+

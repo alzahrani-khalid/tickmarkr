@@ -23,12 +23,15 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     const { repo } = setupRepo([T("T1")], { tasks: {} });
     const j = scopeParkedRun(repo, "run-recheck");
 
-    const msg = await approve(["run-recheck", "T1", "--recheck", "--by", "overseer"], repo);
+    const msg = await approve(["run-recheck", "T1", "--recheck", "--review-rounds", "1", "--by", "overseer"], repo);
     expect(msg).toMatch(/no gate marked satisfied/);
 
     const approvals = j.read().filter((e) => e.event === "task-approved");
     expect(approvals).toHaveLength(1);
-    expect(approvals[0]).toMatchObject({ taskId: "T1", data: { by: "overseer", via: "cli", release: "recheck" } });
+    expect(approvals[0]).toMatchObject({
+      taskId: "T1",
+      data: { by: "overseer", via: "cli", release: "recheck", reviewRoundCeiling: 1 },
+    });
     // the whole point: plain approve would put scope here, skipping build/test/lint/evidence/scope
     expect(j.replaySatisfiedGates()).toEqual(new Map());
     expect(j.replayStatuses().get("T1")).toBe("pending");
@@ -64,5 +67,23 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     await expect(approve(["run-recheck-both", "T1", "--uphold", "--recheck"], repo))
       .rejects.toThrow(/different decisions/);
     expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
+  });
+
+  test("test: uphold and recheck remain mutually exclusive and each still refuses a park whose last failed gate does not match it", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const scopePark = scopeParkedRun(repo, "run-recheck-contract");
+
+    await expect(approve(["run-recheck-contract", "T1", "--uphold", "--recheck"], repo))
+      .rejects.toThrow(/different decisions/);
+    await expect(approve(["run-recheck-contract", "T1", "--uphold"], repo))
+      .rejects.toThrow(/last failed gate is scope/);
+    expect(scopePark.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
+
+    const unmatched = Journal.create(repo, "run-recheck-unmatched");
+    unmatched.append("task-dispatch", "T1", { assignment, attempt: 0 });
+    unmatched.append("task-human", "T1", { kind: "reroute-exhausted", reason: "no failed gate" });
+    await expect(approve(["run-recheck-unmatched", "T1", "--recheck"], repo))
+      .rejects.toThrow(/park kind is reroute-exhausted/);
+    expect(unmatched.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
   });
 });

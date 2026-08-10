@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { RunGraph } from "../graph/schema.js";
+import { type RunGraph, type SpecSource, validateGraph } from "../graph/schema.js";
 import { taskUnitContractErrors } from "./collateral.js";
 import { CompileError } from "./common.js";
 import { compileGsd, isGsdPhaseDir } from "./gsd.js";
@@ -8,7 +8,21 @@ import { compileNative, TICKMARKR_NATIVE_MARKER } from "./native.js";
 import { compilePrd } from "./prd.js";
 import { compileSpecKit } from "./speckit.js";
 
-type SourceType = "speckit" | "gsd" | "prd" | "native";
+type SourceType = SpecSource;
+
+// Dialects stop at translation. Every downstream compile-time consumer receives this one flat
+// shape, and finalizePlan is the only seam that turns it back into the durable RunGraph.
+export type PlanIR = {
+  version: RunGraph["version"];
+  source: RunGraph["spec"]["source"];
+  paths: RunGraph["spec"]["paths"];
+  hash: RunGraph["spec"]["hash"];
+  base?: RunGraph["spec"]["base"];
+  mode?: RunGraph["mode"];
+  tasks: RunGraph["tasks"];
+};
+
+export type PlanFinalizationHook = (plan: PlanIR) => PlanIR;
 
 function detect(src: string): SourceType | null {
   if (existsSync(src) && statSync(src).isDirectory()) {
@@ -42,13 +56,49 @@ function enforceTaskUnitContract(g: RunGraph, src: string): RunGraph {
   return g;
 }
 
-export function compileSource(src: string, type?: SourceType, root?: string): RunGraph {
+export function finalizePlan(plan: PlanIR, src: string): RunGraph {
+  const graph = validateGraph({
+    version: plan.version,
+    ...(plan.mode !== undefined ? { mode: plan.mode } : {}),
+    spec: {
+      source: plan.source,
+      paths: plan.paths,
+      hash: plan.hash,
+      ...(plan.base !== undefined ? { base: plan.base } : {}),
+    },
+    tasks: plan.tasks,
+  });
+  return enforceTaskUnitContract(graph, src);
+}
+
+function compilePlan(src: string, type?: SourceType, root?: string): PlanIR {
   const kind = type ?? detect(src);
-  if (kind === "speckit") return enforceTaskUnitContract(compileSpecKit(src), src);
-  if (kind === "gsd") return enforceTaskUnitContract(compileGsd(src, root), src);
-  if (kind === "native") return enforceTaskUnitContract(compileNative(src), src);
-  if (kind === "prd") return enforceTaskUnitContract(compilePrd(src), src);
-  throw new CompileError(
-    `cannot detect spec type for ${src} — pass a Spec Kit feature dir (with tasks.md), a GSD phase dir (with *-PLAN.md), or a marked native/generic PRD .md file, or use --type speckit|prd|gsd|native`,
-  );
+  const graph = kind === "speckit" ? compileSpecKit(src)
+    : kind === "gsd" ? compileGsd(src, root)
+    : kind === "native" ? compileNative(src)
+    : kind === "prd" ? compilePrd(src)
+    : null;
+  if (!graph) {
+    throw new CompileError(
+      `cannot detect spec type for ${src} — pass a Spec Kit feature dir (with tasks.md), a GSD phase dir (with *-PLAN.md), or a marked native/generic PRD .md file, or use --type speckit|prd|gsd|native`,
+    );
+  }
+  return {
+    version: graph.version,
+    source: graph.spec.source,
+    paths: graph.spec.paths,
+    hash: graph.spec.hash,
+    ...(graph.spec.base !== undefined ? { base: graph.spec.base } : {}),
+    ...(graph.mode !== undefined ? { mode: graph.mode } : {}),
+    tasks: graph.tasks,
+  };
+}
+
+export function compileSource(
+  src: string,
+  type?: SourceType,
+  root?: string,
+  beforeFinalize: PlanFinalizationHook = (plan) => plan,
+): RunGraph {
+  return finalizePlan(beforeFinalize(compilePlan(src, type, root)), src);
 }

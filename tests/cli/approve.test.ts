@@ -152,6 +152,20 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     await expect(approve(["run-x"], repo)).rejects.toThrow(/usage: tickmarkr approve/);
   });
 
+  test("a review-round ceiling must be a positive integer and invalid values append no approval", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-invalid-review-ceiling");
+    j.append("task-human", "T1", { kind: "human-gate", reason: "approval required" });
+
+    for (const value of ["0", "-1", "1.5", "many"]) {
+      await expect(approve(["run-invalid-review-ceiling", "T1", "--review-rounds", value], repo))
+        .rejects.toThrow(/--review-rounds must be a positive integer/);
+    }
+    await expect(approve(["run-invalid-review-ceiling", "T1", "--review-rounds"], repo))
+      .rejects.toThrow(/usage: tickmarkr approve/);
+    expect(j.read().filter((event) => event.event === "task-approved")).toHaveLength(0);
+  });
+
   test("GATE-08 end-to-end through the real command: park → approve() → resume → done", async () => {
     // proves the command and the daemon agree on the event name and semantics (not a journal append,
     // but the actual exported approve() function).

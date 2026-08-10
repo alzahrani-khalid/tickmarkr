@@ -50,6 +50,24 @@ describe("buildTaskPrompt", () => {
     expect(p).toContain("plain criterion");
     expect(p).not.toContain("[object Object]");
   });
+
+  // v1.87 T5: the prompt used to say an out-of-scope edit fails "unless the operator's config
+  // allowlists that path" — an exemption bound at run-start, which a worker reading it mid-run can
+  // neither reach nor influence. A surface may not assert more than the runtime enforces.
+  test("test: the worker prompt states that an out-of-scope edit fails the scope gate and that the allowlist is fixed for the run, and names no capability the worker can invoke mid-run", () => {
+    const p = buildTaskPrompt(task, "", N);
+    const rule = p.split("\n").find((l) => /scope gate/.test(l))!;
+    expect(rule).toBeDefined();
+    // what is actually enforced: the gate fails, and the allowlist it decides against is frozen
+    expect(rule).toMatch(/Out-of-scope edits FAIL the scope gate\./);
+    expect(rule).toMatch(/allowlist is fixed when the run starts/);
+    expect(rule).toMatch(/nothing you do can change it while your work is judged/);
+    expect(rule).toMatch(/declaring a deviation never passes the gate/);
+    // and no mid-run capability, in either grammar: a conditional exemption, or something to invoke
+    expect(rule).not.toMatch(/\bunless\b/i);
+    expect(rule).not.toMatch(/\b(?:ask|request)\b/i);
+    expect(p).not.toContain("unless the operator's config allowlists that path");
+  });
 });
 
 describe("parseWorkerResult", () => {

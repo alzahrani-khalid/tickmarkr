@@ -1,5 +1,10 @@
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { GATE_NAMES, GraphValidationError, renderAcceptanceItem, validateGraph } from "../../src/graph/schema.js";
+import { finalizePlan, type PlanIR } from "../../src/compile/index.js";
+import { graphPath, loadGraph, saveGraph } from "../../src/graph/graph.js";
+import { GATE_NAMES, GRAPH_ROUTING_MODES, GraphValidationError, SPEC_SOURCES, renderAcceptanceItem, validateGraph } from "../../src/graph/schema.js";
 
 const task = (over: Record<string, unknown> = {}) => ({
   id: "T1",
@@ -173,4 +178,88 @@ describe("renderAcceptanceItem (shared text rendering — v1.19)", () => {
     expect(renderAcceptanceItem({ oracle: "test", test: "auth suite" })).toBe("test: auth suite");
     expect(renderAcceptanceItem({ oracle: "judge", text: "behaves" })).toBe("behaves");
   });
+});
+
+test("schema parity serializes a canonical plan containing source, paths, hash, optional base and admission facts through validateGraph, generated rungraph schema and disk reload byte-equivalently, while deleting each durable field before reload produces the documented compatible-optional or fail-closed result", () => {
+  const plan: PlanIR = {
+    version: 1,
+    mode: "staff-led",
+    source: "native",
+    paths: ["specs/canonical.spec.md"],
+    hash: "canonical-source-hash",
+    base: "refs/heads/canonical-base",
+    tasks: [
+      {
+        id: "T1",
+        title: "Preserve admission facts",
+        goal: "Canonical plan facts reach every durable consumer",
+        shape: "implement",
+        complexity: 4,
+        deps: [],
+        files: ["src/graph/schema.ts"],
+        context: [],
+        acceptance: ["canonical facts survive"],
+        gates: [...GATE_NAMES],
+        routingHints: { floor: "frontier", source: "canonical.spec.md" },
+        humanGate: true,
+        status: "pending",
+        evidence: { commits: [], artifacts: [], gateResults: [] },
+      },
+    ],
+  };
+  const canonical = finalizePlan(plan, "canonical-plan");
+  expect(validateGraph(canonical)).toEqual(canonical);
+  expect(canonical).toMatchObject({
+    mode: plan.mode,
+    spec: { source: plan.source, paths: plan.paths, hash: plan.hash, base: plan.base },
+    tasks: [{ humanGate: true, routingHints: { floor: "frontier", source: "canonical.spec.md" } }],
+  });
+
+  const generated = JSON.parse(readFileSync("schema/rungraph.schema.json", "utf8")) as {
+    properties: {
+      mode: { enum: string[] };
+      spec: {
+        properties: { source: { enum: string[] }; base: { type: string; minLength: number } };
+        required: string[];
+      };
+    };
+    required: string[];
+  };
+  expect(generated.properties.mode.enum).toEqual([...GRAPH_ROUTING_MODES]);
+  expect(generated.properties.spec.properties.source.enum).toEqual([...SPEC_SOURCES]);
+  expect(generated.properties.spec.properties.base).toEqual({ type: "string", minLength: 1 });
+  expect(generated.properties.spec.required).toEqual(["source", "paths", "hash"]);
+  expect(generated.required).toEqual(["version", "spec", "tasks"]);
+
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-schema-parity-"));
+  saveGraph(repo, canonical);
+  expect(readFileSync(graphPath(repo), "utf8")).toBe(`${JSON.stringify(canonical, null, 2)}\n`);
+  expect(loadGraph(repo)).toEqual(canonical);
+
+  type MutableGraph = Record<string, unknown> & { spec?: Record<string, unknown> };
+  const deletionContract: Array<{
+    field: string;
+    result: "compatible-optional" | "fail-closed";
+    remove: (graph: MutableGraph) => void;
+  }> = [
+    { field: "version", result: "fail-closed", remove: (g) => { delete g.version; } },
+    { field: "mode", result: "compatible-optional", remove: (g) => { delete g.mode; } },
+    { field: "spec.source", result: "fail-closed", remove: (g) => { delete g.spec?.source; } },
+    { field: "spec.paths", result: "fail-closed", remove: (g) => { delete g.spec?.paths; } },
+    { field: "spec.hash", result: "fail-closed", remove: (g) => { delete g.spec?.hash; } },
+    { field: "spec.base", result: "compatible-optional", remove: (g) => { delete g.spec?.base; } },
+    { field: "tasks", result: "fail-closed", remove: (g) => { delete g.tasks; } },
+  ];
+  for (const contract of deletionContract) {
+    const changed = structuredClone(canonical) as MutableGraph;
+    contract.remove(changed);
+    writeFileSync(graphPath(repo), `${JSON.stringify(changed, null, 2)}\n`);
+    if (contract.result === "compatible-optional") {
+      const loaded = loadGraph(repo);
+      if (contract.field === "mode") expect(loaded.mode, contract.field).toBeUndefined();
+      else expect(loaded.spec.base, contract.field).toBeUndefined();
+    } else {
+      expect(() => loadGraph(repo), contract.field).toThrow(GraphValidationError);
+    }
+  }
 });

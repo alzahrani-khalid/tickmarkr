@@ -135,12 +135,16 @@ describe("worker/judge header parity (T5)", () => {
       "visibility:\n  llm: pane\n",
     );
     const inner = new SubprocessDriver();
-    const commands: string[] = [];
+    const dispatches: { line: string; script?: string }[] = [];
     const driver: ExecutorDriver = {
       id: "spy",
       interactive: false,
       slot: inner.slot.bind(inner),
-      run: async (s, c) => { commands.push(c); return inner.run(s, c); },
+      run: async (slot, line) => {
+        const scriptPath = /^bash '(.+)'$/.exec(line)?.[1];
+        dispatches.push({ line, ...(scriptPath ? { script: readFileSync(scriptPath, "utf8") } : {}) });
+        return inner.run(slot, line);
+      },
       waitOutput: inner.waitOutput.bind(inner),
       waitAgentStatus: inner.waitAgentStatus.bind(inner),
       read: inner.read.bind(inner),
@@ -153,7 +157,7 @@ describe("worker/judge header parity (T5)", () => {
     expect(s.done).toEqual(["T1"]);
     // v1.62 T1: EVERY pane dispatch — worker and judge/review alike — is one short script invocation;
     // both scripts hold the SAME banner one-liner — one header shape for the fleet
-    const scripts = commands.filter((c) => c.startsWith("bash '")).map((c) => readFileSync(c.slice(6, -1), "utf8"));
+    const scripts = dispatches.filter((capture) => capture.line.startsWith("bash '")).map((capture) => capture.script!);
     const worker = scripts.find((body) => body.includes("TICKMARKR_RESULT"))!;
     const gate = scripts.find((body) => !body.includes("TICKMARKR_RESULT"))!;
     expect(worker).toContain(bannerShell());
@@ -172,12 +176,16 @@ describe("worker dispatch script delivery (v1.62 T1)", () => {
       { tasks: { T1: [{ shell: `echo s > s.txt && ${COMMIT} s`, result: { ok: true, summary: "scripted" } }] } },
     );
     const inner = new SubprocessDriver();
-    const commands: string[] = [];
+    const dispatches: Captured[] = [];
     const driver: ExecutorDriver = {
       id: interactive ? "spy-interactive" : "spy",
       interactive,
       slot: inner.slot.bind(inner),
-      run: async (s, c) => { commands.push(c); return inner.run(s, c); },
+      run: async (slot, line) => {
+        const scriptPath = /^bash '(.+)'$/.exec(line)?.[1];
+        if (scriptPath) dispatches.push({ line, script: readFileSync(scriptPath, "utf8") });
+        return inner.run(slot, line);
+      },
       waitOutput: inner.waitOutput.bind(inner),
       waitAgentStatus: inner.waitAgentStatus.bind(inner),
       read: inner.read.bind(inner),
@@ -189,11 +197,7 @@ describe("worker dispatch script delivery (v1.62 T1)", () => {
     const s = await runDaemon(repo, { adapters: [fake], runId, driver });
     expect(s.done).toEqual(["T1"]);
     // the worker's delivered line is the one whose script carries the fake's TICKMARKR_RESULT echo
-    const line = commands.find((c) => {
-      const p = /^bash '(.+)'$/.exec(c)?.[1];
-      return p !== undefined && readFileSync(p, "utf8").includes("TICKMARKR_RESULT");
-    })!;
-    return { line, script: readFileSync(/^bash '(.+)'$/.exec(line)![1], "utf8") };
+    return dispatches.find((capture) => capture.script.includes("TICKMARKR_RESULT"))!;
   }
   // memoized: two daemon runs total (print + interactive), shared by the four assertions below
   let printCap: Captured | undefined;

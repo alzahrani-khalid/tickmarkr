@@ -52,7 +52,8 @@ describe("gateway --json projection (omp 17.2.9 capture, 2026-08-06)", () => {
   });
 
   test("the field selector is the id key only — a schema-accepted contract and a projection that reads no price or vendor field", () => {
-    const drive = { headless: "omp run {promptFile} --model {model}", interactive: null, listModels: { argv: ["models", "ls", "--json"], parser: "json" as const, path: "models", field: "selector" } };
+    // v1.89 T1: every drive contract declares its trust posture; this fixture spawns no CLI.
+    const drive = { headless: "omp run {promptFile} --model {model}", interactive: null, trustDialog: { kind: "none" as const, reason: "projection fixture — no CLI is launched, so no pane exists to capture" }, listModels: { argv: ["models", "ls", "--json"], parser: "json" as const, path: "models", field: "selector" } };
     expect(CliEntrySchema.parse({ id: "omp", binary: "omp", identity: ".+", vendor: "openai", drive }).drive).toEqual(drive);
     // A selector the parser would ignore is refused rather than silently dropped.
     expect(() => CliEntrySchema.parse({ id: "omp", binary: "omp", identity: ".+", vendor: "openai", drive: { ...drive, listModels: { ...drive.listModels, parser: "lines" as const } } })).toThrow(/field/);

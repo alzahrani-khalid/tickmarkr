@@ -1,8 +1,8 @@
 import { cpSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { report } from "../../src/cli/commands/report.js";
-import { Journal } from "../../src/run/journal.js";
+import { renderMarkdownRecord, report } from "../../src/cli/commands/report.js";
+import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const corpusDir = join(import.meta.dirname, "../fixtures/journal-corpus");
@@ -173,6 +173,120 @@ describe("tickmarkr report --md (REC-01 execution record)", () => {
       // declinedRun journals build+review for T1 and build+declined-review for T2 → 3 ran, 3 pass.
       expect(out).toContain("| gate pass rate | 1/1 | 3/3 |");
       expect(out).not.toContain("4/4");
+    });
+  });
+
+  // T4: a run is green only when run-end exists AND its tipVerify is not failed. The record now
+  // states which of the three verification states the run reached, and names a cached verify —
+  // a verified green of an EARLIER tip — instead of folding it into a plain pass.
+  describe("verification state (tip-verify-before-green)", () => {
+    // One task merged and done, and only the closing verdict differs between cases.
+    const verifiedRun = (
+      runId: string,
+      close: { tipVerify?: "passed" | "failed"; cached?: boolean; resumedCached?: boolean } = {},
+    ): JournalEvent[] => {
+      const events: JournalEvent[] = [];
+      const append = (event: string, taskId: string | undefined, data: Record<string, unknown>) => {
+        events.push({
+          ts: new Date(Date.parse("2026-08-07T00:00:00.000Z") + events.length * 1_000).toISOString(),
+          event,
+          ...(taskId === undefined ? {} : { taskId }),
+          data,
+        });
+      };
+      append("run-start", undefined, { baseRef: "abc123def", pid: 1 });
+      append("task-dispatch", "T1", {
+        assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "cheap" },
+        attempt: 0,
+      });
+      append("gate-result", "T1", { gate: "build", pass: true, details: "exit 0" });
+      append("task-done", "T1", { attempts: 1 });
+      append("merge", "T1", { branch: `tickmarkr/${runId}`, commit: "deadbeef" });
+      if (close.tipVerify !== undefined) {
+        append("tip-verify-start", undefined, { tip: "cafe1234", gates: ["test"], cached: close.cached === true });
+        if (close.cached) {
+          append("tip-verify-cached", undefined, { tip: "cafe1234", gates: ["test"] });
+          append("tip-verify", undefined, { gate: "test", pass: true, exitCode: 0, cached: true, tip: "cafe1234" });
+        } else if (close.tipVerify === "failed") {
+          append("tip-verify-failed", undefined, { gate: "test", exitCode: 1, tip: "cafe1234" });
+        } else {
+          append("tip-verify", undefined, { gate: "test", pass: true, exitCode: 0, tip: "cafe1234" });
+        }
+      }
+      append("run-end", undefined, {
+        runId,
+        branch: `tickmarkr/${runId}`,
+        done: ["T1"],
+        failed: [],
+        human: [],
+        ...(close.tipVerify === undefined ? {} : { tipVerify: close.tipVerify }),
+      });
+      // A resume that re-verified an unmoved tip and has not closed yet: these events belong to a
+      // cycle no run-end has judged, so nothing they say may reach the record's reading.
+      if (close.resumedCached) {
+        append("run-resume", undefined, { pid: 2 });
+        append("tip-verify-start", undefined, { tip: "cafe1234", gates: ["test"], cached: true });
+        append("tip-verify-cached", undefined, { tip: "cafe1234", gates: ["test"] });
+        append("tip-verify", undefined, { gate: "test", pass: true, exitCode: 0, cached: true, tip: "cafe1234" });
+      }
+      return events;
+    };
+
+    const verificationLine = (out: string): string =>
+      out.split("\n").find((line) => line.startsWith("- **verification:**")) ?? "";
+
+    test("test: a run whose run-end carries tipVerify failed produces a report stating the run did not verify, and that report never describes the run as green", () => {
+      const out = renderMarkdownRecord(
+        "run-md-tip-failed",
+        verifiedRun("run-md-tip-failed", { tipVerify: "failed" }),
+      );
+      // Every task landed — the record must still refuse to read as a verified run.
+      expect(out).toContain("**done:** 1");
+      expect(verificationLine(out)).toContain("FAILED");
+      expect(verificationLine(out)).toContain("did not verify");
+      expect(out).not.toMatch(/green/i);
+    });
+
+    test("test: a run whose run-end carries no tipVerify field produces a report naming verification as absent, distinct from both passed and failed", () => {
+      const absent = verificationLine(renderMarkdownRecord("run-md-tip-absent", verifiedRun("run-md-tip-absent")));
+      const passed = verificationLine(renderMarkdownRecord(
+        "run-md-tip-passed",
+        verifiedRun("run-md-tip-passed", { tipVerify: "passed" }),
+      ));
+      const failed = verificationLine(renderMarkdownRecord(
+        "run-md-tip-red",
+        verifiedRun("run-md-tip-red", { tipVerify: "failed" }),
+      ));
+      expect(absent).not.toBe(passed);
+      expect(absent).not.toBe(failed);
+      // An unrecorded verification is not a zero to invent: it claims neither verdict.
+      expect(absent).toMatch(/verification:\*\* absent/);
+      expect(passed).toMatch(/verification:\*\* passed/);
+      expect(failed).toMatch(/verification:\*\* FAILED/);
+    });
+
+    test("test: a run verified from cache produces a report that says the verify was cached rather than reporting a plain pass", () => {
+      const cached = verificationLine(renderMarkdownRecord(
+        "run-md-tip-cached",
+        verifiedRun("run-md-tip-cached", { tipVerify: "passed", cached: true }),
+      ));
+      const passed = verificationLine(renderMarkdownRecord(
+        "run-md-tip-fresh",
+        verifiedRun("run-md-tip-fresh", { tipVerify: "passed" }),
+      ));
+      expect(cached).toContain("cached");
+      expect(cached).not.toBe(passed);
+      expect(passed).toContain("passed");
+      expect(passed).not.toContain("cached");
+      // Provenance is read from the closed cycle, the same events the cockpit judged: a resumed
+      // cached verify appended AFTER the final run-end has been closed by nothing, so it cannot
+      // relabel the fresh pass that run-end does speak for.
+      const resumed = verificationLine(renderMarkdownRecord(
+        "run-md-tip-resumed",
+        verifiedRun("run-md-tip-resumed", { tipVerify: "passed", resumedCached: true }),
+      ));
+      expect(resumed).toBe(passed);
+      expect(resumed).not.toContain("cached");
     });
   });
 

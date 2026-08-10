@@ -6,6 +6,14 @@
       "type": "number",
       "const": 1
     },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "partner-led",
+        "risk-based",
+        "staff-led"
+      ]
+    },
     "spec": {
       "type": "object",
       "properties": {
@@ -15,8 +23,7 @@
             "speckit",
             "gsd",
             "prd",
-            "native",
-            "taskmaster"
+            "native"
           ]
         },
         "paths": {
@@ -27,6 +34,10 @@
         },
         "hash": {
           "type": "string"
+        },
+        "base": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
@@ -113,6 +124,10 @@
                     "command": {
                       "type": "string",
                       "minLength": 1
+                    },
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
                     }
                   },
                   "required": [
@@ -128,6 +143,10 @@
                       "const": "test"
                     },
                     "test": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "text": {
                       "type": "string",
                       "minLength": 1
                     }

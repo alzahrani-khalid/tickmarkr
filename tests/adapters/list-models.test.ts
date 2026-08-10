@@ -1,11 +1,14 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { isNativeCliDrive, SHIPPED_CLI_CATALOG } from "../../src/adapters/catalog.js";
 import { codex, readCodexModelsCache } from "../../src/adapters/codex.js";
 import { parseCursorModels } from "../../src/adapters/cursor-agent.js";
 import { parseOpencodeModels } from "../../src/adapters/opencode.js";
 import { parsePiModels } from "../../src/adapters/pi.js";
+import { allAdapters, parseDeclaredModels } from "../../src/adapters/registry.js";
+import { MODEL_ID_RE, shq } from "../../src/adapters/types.js";
 
 // Fixtures are verbatim (trimmed) live output captured 2026-07-10 — see 08-RESEARCH.md
 // "Fixture strings for parser tests". A poisoned row (ANSI/shell metachars) is added to each
@@ -142,4 +145,90 @@ describe("readCodexModelsCache (codex-cli 0.143.0 cache, verified 2026-07-10)", 
       else process.env.CODEX_HOME = prev;
     }
   });
+});
+
+// v1.89 T2. fixtures/gateway-models.json is the verbatim `omp models ls --json` capture
+// (2026-08-07): an OBJECT keyed by `models`, 370 entries, every one carrying BOTH a prefixed
+// `selector` and a bare unprefixed `id`. The neighbouring field is what makes this dangerous —
+// projecting it returns exactly as many plausible ids, and every one of them routes to nothing.
+test("omp's model list projects the selector field and every returned id keeps its provider prefix, exercised against an object payload keyed by models, a bare array, and entries that also carry a bare unprefixed id field; {models:[{id:\"x\"}]} records invalid-payload with reason \"missing selector\" and {models:[]} records empty with reason \"no models\", so the neighbouring id field is never projected and both zero-id results stay distinguishable", async () => {
+  const entry = SHIPPED_CLI_CATALOG.find((candidate) => candidate.id === "omp");
+  if (!entry?.drive || isNativeCliDrive(entry.drive) || !entry.drive.listModels) {
+    throw new Error("shipped omp listModels contract is missing");
+  }
+  const contract = entry.drive.listModels;
+  const capture = readFileSync(join(process.cwd(), "fixtures", "gateway-models.json"), "utf8");
+  const rows = (JSON.parse(capture) as { models: Array<{ selector: string; id: string }> }).models;
+  const objectProjection = parseDeclaredModels(capture, contract.parser, contract.path, contract.field);
+  const arrayProjection = parseDeclaredModels(JSON.stringify(rows), contract.parser, undefined, contract.field);
+  const plausibleNeighbouringIds = rows.map((row) => row.id).filter((id) => MODEL_ID_RE.test(id));
+
+  expect(contract).toEqual({ argv: ["models", "ls", "--json"], parser: "json", path: "models", field: "selector" });
+  expect(rows).toHaveLength(370);
+  expect(rows.every((row) => row.selector.includes("/") && !row.id.includes("/"))).toBe(true);
+  expect(plausibleNeighbouringIds).toHaveLength(rows.length);
+  expect(objectProjection).toEqual({ models: rows.map((row) => row.selector) });
+  expect(arrayProjection).toEqual(objectProjection);
+  expect(objectProjection.models.every((id) => /^[^/]+\/.+/.test(id))).toBe(true);
+  expect(objectProjection.models).not.toEqual(plausibleNeighbouringIds);
+
+  // The two zero-id payloads go through the PRODUCTION listModels implementation — a real spawn of
+  // a stub `omp` on PATH — so a contract that still named `id` would answer ["x"] here rather than
+  // recording an invalid payload.
+  const adapter = allAdapters({ cliEntries: SHIPPED_CLI_CATALOG }).find((candidate) => candidate.id === "omp");
+  if (!adapter?.listModels) throw new Error("shipped omp listModels implementation is missing");
+
+  const binDir = mkdtempSync(join(tmpdir(), "tickmarkr-omp-list-"));
+  const executable = join(binDir, "omp");
+  writeFileSync(executable, [
+    "#!/bin/sh",
+    "if [ \"$1\" = models ] && [ \"$2\" = ls ] && [ \"$3\" = --json ]; then",
+    "  printf '%s' \"${TICKMARKR_OMP_LIST_PAYLOAD:-}\"",
+    "  exit 0",
+    "fi",
+    "exit 97",
+    "",
+  ].join("\n"));
+  chmodSync(executable, 0o755);
+  const bashEnv = join(binDir, "bash-env");
+  writeFileSync(bashEnv, `export PATH=${shq(binDir)}:"$PATH"\n`);
+
+  const bashEnvBefore = process.env.BASH_ENV;
+  const payloadBefore = process.env.TICKMARKR_OMP_LIST_PAYLOAD;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    process.env.BASH_ENV = bashEnv;
+    const observe = async (payload: unknown) => {
+      process.env.TICKMARKR_OMP_LIST_PAYLOAD = JSON.stringify(payload);
+      warn.mockClear();
+      const models = await adapter.listModels!();
+      const warning = warn.mock.calls.map(([message]) => String(message)).join("\n") || null;
+      if (models.length > 0) return { status: "models", reason: null, models, warning };
+      if (warning?.includes('field "selector"')) {
+        return { status: "invalid-payload", reason: "missing selector", models, warning };
+      }
+      return { status: "empty", reason: "no models", models, warning };
+    };
+
+    const records = [
+      await observe({ models: [{ id: "x" }] }),
+      await observe({ models: [] }),
+    ];
+
+    expect(records).toEqual([
+      {
+        status: "invalid-payload",
+        reason: "missing selector",
+        models: [],
+        warning: 'tickmarkr: omp listed no models — no string field "selector" on any of the 1 entries',
+      },
+      { status: "empty", reason: "no models", models: [], warning: null },
+    ]);
+  } finally {
+    warn.mockRestore();
+    if (bashEnvBefore === undefined) delete process.env.BASH_ENV;
+    else process.env.BASH_ENV = bashEnvBefore;
+    if (payloadBefore === undefined) delete process.env.TICKMARKR_OMP_LIST_PAYLOAD;
+    else process.env.TICKMARKR_OMP_LIST_PAYLOAD = payloadBefore;
+  }
 });

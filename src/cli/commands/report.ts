@@ -9,6 +9,7 @@ import { compareRuns } from "../../report/compare.js";
 import { estimateCosts, type ChannelCost } from "../../report/cost.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
 import { Journal, loadRoutingProfile, type JournalEvent, type TelemetryRow } from "../../run/journal.js";
+import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
 
 const n = (x: number) => x.toLocaleString("en-US"); // explicit locale — CI/darwin flake guard
 const EM = "—";
@@ -138,6 +139,66 @@ const outcomeFor = (events: JournalEvent[], taskId: string, runEnd?: JournalEven
   return "not recorded";
 };
 
+/**
+ * Whether the run verified itself — the half of tip-verify-before-green the record used to omit
+ * entirely (a v1.87 report read four tasks done over a tip verify that had failed, and the close
+ * had to say so by hand). The state is READ from the cockpit's derivation, never re-derived here:
+ * `deriveRunCockpitData` folds the latest verification cycle in derive.ts `tipVerificationPassed`
+ * and surfaces it as the `tip-verify` status item, in three states — pass, fail, and absent — so a
+ * second implementation cannot drift from the surface the operator watches live.
+ */
+type Verification = "passed" | "cached" | "failed" | "absent";
+
+const tipStatusItem = (runId: string, events: JournalEvent[]) => {
+  try {
+    return deriveRunCockpitData(
+      { fileName: runId, raw: events.map((e) => JSON.stringify(e)).join("\n") },
+      "", // binaryVersion — unread here; the tip-verify status item is all this asks for
+      { isDaemonAlive: () => false }, // a record is read after the fact: no daemon pid to probe
+    ).statusItems.find((item) => item.text.startsWith("tip-verify "));
+  } catch {
+    // A capture the cockpit refuses (empty, or no run-start) verified nothing. Absent, never a pass.
+    return undefined;
+  }
+};
+
+/**
+ * The events the cockpit's verdict speaks for: a verification cycle ends at the `run-end` that
+ * closes it (derive.ts tipVerificationPassed slices to `lastRunEnd + 1`), so verify events a later
+ * resume appended belong to a cycle nothing has closed. Both readings below take THIS one slice, so
+ * the record can never name a cache that belongs to a cycle the state never judged.
+ */
+const closedCycle = (events: JournalEvent[]): JournalEvent[] => {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].event === "run-end") return events.slice(0, i + 1);
+  }
+  return events;
+};
+
+const verificationOf = (runId: string, events: JournalEvent[]): Verification => {
+  const cycle = closedCycle(events);
+  const tip = tipStatusItem(runId, cycle);
+  if (tip?.state === "fail") return "failed";
+  if (tip?.state !== "pass") return "absent";
+  // A cached green is a verified green of an EARLIER tip (daemon.ts verifyIntegrationTipCached
+  // stamps `cached` on every gate it replays), so the record names it instead of folding it into a
+  // plain pass. Still no second window: the cockpit reports "pass" only when the closed cycle
+  // carried verdicts, so the last `tip-verify` IN THAT CYCLE is the one it passed on.
+  const last = [...cycle].reverse().find((e) => e.event === "tip-verify");
+  return last?.data.cached === true ? "cached" : "passed";
+};
+
+// Absent is a state to render, never a zero to invent — and no reading here calls a run green.
+// NOTE: every reading below is byte-pinned by tests/fixtures/brand-surfaces/report-md.md — the
+// golden freezes the WHOLE markdown record, so changing a reading (or the line that renders it)
+// means regenerating that fixture in the same commit.
+const VERIFICATION_READING: Record<Verification, string> = {
+  passed: "passed — tickmarkr verified this run's integration tip",
+  cached: "cached — carried forward from an earlier verified tip, not re-run for this one",
+  failed: "FAILED — the run did not verify its own tip",
+  absent: "absent — no tip verification recorded: neither passed nor failed",
+};
+
 // VIS-07 / REC-01: derived only from the run journal, telemetry, and local configuration.
 export function renderMarkdownRecord(runId: string, events: JournalEvent[], prices: ChannelCost[] = [], rows: TelemetryRow[] = []): string {
   const runStart = events.find((e) => e.event === "run-start");
@@ -173,6 +234,7 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     `- **done:** ${count("done")}`,
     `- **failed:** ${count("failed")}`,
     `- **human:** ${count("human")}`,
+    `- **verification:** ${VERIFICATION_READING[verificationOf(runId, events)]}`,
     "",
     "## Usage & efficiency",
     "",

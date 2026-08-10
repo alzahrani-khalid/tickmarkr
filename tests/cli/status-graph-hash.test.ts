@@ -1,12 +1,13 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { engagementComparable, Journal, recordedGraphDefinitionHash, type JournalEvent } from "../../src/run/journal.js";
 import { runDaemon } from "../../src/run/daemon.js";
+import { cellWidth } from "../../src/tui/cockpit/width.js";
 import { setupRepo, T, COMMIT } from "../helpers/tmprepo.js";
 
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-graph-hash-"));
@@ -38,7 +39,82 @@ const runStart = (graphDefinitionHash?: string, extra: Record<string, unknown> =
   data: { pid: process.pid, ...(graphDefinitionHash ? { graphDefinitionHash } : {}), ...extra },
 });
 
+/** One bounded watch frame at a named terminal width, on a tty, with the cockpit's writes swallowed. */
+const watchFrameAt = async (repo: string, columns: number): Promise<string> => {
+  const isTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const cols = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+  const noColor = process.env.NO_COLOR;
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+  Object.defineProperty(process.stdout, "columns", { configurable: true, value: columns });
+  delete process.env.NO_COLOR;
+  const spy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  try {
+    return await status(["--watch"], repo, { iterations: 1, sleep: async () => {} });
+  } finally {
+    spy.mockRestore();
+    if (isTTY) Object.defineProperty(process.stdout, "isTTY", isTTY);
+    else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    if (cols) Object.defineProperty(process.stdout, "columns", cols);
+    else delete (process.stdout as { columns?: number }).columns;
+    if (noColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = noColor;
+  }
+};
+
+/** Wrapping inserts whitespace and nothing else, so a squashed frame reassembles a wrapped phrase. */
+const squash = (frame: string): string =>
+  frame.replace(/\x1b\[[0-9;]*m/gu, "").replace(/\s+/gu, "");
+
 describe("OBS-52 status graph-hash join guard", () => {
+  // The board's CLAIMS, not its rendering: the same recorded verdict is a fact about THIS graph in
+  // one journal and about a graph nobody has any more in the other, and only the run-start hash
+  // separates them.
+  test("test: status --watch at 55 columns renders \"graph not comparable\" and tip state \"unavailable\" for a hash mismatch, while the identical journal with the current hash renders \"verify passed\"; keep run-end bytes fixed so a renderer that trusts the old tip or always hides it fails", async () => {
+    const g = graph(GRAPH_HASH, ["T1", "T2"]);
+    // Byte-for-byte the same recorded run, verdict included; only run-start's hash differs.
+    const tail = (): JournalEvent[] => [
+      { ts: "2026-08-07T08:00:00.000Z", event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "mid" }, attempt: 0 } },
+      { ts: "2026-08-07T08:00:01.000Z", event: "task-done", taskId: "T1", data: { attempts: 1 } },
+      { ts: "2026-08-07T08:00:02.000Z", event: "merge", taskId: "T1", data: { commit: "abc123" } },
+      { ts: "2026-08-07T08:00:03.000Z", event: "task-dispatch", taskId: "T2", data: { assignment: { adapter: "fake", model: "fake-2", channel: "sub", tier: "mid" }, attempt: 0 } },
+      { ts: "2026-08-07T08:00:04.000Z", event: "task-done", taskId: "T2", data: { attempts: 1 } },
+      { ts: "2026-08-07T08:00:05.000Z", event: "merge", taskId: "T2", data: { commit: "def456" } },
+      { ts: "2026-08-07T08:00:06.000Z", event: "run-end", data: { done: ["T1", "T2"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed" } },
+    ];
+    const start = (hash: string): JournalEvent => ({
+      ts: "2026-08-07T07:59:59.000Z",
+      event: "run-start",
+      data: { pid: process.pid, graphDefinitionHash: hash, commands: { test: "npm test" } },
+    });
+    const journalPath = (repo: string) => join(tickmarkrDir(repo), "runs", "run-verified", "journal.jsonl");
+
+    const matching = mkRepo();
+    saveGraph(matching, g);
+    seedJournal(matching, "run-verified", [start(graphDefinitionHash(g)), ...tail()]);
+    const mismatched = mkRepo();
+    saveGraph(mismatched, g);
+    seedJournal(mismatched, "run-verified", [start(OTHER_HASH), ...tail()]);
+
+    const runEndLine = (repo: string) => readFileSync(journalPath(repo), "utf8")
+      .trimEnd().split("\n").at(-1)!;
+    expect(runEndLine(mismatched)).toBe(runEndLine(matching)); // the recorded verdict is fixed
+    expect(runEndLine(matching)).toContain('"tipVerify":"passed"');
+
+    const verified = await watchFrameAt(matching, 55);
+    const stale = await watchFrameAt(mismatched, 55);
+
+    // The comparable journal states the verdict it records — a board that always hides a passed tip
+    // is indistinguishable from one that never read it.
+    expect(squash(verified)).toContain("verifypassed");
+    expect(squash(verified)).not.toContain("notcomparable");
+    // The incomparable one claims neither the task states nor the verdict, and says which.
+    expect(squash(stale)).toContain("graphnotcomparable");
+    expect(squash(stale)).toContain("verifyunavailable");
+    expect(squash(stale)).not.toContain("verifypassed");
+    for (const line of stale.split("\n")) expect(cellWidth(line), line).toBeLessThanOrEqual(55);
+    for (const line of verified.split("\n")) expect(cellWidth(line), line).toBeLessThanOrEqual(55);
+  });
+
   test("test: after a journaled graph-rehash matching the compiled graph the header renders no recompile warning and no advice to start a new run", async () => {
     const repo = mkRepo();
     const g = graph(GRAPH_HASH, ["T1"]);
@@ -59,7 +135,7 @@ describe("OBS-52 status graph-hash join guard", () => {
     ];
     for (const out of snapshots) {
       const header = out.split("\n")[0]!;
-      expect(header).not.toContain("graph recompiled");
+      expect(header).not.toContain("recompiled");
       expect(header).not.toContain("not comparable");
       expect(header).not.toContain("tickmarkr run");
     }
@@ -71,7 +147,7 @@ describe("OBS-52 status graph-hash join guard", () => {
     seedJournal(repo, "run-unaudited", [runStart(OTHER_HASH)]);
 
     const header = (await status([], repo)).split("\n")[0]!;
-    expect(header).toContain("graph recompiled since this run — task states not comparable");
+    expect(header).toContain("graph not comparable — recompiled since this run");
     expect(header).toMatch(/resum|audit/i);
     expect(header).not.toContain("tickmarkr run");
   });
@@ -213,7 +289,7 @@ describe("OBS-52 status graph-hash join guard", () => {
     ]);
     const out = await status([], repo);
     expect(out).toContain("run run-stale");
-    expect(out).toContain("graph recompiled since this run — task states not comparable");
+    expect(out).toContain("graph not comparable — recompiled since this run");
     expect(out).toContain("0/4 done");
     for (const id of ["T1", "T2", "T3", "T4"]) {
       const line = row(out, id);

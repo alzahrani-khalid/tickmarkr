@@ -667,11 +667,13 @@ describe("OBS-31 probeCwd", () => {
     cfg.tiers.fake = { vendor: "fake", channel: "sub", models: { "fake-1": "mid" } };
     const health = await probeAll([fake]);
     const cwds: string[] = [];
+    const cwdContents: string[][] = [];
     const gitMock = await import("../../src/run/git.js");
     const shMock = gitMock.sh as unknown as ReturnType<typeof vi.fn>;
     const priorImpl = shMock.getMockImplementation();
     shMock.mockImplementation(async (_cmd: string, cwd: string) => {
       cwds.push(cwd);
+      cwdContents.push(readdirSync(cwd));
       return { code: 0, stdout: "OK", stderr: "", timedOut: false };
     });
 
@@ -683,7 +685,8 @@ describe("OBS-31 probeCwd", () => {
 
     expect(cwds).toHaveLength(1);
     expect(cwds[0]).not.toBe(repo);
-    expect(readdirSync(cwds[0])).toEqual([]);
+    expect(cwdContents).toEqual([[]]);
+    expect(existsSync(cwds[0]!)).toBe(false);
   });
 
   test("default probeCwd runs model probes from the repo root", async () => {

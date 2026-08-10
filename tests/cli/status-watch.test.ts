@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
-import { validateGraph } from "../../src/graph/schema.js";
+import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 
 // Counts the journal reads one frame performs. The wrapper calls straight through, so every other
@@ -250,7 +250,7 @@ describe("status checklist rendering", () => {
     saveGraph(nonComparable, changed);
 
     const stale = await status(["--watch"], nonComparable, { iterations: 1 });
-    expect(stale).toContain("task states not comparable");
+    expect(stale).toContain("graph not comparable");
     expect(stale).toContain("0/3 done");
     expect(stale).not.toContain("1/3 done");
     expect(row(stale, "T1")).toBeUndefined();
@@ -694,7 +694,7 @@ describe("status checklist rendering", () => {
     ]);
 
     const header = (await status([], repo)).split("\n")[0]!;
-    expect(strip(header)).toContain("tip-verify: FAILED (test)");
+    expect(strip(header)).toContain("verify FAILED (test)");
     expect(strip(header)).toContain("2 fingerprints");
   });
 
@@ -711,7 +711,7 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const header = (await status(["--watch"], repo, { iterations: 1, sleep: async () => {} })).split("\n")[0]!;
-      expect(strip(header)).toContain("tip-verify: FAILED (test) → re-verifying (run attempt 2)");
+      expect(strip(header)).toContain("verify FAILED (test) → re-verifying (run attempt 2)");
       expect(strip(header)).not.toContain("3/3 done");
     });
   });
@@ -735,7 +735,7 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       for (const [repo, phase] of [[failedRepo, "FAILED (test)"], [pendingRepo, "pending"]] as const) {
         const header = (await status([], repo)).split("\n").find((line) => line.includes("run run-watch"))!;
-        expect(strip(header)).toContain(`tip-verify: ${phase}`);
+        expect(strip(header)).toContain(`verify ${phase}`);
         expect(strip(header)).toContain("3/3 tasks done · run not verified");
         expect(strip(header)).not.toContain("3/3 done");
         expect(header).not.toContain("\x1b[32m██████████");
@@ -744,7 +744,12 @@ describe("status checklist rendering", () => {
     });
   });
 
-  test("test: a run whose tip verification passed renders exactly as today", async () => {
+  // SUPERSEDES "a run whose tip verification passed renders exactly as today" (v1.77), which pinned
+  // a passed tip to render byte-identically to a run-end that recorded no verdict at all. Silence
+  // reads the same from a board that hides the verdict as from one that never had it, so the board
+  // now STATES what the record says — and these two journals, which differ in exactly that field,
+  // must no longer render the same bytes.
+  test("test: a run whose tip verification passed says so, and a run-end recording no verdict is never presented as one", async () => {
     const legacyRepo = mkRepo();
     const passedRepo = mkRepo();
     const baseEvents = [
@@ -761,11 +766,14 @@ describe("status checklist rendering", () => {
     ]);
 
     await withTty(async () => {
-      const legacy = await status([], legacyRepo, { now: () => Date.parse(ts) });
-      const passed = await status([], passedRepo, { now: () => Date.parse(ts) });
-      expect(passed).toBe(legacy);
-      expect(strip(passed)).toContain("3/3 done");
-      expect(strip(passed)).not.toContain("tip-verify:");
+      const legacy = strip(await status([], legacyRepo, { now: () => Date.parse(ts) }));
+      const passed = strip(await status([], passedRepo, { now: () => Date.parse(ts) }));
+      expect(passed).toContain("verify passed");
+      expect(legacy).toContain("verify unrecorded");
+      expect(legacy).not.toContain("verify passed");
+      // the tally and every task row still read as they did — only the verdict segment differs
+      for (const frame of [legacy, passed]) expect(frame).toContain("3/3 done");
+      expect(passed.replace("verify passed", "")).toBe(legacy.replace("verify unrecorded", ""));
     });
   });
 
@@ -806,6 +814,56 @@ describe("status checklist rendering", () => {
       expect(strip(row(first!, "T2"))).toContain("⠋ T2");
       expect(strip(row(second!, "T2"))).toContain("⠙ T2");
     });
+  });
+
+  // The daemon writes the phase word it chose (phaseForGate) and the gate itself in the same row.
+  // The gate is the fact; the phase word cannot tell an acceptance round from a review one, and the
+  // journals this board is judged on carry BOTH gates under a phase of "judge".
+  test("test: status --watch renders the journal gate field for build, acceptance and review as those exact names; use identical phase \"judge\" for acceptance and review so reading the phase word, special-casing build or testing an uncalled helper fails", async () => {
+    const repo = mkRepo();
+    const gatedGraph = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: ["T1", "T2", "T3"].map((id) => ({
+        id, title: id, goal: `Gate ${id}.`, shape: "implement" as const, complexity: 3,
+        acceptance: ["a"], gates: [...GATE_NAMES],
+      })),
+    });
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    const phaseAt = (taskId: string, phase: string, gate: string): JournalEvent => ({
+      ts: new Date(startedAt).toISOString(),
+      event: "phase-start",
+      taskId,
+      data: { phase, gate, index: 1, total: 7 },
+    });
+    seed(repo, [
+      { ts, event: "run-start", data: { pid: process.pid, graphDefinitionHash: graphDefinitionHash(gatedGraph) } },
+      dispatch("T1", "fake-1"), dispatch("T2", "fake-2"), dispatch("T3", "fake-3"),
+      phaseAt("T1", "gate:build", "build"),
+      // Both rounds under the SAME phase word — only the gate field separates them.
+      phaseAt("T2", "judge", "acceptance"),
+      phaseAt("T3", "judge", "review"),
+    ], gatedGraph);
+
+    const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    Object.defineProperty(process.stdout, "columns", { configurable: true, value: 140 });
+    try {
+      await withTty(async () => {
+        const out = strip(await status(["--watch"], repo, {
+          iterations: 1,
+          sleep: async () => {},
+          now: () => startedAt + 3_000,
+        }));
+        expect(card(out, "T1")).toContain("gate build · 3s elapsed");
+        expect(card(out, "T2")).toContain("gate acceptance · 3s elapsed");
+        expect(card(out, "T3")).toContain("gate review · 3s elapsed");
+        // The phase word the daemon happened to choose never reaches the operator's board.
+        expect(out).not.toContain("judge");
+      });
+    } finally {
+      if (columns) Object.defineProperty(process.stdout, "columns", columns);
+      else delete (process.stdout as { columns?: number }).columns;
+    }
   });
 
   test("test: a task between its phase start and that phase's outcome never renders with an idle presentation", async () => {
@@ -955,6 +1013,7 @@ describe("status checklist rendering", () => {
     const golden =
       "tickmarkr status / run run-watch / last event 10m ago / daemon pid unknown / 1/3 done\n" +
       "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
+      "  supervision: orchestrator ABSENT / overseer ABSENT / watch ABSENT\n" +
       "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
       "  [!] T2 mixed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
       "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";

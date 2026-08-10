@@ -31,10 +31,33 @@ class MalformedTrailerFake extends FakeAdapter {
 }
 
 describe("classifyWorkerResultCause (OBS-53 unit)", () => {
-  test("provider-death when output contains provider-outage signature", () => {
+  test("a successful finished worker has no failure cause despite stale timeout and provider-outage signals", () => {
+    expect(classifyWorkerResultCause({
+      output: "completed while quoting: Unable to reach the model provider",
+      ok: true, finished: true, exitCode: null,
+      summary: "completed", timedOut: true,
+    })).toBeUndefined();
+  });
+
+  test("a worker result that both timed out and carries the unparseable-trailer summary classifies as a stall timeout, and the same input classifies as a malformed trailer before the change", () => {
+    expect(classifyWorkerResultCause({
+      output: "worker killed at the stall deadline", ok: false, finished: false, exitCode: null,
+      summary: "unparseable TICKMARKR_RESULT trailer", timedOut: true,
+    })).toBe("stall-timeout");
+  });
+
+  test("a worker that did not time out and returned an unparseable trailer still classifies as a malformed trailer, so the fix does not swallow the real trailer defect", () => {
+    expect(classifyWorkerResultCause({
+      output: 'TICKMARKR_RESULT_abcd {"ok":true broken', ok: false, finished: true, exitCode: null,
+      summary: "unparseable TICKMARKR_RESULT trailer", timedOut: false,
+    })).toBe("malformed-trailer");
+  });
+
+  test("a provider outage still classifies as provider death even when the result also timed out", () => {
     expect(classifyWorkerResultCause({
       output: "committing…\nUnable to reach the model provider\n",
-      ok: false, finished: false, exitCode: null, summary: "worker produced no TICKMARKR_RESULT trailer", timedOut: false,
+      ok: false, finished: false, exitCode: null,
+      summary: "unparseable TICKMARKR_RESULT trailer", timedOut: true,
     })).toBe("provider-death");
   });
 
@@ -43,13 +66,6 @@ describe("classifyWorkerResultCause (OBS-53 unit)", () => {
       output: "still working…", ok: false, finished: false, exitCode: null,
       summary: "worker produced no TICKMARKR_RESULT trailer", timedOut: true,
     })).toBe("stall-timeout");
-  });
-
-  test("malformed-trailer when trailer token present but unparseable", () => {
-    expect(classifyWorkerResultCause({
-      output: 'TICKMARKR_RESULT_abcd {"ok":true broken', ok: false, finished: true, exitCode: null,
-      summary: "unparseable TICKMARKR_RESULT trailer", timedOut: false,
-    })).toBe("malformed-trailer");
   });
 
   test("clean-exit-no-trailer when process exits without trailer", () => {

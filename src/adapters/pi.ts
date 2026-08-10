@@ -66,6 +66,17 @@ export const pi: WorkerAdapter = {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },
   parse: parseWorkerResult,
+  // v1.89 T1 / OBS-414: pi HAS a per-directory trust prompt, and both command builders above already
+  // suppress it with --approve — a global option legal in both modes (pi --help 0.80.3), chosen for
+  // exactly this reason. Live-checked 2026-07-10 in a fresh worktree: no trust prompt reached the
+  // pane, so there is nothing captured, and a fingerprint here would be a guess about a dialog this
+  // adapter never lets render.
+  // FALSIFIER: drop --approve from interactiveCommand, dispatch into a fresh worktree, and capture
+  // the prompt that appears — then this becomes {fingerprint, key} rather than a suppression claim.
+  trustDialog: {
+    kind: "none",
+    reason: "pi 0.80.3's per-directory trust prompt is suppressed before it renders by --approve on both command builders (live-checked 2026-07-10, fresh worktree, no prompt); falsified by removing --approve and capturing the pane",
+  },
   // v1.5 MODEL-01: fail OPEN to [] (detection is advisory — unlike gates' fail-closed posture).
   // spawnSync mirrors probeVersion; 15s timeout. Live-verified 2026-07-10, pi 0.80.3.
   listModels: async () => {

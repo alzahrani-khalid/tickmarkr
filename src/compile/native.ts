@@ -94,6 +94,7 @@ export function compileNative(file: string): RunGraph {
   const drafts: Draft[] = [];
   let plainCount = 0; // v1.19: plain-string acceptance items compiled as judge oracles (compat) — warn once
   let specMode: (typeof GRAPH_ROUTING_MODES)[number] | undefined;
+  let specBase: string | undefined;
 
   for (const line of content.split("\n")) {
     const heading = line.match(HEAD_RE);
@@ -103,6 +104,18 @@ export function compileNative(file: string): RunGraph {
     }
     const draft = drafts.at(-1);
     if (!draft) {
+      const base = line.match(/^base:\s*(.*)$/);
+      if (base) {
+        const value = base[1].trim();
+        if (!value) {
+          throw new CompileError("spec front-matter base must not be empty — repair: write lower-case base: <commit-or-ref> at column zero");
+        }
+        specBase = value;
+        continue;
+      }
+      if (/^Base:\s*/.test(line)) {
+        throw new CompileError("native task unit contract rejects column-zero Base: as untyped prose — repair: write lower-case base: <commit-or-ref>");
+      }
       // v1.51 T2: spec front-matter — a top-level `mode: <name>` line before the first task heading
       // declares the engagement's routing mode (loses only to an explicit run flag).
       const fm = line.match(/^mode:\s*(\S+)\s*$/);
@@ -367,7 +380,12 @@ export function compileNative(file: string): RunGraph {
   const result = validateGraph({
     version: 1,
     ...(specMode ? { mode: specMode } : {}),
-    spec: { source: "native", paths: [file], hash: sha256(content) },
+    spec: {
+      source: "native",
+      paths: [file],
+      hash: sha256(content),
+      ...(specBase !== undefined ? { base: specBase } : {}),
+    },
     tasks,
   });
   // v1.19 read-old/write-new: a plain-string acceptance item compiles as a judge oracle. This is the
@@ -391,7 +409,7 @@ export function compileNative(file: string): RunGraph {
   // OBS-170/OBS-184: warn per unreachable context: entry, classified by the action its author must
   // take. Warn-only by operator ruling (2026-08-03) — fail-closed would have refused to compile the
   // spec that shipped green. Fails open when git cannot answer, so non-repo fixtures stay silent.
-  const repo = trackedAtHead(dirname(file));
+  const repo = tasks.some((task) => task.context.length > 0) ? trackedAtHead(dirname(file)) : undefined;
   if (repo) {
     const unreachable: string[] = [];
     for (const t of tasks) {
@@ -438,6 +456,8 @@ acceptance is required on every task (a nested list of observable outcomes).
   Spec front-matter (top-level, before the first task heading):
     mode: partner-led | risk-based | staff-led — this engagement's routing mode
           (loses only to an explicit \`run --mode\` flag)
+    base: commit-or-ref — optional declared source base; the declaration must begin at column zero
+                          (runtime enforcement happens before a run)
 
   Fields available per task:
     goal:        outcome the task must achieve (defaults to the title if omitted)
@@ -469,6 +489,10 @@ acceptance is required on every task (a nested list of observable outcomes).
   WHAT MAKES A CRITERION REAL:
     - "test:" must name a real test asserting on recorded state, journal lines, or drawn frames, and its
       title must match the criterion string verbatim. It also needs a collectable test path in files[].
+    - A "test:" oracle must name a TOP-LEVEL test case, never one nested under describe(). Vitest prefixes
+      nested cases with every suite title, while the acceptance gate builds an anchored pattern that
+      vitest -t applies against the FULL runner-visible name; the verbatim leaf title then selects ZERO
+      tests and the gate parks even though the suite is green. Measured: two parks in one run.
     - NO criterion may be satisfiable by an absence, a rename, a source-text grep, or an empty collection.
       "no file references X" is not a criterion — it passes in a repo where the feature was never built.
     - "goal:" is NEVER verification. Prose in the goal enforces nothing: every obligation needs an
@@ -480,9 +504,31 @@ acceptance is required on every task (a nested list of observable outcomes).
       correctly-shaped fix that runs SOMETIMES satisfies it. "cleanup is try/finally at all four sites"
       is satisfied by \`finally { if (cond) cleanup() }\` — the shape is present and the fix is inert in
       production. Say UNCONDITIONAL, or name the branch that may not exist.
+    - Ask of every criterion: COULD THIS BE SATISFIED BY CODE THAT NOTHING OUTSIDE THE TEST SUITE CALLS?
+      A criterion naming a CAPABILITY is satisfiable by a stub whose only caller is its own test, and the
+      judge cannot catch it — it reads the DIFF, and a stub's hunks are real. Name the PRODUCTION CALLER
+      that must exercise the capability, and the path it runs on; "X is supported" ships as dead code.
     - Enumerating one axis exhaustively is what hides the others. A spec that guards PARTIAL coverage
       site-by-site, member-by-member, can be defeated wholesale by CONDITIONAL coverage, which leaves
       every enumeration satisfied. After you enumerate, ask what a single flag would do to the whole set.
+    - A criterion that names a behaviour must name the VALUE AT WHICH IT WOULD BREAK. Every criterion is a
+      claim about a variable — a status, a width, a count, an arrival time — and if it does not say which
+      value of that variable is the hard one, THE TEST WILL CHOOSE THE EASY ONE AND BE GREEN. Measured: a
+      grace-window criterion whose tests pinned pane status to "working" when the defect needed "blocked";
+      a width criterion tested at 2-cell task ids when the schema permits 64; a fork-budget criterion
+      tested only where concurrency <= cores when config accepts every positive integer. Each was
+      satisfied exactly as written, and each shipped the defect. State six things per criterion:
+        1. the PRODUCTION ENTRY POINT and the FINAL OBSERVABLE — what a caller invokes, what a reader sees;
+        2. the AUTHORITATIVE SOURCE of each value, never a nearby re-derivation that can disagree with it;
+        3. the QUANTIFIER, or the closed subject set the claim ranges over;
+        4. the VARIABLE whose change could falsify the claim;
+        5. TWO DISCRIMINATING CASES that vary that variable — or the invariance relation, if the claim is
+           that varying it changes nothing — drawn from the FULL domain the system accepts, never a
+           convenient subrange, because the domain is chosen by whoever must satisfy the criterion;
+        6. the concrete FALSE-CLEAN case: what a passing test would look like if the mechanism were absent.
+      A criterion that cannot name (4) is a claim about nothing and its test cannot fail. If (5) has no
+      hard value anywhere in the domain, the criterion asserts a universal that may be FALSE ABOUT THE
+      WORLD — bound it or say where it stops holding, rather than demanding a value that does not exist.
 
   ORDERING AND OWNERSHIP:
     - Every path has exactly ONE owning task. Two tasks writing one file must be ORDERED by deps, or the
@@ -492,6 +538,15 @@ acceptance is required on every task (a nested list of observable outcomes).
     - Deleting or renaming a symbol is a cross-task contract. Sweep for consumers by symbol AND by what the
       mechanism DOES for them; the most dangerous consumer is a file no task owns, because nothing fixes it
       and no edge can order it.
+
+  EVIDENCE DISCIPLINE THE REVIEWERS ENFORCE (write criteria assuming these; violations are material):
+    - A result row whose shape is unknown, mixed, or internally contradictory is MALFORMED and must fail
+      closed. Recognizing one discriminator never licenses ignoring the rest of the row; malformed input
+      may never normalize to passed or any other gate-satisfying outcome.
+    - Preserve machine evidence according to the producer's protocol: never trim, discard, or change
+      delimiters before validation. Git path evidence MUST use -z and NUL parsing with bytes preserved;
+      inspect timeout, signal, and exit status before interpreting output, because a failed or timed-out
+      producer may never normalize to an empty successful result.
 
   "timeout:" IS A KILL CEILING, NOT AN ESTIMATE. Never read a sum of timeouts as a predicted duration.
 -->

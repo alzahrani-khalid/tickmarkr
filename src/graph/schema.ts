@@ -8,6 +8,7 @@ export const STATUSES = ["pending", "running", "gated", "failed", "done", "human
 export const GATE_NAMES = ["build", "test", "lint", "evidence", "scope", "acceptance", "review"] as const;
 const MANDATORY_GATES = ["build", "test", "lint", "evidence", "scope"] as const;
 export const TIERS = ["cheap", "mid", "frontier"] as const;
+export const SPEC_SOURCES = ["speckit", "gsd", "prd", "native"] as const;
 // v1.19 acceptance oracles: command (exit code), test (named test), judge (LLM, free-text rubric).
 // A plain string is the read-old/write-new compat form — semantically a judge oracle (spec §2).
 export const ORACLES = ["command", "test", "judge"] as const;
@@ -16,6 +17,7 @@ export type Shape = (typeof SHAPES)[number];
 export type TaskStatus = (typeof STATUSES)[number];
 export type GateName = (typeof GATE_NAMES)[number];
 export type Oracle = (typeof ORACLES)[number];
+export type SpecSource = (typeof SPEC_SOURCES)[number];
 
 // Typed acceptance oracle: command carries the thing to run, test the test name, judge free text.
 // text is OPTIONAL non-empty on command/test (declared prose beside the oracle; judge requires it).
@@ -108,9 +110,11 @@ export const RunGraphSchema = z
     // precedence: run flag > this > repo config > global config > default (risk-based).
     mode: z.enum(GRAPH_ROUTING_MODES).optional(),
     spec: z.object({
-      source: z.enum(["speckit", "gsd", "prd", "native", "taskmaster"]),
+      source: z.enum(SPEC_SOURCES),
       paths: z.array(z.string()),
       hash: z.string(),
+      // Q11 compile half: an author-declared ref only. Runtime Git resolution/enforcement is later.
+      base: z.string().min(1).optional(),
     }),
     tasks: z.array(TaskSchema).min(1),
   })

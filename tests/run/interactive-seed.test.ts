@@ -1,7 +1,10 @@
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { describe, expect, test } from "vitest";
+import { join } from "node:path";
+import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { kimi, KIMI_TRUST_DIALOG } from "../../src/adapters/kimi.js";
+import { KIMI_TRUST_PANE, matchesTrustDialog } from "../../src/adapters/types.js";
 import type { Assignment, InteractiveSeed, WorkerAdapter } from "../../src/adapters/types.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
@@ -135,6 +138,168 @@ function makeBannerSeedDriver(banner: string, promptFile: string, opts: { submit
 function bannerSeedAdapter(): Pick<WorkerAdapter, "interactiveSeed"> {
   return { interactiveSeed: SEED };
 }
+
+// v1.89 T19 / OBS-406 — the RECORDED kimi ordering: the workspace-trust modal renders FIRST and the
+// cold-start banner (kimi's own `readinessMatch`) only after it is answered. BOTH panes are imported
+// captures, never re-transcribed — the modal from src/adapters/types.ts (OBS-358's live pane) and
+// the banner from the committed kimi cold-start frame, which carries the Directory/Session/Model/
+// Version rows a real launch prints. Review round 8 (material): the banner here used to be a
+// three-line hand-written box with no Model row, so kimi's confirmBanner reached readiness through
+// its unknown-model fallback and the trace proved nothing about the recorded launch. The frame's
+// own `Model: K2.7 Coding` is why the assignment below is kimi-for-coding.
+const KIMI_READY_PANE = readFileSync(
+  join(import.meta.dirname, "../fixtures/kimi-editor-readiness/frame-01.txt"),
+  "utf8",
+);
+const KIMI_RECORDED_SESSION = "session_4d758ead-0dd9-475f-8ba4-bfa38741b59e";
+
+const KIMI_ASSIGNMENT: Assignment = {
+  adapter: "kimi", model: "kimi-code/kimi-for-coding", channel: "sub", tier: "frontier",
+};
+
+function makeKimiModalDriver(
+  promptFile: string, opts: { modalAfterMs?: number; model?: string } = {},
+) {
+  const model = opts.model ?? KIMI_ASSIGNMENT.model;
+  const keys: string[] = [];
+  const log: string[] = [];
+  const slot: Slot = { id: "p1", name: "kimi-modal", cwd: "/tmp" };
+  const seedCmd = kimi.interactiveSeed!.seedLine(promptFile);
+  let pane = "";
+  // A modal is not always painted by the time the launch command returns: a cold CLI can spend a
+  // minute on startup before it raises the gate. `modalAfterMs` is how long after launch this pane
+  // renders it — 0 (the default) is the immediate case, and every read/wait re-checks the clock.
+  let modalAt = Infinity;
+
+  const settle = () => {
+    if (Date.now() >= modalAt) {
+      pane = KIMI_TRUST_PANE;
+      modalAt = Infinity;
+      log.push("modal");
+    }
+  };
+  const toReady = () => {
+    pane = KIMI_READY_PANE;
+    log.push("ready");
+  };
+  const driver = {
+    run: async (_s: Slot, cmd: string) => {
+      log.push(`run:${cmd}`);
+      if (cmd === kimi.interactiveSeed!.launch(model)) {
+        modalAt = Date.now() + (opts.modalAfterMs ?? 0);
+        settle();
+      } else if (cmd === seedCmd) pane = `${KIMI_READY_PANE}\nworking on the task`;
+    },
+    waitOutput: async (_s: Slot, pattern: string, ms: number, o?: { regex?: boolean }) => {
+      const end = Date.now() + ms;
+      for (;;) {
+        settle();
+        if (o?.regex ? new RegExp(pattern).test(pane) : pane.includes(pattern)) return true;
+        if (Date.now() >= end) return false;
+        await new Promise((r) => setTimeout(r, Math.min(50, Math.max(1, end - Date.now()))));
+      }
+    },
+    read: async (_s: Slot, lines: number) => {
+      settle();
+      return pane.split("\n").slice(-lines).join("\n");
+    },
+    sendKey: async (_s: Slot, key: string) => {
+      keys.push(key);
+      log.push("key");
+      if (pane === KIMI_TRUST_PANE) toReady(); // the modal is what was blocking the banner
+    },
+  };
+  return { driver, slot, keys, log, seedCmd, pane: () => pane };
+}
+
+test("an adapter whose trust modal appears before its readiness banner has that modal answered during the pre-readiness seed launch, exercised over the recorded kimi modal-then-banner ordering, so a declaration the run loop consults only after the seed returns is unreachable and fails", async () => {
+  const promptFile = "/tmp/kimi-modal-prompt.md";
+
+  // ARM A — production. The launch window belongs to the seed, so the modal is answered inside it.
+  const live = makeKimiModalDriver(promptFile);
+  const answered = await runInteractiveSeed({
+    driver: live.driver, slot: live.slot, adapter: kimi,
+    assignment: KIMI_ASSIGNMENT, promptFile, taskTimeoutMinutes: 0.1,
+  });
+  expect(answered.seedFailed).toBe(false);
+  expect(answered.trustAnswered).toBe(true);
+  expect(live.keys).toEqual([KIMI_TRUST_DIALOG.key]);
+  // ORDERING is the claim, not merely the count: the key lands before the readiness banner exists
+  // and before the seed line is injected — i.e. inside the pre-readiness launch.
+  expect(live.log.indexOf("key")).toBeGreaterThan(-1);
+  expect(live.log.indexOf("key")).toBeLessThan(live.log.indexOf("ready"));
+  expect(live.log.indexOf("key")).toBeLessThan(live.log.indexOf(`run:${live.seedCmd}`));
+  // The banner the seed proceeded on is the RECORDED one, and production RECOGNIZED it: kimi's own
+  // confirmBanner maps the frame's `Model: K2.7 Coding` row to the assigned channel and lifts the
+  // launch's session id off it. The unknown-model fallback (what a banner with no Model row buys)
+  // reaches readiness too, so a green seed alone is not evidence — the confirmed status is.
+  expect(kimi.interactiveSeed!.confirmBanner!(KIMI_READY_PANE, KIMI_ASSIGNMENT.model))
+    .toMatchObject({ ok: true, status: "confirmed" });
+  expect(answered.sessionId).toBe(KIMI_RECORDED_SESSION);
+
+  // ...and that recognition is load-bearing, proven by an INSTANCE rather than asserted: the same
+  // recorded ordering with a DIFFERENT model assigned fails on the banner. The unknown fallback
+  // returns ok for every model, so this outcome is unreachable unless the recorded row was read and
+  // mapped. The trust modal is still answered exactly once on the way — the key precedes the banner.
+  const wrong = makeKimiModalDriver(promptFile, { model: "kimi-code/k3" });
+  const mismatched = await runInteractiveSeed({
+    driver: wrong.driver, slot: wrong.slot, adapter: kimi,
+    assignment: { ...KIMI_ASSIGNMENT, model: "kimi-code/k3" }, promptFile, taskTimeoutMinutes: 0.1,
+  });
+  expect(mismatched.seedFailed).toBe(true);
+  expect(mismatched.seedError).toMatch(/model mismatch: expected kimi-code\/k3, saw kimi-code\/kimi-for-coding/);
+  expect(mismatched.trustAnswered).toBe(true);
+  expect(wrong.keys).toEqual([KIMI_TRUST_DIALOG.key]);
+  expect(wrong.log.indexOf("key")).toBeLessThan(wrong.log.indexOf("ready"));
+
+  // ARM B — the control, and it is an INSTANCE of the defect rather than a description of it: the
+  // pre-T19 arrangement, where the seed has no keystroke surface at all and the declaration is
+  // consulted only after runInteractiveSeed returns. Same adapter, same recorded ordering.
+  const late = makeKimiModalDriver(promptFile);
+  const seedOnly = { run: late.driver.run, waitOutput: late.driver.waitOutput, read: late.driver.read };
+  const unreached = await runInteractiveSeed({
+    driver: seedOnly, slot: late.slot, adapter: kimi,
+    assignment: KIMI_ASSIGNMENT, promptFile, taskTimeoutMinutes: 0.02,
+  });
+  expect(unreached.seedFailed).toBe(true);
+  expect(unreached.seedError).toMatch(/readiness pattern not seen/);
+  expect(unreached.trustAnswered).toBe(false);
+  expect(late.keys).toEqual([]);
+  expect(late.log).not.toContain("ready");
+  expect(late.log).not.toContain(`run:${late.seedCmd}`);
+
+  // The declaration was correct the whole time — it is the TIMING that made it dead. Matching it
+  // here, after the seed has already failed the attempt, is exactly what the run loop would do.
+  expect(matchesTrustDialog(late.pane(), kimi.trustDialog)).toBe(true);
+  await late.driver.sendKey(late.slot, KIMI_TRUST_DIALOG.key);
+  expect(late.keys).toEqual([KIMI_TRUST_DIALOG.key]); // a key, but the seed already failed closed
+  expect(unreached.seedFailed).toBe(true);
+
+  // ARM C — the same ordering, painted LATE. "Before the readiness banner" is not "immediately":
+  // a cold CLI can spend a minute starting up before it raises the gate, and an observation window
+  // shorter than the readiness budget is a stretch of time in which a real modal is never read.
+  // Round 7 named the instance — modal at 61s of a two-minute deadline — so it is run here on a
+  // fake clock, which costs no wall time and makes the 60-second cutoff the only thing that fails.
+  vi.useFakeTimers();
+  try {
+    const slow = makeKimiModalDriver(promptFile, { modalAfterMs: 61_000 });
+    const pending = runInteractiveSeed({
+      driver: slow.driver, slot: slow.slot, adapter: kimi,
+      assignment: KIMI_ASSIGNMENT, promptFile, taskTimeoutMinutes: 2,
+    });
+    await vi.advanceTimersByTimeAsync(130_000);
+    const answeredLate = await pending;
+    expect(answeredLate.seedFailed).toBe(false);
+    expect(answeredLate.trustAnswered).toBe(true);
+    expect(slow.keys).toEqual([KIMI_TRUST_DIALOG.key]);
+    // Still the pre-readiness launch, just later in it — and still one key, not one per poll.
+    expect(slow.log.indexOf("key")).toBeGreaterThan(slow.log.indexOf("modal"));
+    expect(slow.log.indexOf("key")).toBeLessThan(slow.log.indexOf("ready"));
+    expect(slow.log.indexOf("key")).toBeLessThan(slow.log.indexOf(`run:${slow.seedCmd}`));
+  } finally {
+    vi.useRealTimers();
+  }
+}, 30_000);
 
 describe("runInteractiveSeed launch banner confirmation", () => {
   test("a launch banner naming the assigned model proceeds to seed injection unchanged", async () => {

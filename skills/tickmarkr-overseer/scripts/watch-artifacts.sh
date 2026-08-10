@@ -38,24 +38,95 @@ shift 3
 # two that happened to be in view at the time. Class, not instance.
 END=$((SECONDS + CAP))
 
-# A file is DONE when the marker appears in its last few lines. Anchored to the tail on purpose: a report
-# that merely *mentions* its own marker mid-body has not finished, and grepping the whole file would call
-# that done. This brief tells seats to end the file with the marker, so the tail is where it must be.
-done_file() {
-  [ -s "$1" ] || return 1
-  tail -5 "$1" 2>/dev/null | grep -qF -- "$MARKER"
+# A file is DONE when the marker appears in its last few lines AND the file has stopped growing.
+#
+# Anchored to the tail on purpose: a report that merely *mentions* its own marker mid-body has not
+# finished, and grepping the whole file would call that done. This brief tells seats to end the file with
+# the marker, so the tail is where it must be.
+#
+# ⚠ THE MARKER ALONE IS NOT COMPLETION, AND THIS COST A RULING. Measured 2026-08-07: a consult report was
+# recorded here at 46,365 bytes WITH its terminal marker at 13:19:03. The seat then kept working — its
+# source had moved again — and at 13:20:10 it rewrote its own summary line from `23 WEAK · 19 SOUND` to
+# `25 WEAK · 17 SOUND`, leaving the marker last. The supervising seat read the earlier version, quoted it
+# faithfully into a binding ruling, and shipped the superseded numbers. **A marker asserts "the file ends
+# with X", which a file still being REVISED satisfies perfectly** — rewrite-in-place keeps the marker
+# terminal at every instant. The failure is silent and reads exactly like a finished artifact.
+#
+# TWO THINGS ARE DONE ABOUT IT, AND ONLY ONE OF THEM IS A MECHANISM.
+#
+# 1. A stability check: the file's CONTENT HASH must be unchanged across two consecutive polls. This
+#    reduces early wakes and costs one poll interval.
+# 2. The wake line PRINTS THE HASH it fired on.
+#
+# **The stability check does NOT establish finality, and the drill proved it cannot.** A seat that pauses
+# longer than one poll interval is indistinguishable from a finished one — and in the incident above the
+# pause was 67 seconds against a 45-second poll, so *this check would not have prevented it either*. That
+# is not a tuning problem: "has stopped writing" is unknowable from the file, because the information
+# lives with the seat. Widening the window only trades one silent failure for latency and a stronger
+# false impression of coverage, which is this project's worst class.
+#
+# **So the load-bearing half is the printed hash, and it is a READER contract, not a watcher feature:**
+# re-hash the artifact when you quote it, and put that hash in whatever you write. If it differs from the
+# wake's, you are reading a superseded file. That is the discipline the supervising seat had already
+# imposed on the seat one level down — record the hash, re-check before writing — and skipped for itself.
+# Signatures are held in an INDEXED array parallel to "$@", not an associative one keyed by path:
+# `declare -A` is bash 4+, macOS ships bash 3.2, and `bash -n` accepts it happily — the failure is at
+# RUNTIME, where the arithmetic then errors, `done_file` returns 1 forever, and the watcher never wakes.
+# Caught by the drill below, not by the syntax check. A syntax check is not a positive control.
+PREV=()
+done_file() {                  # $1 = index into "$@", $2 = path
+  local i="$1" f="$2" sig
+  [ -s "$f" ] || return 1
+  tail -5 "$f" 2>/dev/null | grep -qF -- "$MARKER" || return 1
+  # CONTENT HASH, not size+mtime. The first version of this used `stat` size and mtime and the drill
+  # killed it on the incident's own shape: the correction that cost a ruling was `23 WEAK · 19 SOUND`
+  # -> `25 WEAK · 17 SOUND`, which is **byte-identical in length**, and mtime is whole seconds. A
+  # signature that cannot see an equal-length in-place edit is blind to exactly the edit this exists to
+  # catch. Hashing 48KB per poll costs nothing.
+  sig=$(shasum -a 1 "$f" 2>/dev/null | cut -d' ' -f1)
+  [ -n "$sig" ] || return 1
+  if [ "${PREV[$i]:-}" = "$sig" ]; then return 0; fi
+  PREV[$i]="$sig"              # marked but still moving — hold it one more poll
+  return 1
 }
 
 while :; do
   pending=()
   ready=()
+  i=0
   for f in "$@"; do
-    if done_file "$f"; then ready+=("$f"); else pending+=("$f"); fi
+    if done_file "$i" "$f"; then ready+=("$f"); else pending+=("$f"); fi
+    i=$((i + 1))
   done
+
+  # TKR_WAKE_ON_ANY: wake as soon as ANY artifact completes, naming what is still outstanding.
+  #
+  # Measured 2026-08-07: three consultants were watched as one set. Two produced COMPLETE 30.9KB and
+  # 22.2KB verdicts; the third sat BLOCKED on a permission prompt and never wrote a byte. The watcher
+  # stayed silent — correctly, by its own all-or-nothing contract — and two finished verdicts went unread
+  # until the operator asked. **An all-or-nothing watcher is hostage to its deadest member**, and the more
+  # seats you watch the likelier one of them is stuck. This is OBS-369 recurring through a mechanism the
+  # original fix did not cover: that fix keyed on the marker, which was right, and assumed the set
+  # completes together, which is not.
+  #
+  # Default stays all-or-nothing so existing arms are unchanged. For a fan-out of independent seats,
+  # WAKE_ON_ANY is the correct mode and the outstanding list tells you what to re-arm on.
+  if [ "${TKR_WAKE_ON_ANY:-0}" = "1" ] && [ "${#ready[@]}" -gt 0 ]; then
+    echo "WAKE: ${#ready[@]} of $# artifact(s) complete with marker '$MARKER' — ${#pending[@]} still outstanding"
+    for f in ${ready[@]+"${ready[@]}"};   do echo "  READY       $(wc -c <"$f" | tr -d ' ') bytes  sha1 $(shasum -a 1 "$f" | cut -c1-12)  $f"; done
+    for f in ${pending[@]+"${pending[@]}"}; do
+      if [ -s "$f" ]; then echo "  PARTIAL     $(wc -c <"$f" | tr -d ' ') bytes, no marker yet  $f"
+      else echo "  NOT STARTED $f  <- check whether that seat is BLOCKED; a stalled seat writes nothing"; fi
+    done
+    exit 0
+  fi
 
   if [ "${#pending[@]}" -eq 0 ]; then
     echo "WAKE: all ${#ready[@]} artifact(s) complete with marker '$MARKER'"
-    for f in ${ready[@]+"${ready[@]}"}; do echo "  READY  $(wc -c <"$f" | tr -d ' ') bytes  $f"; done
+    for f in ${ready[@]+"${ready[@]}"}; do echo "  READY  $(wc -c <"$f" | tr -d ' ') bytes  sha1 $(shasum -a 1 "$f" | cut -c1-12)  $f"; done
+    echo "  RE-HASH BEFORE YOU QUOTE IT. The marker means the file ENDS with '$MARKER', never that its"
+    echo "  author has stopped: a rewrite-in-place keeps the marker terminal at every instant. If shasum"
+    echo "  now differs from the value above, you are reading a superseded file."
     # A seat whose artifact is COMPLETE has nothing left to give: the report is the archive, the pane is
     # not. Closing here is safe precisely because the marker — not `done`, not a size — is the trigger,
     # so this can never reap a seat mid-write. Only on the COMPLETE path: on a timeout the seats are

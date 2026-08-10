@@ -1,6 +1,7 @@
+import { availableParallelism } from "node:os";
 import { describe, expect, test } from "vitest";
-import { MAX_BUF, SubprocessDriver } from "../../src/drivers/subprocess.js";
-import { DEFAULT_FORK_CAP, FORK_CAP_ENV } from "../../src/run/git.js";
+import { herdrSealShellPrefix, MAX_BUF, sealHerdrEnv, SubprocessDriver } from "../../src/drivers/subprocess.js";
+import { DEFAULT_FORK_CAP, FORK_CAP_ENV, runWithForkBudget } from "../../src/run/git.js";
 
 describe("SubprocessDriver", () => {
   test("run + waitOutput + read", async () => {
@@ -126,6 +127,32 @@ describe("SubprocessDriver", () => {
       expect((await d.read(slot, 10)).trim()).toBe("3");
     } finally {
       await d.close(slot);
+      if (before === undefined) delete process.env[FORK_CAP_ENV];
+      else process.env[FORK_CAP_ENV] = before;
+    }
+  });
+
+  // T9: both worker-environment seals read the cap the ENCLOSING run resolved. The pane form is the
+  // one herdr seeds its shells with, and herdr.ts only calls this helper — so pinning it here covers
+  // the pane path without that file having to change.
+  test("both worker env seals carry the enclosing run's derived cap, and the operator's export still wins", async () => {
+    const before = process.env[FORK_CAP_ENV];
+    delete process.env[FORK_CAP_ENV];
+    try {
+      const cores = availableParallelism();
+      const cap = String(Math.max(1, Math.floor(cores / 4)));
+      await runWithForkBudget(4, async () => {
+        expect(sealHerdrEnv(process.env)[FORK_CAP_ENV]).toBe(cap);
+        expect(herdrSealShellPrefix(process.env)).toMatch(new RegExp(`export ${FORK_CAP_ENV}='?${cap}'?;`));
+      });
+      // outside any run the standalone default stands, so the budget is scoped, not latched
+      expect(sealHerdrEnv(process.env)[FORK_CAP_ENV]).toBe(DEFAULT_FORK_CAP);
+      process.env[FORK_CAP_ENV] = "3";
+      await runWithForkBudget(4, async () => {
+        expect(sealHerdrEnv(process.env)[FORK_CAP_ENV]).toBe("3");
+        expect(herdrSealShellPrefix(process.env)).toMatch(new RegExp(`export ${FORK_CAP_ENV}='?3'?;`));
+      });
+    } finally {
       if (before === undefined) delete process.env[FORK_CAP_ENV];
       else process.env[FORK_CAP_ENV] = before;
     }

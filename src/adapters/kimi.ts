@@ -8,7 +8,7 @@ import { parseWorkerResult } from "./prompt.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { runInteractiveSeed } from "../run/interactive-seed.js";
 import { sh } from "../run/git.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type InteractiveSeed, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerResult } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type InteractiveSeed, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter, type WorkerResult } from "./types.js";
 
 // KIMI-03 → v1.58 T5: the "no harness-readable counter" block (research F-6, 2026-07-17) is
 // LIFTED for collectUsage — kimi 0.27.0 writes a wire journal per agent at
@@ -266,6 +266,35 @@ const KIMI_SEED: InteractiveSeed = {
   },
 };
 
+// v1.89 T1 / OBS-414: the dialog that cost run …215 thirty minutes. Kimi records trust PER FOLDER
+// (~/.kimi-code/workspaces.json), and tickmarkr recreates a worktree on every attempt, so every kimi
+// dispatch after the first meets a brand-new path and a brand-new prompt. Neither `-y/--yolo` (tool
+// calls) nor `--auto` (agent questions) covers it: the gate is raised before the agent loop.
+//
+// VERBATIM CAPTURES, read off live panes — never composed (v1.79 law). Each is quoted from the
+// record that holds the FULLEST transcription of it, named here so a reviewer reads the same bytes:
+//   OBS-358, pane wW:p2TB, run-20260805-121252 (.overseer/REPAIR-v186/GATE-T28-1.md — five lines;
+//   .planning/OBSERVATIONS.md abridges the same capture to its first three):
+//     Trust this folder?
+//       /Users/…/.tickmarkr/worktrees.noindex/tickmarkr-run-20260805-121252--T29
+//     ❯ Trust this folder     ← highlighted        ("← highlighted" is the observer's annotation)
+//         Enable project MCP servers. Remembered for this folder.
+//       Don't trust
+//   OBS-406, pane wW:p32A, run-20260806-121758-…214 T5:
+//     Kimi Code loads project-level MCP servers (.mcp.json, .kimi-code/mcp.json) only in trusted folders.
+//      ❯ Trust this folder      /      Don't trust
+//
+// The fingerprint carries the SELECTION CURSOR, and that is the load-bearing half: OBS-406's own
+// cursor-less watcher matched bare `Trust this folder` and produced 258 false wakes in 25 minutes —
+// every one of them a supervisor pane with the words on screen as prose. A live modal renders a
+// cursor glyph; prose never does. Enter accepts the highlighted "Trust this folder" option, and the
+// two captures above are the reason the cursor+label pair is the fingerprint rather than either
+// prompt's heading: the same gate ships two different headings.
+export const KIMI_TRUST_DIALOG: TrustDialog = {
+  fingerprint: "❯ Trust this folder",
+  key: "Enter",
+};
+
 // v1.69 T7 / v1.71 T2: thin wrapper over the daemon's generic dispatch path for kimi-only tests.
 export async function runKimiInteractiveSeed(opts: {
   driver: Pick<ExecutorDriver, "run" | "waitOutput" | "read">;
@@ -297,6 +326,14 @@ export const kimi: WorkerAdapter = {
   // v1.65 T3: every flag the command builders below hardcode (-S is resumeCommand's) — verified in
   // `kimi --help` 2026-07-22.
   hardcodedFlags: { binary: "kimi", flags: ["-p", "--model", "--output-format", "-S"] },
+  // KNOWN GAP, stated rather than implied: this declaration is consumed by the daemon's trust loop,
+  // which is entered only AFTER runInteractiveSeed returns — and that seed waits for
+  // `readinessMatch` for the whole task timeout, which is exactly the window this prompt blocks in
+  // (run …215). So on a kimi startup pane the declaration is correct and still unreached: the seed
+  // reports `readiness pattern not seen` with zero keypresses. Answering it during the readiness
+  // wait is a change to src/run/interactive-seed.ts — WHEN and HOW OFTEN a declaration is answered
+  // is T19's half of this contract, and src/run may not appear in this task's diff.
+  trustDialog: KIMI_TRUST_DIALOG,
   // KIMI-02 headless. -p prompt mode + explicit model, NO permission flag: kimi 0.26.0 rejects
   // -p combined with -y/--auto at argument parse time ("Cannot combine --prompt with --yolo",
   // OBS-67 — doctor probes all failed on it), and prompt mode is already non-interactive with

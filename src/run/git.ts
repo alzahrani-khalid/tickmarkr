@@ -1,5 +1,7 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import { join, resolve } from "node:path";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
@@ -14,6 +16,42 @@ export { ROUTING_ENV_SEAMS };
 export const FORK_CAP_ENV = "VITEST_MAX_FORKS";
 export const DEFAULT_FORK_CAP = "6";
 
+/**
+ * The fork budget belongs to ONE run: how many gate suites can be in flight at once is exactly that
+ * run's resolved concurrency, so the per-suite cap must divide the machine by THAT number and no
+ * other. Two things rule out a module-level variable. A single Node process holds more than one
+ * runDaemon call — the suites do it, and so does a supervisor driving two repositories — so a
+ * captured-once global hands whichever run started first its cap to every other run, and only a
+ * reset seam production never calls could hide it. And re-deriving the number at spawn time reads
+ * whatever `process.argv` or the config overlay says NOW, not what the run resolved: `parseArgs`
+ * settles `--concurrency 2 --concurrency 8` on the LAST occurrence, and an overlay is a mutable
+ * file, so a re-derived cap can disagree with the concurrency the run is actually enforcing.
+ *
+ * AsyncLocalStorage is the stdlib answer to both. The store is entered once, around the run body,
+ * from the single value `runDaemon` resolved; every shell that run spawns — baseline capture, gate
+ * batteries, tip verify, worker environments — inherits it through the async context, and a
+ * concurrent run's shells inherit their own. There is nothing to reset: leaving the run leaves
+ * the store, so sequential runs cannot inherit each other either.
+ */
+const forkBudget = new AsyncLocalStorage<string>();
+
+/**
+ * cap = max(1, floor(cores / concurrency)). Total test parallelism is then cap × concurrency, which
+ * never exceeds max(cores, concurrency): at or below the core count the floor keeps the product
+ * under `cores`, and above it the floor is 0 so the minimum of 1 pins the product to `concurrency`
+ * itself. (The tempting `cap × concurrency ≤ cores` is unsatisfiable once concurrency > cores —
+ * a run cannot give a suite less than one fork.)
+ */
+export const deriveForkCap = (concurrency: number, cores: number = availableParallelism()): number =>
+  Math.max(1, Math.floor(cores / Math.max(1, concurrency)));
+
+/** Run `fn` with the fork budget this run's resolved concurrency implies. */
+export const runWithForkBudget = <T>(concurrency: number, fn: () => Promise<T>): Promise<T> =>
+  forkBudget.run(String(deriveForkCap(concurrency)), fn);
+
+/** The cap owned by the run on this async context; the standalone default outside one. */
+export const resolvedForkCap = (): string => forkBudget.getStore() ?? DEFAULT_FORK_CAP;
+
 export interface ShResult { code: number; stdout: string; stderr: string; timedOut?: boolean }
 
 // stdin "ignore": same class as HARD-05 / SubprocessDriver — never leave an open pipe a child can block on
@@ -25,8 +63,8 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   // children are hermetic by construction; the daemon's own process.env stays unchanged.
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
-  // OBS-110: apply the default fork cap only when the operator has not already set one.
-  if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = DEFAULT_FORK_CAP;
+  // OBS-110: apply the run's own fork cap only when the operator has not already set one.
+  if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = resolvedForkCap();
   return new Promise((resolve) => {
     // detached: bash gets its own process group so a timeout can kill the whole tree —
     // SIGKILLing bash alone orphans grandchildren (codex/pi) that hold the stdio pipes
@@ -231,6 +269,105 @@ export function linkNodeModules(repo: string, dir: string, { force = false } = {
 // worker from spending an attempt on environment repair.
 export const WORKTREE_LAYOUT_CONTRACT = `## Worktree layout contract (harness-provisioned — do not modify)
 - node_modules is a symlink into the main repo's node_modules, provisioned by tickmarkr. Never commit, delete, or replace it — the harness re-asserts this link before gates run, so modifying it cannot help and may fail your attempt.`;
+
+/** A declared patch this probe could not find in the target's history, with the paths it touched. */
+export interface MissingDeclaredPatch { commit: string; paths: string[]; merge: boolean }
+
+/**
+ * `contained` — every declared patch is in the target, by ancestry or by patch identity.
+ * `drifted`   — at least one declared patch is missing (or is an unproven merge); each is named.
+ * `unresolvable` — git could not answer; the raw git output is kept so the caller reports evidence,
+ * not a guess. Only `contained` is a clean verdict: the other two never let a caller assume one.
+ */
+export type BaseContainment =
+  | { result: "contained"; via: "ancestry" | "patch-id" }
+  | { result: "drifted"; missing: MissingDeclaredPatch[] }
+  | { result: "unresolvable"; ref: string; evidence: string };
+
+// First-parent name-only diff: works for ordinary commits, merges (--diff-merges=first-parent, which
+// a bare -m would widen to every parent's diff) and the root commit (--root), so one command names
+// the paths of every commit shape this probe can report. The raw result is returned, never a path
+// list: a failed diff-tree produced NO paths, and folding that into an empty array would ship a
+// drifted verdict whose "touched nothing" evidence git never said — an empty list is only an answer
+// after a successful command, so the caller turns a failure into unresolvable with git's own words.
+const touchedPaths = (cwd: string, sha: string): Promise<ShResult> =>
+  shGit(`git diff-tree --no-commit-id --name-only -z -r --root --diff-merges=first-parent ${shq(sha)}`, cwd);
+
+/**
+ * Is the declared base contained in `targetRef`'s history? Pure git evidence — no journal, no daemon
+ * state, no worker claim. Ancestry answers it outright; a recreated branch carries the same patches
+ * under new commit identities, which `git cherry` settles by patch-id.
+ *
+ * The trap this probe exists to refuse: `git cherry` (like `git log -p | git patch-id`) SKIPS merge
+ * commits, so a declared tip whose unique commits are all merges produces an EMPTY patch stream, and
+ * "no missing patches" reads exactly like "contained". So the verdict is NOT read off that stream.
+ * The commits are enumerated from `git rev-list --parents`, which sees merges, and patch identity
+ * only ever SUBTRACTS from that list: every unique commit is drift until something proves it, and
+ * for a merge the only direct proof git offers is reachability from the target — which would have
+ * kept it out of the range to begin with. The `!merge` guard below keeps that fail-closed even if a
+ * future `git cherry` ever emitted a `-` line for a merge.
+ */
+export async function declaredBaseContainment(
+  cwd: string,
+  declaredRef: string,
+  targetRef = "HEAD",
+): Promise<BaseContainment> {
+  for (const ref of [declaredRef, targetRef]) {
+    const r = await shGit(`git rev-parse --verify ${shq(`${ref}^{commit}`)}`, cwd);
+    if (r.code !== 0) return { result: "unresolvable", ref, evidence: (r.stderr || r.stdout).trim() };
+  }
+  const ancestor = await shGit(`git merge-base --is-ancestor ${shq(declaredRef)} ${shq(targetRef)}`, cwd);
+  if (ancestor.timedOut) {
+    const detail = (ancestor.stderr || ancestor.stdout).trim();
+    return {
+      result: "unresolvable",
+      ref: declaredRef,
+      evidence: `git merge-base --is-ancestor timed out${detail ? `: ${detail}` : ""}`,
+    };
+  }
+  if (ancestor.code === 0) return { result: "contained", via: "ancestry" };
+  // 1 is the honest "not an ancestor"; anything else is git failing to answer, never a clean read.
+  if (ancestor.code !== 1) {
+    return { result: "unresolvable", ref: declaredRef, evidence: (ancestor.stderr || ancestor.stdout).trim() };
+  }
+  // Ancestry above is a POSITIVE proof and survives a truncated history; everything below reads
+  // history as if it were complete, and a shallow clone is exactly the history that is not. Its
+  // graft makes the boundary commit parentless, so `rev-list` stops there and `git cherry` offers
+  // the boundary's whole tree as ONE synthetic patch — which a single squashed commit on the target
+  // matches, hiding every truncated declared patch behind it (a depth-1 clone reports one matched
+  // patch where the complete repository reports three missing ones). The same truncation on the
+  // target side invents drift just as easily, so neither verdict is available: the repository does
+  // not hold the evidence, and saying so is the only honest read.
+  const shallow = await shGit("git rev-parse --is-shallow-repository", cwd);
+  if (shallow.code !== 0 || shallow.stdout.trim() !== "false") {
+    const said = (shallow.stdout || shallow.stderr).trim();
+    return { result: "unresolvable", ref: declaredRef, evidence: `git rev-parse --is-shallow-repository: ${said}` };
+  }
+  const range = `${shq(targetRef)}..${shq(declaredRef)}`;
+  const listed = await shGit(`git rev-list --parents ${range}`, cwd);
+  if (listed.code !== 0) {
+    return { result: "unresolvable", ref: declaredRef, evidence: (listed.stderr || listed.stdout).trim() };
+  }
+  const cherry = await shGit(`git cherry ${shq(targetRef)} ${shq(declaredRef)}`, cwd);
+  if (cherry.code !== 0) {
+    return { result: "unresolvable", ref: declaredRef, evidence: (cherry.stderr || cherry.stdout).trim() };
+  }
+  const proven = new Set(
+    cherry.stdout.split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2).trim()),
+  );
+  const missing: MissingDeclaredPatch[] = [];
+  for (const line of listed.stdout.split("\n").filter((l) => l.trim())) {
+    const [sha, ...parents] = line.trim().split(/\s+/);
+    const merge = parents.length > 1;
+    if (!merge && proven.has(sha!)) continue;
+    const paths = await touchedPaths(cwd, sha!);
+    if (paths.code !== 0) {
+      return { result: "unresolvable", ref: sha!, evidence: (paths.stderr || paths.stdout).trim() };
+    }
+    missing.push({ commit: sha!, paths: paths.stdout.split("\0").filter((path) => path.length > 0), merge });
+  }
+  return missing.length > 0 ? { result: "drifted", missing } : { result: "contained", via: "patch-id" };
+}
 
 export async function removeWorktree(repo: string, dir: string): Promise<void> {
   await shGit(`git worktree remove --force ${shq(dir)}`, repo); // best-effort; stale dirs are re-added with -B

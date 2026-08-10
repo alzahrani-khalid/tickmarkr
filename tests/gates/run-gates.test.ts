@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -10,12 +10,12 @@ import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
-import { captureBaseline } from "../../src/gates/baseline.js";
+import { captureBaseline, type Baseline } from "../../src/gates/baseline.js";
 import { extractPromptNonce } from "../../src/gates/llm.js";
 import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import type { GateResult } from "../../src/gates/types.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
-import { validateGraph } from "../../src/graph/schema.js";
+import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import {
   NUDGEABLE_ADAPTERS, resetHarvestSilentMsForTests, resetNudgeTimingForTests, runDaemon,
   setHarvestSilentMsForTests, setNudgeTimingForTests, verifyIntegrationTipCached, WORKER_NUDGE_MESSAGE,
@@ -218,7 +218,13 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
   // The other half of the screen: it is a screen, not a reordering. A green one must leave the round
   // exactly as it found it — one journaled verdict per gate, in GATE_NAMES order, and one battery.
   test("a green screen journals each gate once, in canonical order, and buys the battery once", async () => {
-    const repo = makeRepo({ "src/a.ts": "export const a = 1;\n", "witness.sh": "echo \"$1\" >> battery.log\n" });
+    const repo = makeRepo({
+      "src/a.ts": "export const a = 1;\n",
+      "witness.sh": "echo \"$1\" >> battery.log\n",
+      // v1.87 T5: the witness's own log is a build artifact — declared as one, or the battery is
+      // (correctly) refused for leaving uncommitted work behind.
+      ".gitignore": "battery.log\n",
+    });
     const baseRef = await gitHead(repo);
     writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
     commitAll(repo, "in-scope-work");
@@ -262,6 +268,265 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
     expect(readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n")).toEqual(["build"]);
     expect(results.some((r) => r.gate === "lint")).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------------------------
+// v1.87 T5: the shell gates command the WORKING TREE while evidence, scope and the merge read
+// COMMITS. One fixture, one bit different: the battery is a witness — each command appends its own
+// name the moment it runs — so "no command ran" is proven by the absence of the log rather than by
+// a claim about ordering, and the same fixture with a clean tree runs all three.
+// ---------------------------------------------------------------------------------------------
+let t5RepoTemplate: string | undefined;
+
+function makeT5Repo(): string {
+  t5RepoTemplate ??= makeRepo({
+    "src/a.ts": "export const a = 1;\n",
+    "tracked.txt": "before\n",
+    "README.md": "r\n",
+    "witness.sh": "echo \"$1\" >> battery.log\n",
+    ".gitignore": "battery.log\n",
+  });
+  const repo = makeTestTempDir("tickmarkr-t5-repo-");
+  cpSync(t5RepoTemplate, repo, { recursive: true });
+  return repo;
+}
+
+async function witnessRound(uncommitted: Record<string, string>): Promise<{
+  results: GateResult[];
+  journaled: string[];
+  stream: string[];
+  battery: string[];
+}> {
+  const repo = makeT5Repo();
+  const baseRef = await gitHead(repo);
+  writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
+  commitAll(repo, "committed-work");
+  const commands = { build: "sh witness.sh build", test: "sh witness.sh test", lint: "sh witness.sh lint" };
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.judge.adapter = "fake";
+  const baseline = greenBaseline(commands);
+  const log = join(repo, "battery.log");
+  rmSync(log, { force: true }); // …the round under test starts from a clean witness
+
+  for (const [rel, body] of Object.entries(uncommitted)) writeFileSync(join(repo, rel), body);
+
+  const journaled: string[] = [];
+  const stream: string[] = [];
+  const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
+    worktree: repo, baseRef, author,
+    result: { ok: true, summary: "", deviations: [], raw: "" },
+    commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+    onGate: (e) => {
+      stream.push(`${e.gate}:${e.phase}`);
+      if (e.phase === "end") journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`);
+    },
+  });
+  return {
+    results,
+    journaled,
+    stream,
+    battery: existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [],
+  };
+}
+
+// These fixtures exercise the gate run, not baseline capture. A known-green baseline is sufficient
+// and avoids nine redundant shell processes contending with the suite's CPU-heavy rendering tests.
+function greenBaseline(commands: Record<string, string>): Baseline {
+  return {
+    commands: Object.fromEntries(Object.keys(commands).map((name) => [
+      name,
+      { exitCode: 0, fingerprints: [] },
+    ])),
+  };
+}
+
+describe("v1.87 T5 — a dirty worktree is not gatable (the runtime refuses what it cannot judge)", () => {
+  test("test: a worktree carrying uncommitted changes is refused before any shell gate command runs, and the refusal is recorded as a gate failure naming the dirty tree", async () => {
+    const { results, journaled, battery } = await witnessRound({
+      "src/a.ts": "export const a = 3; // edited, never committed\n", // tracked, modified
+      "src/stray.ts": "export const stray = true;\n", // untracked, and just as gate-visible
+    });
+
+    expect(battery).toEqual([]); // not one shell gate command ran
+    const refusal = results.find((r) => r.gate === "build")!;
+    expect(refusal.pass).toBe(false);
+    expect(refusal.meta?.dirtyWorktree).toBe(true);
+    // the refusal NAMES the dirty tree — both shapes of uncommitted work, in git's own porcelain
+    expect(refusal.details).toMatch(/refusing to gate a dirty worktree/);
+    expect(refusal.details).toMatch(/^\s*M\s+src\/a\.ts$/m);
+    expect(refusal.details).toMatch(/^\?\?\s+src\/stray\.ts$/m);
+    // and it is the round's verdict: journaled as a gate failure, nothing after it, no merge
+    expect(journaled).toEqual(["build:fail"]);
+    expect(results.map((r) => r.gate)).toEqual(["build"]);
+    expect(results.every((r) => r.pass)).toBe(false);
+  }, 30_000);
+
+  test("test: a clean worktree runs the shell gates unchanged, proving the refusal is scoped to the dirty case and not a blanket block", async () => {
+    const { results, journaled, stream, battery } = await witnessRound({}); // the same fixture, committed
+
+    expect(battery).toEqual(["build", "test", "lint"]); // every command really ran, in order
+    expect(journaled).toEqual(DETERMINISTIC.map((g) => `${g}:pass`));
+    expect(stream).toEqual(DETERMINISTIC.flatMap((g) => [`${g}:start`, `${g}:end`]));
+    expect(results.map((r) => r.gate)).toEqual(DETERMINISTIC);
+    expect(results.every((r) => r.pass)).toBe(true);
+    expect(results.some((r) => r.meta?.dirtyWorktree === true)).toBe(false);
+  }, 30_000);
+
+  // The other half of the refusal, and the one a once-before-the-battery check cannot make: the tree
+  // is clean when the battery starts and a green command dirties it. Everything after that command —
+  // the next shell gate especially — would be judging bytes HEAD does not hold.
+  test("a shell gate command that leaves the tree dirty fails at THAT gate, before the next command runs", async () => {
+    const repo = makeT5Repo();
+    const baseRef = await gitHead(repo);
+    writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
+    commitAll(repo, "committed-work");
+    const witness = { build: "sh witness.sh build", test: "sh witness.sh test", lint: "sh witness.sh lint" };
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.judge.adapter = "fake";
+    const baseline = greenBaseline(witness); // clean commands: the tree is clean at round start
+    const log = join(repo, "battery.log");
+    rmSync(log, { force: true });
+
+    // build exits 0 AND rewrites a tracked file — the shortcut every "it passed" claim rests on
+    const commands = { ...witness, build: `${witness.build}; echo 'export const a = 99;' > src/a.ts` };
+    const journaled: string[] = [];
+    const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
+      worktree: repo, baseRef, author,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+      onGate: (e) => { if (e.phase === "end") journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`); },
+    });
+
+    expect(readFileSync(log, "utf8").trim().split("\n")).toEqual(["build"]); // test and lint never ran
+    const refusal = results.find((r) => r.gate === "build")!;
+    expect(refusal.pass).toBe(false);
+    expect(refusal.meta).toMatchObject({ dirtyWorktree: true, dirtiedBy: "build" });
+    expect(refusal.details).toMatch(/refusing to gate a dirty worktree/);
+    expect(refusal.details).toMatch(/^\s*M\s+src\/a\.ts$/m);
+    // the round is the refusal: no later gate judged the tree the build command left behind
+    expect(journaled).toEqual(["build:fail"]);
+    expect(results.map((r) => r.gate)).toEqual(["build"]);
+  }, 30_000);
+
+  // The hole a battery-scoped check leaves, reproduced: a task with NO build/test/lint command
+  // configured skips the battery entirely — but the acceptance gate still runs command and named-test
+  // oracles in this worktree (acceptance.ts:264,275). Guarded only around the tool commands, a dirty
+  // tree bought every one of the seven gates and merged a commit whose oracle judged uncommitted state.
+  test("a dirty tree with NO tool command configured is still refused, before an acceptance oracle can run", async () => {
+    const repo = makeT5Repo();
+    const baseRef = await gitHead(repo);
+    writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
+    commitAll(repo, "committed-work");
+    writeFileSync(join(repo, "tracked.txt"), "after — and never committed\n"); // the dirt
+
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.judge.adapter = "fake";
+    // the oracle is the witness: if it runs at all it leaves its own file behind
+    const acceptance = [{ oracle: "command", command: "echo ran > oracle-ran.log" }];
+    const fake = fakeWith({ review: { approve: true, issues: [] } }).adapter;
+    const journaled: string[] = [];
+    const { results } = await runGates(mkTask({ gates: [...GATE_NAMES], files: ["**"], acceptance }), {
+      worktree: repo, baseRef, author,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands: {}, baseline: await captureBaseline(repo, {}),
+      channels, adapters: [fake], cfg, pipeline: "v185",
+      onGate: (e) => { if (e.phase === "end") journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`); },
+    });
+
+    expect(existsSync(join(repo, "oracle-ran.log"))).toBe(false); // not one shell gate command ran
+    const refusal = results.find((r) => r.gate === "build")!;
+    expect(refusal.pass).toBe(false);
+    expect(refusal.meta?.dirtyWorktree).toBe(true);
+    expect(refusal.details).toMatch(/refusing to gate a dirty worktree/);
+    expect(refusal.details).toMatch(/^\s*M\s+tracked\.txt$/m);
+    // the round IS the refusal — no gate was satisfied, so nothing here is mergeable
+    expect(journaled).toEqual(["build:fail"]);
+    expect(results.map((r) => r.gate)).toEqual(["build"]);
+    expect(results.every((r) => r.pass)).toBe(false);
+    expect(git(repo, "status --porcelain").trim()).toBe("M tracked.txt"); // and the round changed nothing
+  }, 30_000);
+
+  // The other end of the same rule: clean when the round starts, dirty when it ends. An oracle that
+  // exits 0 having written into the worktree is caught by no check that runs before it, so the last
+  // word on cleanliness is the round's last act — the green is withdrawn rather than merged.
+  test("a merge-satisfied round that ends dirty is withdrawn on its last gate, not merged", async () => {
+    const repo = makeT5Repo();
+    const baseRef = await gitHead(repo);
+    writeFileSync(join(repo, "CHANGELOG.md"), "leaf-class work\n");
+    commitAll(repo, "committed-leaf-work"); // clean at round entry
+
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.judge.adapter = "fake";
+    const acceptance = [{ oracle: "command", command: "echo ran > oracle-ran.log" }]; // exit 0, and it writes
+    const fake = fakeWith({ review: { approve: true, issues: [] } }).adapter;
+    const journaled: string[] = [];
+    const ended: GateResult[] = [];
+    const { results } = await runGates(mkTask({ gates: [...GATE_NAMES], files: ["CHANGELOG.md"], acceptance }), {
+      worktree: repo, baseRef, author,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands: {}, baseline: await captureBaseline(repo, {}),
+      channels, adapters: [fake], cfg, pipeline: "v185",
+      onGate: (e) => {
+        if (e.phase !== "end") return;
+        journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`);
+        ended.push(e.result);
+      },
+    });
+
+    expect(existsSync(join(repo, "oracle-ran.log"))).toBe(true); // the oracle really ran, and really dirtied
+    expect(results.find((r) => r.gate === "acceptance")?.pass).toBe(true); // the judge said yes…
+    const reviewEvents = ended.filter((r) => r.gate === "review");
+    // …and the leaf-only review declined. That is still merge-satisfied (`gateSatisfied`), so a dirty
+    // round must retract it exactly as it retracts a conventional pass.
+    expect(reviewEvents[0]?.pass).toBe(false);
+    expect(reviewEvents[0]?.meta).toMatchObject({ skipped: true, policy: "judge-only" });
+    const withdrawn = results.at(-1)!;
+    expect(withdrawn.gate).toBe("review");
+    expect(withdrawn.pass).toBe(false); // …and the round still cannot merge
+    expect(withdrawn.meta).toMatchObject({ dirtyWorktree: true, dirtyAtRoundEnd: true });
+    expect(withdrawn.details).toMatch(/refusing to gate a dirty worktree/);
+    expect(withdrawn.details).toMatch(/^\?\?\s+oracle-ran\.log$/m);
+    expect(results.every((r) => r.pass || r.meta?.skipped === true)).toBe(false);
+    // the withdrawal is journaled too: the satisfied result is on the record, and so is its retraction
+    expect(journaled.at(-1)).toBe("review:fail");
+    expect(reviewEvents[1]?.meta).toMatchObject({ dirtyWorktree: true, dirtyAtRoundEnd: true });
+    expect(journaled.filter((j) => j.startsWith("review:"))).toEqual(["review:fail", "review:fail"]);
+  }, 30_000);
+});
+
+// The allowlist is bound when the round starts — not re-read per gate. `ctx.cfg` is the daemon's live
+// object; a round that re-read it could judge one attempt's diff against two different policies.
+describe("v1.87 T5 — scope.allowDeviations is bound for the round", () => {
+  test("widening cfg.scope.allowDeviations mid-round cannot reach the scope gate", async () => {
+    const repo = makeT5Repo();
+    const baseRef = await gitHead(repo);
+    writeFileSync(join(repo, "README.md"), "drive-by edit outside src/**\n");
+    commitAll(repo, "out-of-scope");
+
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.judge.adapter = "fake";
+    cfg.scope = { allowDeviations: [] };
+    const widenedAt: string[] = [];
+    // no battery commands, so the gates walk their canonical order: the widening lands between the
+    // first journaled gate and the scope gate it is trying to buy off.
+    const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["src/**"] }), {
+      worktree: repo, baseRef, author,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands: {}, baseline: await captureBaseline(repo, {}),
+      channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+      onGate: (e) => {
+        if (e.phase !== "end" || e.gate !== "build") return;
+        cfg.scope!.allowDeviations!.push("**"); // the operator's live config, widened mid-round
+        widenedAt.push(e.gate);
+      },
+    });
+
+    expect(widenedAt).toEqual(["build"]); // the widening really happened, and before scope ran
+    expect(cfg.scope.allowDeviations).toEqual(["**"]);
+    const scope = results.find((r) => r.gate === "scope")!;
+    expect(scope.pass).toBe(false); // …and the gate judged against the list the round started with
+    expect(scope.details).toContain("README.md");
+  }, 30_000);
 });
 
 // A judge and a reviewer that BLOCK on each other: the judge announces itself and waits for the
@@ -501,6 +766,9 @@ function corpusRepo(): { repo: string; baseRef: Promise<string> } {
     "tests/a.test.ts": "import { a } from \"../src/a.js\";\na();\n",
     "tests/b.test.ts": "import { old } from \"../src/old.js\";\nold();\n",
     "run.sh": "echo \"$*\" >> argv.log\nexit 0\n",
+    // v1.87 T5: the runner's own scratch is a build artifact, declared as one. Left undeclared it is
+    // uncommitted work by every reading git offers, and the battery now refuses to gate such a tree.
+    ".gitignore": "argv.log\nmiss.flag\n",
   });
   return { repo, baseRef: gitHead(repo) };
 }

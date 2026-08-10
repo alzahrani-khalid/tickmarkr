@@ -7,6 +7,14 @@ import type { TickmarkrConfig } from "../config/config.js";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, TIERS, type GateName, type TaskStatus } from "../graph/schema.js";
 import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
+import {
+  DecisionEventSchema,
+  trackJournalRows,
+  type DecisionEvent,
+  type DecisionEventWrite,
+  type JournalSourceRow,
+  type TrackedJournalRow,
+} from "./protocol.js";
 import { redactSecrets } from "./redact.js";
 
 export interface JournalEvent {
@@ -57,6 +65,14 @@ export interface ResumeState {
   upheldFeedback?: string;
 }
 
+// T15: a gate result is reusable evidence, not operator authority. The daemon may reuse only the
+// newest attempt's results and only while the task branch still carries the exact commit they name.
+// `replaySatisfiedGates()` remains the separate OBS-130 authority fold for waiving a FAILED gate.
+export interface CurrentAttemptGateReplay {
+  commit: string;
+  results: Map<GateName, boolean>;
+}
+
 // v1.71 OBS-119: run-wide channel exclusions derived from journal events — companion to
 // replayResumeState(), consumed by the daemon on resume to re-seed demotedChannels.
 export const CHANNEL_EXCLUSION_KINDS = ["dead-channel"] as const;
@@ -83,13 +99,15 @@ export const RECHECK_RELEASE = "recheck" as const;
 
 // OBS-189: review rounds are scoped to the current ENGAGEMENT — the stretch since the newest operator
 // approval for the task. A whole-journal count re-parks an upheld task before its funded attempt can
-// dispatch (measured live on run-20260726-213539), making a fresh journal the only escape.
+// dispatch (measured live on run-20260726-213539), making a fresh journal the only escape. A T15
+// replayMeasurement re-observes an interrupted round and is audit evidence, not a newly funded round.
 export function reviewRoundsSinceApproval(events: JournalEvent[], taskId: string): number {
   let rounds = 0;
   for (const e of events) {
     if (e.taskId !== taskId) continue;
     if (e.event === "task-approved") rounds = 0;
-    else if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false) rounds++;
+    else if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
+             && e.data.replayMeasurement !== true) rounds++;
   }
   return rounds;
 }
@@ -227,6 +245,17 @@ const VOLATILE_TOKENS: Array<[RegExp, string]> = [
   // An absolute path INTO the repo keeps its repo-relative tail — that tail IS identity (a defect in
   // daemon.ts is not a defect in journal.ts); only the machine/worktree prefix ahead of it is volatile.
   [/\/(?:[\w.@~+%-]+\/)*((?:src|tests|scripts|docs|fixtures|specs|schema|skills|assets)\/[\w.@~+%/-]+)/g, "<path>/$1"],
+  // v1.88 T3: a mkdtemp directory name is a chosen prefix plus six characters the RUNTIME generates,
+  // and the final-segment rule below keeps the whole name as identity — so a failure that NAMES the
+  // temp directory carried its random suffix through, two dispatches of one defect fingerprinted
+  // apart, and gate-fingerprint-cap was unreachable (v1.87 T5 re-ran six times where the cap would
+  // have parked it at two). Only the generated suffix is volatile; the chosen prefix is identity —
+  // a tickmarkr-llm- failure is not a tickmarkr-eval- one and must not spend its retry budget.
+  // Gated three ways, because a false cap bans a legitimate retry while a missed cap costs one round:
+  // on a tmp ROOT (mkdtemp writes under os.tmpdir()), on the separator that ends the chosen prefix
+  // (it is what tells us where the prefix stops), and on the suffix carrying an uppercase or a digit
+  // so an ordinary six-letter word — /tmp/tickmarkr-worker-output — stays identity.
+  [/(\/(?:private\/)?(?:tmp|var\/folders)\/(?:[\w.@~+%-]+\/)*?[\w.@~+%-]*[-_])(?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]{6}(?![\w.@~+%-])/g, "$1<tmp>"],
   // Rule: an absolute diagnostic path's machine/worktree prefix is volatile, but its named file is
   // identity. Therefore paths outside the repo-marker set keep their final segment: two machines
   // naming parse.js normalize together, while parse.js and render.js can never spend one another's
@@ -330,7 +359,8 @@ export function normalizeGateFailure(details: string): string {
 
 // Two normalized-identical failures of one gate on one task buy no more rounds (the ladder cannot fix
 // what it already re-ran verbatim). Engagement-scoped exactly like reviewRoundsSinceApproval: an
-// operator approval is a new engagement, and nothing else resets the count.
+// operator approval is a new engagement, and nothing else resets the count. Resume re-measurements
+// are excluded because the interrupted attempt already bought the result they confirm.
 export const GATE_FINGERPRINT_CAP = 2;
 
 export function identicalGateFailures(events: JournalEvent[], taskId: string, gate: string, normalized: string): number {
@@ -339,6 +369,7 @@ export function identicalGateFailures(events: JournalEvent[], taskId: string, ga
     if (e.taskId !== taskId) continue;
     if (e.event === "task-approved") n = 0;
     else if (e.event === "gate-result" && e.data.gate === gate && e.data.pass === false
+             && e.data.replayMeasurement !== true
              && typeof e.data.details === "string"
              && normalizeGateFailure(e.data.details) === normalized) n++;
   }
@@ -517,9 +548,11 @@ export function classifyWorkerResultCause(opts: {
   timedOut: boolean;
 }): WorkerResultCause | undefined {
   if (opts.ok && opts.finished) return undefined;
+  // v1.89 T7: a provider-outage signature is independent of trailer state and has its own remedy.
   if (PROVIDER_OUTAGE_RE.test(opts.output)) return "provider-death";
+  // A stall kill is distinguished by its timeout signal, before any trailer-derived result fields.
+  if (opts.timedOut) return "stall-timeout";
   if (opts.summary === "unparseable TICKMARKR_RESULT trailer") return "malformed-trailer";
-  if (!opts.finished && opts.timedOut) return "stall-timeout";
   if (!opts.finished && opts.exitCode !== null) return "clean-exit-no-trailer";
   if (!opts.finished) return "stall-timeout";
   return undefined;
@@ -723,6 +756,22 @@ function readJsonl(path: string): unknown[] {
   return out;
 }
 
+// The tracked compatibility boundary additionally retains physical source identity. Keep it separate
+// from readJsonl so the daemon's hot raw replay path pays no schema or wrapper-allocation cost.
+function readJsonlSource(path: string): JournalSourceRow[] {
+  if (!existsSync(path)) return [];
+  const out: JournalSourceRow[] = [];
+  for (const [sourceIndex, line] of readFileSync(path, "utf8").split("\n").entries()) {
+    if (!line.trim()) continue;
+    try {
+      out.push({ sourceIndex, raw: JSON.parse(line) });
+    } catch {
+      // torn trailing write after a crash — ignore; everything before it is intact
+    }
+  }
+  return out;
+}
+
 // Cross-run telemetry for Phase-12 profile derivation: the last K runs' rows, each
 // tagged with its runId (runIds are zero-padded run-UTCYYYYMMDD-HHMMSS-sequence ⇒ plain .sort() is
 // chronological, same as latestRunId). Rows are facts, not classifications — Phase 12
@@ -841,17 +890,32 @@ export class Journal {
     return join(this.dir, "journal.jsonl");
   }
 
-  append(event: string, taskId?: string, data: Record<string, unknown> = {}): void {
+  // The object overload is the T32 write boundary: all new decision writes validate as one closed
+  // union member before persistence. The tuple overload is retained solely for the current producer
+  // corpus; T38/T40 own migrating those call sites, so this task neither dual-writes nor changes their
+  // emitted bytes.
+  append(decision: DecisionEventWrite): void;
+  append(event: string, taskId?: string, data?: Record<string, unknown>): void;
+  append(
+    eventOrDecision: string | DecisionEventWrite,
+    taskId?: string,
+    data: Record<string, unknown> = {},
+  ): void {
+    const decisionRow: DecisionEvent | undefined = typeof eventOrDecision === "string"
+      ? undefined
+      : DecisionEventSchema.parse({ ...eventOrDecision, ts: new Date().toISOString() });
+    const event = decisionRow?.event ?? eventOrDecision as string;
+    const inputData = decisionRow?.data ?? data;
     const evidence = judgePersistence.getStore();
     const failed = evidence?.invocations.filter((invocation) => invocation.transcript !== undefined) ?? [];
     const persistedData = event === "judge-retry" && failed.length > 0
       ? {
-          ...data,
+          ...inputData,
           transcript: failed[0]!.transcript,
           ...(failed[1] ? { retryTranscript: failed[1].transcript } : {}),
         }
-      : data;
-    const row: JournalEvent = {
+      : inputData;
+    const row: JournalEvent = decisionRow ?? {
       ts: new Date().toISOString(), event, ...(taskId ? { taskId } : {}), data: persistedData,
     };
     // T3 secret redaction: only the persisted bytes are masked — the caller's data stays untouched in
@@ -891,6 +955,10 @@ export class Journal {
 
   read(): JournalEvent[] {
     return readJsonl(this.journalPath) as JournalEvent[];
+  }
+
+  readTracked(): TrackedJournalRow[] {
+    return trackJournalRows(this.runId, readJsonlSource(this.journalPath));
   }
 
   replayStatuses(): Map<string, TaskStatus> {
@@ -1005,6 +1073,51 @@ export class Journal {
       }
     }
     return satisfied;
+  }
+
+  // T15: replay completed measurements from the CURRENT worker attempt. A later task-dispatch starts
+  // a new attempt and erases every older result; a result naming a different commit starts a new
+  // commit-scoped set. Last result per gate wins, so a later failure retracts a pass and a later pass
+  // can replace a failure. Missing/malformed commit or gate data is inert and therefore never skipped.
+  // This fold never derives satisfaction from task-approved: failed-gate authority belongs
+  // exclusively to replaySatisfiedGates(), whose typed release-marker contract above is unchanged.
+  replayCurrentAttemptGateResults(): Map<string, CurrentAttemptGateReplay> {
+    const replay = new Map<string, CurrentAttemptGateReplay>();
+    for (const e of this.read()) {
+      if (!e.taskId) continue;
+      if (e.event === "task-dispatch") {
+        replay.delete(e.taskId);
+        continue;
+      }
+      // Releases that buy another worker deliberately end the attempt whose measurements preceded
+      // them. An untyped approval and gate-satisfied stay in their own authority semantics: neither
+      // can turn a failure into observed green here.
+      if (e.event === "task-approved"
+          && (e.data.release === ATTEMPT_CAP_RELEASE || e.data.release === RECHECK_RELEASE
+            || e.data.release === REVIEW_UPHELD_RELEASE)) {
+        replay.delete(e.taskId);
+        continue;
+      }
+      if (e.event !== "gate-result") continue;
+      if (typeof e.data.commit !== "string" || typeof e.data.gate !== "string"
+          || !(GATE_NAMES as readonly string[]).includes(e.data.gate)) {
+        replay.delete(e.taskId); // a newer unattributable verdict invalidates the older candidate
+        continue;
+      }
+      let state = replay.get(e.taskId);
+      if (!state || state.commit !== e.data.commit) {
+        state = { commit: e.data.commit, results: new Map() };
+        replay.set(e.taskId, state);
+      }
+      // A selected-test green is explicitly a screen, never the merge verdict. Only its later
+      // fullSuite replacement may survive a restart as a satisfied test gate.
+      const incompleteTest = e.data.gate === "test" && Array.isArray(e.data.selectedTests)
+        && e.data.fullSuite !== true;
+      const satisfied = !incompleteTest
+        && (e.data.pass === true || e.data.skipped === true) && e.data.infra !== true;
+      state.results.set(e.data.gate as GateName, satisfied);
+    }
+    return replay;
   }
 
   // v1.71 OBS-119: run-wide exclusion fold — same replay discipline as replayResumeState().

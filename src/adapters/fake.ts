@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type AuthHealth, type BillingChannel, type ContextUsage, type Invocation, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerResult } from "./types.js";
+import { type Assignment, type AuthHealth, type BillingChannel, type ContextUsage, type Invocation, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter, type WorkerResult } from "./types.js";
 
 export interface FakeScript {
   // a step without `result` emits no trailer — scripts stall/quota scenarios.
@@ -24,6 +24,13 @@ export interface FakeScript {
 export class FakeAdapter implements WorkerAdapter {
   id = "fake";
   vendor = "fake-a";
+  // v1.89 T1 / OBS-414: the scripted adapter runs `bash -c` — it has no TUI, so no prompt of any
+  // kind can render. Daemon tests that exercise the auto-answer seam assign a captured declaration
+  // to this field explicitly; that assignment is the falsifier for the claim made here.
+  trustDialog: TrustDialog = {
+    kind: "none",
+    reason: "the zero-token scripted adapter dispatches a bash command and renders no TUI, so no trust prompt exists to capture",
+  };
   private script: FakeScript;
   private attempts = new Map<string, number>();
 

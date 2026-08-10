@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -7,6 +7,7 @@ import type { WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
+import { harnessLine, resolveHarness } from "../../src/cli/harness.js";
 import { run } from "../../src/cli/commands/run.js";
 import { tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -672,5 +673,25 @@ describe("v1.86 T3 autoPrefer deleted — plan and doctor surfaces", () => {
       if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;
     }
+  });
+});
+
+// v1.89 T4: every other harness assertion supplies the location, which leaves the PRODUCTION default
+// untested. These pin it: with nothing supplied, plan resolves the INVOKED entrypoint (argv[1]) through
+// the shared resolver — never its own module — and the banner sits above the routing table it vouches for.
+describe("v1.89 T4 harness banner — production default", () => {
+  test("plan with no supplied location names the invoked entrypoint, not the command module it happens to live in", async () => {
+    const out = await plan([], mkRepo());
+    expect(out.split("\n")[2]).toBe(harnessLine(resolveHarness(process.argv[1]!)));
+    // the regression this guards: import.meta.url here names src/cli/commands/plan.ts (dist/…/plan.js
+    // once built), an internal module — never the harness a user actually invoked.
+    expect(out.split("\n")[2]).not.toContain(realpathSync(join(import.meta.dirname, "../../src/cli/commands/plan.ts")));
+  });
+
+  test("the harness banner precedes the routing table and leaves the mode line where it was", async () => {
+    const lines = (await plan([], mkRepo())).split("\n");
+    expect(lines[1].startsWith("mode: ")).toBe(true); // other suites index this line
+    expect(lines[2].startsWith("harness: ")).toBe(true);
+    expect(lines.findIndex((l) => l.trimStart().startsWith("T1"))).toBeGreaterThan(2);
   });
 });

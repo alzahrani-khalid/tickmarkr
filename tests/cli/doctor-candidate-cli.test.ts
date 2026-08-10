@@ -12,6 +12,7 @@ import {
   registeredAdapterBinaries,
   resolveShellBinary,
 } from "../../src/adapters/registry.js";
+import { projectCliEntries, SHIPPED_CLI_CATALOG } from "../../src/adapters/catalog.js";
 import { channelsFromConfig, type AuthHealth, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
@@ -47,44 +48,94 @@ function capabilityRows(out: string): CapabilityRow[] {
   });
 }
 
+// v1.89 T2: omp now ships a drive contract, so it is an ADAPTER here, not the advisory fixture.
+// Every guard below re-points at gemini — still a bare string in catalog.ts — so the
+// detected-not-routable class keeps a live instance rather than being retired by the change.
+const ADVISORY_FIXTURE = "gemini";
+// Native adapters declare their binary in hardcodedFlags; a catalog-driven one carries it in the
+// entry. Derive from the shipped catalog so neither kind can fall out of this fixture silently.
+const registryBinaries = (): Map<string, string> =>
+  new Map(projectCliEntries(SHIPPED_CLI_CATALOG).routable.map((entry) => [entry.id, entry.binary]));
+
 function contradictionIds(rows: CapabilityRow[]): string[] {
   const counts = new Map<string, number>();
   for (const row of rows) counts.set(row.id, (counts.get(row.id) ?? 0) + 1);
   return [...counts.entries()].filter(([, count]) => count > 1).map(([id]) => id).sort();
 }
 
+let pathPrev: string | undefined;
+let homePrev: string | undefined;
+let binDir: string;
+let adapters: WorkerAdapter[];
+
+// Shared by the describe below and the top-level enrolment test: the acceptance oracle anchors its
+// -t filter on the runner-visible FULL name (describe titles + test title), so a criterion-titled
+// test cannot live under a describe — it enters and leaves this fixture environment itself.
+const enterCandidateEnv = () => {
+  pathPrev = process.env.PATH;
+  homePrev = process.env.HOME;
+  binDir = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-bin-"));
+  process.env.PATH = fixturePath(binDir);
+  process.env.HOME = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-home-"));
+  // registry resolution intentionally uses `bash -lc`; make its isolated login PATH deterministic.
+  writeFileSync(join(process.env.HOME, ".bash_profile"), `export PATH='${process.env.PATH}'\n`);
+
+  // The fixture IS the registry. Only external probe/trust effects are replaced; membership,
+  // ids and hardcoded binary declarations remain the production allAdapters() values.
+  adapters = allAdapters();
+  for (const adapter of adapters) {
+    // A catalog-driven adapter's probe IS the contract under test (identity regex over the real
+    // banner), and probeAll cannot substitute a shell probe for it — leave it live so the fixture
+    // binary's own bytes decide installed/authed rather than a mock.
+    if (adapter.hardcodedFlags) vi.spyOn(adapter, "probe").mockResolvedValue({ installed: false, authed: false, models: [] });
+    if (adapter.listModels) vi.spyOn(adapter, "listModels").mockResolvedValue([]);
+    if (adapter.trust) vi.spyOn(adapter, "trust").mockReturnValue({ status: "trusted" });
+  }
+};
+
+const leaveCandidateEnv = () => {
+  vi.restoreAllMocks();
+  if (pathPrev !== undefined) process.env.PATH = pathPrev;
+  else delete process.env.PATH;
+  if (homePrev !== undefined) process.env.HOME = homePrev;
+  else delete process.env.HOME;
+};
+
+test("the production adapter enumeration over the shipped catalog yields omp as a routable adapter alongside the seven natives, and the doctor matrix names omp exactly once as an adapter row and in no detected-not-routable row, while another bare-string entry still renders the detected-not-routable advisory, so the guard class keeps a live instance", async () => {
+  enterCandidateEnv();
+  try {
+    // Enumeration first: allAdapters() over the SHIPPED catalog, not a fixture array.
+    expect(allAdapters({ cliEntries: SHIPPED_CLI_CATALOG }).map((adapter) => adapter.id)).toEqual([
+      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp",
+    ]);
+    expect(CANDIDATE_CLI_CATALOG).toContain(ADVISORY_FIXTURE);
+    expect(CANDIDATE_CLI_CATALOG).not.toContain("omp");
+
+    // Then the rendered matrix, with both an omp and an advisory binary present on PATH.
+    fakeBin(binDir, "omp", "#!/bin/sh\nprintf '%s\\n' 'omp/17.2.10'\n");
+    const advisoryPath = fakeBin(binDir, ADVISORY_FIXTURE, "#!/bin/sh\nexit 97\n");
+    const repo = makeRepo({ "keep.txt": "x" });
+    const out = await doctor(["--"], repo, adapters, {
+      banner: false,
+      resolveClaudeAliasIdentity: () => undefined,
+    });
+    const rows = capabilityRows(out);
+
+    expect(rows.filter((row) => row.id === "omp")).toEqual([
+      { id: "omp", value: "omp/17.2.10 (auth assumed; verified at dispatch (failover on auth/quota errors))" },
+    ]);
+    expect(rows.filter((row) => row.id === "omp" && row.value.includes("not routable"))).toEqual([]);
+    expect(rows.filter((row) => row.id === ADVISORY_FIXTURE)).toEqual([
+      { id: ADVISORY_FIXTURE, value: `detected at ${advisoryPath} (no drive contract — not routable)` },
+    ]);
+  } finally {
+    leaveCandidateEnv();
+  }
+});
+
 describe("doctor candidate-CLI truth (v1.86 T12)", () => {
-  let pathPrev: string | undefined;
-  let homePrev: string | undefined;
-  let binDir: string;
-  let adapters: WorkerAdapter[];
-
-  beforeEach(() => {
-    pathPrev = process.env.PATH;
-    homePrev = process.env.HOME;
-    binDir = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-bin-"));
-    process.env.PATH = fixturePath(binDir);
-    process.env.HOME = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-home-"));
-    // registry resolution intentionally uses `bash -lc`; make its isolated login PATH deterministic.
-    writeFileSync(join(process.env.HOME, ".bash_profile"), `export PATH='${process.env.PATH}'\n`);
-
-    // The fixture IS the registry. Only external probe/trust effects are replaced; membership,
-    // ids and hardcoded binary declarations remain the production allAdapters() values.
-    adapters = allAdapters();
-    for (const adapter of adapters) {
-      vi.spyOn(adapter, "probe").mockResolvedValue({ installed: false, authed: false, models: [] });
-      if (adapter.listModels) vi.spyOn(adapter, "listModels").mockResolvedValue([]);
-      if (adapter.trust) vi.spyOn(adapter, "trust").mockReturnValue({ status: "trusted" });
-    }
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    if (pathPrev !== undefined) process.env.PATH = pathPrev;
-    else delete process.env.PATH;
-    if (homePrev !== undefined) process.env.HOME = homePrev;
-    else delete process.env.HOME;
-  });
+  beforeEach(enterCandidateEnv);
+  afterEach(leaveCandidateEnv);
 
   test("test: no candidate-catalog name is also a registered adapter binary, proven over the binaries derived from allAdapters() rather than a hand-maintained list, and adding an adapter whose binary is in the catalog fails the guard", () => {
     const assertNoCatalogCollision = (registry: WorkerAdapter[]) => {
@@ -93,20 +144,23 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
       if (collisions.length) throw new Error(`candidate catalog collides with adapter binaries: ${collisions.join(", ")}`);
     };
 
-    expect(registeredAdapterBinaries()).toEqual(adapters.map((adapter) => adapter.hardcodedFlags?.binary).filter(Boolean));
+    expect(registeredAdapterBinaries()).toEqual(adapters.map((adapter) => registryBinaries().get(adapter.id)));
     expect(() => assertNoCatalogCollision(adapters)).not.toThrow();
 
-    const conflictingAdapter = stub("omp-adapter-fixture", "omp");
-    expect(() => assertNoCatalogCollision([...adapters, conflictingAdapter])).toThrow(/\bomp\b/);
+    const conflictingAdapter = stub(`${ADVISORY_FIXTURE}-adapter-fixture`, ADVISORY_FIXTURE);
+    expect(() => assertNoCatalogCollision([...adapters, conflictingAdapter])).toThrow(new RegExp(`\\b${ADVISORY_FIXTURE}\\b`));
   });
 
-  test("test: doctor's matrix names each installed binary exactly once with no id appearing as both an adapter row and a detected-not-routable row, proven member by member over the full registry — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture and a kimi fixture", async () => {
+  test("test: doctor's matrix names each installed binary exactly once with no id appearing as both an adapter row and a detected-not-routable row, proven member by member over the full registry — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture, a kimi fixture and an omp fixture", async () => {
     for (const adapter of adapters) {
-      const binary = adapter.hardcodedFlags?.binary;
+      const binary = registryBinaries().get(adapter.id);
       expect(binary, `${adapter.id} must declare its registry binary`).toBeTruthy();
-      fakeBin(binDir, binary!, `#!/bin/sh\nprintf '%s\\n' '${adapter.id} fixture 1.0.0'\n`);
+      // omp's banner is the recorded one: its declarative probe gates on identity `^omp/`, so an
+      // "omp fixture 1.0.0" line would land the row as an identity mismatch instead of installed.
+      const banner = adapter.id === "omp" ? "omp/17.2.10" : `${adapter.id} fixture 1.0.0`;
+      fakeBin(binDir, binary!, `#!/bin/sh\nprintf '%s\\n' '${banner}'\n`);
     }
-    const ompPath = fakeBin(binDir, "omp", "#!/bin/sh\nexit 97\n");
+    const advisoryPath = fakeBin(binDir, ADVISORY_FIXTURE, "#!/bin/sh\nexit 97\n");
 
     const repo = makeRepo({ "keep.txt": "x" });
     const out = await doctor(["--"], repo, adapters, {
@@ -128,11 +182,12 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
       "pi",
       "grok",
       "kimi",
+      "omp",
     ]);
     expect(adapterRows.map((row) => row.id).sort()).toEqual(adapters.map((adapter) => adapter.id).sort());
-    expect(advisoryRows).toEqual([{ id: "omp", value: `detected at ${ompPath} (no drive contract — not routable)` }]);
+    expect(advisoryRows).toEqual([{ id: ADVISORY_FIXTURE, value: `detected at ${advisoryPath} (no drive contract — not routable)` }]);
     const binaryClaims = [
-      ...adapters.map((adapter) => ({ id: adapter.hardcodedFlags!.binary, value: `adapter:${adapter.id}` })),
+      ...adapters.map((adapter) => ({ id: registryBinaries().get(adapter.id)!, value: `adapter:${adapter.id}` })),
       ...advisoryRows.map((row) => ({ id: row.id, value: `advisory:${row.value}` })),
     ];
     expect(contradictionIds(binaryClaims)).toEqual([]);
@@ -156,12 +211,12 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
     }
   });
 
-  test("test: an omp fixture on PATH renders one advisory detected row carrying no version string and appears in no discovered channel and no doctor.json health key", async () => {
-    const executionMarker = join(binDir, "omp-executed");
-    const ompPath = fakeBin(
+  test("test: a gemini fixture on PATH renders one advisory detected row carrying no version string and appears in no discovered channel and no doctor.json health key", async () => {
+    const executionMarker = join(binDir, `${ADVISORY_FIXTURE}-executed`);
+    const advisoryPath = fakeBin(
       binDir,
-      "omp",
-      `#!/bin/sh\nprintf executed > '${executionMarker}'\nprintf '%s\\n' 'OMP_VERSION_SENTINEL'\n`,
+      ADVISORY_FIXTURE,
+      `#!/bin/sh\nprintf executed > '${executionMarker}'\nprintf '%s\\n' 'ADVISORY_VERSION_SENTINEL'\n`,
     );
     const repo = makeRepo({ "keep.txt": "x" });
 
@@ -170,49 +225,49 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
       resolveClaudeAliasIdentity: () => undefined,
     });
     const health = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8")) as Record<string, AuthHealth>;
-    const rows = capabilityRows(out).filter((row) => row.id === "omp");
+    const rows = capabilityRows(out).filter((row) => row.id === ADVISORY_FIXTURE);
 
-    expect(rows).toEqual([{ id: "omp", value: `detected at ${ompPath} (no drive contract — not routable)` }]);
-    expect(out).not.toContain("OMP_VERSION_SENTINEL");
+    expect(rows).toEqual([{ id: ADVISORY_FIXTURE, value: `detected at ${advisoryPath} (no drive contract — not routable)` }]);
+    expect(out).not.toContain("ADVISORY_VERSION_SENTINEL");
     expect(existsSync(executionMarker)).toBe(false);
-    expect(health.omp).toBeUndefined();
-    expect(discoverChannels(DEFAULT_CONFIG, adapters, health).map((channel) => channel.adapter)).not.toContain("omp");
+    expect(health[ADVISORY_FIXTURE]).toBeUndefined();
+    expect(discoverChannels(DEFAULT_CONFIG, adapters, health).map((channel) => channel.adapter)).not.toContain(ADVISORY_FIXTURE);
   });
 
   test("test: no advisory-only target is executed, proven over the closed set of resolution paths — a catalog entry without a drive block, a shadowed binary and a symlinked binary — each resolved for presence only", () => {
-    const detectOmp = (pathEnv: string) => {
+    const detectAdvisory = (pathEnv: string) => {
       process.env.PATH = pathEnv;
       const detected = detectCandidateClis({
         cwd: binDir,
         pathEnv,
       });
-      return detected.filter((entry) => entry.binary === "omp");
+      return detected.filter((entry) => entry.binary === ADVISORY_FIXTURE);
     };
     const body = (marker: string) => `#!/bin/sh\nprintf executed >> '${marker}'\nprintf '%s\\n' 'MUST_NOT_BE_RENDERED'\n`;
 
     const catalogDir = mkdtempSync(join(tmpdir(), "tickmarkr-catalog-only-"));
     const catalogMarker = join(catalogDir, "executed");
-    const catalogPath = fakeBin(catalogDir, "omp", body(catalogMarker));
-    expect(detectOmp(fixturePath(catalogDir))).toEqual([{ binary: "omp", path: catalogPath }]);
+    const catalogPath = fakeBin(catalogDir, ADVISORY_FIXTURE, body(catalogMarker));
+    expect(detectAdvisory(fixturePath(catalogDir))).toEqual([{ binary: ADVISORY_FIXTURE, path: catalogPath }]);
     expect(existsSync(catalogMarker)).toBe(false);
 
     const shadowA = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-shadow-a-"));
     const shadowB = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-shadow-b-"));
     const shadowMarkerA = join(shadowA, "executed");
     const shadowMarkerB = join(shadowB, "executed");
-    const shadowPathA = fakeBin(shadowA, "omp", body(shadowMarkerA));
-    fakeBin(shadowB, "omp", body(shadowMarkerB));
-    expect(detectOmp(fixturePath(shadowA, shadowB))).toEqual([{ binary: "omp", path: shadowPathA }]);
+    const shadowPathA = fakeBin(shadowA, ADVISORY_FIXTURE, body(shadowMarkerA));
+    fakeBin(shadowB, ADVISORY_FIXTURE, body(shadowMarkerB));
+    expect(detectAdvisory(fixturePath(shadowA, shadowB))).toEqual([{ binary: ADVISORY_FIXTURE, path: shadowPathA }]);
     expect(existsSync(shadowMarkerA)).toBe(false);
     expect(existsSync(shadowMarkerB)).toBe(false);
 
     const targetDir = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-target-"));
     const linkDir = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-link-"));
     const symlinkMarker = join(targetDir, "executed");
-    const target = fakeBin(targetDir, "omp-target", body(symlinkMarker));
-    const link = join(linkDir, "omp");
+    const target = fakeBin(targetDir, `${ADVISORY_FIXTURE}-target`, body(symlinkMarker));
+    const link = join(linkDir, ADVISORY_FIXTURE);
     symlinkSync(target, link);
-    expect(detectOmp(fixturePath(linkDir))).toEqual([{ binary: "omp", path: link }]);
+    expect(detectAdvisory(fixturePath(linkDir))).toEqual([{ binary: ADVISORY_FIXTURE, path: link }]);
     expect(existsSync(symlinkMarker)).toBe(false);
   });
 

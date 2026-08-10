@@ -1,8 +1,8 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
-import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readlinkSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { stringify } from "yaml";
 import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
@@ -22,15 +22,16 @@ import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHa
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
-import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, runWithForkBudget, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, GATE_FINGERPRINT_CAP, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, pendingRepairFindings, phaseForGate, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, structuredFindings, upheldFeedbackByTask, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, pendingRepairFindings, phaseForGate, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
-import { acquireRunLock, releaseRunLock } from "./lock.js";
+import { acquireApprovalSerialization, acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
 import { nextChannel, route } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
 import { NUDGEABLE_ADAPTERS, PANE_READ_ROWS, StallProgressTracker, stallSnapshotBannerRows } from "./stall.js";
+import { armSupervision, type ArmedSupervision } from "./supervision.js";
 
 export interface RunOptions {
   runId?: string;
@@ -55,6 +56,11 @@ export interface RunOptions {
   // v1.54 T2: test seam — replaces process.exit in the termination reaper (the vitest process must
   // survive a synthetic signal). Production omits it and the reaper exits the process.
   exit?: (code: number) => void;
+  // T16: arm the orchestrator supervision tier for the life of the run. Defaults ON — production
+  // never sets it. `false` is the CONTROL: a run that is otherwise identical and arms nothing, so a
+  // tier that reads ARMED under a real run proves the RUNTIME armed it rather than something else
+  // in the fixture having written a beat.
+  supervise?: boolean;
 }
 
 // v1.51 T2: mode sources — run flag > spec front-matter > repo config > global config > default.
@@ -121,6 +127,43 @@ export interface RunSummary {
   blocked: string[];
   tipVerify?: "passed" | "failed";
   lastMergedTask?: string;
+  /** T14: did every approval this run accepted actually get enacted, or did the run end over one? */
+  approvalDisposition?: "complete" | "outstanding";
+  /** the accepted approvals that never reached a dispatch — named, never left to the park buckets */
+  outstandingApprovals?: string[];
+}
+
+// T14: the events that prove an approval was ENACTED — narrowly causal, never merely subsequent.
+// An ordinary approval (no release, attempt-cap, recheck, review-upheld) all buy a WORKER, so the
+// proof is a dispatch. Generic terminal events are deliberately NOT proof: an approved human-gate
+// task can fail in routing before task-dispatch, and the catch appends task-failed — treating that
+// as enactment reports "complete" over an approval that never ran (the exact silent-completion this
+// task exists to kill).
+const DISPATCH_ENACTMENT = new Set(["task-dispatch", "repair-dispatch"]);
+// The ONE approval that enacts without buying a worker: GATE_SATISFIED_RELEASE resumes from the
+// persisted task branch after the approved gate (execTask's satisfiedGate branch), whose first act
+// for the task is worktree-recreation. That event is causal for this path, not incidental.
+const GATE_SATISFIED_ENACTMENT = "worktree-recreation";
+
+/**
+ * T14: approvals the run accepted and never acted on. `approved` above is built ONCE at startup —
+ * deliberately, replay determinism depends on it — so an approval written while the daemon is live is
+ * inert for that run. Without this the run-end record stated only buckets and tipVerify, both
+ * accurate, over a milestone that was silently incomplete: run …230 ended tipVerify "passed" with two
+ * upheld approvals and zero subsequent dispatches. Scored per task on its NEWEST approval: a later
+ * approval is the live decision, and the events that answer it are the ones after it.
+ */
+export function outstandingApprovals(events: JournalEvent[]): string[] {
+  const newest = new Map<string, number>();
+  events.forEach((e, i) => { if (e.event === "task-approved" && e.taskId) newest.set(e.taskId, i); });
+  return [...newest]
+    .filter(([taskId, i]) => {
+      const noWorker = events[i]!.data.release === GATE_SATISFIED_RELEASE;
+      return !events.slice(i + 1).some((e) => e.taskId === taskId
+        && (DISPATCH_ENACTMENT.has(e.event) || (noWorker && e.event === GATE_SATISFIED_ENACTMENT)));
+    })
+    .map(([taskId]) => taskId)
+    .sort();
 }
 
 // VIS-01: one formatter, four readers (run-end journal event, run/resume CLI, run-end notify).
@@ -129,7 +172,23 @@ export function formatSummary(s: RunSummary): string {
   const tip = s.tipVerify === "failed"
     ? `\ntip verify: FAILED${s.lastMergedTask ? ` (last merged: ${s.lastMergedTask})` : ""}`
     : s.tipVerify === "passed" ? "\ntip verify: passed" : "";
-  return `done: ${s.done.length}, failed: ${s.failed.length}, human: ${s.human.length}, blocked: ${s.blocked.length}, pending: ${s.pending.length}\nintegration branch: ${s.branch}${tip}`;
+  // T14: an accepted decision this run never enacted is part of the outcome, not a footnote the
+  // operator has to reconstruct from the journal — every reader of the record gets it.
+  //
+  // The recovery command is NOT advertised over all of them (reviewer finding 3). An approval whose
+  // task then FAILED before any dispatch replays as `failed`, which plain resume leaves parked, and
+  // `--retry-failed` skips it too: classifyTaskFailure returns "infra" when no task-dispatch precedes
+  // the failure, and only kind "dispatch" is re-opened (daemon.ts, opts.retryFailed). Naming a command
+  // that cannot enact the approval is worse than naming none, so those ids are listed as what they
+  // are and the command is claimed only over the ids it actually releases.
+  const stalled = s.outstandingApprovals?.filter((id) => s.failed.includes(id)) ?? [];
+  const resumable = s.outstandingApprovals?.filter((id) => !s.failed.includes(id)) ?? [];
+  const outstanding = s.approvalDisposition === "outstanding" && s.outstandingApprovals?.length
+    ? `\napprovals outstanding: ${s.outstandingApprovals.join(", ")} — accepted, never dispatched`
+      + (resumable.length ? `; \`tickmarkr resume ${s.runId}\` enacts ${resumable.join(", ")}` : "")
+      + (stalled.length ? `; ${stalled.join(", ")} failed before any dispatch — neither resume nor \`--retry-failed\` re-dispatches that` : "")
+    : "";
+  return `done: ${s.done.length}, failed: ${s.failed.length}, human: ${s.human.length}, blocked: ${s.blocked.length}, pending: ${s.pending.length}\nintegration branch: ${s.branch}${tip}${outstanding}`;
 }
 
 const MAX_ATTEMPTS = 10; // ponytail: hard cap so a pathological ladder can never loop forever
@@ -157,7 +216,15 @@ const isOracleFailure = (g: GateResult) => g.details.startsWith("oracle failed:"
  * verdict — reads an unrun gate as a defect. `gateFailed` is the seam they now share, and the journal
  * write below is the seam every OUT-of-file fold shares.
  */
-const gateSatisfied = (g: GateResult) => g.pass || g.meta?.skipped === true;
+/**
+ * T9: `meta.infra === true` overrides BOTH clauses above. A runner that died on the machine
+ * (spawn EAGAIN, OOM) without completing a suite answered nothing about the work, so the honest
+ * report of that fact must not double as authorization to merge — and it is the merge predicate,
+ * not the gate, that has to say so: classifying the failure into infra metadata while still
+ * reporting `pass: true` is exactly how a run that never verified anything gets merged. A declared
+ * skip stays satisfied; a gate that ran and passed stays satisfied.
+ */
+export const gateSatisfied = (g: GateResult) => (g.pass || g.meta?.skipped === true) && g.meta?.infra !== true;
 const gateFailed = (g: GateResult) => !gateSatisfied(g);
 
 // v1.85 T3: the gates whose failure IS a deterministic measurement — a machine re-ran a command over a
@@ -232,13 +299,24 @@ function repairBrief(findings: string, diff: string, baseRef: string): string {
     "```",
   ].join("\n");
 }
-// v1.70 T5: request-changes review rounds a single task may draw before it parks for a human decision
-// instead of cycling. Well below MAX_ATTEMPTS so review non-convergence is caught long before the
-// global cap. ponytail: literal constant; lift to cfg.review.roundCap only if a second knob-turner appears.
-// OBS-189 (park-economics patch): 3 → 2, counted per ENGAGEMENT (since the newest operator approval,
-// reviewRoundsSinceApproval) — a park is now cheap (approve/--uphold both cost one decision, never a
-// run), so non-convergence parks earlier and an upheld task re-enters with a fresh round budget.
+// v1.70 T5: default request-changes rounds a task may draw before it parks. OBS-419 keeps this as the
+// no-ceiling behavior; an operator may narrow only the next engagement on the approval that releases it.
 const REVIEW_ROUND_CAP = 2;
+
+// OBS-419: the newest approval starts the current engagement, so it is also the sole authority for
+// that engagement's optional ceiling. Stop at the newest approval even when the field is absent: a
+// later ordinary release restores the module default instead of inheriting an older operator limit.
+function approvedReviewRoundCeiling(events: JournalEvent[], taskId: string): number | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    if (event.event !== "task-approved" || event.taskId !== taskId) continue;
+    const ceiling = event.data.reviewRoundCeiling;
+    return typeof ceiling === "number" && Number.isSafeInteger(ceiling) && ceiling > 0
+      ? ceiling
+      : undefined;
+  }
+  return undefined;
+}
 const BLOCKED_POLL_MS = 30_000; // between trailer-wait slices, check whether the pane is blocked on a prompt
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
@@ -665,23 +743,143 @@ async function commitsAheadOf(base: string, wt: string): Promise<string[]> {
   return r.stdout.trim().split("\n").filter(Boolean);
 }
 
-// T1 (R1 fast-kill): worktree delta = commits ahead of the task base OR any uncommitted change.
-// The fast-kill may only run once the ABSENCE of work has been positively established, so every
-// probe fails OPEN toward "delta": a throwing rev-parse, a non-zero `git log`, and a non-zero
-// `git status` all report delta. commitsAheadOf() is deliberately NOT reused here — it converts a
-// failed log into an empty list, which reads as "no commits" and would kill a live worker.
-async function worktreeHasDelta(wt: string, base: string): Promise<boolean> {
+// Gate reuse needs a commit-scoped token, but raw Git object ids also contain wall-clock commit
+// metadata. Two byte-identical attempts in independent repositories therefore get different ids,
+// which would make an otherwise observational daemon option change the journal. Canonicalize the
+// task's commit series from the full tree at each commit plus its stable author/message identity.
+// This still changes for content edits, reordered/squashed commits and empty commits, while remaining
+// identical for the same logical commit series reproduced in another repository.
+async function gateCommitSubject(base: string, head: string, wt: string): Promise<string> {
+  const history = await shGit(
+    `git log --reverse --format='%T%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e' ${shq(base)}..${shq(head)}`,
+    wt,
+  );
+  if (history.code !== 0) return head; // fail closed to the exact object id if canonicalization fails
+  return createHash("sha256").update(history.stdout).digest("hex");
+}
+
+type WorktreeObservation =
+  | { state: "READABLE"; signature: string }
+  | { state: "UNREADABLE" };
+
+type WorktreeComparison = "changed" | "unchanged" | "unreadable";
+
+const OBSERVE_CHUNK_BYTES = 64 * 1024;
+const OBSERVE_BUDGET_BYTES = 256 * 1024 * 1024;
+let observeBudgetBytes = OBSERVE_BUDGET_BYTES;
+
+/** Test seam — exercise the production observer's total read bound with a small real tree. */
+export function setObserveBudgetBytesForTests(bytes: number): void {
+  observeBudgetBytes = bytes;
+}
+
+export function resetObserveBudgetBytesForTests(): void {
+  observeBudgetBytes = OBSERVE_BUDGET_BYTES;
+}
+
+function isInsideWorktree(worktree: string, path: string): boolean {
+  const fromRoot = relative(worktree, path);
+  return fromRoot !== "" && fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot);
+}
+
+function observedPath(worktree: string, path: string): string {
+  const root = resolve(worktree);
+  const fullPath = resolve(root, path);
+  if (!isInsideWorktree(root, fullPath)) throw new Error(`observation path escapes worktree: ${path}`);
+  return fullPath;
+}
+
+// Worker-controlled paths are never followed. A regular file is opened with O_NOFOLLOW and
+// revalidated through its descriptor before its mode and bytes enter the signature. A symlink is
+// identified by its link text only, and a target outside the worker worktree makes the observation
+// unreadable. Every byte is charged to the one observation budget.
+function hashObservedPath(hash: Hash, worktree: string, path: string, budget: number): number {
+  const fullPath = observedPath(worktree, path);
+  let entry;
   try {
-    const head = await gitHead(wt);
-    if (head !== base) {
-      const log = await shGit(`git log --reverse --format=%H ${shq(base)}..${shq(head)}`, wt);
-      if (log.code !== 0 || log.stdout.trim().length > 0) return true;
-    }
-    const r = await shGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain", wt);
-    return r.code !== 0 || r.stdout.trim().length > 0;
-  } catch {
-    return true; // an unreadable worktree is never evidence that the worker did nothing
+    entry = lstatSync(fullPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    hash.update("missing\0");
+    return 0;
   }
+  if (entry.isSymbolicLink()) {
+    const target = readlinkSync(fullPath);
+    const targetPath = resolve(dirname(fullPath), target);
+    if (!isInsideWorktree(resolve(worktree), targetPath)) {
+      throw new Error(`symlink target escapes worktree: ${path}`);
+    }
+    const bytes = Buffer.byteLength(target);
+    if (bytes > budget) throw new Error(`observation budget spent reading ${path}`);
+    hash.update("symlink\0").update(target);
+    return bytes;
+  }
+  if (!entry.isFile() || (entry.mode & 0o444) === 0) {
+    throw new Error(`path is not a readable regular file: ${path}`);
+  }
+  const fd = openSync(fullPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`path is not a regular file: ${path}`);
+    hash.update("file\0").update(String(stat.mode & 0o777)).update("\0");
+    const buffer = Buffer.allocUnsafe(OBSERVE_CHUNK_BYTES);
+    let spent = 0;
+    for (;;) {
+      const read = readSync(fd, buffer, 0, buffer.length, null);
+      if (read <= 0) return spent;
+      spent += read;
+      if (spent > budget) throw new Error(`observation budget spent reading ${path}`);
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Git output is worker-controlled in size too. The pipe closes after one byte beyond the remaining
+// allowance; pipefail turns either a failed git probe or that truncated stream into UNREADABLE.
+async function boundedGitObservation(command: string, worktree: string, budget: number): Promise<string | undefined> {
+  if (budget < 0) return undefined;
+  const result = await shGit(`set -o pipefail; ${command} | head -c ${budget + 1}`, worktree);
+  if (result.code !== 0 || Buffer.byteLength(result.stdout) > budget) return undefined;
+  return result.stdout;
+}
+
+// The signature has four git-owned inputs: HEAD, staged blob/mode/path identity, porcelain path and
+// state, and the set of worktree paths whose bytes Git cannot supply. Those paths contribute their
+// filesystem identity, mode, symlink text, and content. A failed or over-budget leg is a third
+// state; it can never be compared as unchanged.
+async function observeWorktree(worktree: string): Promise<WorktreeObservation> {
+  let budget = observeBudgetBytes;
+  const hash = createHash("sha256");
+  let contentPaths = "";
+  for (const [label, command] of [
+    ["head", "GIT_OPTIONAL_LOCKS=0 git rev-parse HEAD"],
+    ["index", "GIT_OPTIONAL_LOCKS=0 git ls-files --stage -z"],
+    ["status", "GIT_OPTIONAL_LOCKS=0 git status --porcelain=v1 -z --untracked-files=all"],
+    ["content-paths", "GIT_OPTIONAL_LOCKS=0 git ls-files --modified --others --exclude-standard -z"],
+  ] as const) {
+    const view = await boundedGitObservation(command, worktree, budget);
+    if (view === undefined) return { state: "UNREADABLE" };
+    budget -= Buffer.byteLength(view);
+    if (label === "content-paths") contentPaths = view;
+    hash.update(label).update("\0").update(view).update("\0");
+  }
+  try {
+    for (const path of new Set(contentPaths.split("\0").filter(Boolean))) {
+      hash.update("content\0").update(path).update("\0");
+      budget -= hashObservedPath(hash, worktree, path, budget);
+      hash.update("\0");
+    }
+  } catch {
+    return { state: "UNREADABLE" };
+  }
+  return { state: "READABLE", signature: hash.digest("hex") };
+}
+
+function compareWorktrees(before: WorktreeObservation, after: WorktreeObservation): WorktreeComparison {
+  if (before.state === "UNREADABLE" || after.state === "UNREADABLE") return "unreadable";
+  return before.signature === after.signature ? "unchanged" : "changed";
 }
 
 async function cherryPickCommits(wt: string, commits: string[]): Promise<string[]> {
@@ -774,6 +972,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // subprocess, so the optional-chain open below is a no-op there). Cosmetic-only: any failure is
   // swallowed (never affects the run); the operator closes a surviving watch pane.
   const lock = acquireRunLock(repoRoot, runId);
+  // T16: the orchestrator seat IS this daemon, so this is where the tier gets armed — the writer half
+  // T3 shipped had no caller outside its own tests, which made the reader honest and useless: it read
+  // ABSENT for the entire life of every run. Armed immediately after the lock (the first instant this
+  // process owns the run) and held to the last, so the beat's span is the run's span. armSupervision
+  // never throws, so an unwritable beat can never take a run down; it is deregistered in BOTH exits
+  // below, because the signal reaper exits the process before the finally can run.
+  const supervision: ArmedSupervision | undefined =
+    opts.supervise === false ? undefined : armSupervision(repoRoot, "orchestrator");
   // v1.54 T2: declared before the try so the finally can always deregister (a throw before
   // registration leaves it undefined — the guard below covers that path).
   let onTermination: ((sig: NodeJS.Signals) => void) | undefined;
@@ -781,12 +987,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let runStarted = false;
   let taskLoopStarted = false;
   let branch = "";
+  let releaseApprovalSerialization: (() => void) | undefined;
   try {
   let graph = loadGraph(repoRoot);
   // v1.51 T2: the routing mode resolves BEFORE any routing input is built — run flag > spec front-matter
   // > repo > global > default. The resolved cfg carries mode-compiled floors; route() never sees the mode.
   const rm = resolveRunMode(repoRoot, { flag: opts.mode, spec: graph.mode, globalDir: opts.globalDir });
   const cfg = rm.cfg;
+  // T9: the run's concurrency is resolved HERE, once, and this single value is both what the
+  // dispatch loop enforces below and what the fork budget divides the machine by. Resolving it
+  // twice (or re-reading argv/the overlay at spawn time) is how a run ends up enforcing one number
+  // while its shells are sized for another. The budget wraps the whole body — baseline capture,
+  // every gate battery, tip verify and every worker environment — so no shell this run launches
+  // can predate it, and it is entered per-call so a concurrent run never inherits this one's.
+  const concurrency = opts.concurrency ?? cfg.concurrency;
+  return await runWithForkBudget(concurrency, async () => {
   // v1.51 T4: every dispatch provenance line begins with the mode and its source; when a pin won
   // the route (the final "→ " segment is a pin, not a degraded-to-auto tail) it names the mode it bypassed.
   const dispatchProvenance = (p: string): string =>
@@ -827,10 +1042,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     close: closeSlot,
     worktree: (r, b, base) => driver.worktree(r, b, base),
   };
-  // Termination (SIGINT/SIGTERM): close every live slot, reconcile owned panes against an EMPTY
+  // Termination (SIGINT/SIGTERM): record the daemon-controlled exit before closing every live slot,
+  // reconcile owned panes against an EMPTY
   // desired set (herdr panes not in memory; panesToClose spares foreign names, watch panes, and
-  // other runs' panes by construction), release the run lock, then exit. Journal-silent by design —
-  // no run-end/interrupted event, so stop-amend-resume keeps resuming. keepPanes:"forever" (the
+  // other runs' panes by construction), release the run lock, then exit. There is still no run-end,
+  // so stop-amend-resume keeps resuming; exit-cause distinguishes this deliberate stop from an
+  // observer-classified abrupt death. keepPanes:"forever" (the
   // keep-everything debug override) preserves panes but still releases the lock and exits.
   let termSignal: NodeJS.Signals | undefined;
   let abortRun: (err: Error) => void = () => {};
@@ -843,12 +1060,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     void (async () => {
       if (!reaping) {
         reaping = true;
+        try { journal?.append("exit-cause", undefined, { cause: "deliberate", signal: sig }); }
+        catch (error) {
+          console.error(`tickmarkr ${runId}: deliberate exit cause could not be journalled (${error instanceof Error ? error.message : String(error)})`);
+        }
         if (cfg.visibility.keepPanes !== "forever") {
           for (const s of liveSlots) { // closeSlot only deletes the element being visited — safe during Set iteration
             try { await closeSlot(s); } catch { /* cosmetic — reconcile is the backstop */ }
           }
           try { await driver.reconcile?.(new Set(), runId); } catch { /* cosmetic — visibility is never a gate */ }
         }
+        supervision?.disarm(); // T16: same reason as the lock — this seat stood down, it did not die
         releaseRunLock(repoRoot); // the process dies at exit() below — the finally never runs on this path
       }
       abortRun(new Error(`terminated by ${sig}`));
@@ -859,6 +1081,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   process.on("SIGTERM", onTermination);
 
   journal = opts.resume ? Journal.open(repoRoot, runId, opts.narrate) : Journal.create(repoRoot, runId, opts.narrate);
+  // Capture this before this observer appends run-resume. A prior run-end belongs to a completed
+  // lifecycle and must use the ordinary resume/redispatch rules; only an interrupted live attempt
+  // owns reusable measurements or unclean-death residue.
+  const resumeLifecycleOpen = opts.resume && !runHasEnded(journal.read());
   const branchEvent = opts.resume
     ? [...journal.read()].reverse().find((e) => (e.event === "run-start" || e.event === "run-end" || e.event === "merge") && typeof e.data.branch === "string")
     : undefined;
@@ -866,7 +1092,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   branch = recordedBranch
     ? branchEvent!.event === "merge" ? recordedBranch.slice(0, recordedBranch.lastIndexOf("--")) : recordedBranch
     : integrationBranch(cfg, runId);
-  if (lock.reclaimed) journal.append("lock-reclaimed", undefined, lock.reclaimed); // HARD-02 audit trail
+  if (lock.reclaimed) {
+    // T15: SIGKILL/the kernel/power loss cannot ask the dead daemon to append a cause. The next live
+    // observer owns that classification: a reclaimed durable lock plus an open journal lifecycle is
+    // positive residue of an unclean exit. A completed lifecycle is not mislabeled on later resume.
+    if (resumeLifecycleOpen) {
+      journal.append("exit-cause", undefined, {
+        cause: "unclean", priorPid: lock.reclaimed.pid, evidence: "reclaimed-lock-with-open-journal",
+      });
+    }
+    journal.append("lock-reclaimed", undefined, lock.reclaimed); // HARD-02 audit trail
+  }
   // GATE-08 (v1.12): the humanGate guard consults this run's journaled approvals, not just the compiled
   // flag. Built ONCE at startup from the journal; a fresh run's journal is empty ⇒ empty set ⇒ unapproved
   // gates park exactly as today. (D-02 step 3 — the load-bearing change: a command + event WITHOUT this
@@ -882,6 +1118,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // equivalence to the router.ts:194 profile⇒undefined pattern: no map entry ⇒ today's literal.
   const resume = opts.resume ? journal.replayResumeState() : new Map<string, ResumeState>();
   const satisfiedGates = opts.resume ? journal.replaySatisfiedGates() : new Map<string, GateName>();
+  const replayedGateResults = resumeLifecycleOpen
+    ? journal.replayCurrentAttemptGateResults()
+    : new Map<string, CurrentAttemptGateReplay>();
   const replayedExclusions = opts.resume ? journal.replayExcludedChannels() : new Set<string>();
   if (opts.resume) {
     // v1.53 T5: a superseded run is dead — resuming it beside its successor is the exact
@@ -965,7 +1204,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   }
 
   const intWt = await ensureIntegration(repoRoot, branch, baseRef);
-  const concurrency = opts.concurrency ?? cfg.concurrency;
 
   // v1.1 visibility: role-named slots; panes persist per keepPanes (attempt = v1 close-after-harvest)
   const keepOpen = cfg.visibility.keepPanes !== "attempt";
@@ -1121,6 +1359,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // structured — class + canonical path + stable symbol — so a retry, a consult or an auto-uphold
     // decision reads identity instead of re-parsing prose, and line-number churn is not a new finding.
     // One helper, both onGate sites (satisfied-gate resume + main attempt loop).
+    let gateSubject: { commit: string; attempt: number; replayMeasurement?: true } | undefined;
     const journalGateResult = (g: GateResult) => {
       const blocking = gateFailed(g) && (g.gate === "review" || g.gate === "acceptance");
       // R3 (OBS-186): a gate that DECLINED has no verdict to state, and this row is the ONE seam every
@@ -1137,7 +1376,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const unverdicted = g.meta?.skipped === true && !g.pass;
       journal.append("gate-result", t.id, {
         gate: g.gate, ...(unverdicted ? {} : { pass: g.pass }), details: g.details,
+        ...(gateSubject ? { commit: gateSubject.commit, attempt: gateSubject.attempt } : {}),
+        ...(gateSubject?.replayMeasurement ? { replayMeasurement: true } : {}),
         ...(g.meta?.skipped === true ? { skipped: true } : {}),
+        // T9: an infra-only exit is journaled AS one. The operator reading a red `test` row has to
+        // be able to tell "the suite found a defect" from "the runner never ran", and the merge
+        // predicate's reason for refusing has to be legible in the ledger it refused from.
+        ...(g.meta?.infra === true ? { infra: true } : {}),
         // R3 (OBS-186): a declined review is journal truth, not an absence. `skipped: true` alone
         // says a gate did not run; these say WHICH policy declined it and WHY, so a reader of the
         // ledger never has to infer participation from a details string. The green-skip branch that
@@ -1311,20 +1556,35 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       return false;
     };
 
-    // OBS-130: an operator-approved gate-fail resumes from the persisted task branch, after the exact
-    // satisfied gate. No worker dispatch and no earlier gate/judge invocation occur on this path.
-    // replaySatisfiedGates() admits only an explicit task-approved ledger event, scoped by task+gate.
+    // OBS-130/T15: both gate-resume paths consume the persisted task branch with no worker dispatch.
+    // An operator approval skips its exact failed gate by authority; observed results skip only the
+    // contiguous green prefix whose recorded commit is still the task branch tip.
     const satisfiedGate = satisfiedGates.get(t.id);
-    if (satisfiedGate) {
+    const replayedGates = replayedGateResults.get(t.id);
+    resumeGateReplay: if (satisfiedGate || replayedGates) {
       const taskBase = await integrationHead(intWt);
       const taskBranch = `${branch}--${t.id}`;
       const priorWt = worktreePath(repoRoot, taskBranch);
       if (!existsSync(priorWt)) {
-        throw new Error(`approved gate ${satisfiedGate} cannot resume: task worktree is missing`);
+        if (satisfiedGate) throw new Error(`approved gate ${satisfiedGate} cannot resume: task worktree is missing`);
+        // Observed passes are an optimization, never authority: without the task worktree there is no
+        // commit to compare and no landed work to gate, so fall through to the ordinary worker path.
+        replayedGateResults.delete(t.id);
+        break resumeGateReplay;
       }
+      const resumeReason = satisfiedGate
+        ? `approved gate ${satisfiedGate}`
+        : `recorded gates on ${replayedGates!.commit.slice(0, 10)}`;
+      const priorTaskTip = await gitHead(priorWt);
+      const priorTaskSubject = await gateCommitSubject(taskBase, priorTaskTip, priorWt);
       const commitsToCarry = await commitsAheadOf(taskBase, priorWt);
       const wt = await driver.worktree(repoRoot, taskBranch, taskBase);
       const carriedCommits = await cherryPickCommits(wt, commitsToCarry);
+      // Reuse is about the tree the gates will actually inspect. The integration tip may have moved
+      // while the daemon was down, so compare after recreating the task on today's taskBase rather
+      // than against the stale worktree whose task-only history cannot see newly merged dependencies.
+      const currentTaskTip = await gitHead(wt);
+      const currentTaskSubject = await gateCommitSubject(taskBase, currentTaskTip, wt);
       journal.append("worktree-recreation", t.id, { attempted: commitsToCarry, carried: carriedCommits });
       // OBS-212: same fail-closed rule as the dispatch path — but this path is worse, because it runs
       // ONLY the gates after the approved one and then MERGES. T3 took it on run-20260728-110135:
@@ -1340,7 +1600,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const lost = commitsToCarry.filter((h) => !present.has(h));
         if (lost.length > 0) {
           await park(t,
-            `carry lost ${lost.length} of ${commitsToCarry.length} verified commit(s) recreating the worktree for approved gate ${satisfiedGate} (first missing: ${lost[0]!.slice(0, 10)}) — refusing to merge a tree that is missing landed work`,
+            `carry lost ${lost.length} of ${commitsToCarry.length} verified commit(s) recreating the worktree for ${resumeReason} (first missing: ${lost[0]!.slice(0, 10)}) — refusing to merge a tree that is missing landed work`,
             "infra", assignment, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
           return;
         }
@@ -1360,7 +1620,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
       const workerEvent = [...journal.read()].reverse()
         .find((e) => e.event === "worker-result" && e.taskId === t.id);
-      if (!workerEvent) throw new Error(`approved gate ${satisfiedGate} cannot resume: worker result is missing`);
+      if (!workerEvent) throw new Error(`${resumeReason} cannot resume: worker result is missing`);
       const priorResult: WorkerResult = {
         ok: workerEvent.data.ok === true,
         summary: typeof workerEvent.data.summary === "string" ? workerEvent.data.summary : "",
@@ -1370,7 +1630,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         raw: "",
       };
       const gateAuthor = rs?.lastAssignment ?? assignment;
-      const satisfiedIndex = GATE_NAMES.indexOf(satisfiedGate);
+      const satisfiedIndex = satisfiedGate ? GATE_NAMES.indexOf(satisfiedGate) : -1;
       // The serial pipeline could have at most one blocking result, so "everything after the
       // approved gate" was enough. v1.85 can record both verdict siblings red in one round, and a
       // selected test screen can be green without a complete suite. Approval waives exactly its
@@ -1391,18 +1651,50 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             || !(GATE_NAMES as readonly string[]).includes(e.data.gate)) continue;
         priorResults.set(e.data.gate as GateName, e);
       }
-      const remainingGates = t.gates.filter((gate) => {
-        if (gate === satisfiedGate) return false;
-        const prior = priorResults.get(gate)?.data;
-        const followsApproved = GATE_NAMES.indexOf(gate) > satisfiedIndex;
-        const otherRed = prior?.pass === false;
-        const needsFullSuite = gate === "test" && prior?.fullSuite !== true;
-        return followsApproved || otherRed || needsFullSuite;
-      });
+      let remainingGates: GateName[];
+      if (satisfiedGate) {
+        remainingGates = t.gates.filter((gate) => {
+          if (gate === satisfiedGate) return false;
+          const prior = priorResults.get(gate)?.data;
+          const followsApproved = GATE_NAMES.indexOf(gate) > satisfiedIndex;
+          const otherRed = prior?.pass === false;
+          const needsFullSuite = gate === "test" && prior?.fullSuite !== true;
+          return followsApproved || otherRed || needsFullSuite;
+        });
+      } else {
+        // T15: reuse only a contiguous green prefix from the current attempt on the exact task tip.
+        // The first failed/missing gate and everything after it re-enters runGates, so neither an
+        // inert resume nor a blanket skip can pass. A changed tip re-runs the complete declared set.
+        // Raw object ids remain valid for hand-written/older rows; daemon-written rows use the
+        // canonical commit subject so equivalent repositories retain journal identity.
+        const exactCurrentCommit = currentTaskTip === replayedGates!.commit;
+        const canonicalCurrentCommit = currentTaskSubject === replayedGates!.commit;
+        const recreatedLegacyCommit = priorTaskTip === replayedGates!.commit
+          && priorTaskSubject === currentTaskSubject;
+        let reusable = exactCurrentCommit || canonicalCurrentCommit || recreatedLegacyCommit;
+        const reused: GateName[] = [];
+        const declaredGates = GATE_NAMES.filter((gate) => t.gates.includes(gate));
+        for (const gate of declaredGates) {
+          if (!reusable || replayedGates!.results.get(gate) !== true) reusable = false;
+          else reused.push(gate);
+        }
+        for (const gate of reused) {
+          journal.append("gate-reused", t.id, { gate, commit: replayedGates!.commit });
+        }
+        remainingGates = declaredGates.slice(reused.length);
+      }
       const resumedTask = { ...t, gates: remainingGates };
 
       gateLoop: while (true) {
         const gated = await gitHead(wt);
+        gateSubject = {
+          commit: await gateCommitSubject(taskBase, gated, wt),
+          attempt: rs?.attempts ?? 0,
+          // This suffix is re-measured to decide whether resume may advance, but the interrupted
+          // attempt already paid for its red result. The next worker-backed round remains the next
+          // deterministic-fingerprint occurrence/review round for budget accounting.
+          ...(!satisfiedGate ? { replayMeasurement: true as const } : {}),
+        };
         journal.phaseStart(t.id, "gates");
         const { results } = await runGates(resumedTask, {
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
@@ -1441,6 +1733,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         saveGraph(repoRoot, graph);
         if (!results.every(gateSatisfied)) {
           gateFails++;
+          // Observed green gates are only measurements. If the resumed suffix is red, preserve that
+          // result in the journal and return to the ordinary attempt/consult ladder, which rebuilds
+          // feedback from those rows. Only an operator-authorized gate release parks on a new red.
+          if (!satisfiedGate) break gateLoop;
           await park(t, "post-approval gate failed", "gate-fail", gateAuthor, rs?.attempts ?? 0,
             startMs, gateFails, consults, tokens, metered, retryMode);
           return;
@@ -1456,7 +1752,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
         if (!m.ok) {
           journal.append("merge-conflict", t.id, { conflict: m.conflict });
-          await park(t, `merge conflict after approved gate: ${m.conflict ?? "unknown conflict"}`,
+          await park(t, `merge conflict after ${resumeReason}: ${m.conflict ?? "unknown conflict"}`,
             "merge-conflict", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
           return;
         }
@@ -1495,13 +1791,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await park(t, `attempt cap (${MAX_ATTEMPTS}) reached`, "attempt-cap", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
-      // v1.70 T5: a task that has already drawn REVIEW_ROUND_CAP request-changes review rounds parks for
-      // a human decision instead of dispatching another round. Condition on the review history (data),
-      // never the code path. OBS-189: the count is engagement-scoped — any operator approval resets it
-      // by construction (reviewRoundsSinceApproval), so the old blanket approved-task exemption is gone
-      // and an upheld task that STILL cannot converge re-parks after another full round budget.
-      if (attempt > 0 && reviewRoundsDrawn() >= REVIEW_ROUND_CAP) {
-        await park(t, `review round cap (${REVIEW_ROUND_CAP}) reached this engagement — \`tickmarkr approve\` accepts the diff past review; \`tickmarkr approve --uphold\` funds one fixed attempt carrying the findings`, "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
+      // OBS-419: read the approval-carried ceiling at the funding boundary, after every escalation
+      // decision but before the sole task-dispatch below. Both interactive and headless worker-launch
+      // branches are dominated by this check, so no route can fund another worker without consulting it.
+      // reviewRoundsSinceApproval resets the DRAWN count at approval; the ceiling on that same approval
+      // survives the reset and governs only those further rounds. Absence preserves the module default.
+      const reviewRoundCap = approvedReviewRoundCeiling(journal.read(), t.id) ?? REVIEW_ROUND_CAP;
+      if (attempt > 0 && reviewRoundsDrawn() >= reviewRoundCap) {
+        await park(t, `review round cap (${reviewRoundCap}) reached this engagement — \`tickmarkr approve\` accepts the diff past review; \`tickmarkr approve --uphold\` funds one fixed attempt carrying the findings`, "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       // OBS-57: a demoted channel must not be re-dispatched on consult retry or provider requeue.
@@ -1853,6 +2150,23 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let earlyLaunchDead = false;
       let settleParsed: WorkerResult | undefined;
       let seedResult: InteractiveSeedResult | undefined;
+      // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
+      // Any other blocked/idle dialog pages the operator (unlatched since T1 — see below).
+      // v1.89 T19: the latch is PER SLOT, and the seed launch shares this slot — it answers the
+      // startup modal before the readiness banner the loop below can only run after. So it is
+      // declared HERE, above every exit from the launch, and armed by the seed's own report the
+      // instant the key is spent. Review round 8 (material): initializing it from the RETURNED
+      // result only was not every path — the seed line delivered after the answer throws
+      // DeliveryReadinessError, and that catch continues or returns with no result to read, so a
+      // latch built from one would start false with the key already sent, and the next modal on
+      // this slot would get the free Enter this contract exists to prevent.
+      let trustAnswered = false;
+      const noteSeedTrustAnswered = () => {
+        if (trustAnswered) return;
+        trustAnswered = true;
+        // Same audit line the loop below writes, so a live run shows the answer wherever it happened.
+        journal.append("trust-auto-answer", t.id, { slot: slot.name, adapter: adapter.id, phase: "seed" });
+      };
       const handleDeliveryReadiness = async (error: DeliveryReadinessError): Promise<boolean> => {
         journal.append("delivery-readiness-failed", t.id, {
           attempt,
@@ -1889,12 +2203,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // The exit wrapper still fires if the TUI dies (crash/quit): fast-fail instead of burning the timeout.
         finished = false;
         exitCode = null;
+        // Snapshot the exact tree the worker is about to receive. This immutable launch observation
+        // answers the fast-kill's worktree clause; a separate rolling observation below identifies
+        // each new worker change so it can rearm the stall clock exactly once.
+        const launchWorktreeObservation = await observeWorktree(wt);
+        let priorWorktreeObservation = launchWorktreeObservation;
+        let worktreeUnreadableNoted = false;
         if (adapter.interactiveSeed) {
           // v1.69 T6: launch the real TUI without a prompt, wait for readiness, inject one seed turn,
           // then fall through to the normal trailer harvest. A failed seed is recorded as a finished
           // failure rather than allowed to race the trailer wait.
           try {
-            seedResult = await runInteractiveSeed({ driver, slot, adapter, assignment, promptFile, taskTimeoutMinutes });
+            seedResult = await runInteractiveSeed({
+              driver, slot, adapter, assignment, promptFile, taskTimeoutMinutes,
+              onTrustAnswered: noteSeedTrustAnswered,
+            });
           } catch (error) {
             if (!(error instanceof DeliveryReadinessError)) throw error;
             if (await handleDeliveryReadiness(error)) continue attempts;
@@ -1913,12 +2236,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           noteLaunched();
           output = await driver.read(slot, PANE_READ_ROWS);
         }
+        // The returning paths report the same fact on the result; both callbacks land on the one
+        // latch, and the second is a no-op. A seed that answered is never re-answered by the loop.
+        if (seedResult?.trustAnswered) noteSeedTrustAnswered();
         if (seedResult?.seedFailed) {
           finished = false;
         } else {
-          // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
-          // Any other blocked/idle dialog pages the operator (unlatched since T1 — see below).
-          let trustAnswered = false;
           // OBS-201: one liveness nudge per attempt; the grace deadline is its OWN timer, never the
           // stall window (the nudge's pane echo is absorbed before it starts, or the echo itself
           // would reset the window and make the early conclusion unreachable).
@@ -2000,6 +2323,25 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 journal.append("worker-nudge-answered", t.id, { slot: slot.name, attempt });
               }
             }
+            // This observation is independent of panes, scraped status and daemon delivery. The
+            // immutable comparison says whether this attempt changed the launch tree; the rolling
+            // comparison says whether a new filesystem/git change happened during this slice.
+            const currentWorktreeObservation = await observeWorktree(wt);
+            const worktreeSinceLaunch = compareWorktrees(launchWorktreeObservation, currentWorktreeObservation);
+            const worktreeSincePriorRead = compareWorktrees(priorWorktreeObservation, currentWorktreeObservation);
+            priorWorktreeObservation = currentWorktreeObservation;
+            if (worktreeSincePriorRead === "changed") {
+              lastProgressAt = Date.now();
+              worktreeUnreadableNoted = false;
+              journal.append("worker-contact", t.id, { slot: slot.name, attempt, evidence: "worktree" });
+            } else if (worktreeSincePriorRead === "unreadable") {
+              if (!worktreeUnreadableNoted) {
+                worktreeUnreadableNoted = true;
+                journal.append("contact-unreadable", t.id, { slot: slot.name, attempt, source: "worktree", concludes: false });
+              }
+            } else {
+              worktreeUnreadableNoted = false;
+            }
             const sliceNow = Date.now();
             // T1 (OBS-263): quota banners are classified IN-LOOP — two consecutive matching slices
             // plus >=3m tracker silence — then the post-loop quota failover runs NOW, not after the
@@ -2076,7 +2418,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // ANSWERED or twice-undeliverable nudge leaves nothing pending, so the triad governs
             // again; the hold is on a pending daemon ACTION, never on the adapter being nudgeable.
             if ((!nudgePending || nudgeFailed) && await harvestConcludes(sliceNow - lastProgressAt)) break;
-            // T1 (R1 dead-channel fast-kill): no trailer, no worktree delta, and no output growth
+            // T1 (R1 dead-channel fast-kill): no trailer, an unchanged launch tree, and no output growth
             // for the fast-kill window — the channel is dead, so conclude NOW
             // (journaled) and let the existing no-trailer tail classify and route the attempt.
             // The tracker is the growth signal on purpose: raw pane bytes grow on cosmetic repaint
@@ -2092,18 +2434,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // that pane, exactly as pre-T1. Token growth counts as life either way, so a metered
             // worker thinking through a long tool run survives.
             // The triad has NO status exemption: a pane that herdr reports as blocked, idle, working
-            // or unknown dies alike once it holds no trailer, no delta and no growth — waiting the
+            // or unknown dies alike once it holds no trailer, an unchanged tree and no growth — waiting the
             // rolling window out on a status reading is exactly the blindness T1 removes. A matched
             // trust dialog is auto-answered above and `continue`s before ever reaching here.
             // The NUDGE gets first crack at a nudgeable pane: the fast-kill holds while the daemon
             // still has an action of its own pending (un-nudged, or inside the grace window) —
             // under the shipped constants (kill 5m < nudge 10m) a delta-less pane would otherwise
             // die before the rescue could ever fire. An ANSWERED nudge leaves nothing pending, so
-            // the hold lifts and the triad governs again. Once a nudge has failed to deliver TWICE
-            // (one in-slice retry filters a driver flake — see below), the delta clause drops too:
-            // a delta is past work, and a pane no signal can reach must not buy the rest of the
-            // window with it (a `working` pane can't be paged either, so this is the only bound
-            // that path has).
+            // the hold lifts and the triad governs again. Delivery success or failure never
+            // supplies worktree evidence: only the immutable launch observation and the current
+            // filesystem/git observation answer that clause.
             if (stallProgress.rowSignalSaturated && !rowSaturationHeld) {
               rowSaturationHeld = true;
               journal.append("worker-dead-held", t.id, { slot: slot.name, attempt, reason: "row-signal-saturated" });
@@ -2119,7 +2459,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             if (!stallProgress.rowSignalSaturated
               && (!nudgePending || nudgeFailed)
               && sliceNow - lastOutputGrowthAt >= deadChannelFastKillMs
-              && (nudgeFailed || !(await worktreeHasDelta(wt, taskBase)))) {
+              && worktreeSinceLaunch === "unchanged") {
               journal.append("worker-dead", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastOutputGrowthAt });
               break;
             }
@@ -2143,11 +2483,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 nudgeDeadline = Date.now() + workerNudgeGraceMs;
                 journal.append("worker-nudge", t.id, { slot: slot.name, attempt });
               } else {
-                // T1: an undeliverable nudge is itself a condemnation — the channel is unreachable,
-                // so the fast-kill above stops requiring a clean worktree for THIS pane (see there).
-                // A blocked/idle pane is still paged below; a `working`/`unknown` one cannot be, and
-                // for it the conclusion's own escalation is what notifies. Nothing here waits the
-                // rolling window out.
+                // Delivery failure is journal evidence about the daemon's contact attempt only.
+                // The fast-kill's worktree clause remains wholly filesystem/git-derived above.
                 nudgeFailed = true;
                 journal.append("worker-nudge-failed", t.id, { slot: slot.name, attempt });
               }
@@ -2534,6 +2871,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let commits: string[] = [];
       gateLoop: while (true) {
         const gated = await gitHead(wt);
+        gateSubject = { commit: await gateCommitSubject(taskBase, gated, wt), attempt };
         journal.phaseStart(t.id, "gates");
         ({ results, commits } = await runGates(t, {
           worktree: wt, baseRef: taskBase, result, author: assignment,
@@ -2795,6 +3133,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     if (tipFailed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
   }
 
+  // T14: read the journal, not the startup `approved` set — an approval appended DURING this run is
+  // exactly the one the set cannot see, and it is the one the record has to name.
+  //
+  // Serialize this sample WITH the run-end append. The daemon holds the boundary through its final
+  // graph.lock release in the outer finally: an approval that wins first is included below, while an
+  // approval that loses cannot append until the live owner is gone and reports recorded-no-owner.
+  // Thus no accepted approval can land after this sample while still being attributed to this run.
+  const approvalSerialization = await acquireApprovalSerialization(repoRoot, runId);
+  releaseApprovalSerialization = approvalSerialization.release;
+  const outstanding = outstandingApprovals(journal.read());
+  summary.approvalDisposition = outstanding.length === 0 ? "complete" : "outstanding";
+  if (outstanding.length > 0) summary.outstandingApprovals = outstanding;
+
   journal.append("run-end", undefined, { ...summary });
   await reconcile(); // run-end boundary: nothing in flight — full sweep (empty desired set)
   // OBS-28: lingering worktrees starve CLI probes; keepPanes:forever is the debug override.
@@ -2817,6 +3168,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     { tier: summary.tipVerify === "failed" ? "attention" : "routine" },
   );
   return summary;
+  });
   } catch (err) {
     // T7 (v1.86): guarded — a journal read/append failure while recording the fatal run-end is
     // reported alongside err, never instead of it; recordFatalRunEnd never throws, so the original
@@ -2831,6 +3183,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       process.removeListener("SIGINT", onTermination);
       process.removeListener("SIGTERM", onTermination);
     }
-    releaseRunLock(repoRoot);
+    // T16: every other exit — normal end, throw, termination unwind. disarm() is idempotent, so the
+    // signal path having already stood the tier down changes nothing here.
+    supervision?.disarm();
+    try {
+      releaseRunLock(repoRoot);
+    } finally {
+      releaseApprovalSerialization?.();
+    }
   }
 }

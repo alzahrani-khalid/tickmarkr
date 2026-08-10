@@ -20,9 +20,11 @@ export const STALE_MS = 60_000; // 6× heartbeat headroom; PITFALLS floor is ≥
 const PayloadSchema = z.object({ pid: z.number().int().positive(), runId: z.string(), startedAt: z.number() });
 
 const lockPath = (repoRoot: string) => join(tickmarkrDir(repoRoot), "graph.lock");
+const approvalSerializationPath = (repoRoot: string) => join(tickmarkrDir(repoRoot), "approval.lock");
 
 let heartbeat: NodeJS.Timeout | undefined;
 let heldPath: string | undefined;
+let approvalSequence = 0;
 
 // Best-effort release if the daemon exits without hitting its finally (crash mid-body). NO
 // SIGINT/SIGTERM handlers — those change kill semantics and leak listeners across the test
@@ -121,13 +123,89 @@ export function releaseRunLock(repoRoot: string): void {
   heldPath = undefined;
 }
 
+export interface ApprovalSerialization {
+  /** true when another approval or run-end already owned the boundary before this caller */
+  contended: boolean;
+  release(): void;
+}
+
+// T14: task-approved append and the terminal outstandingApprovals sample + run-end append are one
+// cross-process critical section. The daemon keeps this boundary until AFTER it releases graph.lock:
+// an approval wins first and is necessarily in run-end, or run-end wins first and the command cannot
+// append until there is no live owner. There is no interval in which an accepted approval can land
+// behind the completion sample while graph.lock still makes it look deferred to that daemon.
+//
+// The boundary uses the same atomic link(2) idiom and the same inspect() authority as graph.lock.
+// A dead holder is reclaimed with the same inode+mtime guard; a live holder is waited out; garbage
+// fails closed. No caller re-derives pid liveness.
+export async function acquireApprovalSerialization(repoRoot: string, runId: string): Promise<ApprovalSerialization> {
+  const p = approvalSerializationPath(repoRoot);
+  let contended = false;
+  while (true) {
+    const tmp = join(tickmarkrDir(repoRoot), `approval.lock.${process.pid}.${approvalSequence++}.tmp`);
+    try {
+      writeFileSync(tmp, JSON.stringify({ pid: process.pid, runId, startedAt: Date.now() }));
+      try {
+        linkSync(tmp, p);
+      } finally {
+        unlinkSync(tmp);
+      }
+      let released = false;
+      return {
+        contended,
+        release: () => {
+          if (released) return;
+          released = true;
+          unlinkIfOurs(p);
+        },
+      };
+    } catch (e) {
+      try { unlinkSync(tmp); } catch { /* link loser already cleaned its private temporary */ }
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      contended = true;
+      let insp: Inspection;
+      try { insp = inspect(p); }
+      catch (inspectError) {
+        if ((inspectError as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw inspectError;
+      }
+      if (insp.garbage) {
+        throw new Error(`${stateDirName(repoRoot)}/approval.lock holds an unreadable/garbage payload — refusing to cross the run-end boundary`);
+      }
+      if (insp.dead) {
+        let st;
+        try { st = statSync(p); }
+        catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw statError;
+        }
+        if (st.ino !== insp.ino || st.mtimeMs !== insp.mtimeMs) continue;
+        try { unlinkSync(p); } catch (e2) { if ((e2 as NodeJS.ErrnoException).code !== "ENOENT") throw e2; }
+        continue;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+  }
+}
+
+// LOCK-04: the owner the decision table sees, read-only, for callers that need the pid as well as
+// the answer. inspect() owns pid-liveness (ESRCH dead / EPERM alive / garbage fail-closed); a second
+// `process.kill(pid, 0)` anywhere else would be a second copy of that rule, free to drift. undefined
+// ⇒ no lock at all — never conflate that with a lock whose recorded owner is dead.
+export function runLockOwner(repoRoot: string): { pid?: number; runId?: string; live: boolean } | undefined {
+  let insp: Inspection;
+  try { insp = inspect(lockPath(repoRoot)); }
+  catch { return undefined; } // statSync ENOENT ⇒ not held
+  // `runId` is carried so a caller can name the run the live owner is actually executing — the lock is
+  // REPOSITORY-wide, so a live pid here is not proof it is running the run the caller cares about.
+  return { pid: insp.pid, runId: insp.runId, live: shouldRefuse(insp) };
+}
+
 // Read-only predicate: true iff a lock exists that the decision table would REFUSE on (alive,
 // EPERM, or ANY garbage). A provably-dead holder (ESRCH) reads not-live (LOCK-02/OBS-05). Never
 // mutates the lock. compile now acquires via acquireRunLock; this remains for drift oracles/tests.
 export function isRunLockLive(repoRoot: string): boolean {
-  try {
-    return shouldRefuse(inspect(lockPath(repoRoot)));
-  } catch { return false; } // no lock
+  return runLockOwner(repoRoot)?.live ?? false;
 }
 
 // LOCK-03: operator escape hatch. Liveness-checked delete — removes a dead-holder or garbage lock,
