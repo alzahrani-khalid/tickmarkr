@@ -168,6 +168,9 @@ describe("declared-base containment probe", () => {
     // one squashed commit whose tree equals the graft boundary's: git cherry says the boundary's
     // synthetic full-tree patch is present, which is the whole of what this clone can see
     git(clone, "checkout -q --orphan squashed");
+    // fresh clone inherits no identity config; CI runners have no global one (release 1.89.0 red)
+    git(clone, "config user.email containment@test");
+    git(clone, "config user.name containment");
     git(clone, "commit --no-gpg-sign -m squashed");
     expect(git(clone, "cherry squashed main")).toMatch(/^- /);
 

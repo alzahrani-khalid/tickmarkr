@@ -80,7 +80,8 @@ const reviewTask = validateGraph({
 
 describe("diff cap — OBS-48 zero-context metric", () => {
   test("scattered one-line hunks: full diff over cap, -U0 under cap, gate passes to judge", async () => {
-    const { repo, base } = scatteredSweepRepo(95, 200);
+    // 89 files: --full-index grew each section's index line, so 95 pushed -U0 past the test CAP
+    const { repo, base } = scatteredSweepRepo(89, 200);
     const { full, forCap } = await fetchTaskDiff(repo, base);
     expect(full.length).toBeGreaterThan(CAP);
     expect(forCap.length).toBeLessThanOrEqual(CAP);
@@ -252,7 +253,8 @@ function repoWithChange(
 const rawU0 = (repo: string, base: string) =>
   execSync(`git diff -U0 ${base}..HEAD`, { cwd: repo, encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
 const rawFull = (repo: string, base: string) =>
-  execSync(`git diff ${base}..HEAD`, { cwd: repo, encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
+  // --full-index matches fetchTaskDiff's rendering (reproducible index-line bytes, release 1.89.0)
+  execSync(`git diff --full-index ${base}..HEAD`, { cwd: repo, encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
 
 function capturingFake(script: Record<string, unknown>): { fake: FakeAdapter; prompts: string[] } {
   const fake = fakeWith(script);

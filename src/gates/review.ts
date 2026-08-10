@@ -132,7 +132,7 @@ const VERSION_FIELD_LINE_RE = /^[+-]\s*"version":\s*"[^"]*",?\s*$/;
 export async function mirrorsVersionOnly(worktree: string, baseRef: string, path: string): Promise<boolean> {
   let diff: string;
   try {
-    diff = await shOk(`git diff -U0 '${baseRef}..HEAD' -- ${shq(path)}`, worktree);
+    diff = await shOk(`git diff --full-index -U0 '${baseRef}..HEAD' -- ${shq(path)}`, worktree);
   } catch {
     return false;
   }
@@ -153,9 +153,11 @@ export type TaskDiffMeasurement = {
 };
 
 export async function fetchTaskDiff(worktree: string, baseRef: string): Promise<TaskDiffMeasurement> {
+  // --full-index: abbreviated index lines vary with object-store density, so two measurements of
+  // the same diff could disagree by a few bytes between invocations (CI-only red, release 1.89.0).
   const [rawFull, rawForCap] = await Promise.all([
-    shOk(`git diff '${baseRef}..HEAD'`, worktree),
-    shOk(`git diff -U0 '${baseRef}..HEAD'`, worktree),
+    shOk(`git diff --full-index '${baseRef}..HEAD'`, worktree),
+    shOk(`git diff --full-index -U0 '${baseRef}..HEAD'`, worktree),
   ]);
   const fullMeasurement = measureArtifactDiff(rawFull);
   const capMeasurement = measureArtifactDiff(rawForCap);
