@@ -222,7 +222,7 @@ number — an unmeasured budget is not a small budget.
   and `cwd` columns before dispatching to any name. Same class as the liveness rule: a matcher broader
   than the thing it names finds things that are not it, and its output is shaped exactly like a right
   answer.
-- **A dead pane accepts your dispatch and reports success.** `herdr wait agent-status` exits 1 on timeout, 0
+- **A dead pane accepts your dispatch and reports success.** `herdr agent wait` exits 1 on timeout, 0
   on match — but ALSO 0 (with an error JSON) when the pane is GONE. So does `pane run`: sending to a vanished
   pane prints `{"error":{"code":"pane_not_found"}}` and **still exits 0**, so `pane run … >/dev/null && echo
   sent` reports a delivery that never happened. Never chain `wait && act` or trust a send's exit status —
@@ -242,7 +242,7 @@ with `&` orphans it from the wake chain. It prints one wake reason and exits; re
 
 Default mode wakes only when both panes are quiet (dropped handoff) or the orchestrator blocks; the
 orchestrator gets a 90s grace window to handle worker blocks first. For long parked stretches a targeted
-`herdr wait agent-status <pane> --status <s> --timeout <ms>` beats the watcher. When parking a human
+`herdr agent wait <pane-or-name> --until <s> --timeout <ms>` beats the watcher. When parking a human
 checkpoint, also fire `herdr notification show "HUMAN CHECKPOINT: <gate>" --sound request`.
 
 **⚠ THIS WATCHER KEYS ON `agent_status`, AND `agent_status` IS A PROXY THAT FAILS IN BOTH DIRECTIONS.**
@@ -250,7 +250,7 @@ Measured 2026-08-06 on ONE pane inside TEN MINUTES: a worker wedged behind a CLI
 reported **`idle`** (not `blocked`), and the same pane minutes later reported **`done`** while demonstrably
 mid-work — reading files, context climbing. So a status-keyed watcher can both **sleep through a wedged
 worker** and **fire on a working one**, and neither failure announces itself. The bundled watcher inherits
-this; so does any `herdr wait agent-status`. It is still worth arming — it catches vanished panes and real
+this; so does any `herdr agent wait`. It is still worth arming — it catches vanished panes and real
 blocks — but **never treat its silence as evidence a worker is healthy.**
 Two keys that do not lie, in order of strength:
 - **The daemon's own waiter.** What `herdr pane wait-output` is matching on tells you the phase from the
