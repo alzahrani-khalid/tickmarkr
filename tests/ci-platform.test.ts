@@ -10,7 +10,15 @@ const workflowPaths = [".github/workflows/ci.yml", ".github/workflows/ci.public.
   existsSync(join(repoRoot, p)),
 );
 if (workflowPaths.length === 0) throw new Error("no CI workflow definitions found to assert on");
-const gateCommands = ["npm run build", "npm run lint", "npm run test:coverage"];
+// The coverage gate is split (RULING-1890-CI-DESIGN option c): the main run carries every
+// project except sync-heavy, whose birpc-starving members run as their own serial step.
+// Both commands are load-bearing — a lane missing the serial step runs a reduced subset.
+const gateCommands = [
+  "npm run build",
+  "npm run lint",
+  "npm run test:coverage -- --project suite --project built-cli --project signal-reaper",
+  "npx vitest run --project sync-heavy",
+];
 
 type Workflow = {
   jobs?: Record<string, { "runs-on"?: string; steps?: Array<{ run?: string }> }>;

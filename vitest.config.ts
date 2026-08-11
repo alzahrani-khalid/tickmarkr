@@ -38,6 +38,16 @@ export const DIST_COUPLED_TESTS = [
 
 export const SIGNAL_REAPER_TESTS = ["tests/run/reconcile-live.test.ts"];
 
+// Report-26 birpc-starver class (Q72s): on the 2-core hosted runner the single vitest worker
+// starves its own birpc channel under long SYNCHRONOUS work — first 4/4 deterministic
+// end-of-suite kills (docs-truth member sweep, remedied by async spawn), then run 31452816678
+// still lost sweep.test.ts at 601s + post-suite onTaskUpdate timeouts. The starver is a CLASS;
+// this list is ONLY its members with a produced CI red (RULING-1890-CI-DESIGN option c: own
+// serial CI step, no rpc tuning, no class-wide absorption — an unknown red does not belong
+// here). ci.public.yml runs this project as a separate step so the main suite's worker channel
+// never carries their sync work; locally they simply serialize in one fork.
+export const SYNC_HEAVY_TESTS = ["tests/cockpit/sweep.test.ts", "tests/docs-truth-testing.test.ts"];
+
 export default defineConfig({
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
@@ -48,7 +58,17 @@ export default defineConfig({
         test: {
           name: "suite",
           include: ["tests/**/*.test.ts"],
-          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS],
+          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS, ...SYNC_HEAVY_TESTS],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "sync-heavy",
+          include: SYNC_HEAVY_TESTS,
+          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS],
+          poolOptions: { forks: { singleFork: true } },
+          testTimeout: 1_200_000, // generous by ruling: these members starve their own RPC under load
         },
       },
       {
