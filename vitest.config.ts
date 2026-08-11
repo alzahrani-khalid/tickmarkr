@@ -52,6 +52,13 @@ export default defineConfig({
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
     testTimeout: 20000,
+    // GO-10 cycle-2 final candidate (threads reverted: 45 isolation-semantics fails at local
+    // proof): the 2-core CI host answers worker birpc BETWEEN reporter/coverage rendering work,
+    // and the fixed 60s worker->host timeout fires at the suite tail with every test green.
+    // Trim host-side rendering under an env guard so CI's host answers inside the window;
+    // local runs keep full reporters. Env-only delta: run commands and the ci-platform pin
+    // stay byte-stable.
+    ...(process.env.TICKMARKR_CI_LEAN_REPORTERS === "1" ? { reporters: ["dot" as const] } : {}),
     projects: [
       {
         extends: true,
@@ -91,6 +98,10 @@ export default defineConfig({
     ],
     coverage: {
       provider: "v8",
+      // GO-10: json-summary alone under the CI guard — thresholds enforce off the coverage map
+      // regardless of reporter; text/html rendering is pure host-side crunch the 2-core runner
+      // pays while the worker's last onTaskUpdate waits.
+      ...(process.env.TICKMARKR_CI_LEAN_REPORTERS === "1" ? { reporter: ["json-summary" as const] } : {}),
       include: [
         "src/graph/**", "src/route/**", "src/gates/**", "src/run/**",
         "src/config/**", "src/compile/**", "src/adapters/**", "src/drivers/**", "src/cli/**",

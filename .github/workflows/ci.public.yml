@@ -40,6 +40,7 @@ jobs:
       # suite's single worker never carries the birpc-starving members.
       - run: npm run test:coverage -- --project suite --project built-cli --project signal-reaper
         env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
       # RULING-1890-CI-DESIGN option (c): the birpc-starver class members with a produced CI
@@ -65,6 +66,7 @@ jobs:
       # OBS-156: same serialization as the ubuntu job — macos hosted runners are 2-core too
       - run: npm run test:coverage -- --project suite --project built-cli --project signal-reaper
         env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
       # same serial sync-heavy step as the ubuntu job (RULING-1890-CI-DESIGN option c)
