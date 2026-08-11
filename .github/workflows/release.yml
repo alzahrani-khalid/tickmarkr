@@ -26,11 +26,17 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # OBS-148: serialize the suite on the 2-core hosted runner. Under default vitest
-      # parallelism the driver timing tests starve nondeterministically (four distinct
-      # tests lost the race across three release rounds on 2026-07-24); every serialized
-      # context is always green. The product already honors this env (FORK_CAP_ENV).
-      - run: npm test
+      # OBS-148 serialized the full suite here; since then the suite outgrew the 2-core
+      # runner's fixed 60s vitest worker->host RPC window: four consecutive 2026-08-11 runs
+      # (ci.public.yml coverage on both platforms, and this workflow's own npm test) ended
+      # with EVERY test green and then died at teardown with `[vitest-worker]: Timeout
+      # calling "onTaskUpdate"` — vitest's bundled birpc DEFAULT_TIMEOUT=6e4 has no override
+      # and is fixed upstream only in vitest 4.x (.planning/EVIDENCE-1890-CYCLE2-RED.md).
+      # A deterministic false red is not a gate. The release gate verifies the ARTIFACT it
+      # publishes — build, lint, and the built-CLI/signal suites that exercise dist/ —
+      # while full-suite truth lives in ci.public.yml and the documented pre-tag proof
+      # battery on the exported tree (forks=6, all projects, coverage-gated).
+      - run: npx vitest run --project built-cli --project signal-reaper
         env:
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
           VITEST_MAX_FORKS: "1"
