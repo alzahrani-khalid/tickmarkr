@@ -86,7 +86,7 @@ test("native-base round trip compiles a column-zero lower-case base into graph.s
   }
 });
 
-test("malformed-source controls reject an empty base and a column-zero prose Base label with a repair naming lower-case base, accept Base inside task text, and reject taskmaster at validateGraph and generated-schema boundaries while all four implemented source members pass", () => {
+test("malformed-source controls reject an empty base and a column-zero prose Base label with a repair naming lower-case base, reject Base inside task text as unconsumed bytes distinct from the front-matter repair, and reject taskmaster at validateGraph and generated-schema boundaries while all four implemented source members pass", () => {
   for (const frontMatter of ["base:   \n", "Base: release-candidate\n"]) {
     let error: unknown;
     try {
@@ -98,9 +98,19 @@ test("malformed-source controls reject an empty base and a column-zero prose Bas
     expect((error as Error).message).toMatch(/lower-case base:/);
   }
 
-  const taskProse = compileSource(nativeFixture("", "Base: this remains ordinary task text.\n"), "native");
-  expect(taskProse.tasks[0].id).toBe("T1");
-  expect(taskProse.spec.base).toBeUndefined();
+  // OBS-488: before the unconsumed-line invariant this control asserted the compile SUCCEEDED,
+  // which certified the exact meta-defect — the line was never "task text", it was silently
+  // dropped bytes. The discriminator this control exists for survives unchanged: an in-task
+  // Base: must never draw the front-matter lower-case-base repair, and it still does not.
+  let taskProse: unknown;
+  try {
+    compileSource(nativeFixture("", "Base: this remains ordinary task text.\n"), "native");
+  } catch (caught) {
+    taskProse = caught;
+  }
+  expect(taskProse).toBeInstanceOf(CompileError);
+  expect((taskProse as Error).message).toMatch(/no parse rule consumes/);
+  expect((taskProse as Error).message).not.toMatch(/lower-case base:/);
 
   const graphWithSource = (source: string) => ({
     version: 1,

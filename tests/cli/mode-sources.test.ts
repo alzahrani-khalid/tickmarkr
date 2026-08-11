@@ -246,10 +246,13 @@ describe("v1.51 T2 mode-source edges", () => {
     writeFileSync(file, nativeSpec("mode: economy\n"));
     expect(() => compileNative(file)).toThrow(CompileError);
     expect(() => compileNative(file)).toThrow(/partner-led, risk-based, staff-led/);
-    // a mode line after the first task heading is task prose, not front-matter
+    // OBS-488 breaking change (v1.89.0): a mode line after the first task heading was silently
+    // dropped as task prose (the OBS-394 silent-override class); the compiler now refuses any
+    // line no parse rule consumes — dropping author bytes is how criteria were truncated for months
     const file2 = join(dir, "spec2.md");
     writeFileSync(file2, `<!-- tickmarkr:spec -->\n\n## T1: thing\n- shape: implement\n- complexity: 3\n- acceptance:\n  - test: x\n\nmode: partner-led\n`);
-    expect(compileNative(file2).mode).toBeUndefined();
+    expect(() => compileNative(file2)).toThrow(CompileError);
+    expect(() => compileNative(file2)).toThrow(/no parse rule consumes this line/);
   });
 
   test("plan --mode previews the mode through the preset compiler", async () => {

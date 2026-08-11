@@ -73,10 +73,16 @@ interface Draft {
   id: string;
   title: string;
   fields: Record<string, string>;
+  // OBS-488: list items accumulate as raw text so wrapped continuation lines join BEFORE the
+  // typed-oracle prefix parses — the oracle must see the complete logical criterion, not line 1.
+  acceptanceRaw: string[];
   acceptance: AcceptanceItem[];
   gates: string[];
   hasGates: boolean;
   list: "acceptance" | "gates" | null;
+  // true while the last item of `list` may still absorb wrapped continuation lines; cleared by
+  // any field bullet or blank line, so a dangling indented line elsewhere fails closed below.
+  itemOpen: boolean;
   continuationField: "goal" | "deps" | "files" | "context" | null;
 }
 
@@ -96,10 +102,10 @@ export function compileNative(file: string): RunGraph {
   let specMode: (typeof GRAPH_ROUTING_MODES)[number] | undefined;
   let specBase: string | undefined;
 
-  for (const line of content.split("\n")) {
+  for (const [index, line] of content.split("\n").entries()) {
     const heading = line.match(HEAD_RE);
     if (heading) {
-      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptance: [], gates: [], hasGates: false, list: null, continuationField: null });
+      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptanceRaw: [], acceptance: [], gates: [], hasGates: false, list: null, itemOpen: false, continuationField: null });
       continue;
     }
     const draft = drafts.at(-1);
@@ -133,6 +139,7 @@ export function compileNative(file: string): RunGraph {
       const name = field[1].toLowerCase();
       if (!FIELDS.has(name)) invalid(draft.id, field[1], "is unknown");
       const value = field[2].trim();
+      draft.itemOpen = false;
       if (name === "acceptance" || name === "gates") {
         if (value) invalid(draft.id, field[1], "must be a nested list");
         draft.list = name;
@@ -178,28 +185,53 @@ export function compileNative(file: string): RunGraph {
     if (nested && draft.list) {
       const value = nested[1].trim();
       if (!value) invalid(draft.id, draft.list, "must not contain empty entries");
-      // v1.19: only the acceptance list parses typed oracle prefixes; gates stay plain names.
-      if (draft.list === "acceptance") {
-        const typed = value.match(ORACLE_RE);
-        if (typed) {
-          const [, kind, body] = typed;
-          if (!body.trim()) invalid(draft.id, "acceptance", `${kind} oracle must carry a value`);
-          draft.acceptance.push(
-            kind === "command" ? { oracle: "command", command: body.trim() }
-              : kind === "test" ? { oracle: "test", test: body.trim() }
-              : { oracle: "judge", text: body.trim() },
-          );
-        } else {
-          plainCount++;
-          draft.acceptance.push(value);
-        }
-      } else {
-        draft[draft.list].push(value);
-      }
+      (draft.list === "acceptance" ? draft.acceptanceRaw : draft.gates).push(value);
+      draft.itemOpen = true;
+      continue;
+    }
+    // OBS-488: a deeper-indented non-item line under a list item is that item's wrapped
+    // continuation — join with a single space, exactly as OBS-60/OBS-308 guarantee for fields.
+    // 1.87.0 dropped these lines silently: 53/78 of run-551's criteria compiled to first-line
+    // stubs and every falsifier tail was invisible to the judge.
+    if (draft.list && draft.itemOpen && (line.startsWith(" ") || line.startsWith("\t")) && line.trim()) {
+      const items = draft.list === "acceptance" ? draft.acceptanceRaw : draft.gates;
+      items[items.length - 1] += ` ${line.trim()}`;
       continue;
     }
     if (line.startsWith("- ")) invalid(draft.id, "field", `bullet is malformed: ${JSON.stringify(line)}`);
-    if (line.trim() && !line.startsWith(" ")) draft.list = null;
+    if (!line.trim()) {
+      draft.itemOpen = false;
+      continue;
+    }
+    // OBS-488 fail-closed invariant: a non-blank line inside a task block that no rule consumes
+    // is an error, never a silent drop — dropping author bytes is the meta-defect that hid the
+    // criterion truncation for months.
+    throw new CompileError(
+      `Task ${draft.id} line ${index + 1}: no parse rule consumes this line: ${JSON.stringify(line)}.\n` +
+        `A non-blank line in a task block must be a "- field:" bullet, a "  - " list item, or an\n` +
+        `indented continuation of the preceding field or list item. tickmarkr refuses to silently\n` +
+        `drop spec bytes (OBS-488) — move prose above the first task heading or into a field.`,
+    );
+  }
+
+  // OBS-488: typed-oracle prefixes parse on the COMPLETE joined item text, never its first
+  // physical line — a wrapped `command:` body or falsifier tail is part of the criterion.
+  for (const draft of drafts) {
+    for (const raw of draft.acceptanceRaw) {
+      const typed = raw.match(ORACLE_RE);
+      if (typed) {
+        const [, kind, body] = typed;
+        if (!body.trim()) invalid(draft.id, "acceptance", `${kind} oracle must carry a value`);
+        draft.acceptance.push(
+          kind === "command" ? { oracle: "command", command: body.trim() }
+            : kind === "test" ? { oracle: "test", test: body.trim() }
+            : { oracle: "judge", text: body.trim() },
+        );
+      } else {
+        plainCount++;
+        draft.acceptance.push(raw);
+      }
+    }
   }
 
   if (!drafts.length) {

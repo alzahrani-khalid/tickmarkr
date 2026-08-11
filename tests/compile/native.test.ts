@@ -214,11 +214,14 @@ describe("native spec compiler", () => {
       // declined a retroactive sweep — measured, 11 archived specs carry 24 dead entries and none
       // will be recompiled. The assertion this test actually makes is "no spec fails for an
       // UNKNOWN reason"; it has never asserted that every archive compiles (65 already do not).
+      // OBS-488: the unconsumed-line invariant is the fourth bar. Measured over the corpus:
+      // 3 column-zero prose lines across v1.86 (2) and v1.90 (1) were silently DROPPED by every
+      // prior compiler — the error now names them instead.
       try {
         expect(compileSource(join("specs", file)).spec.source).toBe("native");
       } catch (error) {
         expect(error).toBeInstanceOf(CompileError);
-        expect((error as Error).message).toMatch(/OBS-97|task unit contract|context: paths that do not exist/);
+        expect((error as Error).message).toMatch(/OBS-97|task unit contract|context: paths that do not exist|no parse rule consumes/);
       }
     }
   });

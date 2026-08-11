@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { describe, expect, test } from "vitest";
 
 const repoRoot = join(import.meta.dirname, "..");
@@ -127,20 +127,32 @@ function runScratchTests(scratch: string, files: string[], title?: string) {
     const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     args.push("--testNamePattern", escaped);
   }
-  return spawnSync(process.execPath, args, {
-    cwd: scratch,
-    encoding: "utf8",
-    timeout: 120_000,
-    env: {
-      ...process.env,
-      FORCE_COLOR: "0",
-      NO_COLOR: "1",
-      TICKMARKR_DOCS_TRUTH_MUTATION_CHILD: "1",
-    },
+  // Q72s: async spawn, not spawnSync — a synchronous child run blocks this worker's event
+  // loop for the child's whole lifetime, starving vitest's birpc on 2-core CI runners
+  // (4/4 deterministic end-of-suite kills). The loop must breathe DURING children.
+  return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+    const child = spawn(process.execPath, args, {
+      cwd: scratch,
+      env: {
+        ...process.env,
+        FORCE_COLOR: "0",
+        NO_COLOR: "1",
+        TICKMARKR_DOCS_TRUTH_MUTATION_CHILD: "1",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+    const timer = setTimeout(() => child.kill("SIGTERM"), 120_000);
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr });
+    });
   });
 }
 
-function childOutput(result: ReturnType<typeof runScratchTests>): string {
+function childOutput(result: Awaited<ReturnType<typeof runScratchTests>>): string {
   return `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
 }
 
@@ -405,7 +417,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
             'import { test } from "vitest";\ntest.skip("temporary test-count perturbation probe", () => {});\n'
           );
           unlinkSync(removedPath);
-          const result = runScratchTests(scratch, [
+          const result = await runScratchTests(scratch, [
             "tests/docs-truth-testing.test.ts",
             "tests/repo/release-docs.test.ts",
           ]);
@@ -424,10 +436,10 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
     }
   }, 240_000);
 
-  test.skipIf(mutationChild)(RETAINED_CONTRACTS_CRITERION, () => {
+  test.skipIf(mutationChild)(RETAINED_CONTRACTS_CRITERION, async () => {
     const scratch = makeScratchRepo("tickmarkr-retained-contracts-");
-    const expectNamedFailure = (title: string, guarded: string) => {
-      const result = runScratchTests(scratch, ["tests/docs-truth-testing.test.ts"], title);
+    const expectNamedFailure = async (title: string, guarded: string) => {
+      const result = await runScratchTests(scratch, ["tests/docs-truth-testing.test.ts"], title);
       const output = childOutput(result);
       expect(result.status, `mutation for ${guarded} unexpectedly passed\n${output}`).not.toBe(0);
       expect(output, `failure output did not name ${guarded}`).toContain(guarded);
@@ -439,7 +451,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
         const source = readFileSync(path);
         try {
           unlinkSync(path);
-          expectNamedFailure(
+          await expectNamedFailure(
             "test: every source file cited on the testing and cli design pages exists in the tree",
             citedFile
           );
@@ -456,7 +468,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
         const index = match!.index;
         try {
           writeFileSync(testingPath, testing.slice(0, index) + testing.slice(index + match![0].length));
-          expectNamedFailure(
+          await expectNamedFailure(
             "test: the documentation-truth check asserts the amended law's presence, so removing it fails a test rather than passing a review",
             `AUTHORING LAW lost its ${name} clause`
           );
@@ -471,7 +483,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
         const mutated = threshold.raw.replace(/\d+/, (value) => String(Number(value) + 1));
         try {
           writeFileSync(testingPath, testing.replace(threshold.raw, mutated));
-          expectNamedFailure(COVERAGE_THRESHOLDS_TITLE, `coverage threshold ${threshold.key}`);
+          await expectNamedFailure(COVERAGE_THRESHOLDS_TITLE, `coverage threshold ${threshold.key}`);
         } finally {
           writeFileSync(testingPath, testing);
         }
