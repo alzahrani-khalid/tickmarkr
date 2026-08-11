@@ -1,10 +1,33 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { captureBaseline, compareToBaseline, detectGateCommands, detectVacuousOracles, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
+import { captureBaseline, compareToBaseline, detectGateCommands, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../../src/route/router.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, type ShResult } from "../../src/run/git.js";
 import { makeRepo } from "../helpers/tmprepo.js";
+
+// The ceiling a battery runs under is an ARGUMENT to the shell, and an argument is only observable at
+// the seam that receives it. This spy passes every call through to the real shell — so every other test
+// in this file keeps running real commands, byte-identically — while recording the timeout each caller
+// asked for, and lets one test hand back the ShResult a SIGKILLed child produces (a 600s wait is not a
+// test). vi.hoisted: the mock factory is hoisted above the imports, so its state must be too.
+const shSpy = vi.hoisted(() => ({
+  calls: [] as { cmd: string; timeoutMs: number | undefined }[],
+  stub: undefined as undefined | ((cmd: string) => ShResult | undefined),
+}));
+
+vi.mock("../../src/run/git.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/run/git.js")>();
+  return {
+    ...actual,
+    sh: (cmd: string, cwd: string, timeoutMs?: number) => {
+      shSpy.calls.push({ cmd, timeoutMs });
+      const stubbed = shSpy.stub?.(cmd);
+      return stubbed ? Promise.resolve(stubbed) : actual.sh(cmd, cwd, timeoutMs);
+    },
+  };
+});
 
 describe("fingerprint", () => {
   test("keeps failure lines, normalizes digits/whitespace, dedupes", () => {
@@ -638,3 +661,75 @@ describe("HYG-08: failing details name the failing test, not stdout noise", () =
     );
   });
 });
+
+// Q24/Q25 (v1.89 run 498, 7 zero-information kills): a gate battery SIGKILLed at its ceiling has no
+// verdict to report. Before this, the kill's partial output carried no failure shape, so a green
+// baseline turned it into "command was green at baseline but now exits 137 with no recognizable
+// failure lines" — a sentence about the WORK, printed about a suite the machine took away mid-run.
+// Both criteria run at TOP LEVEL: vitest's -t contract is the full name (describe titles + title),
+// and the acceptance gate anchors it, so a describe wrapper would break the verbatim match.
+
+test("a gate command SIGKILLed at its ceiling produces a gate-result whose details begin", async () => {
+  // ONE fixture, ONE command: the only difference between the two reads below is whether it was killed
+  const repo = makeRepo({ "run.sh": "exit 0\n" });
+  const commands = { test: "bash run.sh" };
+  const base = await captureBaseline(repo, commands);
+  writeFileSync(
+    join(repo, "run.sh"),
+    "echo ' FAIL  tests/a.test.ts > boom'; echo ' Tests  1 failed | 9 passed (10)'; exit 1\n",
+  );
+  try {
+    // the runner answered, so its answer is what gets reported — unchanged by this task
+    const [red] = await compareToBaseline(repo, commands, base, ["test"]);
+    expect(red.pass).toBe(false);
+    expect(red.details.startsWith("ceiling-kill")).toBe(false);
+    expect(red.details).toContain("FAIL  tests/a.test.ts > boom");
+    expect(red.meta?.failingTests).toEqual([" FAIL  tests/a.test.ts > boom"]);
+    expect(red.meta?.kind).toBeUndefined();
+
+    // same fixture, same command, same green baseline — this time the ceiling killed it
+    shSpy.stub = (cmd) =>
+      cmd.includes("run.sh")
+        ? { code: 137, stdout: " ✓ tests/a.test.ts > slow start 1\n", stderr: "", timedOut: true, durationMs: 600_042 }
+        : undefined;
+    const [killed] = await compareToBaseline(repo, commands, base, ["test"]);
+    expect(killed.pass).toBe(false);
+    expect(killed.details.startsWith("ceiling-kill")).toBe(true);
+    expect(killed.details).toContain("600042ms"); // elapsed
+    expect(killed.details).toContain(`${base.commands.test.ceilingMs}ms`); // configured
+    // the sentence this task exists to delete: a kill is not a claim about the work
+    expect(killed.details).not.toContain("no recognizable failure lines");
+    expect(killed.meta).toMatchObject({
+      kind: "ceiling-kill", classification: "infra", infra: true, durationMs: 600_042, ceilingMs: 600_000,
+    });
+  } finally {
+    shSpy.stub = undefined;
+  }
+}, 30_000);
+
+test("baseline capture stores the measured suite duration and a later battery uses", async () => {
+  const repo = makeRepo({ "run.sh": "sleep 0.2; exit 0\n" });
+  const commands = { test: "bash run.sh" };
+  const base = await captureBaseline(repo, commands);
+  const measured = base.commands.test.durationMs!;
+  expect(measured).toBeGreaterThanOrEqual(200); // the suite's own clock, not a constant
+  expect(base.commands.test.ceilingMs).toBe(Math.max(600_000, 3 * measured)); // persisted with it
+
+  // a measured repository whose suite is slower than the floor: 3 × measured is the only number a
+  // hard-coded 600000 cannot produce, so this is the assertion that falsifies a constant ceiling
+  shSpy.calls.length = 0;
+  const slow = { commands: { test: { exitCode: 0, fingerprints: [], durationMs: 400_000, ceilingMs: 1_200_000 } } };
+  await compareToBaseline(repo, commands, slow, ["test"]);
+  expect(shSpy.calls.map((c) => c.timeoutMs)).toEqual([1_200_000]);
+
+  // …and a pre-v1.90 baseline.json, which has no measurement at all, gets the shipped constant
+  shSpy.calls.length = 0;
+  await compareToBaseline(repo, commands, { commands: { test: { exitCode: 0, fingerprints: [] } } }, ["test"]);
+  expect(shSpy.calls.map((c) => c.timeoutMs)).toEqual([DEFAULT_SHELL_TIMEOUT_MS]);
+  expect(DEFAULT_SHELL_TIMEOUT_MS).toBe(600_000);
+
+  // capture and compare both derive the number here, so the two cannot drift apart
+  expect(effectiveCeilingMs({ durationMs: 400_000 })).toBe(1_200_000);
+  expect(effectiveCeilingMs({ durationMs: 1_000 })).toBe(600_000);
+  expect(effectiveCeilingMs(undefined)).toBe(600_000);
+}, 30_000);

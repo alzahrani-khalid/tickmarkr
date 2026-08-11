@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -214,6 +214,8 @@ describe("native spec compiler", () => {
       // declined a retroactive sweep — measured, 11 archived specs carry 24 dead entries and none
       // will be recompiled. The assertion this test actually makes is "no spec fails for an
       // UNKNOWN reason"; it has never asserted that every archive compiles (65 already do not).
+      // Frame-v2 criterion-scope is the same class: the checked-in corpus guards current authoring,
+      // while immutable pre-lint specs remain useful historical inputs rather than migration work.
       // OBS-488: the unconsumed-line invariant is the fourth bar. Measured over the corpus:
       // 3 column-zero prose lines across v1.86 (2) and v1.90 (1) were silently DROPPED by every
       // prior compiler — the error now names them instead.
@@ -221,7 +223,7 @@ describe("native spec compiler", () => {
         expect(compileSource(join("specs", file)).spec.source).toBe("native");
       } catch (error) {
         expect(error).toBeInstanceOf(CompileError);
-        expect((error as Error).message).toMatch(/OBS-97|task unit contract|context: paths that do not exist|no parse rule consumes/);
+        expect((error as Error).message).toMatch(/OBS-97|task unit contract|context: paths that do not exist|criterion-scope authoring lint|no parse rule consumes/);
       }
     }
   });
@@ -394,6 +396,42 @@ describe("native spec semicolon-joined judge lint (OBS-51)", () => {
     expect(obs51[0]).toMatch(/task T2/);
     expect(obs51[0]).toMatch(/looks good; smells good/);
   });
+});
+
+test("criterion-scope lint errors when a criterion names a file or a `52/64`-form rendered", () => {
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-criterion-scope-"));
+  mkdirSync(join(repo, "tests"));
+  writeFileSync(
+    join(repo, "tests", "render.test.ts"),
+    'test("rendered numerator", () => expect("52/64").toBe("52/64"));\n',
+  );
+  execSync("git init -q", { cwd: repo });
+  execSync("git config user.email t@t.t", { cwd: repo });
+  execSync("git config user.name t", { cwd: repo });
+  execSync("git add tests/render.test.ts", { cwd: repo });
+  execSync("git -c commit.gpgsign=false commit -qm base", { cwd: repo });
+
+  const spec = join(repo, "scope.spec.md");
+  const source = (criterion: string, includeTest: boolean) => `<!-- tickmarkr:spec -->
+## T1: Criterion scope
+- goal: Render the normalized result
+- files: src/render.ts${includeTest ? ", tests/render.test.ts" : ""}
+- acceptance:
+  - judge: ${criterion}
+`;
+
+  for (const criterion of [
+    "the oracle in `tests/render.test.ts` renders the normalized result",
+    "the rendered summary is `52/64`",
+  ]) {
+    writeFileSync(spec, source(criterion, false));
+    expect(() => compileSource(spec, "native"), criterion).toThrow(CompileError);
+    expect(() => compileSource(spec, "native"), criterion).toThrow(/authoring-lint\[criterion-scope\]/);
+    expect(() => compileSource(spec, "native"), criterion).toThrow(/tests\/render\.test\.ts/);
+
+    writeFileSync(spec, source(criterion, true));
+    expect(compileSource(spec, "native").tasks[0].files, criterion).toContain("tests/render.test.ts");
+  }
 });
 
 // OBS-170/OBS-184: `context:` entries reached workers split at annotation commas and unvalidated.

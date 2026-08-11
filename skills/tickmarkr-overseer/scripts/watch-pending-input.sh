@@ -29,6 +29,16 @@ status_of() {
 # The rendered prompt line is the condition itself. `agent_status` is the harness's OPINION about the
 # seat and fails in both directions (a wedged worker has reported `idle`, a working one `done`), so the
 # text in the box is the stronger signal — it is what will not run.
+# GHOST DISCRIMINATOR (OBS-482 addendum 34): claude-code AUTOSUGGEST renders its suggestion on the
+# prompt line wrapped in SGR dim — sampled live 2026-08-11: `❯ \e[0m\e[2mcheck T76 progress\e[0m`.
+# Typed text renders default. A dim-wrapped pending line is a GHOST (rendering, not state): skip it —
+# no wake, no streak. Negative scope: sampled on one theme/version; a theme rendering typed input dim
+# would blind this check TOWARD silence, so a wake is still authoritative but its absence is not proof.
+is_ghost() {
+  herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
+    | grep -F -- "❯" | grep -F -- "$1" | head -1 | grep -q "$(printf '\033')\[2m"
+}
+
 pending_text() {
   herdr agent read "$TARGET" --source visible --lines 14 2>/dev/null \
     | sed -n 's/^[[:space:]]*❯[[:space:]]*//p' | head -1 \
@@ -126,6 +136,7 @@ while [ "$elapsed" -lt "$CAP" ]; do
   case "$S" in
     idle|done)
       T=$(pending_text)
+      if [ -n "$T" ] && is_ghost "$T"; then T=""; fi
       if [ -n "$T" ]; then
         streak=$((streak + 1))
         if [ "$streak" -ge "$CONFIRM" ]; then
@@ -159,6 +170,13 @@ while [ "$elapsed" -lt "$CAP" ]; do
           fi
           echo "PENDING_INPUT $TARGET status=$S sustained=$((streak * POLL))s"
           echo "  unsubmitted: $T"
+          # GHOST WARNING (OBS-482 addendum 33): claude-code AUTOSUGGEST renders context-plausible
+          # ghost text on this same prompt line, and in text-format reads it is BYTE-IDENTICAL to a
+          # typed draft. Ghost text renders dim/grey; typed text renders default. Emit the styled
+          # bytes so the reader can discriminate before treating this as a draft.
+          echo "  styling evidence (dim/grey SGR around the text = autosuggest ghost, NOT a draft):"
+          herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
+            | grep -F -- "$T" | head -2 | cat -v | sed 's/^/    /'
           echo "  the seat is idle and holding live work in its prompt — supersede it, do not re-send:"
           echo "  herdr agent prompt $TARGET \" <-- disregard everything before this arrow (stale draft). ACTUAL: …\""
           # Name the ACTUAL reason we fell through. Saying "budget exhausted" when the cause was the

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import picomatch from "picomatch";
+import { filesGlob } from "../graph/files-glob.js";
 import { Document, parse } from "yaml";
 import { z } from "zod";
 import { CITED_MODEL_WINDOWS } from "../adapters/model-windows.js";
@@ -255,7 +255,7 @@ export function criticalPathHits(
     for (const rawCritical of criticalPaths) {
       const critical = normPath(rawCritical);
       if (!critical) continue;
-      if (f === critical || picomatch(critical, { dot: true })(f) || picomatch(f, { dot: true })(critical)
+      if (f === critical || filesGlob(critical)(f) || filesGlob(f)(critical) // Q120s shared matcher
           || (GLOB_META_RE.test(f) && GLOB_META_RE.test(critical) && globsMayIntersect(f, critical))) {
         hits.add(f);
       }

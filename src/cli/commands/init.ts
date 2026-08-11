@@ -90,6 +90,7 @@ tickmarkr compiles repository specs into isolated, independently verified agent 
 - \`tickmarkr resume <runId>\` — continue a paused or failed run
 - \`tickmarkr approve <runId> <taskId>\` — release a human gate
 - \`tickmarkr report <runId> --md\` — execution record beside the spec
+- \`tickmarkr verify --base <ref>\` — run the gate battery standalone against merge-base(base, HEAD)..HEAD: no daemon, no retries, one fail-closed verdict (\`--criteria <file>\` or \`--task <id>\` adds the semantic gates; \`--no-review\` for deterministic-only)
 
 Loop: compile → plan → run → report. Watch the journal for run-end rather than polling workers.
 

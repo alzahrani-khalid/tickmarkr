@@ -2,11 +2,21 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
-import { sh } from "../run/git.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, sh, type ShResult } from "../run/git.js";
 import type { GateResult } from "./types.js";
 
+export interface BaselineCommand {
+  exitCode: number;
+  fingerprints: string[];
+  missingCommand?: boolean;
+  /** What this command actually took at capture, on a pristine tree. Absent in pre-v1.90 baselines. */
+  durationMs?: number;
+  /** The ceiling that measurement implies, persisted so every later battery uses the same number. */
+  ceilingMs?: number;
+}
+
 export interface Baseline {
-  commands: Record<string, { exitCode: number; fingerprints: string[]; missingCommand?: boolean }>;
+  commands: Record<string, BaselineCommand>;
   warnings?: BaselineWarning[];
 }
 
@@ -137,6 +147,21 @@ const unrecognizedEvidence = (raw: string): string =>
 // on-disk baseline.json files stay comparable without recapture (compat invariant, CLAUDE.md)
 const renormalize = (fp: string) => normalizeLine(fp.replace(ANSI_RE, ""));
 
+/**
+ * Q121s: the battery's forgiveness math, exported so tip-verify applies the IDENTICAL rule.
+ * Returns the failure fingerprints of `raw` that are NOT in the baseline entry (fresh), and
+ * whether the output carried no recognizable failure shape at all.
+ */
+export function freshFailures(entry: BaselineCommand | undefined, raw: string): { failing: string[]; unreadable: boolean } {
+  const known = new Set((entry?.fingerprints ?? []).map(renormalize));
+  // OBS-42: diagnostic headings enrich fingerprints but cannot invalidate legacy baselines.
+  const current = fingerprint(raw);
+  const fresh = current.filter(
+    (f) => !known.has(f) && (!FAIL_ANCHOR_RE.test(f) || f.startsWith("FAIL ")),
+  );
+  return { failing: fresh.filter((f) => f !== UNRECOGNIZED_FAILURE), unreadable: current.includes(UNRECOGNIZED_FAILURE) };
+}
+
 export function detectGateCommands(repoRoot: string, cfg: TickmarkrConfig): Record<string, string> {
   const out: Record<string, string> = {};
   const pkgPath = join(repoRoot, "package.json");
@@ -169,17 +194,62 @@ function missingConfiguredCommand(cmd: string, result: { code: number; stdout: s
   return new RegExp(`(?:^|[:\\s])${reEscape(token)}:\\s+(?:command not found|No such file or directory)`, "i").test(output);
 }
 
+/**
+ * How much longer than the baseline a battery may legitimately take. Gate batteries run inside a
+ * worktree beside up to `concurrency` siblings, so the same suite is genuinely slower than its
+ * pristine-tree capture — 3× is the headroom, not a performance budget.
+ */
+const CEILING_SLACK = 3;
+
+/**
+ * The ceiling a battery runs under: whichever is larger of the shipped constant and the slack applied
+ * to what this command actually measured. A pre-v1.90 baseline (no measurement) gets exactly the
+ * shipped constant, so nothing regresses on an existing on-disk baseline.json — the same read-old
+ * compat rule the fingerprint renormalizer follows.
+ */
+export const effectiveCeilingMs = (entry?: Pick<BaselineCommand, "durationMs" | "ceilingMs">): number =>
+  entry?.ceilingMs ?? Math.max(DEFAULT_SHELL_TIMEOUT_MS, CEILING_SLACK * (entry?.durationMs ?? 0));
+
+/**
+ * The ONLY producer of a `ceiling-kill` gate result. It is gated on `timedOut`, which git.ts sets in
+ * exactly one place — inside the timer callback that issues the SIGKILL — so a process that exited on
+ * its own can never reach this text however it exited: a slow red suite, an unreadable runner, exit
+ * 137 from a kill somebody ELSE sent. Returning `undefined` rather than a result keeps that structural:
+ * every caller must go on to the ordinary verdict path, it cannot fall through into this one.
+ *
+ * A kill is not a verdict. The battery was still running when the machine took it away, so its exit
+ * code is evidence about the ceiling and nothing about the work — which is why this reports `infra`
+ * and never enters baseline forgiveness (there is no runner output to forgive).
+ */
+export function ceilingKillResult(gate: string, r: ShResult, ceilingMs: number): GateResult | undefined {
+  if (r.timedOut !== true) return undefined;
+  // no measurement only when a caller synthesized the result; a real kill fires AT the ceiling
+  const durationMs = r.durationMs ?? ceilingMs;
+  return {
+    gate,
+    pass: false,
+    details: `ceiling-kill: SIGKILLed after ${durationMs}ms at the configured ${ceilingMs}ms ceiling — `
+      + `the battery never returned a verdict, so this gate verified nothing (exit ${r.code} is the kill, not a test result)`,
+    meta: { classification: "infra" satisfies FailureClassification, infra: true, kind: "ceiling-kill", durationMs, ceilingMs },
+  };
+}
+
 export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   for (const [name, cmd] of Object.entries(commands)) {
     const r = await sh(cmd, cwd);
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
+    // ponytail: a capture that was itself killed records the ceiling as its "measurement", which
+    // scales the next ceiling up — the right direction for a suite that never finished once.
+    const durationMs = r.durationMs ?? 0;
     base.commands[name] = {
       exitCode: r.code,
       // a command that exits 0 has no failures to fingerprint — recording any would be a lie the
       // compare step then has to forgive
       fingerprints: r.code === 0 ? [] : fingerprint((r.stdout + "\n" + r.stderr).split(cwd).join("")),
       missingCommand: missingConfiguredCommand(cmd, r),
+      durationMs,
+      ceilingMs: effectiveCeilingMs({ durationMs }),
     };
   }
   const names = Object.keys(commands);
@@ -262,7 +332,17 @@ export async function compareToBaseline(
       results.push({ gate: name, pass: true, details: `no ${name} command detected — skipped`, meta: { skipped: true } });
       continue;
     }
-    const r = await sh(cmd, cwd);
+    const ceilingMs = effectiveCeilingMs(baseline.commands[name]);
+    const r = await sh(cmd, cwd, ceilingMs);
+    // Q24: the kill is read BEFORE the exit code is interpreted at all. A SIGKILLed battery has
+    // whatever partial output it had flushed — typically no failure shape — so every path below
+    // would otherwise turn a timeout into a claim about the work: "no recognizable failure lines"
+    // when the baseline was green, or a forgiven pre-existing red when it was not. Neither is true.
+    const killed = ceilingKillResult(name, r, ceilingMs);
+    if (killed) {
+      results.push(killed);
+      continue;
+    }
     if (r.code === 0) {
       results.push({ gate: name, pass: true, details: "exit 0" });
       continue;
@@ -283,12 +363,6 @@ export async function compareToBaseline(
       });
       continue;
     }
-    const known = new Set((baseline.commands[name]?.fingerprints ?? []).map(renormalize));
-    // OBS-42: diagnostic headings enrich fingerprints but cannot invalidate legacy baselines.
-    const current = fingerprint(raw);
-    const fresh = current.filter(
-      (f) => !known.has(f) && (!FAIL_ANCHOR_RE.test(f) || f.startsWith("FAIL ")),
-    );
     // OBS-278: only a failure SHAPE is a verdict — everything fingerprint() keeps is one, except the
     // unrecognized-output marker, which is evidence for the operator and never grounds to reject.
     // ponytail: ceiling — a runner whose failure output holds no shape above and whose baseline is
@@ -296,8 +370,7 @@ export async function compareToBaseline(
     // below rather than reading as a verified green. Raise the ceiling by teaching isFailureShaped
     // that runner's position rule (leading verdict + identifier, or identifier + separator + trailing
     // verdict); loosening back to vocabulary re-opens OBS-278.
-    const unreadable = current.includes(UNRECOGNIZED_FAILURE);
-    const failing = fresh.filter((f) => f !== UNRECOGNIZED_FAILURE);
+    const { failing, unreadable } = freshFailures(baseline.commands[name], raw);
     if (!failing.length && (baseline.commands[name]?.exitCode ?? 1) === 0) {
       const closed = `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`;
       const evidence = unrecognizedEvidence(raw);

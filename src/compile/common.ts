@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import picomatch from "picomatch";
+import { filesGlob } from "../graph/files-glob.js";
 import type { Shape } from "../graph/schema.js";
 
 export class CompileError extends Error {
@@ -37,7 +37,7 @@ export interface WriteDirective {
 export function assertWriteScope(source: string, taskId: string, files: string[], writes: WriteDirective[]): void {
   // #1 over-fire landmine: empty files[] is unrestricted — mirrors scope.ts:12
   if (!files.length) return;
-  const inScope = picomatch(files, { dot: true }); // byte-identical options to src/gates/scope.ts:15
+  const inScope = filesGlob(files); // the ONE files[] matcher — src/graph/files-glob.ts (Q120s)
   for (const { path, directive, bare } of writes) {
     const normalized = path.replace(/^\.\//, "");
     if (inScope(normalized)) continue;

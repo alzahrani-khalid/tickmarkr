@@ -52,7 +52,13 @@ export const runWithForkBudget = <T>(concurrency: number, fn: () => Promise<T>):
 /** The cap owned by the run on this async context; the standalone default outside one. */
 export const resolvedForkCap = (): string => forkBudget.getStore() ?? DEFAULT_FORK_CAP;
 
-export interface ShResult { code: number; stdout: string; stderr: string; timedOut?: boolean }
+/** The shipped shell ceiling: the fallback every caller gets when nothing measured a better one. */
+export const DEFAULT_SHELL_TIMEOUT_MS = 600000;
+
+// durationMs is the child's own wall clock, measured at this one seam so no caller has to bracket its
+// own Date.now() around a shell (two callers bracketing differently is how a "measured" number starts
+// disagreeing with itself). On a timeout it is the elapsed time at the kill, not the ceiling.
+export interface ShResult { code: number; stdout: string; stderr: string; timedOut?: boolean; durationMs?: number }
 
 // stdin "ignore": same class as HARD-05 / SubprocessDriver — never leave an open pipe a child can block on
 // (pi -p / codex exec wait for stdin EOF). timedOut distinguishes SIGKILL-timeout from a real nonzero exit.
@@ -66,6 +72,7 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   // OBS-110: apply the run's own fork cap only when the operator has not already set one.
   if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = resolvedForkCap();
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     // detached: bash gets its own process group so a timeout can kill the whole tree —
     // SIGKILLing bash alone orphans grandchildren (codex/pi) that hold the stdio pipes
     // open, so "close" never fires and the promise wedges forever (v1.33.1 init hang).
@@ -76,7 +83,7 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ code, stdout, stderr: err ?? stderr, timedOut });
+      resolve({ code, stdout, stderr: err ?? stderr, timedOut, durationMs: Date.now() - startedAt });
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -91,12 +98,12 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   });
 }
 
-export function sh(cmd: string, cwd: string, timeoutMs = 600000): Promise<ShResult> {
+export function sh(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<ShResult> {
   return shell(cmd, cwd, timeoutMs, true);
 }
 
 // Git plumbing never needs an operator profile; skip login-shell startup and its side effects.
-export function shGit(cmd: string, cwd: string, timeoutMs = 600000): Promise<ShResult> {
+export function shGit(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<ShResult> {
   return shell(cmd, cwd, timeoutMs, false);
 }
 

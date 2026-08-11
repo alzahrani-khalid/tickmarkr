@@ -1,4 +1,5 @@
 import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
@@ -24,6 +25,51 @@ export type DoctorOpts = {
   catalog?: CatalogReadResult;
   catalogNow?: () => Date;
 };
+
+/**
+ * Q122s (TRIAL T-OBS-3): tickmarkr provisions run worktrees INSIDE the repo
+ * (.tickmarkr/worktrees.noindex/). A target repo whose test runner collects with
+ * repo-wide globs (jest's default `**​/__tests__/**` shape, vitest's default include)
+ * scans every suite once per live worktree — duplicate-suite interference red the
+ * baseline AND tip-verify on SentioQ's first external run, a class invisible to
+ * dogfooding (this repo's own includes are rooted at tests/).
+ *
+ * Text-level heuristic, advisory only — never enters health/doctor.json or routing.
+ * ponytail: ceilings — a commented-out ignore false-passes; an include built from
+ * variables is judged by its literal text. Both cost one advisory row, nothing more.
+ */
+export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; detail: string } | undefined {
+  const readIf = (p: string): string => (existsSync(join(cwd, p)) ? readFileSync(join(cwd, p), "utf8") : "");
+  const pkgText = readIf("package.json");
+  let pkg: { scripts?: Record<string, string>; jest?: unknown } = {};
+  try { pkg = JSON.parse(pkgText || "{}") as typeof pkg; } catch { /* unparseable manifest: judge config files alone */ }
+  const jestConfig = ["jest.config.js", "jest.config.cjs", "jest.config.mjs", "jest.config.ts", "jest.config.json"].find((p) => existsSync(join(cwd, p)));
+  const vitestConfig = ["vitest.config.ts", "vitest.config.js", "vitest.config.mts", "vitest.config.mjs", "vitest.config.cts"].find((p) => existsSync(join(cwd, p)));
+  const testScript = pkg.scripts?.test ?? "";
+  const isJest = jestConfig !== undefined || pkg.jest !== undefined || /\bjest\b/.test(testScript);
+  const isVitest = !isJest && (vitestConfig !== undefined || /\bvitest\b/.test(testScript));
+  if (!isJest && !isVitest) return undefined;
+
+  const configText = isJest
+    ? `${jestConfig ? readIf(jestConfig) : ""}${pkg.jest ? JSON.stringify(pkg.jest) : ""}`
+    : vitestConfig ? readIf(vitestConfig) : "";
+  if (/\.tickmarkr|worktrees\.noindex/.test(configText)) {
+    return { verdict: "pass", detail: `${isJest ? "jest" : "vitest"} config ignores .tickmarkr/ — run worktrees stay out of the suite` };
+  }
+  // Rooted collection globs never reach .tickmarkr/…; only repo-wide `**/`-style patterns (or
+  // runner defaults, which are repo-wide) can collect worktree copies.
+  const repoWide = configText === "" || /["'`]\*\*\//.test(configText);
+  if (!repoWide) {
+    return { verdict: "pass", detail: `${isJest ? "jest" : "vitest"} collection globs are rooted — run worktrees are not collectable` };
+  }
+  const remedy = isJest
+    ? `add "/.tickmarkr/" to testPathIgnorePatterns in ${jestConfig ?? "the package.json jest block"}`
+    : `add "**/.tickmarkr/**" to test.exclude in ${vitestConfig ?? "a vitest config"}`;
+  return {
+    verdict: "warn",
+    detail: `${isJest ? "jest" : "vitest"} collects repo-wide and will scan .tickmarkr/ run worktrees (duplicate suites, false reds) — ${remedy}`,
+  };
+}
 
 export async function doctor(
   _argv: string[],
@@ -104,6 +150,9 @@ export async function doctor(
   ));
   const herdr = HerdrDriver.available();
   rows.push(alignedStatusRow(herdr ? "pass" : "fail", "herdr", herdr ? "driver available (HERDR_ENV=1)" : "not detected — subprocess driver will be used"));
+  // Q122s: the target repo's runner must not scan tickmarkr's own worktrees (advisory row).
+  const runnerIgnore = runnerIgnoreFinding(cwd);
+  if (runnerIgnore) rows.push(alignedStatusRow(runnerIgnore.verdict, "test-runner", runnerIgnore.detail));
   // v1.22 T5: workspace-trust pre-flight — per installed adapter: trusted | seeded | action-required | n/a.
   // action-required names the exact one-time command (or dialog) the operator must run once.
   rows.push(legend("workspace trust:"));

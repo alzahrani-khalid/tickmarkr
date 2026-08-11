@@ -1,8 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { filesGlob } from "../graph/files-glob.js";
 import picomatch from "picomatch";
-import { type AcceptanceItem, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, SHAPES, TIERS, type RunGraph, validateGraph } from "../graph/schema.js";
+import {
+  type AcceptanceItem, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, renderAcceptanceItem, SHAPES, TIERS,
+  type RunGraph, type Task, validateGraph,
+} from "../graph/schema.js";
 import { CompileError, inferShape, sha256 } from "./common.js";
 
 // OBS-170/OBS-184: `context:` is a promise to the worker, and nothing ever checked it could be kept.
@@ -88,6 +92,231 @@ interface Draft {
 
 function invalid(task: string, field: string, detail: string): never {
   throw new CompileError(`Task ${task} field "${field}" ${detail}`);
+}
+
+export const AUTHORING_LINT_CODES = [
+  "criterion-scope",
+  "dependency-closure",
+  "dependency-coupling",
+  "proxy-metric",
+  "external-referent",
+  "closed-enumeration",
+  "one-behavior",
+  "concern-bundle",
+  "seam-exists",
+] as const;
+
+export type AuthoringLintCode = (typeof AUTHORING_LINT_CODES)[number];
+
+export interface AuthoringLintFinding {
+  code: AuthoringLintCode;
+  fixtureId: string;
+  taskId: string;
+  criterion?: number;
+  detail: string;
+}
+
+type HeadTest = { path: string; text: string };
+
+// The authoring frame's observable oracle is the branch-tip test corpus, never the mutable index or
+// an author's untracked checkout. Load it once per repository: one bounded git read replaces a grep
+// subprocess per token and preserves the base-only native compile's zero-Git property (the index is
+// requested only when a criterion actually carries a rendered observable or a test basename).
+const headTestCache = new Map<string, HeadTest[]>();
+
+function repositoryRoot(file: string): string | undefined {
+  let current = resolve(dirname(file));
+  for (;;) {
+    if (existsSync(join(current, ".git"))) return current;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+function testsAtHead(root: string): HeadTest[] {
+  const cached = headTestCache.get(root);
+  if (cached) return cached;
+  const grep = spawnSync(
+    "git",
+    ["-C", root, "grep", "-I", "-n", "-e", "", "HEAD", "--", "tests/*.test.ts", "tests/**/*.test.ts"],
+    { encoding: "utf8", maxBuffer: 1 << 25 },
+  );
+  if (grep.status !== 0 || typeof grep.stdout !== "string") {
+    headTestCache.set(root, []);
+    return [];
+  }
+  const bodies = new Map<string, string[]>();
+  for (const line of grep.stdout.split("\n")) {
+    const match = line.match(/^HEAD:(tests\/.*\.test\.ts):\d+:(.*)$/);
+    if (!match) continue;
+    const lines = bodies.get(match[1]) ?? [];
+    lines.push(match[2]);
+    bodies.set(match[1], lines);
+  }
+  const tests = [...bodies].map(([path, lines]) => ({ path, text: lines.join("\n") }));
+  headTestCache.set(root, tests);
+  return tests;
+}
+
+function criterionTexts(task: Pick<Task, "acceptance">): string[] {
+  return task.acceptance.map(renderAcceptanceItem);
+}
+
+function fixtureId(file: string): string {
+  return basename(file).replace(/(?:\.spec)?\.md$/, "");
+}
+
+function strictNegativeCount(text: string): number {
+  return (text.match(/\b(?:never|neither|cannot)\b|\bno\s+[a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,3}\s+(?:may|can|supplies|becomes)\b/gi) ?? []).length;
+}
+
+function namedCriterionPaths(text: string, tests: HeadTest[]): string[] {
+  const paths = new Set<string>();
+  for (const match of text.matchAll(/(?:^|[\s("'`])((?:src|tests|fixtures|scripts)\/[A-Za-z0-9_@{}*?.,/+-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|txt))/g)) {
+    paths.add(match[1]);
+  }
+  for (const match of text.matchAll(/\b([A-Za-z0-9_.-]+\.test\.ts)\b/g)) {
+    for (const test of tests) if (basename(test.path) === match[1]) paths.add(test.path);
+  }
+  return [...paths];
+}
+
+function renderedObservables(text: string): { exact: string[]; denominators: string[] } {
+  const exact = new Set<string>();
+  const denominators = new Set<string>();
+  for (const match of text.matchAll(/`([^`\n]{2,120})`/g)) {
+    const token = match[1].trim();
+    // Plain vocabulary in backticks is documentation, not a concrete rendered value. Digit-bearing,
+    // path/punctuation-shaped, snake/camel-case tokens are the branch-tip grep substrate from C1.
+    if (/\d|[_./:%-]|[a-z][A-Z]/.test(token)) exact.add(token);
+  }
+  for (const match of text.matchAll(/\b(\d+)\s*(?:\/|of)\s*(\d+)\b/gi)) {
+    exact.add(`${match[1]}/${match[2]}`);
+    denominators.add(match[2]);
+  }
+  return { exact: [...exact], denominators: [...denominators] };
+}
+
+function criterionScopeFinding(
+  task: Pick<Task, "id" | "files" | "acceptance">,
+  text: string,
+  criterion: number,
+  id: string,
+  tests: HeadTest[],
+): AuthoringLintFinding | undefined {
+  if (task.files.length === 0) return undefined; // empty files[] is deliberately unrestricted
+  const inScope = filesGlob(task.files.map((entry) => entry.replace(/^\.\//, ""))); // Q120s shared matcher
+  const named = namedCriterionPaths(text, tests);
+  const { exact, denominators } = renderedObservables(text);
+  const asserting = tests.filter((test) =>
+    exact.some((token) => test.text.includes(token))
+      || denominators.some((denominator) => new RegExp(`(?:^|\\D)\\d+/${denominator}(?:\\D|$)`).test(test.text)),
+  ).map((test) => test.path);
+  const missing = [...new Set([...named, ...asserting])].filter((path) => !inScope(path));
+  if (missing.length === 0) return undefined;
+  return {
+    code: "criterion-scope",
+    fixtureId: id,
+    taskId: task.id,
+    criterion,
+    detail: `criterion names asserting file${missing.length === 1 ? "" : "s"} outside expanded files[]: ${missing.join(", ")}`,
+  };
+}
+
+function exportedIdentifier(root: string, files: readonly string[], identifier: string): boolean {
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const declaration = new RegExp(`\\bexport\\s+(?:(?:declare|default|async)\\s+)*(?:function|class|const|let|var|interface|type)\\s+${escaped}\\b|\\bexport\\s*\\{[^}]*\\b${escaped}\\b`);
+  return files.some((file) => {
+    if (/[*?{[]/.test(file)) return false;
+    try {
+      return declaration.test(readFileSync(join(root, file), "utf8"));
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Frame-v2 authoring checks over the compiled native task shape. Criterion-scope is blocking at the
+ * compile boundary; the remaining checks are review findings, emitted by compileNative below.
+ */
+export function authoringLintFindings(tasks: readonly Task[], file: string): AuthoringLintFinding[] {
+  const id = fixtureId(file);
+  const root = repositoryRoot(file);
+  let indexedTests: HeadTest[] | undefined;
+  const testIndex = () => indexedTests ??= root ? testsAtHead(root) : [];
+  const findings: AuthoringLintFinding[] = [];
+
+  for (const task of tasks) {
+    const criteria = criterionTexts(task);
+    for (const [index, text] of criteria.entries()) {
+      const needsTestIndex = /`[^`\n]{2,120}`|\b\d+\s*(?:\/|of)\s*\d+\b|\b[A-Za-z0-9_.-]+\.test\.ts\b/.test(text);
+      const scope = criterionScopeFinding(task, text, index + 1, id, needsTestIndex ? testIndex() : []);
+      if (scope) findings.push(scope);
+
+      if (/line[- ]count|physical line|not greater than (?:the|\d)|no larger than|at most \d+ (?:lines|bytes)/i.test(text)) {
+        findings.push({ code: "proxy-metric", fixtureId: id, taskId: task.id, criterion: index + 1, detail: "criterion uses a proxy size metric; state the structural intent instead" });
+      }
+      if (/\bthe (?:audit|ruling|sweep|standby|decision|analysis|handoff)\b|\bper the\b|\bat \.planning\//i.test(text)) {
+        findings.push({ code: "external-referent", fixtureId: id, taskId: task.id, criterion: index + 1, detail: "criterion depends on an external governance referent; inline the deciding fact" });
+      }
+      const separators = text.match(/\band\b|\bwhile\b|\bthen\b|\bplus\b|\bwith\b|,|—/gi) ?? [];
+      if (separators.length >= 4) {
+        findings.push({ code: "one-behavior", fixtureId: id, taskId: task.id, criterion: index + 1, detail: `${separators.length} independently-failable separators; split unless one leg alone reds this title` });
+      }
+    }
+
+    const prose = [task.goal, ...criteria].join("\n");
+    const dependencyText = prose
+      .replace(/`[^`]*`/g, "")
+      .split("\n")
+      .filter((line) => !/\b(?:accepts?|rejects?)\b/i.test(line))
+      .join("\n");
+    const referenced = [...new Set(dependencyText.match(/\bT\d+\b/g) ?? [])]
+      .filter((dep) => dep !== task.id && !task.deps.includes(dep));
+    if (referenced.length > 0) {
+      findings.push({ code: "dependency-closure", fixtureId: id, taskId: task.id, detail: `references ${referenced.join(", ")} outside deps[]` });
+    }
+    if (/\bwhose independent [^.\n]{0,80}(?:classification|result|decision|output|evidence)\b|\b(?:from|through|provided by|owned by) (?:a |the )?(?:successor|downstream|later|sibling)\b/i.test(dependencyText)) {
+      findings.push({ code: "dependency-coupling", fixtureId: id, taskId: task.id, detail: "de-numbered cross-task coupling needs a dependency or a declared consumes contract" });
+    }
+
+    const negatives = strictNegativeCount(prose);
+    if (negatives >= 2 && !/enumerat|closed (?:input )?list|closed \w* table|STANDBY/i.test(prose)) {
+      findings.push({ code: "closed-enumeration", fixtureId: id, taskId: task.id, detail: `${negatives} strict prohibitions have no closed enumeration pointer` });
+    }
+
+    const concerns = [...new Set(task.goal.match(/\bQ\d+\b/g) ?? [])];
+    if (concerns.length > 1) {
+      findings.push({ code: "concern-bundle", fixtureId: id, taskId: task.id, detail: `goal bundles ${concerns.join(", ")}` });
+    }
+
+    if (root && negatives > 0) {
+      const monoliths = task.files.filter((entry) => {
+        if (!entry.startsWith("src/") || /[*?{[]/.test(entry)) return false;
+        try {
+          return readFileSync(join(root, entry), "utf8").split("\n").length > 1500;
+        } catch {
+          return false;
+        }
+      });
+      if (monoliths.length > 0) {
+        const identifiers = [...prose.matchAll(/`([A-Za-z_$][A-Za-z0-9_$]*)`/g)].map((match) => match[1]);
+        const seamExists = identifiers.some((identifier) => exportedIdentifier(root, task.files, identifier));
+        const firstCreatesSeam = /\b(?:add|create|extract|introduce|ship)\b[^.\n]{0,100}\b(?:injectable|seam|clock|snapshot|evidence)\b/i.test(criteria[0] ?? "");
+        if (!seamExists && !firstCreatesSeam) {
+          findings.push({ code: "seam-exists", fixtureId: id, taskId: task.id, detail: `law-shaped task touches ${monoliths.join(", ")} but names no exported seam and does not create one first` });
+        }
+      }
+    }
+  }
+  return findings;
+}
+
+function renderAuthoringFinding(finding: AuthoringLintFinding): string {
+  const criterion = finding.criterion === undefined ? "" : ` criterion ${finding.criterion}`;
+  return `tickmarkr: authoring-lint[${finding.code}] fixture ${finding.fixtureId} task ${finding.taskId}${criterion}: ${finding.detail}`;
 }
 
 export function compileNative(file: string): RunGraph {
@@ -342,7 +571,7 @@ export function compileNative(file: string): RunGraph {
     return [probe, ...variants];
   };
   const canHostTest = (entry: string) => {
-    const self = picomatch(entry, { dot: true });
+    const self = filesGlob(entry); // Q120s shared matcher — paren dirs stay literal in the self-probe
     return expandBraces(entry)
       .flatMap((branch) => PROBE_TOKENS.map((token) => branch.replace(/\*+/g, token)))
       .flatMap(qmarkVariants)
@@ -420,6 +649,17 @@ export function compileNative(file: string): RunGraph {
     },
     tasks,
   });
+  const authoringFindings = authoringLintFindings(result.tasks, file);
+  for (const finding of authoringFindings.filter(({ code }) => code !== "criterion-scope")) {
+    console.warn(renderAuthoringFinding(finding));
+  }
+  const scopeErrors = authoringFindings.filter(({ code }) => code === "criterion-scope");
+  if (scopeErrors.length > 0) {
+    throw new CompileError(
+      `${file} violates the criterion-scope authoring lint (${scopeErrors.length} error${scopeErrors.length === 1 ? "" : "s"}):\n`
+        + scopeErrors.map((finding) => `  - ${renderAuthoringFinding(finding)}`).join("\n"),
+    );
+  }
   // v1.19 read-old/write-new: a plain-string acceptance item compiles as a judge oracle. This is the
   // one-time nudge toward typed oracles (command/test/judge); PRD/Spec Kit/GSD stay silent (untouched).
   if (plainCount > 0) {

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import picomatch from "picomatch";
+import { filesGlob } from "../../src/graph/files-glob.js";
 import { describe, expect, test } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
 import { compileGsd } from "../../src/compile/gsd.js";
@@ -321,11 +321,11 @@ describe("HARD-07 write-directive scope seam", () => {
     expect(() => compileGsd(dir, dir)).not.toThrow();
   });
 
-  // RED on unfixed HEAD: no compile-time check exists yet; picomatch half is the reference
+  // RED on unfixed HEAD: no compile-time check exists yet; the shared filesGlob half is the reference
   test("HARD-07: compile rejection agrees with the scope gate (matcher parity)", () => {
     const files = ["src/a.ts"];
     const path = ".planning/out/20-01-SUMMARY.md";
-    expect(picomatch(files, { dot: true })(path)).toBe(false);
+    expect(filesGlob(files)(path)).toBe(false);
     const dir = scratchPhase("h07-parity", {
       "20-01-PLAN.md": plan(
         "files_modified:\n  - src/a.ts",

@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, relative } from "node:path";
-import picomatch from "picomatch";
+import { filesGlob } from "../graph/files-glob.js";
 import {
   criticalPathHits, DEFAULT_CONFIG, DEFAULT_REVIEW_CRITICAL_PATHS, effectiveReviewPolicy, loadConfig,
   type TickmarkrConfig,
@@ -108,7 +108,7 @@ export function collateralLints(tasks: ReadonlyArray<Pick<Task, "id" | "files">>
   const lines: string[] = [];
   for (const t of tasks) {
     // OBS-22: scopeGate accepts picomatch globs; advisory collateral warnings must agree.
-    const scoped = picomatch(t.files.map((f) => f.replace(/^\.\//, "")), { dot: true });
+    const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
     const srcFiles = t.files.map((f) => f.replace(/^\.\//, "")).filter(isSrcPath);
     if (!srcFiles.length) continue;
 
@@ -177,7 +177,7 @@ export function newDirectoryLints(
   const lines: string[] = [];
   for (const t of tasks) {
     // OBS-22: scopeGate accepts picomatch globs; advisory warnings must agree.
-    const scoped = picomatch(t.files.map((f) => f.replace(/^\.\//, "")), { dot: true });
+    const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
     const newDirs = new Set<string>();
     for (const f of t.files) {
       const dir = topLevelSrcDir(f);
@@ -215,7 +215,7 @@ export function sourceScopeLints(
   const lines: string[] = [];
   for (const { t, needles } of perTask) {
     // OBS-22: scopeGate accepts picomatch globs; advisory warnings must agree.
-    const scoped = picomatch(t.files.map((f) => f.replace(/^\.\//, "")), { dot: true });
+    const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
     // needles are word-chars by construction — no regex escaping needed; whole-word match only
     const res = needles.map((n) => new RegExp(`\\b${n}\\b`));
     const hits: string[] = [];
@@ -265,8 +265,8 @@ function overlappingPatterns(a: ReadonlyArray<string>, b: ReadonlyArray<string>)
   for (const pa of a) {
     for (const pb of b) {
       if (pa === pb) { hits.add(pa); continue; }
-      if (isGlob(pa) && !isGlob(pb) && picomatch(pa)(pb)) hits.add(`${pb} ⊂ ${pa}`);
-      else if (isGlob(pb) && !isGlob(pa) && picomatch(pb)(pa)) hits.add(`${pa} ⊂ ${pb}`);
+      if (isGlob(pa) && !isGlob(pb) && filesGlob(pa)(pb)) hits.add(`${pb} ⊂ ${pa}`);
+      else if (isGlob(pb) && !isGlob(pa) && filesGlob(pb)(pa)) hits.add(`${pa} ⊂ ${pb}`);
     }
   }
   return [...hits].sort();
@@ -554,7 +554,7 @@ export function symbolOwnershipErrors(
 
   for (const { t, symbols } of perTask) {
     // OBS-22: scopeGate accepts picomatch globs; ownership must agree.
-    const scoped = picomatch(t.files.map((f) => f.replace(/^\.\//, "")), { dot: true });
+    const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
     for (const sym of symbols) {
       const defs = sites.get(sym) ?? [];
       if (defs.length !== 1) continue; // unknown or ambiguous — silent by ruling

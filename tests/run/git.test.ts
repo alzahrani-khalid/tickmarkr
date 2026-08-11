@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { DEFAULT_FORK_CAP, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, createWorktree, gitHead, linkNodeModules, removeWorktree, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, createWorktree, gitHead, linkNodeModules, removeWorktree, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -19,6 +19,21 @@ describe("sh", () => {
     expect(r.code).not.toBe(0);
     expect(r.timedOut).toBe(true);
   }, 10000);
+
+  // Q24: the ceiling scales with what a suite actually costs, so the shell has to report that cost.
+  // Measured at this seam, not by each caller — two callers bracketing their own Date.now() is how a
+  // "measured" duration starts disagreeing with itself. A killed child reports elapsed-at-the-kill.
+  test("every shell reports its own wall clock, and a killed one reports elapsed at the kill", async () => {
+    const ran = await sh("sleep 0.3", "/tmp");
+    expect(ran.durationMs).toBeGreaterThanOrEqual(300);
+    expect(ran.durationMs).toBeLessThan(20000);
+
+    const killed = await sh("sleep 30", "/tmp", 300);
+    expect(killed.timedOut).toBe(true);
+    expect(killed.durationMs).toBeGreaterThanOrEqual(300);
+    expect(killed.durationMs).toBeLessThan(5000); // the kill's elapsed, never the 30s the command asked for
+    expect(DEFAULT_SHELL_TIMEOUT_MS).toBe(600000); // the shipped ceiling every unmeasured caller falls back to
+  }, 15000);
 
   test("timeout resolves even when a grandchild keeps the stdio pipes open", async () => {
     // v1.33.1 init hang: SIGKILLing bash orphaned a background child that inherited our

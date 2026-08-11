@@ -29,7 +29,10 @@ STATE="$(dirname "$J")/.contamination.seen"
 INFRA_RE='vitest-worker|Timeout calling|JS heap out of memory|ENOMEM|EAGAIN|spawn ENOENT|Killed|SIGKILL'
 
 load1() { uptime | sed 's/.*load averages*: *//' | awk '{print $1}' | tr -d ','; }
-vitest_n() { pgrep -f vitest 2>/dev/null | wc -l | tr -d ' '; }
+# Count real vitest runners only. `pgrep -f vitest` over-counts by an order: it matches the WORD
+# in any argv — worker prompts, VITEST_MAX_FORKS in shell strings (measured 7 vs 2 real, 2026-08-10).
+# [v] keeps the pattern from matching its own grep. Forked workers retitle to "node (vitest N)" (comm).
+vitest_n() { ps -axo comm,command 2>/dev/null | grep -Ec 'node_modules/(\.bin/)?[v]itest|[v]itest/dist/|\([v]itest [0-9]+\)'; }
 
 # Seed the seen-set so we wake on what happens NEXT, not on history already ruled on.
 if [ -f "$J" ]; then

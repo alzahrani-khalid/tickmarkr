@@ -54,8 +54,8 @@ Per release:
 2. In the **public** repository (the mirror), tag the export commit and push the tag:
 
    ```bash
-   git tag -a v1.89.0 -m "v1.89.0"
-   git push origin v1.89.0
+   git tag -a v1.90.0 -m "v1.90.0"
+   git push origin v1.90.0
    ```
 
 3. The tag push runs `release.yml` in the public repository:
@@ -63,7 +63,10 @@ Per release:
    - `npm ci`
    - `npm run build`
    - `npm run lint`
-   - `npm test`
+   - `npx vitest run --project built-cli --project signal-reaper` (artifact-scoped release gate —
+     the full suite outgrew the 2-core runner's fixed 60s vitest RPC window and died at teardown
+     with every test green, four consecutive runs on 2026-08-11; full-suite truth lives in
+     `ci.public.yml` and the pre-tag proof battery on the exported tree)
    - `npm publish --provenance --access public` (only if all checks pass)
 
 Publish is fail-closed: a failing build, lint, or test blocks publication.

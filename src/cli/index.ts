@@ -16,6 +16,7 @@ import { scope } from "./commands/scope.js";
 import { status } from "./commands/status.js";
 import { ui } from "./commands/ui.js";
 import { unlock } from "./commands/unlock.js";
+import { verify } from "./commands/verify.js";
 import { version } from "./commands/version.js";
 
 export type CommandResult = string | { out: string; code: number };
@@ -25,7 +26,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS: CommandMap = {
-  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, version, eval: evalCommand,
+  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, version, verify, eval: evalCommand,
 };
 
 const VERSION_FLAGS = new Set(["version", "--version", "-v"]);
@@ -45,6 +46,7 @@ usage: tickmarkr <command>
   eval          run checked-in fixtures against every channel in isolated temp repos
   run           execute the graph (--concurrency N --driver herdr|subprocess --route-strict)
   status        live run state
+  verify        run the gate battery standalone against merge-base(--base, HEAD)..HEAD — no daemon, one verdict (--base main --criteria <file> | --task <id> [--files <glob>] [--author adapter:model] [--no-review] [--json])
   resume <id>   continue a run from its journal
   report <id>   cost/quality report (--md for committable execution record)
   profile       show learned routing profile (profile reset = forget history via cursor, keeps telemetry)

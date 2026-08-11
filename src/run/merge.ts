@@ -2,7 +2,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { shq } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
-import { fingerprint } from "../gates/baseline.js";
+import { type Baseline, classifyFailureOutput, fingerprint, freshFailures } from "../gates/baseline.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { gitHead, linkNodeModules, resolveIntegrationBranch, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
 
@@ -14,6 +14,8 @@ export interface TipVerifyResult {
   fingerprints: string[];
   details: string;
   artifact?: string;
+  /** Q121s: nonzero exit whose failures are ALL baseline-recorded — forgiven exactly as the battery forgives. */
+  forgiven?: boolean;
 }
 
 export function integrationBranch(cfg: TickmarkrConfig, runId: string): string {
@@ -63,25 +65,45 @@ export async function mergeTask(
   return { ok: false, conflict };
 }
 
-// OBS-34: strict exit-code verify on the integration tip — no baseline forgiveness.
+// OBS-34 ruled strict exit-code verify; Q121s (TRIAL T-OBS-1) narrows it: a red whose failure
+// fingerprints are ALL recorded in the run's baseline is forgiven with the battery's own math
+// (freshFailures) — on any repo whose main carries a pre-existing red, strict verify made a green
+// terminus unreachable by construction and misattributed the red to the last merged task.
+// Fail-closed edges kept: no baseline → strict; baseline green for that gate → strict; any fresh
+// fingerprint, or output with no recognizable failure shape, → failed.
 export async function verifyIntegrationTip(
   intWt: string,
   commands: Record<string, string>,
   runDir: string,
+  baseline?: Baseline,
 ): Promise<TipVerifyResult[]> {
   const results: TipVerifyResult[] = [];
   for (const [gate, cmd] of Object.entries(commands)) {
     const r = await sh(cmd, intWt);
     const raw = r.stdout + "\n" + r.stderr;
-    const artifact = r.code !== 0 ? join(runDir, `tip-verify-${gate}.log`) : undefined;
+    const stripped = raw.split(intWt).join("");
+    const entry = baseline?.commands[gate];
+    const { failing, unreadable } = freshFailures(entry, stripped);
+    // `?? 1` is the battery's own default (baseline.ts compareToBaseline): an exitCode-less legacy
+    // entry reads as red-at-baseline there, so it must read the same here or old baselines silently
+    // lose forgiveness. Battery parity on the infra rule too (T9): infrastructure-only output means
+    // the runner never completed a suite — nothing was verified, so nothing is forgivable, however
+    // familiar its fingerprints. Stricter-than-battery edge kept: unreadable output never forgives.
+    const forgiven = r.code !== 0 && entry !== undefined && (entry.exitCode ?? 1) !== 0
+      && failing.length === 0 && !unreadable && classifyFailureOutput(stripped) !== "infra";
+    const pass = r.code === 0 || forgiven;
+    const artifact = pass ? undefined : join(runDir, `tip-verify-${gate}.log`);
     if (artifact) writeFileSync(artifact, raw);
     results.push({
       gate,
       cmd,
-      pass: r.code === 0,
+      pass,
       exitCode: r.code,
-      fingerprints: r.code !== 0 ? fingerprint(raw.split(intWt).join("")) : [],
-      details: r.code === 0 ? "exit 0" : `exit ${r.code}`,
+      fingerprints: r.code !== 0 ? fingerprint(stripped) : [],
+      details: r.code === 0 ? "exit 0"
+        : forgiven ? `exit ${r.code} but only baseline-recorded failures (forgiven vs baseline)`
+        : `exit ${r.code}`,
+      ...(forgiven ? { forgiven: true } : {}),
       ...(artifact ? { artifact } : {}),
     });
   }

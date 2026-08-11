@@ -1,5 +1,5 @@
-import picomatch from "picomatch";
 import type { WorkerResult } from "../adapters/types.js";
+import { filesGlob } from "../graph/files-glob.js";
 import { shGitOk } from "../run/git.js";
 import type { GateResult } from "./types.js";
 
@@ -14,7 +14,7 @@ export async function scopeDiffBase(worktree: string, integrationTip: string): P
 
 /** Pure offender split — corpus-replay oracle exercises this exact decision logic. */
 export function dispositionOffenders(offenders: string[], allowDeviations: string[]): { hard: string[]; allowed: string[] } {
-  const allowedMatch = allowDeviations.length ? picomatch(allowDeviations, { dot: true }) : () => false;
+  const allowedMatch = allowDeviations.length ? filesGlob(allowDeviations) : () => false;
   const allowed: string[] = [];
   const hard: string[] = [];
   for (const f of offenders) {
@@ -34,7 +34,7 @@ export async function scopeGate(
   if (!files.length) return { gate: "scope", pass: true, details: "no file scope declared — unrestricted" };
   const baseRef = await scopeDiffBase(worktree, integrationTip);
   const changed = (await shGitOk(`git diff --name-only '${baseRef}..HEAD'`, worktree)).trim().split("\n").filter(Boolean);
-  const inScope = picomatch(files, { dot: true }); // byte-identical options to assertWriteScope in src/compile/common.ts
+  const inScope = filesGlob(files); // the ONE files[] matcher — src/graph/files-glob.ts (Q120s)
   const offenders = changed.filter((f) => !inScope(f));
   if (!offenders.length) return { gate: "scope", pass: true, details: `all ${changed.length} changed files in scope` };
   // HARD-08: a worker's declared deviation is an audit note, NEVER a pass — the gate decides against

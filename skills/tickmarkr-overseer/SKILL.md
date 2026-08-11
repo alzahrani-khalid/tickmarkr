@@ -228,6 +228,11 @@ number — an unmeasured budget is not a small budget.
   sent` reports a delivery that never happened. Never chain `wait && act` or trust a send's exit status —
   confirm the pane exists and read it back. An orchestrator's pane can vanish mid-mission without any event
   reaching you; the first symptom is a dispatch into nothing.
+- **Renaming a live agent kills every watcher keyed on the old NAME.** herdr resolves names live,
+  so after `herdr agent rename` the old name stops existing and any `agent wait <old-name>` or
+  name-keyed poll script exits with `agent_not_running` — an exit shaped exactly like a real wake.
+  Re-arm name-keyed watchers in the same act as the rename; file-keyed artifact watchers are
+  unaffected (one more reason to prefer them).
 - Stale typed input is unclearable via CLI — supersede it:
   `pane run "<-- disregard everything before this arrow (stale draft). ACTUAL: <message>"`.
 

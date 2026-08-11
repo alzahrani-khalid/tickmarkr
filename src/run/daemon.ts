@@ -485,8 +485,8 @@ export function commandsHash(commands: Record<string, string>): string {
  * so a cycle cut short by a killed process is missing gates and can never satisfy the caller. A
  * legacy event (no tip/cmdHash) is unattributable and breaks the chain outright.
  */
-function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string; gates: Set<string>; failed: boolean } | undefined {
-  let cur: { tip: string; cmdHash: string; gates: Set<string>; failed: boolean } | undefined;
+function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string; gates: Set<string>; failed: boolean; forgiven: boolean } | undefined {
+  let cur: { tip: string; cmdHash: string; gates: Set<string>; failed: boolean; forgiven: boolean } | undefined;
   let afterRunEnd = false;
   for (const e of events) {
     // New journals delimit every attempt explicitly. run-end is the legacy delimiter: it starts a
@@ -495,7 +495,7 @@ function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string
     if (e.event === "tip-verify-start") {
       const { tip, cmdHash } = e.data;
       cur = typeof tip === "string" && typeof cmdHash === "string"
-        ? { tip, cmdHash, gates: new Set(), failed: false }
+        ? { tip, cmdHash, gates: new Set(), failed: false, forgiven: false }
         : undefined;
       afterRunEnd = false;
       continue;
@@ -512,11 +512,17 @@ function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string
       continue;
     }
     if (!cur || afterRunEnd || cur.tip !== tip || cur.cmdHash !== cmdHash) {
-      cur = { tip, cmdHash, gates: new Set(), failed: false };
+      cur = { tip, cmdHash, gates: new Set(), failed: false, forgiven: false };
     }
     afterRunEnd = false;
     if (e.event === "tip-verify-failed") cur.failed = true;
-    else cur.gates.add(gate);
+    else {
+      cur.gates.add(gate);
+      // Q121s review M1: a forgiven green depends on the baseline that forgave it. Baselines are not
+      // part of the cache key, so a forgiven cycle is NEVER cache-eligible — an unchanged tip whose
+      // baseline later vanishes or changes must re-run the full verify, not inherit the green.
+      if (e.data.forgiven === true) cur.forgiven = true;
+    }
   }
   return cur;
 }
@@ -536,14 +542,14 @@ export async function verifyIntegrationTipCached(
   intWt: string,
   commands: Record<string, string>,
   journal: Journal,
-  opts: { lastMergedTask?: string } = {},
+  opts: { lastMergedTask?: string; baseline?: Baseline } = {},
 ): Promise<boolean> {
   const cmdHash = commandsHash(commands);
   const tip = await gitHead(intWt);
   const porcelain = await shGit("git status --porcelain", intWt);
   const clean = porcelain.code === 0 && porcelain.stdout.trim() === "";
   const last = lastVerifyCycle(journal.read());
-  const cached = last !== undefined && !last.failed && last.tip === tip && last.cmdHash === cmdHash
+  const cached = last !== undefined && !last.failed && !last.forgiven && last.tip === tip && last.cmdHash === cmdHash
     && Object.keys(commands).every((g) => last.gates.has(g));
   // A pair can be verified red and then green without either SHA or command hash changing (for
   // example, an external service or ignored fixture recovers). Delimit attempts explicitly so that
@@ -561,9 +567,10 @@ export async function verifyIntegrationTipCached(
     return false;
   }
   let tipFailed = false;
-  for (const r of await verifyIntegrationTip(intWt, commands, journal.dir)) {
+  for (const r of await verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline)) {
     if (r.pass) {
-      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, tip, cmdHash });
+      // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
+      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash });
     } else {
       journal.append("tip-verify-failed", undefined, {
         gate: r.gate,
@@ -3128,7 +3135,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
   const lastMergedTask = [...journal.read()].reverse().find((e) => e.event === "merge" && e.taskId)?.taskId;
   if (summary.done.length > 0 && Object.keys(commands).length > 0) {
-    const tipFailed = await verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask });
+    const tipFailed = await verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline });
     summary.tipVerify = tipFailed ? "failed" : "passed";
     if (tipFailed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
   }
