@@ -34,9 +34,20 @@ export type DoctorOpts = {
  * baseline AND tip-verify on SentioQ's first external run, a class invisible to
  * dogfooding (this repo's own includes are rooted at tests/).
  *
+ * Q130s (TRIAL T-OBS-6): the ignore must be <rootDir>-anchored. Jest
+ * testPathIgnorePatterns are REGEXES matched against the ABSOLUTE test path; an
+ * unanchored "/.tickmarkr/" also matches every suite INSIDE a worktree provisioned at
+ * <repo>/.tickmarkr/worktrees.noindex/… — jest discovers nothing there and the whole
+ * gate battery fails closed (SentioQ run 2: 10 dispatches, 0 merges). Anchored
+ * patterns resolve <rootDir> to the worktree itself and stay inert. Vitest
+ * include/exclude globs match root-relative paths, so they cannot self-match, but the
+ * prescribed shape is root-anchored anyway.
+ *
  * Text-level heuristic, advisory only — never enters health/doctor.json or routing.
- * ponytail: ceilings — a commented-out ignore false-passes; an include built from
- * variables is judged by its literal text. Both cost one advisory row, nothing more.
+ * ponytail: ceilings — comments are stripped before judgment, but an include built
+ * from variables is still judged by its literal text, and a pattern string containing
+ * `//` would be truncated by the line-comment strip. Each costs one advisory row,
+ * nothing more.
  */
 export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; detail: string } | undefined {
   const readIf = (p: string): string => (existsSync(join(cwd, p)) ? readFileSync(join(cwd, p), "utf8") : "");
@@ -50,10 +61,23 @@ export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; de
   const isVitest = !isJest && (vitestConfig !== undefined || /\bvitest\b/.test(testScript));
   if (!isJest && !isVitest) return undefined;
 
-  const configText = isJest
+  // Comments are stripped before judgment: a commented-out ignore must not false-pass,
+  // and a prose comment mentioning .tickmarkr must not false-warn the anchor probe.
+  const stripComments = (s: string): string => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const configText = stripComments(isJest
     ? `${jestConfig ? readIf(jestConfig) : ""}${pkg.jest ? JSON.stringify(pkg.jest) : ""}`
-    : vitestConfig ? readIf(vitestConfig) : "";
+    : vitestConfig ? readIf(vitestConfig) : "");
   if (/\.tickmarkr|worktrees\.noindex/.test(configText)) {
+    // Q130s self-match probe: erase every <rootDir>-anchored token (through the end of
+    // its quoted string); any surviving mention is a pattern that would also match
+    // inside a provisioned worktree (jest regex-vs-absolute-path semantics only).
+    const unanchored = configText.replace(/<rootDir>[^"'`\s]*/g, "");
+    if (isJest && /\.tickmarkr|worktrees\.noindex/.test(unanchored)) {
+      return {
+        verdict: "warn",
+        detail: `jest ignore for .tickmarkr/ is not <rootDir>-anchored — testPathIgnorePatterns are regexes against ABSOLUTE paths, so inside run worktrees (provisioned under .tickmarkr/worktrees.noindex/) it matches EVERY suite and the test gate fails closed; use "<rootDir>/\\\\.tickmarkr/" in ${jestConfig ?? "the package.json jest block"}`,
+      };
+    }
     return { verdict: "pass", detail: `${isJest ? "jest" : "vitest"} config ignores .tickmarkr/ — run worktrees stay out of the suite` };
   }
   // Rooted collection globs never reach .tickmarkr/…; only repo-wide `**/`-style patterns (or
@@ -63,8 +87,8 @@ export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; de
     return { verdict: "pass", detail: `${isJest ? "jest" : "vitest"} collection globs are rooted — run worktrees are not collectable` };
   }
   const remedy = isJest
-    ? `add "/.tickmarkr/" to testPathIgnorePatterns in ${jestConfig ?? "the package.json jest block"}`
-    : `add "**/.tickmarkr/**" to test.exclude in ${vitestConfig ?? "a vitest config"}`;
+    ? `add "<rootDir>/\\\\.tickmarkr/" to testPathIgnorePatterns in ${jestConfig ?? "the package.json jest block"}`
+    : `add ".tickmarkr/**" to test.exclude in ${vitestConfig ?? "a vitest config"}`;
   return {
     verdict: "warn",
     detail: `${isJest ? "jest" : "vitest"} collects repo-wide and will scan .tickmarkr/ run worktrees (duplicate suites, false reds) — ${remedy}`,
