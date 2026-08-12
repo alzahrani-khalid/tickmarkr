@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { captureBaseline, compareToBaseline, detectGateCommands, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
+import { captureBaseline, compareToBaseline, detectGateCommands, detectPackageManager, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../../src/route/router.js";
 import { DEFAULT_SHELL_TIMEOUT_MS, type ShResult } from "../../src/run/git.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -102,6 +102,44 @@ describe("detectGateCommands", () => {
       test: "npm run -s test",
       lint: "npm run -s lint",
     });
+  });
+});
+
+// Operator directive 2026-08-12 (D-OBS-10): package-manager agnostic. The dossier
+// exhibit: `npm run -s test` synthesized for a pnpm workspace whose engines said
+// "please-use-pnpm" — turbo could not resolve pnpm and every gate died on environment.
+describe("detectPackageManager + PM-correct gate commands", () => {
+  const scripts = JSON.stringify({ scripts: { test: "turbo run test" } });
+
+  test("packageManager field is authoritative over lockfiles", () => {
+    const repo = makeRepo({
+      "package.json": JSON.stringify({ packageManager: "pnpm@10.29.1+sha512.abc", scripts: { test: "turbo run test" } }),
+      "package-lock.json": "{}",
+    });
+    expect(detectPackageManager(repo)).toBe("pnpm");
+    expect(detectGateCommands(repo, DEFAULT_CONFIG).test).toBe("pnpm -s run test");
+  });
+
+  test.each([
+    ["pnpm-lock.yaml", "pnpm", "pnpm -s run test"],
+    ["yarn.lock", "yarn", "yarn run test"],
+    ["bun.lockb", "bun", "bun run test"],
+    ["package-lock.json", "npm", "npm run -s test"],
+  ] as const)("lockfile %s → %s", (lockfile, pm, cmd) => {
+    const repo = makeRepo({ "package.json": scripts, [lockfile]: "" });
+    expect(detectPackageManager(repo)).toBe(pm);
+    expect(detectGateCommands(repo, DEFAULT_CONFIG).test).toBe(cmd);
+  });
+
+  test("no field, no lockfile → npm (last resort)", () => {
+    const repo = makeRepo({ "package.json": scripts });
+    expect(detectPackageManager(repo)).toBe("npm");
+  });
+
+  test("cfg override still beats PM detection", () => {
+    const repo = makeRepo({ "package.json": scripts, "pnpm-lock.yaml": "" });
+    const cfg = { ...DEFAULT_CONFIG, gates: { test: "make check" } };
+    expect(detectGateCommands(repo, cfg).test).toBe("make check");
   });
 });
 

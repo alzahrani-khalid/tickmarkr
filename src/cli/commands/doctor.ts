@@ -1,6 +1,8 @@
 import { writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { detectPackageManager } from "../../gates/baseline.js";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
@@ -181,6 +183,27 @@ export function applyRunnerIgnore(cwd: string): { action: "none" | "wrote" | "ma
   return { action: "manual", detail: finding.detail };
 }
 
+/**
+ * Q140s(b) / operator directive (D-OBS-10): the repo's package manager must resolve in
+ * THIS process's environment — the same class of environment the daemon spawns gates
+ * into. Dossier run 1: pnpm lived only in the operator's interactive PATH; every gate
+ * died on `Unable to find package manager binary` / `spawnSync pnpm ENOENT`, the reds
+ * were baseline-forgiven, and no suite ever ran. A which(1)-grade check at doctor time
+ * turns that into preflight information.
+ */
+export function packageManagerFinding(
+  cwd: string,
+  probe: (pm: string) => boolean = (pm) => spawnSync(pm, ["--version"], { stdio: "ignore", shell: false }).error === undefined,
+): { verdict: "pass" | "fail"; detail: string } | undefined {
+  if (!existsSync(join(cwd, "package.json"))) return undefined;
+  const pm = detectPackageManager(cwd);
+  if (probe(pm)) return { verdict: "pass", detail: `${pm} (detected) resolves in this environment` };
+  return {
+    verdict: "fail",
+    detail: `repo uses ${pm} but the binary does not resolve in this environment — every auto-detected gate command will die before running any suite (fix: corepack enable, or install ${pm} on the daemon's PATH)`,
+  };
+}
+
 export async function doctor(
   _argv: string[],
   cwd = process.cwd(),
@@ -273,6 +296,9 @@ export async function doctor(
       rows.push(alignedStatusRow(runnerIgnore.verdict, "test-runner", runnerIgnore.detail));
     }
   }
+  // Q140s(b): the repo's package manager must resolve where gates spawn (D-OBS-10).
+  const pmRow = packageManagerFinding(cwd);
+  if (pmRow) rows.push(alignedStatusRow(pmRow.verdict, "package-manager", pmRow.detail));
   // v1.22 T5: workspace-trust pre-flight — per installed adapter: trusted | seeded | action-required | n/a.
   // action-required names the exact one-time command (or dialog) the operator must run once.
   rows.push(legend("workspace trust:"));

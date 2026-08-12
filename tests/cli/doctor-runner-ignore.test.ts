@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { applyRunnerIgnore, runnerIgnoreFinding } from "../../src/cli/commands/doctor.js";
+import { applyRunnerIgnore, packageManagerFinding, runnerIgnoreFinding } from "../../src/cli/commands/doctor.js";
 import { makeTestTempDir } from "../helpers/tmprepo.js";
 
 // Q122s (TRIAL T-OBS-3): a repo-wide-collecting runner scans .tickmarkr/ worktrees —
@@ -230,5 +230,28 @@ describe("doctor --fix runner-ignore writer (Q134s)", () => {
     const r = applyRunnerIgnore(dir);
     expect(r.action).toBe("manual");
     expect(readFileSync(join(dir, "vitest.config.ts"), "utf8")).toBe(cfg);
+  });
+});
+
+// Q140s(b) / D-OBS-10: the repo's package manager must resolve where gates spawn.
+describe("doctor package-manager preflight", () => {
+  test("detected pnpm missing from the environment → FAIL naming the fix", () => {
+    const dir = repo({ "package.json": JSON.stringify({ packageManager: "pnpm@10.0.0" }), "pnpm-lock.yaml": "" });
+    const f = packageManagerFinding(dir, () => false);
+    expect(f?.verdict).toBe("fail");
+    expect(f?.detail).toContain("pnpm");
+    expect(f?.detail).toContain("corepack enable");
+  });
+
+  test("resolvable manager → pass naming it", () => {
+    const dir = repo({ "package.json": JSON.stringify({ scripts: { test: "jest" } }) });
+    const f = packageManagerFinding(dir, () => true);
+    expect(f?.verdict).toBe("pass");
+    expect(f?.detail).toContain("npm");
+  });
+
+  test("no package.json → no row", () => {
+    const dir = repo({ "readme.md": "x" });
+    expect(packageManagerFinding(dir, () => true)).toBeUndefined();
   });
 });

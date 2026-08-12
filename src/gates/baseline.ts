@@ -161,6 +161,36 @@ export function freshFailures(entry: BaselineCommand | undefined, raw: string): 
   );
   return { failing: fresh.filter((f) => f !== UNRECOGNIZED_FAILURE), unreadable: current.includes(UNRECOGNIZED_FAILURE) };
 }
+export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
+
+/**
+ * Operator directive 2026-08-12 (D-OBS-10): tickmarkr is package-manager agnostic.
+ * The `packageManager` field is authoritative (corepack's own contract); lockfiles
+ * break ties; npm is only the LAST resort. Dossier exhibit: auto-detected
+ * `npm run -s test` on a repo whose engines said `"npm": "please-use-pnpm"` — turbo
+ * then failed to resolve pnpm and every gate died on environment, not code.
+ */
+export function detectPackageManager(repoRoot: string): PackageManager {
+  const pkgPath = join(repoRoot, "package.json");
+  try {
+    const pm = (JSON.parse(readFileSync(pkgPath, "utf8")) as { packageManager?: string }).packageManager;
+    const name = pm?.split("@")[0];
+    if (name === "pnpm" || name === "yarn" || name === "bun" || name === "npm") return name;
+  } catch { /* no or unparseable manifest: lockfiles decide */ }
+  if (existsSync(join(repoRoot, "pnpm-lock.yaml"))) return "pnpm";
+  if (existsSync(join(repoRoot, "yarn.lock"))) return "yarn";
+  if (existsSync(join(repoRoot, "bun.lock")) || existsSync(join(repoRoot, "bun.lockb"))) return "bun";
+  return "npm";
+}
+
+// Silent where the manager supports it everywhere (npm -s; pnpm's global -s), bare
+// where a flag would break a major version (yarn berry rejects run -s; bun is quiet).
+const RUN_PREFIX: Record<PackageManager, string> = {
+  npm: "npm run -s",
+  pnpm: "pnpm -s run",
+  yarn: "yarn run",
+  bun: "bun run",
+};
 
 export function detectGateCommands(repoRoot: string, cfg: TickmarkrConfig): Record<string, string> {
   const out: Record<string, string> = {};
@@ -168,9 +198,10 @@ export function detectGateCommands(repoRoot: string, cfg: TickmarkrConfig): Reco
   const scripts: Record<string, string> = existsSync(pkgPath)
     ? (JSON.parse(readFileSync(pkgPath, "utf8")).scripts ?? {})
     : {};
+  const runPrefix = RUN_PREFIX[detectPackageManager(repoRoot)];
   for (const name of ["build", "test", "lint"] as const) {
     if (cfg.gates[name]) out[name] = cfg.gates[name]!;
-    else if (scripts[name]) out[name] = `npm run -s ${name}`;
+    else if (scripts[name]) out[name] = `${runPrefix} ${name}`;
   }
   return out;
 }
