@@ -35,6 +35,27 @@ describe("fingerprint", () => {
     expect(fp).toEqual(["FAIL src/a.test.ts:# took #.#s", "Error: boom"]);
   });
 
+  // Q137s (verbatim from dossier run-2's consult dossier): turbo/pnpm monorepo failure grammar
+  // was shapeless — reds carried only the <unrecognized failure output> sentinel, so forgiveness
+  // degraded to exit-code equality and repair workers got "no recognizable failure lines".
+  test("turbo/pnpm failure lines fingerprint instead of collapsing to the unrecognized sentinel", () => {
+    const out = [
+      "   • Packages in scope: agent-runtime, intake-backend, intake-frontend",
+      "intake-frontend:lint:  ELIFECYCLE  Command failed with exit code 1.",
+      "Failed:    intake-frontend#lint",
+      " ERROR  intake-frontend#lint: command (/frontend) /Users/x/bin/pnpm run lint exited (1)",
+      " ERROR  run failed: command  exited (1)",
+    ].join("\n");
+    const fp = fingerprint(out);
+    expect(fp).not.toContain(UNRECOGNIZED_FAILURE);
+    expect(fp).toContain("intake-frontend:lint: ELIFECYCLE Command failed with exit code #.");
+    expect(fp).toContain("Failed: intake-frontend#lint");
+  });
+
+  test("prose or chrome containing 'Failed' or 'ERROR' without the driver grammar stays shapeless", () => {
+    expect(fingerprint("the deployment Failed: badly\nERROR happened somewhere")).toEqual([UNRECOGNIZED_FAILURE]);
+  });
+
   // incident #2 (run-20260709-104447): a vitest PASS line with "error" in the test NAME was fingerprinted as a failure
   test("labeled ANSI-wrapped ✓ pass line with 'error' in the name is dropped", () => {
     expect(fingerprint("intake:test: \x1b[32m✓\x1b[0m maps DUPLICATE_USERNAME to a field-level error on username")).toEqual([]);

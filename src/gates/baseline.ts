@@ -76,9 +76,19 @@ const TRAILING_FAIL_RE = /^\s*(?:test\s+)?\S+(?:\s+\([^)]*\))?\s+(?:\.{3}|-{3,})
 // runner sharing the glyph protocol is read without being enumerated; a status strip drawing ✖
 // mid-line inside chrome matches nothing, the same position rule as the other shapes.
 const GLYPH_FAIL_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)✖\s+\S/;
+// Q137s (verbatim capture, dossier run-2 consult dossier, turbo 2.9.14 + pnpm 10): monorepo
+// drivers prefix child output and summarize failures in their own grammar. Four shapes, all
+// positional — `<pkg>:<task>:` prefixes reuse GLYPH_FAIL_RE's prefix idiom; `Failed:`/`ERROR`
+// require the driver's own `pkg#task` identifier or its literal terminus, so prose or drawn
+// chrome containing the words matches nothing (OBS-278 discipline):
+//   `intake-frontend:lint:  ELIFECYCLE  Command failed with exit code 1.`
+//   `Failed:    intake-frontend#lint`
+//   ` ERROR  intake-frontend#lint: command (…) … exited (1)`
+//   ` ERROR  run failed: command  exited (1)`
+const TURBO_FAIL_RE = /^\s*(?:[\w@./-]+:\s*)*ELIFECYCLE\s+Command failed\b|^\s*Failed:\s+\S+#\S+|^\s*ERROR\s+(?:\S+#\S+:|run failed\b)/;
 // Lines that NAME a failing test — the ones worth headlining to the operator. One list, so recognition
 // and reporting cannot drift apart (a shape that blocks but never gets named cost 3 attempts once).
-const namesFailure = (l: string) => FAIL_ANCHOR_RE.test(l) || RUNNER_FAIL_RE.test(l) || TRAILING_FAIL_RE.test(l) || GLYPH_FAIL_RE.test(l);
+const namesFailure = (l: string) => FAIL_ANCHOR_RE.test(l) || RUNNER_FAIL_RE.test(l) || TRAILING_FAIL_RE.test(l) || GLYPH_FAIL_RE.test(l) || TURBO_FAIL_RE.test(l);
 const isFailureShaped = (l: string) =>
   namesFailure(l) || SUMMARY_FAIL_RE.test(l) || ERROR_ANCHOR_RE.test(l)
   || TSC_ERROR_RE.test(l) || LINTER_ERROR_RE.test(l);

@@ -5,7 +5,7 @@ import type { WorkerAdapter } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
-import { extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
+import { dewrapPaneVerdict, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
 import { disallowedBy } from "../route/preference.js";
@@ -218,7 +218,21 @@ export async function consult(
         if (!opts.keep) await driver.close(slot);
       }
     }
-    return parseConsultVerdict(out, nonce);
+    // D-OBS-12 (dossier runs 1-2, 3/3 valid verdicts destroyed): the pane path is a terminal
+    // scrape — a single-line ~2000-char verdict soft-wraps in rendering and brace balance dies.
+    // Judge/review got dewrapPaneVerdict for exactly this (llm.ts, OBS-209 lineage); the consult
+    // seat never did. Headless output is machine-read stdout and needs no reconstruction.
+    const effective = cfg.visibility.llm === "headless" ? out : dewrapPaneVerdict(out, nonce);
+    const parsed = parseConsultVerdict(effective, nonce);
+    if (!parsed.verdict) {
+      // Q144s / OBS-196 parity: an unparseable verdict persists its raw bytes (pre-dewrap,
+      // rendering verbatim) beside the prompt — three human parks carried zero diagnostic
+      // payload because this artifact did not exist.
+      try {
+        writeFileSync(join(dir, `${d.taskId}-${n}${seatIdx > 0 ? `-s${seatIdx}` : ""}-response.txt`), out);
+      } catch { /* evidence persistence must never fail the seat walk */ }
+    }
+    return parsed;
   };
 
   // v1.54 T1: ranked seat failover. Walk consult.prefer (adapter:model entries) to the first entry

@@ -198,6 +198,32 @@ describe("consult", () => {
     expect((await consult(dossier, c2, [f2], new SubprocessDriver(), "/tmp", r2)).action).toBe("human");
   });
 
+  // D-OBS-12 (dossier runs 1-2): the pane path is a terminal scrape; a long single-line verdict
+  // soft-wraps in rendering and JSON dies mid-token. Judge/review had dewrapPaneVerdict; consult
+  // did not — 3/3 VALID verdicts were discarded and charged as human gates.
+  test("a pane verdict wrapped mid-token is reconstructed by dewrap and returned, not parked", async () => {
+    const { cfg, fake, runDir } = setup({ action: "retry", notes: "unused" });
+    cfg.visibility.llm = "pane";
+    // Emit the verdict split INSIDE tokens (act\nion, dew\nrapped) — unparseable raw, exact after dewrap.
+    fake.headlessCommand = (pf: string): string =>
+      `n=$(grep -oE 'VERDICT_NONCE: [a-f0-9]+' ${shq(pf)} | head -1 | awk '{print $2}'); printf '{ "nonce": "%s", "act\\nion": "retry", "notes": "dew\\nrapped" }\\n' "$n"`;
+    const v = await consult(dossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
+    expect(v).toEqual({ action: "retry", notes: "dewrapped" });
+  });
+
+  // Q144s / OBS-196 parity: an unparseable verdict persists its raw bytes for diagnosis —
+  // three human parks carried zero diagnostic payload because this artifact did not exist.
+  test("an unparseable consult verdict persists its raw response beside the prompt", async () => {
+    const { cfg, fake, runDir } = setup("gibberish not a verdict");
+    cfg.visibility.llm = "pane";
+    const v = await consult(dossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
+    expect(v.action).toBe("human");
+    const files = readdirSync(join(runDir, "consults"));
+    const raw = files.find((f) => f.endsWith("-response.txt"));
+    expect(raw).toBeDefined();
+    expect(readFileSync(join(runDir, "consults", raw!), "utf8")).toContain("gibberish");
+  });
+
   test("OBS-50: visible consult pane dispatches a short bash script that includes the brand banner", async () => {
     const captured: string[] = [];
     let paneOutput = "";
