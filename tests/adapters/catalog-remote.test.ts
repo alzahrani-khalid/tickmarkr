@@ -124,6 +124,34 @@ describe("cache-only model capability catalog", () => {
     }
   });
 
+  // D-OBS-11 follow-up: the kimi/cursor blanket-uncoverage class. A hint matching NO
+  // catalog provider must fall open to the full scan, and CLI-namespaced ids resolve
+  // via the bare segment after the last "/".
+  test("a provider hint matching no catalog provider falls open to the full scan instead of zeroing coverage", () => {
+    const cache = catalogFixture([{ id: "kimi-k3", input: 1, output: 4, context: 1_048_576 }]);
+    expect(resolveCatalogModel(cache, { provider: "moonshot", model: "kimi-k3" })?.contextWindow).toBe(1_048_576);
+  });
+
+  test("a hint that DOES match a provider still never borrows an identically named model elsewhere", () => {
+    const cache = catalogFixture([{ id: "shared-id", input: 1, output: 4, context: 100 }]);
+    (cache.modelsDev as Record<string, unknown>)["other"] = { id: "other", models: {} };
+    expect(resolveCatalogModel(cache, { provider: "other", model: "shared-id" })).toBeUndefined();
+  });
+
+  test("a CLI-namespaced id (kimi-code/k3) resolves through its bare segment", () => {
+    const cache = catalogFixture([{ id: "k3", input: 0, output: 0, context: 1_048_576 }]);
+    const evidence = resolveCatalogModel(cache, { provider: "kimi-for-coding", model: "kimi-code/k3" });
+    expect(evidence?.contextWindow).toBe(1_048_576);
+  });
+
+  test("bare-segment retry runs only after full-id lookups miss — a full-id match wins", () => {
+    const cache = catalogFixture([
+      { id: "ns/model-x", input: 9, output: 9, context: 111 },
+      { id: "model-x", input: 1, output: 1, context: 222 },
+    ]);
+    expect(resolveCatalogModel(cache, { provider: "anthropic", model: "ns/model-x" })?.contextWindow).toBe(111);
+  });
+
   test("test: no suggested tier is ever written into live config, and a suggestion carries its evidence into the provenance note the operator must confirm", () => {
     const repo = makeRepo({ "keep.txt": "x" });
     mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
@@ -275,8 +303,11 @@ describe("cache-only model capability catalog", () => {
     writeCache(repo, fakeCatalog());
     const cached = readCachedCatalog(repo);
     const cfg = loadConfig(repo);
+    // D-OBS-11: a vendor hint matching NO catalog provider fails OPEN to the full scan
+    // (the old uncovered-by-construction contract blanket-hid whole adapters — kimi, cursor).
+    // The no-borrow rule is preserved for hints that DO match: see the shared-id test above.
     cfg.tiers.fake = { vendor: "not-a-catalog-provider", channel: "api", models: {} };
-    expect(catalogModelAdvisory(cfg, cached, "fake", "fake-2").coverage).toBe("uncovered");
+    expect(catalogModelAdvisory(cfg, cached, "fake", "fake-2").coverage).toBe("covered");
     cfg.tiers.fake = { vendor: "anthropic", channel: "sub", models: {} };
     const subscription = catalogModelAdvisory(cfg, cached, "fake", "fake-2");
     cfg.tiers.fake = { ...cfg.tiers.fake, channel: "api" };

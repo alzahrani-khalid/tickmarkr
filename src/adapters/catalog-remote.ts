@@ -144,18 +144,32 @@ function providerModels(modelsDev: unknown, preferred?: string): Record<string, 
     : [];
   // Price is provider-specific. A provider-qualified query must never borrow an identically named
   // model from another provider, where subscription and metered costs can differ materially.
-  const selected = preferred ? preferredEntries : entries;
+  // D-OBS-11 follow-up: that rule presumes the hinted provider EXISTS in the catalog. A hint that
+  // matches nothing (kimi's "moonshot" vs the catalog's "moonshotai"/"kimi-for-coding"; cursor has
+  // no provider at all) used to ZERO the search space and blanket-uncover the whole adapter.
+  // Fail open to the full scan instead — advisory evidence with a visible models.dev id beats none.
+  const selected = preferred && preferredEntries.length > 0 ? preferredEntries : entries;
   return selected
     .map(([, provider]) => record(record(provider)?.models))
     .filter((models): models is Record<string, unknown> => models !== undefined);
 }
 
 function findModelsDevModel(catalog: CatalogCache, provider: string | undefined, modelId: string): Record<string, unknown> | undefined {
+  // CLI namespaces prefix their catalog ids (kimi-code/k3 vs catalog key k3; omp's openai/gpt-4):
+  // after exact key/id misses, retry with the bare segment after the last "/". Deterministic
+  // provider order; first hit wins — acceptable for advisory evidence, never routing.
+  const bare = modelId.includes("/") ? modelId.slice(modelId.lastIndexOf("/") + 1) : undefined;
   for (const models of providerModels(catalog.modelsDev, provider)) {
     const direct = record(models[modelId]);
     if (direct) return direct;
     const byId = Object.values(models).map(record).find((candidate) => candidate?.id === modelId);
     if (byId) return byId;
+  }
+  if (bare) {
+    for (const models of providerModels(catalog.modelsDev, provider)) {
+      const direct = record(models[bare]);
+      if (direct) return direct;
+    }
   }
   return undefined;
 }

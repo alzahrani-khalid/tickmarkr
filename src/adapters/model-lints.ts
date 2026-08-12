@@ -12,8 +12,9 @@ export const MODEL_STALE_DAYS = 30;
 const DAY_MS = 86400000;
 // cursor-agent 2026.07.08 reports 193 mostly-parameterized ids (e.g. gpt-5.3-codex-high-fast); filter the `auto`
 // pseudo-model + effort/speed variant suffixes from the unconfigured-lint aggregation ONLY — doctor.json keeps the
-// raw list (verified 2026-07-10). Data stays raw; lints stay signal.
-const LINT_VARIANT_RE = /^auto$|-(fast|minimal|low|medium|high|xhigh)$/;
+// raw list (verified 2026-07-10). Data stays raw; lints stay signal. -max/-none/-thinking joined the suffix set
+// 2026-08-12 (D-OBS-11: cursor's residual lint list was still mostly effort variants of configured bases).
+const LINT_VARIANT_RE = /^auto$|-(fast|minimal|none|low|medium|high|xhigh|max|thinking)$/;
 const LINT_CAP = 5;
 const TTY_LINT_CAP = 3;
 const DEFAULT_STATE_DIR = ".tickmarkr";
