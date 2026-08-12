@@ -3,7 +3,8 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { detectPackageManager } from "../../gates/baseline.js";
-import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { version } from "./version.js";
+import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
@@ -204,6 +205,44 @@ export function packageManagerFinding(
   };
 }
 
+/**
+ * Q142s: tickmarkr guarded every binary except its own. Exhibit (operator machine,
+ * 2026-08-12): an orphaned npm-prefix root at ~/.local held tickmarkr AND tkr at
+ * 1.85.0 beside the live 1.90.3 — two seats disagreed about the tool's version and
+ * were BOTH right about their own PATH order (a consultant reported "no verify
+ * command" — verify shipped in 1.90.0 — while the overseer saw it present). Checks
+ * EVERY bin name the package declares: the first sweep of that machine missed `tkr`.
+ */
+export function selfShadowFinding(
+  ownVersion: string,
+  cwd = process.cwd(),
+  resolve: (bin: string, cwd: string) => { resolved?: string; all: string[] } = resolveShellBinary,
+  versionOf: (path: string) => string | undefined = (p) => {
+    const r = spawnSync(p, ["version"], { encoding: "utf8", timeout: 5_000, shell: false });
+    return r.status === 0 ? r.stdout.trim().split("\n")[0] : undefined;
+  },
+): { verdict: "pass" | "fail"; detail: string } | undefined {
+  const hits = new Map<string, string>(); // path -> version
+  for (const bin of ["tickmarkr", "tkr"]) {
+    for (const p of resolve(bin, cwd).all) {
+      if (!hits.has(p)) hits.set(p, versionOf(p) ?? "?");
+    }
+  }
+  if (hits.size === 0) return undefined; // no install on PATH (repo checkout) — nothing to shadow
+  const stale = [...hits].filter(([, v]) => v !== ownVersion);
+  if (stale.length === 0) {
+    return { verdict: "pass", detail: `single install root at ${ownVersion} (${[...hits.keys()].join(", ")})` };
+  }
+  const listing = stale.map(([p, v]) => `${p} → ${v}`).join(", ");
+  // One mismatched hit and it's the one running? Impossible — it would report ownVersion.
+  // Mismatch therefore means a SECOND root: a shell or daemon with a different PATH
+  // order runs a different tickmarkr than this one, silently.
+  return {
+    verdict: "fail",
+    detail: `stale tickmarkr/tkr binaries on PATH: ${listing} (running ${ownVersion}) — a seat with different PATH order silently runs the old binary; remove the stale install root`,
+  };
+}
+
 export async function doctor(
   _argv: string[],
   cwd = process.cwd(),
@@ -299,6 +338,9 @@ export async function doctor(
   // Q140s(b): the repo's package manager must resolve where gates spawn (D-OBS-10).
   const pmRow = packageManagerFinding(cwd);
   if (pmRow) rows.push(alignedStatusRow(pmRow.verdict, "package-manager", pmRow.detail));
+  // Q142s: tickmarkr's own binary gets the shadow check every adapter binary already had.
+  const shadowRow = selfShadowFinding(await version(), cwd);
+  if (shadowRow) rows.push(alignedStatusRow(shadowRow.verdict, "tickmarkr-binary", shadowRow.detail));
   // v1.22 T5: workspace-trust pre-flight — per installed adapter: trusted | seeded | action-required | n/a.
   // action-required names the exact one-time command (or dialog) the operator must run once.
   rows.push(legend("workspace trust:"));

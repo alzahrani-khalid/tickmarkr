@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { applyRunnerIgnore, packageManagerFinding, runnerIgnoreFinding } from "../../src/cli/commands/doctor.js";
+import { applyRunnerIgnore, packageManagerFinding, runnerIgnoreFinding, selfShadowFinding } from "../../src/cli/commands/doctor.js";
 import { makeTestTempDir } from "../helpers/tmprepo.js";
 
 // Q122s (TRIAL T-OBS-3): a repo-wide-collecting runner scans .tickmarkr/ worktrees —
@@ -253,5 +253,55 @@ describe("doctor package-manager preflight", () => {
   test("no package.json → no row", () => {
     const dir = repo({ "readme.md": "x" });
     expect(packageManagerFinding(dir, () => true)).toBeUndefined();
+  });
+});
+
+// Q142s: tickmarkr guarded every binary except its own. The check covers BOTH
+// declared bin names — the first sweep of the exhibit machine missed `tkr`.
+describe("doctor self-shadow check (Q142s)", () => {
+  const resolver = (hits: Record<string, string[]>) => (bin: string) => ({ resolved: hits[bin]?.[0], all: hits[bin] ?? [] });
+
+  test("stale second root → FAIL naming path and version, running version stated", () => {
+    const f = selfShadowFinding(
+      "1.90.3", "/tmp",
+      resolver({ tickmarkr: ["/opt/homebrew/bin/tickmarkr", "/Users/x/.local/bin/tickmarkr"] }),
+      (p) => p.includes(".local") ? "1.85.0" : "1.90.3",
+    );
+    expect(f?.verdict).toBe("fail");
+    expect(f?.detail).toContain("/Users/x/.local/bin/tickmarkr → 1.85.0");
+    expect(f?.detail).toContain("running 1.90.3");
+  });
+
+  test("stale tkr alias alone is enough to FAIL — both bin names are swept", () => {
+    const f = selfShadowFinding(
+      "1.90.3", "/tmp",
+      resolver({ tickmarkr: ["/opt/homebrew/bin/tickmarkr"], tkr: ["/Users/x/.local/bin/tkr"] }),
+      (p) => p.endsWith("/tkr") ? "1.85.0" : "1.90.3",
+    );
+    expect(f?.verdict).toBe("fail");
+    expect(f?.detail).toContain("/Users/x/.local/bin/tkr → 1.85.0");
+  });
+
+  test("single root, both names current → pass", () => {
+    const f = selfShadowFinding(
+      "1.90.3", "/tmp",
+      resolver({ tickmarkr: ["/opt/homebrew/bin/tickmarkr"], tkr: ["/opt/homebrew/bin/tkr"] }),
+      () => "1.90.3",
+    );
+    expect(f?.verdict).toBe("pass");
+  });
+
+  test("no install on PATH (repo checkout) → no row", () => {
+    expect(selfShadowFinding("1.90.3", "/tmp", resolver({}), () => undefined)).toBeUndefined();
+  });
+
+  test("unversionable binary reads as stale (?), never as silently current", () => {
+    const f = selfShadowFinding(
+      "1.90.3", "/tmp",
+      resolver({ tickmarkr: ["/opt/homebrew/bin/tickmarkr", "/broken/tickmarkr"] }),
+      (p) => p.startsWith("/broken") ? undefined : "1.90.3",
+    );
+    expect(f?.verdict).toBe("fail");
+    expect(f?.detail).toContain("/broken/tickmarkr → ?");
   });
 });
