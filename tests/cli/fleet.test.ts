@@ -9,7 +9,7 @@ import { parse } from "yaml";
 import * as registry from "../../src/adapters/registry.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { GLYPHS } from "../../src/brand.js";
-import { fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
 import { formatFleetPrint, loadConfig, overlayBytesLoadError } from "../../src/config/config.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -40,6 +40,7 @@ const KEYS = {
   f: "f",
   y: "y",
   n: "n",
+  backspace: "\x7f",
 } as const;
 
 const withOverlay = (repo: string, yaml: string) => {
@@ -667,15 +668,22 @@ describe("tickmarkr fleet", () => {
   test("arrow and space interaction fully replaces number-typed toggles on the membership and models screens", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.enter + "1" + KEYS.enter + "2" + KEYS.q);
+    const out = await drive(repo, adapter, io, KEYS.enter + "1" + KEYS.enter + "2" + KEYS.backspace + KEYS.q);
     expect(out).toBe("fleet: quit without writing");
-    // digits are dead keys: they never toggle. The invariant is the settled toggle STATE, not the frame
-    // count — the runtime coalesces a render-timing-dependent number of frames (CI differs from local), so
-    // assert by content on the settled frames: the CLIs frame keeps fake ACTIVE and the settled models
-    // frame keeps fake-1 ALLOWED (a live digit-toggle would flip these marks).
+    // digits are dead keys for TOGGLING: on the models screen they feed type-to-search instead, so
+    // the digit narrows the list and never flips a mark. The invariant is the settled toggle STATE,
+    // not the frame count — the runtime coalesces a render-timing-dependent number of frames (CI
+    // differs from local), so assert by content on the settled frames: the CLIs frame keeps fake
+    // ACTIVE and the settled models frame (after backspace restores the list) keeps fake-1 ALLOWED.
     await settle(() => strip(writes.at(-1) ?? "").includes(`${GLYPHS.toggleActive} fake-1  mid  allowed`));
     const membership = writes.find((f) => strip(f).includes("step 2/6 · agent CLIs"));
     expect(strip(membership ?? "")).toContain(`${GLYPHS.toggleActive} fake`);
+    // the typed digit searched rather than toggled: the narrowed frame names the filter, keeps only
+    // the matching model, and the backspace restores the full list with fake-1 still allowed
+    const searched = writes.map(strip).find((frame) => frame.includes("search: 2"));
+    expect(searched).toBeDefined();
+    expect(searched).toContain("fake-2");
+    expect(searched).not.toContain("fake-1");
     expect(strip(writes.at(-1)!)).toContain(`${GLYPHS.toggleActive} fake-1  mid  allowed`);
   });
 
@@ -1567,5 +1575,100 @@ review:
     expect(all).toContain("fake:fake-1"); // the deny edit reached the review diff
     expect(all).toContain("fake-2: frontier"); // and so did the corrected classification
     expect(readFileSync(overlayAt(repo), "utf8")).toBe(before);
+  });
+  // ── v1.61: preset-first entry (init's editor path), the judge seat, and type-to-search ──
+  // entry="presets" is only reachable through the assembler contract init.ts consumes, so these
+  // drive assembleFleetEditor + runFleetInkEditor directly rather than the fleet() command shell.
+  const driveEntry = async (repo: string, adapter: FakeAdapter, bytes: string) => {
+    const io = makeIO();
+    // dynamic import mirrors init.ts and keeps Ink's color detection AFTER the TTY fixture above
+    const { runFleetInkEditor } = await import("../../src/tui/ink/fleet-app.js");
+    const assembled = await assembleFleetEditor(repo, [adapter], io.io, {
+      globalDir: isolatedGlobal(),
+      entry: "presets",
+    });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    const done = runFleetInkEditor(assembled.props);
+    io.input.write(bytes);
+    const result = await done;
+    return { io, out: assembled.commit(result) };
+  };
+
+  test("entry=presets opens on the routing presets screen with the custom row and a mode pick routes straight to the diff confirm", async () => {
+    const { repo, adapter } = setup();
+    // cursor starts on the current mode (risk-based); one down lands on staff-led
+    const { io, out } = await driveEntry(repo, adapter, KEYS.down + KEYS.enter + KEYS.y);
+    expect(out).toMatch(/^fleet: wrote /);
+    const first = strip(io.writes[0] ?? "");
+    expect(first).toContain("fleet · routing presets");
+    expect(first).toContain("custom");
+    expect(first).toContain("walk the full editor (agents → models → shapes → seats)");
+    const all = strip(io.writes.join(""));
+    expect(all).toContain("review · overlay diff");
+    expect(all).not.toContain("step 2/6 · agent CLIs"); // the preset pick skipped the walk
+    expect(parsedOverlay(repo).routing.mode).toBe("staff-led");
+  });
+
+  test("entry=presets picking the current mode is an empty diff and Esc on the entry screen quits", async () => {
+    const a = setup();
+    expect((await driveEntry(a.repo, a.adapter, KEYS.enter)).out)
+      .toBe("fleet: no overlay changes (empty diff)");
+    const b = setup();
+    expect((await driveEntry(b.repo, b.adapter, KEYS.escape)).out)
+      .toBe("fleet: quit without writing");
+  });
+
+  test("entry=presets selecting custom walks the full editor starting at the agents screen", async () => {
+    const { repo, adapter } = setup();
+    // over-pressing down clamps on the final custom row without pinning the mode count
+    const { io, out } = await driveEntry(repo, adapter, KEYS.down.repeat(9) + KEYS.enter + KEYS.q);
+    expect(out).toBe("fleet: quit without writing");
+    expect(strip(io.writes.join(""))).toContain("step 2/6 · agent CLIs");
+  });
+
+  // ── the judge seat: a SINGLE adapter:model pick on the steering screen (never a chain) ──
+  test("picking a judge seat stages an overlay diff carrying judge adapter and model and the write lands both", async () => {
+    const { repo, adapter } = setup();
+    queueAnswers("y");
+    const io = makeIO();
+    // steering: down down lands on the judge row; f opens the picker; down skips (keep default)
+    const bytes = TO_STEER + KEYS.down + KEYS.down + KEYS.f + KEYS.down + KEYS.enter + KEYS.enter;
+    const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", isolatedGlobal()]);
+    expect(out).toMatch(/^fleet: wrote /);
+    const all = strip(io.writes.join(""));
+    expect(all).toContain("(keep default)  claude-code:fable"); // the picker names the resolved default
+    expect(all).toContain("judge:"); // the confirmed diff carries the judge block
+    expect(parsedOverlay(repo).judge).toEqual({ adapter: "fake", model: "fake-1" });
+  });
+
+  test("picking (keep default) on the judge screen stages nothing and an otherwise unchanged walk stays an empty diff", async () => {
+    const { repo, adapter } = setup();
+    const before = readFileSync(overlayAt(repo), "utf8");
+    const bytes = TO_STEER + KEYS.down + KEYS.down + KEYS.f + KEYS.enter + KEYS.enter;
+    const out = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
+    expect(out).toBe("fleet: no overlay changes (empty diff)");
+    expect(readFileSync(overlayAt(repo), "utf8")).toBe(before);
+  });
+
+  // ── type-to-search on the long lists ──
+  test("type-to-search narrows a picker list and backspace restores the dropped rows", async () => {
+    const { repo, adapter } = setup();
+    const io = makeIO();
+    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    io.input.write(TO_STEER + KEYS.f);
+    await settle(() => io.writes.join("").includes("pick · review.prefer"));
+    io.input.write("1");
+    await settle(() => strip(io.writes.join("")).includes("search: 1"));
+    const bareRow = /^(?:❯ | {2})· fake$/m;
+    const narrowed = strip(io.writes.at(-1)!);
+    expect(narrowed).toContain("fake:fake-1");
+    expect(narrowed).not.toContain("fake:fake-2");
+    expect(narrowed).not.toMatch(bareRow);
+    const mark = io.writes.length;
+    io.input.write(KEYS.backspace);
+    await settle(() => io.writes.slice(mark).some((frame) => bareRow.test(strip(frame))));
+    expect(io.writes.slice(mark).map(strip).some((frame) => bareRow.test(frame))).toBe(true);
+    io.input.write(KEYS.q);
+    expect(await done).toBe("fleet: quit without writing");
   });
 });

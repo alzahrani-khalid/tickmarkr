@@ -10,6 +10,7 @@ import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir } from "../../graph/graph.js";
 import { Journal } from "../../run/journal.js";
 import { doctor } from "./doctor.js";
+import { assembleFleetEditor } from "./fleet.js";
 
 const SCAFFOLD_SPEC = "tickmarkr.spec.md";
 
@@ -221,6 +222,11 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
   let prompt: Interface | undefined;
   const confirm = async (question: string) => {
     if (!interactive) return false;
+    // Post-wizard hardening: an Ink act that ran earlier in this process leaves stdin paused and
+    // unref'd on unmount, and readline revives neither — the process exits mid-question (found by
+    // the consolidated-init smoke). Revive explicitly before asking.
+    process.stdin.resume();
+    process.stdin.ref();
     prompt ??= createInterface({ input: process.stdin, output: process.stdout });
     return /^(?:y|yes)$/i.test((await prompt.question(`${question} [y/N] `)).trim());
   };
@@ -276,48 +282,38 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
   }
 }
 
-const askDefault = async (rl: Interface, label: string, def: string) => {
-  const answer = (await rl.question(`${label} [${def}] `)).trim();
-  return answer || def;
-};
-
-const askYesNo = async (rl: Interface, label: string, def: boolean) => {
-  const hint = def ? "Y/n" : "y/N";
-  const answer = (await rl.question(`${label} [${hint}] `)).trim();
-  if (!answer) return def;
-  return /^(?:y|yes)$/i.test(answer);
-};
-
-async function runInitWizard(cwd: string): Promise<{ overlay: InitConfigOverlay; installSkills: boolean }> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const driverDef = wizardDriverDefault();
-    const driverRaw = await askDefault(rl, "Driver (auto|herdr|subprocess)", driverDef);
-    const driver: TickmarkrConfig["driver"] = (["auto", "herdr", "subprocess"] as const).includes(driverRaw as TickmarkrConfig["driver"])
-      ? driverRaw as TickmarkrConfig["driver"]
-      : driverDef;
-
-    const concRaw = await askDefault(rl, "Concurrency", String(DEFAULT_CONFIG.concurrency));
-    const parsed = Number.parseInt(concRaw, 10);
-    const concurrency = Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_CONFIG.concurrency;
-
-    const llmDef = DEFAULT_CONFIG.visibility.llm;
-    const llmRaw = await askDefault(rl, "visibility.llm (pane|headless)", llmDef);
-    const llm = llmRaw === "pane" || llmRaw === "headless" ? llmRaw : llmDef;
-
-    let installSkills = false;
-    if (!skillsInstalled(cwd)) {
-      const skillsDef = existsSync(join(cwd, ".claude", "skills")) && !skillsInstalled(cwd);
-      installSkills = await askYesNo(rl, "Install agent skills (tickmarkr-loop/tickmarkr-auto/tickmarkr-overseer)?", skillsDef);
-    }
-
-    return { overlay: { driver, concurrency, visibility: { llm } }, installSkills };
-  } finally {
-    rl.close();
-  }
+// The consolidated wizard (operator directive 2026-08-12): init walks three acts in one
+// command — preferences (Ink form) → discovery (doctor, the sensor) → fleet (presets or the
+// full editor). The readline asks this replaced live on in git history; the Ink act keeps the
+// same four questions and the same defaults, so `--yes` and non-TTY paths are unchanged.
+async function runInitWizard(
+  cwd: string,
+  input: NodeJS.ReadStream,
+  output: NodeJS.WriteStream,
+): Promise<{ overlay: InitConfigOverlay; installSkills: boolean; installDocs: boolean } | null> {
+  // Dynamic import, deliberately (same seam as fleet.ts): the Ink/React runtime must stay out of
+  // the non-TTY and --yes paths — init runs in CI and agent shells where importing Ink at module
+  // load would drag a renderer into paths that never draw.
+  const { runInitWizardApp } = await import("../../tui/ink/init-app.js");
+  const result = await runInitWizardApp({
+    fields: {
+      driver: wizardDriverDefault(),
+      concurrency: DEFAULT_CONFIG.concurrency,
+      visibilityLlm: DEFAULT_CONFIG.visibility.llm,
+      offerSkills: !skillsInstalled(cwd),
+      skillsDefault: existsSync(join(cwd, ".claude", "skills")) && !skillsInstalled(cwd),
+    },
+    input,
+    output,
+  });
+  if (result.kind === "quit") return null;
+  return { overlay: result.overlay, installSkills: result.installSkills, installDocs: result.installDocs };
 }
 
-export async function init(argv: string[], cwd = process.cwd()): Promise<string> {
+/** Test seam mirroring FleetIO: production callers omit it and get the process streams. */
+export type InitIO = { input?: NodeJS.ReadStream; output?: NodeJS.WriteStream };
+
+export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {}): Promise<string> {
   let bannerEmitted = false;
   const emitBanner = () => {
     if (visual() && !bannerEmitted) {
@@ -377,23 +373,56 @@ export async function init(argv: string[], cwd = process.cwd()): Promise<string>
     }
   }
 
-  const fresh = values.fresh ?? false;
-  const { reuse, ageMs, health } = initDoctorReuse(cwd, fresh);
-  const doc = reuse && health && ageMs !== null
-    ? `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)\n${formatDoctorReport(cwd, loadConfig(cwd), health, allAdapters(), { wrote: false })}`
-    : await doctor([], cwd, undefined, { banner: false });
+  const input = io.input ?? process.stdin;
+  const output = io.output ?? process.stdout;
+  const interactive = input.isTTY === true && output.isTTY === true && !(values.yes ?? false);
 
-  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true && !(values.yes ?? false);
+  // Act 1 — preferences. Only when the repo config does not exist yet: init never rewrites an
+  // operator's config; re-tuning is `tickmarkr fleet` (act 3 below still runs and writes overlays).
+  let wizardQuit = false;
   if (!repoConfigExists) {
     if (interactive) {
       emitBanner();
-      const wizard = await runInitWizard(cwd);
-      writeFileSync(repoConfigPath, configTemplate(wizard.overlay));
-      notes.push(`wrote ${repoConfigPath}`);
-      if (wizard.installSkills) await installAgentFiles(cwd, values.force ?? false, values.docs ?? false, notes);
+      const wizard = await runInitWizard(cwd, input, output);
+      if (wizard === null) {
+        wizardQuit = true;
+        notes.push("wizard quit — no repo config written; re-run tickmarkr init (or tickmarkr fleet after a manual config)");
+      } else {
+        writeFileSync(repoConfigPath, configTemplate(wizard.overlay));
+        notes.push(`wrote ${repoConfigPath}`);
+        if (wizard.installSkills) {
+          await installAgentFiles(cwd, values.force ?? false, wizard.installDocs || (values.docs ?? false), notes);
+        }
+      }
     } else {
       writeFileSync(repoConfigPath, configTemplate());
       notes.push(`wrote ${repoConfigPath}`);
+    }
+  }
+
+  // Act 2 — discovery. Doctor is the sensor (fleet never re-probes); runs after preferences so the
+  // probe reads the config the operator just chose. Reuse keeps init fast; --fresh forces the probe.
+  const fresh = values.fresh ?? false;
+  const { reuse, ageMs, health } = initDoctorReuse(cwd, fresh);
+  let doc = reuse && health && ageMs !== null
+    ? `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)\n${formatDoctorReport(cwd, loadConfig(cwd), health, allAdapters(), { wrote: false })}`
+    : await doctor([], cwd, undefined, { banner: false });
+
+  // Act 3 — fleet. Interactive only, and never after a wizard quit ("stop" means stop). The
+  // discovery report prints BETWEEN the acts so the operator reads what the presets screen
+  // ranks with; the final summary then carries a pointer instead of the same bytes twice.
+  if (interactive && !wizardQuit) {
+    output.write(`${doc}\n`);
+    doc = "discovery report shown above — re-print any time with `tickmarkr doctor`";
+    // Same lazy-Ink seam as fleet.ts: load the editor runtime up front so the assembler's
+    // returned props need no startup-input capture window on this path.
+    const { runFleetInkEditor } = await import("../../tui/ink/fleet-app.js");
+    const editor = await assembleFleetEditor(cwd, allAdapters(), { input, output }, { globalDir: gdir, entry: "presets" });
+    if ("unavailable" in editor) {
+      notes.push(`fleet: ${editor.unavailable}`);
+    } else {
+      const result = await runFleetInkEditor(editor.props);
+      notes.push(editor.commit(result));
     }
   }
 

@@ -76,6 +76,14 @@ const TRAILING_FAIL_RE = /^\s*(?:test\s+)?\S+(?:\s+\([^)]*\))?\s+(?:\.{3}|-{3,})
 // runner sharing the glyph protocol is read without being enumerated; a status strip drawing ✖
 // mid-line inside chrome matches nothing, the same position rule as the other shapes.
 const GLYPH_FAIL_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)✖\s+\S/;
+// vitest's default reporter draws the same glyph protocol with × (U+00D7, verbatim capture,
+// GATE-FIX-4 drill: `intake-backend:test:  × GF4BE deliberate failure — probe only`). It is a
+// fingerprintable SHAPE (isFailureShaped) but deliberately NOT in namesFailure: vitest prints a
+// FAIL twin naming the same test, and the HYG-08 meta.failingTests pin (tests/gates/baseline.test.ts)
+// keeps headline naming to one line per failure — duplicating each failure as glyph + FAIL would
+// re-headline the noise HYG-08 removed, while dropping the × from the fingerprint set would shrink
+// the per-test discriminators DEFECT 4 exists to harvest.
+const X_GLYPH_FAIL_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)×\s+\S/;
 // Q137s (verbatim capture, dossier run-2 consult dossier, turbo 2.9.14 + pnpm 10): monorepo
 // drivers prefix child output and summarize failures in their own grammar. Four shapes, all
 // positional — `<pkg>:<task>:` prefixes reuse GLYPH_FAIL_RE's prefix idiom; `Failed:`/`ERROR`
@@ -86,12 +94,35 @@ const GLYPH_FAIL_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)✖\s+\S/;
 //   ` ERROR  intake-frontend#lint: command (…) … exited (1)`
 //   ` ERROR  run failed: command  exited (1)`
 const TURBO_FAIL_RE = /^\s*(?:[\w@./-]+:\s*)*ELIFECYCLE\s+Command failed\b|^\s*Failed:\s+\S+#\S+|^\s*ERROR\s+(?:\S+#\S+:|run failed\b)/;
+// GATE-FIX-4 DEFECT 4 (dossier drill, control 3): turbo prefixes every child line with
+// `<pkg>:<task>:  `, so the per-test shapes above (FAIL_ANCHOR_RE etc.) — all anchored at line
+// START — never fingerprinted; forgiveness compared only TURBO_FAIL_RE's package-level lines, and a
+// package with one tolerated pre-existing red was blind to every NEW failure inside it (a deliberate
+// failing test came back green). The counts route is closed too: normalizeLine masks digits, so
+// `Tests 3 failed` vs `Tests 2 failed` is not a discriminator — per-test lines, which carry file
+// paths and test names, are. This prefix is deliberately narrower than TURBO_FAIL_RE's label idiom:
+// at least TWO colon-joined segments (`<pkg>:<task>:`, tasks may nest — `pkg:test:unit:`), every
+// segment after the first starting with a letter — so `Error: boom` (one segment), `src/x.ts:12:`
+// (digit segment) and `12:34 error` (eslint stylish) are never stripped.
+const TURBO_PREFIX_RE = /^\s*[\w@./-]+(?::[A-Za-z_][\w.-]*)+:\s+/;
+const stripTurboPrefix = (l: string): string | undefined => {
+  const m = TURBO_PREFIX_RE.exec(l);
+  return m ? l.slice(m[0].length) : undefined;
+};
 // Lines that NAME a failing test — the ones worth headlining to the operator. One list, so recognition
 // and reporting cannot drift apart (a shape that blocks but never gets named cost 3 attempts once).
 const namesFailure = (l: string) => FAIL_ANCHOR_RE.test(l) || RUNNER_FAIL_RE.test(l) || TRAILING_FAIL_RE.test(l) || GLYPH_FAIL_RE.test(l) || TURBO_FAIL_RE.test(l);
+// The stripped form is a second READ of the same line, for the recognition/headline paths that ask
+// "does anything here name a failure" — verdict classification (isInfraLine/namesRegression) keeps
+// reading the raw line only, so infra/regression verdicts are byte-unchanged by the prefix pass.
+const namesFailureEitherForm = (l: string): boolean => {
+  if (namesFailure(l)) return true;
+  const stripped = stripTurboPrefix(l);
+  return stripped !== undefined && namesFailure(stripped);
+};
 const isFailureShaped = (l: string) =>
   namesFailure(l) || SUMMARY_FAIL_RE.test(l) || ERROR_ANCHOR_RE.test(l)
-  || TSC_ERROR_RE.test(l) || LINTER_ERROR_RE.test(l);
+  || TSC_ERROR_RE.test(l) || LINTER_ERROR_RE.test(l) || X_GLYPH_FAIL_RE.test(l);
 const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 
 // T9 — the infra/regression discriminator. A runner that died because the MACHINE ran out of
@@ -138,7 +169,16 @@ export function fingerprint(output: string): string[] {
     .split("\n")
     .map((l) => l.replace(ANSI_RE, ""))
     .filter((l) => !PASS_LINE_RE.test(l));
-  const shaped = lines.filter(isFailureShaped);
+  // GATE-FIX-4 DEFECT 4: every line is read twice — as printed, and with a turbo `<pkg>:<task>:`
+  // prefix removed. A recognized stripped line fingerprints as its STRIPPED text, so the same
+  // failure fingerprints identically whether turbo prefixed it or a bare runner printed it; the
+  // prefixed form keeps fingerprinting too (baseline-recorded package-level reds stay forgivable).
+  const shaped: string[] = [];
+  for (const l of lines) {
+    if (isFailureShaped(l)) shaped.push(l);
+    const stripped = stripTurboPrefix(l);
+    if (stripped !== undefined && !PASS_LINE_RE.test(stripped) && isFailureShaped(stripped)) shaped.push(stripped);
+  }
   if (!shaped.length) return lines.some((l) => l.trim()) ? [UNRECOGNIZED_FAILURE] : [];
   return [...new Set(shaped.map(normalizeLine))];
 }
@@ -214,6 +254,38 @@ export function detectGateCommands(repoRoot: string, cfg: TickmarkrConfig): Reco
     else if (scripts[name]) out[name] = `${runPrefix} ${name}`;
   }
   return out;
+}
+
+/**
+ * Dossier GATE-FIX-4 §3 (2026-08-13): turbo schedules per-package tasks and ABORTS the whole
+ * run at the first failing package, so every package after the abort goes unverified — and the
+ * baseline gate then forgives the truncated output as "matching". The class appeared in three
+ * gates and four syntaxes on one repo (turbo's scheduler, `&&`, a JS for-loop process.exit, and
+ * turbo nested inside two of them). This preflight names only what it can see textually: the
+ * resolved gate command, and — for the synthesized `<pm> run <script>` form — that script's own
+ * body. The remedy deliberately demands a forwarding check first: the same repo's lint wrapper
+ * branched on argv.length, so a blind `-- --continue` silently replaced the gate with a
+ * different command (the trap their overseer caught by reading, not by symmetry).
+ */
+export function turboContinueFindings(repoRoot: string, cfg: TickmarkrConfig): Array<{ gate: string; detail: string }> {
+  const pkgPath = join(repoRoot, "package.json");
+  const scripts: Record<string, string> = existsSync(pkgPath)
+    ? (JSON.parse(readFileSync(pkgPath, "utf8")).scripts ?? {})
+    : {};
+  const findings: Array<{ gate: string; detail: string }> = [];
+  for (const [gate, cmd] of Object.entries(detectGateCommands(repoRoot, cfg))) {
+    // The command text plus every package.json script it invokes by name — one level, textual.
+    const referenced = Object.keys(scripts).filter((name) =>
+      new RegExp(`\\brun\\s+(?:-s\\s+)?${reEscape(name)}(?:\\s|$)`).test(cmd));
+    const surface = [cmd, ...referenced.map((name) => scripts[name]!)].join("\n");
+    if (/\bturbo\s+run\b/.test(surface) && !surface.includes("--continue")) {
+      findings.push({
+        gate,
+        detail: `runs turbo without --continue — turbo aborts at the first failing package, so later packages go unverified yet baseline-forgiven. Append --continue where turbo is invoked, and verify forwarding first (\`run ${gate} -- --continue --dry=text\` must echo it): wrappers that branch on argv can silently swap the gated command`,
+      });
+    }
+  }
+  return findings;
 }
 
 const shellToken = (cmd: string): string | undefined => {
@@ -350,11 +422,11 @@ function headlineDetails(raw: string, fresh: string[]): { details: string; meta?
   const headlines = raw
     .split("\n")
     .map((l) => l.replace(ANSI_RE, ""))
-    .filter((l) => namesFailure(l) || SUMMARY_FAIL_RE.test(l));
+    .filter((l) => namesFailureEitherForm(l) || SUMMARY_FAIL_RE.test(l));
   if (!headlines.length) return { details: `new failures vs baseline:\n${fresh.join("\n")}` };
   return {
     details: `failing tests:\n${headlines.join("\n")}\n\nnew failure fingerprints vs baseline (secondary):\n${fresh.join("\n")}`,
-    meta: { failingTests: headlines.filter(namesFailure) },
+    meta: { failingTests: headlines.filter(namesFailureEitherForm) },
   };
 }
 

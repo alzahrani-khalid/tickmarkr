@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { detectPackageManager } from "../../gates/baseline.js";
+import { detectPackageManager, turboContinueFindings } from "../../gates/baseline.js";
 import { version } from "./version.js";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
@@ -255,6 +255,8 @@ export async function doctor(
       ? `tickmarkr doctor --refresh-catalog: model catalog refreshed${refreshed.warning ? `; ${refreshed.warning}` : ""}`
       : `tickmarkr doctor --refresh-catalog: catalog refresh unavailable — ${refreshed.warning ?? "unknown failure"}; retained ${refreshed.catalog.source} catalog`;
   }
+  // Operator directive 2026-08-12 (declutter): long per-model lists render only when asked for.
+  const listAllModels = _argv.includes("--models");
   const cfg = loadConfig(cwd);
   // T17: synchronous/cache-only by operator ruling. The only network-bearing catalog function is the
   // separately invoked refreshCatalogCommand; ordinary doctor never calls it.
@@ -338,6 +340,11 @@ export async function doctor(
   // Q140s(b): the repo's package manager must resolve where gates spawn (D-OBS-10).
   const pmRow = packageManagerFinding(cwd);
   if (pmRow) rows.push(alignedStatusRow(pmRow.verdict, "package-manager", pmRow.detail));
+  // GATE-FIX-4 §3 (dossier, 2026-08-13): an early-abort runner leaves later packages unverified
+  // yet baseline-forgiven — surface it BEFORE a run pays for it.
+  for (const f of turboContinueFindings(cwd, cfg)) {
+    rows.push(alignedStatusRow("warn", `gates.${f.gate}`, f.detail));
+  }
   // Q142s: tickmarkr's own binary gets the shadow check every adapter binary already had.
   const shadowRow = selfShadowFinding(await version(), cwd);
   if (shadowRow) rows.push(alignedStatusRow(shadowRow.verdict, "tickmarkr-binary", shadowRow.detail));
@@ -460,9 +467,24 @@ export async function doctor(
       // Keep the historical count as an index, but it is no longer the whole report: every model gets
       // a cache-backed evidence or explicit uncovered line. Neither branch changes cfg, health, or route().
       rows.push(`    ${dim(`(${unclassified.length} more listed, unclassified)`)}`);
-      for (const model of unclassified) {
-        const advisory = catalogModelAdvisory(cfg, catalog, a.id, model, resolvedCatalogModel(a.id, model));
-        rows.push(`    ${dim(`catalog · ${advisory.display}`)}`);
+      const advisories = unclassified.map((model) =>
+        catalogModelAdvisory(cfg, catalog, a.id, model, resolvedCatalogModel(a.id, model)));
+      // Q128s exhibit #4 / operator directive 2026-08-12: ~600 per-model advisory rows buried the six
+      // decision-grade flags on a real machine. Default view keeps ONLY rows that ask the operator for a
+      // decision (tier suggestions); the no-decision bulk (uncovered + covered evidence-only) compresses
+      // to one counted line per adapter. `doctor --models` restores every row — asked-for, not ambient.
+      const decisive = advisories.filter((adv) => adv.suggestion);
+      const bulk = advisories.filter((adv) => !adv.suggestion);
+      const shown = listAllModels ? advisories : decisive;
+      for (const advisory of shown) rows.push(`    ${dim(`catalog · ${advisory.display}`)}`);
+      if (!listAllModels && bulk.length) {
+        const uncovered = bulk.filter((adv) => adv.coverage === "uncovered").length;
+        const evidenceOnly = bulk.length - uncovered;
+        const parts = [
+          ...(uncovered ? [`${uncovered} uncovered by ${catalog.source === "cache" ? "cached catalogs" : "vendored catalog"}`] : []),
+          ...(evidenceOnly ? [`${evidenceOnly} covered without a tier suggestion`] : []),
+        ];
+        rows.push(`    ${dim(`catalog · ${parts.join(" · ")} — tickmarkr doctor --models lists each`)}`);
       }
     }
     return rows;

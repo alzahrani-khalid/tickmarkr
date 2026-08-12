@@ -36,17 +36,20 @@ export function FleetListScreen({
   rows,
   cursor,
   details = [],
+  filter,
 }: {
   title: string;
   legend: string;
   rows: FleetListRow[];
   cursor: number;
   details?: string[];
+  /** active type-to-search string; rendered on the legend line so the operator sees the narrowing */
+  filter?: string;
 }) {
   return (
     <Box flexDirection="column">
       <Text bold>{title}</Text>
-      <Text dimColor>{legend}</Text>
+      <Text dimColor>{filter ? `${legend} · search: ${filter}` : legend}</Text>
       {rows.map((row, index) => (
         <Text key={row.id} bold={index === cursor}>
           {index === cursor ? `${GLYPHS.pointer} ` : "  "}

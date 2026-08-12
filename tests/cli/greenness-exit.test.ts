@@ -48,16 +48,16 @@ describe("run/resume greenness exit contract", () => {
     expect(r.code).toBe(0);
   }, 120_000);
 
-  test("run summary with a failed task exits 2", async () => {
+  test("a fresh run over an all-terminal graph refuses instead of minting a summary", async () => {
     const { repo, scriptPath } = setupRepo([T("T1")], { tasks: {} });
     saveGraph(repo, setStatus(loadGraph(repo), "T1", "failed"));
     writeDoctor(repo, FAKE_ONLY_DOCTOR);
     process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
 
-    const r = await run(["--driver", "subprocess"], repo);
-    expect(r.out).toMatch(/finished/);
-    expect(r.out).toMatch(/failed: 1/);
-    expect(r.code).toBe(2);
+    // Q150s (dossier GATE-FIX family): a run that can dispatch nothing must not journal a
+    // run-end that reads as completion — it refuses, naming the counts and both remedies.
+    // Failure exit taxonomy for runs that FINISH with failures is pinned by the sibling tests.
+    await expect(run(["--driver", "subprocess"], repo)).rejects.toThrow(/nothing to dispatch[\s\S]*failed 1/);
   }, 120_000);
 
   test("run summary with a non-green parked task exits 2", async () => {

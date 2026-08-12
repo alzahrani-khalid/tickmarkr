@@ -27,10 +27,13 @@ import { route } from "../../route/router.js";
 import { resolveRunMode, type ResolvedRunMode } from "../../run/daemon.js";
 import { loadRoutingProfile } from "../../run/journal.js";
 import type {
+  FleetEditorResult,
   FleetEditorState,
   FleetOverlayReview,
   FleetSteeringKey,
 } from "../../tui/ink/fleet-app.js";
+
+type FleetEditorProps = Parameters<typeof import("../../tui/ink/fleet-app.js").runFleetInkEditor>[0];
 
 const NON_TTY_MSG = "tickmarkr fleet: interactive fleet editor requires a TTY — use `tickmarkr fleet --print` for non-interactive output";
 const QUIT = "fleet: quit without writing";
@@ -158,12 +161,68 @@ export async function fleet(
 
   if (!why && !interactive) return { out: NON_TTY_MSG, code: 1 };
 
-  const fresh = values.fresh ?? false;
-  const { reuse, health: cached } = initDoctorReuse(cwd, fresh);
+  const assembled = await assembleFleetEditor(cwd, adapters, io, {
+    globalDir,
+    fresh: values.fresh ?? false,
+  });
+  if ("unavailable" in assembled) return { out: assembled.unavailable, code: 1 };
+  if (why) return assembled.renderWhy();
+
+  // Keep Ink out of print, non-TTY, and missing-probe paths: the component runtime belongs
+  // exclusively to the interactive editor. The capture window brackets only the dynamic Ink
+  // import — keys typed while the module loads land in props.initialInput, never get dropped.
+  const initialInput: string[] = [];
+  const productionInput = input as FleetInput & Partial<Pick<NodeJS.ReadStream, "ref" | "unref">>;
+  const captureStartupInput = typeof productionInput.ref === "function"
+    && typeof productionInput.unref === "function";
+  const onStartupInput = (chunk: string | Buffer) => {
+    initialInput.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+  };
+  if (captureStartupInput) {
+    input.on("data", onStartupInput);
+    input.resume();
+  }
+  let runFleetInkEditor: typeof import("../../tui/ink/fleet-app.js").runFleetInkEditor;
+  try {
+    ({ runFleetInkEditor } = await import("../../tui/ink/fleet-app.js"));
+  } catch (error) {
+    if (captureStartupInput) {
+      input.off("data", onStartupInput);
+      input.pause();
+    }
+    throw error;
+  }
+  if (captureStartupInput) {
+    input.off("data", onStartupInput);
+    input.pause();
+  }
+  assembled.props.initialInput = initialInput;
+  const result = await runFleetInkEditor(assembled.props);
+  return assembled.commit(result);
+}
+
+/** Everything between the doctor-reuse gate and the Ink render, packaged for reuse: `tickmarkr init`
+ * runs the same editor (preset-first) without re-owning the assembly or the write funnel. `commit`
+ * remains the single config actuator — it maps editor results to the command's exact result strings
+ * and performs the one guarded overlay write. */
+export async function assembleFleetEditor(
+  cwd: string,
+  adapters: WorkerAdapter[],
+  io: FleetIO,
+  opts: { globalDir: string; entry?: "presets" | "probe"; fresh?: boolean },
+): Promise<
+  | {
+    props: FleetEditorProps;
+    commit: (result: FleetEditorResult) => string;
+    renderWhy: () => string;
+  }
+  | { unavailable: string }
+> {
+  const globalDir = opts.globalDir;
+  const { reuse, health: cached } = initDoctorReuse(cwd, opts.fresh ?? false);
   if (!reuse || !cached) {
     return {
-      out: "tickmarkr fleet: probe data missing or stale — run `tickmarkr doctor` first (fleet never re-probes; doctor is the sensor)",
-      code: 1,
+      unavailable: "tickmarkr fleet: probe data missing or stale — run `tickmarkr doctor` first (fleet never re-probes; doctor is the sensor)",
     };
   }
 
@@ -302,7 +361,6 @@ export async function fleet(
   };
   const routedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>) =>
     projectedShapeRows(mode, map).map(({ id, label }) => ({ id, label }));
-  if (why) return renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map));
   const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>) =>
     shapeCandidates(previewTask(shape), previewCfg(mode, map), channels, profile).map((candidate) => ({
       id: `${candidate.assignment.adapter}:${candidate.assignment.model}`,
@@ -326,6 +384,9 @@ export async function fleet(
     const discovered = which === "review" ? [...reviewAdapters, ...seats] : seats;
     return [...discovered, ...current.filter((entry) => !discovered.includes(entry))];
   };
+  // The judge is one seat by schema (config.judge: { adapter, model }); the editor offers the same
+  // discovered seats universe plus a keep-default row, and a write is staged only on a real change.
+  const initialJudge = `${cfg.judge.adapter}:${cfg.judge.model}`;
   let pendingWrite: FleetOverlayWrite | null = null;
   const reviewOverlay = (state: FleetEditorState): FleetOverlayReview => {
     const staged = structuredClone(initial) as FleetEditable;
@@ -349,7 +410,10 @@ export async function fleet(
     const steeringChanged = (["review", "consult"] as const).some(
       (key) => JSON.stringify(state.steering[key]) !== JSON.stringify(initialSteering[key]),
     );
-    if (!modeChanged && !steeringChanged && fleetEditableEquals(initial, staged)) {
+    const judgeSeat = state.judgeSeat;
+    const judgeChanged = judgeSeat !== undefined
+      && `${judgeSeat.adapter}:${judgeSeat.model}` !== initialJudge;
+    if (!modeChanged && !steeringChanged && !judgeChanged && fleetEditableEquals(initial, staged)) {
       pendingWrite = null;
       return { kind: "empty" };
     }
@@ -357,6 +421,7 @@ export async function fleet(
       initial,
       edited: staged,
       ...(modeChanged ? { mode: state.selectedMode } : {}),
+      ...(judgeChanged && judgeSeat ? { judge: judgeSeat } : {}),
       steering: { initial: initialSteering, edited: state.steering },
     };
     const after = renderFleetOverlayWrite(before, write);
@@ -376,34 +441,7 @@ export async function fleet(
   const reloadGuard = io.reloadGuard
     ?? ((bytes: string) => overlayBytesLoadError(cwd, bytes, { globalDir }));
 
-  // Keep Ink out of print, non-TTY, and missing-probe paths: the component runtime belongs
-  // exclusively to the interactive editor.
-  const initialInput: string[] = [];
-  const productionInput = input as FleetInput & Partial<Pick<NodeJS.ReadStream, "ref" | "unref">>;
-  const captureStartupInput = typeof productionInput.ref === "function"
-    && typeof productionInput.unref === "function";
-  const onStartupInput = (chunk: string | Buffer) => {
-    initialInput.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
-  };
-  if (captureStartupInput) {
-    input.on("data", onStartupInput);
-    input.resume();
-  }
-  let runFleetInkEditor: typeof import("../../tui/ink/fleet-app.js").runFleetInkEditor;
-  try {
-    ({ runFleetInkEditor } = await import("../../tui/ink/fleet-app.js"));
-  } catch (error) {
-    if (captureStartupInput) {
-      input.off("data", onStartupInput);
-      input.pause();
-    }
-    throw error;
-  }
-  if (captureStartupInput) {
-    input.off("data", onStartupInput);
-    input.pause();
-  }
-  const result = await runFleetInkEditor({
+  const props: FleetEditorProps = {
     ageMs: doctorAgeMs(cwd),
     adapters,
     health,
@@ -424,22 +462,34 @@ export async function fleet(
     steeringOptionsFor,
     reviewOverlay,
     reloadGuard,
-    initialInput,
-    input: input as NodeJS.ReadStream,
-    output: output as NodeJS.WriteStream,
+    entry: opts.entry,
+    initialJudge,
+    judgeSeats: seats,
+    initialInput: [],
+    input: (io.input ?? (process.stdin as FleetInput)) as NodeJS.ReadStream,
+    output: (io.output ?? (process.stdout as FleetOutput)) as NodeJS.WriteStream,
     debug: io.debug,
-  });
-  if (result.kind === "quit") return QUIT;
-  if (result.kind === "refresh") {
-    return "fleet: run `tickmarkr doctor` to refresh probe data, then re-run `tickmarkr fleet` (doctor is the sensor; fleet never re-probes)";
-  }
-  if (result.kind === "no-changes") return "fleet: no overlay changes (empty diff)";
-  if (result.kind === "discard") return "fleet: discarded overlay changes";
+  };
 
-  // The command remains the single config actuator. Every interactive edit reaches this
-  // one write only after the component-rendered diff confirm and the production reload guard.
-  const write = pendingWrite;
-  if (!write) throw new Error("fleet write reached confirmation without a staged overlay mutation");
-  writeFleetOverlay(result.review.path, (prior) => renderFleetOverlayWrite(prior, write));
-  return `fleet: wrote ${result.review.path}`;
+  const commit = (result: FleetEditorResult): string => {
+    if (result.kind === "quit") return QUIT;
+    if (result.kind === "refresh") {
+      return "fleet: run `tickmarkr doctor` to refresh probe data, then re-run `tickmarkr fleet` (doctor is the sensor; fleet never re-probes)";
+    }
+    if (result.kind === "no-changes") return "fleet: no overlay changes (empty diff)";
+    if (result.kind === "discard") return "fleet: discarded overlay changes";
+
+    // The command remains the single config actuator. Every interactive edit reaches this
+    // one write only after the component-rendered diff confirm and the production reload guard.
+    const write = pendingWrite;
+    if (!write) throw new Error("fleet write reached confirmation without a staged overlay mutation");
+    writeFleetOverlay(result.review.path, (prior) => renderFleetOverlayWrite(prior, write));
+    return `fleet: wrote ${result.review.path}`;
+  };
+
+  return {
+    props,
+    commit,
+    renderWhy: () => renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map)),
+  };
 }

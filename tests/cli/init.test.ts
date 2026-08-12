@@ -1,12 +1,13 @@
 import { existsSync, mkdtempSync, readFileSync, utimesSync } from "node:fs";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-const { mockQuestion, mockCreateInterface } = vi.hoisted(() => {
+const { mockCreateInterface } = vi.hoisted(() => {
   const mockQuestion = vi.fn();
   const mockCreateInterface = vi.fn(() => ({ question: mockQuestion, close: vi.fn() }));
-  return { mockQuestion, mockCreateInterface };
+  return { mockCreateInterface };
 });
 
 vi.mock("node:readline/promises", () => ({ createInterface: mockCreateInterface }));
@@ -23,6 +24,91 @@ const ROOT = join(import.meta.dirname, "../..");
 const skill = (name: string) => readFileSync(join(ROOT, "skills", name, "SKILL.md"));
 const runInit = (repo: string, ...args: string[]) =>
   init(["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-")), ...args], repo);
+
+const KEY = { down: "\x1b[B", enter: "\r", space: " ", esc: "\x1b" };
+const strip = (s: string) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+
+type TestInput = PassThrough & {
+  isTTY: boolean;
+  setRawMode: (mode: boolean) => void;
+  ref: () => TestInput;
+  unref: () => TestInput;
+};
+
+// Adapted from tests/cli/fleet.test.ts makeIO: a plain PassThrough decoded by node's own
+// emitKeypressEvents (the production path), split one key sequence per event because Ink
+// treats a multi-character write as a paste. Output collects frames for assertions.
+const makeIO = () => {
+  const input = new PassThrough() as TestInput;
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  input.ref = () => input;
+  input.unref = () => input;
+  const directWrite = input.write.bind(input);
+  const pendingWrites: string[] = [];
+  let pumping = false;
+  const pump = () => {
+    const chunk = pendingWrites.shift();
+    if (chunk === undefined) {
+      pumping = false;
+      return;
+    }
+    directWrite(chunk);
+    setImmediate(pump);
+  };
+  input.write = ((chunk: string | Uint8Array) => {
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    pendingWrites.push(...(text.match(/\x1b\[[0-9;]*[A-Za-z~]|[\s\S]/g) ?? []));
+    if (!pumping) {
+      pumping = true;
+      setImmediate(pump);
+    }
+    return true;
+  }) as typeof input.write;
+  const writes: string[] = [];
+  const frameWaiters: Array<{ marker: string; resolve: () => void }> = [];
+  const output = {
+    isTTY: true,
+    columns: 120,
+    rows: 60,
+    write: (chunk: string) => {
+      if (chunk === "" || chunk === "\x1b[?25l" || chunk === "\x1b[?25h") return true;
+      if (writes.at(-1) === chunk) return true;
+      writes.push(chunk);
+      for (let i = frameWaiters.length - 1; i >= 0; i--) {
+        if (strip(chunk).includes(frameWaiters[i]!.marker)) frameWaiters.splice(i, 1)[0]!.resolve();
+      }
+      return true;
+    },
+    on: () => {},
+    off: () => {},
+    removeListener: () => {},
+  };
+  // Event-driven, no wall clock: resolves on the write that renders the marker; a frame that
+  // never renders fails at vitest's own test timeout, pointing at the awaiting line.
+  const whenFrame = (marker: string) => {
+    if (writes.some((w) => strip(w).includes(marker))) return Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    frameWaiters.push({ marker, resolve });
+    return promise;
+  };
+  return { input, output, writes, whenFrame };
+};
+
+// Drive the consolidated init: wizard bytes first (buffered until act 1 mounts), then Esc the
+// act-3 fleet editor once its presets screen renders — every interactive init ends there now.
+const driveInit = async (repo: string, wizardBytes: string, ...args: string[]) => {
+  const io = makeIO();
+  const p = init(
+    ["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-")), ...args],
+    repo,
+    { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
+  );
+  if (wizardBytes) io.input.write(wizardBytes);
+  await io.whenFrame("routing presets");
+  io.input.write(KEY.esc);
+  return { out: await p, io };
+};
 
 const stampDoctor = (repo: string, ageMs: number) => {
   registry.writeDoctor(repo, { fake: { installed: true, authed: true, models: [] } });
@@ -66,11 +152,6 @@ const withoutTTY = async (fn: () => Promise<void>) => {
   }
 };
 
-const mockWizardAnswers = (...answers: string[]) => {
-  mockQuestion.mockReset();
-  for (const a of answers) mockQuestion.mockResolvedValueOnce(a);
-  return mockQuestion;
-};
 
 describe("tickmarkr init doctor.json reuse (T1)", () => {
   test("reuses a doctor.json stamped 5 minutes ago and skips model probes", async () => {
@@ -195,18 +276,19 @@ describe("tickmarkr init wizard (T4)", () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     stampDoctor(repo, 5 * 60 * 1000);
-    const question = mockWizardAnswers("herdr", "5", "pane", "n");
 
-    await withTTY(async () => {
-      await runInit(repo);
-    });
+    // driver auto→herdr · concurrency 3→5 (first digit replaces) · visibility headless→pane ·
+    // clamp down onto Continue, Enter — then Esc the act-3 fleet editor (driveInit does that).
+    await driveInit(
+      repo,
+      KEY.enter + KEY.down + "5" + KEY.down + KEY.enter + KEY.down.repeat(3) + KEY.enter,
+    );
 
     const cfgText = readFileSync(join(tickmarkrDir(repo), "config.yaml"), "utf8");
     expect(cfgText).toMatch(/^concurrency: 5$/m);
     expect(cfgText).toMatch(/^driver: herdr$/m);
     expect(cfgText).toMatch(/^  llm: pane$/m);
     expect(loadConfig(repo)).toMatchObject({ concurrency: 5, driver: "herdr", visibility: { llm: "pane" } });
-    expect(question).toHaveBeenCalledTimes(4);
   });
 
   test("a yes to the skills question installs skills exactly as init --agent does; a no leaves the repo untouched", async () => {
@@ -215,17 +297,16 @@ describe("tickmarkr init wizard (T4)", () => {
     const noRepo = makeRepo({ "keep.txt": "x" });
     stampDoctor(yesRepo, 5 * 60 * 1000);
     stampDoctor(noRepo, 5 * 60 * 1000);
-    mockWizardAnswers("", "", "", "yes", "n");
-    await withTTY(async () => {
-      await runInit(yesRepo);
-    });
+
+    // Space toggles skills (default off in a bare repo), Space on the next row toggles the
+    // agent-docs append, Enter on Continue — the docs block lands without any readline ask.
+    await driveInit(yesRepo, KEY.down + KEY.down + KEY.down + KEY.space + KEY.down + KEY.space + KEY.down + KEY.enter);
     expect(readFileSync(join(yesRepo, ".agents/skills/tickmarkr-loop/SKILL.md"))).toEqual(skill("tickmarkr-loop"));
     expect(readFileSync(join(yesRepo, ".agents/skills/tickmarkr-auto/SKILL.md"))).toEqual(skill("tickmarkr-auto"));
+    expect(readFileSync(join(yesRepo, "AGENTS.md"), "utf8")).toContain("<!-- tickmarkr:agent-docs begin -->");
 
-    mockWizardAnswers("", "", "", "no");
-    await withTTY(async () => {
-      await runInit(noRepo);
-    });
+    // Untouched toggles = no: clamp down onto Continue.
+    await driveInit(noRepo, KEY.down.repeat(9) + KEY.enter);
     expect(existsSync(join(noRepo, ".claude"))).toBe(false);
   });
 
@@ -238,14 +319,12 @@ describe("tickmarkr init wizard (T4)", () => {
       ]),
     ));
     stampDoctor(repo, 5 * 60 * 1000);
-    const question = mockWizardAnswers("", "", "");
 
-    await withTTY(async () => {
-      await runInit(repo);
-    });
+    // With skills installed the row is absent: three downs land on Continue directly.
+    const { io } = await driveInit(repo, KEY.down.repeat(3) + KEY.enter);
 
-    expect(question).toHaveBeenCalledTimes(3);
-    expect(question.mock.calls.every((c) => !String(c[0]).includes("skills"))).toBe(true);
+    expect(io.writes.some((w) => strip(w).includes("Install agent skills"))).toBe(false);
+    expect(readFileSync(join(repo, ".agents/skills/tickmarkr-loop/SKILL.md"), "utf8")).toBe("installed\n");
   });
 
   test("non-TTY init writes the plain template, asks nothing, installs no skills (CI-safe)", async () => {
@@ -271,14 +350,12 @@ describe("tickmarkr init wizard (T4)", () => {
     const overlay = "concurrency: 9\ndriver: subprocess\n";
     const repo = makeRepo({ ".tickmarkr/config.yaml": overlay });
     stampDoctor(repo, 5 * 60 * 1000);
-    const question = mockWizardAnswers("herdr", "5", "pane", "yes");
 
-    await withTTY(async () => {
-      await runInit(repo);
-    });
+    // Existing config skips act 1 entirely — init lands on the act-3 presets screen.
+    const { io } = await driveInit(repo, "");
 
     expect(readFileSync(join(repo, ".tickmarkr/config.yaml"), "utf8")).toBe(overlay);
-    expect(question).not.toHaveBeenCalled();
+    expect(io.writes.some((w) => strip(w).includes("Preferences"))).toBe(false);
   });
 
   test("pressing Enter through every default writes uncommented defaults", async () => {
@@ -287,12 +364,10 @@ describe("tickmarkr init wizard (T4)", () => {
     stampDoctor(repo, 5 * 60 * 1000);
     const herdr = process.env.HERDR_ENV;
     delete process.env.HERDR_ENV;
-    mockWizardAnswers("", "", "", "");
 
     try {
-      await withTTY(async () => {
-        await runInit(repo);
-      });
+      // Over-pressing down clamps on Continue; Enter accepts every default untouched.
+      await driveInit(repo, KEY.down.repeat(9) + KEY.enter);
       const cfg = loadConfig(repo);
       expect(cfg.concurrency).toBe(3);
       expect(cfg.driver).toBe("auto");
@@ -389,25 +464,44 @@ describe("T4 init closing block", () => {
 });
 
 describe("T3 brand banner (TTY gate)", () => {
-  test("TTY stdout emits the banner before the first prompt (wizard path)", async () => {
+  test("TTY stdout emits the banner before the first wizard frame (wizard path)", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     stampDoctor(repo, 5 * 60 * 1000);
-    const writes: string[] = [];
+    // One shared sequence across BOTH streams: the banner rides process.stdout while wizard
+    // frames ride the injected io — ordering is only provable on a merged log.
+    const seq: string[] = [];
     const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
-      writes.push(String(chunk));
+      seq.push(`stdout:${String(chunk)}`);
       return true;
     });
-    mockWizardAnswers("", "", "", "n");
 
-    await withTTY(async () => {
-      await runInit(repo);
-    });
+    try {
+      await withTTY(async () => {
+        const io = makeIO();
+        const inkWrite = io.output.write;
+        io.output.write = (chunk: string) => {
+          seq.push(`ink:${chunk}`);
+          return inkWrite(chunk);
+        };
+        const p = init(
+          ["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-"))],
+          repo,
+          { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
+        );
+        io.input.write(KEY.down.repeat(9) + KEY.enter);
+        await io.whenFrame("routing presets");
+        io.input.write(KEY.esc);
+        await p;
+      });
+    } finally {
+      writeSpy.mockRestore();
+    }
 
-    const bannerIdx = writes.findIndex((w) => w.includes("tickmarkr") && w.includes("spec in, verified work out."));
+    const bannerIdx = seq.findIndex((w) => w.startsWith("stdout:") && w.includes("spec in, verified work out."));
+    const firstFrameIdx = seq.findIndex((w) => w.startsWith("ink:"));
     expect(bannerIdx).toBeGreaterThanOrEqual(0);
-    expect(writeSpy.mock.invocationCallOrder[bannerIdx]!).toBeLessThan(mockQuestion.mock.invocationCallOrder[0]!);
-    writeSpy.mockRestore();
+    expect(firstFrameIdx).toBeGreaterThan(bannerIdx);
   });
 
   test("TTY stdout emits the banner at start when the wizard is skipped", async () => {
@@ -422,10 +516,13 @@ describe("T3 brand banner (TTY gate)", () => {
       return true;
     });
     let out: string;
-    await withTTY(async () => {
-      out = await runInit(repo);
-    });
-    writeSpy.mockRestore();
+    try {
+      await withTTY(async () => {
+        out = (await driveInit(repo, "")).out;
+      });
+    } finally {
+      writeSpy.mockRestore();
+    }
 
     expect(writes.some((w) => w.includes("spec in, verified work out."))).toBe(true);
     expect(out!.startsWith(BANNER)).toBe(false); // the start write is the single emission — body stays banner-free
@@ -442,7 +539,7 @@ describe("T3 brand banner (TTY gate)", () => {
     await withTTY(async () => {
       const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
       try {
-        out = await runInit(repo);
+        out = (await driveInit(repo, "")).out;
         shared = {
           initTitle: title("tickmarkr init"),
           notesLegend: legend("· setup notes"),

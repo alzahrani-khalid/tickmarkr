@@ -232,6 +232,41 @@ describe("model status table (T4)", () => {
     expect(out).not.toMatch(/^\s+fake-2\s/m);
   });
 
+  test("no-decision catalog advisories collapse to one counted line; --models restores every row", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    withOverlay(repo, fakeTiers);
+
+    // fake-2 is unclassified and uncovered (no catalog cache) — a no-decision row, collapsed by default
+    const collapsed = await doctor(["--"], repo, [mkFake(script)]);
+    expect(collapsed).toMatch(/catalog · 1 uncovered by vendored catalog — tickmarkr doctor --models lists each/);
+    expect(collapsed).not.toMatch(/catalog · fake-2/);
+
+    const listed = await doctor(["--models"], repo, [mkFake(script)]);
+    expect(listed).toMatch(/catalog · fake-2 — uncovered by vendored catalog; no tier suggestion/);
+    expect(listed).not.toMatch(/lists each/);
+  });
+
+  test("a turbo gate without --continue warns naming the abort hazard; --continue silences it", async () => {
+    const repo = makeRepo({
+      "keep.txt": "x",
+      // the dossier shape: the gate command is `npm run -s test`, turbo hides one level down
+      "package.json": JSON.stringify({ name: "t", scripts: { test: "turbo run test" } }),
+    });
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    withOverlay(repo, fakeTiers);
+
+    const warned = await doctor(["--"], repo, [mkFake(script)]);
+    expect(warned).toMatch(/gates\.test.*runs turbo without --continue/);
+    expect(warned).toMatch(/verify forwarding first/);
+
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "t", scripts: { test: "turbo run test --continue" } }));
+    const silent = await doctor(["--"], repo, [mkFake(script)]);
+    expect(silent).not.toMatch(/runs turbo without --continue/);
+  });
+
   test("a model window declared in config renders in the doctor matrix", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const script = join(repo, "fake.json");

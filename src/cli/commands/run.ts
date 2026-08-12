@@ -72,8 +72,9 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     console.warn(`tickmarkr: !! ${conflict}`);
   }
   // OBS-107 (v1.67 T5): advisory only — a stale compiled graph with prior terminal statuses and no
-  // live daemon will otherwise finish with zero work and confuse the operator. The recompile remedy
-  // is named; dispatch proceeds unchanged.
+  // live daemon will otherwise confuse the operator. The recompile remedy is named; dispatch
+  // proceeds unchanged when anything is still dispatchable. When NOTHING is (all-terminal graph),
+  // runDaemon's no-op refusal (GATE-FIX-4 defect 4) turns the old zero-work "finished" into an error.
   const TERMINAL_STATUSES: TaskStatus[] = ["done", "failed", "human"];
   if (graph.tasks.some((t) => TERMINAL_STATUSES.includes(t.status)) && !isRunLockLive(cwd)) {
     console.warn(

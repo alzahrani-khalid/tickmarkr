@@ -21,6 +21,9 @@ export type FleetOverlayWrite = {
   initial: FleetEditable;
   edited: FleetEditable;
   mode?: RoutingMode;
+  // config.judge is one adapter+model seat by schema (never a prefer chain; failover is runtime),
+  // so a changed judge writes two scalars — set only when it differs from the resolved config.
+  judge?: { adapter: string; model: string };
   steering?: {
     initial: { review?: string[]; consult?: string[] };
     edited: { review?: string[]; consult?: string[] };
@@ -198,6 +201,10 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
 
   if (write.mode !== undefined) {
     setScalarPreservingComment(doc, ["routing", "mode"], write.mode);
+  }
+  if (write.judge) {
+    setScalarPreservingComment(doc, ["judge", "adapter"], write.judge.adapter);
+    setScalarPreservingComment(doc, ["judge", "model"], write.judge.model);
   }
 
   if (write.steering) {

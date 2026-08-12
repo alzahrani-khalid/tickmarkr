@@ -186,15 +186,18 @@ describe("run lock at the daemon seam (fake adapter, zero tokens)", () => {
     expect(reclaims[0].data.pid).toBe(dead);
   });
 
-  test("released: lock gone after a normal run; a second sequential run succeeds", async () => {
+  test("released: lock gone after a normal run; a second sequential run is not blocked by a stale lock", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: `echo x > f.txt && ${COMMIT} x`, result: { ok: true, summary: "x" } }] } },
     );
     await runDaemon(repo, { adapters: [fake], runId: "run-1" });
     expect(existsSync(lockOf(repo))).toBe(false);
-    const s2 = await runDaemon(repo, { adapters: [fake], runId: "run-2" });
-    expect(s2.done).toEqual(["T1"]);
+    // Q150s: the completed graph now refuses a second FRESH run (nothing to dispatch) — the
+    // lock contract this test defends is that the refusal comes from the graph, never from a
+    // stale lock, and that the lock is released again on the refusal path's finally.
+    await expect(runDaemon(repo, { adapters: [fake], runId: "run-2" })).rejects.toThrow(/nothing to dispatch/);
+    expect(existsSync(lockOf(repo))).toBe(false);
   });
 });
 

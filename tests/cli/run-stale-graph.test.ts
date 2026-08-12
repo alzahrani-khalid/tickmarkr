@@ -16,22 +16,22 @@ const FAKE_ONLY_DOCTOR = {
 describe("stale-graph run warning", () => {
   afterEach(() => { delete process.env.TICKMARKR_FAKE_SCRIPT; });
 
-  test("test: a run against a graph with terminal statuses and no active daemon prints the stale-graph warning naming the recompile remedy", async () => {
+  test("test: a run against an all-terminal graph prints the stale-graph warning, then the daemon refuses to start a no-op run", async () => {
     const { repo, scriptPath } = setupRepo(
       [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 3, acceptance: ["done"] }],
       { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "t1" } }] } },
     );
     writeDoctor(repo, FAKE_ONLY_DOCTOR);
-    // Mark the task done before the run so the daemon finishes immediately while the graph still
-    // carries a terminal status — this keeps the test fast and isolated from the warning seam.
+    // Mark the task done before the run: the graph carries a terminal status with no daemon alive,
+    // so the CLI's advisory fires — and since NOTHING is dispatchable, the daemon now refuses to
+    // start (GATE-FIX-4 defect 4) instead of journaling a zero-dispatch run-start/run-end that this
+    // test used to accept as "finished". The warning seam stays isolated and fast: no run exists.
     saveGraph(repo, setStatus(loadGraph(repo), "T1", "done"));
     process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const r = await run(["--driver", "subprocess"], repo);
-      expect(r.out).toMatch(/finished/);
-      expect(r.code).toBe(0);
+      await expect(run(["--driver", "subprocess"], repo)).rejects.toThrow(/nothing to dispatch/);
       expect(loadGraph(repo).tasks[0].status).toBe("done");
       const staleWarning = warnSpy.mock.calls.find(
         (call) => typeof call[0] === "string" && call[0].includes("stale graph"),

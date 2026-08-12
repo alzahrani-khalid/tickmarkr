@@ -17,6 +17,9 @@ export type FleetEditorState = {
   classifications: FleetClassification[];
   selectedMode: RoutingMode;
   map: Record<string, MapEntry>;
+  // v1.61: one seat, not a chain — config.judge is z.object({ adapter, model }) (GATE-09 failover
+  // is runtime). Present only when the operator picked a seat in the editor.
+  judgeSeat?: { adapter: string; model: string };
   steering: Record<FleetSteeringKey, string[] | undefined>;
 };
 
@@ -165,6 +168,13 @@ export function formatDoctorAge(ageMs: number | null): string {
   return `${Math.floor(mins / 60)}h old`;
 }
 
+// judge seats travel the editor as the same "adapter:model" strings the pickers list; the model
+// half may itself contain ":" so only the first separator is structural.
+function splitSeat(seat: string): { adapter: string; model: string } {
+  const at = seat.indexOf(":");
+  return { adapter: seat.slice(0, at), model: seat.slice(at + 1) };
+}
+
 export function FleetApp({
   ageMs,
   agents,
@@ -182,6 +192,9 @@ export function FleetApp({
   steeringOptionsFor,
   reviewOverlay,
   reloadGuard,
+  entry = "probe",
+  initialJudge = "",
+  judgeSeats = [],
 }: {
   ageMs: number | null;
   agents: AgentCli[];
@@ -203,6 +216,13 @@ export function FleetApp({
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
+  // "presets" starts on the routing-mode screen with an extra `custom` row (init's entry point);
+  // "probe" is the classic six-step walk, byte-for-byte the pre-entry behavior.
+  entry?: "presets" | "probe";
+  /** resolved config judge as "adapter:model" — shown on the (keep default) picker row */
+  initialJudge?: string;
+  /** discovered adapter:model seats — the judge picker universe */
+  judgeSeats?: string[];
 }) {
   const { exit } = useApp();
   const [screen, setScreen] = useState<
@@ -219,8 +239,9 @@ export function FleetApp({
     | "shape-prefer"
     | "steering"
     | "steering-prefer"
+    | "judge-pick"
     | "review"
-  >("probe");
+  >(entry === "presets" ? "modes" : "probe");
   const screenRef = useRef(screen);
   const [cursor, setCursor] = useState(0);
   const cursorRef = useRef(cursor);
@@ -275,9 +296,19 @@ export function FleetApp({
   const steeringPickerCursorRef = useRef(0);
   const [steeringPickerCursor, setSteeringPickerCursor] = useState(0);
   const [, setSteeringPickerRevision] = useState(0);
+  const judgeCursorRef = useRef(0);
+  const [judgeCursor, setJudgeCursor] = useState(0);
+  const judgeSeatRef = useRef<string | null>(null);
+  const [judgeSeat, setJudgeSeat] = useState<string | null>(null);
   const reviewRef = useRef<Extract<FleetOverlayReview, { kind: "diff" }> | null>(null);
   const [review, setReview] = useState<Extract<FleetOverlayReview, { kind: "diff" }> | null>(null);
   const doneRef = useRef(false);
+  // entry === "presets": the first modes visit is the preset pick (mode → review, custom → the
+  // full walk). Once custom is chosen this flips off and modes behaves exactly as in probe entry.
+  const presetPickRef = useRef(entry === "presets");
+  // type-to-search on the long lists — reset on every screen change (per-screen-visit filter)
+  const filterRef = useRef("");
+  const [filter, setFilter] = useState("");
 
   const enabledModelGroups = () => modelGroups.filter((group) => !denyRef.current?.has(group.adapter));
   const stagedMap = () => mapRef.current as Record<string, MapEntry>;
@@ -298,6 +329,42 @@ export function FleetApp({
     }
     return rows;
   };
+  // type-to-search over the long lists: plain case-insensitive substring on the row's visible
+  // label. Each filterable screen derives its rows through these so input and render agree.
+  const matches = (label: string, f = filterRef.current) =>
+    f === "" || label.toLowerCase().includes(f.toLowerCase());
+  const filteredModelRows = (f = filterRef.current) =>
+    currentModelRows().filter((row) => matches(row.model, f));
+  const filteredCandidates = (f = filterRef.current) =>
+    candidatesRef.current.filter((candidate) => matches(candidate.label, f));
+  const filteredSteeringRows = (f = filterRef.current) =>
+    steeringRowsRef.current.filter((option) => matches(option, f));
+  const judgeKeepRow = initialJudge ? `(keep default)  ${initialJudge}` : "(keep default)";
+  const filteredJudgeRows = (f = filterRef.current) =>
+    [judgeKeepRow, ...judgeSeats].filter((row) => matches(row, f));
+
+  // Shared filter-edit tail for the filterable screens: hotkeys run first in each screen block,
+  // whatever printable input is left appends here (space stays a toggle key, never a filter char).
+  const filterInput = (
+    countFor: (f: string) => number,
+    cursorRef: { current: number },
+    setCursorState: (next: number) => void,
+    input: string,
+    key: { backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean },
+  ): boolean => {
+    // printable chars only: "\r" reaches here when an emptied list makes key.return a no-op
+    const printable = input > " " && !key.ctrl && !key.meta;
+    const next = key.backspace || key.delete
+      ? filterRef.current.slice(0, -1)
+      : (printable ? filterRef.current + input : null);
+    if (next === null) return false;
+    filterRef.current = next;
+    setFilter(next);
+    const clamped = Math.min(cursorRef.current, Math.max(countFor(next) - 1, 0));
+    cursorRef.current = clamped;
+    setCursorState(clamped);
+    return true;
+  };
 
   const editorState = (): FleetEditorState => ({
     denyAdapters: [...(denyRef.current ?? [])].sort(),
@@ -314,6 +381,7 @@ export function FleetApp({
         : classification),
     selectedMode: selectedModeRef.current,
     map: stagedMap(),
+    ...(judgeSeatRef.current ? { judgeSeat: splitSeat(judgeSeatRef.current) } : {}),
     steering: structuredClone(steeringRef.current as Record<FleetSteeringKey, string[] | undefined>),
   });
 
@@ -328,8 +396,24 @@ export function FleetApp({
   };
 
   const showScreen = (next: typeof screen) => {
+    filterRef.current = "";
+    setFilter("");
     screenRef.current = next;
     setScreen(next);
+  };
+
+  // The one review funnel: an empty staged overlay finishes as no-changes, a real diff shows the
+  // confirm screen. Reached from the steering enter and, in preset entry, from a mode pick.
+  const goReview = () => {
+    const nextReview = reviewOverlay(editorState());
+    if (nextReview.kind === "empty") {
+      finish({ kind: "no-changes" });
+      return;
+    }
+    reviewRef.current = nextReview as Extract<FleetOverlayReview, { kind: "diff" }>;
+    setReview(reviewRef.current);
+    setNotice("");
+    showScreen("review");
   };
 
   const beginClassification = (group: FleetModelGroup, model: string) => {
@@ -371,7 +455,7 @@ export function FleetApp({
       showScreen("shapes");
       return;
     }
-    if (key.escape && screenRef.current === "steering-prefer") {
+    if (key.escape && (screenRef.current === "steering-prefer" || screenRef.current === "judge-pick")) {
       showScreen("steering");
       return;
     }
@@ -425,7 +509,7 @@ export function FleetApp({
     }
 
     if (screenRef.current === "models") {
-      const rows = currentModelRows();
+      const rows = filteredModelRows();
       if (key.downArrow || input === "j") {
         const next = Math.min(modelCursorRef.current + 1, Math.max(rows.length - 1, 0));
         modelCursorRef.current = next;
@@ -473,9 +557,15 @@ export function FleetApp({
           setModelGroup(next);
           modelCursorRef.current = 0;
           setModelCursor(0);
+          filterRef.current = "";
+          setFilter("");
         } else {
           showScreen("modes");
         }
+        return;
+      }
+      if (filterInput((f) => filteredModelRows(f).length, modelCursorRef, setModelCursor, input, key)) {
+        setNotice("");
       }
       return;
     }
@@ -586,9 +676,11 @@ export function FleetApp({
     }
 
     if (screenRef.current === "modes") {
+      // preset entry adds one final `custom` row after the modes — the full-walk escape hatch
+      const rowCount = modeOptions.length + (presetPickRef.current ? 1 : 0);
       const currentModeCursor = modeCursorRef.current ?? 0;
       if (key.downArrow || input === "j") {
-        const next = Math.min(currentModeCursor + 1, Math.max(modeOptions.length - 1, 0));
+        const next = Math.min(currentModeCursor + 1, Math.max(rowCount - 1, 0));
         modeCursorRef.current = next;
         setModeCursor(next);
         return;
@@ -599,8 +691,19 @@ export function FleetApp({
         setModeCursor(next);
         return;
       }
-      if (key.return && modeOptions[currentModeCursor]) {
+      if (key.return) {
+        if (presetPickRef.current && currentModeCursor === modeOptions.length) {
+          presetPickRef.current = false;
+          showScreen("agents");
+          return;
+        }
+        if (!modeOptions[currentModeCursor]) return;
         selectedModeRef.current = modeOptions[currentModeCursor].id;
+        if (presetPickRef.current) {
+          // entry context: a preset pick goes straight to the diff confirm
+          goReview();
+          return;
+        }
         showScreen("shapes");
       }
       return;
@@ -650,8 +753,9 @@ export function FleetApp({
     }
 
     if (screenRef.current === "candidates") {
+      const rows = filteredCandidates();
       if (key.downArrow || input === "j") {
-        const next = Math.min(candidateCursorRef.current + 1, Math.max(candidatesRef.current.length - 1, 0));
+        const next = Math.min(candidateCursorRef.current + 1, Math.max(rows.length - 1, 0));
         candidateCursorRef.current = next;
         setCandidateCursor(next);
         return;
@@ -662,16 +766,18 @@ export function FleetApp({
         setCandidateCursor(next);
         return;
       }
-      if (key.return && candidatesRef.current[candidateCursorRef.current]) {
+      if (key.return && rows[candidateCursorRef.current]) {
         const shape = shapeRows(selectedModeRef.current, stagedMap())[shapeCursorRef.current]?.id;
         if (shape) {
-          const picked = candidatesRef.current[candidateCursorRef.current];
+          const picked = rows[candidateCursorRef.current];
           const nextMap = { ...stagedMap(), [shape]: { pin: picked.pin } };
           mapRef.current = nextMap;
           setMap(nextMap);
         }
         showScreen("shapes");
+        return;
       }
+      filterInput((f) => filteredCandidates(f).length, candidateCursorRef, setCandidateCursor, input, key);
       return;
     }
 
@@ -712,8 +818,9 @@ export function FleetApp({
     }
 
     if (screenRef.current === "steering") {
+      // review.prefer + consult.prefer rows plus the single judge seat as the final row
       if (key.downArrow || input === "j") {
-        const next = Math.min(steeringCursorRef.current + 1, STEERING_KEYS.length - 1);
+        const next = Math.min(steeringCursorRef.current + 1, STEERING_KEYS.length);
         steeringCursorRef.current = next;
         setSteeringCursor(next);
         return;
@@ -725,6 +832,13 @@ export function FleetApp({
         return;
       }
       if (input === "f") {
+        if (steeringCursorRef.current === STEERING_KEYS.length) {
+          judgeCursorRef.current = 0;
+          setJudgeCursor(0);
+          setNotice("");
+          showScreen("judge-pick");
+          return;
+        }
         const which = STEERING_KEYS[steeringCursorRef.current];
         const current = steeringRef.current?.[which] ?? [];
         steeringPickerRef.current = which;
@@ -736,25 +850,43 @@ export function FleetApp({
         showScreen("steering-prefer");
         return;
       }
-      if (key.return) {
-        const nextReview = reviewOverlay(editorState());
-        if (nextReview.kind === "empty") {
-          finish({ kind: "no-changes" });
-          return;
-        }
-        reviewRef.current = nextReview;
-        setReview(nextReview);
-        setNotice("");
-        showScreen("review");
+      if (key.return) goReview();
+      return;
+    }
+
+    if (screenRef.current === "judge-pick") {
+      const rows = filteredJudgeRows();
+      if (key.downArrow || input === "j") {
+        const next = Math.min(judgeCursorRef.current + 1, Math.max(rows.length - 1, 0));
+        judgeCursorRef.current = next;
+        setJudgeCursor(next);
+        return;
       }
+      if (key.upArrow || input === "k") {
+        const next = Math.max(judgeCursorRef.current - 1, 0);
+        judgeCursorRef.current = next;
+        setJudgeCursor(next);
+        return;
+      }
+      if (key.return && rows[judgeCursorRef.current]) {
+        // single-select: one seat or back to the config default — never a chain
+        const picked = rows[judgeCursorRef.current];
+        const seat = picked === judgeKeepRow ? null : picked;
+        judgeSeatRef.current = seat;
+        setJudgeSeat(seat);
+        showScreen("steering");
+        return;
+      }
+      filterInput((f) => filteredJudgeRows(f).length, judgeCursorRef, setJudgeCursor, input, key);
       return;
     }
 
     if (screenRef.current === "steering-prefer") {
+      const rows = filteredSteeringRows();
       if (key.downArrow || input === "j") {
         const next = Math.min(
           steeringPickerCursorRef.current + 1,
-          Math.max(steeringRowsRef.current.length - 1, 0),
+          Math.max(rows.length - 1, 0),
         );
         steeringPickerCursorRef.current = next;
         setSteeringPickerCursor(next);
@@ -766,8 +898,8 @@ export function FleetApp({
         setSteeringPickerCursor(next);
         return;
       }
-      if (input === " " && steeringRowsRef.current[steeringPickerCursorRef.current]) {
-        const option = steeringRowsRef.current[steeringPickerCursorRef.current];
+      if (input === " " && rows[steeringPickerCursorRef.current]) {
+        const option = rows[steeringPickerCursorRef.current];
         const at = steeringChainRef.current.indexOf(option);
         if (at === -1) steeringChainRef.current.push(option);
         else steeringChainRef.current.splice(at, 1);
@@ -784,7 +916,9 @@ export function FleetApp({
         setSteering(next);
         setNotice("");
         showScreen("steering");
+        return;
       }
+      filterInput((f) => filteredSteeringRows(f).length, steeringPickerCursorRef, setSteeringPickerCursor, input, key);
       return;
     }
 
@@ -799,7 +933,7 @@ export function FleetApp({
           setNotice(`fleet: config loader rejects the proposed overlay — ${loadError}`);
           reviewRef.current = null;
           setReview(null);
-          showScreen("steering");
+          showScreen(presetPickRef.current ? "modes" : "steering");
           return;
         }
         finish({ kind: "write", review: reviewRef.current });
@@ -845,9 +979,8 @@ export function FleetApp({
   }
 
   const group = enabledModelGroups()[modelGroup];
-  const modelRows = currentModelRows();
   if (screen === "models") {
-    const rows: FleetListRow[] = modelRows.map((row) => {
+    const rows: FleetListRow[] = filteredModelRows().map((row) => {
       const denied = group ? denyModels.has(`${group.adapter}:${row.model}`) : false;
       return {
         id: row.model,
@@ -862,10 +995,11 @@ export function FleetApp({
     return (
       <FleetListScreen
         title={`step 3/6 · models · ${group?.adapter ?? ""}`}
-        legend="↑↓/jk move · space toggle · t tier · n add model · enter next · esc/q quit"
+        legend="↑↓ to move · Space to toggle · t to classify tier · n to add model · Enter for next · Type to search · Esc to quit"
         rows={rows}
         cursor={modelCursor}
         details={notice ? [notice] : []}
+        filter={filter}
       />
     );
   }
@@ -911,21 +1045,34 @@ export function FleetApp({
   );
 
   if (screen === "modes") {
+    const presetPick = presetPickRef.current;
+    const rows: FleetListRow[] = modeOptions.map((option) => ({
+      id: option.id,
+      content: (
+        <>
+          {option.id === initialMode ? <ToggleMark active /> : <Text> </Text>}
+          <Text>{` ${option.id.padEnd(11)}  ${option.gloss}`}</Text>
+        </>
+      ),
+    }));
+    if (presetPick) {
+      rows.push({
+        id: "custom",
+        content: (
+          <>
+            <Text> </Text>
+            <Text>{` ${"custom".padEnd(11)}  walk the full editor (agents → models → shapes → seats)`}</Text>
+          </>
+        ),
+      });
+    }
     return (
       <FleetListScreen
-        title="step 4/6 · routing mode"
-        legend="↑↓/jk move · enter select · esc/q quit"
-        rows={modeOptions.map((option) => ({
-          id: option.id,
-          content: (
-            <>
-              {option.id === initialMode ? <ToggleMark active /> : <Text> </Text>}
-              <Text>{` ${option.id.padEnd(11)}  ${option.gloss}`}</Text>
-            </>
-          ),
-        }))}
+        title={presetPick ? "fleet · routing presets" : "step 4/6 · routing mode"}
+        legend={presetPick ? "↑↓ to move · Enter to apply preset · Esc to close" : "↑↓/jk move · enter select · esc/q quit"}
+        rows={rows}
         cursor={modeCursor}
-        details={modePreview(modeOptions[modeCursor].id, map)}
+        details={modeOptions[modeCursor] ? modePreview(modeOptions[modeCursor].id, map) : []}
       />
     );
   }
@@ -947,12 +1094,13 @@ export function FleetApp({
     return (
       <FleetListScreen
         title={`pick · ${shape}`}
-        legend="↑↓/jk move · enter pin · esc cancel · q quit"
-        rows={candidatesRef.current.map((candidate) => ({
+        legend="↑↓ to move · Enter to pin · Type to search · Esc to cancel · q to quit"
+        rows={filteredCandidates().map((candidate) => ({
           id: candidate.id,
           content: <Text>{candidate.label}</Text>,
         }))}
         cursor={candidateCursor}
+        filter={filter}
       />
     );
   }
@@ -973,13 +1121,40 @@ export function FleetApp({
     return (
       <FleetListScreen
         title="step 6/6 · steering"
-        legend="↑↓/jk move · f prefer · enter review · esc/q quit"
-        rows={STEERING_KEYS.map((key) => ({
-          id: key,
-          content: <Text>{`${key}.prefer  →  ${steering[key]?.join(", ") ?? "(none)"}`}</Text>,
-        }))}
+        legend="↑↓ to move · f to edit · Enter to review · Esc/q to quit"
+        rows={[
+          ...STEERING_KEYS.map((key): FleetListRow => ({
+            id: key,
+            content: <Text>{`${key}.prefer  →  ${steering[key]?.join(", ") ?? "(none)"}`}</Text>,
+          })),
+          {
+            id: "judge",
+            content: <Text>{`judge  →  ${judgeSeat ?? (initialJudge ? `${initialJudge} (default)` : "(default)")}`}</Text>,
+          },
+        ]}
         cursor={steeringCursor}
         details={notice ? [notice] : []}
+      />
+    );
+  }
+
+  if (screen === "judge-pick") {
+    const selected = judgeSeat ?? judgeKeepRow;
+    return (
+      <FleetListScreen
+        title="pick · judge"
+        legend="↑↓ to move · Enter to select · Type to search · Esc to cancel · q to quit"
+        rows={filteredJudgeRows().map((label) => ({
+          id: label,
+          content: (
+            <>
+              {label === selected ? <ToggleMark active /> : <Text> </Text>}
+              <Text>{` ${label}`}</Text>
+            </>
+          ),
+        }))}
+        cursor={judgeCursor}
+        filter={filter}
       />
     );
   }
@@ -989,12 +1164,13 @@ export function FleetApp({
     return (
       <FleetListScreen
         title={`pick · ${which}.prefer`}
-        legend="↑↓/jk move · space add/drop · enter apply (empty clears) · esc cancel · q quit"
-        rows={steeringRowsRef.current.map((option) => {
+        legend="↑↓ to move · Space to add/drop · Enter to apply (empty clears) · Type to search · Esc to cancel · q to quit"
+        rows={filteredSteeringRows().map((option) => {
           const at = steeringChainRef.current.indexOf(option);
           return { id: option, content: <Text>{`${at === -1 ? "·" : String(at + 1)} ${option}`}</Text> };
         })}
         cursor={steeringPickerCursor}
+        filter={filter}
       />
     );
   }
@@ -1026,6 +1202,9 @@ export async function runFleetInkEditor({
   steeringOptionsFor,
   reviewOverlay,
   reloadGuard,
+  entry = "probe",
+  initialJudge = "",
+  judgeSeats = [],
   initialInput = [],
   input,
   output,
@@ -1052,6 +1231,10 @@ export async function runFleetInkEditor({
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
+  /** "presets" opens on the routing-mode screen with the extra custom row; default preserves the probe-first walk */
+  entry?: "presets" | "probe";
+  initialJudge?: string;
+  judgeSeats?: string[];
   initialInput?: string[];
   input: NodeJS.ReadStream;
   output: NodeJS.WriteStream;
@@ -1091,6 +1274,9 @@ export async function runFleetInkEditor({
       steeringOptionsFor={steeringOptionsFor}
       reviewOverlay={reviewOverlay}
       reloadGuard={reloadGuard}
+      entry={entry}
+      initialJudge={initialJudge}
+      judgeSeats={judgeSeats}
     />,
     {
       // FleetIO's injected stream predates Ink and did not require ref/unref.

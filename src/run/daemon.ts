@@ -997,6 +997,33 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let releaseApprovalSerialization: (() => void) | undefined;
   try {
   let graph = loadGraph(repoRoot);
+  // GATE-FIX-4 defect 4 (no-op run refusal): a fresh run on a graph with nothing dispatchable used
+  // to journal {run-start, run-end} with zero dispatches — and downstream readers (greenness exit,
+  // status, notify) treat that run-end as completion, so an all-terminal graph "went green" having
+  // done nothing. Refuse HERE, the earliest seam where the graph is known and BEFORE Journal.create
+  // makes the run dir: no run-start row, no run dir, and the error exits nonzero through the CLI's
+  // ordinary catch. Dispatchability reuses graph.ts's status math rather than restating it: a task
+  // is dispatchable iff it is ready now (readyTasks) or can still become ready — pending with a
+  // non-parked closure (pendingTasks), or unblocked later by in-flight running/gated residue.
+  // FRESH runs only: a resume where everything is terminal already owns its run-end and keeps its
+  // current replay-then-quiesce behavior (the run-narrate test pins run-resume → run-end).
+  if (!opts.resume && readyTasks(graph).length === 0 && pendingTasks(graph).length === 0
+      && !graph.tasks.some((t) => t.status === "running" || t.status === "gated")) {
+    // Every pending task here is blocked-on-terminal by construction (pendingTasks(graph) is empty),
+    // so the count is labeled truthfully instead of as still-runnable "pending".
+    const counts = new Map<string, number>();
+    for (const t of graph.tasks) {
+      const bucket = t.status === "pending" ? "blocked-on-terminal" : t.status;
+      counts.set(bucket, (counts.get(bucket) ?? 0) + 1);
+    }
+    const breakdown = counts.size === 0 ? "graph has zero tasks"
+      : [...counts.entries()].map(([s, n]) => `${s} ${n}`).join(", ");
+    throw new Error(
+      `nothing to dispatch — no task is ready and none can become ready (${breakdown}). `
+      + "Refusing to start a run that would journal run-start/run-end with zero dispatches. "
+      + "Release parked tasks with `tickmarkr approve <runId> <taskId>`, or compile a fresh graph with `tickmarkr compile`.",
+    );
+  }
   // v1.51 T2: the routing mode resolves BEFORE any routing input is built — run flag > spec front-matter
   // > repo > global > default. The resolved cfg carries mode-compiled floors; route() never sees the mode.
   const rm = resolveRunMode(repoRoot, { flag: opts.mode, spec: graph.mode, globalDir: opts.globalDir });

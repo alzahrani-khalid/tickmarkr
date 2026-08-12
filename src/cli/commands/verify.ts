@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -46,6 +46,17 @@ export function parseCriteria(text: string): AcceptanceItem[] {
 // verify models the author as a "human" vendor channel — resolvable, excludes nothing real.
 export const HUMAN_CHANNEL: BillingChannel = { adapter: "human", vendor: "human", model: "human", channel: "sub", tier: "frontier" };
 export const HUMAN_AUTHOR: Assignment = { adapter: "human", model: "human", channel: "sub", tier: "frontier" };
+
+// GATE-FIX-4 defect 1 (false-RED on macOS): os.tmpdir() returns /var/folders/…, a symlink into
+// /private/var — so a baseline captured under the repo path and a head battery run under the tmp
+// path disagree on every path-bearing fingerprint, and verify reds a green diff. graph.ts's
+// saveGraph carries the standing precedent ("never os.tmpdir()" — rename(2) atomicity there, path
+// identity here): tmpdir is fine for verify's disposable state, but only through realpathSync so
+// every path verify hands to gates is already canonical. Exported for the unit test that pins the
+// realpath (CI cannot rely on the macOS symlink).
+export function verifyStateDir(cwd: string): string {
+  return join(realpathSync(tmpdir()), "tickmarkr-verify", createHash("sha256").update(cwd).digest("hex").slice(0, 12));
+}
 
 export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
   const { values } = parseArgs({
@@ -108,7 +119,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   // ALL verify state (cache, base worktree, artifacts) lives OUTSIDE the repo: verify gates the repo
   // root itself, so any file it wrote there would trip the battery's own dirty-worktree refusal.
   // ponytail: tmpdir means the baseline cache dies on reboot/cleanup — worst case is one re-capture.
-  const stateDir = join(tmpdir(), "tickmarkr-verify", createHash("sha256").update(cwd).digest("hex").slice(0, 12));
+  const stateDir = verifyStateDir(cwd);
   mkdirSync(stateDir, { recursive: true });
   let baseline: Baseline;
   const cachePath = join(stateDir, `baseline-${mergeBase.slice(0, 12)}.json`);
