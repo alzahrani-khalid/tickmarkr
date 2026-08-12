@@ -54,8 +54,8 @@ Per release:
 2. In the **public** repository (the mirror), tag the export commit and push the tag:
 
    ```bash
-   git tag -a v1.90.1 -m "v1.90.1"
-   git push origin v1.90.1
+   git tag -a v1.90.2 -m "v1.90.2"
+   git push origin v1.90.2
    ```
 
 3. The tag push runs `release.yml` in the public repository:

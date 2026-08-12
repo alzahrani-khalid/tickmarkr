@@ -38,7 +38,7 @@ import { BANNER } from "../brand.js";
 export const USAGE = `tickmarkr — spec-driven orchestration harness for AI coding agents
 usage: tickmarkr <command>
   init          guided setup + doctor; init --agent [--force] [--docs] adds agent skills/docs
-  doctor        re-probe adapters, herdr, auth; print capability matrix
+  doctor        re-probe adapters, herdr, auth; print capability matrix (--fix writes the test-runner ignore when a safe edit exists)
   fleet         interactive fleet editor (fleet --print for CI drift checks)
   compile <src> spec → .tickmarkr/graph.json (fails without acceptance criteria)
   scope <intent> draft a compiled native spec beside an answered intent (--force to overwrite)

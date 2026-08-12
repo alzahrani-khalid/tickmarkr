@@ -44,26 +44,56 @@ export type DoctorOpts = {
  * prescribed shape is root-anchored anyway.
  *
  * Text-level heuristic, advisory only — never enters health/doctor.json or routing.
- * ponytail: ceilings — comments are stripped before judgment, but an include built
- * from variables is still judged by its literal text, and a pattern string containing
- * `//` would be truncated by the line-comment strip. Each costs one advisory row,
- * nothing more.
+ * ponytail: ceilings — comment LINES are stripped before judgment (line-granular; see
+ * stripComments), but an include built from variables is still judged by its literal
+ * text, and a trailing same-line comment survives the strip. Each costs one advisory
+ * row, nothing more.
  */
-export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; detail: string } | undefined {
+type RunnerInfo = {
+  kind: "jest" | "vitest";
+  /** config file relative path when one exists; jest may instead live in the package.json block */
+  configPath?: string;
+  pkgJestBlock: boolean;
+};
+
+function detectRunner(cwd: string): RunnerInfo | undefined {
   const readIf = (p: string): string => (existsSync(join(cwd, p)) ? readFileSync(join(cwd, p), "utf8") : "");
-  const pkgText = readIf("package.json");
   let pkg: { scripts?: Record<string, string>; jest?: unknown } = {};
-  try { pkg = JSON.parse(pkgText || "{}") as typeof pkg; } catch { /* unparseable manifest: judge config files alone */ }
+  try { pkg = JSON.parse(readIf("package.json") || "{}") as typeof pkg; } catch { /* unparseable manifest: judge config files alone */ }
   const jestConfig = ["jest.config.js", "jest.config.cjs", "jest.config.mjs", "jest.config.ts", "jest.config.json"].find((p) => existsSync(join(cwd, p)));
   const vitestConfig = ["vitest.config.ts", "vitest.config.js", "vitest.config.mts", "vitest.config.mjs", "vitest.config.cts"].find((p) => existsSync(join(cwd, p)));
   const testScript = pkg.scripts?.test ?? "";
-  const isJest = jestConfig !== undefined || pkg.jest !== undefined || /\bjest\b/.test(testScript);
-  const isVitest = !isJest && (vitestConfig !== undefined || /\bvitest\b/.test(testScript));
-  if (!isJest && !isVitest) return undefined;
+  if (jestConfig !== undefined || pkg.jest !== undefined || /\bjest\b/.test(testScript)) {
+    return { kind: "jest", configPath: jestConfig, pkgJestBlock: pkg.jest !== undefined };
+  }
+  if (vitestConfig !== undefined || /\bvitest\b/.test(testScript)) {
+    return { kind: "vitest", configPath: vitestConfig, pkgJestBlock: false };
+  }
+  return undefined;
+}
 
-  // Comments are stripped before judgment: a commented-out ignore must not false-pass,
-  // and a prose comment mentioning .tickmarkr must not false-warn the anchor probe.
-  const stripComments = (s: string): string => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; detail: string } | undefined {
+  const readIf = (p: string): string => (existsSync(join(cwd, p)) ? readFileSync(join(cwd, p), "utf8") : "");
+  const runner = detectRunner(cwd);
+  if (!runner) return undefined;
+  const isJest = runner.kind === "jest";
+  const jestConfig = isJest ? runner.configPath : undefined;
+  const vitestConfig = isJest ? undefined : runner.configPath;
+  let pkg: { jest?: unknown } = {};
+  try { pkg = JSON.parse(readIf("package.json") || "{}") as typeof pkg; } catch { /* judged above */ }
+
+  // Comment LINES are stripped before judgment: a commented-out ignore must not
+  // false-pass, and a prose comment mentioning .tickmarkr must not false-warn the
+  // anchor probe. Stripping is LINE-granular on purpose: in-line regex stripping ate
+  // glob strings — `'**/*.d.ts'` contains `/*` and later globs contain `*/`, so a
+  // naive block-comment regex deleted the middle of real configs and false-PASSED a
+  // repo-wide vitest include (caught on Intl-Dossier's config; shipped briefly in
+  // 1.90.1). Trailing same-line comments survive — acceptable: they can only make the
+  // probe more conservative on lines that also carry code.
+  const stripComments = (s: string): string => s.split("\n").filter((l) => {
+    const t = l.trimStart();
+    return !(t.startsWith("//") || t.startsWith("/*") || t.startsWith("*"));
+  }).join("\n");
   const configText = stripComments(isJest
     ? `${jestConfig ? readIf(jestConfig) : ""}${pkg.jest ? JSON.stringify(pkg.jest) : ""}`
     : vitestConfig ? readIf(vitestConfig) : "");
@@ -93,6 +123,62 @@ export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; de
     verdict: "warn",
     detail: `${isJest ? "jest" : "vitest"} collects repo-wide and will scan .tickmarkr/ run worktrees (duplicate suites, false reds) — ${remedy}`,
   };
+}
+
+/**
+ * Q134s (doctor --fix): the WRITE half of Q122s/Q130s. Doctor's advisory row cost two
+ * repos a hand-edit (SentioQ run 2 paid a whole run first); --fix applies the ignore
+ * where a safe textual edit exists and refuses loudly otherwise.
+ *
+ * Safety contract: only three write shapes, each verified by re-running
+ * runnerIgnoreFinding afterward — a write that does not turn the row green is
+ * REVERTED and reported as manual. Never touches package.json (jest block → manual).
+ * ponytail: text-level edits, same ceilings as the finding; the verify-then-revert
+ * loop is what makes them safe to ship.
+ */
+export function applyRunnerIgnore(cwd: string): { action: "none" | "wrote" | "manual"; detail: string } {
+  const finding = runnerIgnoreFinding(cwd);
+  if (!finding) return { action: "none", detail: "no recognized test runner" };
+  if (finding.verdict === "pass") return { action: "none", detail: finding.detail };
+  const runner = detectRunner(cwd);
+  if (!runner?.configPath) {
+    // package.json jest block, or a runner detected only via the test script: hand edit.
+    return { action: "manual", detail: finding.detail };
+  }
+  const file = join(cwd, runner.configPath);
+  const original = readFileSync(file, "utf8");
+  let text = original;
+  if (runner.kind === "jest") {
+    // 1) Replace unanchored poison entries in place (the SentioQ run-2 shape).
+    text = text.replace(/(["'])\/?\.tickmarkr\/?\1/g, '"<rootDir>/\\\\.tickmarkr/"');
+    if (text === original && !/\.tickmarkr/.test(text)) {
+      const arr = /testPathIgnorePatterns(["']?)\s*:\s*\[/;
+      if (arr.test(text)) {
+        // 2) Existing ignore array: prepend the anchored entry.
+        text = text.replace(arr, (m) => `${m}"<rootDir>/\\\\.tickmarkr/", `);
+        if (runner.configPath.endsWith(".json")) text = text.replace(/,(\s*)\]/g, "$1]");
+      } else {
+        // 3) No array: add the property, preserving jest's default /node_modules/ ignore.
+        const anchor = /(module\.exports\s*=\s*\{|export\s+default\s+\{|export\s+default\s+defineConfig\(\{)/g;
+        if ((text.match(anchor) ?? []).length === 1) {
+          text = text.replace(anchor, (m) => `${m}\n  testPathIgnorePatterns: ["/node_modules/", "<rootDir>/\\\\.tickmarkr/"],`);
+        }
+      }
+    }
+  } else if (!/\.tickmarkr/.test(text)) {
+    // vitest: add the glob to every exclude array — test.exclude is the target;
+    // coverage.exclude gaining it is correct behavior, not collateral.
+    const arr = /exclude\s*:\s*\[/g;
+    if (arr.test(text)) text = text.replace(arr, (m) => `${m}'.tickmarkr/**', `);
+  }
+  if (text === original) return { action: "manual", detail: finding.detail };
+  writeFileSync(file, text);
+  const after = runnerIgnoreFinding(cwd);
+  if (after?.verdict === "pass") {
+    return { action: "wrote", detail: `wrote ${runner.configPath} — ${after.detail}` };
+  }
+  writeFileSync(file, original); // verify failed: never leave a half-fix behind
+  return { action: "manual", detail: finding.detail };
 }
 
 export async function doctor(
@@ -175,8 +261,18 @@ export async function doctor(
   const herdr = HerdrDriver.available();
   rows.push(alignedStatusRow(herdr ? "pass" : "fail", "herdr", herdr ? "driver available (HERDR_ENV=1)" : "not detected — subprocess driver will be used"));
   // Q122s: the target repo's runner must not scan tickmarkr's own worktrees (advisory row).
+  // Q134s: `doctor --fix` writes the ignore when a safe edit exists (verified, else reverted).
   const runnerIgnore = runnerIgnoreFinding(cwd);
-  if (runnerIgnore) rows.push(alignedStatusRow(runnerIgnore.verdict, "test-runner", runnerIgnore.detail));
+  if (runnerIgnore) {
+    if (_argv.includes("--fix") && runnerIgnore.verdict === "warn") {
+      const fixed = applyRunnerIgnore(cwd);
+      rows.push(fixed.action === "wrote"
+        ? alignedStatusRow("pass", "test-runner", fixed.detail)
+        : alignedStatusRow("warn", "test-runner", `--fix could not edit safely — apply by hand: ${fixed.detail}`));
+    } else {
+      rows.push(alignedStatusRow(runnerIgnore.verdict, "test-runner", runnerIgnore.detail));
+    }
+  }
   // v1.22 T5: workspace-trust pre-flight — per installed adapter: trusted | seeded | action-required | n/a.
   // action-required names the exact one-time command (or dialog) the operator must run once.
   rows.push(legend("workspace trust:"));
