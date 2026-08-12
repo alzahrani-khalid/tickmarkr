@@ -356,6 +356,31 @@ describe("tickmarkr init wizard (T4)", () => {
 
     expect(readFileSync(join(repo, ".tickmarkr/config.yaml"), "utf8")).toBe(overlay);
     expect(io.writes.some((w) => strip(w).includes("Preferences"))).toBe(false);
+    // interactive reuse branch stays compact — the matrix lives behind `tickmarkr doctor`
+    expect(io.writes.some((w) => strip(w).includes("full matrix: tickmarkr doctor"))).toBe(true);
+  });
+
+  test("wizard quit is one line — no probe, no report wall, no fleet act", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const probeAllSpy = vi.spyOn(registry, "probeAll");
+    const repo = makeRepo({ "keep.txt": "x" });
+    stampDoctor(repo, 5 * 60 * 1000);
+
+    const io = makeIO();
+    const p = init(
+      ["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-"))],
+      repo,
+      { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
+    );
+    io.input.write(KEY.esc);
+    const out = await p;
+
+    expect(out).toMatch(/^init: wizard quit — nothing further run/);
+    expect(out).not.toContain("capability matrix");
+    expect(out).not.toContain("next steps");
+    expect(probeAllSpy).not.toHaveBeenCalled();
+    expect(io.writes.some((w) => strip(w).includes("routing presets"))).toBe(false);
+    expect(existsSync(join(repo, ".tickmarkr", "config.yaml"))).toBe(false);
   });
 
   test("pressing Enter through every default writes uncommented defaults", async () => {

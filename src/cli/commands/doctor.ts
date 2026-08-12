@@ -27,6 +27,9 @@ export type DoctorOpts = {
   resolveClaudeAliasIdentity?: (cwd: string, alias: ClaudeAlias) => string | undefined;
   catalog?: CatalogReadResult;
   catalogNow?: () => Date;
+  /** init's between-acts surface: status rows only — the model matrix and inline drift stay
+   *  behind `tickmarkr doctor` (files are still written; only the RETURNED string shrinks). */
+  compact?: boolean;
 };
 
 /**
@@ -495,5 +498,10 @@ export async function doctor(
   const header = visual()
     ? `${statusRow("pass", `${title("tickmarkr doctor")} ${legend("· capability matrix")}`)}\n${rule()}`
     : "tickmarkr doctor — capability matrix:";
+  if (opts.compact) {
+    // Operator field report 2026-08-13: the full matrix mid-init-journey is clutter between two
+    // TUIs. Every file side effect above already happened; the pointer line is the contract.
+    return `${header}\n${rows.join("\n")}\n  ${dim(`model matrix elided — \`tickmarkr doctor\` prints it in full${drift ? "; drift overlay written" : ""}`)}\nwrote ${stateDirName(cwd)}/doctor.json`;
+  }
   return `${header}\n${rows.join("\n")}${modelSummary}${drift}\nwrote ${stateDirName(cwd)}/doctor.json`;
 }

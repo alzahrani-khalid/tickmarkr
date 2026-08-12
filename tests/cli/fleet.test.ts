@@ -1626,6 +1626,19 @@ review:
     expect(strip(io.writes.join(""))).toContain("step 2/6 · agent CLIs");
   });
 
+  test("entry=presets Esc inside the walk returns HOME to the presets screen; Esc there quits", async () => {
+    const { repo, adapter } = setup();
+    // custom → agents, Esc → back on presets (custom row restored), Esc again → quit
+    const { io, out } = await driveEntry(repo, adapter, KEYS.down.repeat(9) + KEYS.enter + KEYS.escape + KEYS.escape);
+    expect(out).toBe("fleet: quit without writing");
+    const frames = io.writes.map(strip);
+    const agentsAt = frames.findIndex((f) => f.includes("step 2/6 · agent CLIs"));
+    expect(agentsAt).toBeGreaterThan(-1);
+    const homeAgain = frames.slice(agentsAt + 1).find((f) => f.includes("routing presets"));
+    expect(homeAgain).toBeTruthy();
+    expect(homeAgain).toContain("walk the full editor"); // presetPick restored, custom row back
+  });
+
   // ── the judge seat: a SINGLE adapter:model pick on the steering screen (never a chain) ──
   test("picking a judge seat stages an overlay diff carrying judge adapter and model and the write lands both", async () => {
     const { repo, adapter } = setup();

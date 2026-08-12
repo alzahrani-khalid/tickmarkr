@@ -464,6 +464,15 @@ export function FleetApp({
       showScreen("models");
       return;
     }
+    // v1.90.8 (operator field report): inside the init journey, one Esc must never discard the
+    // whole walk — from any walk screen it returns HOME to the presets screen; Esc there (or
+    // `q`/ctrl+c anywhere) remains the real quit. Sub-screen Escs above keep their tighter backs.
+    if (key.escape && entry === "presets" && screenRef.current !== "modes") {
+      setReview(null);
+      presetPickRef.current = true;
+      showScreen("modes");
+      return;
+    }
     const typing = screenRef.current === "provenance" || screenRef.current === "add-model";
     if (key.escape || (!typing && input === "q") || (key.ctrl && input === "c")) {
       finish({ kind: "quit" });
@@ -1068,8 +1077,8 @@ export function FleetApp({
     }
     return (
       <FleetListScreen
-        title={presetPick ? "fleet · routing presets" : "step 4/6 · routing mode"}
-        legend={presetPick ? "↑↓ to move · Enter to apply preset · Esc to close" : "↑↓/jk move · enter select · esc/q quit"}
+        title={presetPick ? "tickmarkr init · act 3 of 3 — fleet · routing presets" : "step 4/6 · routing mode"}
+        legend={presetPick ? "↑↓ to move · Enter to apply preset · Enter on custom to walk the editor · Esc inside the walk returns here · Esc here closes" : "↑↓/jk move · enter select · esc/q quit"}
         rows={rows}
         cursor={modeCursor}
         details={modeOptions[modeCursor] ? modePreview(modeOptions[modeCursor].id, map) : []}

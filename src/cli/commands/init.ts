@@ -379,20 +379,20 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
 
   // Act 1 — preferences. Only when the repo config does not exist yet: init never rewrites an
   // operator's config; re-tuning is `tickmarkr fleet` (act 3 below still runs and writes overlays).
-  let wizardQuit = false;
   if (!repoConfigExists) {
     if (interactive) {
       emitBanner();
       const wizard = await runInitWizard(cwd, input, output);
       if (wizard === null) {
-        wizardQuit = true;
-        notes.push("wizard quit — no repo config written; re-run tickmarkr init (or tickmarkr fleet after a manual config)");
-      } else {
-        writeFileSync(repoConfigPath, configTemplate(wizard.overlay));
-        notes.push(`wrote ${repoConfigPath}`);
-        if (wizard.installSkills) {
-          await installAgentFiles(cwd, values.force ?? false, wizard.installDocs || (values.docs ?? false), notes);
-        }
+        // Operator field report 2026-08-13: quit means QUIT — no probe, no report wall, no fleet
+        // act, one line out. Scaffolding above already happened (spec/global config), and saying
+        // so costs one clause; everything else stops here. Esc and ctrl+c both land here.
+        return `init: wizard quit — nothing further run (scaffolding kept: ${notes.filter((n) => n.startsWith("wrote")).length} file(s) written above). Re-run tickmarkr init to continue.`;
+      }
+      writeFileSync(repoConfigPath, configTemplate(wizard.overlay));
+      notes.push(`wrote ${repoConfigPath}`);
+      if (wizard.installSkills) {
+        await installAgentFiles(cwd, values.force ?? false, wizard.installDocs || (values.docs ?? false), notes);
       }
     } else {
       writeFileSync(repoConfigPath, configTemplate());
@@ -402,18 +402,21 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
 
   // Act 2 — discovery. Doctor is the sensor (fleet never re-probes); runs after preferences so the
   // probe reads the config the operator just chose. Reuse keeps init fast; --fresh forces the probe.
+  // Interactive journeys get the COMPACT surface (status rows + pointer) — the full matrix between
+  // two TUIs was the operator's clutter report; non-TTY keeps the complete machine surface.
   const fresh = values.fresh ?? false;
   const { reuse, ageMs, health } = initDoctorReuse(cwd, fresh);
   let doc = reuse && health && ageMs !== null
-    ? `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)\n${formatDoctorReport(cwd, loadConfig(cwd), health, allAdapters(), { wrote: false })}`
-    : await doctor([], cwd, undefined, { banner: false });
+    ? interactive
+      ? `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — full matrix: tickmarkr doctor · refresh: init --fresh`
+      : `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)\n${formatDoctorReport(cwd, loadConfig(cwd), health, allAdapters(), { wrote: false })}`
+    : await doctor([], cwd, undefined, { banner: false, compact: interactive });
 
-  // Act 3 — fleet. Interactive only, and never after a wizard quit ("stop" means stop). The
-  // discovery report prints BETWEEN the acts so the operator reads what the presets screen
-  // ranks with; the final summary then carries a pointer instead of the same bytes twice.
-  if (interactive && !wizardQuit) {
+  // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads
+  // what the presets screen ranks with; the final summary then carries a pointer, not a repeat.
+  if (interactive) {
     output.write(`${doc}\n`);
-    doc = "discovery report shown above — re-print any time with `tickmarkr doctor`";
+    doc = "discovery shown above — full matrix any time with `tickmarkr doctor`";
     // Same lazy-Ink seam as fleet.ts: load the editor runtime up front so the assembler's
     // returned props need no startup-input capture window on this path.
     const { runFleetInkEditor } = await import("../../tui/ink/fleet-app.js");

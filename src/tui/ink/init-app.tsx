@@ -128,8 +128,8 @@ type Row = { id: "driver" | "concurrency" | "visibility" | "skills" | "docs" | "
 // Three fields, one toggle, one action — a descriptor array, deliberately not a forms framework.
 function buildRows(offerSkills: boolean): Row[] {
   const rows: Row[] = [
-    { id: "driver", section: "Run", label: "Driver", desc: "auto: pick herdr when HERDR_ENV=1, else subprocess" },
-    { id: "concurrency", section: "Run", label: "Concurrency", desc: "parallel task batteries per run" },
+    { id: "driver", section: "Run", label: "Driver", desc: "auto: herdr when HERDR_ENV=1, else subprocess · herdr: visible panes · subprocess: headless child processes" },
+    { id: "concurrency", section: "Run", label: "Concurrency", desc: "parallel task batteries per run — min 1; an empty or zero entry reverts on leave" },
     {
       id: "visibility",
       section: "Run",
