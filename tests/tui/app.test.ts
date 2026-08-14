@@ -79,6 +79,7 @@ describe("studio app", () => {
       "FleetReviewScreen",
       "TextLines",
       "ToggleMark",
+      "windowRows",
     ]);
 
     // Member by member over the closed set, each drawn into a real frame.

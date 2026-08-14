@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
@@ -27,8 +27,13 @@ const stub = (id: string, binary?: string) =>
     ...(binary ? { hardcodedFlags: { binary, flags: [] } } : {}),
   }) as unknown as WorkerAdapter;
 
-const GIT_BIN_DIR = dirname(execSync("command -v git", { encoding: "utf8" }).trim());
-const fixturePath = (...dirs: string[]) => [...new Set([...dirs, GIT_BIN_DIR, "/bin", "/usr/bin"])].join(":");
+// OBS-503: admitting git's whole DIRECTORY leaked every sibling binary (homebrew: /opt/homebrew/bin)
+// into the "hermetic" candidate PATH — any catalog candidate the operator installed via homebrew
+// (prime-agent) rendered a machine-truth advisory row the member-by-member oracle rejects. Link git
+// alone into a dedicated tool dir so the fixture PATH admits exactly the tools the tests name.
+const GIT_TOOL_DIR = mkdtempSync(join(tmpdir(), "tickmarkr-candidate-git-"));
+symlinkSync(execSync("command -v git", { encoding: "utf8" }).trim(), join(GIT_TOOL_DIR, "git"));
+const fixturePath = (...dirs: string[]) => [...new Set([...dirs, GIT_TOOL_DIR, "/bin", "/usr/bin"])].join(":");
 
 const fakeBin = (dir: string, name: string, body: string) => {
   const path = join(dir, name);
@@ -106,7 +111,7 @@ test("the production adapter enumeration over the shipped catalog yields omp as 
   try {
     // Enumeration first: allAdapters() over the SHIPPED catalog, not a fixture array.
     expect(allAdapters({ cliEntries: SHIPPED_CLI_CATALOG }).map((adapter) => adapter.id)).toEqual([
-      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp",
+      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp", "agy", "prime-agent",
     ]);
     expect(CANDIDATE_CLI_CATALOG).toContain(ADVISORY_FIXTURE);
     expect(CANDIDATE_CLI_CATALOG).not.toContain("omp");
@@ -151,13 +156,17 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
     expect(() => assertNoCatalogCollision([...adapters, conflictingAdapter])).toThrow(new RegExp(`\\b${ADVISORY_FIXTURE}\\b`));
   });
 
-  test("test: doctor's matrix names each installed binary exactly once with no id appearing as both an adapter row and a detected-not-routable row, proven member by member over the full registry — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture, a kimi fixture and an omp fixture", async () => {
+  test("test: doctor's matrix names each installed binary exactly once with no id appearing as both an adapter row and a detected-not-routable row, proven member by member over the full registry — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture, a kimi fixture, an omp fixture, an agy fixture and a prime-agent fixture", async () => {
     for (const adapter of adapters) {
       const binary = registryBinaries().get(adapter.id);
       expect(binary, `${adapter.id} must declare its registry binary`).toBeTruthy();
-      // omp's banner is the recorded one: its declarative probe gates on identity `^omp/`, so an
-      // "omp fixture 1.0.0" line would land the row as an identity mismatch instead of installed.
-      const banner = adapter.id === "omp" ? "omp/17.2.10" : `${adapter.id} fixture 1.0.0`;
+      // Recorded banners for the identity-gated declarative probes: `^omp/` and the bare-semver
+      // `^\d+\.\d+\.\d+` gates (agy, prime-agent) — an "<id> fixture 1.0.0" line would land those
+      // rows as identity mismatches instead of installed.
+      const banner = adapter.id === "omp" ? "omp/17.2.10"
+        : adapter.id === "agy" ? "1.1.12"
+        : adapter.id === "prime-agent" ? "0.7.1"
+        : `${adapter.id} fixture 1.0.0`;
       fakeBin(binDir, binary!, `#!/bin/sh\nprintf '%s\\n' '${banner}'\n`);
     }
     const advisoryPath = fakeBin(binDir, ADVISORY_FIXTURE, "#!/bin/sh\nexit 97\n");
@@ -187,6 +196,8 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
       "grok",
       "kimi",
       "omp",
+      "agy",
+      "prime-agent",
     ]);
     expect(adapterRows.map((row) => row.id).sort()).toEqual(adapters.map((adapter) => adapter.id).sort());
     expect(advisoryRows).toEqual([{ id: ADVISORY_FIXTURE, value: `detected at ${advisoryPath} (no drive contract — not routable)` }]);
@@ -287,7 +298,7 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
 
     const repeatedDir = mkdtempSync(join(tmpdir(), "tickmarkr-shadow-repeat-"));
     fakeBin(repeatedDir, "shadow-fixture", "#!/bin/sh\nexit 0\n");
-    expect(warningsFor([repeatedDir, repeatedDir, GIT_BIN_DIR, "/bin", "/usr/bin"].join(":"))).toEqual([]);
+    expect(warningsFor([repeatedDir, repeatedDir, GIT_TOOL_DIR, "/bin", "/usr/bin"].join(":"))).toEqual([]);
 
     const distinctA = mkdtempSync(join(tmpdir(), "tickmarkr-shadow-distinct-a-"));
     const distinctB = mkdtempSync(join(tmpdir(), "tickmarkr-shadow-distinct-b-"));

@@ -2,7 +2,9 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse } from "../../adapters/registry.js";
-import { fleetUnclassifiedModels } from "../../adapters/model-lints.js";
+import { catalogModelAdvisory, catalogTierRanking, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
+import { readCachedCatalog } from "../../adapters/catalog-remote.js";
+import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import {
   fleetEditableFromConfig,
@@ -231,17 +233,44 @@ export async function assembleFleetEditor(
   const initial = fleetEditableFromConfig(cfg);
   const editable = structuredClone(initial) as FleetEditable;
   const health = cached;
+  // OBS-508: the same catalog evidence doctor's drift overlay prints now rides each unclassified
+  // row — it prefills the classify flow and feeds the bulk `s` stage. Suggestions stay advisory:
+  // only the review-diff confirm writes, so "tickmarkr never applies" holds with less typing.
+  const catalog = readCachedCatalog(cwd);
+  // The same alias→identity resolution doctor hands its advisory rows: models.dev has never heard of
+  // `opus`, so without it the fleet's own frontier models drop out of the universe they are supposed
+  // to anchor and fleet bands a different set than doctor for one fleet. The stored identity wins;
+  // the stamped one backs it up. No probe — fleet never re-probes, doctor is the sensor (and doctor
+  // is the seat that lints a stamp the live identity has drifted away from).
+  const resolvedCatalogModel = (adapter: string, model: string): string | undefined =>
+    adapter !== "claude-code" || !(model in CLAUDE_ALIAS_IDENTITY_STAMPS)
+      ? undefined
+      : readClaudeAliasIdentity(cwd, model as ClaudeAlias) ?? CLAUDE_ALIAS_IDENTITY_STAMPS[model as ClaudeAlias];
+  // One ranking universe for the whole screen: every unclassified row bands fleet-relatively
+  // against the same set, so a suggestion never depends on which adapter group renders first.
+  const unclassifiedRows = fleetUnclassifiedModels(cfg, health, adapters)
+    .map((row) => ({ ...row, resolvedModel: resolvedCatalogModel(row.adapter, row.model) }));
+  const catalogRanking = catalogTierRanking(cfg, catalog, unclassifiedRows, resolvedCatalogModel);
   const modelGroups = adapters
     .filter((adapter) => health[adapter.id]?.installed)
     .map((adapter) => {
-      const unclassified = fleetUnclassifiedModels(cfg, health, adapters).filter((row) => row.adapter === adapter.id);
+      const unclassified = unclassifiedRows.filter((row) => row.adapter === adapter.id);
       return {
         adapter: adapter.id,
         rows: [
           ...Object.entries(editable.tiers[adapter.id] ?? {}).map(([model, value]) => ({ model, tier: value?.tier })),
           ...unclassified
             .filter((row) => !editable.tiers[adapter.id]?.[row.model])
-            .map((row) => ({ model: row.model, detectedAt: row.detectedAt })),
+            .map((row) => {
+              const advisory = catalogModelAdvisory(cfg, catalog, adapter.id, row.model, row.resolvedModel, catalogRanking);
+              return {
+                model: row.model,
+                detectedAt: row.detectedAt,
+                ...(advisory.suggestion
+                  ? { suggestion: { tier: advisory.suggestion.tier, note: advisory.suggestion.provenanceNote } }
+                  : {}),
+              };
+            }),
         ],
       };
     });

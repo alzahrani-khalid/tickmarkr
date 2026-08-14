@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { beforeEach, afterEach, describe, expect, test, vi } from "vitest";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
 import { hasCodexTrustedProject, seedCodexTrust } from "../../src/adapters/codex.js";
+import { LIVEBENCH_TABLE_DATE } from "../../src/adapters/catalog-remote.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import * as registry from "../../src/adapters/registry.js";
 import { channelsFromConfig, type TrustVerdict, type WorkerAdapter } from "../../src/adapters/types.js";
@@ -577,6 +578,58 @@ describe("OBS-117 doctor binary resolution + model-alias validation (T5)", () =>
     }
   });
 
+  test("OBS-503: a resolved binary whose --version crashes under the worker shell reports the crash — never a bare 'not installed' — and probeAll carries the reason into health", async () => {
+    const binDir = mkdtempSync(join(tmpdir(), "tickmarkr-crashbin-"));
+    const bin = join(binDir, "crashcli");
+    // Live shape 2026-08-13: pi (#!/usr/bin/env node) resolved a stale /usr/local/bin/node v20
+    // under bash -lc and crashed in undici, while the operator's interactive shell ran it fine.
+    writeFileSync(bin, "#!/bin/sh\necho 'TypeError: webidl.util.markAsUncloneable is not a function' >&2\nexit 1\n", { mode: 0o755 });
+    vi.stubEnv("PATH", `${binDir}:${process.env.PATH}`);
+    try {
+      const shell = probeVersionShell("crashcli", binDir);
+      expect(shell.installed).toBe(false);
+      expect(shell.authed).toBe(false);
+      expect(shell.note).toContain(bin);
+      expect(shell.note).toContain("exited 1");
+      expect(shell.note).toContain("markAsUncloneable");
+
+      // The shell verdict's note must REPLACE the adapter probe's own success note — storing
+      // "auth verified …" beside installed:false is the self-contradiction doctor.json held.
+      const adapter = {
+        id: "crashcli",
+        vendor: "x",
+        probe: async () => ({ installed: true, authed: true, version: "0.84.1", models: [], note: "auth verified via crashcli --list-models" }),
+        hardcodedFlags: { binary: "crashcli", flags: [] },
+      } as unknown as WorkerAdapter;
+      const health = await registry.probeAll([adapter], { cwd: binDir });
+      expect(health.crashcli.installed).toBe(false);
+      expect(health.crashcli.note).toContain("exited 1");
+      expect(health.crashcli.note).not.toContain("auth verified");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  test("OBS-505 residue: compact doctor elides advisory lints behind a counted pointer while full doctor still prints each — capability and trust rows stay on both surfaces", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    // A stub with no listModels surface triggers the "no model-list surface" advisory lint.
+    const adapter = {
+      id: "lintcli",
+      vendor: "x",
+      probe: async () => ({ installed: true, authed: true, version: "1.0.0", models: [] }),
+      channels: (cfg: Parameters<typeof channelsFromConfig>[1]) => channelsFromConfig("lintcli", cfg),
+    } as unknown as WorkerAdapter;
+
+    const full = await doctor(["--"], repo, [adapter], { banner: false });
+    expect(full).toContain("lintcli: no model-list surface");
+
+    const compact = await doctor(["--"], repo, [adapter], { banner: false, compact: true });
+    expect(compact).not.toContain("no model-list surface");
+    expect(compact).toMatch(/\d+ advisory lints? and model matrix elided — `tickmarkr doctor` prints them in full/);
+    expect(compact).toContain("lintcli");
+    expect(compact).toContain("1.0.0");
+  });
+
   test("doctor warns when more than one install of the same adapter binary is resolvable on the machine", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const dir1 = mkdtempSync(join(tmpdir(), "kimi-shadow-1-"));
@@ -751,5 +804,29 @@ describe("T7 deny∩prefer static preflight (doctor + resume)", () => {
     const events = Journal.open(repo, "run-deny-prefer").read();
     expect(events.some((e) => e.event === "run-resume")).toBe(false);
     expect(events.filter((e) => e.event === "task-dispatch")).toHaveLength(1);
+  });
+});
+
+describe("§4.4 LiveBench table staleness lint", () => {
+  // Dates derive from the constant under test: bumping LIVEBENCH_TABLE_DATE must not need a test edit.
+  const pinnedMs = Date.parse(`${LIVEBENCH_TABLE_DATE.replace(/_/g, "-")}T00:00:00Z`);
+  const clockAt = (daysPast: number) => () => new Date(pinnedMs + daysPast * 86_400_000);
+
+  test("test: doctor under an injected clock 91 days past the pinned LiveBench table date prints a staleness lint naming the pinned date and the github contents url and prints none at 89 days, so an unlinted stale constant or an always-on warning fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const adapters = [stub("lintcli")];
+
+    const stale = await doctor(["--"], repo, adapters, { banner: false, catalogNow: clockAt(91) });
+    expect(stale).toContain(LIVEBENCH_TABLE_DATE);
+    expect(stale).toContain("https://api.github.com/repos/LiveBench/livebench.github.io/contents/public");
+    expect(stale).toMatch(/91 days old/);
+    expect(stale).toContain("bump LIVEBENCH_TABLE_DATE");
+
+    // One day short of the 90-day window on either side of the boundary: silent.
+    for (const daysPast of [0, 89, 90]) {
+      const fresh = await doctor(["--"], repo, adapters, { banner: false, catalogNow: clockAt(daysPast) });
+      expect(fresh, `${daysPast}d`).not.toContain(LIVEBENCH_TABLE_DATE);
+      expect(fresh, `${daysPast}d`).not.toContain("api.github.com/repos/LiveBench");
+    }
   });
 });

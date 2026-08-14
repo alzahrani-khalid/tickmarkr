@@ -75,6 +75,28 @@ test("test: a fleet write preserves every routing key and routing-side comment e
   }
 });
 
+test("OBS-505: a one-key write onto the init scaffold preserves every block-comment line byte-for-byte — column-0 template lines and indented essays gain no leading space, while inline notes keep the two-space style", () => {
+  const scaffold = [
+    "# tickmarkr config overlay — merges over built-in defaults",
+    "# concurrency: 3",
+    "# routing:",
+    "#   mode: risk-based      # a preset compiled into floors at",
+    "",
+  ].join("\n");
+  const state = editable();
+  const after = renderFleetOverlayWrite(scaffold, { initial: state, edited: state, mode: "staff-led" });
+  // The whole scaffold survives contiguously and unmangled; the write is a pure append.
+  expect(after).toContain(scaffold.trimEnd());
+  expect(after).not.toMatch(/^ #/m);
+  expect(parse(after).routing.mode).toBe("staff-led");
+
+  // Indented block comments keep their exact indent (the old commentString emitted three spaces).
+  const indented = "routing:\n  # essay line\n  future-policy: hold  # note\n";
+  const rewritten = renderFleetOverlayWrite(indented, { initial: state, edited: state, mode: "staff-led" });
+  expect(rewritten).toMatch(/^  # essay line$/m);
+  expect(rewritten).toMatch(/^  future-policy: hold {2}# note$/m);
+});
+
 test("test: exactly one mechanism writes provenance notes after this task, proven over repeated write-and-reload cycles by every note surviving in exactly ONE copy, so a second mechanism re-attaching its own would be observable as duplication", () => {
   const tierNote = "SWE-bench Pro 62.1 — fleet 2026-07-18";
   const denyNote = "quota incident — retry in August";

@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import { render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
+import { retiredModelReason } from "../../adapters/model-lints.js";
 import type { MapEntry, RoutingMode, Tier } from "../../config/config.js";
 import { fleetFirstTouchProvenance } from "../../config/fleet-overlay.js";
 import { TIERS, type Shape } from "../../graph/schema.js";
@@ -46,10 +47,14 @@ type AgentCli = {
   authed: boolean;
 };
 
+export type FleetModelSuggestion = { tier: Tier; note: string };
+
 export type FleetModelGroup = {
   adapter: string;
   vendor?: string;
-  rows: Array<{ model: string; tier?: Tier; detectedAt?: string }>;
+  // OBS-508: `suggestion` is catalog evidence (catalogModelAdvisory) — prefills the classify flow
+  // and feeds the bulk `s` stage; tickmarkr still never WRITES a tier without the review diff.
+  rows: Array<{ model: string; tier?: Tier; detectedAt?: string; suggestion?: FleetModelSuggestion }>;
 };
 
 export type FleetClassification = {
@@ -195,6 +200,7 @@ export function FleetApp({
   entry = "probe",
   initialJudge = "",
   judgeSeats = [],
+  viewRows = Number.POSITIVE_INFINITY,
 }: {
   ageMs: number | null;
   agents: AgentCli[];
@@ -223,6 +229,8 @@ export function FleetApp({
   initialJudge?: string;
   /** discovered adapter:model seats — the judge picker universe */
   judgeSeats?: string[];
+  /** list viewport capacity (terminal rows minus chrome) — long lists window around the cursor */
+  viewRows?: number;
 }) {
   const { exit } = useApp();
   const [screen, setScreen] = useState<
@@ -265,6 +273,10 @@ export function FleetApp({
   const tierCursorRef = useRef(0);
   const [tierCursor, setTierCursor] = useState(0);
   const pendingClassificationRef = useRef<Omit<FleetClassification, "note"> | null>(null);
+  // OBS-508: the suggestion riding the in-flight classification (prefills tier + note), and the
+  // rows a bulk `s` staged while waiting on the one first-touch channel answer.
+  const pendingSuggestionRef = useRef<FleetModelSuggestion | null>(null);
+  const bulkRef = useRef<{ group: FleetModelGroup; rows: Array<{ model: string; suggestion: FleetModelSuggestion }> } | null>(null);
   const noteRef = useRef("");
   const [note, setNote] = useState("");
   const [notice, setNotice] = useState("");
@@ -309,6 +321,9 @@ export function FleetApp({
   // type-to-search on the long lists — reset on every screen change (per-screen-visit filter)
   const filterRef = useRef("");
   const [filter, setFilter] = useState("");
+  // `a` on the models screen reveals retired/preview/non-worker shapes; sticky for the session.
+  const showAllModelsRef = useRef(false);
+  const [, setShowAllModels] = useState(false);
 
   const enabledModelGroups = () => modelGroups.filter((group) => !denyRef.current?.has(group.adapter));
   const stagedMap = () => mapRef.current as Record<string, MapEntry>;
@@ -333,8 +348,15 @@ export function FleetApp({
   // label. Each filterable screen derives its rows through these so input and render agree.
   const matches = (label: string, f = filterRef.current) =>
     f === "" || label.toLowerCase().includes(f.toLowerCase());
+  // Operator directive 2026-08-13: retired shapes (dated snapshots, previews, non-worker SKUs,
+  // legacy families) hide by DEFAULT — omp reports 218 ids and most can never carry a worker.
+  // `a` reveals them; a CLASSIFIED row is never hidden (a tiered dated snapshot was meant).
   const filteredModelRows = (f = filterRef.current) =>
-    currentModelRows().filter((row) => matches(row.model, f));
+    currentModelRows().filter((row) =>
+      matches(row.model, f)
+      && (showAllModelsRef.current || row.tier !== undefined || retiredModelReason(row.model) === null));
+  const hiddenModelCount = (f = filterRef.current) =>
+    currentModelRows().filter((row) => matches(row.model, f)).length - filteredModelRows(f).length;
   const filteredCandidates = (f = filterRef.current) =>
     candidatesRef.current.filter((candidate) => matches(candidate.label, f));
   const filteredSteeringRows = (f = filterRef.current) =>
@@ -416,9 +438,31 @@ export function FleetApp({
     showScreen("review");
   };
 
+  const stageSuggested = (
+    group: FleetModelGroup,
+    rows: Array<{ model: string; suggestion: FleetModelSuggestion }>,
+    firstTouch?: { vendor: string; channel: "sub" | "api" },
+  ) => {
+    const staged = rows.map((row) => ({
+      adapter: group.adapter,
+      model: row.model,
+      tier: row.suggestion.tier,
+      note: row.suggestion.note,
+      ...firstTouch,
+    }));
+    classificationsRef.current = [...classificationsRef.current, ...staged];
+    setClassificationRevision((revision) => revision + 1);
+    setNotice(`fleet: staged ${staged.length} catalog-suggested classification(s) — nothing writes before the review diff`);
+  };
+
   const beginClassification = (group: FleetModelGroup, model: string) => {
-    tierCursorRef.current = 0;
-    setTierCursor(0);
+    // OBS-508: catalog evidence prefills the flow — tier cursor lands on the suggested band and
+    // (when the operator keeps that band) the provenance note arrives pre-typed. Free to override.
+    const suggestion = group.rows.find((row) => row.model === model)?.suggestion ?? null;
+    pendingSuggestionRef.current = suggestion;
+    const tierAt = suggestion ? Math.max(TIERS.indexOf(suggestion.tier), 0) : 0;
+    tierCursorRef.current = tierAt;
+    setTierCursor(tierAt);
     const firstTouch = !group.rows.some((row) => row.tier !== undefined);
     const pending: Omit<FleetClassification, "note"> = {
       adapter: group.adapter,
@@ -459,8 +503,15 @@ export function FleetApp({
       showScreen("steering");
       return;
     }
-    if (key.escape && screenRef.current === "add-model") {
+    // The classification sub-flow (add-model → channel → tier → provenance) cancels back to the
+    // models list — before this, provenance's own "esc cancel" legend lied: Esc fell through to
+    // the walk-home branch in init entry and to QUIT in fleet entry, discarding staged work.
+    if (key.escape && (screenRef.current === "add-model" || screenRef.current === "channel" || screenRef.current === "tiers" || screenRef.current === "provenance")) {
+      noteRef.current = "";
+      setNote("");
       setNotice("");
+      pendingSuggestionRef.current = null;
+      bulkRef.current = null;
       showScreen("models");
       return;
     }
@@ -473,14 +524,19 @@ export function FleetApp({
       showScreen("modes");
       return;
     }
+    // While a type-to-search filter is LIVE, every printable char belongs to the search box:
+    // the letter aliases (j/k navigation, q quit, models' t/n/a) go dormant so "fake-n" or
+    // "qwen" can actually be typed — the k moved the cursor and the q quit the editor before
+    // this (operator field session, 2026-08-13). Arrows, Enter, Space, and Esc keep their roles.
+    const letterAlias = filterRef.current === "" ? input : "";
     const typing = screenRef.current === "provenance" || screenRef.current === "add-model";
-    if (key.escape || (!typing && input === "q") || (key.ctrl && input === "c")) {
+    if (key.escape || (!typing && letterAlias === "q") || (key.ctrl && input === "c")) {
       finish({ kind: "quit" });
       return;
     }
 
     if (screenRef.current === "probe") {
-      if (input === "r") {
+      if (letterAlias === "r") {
         finish({ kind: "refresh" });
       } else if (key.return) {
         showScreen("agents");
@@ -489,13 +545,13 @@ export function FleetApp({
     }
 
     if (screenRef.current === "agents") {
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(cursorRef.current + 1, Math.max(agents.length - 1, 0));
         cursorRef.current = next;
         setCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(cursorRef.current - 1, 0);
         cursorRef.current = next;
         setCursor(next);
@@ -519,14 +575,14 @@ export function FleetApp({
 
     if (screenRef.current === "models") {
       const rows = filteredModelRows();
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(modelCursorRef.current + 1, Math.max(rows.length - 1, 0));
         modelCursorRef.current = next;
         setModelCursor(next);
         setNotice("");
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(modelCursorRef.current - 1, 0);
         modelCursorRef.current = next;
         setModelCursor(next);
@@ -535,7 +591,14 @@ export function FleetApp({
       }
       const group = enabledModelGroups()[modelGroupRef.current];
       const row = rows[modelCursorRef.current];
-      if (input === " " && group && row?.tier) {
+      if (input === " " && group && row) {
+        if (!row.tier) {
+          // v1.90.9 (operator field report: "not selectable"): an unclassified model has no tier
+          // to route on — selecting IS classifying, so Space opens the same channel → tier →
+          // provenance flow as `t` instead of dying silently on a row drawn like a checkbox.
+          beginClassification(group, row.model);
+          return;
+        }
         const id = `${group.adapter}:${row.model}`;
         const next = new Set(denyModelsRef.current);
         if (next.has(id)) next.delete(id);
@@ -544,7 +607,10 @@ export function FleetApp({
         setDenyModels(next);
         return;
       }
-      if (input === "t" && group && row) {
+      // Letter hotkeys yield to an ACTIVE search (letterAlias above): with a filter live, every
+      // printable char belongs to the search box — otherwise typing "anthropic" toggles show-all
+      // at the `a` and opens classify at the `t`.
+      if (letterAlias === "t" && group && row) {
         if (row.tier) {
           setNotice("fleet: tier reassignment on classified models is not supported in v1 — edit config directly");
           return;
@@ -552,11 +618,51 @@ export function FleetApp({
         beginClassification(group, row.model);
         return;
       }
-      if (input === "n" && group) {
+      if (letterAlias === "n" && group) {
         modelIdRef.current = "";
         setModelId("");
         setNotice("");
         showScreen("add-model");
+        return;
+      }
+      if (letterAlias === "s" && group) {
+        // OBS-508: bulk-stage every VISIBLE unclassified model carrying a catalog suggestion —
+        // visible means the type-to-search filter and the retired-hide both scope the batch. The
+        // staging is consent-preserving: it lands in the same classifications list the single
+        // flow feeds, and only the review diff (y) ever writes.
+        const suggested = filteredModelRows()
+          .filter((candidate): candidate is { model: string; suggestion: FleetModelSuggestion } => !candidate.tier && candidate.suggestion !== undefined);
+        if (!suggested.length) {
+          setNotice("fleet: no catalog tier suggestions among the visible unclassified models — evidence comes from the cached catalogs (AA index / API pricing)");
+          return;
+        }
+        const firstTouch = !group.rows.some((candidate) => candidate.tier !== undefined);
+        if (!firstTouch) {
+          stageSuggested(group, suggested);
+          return;
+        }
+        if (!group.vendor) {
+          setNotice(`fleet: ${group.adapter} has no vendor declaration — classification cannot be saved`);
+          return;
+        }
+        const answered = channelByAdapterRef.current[group.adapter];
+        if (answered) {
+          stageSuggested(group, suggested, { vendor: group.vendor, channel: answered });
+          return;
+        }
+        bulkRef.current = { group, rows: suggested };
+        channelCursorRef.current = 0;
+        setChannelCursor(0);
+        setNotice("");
+        showScreen("channel");
+        return;
+      }
+      if (letterAlias === "a") {
+        showAllModelsRef.current = !showAllModelsRef.current;
+        setShowAllModels(showAllModelsRef.current);
+        const clamped = Math.min(modelCursorRef.current, Math.max(filteredModelRows().length - 1, 0));
+        modelCursorRef.current = clamped;
+        setModelCursor(clamped);
         return;
       }
       if (key.return) {
@@ -610,44 +716,61 @@ export function FleetApp({
     }
 
     if (screenRef.current === "channel") {
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(channelCursorRef.current + 1, CHANNELS.length - 1);
         channelCursorRef.current = next;
         setChannelCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(channelCursorRef.current - 1, 0);
         channelCursorRef.current = next;
         setChannelCursor(next);
         return;
       }
-      if (key.return && pendingClassificationRef.current) {
+      if (key.return) {
         const channel = CHANNELS[channelCursorRef.current];
-        channelByAdapterRef.current[pendingClassificationRef.current.adapter] = channel;
-        pendingClassificationRef.current.channel = channel;
-        showScreen("tiers");
+        // OBS-508: a bulk stage waiting on the one first-touch channel answer resumes here.
+        const bulk = bulkRef.current;
+        if (bulk?.group.vendor) {
+          channelByAdapterRef.current[bulk.group.adapter] = channel;
+          stageSuggested(bulk.group, bulk.rows, { vendor: bulk.group.vendor, channel });
+          bulkRef.current = null;
+          showScreen("models");
+          return;
+        }
+        if (pendingClassificationRef.current) {
+          channelByAdapterRef.current[pendingClassificationRef.current.adapter] = channel;
+          pendingClassificationRef.current.channel = channel;
+          showScreen("tiers");
+        }
       }
       return;
     }
 
     if (screenRef.current === "tiers") {
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(tierCursorRef.current + 1, TIERS.length - 1);
         tierCursorRef.current = next;
         setTierCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(tierCursorRef.current - 1, 0);
         tierCursorRef.current = next;
         setTierCursor(next);
         return;
       }
       if (key.return && pendingClassificationRef.current) {
-        pendingClassificationRef.current.tier = TIERS[tierCursorRef.current];
-        noteRef.current = "";
-        setNote("");
+        const chosen = TIERS[tierCursorRef.current];
+        pendingClassificationRef.current.tier = chosen;
+        // OBS-508: keep the suggested band → the evidence note arrives pre-typed (Enter applies
+        // it as-is); override the band → the note starts empty, because the suggestion's text
+        // argues for a DIFFERENT tier than the one being recorded.
+        const suggestion = pendingSuggestionRef.current;
+        const prefill = suggestion && suggestion.tier === chosen ? suggestion.note : "";
+        noteRef.current = prefill;
+        setNote(prefill);
         setNotice("");
         showScreen("provenance");
       }
@@ -667,6 +790,7 @@ export function FleetApp({
           setClassificationRevision((revision) => revision + 1);
         }
         pendingClassificationRef.current = null;
+        pendingSuggestionRef.current = null;
         setNotice("");
         showScreen("models");
         return;
@@ -688,13 +812,13 @@ export function FleetApp({
       // preset entry adds one final `custom` row after the modes — the full-walk escape hatch
       const rowCount = modeOptions.length + (presetPickRef.current ? 1 : 0);
       const currentModeCursor = modeCursorRef.current ?? 0;
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(currentModeCursor + 1, Math.max(rowCount - 1, 0));
         modeCursorRef.current = next;
         setModeCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(currentModeCursor - 1, 0);
         modeCursorRef.current = next;
         setModeCursor(next);
@@ -720,20 +844,20 @@ export function FleetApp({
 
     if (screenRef.current === "shapes") {
       const rows = shapeRows(selectedModeRef.current, stagedMap());
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(shapeCursorRef.current + 1, Math.max(rows.length - 1, 0));
         shapeCursorRef.current = next;
         setShapeCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(shapeCursorRef.current - 1, 0);
         shapeCursorRef.current = next;
         setShapeCursor(next);
         return;
       }
       const shape = rows[shapeCursorRef.current]?.id;
-      if (input === "a" && shape) {
+      if (letterAlias === "a" && shape) {
         const nextEntry = { ...stagedMap()[shape] };
         delete nextEntry.pin;
         const nextMap = { ...stagedMap(), [shape]: nextEntry };
@@ -741,14 +865,14 @@ export function FleetApp({
         setMap(nextMap);
         return;
       }
-      if (input === "p" && shape) {
+      if (letterAlias === "p" && shape) {
         candidatesRef.current = candidatesForShape(shape, selectedModeRef.current, stagedMap());
         candidateCursorRef.current = 0;
         setCandidateCursor(0);
         showScreen("candidates");
         return;
       }
-      if (input === "f" && shape) {
+      if (letterAlias === "f" && shape) {
         const current = stagedMap()[shape]?.prefer ?? [];
         preferRowsRef.current = preferOptionsForShape(shape, current);
         preferChainRef.current = current.slice();
@@ -763,13 +887,13 @@ export function FleetApp({
 
     if (screenRef.current === "candidates") {
       const rows = filteredCandidates();
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(candidateCursorRef.current + 1, Math.max(rows.length - 1, 0));
         candidateCursorRef.current = next;
         setCandidateCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(candidateCursorRef.current - 1, 0);
         candidateCursorRef.current = next;
         setCandidateCursor(next);
@@ -791,13 +915,13 @@ export function FleetApp({
     }
 
     if (screenRef.current === "shape-prefer") {
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(preferCursorRef.current + 1, Math.max(preferRowsRef.current.length - 1, 0));
         preferCursorRef.current = next;
         setPreferCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(preferCursorRef.current - 1, 0);
         preferCursorRef.current = next;
         setPreferCursor(next);
@@ -828,19 +952,19 @@ export function FleetApp({
 
     if (screenRef.current === "steering") {
       // review.prefer + consult.prefer rows plus the single judge seat as the final row
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(steeringCursorRef.current + 1, STEERING_KEYS.length);
         steeringCursorRef.current = next;
         setSteeringCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(steeringCursorRef.current - 1, 0);
         steeringCursorRef.current = next;
         setSteeringCursor(next);
         return;
       }
-      if (input === "f") {
+      if (letterAlias === "f") {
         if (steeringCursorRef.current === STEERING_KEYS.length) {
           judgeCursorRef.current = 0;
           setJudgeCursor(0);
@@ -865,13 +989,13 @@ export function FleetApp({
 
     if (screenRef.current === "judge-pick") {
       const rows = filteredJudgeRows();
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(judgeCursorRef.current + 1, Math.max(rows.length - 1, 0));
         judgeCursorRef.current = next;
         setJudgeCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(judgeCursorRef.current - 1, 0);
         judgeCursorRef.current = next;
         setJudgeCursor(next);
@@ -892,7 +1016,7 @@ export function FleetApp({
 
     if (screenRef.current === "steering-prefer") {
       const rows = filteredSteeringRows();
-      if (key.downArrow || input === "j") {
+      if (key.downArrow || letterAlias === "j") {
         const next = Math.min(
           steeringPickerCursorRef.current + 1,
           Math.max(rows.length - 1, 0),
@@ -901,7 +1025,7 @@ export function FleetApp({
         setSteeringPickerCursor(next);
         return;
       }
-      if (key.upArrow || input === "k") {
+      if (key.upArrow || letterAlias === "k") {
         const next = Math.max(steeringPickerCursorRef.current - 1, 0);
         steeringPickerCursorRef.current = next;
         setSteeringPickerCursor(next);
@@ -980,6 +1104,7 @@ export function FleetApp({
     return (
       <FleetListScreen
         title="step 2/6 · agent CLIs"
+        viewRows={viewRows}
         legend="↑↓/jk move · space toggle · enter next · esc/q quit"
         rows={rows}
         cursor={cursor}
@@ -989,7 +1114,8 @@ export function FleetApp({
 
   const group = enabledModelGroups()[modelGroup];
   if (screen === "models") {
-    const rows: FleetListRow[] = filteredModelRows().map((row) => {
+    const filtered = filteredModelRows();
+    const rows: FleetListRow[] = filtered.map((row) => {
       const denied = group ? denyModels.has(`${group.adapter}:${row.model}`) : false;
       return {
         id: row.model,
@@ -998,16 +1124,33 @@ export function FleetApp({
             <ToggleMark active={!denied} />
             <Text>{` ${row.model}  ${row.tier}  ${denied ? "denied" : "allowed"}`}</Text>
           </>
-        ) : <Text>{`( ) ${row.model}  ???  unclassified${row.detectedAt ? ` (${row.detectedAt})` : ""}`}</Text>,
+        ) : <Text>{`?  ${row.model}${row.suggestion ? `  → ${row.suggestion.tier} suggested` : ""}`}</Text>,
       };
     });
+    // The remedy renders ONCE, for the row under the cursor — 218 identical "Space or t to
+    // classify" suffixes drowned the model names and wrapped long ids (operator screenshot,
+    // 2026-08-13). A notice always wins the line.
+    const focused = filtered[modelCursor];
+    const hidden = hiddenModelCount();
+    const detail = [
+      ...(notice
+        ? [notice]
+        : focused && !focused.tier
+          ? [focused.suggestion
+            ? `?  ${focused.suggestion.tier} suggested from catalog evidence — Space accepts prefilled, s stages every visible suggestion${focused.detectedAt ? ` (detected ${focused.detectedAt})` : ""}`
+            : `?  unclassified — Space or t to classify${focused.detectedAt ? ` (detected ${focused.detectedAt})` : ""}; unclassified models are never routed`]
+          : []),
+      ...(hidden > 0 ? [`… ${hidden} retired/preview/non-worker hidden — a shows all`] : []),
+      ...(showAllModelsRef.current ? ["showing retired models — a hides them again"] : []),
+    ];
     return (
       <FleetListScreen
         title={`step 3/6 · models · ${group?.adapter ?? ""}`}
-        legend="↑↓ to move · Space to toggle · t to classify tier · n to add model · Enter for next · Type to search · Esc to quit"
+        legend="↑↓ move · Space toggle/classify · s stage suggested · t tier · n add · a all · Enter next · Type to search · Esc quit"
+        viewRows={viewRows}
         rows={rows}
         cursor={modelCursor}
-        details={notice ? [notice] : []}
+        details={detail}
         filter={filter}
       />
     );
@@ -1026,7 +1169,7 @@ export function FleetApp({
   if (screen === "channel") return (
     <FleetListScreen
       title={`channel · ${pendingClassificationRef.current?.adapter ?? ""}`}
-      legend="↑↓/jk move · enter select · esc/q quit"
+      legend="↑↓/jk move · enter select · esc cancel · q quit"
       rows={CHANNELS.map((channel) => ({ id: channel, content: <Text>{channel}</Text> }))}
       cursor={channelCursor}
     />
@@ -1036,7 +1179,7 @@ export function FleetApp({
     return (
       <FleetListScreen
         title={`pick · tier · ${pendingClassificationRef.current?.adapter}:${pendingClassificationRef.current?.model}`}
-        legend="↑↓/jk move · enter select · esc/q quit"
+        legend="↑↓/jk move · enter select · esc cancel · q quit"
         rows={TIERS.map((tier) => ({ id: tier, content: <Text>{tier}</Text> }))}
         cursor={tierCursor}
       />
@@ -1103,6 +1246,7 @@ export function FleetApp({
     return (
       <FleetListScreen
         title={`pick · ${shape}`}
+        viewRows={viewRows}
         legend="↑↓ to move · Enter to pin · Type to search · Esc to cancel · q to quit"
         rows={filteredCandidates().map((candidate) => ({
           id: candidate.id,
@@ -1117,6 +1261,7 @@ export function FleetApp({
   if (screen === "shape-prefer") return (
     <FleetListScreen
       title={`pick · ${shape}.prefer`}
+      viewRows={viewRows}
       legend="↑↓/jk move · space add/drop · enter apply (empty clears) · esc cancel · q quit"
       rows={preferRowsRef.current.map((option) => {
         const at = preferChainRef.current.indexOf(option);
@@ -1152,6 +1297,7 @@ export function FleetApp({
     return (
       <FleetListScreen
         title="pick · judge"
+        viewRows={viewRows}
         legend="↑↓ to move · Enter to select · Type to search · Esc to cancel · q to quit"
         rows={filteredJudgeRows().map((label) => ({
           id: label,
@@ -1173,6 +1319,7 @@ export function FleetApp({
     return (
       <FleetListScreen
         title={`pick · ${which}.prefer`}
+        viewRows={viewRows}
         legend="↑↓ to move · Space to add/drop · Enter to apply (empty clears) · Type to search · Esc to cancel · q to quit"
         rows={filteredSteeringRows().map((option) => {
           const at = steeringChainRef.current.indexOf(option);
@@ -1286,6 +1433,9 @@ export async function runFleetInkEditor({
       entry={entry}
       initialJudge={initialJudge}
       judgeSeats={judgeSeats}
+      // v1.90.9: omp's 218-model list rendered taller than the terminal and scrolled the cursor
+      // and chrome off-screen — cap every list to the terminal, minus title/legend/markers/details.
+      viewRows={Math.max(8, (output.rows ?? 40) - 10)}
     />,
     {
       // FleetIO's injected stream predates Ink and did not require ref/unref.

@@ -3,7 +3,12 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { parse } from "yaml";
 import {
+  ARTIFICIAL_ANALYSIS_CATALOG_URL,
   catalogCachePath,
+  LIVEBENCH_CATEGORIES_URL,
+  LIVEBENCH_TABLE_DATE,
+  LIVEBENCH_TABLE_URL,
+  MODELS_DEV_CATALOG_URL,
   readCachedCatalog,
   refreshCatalogCommand,
   resolveCatalogModel,
@@ -29,6 +34,7 @@ type ModelFixture = {
   attachment?: boolean;
   intelligence?: number;
   name?: string;
+  family?: string;
 };
 
 const catalogFixture = (models: ModelFixture[], fetchedAt = "2026-08-05T00:00:00.000Z"): CatalogCache => ({
@@ -40,6 +46,7 @@ const catalogFixture = (models: ModelFixture[], fetchedAt = "2026-08-05T00:00:00
       models: Object.fromEntries(models.map((model) => [model.id, {
         id: model.id,
         ...(model.name ? { name: model.name } : {}),
+        ...(model.family ? { family: model.family } : {}),
         cost: { input: model.input, output: model.output },
         limit: { context: model.context, output: 32_000 },
         reasoning: model.reasoning ?? true,
@@ -70,7 +77,47 @@ const response = (body: unknown, status = 200) => ({
   ok: status >= 200 && status < 300,
   status,
   json: async () => body,
+  text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
 });
+
+// LiveBench fixtures. The column order is deliberately NOT category order: an aggregate built from
+// a hardcoded column list would still look plausible, so the categories file is the only map.
+const LIVEBENCH_COLUMNS = ["code_completion", "code_generation", "javascript", "python", "typescript"] as const;
+const liveBenchCsv = (rows: { model: string; scores: Record<string, number> }[]): string =>
+  [`model,${LIVEBENCH_COLUMNS.join(",")}`, ...rows.map(({ model, scores }) =>
+    [model, ...LIVEBENCH_COLUMNS.map((column) => scores[column] ?? "")].join(","))].join("\n") + "\n";
+
+const LIVEBENCH_CATEGORIES = {
+  "Agentic Coding": ["javascript", "typescript", "python"],
+  Coding: ["code_generation", "code_completion"],
+  Reasoning: ["zebra_puzzle"],
+};
+// python moves from Agentic Coding into Coding — both means must move with it.
+const RESHUFFLED_CATEGORIES = {
+  "Agentic Coding": ["javascript", "typescript"],
+  Coding: ["code_generation", "code_completion", "python"],
+  Reasoning: ["zebra_puzzle"],
+};
+const FAKE_2_SCORES = { code_completion: 96, code_generation: 90, javascript: 60, python: 80, typescript: 70 };
+
+type StubResponse = ReturnType<typeof response>;
+
+/** Routes by URL rather than call order, so a leg that never fires is a missing call, not a shift. */
+const routedFetcher = (routes: {
+  modelsDev?: () => StubResponse;
+  table?: () => StubResponse;
+  categories?: () => StubResponse;
+  aa?: () => StubResponse;
+} = {}) => vi.fn(async (input: string | URL | Request): Promise<StubResponse> => {
+  const url = String(input);
+  if (url.startsWith(MODELS_DEV_CATALOG_URL)) return (routes.modelsDev ?? (() => response(fakeCatalog().modelsDev)))();
+  if (url.startsWith(LIVEBENCH_TABLE_URL)) return (routes.table ?? (() => response(liveBenchCsv([{ model: "fake-2", scores: FAKE_2_SCORES }]))))();
+  if (url.startsWith(LIVEBENCH_CATEGORIES_URL)) return (routes.categories ?? (() => response(LIVEBENCH_CATEGORIES)))();
+  return (routes.aa ?? (() => response({ pagination: { has_more: false }, data: [] })))();
+});
+
+const requestedUrls = (fetcher: { mock: { calls: unknown[][] } }): string[] =>
+  fetcher.mock.calls.map((call) => String(call[0]));
 
 const fakeCatalog = (fetchedAt = "2026-08-05T00:00:00.000Z") => catalogFixture([
   { id: "fake-2", input: 0, output: 0, context: 200_000, toolCall: true },
@@ -115,6 +162,7 @@ describe("cache-only model capability catalog", () => {
       });
       expect(evidence, member.alias).toMatchObject({
         modelId: member.identity,
+        catalogId: `anthropic/${member.identity}`,
         inputCostPerMtok: member.input,
         outputCostPerMtok: member.output,
         contextWindow: member.context,
@@ -231,16 +279,20 @@ describe("cache-only model capability catalog", () => {
         },
       ],
     }));
+    network.mockResolvedValueOnce(response(liveBenchCsv([{ model: "fake-2", scores: FAKE_2_SCORES }])));
+    network.mockResolvedValueOnce(response(LIVEBENCH_CATEGORIES));
     vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "configured-key");
     const refreshOutput = await doctor(["--refresh-catalog"], repo, [adapter], {
       banner: false,
       catalogNow: () => new Date("2026-08-05T01:00:00.000Z"),
     });
     expect(refreshOutput).toContain("model catalog refreshed");
-    expect(network).toHaveBeenCalledTimes(3);
+    expect(network).toHaveBeenCalledTimes(5);
     expect(network.mock.calls[1][1]).toMatchObject({ headers: { "x-api-key": "configured-key" } });
-    expect(String(network.mock.calls[1][0])).toContain("/free?page=1");
-    expect(String(network.mock.calls[2][0])).toContain("/free?page=2");
+    expect(String(network.mock.calls[1][0])).toContain("/api/v2/data/llms/models?page=1");
+    expect(String(network.mock.calls[2][0])).toContain("/api/v2/data/llms/models?page=2");
+    expect(String(network.mock.calls[3][0])).toBe(LIVEBENCH_TABLE_URL);
+    expect(String(network.mock.calls[4][0])).toBe(LIVEBENCH_CATEGORIES_URL);
     expect(probe).toHaveBeenCalledOnce();
     expect(listModels).toHaveBeenCalledOnce();
     expect(resolveCatalogModel(readCachedCatalog(repo).catalog, { provider: "anthropic", model: "fake-2" })?.intelligenceIndex).toBe(72);
@@ -254,7 +306,7 @@ describe("cache-only model capability catalog", () => {
       { name: "401", fetcher: vi.fn(async () => response({}, 401)) },
       { name: "500", fetcher: vi.fn(async () => response({}, 500)) },
       { name: "timeout", fetcher: vi.fn(() => new Promise<never>(() => {})), timeoutMs: 5 },
-      { name: "malformed-JSON", fetcher: vi.fn(async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("bad JSON"); } })) },
+      { name: "malformed-JSON", fetcher: vi.fn(async () => ({ ok: true, status: 200, text: async () => "", json: async () => { throw new SyntaxError("bad JSON"); } })) },
     ] as const;
     for (const failure of failures) {
       const cacheBefore = readFileSync(catalogCachePath(repo), "utf8");
@@ -293,7 +345,7 @@ describe("cache-only model capability catalog", () => {
     })?.modelId).toBe(CLAUDE_ALIAS_IDENTITY_STAMPS.fable);
 
     const cfgAfter = loadConfig(repo);
-    expect(network).toHaveBeenCalledTimes(3);
+    expect(network).toHaveBeenCalledTimes(5);
     expect(cfgAfter).toEqual(cfgBefore);
     expect(route(task, cfgAfter, adapter.channels!(cfgAfter))).toEqual(routeBefore);
   });
@@ -367,5 +419,187 @@ describe("cache-only model capability catalog", () => {
     expect(suggestion).toMatch(/^\s*# fake-2: \?\?\?/m);
     expect(suggestion).not.toMatch(/^\s*fake-2:\s*(cheap|mid|frontier)/m);
     expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(configBefore);
+  });
+});
+
+// The four named-test oracles below live at TOP LEVEL, titled verbatim: the acceptance gate anchors
+// its -t filter (^…$) to the runner-visible full name, so a describe title would prefix them out of
+// their own criterion (src/gates/acceptance.ts testFilterPattern).
+test("a refresh against stubbed LiveBench endpoints stores liveBench tableDate categories and rows and resolveCatalogModel returns agenticCodingScore codingScore and evidenceDate whose values move when a reshuffled categories fixture reassigns tasks between categories, so aggregates from a hardcoded column list fail", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  // No key: the LiveBench leg is unconditional and carries evidence on its own (D-1).
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+  const fetcher = routedFetcher();
+  const refreshed = await refreshCatalogCommand({ repoRoot: repo, fetcher });
+
+  expect(refreshed.updated).toBe(true);
+  expect(refreshed.warning).toBeUndefined();
+  expect(requestedUrls(fetcher)).toEqual(expect.arrayContaining([
+    "https://livebench.ai/table_2026_06_25.csv",
+    "https://livebench.ai/categories_2026_06_25.json",
+  ]));
+  expect(requestedUrls(fetcher).some((url) => url.includes("artificialanalysis.ai"))).toBe(false);
+
+  const stored = readCachedCatalog(repo).catalog.liveBench as { tableDate: string; categories: unknown; rows: unknown[] };
+  expect(stored.tableDate).toBe(LIVEBENCH_TABLE_DATE);
+  expect(stored.categories).toEqual(LIVEBENCH_CATEGORIES);
+  expect(stored.rows).toEqual([{ model: "fake-2", ...FAKE_2_SCORES }]);
+
+  const evidence = resolveCatalogModel(readCachedCatalog(repo).catalog, { provider: "anthropic", model: "fake-2" });
+  expect(evidence?.agenticCodingScore).toBeCloseTo(70, 6); // mean(javascript 60, typescript 70, python 80)
+  expect(evidence?.codingScore).toBeCloseTo(93, 6); // mean(code_generation 90, code_completion 96)
+  expect(evidence?.evidenceDate).toBe(LIVEBENCH_TABLE_DATE);
+
+  const reshuffled = await refreshCatalogCommand({
+    repoRoot: repo,
+    fetcher: routedFetcher({ categories: () => response(RESHUFFLED_CATEGORIES) }),
+  });
+  expect(reshuffled.updated).toBe(true);
+  const moved = resolveCatalogModel(readCachedCatalog(repo).catalog, { provider: "anthropic", model: "fake-2" });
+  // Same table, same row, same code: only the categories file moved python across.
+  expect(moved?.agenticCodingScore).toBeCloseTo(65, 6); // mean(60, 70)
+  expect(moved?.codingScore).toBeCloseTo(88.6667, 3); // mean(90, 96, 80)
+  expect(moved?.evidenceDate).toBe(LIVEBENCH_TABLE_DATE);
+});
+
+test("a fleet id resolves the highest-effort LiveBench row among its suffix variants while glm-5 resolves nothing from a table containing only glm-5.2, so a bare startsWith prefix match or a lowest-effort pick fails", () => {
+  // Row order defeats both "first row wins" and "last row wins": the max-effort row is neither.
+  // `family: "glm"` is verbatim real models.dev (zhipuai carries it on EVERY glm-*): a matcher that
+  // admits family as an identity resolves glm-5 straight into glm-5.2's row.
+  const cache: CatalogCache = {
+    ...catalogFixture([
+      { id: "glm-5.2", input: 1, output: 4, context: 200_000, family: "glm" },
+      { id: "glm-5", input: 1, output: 4, context: 200_000, family: "glm" },
+    ]),
+    liveBench: {
+      tableDate: LIVEBENCH_TABLE_DATE,
+      categories: LIVEBENCH_CATEGORIES,
+      rows: [
+        { model: "glm-5.2-low", javascript: 10, typescript: 10, python: 10, code_generation: 10, code_completion: 10 },
+        { model: "glm-5.2-max-effort", javascript: 90, typescript: 90, python: 90, code_generation: 80, code_completion: 80 },
+        { model: "glm-5.2-thinking-auto-medium-effort", javascript: 50, typescript: 50, python: 50, code_generation: 50, code_completion: 50 },
+      ],
+    },
+  };
+
+  const best = resolveCatalogModel(cache, { provider: "anthropic", model: "glm-5.2" });
+  expect(best?.agenticCodingScore).toBeCloseTo(90, 6);
+  expect(best?.codingScore).toBeCloseTo(80, 6);
+  expect(best?.evidenceDate).toBe(LIVEBENCH_TABLE_DATE);
+
+  // "glm-5" is a bare-startsWith prefix of "glm-5.2" — the residue ".2" is not an effort suffix.
+  const shorter = resolveCatalogModel(cache, { provider: "anthropic", model: "glm-5" });
+  expect(shorter?.modelId).toBe("glm-5");
+  expect(shorter?.agenticCodingScore).toBeUndefined();
+  expect(shorter?.codingScore).toBeUndefined();
+  expect(shorter?.evidenceDate).toBeUndefined();
+
+  // Real fleet member, verbatim real models.dev shape (kimi-for-coding/k3): the id is the bare
+  // suffix `k3` and LiveBench spells the row `kimi-k3`. The per-model `name` bridges them; the
+  // model's real `family` is a LINEAGE label and must not be what carries the match.
+  const kimi: CatalogCache = {
+    schemaVersion: 1,
+    fetchedAt: "2026-08-05T00:00:00.000Z",
+    modelsDev: {
+      "kimi-for-coding": {
+        id: "kimi-for-coding",
+        models: { k3: { id: "k3", name: "Kimi K3", cost: { input: 1, output: 4 }, limit: { context: 256_000, output: 32_000 } } },
+      },
+    },
+    liveBench: {
+      tableDate: LIVEBENCH_TABLE_DATE,
+      categories: LIVEBENCH_CATEGORIES,
+      rows: [{ model: "kimi-k3", javascript: 40, typescript: 50, python: 60, code_generation: 30, code_completion: 20 }],
+    },
+  };
+  const k3 = resolveCatalogModel(kimi, { provider: "kimi-for-coding", model: "k3" });
+  expect(k3?.agenticCodingScore).toBeCloseTo(50, 6); // mean(40, 50, 60)
+  expect(k3?.codingScore).toBeCloseTo(25, 6); // mean(30, 20)
+  expect(k3?.evidenceDate).toBe(LIVEBENCH_TABLE_DATE);
+
+  // Broad-family negative: `family: "gpt"` is verbatim real models.dev on openai/gpt-4o, and the
+  // table benchmarks a DIFFERENT model. Admitting family as an identity hands this unbenchmarked
+  // model gpt-5.6's scores and evidenceDate; only its own id and name may speak for it.
+  const broadFamily: CatalogCache = {
+    schemaVersion: 1,
+    fetchedAt: "2026-08-05T00:00:00.000Z",
+    modelsDev: {
+      openai: {
+        id: "openai",
+        models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o", family: "gpt", cost: { input: 2.5, output: 10 }, limit: { context: 128_000, output: 16_384 } } },
+      },
+    },
+    liveBench: {
+      tableDate: LIVEBENCH_TABLE_DATE,
+      categories: LIVEBENCH_CATEGORIES,
+      rows: [{ model: "gpt-5.6-max-effort", javascript: 95, typescript: 95, python: 95, code_generation: 95, code_completion: 95 }],
+    },
+  };
+  const unbenchmarked = resolveCatalogModel(broadFamily, { provider: "openai", model: "gpt-4o" });
+  expect(unbenchmarked?.contextWindow).toBe(128_000); // resolved, just not LiveBench-scored
+  expect(unbenchmarked?.agenticCodingScore).toBeUndefined();
+  expect(unbenchmarked?.codingScore).toBeUndefined();
+  expect(unbenchmarked?.evidenceDate).toBeUndefined();
+});
+
+test("a LiveBench fetch that fails and one that parses to zero rows each preserve the previous liveBench section while modelsDev still updates and the warning names LiveBench, so reading an empty probe as an empty fleet or losing the models.dev refresh fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+  await refreshCatalogCommand({ repoRoot: repo, fetcher: routedFetcher() });
+  const priorLiveBench = readCachedCatalog(repo).catalog.liveBench;
+  expect(priorLiveBench).toBeDefined();
+
+  const laterModelsDev = () => response({
+    anthropic: {
+      id: "anthropic",
+      models: { "later-model": { id: "later-model", cost: { input: 2, output: 8 }, limit: { context: 4_096, output: 512 } } },
+    },
+  });
+  const legs = [
+    { name: "fetch failure", routes: { modelsDev: laterModelsDev, table: () => response("", 500) } },
+    { name: "zero rows", routes: { modelsDev: laterModelsDev, table: () => response(`model,${LIVEBENCH_COLUMNS.join(",")}\n`) } },
+    // Truncated payload: a model-only row scores nothing, so it is zero rows, not a one-model fleet.
+    { name: "scoreless rows", routes: { modelsDev: laterModelsDev, table: () => response("model,javascript\nfoo,\n") } },
+    // Scores present but the categories file cannot address them — nothing to aggregate.
+    { name: "unusable categories", routes: { modelsDev: laterModelsDev, categories: () => response({}) } },
+  ] as const;
+
+  for (const leg of legs) {
+    const result = await refreshCatalogCommand({ repoRoot: repo, fetcher: routedFetcher(leg.routes) });
+    expect(result.updated, leg.name).toBe(true);
+    expect(String(result.warning), leg.name).toContain("LiveBench");
+    const after = readCachedCatalog(repo).catalog;
+    expect(after.liveBench, leg.name).toEqual(priorLiveBench);
+    expect(resolveCatalogModel(after, { provider: "anthropic", model: "later-model" })?.outputCostPerMtok, leg.name).toBe(8);
+  }
+});
+
+test("the AA leg requests the documented data llms models route and resolved evidence carries codingIndex from artificial_analysis_coding_index beside the intelligence index, so the legacy language models free route or a dropped coding index fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const fetcher = routedFetcher({
+    aa: () => response({
+      pagination: { page: 1, page_size: 100, has_more: false },
+      intelligence_index_version: "4.1.1",
+      data: [{
+        id: "00000000-0000-4000-8000-fake20000000",
+        slug: "fake-2",
+        model_creator: { slug: "anthropic", name: "Anthropic" },
+        evaluations: { artificial_analysis_intelligence_index: 63.05, artificial_analysis_coding_index: 48.5 },
+      }],
+    }),
+  });
+  const result = await refreshCatalogCommand({ repoRoot: repo, fetcher, artificialAnalysisKey: "configured-key" });
+
+  expect(result.updated).toBe(true);
+  expect(ARTIFICIAL_ANALYSIS_CATALOG_URL).toBe("https://artificialanalysis.ai/api/v2/data/llms/models");
+  const aaUrls = requestedUrls(fetcher).filter((url) => url.includes("artificialanalysis.ai"));
+  expect(aaUrls[0]).toContain("/api/v2/data/llms/models?page=1");
+  expect(aaUrls.some((url) => url.includes("/language/models/free"))).toBe(false);
+
+  const evidence = resolveCatalogModel(readCachedCatalog(repo).catalog, { provider: "anthropic", model: "fake-2" });
+  expect(evidence).toMatchObject({
+    intelligenceIndex: 63.05,
+    intelligenceIndexVersion: "4.1.1",
+    codingIndex: 48.5,
   });
 });

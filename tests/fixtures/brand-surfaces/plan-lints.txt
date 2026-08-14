@@ -11,6 +11,7 @@ est. cost (API channels only, rough): ~$0.00 + judge/review/consult calls
 
 routing lints:
   ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
+  ! agy: no model-list surface and no configured models — classify per benchmark policy to open channels
   ! routing seed names dead adapter 'cursor-agent' for shape 'implement' — no declared preference overrides it
   ! routing seed names dead adapter 'codex' for shape 'implement' — no declared preference overrides it
   ! routing seed names dead adapter 'opencode' for shape 'tests' — no declared preference overrides it

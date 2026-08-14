@@ -232,3 +232,62 @@ test("omp's model list projects the selector field and every returned id keeps i
     else process.env.TICKMARKR_OMP_LIST_PAYLOAD = payloadBefore;
   }
 });
+
+// OBS-506: prime-agent prints its model table to STDERR — stdout is 0 bytes (live-verified
+// 2026-08-13, prime-agent 0.7.1). The production listModels must fall back to stderr when
+// stdout is EMPTY, and a headerless output must record a NAMED reason: the reasonless silent
+// zero is exactly what hid the empty projection for a whole doctor run.
+test("prime-agent's stderr-routed pi-table projects joined provider/model ids through the production listModels implementation, and a headerless output warns with a named reason instead of a silent zero", async () => {
+  const entry = SHIPPED_CLI_CATALOG.find((candidate) => candidate.id === "prime-agent");
+  if (!entry?.drive || isNativeCliDrive(entry.drive) || !entry.drive.listModels) {
+    throw new Error("shipped prime-agent listModels contract is missing");
+  }
+  expect(entry.drive.listModels).toEqual({ argv: ["model", "list"], parser: "pi-table" });
+
+  const adapter = allAdapters({ cliEntries: SHIPPED_CLI_CATALOG }).find((candidate) => candidate.id === "prime-agent");
+  if (!adapter?.listModels) throw new Error("shipped prime-agent listModels implementation is missing");
+
+  const binDir = mkdtempSync(join(tmpdir(), "tickmarkr-prime-list-"));
+  const executable = join(binDir, "prime-agent");
+  writeFileSync(executable, [
+    "#!/bin/sh",
+    "if [ \"$1\" = model ] && [ \"$2\" = list ]; then",
+    "  printf '%s' \"${TICKMARKR_PRIME_LIST_PAYLOAD:-}\" >&2",
+    "  exit 0",
+    "fi",
+    "exit 97",
+    "",
+  ].join("\n"));
+  chmodSync(executable, 0o755);
+  const bashEnv = join(binDir, "bash-env");
+  writeFileSync(bashEnv, `export PATH=${shq(binDir)}:"$PATH"\n`);
+
+  const bashEnvBefore = process.env.BASH_ENV;
+  const payloadBefore = process.env.TICKMARKR_PRIME_LIST_PAYLOAD;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    process.env.BASH_ENV = bashEnv;
+    // Verbatim shape of `prime-agent model list` 0.7.1 (trimmed): header + provider/model rows,
+    // including a prime-inference row whose model column itself carries a slash.
+    process.env.TICKMARKR_PRIME_LIST_PAYLOAD = [
+      "provider         model                               context  max-out  thinking  images",
+      "anthropic        claude-fable-5                      1M       128K     yes       yes   ",
+      "prime-inference  z-ai/glm-5.2                        1.0M     131.1K   yes       no    ",
+      "",
+    ].join("\n");
+    warn.mockClear();
+    expect(await adapter.listModels()).toEqual(["anthropic/claude-fable-5", "prime-inference/z-ai/glm-5.2"]);
+    expect(warn).not.toHaveBeenCalled();
+
+    process.env.TICKMARKR_PRIME_LIST_PAYLOAD = "Fetching models...\nno table today\n";
+    warn.mockClear();
+    expect(await adapter.listModels()).toEqual([]);
+    expect(warn.mock.calls.map(([m]) => String(m)).join("\n")).toMatch(/prime-agent listed no models — no `provider model …` table header/);
+  } finally {
+    warn.mockRestore();
+    if (bashEnvBefore === undefined) delete process.env.BASH_ENV;
+    else process.env.BASH_ENV = bashEnvBefore;
+    if (payloadBefore === undefined) delete process.env.TICKMARKR_PRIME_LIST_PAYLOAD;
+    else process.env.TICKMARKR_PRIME_LIST_PAYLOAD = payloadBefore;
+  }
+});

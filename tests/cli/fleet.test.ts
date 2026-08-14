@@ -8,6 +8,7 @@ import { parse } from "yaml";
 
 import * as registry from "../../src/adapters/registry.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { retiredModelReason } from "../../src/adapters/model-lints.js";
 import { GLYPHS } from "../../src/brand.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
 import { formatFleetPrint, loadConfig, overlayBytesLoadError } from "../../src/config/config.js";
@@ -709,7 +710,10 @@ describe("tickmarkr fleet", () => {
     const models = writes.find((f) => strip(f).includes("step 3/6 · models"));
     expect(strip(membership ?? "")).toMatch(new RegExp(`[${GLYPHS.toggleActive}${GLYPHS.toggleInactive}]`));
     expect(strip(models ?? "")).toMatch(new RegExp(`[${GLYPHS.toggleActive}${GLYPHS.toggleInactive}]`));
-    expect(strip(models ?? "")).toContain("( )");
+    // v1.90.9: the unclassified glyph is `?` with a bare model id; the remedy renders ONCE as a
+    // detail line for the focused row — 218 identical per-row suffixes drowned the names (operator
+    // screenshot) and the old `( )` checkbox died silently on Space ("not selectable").
+    expect(strip(models ?? "")).toContain("?  fake-2");
   });
 
   test("the injected test parser and the production keypress decoder agree on every key the editor handles including j and k", async () => {
@@ -992,6 +996,63 @@ describe("tickmarkr fleet", () => {
     expect(parsedOverlay(repo).consult.prefer).toEqual(["fake:fake-1"]);
   });
 
+  // OBS-508: catalog evidence drives the classify flow — `s` bulk-stages every visible suggested
+  // model, and the ONLY writer remains the review-diff confirm. T2/D-2: the band is fleet-relative,
+  // so the fixture carries a four-model AA universe (configured opus 63 / sonnet 55 / fake-1 45 plus
+  // the unclassified fake-2 at 50) — fake-2 sits in the middle third → mid. fake-new stays uncovered.
+  // The two claude records are spelled as models.dev really spells them (`claude-opus-4-8`), NOT as
+  // the aliases config carries (`opus`): the aliases reach them only through fleet's resolved-model
+  // callback. Drop that callback and the universe is two models, the AA basis yields under the
+  // three-model floor, and the rank-3/4 provenance below is gone.
+  test("s bulk-stages every visible catalog-suggested model through the review funnel — the written overlay carries the suggested tier with its evidence provenance while uncovered models stay unclassified", async () => {
+    const { repo, adapter } = setup();
+    writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+      schemaVersion: 1,
+      fetchedAt: new Date().toISOString(),
+      modelsDev: {
+        fake: {
+          models: {
+            "fake-1": { id: "fake-1", cost: { input: 1, output: 5 }, limit: { context: 200000 } },
+            "fake-2": { id: "fake-2", cost: { input: 1, output: 5 }, limit: { context: 200000 } },
+          },
+        },
+        anthropic: {
+          id: "anthropic",
+          models: {
+            "claude-opus-4-8": { id: "claude-opus-4-8", cost: { input: 5, output: 25 }, limit: { context: 200000 } },
+            "claude-sonnet-5": { id: "claude-sonnet-5", cost: { input: 2, output: 10 }, limit: { context: 200000 } },
+          },
+        },
+      },
+      artificialAnalysis: {
+        intelligence_index_version: "4.1.1",
+        data: [
+          { id: "claude-opus-4-8", intelligence_index: 63 },
+          { id: "claude-sonnet-5", intelligence_index: 55 },
+          { id: "fake-2", intelligence_index: 50 },
+          { id: "fake-1", intelligence_index: 45 },
+        ],
+      },
+    }));
+    queueAnswers("y");
+    const out = await drive(
+      repo,
+      adapter,
+      makeIO().io,
+      KEYS.enter.repeat(2) + "s" + KEYS.enter.repeat(4),
+      ["--global-dir", isolatedGlobal()],
+    );
+    expect(out).toMatch(/^fleet: wrote /);
+    const overlay = parsedOverlay(repo);
+    expect(overlay.tiers.fake.models["fake-2"]).toBe("mid");
+    expect(overlay.tiers.fake.models["fake-new"]).toBeUndefined();
+    const bytes = readFileSync(overlayAt(repo), "utf8");
+    expect(bytes).toContain("SUGGESTED mid (intelligence inference, not a measurement)");
+    expect(bytes).toContain("fleet-relative rank 3/4 by Artificial Analysis Intelligence Index 50 (intelligence index version 4.1.1)");
+    expect(bytes).toContain("operator confirmation required");
+    expect(bytes).toMatch(/— fleet \d{4}-\d{2}-\d{2}/);
+  });
+
   // the root-cause fix for the live bare-adapter consult incident: the consult picker offers
   // adapter:model seats ONLY, so the rejected grammar is unreachable from the editor
   test("the consult picker offers only full adapter-and-model seats while the review picker additionally offers bare adapters", async () => {
@@ -1066,7 +1127,10 @@ describe("tickmarkr fleet", () => {
       KEYS.enter + KEYS.q,
       KEYS.enter.repeat(2) + KEYS.q,
       KEYS.enter.repeat(2) + KEYS.down + KEYS.t + KEYS.q,
-      KEYS.enter.repeat(2) + KEYS.down + KEYS.t + KEYS.enter + KEYS.escape,
+      // Esc inside the classification sub-flow CANCELS back to models (it used to quit — the
+      // provenance legend's "esc cancel" was a lie); q then quits from models, proving the
+      // cancel left no orphaned state between the two.
+      KEYS.enter.repeat(2) + KEYS.down + KEYS.t + KEYS.enter + KEYS.escape + KEYS.q,
       KEYS.enter.repeat(3) + KEYS.q,
       KEYS.enter.repeat(4) + KEYS.q,
       TO_DOCS + KEYS.p + KEYS.q,
@@ -1652,6 +1716,119 @@ review:
     expect(all).toContain("(keep default)  claude-code:fable"); // the picker names the resolved default
     expect(all).toContain("judge:"); // the confirmed diff carries the judge block
     expect(parsedOverlay(repo).judge).toEqual({ adapter: "fake", model: "fake-1" });
+  });
+
+  // ── viewport windowing: "can't choose models for omp" (operator field report, 218-model list) ──
+  test("a model list taller than the terminal windows around the cursor with chrome and pointer always visible", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, FAKE_TIERS);
+    const many = Array.from({ length: 120 }, (_, i) => `bulk-${String(i).padStart(3, "0")}`);
+    registry.writeDoctor(repo, {
+      fake: {
+        installed: true,
+        authed: true,
+        version: "fake",
+        models: ["fake-1", "fake-2", ...many],
+        modelsDetectedAt: "2026-07-16T12:00:00.000Z",
+        modelAuth: {
+          "fake-1": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
+          "fake-2": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
+        },
+      },
+    });
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    const adapter = fakeAdapter(repo);
+
+    // custom → agents → enter → models screen with 120+ unclassified rows; makeIO is 60 rows tall
+    const { io, out } = await driveEntry(repo, adapter, KEYS.down.repeat(9) + KEYS.enter + KEYS.enter + KEYS.q);
+    expect(out).toBe("fleet: quit without writing");
+    const modelFrames = io.writes.map(strip).filter((f) => f.includes("step 3/6 · models"));
+    expect(modelFrames.length).toBeGreaterThan(0);
+    const frame = modelFrames.at(-1)!;
+    expect(frame).toContain("❯");                       // the cursor is IN the frame
+    expect(frame).toMatch(/… \d+ below — type to search/); // elision named, remedy named
+    expect(frame.split("\n").length).toBeLessThan(60);   // never taller than the terminal
+  });
+
+  test("Space on an unclassified model opens the classify flow instead of dying silently", async () => {
+    const { repo, adapter } = setup();
+    const io = makeIO();
+    // agents → models; fake-new is the unclassified row two below the cursor; Space on it must
+    // land in the classify flow (FAKE_TIERS declares the channel, so it opens at the tier pick —
+    // the same flow `t` opens) — never a silent no-op.
+    const bytes = KEYS.enter + KEYS.enter + KEYS.down + KEYS.down + KEYS.space;
+    const p = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    io.input.write(bytes + KEYS.escape + KEYS.q);
+    await p;
+    const all = strip(io.writes.join(""));
+    expect(all).toContain("pick · tier · fake:fake-new"); // classify flow opened from Space
+    expect(all).toContain("unclassified — Space or t to classify"); // the row names its own remedy
+  });
+
+
+  test("retired shapes hide by default with a counted line, `a` reveals them, and a classified dated snapshot is never hidden", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    // fake-old-20240620 is CLASSIFIED (tiered) — dated shape must not hide it
+    withOverlay(repo, `${FAKE_TIERS}      fake-old-20240620: cheap\n`);
+    registry.writeDoctor(repo, {
+      fake: {
+        installed: true,
+        authed: true,
+        version: "fake",
+        models: ["fake-1", "fake-old-20240620", "fake-live", "fake-snap-20250101", "fake-embedding", "fake-x-preview"],
+        modelsDetectedAt: "2026-07-16T12:00:00.000Z",
+        modelAuth: { "fake-1": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } },
+      },
+    });
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    const adapter = fakeAdapter(repo);
+    const io = makeIO();
+    const p = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    // models screen → toggle show-all → quit
+    io.input.write(KEYS.enter + KEYS.enter + "a" + KEYS.q);
+    await p;
+    const frames = io.writes.map(strip);
+    const before = frames.find((f) => f.includes("step 3/6") && f.includes("hidden — a shows all"))!;
+    expect(before).toBeDefined();
+    expect(before).toContain("… 3 retired/preview/non-worker hidden"); // snap + embedding + preview
+    expect(before).not.toContain("fake-snap-20250101");
+    expect(before).toContain("fake-old-20240620"); // classified dated snapshot stays visible
+    expect(before).toContain("fake-live");
+    const after = frames.find((f) => f.includes("showing retired models"));
+    expect(after).toBeDefined();
+    expect(after).toContain("fake-snap-20250101");
+  });
+
+  test("retiredModelReason classifies the shapes and letter hotkeys yield to an active search", async () => {
+    expect(retiredModelReason("anthropic/claude-3-5-sonnet-20241022")).toBe("dated snapshot");
+    expect(retiredModelReason("google/deep-research-preview-04-2026")).toBe("preview");
+    expect(retiredModelReason("google/gemini-2.5-flash-image")).toBe("non-worker");
+    expect(retiredModelReason("google/gemini-1.5-pro")).toBe("legacy family");
+    expect(retiredModelReason("openai/gpt-5.6-sol")).toBeNull();
+    expect(retiredModelReason("kimi-code/k3")).toBeNull();
+
+    // an active search swallows t/n/a as search characters — "fake-new" narrowing keeps working
+    const { repo, adapter } = setup();
+    const io = makeIO();
+    const p = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    io.input.write(KEYS.enter + KEYS.enter + "fake-n" + KEYS.escape + KEYS.q);
+    await p;
+    const all = strip(io.writes.join(""));
+    expect(all).toContain("search: fake-n"); // the n joined the filter instead of opening add-model
+    expect(all).not.toContain("add model · fake");
+  });
+
+  test("windowRows keeps the cursor centered and clamps at both ends", async () => {
+    // dynamic, deliberately: components.tsx imports Ink, and Ink's color detection must run
+    // AFTER this file's TTY fixture (same seam as the fleet-app import in driveEntry above).
+    const { windowRows } = await import("../../src/tui/ink/components.js");
+    const rows = Array.from({ length: 100 }, (_, i) => i);
+    expect(windowRows(rows, 0, 10)).toMatchObject({ start: 0, above: 0, below: 90 });
+    expect(windowRows(rows, 50, 10)).toMatchObject({ start: 45, above: 45, below: 45 });
+    expect(windowRows(rows, 99, 10)).toMatchObject({ start: 90, above: 90, below: 0 });
+    expect(windowRows(rows, 5, 200).visible).toHaveLength(100); // capacity beyond length = no window
   });
 
   test("picking (keep default) on the judge screen stages nothing and an otherwise unchanged walk stays an empty diff", async () => {

@@ -761,10 +761,11 @@ acceptance is required on every task (a nested list of observable outcomes).
   WHAT MAKES A CRITERION REAL:
     - "test:" must name a real test asserting on recorded state, journal lines, or drawn frames, and its
       title must match the criterion string verbatim. It also needs a collectable test path in files[].
-    - A "test:" oracle must name a TOP-LEVEL test case, never one nested under describe(). Vitest prefixes
-      nested cases with every suite title, while the acceptance gate builds an anchored pattern that
-      vitest -t applies against the FULL runner-visible name; the verbatim leaf title then selects ZERO
-      tests and the gate parks even though the suite is green. Measured: two parks in one run.
+    - A "test:" oracle's criterion must be the test's OWN title — the leaf — verbatim. Nesting under
+      describe() is allowed (OBS-511: the gate matches the criterion as the trailing segment of the
+      runner-visible full name), but the leaf title itself must equal the criterion: a shortened,
+      decorated, or paraphrased leaf selects ZERO tests and the gate parks even though the suite is green.
+      Measured before the widening: two parks across two runs, one full attempt lost in each.
     - NO criterion may be satisfiable by an absence, a rename, a source-text grep, or an empty collection.
       "no file references X" is not a criterion — it passes in a repo where the feature was never built.
     - "goal:" is NEVER verification. Prose in the goal enforces nothing: every obligation needs an

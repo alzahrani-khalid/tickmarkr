@@ -6,14 +6,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { parse } from "yaml";
 import { allAdapters, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
-import { MODEL_STALE_DAYS, SEED_STAMPED, contextWindowLints, estimateTaskPayloadTokens, hasWindowsConfig, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
+import { readCachedCatalog, type CatalogReadResult } from "../../src/adapters/catalog-remote.js";
+import { MODEL_STALE_DAYS, SEED_STAMPED, catalogModelAdvisory, catalogTierRanking, contextWindowLints, estimateTaskPayloadTokens, hasWindowsConfig, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
 import { CITED_MODEL_WINDOWS } from "../../src/adapters/model-windows.js";
 import { compileSource } from "../../src/compile/index.js";
 import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
 import { readyTasks, setStatus } from "../../src/graph/graph.js";
 import type { RunGraph } from "../../src/graph/schema.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import type { AuthHealth } from "../../src/adapters/types.js";
+import type { AuthHealth, WorkerAdapter } from "../../src/adapters/types.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const emptyRepo = () => ({ repo: mkdtempSync(join(tmpdir(), "tickmarkr-ml-r-")), globalDir: mkdtempSync(join(tmpdir(), "tickmarkr-ml-g-")) });
@@ -237,6 +238,317 @@ describe("suggestOverlay — paste-ready drift fragment", () => {
     expect(suggestOverlay(cfg(), clean, adapters)).toBe("");
     // claude-code has no listModels; opencode installed but empty detection → both skipped, mirroring modelLints guards
     expect(suggestOverlay(cfg(), { "claude-code": installed([]), opencode: installed([]) }, adapters)).toBe("");
+  });
+});
+
+// D-2 (.planning/assessments/2026-08-13-ranking-sites.md §4.3): the absolute `index >= 65 → frontier`
+// cut was calibrated against a pre-rescale AA index. Under v4.x the #1 model on the whole leaderboard
+// scores 63.05, so the frontier branch was unreachable. Bands are FLEET-RELATIVE thirds now, over the
+// models that actually carry same-basis evidence, so the next vendor rescale moves nothing.
+describe("catalogModelAdvisory — fleet-relative tier bands", () => {
+  const AGENTIC_TASKS = ["javascript", "typescript", "python"] as const;
+  const CATEGORIES = { "Agentic Coding": [...AGENTIC_TASKS], Coding: ["code_generation"] };
+  const NOW = () => new Date("2026-08-10T00:00:00.000Z");
+  const DETECTED_AT = "2026-08-09T09:00:00.000Z";
+  const INDEX_VERSION = "4.1.1";
+  // Ids that share no prefix with one another: LiveBench resolves rows by prefix, so `m-a` vs `m-ab`
+  // would be a fixture artifact rather than a test.
+  type Fixture = { id: string; output?: number; intelligence?: number; agentic?: number };
+
+  const catalogCache = (models: readonly Fixture[], opts: { liveBench?: boolean } = {}) => ({
+    schemaVersion: 1,
+    fetchedAt: "2026-08-09T00:00:00.000Z",
+    modelsDev: {
+      anthropic: {
+        id: "anthropic",
+        models: Object.fromEntries(models.map((m) => [m.id, {
+          id: m.id,
+          name: m.id,   // models.dev `name` is how a namespaced fleet id (zai/glm-5.2) reaches its benchmark rows
+          cost: { input: 1, output: m.output ?? 1 },
+          limit: { context: 200_000, output: 32_000 },
+          reasoning: true,
+          tool_call: true,
+        }])),
+      },
+    },
+    artificialAnalysis: {
+      intelligence_index_version: INDEX_VERSION,
+      data: models.filter((m) => m.intelligence !== undefined).map((m) => ({
+        id: m.id,
+        evaluations: { artificial_analysis_intelligence_index: m.intelligence },
+      })),
+    },
+    ...(opts.liveBench === false ? {} : {
+      liveBench: {
+        tableDate: "2026_06_25",
+        categories: CATEGORIES,
+        rows: models.filter((m) => m.agentic !== undefined).map((m) => ({
+          model: m.id,
+          ...Object.fromEntries(AGENTIC_TASKS.map((task) => [task, m.agentic])),
+          code_generation: 90,
+        })),
+      },
+    }),
+  });
+
+  /** A real cache read (source: "cache"), because a vendored read is a different contract entirely. */
+  const fetched = (models: readonly Fixture[], opts: { liveBench?: boolean } = {}) => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify(catalogCache(models, opts)));
+    return { repo, catalog: readCachedCatalog(repo, { now: NOW }) };
+  };
+
+  /** An api-channel adapter whose models are all unclassified — the fleet screen's shape. */
+  const apiCfg = () => {
+    const base = cfg();
+    base.tiers.fake = { vendor: "anthropic", channel: "api", models: {} };
+    return base;
+  };
+
+  const suggestions = (base: ReturnType<typeof cfg>, catalog: CatalogReadResult, ids: readonly string[]) => {
+    const rows = ids.map((model) => ({ adapter: "fake", model }));
+    const ranking = catalogTierRanking(base, catalog, rows);
+    return new Map(ids.map((model) =>
+      [model, catalogModelAdvisory(base, catalog, "fake", model, undefined, ranking).suggestion]));
+  };
+
+  test("test: a fleet whose best AA intelligence index is 63 gets frontier suggested for its top third mid for its middle third and cheap for its bottom third, so the retired absolute 65 cut under which no model in existence could reach frontier fails", () => {
+    // Verbatim from the 2026-08-13 AA leaderboard read: the #1 model scores 63.05 and NOTHING in
+    // this fleet clears the retired 65. Six models → thirds are 2/2/2.
+    const fleet: Fixture[] = [
+      { id: "aurora", intelligence: 63.05 },
+      { id: "boreal", intelligence: 60.9 },
+      { id: "cinder", intelligence: 55 },
+      { id: "dunlin", intelligence: 50 },
+      { id: "ember", intelligence: 45 },
+      { id: "flint", intelligence: 40 },
+    ];
+    const ids = fleet.map((m) => m.id);
+    const { catalog } = fetched(fleet);
+    const base = apiCfg();
+    const suggested = suggestions(base, catalog, ids);
+
+    expect(fleet.every((m) => (m.intelligence ?? 0) < 65)).toBe(true);   // the retired cut's premise
+    expect(ids.map((id) => suggested.get(id)?.tier)).toEqual(["frontier", "frontier", "mid", "mid", "cheap", "cheap"]);
+    expect(suggested.get("aurora")).toMatchObject({ kind: "inference", basis: "intelligence" });
+    expect(suggested.get("aurora")?.provenanceNote).toContain("fleet-relative rank 1/6");
+    expect(suggested.get("flint")?.provenanceNote).toContain("fleet-relative rank 6/6");
+
+    // The paste-ready overlay is a production caller: it must band against the same universe.
+    const adapter = { id: "fake", listModels: async () => ids } as unknown as WorkerAdapter;
+    const frag = suggestOverlay(base, { fake: installed(ids, DETECTED_AT) }, [adapter], ".tickmarkr", { catalog });
+    expect(frag).toContain("SUGGESTED frontier (intelligence inference, not a measurement)");
+    expect(frag).toContain("SUGGESTED cheap (intelligence inference, not a measurement)");
+    // still advisory: every addition stays whole-line-commented with the ??? placeholder
+    expect(frag).not.toMatch(/^[^#]*:\s*(cheap|mid|frontier)\s*($|#)/m);
+  });
+
+  test("test: a model carrying both agenticCodingScore and intelligenceIndex is banded by its LiveBench rank in a fixture where its AA rank lands a different band, and an AA-based suggestion's provenance note records the intelligence index version, so wrong basis precedence or a silently rescalable AA suggestion fails", () => {
+    // aurora is the AA leader and the LiveBench laggard — the two bases disagree on purpose.
+    const fleet: Fixture[] = [
+      { id: "aurora", intelligence: 63, agentic: 30 },
+      { id: "boreal", intelligence: 40, agentic: 80 },
+      { id: "cinder", intelligence: 45, agentic: 70 },
+      { id: "dunlin", intelligence: 50 },
+    ];
+    const ids = fleet.map((m) => m.id);
+    const base = apiCfg();
+    const { catalog } = fetched(fleet);
+    const suggested = suggestions(base, catalog, ids);
+
+    // LiveBench wins: bottom of three agentic scores → cheap, and the note names table + date.
+    expect(suggested.get("aurora")).toMatchObject({ tier: "cheap", basis: "agentic-coding" });
+    expect(suggested.get("aurora")?.provenanceNote)
+      .toContain("fleet-relative rank 3/3 by LiveBench Agentic Coding 30 (LiveBench table 2026_06_25)");
+    // control: the SAME fixture without the LiveBench leg bands aurora frontier off its AA rank —
+    // so "cheap" above is basis precedence, not an accident of the numbers.
+    const aaOnly = fetched(fleet, { liveBench: false });
+    expect(suggestions(base, aaOnly.catalog, ids).get("aurora")).toMatchObject({ tier: "frontier", basis: "intelligence" });
+
+    // dunlin has no LiveBench row, so it falls to AA — and an AA band must date itself by index version.
+    expect(suggested.get("dunlin")).toMatchObject({ basis: "intelligence" });
+    expect(suggested.get("dunlin")?.provenanceNote).toContain(`intelligence index version ${INDEX_VERSION}`);
+  });
+
+  test("test: an advisory read from the vendored catalog yields no tier suggestion and its display names the shipped catalog as non-evidence while identical evidence read from the fetched cache suggests a tier, so a shipped default laundered into a fleet-reported suggestion fails", () => {
+    // Orca import #1: `catalogOrigin: spec` — a shipped default must never pass as a probe result.
+    // claude-sonnet-5 ships inside the vendored catalog; the cache below mirrors its record exactly,
+    // so the ONLY difference between the two reads is where the bytes came from.
+    const base = apiCfg();
+    const shipped = makeRepo({ "keep.txt": "x" });                 // no cache file → vendored read
+    const vendored = readCachedCatalog(shipped, { now: NOW });
+    expect(vendored.source).toBe("vendored");
+
+    const mirrored = makeRepo({ "keep.txt": "x" });
+    mkdirSync(join(mirrored, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(mirrored, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+      schemaVersion: 1,
+      fetchedAt: "2026-08-09T00:00:00.000Z",
+      modelsDev: {
+        anthropic: {
+          id: "anthropic",
+          models: {
+            "claude-sonnet-5": {
+              id: "claude-sonnet-5",
+              cost: { input: 2, output: 10 },
+              limit: { context: 1_000_000, output: 128_000 },
+              reasoning: true,
+              tool_call: true,
+              structured_output: true,
+              attachment: true,
+            },
+          },
+        },
+      },
+    }));
+    const cached = readCachedCatalog(mirrored, { now: NOW });
+    expect(cached.source).toBe("cache");
+
+    const fromShipped = catalogModelAdvisory(base, vendored, "fake", "claude-sonnet-5");
+    const fromCache = catalogModelAdvisory(base, cached, "fake", "claude-sonnet-5");
+
+    expect(fromShipped.evidence).toEqual(fromCache.evidence);       // identical evidence, both covered
+    expect(fromShipped.coverage).toBe("covered");
+    expect(fromShipped.suggestion).toBeUndefined();
+    expect(fromShipped.display).toContain("the vendored catalog is a shipped default, not fetched evidence — no tier suggestion");
+    expect(fromShipped.display).not.toContain("SUGGESTED");
+    expect(fromCache.suggestion).toMatchObject({ tier: "mid", kind: "inference" });
+    // and a vendored read seeds no ranking either — otherwise shipped defaults would move real bands
+    expect(catalogTierRanking(base, vendored, [{ adapter: "fake", model: "claude-sonnet-5" }])).toEqual([]);
+  });
+
+  test("test: a basis with fewer than three evidenced models in the ranking universe yields to the next basis and an evidence-free api-channel model still receives the price-derived suggestion, so banding thirds over a two-model sample or breaking the composer-2.5 price fallback fails", () => {
+    // Two LiveBench rows is a coin toss, not a banding — the agentic basis yields to AA. composer-2.5
+    // has zero public benchmark evidence anywhere (assessment §4.4): price is its permanent home.
+    const fleet: Fixture[] = [
+      { id: "aurora", intelligence: 63, agentic: 80 },
+      { id: "boreal", intelligence: 55, agentic: 70 },
+      { id: "cinder", intelligence: 45 },
+      { id: "composer-2.5", output: 30 },
+    ];
+    const ids = fleet.map((m) => m.id);
+    const base = apiCfg();
+    const { catalog } = fetched(fleet);
+    const ranking = catalogTierRanking(base, catalog, ids.map((model) => ({ adapter: "fake", model })));
+    const suggested = suggestions(base, catalog, ids);
+
+    expect(ranking.map((band) => band.basis)).toEqual(["intelligence"]);   // agentic (2) yielded
+    // aurora HAS an agentic score and is still banded by AA — the yield is per universe, not per model
+    expect(suggested.get("aurora")).toMatchObject({ tier: "frontier", basis: "intelligence" });
+    expect(suggested.get("aurora")?.provenanceNote).toContain("fleet-relative rank 1/3");
+    expect(suggested.get("cinder")).toMatchObject({ tier: "cheap", basis: "intelligence" });
+
+    expect(suggested.get("composer-2.5")).toMatchObject({ tier: "frontier", kind: "inference", basis: "price" });
+    expect(suggested.get("composer-2.5")?.provenanceNote).toContain("price-derived fallback");
+    // a subscription channel still refuses to read price as capability
+    const sub = apiCfg();
+    sub.tiers.fake = { ...sub.tiers.fake, channel: "sub" };
+    const subAdvisory = catalogModelAdvisory(sub, catalog, "fake", "composer-2.5", undefined, ranking);
+    expect(subAdvisory.suggestion).toBeUndefined();
+    expect(subAdvisory.display).toContain("subscription billing; no price-derived suggestion");
+  });
+
+  // The ranking universe is keyed by the resolver's matched CATALOG record, not by `modelId`, which
+  // preserves the caller's resolved spelling. The SHIPPED fleet already spells one model two ways
+  // (opencode:zai-coding-plan/glm-5.2 and pi:zai/glm-5.2 — config.ts:508/520, "two channels, one model").
+  // Counted twice, that pair alone fakes MIN_RANKED_MODELS and bands a two-model sample. The mirror
+  // defect is a configured claude alias (`opus`), which models.dev has never heard of: without the same
+  // resolver the advisory rows get, the fleet's own frontier models drop out of the universe they anchor.
+  test("two spellings of one catalog model count once in the ranking universe while a configured alias joins it through the call site's resolver, so a duplicate that fakes the three-model floor fails", () => {
+    const fleet: Fixture[] = [
+      { id: "aurora", intelligence: 63 },
+      { id: "glm-5.2", intelligence: 60 },
+      { id: "claude-opus-5", intelligence: 58 },
+    ];
+    const { catalog } = fetched(fleet);
+    const base = apiCfg();                                  // DEFAULT_CONFIG tiers, so both glm seeds are configured
+    const configuredGlm = [base.tiers.opencode?.models, base.tiers.pi?.models].map((m) => Object.keys(m ?? {}));
+    expect(configuredGlm).toEqual([["zai-coding-plan/glm-5.2"], ["zai/glm-5.2"]]);   // the shipped duplicate
+    expect(Object.keys(base.tiers["claude-code"]?.models ?? {})).toContain("opus");  // the shipped alias
+
+    const rows = [{ adapter: "fake", model: "aurora" }];
+    // glm-5.2 (×2 spellings) + aurora = TWO models, not three — the floor is unmet and the basis yields.
+    expect(catalogTierRanking(base, catalog, rows)).toEqual([]);
+    // the alias resolves only through the resolver; with it the universe is three DISTINCT models.
+    const resolver = (adapter: string, model: string) =>
+      adapter === "claude-code" && model === "opus" ? "claude-opus-5" : undefined;
+    expect(catalogTierRanking(base, catalog, rows, resolver)).toEqual([{ basis: "intelligence", scores: [63, 60, 58] }]);
+    // and one more spelling of the SAME model still adds nobody
+    expect(catalogTierRanking(base, catalog, [...rows, { adapter: "fake", model: "zai-coding-plan/glm-5.2" }], resolver))
+      .toEqual([{ basis: "intelligence", scores: [63, 60, 58] }]);
+  });
+
+  // Identity is the model's catalog id, never its evidence payload. Fingerprinted on the payload,
+  // models that TIE on every observable field read as one member: the sample falls under
+  // MIN_RANKED_MODELS, the basis yields, and three models that hold same-basis evidence all drop to
+  // price. Nothing about a tie makes two models one — an exact tie is the payload at its least
+  // discriminating, which is exactly when a value fingerprint is trusted most.
+  test("three distinct models whose evidence ties on every observable field stay three members of the ranking universe, so an identity fingerprinted from the evidence payload fails", () => {
+    const tied: Fixture[] = [
+      { id: "alpha", intelligence: 50 },
+      { id: "bravo", intelligence: 50 },
+      { id: "charlie", intelligence: 50 },
+    ];
+    const ids = tied.map((m) => m.id);
+    const { catalog } = fetched(tied);
+    const base = apiCfg();
+    // the tie is exact: identical cost, window, features and index — only the identity differs
+    const payloads = ids.map((id) =>
+      JSON.stringify({ ...catalogModelAdvisory(base, catalog, "fake", id).evidence, modelId: undefined, catalogId: undefined }));
+    expect(new Set(payloads).size).toBe(1);
+
+    expect(catalogTierRanking(base, catalog, ids.map((model) => ({ adapter: "fake", model }))))
+      .toEqual([{ basis: "intelligence", scores: [50, 50, 50] }]);   // three members, not one
+    const suggested = suggestions(base, catalog, ids);
+    expect(ids.map((id) => suggested.get(id)?.basis)).toEqual(["intelligence", "intelligence", "intelligence"]);
+    expect(suggested.get("alpha")?.provenanceNote).toContain("fleet-relative rank 1/3");
+  });
+
+  test("test: two providers sharing a bare model id rank as two distinct members by catalogId while two fleet aliases resolving to the same matched catalog record dedup to one member, so namespace-stripped or caller-spelling identity that collapses or double-counts the ranked basis fails", () => {
+    const provider = (id: string, model: string, name: string) => [id, {
+      id,
+      models: { [model]: { id: model, name, cost: { input: 1, output: 1 }, limit: { context: 200_000 }, reasoning: true } },
+    }] as const;
+    const repo = makeRepo({ "keep.txt": "x" });
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+      schemaVersion: 1,
+      fetchedAt: "2026-08-09T00:00:00.000Z",
+      modelsDev: Object.fromEntries([
+        provider("p1", "shared", "p1-shared"),
+        provider("p2", "shared", "p2-shared"),
+        provider("p3", "unique", "p3-unique"),
+      ]),
+      artificialAnalysis: {
+        intelligence_index_version: INDEX_VERSION,
+        data: [
+          { id: "p1-shared", evaluations: { artificial_analysis_intelligence_index: 60 } },
+          { id: "p2-shared", evaluations: { artificial_analysis_intelligence_index: 50 } },
+          { id: "p3-unique", evaluations: { artificial_analysis_intelligence_index: 40 } },
+        ],
+      },
+    }));
+    const catalog = readCachedCatalog(repo, { now: NOW });
+    const base = cfg();
+    base.tiers.a1 = { vendor: "p1", channel: "api", models: {} };
+    base.tiers.a1Alias = { vendor: "p1", channel: "api", models: {} };
+    base.tiers.a2 = { vendor: "p2", channel: "api", models: {} };
+    base.tiers.a3 = { vendor: "p3", channel: "api", models: {} };
+    const rows = [
+      { adapter: "a1", model: "p1/shared" },
+      { adapter: "a1Alias", model: "alias/shared" },
+      { adapter: "a2", model: "p2/shared" },
+      { adapter: "a3", model: "p3/unique" },
+    ];
+
+    const advisories = rows.map((row) => catalogModelAdvisory(base, catalog, row.adapter, row.model));
+    expect(advisories.map((advisory) => advisory.evidence?.catalogId))
+      .toEqual(["p1/shared", "p1/shared", "p2/shared", "p3/unique"]);
+    const ranking = catalogTierRanking(base, catalog, rows);
+    expect(ranking).toEqual([{ basis: "intelligence", scores: [60, 50, 40] }]);
+    expect(rows.map((row) => catalogModelAdvisory(base, catalog, row.adapter, row.model, undefined, ranking).suggestion?.tier))
+      .toEqual(["frontier", "frontier", "mid", "cheap"]);
   });
 });
 

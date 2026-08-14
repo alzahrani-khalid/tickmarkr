@@ -49,16 +49,29 @@ anything; publication happens only when the tag is pushed in the public reposito
 
 Per release:
 
-1. In the private repository: bump `version` in `package.json`, commit, and run the export in
-   mirror publish mode (below). Review the mirror commit, then push the mirror's `main`.
-2. In the **public** repository (the mirror), tag the export commit and push the tag:
+1. Check the pinned LiveBench table for a newer release and bump it if one shipped:
 
    ```bash
-   git tag -a v1.90.8 -m "v1.90.8"
-   git push origin v1.90.8
+   curl -s https://api.github.com/repos/LiveBench/livebench.github.io/contents/public \
+     | grep -o 'table_[0-9_]*\.csv' | sort -u | tail -1
    ```
 
-3. The tag push runs `release.yml` in the public repository:
+   If that filename is newer than `LIVEBENCH_TABLE_DATE` in `src/adapters/catalog-remote.ts`, bump
+   the constant (the table and categories URLs derive from it) and re-run `npm test`. The constant
+   is hand-bumped, so this listing is the only thing that notices a new question set; `tickmarkr
+   doctor` lints the age past 90 days but never fetches, and a stale pin means every tier suggestion
+   cites a dead table. Fetch tables from `livebench.ai`, never `raw.githubusercontent.com` — same
+   filename, 15 fewer models on raw.
+2. In the private repository: bump `version` in `package.json`, commit, and run the export in
+   mirror publish mode (below). Review the mirror commit, then push the mirror's `main`.
+3. In the **public** repository (the mirror), tag the export commit and push the tag:
+
+   ```bash
+   git tag -a v1.91.0 -m "v1.91.0"
+   git push origin v1.91.0
+   ```
+
+4. The tag push runs `release.yml` in the public repository:
    - `npm install -g npm@11` (OIDC trusted publishing needs a current npm)
    - `npm ci`
    - `npm run build`

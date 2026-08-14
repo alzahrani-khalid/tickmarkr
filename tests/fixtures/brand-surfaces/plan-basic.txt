@@ -13,3 +13,4 @@ routing lints:
   ! cursor-agent: no detection data — run tickmarkr doctor
   ! opencode: no detection data — run tickmarkr doctor
   ! pi: no detection data — run tickmarkr doctor
+  ! agy: no model-list surface and no configured models — classify per benchmark policy to open channels

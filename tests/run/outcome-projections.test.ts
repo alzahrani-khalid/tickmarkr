@@ -71,10 +71,11 @@ const VOCABULARY: GateOutcome[] = [
   { kind: "infra", reason: "Error: spawn EAGAIN", retryable: true },
 ];
 
-// Deliberately TOP-LEVEL and titled verbatim: the shipped acceptance gate runs the criterion through
-// `testFilterPattern`, which anchors `^…$` against Vitest's runner-visible full name — enclosing
-// describe titles space-joined onto the test title (acceptance.ts:109). A describe wrapper, or the
-// compiler-stripped `test:` marker left in the title, makes that selector match zero tests.
+// Deliberately titled verbatim at TOP LEVEL: the shipped acceptance gate runs the criterion through
+// `testFilterPattern`, whose leaf-anchored `(^| )…$` matches the criterion as the complete trailing
+// segment of Vitest's runner-visible full name (acceptance.ts — OBS-511 widened it through describe
+// prefixes). The leaf title itself must equal the criterion; a compiler-stripped `test:` marker left
+// in the title still makes the selector match zero tests.
 test("closed GateOutcome table drives normalizeGateOutcome over every vocabulary member and over legacy review-skip, baseline-skip, infra-retryable, held and malformed rows, where passed and failed controls remain unchanged and every reason is retained, so collapsing non-failure into pass or unknown into clean fails", async () => {
   // The vocabulary half. The table must name EVERY member — a member added to the union without a
   // sample here fails this line, so the table cannot silently stop being closed.

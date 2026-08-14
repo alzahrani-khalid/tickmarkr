@@ -162,6 +162,65 @@ export const CLI_CATALOG: readonly CliEntry[] = [
       listModels: { argv: ["models", "ls", "--json"], parser: "json", path: "models", field: "selector" },
     },
   } satisfies CliEntry,
+  {
+    id: "agy",
+    binary: "agy",
+    // PROBE-agy-v190.md, recorded by hand 2026-08-13: `agy --version` → `1.1.12`. A bare semver
+    // banner, so the identity pins the shape, prefix-matched to survive patch bumps.
+    identity: "^\\d+\\.\\d+\\.\\d+",
+    // agy (Antigravity) is a multi-provider gateway: its model list spans google, anthropic and
+    // openai ids, so a selected model carries its real vendor — same posture as omp.
+    vendor: "mixed",
+    drive: {
+      // PROBE-agy-v190.md: three recorded traps shape every byte of this template. (1) `-p`
+      // consumes the NEXT argv as the prompt, so every flag precedes it. (2) tool writes land in
+      // cwd ONLY when cwd is workspace-added by ABSOLUTE path — without `--add-dir "$PWD"` (and
+      // with a relative `.`) the write is silently redirected to ~/.gemini/antigravity-cli/scratch
+      // while the model still claims DONE; dispatch runs through bash -lc, so the literal "$PWD"
+      // expands to the worktree at runtime. (3) --print-timeout defaults to 5m0s, which would kill
+      // any real worker task. --dangerously-skip-permissions: a permission prompt in print mode
+      // has no answerer.
+      headless: `agy --add-dir "$PWD" --dangerously-skip-permissions --print-timeout 240m --model {model} -p "$(cat {promptFile})"`,
+      // No interactive probe is recorded (PROBE-agy-v190.md names the falsifier) — null keeps the
+      // claim honest and the print fallback drives visible panes.
+      interactive: null,
+      trustDialog: {
+        kind: "none",
+        reason: "agy 1.1.12 rendered no workspace-trust prompt across five fresh-temp-repo print-mode probes (PROBE-agy-v190.md, 2026-08-13); interactive is null, so no dialog can reach a pane",
+      },
+      // `agy models` emits `id<TAB>label` rows behind a fetch banner — no parser projects that
+      // shape without admitting label words, so the list surface stays undeclared and doctor
+      // reports "no model-list surface" (claude-code posture).
+    },
+  } satisfies CliEntry,
+  {
+    id: "prime-agent",
+    binary: "prime-agent",
+    // PROBE-prime-agent-v190.md, recorded by hand 2026-08-13: `prime-agent --version` → `0.7.1`.
+    // Bare semver banner — shape-pinned, prefix-matched (agy precedent).
+    identity: "^\\d+\\.\\d+\\.\\d+",
+    // Multi-provider gateway (anthropic, google, openai model list) — the joined provider/model
+    // id carries the real vendor, same posture as omp and agy.
+    vendor: "mixed",
+    drive: {
+      // PROBE-prime-agent-v190.md: print mode executes tools unattended in cwd with NO approval
+      // flag needed (hello.txt probe: file in cwd, exit 0, 5.6s) and no trust prompt in fresh
+      // repos. `--model` accepts the joined provider/model form the listModels contract emits
+      // (verified: --model google/gemini-3.6-flash). Prompt rides "$(cat …)" — the `@file`
+      // attach syntax exists but its semantics were not probed, so the contract does not use it.
+      headless: `prime-agent -p --model {model} "$(cat {promptFile})"`,
+      // No interactive probe is recorded (PROBE-prime-agent-v190.md names the falsifier) — null
+      // keeps the claim honest and the print fallback drives visible panes.
+      interactive: null,
+      trustDialog: {
+        kind: "none",
+        reason: "prime-agent 0.7.1 rendered no workspace-trust or tool-approval prompt across three fresh-temp-repo print-mode probes (PROBE-prime-agent-v190.md, 2026-08-13); interactive is null, so no dialog can reach a pane",
+      },
+      // `prime-agent model list` is the pi-table shape: header `provider  model …`, first two
+      // columns join to the id `--model` accepts (live-verified 2026-08-13).
+      listModels: { argv: ["model", "list"], parser: "pi-table" },
+    },
+  } satisfies CliEntry,
 ].flatMap((entry) => typeof entry === "string"
   ? [{ id: entry, binary: entry, identity: ".+", vendor: null } satisfies CliEntry]
   : [entry]);

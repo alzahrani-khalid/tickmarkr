@@ -1,5 +1,5 @@
 // Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
-import { isMap, isScalar, isSeq, parseDocument, stringify } from "yaml";
+import { isMap, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
 import type { FleetEditable, MapEntry, RoutingMode, Tier } from "./config.js";
 
 /** Fleet-owned overlay keys — the only config surface `tickmarkr fleet` may write. */
@@ -37,6 +37,9 @@ export type FleetFirstTouch = { vendor: string; channel: "sub" | "api" };
 // private provenance envelope until this module writes the YAML. The envelope never reaches disk.
 const FIRST_TOUCH_OPEN = "\uE000tickmarkr-fleet-first-touch:";
 const FIRST_TOUCH_CLOSE = "\uE001";
+// OBS-505: marks a scalar-trailing single-line comment for the two-space inline note style at
+// stringify time; applied and consumed inside renderFleetOverlayWrite, never written to disk.
+const INLINE_COMMENT_SENTINEL = "\uE002";
 
 export function fleetFirstTouchProvenance(note: string, firstTouch: FleetFirstTouch): string {
   return `${FIRST_TOUCH_OPEN}${encodeURIComponent(firstTouch.vendor)}:${firstTouch.channel}${FIRST_TOUCH_CLOSE}${note}`;
@@ -221,10 +224,23 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     }
   }
 
-  // Fleet's established note style uses two spaces before `#`; the Document remains the sole
-  // comment writer while preserving that byte-level convention for old and newly-authored notes.
+  // OBS-505: fleet's two-space note style (`tier: mid  # note`) applies to INLINE comments only.
+  // The previous commentString prefixed " #" onto EVERY comment line, so block comments — the
+  // whole init scaffold at column 0, and indented operator essays — each gained a stray leading
+  // space, turning a one-key write into a whole-file diff on the one confirmation surface an
+  // operator reviews. commentString has no position context, but this writer owns the document:
+  // scalar-trailing single-line comments (the only inline form fleet emits) are marked with a
+  // private-use sentinel (the FIRST_TOUCH envelope precedent above), everything else renders
+  // byte-identical to yaml's own stringifyComment.
+  visit(doc, (_key, node) => {
+    if (isScalar(node) && typeof node.comment === "string" && !node.comment.includes("\n")) {
+      node.comment = `${INLINE_COMMENT_SENTINEL}${node.comment}`;
+    }
+  });
   return doc.toString({
-    commentString: (comment) => comment.replace(/^(?!$)(?: $)?/gm, " #"),
+    commentString: (comment) => comment.startsWith(INLINE_COMMENT_SENTINEL)
+      ? ` #${comment.slice(1)}`
+      : comment.replace(/^(?!$)(?: $)?/gm, "#"),
   });
 }
 

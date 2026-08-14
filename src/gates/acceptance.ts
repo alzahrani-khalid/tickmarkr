@@ -105,10 +105,17 @@ function escapeRegExp(s: string): string {
 }
 
 // v1.89 T6: Vitest applies -t to the runner-visible full name (enclosing describe titles and the test
-// title, space-joined). Escaping preserves literal criteria; anchoring makes equality, rather than
-// substring containment, the named-test contract.
+// title, space-joined). Escaping preserves literal criteria; the leaf anchor makes trailing-title
+// equality, rather than substring containment, the named-test contract.
+// OBS-511 (runs 1013+1027, one full attempt lost in EACH): two independent workers nested the verbatim
+// criterion under a describe, the old `^…$` full-name equality matched zero tests, and the gate parked a
+// green suite. `(^| )` accepts any describe prefix while keeping the criterion as the complete trailing
+// segment — equality still matches (empty prefix), and a title merely CONTAINING the criterion still
+// selects zero. ponytail: a leaf title that itself ENDS with " <criterion>" also matches — vitest -t sees
+// only the space-joined full name, so true leaf-boundary precision needs the runner's --list JSON
+// (auditAcceptanceCorpus has it at doctor time); upgrade there if this window is ever exploited.
 export function testFilterPattern(name: string): string {
-  return `^${escapeRegExp(name)}$`;
+  return `(^| )${escapeRegExp(name)}$`;
 }
 
 // OBS-55: when the base command already contains `--`, append -t after forwarded args — a second `--`
@@ -181,8 +188,10 @@ export function auditAcceptanceCorpus(
               ? {
                 namedTest: {
                   criterion: item.test,
+                  // OBS-511: mirror the gate's leaf-anchored suffix rule — the audit's denominator
+                  // must count exactly the tests the -t filter would select, or doctor and gate disagree.
                   matches: runnerNames
-                    .filter(({ fullName }) => fullName === item.test)
+                    .filter(({ fullName }) => fullName === item.test || fullName.endsWith(` ${item.test}`))
                     .map(({ listed }) => listed),
                 },
               }

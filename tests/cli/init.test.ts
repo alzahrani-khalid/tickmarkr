@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { parse } from "yaml";
 
 const { mockCreateInterface } = vi.hoisted(() => {
   const mockQuestion = vi.fn();
@@ -15,7 +16,7 @@ vi.mock("node:readline/promises", () => ({ createInterface: mockCreateInterface 
 import * as registry from "../../src/adapters/registry.js";
 import { BANNER, legend, rule, statusRow, title } from "../../src/brand.js";
 import { init } from "../../src/cli/commands/init.js";
-import { configTemplate, loadConfig } from "../../src/config/config.js";
+import { configTemplate, loadConfig, renderFleetOverlayWrite, type FleetEditable } from "../../src/config/config.js";
 import { tickmarkrDir, stateDirName } from "../../src/graph/graph.js";
 import { Journal } from "../../src/run/journal.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -598,5 +599,35 @@ describe("T3 brand banner (TTY gate)", () => {
     expect(out!).toMatch(/^wrote /);
     expect(out!).toContain("tickmarkr doctor — capability matrix:");
     expect(out!).not.toMatch(/\x1b\[/);
+  });
+});
+
+describe("D-1 documentation half: the AA key is advertised where the catalog is refreshed", () => {
+  test("test: the written config template documents ARTIFICIAL_ANALYSIS_API_KEY beside the refresh-catalog command and a fleet overlay write onto that template preserves it verbatim, so an undocumented AA key or a template the overlay writer mangles fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    stampDoctor(repo, 5 * 60 * 1000);
+    await withoutTTY(async () => {
+      await runInit(repo);
+    });
+    const written = readFileSync(join(tickmarkrDir(repo), "config.yaml"), "utf8");
+
+    // Beside, not merely somewhere: the key rides the same comment block as the command that
+    // gates on it — an operator reading `--refresh-catalog` cannot miss why the AA leg is inert.
+    const lines = written.split("\n");
+    const start = lines.findIndex((l) => l.includes("tickmarkr doctor --refresh-catalog"));
+    expect(start, written).toBeGreaterThanOrEqual(0);
+    const block = lines.slice(start).findIndex((l) => !l.startsWith("#")) + start;
+    const doc = lines.slice(start, block).join("\n");
+    expect(doc).toContain("ARTIFICIAL_ANALYSIS_API_KEY");
+    expect(doc.split("\n").every((l) => l.startsWith("#"))).toBe(true); // documentation, never a live key
+
+    // OBS-505 law on the NEW template: a fleet write is still a pure append, byte-for-byte.
+    const state: FleetEditable = { denyAdapters: [], denyModels: [], tiers: {}, map: {}, floors: {} };
+    const after = renderFleetOverlayWrite(written, { initial: state, edited: state, mode: "staff-led" });
+    expect(after.startsWith(written)).toBe(true);
+    expect(after.split(doc).length - 1).toBe(1);
+    expect(after).not.toMatch(/^ #/m);
+    expect(parse(after).routing.mode).toBe("staff-led");
   });
 });

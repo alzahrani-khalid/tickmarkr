@@ -19,14 +19,27 @@ function noCall(): FakeAdapter {
 const repoRoot = process.cwd();
 const base = execSync("git rev-parse HEAD", { cwd: repoRoot, encoding: "utf8" }).trim();
 
-// Dedicated file-level fixtures: a named-test oracle now means the complete runner-visible name, so an
-// enclosing describe title or a decorative suffix would deliberately make these different names.
+// Dedicated file-level fixtures: a named-test oracle means the criterion is the complete TRAILING
+// segment of the runner-visible name — top-level equality and describe-nested verbatim leaves both
+// match (OBS-511); a decorative suffix on the leaf still makes a different name.
 test("OBS55_MATCH_PASS", () => {
   expect(true).toBe(true);
 });
 
 // OBS-62: criterion strings with regex metachars must match verbatim-titled tests once escaped.
 test("init points at existing specs when specs/*.spec.md already exist", () => {
+  expect(true).toBe(true);
+});
+
+// OBS-511: two independent workers nested the verbatim criterion under a describe and the old
+// full-name equality selected zero tests. This fixture pins the widened contract: nested verbatim
+// leaf matches; a leaf that merely CONTAINS the criterion mid-title still selects zero.
+describe("OBS511 enclosing suite title", () => {
+  test("OBS511_NESTED_MATCH_PASS", () => {
+    expect(true).toBe(true);
+  });
+});
+test("OBS511_MIDSTRING_DECOY trailing words", () => {
   expect(true).toBe(true);
 });
 
@@ -76,6 +89,24 @@ describe("OBS-55 — test oracle match verification", () => {
     expect(r.details).toContain("OBS55_MATCH_PASS");
   }, 60_000);
 
+  test("OBS-511: a verbatim criterion leaf nested under a describe now matches and passes", async () => {
+    const r = await acceptanceGate(
+      oracleTask("OBS511_NESTED_MATCH_PASS"),
+      repoRoot, base, { adapter: noCall(), model: "fake-1" }, undefined, { testCmd: oneFileCmd },
+    );
+    expect(r.pass).toBe(true);
+    expect(r.details).toContain("OBS511_NESTED_MATCH_PASS");
+  }, 60_000);
+
+  test("OBS-511: a leaf that merely contains the criterion mid-title still selects zero tests and fails closed", async () => {
+    const r = await acceptanceGate(
+      oracleTask("OBS511_MIDSTRING_DECOY"),
+      repoRoot, base, { adapter: noCall(), model: "fake-1" }, undefined, { testCmd: oneFileCmd },
+    );
+    expect(r.pass).toBe(false);
+    expect(r.details).toMatch(/matched zero tests/i);
+  }, 60_000);
+
   test("a test oracle with a matching failing test still fails", async () => {
     const repo = makeRepo({ "x.txt": "x\n" });
     const b = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
@@ -92,13 +123,13 @@ describe("OBS-55 — test oracle match verification", () => {
 
   test("testFiltered composes a base command already containing `--` without dropping the name filter", () => {
     const cmd = testFiltered("npm test -- --maxWorkers=6", "OBS55_MATCH_PASS");
-    expect(cmd).toBe("npm test -- --maxWorkers=6 -t '^OBS55_MATCH_PASS$'");
+    expect(cmd).toBe("npm test -- --maxWorkers=6 -t '(^| )OBS55_MATCH_PASS$'");
     expect(cmd).not.toMatch(/\s--\s-t\b/);
 
     expect(testFiltered("vitest run", "OBS55_MATCH_PASS"))
-      .toBe("vitest run -t '^OBS55_MATCH_PASS$'");
+      .toBe("vitest run -t '(^| )OBS55_MATCH_PASS$'");
     expect(testFiltered("npm test", "OBS55_MATCH_PASS"))
-      .toBe("npm test -- -t '^OBS55_MATCH_PASS$'");
+      .toBe("npm test -- -t '(^| )OBS55_MATCH_PASS$'");
   });
 
   test("no code path lets a zero-matched test run count as an oracle pass", async () => {
@@ -483,7 +514,7 @@ t6AcceptanceTest(
 );
 
 t6AcceptanceTest(
-  `runAcceptanceGate uses Vitest's listed full name for fixtures at one and two describe levels; each exact space-joined criterion passes and the identical inner title alone fails, with gate results proving a helper not called by acceptance cannot satisfy it`,
+  `runAcceptanceGate uses Vitest's listed full name for fixtures at one and two describe levels; the exact space-joined criterion and the verbatim leaf title both pass through describe prefixes, while an enclosing describe title alone still matches zero tests`,
   async () => {
     const fixtures = [writeFixture("inner", ["outer"]), writeFixture("inner", ["outer", "middle"])];
     try {
@@ -494,10 +525,14 @@ t6AcceptanceTest(
         expect(fullName).not.toBe("inner");
 
         const exact = await runAcceptanceGate(root, file, fullName);
-        const innerOnly = await runAcceptanceGate(root, file, "inner");
+        // OBS-511: the verbatim leaf title is the criterion contract — describe nesting no longer hides it.
+        const leafOnly = await runAcceptanceGate(root, file, "inner");
+        // A describe title is never a criterion: nothing in the full name ENDS with it.
+        const describeOnly = await runAcceptanceGate(root, file, "outer");
         expect(exact.pass).toBe(true);
-        expect(innerOnly.pass).toBe(false);
-        expect(innerOnly.details).toMatch(/matched zero tests/i);
+        expect(leafOnly.pass).toBe(true);
+        expect(describeOnly.pass).toBe(false);
+        expect(describeOnly.details).toMatch(/matched zero tests/i);
       }
     } finally {
       for (const { root } of fixtures) rmSync(root, { recursive: true, force: true });

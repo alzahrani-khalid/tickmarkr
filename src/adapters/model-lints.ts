@@ -16,6 +16,26 @@ const DAY_MS = 86400000;
 // 2026-08-12 (D-OBS-11: cursor's residual lint list was still mostly effort variants of configured bases).
 const LINT_VARIANT_RE = /^auto$|-(fast|minimal|none|low|medium|high|xhigh|max|thinking)$/;
 const LINT_CAP = 5;
+
+/**
+ * Operator directive 2026-08-13 ("we should exclude all retired models"): the fleet models
+ * screen hides these classes BY DEFAULT — omp alone reports 218 ids, most of them dated
+ * snapshots, previews, and SKUs that can never carry a worker. Shape-based on purpose: a
+ * knowledge list of retired families rots, a suffix grammar does not. Hidden is never gone —
+ * the screen counts what it hid and one key reveals it, and CLASSIFIED models are never hidden
+ * regardless of shape (an operator who tiered a dated snapshot meant it).
+ */
+export function retiredModelReason(model: string): "dated snapshot" | "preview" | "non-worker" | "legacy family" | null {
+  const bare = model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
+  // vendor-dated pins: claude-3-5-sonnet-20241022, claude-opus-4-1-20250805, *-preview-10-2025
+  if (/-20\d{6}$/.test(bare)) return "dated snapshot";
+  if (/-preview(?:-\d{2}-20\d{2})?$/.test(bare)) return "preview";
+  // SKUs that cannot carry a worker seat: media, embedding, retrieval, and browsing surfaces
+  if (/(?:^|-)(?:embed(?:ding)?s?|tts|whisper|audio|image|vision|ocr|rerank|moderation|computer-use|deep-research)(?:-|$)/.test(bare)) return "non-worker";
+  // superseded generations still reported by CLIs long after retirement
+  if (/^(?:gemini-1\.|claude-3-|gpt-3\.|gpt-4-)/.test(bare)) return "legacy family";
+  return null;
+}
 const TTY_LINT_CAP = 3;
 const DEFAULT_STATE_DIR = ".tickmarkr";
 const doctorJsonRef = (stateDir: string) => ` — see ${stateDir}/doctor.json`;
@@ -27,26 +47,130 @@ export const ttyVisual = () => process.stdout.isTTY === true && process.env.NO_C
 // ponytail: chars/4 token heuristic — good enough for advisory plan lint; no tokenizer dep.
 const CHARS_PER_TOKEN = 4;
 
+/** Bases that band FLEET-RELATIVELY, most-trusted first (2026-08-13 ranking-sites assessment §4.3). */
+const RANKED_BASES = ["agentic-coding", "intelligence"] as const;
+type RankedBasis = typeof RANKED_BASES[number];
+export type CatalogSuggestionBasis = RankedBasis | "price";
+
 export interface CatalogModelAdvisory {
   coverage: "covered" | "uncovered";
   evidence?: CatalogModelEvidence;
-  suggestion?: { tier: Tier; kind: "inference"; basis: "intelligence" | "price"; provenanceNote: string };
+  suggestion?: { tier: Tier; kind: "inference"; basis: CatalogSuggestionBasis; provenanceNote: string };
   display: string;
 }
 
-const intelligenceTier = (index: number): Tier => index >= 65 ? "frontier" : index >= 40 ? "mid" : "cheap";
+/** A (adapter, model) pair under advisory at a call site; it joins that call's ranking universe. */
+export interface CatalogAdvisoryRow { adapter: string; model: string; resolvedModel?: string }
+
+/** Per-basis descending scores; a basis below MIN_RANKED_MODELS never appears, so it yields. */
+export type CatalogTierRanking = ReadonlyArray<{ basis: RankedBasis; scores: number[] }>;
+
+/**
+ * D-2 (2026-08-13 ranking-sites assessment): the retired `index >= 65 → frontier` cut was calibrated
+ * against an older, higher-ceilinged AA index. After the v4.x rescale the best model in existence
+ * scored 63.05, so NOTHING could ever be frontier. An absolute cut against a vendor index that gets
+ * rescaled is the defect CLASS — the fix is a rank among the models we actually hold same-basis
+ * evidence for, not a new magic number. Three is the floor: thirds over two models is a coin toss.
+ */
+const MIN_RANKED_MODELS = 3;
+
+/** Rank r of n, 0-based: top third → frontier, middle third → mid, bottom third → cheap. */
+const bandOfRank = (rank: number, total: number): Tier =>
+  rank * 3 < total ? "frontier" : rank * 3 < total * 2 ? "mid" : "cheap";
+
+const basisScore = (evidence: CatalogModelEvidence, basis: RankedBasis): number | undefined =>
+  basis === "agentic-coding" ? evidence.agenticCodingScore : evidence.intelligenceIndex;
+
 const priceTier = (outputPerMtok: number): Tier => outputPerMtok >= 12 ? "frontier" : outputPerMtok >= 2 ? "mid" : "cheap";
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+
+function catalogEvidenceFor(
+  cfg: TickmarkrConfig,
+  catalog: CatalogReadResult,
+  row: CatalogAdvisoryRow,
+): CatalogModelEvidence | undefined {
+  return resolveCatalogModel(catalog.catalog, {
+    // A tier vendor is NULLABLE (config.ts:64) — null means "declared as having none at tier level, so
+    // each model must declare its own". `resolveCatalogModel` takes an optional provider HINT
+    // (catalog-remote.ts:218), and "no hint" is `undefined` there, so null normalizes to undefined rather
+    // than travelling as a third state. Neither T17 nor T19 could see this seam: their files[] are
+    // disjoint, so no ordering edge was derived, they dispatched 7ms apart, and each worktree was cut
+    // before the other's change existed. Both gates passed truthfully; only the merged pair fails to
+    // compile (OBS-371).
+    provider: cfg.tiers[row.adapter]?.vendor ?? undefined,
+    model: row.model,
+    ...(row.resolvedModel ? { resolvedModel: row.resolvedModel } : {}),
+  });
+}
+
+/**
+ * The ranking universe: configured tier models ∪ the rows under advisory at THIS call site,
+ * restricted per basis to those that resolve it. Build it once per call — a band that depended on
+ * which adapter happened to be iterated first would not be a band. `resolvedModel` is the SAME
+ * resolver the call site hands its advisory rows: a configured claude alias (`opus`) is absent from
+ * models.dev under that spelling, so without it the fleet's own frontier models silently drop out
+ * of the universe they are supposed to anchor.
+ */
+export function catalogTierRanking(
+  cfg: TickmarkrConfig,
+  catalog: CatalogReadResult,
+  rows: readonly CatalogAdvisoryRow[] = [],
+  resolvedModel?: (adapter: string, model: string) => string | undefined,
+): CatalogTierRanking {
+  // Orca import #1: the vendored catalog is a shipped default (`catalogOrigin: spec` in orca's terms),
+  // never a fetched observation — it may not seed a ranking any more than it may seed a suggestion.
+  if (catalog.source === "vendored") return [];
+  const configured: CatalogAdvisoryRow[] = Object.entries(cfg.tiers).flatMap(([adapter, entry]) =>
+    Object.keys(entry.models).map((model) => ({ adapter, model, resolvedModel: resolvedModel?.(adapter, model) })));
+  // The resolver supplies the matched `<providerKey>/<recordId>`: caller spellings never define
+  // identity, aliases of one record collapse, and equal bare ids under distinct providers do not.
+  const universe = new Map<string, CatalogModelEvidence>();
+  for (const row of [...configured, ...rows]) {
+    const evidence = catalogEvidenceFor(cfg, catalog, row);
+    if (evidence) universe.set(evidence.catalogId, evidence);
+  }
+  const members = [...universe.values()];
+  return RANKED_BASES.flatMap((basis) => {
+    const scores = members
+      .map((member) => basisScore(member, basis))
+      .filter((score): score is number => score !== undefined)
+      .sort((a, b) => b - a);
+    return scores.length >= MIN_RANKED_MODELS ? [{ basis, scores }] : [];
+  });
+}
+
+/** First basis that both clears the floor AND can place this model; ties share the better band. */
+function rankedSuggestion(
+  ranking: CatalogTierRanking,
+  evidence: CatalogModelEvidence,
+): { basis: RankedBasis; tier: Tier; basisNote: string } | undefined {
+  for (const { basis, scores } of ranking) {
+    const score = basisScore(evidence, basis);
+    if (score === undefined) continue;
+    const rank = scores.filter((other) => other > score).length;
+    // Every suggestion names its evidence source AND its date: an AA band that omits the index
+    // version is exactly the silent-rescale defect D-2 shipped to everyone.
+    const source = basis === "agentic-coding"
+      ? `LiveBench Agentic Coding ${round1(score)} (LiveBench table ${evidence.evidenceDate ?? "date not reported"})`
+      : `Artificial Analysis Intelligence Index ${round1(score)} (intelligence index version ${evidence.intelligenceIndexVersion ?? "not reported"})`;
+    return { basis, tier: bandOfRank(rank, scores.length), basisNote: `fleet-relative rank ${rank + 1}/${scores.length} by ${source}` };
+  }
+  return undefined;
+}
 
 function catalogEvidenceNote(evidence: CatalogModelEvidence, catalog: CatalogReadResult): string {
   const cost = evidence.inputCostPerMtok !== undefined && evidence.outputCostPerMtok !== undefined
     ? `$${evidence.inputCostPerMtok}/$${evidence.outputCostPerMtok} per Mtok`
     : "not reported";
   const features = evidence.features.length ? evidence.features.join(",") : "none reported";
+  const agentic = evidence.agenticCodingScore !== undefined
+    ? `; LiveBench Agentic Coding=${round1(evidence.agenticCodingScore)}${evidence.evidenceDate ? ` (table ${evidence.evidenceDate})` : ""}`
+    : "";
   const intelligence = evidence.intelligenceIndex !== undefined
     ? `; Artificial Analysis Intelligence Index=${evidence.intelligenceIndex}${evidence.intelligenceIndexVersion ? ` (version ${evidence.intelligenceIndexVersion})` : ""}`
     : "";
   const freshness = catalog.stale ? `${catalog.source} stale cache` : catalog.source;
-  return `models.dev id=${evidence.modelId}; cost=${cost}; context=${evidence.contextWindow ?? "not reported"}; features=${features}${intelligence}; catalog=${freshness}; fetchedAt=${catalog.catalog.fetchedAt}`;
+  return `models.dev id=${evidence.modelId}; cost=${cost}; context=${evidence.contextWindow ?? "not reported"}; features=${features}${agentic}${intelligence}; catalog=${freshness}; fetchedAt=${catalog.catalog.fetchedAt}`;
 }
 
 export function catalogModelAdvisory(
@@ -55,20 +179,11 @@ export function catalogModelAdvisory(
   adapter: string,
   model: string,
   resolvedModel?: string,
+  ranking?: CatalogTierRanking,
 ): CatalogModelAdvisory {
   const entry = cfg.tiers[adapter];
-  const evidence = resolveCatalogModel(catalog.catalog, {
-    // A tier vendor is NULLABLE (config.ts:64) — null means "declared as having none at tier level, so
-    // each model must declare its own". `resolveCatalogModel` takes an optional provider HINT
-    // (catalog-remote.ts:218), and "no hint" is `undefined` there, so null normalizes to undefined rather
-    // than travelling as a third state. Neither T17 nor T19 could see this seam: their files[] are
-    // disjoint, so no ordering edge was derived, they dispatched 7ms apart, and each worktree was cut
-    // before the other's change existed. Both gates passed truthfully; only the merged pair fails to
-    // compile (OBS-371).
-    provider: entry?.vendor ?? undefined,
-    model,
-    ...(resolvedModel ? { resolvedModel } : {}),
-  });
+  const row: CatalogAdvisoryRow = { adapter, model, resolvedModel };
+  const evidence = catalogEvidenceFor(cfg, catalog, row);
   if (!evidence) {
     return {
       coverage: "uncovered",
@@ -77,11 +192,21 @@ export function catalogModelAdvisory(
   }
 
   const note = catalogEvidenceNote(evidence, catalog);
-  const basis = evidence.intelligenceIndex !== undefined
-    ? { basis: "intelligence" as const, tier: intelligenceTier(evidence.intelligenceIndex) }
-    : entry?.channel === "api" && evidence.outputCostPerMtok !== undefined
-      ? { basis: "price" as const, tier: priceTier(evidence.outputCostPerMtok) }
-      : undefined;
+  // Orca import #1, read site: a shipped default must never launder into a fleet-reported suggestion.
+  if (catalog.source === "vendored") {
+    return {
+      coverage: "covered",
+      evidence,
+      display: `${model} → ${note}; the vendored catalog is a shipped default, not fetched evidence — no tier suggestion (run tickmarkr doctor --refresh-catalog)`,
+    };
+  }
+  const ranked = rankedSuggestion(ranking ?? catalogTierRanking(cfg, catalog, [row]), evidence);
+  const basis = ranked
+    ?? (entry?.channel === "api" && evidence.outputCostPerMtok !== undefined
+      // composer-2.5's permanent home: it has zero public benchmark evidence anywhere, so price is
+      // the only basis it will ever have. Unchanged absolute thresholds — price is not rescaled.
+      ? { basis: "price" as const, tier: priceTier(evidence.outputCostPerMtok), basisNote: "price-derived fallback — no fleet-relative ranking basis covers this model" }
+      : undefined);
   if (!basis) {
     const reason = entry?.channel === "sub" && evidence.outputCostPerMtok !== undefined
       ? "subscription billing; no price-derived suggestion"
@@ -89,7 +214,7 @@ export function catalogModelAdvisory(
     return { coverage: "covered", evidence, display: `${model} → ${note}; ${reason}` };
   }
 
-  const provenanceNote = `SUGGESTED ${basis.tier} (${basis.basis} inference, not a measurement) — ${note}; operator confirmation required`;
+  const provenanceNote = `SUGGESTED ${basis.tier} (${basis.basis} inference, not a measurement) — ${basis.basisNote}; ${note}; operator confirmation required`;
   return {
     coverage: "covered",
     evidence,
@@ -314,7 +439,12 @@ export function modelLints(
   for (const adapter of adapters) {
     const id = adapter.id;
     if (!adapter.listModels) {
-      lints.push(`${id}: no model-list surface — seeds stamped ${SEED_STAMPED}; verify manually`);
+      // v1.90 / OBS-504: the seeds-stamped wording presumes a seeded tier table. agy ships routable
+      // but UNCLASSIFIED (no listModels, no seed models) — for that shape the honest sentence names
+      // the classification debt, not a seed stamp with nothing behind it.
+      lints.push(Object.keys(cfg.tiers[id]?.models ?? {}).length > 0
+        ? `${id}: no model-list surface — seeds stamped ${SEED_STAMPED}; verify manually`
+        : `${id}: no model-list surface and no configured models — classify per benchmark policy to open channels`);
       continue;
     }
     const h = health[id];
@@ -383,23 +513,18 @@ export function suggestOverlay(
     resolvedModel?: (adapter: string, model: string) => string | undefined;
   } = {},
 ): string {
-  const blocks: string[] = [];
-  for (const adapter of adapters) {
+  // Pass 1 — decide WHAT each adapter drifts by. Pass 2 renders, after every addition this call
+  // will print has joined one ranking universe: a fleet-relative band must not depend on which
+  // adapter happened to be iterated first.
+  const drifts = adapters.flatMap((adapter) => {
     const id = adapter.id;
-    if (!adapter.listModels) continue;       // no list surface → nothing to diff (mirror modelLints)
+    if (!adapter.listModels) return [];      // no list surface → nothing to diff (mirror modelLints)
     const h = health[id];
     const detected = h?.models ?? [];
-    if (detected.length === 0) continue;     // no detection data → don't guess a delta
+    if (detected.length === 0) return [];    // no detection data → don't guess a delta
     const configured = Object.keys(cfg.tiers[id]?.models ?? {});
-    const date = h?.modelsDetectedAt?.split("T")[0]; // best-effort day stamp
-    const detNote = date ? ` (detected ${date})` : "";
-
-    const lines: string[] = [];
     // Tombstones: configured ids the CLI no longer reports. Ids are operator-authored (from cfg) → MODEL_ID_RE only.
-    for (const model of configured) {
-      if (detected.includes(model) || !MODEL_ID_RE.test(model)) continue;
-      lines.push(`      ${model}: null   # tombstone: ${id} no longer reports this id${detNote}${referenceWarning(cfg, id, model)}`);
-    }
+    const tombstones = configured.filter((model) => !detected.includes(model) && MODEL_ID_RE.test(model));
     // Additions: detected ids not in cfg. WHOLE line commented, no tier (MODEL-06). Ids come from an external
     // CLI → MODEL_ID_RE (defense-in-depth, T-21-01) + the variant filter (cursor's ~193 parameterized ids).
     // RELATIONAL gate (no capability judgment — "looks like an embedding model" is auto-tiering's cousin, the
@@ -413,6 +538,7 @@ export function suggestOverlay(
     // not silently. ponytail: not worth a per-adapter heuristic to quiet cursor at the price of codex signal.
     const cfgPrefixes = new Set(configured.map(providerPrefix));
     const cfgCanon = new Set(configured.map(canonical));
+    const additions: string[] = [];
     let omitted = 0;
     for (const model of detected) {
       if (configured.includes(model) || !MODEL_ID_RE.test(model) || LINT_VARIANT_RE.test(model)) continue;
@@ -420,8 +546,25 @@ export function suggestOverlay(
         omitted++;
         continue;
       }
+      additions.push(model);
+    }
+    return [{ id, date: h?.modelsDetectedAt?.split("T")[0], tombstones, additions, omitted }]; // date: best-effort day stamp
+  });
+  const ranking = opts.catalog
+    ? catalogTierRanking(cfg, opts.catalog, drifts.flatMap(({ id, additions }) =>
+      additions.map((model) => ({ adapter: id, model, resolvedModel: opts.resolvedModel?.(id, model) }))), opts.resolvedModel)
+    : [];
+
+  const blocks: string[] = [];
+  for (const { id, date, tombstones, additions, omitted } of drifts) {
+    const detNote = date ? ` (detected ${date})` : "";
+    const lines: string[] = [];
+    for (const model of tombstones) {
+      lines.push(`      ${model}: null   # tombstone: ${id} no longer reports this id${detNote}${referenceWarning(cfg, id, model)}`);
+    }
+    for (const model of additions) {
       const advisory = opts.catalog
-        ? catalogModelAdvisory(cfg, opts.catalog, id, model, opts.resolvedModel?.(id, model))
+        ? catalogModelAdvisory(cfg, opts.catalog, id, model, opts.resolvedModel?.(id, model), ranking)
         : undefined;
       const guidance = advisory?.suggestion
         ? `provenance note (operator confirmation required): ${advisory.suggestion.provenanceNote}; choose a tier, then uncomment`

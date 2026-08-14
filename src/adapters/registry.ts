@@ -78,7 +78,21 @@ export function probeVersionShell(bin: string, cwd = process.cwd()): AuthHealth 
   const { resolved, all } = resolveShellBinary(bin, cwd);
   if (!resolved) return { installed: false, authed: false, models: [] };
   const r = shellSpawnSync(`${shq(resolved)} --version`, cwd);
-  if (r.code !== 0) return { installed: false, authed: false, models: [], binaryPaths: all };
+  if (r.code !== 0) {
+    // OBS-503: a resolved binary whose --version CRASHES under the worker shell is not "not
+    // installed" — a stale node on the login-shell PATH (bash -lc re-derives PATH) crashes every
+    // `#!/usr/bin/env node` CLI at dispatch while the operator's interactive shell runs it fine.
+    // installed stays false (dispatch runs through this same shell and would crash identically —
+    // fail closed), but the note names the real failure so doctor never prints a lie.
+    const reason = `${r.stderr}\n${r.stdout}`.replace(/\s+/g, " ").trim();
+    return {
+      installed: false,
+      authed: false,
+      models: [],
+      binaryPaths: all,
+      note: `found at ${resolved} but \`--version\` exited ${r.code} under the worker shell (bash -lc)${reason ? ` — ${reasonTail(reason)}` : ""}`,
+    };
+  }
   return {
     installed: true,
     authed: true,
@@ -289,7 +303,13 @@ export function parseDeclaredModels(
   } else if (parser === "pi-table") {
     const lines = raw.trim().split("\n");
     const header = lines.findIndex((line) => /^provider\s+model\b/i.test(line.trim()));
-    values = header === -1 ? [] : lines.slice(header + 1).map((line) => {
+    // OBS-506: a missing header previously fell through to a REASONLESS empty result, so the
+    // "never silently" warning below the parser could not fire — prime-agent's stderr-routed
+    // table produced a silent zero for a whole doctor run. An absent table names itself.
+    if (header === -1) {
+      return { models: [], reason: `no \`provider model …\` table header in ${raw.trim() ? `${lines.length} line(s) of output` : "empty output"}` };
+    }
+    values = lines.slice(header + 1).map((line) => {
       const [provider, model] = line.trim().split(/\s+/);
       return provider && model ? `${provider}/${model}` : "";
     });
@@ -347,7 +367,10 @@ function declarativeAdapter(entry: CliEntry & { drive: DeclarativeCliDrive }): W
         const result = shellSpawnSync(cmd, process.cwd(), 15000);
         if (result.code !== 0) return [];
         const { models, reason } = parseDeclaredModels(
-          result.stdout,
+          // OBS-506: prime-agent prints its model table to STDERR (stdout 0 bytes, live-verified
+          // 2026-08-13) — the same stream convention probeVersionShell already tolerates for
+          // version banners. Fall back only when stdout is EMPTY, never merge the streams.
+          result.stdout.trim() ? result.stdout : result.stderr,
           drive.listModels!.parser,
           drive.listModels!.path,
           drive.listModels!.field,
@@ -402,7 +425,9 @@ export async function probeAll(adapters: WorkerAdapter[], opts: { cwd?: string }
     if (bin) {
       const shell = probeVersionShell(bin, cwd);
       h = { ...h, installed: shell.installed, version: shell.version ?? h.version };
-      if (!shell.installed) h = { ...h, installed: false, authed: false };
+      // OBS-503: the shell probe's note replaces the adapter probe's own — keeping a bare-spawn
+      // success note ("auth verified via …") next to installed:false stores a self-contradiction.
+      if (!shell.installed) h = { ...h, installed: false, authed: false, note: shell.note };
     }
     out[a.id] = h;
   }));
@@ -712,7 +737,8 @@ export function initDoctorReuse(repoRoot: string, fresh: boolean): { reuse: bool
 export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Record<string, AuthHealth>, adapters: WorkerAdapter[], opts: { wrote?: boolean } = {}): string {
   const rows = adapters.map((a) => {
     const h = health[a.id];
-    const state = !h?.installed ? "not installed" : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
+    // OBS-503: a crash-on-version verdict carries its reason in note — print it instead of the lie.
+    const state = !h?.installed ? (h?.note ?? "not installed") : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
     return `  ${h?.installed ? "✓" : "✗"} ${a.id.padEnd(14)} ${state}`;
   });
   rows.push(`  ${HerdrDriver.available() ? "✓" : "✗"} herdr          ${HerdrDriver.available() ? "driver available (HERDR_ENV=1)" : "not detected — subprocess driver will be used"}`);

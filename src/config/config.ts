@@ -757,6 +757,11 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 # tiers:                  # model → capability band; extend when new models ship
 #   claude-code: { vendor: anthropic, channel: sub, models: { fable: frontier } }
 #   codex: { models: { gpt-5.2-codex: null } }   # null = tombstone: removes a stale seed id
+# tier evidence: \`tickmarkr doctor --refresh-catalog\` fetches the catalogs behind tier suggestions.
+#   models.dev and LiveBench need no key. The Artificial Analysis leg runs ONLY when the environment
+#   carries ARTIFICIAL_ANALYSIS_API_KEY (free key: artificialanalysis.ai) — unset, AA contributes
+#   nothing and suggestions fall back to LiveBench's agentic-coding rank, then price. Not a config
+#   key: an API credential belongs in the environment, never in a tracked overlay.
 # visibility:
 #   llm: headless         # headless (default): judge/review/consult run silently | pane: visible agents
 #   keepPanes: run        # run (default): ephemeral judge/review/consult panes close when read; a merged task's worker pane closes on done; other worker panes persist until run end | attempt | forever (keep everything for debugging)

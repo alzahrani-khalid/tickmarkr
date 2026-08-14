@@ -17,9 +17,9 @@ import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 // accepted approval that never reached a dispatch, with a recovery command claimed only over the ids
 // it can actually release.
 //
-// Every test here is TOP-LEVEL, never inside a describe(): the acceptance oracle filters with an
-// ANCHORED `-t '^…$'` over vitest's full name (enclosing describe titles space-joined onto the test
-// title), so a wrapper makes a verbatim criterion unmatchable.
+// Every test here is TOP-LEVEL with a verbatim title: the acceptance oracle filters with a leaf-anchored
+// `-t '(^| )…$'` over vitest's full name (OBS-511 widened it through describe prefixes), so the test's
+// OWN title must still equal the criterion — a shortened or decorated leaf stays unmatchable.
 
 const lockPath = (repo: string) => join(tickmarkrDir(repo), "graph.lock");
 

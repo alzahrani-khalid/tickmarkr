@@ -2,6 +2,14 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.91 — evidence tiering
+
+Tier suggestions stop wearing a costume. Before this release every "intelligence" tier suggestion in a keyless install was price inference in disguise — the Artificial Analysis leg only fetched behind an API key nobody was told to set (D-1), and even with the key, the absolute `index >= 65 → frontier` cut was unreachable after AA's v4 rescale left the #1 model on the whole leaderboard at 63 (D-2): no model in existence could be suggested frontier.
+
+The catalog gains a keyless LiveBench leg as the default evidence path: the pinned `table_<date>.csv` and `categories_<date>.json` fetched from `livebench.ai` (never the stale GitHub mirror), aggregates derived from the published categories file rather than a hardcoded column list, fleet ids matched by boundary-respecting prefix with the highest-effort row winning, and a failed or zero-row fetch preserved as a failed probe instead of an empty fleet. Evidence rows now carry `agenticCodingScore`, `codingScore`, the table date, AA's coding index — and `catalogId`, the matched catalog record's own `provider/id` identity, so rankings can never inherit scores through a caller's spelling, a stripped namespace, or a broad model family.
+
+Tier suggestions are now fleet-relative: models rank against the fleet's own same-basis evidence (LiveBench agentic coding first, then the AA index with its version recorded in the provenance note, then the unchanged price fallback), top third frontier, middle mid, bottom cheap — immune to the next vendor rescale by construction. A basis needs at least three evidenced members before it bands anything, the vendored fallback catalog is refused as suggestion evidence outright, and suggestions remain strictly advisory: the review-diff consent gate is untouched. Doctor lints the pinned LiveBench table once it ages past 90 days, the release ritual checks upstream for a newer table, and `ARTIFICIAL_ANALYSIS_API_KEY` is finally documented where operators actually look. No breaking changes.
+
 ## v1.90 — external truth
 
 The first release shaped by real external use instead of self-hardening: a two-week trial running tickmarkr as the executor on a production Expo app surfaced, in its first nineteen minutes, defect classes forty releases of dogfooding could never see — and this release ships their fixes plus the command that makes the verifier usable without the run loop.

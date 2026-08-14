@@ -214,9 +214,9 @@ describe("KIMI-02 command shapes + trailer parse", () => {
 describe("registry + tiers", () => {
   // v1.89 T2: catalog-driven adapters append after the natives, so omp took the terminal slot from
   // kimi — kimi stays last among the natives, which is what the historical tie-break order pins.
-  test("omp is the last adapter in the registry order", () => {
+  test("prime-agent is the last adapter in the registry order", () => {
     expect(allAdapters().map((a) => a.id)).toEqual([
-      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp",
+      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp", "agy", "prime-agent",
     ]);
   });
 

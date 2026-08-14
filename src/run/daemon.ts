@@ -2018,7 +2018,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const promptFile = writePrompt(journal.dir, t, attempt, feedback, nonce);
       // OBS-56: state the non-interactive, one-pass finish contract and the OBS-54 stall budget in every
       // worker prompt, not only consult retry guidance. Prepended so prompt.ts's completion trailer stays last.
-      const workerContract = `## Harness contract\n- This harness is non-interactive: make one continuous pass; do not stop for questions or follow-up input.\n- You have a ${taskTimeoutMinutes} minute stall window. Budget the full suite once, then commit and emit the completion trailer before it expires.\n- Each test: acceptance criterion must exist as a vitest test whose title matches the criterion string verbatim.`; // OBS-64
+      const workerContract = `## Harness contract\n- This harness is non-interactive: make one continuous pass; do not stop for questions or follow-up input.\n- You have a ${taskTimeoutMinutes} minute stall window. Budget the full suite once, then commit and emit the completion trailer before it expires.\n- Each test: acceptance criterion must exist as a vitest test whose OWN title (the leaf, not counting enclosing describe titles) is the criterion string verbatim — never shortened, never decorated. Nesting under describe() is allowed.`; // OBS-64; OBS-511: leaf-title rule stated where the worker reads it
       // OBS-47: state the worktree layout contract in the worker prompt (cheap-tier workers were
       // committing/deleting node_modules and tripping the scope gate). The harness re-asserts the link
       // itself before gates regardless of what the worker does with it.

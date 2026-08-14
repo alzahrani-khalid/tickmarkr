@@ -197,7 +197,7 @@ describe("registry + doctor", () => {
   test("getAdapter throws on unknown; fake only present when scripted", () => {
     // deliberate order assertion — pi+grok registered LAST among the natives so the Phase 6 matrix
     // stays byte-identical; v1.89 T2: catalog-driven adapters append after them, omp first of those
-    expect(allAdapters().map((a) => a.id)).toEqual(["claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp"]);
+    expect(allAdapters().map((a) => a.id)).toEqual(["claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp", "agy", "prime-agent"]);
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reg-"));
     const sp = join(dir, "s.json");
     writeFileSync(sp, JSON.stringify({ tasks: {} }));

@@ -8,13 +8,18 @@ import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnin
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
-import { catalogModelAdvisory, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
+import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
-import { readCachedCatalog, refreshCatalogCommand, type CatalogReadResult } from "../../adapters/catalog-remote.js";
+import { LIVEBENCH_TABLE_DATE, readCachedCatalog, refreshCatalogCommand, type CatalogReadResult } from "../../adapters/catalog-remote.js";
+
+/** Where a newer `table_<date>.csv` is discovered — the deployed site builds filenames by
+ *  concatenation and publishes no index, so the release listing is the only enumerable surface. */
+export const LIVEBENCH_RELEASES_URL = "https://api.github.com/repos/LiveBench/livebench.github.io/contents/public";
+export const LIVEBENCH_TABLE_MAX_AGE_DAYS = 90;
 
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
 const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value: string) =>
@@ -246,6 +251,20 @@ export function selfShadowFinding(
   };
 }
 
+/**
+ * §4.4: `LIVEBENCH_TABLE_DATE` is a hand-bumped constant, and a constant nobody lints is a stale
+ * constant — the pinned table ages silently while every tier suggestion keeps citing it. Warns past
+ * 90 days, naming the pinned date and the listing where a newer table is discovered.
+ * ponytail: a LINT, never a fetch — doctor stays cache-only (T17); the operator (or RELEASING.md's
+ * release-time check) reads the listing and bumps the constant.
+ */
+export function liveBenchStalenessFinding(now: Date): string | undefined {
+  const pinnedMs = Date.parse(`${LIVEBENCH_TABLE_DATE.replace(/_/g, "-")}T00:00:00Z`);
+  const days = Math.floor((now.getTime() - pinnedMs) / 86_400_000);
+  if (!Number.isFinite(days) || days <= LIVEBENCH_TABLE_MAX_AGE_DAYS) return undefined;
+  return `LiveBench table pinned at ${LIVEBENCH_TABLE_DATE} is ${days} days old (>${LIVEBENCH_TABLE_MAX_AGE_DAYS}d) — list ${LIVEBENCH_RELEASES_URL} for a newer table_<date>.csv and bump LIVEBENCH_TABLE_DATE (advisory — tickmarkr never fetches that listing)`;
+}
+
 export async function doctor(
   _argv: string[],
   cwd = process.cwd(),
@@ -313,7 +332,8 @@ export async function doctor(
   writeDoctor(cwd, health);
   const rows = adapters.map((a) => {
     const h = health[a.id];
-    const state = !h.installed ? "not installed" : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
+    // OBS-503: a crash-on-version verdict carries its reason in note — print it instead of the lie.
+    const state = !h.installed ? (h.note ?? "not installed") : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
     const healthy = h.installed && (a.id !== kimi.id || h.authed);
     return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
   });
@@ -375,19 +395,25 @@ export async function doctor(
       rows.push(attentionRow(`${role} runs on ${sel.adapter}:${sel.model} — NOT installed; that gate will fail closed until you install it or remap cfg.${role}`));
     }
   }
-  rows.push(...modelLints(cfg, health, adapters, { tty: ttyVisual(), stateDir: stateDirName(cwd), overlayPreferShapes: overlayPreferShapes(cwd) }).map(attentionRow));
+  // OBS-505 residue: advisory lints collect apart from the capability/trust rows so the compact
+  // init journey can elide them behind the doctor pointer (one measured lint line ran 282 chars —
+  // pure wrap noise between two TUIs). Full doctor output is byte-identical: they rejoin in order.
+  const lintRows: string[] = [];
+  const liveBenchStale = liveBenchStalenessFinding(opts.catalogNow?.() ?? new Date());
+  if (liveBenchStale) lintRows.push(attentionRow(liveBenchStale));
+  lintRows.push(...modelLints(cfg, health, adapters, { tty: ttyVisual(), stateDir: stateDirName(cwd), overlayPreferShapes: overlayPreferShapes(cwd) }).map(attentionRow));
   const excluded = excludedChannels(cfg, adapters, health);
-  if (excluded.length) rows.push(attentionRow(exclusionLine(excluded)));
-  rows.push(...denyPreferCollisions(cfg).map((c) => attentionRow(denyPreferCollisionLine(c))));
+  if (excluded.length) lintRows.push(attentionRow(exclusionLine(excluded)));
+  lintRows.push(...denyPreferCollisions(cfg).map((c) => attentionRow(denyPreferCollisionLine(c))));
   const aliasExcluded = modelAliasExclusions(cfg, adapters, health);
-  if (aliasExcluded.length) rows.push(attentionRow(modelAliasLine(aliasExcluded)));
-  rows.push(...binaryShadowWarnings(adapters, health, cwd).map(attentionRow));
+  if (aliasExcluded.length) lintRows.push(attentionRow(modelAliasLine(aliasExcluded)));
+  lintRows.push(...binaryShadowWarnings(adapters, health, cwd).map(attentionRow));
   // HYG-07(a): doctor just probed fresh (probeAll above), so servability attribution is current by construction.
   const servable = servableExclusions(cfg, adapters, health);
-  if (servable.length) rows.push(attentionRow(servabilityLine(servable)));
+  if (servable.length) lintRows.push(attentionRow(servabilityLine(servable)));
   // v1.65 T3: hardcoded-flag drift — advisory warn rows only. Runs AFTER writeDoctor so the verdicts
   // can never leak into doctor.json, and discoverChannels/routing never read them.
-  rows.push(...flagDriftWarnings(adapters, health).map(attentionRow));
+  lintRows.push(...flagDriftWarnings(adapters, health).map(attentionRow));
   // OBS-145: resolved-identity drift is the same class of display-only doctor warning. Stamps live
   // beside the alias-owning adapter; the comparison runs only for configured floating aliases and
   // never enters health/doctor.json, config, channel discovery, learned profiles, or route().
@@ -404,7 +430,7 @@ export async function doctor(
         continue; // advisory source failure is unknown, never a doctor failure
       }
       if (resolvedIdentity && resolvedIdentity !== stampedIdentity) {
-        rows.push(attentionRow(
+        lintRows.push(attentionRow(
           `resolved-identity drift: claude-code:${alias} resolved to ${resolvedIdentity}, stamped identity ${stampedIdentity} — reclassify per benchmark policy (advisory — routing unchanged)`,
         ));
       }
@@ -442,12 +468,22 @@ export async function doctor(
   const trunc = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
   const dateOf = (iso: string) => iso.slice(0, 10);
   const showWindows = hasWindowsConfig(cfg);
+  const unclassifiedByAdapter = new Map(adapters.flatMap((a) => {
+    const h = health[a.id];
+    if (!h?.installed) return [];
+    const classified = cfg.tiers[a.id]?.models ?? {};
+    return [[a.id, (h.models ?? []).filter((m) => !(m in classified))] as const];
+  }));
+  // Every model under advisory in THIS report bands against one universe, built before any row
+  // renders — otherwise an adapter's band would depend on where it sits in the iteration.
+  const catalogRanking = catalogTierRanking(cfg, catalog, [...unclassifiedByAdapter].flatMap(([adapter, models]) =>
+    models.map((model) => ({ adapter, model, resolvedModel: resolvedCatalogModel(adapter, model) }))), resolvedCatalogModel);
   const modelStatus = adapters.flatMap((a) => {
     const h = health[a.id];
     if (!h?.installed) return [];
     const classified = cfg.tiers[a.id]?.models ?? {};
     const models = Object.keys(classified);
-    const unclassified = (h.models ?? []).filter((m) => !(m in classified));
+    const unclassified = unclassifiedByAdapter.get(a.id) ?? [];
     if (!models.length && !unclassified.length) return [];
     const w = Math.max(8, ...models.map((m) => m.length));
     const rows: string[] = [`  ${dim(a.id)}`];
@@ -471,7 +507,7 @@ export async function doctor(
       // a cache-backed evidence or explicit uncovered line. Neither branch changes cfg, health, or route().
       rows.push(`    ${dim(`(${unclassified.length} more listed, unclassified)`)}`);
       const advisories = unclassified.map((model) =>
-        catalogModelAdvisory(cfg, catalog, a.id, model, resolvedCatalogModel(a.id, model)));
+        catalogModelAdvisory(cfg, catalog, a.id, model, resolvedCatalogModel(a.id, model), catalogRanking));
       // Q128s exhibit #4 / operator directive 2026-08-12: ~600 per-model advisory rows buried the six
       // decision-grade flags on a real machine. Default view keeps ONLY rows that ask the operator for a
       // decision (tier suggestions); the no-decision bulk (uncovered + covered evidence-only) compresses
@@ -501,7 +537,13 @@ export async function doctor(
   if (opts.compact) {
     // Operator field report 2026-08-13: the full matrix mid-init-journey is clutter between two
     // TUIs. Every file side effect above already happened; the pointer line is the contract.
-    return `${header}\n${rows.join("\n")}\n  ${dim(`model matrix elided — \`tickmarkr doctor\` prints it in full${drift ? "; drift overlay written" : ""}`)}\nwrote ${stateDirName(cwd)}/doctor.json`;
+    // Advisory lints elide with the matrix (OBS-505 residue) — capability, trust, and fail-closed
+    // judge/consult rows stay; the counted pointer names what moved behind `tickmarkr doctor`.
+    const elided = [
+      ...(lintRows.length ? [`${lintRows.length} advisory lint${lintRows.length === 1 ? "" : "s"}`] : []),
+      "model matrix",
+    ].join(" and ");
+    return `${header}\n${rows.join("\n")}\n  ${dim(`${elided} elided — \`tickmarkr doctor\` prints them in full${drift ? "; drift overlay written" : ""}`)}\nwrote ${stateDirName(cwd)}/doctor.json`;
   }
-  return `${header}\n${rows.join("\n")}${modelSummary}${drift}\nwrote ${stateDirName(cwd)}/doctor.json`;
+  return `${header}\n${[...rows, ...lintRows].join("\n")}${modelSummary}${drift}\nwrote ${stateDirName(cwd)}/doctor.json`;
 }

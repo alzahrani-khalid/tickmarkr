@@ -376,7 +376,9 @@ test("enumerate production registry construction before and after the change: om
     droid: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
     auggie: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
     crush: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
+    "prime-agent": "459d0095ae0262ff6fce15db214b6f133d23ee11f922f09558d46dea5faa6f82",
     omp: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
+    agy: "b1f724e78c4e7cb04ee8ce27bf7285dbd15dde4c3dffada16dad7cc3bc75f040",
   };
 
   expect(before.omp).toEqual({ routable: false, vendor: null, command: null, trust: null, identity: ".+" });

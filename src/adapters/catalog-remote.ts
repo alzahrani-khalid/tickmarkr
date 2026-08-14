@@ -3,7 +3,13 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { dirname, join } from "node:path";
 
 export const MODELS_DEV_CATALOG_URL = "https://models.dev/api.json";
-export const ARTIFICIAL_ANALYSIS_CATALOG_URL = "https://artificialanalysis.ai/api/v2/language/models/free";
+export const ARTIFICIAL_ANALYSIS_CATALOG_URL = "https://artificialanalysis.ai/api/v2/data/llms/models";
+// LiveBench ships one dated CSV per question-set release plus the category->task map that defines
+// the aggregates. Fetch the deployed site, NEVER raw.githubusercontent.com: same filename, 15 fewer
+// models on raw. ponytail: hand-bumped constant; doctor lints its age against the release listing.
+export const LIVEBENCH_TABLE_DATE = "2026_06_25";
+export const LIVEBENCH_TABLE_URL = `https://livebench.ai/table_${LIVEBENCH_TABLE_DATE}.csv`;
+export const LIVEBENCH_CATEGORIES_URL = `https://livebench.ai/categories_${LIVEBENCH_TABLE_DATE}.json`;
 export const CATALOG_CACHE_MAX_AGE_MS = 30 * 86_400_000;
 export const CATALOG_REFRESH_TIMEOUT_MS = 10_000;
 const ARTIFICIAL_ANALYSIS_PAGE_SIZE = 100;
@@ -14,6 +20,8 @@ export interface CatalogCache {
   fetchedAt: string;
   modelsDev: unknown;
   artificialAnalysis?: unknown;
+  // Optional, so schemaVersion stays 1 and validCache still requires only modelsDev.
+  liveBench?: unknown;
 }
 
 export interface CatalogReadResult {
@@ -25,6 +33,7 @@ export interface CatalogReadResult {
 
 export interface CatalogModelEvidence {
   modelId: string;
+  catalogId: string;
   inputCostPerMtok?: number;
   outputCostPerMtok?: number;
   contextWindow?: number;
@@ -32,9 +41,13 @@ export interface CatalogModelEvidence {
   features: string[];
   intelligenceIndex?: number;
   intelligenceIndexVersion?: string;
+  codingIndex?: number;
+  agenticCodingScore?: number;
+  codingScore?: number;
+  evidenceDate?: string;
 }
 
-type CatalogResponse = { ok: boolean; status: number; json: () => Promise<unknown> };
+type CatalogResponse = { ok: boolean; status: number; json: () => Promise<unknown>; text: () => Promise<string> };
 export type CatalogFetcher = (
   input: string | URL | Request,
   init?: RequestInit,
@@ -135,7 +148,10 @@ export function readCachedCatalog(repoRoot: string, opts: { now?: () => Date } =
   }
 }
 
-function providerModels(modelsDev: unknown, preferred?: string): Record<string, unknown>[] {
+type ModelsDevProvider = { providerKey: string; models: Record<string, unknown> };
+type ModelsDevMatch = ModelsDevProvider & { recordId: string; model: Record<string, unknown> };
+
+function providerModels(modelsDev: unknown, preferred?: string): ModelsDevProvider[] {
   const providers = record(modelsDev);
   if (!providers) return [];
   const entries = Object.entries(providers);
@@ -149,26 +165,29 @@ function providerModels(modelsDev: unknown, preferred?: string): Record<string, 
   // no provider at all) used to ZERO the search space and blanket-uncover the whole adapter.
   // Fail open to the full scan instead — advisory evidence with a visible models.dev id beats none.
   const selected = preferred && preferredEntries.length > 0 ? preferredEntries : entries;
-  return selected
-    .map(([, provider]) => record(record(provider)?.models))
-    .filter((models): models is Record<string, unknown> => models !== undefined);
+  return selected.flatMap(([providerKey, provider]) => {
+    const models = record(record(provider)?.models);
+    return models ? [{ providerKey, models }] : [];
+  });
 }
 
-function findModelsDevModel(catalog: CatalogCache, provider: string | undefined, modelId: string): Record<string, unknown> | undefined {
+function findModelsDevModel(catalog: CatalogCache, provider: string | undefined, modelId: string): ModelsDevMatch | undefined {
   // CLI namespaces prefix their catalog ids (kimi-code/k3 vs catalog key k3; omp's openai/gpt-4):
   // after exact key/id misses, retry with the bare segment after the last "/". Deterministic
   // provider order; first hit wins — acceptable for advisory evidence, never routing.
   const bare = modelId.includes("/") ? modelId.slice(modelId.lastIndexOf("/") + 1) : undefined;
-  for (const models of providerModels(catalog.modelsDev, provider)) {
+  for (const { providerKey, models } of providerModels(catalog.modelsDev, provider)) {
     const direct = record(models[modelId]);
-    if (direct) return direct;
-    const byId = Object.values(models).map(record).find((candidate) => candidate?.id === modelId);
-    if (byId) return byId;
+    if (direct) return { providerKey, models, recordId: modelId, model: direct };
+    for (const [recordId, value] of Object.entries(models)) {
+      const candidate = record(value);
+      if (candidate?.id === modelId) return { providerKey, models, recordId, model: candidate };
+    }
   }
   if (bare) {
-    for (const models of providerModels(catalog.modelsDev, provider)) {
+    for (const { providerKey, models } of providerModels(catalog.modelsDev, provider)) {
       const direct = record(models[bare]);
-      if (direct) return direct;
+      if (direct) return { providerKey, models, recordId: bare, model: direct };
     }
   }
   return undefined;
@@ -190,7 +209,7 @@ function artificialAnalysisIndex(
   value: unknown,
   identities: string[],
   provider?: string,
-): { index: number; version?: string } | undefined {
+): { index: number; version?: string; codingIndex?: number } | undefined {
   const root = record(value);
   const wanted = identities.map(canonicalCatalogIdentity).filter(Boolean);
   for (const raw of artificialAnalysisRows(value)) {
@@ -216,14 +235,106 @@ function artificialAnalysisIndex(
       const n = nonNegative(candidate);
       if (n !== undefined) {
         const version = root?.intelligence_index_version;
+        const coding = [
+          evaluations?.artificial_analysis_coding_index,
+          row.artificial_analysis_coding_index,
+        ].map(nonNegative).find((value) => value !== undefined);
         return {
           index: n,
           ...((typeof version === "string" || typeof version === "number") ? { version: String(version) } : {}),
+          ...(coding !== undefined ? { codingIndex: coding } : {}),
         };
       }
     }
   }
   return undefined;
+}
+
+/**
+ * LiveBench ships the table as CSV and the category->task map as JSON. Every aggregate is derived
+ * from that map, never from a task-column list written here: a category reshuffle upstream must
+ * re-score us, not silently mis-score us.
+ */
+function parseLiveBenchTable(csv: string): Record<string, unknown>[] {
+  const lines = csv.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const header = lines.shift()?.split(",").map((cell) => cell.trim());
+  if (header?.[0] !== "model") return [];
+  return lines.flatMap((line) => {
+    const cells = line.split(",").map((cell) => cell.trim());
+    const model = cells[0];
+    if (!model) return [];
+    const row: Record<string, unknown> = { model };
+    header.forEach((column, i) => {
+      const score = i > 0 && cells[i] !== "" ? finite(Number(cells[i])) : undefined;
+      if (score !== undefined) row[column] = score;
+    });
+    // A scoreless row (truncated payload, blank cells) carries no evidence — it is not a fleet member.
+    return Object.keys(row).length > 1 ? [row] : [];
+  });
+}
+
+/**
+ * A probe is usable only if it can actually score the two categories we read: both must be arrays
+ * naming at least one task column the table really scored. Otherwise throw — an unusable probe must
+ * never overwrite the cached section (a truncated table plus `{}` categories is a failed fetch).
+ */
+function assertUsableLiveBench(rows: Record<string, unknown>[], categories: Record<string, unknown>): void {
+  const scored = new Set(rows.flatMap((row) => Object.keys(row).filter((key) => key !== "model")));
+  for (const name of ["Agentic Coding", "Coding"]) {
+    const tasks = categories[name];
+    if (!Array.isArray(tasks) || !tasks.some((task) => typeof task === "string" && scored.has(task))) {
+      throw new Error(`LiveBench categories name no scored "${name}" task`);
+    }
+  }
+}
+
+// LiveBench splits one model across reasoning-effort rows (`-max-effort`, `-xhigh`,
+// `-thinking-auto-medium-effort`); the highest effort is the model at its best. Rank by
+// hyphen-delimited token so `xhigh` never reads as `high`.
+const LIVEBENCH_EFFORT_RANK: Record<string, number> = { max: 5, xhigh: 4, high: 3, medium: 2, low: 1 };
+
+const liveBenchEffortRank = (residue: string): number =>
+  residue.split("-").reduce((rank, token) => Math.max(rank, LIVEBENCH_EFFORT_RANK[token] ?? 0), 0);
+
+const liveBenchCategoryMean = (row: Record<string, unknown>, tasks: unknown): number | undefined => {
+  const scores = (Array.isArray(tasks) ? tasks : [])
+    .map((task) => (typeof task === "string" ? finite(row[task]) : undefined))
+    .filter((score): score is number => score !== undefined);
+  return scores.length > 0 ? scores.reduce((sum, score) => sum + score, 0) / scores.length : undefined;
+};
+
+/** LiveBench hyphenates where models.dev spaces: `Kimi K3` is `kimi-k3` in the table. */
+const liveBenchIdentity = (value: string): string => value.trim().toLowerCase().replace(/\s+/g, "-");
+
+function liveBenchIndex(
+  value: unknown,
+  identities: string[],
+): { agenticCodingScore?: number; codingScore?: number; tableDate?: string } | undefined {
+  const root = record(value);
+  if (!root || !Array.isArray(root.rows)) return undefined;
+  const wanted = identities.map(liveBenchIdentity).filter(Boolean);
+  let best: { row: Record<string, unknown>; rank: number } | undefined;
+  for (const raw of root.rows) {
+    const row = record(raw);
+    const model = typeof row?.model === "string" ? liveBenchIdentity(row.model) : undefined;
+    if (!row || !model) continue;
+    // Bare startsWith is a false-positive machine: `glm-5` would claim `glm-5.2`. The residue after
+    // the fleet id must be empty or an effort suffix.
+    const residue = wanted.map((identity) => model.startsWith(identity) ? model.slice(identity.length) : undefined)
+      .find((rest) => rest === "" || rest?.startsWith("-"));
+    if (residue === undefined) continue;
+    const rank = liveBenchEffortRank(residue);
+    if (!best || rank > best.rank) best = { row, rank };
+  }
+  if (!best) return undefined;
+  const categories = record(root.categories);
+  const agenticCodingScore = liveBenchCategoryMean(best.row, categories?.["Agentic Coding"]);
+  const codingScore = liveBenchCategoryMean(best.row, categories?.["Coding"]);
+  return {
+    ...(agenticCodingScore !== undefined ? { agenticCodingScore } : {}),
+    ...(codingScore !== undefined ? { codingScore } : {}),
+    ...(typeof root.tableDate === "string" ? { tableDate: root.tableDate } : {}),
+  };
 }
 
 /** Resolve the alias identity first; the floating alias is only a fallback when identity is unknown. */
@@ -232,14 +343,27 @@ export function resolveCatalogModel(
   query: { provider?: string; model: string; resolvedModel?: string },
 ): CatalogModelEvidence | undefined {
   const modelId = query.resolvedModel ?? query.model;
-  const model = findModelsDevModel(catalog, query.provider, modelId);
-  if (!model) return undefined;
+  const match = findModelsDevModel(catalog, query.provider, modelId);
+  if (!match) return undefined;
+  const { model } = match;
+  const catalogId = `${match.providerKey}/${match.recordId}`;
   const cost = record(model.cost);
   const limit = record(model.limit);
+  // LiveBench spells rows with the vendor-prefixed model name (`k3` is `kimi-k3` there), so
+  // models.dev `name` bridges a fleet id that is only the bare suffix. `family` must NEVER join
+  // this list: it is a LINEAGE label many models share — real models.dev has `glm` on every GLM and
+  // `gpt` on gpt-4o — so through it glm-5 would claim glm-5.2's row and an unbenchmarked gpt-4o
+  // would inherit a gpt-5.6 row's scores and evidenceDate. `name` is per-model; `family` is not.
+  const identities = [
+    modelId,
+    query.model,
+    ...(typeof model.name === "string" ? [model.name] : []),
+  ];
   const intelligence = artificialAnalysisIndex(catalog.artificialAnalysis, [
     modelId,
     ...(typeof model.name === "string" ? [model.name] : []),
   ], query.provider);
+  const liveBench = liveBenchIndex(catalog.liveBench, identities);
   const features = [
     ["reasoning", model.reasoning],
     ["tool-call", model.tool_call],
@@ -249,6 +373,7 @@ export function resolveCatalogModel(
   ].filter((entry) => entry[1] === true).map((entry) => entry[0] as string);
   return {
     modelId,
+    catalogId,
     ...(nonNegative(cost?.input) !== undefined ? { inputCostPerMtok: nonNegative(cost?.input) } : {}),
     ...(nonNegative(cost?.output) !== undefined ? { outputCostPerMtok: nonNegative(cost?.output) } : {}),
     ...(positive(limit?.context) !== undefined ? { contextWindow: positive(limit?.context) } : {}),
@@ -257,19 +382,31 @@ export function resolveCatalogModel(
     ...(intelligence !== undefined ? {
       intelligenceIndex: intelligence.index,
       ...(intelligence.version ? { intelligenceIndexVersion: intelligence.version } : {}),
+      ...(intelligence.codingIndex !== undefined ? { codingIndex: intelligence.codingIndex } : {}),
+    } : {}),
+    ...(liveBench !== undefined ? {
+      ...(liveBench.agenticCodingScore !== undefined ? { agenticCodingScore: liveBench.agenticCodingScore } : {}),
+      ...(liveBench.codingScore !== undefined ? { codingScore: liveBench.codingScore } : {}),
+      ...(liveBench.tableDate !== undefined ? { evidenceDate: liveBench.tableDate } : {}),
     } : {}),
   };
 }
 
-async function fetchJson(
+const catalogSourceLabel = (url: string): string =>
+  url.startsWith(MODELS_DEV_CATALOG_URL) ? "models.dev"
+    : url.startsWith(LIVEBENCH_TABLE_URL) || url.startsWith(LIVEBENCH_CATEGORIES_URL) ? "LiveBench"
+      : "Artificial Analysis";
+
+async function fetchCatalog<T>(
   fetcher: CatalogFetcher,
   url: string,
   init: RequestInit,
   timeoutMs: number,
-): Promise<unknown> {
+  read: (response: CatalogResponse) => Promise<T>,
+): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
+  const timeout = new Promise<T>((_resolve, reject) => {
     timer = setTimeout(() => {
       const error = new Error(`catalog request timed out after ${timeoutMs}ms`);
       controller.abort(error);
@@ -279,8 +416,8 @@ async function fetchJson(
   try {
     const request = (async () => {
       const response = await fetcher(url, { ...init, signal: controller.signal });
-      if (!response.ok) throw new Error(`${url === MODELS_DEV_CATALOG_URL ? "models.dev" : "Artificial Analysis"} HTTP ${response.status}`);
-      return response.json();
+      if (!response.ok) throw new Error(`${catalogSourceLabel(url)} HTTP ${response.status}`);
+      return read(response);
     })();
     return await Promise.race([request, timeout]);
   } finally {
@@ -312,7 +449,7 @@ async function fetchArtificialAnalysis(
   let intelligenceIndexVersion: string | number | undefined;
   for (let page = 1; page <= ARTIFICIAL_ANALYSIS_MAX_PAGES; page++) {
     const url = `${ARTIFICIAL_ANALYSIS_CATALOG_URL}?page=${page}&page_size=${ARTIFICIAL_ANALYSIS_PAGE_SIZE}`;
-    const value = await fetchJson(fetcher, url, { headers: { "x-api-key": apiKey } }, timeoutMs);
+    const value = await fetchCatalog(fetcher, url, { headers: { "x-api-key": apiKey } }, timeoutMs, (r) => r.json());
     const root = record(value);
     if (!root || !Array.isArray(root.data)) throw new Error("Artificial Analysis catalog schema is invalid");
     first ??= root;
@@ -333,6 +470,18 @@ async function fetchArtificialAnalysis(
   throw new Error(`Artificial Analysis catalog exceeds ${ARTIFICIAL_ANALYSIS_MAX_PAGES} pages`);
 }
 
+/** Keyless leg: one CSV plus the category map. Both URLs are pinned to the deployed livebench.ai. */
+async function fetchLiveBench(fetcher: CatalogFetcher, timeoutMs: number): Promise<unknown> {
+  const csv = await fetchCatalog(fetcher, LIVEBENCH_TABLE_URL, {}, timeoutMs, (r) => r.text());
+  const categories = record(await fetchCatalog(fetcher, LIVEBENCH_CATEGORIES_URL, {}, timeoutMs, (r) => r.json()));
+  if (!categories) throw new Error("LiveBench categories schema is invalid");
+  const rows = parseLiveBenchTable(csv);
+  // Orca import #3, write site: an empty probe is a failed probe, never an empty fleet.
+  if (rows.length === 0) throw new Error("LiveBench table parsed to zero rows");
+  assertUsableLiveBench(rows, categories);
+  return { tableDate: LIVEBENCH_TABLE_DATE, categories, rows };
+}
+
 /**
  * The named, explicit refresh path. No other function in this module can reach fetch.
  * A failed refresh preserves the previous cache byte-for-byte and returns it fail-open.
@@ -343,7 +492,7 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
   try {
     const fetcher = opts.fetcher ?? globalThis.fetch.bind(globalThis) as CatalogFetcher;
     const timeoutMs = opts.timeoutMs ?? CATALOG_REFRESH_TIMEOUT_MS;
-    const modelsDev = await fetchJson(fetcher, MODELS_DEV_CATALOG_URL, {}, timeoutMs);
+    const modelsDev = await fetchCatalog(fetcher, MODELS_DEV_CATALOG_URL, {}, timeoutMs, (r) => r.json());
     if (!validModelsDevCatalog(modelsDev)) throw new Error("models.dev catalog schema is invalid");
 
     const apiKey = opts.artificialAnalysisKey ?? process.env.ARTIFICIAL_ANALYSIS_API_KEY?.trim();
@@ -351,14 +500,30 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
       ? await fetchArtificialAnalysis(fetcher, apiKey, timeoutMs)
       : undefined;
 
+    // The LiveBench leg is keyless and never costs the models.dev refresh: a failure keeps the
+    // previous section verbatim and names the leg in the warning.
+    let liveBench = current.catalog.liveBench;
+    let warning: string | undefined;
+    try {
+      liveBench = await fetchLiveBench(fetcher, timeoutMs);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warning = message.startsWith("LiveBench") ? message : `LiveBench refresh failed: ${message}`;
+    }
+
     const catalog: CatalogCache = {
       schemaVersion: 1,
       fetchedAt: now().toISOString(),
       modelsDev,
       ...(artificialAnalysis !== undefined ? { artificialAnalysis } : {}),
+      ...(liveBench !== undefined ? { liveBench } : {}),
     };
     writeCatalogCache(opts.repoRoot, catalog);
-    return { updated: true, catalog: readCachedCatalog(opts.repoRoot, { now }) };
+    return {
+      updated: true,
+      catalog: readCachedCatalog(opts.repoRoot, { now }),
+      ...(warning !== undefined ? { warning } : {}),
+    };
   } catch (error) {
     return {
       updated: false,
