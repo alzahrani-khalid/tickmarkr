@@ -123,7 +123,7 @@ function setScalarPreservingComment(
 ): void {
   const existing = doc.getIn(path, true);
   if (isScalar(existing)) existing.value = value;
-  else doc.setIn(path, doc.createNode(value));
+  else setAt(doc, path, doc.createNode(value));
   if (authoredComment !== undefined) {
     const written = doc.getIn(path, true);
     if (isScalar(written)) written.comment = ` ${authoredComment}`;
@@ -150,11 +150,11 @@ function setStringSequencePreservingComments(
       }
       if (comments.length) tombstone.comment = comments.join("\n");
     }
-    doc.setIn(path, tombstone);
+    setAt(doc, path, tombstone);
     return;
   }
   if (!isSeq(existing)) {
-    doc.setIn(path, doc.createNode(values));
+    setAt(doc, path, doc.createNode(values));
     return;
   }
   const available = [...existing.items];
@@ -163,6 +163,33 @@ function setStringSequencePreservingComments(
     if (at >= 0) return available.splice(at, 1)[0];
     return doc.createNode(value);
   });
+}
+
+// OBS-533: yaml's setIn/deleteIn throw on any non-collection intermediate ("Expected YAML
+// collection at spec. Remaining path: pin"), and a v1.1 null tombstone (`spec:` under
+// routing.map) is exactly that scalar — deepMerge prunes it before schema validation, so the
+// overlay loads clean and the first fleet write under the tombstoned key crashed the TUI.
+// Total forms: a delete treats the masked subtree as absent (the operator's tombstone already
+// denies it, and survives untouched); a set clears the scalar and rebuilds what fleet owns —
+// the routing.allow precedent below.
+function deleteAt(doc: OverlayDocument, path: OverlayPath): void {
+  for (let depth = 1; depth < path.length; depth++) {
+    if (!isMap(doc.getIn(path.slice(0, depth), true))) return;
+  }
+  // deleteIn throws on an empty document — only delete keys that exist.
+  if (doc.getIn(path) !== undefined) doc.deleteIn(path);
+}
+
+function setAt(doc: OverlayDocument, path: OverlayPath, value: unknown): void {
+  for (let depth = 1; depth < path.length; depth++) {
+    const node = doc.getIn(path.slice(0, depth), true);
+    if (node === undefined) break;
+    if (!isMap(node)) {
+      doc.deleteIn(path.slice(0, depth));
+      break;
+    }
+  }
+  doc.setIn(path, value);
 }
 
 function deleteEmptyMap(doc: OverlayDocument, path: OverlayPath): void {
@@ -188,24 +215,23 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
       if (form.excluded) {
         const allowNode = doc.getIn(["routing", "allow"], true);
         if (allowNode !== undefined && !isMap(allowNode)) doc.deleteIn(["routing", "allow"]);
-        // deleteIn throws on an empty document — only delete keys that exist.
         if (form.adapters.length) {
           setStringSequencePreservingComments(doc, ["routing", "allow", "adapters"], form.adapters);
-        } else if (doc.getIn(["routing", "allow", "adapters"]) !== undefined) {
-          doc.deleteIn(["routing", "allow", "adapters"]);
+        } else {
+          deleteAt(doc, ["routing", "allow", "adapters"]);
         }
         if (form.models.length) {
           setStringSequencePreservingComments(doc, ["routing", "allow", "models"], form.models);
-        } else if (doc.getIn(["routing", "allow", "models"]) !== undefined) {
-          doc.deleteIn(["routing", "allow", "models"]);
+        } else {
+          deleteAt(doc, ["routing", "allow", "models"]);
         }
         // Whole fleet out: allow stays present but empty — fail-closed, nothing admitted.
         if (doc.getIn(["routing", "allow"]) === undefined) {
-          doc.setIn(["routing", "allow"], doc.createNode({}));
+          setAt(doc, ["routing", "allow"], doc.createNode({}));
         }
-      } else if (doc.getIn(["routing", "allow"]) !== undefined) {
+      } else {
         // Whole fleet in: no restriction to express — the allow block goes away entirely.
-        doc.deleteIn(["routing", "allow"]);
+        deleteAt(doc, ["routing", "allow"]);
       }
       // Residuals stay in deny; covered scopes are tombstoned so a lower layer can never
       // re-exclude behind the operator's back (workers untouched).
@@ -239,8 +265,8 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     const before = initial.map[shape];
     const after = edited.map[shape];
     if (JSON.stringify(before?.pin) !== JSON.stringify(after?.pin)) {
-      if (after?.pin === undefined) doc.deleteIn(["routing", "map", shape, "pin"]);
-      else doc.setIn(["routing", "map", shape, "pin"], doc.createNode(after.pin));
+      if (after?.pin === undefined) deleteAt(doc, ["routing", "map", shape, "pin"]);
+      else setAt(doc, ["routing", "map", shape, "pin"], doc.createNode(after.pin));
     }
     if (JSON.stringify(before?.pool) !== JSON.stringify(after?.pool)) {
       const path = ["routing", "map", shape, "pool"];
@@ -248,8 +274,6 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
         // pool: null tombstone — masks a lower-layer pool instead of inheriting it again.
         setStringSequencePreservingComments(doc, path, null);
       } else {
-        const existing = doc.getIn(path, true);
-        if (existing !== undefined && !isMap(existing)) doc.deleteIn(path);
         setScalarPreservingComment(doc, [...path, "mode"], after.pool.mode);
         // Channel order is semantic (ordered walks it; any breaks ties by it) — dedupe, never sort.
         setStringSequencePreservingComments(doc, [...path, "channels"], [...new Set(after.pool.channels)]);
@@ -260,7 +284,7 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
         // the pin/pool declaration owns the whole slot at merge (deepMerge drops the lower
         // layer's pin/pool/prefer atomically) — an [] mask here would re-declare prefer BESIDE
         // the pool in one document and fail the exclusivity refine; delete the key instead
-        doc.deleteIn(["routing", "map", shape, "prefer"]);
+        deleteAt(doc, ["routing", "map", shape, "prefer"]);
       } else {
         // Clearing a resolved list with no replacing declaration must mask the lower layer
         // with [], not delete the key and inherit it again.
@@ -272,7 +296,7 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
       }
     }
     if (before?.escalate !== after?.escalate) {
-      if (after?.escalate === undefined) doc.deleteIn(["routing", "map", shape, "escalate"]);
+      if (after?.escalate === undefined) deleteAt(doc, ["routing", "map", shape, "escalate"]);
       else setScalarPreservingComment(doc, ["routing", "map", shape, "escalate"], after.escalate);
     }
   }
@@ -280,7 +304,7 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   for (const shape of new Set([...Object.keys(initial.floors), ...Object.keys(edited.floors)])) {
     if (initial.floors[shape] === edited.floors[shape]) continue;
     const tier = edited.floors[shape];
-    if (tier === undefined) doc.deleteIn(["routing", "floors", shape]);
+    if (tier === undefined) deleteAt(doc, ["routing", "floors", shape]);
     else setScalarPreservingComment(doc, ["routing", "floors", shape], tier);
   }
 
@@ -327,13 +351,18 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
       const after = write.steering.edited[key];
       if (JSON.stringify(before) === JSON.stringify(after)) continue;
       if (after === undefined) {
-        doc.deleteIn([key, "prefer"]);
+        deleteAt(doc, [key, "prefer"]);
         deleteEmptyMap(doc, [key]);
       } else {
         setStringSequencePreservingComments(doc, [key, "prefer"], after);
       }
     }
   }
+
+  // Every mutation no-oped against an empty or comment-only overlay (contents stays null;
+  // deleteAt never creates content): return the prior bytes verbatim — stringifying a null
+  // document would write a literal `null` line into the file.
+  if (doc.contents === null) return priorBytes;
 
   // OBS-505: fleet's two-space note style (`tier: mid  # note`) applies to INLINE comments only.
   // The previous commentString prefixed " #" onto EVERY comment line, so block comments — the

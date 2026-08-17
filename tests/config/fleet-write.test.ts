@@ -470,3 +470,21 @@ test("OBS-518 write churn: an untouched flow sequence keeps its unpadded [kimi] 
   expect(written).toContain("adapters: [kimi]");
   expect(written).not.toContain("[ kimi ]");
 });
+
+test("OBS-533 tombstone crash: a fleet write stays total over legal scalar intermediates, proven over the closed set of crash sites — a pin delete under a `spec:` null tombstone no-ops and keeps the operator's mask, a pin set over the tombstone rebuilds the map entry, and an unpin against an empty overlay returns the bytes verbatim", () => {
+  // `spec:` is the v1.1 null tombstone — deepMerge prunes it before schema validation, so the
+  // overlay loads clean; yaml's setIn/deleteIn then threw "Expected YAML collection at spec.
+  // Remaining path: pin" and killed the fleet TUI mid-write.
+  const tombstoned = "routing:\n  map:\n    spec:  # operator mask over the default pin\n";
+  const pinned = editable({ map: { spec: { pin: { via: "claude-code", model: "fable" } } } });
+  const bare = editable();
+
+  const cleared = renderFleetOverlayWrite(tombstoned, { initial: pinned, edited: bare });
+  expect(parse(cleared).routing.map.spec).toBeNull();
+  expect(cleared).toContain("operator mask over the default pin");
+
+  const repinned = renderFleetOverlayWrite(tombstoned, { initial: bare, edited: pinned });
+  expect(parse(repinned).routing.map.spec.pin).toEqual({ via: "claude-code", model: "fable" });
+
+  expect(renderFleetOverlayWrite("", { initial: pinned, edited: bare })).toBe("");
+});
