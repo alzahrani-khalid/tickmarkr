@@ -1,6 +1,6 @@
 // Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
 import { isMap, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
-import type { FleetEditable, MapEntry, RoutingMode, Tier } from "./config.js";
+import { type FleetEditable, type MapEntry, type RoutingMode, type Tier, universeCovers } from "./config.js";
 
 /** Fleet-owned overlay keys — the only config surface `tickmarkr fleet` may write. */
 export const FLEET_OVERLAY_KEYS = ["routing", "tiers"] as const;
@@ -28,7 +28,55 @@ export type FleetOverlayWrite = {
     initial: { review?: string[]; consult?: string[] };
     edited: { review?: string[]; consult?: string[] };
   };
+  // v1.92 fleet membership: the discovered universe (classified models only). Present ⇒ changed
+  // exclusion sets write the minimal routing.allow membership form and tombstone the deny
+  // adapters/models scopes; absent ⇒ the legacy deny-array write, byte-identical to before.
+  universe?: { adapter: string; models: string[] }[];
 };
+
+// The minimal routing.allow form for an exclusion-set membership write: whole adapter ids for
+// fully-in adapters, adapter:model keys for partially-in ones, nothing for fully-out ones.
+// `excluded` false ⇔ the whole universe is in fleet ⇒ the allow block is removed, not written.
+function allowFormFromExclusions(
+  universe: { adapter: string; models: string[] }[],
+  edited: FleetEditable,
+): { adapters: string[]; models: string[]; excluded: boolean } {
+  if (!universe.length) {
+    throw new Error(
+      "fleet write: universe is empty — no classified models to compute routing.allow from; classify models in `tickmarkr fleet` first",
+    );
+  }
+  const denyAdapters = new Set(edited.denyAdapters);
+  const denyModels = new Set(edited.denyModels);
+  const adapters: string[] = [];
+  const models: string[] = [];
+  let excluded = false;
+  for (const row of universe) {
+    if (denyAdapters.has(row.adapter)) {
+      excluded = true;
+      continue;
+    }
+    const inFleet = row.models.filter((m) => !denyModels.has(`${row.adapter}:${m}`));
+    if (inFleet.length === row.models.length) {
+      adapters.push(row.adapter);
+    } else {
+      excluded = true;
+      models.push(...inFleet.map((m) => `${row.adapter}:${m}`));
+    }
+  }
+  return { adapters: sortedUnique(adapters), models: sortedUnique(models), excluded };
+}
+
+// OBS-517: deny entries the discovered universe cannot express through the allow form — the probe
+// dropped their channel (failed auth, rate limit, retired sku) so the allow complement never names
+// them. They must be written back into routing.deny verbatim (deny beats allow at routing time),
+// or a transient probe failure permanently erases a deliberate operator exclusion.
+function residualDeny(
+  universe: { adapter: string; models: string[] }[],
+  entries: string[],
+): string[] {
+  return sortedUnique(entries.filter((entry) => !universeCovers(universe, entry)));
+}
 
 export type FleetFirstTouch = { vendor: string; channel: "sub" | "api" };
 
@@ -133,16 +181,58 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     sortedUnique(initial.denyAdapters).join() !== sortedUnique(edited.denyAdapters).join()
     || sortedUnique(initial.denyModels).join() !== sortedUnique(edited.denyModels).join();
   if (denyChanged) {
-    setStringSequencePreservingComments(
-      doc,
-      ["routing", "deny", "adapters"],
-      edited.denyAdapters.length ? sortedUnique(edited.denyAdapters) : null,
-    );
-    setStringSequencePreservingComments(
-      doc,
-      ["routing", "deny", "models"],
-      edited.denyModels.length ? sortedUnique(edited.denyModels) : null,
-    );
+    if (write.universe) {
+      // Membership write: the allow form IS the fleet; deny adapters/models scopes are tombstoned
+      // so a lower layer can never re-exclude behind the operator's back (workers untouched).
+      const form = allowFormFromExclusions(write.universe, edited);
+      if (form.excluded) {
+        const allowNode = doc.getIn(["routing", "allow"], true);
+        if (allowNode !== undefined && !isMap(allowNode)) doc.deleteIn(["routing", "allow"]);
+        // deleteIn throws on an empty document — only delete keys that exist.
+        if (form.adapters.length) {
+          setStringSequencePreservingComments(doc, ["routing", "allow", "adapters"], form.adapters);
+        } else if (doc.getIn(["routing", "allow", "adapters"]) !== undefined) {
+          doc.deleteIn(["routing", "allow", "adapters"]);
+        }
+        if (form.models.length) {
+          setStringSequencePreservingComments(doc, ["routing", "allow", "models"], form.models);
+        } else if (doc.getIn(["routing", "allow", "models"]) !== undefined) {
+          doc.deleteIn(["routing", "allow", "models"]);
+        }
+        // Whole fleet out: allow stays present but empty — fail-closed, nothing admitted.
+        if (doc.getIn(["routing", "allow"]) === undefined) {
+          doc.setIn(["routing", "allow"], doc.createNode({}));
+        }
+      } else if (doc.getIn(["routing", "allow"]) !== undefined) {
+        // Whole fleet in: no restriction to express — the allow block goes away entirely.
+        doc.deleteIn(["routing", "allow"]);
+      }
+      // Residuals stay in deny; covered scopes are tombstoned so a lower layer can never
+      // re-exclude behind the operator's back (workers untouched).
+      const residualAdapters = residualDeny(write.universe, edited.denyAdapters);
+      const residualModels = residualDeny(write.universe, edited.denyModels);
+      setStringSequencePreservingComments(
+        doc,
+        ["routing", "deny", "adapters"],
+        residualAdapters.length ? residualAdapters : null,
+      );
+      setStringSequencePreservingComments(
+        doc,
+        ["routing", "deny", "models"],
+        residualModels.length ? residualModels : null,
+      );
+    } else {
+      setStringSequencePreservingComments(
+        doc,
+        ["routing", "deny", "adapters"],
+        edited.denyAdapters.length ? sortedUnique(edited.denyAdapters) : null,
+      );
+      setStringSequencePreservingComments(
+        doc,
+        ["routing", "deny", "models"],
+        edited.denyModels.length ? sortedUnique(edited.denyModels) : null,
+      );
+    }
   }
 
   for (const shape of new Set([...Object.keys(initial.map), ...Object.keys(edited.map)])) {
@@ -152,13 +242,34 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
       if (after?.pin === undefined) doc.deleteIn(["routing", "map", shape, "pin"]);
       else doc.setIn(["routing", "map", shape, "pin"], doc.createNode(after.pin));
     }
+    if (JSON.stringify(before?.pool) !== JSON.stringify(after?.pool)) {
+      const path = ["routing", "map", shape, "pool"];
+      if (after?.pool === undefined) {
+        // pool: null tombstone — masks a lower-layer pool instead of inheriting it again.
+        setStringSequencePreservingComments(doc, path, null);
+      } else {
+        const existing = doc.getIn(path, true);
+        if (existing !== undefined && !isMap(existing)) doc.deleteIn(path);
+        setScalarPreservingComment(doc, [...path, "mode"], after.pool.mode);
+        // Channel order is semantic (ordered walks it; any breaks ties by it) — dedupe, never sort.
+        setStringSequencePreservingComments(doc, [...path, "channels"], [...new Set(after.pool.channels)]);
+      }
+    }
     if (JSON.stringify(before?.prefer) !== JSON.stringify(after?.prefer)) {
-      // Clearing a resolved list must mask the lower layer with [], not delete the key and inherit it again.
-      setStringSequencePreservingComments(
-        doc,
-        ["routing", "map", shape, "prefer"],
-        after?.prefer ?? [],
-      );
+      if (after?.prefer === undefined && (after?.pool !== undefined || after?.pin !== undefined)) {
+        // the pin/pool declaration owns the whole slot at merge (deepMerge drops the lower
+        // layer's pin/pool/prefer atomically) — an [] mask here would re-declare prefer BESIDE
+        // the pool in one document and fail the exclusivity refine; delete the key instead
+        doc.deleteIn(["routing", "map", shape, "prefer"]);
+      } else {
+        // Clearing a resolved list with no replacing declaration must mask the lower layer
+        // with [], not delete the key and inherit it again.
+        setStringSequencePreservingComments(
+          doc,
+          ["routing", "map", shape, "prefer"],
+          after?.prefer ?? [],
+        );
+      }
     }
     if (before?.escalate !== after?.escalate) {
       if (after?.escalate === undefined) doc.deleteIn(["routing", "map", shape, "escalate"]);
@@ -241,6 +352,10 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     commentString: (comment) => comment.startsWith(INLINE_COMMENT_SENTINEL)
       ? ` #${comment.slice(1)}`
       : comment.replace(/^(?!$)(?: $)?/gm, "#"),
+    // OBS-518: yaml's default pads flow collections (`[kimi]` → `[ kimi ]`), churning untouched
+    // lines on the one confirmation surface an operator reviews. Hand-written overlays use the
+    // unpadded form; emit it.
+    flowCollectionPadding: false,
   });
 }
 
@@ -250,6 +365,7 @@ export function fleetRepoOverlayFromDelta(
   edited: FleetEditable,
   existingRepo: Record<string, unknown> = {},
   firstTouches: Readonly<Record<string, FleetFirstTouch>> = {},
+  universe?: { adapter: string; models: string[] }[],
 ): Record<string, unknown> {
   if (fleetEditableEquals(initial, edited)) return {};
   const out = structuredClone(existingRepo) as Record<string, unknown>;
@@ -259,18 +375,43 @@ export function fleetRepoOverlayFromDelta(
     sortedUnique(initial.denyAdapters).join() !== sortedUnique(edited.denyAdapters).join()
     || sortedUnique(initial.denyModels).join() !== sortedUnique(edited.denyModels).join();
   if (denyChanged) {
-    routing.deny = {
-      adapters: edited.denyAdapters.length ? edited.denyAdapters : null,
-      models: edited.denyModels.length ? edited.denyModels : null,
-    };
+    if (universe) {
+      const form = allowFormFromExclusions(universe, edited);
+      if (form.excluded) {
+        routing.allow = {
+          ...(form.adapters.length ? { adapters: form.adapters } : {}),
+          ...(form.models.length ? { models: form.models } : {}),
+        };
+      } else delete routing.allow;
+      const residualAdapters = residualDeny(universe, edited.denyAdapters);
+      const residualModels = residualDeny(universe, edited.denyModels);
+      routing.deny = {
+        ...(routing.deny as Record<string, unknown> | undefined),
+        adapters: residualAdapters.length ? residualAdapters : null,
+        models: residualModels.length ? residualModels : null,
+      };
+    } else {
+      routing.deny = {
+        adapters: edited.denyAdapters.length ? edited.denyAdapters : null,
+        models: edited.denyModels.length ? edited.denyModels : null,
+      };
+    }
     routingTouched = true;
   }
-  const mapDelta: Record<string, MapEntry> = {};
+  // pool widened to accept the null tombstone; MapEntry itself never carries null in memory.
+  const mapDelta: Record<string, Omit<MapEntry, "pool"> & { pool?: MapEntry["pool"] | null }> = {};
   for (const shape of new Set([...Object.keys(initial.map), ...Object.keys(edited.map)])) {
     if (JSON.stringify(initial.map[shape]) !== JSON.stringify(edited.map[shape])) {
-      const next = { ...edited.map[shape] };
-      if (initial.map[shape]?.prefer !== undefined && edited.map[shape]?.prefer === undefined) {
+      const next: (typeof mapDelta)[string] = { ...edited.map[shape] };
+      if (
+        initial.map[shape]?.prefer !== undefined && edited.map[shape]?.prefer === undefined
+        && edited.map[shape]?.pool === undefined && edited.map[shape]?.pin === undefined
+      ) {
         next.prefer = [];
+      }
+      // pool: null tombstone — a removed pool must mask the lower layer, never inherit it again.
+      if (initial.map[shape]?.pool !== undefined && edited.map[shape]?.pool === undefined) {
+        next.pool = null;
       }
       mapDelta[shape] = next;
     }

@@ -51,9 +51,13 @@ describe("README steering documentation", () => {
     expect(readme).toMatch(/candidate\s+picker/i);
   });
 
-  test("the readme fleet section counts six steps", () => {
+  test("the readme fleet section documents the two-pane browser and its write key", () => {
     const readme = readFileSync(readmeFile, "utf8");
-    // Look for text that mentions six steps in the fleet section
-    expect(readme).toMatch(/step.*6|six\s+step|6[/\\]6/i);
+    // v1.92: the six-step wizard was replaced by the fleet browser — the README must name the
+    // surface (views + rail) and the diff-confirm write path instead of counting steps.
+    expect(readme).toMatch(/fleet browser/i);
+    expect(readme).toMatch(/All models.*Shapes.*Steering/s);
+    expect(readme).toMatch(/`w`.*diff|diff.*`w`/is);
+    expect(readme).not.toMatch(/six\s+steps/i);
   });
 });

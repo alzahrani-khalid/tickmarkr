@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG, type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { buildTaskPrompt } from "./prompt.js";
-import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "./types.js";
+import { channelKey, MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "./types.js";
 import { resolveCatalogModel, type CatalogModelEvidence, type CatalogReadResult } from "./catalog-remote.js";
 export const SEED_STAMPED = "2026-07-09";
 // knowledge past this age gets a "rerun tickmarkr doctor" nudge (BLOCKED_POLL_MS-style named constant).
@@ -394,6 +394,33 @@ export function seedPreferLints(
   return collectSeedPreferLints(cfg, health, adapters, overlayPreferShapes, DECLARED_SEED_PREFER_DISPOSITION);
 }
 
+// v1.92: dead-pool lint — mirrors the dead-adapter seed lint above. A pool naming zero
+// doctor-found channels renders advisory here; plan/run stays the fail-loud authority (the
+// router's exhaustion RoutingError). Liveness mirrors adapterHasAuthedChannel's compat rule:
+// an installed adapter without per-model probe data counts live, not dead.
+export function deadPoolLints(
+  cfg: TickmarkrConfig,
+  health: Record<string, AuthHealth>,
+  adapters: WorkerAdapter[],
+): string[] {
+  const lints: string[] = [];
+  for (const [shape, entry] of Object.entries(cfg.routing.map)) {
+    const pool = entry.pool;
+    if (!pool) continue;
+    const live = pool.channels.some((id) => {
+      const a = adapters.find((x) => x.id === id.slice(0, id.indexOf(":")));
+      const h = a && health[a.id];
+      if (!a || !h?.installed || typeof a.channels !== "function") return false;
+      const c = a.channels(cfg).find((ch) => channelKey(ch) === id);
+      if (!c) return false;
+      if (!h.modelAuth || !Object.keys(h.modelAuth).length) return true; // no per-model probe data — compat, not dead
+      return h.modelAuth[c.model]?.authed === true;
+    });
+    if (!live) lints.push(`routing.map.${shape}.pool names no live channel — declared: ${pool.channels.join(", ")}`);
+  }
+  return lints;
+}
+
 // v1.54 T3: dead-steering sweep — operator prefer entries (routing.map overlay shapes, review.prefer,
 // consult.prefer) that can never match an installed channel are named at plan time; v1.53 T2 pins the
 // no-match case as a silent no-op, which makes a typo invisible. Advisory only: reads config + doctor
@@ -478,6 +505,7 @@ export function modelLints(
     ? LEGACY_DOCTOR_SEED_PREFER_DISPOSITION
     : DECLARED_SEED_PREFER_DISPOSITION;
   lints.push(...collectSeedPreferLints(cfg, health, adapters, opts?.overlayPreferShapes ?? new Set(), seedDisposition));
+  lints.push(...deadPoolLints(cfg, health, adapters));
   return lints;
 }
 

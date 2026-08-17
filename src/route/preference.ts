@@ -69,7 +69,7 @@ export function disallowedBy(
 }
 
 export interface DenyPreferCollision {
-  kind: "prefer" | "pin";
+  kind: "prefer" | "pin" | "pool";
   shape: string;
   detail: string;
   disallowed: Disallowed;
@@ -131,12 +131,22 @@ export function denyPreferCollisions(cfg: TickmarkrConfig, shapes?: Iterable<str
         disallowed: preferEntryDenied(prefer[0], cfg)!,
       });
     }
+    const pool = entry.pool;
+    if (pool) {
+      const denied = pool.channels.map((p) => {
+        const i = p.indexOf(":");
+        return disallowedBy({ adapter: p.slice(0, i), model: p.slice(i + 1) }, cfg.routing);
+      });
+      // only a FULLY dead pool collides — a partial deny still leaves live members to route
+      if (denied.every((d) => d !== null)) {
+        out.push({ kind: "pool", shape, detail: pool.channels.join(" > "), disallowed: denied[0]! });
+      }
+    }
   }
   return out;
 }
 
 export function denyPreferCollisionLine({ kind, shape, detail, disallowed }: DenyPreferCollision): string {
-  const surface = kind === "pin" ? `routing.map.${shape}.pin` : `routing.map.${shape}.prefer`;
   const verb = kind === "pin" ? "is disallowed" : "fully disallowed";
-  return `deny∩prefer: ${surface} ${detail} ${verb} by routing.${disallowed.by} (${disallowed.entry}) — remove the ${disallowed.by} entry or adjust ${kind === "pin" ? "pin" : "prefer"}`;
+  return `deny∩prefer: routing.map.${shape}.${kind} ${detail} ${verb} by routing.${disallowed.by} (${disallowed.entry}) — remove the ${disallowed.by} entry or adjust ${kind}`;
 }

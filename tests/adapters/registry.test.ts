@@ -20,7 +20,8 @@ import { makeRepo } from "../helpers/tmprepo.js";
 const stub = (id: string) =>
   ({ id, vendor: "x", probe: async () => ({ installed: true, authed: true, models: [] }) }) as unknown as WorkerAdapter;
 
-// Pinned at v1.34 T3: non-TTY doctor stdout must stay byte-identical when probe progress is stderr-only.
+// Pinned at v1.34 T3 (re-pinned v1.92: trust n/a roster + counted attention section): non-TTY
+// doctor stdout must stay byte-identical when probe progress is stderr-only.
 const NON_TTY_DOCTOR_PIN = `tickmarkr doctor — capability matrix:
   ✓ claude-code    installed
   ✓ codex          installed
@@ -29,11 +30,8 @@ const NON_TTY_DOCTOR_PIN = `tickmarkr doctor — capability matrix:
   ✓ pi             installed
   ✗ herdr          not detected — subprocess driver will be used
 workspace trust:
-  = claude-code    trust: n/a
-  = codex          trust: n/a
-  = cursor-agent   trust: n/a
-  = opencode       trust: n/a
-  = pi             trust: n/a
+  = n/a (5): claude-code, codex, cursor-agent, opencode, pi
+attention (8):
   ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! codex: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! cursor-agent: no model-list surface — seeds stamped 2026-07-09; verify manually

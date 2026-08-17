@@ -147,18 +147,20 @@ Configure which agent CLIs and models tickmarkr may route before your first run:
 
 ```bash
 tickmarkr doctor          # probe auth + capabilities (run after install or credential changes)
-tickmarkr fleet           # interactive editor (requires a TTY) — six steps, confirm to write
+tickmarkr fleet           # interactive fleet browser (requires a TTY) — review diff to write
 tickmarkr fleet --print   # effective fleet state (repo > global > defaults), non-interactive
 tickmarkr plan            # lint the resolved routing table against your spec
 tickmarkr run             # dispatch with the fleet you confirmed
 ```
 
-`tickmarkr doctor` is a pure sensor; `tickmarkr fleet` is the actuator. The editor walks **six
-steps** — probe data, agent CLIs, model tiers, routing mode, shape routing with a **candidate
-picker**, and steering preferences — and ends in a unified diff of your repo config overlay.
-Nothing is written until you confirm; pressing Enter through every step leaves config unchanged.
-Step 5/6 uses an arrow-driven candidate picker ranked by the production router; step 3 may ask
-for a benchmark-provenance note when you classify a new model.
+`tickmarkr doctor` is a pure sensor; `tickmarkr fleet` is the actuator. The browser is one
+two-pane surface: the left rail lists views (**All models**, **Shapes**, **Steering**) and every
+installed agent CLI with its auth state and model count; the right pane is a searchable model list
+with tier, context, price, and probe-latency columns. `Space` allows/denies, `Enter` classifies an
+unclassified model (with a required benchmark-provenance note) or pins a classified one to a shape,
+`m` opens the routing-mode presets, and `w` renders the unified diff of your repo config overlay.
+Nothing is written until you confirm the diff with `y`; quitting leaves config unchanged. The
+Shapes view pins from a candidate picker ranked by the production router.
 
 Routing-mode semantics, pin/floor/prefer precedence, review and consult steering syntax,
 provenance rules, and `--quality` / `--mode` flags are documented in
@@ -166,8 +168,9 @@ provenance rules, and `--quality` / `--mode` flags are documented in
 
 ## Steering
 
-Fleet step 6/6 sets `review.prefer` and `consult.prefer`; routing modes (`risk-based`,
-`partner-led`, `staff-led`) are chosen in step 4/6. Full grammar — including when review
+The fleet browser's **Steering** view sets `review.prefer` and `consult.prefer`; routing modes
+(`risk-based`, `partner-led`, `staff-led`) are applied from the presets overlay (`m`). Full
+grammar — including when review
 prefer may name a **bare adapter** versus `adapter:model`, and why consult prefer entries
 require **`adapter:model`** form — plus `tickmarkr run --supersedes` rerun control, is in
 **[FLEET.md](https://github.com/alzahrani-khalid/tickmarkr/blob/main/FLEET.md)**.

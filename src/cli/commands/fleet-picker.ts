@@ -31,7 +31,7 @@ export function shapeCandidates(
   channels: BillingChannel[],
   profile?: RoutingProfile,
 ): RankedCandidate[] {
-  const { pin: _pin, ...entry } = cfg.routing.map[task.shape] ?? {};
+  const { pin: _pin, pool: _pool, ...entry } = cfg.routing.map[task.shape] ?? {};
   const map = { ...cfg.routing.map, [task.shape]: entry };
   return rankCandidates(task, { ...cfg, routing: { ...cfg.routing, map } }, channels, profile);
 }

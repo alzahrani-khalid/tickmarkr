@@ -1,11 +1,9 @@
-import { emitKeypressEvents } from "node:readline";
-import { PassThrough } from "node:stream";
 import { Box, render, Text, useApp, useInput } from "ink";
 import type { ReactNode } from "react";
 import { useRef, useState } from "react";
-import { GLYPHS } from "../../brand.js";
 import type { InitConfigOverlay } from "../../config/config.js";
 import { ToggleMark } from "./components.js";
+import { clip, INK, inkInput, inkOutput, KeyBar, padCell, Pointer } from "./frame.js";
 
 // The enum unions are derived from the config overlay type (src/config/config.ts) so the
 // wizard cannot drift from the schema; only the cycle ORDER is stated here, and tsc rejects
@@ -31,96 +29,6 @@ export type InitWizardResult =
     installDocs: boolean;
   }
   | { kind: "quit" };
-
-// inkOutput/inkInput replicate the compatibility bridges in fleet-app.tsx — they are
-// not exported there and a sibling change owns that file, so importing was not an option when
-// this act landed. If a third Ink act appears, hoist the pair into a shared module.
-const escape = String.fromCharCode(27);
-const inkBookkeepingWrites: Record<string, true> = {
-  "": true,
-  [`${escape}[?25l`]: true,
-  [`${escape}[?25h`]: true,
-  [`${escape}[?2026h`]: true,
-  [`${escape}[?2026l`]: true,
-};
-
-function inkOutput(output: NodeJS.WriteStream): NodeJS.WriteStream {
-  if (typeof output.on === "function" && typeof output.off === "function") return output;
-  const facade = Object.create(output) as NodeJS.WriteStream;
-  const write = output.write.bind(output);
-  facade.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
-    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-    if (inkBookkeepingWrites[text] === true) return true;
-    return Reflect.apply(write, output, [chunk, ...args]) as boolean;
-  }) as NodeJS.WriteStream["write"];
-  facade.on = () => facade;
-  facade.off = () => facade;
-  return facade;
-}
-
-function inkInput(input: NodeJS.ReadStream, initialInput: string[]) {
-  const productionInput = typeof input.ref === "function" && typeof input.unref === "function";
-  // Isolate Ink's listeners on a bridge so every editor exit can detach the one listener it
-  // owns from the operator's terminal (see fleet-app.tsx for the full provenance).
-  const stream = new PassThrough() as PassThrough & {
-    isTTY?: boolean;
-    setRawMode?: (mode: boolean) => unknown;
-    ref: () => NodeJS.ReadStream;
-    unref: () => NodeJS.ReadStream;
-  };
-  stream.isTTY = input.isTTY;
-  stream.setRawMode = input.setRawMode?.bind(input);
-  stream.ref = () => {
-    if (productionInput) input.ref();
-    return stream as unknown as NodeJS.ReadStream;
-  };
-  stream.unref = () => {
-    if (productionInput) input.unref();
-    return stream as unknown as NodeJS.ReadStream;
-  };
-
-  const queued = [...initialInput];
-  let active = true;
-  let scheduled: NodeJS.Timeout | undefined;
-  const pump = () => {
-    scheduled = undefined;
-    if (!active) return;
-    const next = queued.shift();
-    if (next === undefined) return;
-    stream.write(next);
-    scheduled = setTimeout(pump, 0);
-  };
-  const onData = (chunk: string | Buffer) => {
-    queued.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
-    scheduled ??= setTimeout(pump, 0);
-  };
-  const onKeypress = (sequence: string | undefined, key: { sequence?: string } | undefined) => {
-    const token = key?.sequence ?? sequence;
-    if (token === undefined) return;
-    queued.push(token);
-    scheduled ??= setTimeout(pump, 0);
-  };
-  if (productionInput) {
-    input.on("data", onData);
-  } else {
-    emitKeypressEvents(input);
-    input.on("keypress", onKeypress);
-  }
-  input.resume();
-  if (queued.length > 0) scheduled = setTimeout(pump, 0);
-
-  return {
-    stream: stream as unknown as NodeJS.ReadStream,
-    stop() {
-      active = false;
-      clearTimeout(scheduled);
-      if (productionInput) input.off("data", onData);
-      else input.off("keypress", onKeypress);
-      input.pause();
-      stream.end();
-    },
-  };
-}
 
 type Section = "Run" | "Skills";
 type Row = { id: "driver" | "concurrency" | "visibility" | "skills" | "docs" | "continue"; section?: Section; label: string; desc: string };
@@ -155,12 +63,9 @@ function buildRows(offerSkills: boolean): Row[] {
   return rows;
 }
 
-const HINT_BAR = "Enter/Space to change · Tab to jump sections · ↑/↓ to move · Enter on Continue · Esc to quit";
-
-export function InitWizardApp({ fields }: { fields: InitWizardFields }) {
+export function InitWizardApp({ fields, frameColumns = 74 }: { fields: InitWizardFields; frameColumns?: number }) {
   const { exit } = useApp();
   const rows = buildRows(fields.offerSkills);
-  const sections: Section[] = fields.offerSkills ? ["Run", "Skills"] : ["Run"];
   const [cursor, setCursor] = useState(0);
   const cursorRef = useRef(0);
   const driverRef = useRef(fields.driver);
@@ -274,43 +179,48 @@ export function InitWizardApp({ fields }: { fields: InitWizardFields }) {
     }
   };
 
-  const currentSection = rows.slice(0, cursor + 1).reduce<Section | undefined>(
-    (section, row) => row.section ?? section,
-    rows[0].section,
-  );
+  const width = Math.max(58, Math.min(frameColumns, 100));
+  const rendered: ReactNode[] = [];
+  for (const [index, row] of rows.entries()) {
+    if (row.section && rows[index - 1]?.section !== row.section) {
+      if (index > 0) rendered.push(<Text key={`${row.section}-gap`}> </Text>);
+      rendered.push(<Text key={row.section} dimColor>{row.section}</Text>);
+    }
+    if (row.id === "continue") rendered.push(<Text key="continue-gap"> </Text>);
+    rendered.push(
+      <Text key={row.id}>
+        <Pointer on={index === cursor} />
+        <Text bold={index === cursor}>{row.id === "continue" ? row.label : padCell(row.label, 26)}</Text>
+        <Text color={index === cursor ? INK.brand : undefined}>{valueOf(row)}</Text>
+      </Text>,
+    );
+  }
 
   return (
-    <Box flexDirection="column">
-      <Text bold>tickmarkr init</Text>
-      {/* The journey row: only Preferences is live in this act — Discovery and Fleet render dim
-          so the operator sees what follows the Continue action. */}
+    <Box flexDirection="column" width={width}>
       <Text>
-        <Text bold>Preferences</Text>
-        <Text dimColor> · Discovery · Fleet</Text>
+        <Text bold color={INK.brand}>{" tickmarkr init"}</Text>
+        <Text dimColor>{" · act 1 of 3"}</Text>
       </Text>
-      <Text dimColor>act 1 of 3 — run preferences for this repo</Text>
-      <Box marginTop={1}>
-        <Box flexDirection="column" width={10} marginRight={2}>
-          {sections.map((section) => (
-            <Text key={section} bold={section === currentSection} dimColor={section !== currentSection}>
-              {section}
-            </Text>
-          ))}
-        </Box>
-        <Box flexDirection="column">
-          {rows.map((row, index) => (
-            <Text key={row.id} bold={index === cursor}>
-              {index === cursor ? `${GLYPHS.pointer} ` : "  "}
-              {row.id === "continue" ? row.label : row.label.padEnd(24)}
-              {valueOf(row)}
-            </Text>
-          ))}
-        </Box>
+      <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+        {/* The journey row: only Preferences is live in this act — Discovery and Fleet render dim
+            so the operator sees what follows the Continue action. */}
+        <Text>
+          <Text bold color={INK.brand}>Preferences</Text>
+          <Text dimColor>{" › Discovery › Fleet"}</Text>
+        </Text>
+        <Text> </Text>
+        {rendered}
       </Box>
-      <Box marginTop={1} flexDirection="column">
-        <Text dimColor>{rows[cursor].desc}</Text>
-        <Text dimColor>{HINT_BAR}</Text>
-      </Box>
+      <Text dimColor>{` ${clip(rows[cursor].desc, width - 2)}`}</Text>
+      <KeyBar
+        binds={[
+          { key: "Enter/Space", label: "change" },
+          { key: "Tab", label: "section" },
+          { key: "↑↓", label: "move" },
+          { key: "Esc", label: "quit" },
+        ]}
+      />
     </Box>
   );
 }
@@ -323,7 +233,9 @@ export async function runInitWizardApp(opts: {
 }): Promise<InitWizardResult> {
   const bridgedInput = inkInput(opts.input, opts.initialInput ?? []);
   const legacyOutput = typeof opts.output.on !== "function" || typeof opts.output.off !== "function";
-  const app = render(<InitWizardApp fields={opts.fields} />, {
+  // OBS-527: geometry is a live input — rebuild the element on resize (same pattern as fleet-app)
+  const wizardElement = () => <InitWizardApp fields={opts.fields} frameColumns={opts.output.columns ?? 74} />;
+  const app = render(wizardElement(), {
     stdin: bridgedInput.stream,
     stdout: inkOutput(opts.output),
     exitOnCtrlC: false,
@@ -332,9 +244,12 @@ export async function runInitWizardApp(opts: {
     // fleet-app.tsx): disable Ink's render throttling only for that facade.
     debug: legacyOutput,
   });
+  const onResize = () => app.rerender(wizardElement());
+  if (!legacyOutput) opts.output.on("resize", onResize);
   try {
     return await app.waitUntilExit() as InitWizardResult;
   } finally {
+    if (!legacyOutput) opts.output.off("resize", onResize);
     app.unmount();
     bridgedInput.stop();
   }

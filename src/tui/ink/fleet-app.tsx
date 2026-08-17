@@ -1,13 +1,31 @@
-import { emitKeypressEvents } from "node:readline";
-import { PassThrough } from "node:stream";
-import { render, Text, useApp, useInput } from "ink";
+import { Box, render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
 import { retiredModelReason } from "../../adapters/model-lints.js";
 import type { MapEntry, RoutingMode, Tier } from "../../config/config.js";
 import { fleetFirstTouchProvenance } from "../../config/fleet-overlay.js";
 import { TIERS, type Shape } from "../../graph/schema.js";
-import { FleetListScreen, FleetReviewScreen, ToggleMark, type FleetListRow } from "./components.js";
+import { windowRows } from "./components.js";
+import {
+  clip,
+  clipPathTail,
+  ElisionMark,
+  enterAltScreen,
+  fmtCtx,
+  fmtMs,
+  fmtUsdPair,
+  Glyph,
+  INK,
+  inkInput,
+  inkOutput,
+  KeyBar,
+  type KeyBind,
+  OverlayPanel,
+  padCell,
+  padCellStart,
+  Pointer,
+  SearchRow,
+} from "./frame.js";
 
 export type FleetSteeringKey = "review" | "consult";
 const STEERING_KEYS: FleetSteeringKey[] = ["review", "consult"];
@@ -49,12 +67,26 @@ type AgentCli = {
 
 export type FleetModelSuggestion = { tier: Tier; note: string };
 
+/** Catalog + probe metadata rendered as the browser's metadata columns (omp-style). */
+export type FleetModelEvidence = {
+  contextWindow?: number;
+  outputWindow?: number;
+  inputCostPerMtok?: number;
+  outputCostPerMtok?: number;
+  /** doctor's model probe wall clock (modelAuth.durationMs) — the "how fast did it answer" column */
+  probeMs?: number;
+  /** OBS-519: doctor's failed model-auth verdict reason — the row must not render like a healthy one */
+  unauthed?: string;
+};
+
 export type FleetModelGroup = {
   adapter: string;
   vendor?: string;
+  /** configured billing channel (cfg.tiers.<adapter>.channel) — prices render for api, quota for sub */
+  channel?: "sub" | "api";
   // OBS-508: `suggestion` is catalog evidence (catalogModelAdvisory) — prefills the classify flow
   // and feeds the bulk `s` stage; tickmarkr still never WRITES a tier without the review diff.
-  rows: Array<{ model: string; tier?: Tier; detectedAt?: string; suggestion?: FleetModelSuggestion }>;
+  rows: Array<{ model: string; tier?: Tier; detectedAt?: string; suggestion?: FleetModelSuggestion; evidence?: FleetModelEvidence }>;
 };
 
 export type FleetClassification = {
@@ -82,89 +114,7 @@ export type FleetCandidateOption = {
   pin: { via: string; model: string };
 };
 
-const escape = String.fromCharCode(27);
 const CHANNELS = ["sub", "api"] as const;
-const inkBookkeepingWrites = new Set(["", `${escape}[?25l`, `${escape}[?25h`, `${escape}[?2026h`, `${escape}[?2026l`]);
-
-function inkOutput(output: NodeJS.WriteStream): NodeJS.WriteStream {
-  if (typeof output.on === "function" && typeof output.off === "function") return output;
-  const facade = Object.create(output) as NodeJS.WriteStream;
-  const write = output.write.bind(output);
-  facade.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
-    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-    if (inkBookkeepingWrites.has(text)) return true;
-    return Reflect.apply(write, output, [chunk, ...args]) as boolean;
-  }) as NodeJS.WriteStream["write"];
-  facade.on = () => facade;
-  facade.off = () => facade;
-  return facade;
-}
-
-function inkInput(input: NodeJS.ReadStream, initialInput: string[]) {
-  const productionInput = typeof input.ref === "function" && typeof input.unref === "function";
-  // Isolate Ink's listeners on a bridge so every editor exit can detach the
-  // one listener it owns from the operator's terminal. Older injected FleetIO
-  // streams can arrive as decoded keypress events, while real TTYs forward raw
-  // data and leave decoding entirely to Ink.
-  const stream = new PassThrough() as PassThrough & {
-    isTTY?: boolean;
-    setRawMode?: (mode: boolean) => unknown;
-    ref: () => NodeJS.ReadStream;
-    unref: () => NodeJS.ReadStream;
-  };
-  stream.isTTY = input.isTTY;
-  stream.setRawMode = input.setRawMode?.bind(input);
-  stream.ref = () => {
-    if (productionInput) input.ref();
-    return stream as unknown as NodeJS.ReadStream;
-  };
-  stream.unref = () => {
-    if (productionInput) input.unref();
-    return stream as unknown as NodeJS.ReadStream;
-  };
-
-  const queued = [...initialInput];
-  let active = true;
-  let scheduled: NodeJS.Timeout | undefined;
-  const pump = () => {
-    scheduled = undefined;
-    if (!active) return;
-    const next = queued.shift();
-    if (next === undefined) return;
-    stream.write(next);
-    scheduled = setTimeout(pump, 0);
-  };
-  const onData = (chunk: string | Buffer) => {
-    queued.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
-    scheduled ??= setTimeout(pump, 0);
-  };
-  const onKeypress = (sequence: string | undefined, key: { sequence?: string } | undefined) => {
-    const token = key?.sequence ?? sequence;
-    if (token === undefined) return;
-    queued.push(token);
-    scheduled ??= setTimeout(pump, 0);
-  };
-  if (productionInput) {
-    input.on("data", onData);
-  } else {
-    emitKeypressEvents(input);
-    input.on("keypress", onKeypress);
-  }
-  input.resume();
-  if (queued.length > 0) scheduled = setTimeout(pump, 0);
-
-  return {
-    stream: stream as unknown as NodeJS.ReadStream,
-    stop() {
-      active = false;
-      if (scheduled) clearTimeout(scheduled);
-      if (productionInput) input.off("data", onData);
-      else input.off("keypress", onKeypress);
-      input.pause();
-      stream.end();
-    },
-  };
-}
 
 export function formatDoctorAge(ageMs: number | null): string {
   if (ageMs === null) return "no probe data";
@@ -179,6 +129,85 @@ function splitSeat(seat: string): { adapter: string; model: string } {
   const at = seat.indexOf(":");
   return { adapter: seat.slice(0, at), model: seat.slice(at + 1) };
 }
+
+type View = "models" | "shapes" | "steering";
+type DiffReview = Extract<FleetOverlayReview, { kind: "diff" }>;
+
+type ClassifyBulk = { adapter: string; vendor: string; rows: Array<{ model: string; suggestion: FleetModelSuggestion }> };
+
+/** OBS-530: `excludedNote` names the channels the picker CANNOT offer (staged out, denied,
+ * unauthed, unclassified) — the picker's silence was indistinguishable from a bug. */
+type CandidatesOverlay = { kind: "candidates"; shape: Shape; rows: FleetCandidateOption[]; excludedNote?: string; chain: string[]; at: number };
+
+type Overlay =
+  | { kind: "presets"; at: number; home: boolean }
+  | {
+    kind: "classify";
+    adapter: string;
+    model: string;
+    vendor?: string;
+    stage: "channel" | "tier" | "note";
+    channelAt: number;
+    tierAt: number;
+    note: string;
+    suggestion: FleetModelSuggestion | null;
+    /** a bulk `s` stage waiting on the one first-touch channel answer */
+    bulk?: ClassifyBulk;
+  }
+  | { kind: "add-model"; adapter: string; text: string }
+  | { kind: "assign"; adapter: string; model: string; at: number }
+  | CandidatesOverlay
+  // the tiny mode question a non-empty pool selection commits through — Esc restores `picker`
+  // (its chain and cursor intact); Enter stages { pool: { mode, channels: chain } } on the shape
+  | { kind: "poolmode"; picker: CandidatesOverlay; at: number }
+  | { kind: "prefer"; target: { shape: Shape } | { steering: FleetSteeringKey }; rows: string[]; chain: string[]; at: number }
+  | { kind: "judge"; at: number }
+  | { kind: "review"; review: DiffReview; scroll: number };
+
+type RailRow =
+  | { kind: "view"; view: View; label: string; count: number }
+  | { kind: "adapter"; index: number };
+
+type ModelRow = {
+  adapter: string;
+  model: string;
+  tier?: Tier;
+  detectedAt?: string;
+  suggestion?: FleetModelSuggestion;
+  evidence?: FleetModelEvidence;
+  channel?: "sub" | "api";
+  denied: boolean;
+};
+
+type Ui = {
+  focus: "rail" | "list";
+  view: View;
+  railAt: number;
+  /** -1 = all enabled adapters; otherwise an index into modelGroups */
+  adapterAt: number;
+  listAt: number;
+  filter: string;
+  /** explicit search mode — "/" enters, Enter commits (filter stays), Esc cancels */
+  searching: boolean;
+  /** browser filter stashed while an overlay is up — closing the overlay restores it (OBS-520) */
+  stash: { filter: string } | null;
+  /** first Esc/q with staged edits arms; the second within the same key sequence quits (OBS-521) */
+  quitArmed: boolean;
+  showAll: boolean;
+  /** v1.92: the FIRST Shapes entry per session auto-raises the presets overlay (both entries) */
+  presetsSeen: boolean;
+  notice: string;
+  deny: Set<string>;
+  denyModels: Set<string>;
+  classifications: FleetClassification[];
+  selectedMode: RoutingMode;
+  map: Record<string, MapEntry>;
+  steering: Record<FleetSteeringKey, string[] | undefined>;
+  judgeSeat: string | null;
+  channelByAdapter: Record<string, "sub" | "api">;
+  overlay: Overlay | null;
+  done: boolean;
+};
 
 export function FleetApp({
   ageMs,
@@ -201,6 +230,8 @@ export function FleetApp({
   initialJudge = "",
   judgeSeats = [],
   viewRows = Number.POSITIVE_INFINITY,
+  frameColumns = 100,
+  frameRows,
 }: {
   ageMs: number | null;
   agents: AgentCli[];
@@ -210,20 +241,22 @@ export function FleetApp({
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
   initialMap: Record<string, MapEntry>;
-  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>) => string[];
-  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>) => FleetShapeRow[];
+  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => string[];
+  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => FleetShapeRow[];
   candidatesForShape: (
     shape: Shape,
     mode: RoutingMode,
     map: Record<string, MapEntry>,
-  ) => FleetCandidateOption[];
+    deny: { adapters: string[]; models: string[] },
+  ) => { rows: FleetCandidateOption[]; excludedNote?: string };
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
-  // "presets" starts on the routing-mode screen with an extra `custom` row (init's entry point);
-  // "probe" is the classic six-step walk, byte-for-byte the pre-entry behavior.
+  // "presets" is init's entry point: the browser still opens on the models view (fleet scoping
+  // first), but Esc is HOME to the routing-preset overlay instead of quit; Enter on a preset
+  // there goes straight to the review diff, custom closes back into the browser.
   entry?: "presets" | "probe";
   /** resolved config judge as "adapter:model" — shown on the (keep default) picker row */
   initialJudge?: string;
@@ -231,167 +264,156 @@ export function FleetApp({
   judgeSeats?: string[];
   /** list viewport capacity (terminal rows minus chrome) — long lists window around the cursor */
   viewRows?: number;
+  /** terminal width the frame lays out against */
+  frameColumns?: number;
+  /** terminal height — set only on a real TTY so the footer sticks to the bottom */
+  frameRows?: number;
 }) {
   const { exit } = useApp();
-  const [screen, setScreen] = useState<
-    | "probe"
-    | "agents"
-    | "models"
-    | "add-model"
-    | "channel"
-    | "tiers"
-    | "provenance"
-    | "modes"
-    | "shapes"
-    | "candidates"
-    | "shape-prefer"
-    | "steering"
-    | "steering-prefer"
-    | "judge-pick"
-    | "review"
-  >(entry === "presets" ? "modes" : "probe");
-  const screenRef = useRef(screen);
-  const [cursor, setCursor] = useState(0);
-  const cursorRef = useRef(cursor);
-  const denyRef = useRef<Set<string> | undefined>(undefined);
-  denyRef.current ??= new Set(initialDenyAdapters);
-  const [denyAdapters, setDenyAdapters] = useState(() => new Set(initialDenyAdapters));
-  const denyModelsRef = useRef<Set<string> | undefined>(undefined);
-  denyModelsRef.current ??= new Set(initialDenyModels);
-  const [denyModels, setDenyModels] = useState(() => new Set(initialDenyModels));
-  const classificationsRef = useRef<FleetClassification[]>([]);
-  const [, setClassificationRevision] = useState(0);
-  const modelGroupRef = useRef(0);
-  const [modelGroup, setModelGroup] = useState(0);
-  const modelCursorRef = useRef(0);
-  const [modelCursor, setModelCursor] = useState(0);
-  const modelIdRef = useRef("");
-  const [modelId, setModelId] = useState("");
-  const channelCursorRef = useRef(0);
-  const [channelCursor, setChannelCursor] = useState(0);
-  const channelByAdapterRef = useRef<Record<string, "sub" | "api">>({});
-  const tierCursorRef = useRef(0);
-  const [tierCursor, setTierCursor] = useState(0);
-  const pendingClassificationRef = useRef<Omit<FleetClassification, "note"> | null>(null);
-  // OBS-508: the suggestion riding the in-flight classification (prefills tier + note), and the
-  // rows a bulk `s` staged while waiting on the one first-touch channel answer.
-  const pendingSuggestionRef = useRef<FleetModelSuggestion | null>(null);
-  const bulkRef = useRef<{ group: FleetModelGroup; rows: Array<{ model: string; suggestion: FleetModelSuggestion }> } | null>(null);
-  const noteRef = useRef("");
-  const [note, setNote] = useState("");
-  const [notice, setNotice] = useState("");
-  const modeCursorRef = useRef<number | undefined>(undefined);
-  modeCursorRef.current ??= Math.max(modeOptions.findIndex((option) => option.id === initialMode), 0);
-  const [modeCursor, setModeCursor] = useState(modeCursorRef.current);
-  const selectedModeRef = useRef(initialMode);
-  const mapRef = useRef<Record<string, MapEntry> | undefined>(undefined);
-  mapRef.current ??= structuredClone(initialMap);
-  const [map, setMap] = useState(() => structuredClone(initialMap));
-  const shapeCursorRef = useRef(0);
-  const [shapeCursor, setShapeCursor] = useState(0);
-  const candidateCursorRef = useRef(0);
-  const [candidateCursor, setCandidateCursor] = useState(0);
-  const candidatesRef = useRef<FleetCandidateOption[]>([]);
-  const preferCursorRef = useRef(0);
-  const [preferCursor, setPreferCursor] = useState(0);
-  const preferRowsRef = useRef<string[]>([]);
-  const preferChainRef = useRef<string[]>([]);
-  const [, setPreferRevision] = useState(0);
-  const steeringRef = useRef<Record<FleetSteeringKey, string[] | undefined> | undefined>(undefined);
-  steeringRef.current ??= structuredClone(initialSteering);
-  const [steering, setSteering] = useState(() => structuredClone(initialSteering));
-  const steeringCursorRef = useRef(0);
-  const [steeringCursor, setSteeringCursor] = useState(0);
-  const steeringPickerRef = useRef<FleetSteeringKey>("review");
-  const steeringRowsRef = useRef<string[]>([]);
-  const steeringChainRef = useRef<string[]>([]);
-  const steeringPickerCursorRef = useRef(0);
-  const [steeringPickerCursor, setSteeringPickerCursor] = useState(0);
-  const [, setSteeringPickerRevision] = useState(0);
-  const judgeCursorRef = useRef(0);
-  const [judgeCursor, setJudgeCursor] = useState(0);
-  const judgeSeatRef = useRef<string | null>(null);
-  const [judgeSeat, setJudgeSeat] = useState<string | null>(null);
-  const reviewRef = useRef<Extract<FleetOverlayReview, { kind: "diff" }> | null>(null);
-  const [review, setReview] = useState<Extract<FleetOverlayReview, { kind: "diff" }> | null>(null);
-  const doneRef = useRef(false);
-  // entry === "presets": the first modes visit is the preset pick (mode → review, custom → the
-  // full walk). Once custom is chosen this flips off and modes behaves exactly as in probe entry.
-  const presetPickRef = useRef(entry === "presets");
-  // type-to-search on the long lists — reset on every screen change (per-screen-visit filter)
-  const filterRef = useRef("");
-  const [filter, setFilter] = useState("");
-  // `a` on the models screen reveals retired/preview/non-worker shapes; sticky for the session.
-  const showAllModelsRef = useRef(false);
-  const [, setShowAllModels] = useState(false);
+  const [, setRevision] = useState(0);
+  const uiRef = useRef<Ui | null>(null);
+  uiRef.current ??= {
+    focus: "list",
+    view: "models",
+    railAt: 0,
+    adapterAt: -1,
+    listAt: 0,
+    filter: "",
+    searching: false,
+    stash: null,
+    quitArmed: false,
+    showAll: false,
+    presetsSeen: false,
+    notice: "",
+    deny: new Set(initialDenyAdapters),
+    denyModels: new Set(initialDenyModels),
+    classifications: [],
+    selectedMode: initialMode,
+    map: structuredClone(initialMap),
+    steering: structuredClone(initialSteering),
+    judgeSeat: null,
+    channelByAdapter: {},
+    // v1.92: no entry opens an overlay at launch — the browser opens on the models view (fleet
+    // scoping first); the presets overlay raises on the first Shapes entry instead (below).
+    overlay: null,
+    done: false,
+  };
+  const ui = uiRef.current;
+  const bump = () => setRevision((revision) => revision + 1);
 
-  const enabledModelGroups = () => modelGroups.filter((group) => !denyRef.current?.has(group.adapter));
-  const stagedMap = () => mapRef.current as Record<string, MapEntry>;
-  const currentModelRows = () => {
-    const group = enabledModelGroups()[modelGroupRef.current];
-    if (!group) return [];
-    const rows = group.rows.map((row) => {
-      const staged = classificationsRef.current.find(
+  // OBS-521/OBS-522: one truth for "is there staged work" — the Esc/q loss guard, the header
+  // chip, and the empty-`w` notice all read it. Counts staged EDITS, not diff hunks.
+  const initialDenySet = new Set(initialDenyAdapters);
+  const initialDenyModelSet = new Set(initialDenyModels);
+  const stagedCount = (): number => {
+    let n = ui.classifications.length
+      + (ui.selectedMode !== initialMode ? 1 : 0)
+      + (ui.judgeSeat !== null ? 1 : 0);
+    for (const adapter of ui.deny) if (!initialDenySet.has(adapter)) n += 1;
+    for (const adapter of initialDenySet) if (!ui.deny.has(adapter)) n += 1;
+    for (const model of ui.denyModels) if (!initialDenyModelSet.has(model)) n += 1;
+    for (const model of initialDenyModelSet) if (!ui.denyModels.has(model)) n += 1;
+    for (const shape of new Set([...Object.keys(initialMap), ...Object.keys(ui.map)])) {
+      // {} ≡ absent: pin-then-auto leaves an empty entry that writes nothing — not staged work
+      if (JSON.stringify(initialMap[shape] ?? {}) !== JSON.stringify(ui.map[shape] ?? {})) n += 1;
+    }
+    for (const key of STEERING_KEYS) {
+      if (JSON.stringify(ui.steering[key]) !== JSON.stringify(initialSteering[key])) n += 1;
+    }
+    return n;
+  };
+
+  // ── derived data ───────────────────────────────────────────────────────────
+
+  const enabledGroups = () => modelGroups.filter((group) => !ui.deny.has(group.adapter));
+  const scopedGroups = (): FleetModelGroup[] => {
+    if (ui.adapterAt === -1) return enabledGroups();
+    const group = modelGroups[ui.adapterAt];
+    return group && !ui.deny.has(group.adapter) ? [group] : [];
+  };
+
+  const groupRows = (group: FleetModelGroup): ModelRow[] => {
+    const rows: ModelRow[] = group.rows.map((row) => {
+      const staged = ui.classifications.find(
         (classification) => classification.adapter === group.adapter && classification.model === row.model,
       );
-      return staged ? { ...row, tier: staged.tier } : row;
+      return {
+        adapter: group.adapter,
+        model: row.model,
+        tier: staged?.tier ?? row.tier,
+        detectedAt: row.detectedAt,
+        suggestion: row.suggestion,
+        evidence: row.evidence,
+        channel: group.channel,
+        denied: ui.denyModels.has(`${group.adapter}:${row.model}`),
+      };
     });
     const known = new Set(rows.map((row) => row.model));
-    for (const staged of classificationsRef.current) {
+    for (const staged of ui.classifications) {
       if (staged.adapter === group.adapter && !known.has(staged.model)) {
-        rows.push({ model: staged.model, tier: staged.tier });
+        rows.push({
+          adapter: group.adapter,
+          model: staged.model,
+          tier: staged.tier,
+          channel: group.channel,
+          denied: ui.denyModels.has(`${group.adapter}:${staged.model}`),
+        });
       }
     }
     return rows;
   };
-  // type-to-search over the long lists: plain case-insensitive substring on the row's visible
-  // label. Each filterable screen derives its rows through these so input and render agree.
-  const matches = (label: string, f = filterRef.current) =>
-    f === "" || label.toLowerCase().includes(f.toLowerCase());
-  // Operator directive 2026-08-13: retired shapes (dated snapshots, previews, non-worker SKUs,
-  // legacy families) hide by DEFAULT — omp reports 218 ids and most can never carry a worker.
-  // `a` reveals them; a CLASSIFIED row is never hidden (a tiered dated snapshot was meant).
-  const filteredModelRows = (f = filterRef.current) =>
-    currentModelRows().filter((row) =>
-      matches(row.model, f)
-      && (showAllModelsRef.current || row.tier !== undefined || retiredModelReason(row.model) === null));
-  const hiddenModelCount = (f = filterRef.current) =>
-    currentModelRows().filter((row) => matches(row.model, f)).length - filteredModelRows(f).length;
-  const filteredCandidates = (f = filterRef.current) =>
-    candidatesRef.current.filter((candidate) => matches(candidate.label, f));
-  const filteredSteeringRows = (f = filterRef.current) =>
-    steeringRowsRef.current.filter((option) => matches(option, f));
-  const judgeKeepRow = initialJudge ? `(keep default)  ${initialJudge}` : "(keep default)";
-  const filteredJudgeRows = (f = filterRef.current) =>
-    [judgeKeepRow, ...judgeSeats].filter((row) => matches(row, f));
 
-  // Shared filter-edit tail for the filterable screens: hotkeys run first in each screen block,
-  // whatever printable input is left appends here (space stays a toggle key, never a filter char).
-  const filterInput = (
-    countFor: (f: string) => number,
-    cursorRef: { current: number },
-    setCursorState: (next: number) => void,
-    input: string,
-    key: { backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean },
-  ): boolean => {
-    // printable chars only: "\r" reaches here when an emptied list makes key.return a no-op
-    const printable = input > " " && !key.ctrl && !key.meta;
-    const next = key.backspace || key.delete
-      ? filterRef.current.slice(0, -1)
-      : (printable ? filterRef.current + input : null);
-    if (next === null) return false;
-    filterRef.current = next;
-    setFilter(next);
-    const clamped = Math.min(cursorRef.current, Math.max(countFor(next) - 1, 0));
-    cursorRef.current = clamped;
-    setCursorState(clamped);
-    return true;
+  const matches = (label: string, f: string) => f === "" || label.toLowerCase().includes(f.toLowerCase());
+
+  // Operator directive 2026-08-13: retired shapes (dated snapshots, previews, non-worker SKUs,
+  // legacy families) hide by DEFAULT. `a` reveals them; a CLASSIFIED row is never hidden.
+  const modelRows = (f = ui.filter): ModelRow[] =>
+    scopedGroups().flatMap(groupRows).filter((row) =>
+      matches(`${row.adapter}/${row.model}`, f)
+      && (ui.showAll || row.tier !== undefined || retiredModelReason(row.model) === null));
+  const hiddenModelCount = (f = ui.filter) =>
+    scopedGroups().flatMap(groupRows).filter((row) => matches(`${row.adapter}/${row.model}`, f)).length
+    - modelRows(f).length;
+
+  /** rail counts mirror the list's retired-hide (never the text filter) so numbers agree on screen */
+  const visibleCount = (scope: number) => {
+    const groups = scope === -1 ? enabledGroups() : (modelGroups[scope] ? [modelGroups[scope]] : []);
+    return groups.flatMap(groupRows)
+      .filter((row) => ui.showAll || row.tier !== undefined || retiredModelReason(row.model) === null).length;
   };
 
+  // three preview callbacks share it in lockstep — the staged deny truth every preview ranks under
+  const stagedDeny = () => ({ adapters: [...ui.deny].sort(), models: [...ui.denyModels].sort() });
+  const shapeList = () => shapeRows(ui.selectedMode, ui.map, stagedDeny());
+  const steeringList = () => [
+    ...STEERING_KEYS.map((key) => ({
+      id: key as string,
+      label: `${key}.prefer  →  ${ui.steering[key]?.join(", ") ?? "(none)"}`,
+    })),
+    { id: "judge", label: `judge  →  ${ui.judgeSeat ?? (initialJudge ? `${initialJudge} (default)` : "(default)")}` },
+  ];
+
+  const judgeKeepRow = initialJudge ? `(keep default)  ${initialJudge}` : "(keep default)";
+
+  const listLength = () => {
+    if (ui.view === "models") return modelRows().length;
+    if (ui.view === "shapes") return shapeList().length;
+    return steeringList().length;
+  };
+
+  const railRows = (): RailRow[] => [
+    { kind: "view", view: "models", label: "All models", count: visibleCount(-1) },
+    { kind: "view", view: "shapes", label: "Shapes", count: shapeList().length },
+    { kind: "view", view: "steering", label: "Steering", count: STEERING_KEYS.length + 1 },
+    ...modelGroups.map((_, index): RailRow => ({ kind: "adapter", index })),
+  ];
+
+  // ── state transitions ──────────────────────────────────────────────────────
+
   const editorState = (): FleetEditorState => ({
-    denyAdapters: [...(denyRef.current ?? [])].sort(),
-    denyModels: [...(denyModelsRef.current ?? [])].sort(),
-    classifications: classificationsRef.current.map((classification) =>
+    denyAdapters: [...ui.deny].sort(),
+    denyModels: [...ui.denyModels].sort(),
+    classifications: ui.classifications.map((classification) =>
       classification.vendor && classification.channel
         ? {
           ...classification,
@@ -401,944 +423,1495 @@ export function FleetApp({
           }),
         }
         : classification),
-    selectedMode: selectedModeRef.current,
-    map: stagedMap(),
-    ...(judgeSeatRef.current ? { judgeSeat: splitSeat(judgeSeatRef.current) } : {}),
-    steering: structuredClone(steeringRef.current as Record<FleetSteeringKey, string[] | undefined>),
+    selectedMode: ui.selectedMode,
+    map: ui.map,
+    ...(ui.judgeSeat ? { judgeSeat: splitSeat(ui.judgeSeat) } : {}),
+    steering: structuredClone(ui.steering),
   });
 
   const finish = (result: FleetEditorResult) => {
-    if (doneRef.current) return;
-    doneRef.current = true;
+    if (ui.done) return;
+    ui.done = true;
     exit(result);
   };
 
-  const finishEditor = () => {
-    showScreen("steering");
-  };
-
-  const showScreen = (next: typeof screen) => {
-    filterRef.current = "";
-    setFilter("");
-    screenRef.current = next;
-    setScreen(next);
+  const setOverlay = (overlay: Overlay | null) => {
+    // OBS-520: an overlay borrows ui.filter for its own search box — stash the browser's committed
+    // filter on open and restore it on close, so finishing an assignment/classification does not
+    // dump the operator back at the top of an unfiltered list.
+    if (ui.overlay === null && overlay !== null) ui.stash = { filter: ui.filter };
+    ui.overlay = overlay;
+    if (overlay === null) {
+      ui.filter = ui.stash?.filter ?? "";
+      ui.stash = null;
+    } else {
+      ui.filter = "";
+    }
+    ui.searching = false;
+    ui.notice = "";
+    bump();
   };
 
   // The one review funnel: an empty staged overlay finishes as no-changes, a real diff shows the
-  // confirm screen. Reached from the steering enter and, in preset entry, from a mode pick.
+  // confirm overlay. Reached from `w` and, in preset entry, from a preset pick.
   const goReview = () => {
     const nextReview = reviewOverlay(editorState());
     if (nextReview.kind === "empty") {
       finish({ kind: "no-changes" });
       return;
     }
-    reviewRef.current = nextReview as Extract<FleetOverlayReview, { kind: "diff" }>;
-    setReview(reviewRef.current);
-    setNotice("");
-    showScreen("review");
+    setOverlay({ kind: "review", review: nextReview, scroll: 0 });
   };
 
   const stageSuggested = (
-    group: FleetModelGroup,
+    adapter: string,
     rows: Array<{ model: string; suggestion: FleetModelSuggestion }>,
     firstTouch?: { vendor: string; channel: "sub" | "api" },
   ) => {
-    const staged = rows.map((row) => ({
-      adapter: group.adapter,
-      model: row.model,
-      tier: row.suggestion.tier,
-      note: row.suggestion.note,
-      ...firstTouch,
-    }));
-    classificationsRef.current = [...classificationsRef.current, ...staged];
-    setClassificationRevision((revision) => revision + 1);
-    setNotice(`fleet: staged ${staged.length} catalog-suggested classification(s) — nothing writes before the review diff`);
+    ui.classifications = [
+      ...ui.classifications,
+      ...rows.map((row) => ({
+        adapter,
+        model: row.model,
+        tier: row.suggestion.tier,
+        note: row.suggestion.note,
+        ...firstTouch,
+      })),
+    ];
+    ui.notice = `staged ${rows.length} catalog-suggested classification(s) — nothing writes before the review diff`;
+    bump();
   };
 
-  const beginClassification = (group: FleetModelGroup, model: string) => {
-    // OBS-508: catalog evidence prefills the flow — tier cursor lands on the suggested band and
+  const groupOf = (adapter: string) => modelGroups.find((group) => group.adapter === adapter);
+
+  const beginClassification = (adapter: string, model: string) => {
+    const group = groupOf(adapter);
+    if (!group) return;
+    // OBS-508: catalog evidence prefills the flow — the tier cursor lands on the suggested band and
     // (when the operator keeps that band) the provenance note arrives pre-typed. Free to override.
     const suggestion = group.rows.find((row) => row.model === model)?.suggestion ?? null;
-    pendingSuggestionRef.current = suggestion;
     const tierAt = suggestion ? Math.max(TIERS.indexOf(suggestion.tier), 0) : 0;
-    tierCursorRef.current = tierAt;
-    setTierCursor(tierAt);
-    const firstTouch = !group.rows.some((row) => row.tier !== undefined);
-    const pending: Omit<FleetClassification, "note"> = {
-      adapter: group.adapter,
+    const firstTouch = !group.rows.some((row) => row.tier !== undefined)
+      && !ui.classifications.some((c) => c.adapter === adapter);
+    const base = {
+      kind: "classify" as const,
+      adapter,
       model,
-      tier: TIERS[0],
+      channelAt: 0,
+      tierAt,
+      note: "",
+      suggestion,
     };
     if (!firstTouch) {
-      pendingClassificationRef.current = pending;
-      showScreen("tiers");
+      setOverlay({ ...base, stage: "tier" });
       return;
     }
     if (!group.vendor) {
-      setNotice(`fleet: ${group.adapter} has no vendor declaration — classification cannot be saved`);
+      ui.notice = `${adapter} has no vendor declaration — classification cannot be saved`;
+      bump();
       return;
     }
-    pending.vendor = group.vendor;
-    const answered = channelByAdapterRef.current[group.adapter];
+    const answered = ui.channelByAdapter[adapter];
     if (answered) {
-      pending.channel = answered;
-      pendingClassificationRef.current = pending;
-      showScreen("tiers");
+      setOverlay({ ...base, stage: "tier", vendor: group.vendor });
       return;
     }
-    pendingClassificationRef.current = pending;
-    channelCursorRef.current = 0;
-    setChannelCursor(0);
-    setNotice("");
-    showScreen("channel");
+    setOverlay({ ...base, stage: "channel", vendor: group.vendor });
   };
 
+  const applyClassification = (overlay: Extract<Overlay, { kind: "classify" }>) => {
+    const answered = overlay.vendor ? ui.channelByAdapter[overlay.adapter] : undefined;
+    ui.classifications = [
+      ...ui.classifications,
+      {
+        adapter: overlay.adapter,
+        model: overlay.model,
+        tier: TIERS[overlay.tierAt],
+        note: overlay.note.trim(),
+        ...(overlay.vendor && answered ? { vendor: overlay.vendor, channel: answered } : {}),
+      },
+    ];
+    setOverlay(null);
+  };
+
+  const clampList = () => {
+    ui.listAt = Math.min(ui.listAt, Math.max(listLength() - 1, 0));
+  };
+
+  // ── sizing (shared by the input handler and the render below) ──────────────
+
+  const width = Math.max(72, Math.min(frameColumns, 160));
+  const RAIL_W = 24;
+  const bodyW = width - RAIL_W - 5; // borders + padding
+  // OBS-523: reserve what the chrome actually uses — header 1, outer borders 2, padding 1,
+  // scope+search 2, elision marks 2, detail lines ≤2, keybar 1 — not 16. Six list rows were
+  // blank at every terminal size.
+  const capacity = Number.isFinite(viewRows) ? Math.max(4, viewRows as number) : Number.POSITIVE_INFINITY;
+  /** review diff rows: overlay chrome is one row shorter than the browser's (no scope header) */
+  const reviewCapacity = () => Number.isFinite(capacity) ? Math.min(Math.max(capacity + 1, 4), 400) : 400;
+  const reviewWindow = (overlay: Extract<Overlay, { kind: "review" }>) => {
+    const lines = overlay.review.diff.split("\n");
+    const cap = reviewCapacity();
+    const maxScroll = Math.max(lines.length - cap, 0);
+    const scroll = Math.min(Math.max(overlay.scroll, 0), maxScroll);
+    return { lines, cap, maxScroll, scroll, visible: lines.slice(scroll, scroll + cap) };
+  };
+
+  // OBS-521: quitting with staged edits needs a second Esc/q — armed by the first press,
+  // disarmed by any other key. Ctrl+C stays an immediate exit.
+  const guardedQuit = (armed: boolean): boolean => {
+    const staged = stagedCount();
+    if (staged === 0 || armed) {
+      finish({ kind: "quit" });
+      return true;
+    }
+    ui.quitArmed = true;
+    ui.notice = `${staged} staged edit(s) not written — w reviews the diff · press again to discard and quit`;
+    bump();
+    return false;
+  };
+
+  // ── input ──────────────────────────────────────────────────────────────────
+
   useInput((input, key) => {
-    if (doneRef.current) return;
-    if (key.escape && (screenRef.current === "candidates" || screenRef.current === "shape-prefer")) {
-      showScreen("shapes");
-      return;
-    }
-    if (key.escape && (screenRef.current === "steering-prefer" || screenRef.current === "judge-pick")) {
-      showScreen("steering");
-      return;
-    }
-    // The classification sub-flow (add-model → channel → tier → provenance) cancels back to the
-    // models list — before this, provenance's own "esc cancel" legend lied: Esc fell through to
-    // the walk-home branch in init entry and to QUIT in fleet entry, discarding staged work.
-    if (key.escape && (screenRef.current === "add-model" || screenRef.current === "channel" || screenRef.current === "tiers" || screenRef.current === "provenance")) {
-      noteRef.current = "";
-      setNote("");
-      setNotice("");
-      pendingSuggestionRef.current = null;
-      bulkRef.current = null;
-      showScreen("models");
-      return;
-    }
-    // v1.90.8 (operator field report): inside the init journey, one Esc must never discard the
-    // whole walk — from any walk screen it returns HOME to the presets screen; Esc there (or
-    // `q`/ctrl+c anywhere) remains the real quit. Sub-screen Escs above keep their tighter backs.
-    if (key.escape && entry === "presets" && screenRef.current !== "modes") {
-      setReview(null);
-      presetPickRef.current = true;
-      showScreen("modes");
-      return;
-    }
-    // While a type-to-search filter is LIVE, every printable char belongs to the search box:
-    // the letter aliases (j/k navigation, q quit, models' t/n/a) go dormant so "fake-n" or
-    // "qwen" can actually be typed — the k moved the cursor and the q quit the editor before
-    // this (operator field session, 2026-08-13). Arrows, Enter, Space, and Esc keep their roles.
-    const letterAlias = filterRef.current === "" ? input : "";
-    const typing = screenRef.current === "provenance" || screenRef.current === "add-model";
-    if (key.escape || (!typing && letterAlias === "q") || (key.ctrl && input === "c")) {
+    if (ui.done) return;
+    if (key.ctrl && input === "c") {
       finish({ kind: "quit" });
       return;
     }
+    const armed = ui.quitArmed;
+    ui.quitArmed = false;
 
-    if (screenRef.current === "probe") {
-      if (letterAlias === "r") {
-        finish({ kind: "refresh" });
-      } else if (key.return) {
-        showScreen("agents");
+    const overlay = ui.overlay;
+    // Search is an EXPLICIT, visible mode: "/" enters it, Enter commits (filter stays applied),
+    // Esc cancels. While it is on, every printable char belongs to the search box so "kimi" or
+    // "fake-n" can actually be typed; outside it letters are ALWAYS commands — even with a
+    // committed filter applied. The old implicit rule (hotkeys dormant whenever the filter was
+    // non-empty) confused both directions in the field: the first letter of a query fired
+    // commands, and a live filter silently ate m/w/j/k. (operator field sessions, 2026-08-13
+    // and 2026-08-15)
+    const hotkey = ui.searching ? "" : input;
+
+    // filter editing shared by the searchable surfaces
+    const editFilter = (count: (f: string) => number, clampAt?: (max: number) => void): boolean => {
+      // a LEADING "/" is the browser's search affordance, not query text — swallow it so the
+      // muscle memory "/kimi" works in every searchable overlay too (no channel id starts with /).
+      // A real terminal may deliver fast typing or a paste as ONE keypress chunk ("/kimi"), so the
+      // strip handles the chunk form as well as the lone key. A pasted chunk may also carry a
+      // trailing newline ("glm-5.3\r") — control bytes are terminal framing, never query text;
+      // left in, they made every row "not match" until the operator retyped the query by hand.
+      const chunk = ui.filter === "" && input.startsWith("/") ? input.slice(1) : input;
+      const typed = chunk.replace(/[\u0000-\u001f\u007f]/g, "");
+      if (typed === "" && input.startsWith("/")) return true;
+      const printable = typed > " " && !key.ctrl && !key.meta;
+      const next = key.backspace || key.delete
+        ? ui.filter.slice(0, -1)
+        : (printable ? ui.filter + typed : null);
+      if (next === null) return false;
+      ui.filter = next;
+      // OBS-520: the clamp targets the surface being filtered — an overlay clamps ITS cursor,
+      // never the browser's listAt (typing in a picker used to drag the shapes cursor to row 0).
+      const max = Math.max(count(next) - 1, 0);
+      if (clampAt) clampAt(max);
+      else ui.listAt = Math.min(ui.listAt, max);
+      ui.notice = "";
+      bump();
+      return true;
+    };
+
+    if (overlay) {
+      if (overlay.kind === "presets") {
+        const rowCount = modeOptions.length + (overlay.home ? 1 : 0);
+        if (key.escape) {
+          if (overlay.home) {
+            guardedQuit(armed);
+            return;
+          }
+          setOverlay(null);
+          return;
+        }
+        if (hotkey === "q") {
+          guardedQuit(armed);
+          return;
+        }
+        if (key.downArrow || hotkey === "j") {
+          overlay.at = Math.min(overlay.at + 1, rowCount - 1);
+          bump();
+          return;
+        }
+        if (key.upArrow || hotkey === "k") {
+          overlay.at = Math.max(overlay.at - 1, 0);
+          bump();
+          return;
+        }
+        if (key.return) {
+          if (overlay.home && overlay.at === modeOptions.length) {
+            setOverlay(null); // custom → the browser IS the full editor
+            return;
+          }
+          const option = modeOptions[overlay.at];
+          if (!option) return;
+          ui.selectedMode = option.id;
+          if (overlay.home) {
+            goReview(); // entry context: a preset pick goes straight to the diff confirm
+            return;
+          }
+          setOverlay(null);
+        }
+        return;
       }
+
+      if (overlay.kind === "review") {
+        if (key.escape) {
+          // non-destructive: back to the browser with everything still staged
+          setOverlay(entry === "presets" ? { kind: "presets", at: 0, home: true } : null);
+          return;
+        }
+        // OBS-524: the operator must be able to READ the whole diff they are approving —
+        // ↑↓/jk scroll a line, PgUp/PgDn a window; the elision rows carry the counts.
+        const window = reviewWindow(overlay);
+        if (key.downArrow || input === "j") {
+          overlay.scroll = Math.min(window.scroll + 1, window.maxScroll);
+          bump();
+          return;
+        }
+        if (key.upArrow || input === "k") {
+          overlay.scroll = Math.max(window.scroll - 1, 0);
+          bump();
+          return;
+        }
+        if (key.pageDown) {
+          overlay.scroll = Math.min(window.scroll + window.cap, window.maxScroll);
+          bump();
+          return;
+        }
+        if (key.pageUp) {
+          overlay.scroll = Math.max(window.scroll - window.cap, 0);
+          bump();
+          return;
+        }
+        if (input === "n") {
+          finish({ kind: "discard" });
+          return;
+        }
+        if (input === "q") {
+          finish({ kind: "quit" });
+          return;
+        }
+        if (input === "y") {
+          const loadError = reloadGuard(overlay.review.after);
+          if (loadError) {
+            setOverlay(null);
+            ui.notice = `config loader rejects the proposed overlay — ${loadError}`;
+            bump();
+            return;
+          }
+          finish({ kind: "write", review: overlay.review });
+        }
+        return;
+      }
+
+      if (overlay.kind === "classify") {
+        if (key.escape) {
+          setOverlay(null);
+          return;
+        }
+        if (overlay.stage === "channel") {
+          if (key.downArrow || input === "j") {
+            overlay.channelAt = Math.min(overlay.channelAt + 1, CHANNELS.length - 1);
+            bump();
+            return;
+          }
+          if (key.upArrow || input === "k") {
+            overlay.channelAt = Math.max(overlay.channelAt - 1, 0);
+            bump();
+            return;
+          }
+          if (key.return) {
+            const channel = CHANNELS[overlay.channelAt];
+            ui.channelByAdapter[overlay.adapter] = channel;
+            // OBS-508: a bulk stage waiting on the one first-touch channel answer resumes here.
+            if (overlay.bulk) {
+              stageSuggested(overlay.bulk.adapter, overlay.bulk.rows, { vendor: overlay.bulk.vendor, channel });
+              const notice = ui.notice;
+              setOverlay(null);
+              ui.notice = notice;
+              bump();
+              return;
+            }
+            overlay.stage = "tier";
+            bump();
+          }
+          return;
+        }
+        if (overlay.stage === "tier") {
+          if (key.downArrow || input === "j") {
+            overlay.tierAt = Math.min(overlay.tierAt + 1, TIERS.length - 1);
+            bump();
+            return;
+          }
+          if (key.upArrow || input === "k") {
+            overlay.tierAt = Math.max(overlay.tierAt - 1, 0);
+            bump();
+            return;
+          }
+          if (key.return) {
+            // OBS-508: keep the suggested band → the evidence note arrives pre-typed; override the
+            // band → the note starts empty (the suggestion argues for a DIFFERENT tier).
+            const chosen = TIERS[overlay.tierAt];
+            overlay.note = overlay.suggestion && overlay.suggestion.tier === chosen ? overlay.suggestion.note : "";
+            overlay.stage = "note";
+            bump();
+          }
+          return;
+        }
+        // note stage — free text
+        if (key.return) {
+          if (!overlay.note.trim()) {
+            ui.notice = "a typed benchmark-provenance note is required";
+            bump();
+            return;
+          }
+          applyClassification(overlay);
+          return;
+        }
+        if (key.backspace || key.delete) {
+          overlay.note = overlay.note.slice(0, -1);
+          bump();
+          return;
+        }
+        if (input && !key.ctrl && !key.meta) {
+          overlay.note += input;
+          ui.notice = "";
+          bump();
+        }
+        return;
+      }
+
+      if (overlay.kind === "add-model") {
+        if (key.escape) {
+          setOverlay(null);
+          return;
+        }
+        if (key.return) {
+          const candidate = overlay.text;
+          if (!MODEL_ID_RE.test(candidate)) {
+            ui.notice = `model id must match ${MODEL_ID_RE.source}`;
+            bump();
+            return;
+          }
+          const group = groupOf(overlay.adapter);
+          const exists = group
+            && groupRows(group).some((row) => row.model === candidate);
+          if (exists) {
+            ui.notice = `${candidate} is already listed for ${overlay.adapter}`;
+            bump();
+            return;
+          }
+          beginClassification(overlay.adapter, candidate);
+          return;
+        }
+        if (key.backspace || key.delete) {
+          overlay.text = overlay.text.slice(0, -1);
+          bump();
+          return;
+        }
+        if (input && !key.ctrl && !key.meta) {
+          overlay.text += input;
+          ui.notice = "";
+          bump();
+        }
+        return;
+      }
+
+      if (overlay.kind === "assign") {
+        const rows = shapeList();
+        if (key.escape) {
+          setOverlay(null);
+          return;
+        }
+        if (key.downArrow || input === "j") {
+          overlay.at = Math.min(overlay.at + 1, Math.max(rows.length - 1, 0));
+          bump();
+          return;
+        }
+        if (key.upArrow || input === "k") {
+          overlay.at = Math.max(overlay.at - 1, 0);
+          bump();
+          return;
+        }
+        if (key.return && rows[overlay.at]) {
+          const shape = rows[overlay.at].id;
+          ui.map = { ...ui.map, [shape]: { pin: { via: overlay.adapter, model: overlay.model } } };
+          setOverlay(null);
+          ui.notice = `pinned ${shape} → ${overlay.adapter}:${overlay.model}`;
+          bump();
+        }
+        return;
+      }
+
+      if (overlay.kind === "candidates") {
+        const rows = overlay.rows.filter((candidate) => matches(candidate.label, ui.filter));
+        if (key.escape) {
+          setOverlay(null);
+          return;
+        }
+        if (key.downArrow) {
+          overlay.at = Math.min(overlay.at + 1, Math.max(rows.length - 1, 0));
+          bump();
+          return;
+        }
+        if (key.upArrow) {
+          overlay.at = Math.max(overlay.at - 1, 0);
+          bump();
+          return;
+        }
+        if (input === " " && rows[overlay.at]) {
+          const id = rows[overlay.at].id;
+          const at = overlay.chain.indexOf(id);
+          if (at === -1) overlay.chain.push(id);
+          else overlay.chain.splice(at, 1);
+          bump();
+          return;
+        }
+        if (key.return) {
+          if (overlay.chain.length) {
+            // a selection is a POOL, and its mode is a decision, not a default — the tiny
+            // poolmode overlay asks it; Esc there restores this picker with the chain intact
+            // OBS-525: an existing pool's mode seeds the cursor so a round-trip keeps it
+            setOverlay({ kind: "poolmode", picker: overlay, at: ui.map[overlay.shape]?.pool?.mode === "ordered" ? 1 : 0 });
+            return;
+          }
+          if (rows[overlay.at]) {
+            ui.map = { ...ui.map, [overlay.shape]: { pin: rows[overlay.at].pin } };
+            setOverlay(null);
+            return;
+          }
+          return;
+        }
+        editFilter(
+          (f) => overlay.rows.filter((candidate) => matches(candidate.label, f)).length,
+          (max) => {
+            overlay.at = Math.min(overlay.at, max);
+          },
+        );
+        return;
+      }
+
+      if (overlay.kind === "poolmode") {
+        if (key.escape) {
+          setOverlay(overlay.picker); // back to the picker — chain and cursor intact
+          return;
+        }
+        if (key.downArrow || input === "j") {
+          overlay.at = 1;
+          bump();
+          return;
+        }
+        if (key.upArrow || input === "k") {
+          overlay.at = 0;
+          bump();
+          return;
+        }
+        if (key.return) {
+          const { shape, chain } = overlay.picker;
+          // a pool is the shape's WHOLE declaration: pin and prefer leave with it (schema
+          // exclusivity — pin+pool and pool+prefer both fail config load)
+          const { pin: _pin, prefer: _prefer, pool: _pool, ...entry } = ui.map[shape] ?? {};
+          ui.map = {
+            ...ui.map,
+            [shape]: { ...entry, pool: { mode: overlay.at === 0 ? "any" : "ordered", channels: chain.slice() } },
+          };
+          setOverlay(null);
+        }
+        return;
+      }
+
+      if (overlay.kind === "prefer") {
+        const rows = overlay.rows.filter((option) => matches(option, ui.filter));
+        if (key.escape) {
+          setOverlay(null);
+          return;
+        }
+        if (key.downArrow) {
+          overlay.at = Math.min(overlay.at + 1, Math.max(rows.length - 1, 0));
+          bump();
+          return;
+        }
+        if (key.upArrow) {
+          overlay.at = Math.max(overlay.at - 1, 0);
+          bump();
+          return;
+        }
+        if (input === " " && rows[overlay.at]) {
+          const option = rows[overlay.at];
+          const at = overlay.chain.indexOf(option);
+          if (at === -1) overlay.chain.push(option);
+          else overlay.chain.splice(at, 1);
+          bump();
+          return;
+        }
+        if (key.return) {
+          if ("shape" in overlay.target) {
+            const shape = overlay.target.shape;
+            const nextEntry = { ...ui.map[shape] };
+            if (overlay.chain.length) nextEntry.prefer = overlay.chain.slice();
+            else delete nextEntry.prefer;
+            ui.map = { ...ui.map, [shape]: nextEntry };
+          } else {
+            ui.steering = {
+              ...ui.steering,
+              [overlay.target.steering]: overlay.chain.length ? overlay.chain.slice() : undefined,
+            };
+          }
+          setOverlay(null);
+          return;
+        }
+        editFilter(
+          (f) => overlay.rows.filter((option) => matches(option, f)).length,
+          (max) => {
+            overlay.at = Math.min(overlay.at, max);
+          },
+        );
+        return;
+      }
+
+      // judge overlay
+      const rows = [judgeKeepRow, ...judgeSeats].filter((row) => matches(row, ui.filter));
+      if (key.escape) {
+        setOverlay(null);
+        return;
+      }
+      if (key.downArrow) {
+        overlay.at = Math.min(overlay.at + 1, Math.max(rows.length - 1, 0));
+        bump();
+        return;
+      }
+      if (key.upArrow) {
+        overlay.at = Math.max(overlay.at - 1, 0);
+        bump();
+        return;
+      }
+      if (key.return && rows[overlay.at]) {
+        // single-select: one seat or back to the config default — never a chain
+        const picked = rows[overlay.at];
+        ui.judgeSeat = picked === judgeKeepRow ? null : picked;
+        setOverlay(null);
+        return;
+      }
+      editFilter(
+        (f) => [judgeKeepRow, ...judgeSeats].filter((row) => matches(row, f)).length,
+        (max) => {
+          overlay.at = Math.min(overlay.at, max);
+        },
+      );
       return;
     }
 
-    if (screenRef.current === "agents") {
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(cursorRef.current + 1, Math.max(agents.length - 1, 0));
-        cursorRef.current = next;
-        setCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(cursorRef.current - 1, 0);
-        cursorRef.current = next;
-        setCursor(next);
-        return;
-      }
-      if (input === " " && agents.length > 0) {
-        const next = new Set(denyRef.current);
-        const id = agents[cursorRef.current].id;
-        if (next.has(id)) next.delete(id);
-        else next.add(id);
-        denyRef.current = next;
-        setDenyAdapters(next);
+    // ── browser (no overlay) ─────────────────────────────────────────────────
+
+    if (ui.searching) {
+      if (key.escape) {
+        ui.searching = false;
+        ui.filter = "";
+        bump();
         return;
       }
       if (key.return) {
-        if (enabledModelGroups().length === 0) showScreen("modes");
-        else showScreen("models");
+        ui.searching = false;
+        bump();
+        return;
+      }
+      if (key.downArrow) {
+        ui.listAt = Math.min(ui.listAt + 1, Math.max(listLength() - 1, 0));
+        bump();
+        return;
+      }
+      if (key.upArrow) {
+        ui.listAt = Math.max(ui.listAt - 1, 0);
+        bump();
+        return;
+      }
+      editFilter((f) => modelRows(f).length);
+      return;
+    }
+    if (key.escape) {
+      if (ui.filter !== "") {
+        ui.filter = "";
+        bump();
+        return;
+      }
+      // v1.90.8: inside the init journey one Esc must never discard the whole walk — it returns
+      // HOME to the presets overlay; Esc there (or q/ctrl+c anywhere) remains the real quit.
+      if (entry === "presets") {
+        setOverlay({ kind: "presets", at: Math.max(modeOptions.findIndex((option) => option.id === ui.selectedMode), 0), home: true });
+        return;
+      }
+      guardedQuit(armed);
+      return;
+    }
+    if (hotkey === "q") {
+      guardedQuit(armed);
+      return;
+    }
+    if (hotkey === "r") {
+      finish({ kind: "refresh" });
+      return;
+    }
+    if (hotkey === "w") {
+      // OBS-522: an empty `w` used to EXIT the editor as no-changes — a save key must never
+      // double as quit. Say there is nothing to write and stay.
+      if (stagedCount() === 0) {
+        ui.notice = "no staged edits — nothing to write (Esc quits)";
+        bump();
+        return;
+      }
+      goReview();
+      return;
+    }
+    if (hotkey === "m") {
+      setOverlay({ kind: "presets", at: Math.max(modeOptions.findIndex((option) => option.id === ui.selectedMode), 0), home: false });
+      return;
+    }
+    if (hotkey === "/" || (hotkey.startsWith("/") && hotkey.length > 1)) {
+      if (ui.view !== "models") {
+        // the shapes and steering lists are 9/3 fixed rows — nothing to search; say where search
+        // lives instead of eating the key silently (operator field report, 2026-08-16)
+        ui.notice = "this list is not searchable — / searches the models view (All models or an adapter in the rail)";
+        bump();
+        return;
+      }
+      ui.searching = true;
+      ui.focus = "list";
+      ui.notice = "";
+      // fast typing or a paste arrives as one chunk ("/kimi") — the tail is the query; control
+      // bytes (a pasted trailing "\r") are framing, not query text
+      ui.filter = hotkey.slice(1).replace(/[\u0000-\u001f\u007f]/g, "");
+      ui.listAt = Math.min(ui.listAt, Math.max(modelRows(ui.filter).length - 1, 0));
+      bump();
+      return;
+    }
+
+    // focus moves
+    if (key.leftArrow || (key.tab && ui.focus === "list")) {
+      ui.focus = "rail";
+      bump();
+      return;
+    }
+    if (key.rightArrow || (key.tab && ui.focus === "rail")) {
+      ui.focus = "list";
+      bump();
+      return;
+    }
+
+    if (ui.focus === "rail") {
+      const rows = railRows();
+      if (key.downArrow || hotkey === "j") {
+        ui.railAt = Math.min(ui.railAt + 1, rows.length - 1);
+        bump();
+        return;
+      }
+      if (key.upArrow || hotkey === "k") {
+        ui.railAt = Math.max(ui.railAt - 1, 0);
+        bump();
+        return;
+      }
+      const row = rows[ui.railAt];
+      if (!row) return;
+      if (input === " " && row.kind === "adapter") {
+        const id = modelGroups[row.index].adapter;
+        // membership can't fix auth — say so, or the ✗ reads as a toggle that refuses to move
+        // (operator field report, 2026-08-16: expired kimi token)
+        if (agents.find((agent) => agent.id === id)?.authed === false) {
+          ui.notice = `${id} is not authed — Space only toggles fleet membership; re-auth the ${id} CLI, then run tickmarkr doctor`;
+        }
+        const next = new Set(ui.deny);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        ui.deny = next;
+        clampList();
+        bump();
+        return;
+      }
+      if (key.return) {
+        if (row.kind === "view") {
+          ui.view = row.view;
+          if (row.view === "models") ui.adapterAt = -1;
+        } else {
+          ui.view = "models";
+          ui.adapterAt = row.index;
+        }
+        ui.focus = "list";
+        ui.listAt = 0;
+        ui.filter = "";
+        ui.notice = "";
+        // v1.92: the FIRST Shapes entry per session raises the presets overlay (both entries:
+        // fleet and init) — Esc from it lands right here in the shapes list, never quits.
+        if (ui.view === "shapes" && !ui.presetsSeen) {
+          ui.presetsSeen = true;
+          ui.overlay = {
+            kind: "presets",
+            at: Math.max(modeOptions.findIndex((option) => option.id === ui.selectedMode), 0),
+            home: false,
+          };
+        }
+        bump();
       }
       return;
     }
 
-    if (screenRef.current === "models") {
-      const rows = filteredModelRows();
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(modelCursorRef.current + 1, Math.max(rows.length - 1, 0));
-        modelCursorRef.current = next;
-        setModelCursor(next);
-        setNotice("");
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(modelCursorRef.current - 1, 0);
-        modelCursorRef.current = next;
-        setModelCursor(next);
-        setNotice("");
-        return;
-      }
-      const group = enabledModelGroups()[modelGroupRef.current];
-      const row = rows[modelCursorRef.current];
-      if (input === " " && group && row) {
+    // list focus
+    if (key.downArrow || hotkey === "j") {
+      ui.listAt = Math.min(ui.listAt + 1, Math.max(listLength() - 1, 0));
+      ui.notice = "";
+      bump();
+      return;
+    }
+    if (key.upArrow || hotkey === "k") {
+      ui.listAt = Math.max(ui.listAt - 1, 0);
+      ui.notice = "";
+      bump();
+      return;
+    }
+
+    if (ui.view === "models") {
+      const rows = modelRows();
+      const row = rows[ui.listAt];
+      if (input === " " && row) {
         if (!row.tier) {
-          // v1.90.9 (operator field report: "not selectable"): an unclassified model has no tier
-          // to route on — selecting IS classifying, so Space opens the same channel → tier →
-          // provenance flow as `t` instead of dying silently on a row drawn like a checkbox.
-          beginClassification(group, row.model);
+          // v1.90.9: an unclassified model has no tier to route on — selecting IS classifying,
+          // so Space opens the same channel → tier → provenance flow instead of dying silently.
+          beginClassification(row.adapter, row.model);
           return;
         }
-        const id = `${group.adapter}:${row.model}`;
-        const next = new Set(denyModelsRef.current);
+        const id = `${row.adapter}:${row.model}`;
+        const next = new Set(ui.denyModels);
         if (next.has(id)) next.delete(id);
         else next.add(id);
-        denyModelsRef.current = next;
-        setDenyModels(next);
+        ui.denyModels = next;
+        bump();
         return;
       }
-      // Letter hotkeys yield to an ACTIVE search (letterAlias above): with a filter live, every
-      // printable char belongs to the search box — otherwise typing "anthropic" toggles show-all
-      // at the `a` and opens classify at the `t`.
-      if (letterAlias === "t" && group && row) {
+      if (key.return && row) {
+        if (!row.tier) {
+          beginClassification(row.adapter, row.model);
+          return;
+        }
+        if (row.denied || ui.deny.has(row.adapter)) {
+          ui.notice = `${row.adapter}:${row.model} is out of the fleet — Space adds it before assigning`;
+          bump();
+          return;
+        }
+        // model-centric assignment: Enter pins the model to a shape (omp: Enter assigns roles)
+        setOverlay({ kind: "assign", adapter: row.adapter, model: row.model, at: 0 });
+        return;
+      }
+      if (hotkey === "t" && row) {
         if (row.tier) {
-          setNotice("fleet: tier reassignment on classified models is not supported in v1 — edit config directly");
+          ui.notice = "tier reassignment on classified models is not supported in v1 — edit config directly";
+          bump();
           return;
         }
-        beginClassification(group, row.model);
+        beginClassification(row.adapter, row.model);
         return;
       }
-      if (letterAlias === "n" && group) {
-        modelIdRef.current = "";
-        setModelId("");
-        setNotice("");
-        showScreen("add-model");
+      if (hotkey === "n") {
+        if (ui.adapterAt === -1) {
+          ui.notice = "select an adapter in the rail first — n adds a model to one adapter";
+          bump();
+          return;
+        }
+        setOverlay({ kind: "add-model", adapter: modelGroups[ui.adapterAt].adapter, text: "" });
         return;
       }
-      if (letterAlias === "s" && group) {
+      if (hotkey === "s") {
         // OBS-508: bulk-stage every VISIBLE unclassified model carrying a catalog suggestion —
-        // visible means the type-to-search filter and the retired-hide both scope the batch. The
-        // staging is consent-preserving: it lands in the same classifications list the single
-        // flow feeds, and only the review diff (y) ever writes.
-        const suggested = filteredModelRows()
-          .filter((candidate): candidate is { model: string; suggestion: FleetModelSuggestion } => !candidate.tier && candidate.suggestion !== undefined);
-        if (!suggested.length) {
-          setNotice("fleet: no catalog tier suggestions among the visible unclassified models — evidence comes from the cached catalogs (AA index / API pricing)");
+        // visible means the type-to-search filter and the retired-hide both scope the batch.
+        // Adapter-scoped: first-touch channel/vendor provenance is a per-adapter answer.
+        if (ui.adapterAt === -1) {
+          ui.notice = "select an adapter in the rail first — s stages one adapter's suggestions";
+          bump();
           return;
         }
-        const firstTouch = !group.rows.some((candidate) => candidate.tier !== undefined);
+        const group = modelGroups[ui.adapterAt];
+        const suggested = rows
+          .filter((candidate): candidate is ModelRow & { suggestion: FleetModelSuggestion } =>
+            candidate.adapter === group.adapter && !candidate.tier && candidate.suggestion !== undefined)
+          .map((candidate) => ({ model: candidate.model, suggestion: candidate.suggestion }));
+        if (!suggested.length) {
+          ui.notice = "no catalog tier suggestions among the visible unclassified models — evidence comes from the cached catalogs (AA index / API pricing)";
+          bump();
+          return;
+        }
+        const firstTouch = !group.rows.some((candidate) => candidate.tier !== undefined)
+          && !ui.classifications.some((c) => c.adapter === group.adapter);
         if (!firstTouch) {
-          stageSuggested(group, suggested);
+          stageSuggested(group.adapter, suggested);
           return;
         }
         if (!group.vendor) {
-          setNotice(`fleet: ${group.adapter} has no vendor declaration — classification cannot be saved`);
+          ui.notice = `${group.adapter} has no vendor declaration — classification cannot be saved`;
+          bump();
           return;
         }
-        const answered = channelByAdapterRef.current[group.adapter];
+        const answered = ui.channelByAdapter[group.adapter];
         if (answered) {
-          stageSuggested(group, suggested, { vendor: group.vendor, channel: answered });
+          stageSuggested(group.adapter, suggested, { vendor: group.vendor, channel: answered });
           return;
         }
-        bulkRef.current = { group, rows: suggested };
-        channelCursorRef.current = 0;
-        setChannelCursor(0);
-        setNotice("");
-        showScreen("channel");
+        setOverlay({
+          kind: "classify",
+          adapter: group.adapter,
+          model: "",
+          vendor: group.vendor,
+          stage: "channel",
+          channelAt: 0,
+          tierAt: 0,
+          note: "",
+          suggestion: null,
+          bulk: { adapter: group.adapter, vendor: group.vendor, rows: suggested },
+        });
         return;
       }
-      if (letterAlias === "a") {
-        showAllModelsRef.current = !showAllModelsRef.current;
-        setShowAllModels(showAllModelsRef.current);
-        const clamped = Math.min(modelCursorRef.current, Math.max(filteredModelRows().length - 1, 0));
-        modelCursorRef.current = clamped;
-        setModelCursor(clamped);
+      if (hotkey === "a") {
+        ui.showAll = !ui.showAll;
+        clampList();
+        bump();
         return;
-      }
-      if (key.return) {
-        if (modelGroupRef.current + 1 < enabledModelGroups().length) {
-          const next = modelGroupRef.current + 1;
-          modelGroupRef.current = next;
-          setModelGroup(next);
-          modelCursorRef.current = 0;
-          setModelCursor(0);
-          filterRef.current = "";
-          setFilter("");
-        } else {
-          showScreen("modes");
-        }
-        return;
-      }
-      if (filterInput((f) => filteredModelRows(f).length, modelCursorRef, setModelCursor, input, key)) {
-        setNotice("");
       }
       return;
     }
 
-    if (screenRef.current === "add-model") {
-      if (key.return) {
-        const group = enabledModelGroups()[modelGroupRef.current];
-        const candidate = modelIdRef.current;
-        if (!MODEL_ID_RE.test(candidate)) {
-          setNotice(`fleet: model id must match ${MODEL_ID_RE.source}`);
-          return;
-        }
-        if (currentModelRows().some((row) => row.model === candidate)) {
-          setNotice(`fleet: ${candidate} is already listed for ${group?.adapter ?? "this adapter"}`);
-          return;
-        }
-        if (group) beginClassification(group, candidate);
-        return;
-      }
-      if (key.backspace || key.delete) {
-        const next = modelIdRef.current.slice(0, -1);
-        modelIdRef.current = next;
-        setModelId(next);
-        return;
-      }
-      if (input && !key.ctrl && !key.meta) {
-        const next = modelIdRef.current + input;
-        modelIdRef.current = next;
-        setModelId(next);
-        setNotice("");
-      }
-      return;
-    }
-
-    if (screenRef.current === "channel") {
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(channelCursorRef.current + 1, CHANNELS.length - 1);
-        channelCursorRef.current = next;
-        setChannelCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(channelCursorRef.current - 1, 0);
-        channelCursorRef.current = next;
-        setChannelCursor(next);
-        return;
-      }
-      if (key.return) {
-        const channel = CHANNELS[channelCursorRef.current];
-        // OBS-508: a bulk stage waiting on the one first-touch channel answer resumes here.
-        const bulk = bulkRef.current;
-        if (bulk?.group.vendor) {
-          channelByAdapterRef.current[bulk.group.adapter] = channel;
-          stageSuggested(bulk.group, bulk.rows, { vendor: bulk.group.vendor, channel });
-          bulkRef.current = null;
-          showScreen("models");
-          return;
-        }
-        if (pendingClassificationRef.current) {
-          channelByAdapterRef.current[pendingClassificationRef.current.adapter] = channel;
-          pendingClassificationRef.current.channel = channel;
-          showScreen("tiers");
-        }
-      }
-      return;
-    }
-
-    if (screenRef.current === "tiers") {
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(tierCursorRef.current + 1, TIERS.length - 1);
-        tierCursorRef.current = next;
-        setTierCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(tierCursorRef.current - 1, 0);
-        tierCursorRef.current = next;
-        setTierCursor(next);
-        return;
-      }
-      if (key.return && pendingClassificationRef.current) {
-        const chosen = TIERS[tierCursorRef.current];
-        pendingClassificationRef.current.tier = chosen;
-        // OBS-508: keep the suggested band → the evidence note arrives pre-typed (Enter applies
-        // it as-is); override the band → the note starts empty, because the suggestion's text
-        // argues for a DIFFERENT tier than the one being recorded.
-        const suggestion = pendingSuggestionRef.current;
-        const prefill = suggestion && suggestion.tier === chosen ? suggestion.note : "";
-        noteRef.current = prefill;
-        setNote(prefill);
-        setNotice("");
-        showScreen("provenance");
-      }
-      return;
-    }
-
-    if (screenRef.current === "provenance") {
-      if (key.return) {
-        if (!noteRef.current.trim()) {
-          setNotice("fleet: a typed benchmark-provenance note is required");
-          return;
-        }
-        const pending = pendingClassificationRef.current;
-        if (pending) {
-          const next = [...classificationsRef.current, { ...pending, note: noteRef.current.trim() }];
-          classificationsRef.current = next;
-          setClassificationRevision((revision) => revision + 1);
-        }
-        pendingClassificationRef.current = null;
-        pendingSuggestionRef.current = null;
-        setNotice("");
-        showScreen("models");
-        return;
-      }
-      if (key.backspace || key.delete) {
-        const next = noteRef.current.slice(0, -1);
-        noteRef.current = next;
-        setNote(next);
-        return;
-      }
-      if (input && !key.ctrl && !key.meta) {
-        const next = noteRef.current + input;
-        noteRef.current = next;
-        setNote(next);
-      }
-    }
-
-    if (screenRef.current === "modes") {
-      // preset entry adds one final `custom` row after the modes — the full-walk escape hatch
-      const rowCount = modeOptions.length + (presetPickRef.current ? 1 : 0);
-      const currentModeCursor = modeCursorRef.current ?? 0;
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(currentModeCursor + 1, Math.max(rowCount - 1, 0));
-        modeCursorRef.current = next;
-        setModeCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(currentModeCursor - 1, 0);
-        modeCursorRef.current = next;
-        setModeCursor(next);
-        return;
-      }
-      if (key.return) {
-        if (presetPickRef.current && currentModeCursor === modeOptions.length) {
-          presetPickRef.current = false;
-          showScreen("agents");
-          return;
-        }
-        if (!modeOptions[currentModeCursor]) return;
-        selectedModeRef.current = modeOptions[currentModeCursor].id;
-        if (presetPickRef.current) {
-          // entry context: a preset pick goes straight to the diff confirm
-          goReview();
-          return;
-        }
-        showScreen("shapes");
-      }
-      return;
-    }
-
-    if (screenRef.current === "shapes") {
-      const rows = shapeRows(selectedModeRef.current, stagedMap());
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(shapeCursorRef.current + 1, Math.max(rows.length - 1, 0));
-        shapeCursorRef.current = next;
-        setShapeCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(shapeCursorRef.current - 1, 0);
-        shapeCursorRef.current = next;
-        setShapeCursor(next);
-        return;
-      }
-      const shape = rows[shapeCursorRef.current]?.id;
-      if (letterAlias === "a" && shape) {
-        const nextEntry = { ...stagedMap()[shape] };
+    if (ui.view === "shapes") {
+      const rows = shapeList();
+      const shape = rows[ui.listAt]?.id;
+      if (!shape) return;
+      if (hotkey === "a") {
+        // OBS-525: auto reverts the shape's WHOLE routing declaration — pool included, not just
+        // the pin. prefer survives: it biases auto routing and is valid without pin/pool.
+        const nextEntry = { ...ui.map[shape] };
         delete nextEntry.pin;
-        const nextMap = { ...stagedMap(), [shape]: nextEntry };
-        mapRef.current = nextMap;
-        setMap(nextMap);
+        delete nextEntry.pool;
+        ui.map = { ...ui.map, [shape]: nextEntry };
+        bump();
         return;
       }
-      if (letterAlias === "p" && shape) {
-        candidatesRef.current = candidatesForShape(shape, selectedModeRef.current, stagedMap());
-        candidateCursorRef.current = 0;
-        setCandidateCursor(0);
-        showScreen("candidates");
+      if (key.return || hotkey === "p") {
+        const picked = candidatesForShape(shape, ui.selectedMode, ui.map, stagedDeny());
+        setOverlay({
+          kind: "candidates",
+          shape,
+          rows: picked.rows,
+          excludedNote: picked.excludedNote,
+          // OBS-525: an existing pool round-trips — reopening the picker starts from the staged
+          // channels instead of an empty selection that would silently replace the pool with a pin.
+          chain: ui.map[shape]?.pool?.channels.slice() ?? [],
+          at: 0,
+        });
         return;
       }
-      if (letterAlias === "f" && shape) {
-        const current = stagedMap()[shape]?.prefer ?? [];
-        preferRowsRef.current = preferOptionsForShape(shape, current);
-        preferChainRef.current = current.slice();
-        preferCursorRef.current = 0;
-        setPreferCursor(0);
-        showScreen("shape-prefer");
-        return;
-      }
-      if (key.return) finishEditor();
-      return;
-    }
-
-    if (screenRef.current === "candidates") {
-      const rows = filteredCandidates();
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(candidateCursorRef.current + 1, Math.max(rows.length - 1, 0));
-        candidateCursorRef.current = next;
-        setCandidateCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(candidateCursorRef.current - 1, 0);
-        candidateCursorRef.current = next;
-        setCandidateCursor(next);
-        return;
-      }
-      if (key.return && rows[candidateCursorRef.current]) {
-        const shape = shapeRows(selectedModeRef.current, stagedMap())[shapeCursorRef.current]?.id;
-        if (shape) {
-          const picked = rows[candidateCursorRef.current];
-          const nextMap = { ...stagedMap(), [shape]: { pin: picked.pin } };
-          mapRef.current = nextMap;
-          setMap(nextMap);
-        }
-        showScreen("shapes");
-        return;
-      }
-      filterInput((f) => filteredCandidates(f).length, candidateCursorRef, setCandidateCursor, input, key);
-      return;
-    }
-
-    if (screenRef.current === "shape-prefer") {
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(preferCursorRef.current + 1, Math.max(preferRowsRef.current.length - 1, 0));
-        preferCursorRef.current = next;
-        setPreferCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(preferCursorRef.current - 1, 0);
-        preferCursorRef.current = next;
-        setPreferCursor(next);
-        return;
-      }
-      if (input === " " && preferRowsRef.current[preferCursorRef.current]) {
-        const option = preferRowsRef.current[preferCursorRef.current];
-        const at = preferChainRef.current.indexOf(option);
-        if (at === -1) preferChainRef.current.push(option);
-        else preferChainRef.current.splice(at, 1);
-        setPreferRevision((revision) => revision + 1);
-        return;
-      }
-      if (key.return) {
-        const shape = shapeRows(selectedModeRef.current, stagedMap())[shapeCursorRef.current]?.id;
-        if (shape) {
-          const nextEntry = { ...stagedMap()[shape] };
-          if (preferChainRef.current.length) nextEntry.prefer = preferChainRef.current.slice();
-          else delete nextEntry.prefer;
-          const nextMap = { ...stagedMap(), [shape]: nextEntry };
-          mapRef.current = nextMap;
-          setMap(nextMap);
-        }
-        showScreen("shapes");
-      }
-      return;
-    }
-
-    if (screenRef.current === "steering") {
-      // review.prefer + consult.prefer rows plus the single judge seat as the final row
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(steeringCursorRef.current + 1, STEERING_KEYS.length);
-        steeringCursorRef.current = next;
-        setSteeringCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(steeringCursorRef.current - 1, 0);
-        steeringCursorRef.current = next;
-        setSteeringCursor(next);
-        return;
-      }
-      if (letterAlias === "f") {
-        if (steeringCursorRef.current === STEERING_KEYS.length) {
-          judgeCursorRef.current = 0;
-          setJudgeCursor(0);
-          setNotice("");
-          showScreen("judge-pick");
+      if (hotkey === "f") {
+        if (ui.map[shape]?.pool !== undefined) {
+          // OBS-525: pool+prefer fails the config exclusivity refine — blocking here beats
+          // staging an invalid combination the reload guard bounces at the very end.
+          ui.notice = `${shape} routes a pool — prefer applies to auto/pin routing; press a (auto) first or re-pool via Enter`;
+          bump();
           return;
         }
-        const which = STEERING_KEYS[steeringCursorRef.current];
-        const current = steeringRef.current?.[which] ?? [];
-        steeringPickerRef.current = which;
-        steeringRowsRef.current = steeringOptionsFor(which, current);
-        steeringChainRef.current = current.slice();
-        steeringPickerCursorRef.current = 0;
-        setSteeringPickerCursor(0);
-        setNotice("");
-        showScreen("steering-prefer");
-        return;
+        const current = ui.map[shape]?.prefer ?? [];
+        setOverlay({
+          kind: "prefer",
+          target: { shape },
+          rows: preferOptionsForShape(shape, current),
+          chain: current.slice(),
+          at: 0,
+        });
       }
-      if (key.return) goReview();
       return;
     }
 
-    if (screenRef.current === "judge-pick") {
-      const rows = filteredJudgeRows();
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(judgeCursorRef.current + 1, Math.max(rows.length - 1, 0));
-        judgeCursorRef.current = next;
-        setJudgeCursor(next);
+    // steering view
+    const rows = steeringList();
+    const row = rows[ui.listAt];
+    if (!row) return;
+    if (key.return || hotkey === "f") {
+      if (row.id === "judge") {
+        setOverlay({ kind: "judge", at: 0 });
         return;
       }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(judgeCursorRef.current - 1, 0);
-        judgeCursorRef.current = next;
-        setJudgeCursor(next);
-        return;
-      }
-      if (key.return && rows[judgeCursorRef.current]) {
-        // single-select: one seat or back to the config default — never a chain
-        const picked = rows[judgeCursorRef.current];
-        const seat = picked === judgeKeepRow ? null : picked;
-        judgeSeatRef.current = seat;
-        setJudgeSeat(seat);
-        showScreen("steering");
-        return;
-      }
-      filterInput((f) => filteredJudgeRows(f).length, judgeCursorRef, setJudgeCursor, input, key);
-      return;
-    }
-
-    if (screenRef.current === "steering-prefer") {
-      const rows = filteredSteeringRows();
-      if (key.downArrow || letterAlias === "j") {
-        const next = Math.min(
-          steeringPickerCursorRef.current + 1,
-          Math.max(rows.length - 1, 0),
-        );
-        steeringPickerCursorRef.current = next;
-        setSteeringPickerCursor(next);
-        return;
-      }
-      if (key.upArrow || letterAlias === "k") {
-        const next = Math.max(steeringPickerCursorRef.current - 1, 0);
-        steeringPickerCursorRef.current = next;
-        setSteeringPickerCursor(next);
-        return;
-      }
-      if (input === " " && rows[steeringPickerCursorRef.current]) {
-        const option = rows[steeringPickerCursorRef.current];
-        const at = steeringChainRef.current.indexOf(option);
-        if (at === -1) steeringChainRef.current.push(option);
-        else steeringChainRef.current.splice(at, 1);
-        setSteeringPickerRevision((revision) => revision + 1);
-        return;
-      }
-      if (key.return) {
-        const which = steeringPickerRef.current;
-        const next = {
-          ...(steeringRef.current as Record<FleetSteeringKey, string[] | undefined>),
-          [which]: steeringChainRef.current.length ? steeringChainRef.current.slice() : undefined,
-        };
-        steeringRef.current = next;
-        setSteering(next);
-        setNotice("");
-        showScreen("steering");
-        return;
-      }
-      filterInput((f) => filteredSteeringRows(f).length, steeringPickerCursorRef, setSteeringPickerCursor, input, key);
-      return;
-    }
-
-    if (screenRef.current === "review") {
-      if (input === "n") {
-        finish({ kind: "discard" });
-        return;
-      }
-      if (input === "y" && reviewRef.current) {
-        const loadError = reloadGuard(reviewRef.current.after);
-        if (loadError) {
-          setNotice(`fleet: config loader rejects the proposed overlay — ${loadError}`);
-          reviewRef.current = null;
-          setReview(null);
-          showScreen(presetPickRef.current ? "modes" : "steering");
-          return;
-        }
-        finish({ kind: "write", review: reviewRef.current });
-      }
+      const which = row.id as FleetSteeringKey;
+      const current = ui.steering[which] ?? [];
+      setOverlay({
+        kind: "prefer",
+        target: { steering: which },
+        rows: steeringOptionsFor(which, current),
+        chain: current.slice(),
+        at: 0,
+      });
     }
   });
 
-  if (screen === "probe") {
-    return (
-      <FleetListScreen
-        title="step 1/6 · probe data"
-        legend="enter continue · r refresh via doctor · esc/q quit"
-        rows={[{
-          id: "doctor",
-          content: <Text>{`probe data: ${formatDoctorAge(ageMs)} (.tickmarkr/doctor.json)`}</Text>,
-        }]}
-        cursor={0}
-      />
-    );
-  }
+  // ── render ─────────────────────────────────────────────────────────────────
 
-  if (screen === "agents") {
-    const rows: FleetListRow[] = agents.map((agent) => {
-      const active = !denyAdapters.has(agent.id);
-      return {
-        id: agent.id,
-        content: (
-          <>
-            <ToggleMark active={active} />
-            <Text>{` ${agent.id}  ${agent.version}  ${agent.authed ? "authed" : "unauthed"}`}</Text>
-          </>
-        ),
-      };
-    });
-    return (
-      <FleetListScreen
-        title="step 2/6 · agent CLIs"
-        viewRows={viewRows}
-        legend="↑↓/jk move · space toggle · enter next · esc/q quit"
-        rows={rows}
-        cursor={cursor}
-      />
-    );
-  }
 
-  const group = enabledModelGroups()[modelGroup];
-  if (screen === "models") {
-    const filtered = filteredModelRows();
-    const rows: FleetListRow[] = filtered.map((row) => {
-      const denied = group ? denyModels.has(`${group.adapter}:${row.model}`) : false;
-      return {
-        id: row.model,
-        content: row.tier ? (
-          <>
-            <ToggleMark active={!denied} />
-            <Text>{` ${row.model}  ${row.tier}  ${denied ? "denied" : "allowed"}`}</Text>
-          </>
-        ) : <Text>{`?  ${row.model}${row.suggestion ? `  → ${row.suggestion.tier} suggested` : ""}`}</Text>,
-      };
-    });
-    // The remedy renders ONCE, for the row under the cursor — 218 identical "Space or t to
-    // classify" suffixes drowned the model names and wrapped long ids (operator screenshot,
-    // 2026-08-13). A notice always wins the line.
-    const focused = filtered[modelCursor];
-    const hidden = hiddenModelCount();
-    const detail = [
-      ...(notice
-        ? [notice]
-        : focused && !focused.tier
-          ? [focused.suggestion
-            ? `?  ${focused.suggestion.tier} suggested from catalog evidence — Space accepts prefilled, s stages every visible suggestion${focused.detectedAt ? ` (detected ${focused.detectedAt})` : ""}`
-            : `?  unclassified — Space or t to classify${focused.detectedAt ? ` (detected ${focused.detectedAt})` : ""}; unclassified models are never routed`]
-          : []),
-      ...(hidden > 0 ? [`… ${hidden} retired/preview/non-worker hidden — a shows all`] : []),
-      ...(showAllModelsRef.current ? ["showing retired models — a hides them again"] : []),
-    ];
-    return (
-      <FleetListScreen
-        title={`step 3/6 · models · ${group?.adapter ?? ""}`}
-        legend="↑↓ move · Space toggle/classify · s stage suggested · t tier · n add · a all · Enter next · Type to search · Esc quit"
-        viewRows={viewRows}
-        rows={rows}
-        cursor={modelCursor}
-        details={detail}
-        filter={filter}
-      />
-    );
-  }
+  const tierCell = (row: ModelRow): { text: string; color?: string; dim?: boolean } => {
+    if (row.tier === "frontier") return { text: "frontier", color: INK.brand };
+    if (row.tier === "mid") return { text: "mid" };
+    if (row.tier === "cheap") return { text: "cheap", dim: true };
+    if (row.suggestion) return { text: `→ ${row.suggestion.tier}?`, dim: true };
+    return { text: "", dim: true };
+  };
 
-  if (screen === "add-model") return (
-    <FleetListScreen
-      title={`add model · ${group?.adapter ?? ""}`}
-      legend="type model id · enter classify · esc cancel"
-      rows={[{ id: "model", content: <Text>{modelId || "model id (required):"}</Text> }]}
-      cursor={0}
-      details={notice ? [notice] : []}
-    />
+  const priceCell = (row: ModelRow): string => {
+    const usd = fmtUsdPair(row.evidence?.inputCostPerMtok, row.evidence?.outputCostPerMtok);
+    if (row.channel === "sub") return "sub";
+    return usd;
+  };
+
+  const modelDetail = (row: ModelRow): string => {
+    const parts = [
+      `${row.adapter}:${row.model}`,
+      row.tier ?? "unclassified",
+      row.evidence?.unauthed !== undefined ? `UNAUTHED — ${row.evidence.unauthed}` : "",
+      row.evidence?.contextWindow !== undefined ? `${fmtCtx(row.evidence.contextWindow)} ctx` : "",
+      row.evidence?.outputWindow !== undefined ? `${fmtCtx(row.evidence.outputWindow)} out` : "",
+      row.evidence?.inputCostPerMtok !== undefined || row.evidence?.outputCostPerMtok !== undefined
+        ? `${fmtUsdPair(row.evidence?.inputCostPerMtok, row.evidence?.outputCostPerMtok)} per Mtok`
+        : (row.channel === "sub" ? "sub flat-rate quota" : ""),
+      row.evidence?.probeMs !== undefined ? `probed ${fmtMs(row.evidence.probeMs)}` : "",
+      row.detectedAt ? `detected ${row.detectedAt}` : "",
+    ].filter(Boolean);
+    return parts.join(" · ");
+  };
+
+  const renderModelRow = (row: ModelRow, selected: boolean) => {
+    const tier = tierCell(row);
+    const showProbe = bodyW >= 76;
+    const showPrice = bodyW >= 60;
+    // every cell accounted for: pointer 2 + glyph 1 + gap 1 + tier 11 + ctx 6 (+ price 12 + probe 7)
+    const nameW = bodyW - 4 - 11 - 6 - (showPrice ? 12 : 0) - (showProbe ? 7 : 0);
+    // OBS-531: deep router ids (omp/prime-agent) clip tail-preserving — the LAST segment is the
+    // distinguishing half; end-clipping rendered ten identical "prime-agent/anthropic/claude-…" rows.
+    const name = clipPathTail(`${row.adapter}/${row.model}`, nameW);
+    const prefixLen = Math.min(name.length, row.adapter.length + 1);
+    return (
+      <Text key={`${row.adapter}:${row.model}`} wrap="truncate">
+        <Pointer on={selected} />
+        {row.denied
+          ? <Glyph kind="off" />
+          : row.evidence?.unauthed !== undefined
+            ? <Glyph kind="fail" />
+            : row.tier
+              ? <Glyph kind="on" />
+              : <Glyph kind="unknown" />}
+        <Text> </Text>
+        <Text dimColor={row.denied}>
+          <Text dimColor>{name.slice(0, prefixLen)}</Text>
+          <Text bold={selected}>{name.slice(prefixLen).padEnd(Math.max(nameW - prefixLen, 0))}</Text>
+        </Text>
+        <Text color={tier.color} dimColor={tier.dim}>{padCellStart(tier.text, 11)}</Text>
+        <Text dimColor>{padCellStart(fmtCtx(row.evidence?.contextWindow), 6)}</Text>
+        {showPrice && <Text dimColor={priceCell(row) === "sub"}>{padCellStart(priceCell(row), 12)}</Text>}
+        {showProbe && <Text dimColor>{padCellStart(fmtMs(row.evidence?.probeMs), 7)}</Text>}
+      </Text>
+    );
+  };
+
+  const renderPlainRow = (id: string, label: string, selected: boolean, rowW = bodyW - 2) => (
+    <Text key={id} wrap="truncate">
+      <Pointer on={selected} />
+      <Text bold={selected}>{clip(label, rowW)}</Text>
+    </Text>
   );
 
-  if (screen === "channel") return (
-    <FleetListScreen
-      title={`channel · ${pendingClassificationRef.current?.adapter ?? ""}`}
-      legend="↑↓/jk move · enter select · esc cancel · q quit"
-      rows={CHANNELS.map((channel) => ({ id: channel, content: <Text>{channel}</Text> }))}
-      cursor={channelCursor}
-    />
-  );
-
-  if (screen === "tiers") {
+  const renderShapeRow = (row: FleetShapeRow, selected: boolean, rowW = bodyW - 2) => {
+    const prefix = `${row.id}  →  `;
+    const rest = row.label.startsWith(prefix) ? row.label.slice(prefix.length) : row.label;
+    // The provenance chip is the row's decision token (fleet --why parity) — it right-aligns and
+    // never truncates; the assignment text absorbs the clipping instead.
+    const marker = " · source: ";
+    const markerAt = rest.lastIndexOf(marker);
+    const body = markerAt === -1 ? rest : rest.slice(0, markerAt);
+    const source = markerAt === -1 ? "" : rest.slice(markerAt + marker.length);
+    const sourceCell = source ? `source: ${source}` : "";
+    const bodyW2 = rowW - 12 - (sourceCell ? sourceCell.length + 2 : 0);
     return (
-      <FleetListScreen
-        title={`pick · tier · ${pendingClassificationRef.current?.adapter}:${pendingClassificationRef.current?.model}`}
-        legend="↑↓/jk move · enter select · esc cancel · q quit"
-        rows={TIERS.map((tier) => ({ id: tier, content: <Text>{tier}</Text> }))}
-        cursor={tierCursor}
-      />
+      <Text key={row.id} wrap="truncate">
+        <Pointer on={selected} />
+        <Text bold={selected} color={selected ? INK.brand : undefined}>{padCell(row.id, 10)}</Text>
+        <Text>{padCell(body, Math.max(bodyW2, 8))}</Text>
+        {sourceCell !== "" && <Text dimColor>{`  ${sourceCell}`}</Text>}
+      </Text>
     );
-  }
+  };
 
-  if (screen === "provenance") return (
-    <FleetListScreen
-      title={`benchmark provenance · ${pendingClassificationRef.current?.adapter}:${pendingClassificationRef.current?.model}`}
-      legend="type note · enter apply · esc cancel"
-      rows={[{ id: "note", content: <Text>{note || "benchmark provenance note (required):"}</Text> }]}
-      cursor={0}
-      details={notice ? [notice] : []}
-    />
-  );
+  const railView = (row: Extract<RailRow, { kind: "view" }>, index: number) => {
+    const active = ui.view === row.view && (row.view !== "models" || ui.adapterAt === -1);
+    const selected = ui.focus === "rail" && ui.railAt === index;
+    return (
+      <Text key={row.view}>
+        {selected ? <Text color={INK.brand}>{"❯ "}</Text> : <Text>{"  "}</Text>}
+        <Text bold={active} color={active ? INK.brand : undefined}>{padCell(row.label, 13)}</Text>
+        <Text dimColor>{padCellStart(String(row.count), 5)}</Text>
+      </Text>
+    );
+  };
 
-  if (screen === "modes") {
-    const presetPick = presetPickRef.current;
-    const rows: FleetListRow[] = modeOptions.map((option) => ({
-      id: option.id,
-      content: (
-        <>
-          {option.id === initialMode ? <ToggleMark active /> : <Text> </Text>}
-          <Text>{` ${option.id.padEnd(11)}  ${option.gloss}`}</Text>
-        </>
-      ),
-    }));
-    if (presetPick) {
-      rows.push({
-        id: "custom",
-        content: (
-          <>
-            <Text> </Text>
-            <Text>{` ${"custom".padEnd(11)}  walk the full editor (agents → models → shapes → seats)`}</Text>
-          </>
-        ),
-      });
+  const railAdapter = (index: number, railIndex: number) => {
+    const group = modelGroups[index];
+    const agent = agents.find((candidate) => candidate.id === group.adapter);
+    const denied = ui.deny.has(group.adapter);
+    const active = ui.view === "models" && ui.adapterAt === index;
+    const selected = ui.focus === "rail" && ui.railAt === railIndex;
+    return (
+      <Text key={group.adapter}>
+        {selected ? <Text color={INK.brand}>{"❯ "}</Text> : <Text>{"  "}</Text>}
+        {denied ? <Glyph kind="off" /> : agent?.authed === false ? <Glyph kind="fail" /> : <Glyph kind="on" />}
+        <Text> </Text>
+        <Text bold={active} color={active ? INK.brand : undefined} dimColor={denied}>{padCell(group.adapter, 12)}</Text>
+        <Text dimColor>{padCellStart(String(visibleCount(index)), 4)}</Text>
+      </Text>
+    );
+  };
+
+  const rail = railRows();
+  const overlayNode = (() => {
+    const overlay = ui.overlay;
+    if (!overlay) return null;
+
+    if (overlay.kind === "presets") {
+      const details = modeOptions[overlay.at] ? modePreview(modeOptions[overlay.at].id, ui.map, stagedDeny()) : [];
+      return (
+        <OverlayPanel title={overlay.home ? "routing preset" : "routing mode"} width={bodyW}>
+          <Text dimColor>{overlay.home ? "a preset routes every shape — custom opens the browser" : "floors move with the mode; the browser edits the rest"}</Text>
+          <Text> </Text>
+          {modeOptions.map((option, index) => (
+            <Text key={option.id}>
+              <Pointer on={overlay.at === index} />
+              {option.id === ui.selectedMode ? <Glyph kind="on" /> : <Text> </Text>}
+              <Text bold={overlay.at === index}>{` ${padCell(option.id, 12)}`}</Text>
+              <Text dimColor>{clip(option.gloss, bodyW - 20)}</Text>
+            </Text>
+          ))}
+          {overlay.home && (
+            <Text>
+              <Pointer on={overlay.at === modeOptions.length} />
+              <Text> </Text>
+              <Text bold={overlay.at === modeOptions.length}>{` ${padCell("custom", 12)}`}</Text>
+              <Text dimColor>{clip("open the fleet browser (models · shapes · steering)", bodyW - 20)}</Text>
+            </Text>
+          )}
+          <Text> </Text>
+          {details.map((line) => <Text key={line} dimColor>{line}</Text>)}
+        </OverlayPanel>
+      );
     }
-    return (
-      <FleetListScreen
-        title={presetPick ? "tickmarkr init · act 3 of 3 — fleet · routing presets" : "step 4/6 · routing mode"}
-        legend={presetPick ? "↑↓ to move · Enter to apply preset · Enter on custom to walk the editor · Esc inside the walk returns here · Esc here closes" : "↑↓/jk move · enter select · esc/q quit"}
-        rows={rows}
-        cursor={modeCursor}
-        details={modeOptions[modeCursor] ? modePreview(modeOptions[modeCursor].id, map) : []}
-      />
-    );
-  }
 
-  const renderedShapes = shapeRows(selectedModeRef.current, map);
-  if (screen === "shapes") {
-    return (
-      <FleetListScreen
-        title="step 5/6 · shape routing"
-        legend="↑↓/jk move · a auto · p pin · f prefer · enter next · esc/q quit"
-        rows={renderedShapes.map((row) => ({ id: row.id, content: <Text>{row.label}</Text> }))}
-        cursor={shapeCursor}
-      />
-    );
-  }
+    if (overlay.kind === "review") {
+      const { visible, scroll, cap, lines } = reviewWindow(overlay);
+      const below = lines.length - scroll - visible.length;
+      return (
+        <OverlayPanel title={`review · ${overlay.review.path}`} width={bodyW}>
+          <Text dimColor wrap="truncate">{clip("everything staged lands in this one diff — y writes, n discards, ↑↓ scroll, Esc keeps editing", bodyW - 4)}</Text>
+          {scroll > 0 && <ElisionMark count={scroll} side="above" />}
+          {visible.map((line, index) => (
+            <Text
+              key={`${scroll + index}:${line}`}
+              wrap="truncate"
+              color={line.startsWith("+") ? INK.brand : line.startsWith("-") ? INK.fail : undefined}
+              dimColor={line.startsWith("@") || line.startsWith("---") || line.startsWith("+++")}
+            >
+              {clip(line, bodyW - 6) || " "}
+            </Text>
+          ))}
+          {below > 0 && <ElisionMark count={below} side="below" hint={`↓ scrolls · PgDn jumps ${cap} lines`} />}
+        </OverlayPanel>
+      );
+    }
 
-  const shape = renderedShapes[shapeCursor]?.id;
-  if (screen === "candidates") {
-    return (
-      <FleetListScreen
-        title={`pick · ${shape}`}
-        viewRows={viewRows}
-        legend="↑↓ to move · Enter to pin · Type to search · Esc to cancel · q to quit"
-        rows={filteredCandidates().map((candidate) => ({
-          id: candidate.id,
-          content: <Text>{candidate.label}</Text>,
-        }))}
-        cursor={candidateCursor}
-        filter={filter}
-      />
-    );
-  }
-
-  if (screen === "shape-prefer") return (
-    <FleetListScreen
-      title={`pick · ${shape}.prefer`}
-      viewRows={viewRows}
-      legend="↑↓/jk move · space add/drop · enter apply (empty clears) · esc cancel · q quit"
-      rows={preferRowsRef.current.map((option) => {
-        const at = preferChainRef.current.indexOf(option);
-        return { id: option, content: <Text>{`${at === -1 ? "·" : String(at + 1)} ${option}`}</Text> };
-      })}
-      cursor={preferCursor}
-    />
-  );
-
-  if (screen === "steering") {
-    return (
-      <FleetListScreen
-        title="step 6/6 · steering"
-        legend="↑↓ to move · f to edit · Enter to review · Esc/q to quit"
-        rows={[
-          ...STEERING_KEYS.map((key): FleetListRow => ({
-            id: key,
-            content: <Text>{`${key}.prefer  →  ${steering[key]?.join(", ") ?? "(none)"}`}</Text>,
-          })),
-          {
-            id: "judge",
-            content: <Text>{`judge  →  ${judgeSeat ?? (initialJudge ? `${initialJudge} (default)` : "(default)")}`}</Text>,
-          },
-        ]}
-        cursor={steeringCursor}
-        details={notice ? [notice] : []}
-      />
-    );
-  }
-
-  if (screen === "judge-pick") {
-    const selected = judgeSeat ?? judgeKeepRow;
-    return (
-      <FleetListScreen
-        title="pick · judge"
-        viewRows={viewRows}
-        legend="↑↓ to move · Enter to select · Type to search · Esc to cancel · q to quit"
-        rows={filteredJudgeRows().map((label) => ({
-          id: label,
-          content: (
+    if (overlay.kind === "classify") {
+      const subject = overlay.bulk
+        ? `${overlay.adapter} · ${overlay.bulk.rows.length} suggested models`
+        : `${overlay.adapter}:${overlay.model}`;
+      return (
+        <OverlayPanel title={`classify · ${subject}`} width={bodyW}>
+          {overlay.stage === "channel" && (
             <>
-              {label === selected ? <ToggleMark active /> : <Text> </Text>}
-              <Text>{` ${label}`}</Text>
+              <Text dimColor>first touch for {overlay.adapter} — how is this CLI billed?</Text>
+              <Text> </Text>
+              {CHANNELS.map((channel, index) => (
+                <Text key={channel}>
+                  <Pointer on={overlay.channelAt === index} />
+                  <Text bold={overlay.channelAt === index}>{padCell(channel, 5)}</Text>
+                  <Text dimColor>{channel === "sub" ? "flat-rate subscription quota" : "metered API billing"}</Text>
+                </Text>
+              ))}
             </>
-          ),
-        }))}
-        cursor={judgeCursor}
-        filter={filter}
-      />
-    );
-  }
+          )}
+          {overlay.stage === "tier" && (
+            <>
+              <Text dimColor>
+                {overlay.suggestion
+                  ? `catalog suggests ${overlay.suggestion.tier} — keep it and the provenance note arrives pre-typed`
+                  : "pick the capability band this model routes as"}
+              </Text>
+              <Text> </Text>
+              {TIERS.map((tier, index) => (
+                <Text key={tier}>
+                  <Pointer on={overlay.tierAt === index} />
+                  {overlay.suggestion?.tier === tier ? <Glyph kind="on" /> : <Text> </Text>}
+                  <Text bold={overlay.tierAt === index}>{` ${padCell(tier, 9)}`}</Text>
+                  <Text dimColor>
+                    {tier === "frontier" ? "strongest band — integrity shapes" : tier === "mid" ? "capable daily driver" : "fast + cheap"}
+                  </Text>
+                </Text>
+              ))}
+            </>
+          )}
+          {overlay.stage === "note" && (
+            <>
+              <Text dimColor>benchmark provenance (required) — where does this tier claim come from?</Text>
+              <Text> </Text>
+              <Text>
+                <Text color={INK.brand}>{"> "}</Text>
+                <Text>{clip(overlay.note, bodyW - 6) || ""}</Text>
+                <Text color={INK.brand}>█</Text>
+              </Text>
+            </>
+          )}
+        </OverlayPanel>
+      );
+    }
 
-  if (screen === "steering-prefer") {
-    const which = steeringPickerRef.current;
+    if (overlay.kind === "add-model") {
+      return (
+        <OverlayPanel title={`add model · ${overlay.adapter}`} width={bodyW}>
+          <Text dimColor>type the model id exactly as the CLI names it</Text>
+          <Text> </Text>
+          <Text>
+            <Text color={INK.brand}>{"> "}</Text>
+            <Text>{clip(overlay.text, bodyW - 6)}</Text>
+            <Text color={INK.brand}>█</Text>
+          </Text>
+        </OverlayPanel>
+      );
+    }
+
+    if (overlay.kind === "assign") {
+      const rows = shapeList();
+      return (
+        <OverlayPanel title={`pin ${overlay.adapter}:${overlay.model} to a shape`} width={bodyW}>
+          <Text dimColor>Enter pins this model as the shape's route — a on the shape later reverts to auto</Text>
+          <Text> </Text>
+          {rows.map((row, index) => renderShapeRow(row, overlay.at === index, bodyW - 8))}
+        </OverlayPanel>
+      );
+    }
+
+    if (overlay.kind === "candidates") {
+      const rows = overlay.rows.filter((candidate) => matches(candidate.label, ui.filter));
+      const { visible, start, above, below } = windowRows(rows, overlay.at, capacity);
+      const chained = overlay.chain.length > 0;
+      return (
+        <OverlayPanel title={chained ? `pool · ${overlay.shape}` : `pin · ${overlay.shape}`} width={bodyW}>
+          <Text dimColor wrap="truncate">{clip("Enter pins one channel · Space selects a pool in order — Enter then asks its mode (pool replaces pin)", bodyW - 4)}</Text>
+          <SearchRow filter={ui.filter} active />
+          {overlay.excludedNote !== undefined
+            && <Text dimColor wrap="truncate">{clip(overlay.excludedNote, bodyW - 4)}</Text>}
+          {above > 0 && <ElisionMark count={above} side="above" />}
+          {visible.map((candidate, index) => {
+            const at = overlay.chain.indexOf(candidate.id);
+            const selected = start + index === overlay.at;
+            return (
+              <Text key={candidate.id} wrap="truncate">
+                <Pointer on={selected} />
+                {at === -1 ? <Text dimColor>{"· "}</Text> : <Text color={INK.brand}>{`${at + 1} `}</Text>}
+                <Text bold={selected}>{clip(candidate.label, bodyW - 10)}</Text>
+              </Text>
+            );
+          })}
+          {below > 0 && <ElisionMark count={below} side="below" />}
+        </OverlayPanel>
+      );
+    }
+
+    if (overlay.kind === "poolmode") {
+      const modes = [
+        { id: "any", gloss: "economy engine picks within your selection (cost, then tier)" },
+        { id: "ordered", gloss: "walk your selection in order; first live wins" },
+      ];
+      return (
+        <OverlayPanel title={`pool mode · ${overlay.picker.shape}`} width={bodyW}>
+          <Text dimColor>{clip(`pool: ${overlay.picker.chain.join(" → ")}`, bodyW - 4)}</Text>
+          <Text> </Text>
+          {modes.map((mode, index) => (
+            <Text key={mode.id}>
+              <Pointer on={overlay.at === index} />
+              <Text bold={overlay.at === index}>{padCell(mode.id, 9)}</Text>
+              <Text dimColor>{clip(`— ${mode.gloss}`, bodyW - 14)}</Text>
+            </Text>
+          ))}
+        </OverlayPanel>
+      );
+    }
+
+    if (overlay.kind === "prefer") {
+      const title = "shape" in overlay.target ? `${overlay.target.shape}.prefer` : `${overlay.target.steering}.prefer`;
+      const rows = overlay.rows.filter((option) => matches(option, ui.filter));
+      const { visible, start, above, below } = windowRows(rows, overlay.at, capacity);
+      return (
+        <OverlayPanel title={`edit · ${title}`} width={bodyW}>
+          <Text dimColor wrap="truncate">{clip("Space adds/drops in order · Enter applies (empty clears) · ordered chain wins routing ties", bodyW - 4)}</Text>
+          <SearchRow filter={ui.filter} active />
+          {above > 0 && <ElisionMark count={above} side="above" />}
+          {visible.map((option, index) => {
+            const at = overlay.chain.indexOf(option);
+            const selected = start + index === overlay.at;
+            return (
+              <Text key={option}>
+                <Pointer on={selected} />
+                {at === -1 ? <Text dimColor>{"· "}</Text> : <Text color={INK.brand}>{`${at + 1} `}</Text>}
+                <Text bold={selected}>{clip(option, bodyW - 10)}</Text>
+              </Text>
+            );
+          })}
+          {below > 0 && <ElisionMark count={below} side="below" />}
+        </OverlayPanel>
+      );
+    }
+
+    // judge
+    const rows = [judgeKeepRow, ...judgeSeats].filter((row) => matches(row, ui.filter));
+    const { visible, start, above, below } = windowRows(rows, overlay.at, capacity);
+    const selectedSeat = ui.judgeSeat ?? judgeKeepRow;
     return (
-      <FleetListScreen
-        title={`pick · ${which}.prefer`}
-        viewRows={viewRows}
-        legend="↑↓ to move · Space to add/drop · Enter to apply (empty clears) · Type to search · Esc to cancel · q to quit"
-        rows={filteredSteeringRows().map((option) => {
-          const at = steeringChainRef.current.indexOf(option);
-          return { id: option, content: <Text>{`${at === -1 ? "·" : String(at + 1)} ${option}`}</Text> };
-        })}
-        cursor={steeringPickerCursor}
-        filter={filter}
-      />
+      <OverlayPanel title="pick · judge" width={bodyW}>
+        <Text dimColor>one seat judges acceptance criteria — failover stays runtime (GATE-09)</Text>
+        <SearchRow filter={ui.filter} active />
+        {above > 0 && <ElisionMark count={above} side="above" />}
+        {visible.map((label, index) => (
+          <Text key={label}>
+            <Pointer on={start + index === overlay.at} />
+            {label === selectedSeat ? <Glyph kind="on" /> : <Text> </Text>}
+            <Text bold={start + index === overlay.at}>{` ${clip(label, bodyW - 10)}`}</Text>
+          </Text>
+        ))}
+        {below > 0 && <ElisionMark count={below} side="below" />}
+      </OverlayPanel>
     );
-  }
+  })();
 
+  const listNode = (() => {
+    if (overlayNode) return overlayNode;
+    if (ui.view === "models") {
+      const rows = modelRows();
+      const { visible, start, above, below } = windowRows(rows, ui.listAt, capacity);
+      const scopeLabel = ui.adapterAt === -1
+        ? "All models"
+        : modelGroups[ui.adapterAt]?.adapter ?? "";
+      const scopeDenied = ui.adapterAt !== -1 && ui.deny.has(modelGroups[ui.adapterAt]?.adapter ?? "");
+      return (
+        <Box flexDirection="column">
+          <Text>
+            <Text bold>{scopeLabel}</Text>
+            <Text dimColor>{`  ${rows.length}`}</Text>
+          </Text>
+          <SearchRow filter={ui.filter} active={ui.searching} hint="/ to search" />
+          {scopeDenied && <Text color={INK.warn}>{`${modelGroups[ui.adapterAt]?.adapter} is out of the fleet — Space on its rail row adds it back`}</Text>}
+          {above > 0 && <ElisionMark count={above} side="above" />}
+          {visible.map((row, index) => renderModelRow(row, ui.focus === "list" && start + index === ui.listAt))}
+          {below > 0 && <ElisionMark count={below} side="below" hint="/ to search" />}
+          {rows.length === 0 && !scopeDenied && <Text dimColor>{"  no models match"}</Text>}
+        </Box>
+      );
+    }
+    if (ui.view === "shapes") {
+      const rows = shapeList();
+      return (
+        <Box flexDirection="column">
+          <Text>
+            <Text bold>Shapes</Text>
+            <Text dimColor>{`  routed under ${ui.selectedMode}`}</Text>
+          </Text>
+          <Text> </Text>
+          {rows.map((row, index) => renderShapeRow(row, ui.focus === "list" && index === ui.listAt))}
+        </Box>
+      );
+    }
+    const rows = steeringList();
+    return (
+      <Box flexDirection="column">
+        <Text>
+          <Text bold>Steering</Text>
+          <Text dimColor>{"  review · consult · judge"}</Text>
+        </Text>
+        <Text> </Text>
+        {rows.map((row, index) => renderPlainRow(row.id, row.label, ui.focus === "list" && index === ui.listAt))}
+      </Box>
+    );
+  })();
+
+  // ── footer ─────────────────────────────────────────────────────────────────
+
+  const detailLines = (): string[] => {
+    if (ui.notice) return [ui.notice];
+    const overlay = ui.overlay;
+    if (overlay) {
+      if (overlay.kind === "candidates") {
+        const rows = overlay.rows.filter((candidate) => matches(candidate.label, ui.filter));
+        return rows[overlay.at] ? [rows[overlay.at].label] : [];
+      }
+      if (overlay.kind === "prefer") {
+        return overlay.chain.length ? [`chain: ${overlay.chain.join(" → ")}`] : [];
+      }
+      return [];
+    }
+    if (ui.view === "models") {
+      const rows = modelRows();
+      const row = rows[ui.listAt];
+      const lines: string[] = [];
+      if (row) {
+        lines.push(modelDetail(row));
+        if (!row.tier) {
+          lines.push(row.suggestion
+            ? `catalog suggests ${row.suggestion.tier} — Space/Enter classifies with the note pre-typed · s stages every visible suggestion`
+            : "unclassified — Space/Enter classifies; unclassified models are never routed");
+        }
+      }
+      const hidden = hiddenModelCount();
+      if (hidden > 0 && lines.length < 2) lines.push(`${hidden} retired/preview/non-worker hidden — a shows all`);
+      if (ui.showAll && lines.length < 2) lines.push("showing retired models — a hides them again");
+      return lines;
+    }
+    if (ui.view === "shapes") {
+      const row = shapeList()[ui.listAt];
+      return row ? [row.label] : [];
+    }
+    const row = steeringList()[ui.listAt];
+    return row ? [row.label] : [];
+  };
+
+  const keyBinds = (): KeyBind[] => {
+    const overlay = ui.overlay;
+    if (overlay) {
+      if (overlay.kind === "presets") {
+        return overlay.home
+          ? [{ key: "Enter", label: "apply preset" }, { key: "↑↓", label: "move" }, { key: "Esc", label: "quit" }]
+          : [{ key: "Enter", label: "set mode" }, { key: "↑↓", label: "move" }, { key: "Esc", label: "back" }];
+      }
+      if (overlay.kind === "review") {
+        return [{ key: "y", label: "write" }, { key: "n", label: "discard" }, { key: "↑↓", label: "scroll" }, { key: "Esc", label: "keep editing" }];
+      }
+      if (overlay.kind === "classify") {
+        return overlay.stage === "note"
+          ? [{ key: "type", label: "note" }, { key: "Enter", label: "stage" }, { key: "Esc", label: "cancel" }]
+          : [{ key: "↑↓", label: "move" }, { key: "Enter", label: "next" }, { key: "Esc", label: "cancel" }];
+      }
+      if (overlay.kind === "assign") {
+        // OBS-526: assign has no search box — advertising "type search" here promised a dead key
+        return [{ key: "Enter", label: "pin to shape" }, { key: "↑↓", label: "move" }, { key: "Esc", label: "cancel" }];
+      }
+      if (overlay.kind === "add-model") {
+        return [{ key: "type", label: "model id" }, { key: "Enter", label: "classify" }, { key: "Esc", label: "cancel" }];
+      }
+      if (overlay.kind === "prefer") {
+        return [{ key: "Space", label: "add/drop" }, { key: "Enter", label: "apply" }, { key: "type", label: "search" }, { key: "Esc", label: "cancel" }];
+      }
+      if (overlay.kind === "candidates") {
+        return [
+          { key: "Enter", label: overlay.chain.length ? "apply pool" : "pin" },
+          { key: "Space", label: "pool in order" },
+          { key: "type", label: "search" },
+          { key: "Esc", label: "cancel" },
+        ];
+      }
+      if (overlay.kind === "poolmode") {
+        return [
+          { key: "Enter", label: "apply pool" },
+          { key: "↑↓", label: "move" },
+          { key: "Esc", label: "back to picker" },
+        ];
+      }
+      return [{ key: "Enter", label: "select" }, { key: "↑↓", label: "move" }, { key: "type", label: "search" }, { key: "Esc", label: "cancel" }];
+    }
+    if (ui.searching) {
+      return [
+        { key: "type", label: "filter" },
+        { key: "Enter", label: "apply" },
+        { key: "↑↓", label: "move" },
+        { key: "Esc", label: "cancel" },
+      ];
+    }
+    const escLabel = ui.filter !== "" ? "clear search" : entry === "presets" ? "presets" : "quit";
+    if (ui.focus === "rail") {
+      return [
+        { key: "Enter", label: "open" },
+        { key: "↑↓", label: "move" },
+        { key: "Space", label: "fleet in/out CLI" },
+        { key: "→", label: "list" },
+        { key: "w", label: "review + write" },
+        { key: "Esc", label: escLabel },
+      ];
+    }
+    if (ui.view === "models") {
+      return [
+        { key: "Enter", label: "assign/classify" },
+        { key: "Space", label: "fleet in/out" },
+        { key: "m", label: "presets" },
+        { key: "w", label: "review + write" },
+        { key: "←", label: "rail" },
+        { key: "/", label: "search" },
+        { key: "Esc", label: escLabel },
+      ];
+    }
+    if (ui.view === "shapes") {
+      return [
+        { key: "Enter", label: "pin from candidates" },
+        { key: "f", label: "prefer chain" },
+        { key: "a", label: "auto" },
+        { key: "w", label: "review + write" },
+        { key: "←", label: "rail" },
+        { key: "Esc", label: escLabel },
+      ];
+    }
+    return [
+      { key: "Enter", label: "edit" },
+      { key: "w", label: "review + write" },
+      { key: "←", label: "rail" },
+      { key: "Esc", label: escLabel },
+    ];
+  };
+
+  const details = detailLines();
+  const staged = stagedCount();
   return (
-    <FleetReviewScreen
-      title="review · overlay diff"
-      legend="y write · n discard · esc/q quit"
-      diff={review?.diff ?? ""}
-    />
+    <Box flexDirection="column" width={width} height={frameRows}>
+      <Text>
+        <Text bold color={INK.brand}>{" tickmarkr fleet"}</Text>
+        <Text dimColor>{entry === "presets" ? " · init act 3 of 3" : ""}</Text>
+        <Text dimColor>{` · probe ${formatDoctorAge(ageMs)} · mode `}</Text>
+        <Text>{ui.selectedMode}</Text>
+        {staged > 0 && <Text color={INK.warn}>{` · ${staged} staged`}</Text>}
+      </Text>
+      <Box flexGrow={1} borderStyle="round" borderDimColor>
+        <Box width={RAIL_W} flexDirection="column" paddingLeft={1} paddingTop={1}>
+          {rail.slice(0, 3).map((row, index) => railView(row as Extract<RailRow, { kind: "view" }>, index))}
+          <Text dimColor>{"─".repeat(RAIL_W - 2)}</Text>
+          {rail.slice(3).map((row, index) =>
+            railAdapter((row as Extract<RailRow, { kind: "adapter" }>).index, index + 3))}
+        </Box>
+        <Box flexDirection="column" flexGrow={1} paddingX={1} paddingTop={1} borderStyle="single" borderDimColor borderTop={false} borderBottom={false} borderRight={false}>
+          {listNode}
+        </Box>
+      </Box>
+      {ui.notice
+        ? <Text color={INK.warn}>{` ! ${clip(ui.notice, width - 4)}`}</Text>
+        : details.map((line) => <Text key={line} dimColor>{` ${clip(line, width - 2)}`}</Text>)}
+      <KeyBar binds={keyBinds()} />
+    </Box>
   );
 }
+
 
 export async function runFleetInkEditor({
   ageMs,
@@ -1375,19 +1948,20 @@ export async function runFleetInkEditor({
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
   initialMap: Record<string, MapEntry>;
-  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>) => string[];
-  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>) => FleetShapeRow[];
+  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => string[];
+  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => FleetShapeRow[];
   candidatesForShape: (
     shape: Shape,
     mode: RoutingMode,
     map: Record<string, MapEntry>,
-  ) => FleetCandidateOption[];
+    deny: { adapters: string[]; models: string[] },
+  ) => { rows: FleetCandidateOption[]; excludedNote?: string };
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
-  /** "presets" opens on the routing-mode screen with the extra custom row; default preserves the probe-first walk */
+  /** "presets" = init's entry: Esc in the browser is HOME to the preset overlay, not quit */
   entry?: "presets" | "probe";
   initialJudge?: string;
   judgeSeats?: string[];
@@ -1412,7 +1986,13 @@ export async function runFleetInkEditor({
   }));
   const bridgedInput = inkInput(input, initialInput);
   const legacyOutput = typeof output.on !== "function" || typeof output.off !== "function";
-  const app = render(
+  const realTty = output === process.stdout && output.isTTY === true;
+  const leaveAltScreen = enterAltScreen(output);
+  // OBS-527: the terminal geometry is a LIVE input, not a launch constant — the element is
+  // rebuilt from output.columns/rows so a pane resize re-renders at the new size. Same root
+  // element type on every rerender ⇒ React keeps the component instance, so staged edits,
+  // cursor, and overlays all survive the resize.
+  const editorElement = () => (
     <FleetApp
       ageMs={ageMs}
       agents={agents}
@@ -1433,30 +2013,38 @@ export async function runFleetInkEditor({
       entry={entry}
       initialJudge={initialJudge}
       judgeSeats={judgeSeats}
-      // v1.90.9: omp's 218-model list rendered taller than the terminal and scrolled the cursor
-      // and chrome off-screen — cap every list to the terminal, minus title/legend/markers/details.
-      viewRows={Math.max(8, (output.rows ?? 40) - 10)}
-    />,
-    {
-      // FleetIO's injected stream predates Ink and did not require ref/unref.
-      // Real terminal streams pass through unchanged; the compatibility facade
-      // adds only those lifecycle methods and leaves input decoding to Ink.
-      stdin: bridgedInput.stream,
-      stdout: inkOutput(output),
-      exitOnCtrlC: false,
-      patchConsole: false,
-      // Legacy FleetIO outputs collected one complete frame per keypress before the Ink
-      // migration. Disable Ink's render throttling only for that injected facade so a
-      // cold-start byte sequence cannot collapse intermediate compatibility frames.
-      debug: debug || legacyOutput,
-    },
+      // v1.90.9: cap every list to the terminal minus chrome so the cursor and header can
+      // never scroll off-screen (omp's 218-model list did exactly that pre-cap).
+      // OBS-523: chrome is ≤12 rows worst case (header, borders, padding, scope+search,
+      // elisions, two detail lines, keybar) — the old -16 blanked six list rows at every size.
+      viewRows={Math.max(8, (output.rows ?? 40) - 12)}
+      frameColumns={output.columns ?? 100}
+      frameRows={realTty ? output.rows : undefined}
+    />
   );
+  const app = render(editorElement(), {
+    // FleetIO's injected stream predates Ink and did not require ref/unref.
+    // Real terminal streams pass through unchanged; the compatibility facade
+    // adds only those lifecycle methods and leaves input decoding to Ink.
+    stdin: bridgedInput.stream,
+    stdout: inkOutput(output),
+    exitOnCtrlC: false,
+    patchConsole: false,
+    // Legacy FleetIO outputs collected one complete frame per keypress before the Ink
+    // migration. Disable Ink's render throttling only for that injected facade so a
+    // cold-start byte sequence cannot collapse intermediate compatibility frames.
+    debug: debug || legacyOutput,
+  });
+  const onResize = () => app.rerender(editorElement());
+  if (!legacyOutput) output.on("resize", onResize);
   let result: FleetEditorResult | undefined;
   try {
     result = await app.waitUntilExit() as FleetEditorResult;
     return result;
   } finally {
+    if (!legacyOutput) output.off("resize", onResize);
     app.unmount();
     bridgedInput.stop();
+    leaveAltScreen();
   }
 }

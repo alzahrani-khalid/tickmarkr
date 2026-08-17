@@ -6,7 +6,7 @@ import { detectPackageManager, turboContinueFindings } from "../../gates/baselin
 import { version } from "./version.js";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
-import { BANNER, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
+import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
@@ -326,9 +326,20 @@ export async function doctor(
   const modelProbeAdapters = kimiTurnEnabled && health.kimi.authed === false
     ? adapters.filter((a) => a !== kimiAdapter)
     : adapters;
+  // One rewriting stderr line instead of a scrolling line per model (operator report 2026-08-14:
+  // 20 probe lines buried the journey). Totals print once at the end; non-TTY stays silent.
+  let probeOk = 0;
+  let probeBad = 0;
   await probeModels(cfg, cwd, modelProbeAdapters, health, probeProgressTTY
-    ? (adapter, model, status, durationMs) => console.error(`  ${adapter}:${model} ${status} (${(durationMs / 1000).toFixed(1)}s)`)
+    ? (adapter, model, status, durationMs) => {
+      if (status === "ok") probeOk += 1;
+      else probeBad += 1;
+      process.stderr.write(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""} · ${adapter}:${model} ${status} (${(durationMs / 1000).toFixed(1)}s)`);
+    }
     : undefined);
+  if (probeProgressTTY && probeOk + probeBad > 0) {
+    process.stderr.write(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""}\n`);
+  }
   writeDoctor(cwd, health);
   const rows = adapters.map((a) => {
     const h = health[a.id];
@@ -374,10 +385,14 @@ export async function doctor(
   // v1.22 T5: workspace-trust pre-flight — per installed adapter: trusted | seeded | action-required | n/a.
   // action-required names the exact one-time command (or dialog) the operator must run once.
   rows.push(legend("workspace trust:"));
+  // Declutter (operator report 2026-08-14): n/a trust rows carried zero decisions — nine of them
+  // drowned the one action-required line. They compress to a single dim roster; actionable rows keep
+  // their own verdict lines.
+  const trustNa: string[] = [];
   for (const a of adapters) {
     if (!health[a.id]?.installed) continue;
     if (!a.trust) {
-      rows.push(`  ${dim("=")} ${kvRow(a.id, "trust: n/a").slice(2)}`);
+      trustNa.push(a.id);
       continue;
     }
     try {
@@ -390,6 +405,7 @@ export async function doctor(
       rows.push(alignedStatusRow("warn", a.id, `trust: action-required — run ONCE: (trust check failed: ${e instanceof Error ? e.message : String(e)})`));
     }
   }
+  if (trustNa.length) rows.push(`  ${dim("=")} ${dim(`n/a (${trustNa.length}): ${trustNa.join(", ")}`)}`);
   for (const [role, sel] of [["judge", cfg.judge], ["consult", cfg.consult]] as const) {
     if (!health[sel.adapter]?.installed) {
       rows.push(attentionRow(`${role} runs on ${sel.adapter}:${sel.model} — NOT installed; that gate will fail closed until you install it or remap cfg.${role}`));
@@ -489,16 +505,20 @@ export async function doctor(
     const rows: string[] = [`  ${dim(a.id)}`];
     for (const m of models) {
       const v = h.modelAuth?.[m];
+      // probe wall clock (ProbedModelAuth.durationMs) — pre-v1.91 doctor.json rows lack it
+      const probedMs = (v as { durationMs?: number } | undefined)?.durationMs;
+      const probed = probedMs !== undefined ? dim(` ${(probedMs / 1000).toFixed(1)}s`) : "";
       const auth = !v
         ? dim("unknown")
         : v.authed
-          ? ok("authed")
+          ? `${ok("authed")}${probed}`
           : `${fail("unauthed:")} ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
       const d = disallowedBy({ adapter: a.id, model: m }, cfg.routing);
       const denied = d?.by === "deny" ? d.entry : "—";
       const pref = preferRanks({ adapter: a.id, model: m }, cfg).map((p) => `${p.shape}#${p.rank}`).join(",") || "—";
+      const window = declaredModelWindow(cfg, a.id, m);
       const windowCol = showWindows
-        ? ` ${String(declaredModelWindow(cfg, a.id, m) ?? "—").padEnd(8)}`
+        ? ` ${(window !== undefined ? compactTokens(window) : "—").padEnd(5)}`
         : "";
       rows.push(`    ${m.padEnd(w)} ${classified[m].padEnd(8)}${windowCol} ${auth}  ${dim("denied=")}${denied}  ${dim("prefer=")}${pref}`);
     }
@@ -545,5 +565,10 @@ export async function doctor(
     ].join(" and ");
     return `${header}\n${rows.join("\n")}\n  ${dim(`${elided} elided — \`tickmarkr doctor\` prints them in full${drift ? "; drift overlay written" : ""}`)}\nwrote ${stateDirName(cwd)}/doctor.json`;
   }
-  return `${header}\n${[...rows, ...lintRows].join("\n")}${modelSummary}${drift}\nwrote ${stateDirName(cwd)}/doctor.json`;
+  // Attention rows earn a counted section header so the matrix, the lints, and the model table
+  // read as three sections instead of one undifferentiated wall (operator report 2026-08-14).
+  const lintSection = lintRows.length
+    ? `\n${legend(`attention (${lintRows.length}):`)}\n${lintRows.join("\n")}`
+    : "";
+  return `${header}\n${rows.join("\n")}${lintSection}${modelSummary}${drift}\nwrote ${stateDirName(cwd)}/doctor.json`;
 }

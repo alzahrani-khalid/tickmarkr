@@ -7,7 +7,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { parse } from "yaml";
 import { allAdapters, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { readCachedCatalog, type CatalogReadResult } from "../../src/adapters/catalog-remote.js";
-import { MODEL_STALE_DAYS, SEED_STAMPED, catalogModelAdvisory, catalogTierRanking, contextWindowLints, estimateTaskPayloadTokens, hasWindowsConfig, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
+import { MODEL_STALE_DAYS, SEED_STAMPED, catalogModelAdvisory, catalogTierRanking, contextWindowLints, deadPoolLints, estimateTaskPayloadTokens, hasWindowsConfig, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
 import { CITED_MODEL_WINDOWS } from "../../src/adapters/model-windows.js";
 import { compileSource } from "../../src/compile/index.js";
 import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
@@ -597,6 +597,42 @@ describe("OBS-30 T2 seed prefer dead-adapter lint", () => {
     };
     expect(seedPreferLints(cfg, health, allAdapters().filter((a) => ["cursor-agent", "codex", "opencode"].includes(a.id)))).toEqual([]);
     expect(modelLints(cfg, health, allAdapters()).some((l) => l.includes("routing seed names dead adapter"))).toBe(false);
+  });
+});
+
+// v1.92: dead-pool lint — advisory mirror of the seed lint above; plan/run keeps the fail-loud
+// authority (router exhaustion RoutingError). Doctor renders these via modelLints (`  ! ` prefix).
+describe("v1.92 dead-pool lint", () => {
+  const adapters = allAdapters().filter((a) => a.id === "codex");
+
+  test("fires when a pool names zero doctor-found channels, naming the shape and the declared entries", () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.routing.map.implement = { pool: { mode: "any", channels: ["codex:gpt-5.6-terra", "kimi:kimi-code/k3"] } };
+    const health: Record<string, AuthHealth> = {
+      codex: {
+        installed: true, authed: true, models: ["gpt-5.6-terra"],
+        modelAuth: { "gpt-5.6-terra": { authed: false, reason: "HTTP 403", probedAt: "2026-07-15T00:00:00.000Z" } },
+      },
+    };
+    const lints = deadPoolLints(cfg, health, adapters);
+    expect(lints).toEqual([
+      "routing.map.implement.pool names no live channel — declared: codex:gpt-5.6-terra, kimi:kimi-code/k3",
+    ]);
+    // doctor's surface: the advisory rides modelLints, whose rows doctor renders with the `  ! ` prefix
+    expect(modelLints(cfg, health, adapters)).toContain(lints[0]);
+  });
+
+  test("silent when at least one declared pool channel is doctor-found", () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.routing.map.implement = { pool: { mode: "ordered", channels: ["kimi:kimi-code/k3", "codex:gpt-5.6-terra"] } };
+    const health: Record<string, AuthHealth> = {
+      codex: {
+        installed: true, authed: true, models: ["gpt-5.6-terra"],
+        modelAuth: { "gpt-5.6-terra": { authed: true, probedAt: "2026-07-15T00:00:00.000Z" } },
+      },
+    };
+    expect(deadPoolLints(cfg, health, adapters)).toEqual([]);
+    expect(modelLints(cfg, health, adapters).some((l) => l.includes(".pool names no live channel"))).toBe(false);
   });
 });
 

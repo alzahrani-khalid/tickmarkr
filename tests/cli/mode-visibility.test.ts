@@ -125,10 +125,12 @@ describe("v1.51 T4 dispatch provenance mode visibility", () => {
 
 // ── v1.56 T3: the fleet mode selector's estimated spend context ─────────────
 // Minimal fleet TUI driver: raw bytes on a PassThrough decode through node's own keypress
-// path (the production seam). Frames on the walk: 0 probe, 1 CLIs, 2 models, 3 mode, then
-// one frame per mode-screen keypress. The fake fleet is fake-1 (sub, frontier) + fake-2
-// (api, frontier); the DEFAULT map pins plan and spec to claude-code:fable, which cannot
-// route here, so every fixture re-pins them onto a fake channel — all nine shapes route.
+// path (the production seam). The browser opens on the models view; `m` opens the presets
+// overlay whose details carry the highlighted mode's mix line — one frame per keypress in
+// debug mode, so the frames containing "mix:" are exactly the overlay frames. The fake fleet
+// is fake-1 (sub, frontier) + fake-2 (api, frontier); the DEFAULT map pins plan and spec to
+// claude-code:fable, which cannot route here, so every fixture re-pins them onto a fake
+// channel — all nine shapes route.
 const FLEET_TIERS = "tiers:\n  fake:\n    vendor: fake\n    channel: sub\n    models:\n      fake-1: mid\n";
 const PINS_TO = (m: string) =>
   `  map:\n    plan:\n      pin: { via: fake, model: ${m} }\n    spec:\n      pin: { via: fake, model: ${m} }\n`;
@@ -162,27 +164,36 @@ const driveFleet = async (repo: string, adapter: FakeAdapter, bytes: string): Pr
   return writes;
 };
 
-const mixLine = (frame: string) => stripAnsi(frame).split("\n").find((l) => l.trimStart().startsWith("mix:"));
+// the browser frames the body in box-drawing borders, so a mix line is found by inclusion and
+// read from its own "mix:" anchor (it may wrap inside the overlay panel — join handles it)
+const mixFrames = (writes: string[]) =>
+  writes.map((frame) => {
+    const lines = stripAnsi(frame).split("\n");
+    const at = lines.findIndex((l) => l.includes("mix:"));
+    if (at === -1) return undefined;
+    // join the wrapped continuation rows (inside the overlay border) into one logical line
+    const logical = lines.slice(at, at + 3).map((l) => l.replace(/[│╭╮╰╯]/g, "").trim()).join(" ");
+    return logical.slice(logical.indexOf("mix:"));
+  }).filter((line): line is string => line !== undefined);
 
 describe("v1.56 T3 fleet mode spend visibility", () => {
   test("the highlighted mode shows a tier mix line covering all nine shapes", async () => {
     const { repo, adapter } = fleetRepo();
-    const writes = await driveFleet(repo, adapter, "\r\r\r\x1b[Bq");
-    // frame 3 = the mode screen (risk-based highlighted), frame 4 = after the down (staff-led);
-    // both carry a mix line whose tier counts sum to all nine shapes
-    for (const frame of [writes[3], writes[4]]) {
-      const mix = mixLine(frame);
-      expect(mix).toBeDefined();
-      const counts = [...mix!.matchAll(/(\d+) (?:cheap|mid|frontier)/g)].map((m) => Number(m[1]));
+    // m opens the presets overlay (risk-based highlighted), ↓ moves to staff-led, q quits
+    const writes = await driveFleet(repo, adapter, "m\x1b[Bq");
+    const mixes = mixFrames(writes);
+    expect(mixes.length).toBeGreaterThanOrEqual(2);
+    for (const mix of [mixes[0], mixes.at(-1)!]) {
+      const counts = [...mix.matchAll(/(\d+) (?:cheap|mid|frontier)/g)].map((m) => Number(m[1]));
       expect(counts.reduce((a, b) => a + b, 0)).toBe(9);
     }
-    expect(mixLine(writes[3])).toContain("mix: 9 frontier — all sub (flat-rate quota)");
+    expect(mixes[0]).toContain("mix: 9 frontier — all sub (flat-rate quota)");
   });
 
   test("the mode spend line shows no dollar total when every routed shape is on a subscription channel", async () => {
     const { repo, adapter } = fleetRepo();
-    const writes = await driveFleet(repo, adapter, "\r\r\rq");
-    const mix = mixLine(writes[3]);
+    const writes = await driveFleet(repo, adapter, "mq");
+    const mix = mixFrames(writes)[0];
     expect(mix).toContain("all sub (flat-rate quota)");
     expect(mix).not.toContain("$");
   });
@@ -191,8 +202,8 @@ describe("v1.56 T3 fleet mode spend visibility", () => {
     // denying the sub channel forces every preview shape onto fake-2 (api, frontier):
     // 9 × the default pricing-table frontier rate ($2.50) = $22.50
     const { repo, adapter } = fleetRepo(`routing:\n  deny:\n    models: [fake:fake-1]\n${PINS_TO("fake-2")}`);
-    const writes = await driveFleet(repo, adapter, "\r\r\rq");
-    const mix = mixLine(writes[3]);
+    const writes = await driveFleet(repo, adapter, "mq");
+    const mix = mixFrames(writes)[0];
     expect(mix).toContain("9 api");
     expect(mix).toContain("est. cost (API shapes only, rough): ~$22.50");
     expect(mix).not.toContain("sub (flat-rate quota)");

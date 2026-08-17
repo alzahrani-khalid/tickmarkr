@@ -188,7 +188,7 @@ describe("model status table (T4)", () => {
     const saved = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
 
     expect(out).toMatch(/model status:/);
-    expect(out).toMatch(/fake-1\s+mid\s+authed\s+denied=—\s+prefer=—/);
+    expect(out).toMatch(/fake-1\s+mid\s+authed [\d.]+s\s+denied=—\s+prefer=—/);
     // unauthed carries BOTH reason and probe date
     expect(out).toMatch(/fake-denied\s+cheap\s+unauthed: credit exhausted \(\d{4}-\d{2}-\d{2}\)\s+denied=—\s+prefer=—/);
     expect(saved.fake.modelAuth["fake-1"].authed).toBe(true);
@@ -205,7 +205,7 @@ describe("model status table (T4)", () => {
 `);
     const out = await doctor(["--"], repo, [mkFake(script)]);
     // the denied flag names the matched entry; fake-denied (not denied) stays denied=—
-    expect(out).toMatch(/fake-1\s+mid\s+authed\s+denied=fake:fake-1\s+prefer=—/);
+    expect(out).toMatch(/fake-1\s+mid\s+authed [\d.]+s\s+denied=fake:fake-1\s+prefer=—/);
     expect(out).toMatch(/fake-denied[\s\S]*denied=—/);
   });
 
@@ -276,7 +276,7 @@ describe("model status table (T4)", () => {
       fake-1: 200000
 `);
     const out = await doctor(["--"], repo, [mkFake(script)]);
-    expect(out).toMatch(/fake-1\s+mid\s+200000\s+authed/);
+    expect(out).toMatch(/fake-1\s+mid\s+200k\s+authed [\d.]+s/);
   });
 
 });
@@ -307,7 +307,7 @@ describe("workspace trust pre-flight (T5)", () => {
     expect(out).toMatch(/✓ codex\s+trust: seeded/);
     expect(out).toMatch(/✓ claude-code\s+trust: trusted/);
     expect(out).toMatch(/! cursor-agent\s+trust: action-required — run ONCE: accept the cursor-agent "Workspace Trust Required" dialog \(Enter\)/);
-    expect(out).toMatch(/= pi\s+trust: n\/a/);
+    expect(out).toMatch(/= n\/a \(1\): pi/);
   });
 
   test("codex config without the repo root entry gets exactly one projects entry seeded, idempotently", () => {

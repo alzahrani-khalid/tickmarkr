@@ -29,6 +29,15 @@ export type RoutingMode = z.infer<typeof ModeEnum>;
 // Only an explicit operator floor line can — and it draws a standing plan lint every load.
 export const INTEGRITY_FLOOR_SHAPES = ["plan", "spec", "migration", "ui"] as const;
 
+// v1.92: a pool is a shape's OWN closed candidate set — mode "any" lets the economy engine pick
+// inside it (cost, then tier); mode "ordered" walks the declaration order, first live wins. An
+// exhausted pool fails loud at plan (pin precedent, fail-closed).
+export const PoolSchema = z.object({
+  mode: z.enum(["any", "ordered"]),
+  channels: z.array(z.string().regex(/^[^:\s]+:\S.*$/, "pool channels are adapter:model")).min(1),
+});
+export type PoolEntry = z.infer<typeof PoolSchema>;
+
 // v1.52 T5: tier is no longer a map-entry band authority — routing.floors is the only tier
 // source left (v1.51 T3 deprecated this field with a promise to remove it here). Only the legacy
 // `tier: null` tombstone still parses (and normalizes to absent); any real value fails config
@@ -37,6 +46,7 @@ export const INTEGRITY_FLOOR_SHAPES = ["plan", "spec", "migration", "ui"] as con
 // outright) so a map entry can never carry a real tier value again, structurally.
 export const MapEntrySchema = z.object({
   pin: z.object({ via: z.string(), model: z.string() }).optional(),
+  pool: PoolSchema.optional(),
   tier: z
     .null({
       error: (iss) =>
@@ -305,7 +315,25 @@ export const TickmarkrConfigSchema = z.object({
   routing: z.object({
     // v1.51 T1: preset expanded into floors by loadConfig — absent ⇒ risk-based ⇒ byte-identical routing.
     mode: ModeEnum.optional(),
-    map: z.record(z.string(), MapEntrySchema),
+    // v1.92: pool exclusivity — the record-level superRefine (not MapEntrySchema's) because the
+    // error must name the shape. Fail-closed: both keys present fails config load.
+    map: z.record(z.string(), MapEntrySchema).superRefine((map, ctx) => {
+      for (const [shape, entry] of Object.entries(map)) {
+        if (!entry.pool) continue;
+        if (entry.pin) {
+          ctx.addIssue({
+            code: "custom", path: [shape, "pool"],
+            message: `routing.map.${shape}: pin and pool are one declaration — a pin is pool {mode: ordered, channels:[one]}; keep one`,
+          });
+        }
+        if (entry.prefer) {
+          ctx.addIssue({
+            code: "custom", path: [shape, "pool"],
+            message: `routing.map.${shape}: pool already decides the candidate set — prefer is the OPEN bias; keep one`,
+          });
+        }
+      }
+    }),
     floors: z.record(z.string(), TierEnum),
     learned: z.enum(["on", "off"]), // v1.6 ROUTE-09 kill switch; a typo (offf) fails loud via safeParse
     // v1.9 ROUTE-15 — optional overrides for profile.ts HALF_LIFE_RUNS/AVAIL_WEIGHT; absent ⇒ byte-identical defaults.
@@ -566,6 +594,19 @@ function deepMerge<T>(base: T, over: unknown, path: string[] = []): T {
     return over as T;
   }
   const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  // v1.92: pin/pool/prefer form ONE routing declaration slot per shape — a higher layer that
+  // declares any of them overrides the lower layer's whole slot atomically, so a seed prefer can
+  // never merge beside an overlay pool into a same-shape conflict the author never wrote (the
+  // map-entry exclusivity refine still rejects duplicates written in ONE document). Tombstones
+  // (explicit null) keep their precise per-key semantics via the loop below.
+  if (path.length === 3 && path[0] === "routing" && path[1] === "map") {
+    const declared = over as Record<string, unknown>;
+    if (declared.pin != null || declared.pool != null || declared.prefer != null) {
+      delete out.pin;
+      delete out.pool;
+      delete out.prefer;
+    }
+  }
   for (const [k, v] of Object.entries(over as Record<string, unknown>)) {
     if (v === null) {
       // T19: null is a declared multi-vendor state only at tiers.<adapter>.vendor. Every other null
@@ -738,13 +779,16 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #     implement: { prefer: [cursor-agent, codex] }
 #     migration: { pin: { via: claude-code, model: fable } }
 #     tests: { tier: null }   # tombstone: null removes a legacy map tier (a real tier value now fails config load — move the band to routing.floors.tests)
+#     implement: { pool: { mode: any, channels: [codex:gpt-5.6-luna, kimi:kimi-code/k3] } }
+#                         # pool: the shape's OWN candidate set — any: economy engine picks inside it;
+#                         # ordered: first live entry wins. Exhausted pool fails loud at plan (pin precedent).
 #   floors:               # tier authority — advisory minimum bands; 'tickmarkr plan' lints violations
 #     migration: frontier
 #   learned: on            # default ON (ROUTE-14); cold profile = exact v1.5 static routing, warms per workspace. Set 'off' to pin static routing; preview with 'tickmarkr plan'
 #   learnedTuning: { halfLifeRuns: 5, availWeight: 0.05 }  # optional; defaults byte-identical
 #   explore: { mode: on, excludeShapes: [], excludeComplexityAtOrAbove: null, cap: 5 }  # optional; absent ⇒ byte-identical
 #   sla: { implement: 15 }  # optional per-shape minutes — advisory plan lint only; absent ⇒ no lint
-#   allow: { adapters: [claude-code, codex] }   # optional fleet allowlist; presence activates even if empty (fail-closed)
+#   allow: { adapters: [claude-code, codex] }   # the FLEET: presence activates fail-closed; the fleet editor writes this form
 #   deny:                                      # optional fleet denylist; deny beats allow on conflict
 #     models:
 #       - pi:zai/glm-5.2  # OBS-57: pi passes run-start probe but hangs at finish without TICKMARKR_RESULT — remove after no-trailer demotion ships (v1.46 provider-outage taxonomy)
@@ -850,7 +894,26 @@ export function readOverlayFile(path: string): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 
-export function fleetEditableFromConfig(cfg: TickmarkrConfig): FleetEditable {
+/** Grammar A1 membership test: does any discovered universe row cover this deny/allow entry
+ * (adapter id, bare model id, or adapter:model)? Uncovered entries name channels the probe
+ * did not serve this session (failed auth, rate limit, retired sku) — they are NOT editable
+ * membership state and must survive a membership write verbatim, never be re-derived away. */
+export function universeCovers(
+  universe: { adapter: string; models: string[] }[],
+  entry: string,
+): boolean {
+  return universe.some((row) =>
+    entry === row.adapter || row.models.some((m) => entry === m || entry === `${row.adapter}:${m}`));
+}
+
+// v1.92 fleet membership: with a discovered `universe` (classified models only) the deny sets become
+// the EFFECTIVE out-of-fleet complement — anything routing.allow does not admit (fail-closed) UNION
+// routing.deny adapters/models scopes (never workers). Absent universe ⇒ deny arrays verbatim, so
+// non-UI callers stay byte-identical.
+export function fleetEditableFromConfig(
+  cfg: TickmarkrConfig,
+  universe?: { adapter: string; models: string[] }[],
+): FleetEditable {
   const tiers: FleetEditable["tiers"] = {};
   for (const [adapter, entry] of Object.entries(cfg.tiers)) {
     tiers[adapter] = {};
@@ -858,9 +921,44 @@ export function fleetEditableFromConfig(cfg: TickmarkrConfig): FleetEditable {
       tiers[adapter][model] = { tier };
     }
   }
+  let denyAdapters = [...(cfg.routing.deny?.adapters ?? [])].sort();
+  let denyModels = [...(cfg.routing.deny?.models ?? [])].sort();
+  if (universe !== undefined) {
+    const { allow, deny } = cfg.routing;
+    // Grammar A1 (disallowedBy precedent): entries match adapter id, bare model id, or adapter:model.
+    // Inlined rather than imported — route/preference.ts imports this module.
+    const denyEntries = [...(deny?.adapters ?? []), ...(deny?.models ?? [])];
+    const allowEntries = allow ? [...(allow.adapters ?? []), ...(allow.models ?? [])] : null;
+    const outOfFleet = (adapter: string, model: string): boolean => {
+      const matches = (e: string) => e === adapter || e === model || e === `${adapter}:${model}`;
+      if (denyEntries.some(matches)) return true;
+      return allowEntries !== null && !allowEntries.some(matches);
+    };
+    const adaptersOut: string[] = [];
+    const modelsOut: string[] = [];
+    for (const row of universe) {
+      const out = row.models.filter((m) => outOfFleet(row.adapter, m));
+      if (row.models.length ? out.length === row.models.length : outOfFleet(row.adapter, "")) {
+        adaptersOut.push(row.adapter);
+      } else {
+        modelsOut.push(...out.map((m) => `${row.adapter}:${m}`));
+      }
+    }
+    // OBS-517: deny entries the probe universe does not cover (failed/rate-limited probes drop the
+    // channel from discoverChannels) are preserved VERBATIM — deriving membership purely from the
+    // universe silently un-denied them on the next write (fail-open on the operator's own ban list).
+    denyAdapters = [...new Set([
+      ...adaptersOut,
+      ...(deny?.adapters ?? []).filter((e) => !universeCovers(universe, e)),
+    ])].sort();
+    denyModels = [...new Set([
+      ...modelsOut,
+      ...(deny?.models ?? []).filter((e) => !universeCovers(universe, e)),
+    ])].sort();
+  }
   return {
-    denyAdapters: [...(cfg.routing.deny?.adapters ?? [])].sort(),
-    denyModels: [...(cfg.routing.deny?.models ?? [])].sort(),
+    denyAdapters,
+    denyModels,
     tiers,
     map: structuredClone(cfg.routing.map),
     floors: { ...cfg.routing.floors },

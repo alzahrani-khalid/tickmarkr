@@ -121,7 +121,9 @@ describe("fleet --why", () => {
     const adapter = stampFakeDoctor(repoRoot);
     const { io, input, frames } = ttyIO();
     const editing = fleet(["--global-dir", globalDir], repoRoot, [adapter], io);
-    input.write("\r\r\r\r" + "jjp\r" + "q");
+    // the presets overlay (auto-raised on first Shapes entry) eats jj+Enter as a MODE change —
+    // staged work, so the quit guard takes a second q
+    input.write("\x1b[D\x1b[B\r" + "jjp\r" + "qq");
     expect(await editing).toBe("fleet: quit without writing");
     const pinned = stripAnsi(frames.join(""))
       .split("\n")
@@ -153,7 +155,13 @@ describe("fleet --why", () => {
 
     const { io, input, frames } = ttyIO();
     const editing = fleet(["--global-dir", globalDir], repoRoot, [adapter], io);
-    input.write("\r\r\r\r" + "q");
+    // the q must not race the Shapes repaint — under parallel-fork load Ink coalesces frames and
+    // a one-chunk nav+quit could unmount before the shapes list ever painted (the recurring flake)
+    const shapesPainted = () =>
+      stripAnsi(frames.join("")).split("\n").some((line) => line.includes("implement") && line.includes("source:"));
+    input.write("\x1b[D\x1b[B\r" + "\x1b");
+    for (let i = 0; i < 400 && !shapesPainted(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    input.write("q");
     expect(await editing).toBe("fleet: quit without writing");
     const shapeRow = stripAnsi(frames.join(""))
       .split("\n")

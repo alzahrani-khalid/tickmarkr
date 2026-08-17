@@ -26,7 +26,7 @@ const skill = (name: string) => readFileSync(join(ROOT, "skills", name, "SKILL.m
 const runInit = (repo: string, ...args: string[]) =>
   init(["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-")), ...args], repo);
 
-const KEY = { down: "\x1b[B", enter: "\r", space: " ", esc: "\x1b" };
+const KEY = { down: "\x1b[B", left: "\x1b[D", enter: "\r", space: " ", esc: "\x1b" };
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 
 type TestInput = PassThrough & {
@@ -96,8 +96,9 @@ const makeIO = () => {
   return { input, output, writes, whenFrame };
 };
 
-// Drive the consolidated init: wizard bytes first (buffered until act 1 mounts), then Esc the
-// act-3 fleet editor once its presets screen renders — every interactive init ends there now.
+// Drive the consolidated init: wizard bytes first (buffered until act 1 mounts), then quit the
+// act-3 fleet editor once its browser renders — v1.92 opens on the models view (no preset
+// overlay at launch); Esc is HOME to the preset overlay and Esc there quits.
 const driveInit = async (repo: string, wizardBytes: string, ...args: string[]) => {
   const io = makeIO();
   const p = init(
@@ -106,7 +107,9 @@ const driveInit = async (repo: string, wizardBytes: string, ...args: string[]) =
     { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
   );
   if (wizardBytes) io.input.write(wizardBytes);
-  await io.whenFrame("routing presets");
+  await io.whenFrame("All models");
+  io.input.write(KEY.esc);
+  await io.whenFrame("routing preset");
   io.input.write(KEY.esc);
   return { out: await p, io };
 };
@@ -352,13 +355,38 @@ describe("tickmarkr init wizard (T4)", () => {
     const repo = makeRepo({ ".tickmarkr/config.yaml": overlay });
     stampDoctor(repo, 5 * 60 * 1000);
 
-    // Existing config skips act 1 entirely — init lands on the act-3 presets screen.
+    // Existing config skips act 1 entirely — init lands in the act-3 fleet browser.
     const { io } = await driveInit(repo, "");
 
     expect(readFileSync(join(repo, ".tickmarkr/config.yaml"), "utf8")).toBe(overlay);
     expect(io.writes.some((w) => strip(w).includes("Preferences"))).toBe(false);
     // interactive reuse branch stays compact — the matrix lives behind `tickmarkr doctor`
     expect(io.writes.some((w) => strip(w).includes("full matrix: tickmarkr doctor"))).toBe(true);
+  });
+
+  test("the act-3 presets overlay raises on the first Shapes entry, not at launch", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    stampDoctor(repo, 5 * 60 * 1000);
+    const io = makeIO();
+    const p = init(
+      ["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-"))],
+      repo,
+      { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
+    );
+    io.input.write(KEY.down.repeat(9) + KEY.enter); // act 1: accept every default → act 3
+    await io.whenFrame("All models");
+    // NOT at launch: the browser opened on the models view with no preset overlay anywhere yet
+    expect(io.writes.some((w) => strip(w).includes("routing preset"))).toBe(false);
+    expect(io.writes.some((w) => strip(w).includes("routing mode"))).toBe(false);
+    io.input.write(KEY.left + KEY.down + KEY.enter); // rail → Shapes → FIRST Shapes entry
+    await io.whenFrame("routing mode"); // the presets overlay auto-raised
+    io.input.write(KEY.esc); // Esc from it lands in the shapes list — never quits
+    await io.whenFrame("Shapes  routed under");
+    io.input.write(KEY.esc); // browser Esc → HOME preset overlay (init quit-safety)
+    await io.whenFrame("routing preset");
+    io.input.write(KEY.esc); // Esc there quits
+    expect(await p).toContain("fleet: quit without writing");
   });
 
   test("wizard quit is one line — no probe, no report wall, no fleet act", async () => {
@@ -380,7 +408,7 @@ describe("tickmarkr init wizard (T4)", () => {
     expect(out).not.toContain("capability matrix");
     expect(out).not.toContain("next steps");
     expect(probeAllSpy).not.toHaveBeenCalled();
-    expect(io.writes.some((w) => strip(w).includes("routing presets"))).toBe(false);
+    expect(io.writes.some((w) => strip(w).includes("routing preset"))).toBe(false);
     expect(existsSync(join(repo, ".tickmarkr", "config.yaml"))).toBe(false);
   });
 
@@ -516,7 +544,9 @@ describe("T3 brand banner (TTY gate)", () => {
           { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
         );
         io.input.write(KEY.down.repeat(9) + KEY.enter);
-        await io.whenFrame("routing presets");
+        await io.whenFrame("All models"); // v1.92: act 3 opens in the browser, not on presets
+        io.input.write(KEY.esc);
+        await io.whenFrame("routing preset"); // Esc is HOME to the preset overlay
         io.input.write(KEY.esc);
         await p;
       });

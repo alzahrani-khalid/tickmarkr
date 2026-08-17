@@ -197,3 +197,15 @@ const VERDICT: Record<Verdict, () => string> = {
 /** Status row: verdict glyph FIRST, then the label — glyph-first, distinct shape per verdict. */
 export const statusRow = (verdict: Verdict, label: string): string =>
   `${VERDICT[verdict]()} ${label}`;
+
+/** Compact token counts for tables: 1048576 → "1m", 262144 → "262k" (UI-free — safe for doctor). */
+export function compactTokens(tokens: number): string {
+  if (!Number.isFinite(tokens) || tokens <= 0) return "0";
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000;
+    const rounded = m >= 10 ? Math.round(m) : Math.round(m * 10) / 10;
+    return `${String(rounded).replace(/\.0$/, "")}m`;
+  }
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k`;
+  return String(tokens);
+}

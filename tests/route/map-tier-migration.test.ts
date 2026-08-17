@@ -79,3 +79,44 @@ describe("v1.52 T5 — map-entry tier removed: floors become the only band autho
     expect(lints.some((l) => l.includes("routing.map") && l.includes("tier"))).toBe(false);
   });
 });
+
+describe("v1.92 pool — MapEntry config-parse boundary", () => {
+  test("a well-formed pool parses through MapEntrySchema and a full config load", () => {
+    const direct = MapEntrySchema.safeParse({ pool: { mode: "any", channels: ["codex:gpt-5.5"] } });
+    expect(direct.success).toBe(true);
+    expect(direct.data?.pool).toEqual({ mode: "any", channels: ["codex:gpt-5.5"] });
+
+    // shape refactor has no default map entry — deepMerge can't smuggle the seed implement
+    // prefer beside the pool (that union fails the exclusivity superRefine by design)
+    const { repo, globalDir } = emptyRepo();
+    writeFileSync(
+      join(tickmarkrDir(repo), "config.yaml"),
+      "routing:\n  map:\n    refactor:\n      pool:\n        mode: ordered\n        channels: [codex:gpt-5.5, opencode:zai/glm-5.2]\n",
+    );
+    const cfg = loadConfig(repo, { globalDir });
+    expect(cfg.routing.map.refactor?.pool).toEqual({ mode: "ordered", channels: ["codex:gpt-5.5", "opencode:zai/glm-5.2"] });
+  });
+
+  test("a channel without the adapter:model colon fails config load fail-closed", () => {
+    const { repo, globalDir } = emptyRepo();
+    writeFileSync(join(tickmarkrDir(repo), "config.yaml"), "routing:\n  map:\n    refactor:\n      pool:\n        mode: any\n        channels: [codex]\n");
+    let err: unknown;
+    try {
+      loadConfig(repo, { globalDir });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfigError);
+    expect((err as ConfigError).message).toContain("pool channels are adapter:model");
+  });
+
+  test("an empty channels list fails config load fail-closed (min 1)", () => {
+    const direct = MapEntrySchema.safeParse({ pool: { mode: "any", channels: [] } });
+    expect(direct.success).toBe(false);
+  });
+
+  test("a bad mode value fails config load fail-closed (enum boundary)", () => {
+    const direct = MapEntrySchema.safeParse({ pool: { mode: "anyy", channels: ["codex:gpt-5.5"] } });
+    expect(direct.success).toBe(false);
+  });
+});

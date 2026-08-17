@@ -283,9 +283,10 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
 }
 
 // The consolidated wizard (operator directive 2026-08-12): init walks three acts in one
-// command — preferences (Ink form) → discovery (doctor, the sensor) → fleet (presets or the
-// full editor). The readline asks this replaced live on in git history; the Ink act keeps the
-// same four questions and the same defaults, so `--yes` and non-TTY paths are unchanged.
+// command — preferences (Ink form) → discovery (doctor, the sensor) → fleet (the browser opens
+// on the models view; the presets overlay raises on the first Shapes entry). The readline asks
+// this replaced live on in git history; the Ink act keeps the same four questions and the same
+// defaults, so `--yes` and non-TTY paths are unchanged.
 async function runInitWizard(
   cwd: string,
   input: NodeJS.ReadStream,
@@ -413,7 +414,8 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
     : await doctor([], cwd, undefined, { banner: false, compact: interactive });
 
   // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads
-  // what the presets screen ranks with; the final summary then carries a pointer, not a repeat.
+  // what the fleet browser (and its presets overlay, raised on the first Shapes entry) ranks
+  // with; the final summary then carries a pointer, not a repeat.
   if (interactive) {
     output.write(`${doc}\n`);
     doc = "discovery shown above — full matrix any time with `tickmarkr doctor`";

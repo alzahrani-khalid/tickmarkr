@@ -30,11 +30,17 @@ const KEYS = {
   escape: "\x1b",
   backspace: "\x7f",
   down: "\x1b[B",
+  left: "\x1b[D",
   q: "q",
   t: "t",
   n: "n",
+  w: "w",
   y: "y",
 } as const;
+
+// browser rail: All models · Shapes · Steering · one row per adapter — scoping the single
+// adapter is ← (rail) + ↓×3 + Enter, the precondition for the n (add-model) hotkey
+const SCOPE_FIRST_ADAPTER = KEYS.left + KEYS.down.repeat(3) + KEYS.enter;
 
 const editable = (over: Partial<FleetEditable> = {}): FleetEditable => ({
   denyAdapters: [],
@@ -134,7 +140,7 @@ async function driveInk(
     initialMap: {},
     modePreview,
     shapeRows: () => [],
-    candidatesForShape: () => [],
+    candidatesForShape: () => ({ rows: [] }),
     preferOptionsForShape: () => [],
     initialSteering: {},
     steeringOptionsFor: () => [],
@@ -231,12 +237,15 @@ test("test: an installed adapter with detected models and no tiers block contrib
 });
 
 test("test: the channel a first classification needs is asked rather than inferred, and no cost preview is computed from a channel the operator did not answer", async () => {
+  // t on the unclassified row opens the classify overlay at its channel stage (adapter
+  // first-touch); Esc cancels the flow, q quits — no Enter-walk exists in the browser.
   const run = await driveInk(
     [{ adapter: "nova", rows: [{ model: "nova-1", detectedAt: "2026-08-05" }] }],
-    KEYS.enter + KEYS.enter + KEYS.t + KEYS.q,
+    KEYS.t + KEYS.escape + KEYS.q,
   );
   const rendered = stripAnsi(run.writes.join(""));
-  expect(rendered).toContain("channel · nova");
+  expect(rendered).toContain("classify · nova:nova-1");
+  expect(rendered).toContain("how is this CLI billed?");
   expect(rendered).toContain("sub");
   expect(rendered).toContain("api");
   expect(run.modePreview).not.toHaveBeenCalled();
@@ -246,17 +255,18 @@ test("test: the channel a first classification needs is asked rather than inferr
 test("test: a free-text model id is accepted only when it matches the id pattern and is routed through the same classify path as a detected model", async () => {
   expect(MODEL_ID_RE.test("bad model")).toBe(false);
   expect(MODEL_ID_RE.test("custom/model-1")).toBe(true);
-  const finishClassification = KEYS.enter + KEYS.enter + "manual evidence" + KEYS.enter
-    + KEYS.enter.repeat(4);
+  // channel Enter (sub) → tier Enter (cheap) → typed provenance note → w funnels the staged
+  // classification into reviewOverlay (the injected stub returns "empty", ending the app)
+  const finishClassification = KEYS.enter + KEYS.enter + "manual evidence" + KEYS.enter + KEYS.w;
   const manual = await driveInk(
     [{ adapter: "nova", rows: [] }],
-    KEYS.enter + KEYS.enter + KEYS.n + "bad model" + KEYS.enter
+    SCOPE_FIRST_ADAPTER + KEYS.n + "bad model" + KEYS.enter
       + KEYS.backspace.repeat("bad model".length) + "custom/model-1" + KEYS.enter
       + finishClassification,
   );
   const detected = await driveInk(
     [{ adapter: "nova", rows: [{ model: "detected-model" }] }],
-    KEYS.enter + KEYS.enter + KEYS.t + finishClassification,
+    KEYS.t + finishClassification,
   );
 
   expect(stripAnsi(manual.writes.join(""))).toContain("model id must match");
@@ -271,14 +281,14 @@ test("test: a free-text model id is accepted only when it matches the id pattern
 test("test: the two new screens are titled by name and no frame in this task carries a step number, proven over the closed set of new screens — a channel-ask fixture and an add-model fixture", async () => {
   const channel = await driveInk(
     [{ adapter: "nova", rows: [{ model: "nova-1" }] }],
-    KEYS.enter + KEYS.enter + KEYS.t + KEYS.q,
+    KEYS.t + KEYS.escape + KEYS.q,
   );
   const addModel = await driveInk(
     [{ adapter: "nova", rows: [] }],
-    KEYS.enter + KEYS.enter + KEYS.n + KEYS.escape + KEYS.q,
+    SCOPE_FIRST_ADAPTER + KEYS.n + KEYS.escape + KEYS.q,
   );
   const closedSet = [
-    ["channel · nova", channel.writes],
+    ["classify · nova:nova-1", channel.writes],
     ["add model · nova", addModel.writes],
   ] as const;
   for (const [title, writes] of closedSet) {
@@ -310,9 +320,11 @@ test("no classification the operator made is lost between the keystroke and the 
     [adapter],
     { input: io.input, output: io.output } as FleetIO,
   );
+  // t → classify: channel ↓Enter (api) · tier ↓Enter (mid) · typed provenance note ·
+  // then w opens the real review diff and y confirms the guarded write.
   io.input.write(
-    KEYS.enter + KEYS.enter + KEYS.t + KEYS.down + KEYS.enter + KEYS.down + KEYS.enter
-      + "AA Index 54" + KEYS.enter + KEYS.enter.repeat(4) + KEYS.y,
+    KEYS.t + KEYS.down + KEYS.enter + KEYS.down + KEYS.enter
+      + "AA Index 54" + KEYS.enter + KEYS.w + KEYS.y,
   );
   expect(await result).toMatch(/^fleet: wrote /);
 

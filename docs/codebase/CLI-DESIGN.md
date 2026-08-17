@@ -87,3 +87,25 @@ composed as: `title` → `legend` → `rule` → rows (`kvRow` / `statusRow` / t
 `BANNER`, `PLAIN_BANNER`, `bannerShell`, `TICKMARKR_EXIT_TRAILER`, `paneDispatchScript`,
 `paneDispatchCommand` keep their exact byte-for-byte output — they are byte-pinned by
 tests and consumed by machines and the README hero.
+
+## Ink frame layer (v1.92)
+
+`src/tui/ink/frame.tsx` extends the same contract into Ink surfaces (the fleet browser and the
+init act-1 panel). It owns the shared stream bridges (`inkInput`/`inkOutput`, hoisted from the
+per-app copies), the alt-screen guard (`enterAltScreen` — real `process.stdout` TTY only, never
+injected test streams), and the frame vocabulary:
+
+| Export | Use |
+|---|---|
+| `INK` | ink color names for the brand contract (`ansi256(41)` brand, amber warn, red fail) |
+| `Pointer` / `Glyph` | two-column cursor cell; verdict/toggle glyphs incl. `?` (unknown/unclassified) |
+| `SearchRow` | the always-live `>` type-to-search box |
+| `KeyBar` | the ONE keybind line — bright key, dim label, `·` separators |
+| `OverlayPanel` | bordered overlay (presets, classify, pin, prefer, judge, review) |
+| `ElisionMark` | `… N above/below` markers around windowed lists |
+| `fmtCtx` / `fmtUsdPair` / `fmtMs` / `clip` / `padCell` / `padCellStart` | metadata-column formatters |
+
+Layout doctrine for full-screen surfaces: header line → one rounded frame (left rail: views +
+adapters with counts; right body: list or overlay) → detail band (selected row's full evidence, or
+the amber notice) → keybar. Columns are computed against the frame width and truncate — a row
+never wraps. `compactTokens` in `brand.ts` is the UI-free twin doctor's tables share.

@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse } from "../../adapters/registry.js";
-import { catalogModelAdvisory, catalogTierRanking, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
-import { readCachedCatalog } from "../../adapters/catalog-remote.js";
+import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions } from "../../adapters/registry.js";
+import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
+import { type CatalogModelEvidence, readCachedCatalog } from "../../adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import {
@@ -20,17 +20,21 @@ import {
   type MapEntry,
   type RoutingMode,
   type Tier,
+  type TickmarkrConfig,
   unifiedYamlDiff,
 } from "../../config/config.js";
 import { projectFleetWhy, renderFleetWhy, type FleetWhyValue } from "../../config/fleet-why.js";
 import { SHAPES, TIERS, type Shape, type Task } from "../../graph/schema.js";
+import { doctor } from "./doctor.js";
 import { candidateRow, costSignal, shapeCandidates } from "./fleet-picker.js";
 import { route } from "../../route/router.js";
+import { disallowedBy } from "../../route/preference.js";
 import { resolveRunMode, type ResolvedRunMode } from "../../run/daemon.js";
 import { loadRoutingProfile } from "../../run/journal.js";
 import type {
   FleetEditorResult,
   FleetEditorState,
+  FleetModelEvidence,
   FleetOverlayReview,
   FleetSteeringKey,
 } from "../../tui/ink/fleet-app.js";
@@ -163,10 +167,19 @@ export async function fleet(
 
   if (!why && !interactive) return { out: NON_TTY_MSG, code: 1 };
 
-  const assembled = await assembleFleetEditor(cwd, adapters, io, {
-    globalDir,
-    fresh: values.fresh ?? false,
-  });
+  // OBS-528: `--fresh` parsed since v1.92 but nothing ever RAN the probe — it forced the reuse
+  // gate false and guaranteed the "probe data missing or stale" refusal. The law stands — the
+  // EDITOR never probes (previews stay cache-only, `r` still exits to the operator) — but the
+  // command may run the sensor up front, exactly like init's act 2: a stale cache (or --fresh)
+  // probes first, visibly, then the editor assembles from what the probe just recorded.
+  if (!why && interactive) {
+    const { reuse } = initDoctorReuse(cwd, values.fresh ?? false);
+    if (!reuse) {
+      output.write(`${await doctor([], cwd, adapters, { banner: false, compact: true })}\n`);
+    }
+  }
+
+  const assembled = await assembleFleetEditor(cwd, adapters, io, { globalDir });
   if ("unavailable" in assembled) return { out: assembled.unavailable, code: 1 };
   if (why) return assembled.renderWhy();
 
@@ -204,14 +217,15 @@ export async function fleet(
 }
 
 /** Everything between the doctor-reuse gate and the Ink render, packaged for reuse: `tickmarkr init`
- * runs the same editor (preset-first) without re-owning the assembly or the write funnel. `commit`
- * remains the single config actuator — it maps editor results to the command's exact result strings
- * and performs the one guarded overlay write. */
+ * runs the same editor (entry="presets": Esc is HOME to the preset overlay, never a bare quit)
+ * without re-owning the assembly or the write funnel. `commit` remains the single config actuator —
+ * it maps editor results to the command's exact result strings and performs the one guarded
+ * overlay write. */
 export async function assembleFleetEditor(
   cwd: string,
   adapters: WorkerAdapter[],
   io: FleetIO,
-  opts: { globalDir: string; entry?: "presets" | "probe"; fresh?: boolean },
+  opts: { globalDir: string; entry?: "presets" | "probe" },
 ): Promise<
   | {
     props: FleetEditorProps;
@@ -221,18 +235,32 @@ export async function assembleFleetEditor(
   | { unavailable: string }
 > {
   const globalDir = opts.globalDir;
-  const { reuse, health: cached } = initDoctorReuse(cwd, opts.fresh ?? false);
+  const { reuse, health: cached } = initDoctorReuse(cwd, false);
   if (!reuse || !cached) {
     return {
-      unavailable: "tickmarkr fleet: probe data missing or stale — run `tickmarkr doctor` first (fleet never re-probes; doctor is the sensor)",
+      unavailable: "tickmarkr fleet: probe data missing or stale — run `tickmarkr doctor` first, or `tickmarkr fleet` interactively (it runs the probe itself when the cache is stale; --fresh forces one)",
     };
   }
 
   const rm = resolveRunMode(cwd, { globalDir });
   const cfg = rm.cfg;
-  const initial = fleetEditableFromConfig(cfg);
-  const editable = structuredClone(initial) as FleetEditable;
   const health = cached;
+  // v1.92: the discovered fleet universe — every channel the adapters actually SERVE, discovered
+  // blind to both membership scopes (deny and allow). Membership is an allow-complement, which is
+  // only computable against the served universe: cfg.tiers alone would drop served-but-unclassified
+  // channels (adapter-declared extras) out of the fleet the moment any exclusion is staged.
+  // fleetEditableFromConfig folds routing.allow into the editor's exclusion sets with it, and the
+  // writer emits the minimal allow form from it. The same pool later ranks every preview.
+  const { deny: _diskDeny, allow: _diskAllow, ...routingScopeBlind } = cfg.routing;
+  const previewChannels = discoverChannels({ ...cfg, routing: routingScopeBlind }, adapters, health);
+  const universe = adapters
+    .filter((adapter) => health[adapter.id]?.installed)
+    .map((adapter) => ({
+      adapter: adapter.id,
+      models: [...new Set(previewChannels.filter((c) => c.adapter === adapter.id).map((c) => c.model))],
+    }));
+  const initial = fleetEditableFromConfig(cfg, universe);
+  const editable = structuredClone(initial) as FleetEditable;
   // OBS-508: the same catalog evidence doctor's drift overlay prints now rides each unclassified
   // row — it prefills the classify flow and feeds the bulk `s` stage. Suggestions stay advisory:
   // only the review-diff confirm writes, so "tickmarkr never applies" holds with less typing.
@@ -251,21 +279,45 @@ export async function assembleFleetEditor(
   const unclassifiedRows = fleetUnclassifiedModels(cfg, health, adapters)
     .map((row) => ({ ...row, resolvedModel: resolvedCatalogModel(row.adapter, row.model) }));
   const catalogRanking = catalogTierRanking(cfg, catalog, unclassifiedRows, resolvedCatalogModel);
+  // OBS-508 follow-through: the browser renders the metadata the assembler always had — catalog
+  // ctx/price evidence and doctor's model-probe wall clock — as columns instead of dropping them.
+  const rowEvidence = (adapter: string, model: string, evidence?: CatalogModelEvidence): FleetModelEvidence | undefined => {
+    const probed = health[adapter]?.modelAuth?.[model] as { durationMs?: number; authed?: boolean; reason?: string } | undefined;
+    const contextWindow = evidence?.contextWindow ?? declaredModelWindow(cfg, adapter, model);
+    const out: FleetModelEvidence = {
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(evidence?.outputWindow !== undefined ? { outputWindow: evidence.outputWindow } : {}),
+      ...(evidence?.inputCostPerMtok !== undefined ? { inputCostPerMtok: evidence.inputCostPerMtok } : {}),
+      ...(evidence?.outputCostPerMtok !== undefined ? { outputCostPerMtok: evidence.outputCostPerMtok } : {}),
+      ...(probed?.durationMs !== undefined ? { probeMs: probed.durationMs } : {}),
+      // OBS-519: doctor already recorded the failed verdict — a rate-limited/unauthed model must
+      // not render identically to a healthy row on the surface that edits its fleet membership.
+      ...(probed?.authed === false ? { unauthed: probed.reason ?? "probe failed" } : {}),
+    };
+    return Object.keys(out).length > 0 ? out : undefined;
+  };
   const modelGroups = adapters
     .filter((adapter) => health[adapter.id]?.installed)
     .map((adapter) => {
       const unclassified = unclassifiedRows.filter((row) => row.adapter === adapter.id);
       return {
         adapter: adapter.id,
+        channel: cfg.tiers[adapter.id]?.channel,
         rows: [
-          ...Object.entries(editable.tiers[adapter.id] ?? {}).map(([model, value]) => ({ model, tier: value?.tier })),
+          ...Object.entries(editable.tiers[adapter.id] ?? {}).map(([model, value]) => {
+            const advisory = catalogModelAdvisory(cfg, catalog, adapter.id, model, resolvedCatalogModel(adapter.id, model), catalogRanking);
+            const evidence = rowEvidence(adapter.id, model, advisory.coverage === "covered" ? advisory.evidence : undefined);
+            return { model, tier: value?.tier, ...(evidence ? { evidence } : {}) };
+          }),
           ...unclassified
             .filter((row) => !editable.tiers[adapter.id]?.[row.model])
             .map((row) => {
               const advisory = catalogModelAdvisory(cfg, catalog, adapter.id, row.model, row.resolvedModel, catalogRanking);
+              const evidence = rowEvidence(adapter.id, row.model, advisory.coverage === "covered" ? advisory.evidence : undefined);
               return {
                 model: row.model,
                 detectedAt: row.detectedAt,
+                ...(evidence ? { evidence } : {}),
                 ...(advisory.suggestion
                   ? { suggestion: { tier: advisory.suggestion.tier, note: advisory.suggestion.provenanceNote } }
                   : {}),
@@ -284,21 +336,44 @@ export async function assembleFleetEditor(
   ) as Record<RoutingMode, ResolvedRunMode>;
   const channels = discoverChannels(cfg, adapters, health);
   const profile = loadRoutingProfile(cwd, cfg, { preview: true });
-  const previewCfg = (mode: RoutingMode, map: Record<string, MapEntry>) => ({
-    ...cfg,
-    routing: { ...cfg.routing, map, floors: modeCfgs[mode].cfg.routing.floors },
-  });
-  const modeSpend = (mode: RoutingMode, map: Record<string, MapEntry>): string => {
+  // Preview surfaces rank against the STAGED membership state: previewChannels (above) is blind to
+  // both disk scopes and previewCfg carries the session's sets, so a model toggled out this session
+  // leaves the picker immediately and one toggled back in reappears without a relaunch (both
+  // directions exact — the on-disk scopes would otherwise pre-filter the pool at startup and lie
+  // until restart).
+  type StagedDeny = { adapters: string[]; models: string[] };
+  const previewCfg = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) => {
+    // mirror the writer: only the adapters/models scopes are fleet-editable; workers deny survives
+    const nextDeny = { ...cfg.routing.deny };
+    if (deny.adapters.length) nextDeny.adapters = deny.adapters;
+    else delete nextDeny.adapters;
+    if (deny.models.length) nextDeny.models = deny.models;
+    else delete nextDeny.models;
+    const routing = {
+      ...routingScopeBlind,
+      map,
+      floors: modeCfgs[mode].cfg.routing.floors,
+      ...(Object.keys(nextDeny).length ? { deny: nextDeny } : {}),
+    };
+    return { ...cfg, routing };
+  };
+  // route() never deny-filters its pool — that contract lives in discoverChannels — so every
+  // preview call rebuilds the pool the staged deny would discover
+  const previewPool = (cfgPreview: TickmarkrConfig) =>
+    previewChannels.filter((c) => disallowedBy(c, cfgPreview.routing) === null);
+  const modeSpend = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny): string => {
     const tierCount: Partial<Record<Tier, number>> = {};
     let subs = 0;
     let apiN = 0;
     let apiUsd = 0;
+    const cfgPreview = previewCfg(mode, map, deny);
+    const pool = previewPool(cfgPreview);
     for (const shape of SHAPES) {
       try {
         const assignment = route(
           previewTask(shape),
-          previewCfg(mode, map),
-          channels,
+          cfgPreview,
+          pool,
           profile,
           undefined,
           undefined,
@@ -356,28 +431,36 @@ export async function assembleFleetEditor(
       ? { declaredAt: `routing.floors.${shape}` }
       : { declaredAt: "routing.mode" };
   };
-  const projectedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>) => {
+  const projectedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) => {
+    const cfgPreview = previewCfg(mode, map, deny);
+    const pool = previewPool(cfgPreview);
     const values: FleetWhyValue<Shape>[] = SHAPES.map((shape) => {
       try {
         const routed = route(
           previewTask(shape),
-          previewCfg(mode, map),
-          channels,
+          cfgPreview,
+          pool,
           profile,
           undefined,
           undefined,
           PREVIEW_EXPLORE,
         );
         const assignment = routed.assignment;
-        const effective = `${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier})  ${costSignal(assignment, cfg.pricing)}`;
-        const mapProducedValue = map[shape]?.pin !== undefined || routed.provenance.includes("via prefer");
+        // OBS-531: a pooled shape used to render only the routed WINNER — indistinguishable from
+        // a pin. The declaration is the operator's decision; the winner is today's dice.
+        const declaredPool = map[shape]?.pool;
+        const poolPrefix = declaredPool ? `pool(${declaredPool.mode}·${declaredPool.channels.length}) → ` : "";
+        const effective = `${poolPrefix}${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier})  ${costSignal(assignment, cfg.pricing)}`;
+        const mapProducedValue = map[shape]?.pin !== undefined || map[shape]?.pool !== undefined
+          || routed.provenance.includes("via prefer");
         return {
           id: shape,
           effective,
           ...whyDeclaration(shape, mode, map, mapProducedValue),
         };
       } catch (error) {
-        const mapProducedValue = map[shape]?.pin !== undefined || (map[shape]?.prefer?.length ?? 0) > 0;
+        const mapProducedValue = map[shape]?.pin !== undefined || map[shape]?.pool !== undefined
+          || (map[shape]?.prefer?.length ?? 0) > 0;
         return {
           id: shape,
           effective: (error as Error).message,
@@ -388,14 +471,42 @@ export async function assembleFleetEditor(
     });
     return projectFleetWhy(values, { repoRoot: cwd, globalDir });
   };
-  const routedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>) =>
-    projectedShapeRows(mode, map).map(({ id, label }) => ({ id, label }));
-  const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>) =>
-    shapeCandidates(previewTask(shape), previewCfg(mode, map), channels, profile).map((candidate) => ({
+  const routedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) =>
+    projectedShapeRows(mode, map, deny).map(({ id, label }) => ({ id, label }));
+  // OBS-530: the picker silently omitted every excluded channel — the operator asked "why is X
+  // missing" three times in one session and the answer lived only in config archaeology. One dim
+  // line now names each bucket. Static buckets (unauthed, unclassified) computed once; the
+  // staged-vs-disk split recomputed per open because it ranks against the SESSION's deny state.
+  const unauthedClis = adapters
+    .filter((adapter) => health[adapter.id]?.installed && health[adapter.id]?.authed === false)
+    .map((adapter) => adapter.id);
+  const unauthedModelCount = modelAuthExclusions(cfg, adapters, health).length;
+  const excludedNoteFor = (deny: StagedDeny): string | undefined => {
+    let stagedOut = 0;
+    let denied = 0;
+    const stagedRouting = previewCfg(rm.mode.mode, {}, deny).routing;
+    for (const channel of previewChannels) {
+      if (disallowedBy(channel, stagedRouting) === null) continue;
+      if (disallowedBy(channel, cfg.routing) === null) stagedOut += 1;
+      else denied += 1;
+    }
+    const parts: string[] = [];
+    if (stagedOut) parts.push(`${stagedOut} staged out this session`);
+    if (denied) parts.push(`${denied} denied in config`);
+    if (unauthedModelCount) parts.push(`${unauthedModelCount} unauthed`);
+    if (unauthedClis.length) parts.push(`${unauthedClis.join("/")} CLI unauthed`);
+    if (unclassifiedRows.length) parts.push(`${unclassifiedRows.length} unclassified (never routed)`);
+    return parts.length ? `not offered: ${parts.join(" · ")} — the models view explains each row` : undefined;
+  };
+  const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) => {
+    const cfgPreview = previewCfg(mode, map, deny);
+    const rows = shapeCandidates(previewTask(shape), cfgPreview, previewPool(cfgPreview), profile).map((candidate) => ({
       id: `${candidate.assignment.adapter}:${candidate.assignment.model}`,
       label: candidateRow(candidate, cfg.pricing),
       pin: { via: candidate.assignment.adapter, model: candidate.assignment.model },
     }));
+    return { rows, excludedNote: excludedNoteFor(deny) };
+  };
   const preferUniverse = [
     ...new Set(channels.flatMap((channel) => [
       channel.adapter,
@@ -449,6 +560,7 @@ export async function assembleFleetEditor(
     const write: FleetOverlayWrite = {
       initial,
       edited: staged,
+      universe,
       ...(modeChanged ? { mode: state.selectedMode } : {}),
       ...(judgeChanged && judgeSeat ? { judge: judgeSeat } : {}),
       steering: { initial: initialSteering, edited: state.steering },
@@ -480,7 +592,7 @@ export async function assembleFleetEditor(
     initialMode: rm.mode.mode,
     modeOptions: ROUTING_MODES.map((mode) => ({ id: mode, gloss: MODE_GLOSS[mode] })),
     initialMap: editable.map,
-    modePreview: (mode, map) => [modeSpend(mode, map), ...floorPreview(mode)],
+    modePreview: (mode, map, deny) => [modeSpend(mode, map, deny), ...floorPreview(mode)],
     shapeRows: routedShapeRows,
     candidatesForShape,
     preferOptionsForShape: (_shape, current) => [
@@ -503,7 +615,7 @@ export async function assembleFleetEditor(
   const commit = (result: FleetEditorResult): string => {
     if (result.kind === "quit") return QUIT;
     if (result.kind === "refresh") {
-      return "fleet: run `tickmarkr doctor` to refresh probe data, then re-run `tickmarkr fleet` (doctor is the sensor; fleet never re-probes)";
+      return "fleet: probe refresh requested — re-run `tickmarkr fleet --fresh` (doctor is the sensor; the editor itself never re-probes)";
     }
     if (result.kind === "no-changes") return "fleet: no overlay changes (empty diff)";
     if (result.kind === "discard") return "fleet: discarded overlay changes";
@@ -513,12 +625,26 @@ export async function assembleFleetEditor(
     const write = pendingWrite;
     if (!write) throw new Error("fleet write reached confirmation without a staged overlay mutation");
     writeFleetOverlay(result.review.path, (prior) => renderFleetOverlayWrite(prior, write));
-    return `fleet: wrote ${result.review.path}`;
+    // OBS-529: a freshly classified model has no probe verdict (doctor probes CONFIGURED models,
+    // and it was not configured at probe time), so it stays unroutable — invisible in every
+    // picker — until the next probe. Name the step, or the classify flow reads as broken.
+    const unprobed: string[] = [];
+    for (const [adapter, models] of Object.entries(write.edited.tiers)) {
+      for (const [model, assigned] of Object.entries(models)) {
+        if (assigned === null || assigned === undefined) continue;
+        if (JSON.stringify(write.initial.tiers[adapter]?.[model]) === JSON.stringify(assigned)) continue;
+        if (health[adapter]?.modelAuth?.[model] === undefined) unprobed.push(`${adapter}:${model}`);
+      }
+    }
+    const head = `fleet: wrote ${result.review.path}`;
+    if (!unprobed.length) return head;
+    const named = unprobed.slice(0, 3).join(", ") + (unprobed.length > 3 ? `, +${unprobed.length - 3} more` : "");
+    return `${head}\nfleet: ${unprobed.length} newly classified model(s) have no probe verdict yet (${named}) — run \`tickmarkr fleet --fresh\` to probe them; unverified models stay unroutable`;
   };
 
   return {
     props,
     commit,
-    renderWhy: () => renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map)),
+    renderWhy: () => renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map, { adapters: editable.denyAdapters, models: editable.denyModels })),
   };
 }

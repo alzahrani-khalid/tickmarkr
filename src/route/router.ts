@@ -191,9 +191,9 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   const mapPinFloor = taskFloor && (!advisoryFloor || TIER_RANK[taskFloor] >= TIER_RANK[advisoryFloor])
     ? { tier: taskFloor, source: "task" }
     : advisoryFloor ? { tier: advisoryFloor, source: "config" } : undefined;
-  const lintMapPinFloor = (tier: Tier) => {
+  const lintMapPinFloor = (tier: Tier, what: "pin" | "pool" = "pin") => {
     if (mapPinFloor && TIER_RANK[tier] < TIER_RANK[mapPinFloor.tier]) {
-      lints.push(`${task.id} (${task.shape}): map pin routes ${tier}, below ${mapPinFloor.source} floor ${mapPinFloor.tier} — map pins are supreme`);
+      lints.push(`${task.id} (${task.shape}): map ${what} routes ${tier}, below ${mapPinFloor.source} floor ${mapPinFloor.tier} — map ${what}s are supreme`);
     }
   };
   const source = task.routingHints?.source;
@@ -222,6 +222,40 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     lintMapPinFloor(c.tier);
     maybeSlaLint(lints, task, profile, slaMinutes, c);
     return { assignment: toAssignment(c), ladder: ladderFor(task, entry), lints, provenance: `${degraded}pin ${entry.pin.via}:${entry.pin.model} (config routing.map)` };
+  }
+
+  // map pool: operator-authored closed candidate set (v1.92) — sits between the pin (a
+  // single-channel pool) and the open floor/auto path. Exhaustion stays fail-loud (pin precedent).
+  if (entry?.pool) {
+    const pool = entry.pool;
+    if (prefActive) {
+      for (const p of pool.channels) {
+        const i = p.indexOf(":");
+        const d = disallowedBy({ adapter: p.slice(0, i), model: p.slice(i + 1) }, cfg.routing);
+        if (d) {
+          throw new RoutingError(
+            `${task.id}: pool entry ${p} is disallowed by routing.${d.by} (${d.entry}) — remove the ${d.by} entry or drop it from the pool`,
+          );
+        }
+      }
+    }
+    // live preserves pool declaration order — ordered mode and any-mode stable-sort ties depend on it
+    const live = pool.channels
+      .map((id) => channels.find((c) => channelKey(c) === id))
+      .filter((c): c is BillingChannel => c !== undefined);
+    if (!live.length) {
+      throw new RoutingError(
+        `${task.id}: routing.map.${task.shape}.pool has no live channel — declared: ${pool.channels.join(", ")}; doctor found: ${channels.map(channelKey).join(", ") || "(nothing)"}`,
+      );
+    }
+    // ponytail: no learned/explore/spread inside pools in v1 — a pool pick is fully static; the
+    // upgrade path is feeding the pool-filtered set through the learned path below.
+    const chosen = pool.mode === "ordered"
+      ? live[0]
+      : [...live].sort((a, b) => marginalCostRank(a) - marginalCostRank(b) || TIER_RANK[a.tier] - TIER_RANK[b.tier])[0];
+    lintMapPinFloor(chosen.tier, "pool");
+    maybeSlaLint(lints, task, profile, slaMinutes, chosen);
+    return { assignment: toAssignment(chosen), ladder: ladderFor(task, entry), lints, provenance: `${degraded}pool ${pool.mode} ${channelKey(chosen)} (config routing.map)` };
   }
 
   const baseTier: Tier = floor ?? "cheap";

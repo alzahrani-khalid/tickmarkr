@@ -6,6 +6,7 @@ import { parse } from "yaml";
 
 import { fleet, writeFleetOverlay } from "../../src/cli/commands/fleet.js";
 import {
+  fleetEditableFromConfig,
   fleetRepoOverlayFromDelta,
   loadConfig,
   renderFleetOverlayWrite,
@@ -204,4 +205,268 @@ test("test: fleet --print output parses as YAML and its parsed routing and tiers
     expect(parsed.routing, name).toEqual(resolved.routing);
     expect(parsed.tiers, name).toEqual(resolved.tiers);
   }
+});
+
+test("v1.92 membership write: changed exclusion sets emit the minimal routing.allow form — bare ids for fully-in adapters, adapter:model keys for partially-in — and tombstone the deny adapters/models scopes while deny.workers survives byte-for-byte", () => {
+  const prior = [
+    "routing:",
+    "  deny:",
+    "    adapters:  # rail mask",
+    "      - grok",
+    "    workers:",
+    "      adapters:",
+    "        - pi  # reviewer-only mask, fleet never touches it",
+    "",
+  ].join("\n");
+  const universe = [
+    { adapter: "claude-code", models: ["fable", "haiku"] },
+    { adapter: "codex", models: ["gpt-5.6-luna", "o5-mini"] },
+    { adapter: "grok", models: ["grok-4"] },
+  ];
+  const written = renderFleetOverlayWrite(prior, {
+    initial: editable({ denyAdapters: ["grok"] }),
+    edited: editable({ denyAdapters: ["grok"], denyModels: ["codex:o5-mini"] }),
+    universe,
+  });
+  const parsed = parse(written);
+  // grok fully out ⇒ absent; claude-code fully in ⇒ bare id; codex partially in ⇒ adapter:model
+  expect(parsed.routing.allow.adapters).toEqual(["claude-code"]);
+  expect(parsed.routing.allow.models).toEqual(["codex:gpt-5.6-luna"]);
+  expect(parsed.routing.deny.adapters).toBeNull();
+  expect(parsed.routing.deny.models).toBeNull();
+  expect(parsed.routing.deny.workers).toEqual({ adapters: ["pi"] });
+  expect(written).toContain("    workers:\n      adapters:\n        - pi  # reviewer-only mask, fleet never touches it");
+  expect(written).toMatch(/^    adapters: null {2}# rail mask$/m);
+  expect(occurrences(written, "rail mask")).toBe(1);
+});
+
+test("v1.92 membership write: clearing every exclusion removes the routing.allow block entirely and tombstones both deny scopes", () => {
+  const prior = [
+    "routing:",
+    "  allow:",
+    "    adapters: [claude-code]",
+    "  deny:",
+    "    models: [codex:o5-mini]",
+    "",
+  ].join("\n");
+  const written = renderFleetOverlayWrite(prior, {
+    initial: editable({ denyAdapters: ["codex", "grok"] }),
+    edited: editable(),
+    universe: [
+      { adapter: "claude-code", models: ["fable"] },
+      { adapter: "codex", models: ["gpt-5.6-luna"] },
+      { adapter: "grok", models: ["grok-4"] },
+    ],
+  });
+  const parsed = parse(written);
+  expect(parsed.routing.allow).toBeUndefined();
+  expect(written).not.toContain("allow");
+  expect(parsed.routing.deny.adapters).toBeNull();
+  expect(parsed.routing.deny.models).toBeNull();
+});
+
+test("v1.92 slot ownership: a pool replacing a seed-layer prefer writes NO prefer key beside it, and the written overlay loads clean over the seed", () => {
+  // the field defect this pins: masking the removed prefer with [] re-declared prefer BESIDE the
+  // pool in one document and the exclusivity refine bounced the write off the reload guard
+  const initial = editable({ map: { implement: { prefer: ["cursor-agent", "codex"] } } });
+  const edited = editable({
+    map: { implement: { pool: { mode: "any", channels: ["cursor-agent:composer-2.5", "codex:gpt-5.6-terra"] } } },
+  });
+  const written = renderFleetOverlayWrite("", { initial, edited });
+  expect(written).toContain("pool:");
+  expect(written).not.toContain("prefer");
+  // and the loader accepts it over the seed default map (implement carries a seed prefer)
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-slot-r-"));
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-slot-g-"));
+  mkdirSync(join(repo, ".tickmarkr"));
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), written);
+  const cfg = loadConfig(repo, { globalDir });
+  expect(cfg.routing.map.implement.pool).toEqual({ mode: "any", channels: ["cursor-agent:composer-2.5", "codex:gpt-5.6-terra"] });
+  expect(cfg.routing.map.implement.prefer).toBeUndefined();
+  // a prefer cleared with NO replacing declaration keeps the [] mask (lower layer stays masked)
+  const clearedOnly = renderFleetOverlayWrite("", {
+    initial: editable({ map: { implement: { prefer: ["codex"] } } }),
+    edited: editable({ map: { implement: {} } }),
+  });
+  expect(clearedOnly).toMatch(/prefer: \[\]|prefer:\s*\[\s*\]/);
+});
+
+test("v1.92 pool write: a map-entry pool round-trips through write + parse in both modes with declaration order intact, while untouched pin/prefer bytes survive verbatim", () => {
+  const prior = [
+    "routing:",
+    "  map:",
+    "    plan:",
+    "      pin:",
+    "        via: claude-code  # operator pin",
+    "        model: fable",
+    "      prefer:",
+    "        - codex",
+    "        - cursor-agent",
+    "",
+  ].join("\n");
+  for (const mode of ["any", "ordered"] as const) {
+    const channels = ["kimi:kimi-code/k3", "codex:gpt-5.6-luna"];
+    const written = renderFleetOverlayWrite(prior, {
+      initial: editable(),
+      edited: editable({ map: { implement: { pool: { mode, channels } } } }),
+    });
+    const parsed = parse(written);
+    expect(parsed.routing.map.implement.pool, mode).toEqual({ mode, channels });
+    // channel order is semantic (ordered walks it; any breaks ties by it) — never sorted
+    expect(written.indexOf("kimi:kimi-code/k3"), mode).toBeLessThan(written.indexOf("codex:gpt-5.6-luna"));
+    // the write is a pure append: every prior byte survives contiguously
+    expect(written, mode).toContain(prior.trimEnd());
+  }
+});
+
+test("v1.92 pool write: removing a staged pool writes the pool: null tombstone, hoisting its key-line comment and deleting the mode/channels body", () => {
+  const prior = [
+    "routing:",
+    "  map:",
+    "    implement:",
+    "      pool:  # economy set",
+    "        mode: any",
+    "        channels:",
+    "          - codex:gpt-5.6-luna",
+    "",
+  ].join("\n");
+  const written = renderFleetOverlayWrite(prior, {
+    initial: editable({ map: { implement: { pool: { mode: "any", channels: ["codex:gpt-5.6-luna"] } } } }),
+    edited: editable({ map: { implement: {} } }),
+  });
+  const parsed = parse(written);
+  expect(parsed.routing.map.implement.pool).toBeNull();
+  expect(written).toMatch(/^      pool: null {2}# economy set$/m);
+  expect(occurrences(written, "economy set")).toBe(1);
+  expect(written).not.toContain("mode: any");
+});
+
+test("v1.92 membership round-trip: the written allow form reloads into the same exclusion sets via fleetEditableFromConfig(cfg, universe), while the absent-universe call keeps deny arrays verbatim", () => {
+  const universe = [
+    { adapter: "claude-code", models: ["fable", "haiku"] },
+    { adapter: "codex", models: ["gpt-5.6-luna", "o5-mini"] },
+    { adapter: "grok", models: ["grok-4"] },
+  ];
+  const edited = editable({ denyAdapters: ["grok"], denyModels: ["codex:o5-mini"] });
+  const written = renderFleetOverlayWrite("", { initial: editable(), edited, universe });
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-membership-r-"));
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-membership-g-"));
+  mkdirSync(join(repo, ".tickmarkr"));
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), written);
+  const cfg = loadConfig(repo, { globalDir });
+  const reloaded = fleetEditableFromConfig(cfg, universe);
+  expect(reloaded.denyAdapters).toEqual(["grok"]);
+  expect(reloaded.denyModels).toEqual(["codex:o5-mini"]);
+  // absent universe ⇒ deny arrays verbatim: the tombstoned scopes reload as empty
+  expect(fleetEditableFromConfig(cfg).denyAdapters).toEqual([]);
+  expect(fleetEditableFromConfig(cfg).denyModels).toEqual([]);
+});
+
+test("v1.92 plain-object delta: a universe writes the allow form with deny scopes nulled and workers preserved, and a removed pool masks the lower layer with pool: null", () => {
+  const out = fleetRepoOverlayFromDelta(
+    editable(),
+    editable({ denyModels: ["codex:o5-mini"] }),
+    { routing: { deny: { workers: { adapters: ["pi"] } } } },
+    {},
+    [
+      { adapter: "claude-code", models: ["fable"] },
+      { adapter: "codex", models: ["gpt-5.6-luna", "o5-mini"] },
+      { adapter: "grok", models: ["grok-4"] },
+    ],
+  );
+  const routing = out.routing as Record<string, unknown>;
+  expect(routing.allow).toEqual({ adapters: ["claude-code", "grok"], models: ["codex:gpt-5.6-luna"] });
+  expect(routing.deny).toEqual({ workers: { adapters: ["pi"] }, adapters: null, models: null });
+
+  const cleared = fleetRepoOverlayFromDelta(
+    editable({ map: { implement: { pool: { mode: "any", channels: ["codex:gpt-5.6-luna"] } } } }),
+    editable({ map: { implement: {} } }),
+  );
+  expect((cleared.routing as { map: { implement: { pool: null } } }).map.implement.pool).toBeNull();
+});
+
+test("OBS-517 deny fail-open: a denied model the probe universe does not serve survives the read leg, both write legs, and a full write-reload round trip — with its operator rationale comment intact and deny still beating the adapter-level allow", () => {
+  // claude-code:fable is denied on disk with a rationale essay, but its probe rate-limited so
+  // discoverChannels never served it: the universe knows claude-opus-5 only. Before the fix the
+  // next membership write deleted the deny and admitted fable through the whole-adapter allow.
+  const prior = [
+    "routing:",
+    "  deny:",
+    "    models:",
+    "      # operator-directed: replaced by claude-opus-5 at lower cost",
+    "      # restore by deleting this line on dated evidence",
+    "      - claude-code:fable",
+    "      - codex:gpt-5.5",
+    "",
+  ].join("\n");
+  const universe = [
+    { adapter: "claude-code", models: ["claude-opus-5"] },
+    { adapter: "codex", models: ["gpt-5.5", "gpt-5.6-sol"] },
+  ];
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-residual-"));
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-residual-g-"));
+  mkdirSync(join(repo, ".tickmarkr"));
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), prior);
+
+  // read leg: the out-of-universe entry rides the editable state verbatim
+  const initial = fleetEditableFromConfig(loadConfig(repo, { globalDir }), universe);
+  expect(initial.denyModels).toContain("claude-code:fable");
+  expect(initial.denyModels).toContain("codex:gpt-5.5");
+
+  // write leg: an unrelated membership change keeps the residual in routing.deny
+  const edited = structuredClone(initial);
+  edited.denyModels = [...new Set([...edited.denyModels, "codex:gpt-5.6-sol"])].sort();
+  const written = renderFleetOverlayWrite(prior, { initial, edited, universe });
+  const parsed = parse(written);
+  expect(parsed.routing.deny.models).toEqual(["claude-code:fable"]);
+  expect(parsed.routing.deny.adapters).toBeNull();
+  expect(parsed.routing.allow).toEqual({ adapters: ["claude-code"] });
+  expect(written).toContain("# operator-directed: replaced by claude-opus-5 at lower cost");
+  expect(written).toContain("# restore by deleting this line on dated evidence");
+
+  // round trip: reload the written overlay — fable is STILL denied (deny beats allow) and the
+  // editable state reproduces every exclusion
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), written);
+  const reloaded = fleetEditableFromConfig(loadConfig(repo, { globalDir }), universe);
+  expect(reloaded.denyModels).toContain("claude-code:fable");
+  // both codex universe models are now excluded — the derivation folds them into ONE
+  // adapter-level exclusion (grok-round-trip precedent above)
+  expect(reloaded.denyAdapters).toContain("codex");
+});
+
+test("OBS-517 plain-object delta: residual deny entries land in the overlay fragment instead of the null tombstone, alongside the universe-derived allow form", () => {
+  const universe = [
+    { adapter: "claude-code", models: ["claude-opus-5"] },
+    { adapter: "codex", models: ["gpt-5.5"] },
+  ];
+  const initial = editable({ denyModels: ["claude-code:fable"] });
+  const out = fleetRepoOverlayFromDelta(
+    initial,
+    editable({ denyModels: ["claude-code:fable", "codex:gpt-5.5"] }),
+    {},
+    {},
+    universe,
+  );
+  const routing = out.routing as { allow: unknown; deny: Record<string, unknown> };
+  expect(routing.deny.models).toEqual(["claude-code:fable"]);
+  expect(routing.deny.adapters).toBeNull();
+  expect(routing.allow).toEqual({ adapters: ["claude-code"] });
+});
+
+test("OBS-518 write churn: an untouched flow sequence keeps its unpadded [kimi] form through a membership write", () => {
+  const prior = [
+    "routing:",
+    "  deny:",
+    "    workers:",
+    "      adapters: [kimi]",
+    "",
+  ].join("\n");
+  const universe = [{ adapter: "codex", models: ["gpt-5.5", "gpt-5.6-sol"] }];
+  const written = renderFleetOverlayWrite(prior, {
+    initial: editable(),
+    edited: editable({ denyModels: ["codex:gpt-5.5"] }),
+    universe,
+  });
+  expect(written).toContain("adapters: [kimi]");
+  expect(written).not.toContain("[ kimi ]");
 });
