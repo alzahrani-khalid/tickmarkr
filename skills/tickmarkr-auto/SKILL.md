@@ -19,12 +19,13 @@ When working in a multi-agent terminal environment, decide your role before star
   - **Claude Code:** `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions`
   - **Codex:** `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` — the unsandboxed flag is REQUIRED, not optional: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation (`git worktree add` cannot lock the ref). Do not downgrade this flag; the herdr pane and repo scope are the containment.
   - **Auxiliary agents you spawn (consultants, reviewers, scouts) follow the same forms.** Never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions` (tickmarkr's own adapter uses exactly this for workers, judges, and consults). A read-only codex consultant may use `--sandbox read-only`; any codex session that must touch git needs the unsandboxed flag above.
+  - **Auxiliary seats run as the CLI's interactive TUI in their visible pane — never headless** (`claude -p` / `codex exec`): headless buffers output until exit so the pane renders idle for the entire run, is blind to SessionStart hook errors (a broken and a fixed hook both return green), and gives a stall watcher no midpoint — silent-time equals lifetime. Headless is for exit-code probes only (a quota check that wants `rc`), never for work anyone must watch.
 
 Outside a multi-agent terminal environment, run the loop directly.
 
 ## Stand-down (mission end and retirement)
 
-On each mission's terminal state, after the record commit and operator notification: the orchestrator stops every monitor and background task it started, prints one final stand-down line, and leaves nothing queued in its input box. A finished session with an armed watcher or pre-filled input is a loaded gun.
+On each mission's terminal state, after the record commit and operator notification: the orchestrator stops every monitor and background task it started, sweeps the heartbeat/beat files its watchers wrote (a stale beat beside a live one reads as coverage to whoever globs the directory), prints one final stand-down line, and leaves nothing queued in its input box. A finished session with an armed watcher or pre-filled input is a loaded gun.
 
 ## Invariants
 

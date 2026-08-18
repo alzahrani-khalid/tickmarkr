@@ -115,7 +115,7 @@ while :; do
     echo "WAKE: ${#ready[@]} of $# artifact(s) complete with marker '$MARKER' — ${#pending[@]} still outstanding"
     for f in ${ready[@]+"${ready[@]}"};   do echo "  READY       $(wc -c <"$f" | tr -d ' ') bytes  sha1 $(shasum -a 1 "$f" | cut -c1-12)  $f"; done
     for f in ${pending[@]+"${pending[@]}"}; do
-      if [ -s "$f" ]; then echo "  PARTIAL     $(wc -c <"$f" | tr -d ' ') bytes, no marker yet  $f"
+      if [ -s "$f" ]; then echo "  PARTIAL     $(wc -c <"$f" | tr -d ' ') bytes, no marker yet  $f  last-line: $(tail -n 1 "$f" | tr -d '\0' | cut -c1-72)"
       else echo "  NOT STARTED $f  <- check whether that seat is BLOCKED; a stalled seat writes nothing"; fi
     done
     exit 0
@@ -147,7 +147,10 @@ while :; do
     echo "WAKE: cap ${CAP}s reached — ${#ready[@]} of $# complete, re-arm"
     for f in ${ready[@]+"${ready[@]}"};   do echo "  READY    $(wc -c <"$f" | tr -d ' ') bytes  $f"; done
     for f in ${pending[@]+"${pending[@]}"}; do
-      if [ -s "$f" ]; then echo "  PARTIAL  $(wc -c <"$f" | tr -d ' ') bytes, no '$MARKER' yet  $f"
+      # PARTIAL prints the file's ACTUAL last line: a seat that reports the wrong marker for its own
+      # artifact leaves the file complete while this watcher waits forever, and the mismatch is visible
+      # only here (measured 2026-08-17: demanded/reported `SWEEP-END`, written `ORDER4-END`).
+      if [ -s "$f" ]; then echo "  PARTIAL  $(wc -c <"$f" | tr -d ' ') bytes, no '$MARKER' yet  $f  last-line: $(tail -n 1 "$f" | tr -d '\0' | cut -c1-72)"
       else echo "  ABSENT   $f"; fi
     done
     exit 0

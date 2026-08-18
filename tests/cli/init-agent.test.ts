@@ -197,7 +197,12 @@ describe("tickmarkr init — an installed skill is current, not merely present (
     const out = await runInit(repo);
 
     expect(out).toMatch(/stale .*tickmarkr-overseer\/SKILL\.md/);
-    expect(out).toContain("missing scripts/watch-artifacts.sh");
+    // Order-independent on purpose: the missing list is derived and sorted, so a shipped file added
+    // later (seat-send.sh, 2026-08-18) lands mid-list — a `missing <first-file>` substring pin broke
+    // on exactly the event this suite exists to report. Pin both: the original incident's file and
+    // the newest shipped one, each named on the missing line.
+    expect(out).toMatch(/missing [^\n]*scripts\/watch-artifacts\.sh/);
+    expect(out).toMatch(/missing [^\n]*scripts\/seat-send\.sh/);
     expect(out).toContain("tickmarkr init --agent --force");
   });
 
@@ -229,7 +234,7 @@ describe("tickmarkr init — an installed skill is current, not merely present (
 
     const out = await runInit(repo);
 
-    expect(out).toContain("missing scripts/watch-artifacts.sh");
+    expect(out).toMatch(/missing [^\n]*scripts\/watch-artifacts\.sh/);
     expect(out).toContain("modified SKILL.md");
   });
 
@@ -240,7 +245,7 @@ describe("tickmarkr init — an installed skill is current, not merely present (
       [`${overseerDir}/scripts/watch-panes.sh`]: currentWatcher,
     });
 
-    expect(await runInit(repo)).toContain("missing scripts/watch-artifacts.sh");
+    expect(await runInit(repo)).toMatch(/missing [^\n]*scripts\/watch-artifacts\.sh/);
     await runInit(repo, "--agent", "--force");
 
     expect(readFileSync(join(repo, overseerDir, "scripts/watch-artifacts.sh"))).toEqual(

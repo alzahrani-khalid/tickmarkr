@@ -12,6 +12,19 @@ to the user with evidence.
 The mission is the skill argument. If empty, ask the user what to run end-to-end before doing anything else.
 Requires `HERDR_ENV=1`; if unset, say so and stop.
 
+**THE ENGINE IS THE DEFAULT EXECUTOR.** A mission that names a milestone, a phase, or a spec runs the
+loop: `tickmarkr compile` → `plan` → `run` → `report`, and the JOURNAL is the record. `compile` ingests
+GSD phase plans (`src/compile/gsd.ts`), so *"this repo uses GSD"* is not a reason to bypass it. The
+supervised GSD flow (below) is the EXCEPTION: it exists only on an explicit operator order, recorded in
+the brief WITH its costs named — no journal (so no per-task adapter/model record), no routing, no
+enforced gate battery, no enforced cross-vendor review; each is re-implemented by hand or silently lost.
+**Measured 2026-08-18 (P98):** the operator triggered this skill expecting the engine; the mission ran
+as GSD legs instead — 12 seats, 11 of them one model checking that same model's work, and *"which model
+ran each task"* was unanswerable from every mission artifact (no ruling, log, or brief named a model;
+the answer took session-file archaeology). The flip from the engine (P89, journaled runs on disk) to
+GSD legs (P92) had been RULED NOWHERE — no ledger entry decides it — and then propagated for six phases
+through brief lineage. **An executor choice nobody made is still an executor choice, and it compounds.**
+
 ## Setup
 
 0. **Adopt before you build.** If this workspace already has a supervision hierarchy — an
@@ -22,11 +35,17 @@ Requires `HERDR_ENV=1`; if unset, say so and stop.
    status, and either ADOPT the
    existing orchestrator (updated brief, re-armed watchers) or, if the old hierarchy is dead, archive the
    stale brief and build fresh.
+   ⚠ **Adopting a hierarchy silently adopts its EXECUTOR CHOICE.** The P92→P98 GSD drift propagated
+   exactly this way: each overseer read the prior brief, reproduced "the same two-leg pattern as the
+   last three phases", and the unruled bypass of the engine became load-bearing through repetition.
+   At every adopt, re-derive the executor question — *"why is this milestone not compiled?"* — and if
+   the answer is not a recorded operator order, route the mission back through the engine.
 0a. **READ THE PROJECT MEMORY BEFORE YOU START — it already contains discipline you are about to re-earn.**
    `~/.claude/projects/<cwd-slug>/memory/` (slug = the absolute cwd with `/` → `-`). Read `MEMORY.md`, then
-   `ls` the topic entries and open every one whose name concerns METHOD or DISCIPLINE rather than a shipped
-   milestone — names like `*-discipline`, `*-drill`, `*-parity`, `*-least-permission`, `context-reset-*`,
-   `consults-*`, `agent-*`.
+   `ls` the topic entries and open every one whose name concerns METHOD, DISCIPLINE, or a STANDING
+   OPERATOR LAYOUT/CONVENTION rather than a shipped milestone — names like `*-discipline`, `*-drill`,
+   `*-parity`, `*-least-permission`, `context-reset-*`, `consults-*`, `agent-*`, `*-tab-layout`,
+   `*-visible-*`, `*-panes*`, `user-tabs-*`.
    **Earned 2026-08-04, expensively.** That directory held `…-falsification-drill-discipline.md`, written
    three weeks earlier: *"a gate or grep-pin is assumed WRONG until a falsification drill proves it bites…
    run the drill that should redden it and SEE the red before trusting green."* That is Evidence discipline
@@ -35,8 +54,33 @@ Requires `HERDR_ENV=1`; if unset, say so and stop.
    mission-scoped brief. **A memory that exists and is never opened costs more than one that was never
    written, because everyone assumes the lesson is somewhere.** Entries may predate a project rename; search
    by concept, not by the current product name.
+   **And the sweep scope is itself a recorded defect: a filter limited to discipline names SKIPS the
+   layout canon, and that skip is paid.** The layout entry records a 2026-08-05 correction it caused —
+   *"widen the start-of-session read to include layout/convention entries, not only discipline ones"* —
+   and on 2026-08-17 the same skip put a planning seat inside the ORCH tab. A standing operator layout is
+   not cosmetic; it is how the operator reads the fleet, and it binds exactly like a discipline rule.
 1. Load the `herdr` skill. `herdr pane list` to map the workspace — the focused pane is yours. Rename your
    tab OVERSEER; create ONE tab ORCHESTRATOR.
+   **FIVE-TAB CANON (standing operator layout — corrected three times on 2026-07-27, layout approved
+   2026-07-29, re-earned 2026-08-17):**
+   - `OVERSEER` — you, plus a visible pipeline watch pane running the SHIPPED surface (`tickmarkr ui`,
+     newest-run default; never a hand-rolled status loop — the operator flagged an ad-hoc shell-loop
+     watcher as "strange watch design"). A supervision watcher buried in an invisible background task
+     reads as "no watcher" to the operator even when armed.
+   - `ORCH` — the orchestrator, the run's watch board (split `--direction right`, ~0.6 to the board —
+     never `down`; the board needs full height for its task matrix), and the raw journal feed. **Nothing
+     else, ever: a work seat NEVER splits into the ORCH tab**, even when width arithmetic allows a second
+     column. Operator verbatim: *"in orch tab should be the orch and the watcher only."* Re-earned
+     2026-08-17: a planning seat split beside the orchestrator, and the operator caught it, again.
+   - Worker/seat tabs — tickmarkr opens ONE TAB PER TASK itself; GSD-leg seats get the same treatment
+     (own tab, or a shared WORKERS tab), never the ORCH tab.
+   - `CONSULT · <topic>` — ONE shared tab for ALL consultants of a round, side-by-side splits; never one
+     tab per consultant; do NOT auto-close after adjudication (operator, 2026-08-09 — keep the round's
+     panes until the thread is confirmed finished or a successor round supersedes them).
+   - `REVIEW <task>` — reviewer panes.
+   Never multiply beyond these without asking. **Tabs you did not create are the OPERATOR'S — provenance
+   decides: never close, rename, reuse, or send input to one, however idle it looks.** An "idle
+   stale-looking" tab an overseer once swept was the operator's in-progress thinking (2026-07-14).
    **Live tab labels (standing operator rule, 2026-07-12):** on every decision or state change (role
    handoff, task done/merged, run end) rename the affected tabs — and keep labels SHORT: the role as the
    main name plus at most ONE hot-state token. Vocabulary: ORCH carries the milestone and progress
@@ -48,8 +92,9 @@ Requires `HERDR_ENV=1`; if unset, say so and stop.
    truncated brief silently drops policy. Write the full brief to `<repo>/.tickmarkr/overseer/ORCH-BRIEF.md`
    (inside the tickmarkr state dir — already self-gitignored, no exclude step needed), then send one line:
    `herdr pane run <orch> "Read .tickmarkr/overseer/ORCH-BRIEF.md and follow it exactly."` The brief MUST contain: the
-   mission, the pane mechanics below, rules 1–2, and require a verbatim one-sentence acknowledgment of the
-   human-checkpoint rule before anything is dispatched.
+   mission, the five-tab canon from step 1, the pane mechanics below, rules 1–2, the GSD-leg rules
+   (below) whenever the mission dispatches `/gsd:*` legs, and require a verbatim one-sentence
+   acknowledgment of the human-checkpoint rule before anything is dispatched.
    **⚠ HARVEST BEFORE YOU DELETE.** At mission end the brief dir goes — but a long mission accumulates
    *method guards* in that brief (how to know a thing, not what is true of this spec), and deleting them
    re-earns each one at full price on the next mission. So before removing the dir: lift every durable,
@@ -192,12 +237,68 @@ is a lossy summary nobody trusts while a clean session re-oriented from disk-ver
 good, not after. If your own context cannot be read by the watcher, say so to the operator and ask for the
 number — an unmeasured budget is not a small budget.
 
+## Supervising GSD legs — when the mission dispatches `/gsd:*` instead of `tickmarkr run`
+
+Milestones that alternate GSD legs (`/gsd:plan-phase N`, `/gsd:execute-phase N`) under this hierarchy get
+none of the engine's dispatcher, routing, or gates — every guarantee `tickmarkr run` provides has to be
+demanded in the brief instead. **This path is the EXCEPTION and requires the recorded operator order
+named in the default-executor rule at the top of this skill.** Five guarantees get dropped every time
+they are left implicit:
+
+0. **A seats ledger stands in for the journal's assignment records.** Every seat spawn — orchestrator,
+   planner, checker, executor, verifier, consult — appends ONE JSON line to
+   `<state-dir>/overseer/seats.jsonl` in the same act as the spawn:
+   `{"ts":"<iso>","seat":"<name>","pane":"<id>","tab":"<label>","adapter":"<cli>","model":"<model>","role":"<role>","brief":"<path>"}`.
+   The journal answers *"which model ran each task"* in one line; without this file the answer is
+   session-file archaeology, and the model monoculture it would have exposed stays invisible (measured
+   2026-08-18: 12 seats, no artifact naming any seat's model). ⚠ Interim per rule 27 — removal
+   condition: the engine runs the milestone and the journal is the record.
+
+1. **GSD's Agent-tool default is OVERRIDDEN — name the trap in every seat brief.** `/gsd:plan-phase` and
+   `/gsd:execute-phase` fan their work out to in-process Task subagents: invisible to every watcher tier,
+   billed to the seat's own context, visible only in the seat's status footer. Measured 2026-08-17 (P98
+   leg 1): one planning seat ran FIVE in-process subagents to ≈855k tokens — two of them an unexplained
+   duplicate respawn pair — and the operator caught it from the footer, not from any tier of supervision.
+   The violation was first recorded 2026-07-10, and that record already states the fix: *"generic
+   'visible panes' wording is not enough — name the GSD trap."* The concrete mechanism is claude-code
+   TEAMMATES (the seat's footer roster; `Teammate @<name> finished` notices): they run INSIDE the
+   parent seat's turn, so the seat cannot drain its message queue until every teammate returns —
+   **unwatchable and unsteerable are the same defect** (the queued-message law, Pane mechanics).
+   Measured 2026-08-18: two freeze-class directives sat queued behind a planner's teammate fan-out
+   while the plan set they froze was still editable from that queue, and THE OPERATOR ended the turn
+   by hand (Esc, twice) because no seat owned the interrupt. Every GSD seat brief states: subagents
+   run as visible herdr panes in per-task tabs (`herdr agent start …`), and a seat report whose work
+   was produced by invisible subagents is rejected on read.
+2. **Seats are interactive TUI, never headless `-p`.** The P92–P96 exec lane —
+   `cat brief | claude -p … ` in a visible pane — satisfied visibility in the letter only: `claude -p`
+   buffers output until exit, so the pane renders idle for the entire run; it is blind to SessionStart
+   hook errors (a broken and a fixed hook both return green); and its silence has no midpoint for a
+   stall watcher to catch — silent-time equals lifetime. Standing operator rule since 2026-07-13:
+   consults and one-off LLM calls run as the CLI's real interactive TUI in a visible named pane.
+   Headless is for exit-code probes — a quota check that wants `rc`, never work anyone must watch.
+3. **Buy seat diversity from the live capability matrix, at every dispatch.** When one vendor's model
+   quota collapses, the reflex is to collapse every seat onto the surviving model and hold the
+   cross-vendor CLI back for a late probe — P97 ran planner, checker and verifier as one family that
+   way, and three same-family passes confirmed one wrong anchored conclusion with the refuting fact in
+   the room. `<state-dir>/doctor.json` already lists every installed+authed adapter and its models (nine
+   were authed on 2026-08-17 while every seat ran claude). Priority when independence is scarce:
+   **verifier > checker > planner > executors** — the independent seat goes cross-vendor
+   (`herdr agent start … --kind codex`), ruled at dispatch, never debated under time pressure.
+4. **Gate every exec lane with the shipped battery, not hand-rolled greps.**
+   `tickmarkr verify --base <ref> --criteria <file>` is the standalone form of the engine's own gates —
+   build/test/lint diffed against a recorded baseline, evidence, scope, plus the semantic judges — one
+   fail-closed verdict, no daemon, no retries. A per-lane grep gate re-implements a weaker version of
+   this and passes on source text the screen never renders, which is exactly the class the acceptance
+   judge exists to reject. One command per lane, named in the lane's own brief.
+
 ## Pane mechanics that bite
 
 - **Verified send protocol**: `herdr agent send` writes WITHOUT Enter, and `pane run`'s Enter can be swallowed
   by bracketed-paste on long payloads. Robust sequence: read the pane (bare prompt required) → send-text →
   sleep 2–3s → send-keys Enter → read back (input empty / agent `working`). Never report "briefed" without
-  the read-back. Long content goes in a brief file, never pane text.
+  the read-back. Long content goes in a brief file, never pane text. `scripts/seat-send.sh` encodes
+  this whole path — size guard, atomic prompt, prompt-line read-back, optional interrupt — and never
+  auto-resends.
   **PROBE THE READ-BACK WITH THE SHORTEST DISTINCTIVE TOKEN — a commit hash, a pid, an OBS id — NEVER a
   sentence.** A long phrase crosses the pane's render wrap boundary, so grepping for it returns zero on a
   message that arrived intact, and **a badly-probed successful send is byte-identical to a truncated one.**
@@ -206,6 +307,35 @@ number — an unmeasured budget is not a small budget.
   (OBS-396): a grep for the full sentence returned 0 while a grep for one word of the same sentence
   returned 1. This trap lives *inside* the verification step above, which is why it survives — the rule
   that is supposed to catch dropped sends is the rule that manufactures the phantom.
+  **AND A CONTENT PROBE — TOKEN, TAIL, FULL TEXT — CANNOT VERIFY DELIVERY AT ALL, only presence.**
+  Measured 2026-08-18: `herdr pane read` includes the INPUT BOX, so an unsubmitted message renders
+  identically to a submitted one and every content-based probe returns the same answer in both
+  states. A freeze hold was "verified delivered" by three independent content methods and had never
+  been submitted; the receiving seat stopped 19 minutes later without ever reading it — the frozen
+  set was protected by nothing but the operator's manual Esc. **The prompt line is the only state
+  that discriminates** — text sitting on `❯` is exactly what will not run — and a delivery report
+  is prompt-line state alone, or nothing: a decorative check beside a real one reads as
+  corroboration (two greens, one of which was never capable of disagreeing).
+- **A MESSAGE TO A WORKING SEAT IS A QUEUED MESSAGE, AND THE QUEUE DRAINS ONLY AT TURN BOUNDARIES.**
+  Delivery is not arrival: `agent prompt` to a `working` claude seat lands in its queue (`Press up to
+  edit queued messages` on the seat's prompt line is the tell) and is READ only when the current turn
+  ends — and with in-process teammates a turn runs 20–40 minutes, so steering latency equals subagent
+  runtime. Measured 2026-08-17/18 (P98 leg 1): a FREEZE HOLD and a checker-release directive stacked
+  behind a planner's teammate fan-out — the freeze forbade edits its own queue could still trigger —
+  and the OPERATOR ended the turn by hand. Three consequences:
+  - **A queued hold is not a hold.** A freeze-class or superseding directive to a `working` seat is
+    delivered by INTERRUPT, and the interrupt is the SUPERVISING tier's move, never left to the
+    operator: `send-keys esc` → re-read status → esc once more if still working (two, bounded) →
+    verify idle → prompt → verify. The interrupt loses the seat's in-flight step; for a
+    correctness-class directive that is the price, and it is cheaper than a voided verdict.
+  - **Never stack a correction behind a stale directive.** A queued message executes in a context that
+    no longer matches the one it was written in. When conditions change, do not append another
+    message — interrupt, then send ONE directive that NAMES the queue and overrides it (*"your queue
+    holds X and Y; act on neither; current state is Z"*), and require the seat to report what its
+    queue held before acting. The receiving seat re-validates every queued item against CURRENT state.
+  - Five distinct send failures in one leg — front-truncation, sitting unsubmitted, two silent losses,
+    a probe that mistook its own echo for a reply — is what a prose send protocol costs under load:
+    run `scripts/seat-send.sh` instead.
 - **Guard-before-Enter** (race-safe prompt answering): chain with `&&` — pane get shows `blocked` && pane
   read shows the expected option under the cursor && only then send-keys. If no longer `blocked`, someone
   already answered; do nothing.
@@ -235,6 +365,15 @@ number — an unmeasured budget is not a small budget.
   unaffected (one more reason to prefer them).
 - Stale typed input is unclearable via CLI — supersede it:
   `pane run "<-- disregard everything before this arrow (stale draft). ACTUAL: <message>"`.
+  **But DISCRIMINATE before you supersede or file it: text on an idle seat's prompt line has FOUR
+  authors** — the seat's own draft, an operator, another agent's `agent send` (writes WITHOUT Enter),
+  and claude-code's AUTOSUGGEST, which renders context-plausible ghost text BYTE-IDENTICAL to a typed
+  draft in text-format reads (OBS-482). The check is mechanical and only works at observation time:
+  `agent read --format ansi` — dim/grey SGR around the text = autosuggest ghost, NOT input. Measured
+  2026-08-17 (D-206): an unattributed instruction was found in an orchestrator's box, superseded
+  defensively, and its origin stayed UNRESOLVED — the one probe that discriminates was not taken while
+  the text still sat there. An origin question you can close in ten seconds at the pane becomes
+  permanently open the moment anyone clears the box.
 
 ## Supervision watcher
 
@@ -324,6 +463,12 @@ nowhere.
 It wakes when every named file exists AND ends with its terminal marker, and on timeout it reports each
 file as READY / PARTIAL / ABSENT so a quiet arm still proves the watcher was alive. Tell each seat, in its
 brief, the exact marker its report must end with — you cannot watch for a marker you never demanded.
+**Arm on the marker YOU demanded, verified against the FILE — never on the seat's report of its own
+marker.** Measured 2026-08-17: a seat reported its sweep "ends `SWEEP-END`"; the file on disk ended
+`ORDER4-END`. A watcher armed on the reported marker never fires while the artifact sits COMPLETE, and
+that hang is byte-identical to a seat still working. The script prints each unfinished file's actual
+last line on every timeout heartbeat — read it there, and when in doubt `tail -1` the artifact, never
+the transcript's claim about it.
 
 **Arm it in the same call as the spawn, not the next one.** A watcher armed "after I finish this step"
 leaves a gap exactly as wide as however long you stay busy, and you will be busy — you just spawned work.
@@ -713,6 +858,11 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     **Write beats to a conventional path inside the repository the other tier already reads**, one file per
     tier, and state the path when you report. Then have the reader name the tiers that are ABSENT, never
     the ones present: a list of what IS armed is producible by a seat whose watchers are all dead.
+    **And a beat OUTLIVES its mission unless something sweeps it.** Namespace beats per phase/leg and
+    sweep them at stand-down: measured 2026-08-17, a beats directory held SEVEN stale beats from prior
+    phases beside four live tiers, and a stale beat beside live ones reads as coverage to anyone globbing
+    the directory — the outliving-its-trigger failure (rule 11) in file form. Only age distinguishes a
+    frozen beat from a live one, so the reader states ages, and the writer removes what it retires.
 30. **A JOURNAL WATCHER ON A RESUMABLE RUN MUST SCOPE TO THE CURRENT ENGAGEMENT.** A resumed run's journal
     still contains the PREVIOUS `run-end`. A watcher that greps the whole file for its terminal event finds
     that old one immediately, concludes the run is over, and exits — on every resume, which is exactly when

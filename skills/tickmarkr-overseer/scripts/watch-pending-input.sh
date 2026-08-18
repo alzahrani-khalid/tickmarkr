@@ -162,7 +162,7 @@ while [ "$elapsed" -lt "$CAP" ]; do
              && printf '%s' "$T" | grep -qEi -- "$AUTO_ALLOW_RE"; then
             auto=$((auto + 1))
             herdr agent prompt "$TARGET" \
-              " <-- disregard everything before this arrow (stale unsubmitted draft, auto-detected). ACTUAL: proceed exactly as that draft said: ${T}" \
+              " <-- [watch-pending-input auto-supersede] disregard everything before this arrow (stale unsubmitted draft, auto-detected). ACTUAL: proceed exactly as that draft said: ${T}" \
               >/dev/null 2>&1
             echo "$(date '+%H:%M:%S') auto-superseded #${auto}: ${T}" >> "${AUTO_LOG}"
             streak=0
@@ -198,4 +198,20 @@ while [ "$elapsed" -lt "$CAP" ]; do
   esac
 done
 
+# The negative alone is not evidence: a draft can arrive inside the final poll window, and a draft
+# sitting in the box while the seat is WORKING is invisible to the loop above by design (working
+# resets the streak). Measured 2026-08-17 (D-206): this watcher capped with "no sustained pending
+# input in 1800s" while an unattributed instruction sat in the target's box, and blind-vs-timing
+# could not be distinguished afterwards. So the cap line carries one FINAL unsustained read — the
+# last frame of the window, whatever the seat's status — plus the styled bytes so ghost text is
+# discriminable at the only moment it can be.
 echo "WATCH_CAP_REACHED $TARGET status=$(status_of) — no sustained pending input in ${CAP}s"
+FINAL=$(pending_text)
+if [ -n "$FINAL" ]; then
+  echo "  final read (UNSUSTAINED — present at cap, not confirmed across polls): $FINAL"
+  echo "  styling evidence (dim/grey SGR = autosuggest ghost, NOT a draft):"
+  herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
+    | grep -F -- "$FINAL" | head -2 | cat -v | sed 's/^/    /'
+else
+  echo "  final read: input box empty"
+fi
