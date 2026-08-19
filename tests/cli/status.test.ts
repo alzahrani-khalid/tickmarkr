@@ -19,7 +19,11 @@ const seedJournal = (repo: string, runId: string, events: JournalEvent[]) => {
   writeFileSync(join(dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
 };
 
-const row = (out: string, taskId: string) => out.split("\n").find((line) => new RegExp(`\\b${taskId}\\b`).test(line))!;
+// A card's IDENTITY row: the id in its own column, right after the row's verdict glyph. Since
+// v1.94 a card also names OTHER tasks — the dependents waiting on it — in its line-2 detail, so a
+// bare id search would answer a blocker's machinery line for the task it blocks.
+const row = (out: string, taskId: string) =>
+  out.split("\n").find((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(line))!;
 
 // T3: seed a run-start whose recorded graphDefinitionHash matches the saved graph (comparable), so the
 // non-hash assertions (dep-waiting, context-sample, skipped gates) see the real replayed states rather
@@ -311,6 +315,30 @@ describe("v1.65 activity cells on the status surface", () => {
     expect(out.match(/dep-waiting/g)).toHaveLength(1); // no other pending task shows dep-waiting
     expect(row(out, "T1")).toContain("attempt 1 in flight on fake:fake-1 since 08:00:00"); // live attempt, not dep-waiting
     expect(row(out, "T3")).not.toContain("dep-waiting"); // pending with no deps stays unlabeled
+  });
+
+  // OBS-536: on a 41-task graph with 8-way fan-in, `dep-waiting on …` plus the pane name pushed the
+  // machine row past the terminal width and the row paid for it out of the TITLE — 20 rows named no
+  // task at all. The cockpit card forbids exactly that trade (identity on line 1, machinery on line 2).
+  test("a machine row never sheds the task title to pay for its machinery, however many blockers it names", async () => {
+    const repo = mkRepo();
+    const blockers = Array.from({ length: 9 }, (_, i) => `T${i + 1}`);
+    const g = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [
+        ...blockers.map((id) => ({ id, title: `${id} blocker`, goal: "g", shape: "implement", complexity: 3, acceptance: ["a"] })),
+        {
+          id: "T-last", title: "Land the residual rewrite for the long tail", goal: "g",
+          shape: "implement", complexity: 3, deps: blockers, acceptance: ["a"],
+        },
+      ],
+    });
+    saveGraph(repo, g);
+    seedJournal(repo, "run-identity", [startFor(g)]);
+    const out = await status([], repo);
+    expect(row(out, "T-last")).toContain(`dep-waiting on ${blockers.join(", ")}`); // no blocker becomes a +N count
+    expect(row(out, "T-last")).toContain("Land the residual"); // and identity survives beside it
   });
 });
 

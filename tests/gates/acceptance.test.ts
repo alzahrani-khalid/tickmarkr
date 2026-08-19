@@ -363,6 +363,27 @@ describe("acceptanceGate — deterministic oracles (T2)", () => {
   // judge would fail-closed IF consulted: a pass here proves it never ran (zero LLM calls).
   const noCall = () => fakeWithJudge("DEFINITELY NOT JSON");
 
+  test("a command oracle whose own execution produced no verdict records an infra cause naming that blocker, so an unevaluable oracle billed against the diff fails", async () => {
+    const { repo, base } = repoWithDiff();
+    const command = "printf '%s\\n' 'Token not found in system keyring' 'Error: Process from config.webServer was not able to start. Exit code: 1' >&2; exit 1";
+    const r = await acceptanceGate(
+      task([{ oracle: "command", command }]),
+      repo,
+      base,
+      { adapter: noCall(), model: "fake-1" },
+    );
+
+    expect(r).toMatchObject({
+      gate: "acceptance",
+      pass: false,
+      meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false },
+    });
+    expect(r.details).toContain("Token not found in system keyring");
+    expect(r.details).toContain("Process from config.webServer was not able to start");
+    expect(r.details).toContain("verified nothing");
+    expect(r.details).not.toMatch(/unparseable/i); // the judge was never dispatched
+  });
+
   test("command oracle exits non-zero → fails before any LLM judge dispatch", async () => {
     const { repo, base } = repoWithDiff();
     const r = await acceptanceGate(task([{ oracle: "command", command: "printf 'boom\\n' >&2; exit 7" }]), repo, base, { adapter: noCall(), model: "fake-1" });
@@ -438,6 +459,21 @@ describe("acceptanceGate — deterministic oracles (T2)", () => {
     expect(r.details).toContain("c1"); // judge line present
     expect(r.details).not.toMatch(/warning/i); // not only-judge → no warning
   });
+});
+
+test("parsed judge refusals never acquire infra metadata from credential-like prose", async () => {
+  const reason = "the login handler accepts the credentials but the error banner is missing; the secrets, tokens and keyring copy are also wrong";
+  const { repo, base } = repoWithDiff();
+  const judge = fakeWithJudge({
+    pass: false,
+    criteria: [{ criterion: "c1", met: false, reason, evidence: "module.exports = (n) =>" }],
+  });
+  const r = await acceptanceGate(task, repo, base, { adapter: judge, model: "fake-1" });
+
+  expect(r.pass).toBe(false);
+  expect(r.details).toContain(reason);
+  expect(r.meta?.infra).not.toBe(true);
+  expect(r.meta?.retryable).toBeUndefined();
 });
 
 // v1.64 gate-integrity: adversarial rubric — the judge prompt carries the completion-faking checklist,

@@ -774,7 +774,7 @@ describe("contextWindowLints — v1.47 T3", () => {
     }
   });
 
-  test("the context-window lint fires on a task whose measured payload exceeds a declared window and stays silent when the payload fits, with the payload measured against the base tree so an untracked context file contributes zero visible bytes and is reported as unreadable rather than as empty", () => {
+  test("the context-window lint fires on a task whose measured payload exceeds a declared window and stays silent when the payload fits, with the payload measured against the base tree so an untracked context file contributes zero visible bytes and is reported as an unreachable context ref rather than as empty", () => {
     const repo = makeRepo({
       "over.txt": "x".repeat(810_000),
       "fits.txt": "x",
@@ -791,14 +791,103 @@ describe("contextWindowLints — v1.47 T3", () => {
     const fits = taskWithContext("T-fits", "fits.txt");
     expect(contextWindowLints([fits], assignment(fits.id), config, repo)).toEqual([]);
 
-    const unreadable = taskWithContext("T-unreadable", "untracked.txt");
-    const lints = contextWindowLints([unreadable], assignment(unreadable.id), config, repo);
+    const unreachable = taskWithContext("T-unreachable", "untracked.txt");
+    const lints = contextWindowLints([unreachable], assignment(unreachable.id), config, repo);
     expect(lints).toHaveLength(1);
-    expect(lints[0]).toContain("payload unreadable");
-    expect(lints[0]).toContain('context "untracked.txt"');
+    expect(lints[0]).toContain("context unreachable");
+    expect(lints[0]).toContain('"untracked.txt"');
     expect(lints[0]).toContain("not in the base tree");
-    expect(lints[0]).toContain("context-window comparison skipped");
+    expect(lints[0]).toContain("context-window comparison is skipped");
     expect(lints[0]).not.toContain("exceeds");
+  });
+
+  // OBS-535: every task on a real graph declares a files[] pattern and an output it has not written
+  // yet, so pricing write scope as unreadable PAYLOAD skipped the comparison for 41 of 41 tasks in a
+  // live run — the check the lint exists to perform never ran once.
+  test("files[] is priced as write scope rather than as payload, proven over the closed set of scope-entry shapes — a brace pattern covering tracked sources, a pattern matching nothing in the base tree, and an output path the task has yet to write — each leaving the window comparison ARMED, with the pattern's tracked bytes actually charged", () => {
+    const repo = makeRepo({ "src/a.ts": "a".repeat(410_000), "src/b.ts": "b".repeat(410_000), "ctx.txt": "c" });
+    const config = structuredClone(DEFAULT_CONFIG);
+    const scoped = (id: string, files: string[]) => validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id, title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], context: ["ctx.txt"], files }],
+    }).tasks[0];
+    const lintsFor = (files: string[]) => {
+      const t = scoped("T1", files);
+      return contextWindowLints([t], [{ taskId: "T1", adapter: "cursor-agent", model: "composer-2.5" }], config, repo);
+    };
+
+    // both tracked sources are charged (820k chars ⇒ ~205k tokens > the 200k window)
+    expect(lintsFor(["src/{a.ts,b.ts}"])).toEqual([
+      expect.stringMatching(/^T1: payload ~\d+ tokens exceeds cursor-agent:composer-2\.5 window 200000$/),
+    ]);
+    // one source only ⇒ under the window, and the comparison ran to say so
+    expect(lintsFor(["src/a.ts"])).toEqual([]);
+    expect(lintsFor(["docs/**/*.md"])).toEqual([]);
+    expect(lintsFor([".planning/T1-SUMMARY.md"])).toEqual([]);
+    expect(estimateTaskPayloadTokens(scoped("T1", [".planning/T1-SUMMARY.md"]), repo)).toBeTypeOf("number");
+  });
+
+  test("an absent context ref is classified by who can satisfy it, proven member by member over the closed set — one written by a transitive dependency's files[] pattern (silent, and named as a lower bound when the measurable payload alone overflows), one no task in the graph produces (named), and one inside a gitignored tree (named as uncarryable by any commit)", () => {
+    const repo = makeRepo({ "ctx.txt": "x".repeat(810_000), ".gitignore": ".state/\n" });
+    const config = structuredClone(DEFAULT_CONFIG);
+    const graph = (over: boolean) => validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [
+        { id: "T1", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], files: ["scripts/{audit.mjs,census.mjs}"] },
+        { id: "T2", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], deps: ["T1"] },
+        {
+          id: "T3", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], deps: ["T2"],
+          context: over ? ["scripts/audit.mjs", "ctx.txt"] : ["scripts/audit.mjs"],
+        },
+        { id: "T4", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], context: ["scripts/audit.mjs"] },
+        { id: "T5", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], context: [".state/RULING.md"] },
+      ],
+    }).tasks;
+    const lints = (over: boolean) => contextWindowLints(
+      graph(over),
+      graph(over).map((t) => ({ taskId: t.id, adapter: "cursor-agent", model: "composer-2.5" })),
+      config,
+      repo,
+    );
+
+    // T3 reads what its transitive dependency T1 writes: reachable at dispatch, so no lint at all.
+    expect(lints(false).filter((l) => l.startsWith("T3:"))).toEqual([]);
+    expect(lints(true).filter((l) => l.startsWith("T3:"))).toEqual([
+      expect.stringMatching(/^T3: payload ~\d+ tokens exceeds cursor-agent:composer-2\.5 window 200000 \(lower bound — 1 context ref\(s\) are produced upstream and not yet measurable\)$/),
+    ]);
+    // T4 declares no dependency on T1, so nothing in ITS past writes the ref.
+    expect(lints(false)).toContain(
+      'T4: context unreachable — "scripts/audit.mjs" is absent from the base tree and no task in this graph produces it; the worker\'s "read these first" list dangles and the context-window comparison is skipped',
+    );
+    expect(lints(false)).toContain(
+      'T5: context unreachable — ".state/RULING.md" is gitignored — no commit can carry it into a worktree; the worker\'s "read these first" list dangles and the context-window comparison is skipped',
+    );
+  });
+
+  test("a lint naming many unreachable refs caps its enumeration and counts the rest rather than emitting an unbounded line (4,924 columns observed live)", () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const config = structuredClone(DEFAULT_CONFIG);
+    const t = validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{
+        id: "T1", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"],
+        context: ["a.md", "b.md", "c.md", "d.md", "e.md"],
+      }],
+    }).tasks[0];
+    const lints = contextWindowLints([t], [{ taskId: "T1", adapter: "cursor-agent", model: "composer-2.5" }], config, repo);
+    expect(lints).toHaveLength(1);
+    expect(lints[0]).toContain('"a.md"');
+    expect(lints[0]).toContain('"c.md"');
+    expect(lints[0]).not.toContain('"d.md"');
+    expect(lints[0]).toContain(", +2 more");
+  });
+
+  test("a tracked context file with a non-ASCII name is measured rather than read as absent (git quotes such paths unless the tree is listed NUL-separated)", () => {
+    const repo = makeRepo({ "docs/معايير-الترجمة.md": "x".repeat(4_000) });
+    const withArabicContext = taskWithContext("T1", "docs/معايير-الترجمة.md");
+    const est = estimateTaskPayloadTokens(withArabicContext, repo);
+    expect(est).toBeTypeOf("number");
+    expect(est!).toBeGreaterThan(1_000);
   });
 
   test("every seeded window is checked in PRODUCTION against T20's vendored table rather than merely being present, proven member by member over the closed set of rejection shapes — a seeded window with no entry in the table, one disagreeing with its table entry, and one below the plausibility floor — each rejected at config load, while a seeded window matching its table entry is accepted", () => {

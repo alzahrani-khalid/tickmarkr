@@ -87,6 +87,36 @@ export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILE
   return paneCols / 2 >= safeFloor + margin ? "right" : "down";
 }
 
+// The watch board's geometry, deliberately NOT the trailer floor above. `workerSplitDirection`
+// halves the caller and refuses a right split under 108+2 — that bound protects WORKER panes, which
+// print a trailer; the supervising seat + board pair does not. Applied to that pair on 2026-08-18 it
+// sent a 189-column tab's board BELOW the seat and the operator corrected it (QUEUE-v194 criterion 1;
+// skills/tickmarkr-overseer/SKILL.md: "the side placement outranks the halving floor"). So the board
+// is allocated its measured width FIRST and the seat keeps the remainder.
+export const BOARD_TARGET_COLS = 110; // §14a measured clean-render bound for the board
+export const BOARD_SEAT_FLOOR_COLS = 40; // the seat beside it still has to be usable
+
+export interface BoardSplitPlan {
+  direction: "right" | "down";
+  /** herdr's split ratio is the FIRST child's share and a right split's first child is the caller,
+   *  so this is what the SEAT keeps. Absent on `down` — the board then takes the full width. */
+  ratio?: number;
+  /** Columns the board gets under this plan; null when it takes the caller's whole width. */
+  boardCols: number | null;
+}
+
+/** Board-first placement beside the supervising seat: right only while the caller can fund the board
+ *  its target AND leave the seat its floor; otherwise down at full width, never a squeezed board.
+ *  An unmeasurable caller falls back to down like every other placement here (fail closed). */
+export function boardSplitPlan(
+  callerCols: number | null,
+  boardCols = BOARD_TARGET_COLS,
+  seatFloor = BOARD_SEAT_FLOOR_COLS,
+): BoardSplitPlan {
+  if (callerCols == null || callerCols < boardCols + seatFloor) return { direction: "down", boardCols: null };
+  return { direction: "right", ratio: Math.round(((callerCols - boardCols) / callerCols) * 1e4) / 1e4, boardCols };
+}
+
 // VIS-04 role-tab + VIS-09 item 2 cap/overflow: live members of one ref-counted tab (a GENERATION);
 // a group holds N generations (WORKERS, cleanup, cleanup, …), each its own tab, cap-bounded. Teardown
 // is refcounted PER GENERATION: each overflow tab closes when its OWN last member leaves (43-02).
@@ -104,6 +134,23 @@ export function taskGroupOf(name: string): string | undefined {
   const { role, taskId } = canonicalizeLegacyName(name, "");
   if (!TASK_TAB_ROLES.has(role)) return undefined;
   return taskId && taskId.trim() ? taskId : undefined;
+}
+
+/** The operator-facing TITLE for a tab this driver creates when no stage label is supplied: a task
+ *  token for a worker (`T5`, `T5↻2` on a retry) and ROLE + task for a gate pane (`REVIEW T5`) — the
+ *  same vocabulary `renameGroupTab` and the gate call sites already speak. Any name with no task
+ *  identity keeps today's behaviour and titles the tab after the slot itself.
+ *
+ *  Load-bearing because this fallback IS reached in production: once a group's join degrades (D-09,
+ *  `groupSlot`), every later member takes the per-slot path, and the durable PANE name went onto the
+ *  tab — `tickmarkr:worker:T5:1:run-20260819-022723-0000000000001591`, 58 chars, four of them across
+ *  one tab bar (OBS-45's class, live again 2026-08-19 on run …1591). A durable identity and a human
+ *  title are different strings; `pane rename` still gets the identity, unchanged. */
+export function tabLabelFor(name: string): string {
+  const { role, taskId, attempt } = canonicalizeLegacyName(name, "");
+  if (!TASK_TAB_ROLES.has(role) || !taskId.trim()) return name;
+  if (role !== "worker") return `${role.toUpperCase()} ${taskId}`;
+  return attempt > 0 ? `${taskId}↻${attempt}` : taskId;
 }
 
 /** Gate panes ride with the task they belong to and never consume the tab cap; everything else does.
@@ -337,7 +384,7 @@ export class HerdrDriver implements ExecutorDriver {
   // label defaults to the slot name; group tabs pass the STAGE name instead — a first-member label
   // outlives its member once keepPanes reaps it (run-20260709-104447: the codex pane sat in a tab
   // named after a dead cursor worker and the operator read it as a mislabeled agent)
-  private async tabSlot(cwd: string, name: string, label: string = name): Promise<Slot> {
+  private async tabSlot(cwd: string, name: string, label: string = tabLabelFor(name)): Promise<Slot> {
     // tab-per-slot: concurrent agents in one tab split it into sliver columns — TUIs exit or
     // hard-wrap at COLUMNS≈2, shredding even the TICKMARKR_RESULT marker (v1.4 phase-1 incident).
     // A dedicated named tab gives every agent a full-width pane; tab close() reaps it.
@@ -428,7 +475,16 @@ export class HerdrDriver implements ExecutorDriver {
       if (latest && (ridesWithTask(name) || cappedMembers(latest) < this.workersPerTab)) {
         const joined = await this.joinGroup(cwd, name, group, latest);
         if (joined) return joined;
-        state.splitUnsupported = true; // D-09 fail-safe: this and future members degrade to per-slot tabs
+        // D-09 fail-safe: this and future members degrade to per-slot tabs. Best-effort notify, on
+        // the relabel-failure precedent below: the latch is PERMANENT for the group and was the one
+        // layout decision this driver made with no record anywhere — an operator reading a scattered
+        // tab bar had no way to learn a split had failed once, hours earlier.
+        state.splitUnsupported = true;
+        try {
+          await this.notify(`tickmarkr tab grouping degraded: ${group} can no longer join by split — every later member opens its own tab`);
+        } catch {
+          /* cosmetic only — never blocks membership or teardown (v1.18 invariant) */
+        }
         return this.tabSlot(cwd, name);
       }
       return this.newGeneration(cwd, name, group, state); // cap full → overflow to a new generation tab
@@ -1061,7 +1117,11 @@ export class HerdrDriver implements ExecutorDriver {
     }
   }
 
-  private async priorWatch(runId: string): Promise<string | null> {
+  // Every surviving tickmarkr-owned board in this workspace — a PRIOR run's and one already wearing
+  // this run's own name alike. Both are retired before a new board opens (narrator): what a pane this
+  // process did not create is actually RUNNING cannot be read back, and the pre-v1.94 implementation
+  // launched a bare `tickmarkr status --watch`, which follows the newest journal.
+  private async ownedWatchPanes(): Promise<string[]> {
     if (!this.ws) throw new Error("herdr watch placement requires HERDR_WORKSPACE_ID — refusing unseeded pane");
     const list = await this.herdr("pane list");
     if (list.code !== 0) throw new Error(`herdr pane list failed: ${list.stderr || list.stdout}`);
@@ -1072,19 +1132,23 @@ export class HerdrDriver implements ExecutorDriver {
       throw new Error(`herdr pane list returned unparseable JSON: ${list.stdout}`);
     }
     if (!Array.isArray(panes)) throw new Error(`herdr pane list returned no panes: ${list.stdout}`);
-    const prior = panes.find((p) => {
+    return panes.filter((p) => {
       const owned = typeof p.label === "string" ? parseOwnedName(p.label) : null;
-      return p.workspace_id === this.ws && typeof p.pane_id === "string" && owned?.role === "watch" && owned.taskId === "run" && owned.runId !== runId;
-    });
-    return prior?.pane_id ?? null;
+      return p.workspace_id === this.ws && typeof p.pane_id === "string" && owned?.role === "watch" && owned.taskId === "run";
+    }).map((p) => p.pane_id!);
   }
 
-  // T2: the watch is a rightward sibling of the daemon's own pane, never a separate tab. Its durable
-  // owned name lets a resumed daemon find an already-running watch instead of stacking another one.
+  // T2: the watch is a sibling of the daemon's own pane, never a separate tab — beside it when the
+  // tab can fund the board its width, below it at full width when it cannot. Its durable owned name
+  // is how a later daemon RECOGNIZES the board it must retire, so a run never stacks a second one.
   private async watchSlot(cwd: string, name: string): Promise<Slot> {
     if (!this.ws) throw new Error("herdr watch placement requires HERDR_WORKSPACE_ID — refusing unseeded pane");
     if (!this.callerPane) throw new Error("herdr watch placement requires HERDR_PANE_ID — refusing untargeted split");
-    const sp = await this.herdr(`pane split ${shq(this.callerPane)} --direction right --no-focus`);
+    // Board width first (boardSplitPlan), measured off the caller through the driver's own layout
+    // read — never an unconditional right split, and never the worker halving rule.
+    const plan = boardSplitPlan(await this.paneWidth(this.callerPane));
+    const ratio = plan.ratio == null ? "" : ` --ratio ${plan.ratio}`;
+    const sp = await this.herdr(`pane split ${shq(this.callerPane)} --direction ${plan.direction}${ratio} --no-focus`);
     if (sp.code !== 0) throw new Error(`herdr watch split failed: ${sp.stderr || sp.stdout}`);
     let pane: string | undefined;
     try {
@@ -1109,30 +1173,24 @@ export class HerdrDriver implements ExecutorDriver {
     return { id: pane, name, cwd };
   }
 
-  // T6 narrator: the run's single live status surface. Reuse a local or already-running owned watch;
-  // a new run reowns its prior watch, and only a newly split pane receives the watch command. The
-  // status command reads the latest run every frame, so the renamed pane follows the new run without
-  // interrupting the operator's watch loop. Failures propagate — the daemon swallows.
+  // T6 narrator: the run's single live status surface, RUNNING THE COMMAND THIS CALL SUPPLIED. Only
+  // a board this driver instance itself opened is reused (this.watches); any other surviving board —
+  // a prior run's, or one already carrying this run's canonical name after a resume — is retired and
+  // re-split, because adoption cannot restart or even read the process inside it and a pre-v1.94 pane
+  // is running the bare `tickmarkr status --watch`, which narrates the newest journal instead of this
+  // run. The retirement is VERIFIED gone before the replacement splits: reconcile is no backstop here
+  // (panesToClose skips role "watch" by design, types.ts:92), so an unverified close would leave two
+  // boards bound to different runs. Failures propagate — the daemon swallows.
   async narrator(cwd: string, command: string, runId?: string): Promise<Slot> {
     const name = runId ? formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }) : `narrator-watch-${process.pid}`;
     return this.serial(async () => {
       const cached = this.watches.get(name);
       if (cached) return cached;
-      const existing = await this.namedPaneId(name);
-      if (existing) {
-        const s = { id: existing, name, cwd };
-        this.watches.set(name, s);
-        return s;
-      }
-      const prior = runId ? await this.priorWatch(runId) : null;
-      if (prior) {
-        const renamed = await this.herdr(`pane rename ${shq(prior)} ${shq(name)}`);
-        if (renamed.code !== 0 || await this.namedPaneId(name) !== prior) {
-          throw new Error(`herdr watch reclaim failed: ${renamed.stderr || renamed.stdout}`);
-        }
-        const s = { id: prior, name, cwd };
-        this.watches.set(name, s);
-        return s;
+      const stale = await this.ownedWatchPanes();
+      for (const pane of stale) await this.herdr(`pane close ${shq(pane)}`);
+      if (stale.length) {
+        const survived = (await this.ownedWatchPanes()).filter((p) => stale.includes(p));
+        if (survived.length) throw new Error(`herdr watch retire failed: ${survived.join(", ")} survived close — refusing a second board`);
       }
       const s = await this.watchSlot(cwd, name);
       this.watches.set(name, s);

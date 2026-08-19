@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
+import { filesGlob } from "../graph/files-glob.js";
 import type { Task } from "../graph/schema.js";
 import { buildTaskPrompt } from "./prompt.js";
 import { channelKey, MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "./types.js";
@@ -247,72 +248,142 @@ export function declaredModelWindow(cfg: TickmarkrConfig, adapter: string, model
   return cfg.tiers[adapter]?.windows?.[model];
 }
 
-type BaseTree = { root: string; tracked: ReadonlySet<string> };
-type UnreadableReason = "absent" | "untracked" | "glob" | "directory" | "base-tree-unavailable" | "base-tree-read-failed";
-type FileBytes = { status: "measured"; bytes: number } | { status: "unreadable"; reason: UnreadableReason };
-type UnreadablePayloadPath = { field: "context" | "files"; path: string; reason: UnreadableReason };
+type BaseTree = { root: string; sizes: ReadonlyMap<string, number> };
+/**
+ * Why a CONTEXT ref carries no measurable bytes in the worker-visible tree. `produced-upstream` is
+ * the benign member: the ref is written by a task this one transitively depends on, so it exists by
+ * the time this task branches. Every other member is a ref the worker's "read these first" list will
+ * dangle on, and `gitignored` is the member no commit can ever fix (Intl-Dossier P99 launch hold:
+ * 17 tasks cited `.tickmarkr/overseer/RULING-*.md`, a self-gitignored tree).
+ */
+type UnmeasurableReason = "absent" | "untracked" | "gitignored" | "produced-upstream" | "base-tree-unavailable";
+type UnmeasurableContext = { path: string; reason: UnmeasurableReason; producer?: string };
+/** Named paths per lint line: an uncapped enumeration reached 4,924 columns on the P99 graph. */
+const MAX_NAMED_PATHS = 3;
 
 const GLOB_CHARS = /[*?{[]/;
 
 // T13's visibility oracle is the committed base tree: workers are created from HEAD, not from the
 // author's checkout or index. Keep --full-tree load-bearing for callers below the repository root.
+// `-l` prices every blob in the SAME call (a per-path `cat-file -s` spawn cannot price a pattern),
+// and `-z` is load-bearing correctness, not economy: without it git quotes any non-ASCII path, so
+// every Arabic/UTF-8 tracked file read as absent.
 function baseTreeAtHead(dir: string): BaseTree | undefined {
   const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
   const top = git("rev-parse", "--show-toplevel");
-  const tree = git("ls-tree", "--full-tree", "-r", "--name-only", "HEAD");
+  const tree = git("ls-tree", "--full-tree", "-r", "-l", "-z", "HEAD");
   if (top.status !== 0 || tree.status !== 0 || typeof top.stdout !== "string" || typeof tree.stdout !== "string") return undefined;
-  return { root: top.stdout.trim(), tracked: new Set(tree.stdout.split("\n").filter(Boolean)) };
-}
-
-function fileBytes(repoRoot: string, rel: string, tree: BaseTree | undefined = baseTreeAtHead(repoRoot)): FileBytes {
-  if (GLOB_CHARS.test(rel)) return { status: "unreadable", reason: "glob" };
-  if (!tree) return { status: "unreadable", reason: "base-tree-unavailable" };
-  const path = rel.replace(/\/+$/, "");
-  if (!tree.tracked.has(path)) {
-    if ([...tree.tracked].some((tracked) => tracked.startsWith(`${path}/`))) {
-      return { status: "unreadable", reason: "directory" };
-    }
-    return { status: "unreadable", reason: existsSync(join(tree.root, path)) ? "untracked" : "absent" };
+  const sizes = new Map<string, number>();
+  for (const record of tree.stdout.split("\0")) {
+    const tab = record.indexOf("\t");
+    if (tab < 0) continue;
+    // `<mode> <type> <object> <size>\t<path>`; a submodule entry carries `-` as its size and no bytes.
+    const bytes = Number.parseInt(record.slice(0, tab).split(/\s+/)[3] ?? "", 10);
+    sizes.set(record.slice(tab + 1), Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : 0);
   }
-  // Read the blob size from HEAD too: an unstaged/staged checkout edit is not what the worker receives.
-  const size = spawnSync("git", ["-C", tree.root, "cat-file", "-s", `HEAD:${path}`], { encoding: "utf8" });
-  const bytes = Number.parseInt(typeof size.stdout === "string" ? size.stdout.trim() : "", 10);
-  return size.status === 0 && Number.isSafeInteger(bytes) && bytes >= 0
-    ? { status: "measured", bytes }
-    : { status: "unreadable", reason: "base-tree-read-failed" };
+  return { root: top.stdout.trim(), sizes };
 }
 
-function taskPayloadResolution(task: Task, repoRoot: string, feedback: string): { tokens: number; unreadable: UnreadablePayloadPath[] } {
-  let bytes = buildTaskPrompt(task, feedback).length;
-  const unreadable: UnreadablePayloadPath[] = [];
-  const tree = baseTreeAtHead(repoRoot);
-  const add = (field: "context" | "files", path: string) => {
-    const measured = fileBytes(repoRoot, path, tree);
-    if (measured.status === "measured") bytes += measured.bytes;
-    else unreadable.push({ field, path, reason: measured.reason });
+/**
+ * Bytes a worker can read at that path in the base tree, or undefined when the tree carries nothing
+ * there. A files[]-shaped pattern and a directory both price as everything they cover — matching
+ * through src/graph/files-glob.ts so the estimate reads patterns exactly as the scope gate does.
+ */
+function measureBytes(tree: BaseTree, rel: string): number | undefined {
+  const path = rel.replace(/\/+$/, "");
+  const exact = tree.sizes.get(path);
+  if (exact !== undefined) return exact;
+  const match = GLOB_CHARS.test(path) ? filesGlob(path) : undefined;
+  let total = 0;
+  let covered = false;
+  for (const [tracked, bytes] of tree.sizes) {
+    if (!(match ? match(tracked) : tracked.startsWith(`${path}/`))) continue;
+    total += bytes;
+    covered = true;
+  }
+  return covered ? total : undefined;
+}
+
+function absentContextReason(root: string, path: string): "gitignored" | "untracked" | "absent" {
+  if (spawnSync("git", ["-C", root, "check-ignore", "-q", "--", path]).status === 0) return "gitignored";
+  return existsSync(join(root, path)) ? "untracked" : "absent";
+}
+
+/** Which transitive dependency, if any, declares a write scope covering a path this task must read. */
+type UpstreamProducer = (taskId: string, path: string) => string | undefined;
+
+function upstreamProducer(tasks: ReadonlyArray<Task>): UpstreamProducer {
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const cache = new Map<string, Array<{ id: string; covers: (path: string) => boolean }>>();
+  const upstream = (taskId: string) => {
+    let entry = cache.get(taskId);
+    if (!entry) {
+      const seen = new Set<string>();
+      const walk = (from: string) => {
+        for (const dep of byId.get(from)?.deps ?? []) if (!seen.has(dep)) { seen.add(dep); walk(dep); }
+      };
+      walk(taskId);
+      entry = [...seen].map((id) => {
+        const files = byId.get(id)?.files ?? [];
+        return { id, covers: files.length ? filesGlob(files) : () => false };
+      });
+      cache.set(taskId, entry);
+    }
+    return entry;
   };
-  for (const path of task.context) add("context", path);
-  for (const path of task.files) add("files", path);
-  return { tokens: Math.ceil(bytes / CHARS_PER_TOKEN), unreadable };
+  return (taskId, path) => upstream(taskId).find((dep) => dep.covers(path))?.id;
 }
 
-/** A numeric estimate exists only when every payload path is measurable from the worker-visible tree. */
+function taskPayloadResolution(
+  task: Task,
+  repoRoot: string,
+  feedback: string,
+  tree: BaseTree | undefined = baseTreeAtHead(repoRoot),
+  producerOf: UpstreamProducer = () => undefined,
+): { tokens: number; unmeasurable: UnmeasurableContext[] } {
+  let bytes = buildTaskPrompt(task, feedback).length;
+  if (!tree) {
+    return { tokens: Math.ceil(bytes / CHARS_PER_TOKEN), unmeasurable: [{ path: ".", reason: "base-tree-unavailable" }] };
+  }
+  // files[] is WRITE SCOPE, not payload: a task's own output (`99-04-SUMMARY.md`) is absent from the
+  // base tree BY CONSTRUCTION and a scope entry is a set, not a document. Price what the worker can
+  // already read there and charge nothing for the rest. Billing an output path as a measurement
+  // failure is what made the window comparison unreachable on every real graph — 41 of 41 tasks on
+  // the P99 graph reported "payload unreadable" and none was ever compared to its model's window.
+  for (const path of task.files) bytes += measureBytes(tree, path) ?? 0;
+  const unmeasurable: UnmeasurableContext[] = [];
+  for (const path of task.context) {
+    const measured = measureBytes(tree, path);
+    if (measured !== undefined) {
+      bytes += measured;
+      continue;
+    }
+    const producer = producerOf(task.id, path);
+    unmeasurable.push(producer
+      ? { path, reason: "produced-upstream", producer }
+      : { path, reason: absentContextReason(tree.root, path) });
+  }
+  return { tokens: Math.ceil(bytes / CHARS_PER_TOKEN), unmeasurable };
+}
+
+/** A numeric estimate exists only when every context ref is measurable from the worker-visible tree. */
 export function estimateTaskPayloadTokens(task: Task, repoRoot: string, feedback = ""): number | undefined {
   const estimate = taskPayloadResolution(task, repoRoot, feedback);
-  return estimate.unreadable.length === 0 ? estimate.tokens : undefined;
+  return estimate.unmeasurable.length === 0 ? estimate.tokens : undefined;
 }
 
-function unreadablePayloadLint(taskId: string, unreadable: UnreadablePayloadPath[]): string {
-  const describe = ({ field, path, reason }: UnreadablePayloadPath) => {
-    const prefix = `${field} ${JSON.stringify(path)}`;
-    if (reason === "untracked") return `${prefix} is present in the checkout but not in the base tree`;
-    if (reason === "absent") return `${prefix} is absent from the base tree and checkout`;
-    if (reason === "glob") return `${prefix} is a glob and cannot be measured`;
-    if (reason === "directory") return `${prefix} is a directory and cannot be measured as one file`;
-    if (reason === "base-tree-unavailable") return `${prefix} cannot be checked because the base tree is unavailable`;
-    return `${prefix} could not be read from the base tree`;
+function unreachableContextLint(taskId: string, dangling: ReadonlyArray<UnmeasurableContext>): string {
+  const describe = ({ path, reason }: UnmeasurableContext) => {
+    if (reason === "base-tree-unavailable") return "the base tree is unavailable, so no context ref can be checked";
+    const named = JSON.stringify(path);
+    if (reason === "gitignored") return `${named} is gitignored — no commit can carry it into a worktree`;
+    if (reason === "untracked") return `${named} is present in the checkout but not in the base tree`;
+    return `${named} is absent from the base tree and no task in this graph produces it`;
   };
-  return `${taskId}: payload unreadable — ${unreadable.map(describe).join(", ")}; context-window comparison skipped`;
+  const rest = dangling.length - MAX_NAMED_PATHS;
+  return `${taskId}: context unreachable — ${dangling.slice(0, MAX_NAMED_PATHS).map(describe).join(", ")}`
+    + `${rest > 0 ? `, +${rest} more` : ""}; the worker's "read these first" list dangles`
+    + " and the context-window comparison is skipped";
 }
 
 export type RoutedAssignment = { taskId: string; adapter: string; model: string };
@@ -326,19 +397,28 @@ export function contextWindowLints(
 ): string[] {
   if (!hasAnyWindows(cfg)) return [];
   const byId = new Map(assignments.map((a) => [a.taskId, a]));
+  const tree = baseTreeAtHead(repoRoot);
+  const producerOf = upstreamProducer(tasks);
   const lints: string[] = [];
   for (const t of tasks) {
     const a = byId.get(t.id);
     if (!a) continue;
     const window = declaredModelWindow(cfg, a.adapter, a.model);
     if (window === undefined) continue;
-    const estimate = taskPayloadResolution(t, repoRoot, "");
-    if (estimate.unreadable.length > 0) {
-      lints.push(unreadablePayloadLint(t.id, estimate.unreadable));
+    const estimate = taskPayloadResolution(t, repoRoot, "", tree, producerOf);
+    const dangling = estimate.unmeasurable.filter((u) => u.reason !== "produced-upstream");
+    if (dangling.length > 0) {
+      lints.push(unreachableContextLint(t.id, dangling));
       continue;
     }
+    // An upstream-produced ref is unmeasurable but REACHABLE — the run writes it before this task
+    // branches — so it earns no lint of its own: silence on the benign class is what leaves a real
+    // dangling ref visible. The estimate is then a lower bound, and a lower bound over the window is
+    // still an overflow, so it is reported with what it excludes named.
     if (estimate.tokens > window) {
-      lints.push(`${t.id}: payload ~${estimate.tokens} tokens exceeds ${a.adapter}:${a.model} window ${window}`);
+      const pending = estimate.unmeasurable.length;
+      lints.push(`${t.id}: payload ~${estimate.tokens} tokens exceeds ${a.adapter}:${a.model} window ${window}`
+        + (pending > 0 ? ` (lower bound — ${pending} context ref(s) are produced upstream and not yet measurable)` : ""));
     }
   }
   return lints;

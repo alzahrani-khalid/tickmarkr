@@ -11,6 +11,7 @@ import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, 
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause } from "./verdict-cause.js";
 import { reviewableLogicDiff } from "./artifact-manifest.js";
+import { classifyFailureOutput } from "./baseline.js";
 
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
 const JUDGE_TIMEOUT_MS = 900_000;
@@ -231,6 +232,30 @@ function tail(out: string, n = 8): string {
   return "\n" + t.split("\n").slice(-n).join("\n");
 }
 
+/**
+ * OBS-540: classify only bytes produced by the deterministic oracle process. A nonzero command with
+ * an infra-only output shape returned no product verdict, so it remains fail-closed but cannot be
+ * billed as a diff failure. Judge reasons never reach this helper: the judge path starts after the
+ * deterministic loop and a parsed refusal is an evaluated quality verdict whatever its prose says.
+ */
+function oracleExecutionFailure(label: string, code: number, stdout: string, stderr: string): GateResult {
+  const output = [stderr, stdout].filter((part) => part.length > 0).join("\n");
+  const classification = classifyFailureOutput(output);
+  if (classification === "infra") {
+    return {
+      gate: "acceptance",
+      pass: false,
+      details: `oracle failed: ${label} (exit ${code}) — infrastructure blocked execution before a verdict; this oracle verified nothing${tail(output)}`,
+      meta: { cause: "oracle-execution", classification, infra: true, retryable: false },
+    };
+  }
+  return {
+    gate: "acceptance",
+    pass: false,
+    details: `oracle failed: ${label} (exit ${code})${tail(stderr || stdout)}`,
+  };
+}
+
 // v1.70 / OBS-129: the new-file line numbers each changed HUNK spans, per path — parsed from the
 // unified-diff so a citation is validated against real changed regions, not a substring of the whole
 // diff text (which also matches the diff's own +++/@@ headers). A hunk's span is every new-file line it
@@ -344,8 +369,7 @@ export async function acceptanceGate(
     if (isCommand(a)) {
       const r = await sh(a.command, worktree);
       if (r.code !== 0) {
-        return { gate: "acceptance", pass: false,
-          details: `oracle failed: $ ${a.command} (exit ${r.code})${tail(r.stderr || r.stdout)}` };
+        return oracleExecutionFailure(`$ ${a.command}`, r.code, r.stdout, r.stderr);
       }
       passedDet.push(`✓ $ ${a.command} (exit 0)`);
     } else if (isTest(a)) {
@@ -356,8 +380,7 @@ export async function acceptanceGate(
       const r = await sh(testFiltered(opts.testCmd, a.test), worktree);
       const out = (r.stderr || "") + "\n" + (r.stdout || "");
       if (r.code !== 0) {
-        return { gate: "acceptance", pass: false,
-          details: `oracle failed: test "${a.test}" (exit ${r.code})${tail(r.stderr || r.stdout)}` };
+        return oracleExecutionFailure(`test "${a.test}"`, r.code, r.stdout, r.stderr);
       }
       // OBS-55: exit 0 alone is vacuous when the name filter matched zero tests — fail closed.
       const ran = testsRan(out);

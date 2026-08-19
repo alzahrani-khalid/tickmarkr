@@ -57,3 +57,47 @@ test("authoring-lint corpus matrix compiles all twelve fixtures and each emits i
   expect(warn.mock.calls.map(([message]) => String(message)).filter((message) => message.includes("authoring-lint"))).toEqual([]);
   warn.mockRestore();
 });
+
+// OBS-545: criterion-scope is a THROWING lint, and its path extractor read `.json` as `.js` and
+// `.tsx` as `.ts` (first-match-wins alternation), so a criterion naming a file squarely inside its
+// own files[] refused to compile and named a path its author never wrote. Proven over the closed set
+// of shadowed extensions — .json behind .js, .tsx behind .ts, .jsx behind .js — plus the control that
+// a genuinely out-of-scope path still throws AND is reported with its real extension.
+test("a criterion naming a .json, .tsx or .jsx file inside its own files[] compiles, and a genuinely out-of-scope path is still refused under the name its author wrote", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-authoring-ext-"));
+  const spec = (files: string, criterion: string) => {
+    const path = join(dir, `${Buffer.from(criterion).toString("hex").slice(0, 24)}.spec.md`);
+    writeFileSync(path, [
+      "<!-- tickmarkr:spec -->",
+      "## T1: Rewrite the localisation sources",
+      "- goal: Rewrite the sources named in the write scope",
+      `- files: ${files}`,
+      "- acceptance:",
+      `  - judge: ${criterion}`,
+      "",
+    ].join("\n"));
+    return path;
+  };
+  const compile = (files: string, criterion: string) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      return compileSource(spec(files, criterion), "native");
+    } finally {
+      warn.mockRestore();
+    }
+  };
+
+  const scope = "src/i18n/{ar/common.json,en/common.json}, src/ui/Card.tsx, src/ui/Legacy.jsx";
+  expect(compile(scope, "src/i18n/ar/common.json carries a non-empty Arabic value for every key").tasks).toHaveLength(1);
+  expect(compile(scope, "src/ui/Card.tsx renders the Arabic label beside the English one").tasks).toHaveLength(1);
+  expect(compile(scope, "src/ui/Legacy.jsx mounts without the removed prop").tasks).toHaveLength(1);
+
+  let error: unknown;
+  try {
+    compile(scope, "src/other/Untouched.tsx renders the same label");
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(CompileError);
+  expect(String(error)).toContain("src/other/Untouched.tsx"); // the real path, not `Untouched.ts`
+});

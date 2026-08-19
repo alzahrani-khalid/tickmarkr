@@ -149,10 +149,11 @@ describe("Phase 46 resume-replay (RES-01/RES-02 daemon oracles, zero tokens)", (
 
 // OBS-103: after a stop→resume cycle the run-end sweep must retire the prior daemon instance's
 // narrator too — the v1.63 run left it open and the operator closed it by hand. The pane world
-// below mirrors the herdr contract at the two seams that matter: narrator() ADOPTS an already-open
-// watch by its owned name (never learning which instance split the pane), and the driver sweep
-// NEVER closes watch panes (panesToClose spares role "watch") — so zero survivors proves the
-// daemon's own name-keyed close retired the narrator, not a fantasy sweep.
+// below mirrors the herdr contract at the two seams that matter: narrator() leaves the run's board
+// live under its canonical owned name whatever it did to get there (HerdrDriver retires the
+// survivor it finds and re-splits, so the live command is run-bound; the name is the same either
+// way), and the driver sweep NEVER closes watch panes (panesToClose spares role "watch") — so zero
+// survivors proves the daemon's own name-keyed close retired the narrator, not a fantasy sweep.
 describe("OBS-103 run-end narrator sweep across daemon instances (fake adapter, zero tokens)", () => {
   test("a resumed run reaching run end leaves zero run-tagged panes open including a narrator opened by the prior daemon instance", async () => {
     const { repo, fake } = setupResumeRepo();
@@ -189,8 +190,8 @@ describe("OBS-103 run-end narrator sweep across daemon instances (fake adapter, 
         return inner.close(s); // no-op for the adopted pane — inner never created it
       },
       worktree: inner.worktree.bind(inner),
-      // herdr contract: the resumed daemon finds the already-running watch by its owned name and
-      // adopts it — the pane predates this process, so no inner slot backs it.
+      // herdr contract: whatever the driver did with the pane it found, the run ends with one board
+      // under this owned name — the pane predates this process, so no inner slot backs it.
       async narrator(cwd: string, _command: string, rid?: string) {
         const name = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId: rid! });
         live.add(name); // idempotent: already live when adopting the prior instance's pane

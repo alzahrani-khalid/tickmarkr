@@ -35,7 +35,7 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-herdr-"));
   const log = join(dir, "log.txt");
   // herdr 0.7.5 durable identity is the PANE LABEL: `pane rename` registers "<paneId> <label>" and
-  // `pane list` reports it back (namedPaneId/statusByName/reconcile/priorWatch all resolve here).
+  // `pane list` reports it back (namedPaneId/statusByName/reconcile/ownedWatchPanes all resolve here).
   const panes = join(dir, "panes.txt");
   const ctr = join(dir, "tabctr.txt"); // incTabs: distinct tab ids (t1,t2,…) so coexisting tabs are distinguishable
   const verctr = join(dir, "verctr.txt"); // corrupt:"once" — first delivery verify fails, later ones match
@@ -1259,6 +1259,31 @@ describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
     expect(s3.group).toBeUndefined();
   });
 
+  // OBS-45's class, live again on run-20260819-022723-…1591: once D-09 latches, every later member
+  // takes the per-slot path, and that path titled the TAB with the durable PANE name — three
+  // `tickmarkr:worker:T5:1:run-20260819-022723-0000000000001591` tabs (58 chars each) on one bar.
+  // Every dispatch name carries role/task/attempt, so the title is derivable: the task token plus a
+  // retry marker for a worker, ROLE + task for a gate pane. Names with no task identity are
+  // unchanged (test D above still pins `--label n2`), and the durable pane identity never moves.
+  // Legacy-shape names on purpose: a canonical name holds a dispatch lease until run(), which this
+  // allocation-only test never calls.
+  test("degraded per-slot tabs are TITLED for the task, never the durable slot name", async () => {
+    const { bin, log, cwd } = makeStub(0, { tab: true, splitFails: true });
+    const d = new HerdrDriver(bin);
+    await d.slot(cwd, "T5-worker-fake-a0-run", { group: "workers" }); // gen 1 bootstraps
+    const retry = await d.slot(cwd, "T5-worker-fake-a1-run", { group: "workers" }); // join fails → degrade
+    const review = await d.slot(cwd, "review · T5", { group: "workers" }); // gate pane, same latched group
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain(`tab create --label T5↻1 --no-focus --workspace wTEST --cwd ${cwd}`);
+    expect(calls).toContain(`tab create --label REVIEW T5 --no-focus --workspace wTEST --cwd ${cwd}`);
+    expect(calls).not.toContain("--label T5-worker-fake-a1-run"); // the slot name is not a title
+    expect(calls).not.toContain("--label review · T5");
+    // durable identity unchanged — resolution and reconcile still read the slot name back off the pane
+    expect(calls).toContain("pane rename w1:p9 T5-worker-fake-a1-run");
+    expect(retry.group).toBeUndefined();
+    expect(review.group).toBeUndefined();
+  });
+
   test("rename failure reaps the split pane and falls back to a per-slot tab (A1 fail-safe)", async () => {
     const { bin, log, cwd } = makeStub(0, { tab: true, renameFails: true });
     const d = new HerdrDriver(bin);
@@ -1526,34 +1551,97 @@ describe("pickDriver", () => {
 // T2 watch pane: one live status surface per run — a rightward split of the invoking orchestrator
 // pane, never a separate tab. A second request for the same canonical watch name must reuse it.
 describe("HerdrDriver narrator pane (T2)", () => {
-  test("narrator splits right of its invoking pane and reuses the owned watch pane", async () => {
+  test("narrator splits beside its invoking pane; a second daemon retires that board and re-splits it", async () => {
     const { bin, log, cwd } = makeStub(0, { tab: true, incTabs: true });
     const d = new HerdrDriver(bin);
-    const first = await d.narrator(cwd, "tickmarkr status --watch", "run-watch");
-    const second = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch", "run-watch");
+    const first = await d.narrator(cwd, "tickmarkr status --watch run-watch", "run-watch");
+    const second = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch run-watch", "run-watch");
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain("pane split wTEST:pCALLER --direction right --no-focus");
+    expect(calls).toContain("pane split wTEST:pCALLER --direction right --ratio 0.5045 --no-focus"); // 222 → board 110, seat keeps the rest
     expect(calls).toContain("pane rename w1:p7 tickmarkr:watch:run:0:run-watch");
     expect(calls).not.toContain("tab create");
-    expect(calls.match(/pane split /g)).toHaveLength(1);
-    // the watch is a shell dispatch like any other: atomic, nonce-acknowledged, never typed
-    expect(calls.match(/pane run w1:p7 printf .*tickmarkr status --watch/g)).toHaveLength(1);
+    // ONE live board throughout: the second daemon closed the board it found BEFORE splitting its own,
+    // rather than adopting a pane whose running command it cannot read (the stub recycles the pane id).
+    expect(calls.split("\n").filter((l) => /^pane (split|close) /.test(l))).toEqual([
+      "pane split wTEST:pCALLER --direction right --ratio 0.5045 --no-focus",
+      "pane close w1:p7",
+      "pane split wTEST:pCALLER --direction right --ratio 0.5045 --no-focus",
+    ]);
+    // the watch is a shell dispatch like any other: atomic, nonce-acknowledged, never typed — and
+    // EVERY board that goes live is launched with the run-bound command this call supplied.
+    expect(calls.match(/pane run w1:p7 printf .*tickmarkr status --watch run-watch/g)).toHaveLength(2);
     expect(calls).not.toMatch(/pane send-keys w1:p7 Enter/);
-    expect(second).toEqual(first);
+    expect(second).toEqual(first); // the replacement wears the same canonical name
     expect(first.tabId).toBeUndefined();
     await d.close(first);
-    expect(readFileSync(log, "utf8")).toContain("pane close w1:p7");
+    expect(readFileSync(log, "utf8").match(/^pane close w1:p7$/gm)).toHaveLength(2);
   });
 
-  test("a new run reclaims a surviving prior-run watch instead of splitting another pane", async () => {
+  // A pane wearing THIS run's canonical name is not proof of THIS run's board: every pre-v1.94 daemon
+  // launched a bare `tickmarkr status --watch`, which resolves the NEWEST journal, so the operator would
+  // be watching whatever run started last under this run's label. A live pane's command cannot be read
+  // back, so the name is never taken as evidence — the board is retired and re-split, command and all.
+  test("a surviving watch wearing this run's own name is retired too, never adopted with an unverified command", async () => {
+    const { bin, log, cwd } = makeStub(0, { survivingWatch: { name: "tickmarkr:watch:run:0:run-new", pane: "w1:pBARE" } });
+    const slot = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch run-new", "run-new");
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("pane close w1:pBARE"); // the bare-command watcher does not survive
+    expect(calls).toContain("pane split wTEST:pCALLER"); // a FRESH board took its place
+    expect(slot.id).toBe("w1:p7");
+    expect(calls).toMatch(/pane run w1:p7 printf .*tickmarkr status --watch run-new/); // run-bound, and actually launched
+  });
+
+  // A swallowed close leaves the old board alive and splits a second one beside it, each narrating a
+  // different run — and nothing sweeps the survivor later: panesToClose skips role "watch" by design
+  // (types.ts). So the retirement is verified GONE by re-reading the listing, not by trusting an exit
+  // code, and a board that will not die fails the placement instead of gaining a twin.
+  test("a prior board that survives its close blocks the replacement split (never two boards)", async () => {
+    for (const fixture of [
+      { label: "a close that reports failure", opts: { paneCloseFails: true } },
+      { label: "a close that reports success and frees nothing", opts: { paneCloseNoop: true } },
+    ]) {
+      const { bin, log, cwd } = makeStub(0, { survivingWatch: { name: "tickmarkr:watch:run:0:run-old", pane: "w1:pOLD" }, ...fixture.opts });
+      await expect(new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch run-new", "run-new"))
+        .rejects.toThrow(/survived close/i); // propagates; the daemon swallows and runs boardless
+      expect(readFileSync(log, "utf8"), fixture.label).not.toContain("pane split");
+    }
+  });
+
+  // QUEUE-v194 criterion 1: the board's width is allocated first and the seat keeps the remainder,
+  // so the placement has to MEASURE the caller — an unconditional right split hands the board
+  // whatever half is left, which is what put a 189-column tab's board below on 2026-08-18.
+  test("the watch placement measures the caller pane through the driver's pane layout read and issues its split carrying the plan's direction and ratio, so a placement that splits unconditionally right without measuring fails", async () => {
+    const wide = makeStub(0, { tab: true, paneCols: 220 });
+    await new HerdrDriver(wide.bin).narrator(wide.cwd, "tickmarkr status --watch run-board", "run-board");
+    const wideCalls = readFileSync(wide.log, "utf8");
+    expect(wideCalls).toContain("pane layout --pane wTEST:pCALLER"); // measured, not assumed
+    expect(wideCalls).toContain("pane split wTEST:pCALLER --direction right --ratio 0.5 --no-focus");
+
+    // a tab that cannot fund the board its width beside the seat: below, at full width, no ratio
+    const narrow = makeStub(0, { tab: true, paneCols: 140 });
+    await new HerdrDriver(narrow.bin).narrator(narrow.cwd, "tickmarkr status --watch run-board", "run-board");
+    const narrowCalls = readFileSync(narrow.log, "utf8");
+    expect(narrowCalls).toContain("pane layout --pane wTEST:pCALLER");
+    expect(narrowCalls).toContain("pane split wTEST:pCALLER --direction down --no-focus");
+    expect(narrowCalls).not.toContain("--ratio");
+  });
+
+  // QUEUE-v194: the watch command names its run, so a surviving prior-run pane is running the OLD
+  // run's board. Relabelling it (what this path used to do) leaves run-old's numbers under run-new's
+  // name — the wrong-run incident. It is retired and re-split, so the live command names the new run.
+  test("a new run retires a surviving prior-run watch and opens one bound to itself", async () => {
     const oldName = "tickmarkr:watch:run:0:run-old";
     const { bin, log, cwd } = makeStub(0, { survivingWatch: { name: oldName, pane: "w1:pOLD" } });
-    const next = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch", "run-new");
+    const next = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch run-new", "run-new");
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("pane list");
-    expect(calls).toContain("pane rename w1:pOLD tickmarkr:watch:run:0:run-new");
-    expect(calls).not.toContain("pane split");
-    expect(next).toEqual({ id: "w1:pOLD", name: "tickmarkr:watch:run:0:run-new", cwd });
+    expect(calls).toContain("pane close w1:pOLD"); // never renamed into this run's name
+    expect(calls).not.toContain("pane rename w1:pOLD");
+    expect(calls).toContain("pane rename w1:p7 tickmarkr:watch:run:0:run-new");
+    // the ACTIVE command in the live watch pane names the newer run, not the one it replaced
+    expect(calls).toMatch(/pane run w1:p7 printf .*tickmarkr status --watch run-new/);
+    expect(calls).not.toMatch(/status --watch run-old/);
+    expect(next).toEqual({ id: "w1:p7", name: "tickmarkr:watch:run:0:run-new", cwd });
   });
 
   test("narrator reuses fail-closed placement: no HERDR_WORKSPACE_ID → throws (never untargeted)", async () => {

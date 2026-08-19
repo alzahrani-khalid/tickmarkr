@@ -6,13 +6,22 @@ import { DEFAULT_SHELL_TIMEOUT_MS, sh, type ShResult } from "../run/git.js";
 import type { GateResult } from "./types.js";
 
 export interface BaselineCommand {
-  exitCode: number;
+  /**
+   * Absent when the capture returned no verdict — see `infra`. A pre-v1.90 baseline can also lack it
+   * (legacy entries read as red-at-baseline, the `?? 1` default both readers share).
+   */
+  exitCode?: number;
   fingerprints: string[];
   missingCommand?: boolean;
   /** What this command actually took at capture, on a pristine tree. Absent in pre-v1.90 baselines. */
   durationMs?: number;
   /** The ceiling that measurement implies, persisted so every later battery uses the same number. */
   ceilingMs?: number;
+  /**
+   * OBS-534 (T2): the capture was SIGKILLed at its ceiling. It never finished asking the question, so
+   * the entry carries a CAUSE and no verdict: no exit code, no fingerprints, nothing forgivable.
+   */
+  infra?: true;
 }
 
 export interface Baseline {
@@ -133,7 +142,11 @@ const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 // test-level failure — "AssertionError after spawn EAGAIN" names one and is a regression; "spawn
 // EAGAIN" and "Error: spawn EAGAIN" name none and are infra. One regression line anywhere in the
 // output makes the whole output a regression, whatever else the runner printed.
-const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable/;
+// OBS-540: command-oracle startup failures are execution evidence too. These two Playwright/keyring
+// shapes are emitted by the process that was asked to run the oracle; they are deliberately kept in
+// this runner-output classifier rather than applied to any judge-authored reason text. A real test
+// failure still dominates below because one regression-shaped line makes the whole output regression.
+const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable|Token not found in system keyring|Process from config\.webServer was not able to start/i;
 // A named error CLASS ("AssertionError", "TypeError", "MyDomainError") — never bare "Error", which
 // is what an errno report itself is headed with (`Error: spawn EAGAIN`). The prefix is required.
 const ERROR_CLASS_RE = /\b[A-Za-z][A-Za-z0-9]*Error\b/;
@@ -203,7 +216,11 @@ const renormalize = (fp: string) => normalizeLine(fp.replace(ANSI_RE, ""));
  * whether the output carried no recognizable failure shape at all.
  */
 export function freshFailures(entry: BaselineCommand | undefined, raw: string): { failing: string[]; unreadable: boolean } {
-  const known = new Set((entry?.fingerprints ?? []).map(renormalize));
+  // OBS-534 (T2): an infra-recorded entry is a KILL, not a verdict — whatever fingerprints it carries
+  // came from output flushed before the kill, over a suite that never finished. Nothing there is
+  // "pre-existing", so it forgives nothing. The rule lives here rather than in either caller, so the
+  // battery and tip verify inherit it from the one helper they already share.
+  const known = new Set(entry?.infra === true ? [] : (entry?.fingerprints ?? []).map(renormalize));
   // OBS-42: diagnostic headings enrich fingerprints but cannot invalidate legacy baselines.
   const current = fingerprint(raw);
   const fresh = current.filter(
@@ -355,6 +372,19 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
     // ponytail: a capture that was itself killed records the ceiling as its "measurement", which
     // scales the next ceiling up — the right direction for a suite that never finished once.
     const durationMs = r.durationMs ?? 0;
+    // OBS-534 (T2): a capture SIGKILLed at its ceiling never returned a verdict, so `r.code` is the
+    // kill and not evidence about the command. Run 1501 recorded `test: {durationMs: 600007,
+    // exitCode: 1}` for exactly this — a kill written down as a red baseline. There the accident
+    // helped (the inflated ceiling is why every task gate passed); the same accident can mark a
+    // GREEN command permanently red-at-baseline and hand every later gate free forgiveness for
+    // failures the diff really did cause. So record the cause and nothing forgivable: no exit code,
+    // and none of the partial output the runner had flushed before the kill. The measurement stays —
+    // it is the one thing the kill did establish — and still scales the next ceiling up.
+    // `timedOut` is set in exactly one place (git.ts's kill timer), so no ordinary exit reaches here.
+    if (r.timedOut === true) {
+      base.commands[name] = { infra: true, fingerprints: [], durationMs, ceilingMs: effectiveCeilingMs({ durationMs }) };
+      continue;
+    }
     base.commands[name] = {
       exitCode: r.code,
       // a command that exits 0 has no failures to fingerprint — recording any would be a lie the
@@ -445,7 +475,8 @@ export async function compareToBaseline(
       results.push({ gate: name, pass: true, details: `no ${name} command detected — skipped`, meta: { skipped: true } });
       continue;
     }
-    const ceilingMs = effectiveCeilingMs(baseline.commands[name]);
+    const entry = baseline.commands[name];
+    const ceilingMs = effectiveCeilingMs(entry);
     const r = await sh(cmd, cwd, ceilingMs);
     // Q24: the kill is read BEFORE the exit code is interpreted at all. A SIGKILLed battery has
     // whatever partial output it had flushed — typically no failure shape — so every path below
@@ -483,9 +514,16 @@ export async function compareToBaseline(
     // below rather than reading as a verified green. Raise the ceiling by teaching isFailureShaped
     // that runner's position rule (leading verdict + identifier, or identifier + separator + trailing
     // verdict); loosening back to vocabulary re-opens OBS-278.
-    const { failing, unreadable } = freshFailures(baseline.commands[name], raw);
-    if (!failing.length && (baseline.commands[name]?.exitCode ?? 1) === 0) {
-      const closed = `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`;
+    const { failing, unreadable } = freshFailures(entry, raw);
+    // OBS-534 (T2): only a recorded VERDICT can be forgiven. A green baseline has no red to forgive,
+    // and neither has a capture that was killed at its ceiling — it recorded a cause instead, so it
+    // fails closed on the same branch rather than reading as "only pre-existing failures". Legacy
+    // entries with no exitCode keep the `?? 1` red default both readers share (merge.ts:131).
+    const baselineRed = entry?.infra !== true && (entry?.exitCode ?? 1) !== 0;
+    if (!failing.length && !baselineRed) {
+      const closed = entry?.infra === true
+        ? `the baseline capture for this command was killed at its ceiling and recorded no verdict, so nothing here is forgivable — it now exits ${r.code} with no recognizable failure lines — failing closed`
+        : `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`;
       const evidence = unrecognizedEvidence(raw);
       results.push({
         gate: name,

@@ -165,8 +165,11 @@ const boardRepo = (): string => {
 const strip = (text: string): string => text.replace(/\x1b\[[0-9;]*m/gu, "");
 /** Wrapping inserts whitespace and nothing else, so a squashed frame reassembles a wrapped run. */
 const squash = (frame: string): string => strip(frame).replace(/\s+/gu, "");
+// The card's IDENTITY row: the id in its own column, right after the row's verdict box or glyph.
+// A card also names the dependents waiting on it, so a bare ` id ` search answers a blocker's
+// machinery line for the task it blocks — a line with no status word to measure an offset against.
 const cardHead = (frame: string, taskId: string): string =>
-  frame.split("\n").find((line) => strip(line).includes(` ${taskId} `))!;
+  frame.split("\n").find((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(strip(line)))!;
 /** Where a card's status word starts — the same offset in cells, a different one in code units. */
 const statusOffset = (line: string, word: string): { cells: number; codeUnits: number } => {
   const bare = strip(line);

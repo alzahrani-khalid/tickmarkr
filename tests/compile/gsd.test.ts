@@ -2,10 +2,11 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { filesGlob } from "../../src/graph/files-glob.js";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
 import { compileGsd } from "../../src/compile/gsd.js";
 import { compileSource } from "../../src/compile/index.js";
+import { makeRepo } from "../helpers/tmprepo.js";
 
 const PHASE = "fixtures/gsd-sample/07-live-check";
 
@@ -18,6 +19,17 @@ function scratchPhase(name: string, files: Record<string, string>): string {
 
 const plan = (fm: string, body: string) => `---\n${fm}\n---\n\n${body}\n`;
 const doneTask = (done: string) => `<tasks>\n<task type="auto">\n  <name>Task 1</name>\n  <done>${done}</done>\n</task>\n</tasks>`;
+
+function repositoryPhase(name: string, ref: string): { repo: string; phase: string } {
+  const relativePhase = join(".planning", "phases", name);
+  const repo = makeRepo({
+    [join(relativePhase, `${name}-01-PLAN.md`)]: plan(
+      `phase: ${name}\nplan: "01"`,
+      `<objective>\nCheck context reachability.\n</objective>\n\n<context>\n@${ref}\n</context>\n\n${doneTask("context is usable")}`,
+    ),
+  });
+  return { repo, phase: join(repo, relativePhase) };
+}
 
 describe("compileGsd (committed fixture phase)", () => {
   test("phase dir → one task per plan: ids, deps, scope, acceptance, humanGate, done-detection", () => {
@@ -47,7 +59,7 @@ describe("compileGsd (committed fixture phase)", () => {
   test("context keeps the plan file first; only repo-relative @-refs from the <context> block", () => {
     const ctx = compileGsd(PHASE).tasks[0].context;
     expect(ctx[0].endsWith("07-01-PLAN.md")).toBe(true);
-    expect(ctx).toContain(".planning/PROJECT.md");
+    expect(ctx).toContain("fixtures/gsd-sample/PROJECT.md"); // vendored WITH the fixture: `.planning/` resolves only in the private checkout
     expect(ctx.some((c) => c.includes("$HOME") || c.includes("~/"))).toBe(false);
   });
 
@@ -62,6 +74,37 @@ describe("compileGsd (committed fixture phase)", () => {
     const g = compileGsd(join(PHASE, "07-02-PLAN.md"));
     expect(g.tasks.map((t) => t.id)).toEqual(["P07-02"]);
     expect(g.tasks[0].deps).toEqual([]); // 07-01 is outside this graph
+  });
+});
+
+describe("GSD context-ref reachability parity", () => {
+  test("a gsd plan citing a ref absent from the tree refuses to compile and the message names that ref, so a gsd graph compiling clean with a dangling ref fails", () => {
+    const ref = "docs/absent-context.md";
+    const { repo, phase } = repositoryPhase("25-missing-ref", ref);
+    expect(() => compileGsd(phase, repo)).toThrow(ref);
+  });
+
+  test("a gsd plan citing a present-but-untracked ref compiles and warns with the force-add instruction, so a refusal on the operator's opt-in case fails", () => {
+    const ref = "docs/operator-context.md";
+    const { repo, phase } = repositoryPhase("26-untracked-ref", ref);
+    mkdirSync(join(repo, "docs"));
+    writeFileSync(join(repo, ref), "operator-owned context\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(() => compileGsd(phase, repo)).not.toThrow();
+    expect(warn.mock.calls.map(([message]) => String(message))).toContainEqual(
+      expect.stringContaining(`git add -f ${ref} && git commit`),
+    );
+    warn.mockRestore();
+  });
+
+  test("a gsd plan citing a glob compiles silently, so a glob treated as a promise about one file fails", () => {
+    const { repo, phase } = repositoryPhase("27-glob-ref", "docs/**/*.md");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(() => compileGsd(phase, repo)).not.toThrow();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });
 

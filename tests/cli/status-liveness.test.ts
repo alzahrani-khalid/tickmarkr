@@ -299,4 +299,88 @@ describe("VIS-11 status liveness (SC4)", () => {
     expect(frames[1]).toContain("last output 2s ago");
     expect(frames[2]).toContain("last output 5s ago");
   });
+
+  // OBS-538: `worker-contact` — the daemon's own proof that a silent worker is alive, hashed off its
+  // worktree — was journaled and read by nothing. A headless channel prints nothing to its pane ever,
+  // and one-shot `status` scrapes no pane at all, so the row said "no output 14m51s" about a worker
+  // proven alive 10s earlier: a false stall on the surface a kill decision is made from.
+  test("a live worker phase names the daemon's journaled contact when it is fresher than any pane output, and falls back to no-output only when the journal proves nothing", async () => {
+    const repo = mkRepo();
+    const graph = seedGraph(repo);
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    const seed = (extra: JournalEvent[]) => seedJournal(repo, [
+      ev("run-start", { pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) }, new Date(startedAt - 1_000).toISOString()),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "fake-1" } }, new Date(startedAt).toISOString(), "T1"),
+      ev("phase-start", { phase: "worker" }, new Date(startedAt).toISOString(), "T1"),
+      ...extra,
+    ]);
+    const frame = async () => status(["--watch"], repo, {
+      iterations: 1,
+      sleep: async () => {},
+      now: () => startedAt + 600_000,
+    });
+
+    seed([ev("worker-contact", { slot: "s", attempt: 0, evidence: "worktree" }, new Date(startedAt + 590_000).toISOString(), "T1")]);
+    const withContact = await frame();
+    expect(withContact).toContain("last contact 10s ago (worktree)");
+    expect(withContact).not.toContain("no output");
+
+    seed([]);
+    expect(await frame()).toContain("no output 10m0s");
+  });
+
+  // The half-fix the gate record on 8b103bf3 caught: OBS-538 taught the detail PHRASE to read
+  // `worker-contact` and left the stall ALARM (`staleWorker`) clocking pane bytes alone, so for the
+  // very population OBS-538 is about — a headless channel whose pane never prints, so hasOutput stays
+  // false — every live row was warn-painted from 60s onward while line 2 of the same card read "last
+  // contact 10s ago (worktree)". The suite pinned the text and not the paint, which is how it shipped.
+  // The alarm is a COLOR-only difference (same glyph, same word), so this asserts the SGR bytes: the
+  // cockpit's own `visual()` gate is `process.stdout.isTTY === true && NO_COLOR unset`.
+  test("the stall alarm reads the same evidence the detail line names: a live worker with a fresh journaled contact and no pane output is NOT warn-painted, and the same row with nothing observed IS", async () => {
+    const repo = mkRepo();
+    const graph = seedGraph(repo);
+    const startedAt = Date.parse("2026-07-23T08:00:00.000Z");
+    const seed = (extra: JournalEvent[]) => seedJournal(repo, [
+      ev("run-start", { pid: process.pid, graphDefinitionHash: graphDefinitionHash(graph) }, new Date(startedAt - 1_000).toISOString()),
+      ev("task-dispatch", { assignment: { adapter: "fake", model: "fake-1" } }, new Date(startedAt).toISOString(), "T1"),
+      ev("phase-start", { phase: "worker" }, new Date(startedAt).toISOString(), "T1"),
+      ...extra,
+    ]);
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const noColor = process.env.NO_COLOR;
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    delete process.env.NO_COLOR;
+    try {
+      const card = async (): Promise<string> => {
+        const out = await status(["--watch"], repo, {
+          iterations: 1,
+          sleep: async () => {},
+          now: () => startedAt + 600_000,
+        });
+        const lines = out.split("\n");
+        const i = lines.findIndex((line) => line.includes("T1"));
+        return `${lines[i]}\n${lines[i + 1] ?? ""}`;
+      };
+      const AMBER = "\x1b[33m"; // brand.ts warn()
+      const DIM = "\x1b[2m"; //   brand.ts dim()
+
+      // contact 10s old: alive by the daemon's own evidence, so no alarm on either half of the card
+      seed([ev("worker-contact", { slot: "s", attempt: 0, evidence: "worktree" }, new Date(startedAt + 590_000).toISOString(), "T1")]);
+      const alive = await card();
+      expect(alive).toContain("last contact 10s ago (worktree)");
+      expect(alive).not.toContain(AMBER); // neither the status word nor the spinner is flagged
+      expect(alive).toContain(DIM); // the spinner still renders, as chrome
+
+      // nothing observed for ten minutes: the alarm is exactly what should fire here
+      seed([]);
+      const silent = await card();
+      expect(silent).toContain("no output 10m0s");
+      expect(silent).toContain(AMBER);
+    } finally {
+      // restore by descriptor either way: an absent isTTY reads as undefined, which is what the
+      // cockpit's `isTTY === true` gate already treats as "not a terminal"
+      Object.defineProperty(process.stdout, "isTTY", tty ?? { configurable: true, value: undefined });
+      if (noColor !== undefined) process.env.NO_COLOR = noColor;
+    }
+  });
 });

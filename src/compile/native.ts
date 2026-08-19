@@ -173,7 +173,15 @@ function strictNegativeCount(text: string): number {
 
 function namedCriterionPaths(text: string, tests: HeadTest[]): string[] {
   const paths = new Set<string>();
-  for (const match of text.matchAll(/(?:^|[\s("'`])((?:src|tests|fixtures|scripts)\/[A-Za-z0-9_@{}*?.,/+-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|txt))/g)) {
+  // Longest extension first, plus a not-a-name-character tail: regex alternation is first-match-wins,
+  // so `js|json` extracted `src/i18n/ar/common.json` as `src/i18n/ar/common.js` and `ts|tsx` turned
+  // `Card.tsx` into `Card.ts`. criterion-scope is a THROWING lint, so a criterion naming a .json,
+  // .tsx or .jsx file that sits squarely inside its own files[] refused to compile, and the refusal
+  // named a path its author never wrote. Order and boundary both: either alone would fix it, and the
+  // pair makes a future extension added in the wrong place harmless (OBS-545).
+  const ext = "tsx|ts|jsx|json|js|mjs|cjs|md|txt";
+  const re = new RegExp(`(?:^|[\\s("'\`])((?:src|tests|fixtures|scripts)/[A-Za-z0-9_@{}*?.,/+-]+\\.(?:${ext}))(?![A-Za-z0-9])`, "g");
+  for (const match of text.matchAll(re)) {
     paths.add(match[1]);
   }
   for (const match of text.matchAll(/\b([A-Za-z0-9_.-]+\.test\.ts)\b/g)) {
@@ -802,6 +810,23 @@ acceptance is required on every task (a nested list of observable outcomes).
       A criterion that cannot name (4) is a claim about nothing and its test cannot fail. If (5) has no
       hard value anywhere in the domain, the criterion asserts a universal that may be FALSE ABOUT THE
       WORLD — bound it or say where it stops holding, rather than demanding a value that does not exist.
+
+  WHICH SIDE OF A RUN INHERITS ENVIRONMENT — AND IT DEPENDS ON THE DRIVER (OBS-542):
+    - Gate commands and "command:"/"test:" oracles INHERIT THE DAEMON'S ENVIRONMENT. They are children of
+      the daemon, so launching it as \`bash -c 'set -a; . .env.test; set +a; exec tickmarkr run'\` reaches
+      every one of them.
+    - Under the HERDR driver, a WORKER PANE runs with a FRESH AMBIENT ENVIRONMENT: none of the daemon's
+      exports reach it. It carries only what tickmarkr seeds explicitly — the run's workspace id, the
+      pane's identity, and VITEST_MAX_FORKS (the one daemon value that crosses, so a worker's suites and
+      the gate shells divide the machine the same way). A herdr worker cannot see a secret, a token, or
+      an exported PATH edit, by deliberate design.
+    - Under the SUBPROCESS driver, a worker inherits the daemon's environment wholesale (minus tickmarkr's
+      own control vars).
+    - The driver is resolved at RUN START, never at compile time, so a spec cannot know which one it gets.
+    CONSEQUENCE FOR CRITERIA: anything needing credentials, a bound port, or the network belongs in a
+    "command:"/"test:" oracle — NEVER in a worker's prose report. As prose it is satisfiable under the
+    subprocess driver and impossible under herdr, while the byte-identical command inside an oracle passes
+    under both. Measured: two burned attempts and three gate reds on one task, to learn one sentence.
 
   ORDERING AND OWNERSHIP:
     - Every path has exactly ONE owning task. Two tasks writing one file must be ORDERED by deps, or the

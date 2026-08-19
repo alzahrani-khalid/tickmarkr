@@ -19,9 +19,10 @@ import { extractPromptNonce, gatePaneName } from "../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { NO_TRAILER_SUMMARY } from "../../src/adapters/prompt.js";
-import { EARLY_LAUNCH_LIVENESS_MS, HARVESTED_RESULT_SUMMARY, harvestCpuFlatWindowMs, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE, workerTreeCpuMs } from "../../src/run/daemon.js";
+import { EARLY_LAUNCH_LIVENESS_MS, HARVESTED_RESULT_SUMMARY, harvestCpuFlatWindowMs, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, watchCommand, WORKER_NUDGE_MESSAGE, workerTreeCpuMs } from "../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../src/run/git.js";
 import { activeRetryBan, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, pendingRepairFindings, recordedTaskFailureKind, reviewRoundsSinceApproval, runHasEnded, structuredFindings, UNIDENTIFIED, type JournalEvent } from "../../src/run/journal.js";
+import { normalizeGateOutcome } from "../../src/run/outcome.js";
 import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests } from "../../src/run/stall.js";
 import { COMMIT, authedModels, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -1120,6 +1121,19 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
   // ── Phase 11 wave 2: TEL-02 counter population + park discrimination ──
   const telem = (repo: string, runId: string) => Journal.open(repo, runId).readTelemetry();
 
+  // Both infra criteria inspect independent seams of the same terminal verdict. Reuse one completed
+  // daemon run so this coverage does not double the suite's process fan-out under constrained hosts.
+  let oracleInfraFixture: Promise<{ repo: string; summary: Awaited<ReturnType<typeof runDaemon>> }> | undefined;
+  const runOracleInfraFixture = () => oracleInfraFixture ??= (async () => {
+    const command = "printf '%s\\n' 'Token not found in system keyring' >&2; exit 1";
+    const { repo, fake } = setupRepo(
+      [T("T1", { acceptance: [{ oracle: "command", command }] })],
+      { tasks: { T1: [{ shell: `echo landed > landed.txt && ${COMMIT} landed`, result: { ok: true, summary: "landed" } }] } },
+    );
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-oracle-infra" });
+    return { repo, summary };
+  })();
+
   test("TEL-02 clean run: attempts:1, firstAttemptOk:true, gateFails:0, consults:0", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
@@ -1151,6 +1165,59 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(row.firstAttemptOk).toBe(false);
     expect(row.gateFails).toBe(1); // one gate-failed attempt — its own counter, NOT derived from attempts
     expect(row.consults).toBe(0);
+  });
+
+  test("an infra-caused verdict neither increments the gate-failure count nor spends a ladder rung in the daemon's attempt loop, so an infra red that funds a retry fails", async () => {
+    const { repo, summary } = await runOracleInfraFixture();
+    expect(summary.human).toEqual(["T1"]);
+    const events = Journal.open(repo, "run-oracle-infra").read();
+    expect(events.filter((event) => event.event === "task-dispatch" && event.taskId === "T1")).toHaveLength(1);
+    expect(events.some((event) => event.event === "escalation" && event.taskId === "T1")).toBe(false);
+    expect(events.find((event) => event.event === "task-human" && event.taskId === "T1")?.data.kind).toBe("infra");
+    const row = telem(repo, "run-oracle-infra").find((entry) => entry.taskId === "T1")!;
+    expect(row.parkKind).toBe("infra");
+    expect(row.gateFails).toBe(0);
+  });
+
+  test("a judge refusal that evaluated the diff still charges its attempt as a quality failure even when its prose mentions credentials, secrets, tokens or a keyring, so a classifier that reads a judge's reason text fails", async () => {
+    const reason = "the login handler accepts the credentials but the error banner is missing; its secret and token copy also names the system keyring";
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      {
+        judge: [
+          { pass: false, criteria: [{ criterion: "c1", met: false, reason }] },
+          { pass: true, criteria: [{ criterion: "c1", met: true, reason: "the repaired diff satisfies the criterion" }] },
+        ],
+        review: { approve: true, issues: [] },
+        tasks: { T1: [{ shell: `echo landed > landed.txt && ${COMMIT} landed`, result: { ok: true, summary: "landed" } }] },
+      },
+    );
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-judge-prose-quality" });
+    expect(summary.done).toEqual(["T1"]);
+    const events = Journal.open(repo, "run-judge-prose-quality").read();
+    const refusals = events.filter((event) =>
+      event.event === "gate-result" && event.taskId === "T1" && event.data.gate === "acceptance" && event.data.pass === false
+    );
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(refusals.every((event) => event.data.infra === undefined)).toBe(true);
+    expect(refusals.every((event) => String(event.data.details).includes(reason))).toBe(true);
+    expect(events.some((event) => event.event === "escalation" && event.taskId === "T1")).toBe(true);
+    const row = telem(repo, "run-judge-prose-quality").find((entry) => entry.taskId === "T1")!;
+    expect(row.gateFails).toBe(1);
+  });
+
+  test("the journal row for an infra verdict carries its retryable field so a reader reconstructs the verdict as recorded, so a seam that forwards infra and drops retryable fails", async () => {
+    const { repo } = await runOracleInfraFixture();
+    const row = Journal.open(repo, "run-oracle-infra").read().find((event) =>
+      event.event === "gate-result" && event.taskId === "T1" && event.data.gate === "acceptance"
+    )!;
+    expect(row.data).toMatchObject({ pass: false, infra: true, retryable: false });
+    expect(normalizeGateOutcome(row.data)).toEqual({
+      kind: "infra",
+      reason: row.data.details,
+      retryable: false,
+    });
   });
 
   test("TEL-02 consult path: gate-fails reach the consult step, retry verdict → pass writes the consult count", async () => {
@@ -2024,13 +2091,61 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
     // exactly one narrator open, with the watch command
     const opens = ops.filter((o) => o.kind === "narrator-open");
     expect(opens).toHaveLength(1);
-    expect(opens[0]!.cmd).toBe("tickmarkr status --watch");
+    expect(opens[0]!.cmd).toBe(watchCommand("run-narr"));
     // opened at run START — before the first worker slot is created
     const openIdx = ops.findIndex((o) => o.kind === "narrator-open");
     const firstWorker = ops.findIndex((o) => o.kind === "slot" && /-worker-/.test(o.name ?? ""));
     expect(openIdx).toBeGreaterThanOrEqual(0);
     expect(firstWorker).toBeGreaterThan(openIdx);
     expect(ops.filter((o) => o.kind === "close" && o.name === "narrator-watch")).toHaveLength(0);
+  });
+
+  // QUEUE-v194: the board is bound to the run that spawned it. `status` resolves the newest journal
+  // when no run is named, and a board showing a previous milestone's numbers under this run's id is a
+  // recorded incident (skills/tickmarkr-overseer/SKILL.md).
+  test("the exported watchCommand builder names its run id as the explicit status positional and the daemon spawns the narrator through it, so a bare watch command following the newest journal in a repo carrying a second newer run fails", async () => {
+    // status takes exactly one positional and it is the run id (cli/commands/status.ts
+    // positionalRunId reads the first bare token) — so the run id must BE that bare token.
+    const argv = watchCommand("run-board-42").split(" ");
+    expect(argv.slice(0, 2)).toEqual(["tickmarkr", "status"]);
+    expect(argv).toContain("--watch");
+    expect(argv.slice(2).filter((a) => !a.startsWith("-"))).toEqual(["run-board-42"]);
+
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    const inner = new SubprocessDriver();
+    const opens: string[] = [];
+    const driver = {
+      id: "herdr",
+      interactive: true,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      async run(s: { id: string; name: string; cwd: string }, cmd: string) {
+        if (cmd.includes("status --watch")) return; // the narrator is a live loop — never actually run it
+        return inner.run(s, cmd);
+      },
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+      async narrator(cwd: string, command: string) {
+        opens.push(command);
+        return inner.slot(cwd, "narrator-watch");
+      },
+    };
+    // the second, NEWER run this repo carries — what an unnamed `status --watch` would resolve to
+    // (Journal.latestRunId sorts run ids, status.ts:766). It exists BEFORE the board opens.
+    Journal.create(repo, "run-zz-newer").append("run-start", undefined, {});
+
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-bound-board", driver });
+    expect(s.done).toEqual(["T1"]);
+    expect(Journal.latestRunId(repo, { withJournal: true })).toBe("run-zz-newer"); // the bare command's run
+    expect(opens).toEqual([watchCommand("run-bound-board")]);
+    expect(opens[0]).not.toContain("run-zz-newer"); // never the bare, newest-journal-following command
   });
 
   test("a narrator that fails to open never affects the run (cosmetic-only, swallowed)", async () => {

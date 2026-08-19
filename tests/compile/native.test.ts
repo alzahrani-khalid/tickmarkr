@@ -71,6 +71,49 @@ describe("native spec scaffold guard", () => {
   });
 });
 
+// OBS-542: the authoring law has to name the SIDE, not just the subject. A template that talks about
+// credentials without saying that oracles inherit the daemon's environment while a herdr worker pane is
+// seeded fresh leaves the author unable to tell a satisfiable criterion from an impossible one.
+describe("spec template — environment asymmetry law (OBS-542)", () => {
+  // The side has to be IN the pattern: "X inherits the daemon's environment" is true of the wrong X too.
+  const SAYS_WHICH_SIDE_INHERITS = /gate commands[^.]{0,120}oracles[^.]{0,40}inherit the daemon's environment/i;
+  const NAMES_THE_SEALED_SIDE = /herdr[^.]{0,120}worker pane[^.]{0,120}fresh ambient environment/i;
+
+  test("the spec template states which side of a run inherits environment and names the herdr worker pane as the side seeded fresh, so a template that mentions credentials without saying which side inherits fails", () => {
+    const template = specTemplate();
+
+    expect(template).toMatch(SAYS_WHICH_SIDE_INHERITS);
+    expect(template).toMatch(NAMES_THE_SEALED_SIDE);
+    // ...and the author is told what to DO with the asymmetry, not just that it exists.
+    expect(template).toMatch(/never in a worker's prose report/i);
+
+    // False-clean control 1, cut from the real template: strip the law, keep a credentials mention. Both
+    // checks must go false, or they are asserting on prose the law does not own.
+    const lawStart = template.indexOf("  WHICH SIDE OF A RUN INHERITS ENVIRONMENT");
+    const lawEnd = template.indexOf("  ORDERING AND OWNERSHIP:");
+    expect(lawStart).toBeGreaterThan(-1);
+    expect(lawEnd).toBeGreaterThan(lawStart);
+    const credentialsWithoutSides = template.slice(0, lawStart) + template.slice(lawEnd)
+      + "\n  A criterion may require credentials, a bound port, or the network.\n";
+
+    expect(credentialsWithoutSides).toMatch(/credentials/);
+    expect(credentialsWithoutSides).not.toMatch(SAYS_WHICH_SIDE_INHERITS);
+    expect(credentialsWithoutSides).not.toMatch(NAMES_THE_SEALED_SIDE);
+
+    // False-clean control 2: keep the law's shape and every other phrase — the herdr/fresh sentence, the
+    // consequence — but let the inheriting sentence name no side ("Credentials inherit ..."). That is the
+    // prose an author cannot act on, so the side check must go false while the rest stays true.
+    const sidelessInheritance = template.replace(
+      /    - Gate commands and[^]*?every one of them\./,
+      "    - Credentials inherit the daemon's environment.",
+    );
+    expect(sidelessInheritance).not.toBe(template);
+    expect(sidelessInheritance).toMatch(/inherit the daemon's environment/i);
+    expect(sidelessInheritance).toMatch(NAMES_THE_SEALED_SIDE);
+    expect(sidelessInheritance).not.toMatch(SAYS_WHICH_SIDE_INHERITS);
+  });
+});
+
 describe("native spec marker (v1.38)", () => {
   test("a spec bearing only the legacy marker is not auto-detected as native", () => {
     const legacyMarker = `<!-- ${["dro", "vr"].join("")}:spec -->`;

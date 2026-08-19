@@ -2,6 +2,7 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { approve } from "./commands/approve.js";
+import { beat } from "./commands/beat.js";
 import { compile } from "./commands/compile.js";
 import { doctor } from "./commands/doctor.js";
 import { evalCommand } from "./commands/eval.js";
@@ -26,7 +27,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS: CommandMap = {
-  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, version, verify, eval: evalCommand,
+  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
 };
 
 const VERSION_FLAGS = new Set(["version", "--version", "-v"]);
@@ -52,6 +53,7 @@ usage: tickmarkr <command>
   profile       show learned routing profile (profile reset = forget history via cursor, keeps telemetry)
   ui            open the Fleet Studio TUI (full-screen tabbed cockpit)
   unlock        remove a stale/garbage run lock (refuses if the holder is alive)
+  beat <tier>   record one supervision beat for orchestrator|overseer|watch (--stand-down to hand off); a supervising seat's own watcher loop calls it, and status reads the tier STALE once the beats stop
   approve <id> <task>  release a park (--uphold sides with the reviewer and funds a fixed attempt; --by <name> --reason <text>); takes effect on resume`;
 
 // pure, testable dispatcher: resolves a command, forwards argv, shapes the result — no side effects.

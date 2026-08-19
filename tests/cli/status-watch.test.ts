@@ -113,12 +113,16 @@ const clockInZone = (iso: string, timeZone: string): string =>
     hourCycle: "h23",
   }).format(new Date(iso));
 
-const row = (out: string, taskId: string) => out.split("\n").find((line) => new RegExp(`\\b${taskId}\\b`).test(line))!;
+// A card's IDENTITY row: the id in its own column, right after the row's verdict glyph. Since
+// v1.94 a card also names OTHER tasks — the dependents waiting on it — in its line-2 detail, so a
+// bare id search would answer a blocker's machinery line for the task it blocks.
+const row = (out: string, taskId: string) =>
+  out.split("\n").find((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(line))!;
 // v1.67: the TTY frame renders each task as a two-line card — line 1 identity+verdict, line 2
 // gate chain + machinery. card() joins both lines; row() still fences what belongs on line 1.
 const card = (out: string, taskId: string) => {
   const lines = out.split("\n");
-  const i = lines.findIndex((line) => new RegExp(`\\b${taskId}\\b`).test(line));
+  const i = lines.findIndex((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(line));
   return `${lines[i]}\n${lines[i + 1] ?? ""}`;
 };
 // the v1.34 ledger frame colorizes chips and task boxes — strip ANSI to fence glyphs/order, not styling

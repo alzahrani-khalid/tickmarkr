@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { dispatch, USAGE } from "../../src/cli/index.js";
+import { COMMANDS, dispatch, USAGE } from "../../src/cli/index.js";
 
 const retiredBanner = `${["dro", "vr"].join("")} —`;
 
@@ -43,6 +45,22 @@ describe("cli dispatch", () => {
     const r = await dispatch("ping", [], { ping: async () => { throw new Error("boom"); } });
     expect(r.out).toBe("tickmarkr ping: boom"); // catches: raw stack traces leaking to the operator
     expect(r.code).toBe(1);
+  });
+
+  test("cite the command registration and the skill hunk that calls it on the watcher loop, so a verb no shipped script reaches fails", async () => {
+    // A verb registered in COMMANDS but reached by nothing is the defect this pins from the other end:
+    // `beatSupervision` shipped with no caller at all, which is why two of three supervision rows were
+    // constants. So assert BOTH ends — the dispatcher resolves `beat`, and the shipped overseer skill's
+    // watcher loop is the caller that keeps the overseer tier armed.
+    expect(COMMANDS.beat).toBeTypeOf("function");
+    expect(USAGE).toContain("beat <tier>");
+    const r = await dispatch("beat", ["nonesuch"], COMMANDS);
+    expect(r.out).toContain("tickmarkr beat:"); // reached the handler, not the usage fallback
+    expect(r.code).toBe(1);
+
+    const skill = readFileSync(join(process.cwd(), "skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    expect(skill).toMatch(/while :; do tickmarkr beat overseer; sleep 10; done/u);
+    expect(skill).toContain("tickmarkr beat overseer --stand-down");
   });
 
   test("non-tty invocation refuses with a message naming the line-mode alternatives", async () => {

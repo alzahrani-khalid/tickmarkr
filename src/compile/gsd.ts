@@ -1,8 +1,10 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { AcceptanceItemSchema, TIERS, type AcceptanceItem, type RunGraph, validateGraph } from "../graph/schema.js";
 import { CompileError, assertWriteScope, inferShape, sha256, type WriteDirective } from "./common.js";
+import { classifyContextPath } from "./native.js";
 
 // GSD artifact front-end (spec v1.3): one GSD *plan* is one tickmarkr *task* — a plan is
 // worktree-sized; its inner <task> steps stay in the worker prompt via context[0] = the plan file.
@@ -242,6 +244,7 @@ function compileOne(file: string, storedPath: string) {
       ...(routingHints ? { routingHints } : {}),
     },
     content,
+    refs,
   };
 }
 
@@ -306,6 +309,42 @@ export function compileGsd(src: string, root?: string): RunGraph {
       if (!isDir) return []; // external to this single-plan graph
       throw new CompileError(`${files[i]} depends on "${d}" but no such plan exists in ${src}`);
     });
+  }
+
+  // Match native context reachability against the committed tree. This block only obtains the HEAD
+  // snapshot; classifyContextPath remains the single authority for missing, untracked, and glob refs.
+  const gitDir = dirname(files[0]);
+  const top = spawnSync("git", ["-C", gitDir, "rev-parse", "--show-toplevel"], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const tree = spawnSync("git", ["-C", gitDir, "ls-tree", "--full-tree", "-r", "--name-only", "HEAD"], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const repoRoot = typeof top.stdout === "string" ? top.stdout.trim() : "";
+  // `root` is the repository whose worktrees will consume these refs. A source nested inside some
+  // unrelated repository (as with vendored fixtures) must not be judged against that outer tree.
+  const authoritative = root === undefined
+    || (top.status === 0 && repoRoot !== "" && realpathSync(root) === realpathSync(repoRoot));
+  if (top.status === 0 && tree.status === 0 && repoRoot && typeof tree.stdout === "string" && authoritative) {
+    const tracked = new Set(tree.stdout.split("\n").filter(Boolean));
+    const unreachable: string[] = [];
+    for (const [i, t] of tasks.entries()) {
+      for (const entry of compiled[i].refs) {
+        const { kind, suggestion } = classifyContextPath(entry, tracked, repoRoot);
+        if (kind === "untracked") {
+          console.warn(
+            `tickmarkr: OBS-170: task ${t.id} context ${JSON.stringify(entry)} exists in your checkout but is NOT in a worker's worktree. To make it worker context: git add -f ${entry} && git commit. Staging alone is not enough.`,
+          );
+        } else if (kind === "missing") {
+          unreachable.push(
+            `  ${t.id}: ${JSON.stringify(entry)}${suggestion ? `\n      → did you mean ${suggestion} ?` : "\n      → not found in the repository, and not a path."}`,
+          );
+        }
+      }
+    }
+    if (unreachable.length) {
+      throw new CompileError(
+        `context: paths that do not exist in ${src}:\n${unreachable.join("\n")}\n\n` +
+          `A context: entry is a promise the worker can read it. These resolve to nothing in the repository,\n` +
+          `so the worker would be told to read a file that is not there. Fix the paths and recompile.`,
+      );
+    }
   }
 
   return validateGraph({

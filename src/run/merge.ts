@@ -2,7 +2,15 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { shq } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
-import { type Baseline, classifyFailureOutput, fingerprint, freshFailures } from "../gates/baseline.js";
+import {
+  type Baseline,
+  ceilingKillResult,
+  classifyFailureOutput,
+  effectiveCeilingMs,
+  type FailureClassification,
+  fingerprint,
+  freshFailures,
+} from "../gates/baseline.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { gitHead, linkNodeModules, resolveIntegrationBranch, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
 
@@ -16,6 +24,11 @@ export interface TipVerifyResult {
   artifact?: string;
   /** Q121s: nonzero exit whose failures are ALL baseline-recorded — forgiven exactly as the battery forgives. */
   forgiven?: boolean;
+  /**
+   * OBS-534: what a nonzero exit is evidence OF, taken from the battery's own readers — `ceilingKillResult`
+   * for a kill, `classifyFailureOutput` for everything else. `infra` means nothing was verified.
+   */
+  cause?: FailureClassification;
 }
 
 export function integrationBranch(cfg: TickmarkrConfig, runId: string): string {
@@ -79,21 +92,55 @@ export async function verifyIntegrationTip(
 ): Promise<TipVerifyResult[]> {
   const results: TipVerifyResult[] = [];
   for (const [gate, cmd] of Object.entries(commands)) {
-    const r = await sh(cmd, intWt);
+    const entry = baseline?.commands[gate];
+    // OBS-534: the ceiling is the BATTERY's, derived by effectiveCeilingMs from the same baseline entry
+    // this loop already reads for forgiveness two lines down — never the flat DEFAULT_SHELL_TIMEOUT_MS
+    // `sh` defaults to. A suite whose capture measured 600007ms carries a recorded 1800021ms ceiling;
+    // running it under 600000ms here SIGKILLed a green tip three times while every per-task gate passed.
+    const ceilingMs = effectiveCeilingMs(entry);
+    const r = await sh(cmd, intWt, ceilingMs);
     const raw = r.stdout + "\n" + r.stderr;
     const stripped = raw.split(intWt).join("");
-    const entry = baseline?.commands[gate];
+    const artifact = join(runDir, `tip-verify-${gate}.log`);
+    // Battery parity on the ceiling too (baseline.ts Q24): the kill is read BEFORE the exit code is
+    // interpreted at all. A SIGKILLed battery never returned a verdict, so no line of its partial
+    // output is one — fingerprinting it is what produced the `<unrecognized failure output>` an
+    // operator cannot act on. The kill reader's own text (ceiling + elapsed) and cause replace it.
+    const killed = ceilingKillResult(gate, r, ceilingMs);
+    if (killed) {
+      writeFileSync(artifact, raw);
+      results.push({
+        gate,
+        cmd,
+        pass: false,
+        exitCode: r.code,
+        fingerprints: [],
+        details: killed.details,
+        cause: killed.meta?.classification as FailureClassification,
+        artifact,
+      });
+      continue;
+    }
     const { failing, unreadable } = freshFailures(entry, stripped);
+    const cause = r.code === 0 ? undefined : classifyFailureOutput(stripped);
     // `?? 1` is the battery's own default (baseline.ts compareToBaseline): an exitCode-less legacy
     // entry reads as red-at-baseline there, so it must read the same here or old baselines silently
-    // lose forgiveness. Battery parity on the infra rule too (T9): infrastructure-only output means
-    // the runner never completed a suite — nothing was verified, so nothing is forgivable, however
-    // familiar its fingerprints. Stricter-than-battery edge kept: unreadable output never forgives.
-    const forgiven = r.code !== 0 && entry !== undefined && (entry.exitCode ?? 1) !== 0
-      && failing.length === 0 && !unreadable && classifyFailureOutput(stripped) !== "infra";
+    // lose forgiveness. OBS-534 (T2): a capture killed at its ceiling now records a CAUSE and no
+    // verdict, and that default must not launder the missing exit code back into red-at-baseline.
+    // Only a recorded verdict is forgivable, so this reads the same predicate the battery does
+    // (baseline.ts `baselineRed`) — `infra` first, the legacy default only after it. freshFailures
+    // already drops the killed capture's flushed fingerprints, but it cannot close this alone: an
+    // output whose only shape is a diagnostic HEADING (vitest's "Unhandled Errors" banner) is
+    // fingerprintable yet OBS-42-exempt from rejecting, so `failing` comes back empty, `unreadable`
+    // false and the cause reads "regression" — every other guard satisfied, and a real red forgiven
+    // against a capture that never finished asking the question.
+    const baselineRed = entry !== undefined && entry.infra !== true && (entry.exitCode ?? 1) !== 0;
+    // Battery parity on the infra rule too (T9): infrastructure-only output means the runner never
+    // completed a suite — nothing was verified, so nothing is forgivable, however familiar its
+    // fingerprints. Stricter-than-battery edge kept: unreadable output never forgives.
+    const forgiven = r.code !== 0 && baselineRed && failing.length === 0 && !unreadable && cause !== "infra";
     const pass = r.code === 0 || forgiven;
-    const artifact = pass ? undefined : join(runDir, `tip-verify-${gate}.log`);
-    if (artifact) writeFileSync(artifact, raw);
+    if (!pass) writeFileSync(artifact, raw);
     results.push({
       gate,
       cmd,
@@ -104,7 +151,8 @@ export async function verifyIntegrationTip(
         : forgiven ? `exit ${r.code} but only baseline-recorded failures (forgiven vs baseline)`
         : `exit ${r.code}`,
       ...(forgiven ? { forgiven: true } : {}),
-      ...(artifact ? { artifact } : {}),
+      ...(cause ? { cause } : {}),
+      ...(pass ? {} : { artifact }),
     });
   }
   return results;

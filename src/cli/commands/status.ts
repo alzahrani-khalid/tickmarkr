@@ -21,6 +21,7 @@ import {
   runHasEnded,
   type TaskPhase,
 } from "../../run/journal.js";
+import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
 import { readSupervision, supervisionText } from "../../run/supervision.js";
@@ -229,6 +230,13 @@ type LivePhase = {
   attempt: number;
   /** The gate the row names, read from the event's own `gate` field — never from the phase word. */
   gate?: GateName;
+  /**
+   * When the DAEMON last proved this worker alive, and by what evidence (`worker-contact`). A
+   * headless channel prints nothing to its pane for its whole run, so pane silence is not worker
+   * silence — and the daemon's own proof was journaled with no reader (OBS-538).
+   */
+  lastContactAt?: number;
+  contactEvidence?: string;
 };
 
 type WorkerLiveness = {
@@ -283,6 +291,17 @@ const livePhases = (events: JournalEvent[]): Map<string, LivePhase> => {
     if (!event.taskId) continue;
     const active = live.get(event.taskId);
     if (!active) continue;
+    // The daemon proves a silent worker alive by hashing its worktree and journals that proof as
+    // `worker-contact`. It is evidence ABOUT the live phase, never its outcome, so it decorates the
+    // entry and is deliberately absent from the `matched` set below.
+    if (event.event === "worker-contact" && active.phase === "worker") {
+      const at = Date.parse(event.ts);
+      if (Number.isFinite(at)) {
+        active.lastContactAt = at;
+        if (typeof event.data.evidence === "string") active.contactEvidence = event.data.evidence;
+      }
+      continue;
+    }
     const gate = active.gate ?? phaseGate(active.phase);
     const matched =
       (active.phase === "worker" && event.event === "worker-result")
@@ -316,17 +335,45 @@ const fmtElapsed = (ms: number): string => {
   return `${hours}h${minutes % 60}m${seconds % 60}s`;
 };
 
-const workerOutputAge = (phase: LivePhase, now: number, worker?: WorkerLiveness): number =>
-  now - (worker?.phaseStartedAt === phase.startedAt && worker.hasOutput ? worker.lastOutputAt : phase.startedAt);
+/**
+ * The freshest evidence that this worker is alive, and what produced it. ONE derivation, because the
+ * two readers of worker silence drifted apart the first time this was fixed: OBS-538 taught the detail
+ * phrase to read the daemon's journaled `worker-contact` and left the stall ALARM (`staleWorker`)
+ * clocking pane bytes alone. For the exact population OBS-538 is about — a headless channel (codex
+ * `sub`, an API worker) that prints nothing to its pane all run, so `hasOutput` never becomes true —
+ * the alarm then warn-painted every live row from 60s onward while line 2 of the same card read
+ * "last contact 10s ago (worktree)". A card cannot contradict itself if both halves ask this.
+ */
+const workerActivity = (
+  phase: LivePhase,
+  worker?: WorkerLiveness,
+): { at: number; source: "output" | "contact" | "none" } => {
+  const outputAt = worker?.phaseStartedAt === phase.startedAt && worker.hasOutput ? worker.lastOutputAt : undefined;
+  const contactAt = phase.lastContactAt;
+  if (outputAt !== undefined && (contactAt === undefined || outputAt >= contactAt)) return { at: outputAt, source: "output" };
+  if (contactAt !== undefined) return { at: contactAt, source: "contact" };
+  // Nothing has been observed since the phase began: silence is the whole phase, which is what both
+  // the phrase ("no output 14m51s") and the alarm's 60s threshold must measure.
+  return { at: phase.startedAt, source: "none" };
+};
 
+/** How long this worker has been silent by the freshest evidence available — the alarm's clock. */
+const workerSilenceMs = (phase: LivePhase, now: number, worker?: WorkerLiveness): number =>
+  now - workerActivity(phase, worker).at;
+
+/**
+ * What a live worker row says about silence. Pane bytes are not more truthful than a worktree delta,
+ * only different, so the row names whichever evidence is fresher AND names its source.
+ */
 const phaseDetail = (phase: LivePhase, now: number, worker?: WorkerLiveness): string => {
   const elapsed = fmtElapsed(now - phase.startedAt);
   if (phase.phase !== "worker") return `${phaseLabel(phase)} · ${elapsed} elapsed`;
-  const age = fmtElapsed(workerOutputAge(phase, now, worker));
-  const output = worker?.phaseStartedAt === phase.startedAt && worker.hasOutput
-    ? `last output ${age} ago`
-    : `no output ${age}`;
-  return `${phaseLabel(phase.phase)} · ${elapsed} elapsed · ${output}`;
+  const head = `${phaseLabel(phase.phase)} · ${elapsed} elapsed`;
+  const activity = workerActivity(phase, worker);
+  const age = fmtElapsed(now - activity.at);
+  if (activity.source === "output") return `${head} · last output ${age} ago`;
+  if (activity.source === "contact") return `${head} · last contact ${age} ago (${phase.contactEvidence ?? "worktree"})`;
+  return `${head} · no output ${age}`;
 };
 
 const attemptStartIdx = (events: JournalEvent[], taskId: string): number => {
@@ -445,13 +492,16 @@ export const shortGoal = (goal: string, max: number): string => {
   return `${fitCells(clause, cells - 3).trimEnd()}...`;
 };
 
+/** Columns the machine row always spends on the task title, however long its machinery segment runs. */
+const MACHINE_TITLE_FLOOR = 24;
+
 /**
  * A card's detail segments, named in the cockpit's own element vocabulary so the board carries no
  * shed order of its own: `LAYOUT_PRIORITY` is ordered highest-priority first, so its tail is what a
- * narrowing board surrenders, and it surrenders it from the end. The journal segment — where the
- * blocking dependencies of a waiting task are named — sits above that tail and is therefore never
- * shed: it wraps instead, so narrowing costs rows, never the graph's structure, and never turns a
- * named blocker into a `+N` count.
+ * narrowing board surrenders, and it surrenders it from the end. The journal segment — where BOTH
+ * directions of the graph edge are named, the blocking dependencies of a waiting task and the
+ * dependents waiting on it — sits above that tail and is therefore never shed: it wraps instead, so
+ * narrowing costs rows, never the graph's structure, and never turns a named task into a `+N` count.
  */
 type DetailSegment = { element: (typeof LAYOUT_PRIORITY)[number]; text: string };
 
@@ -476,6 +526,112 @@ const detailText = (segments: readonly DetailSegment[], budget: number): string 
  */
 const boardRows = (lines: readonly string[], columns: number): string[] =>
   lines.flatMap((line) => wrapCells(line, columns, { continuationPrefix: "  " }));
+
+type TaskEffort = {
+  taskId: string;
+  dispatches: number;
+  reviews: number;
+  parks: number;
+  total: number;
+};
+
+/**
+ * A funded review round is a review that actually returned a verdict. `passed` and `failed` are the
+ * only two arms of the gate vocabulary that carry one (outcome.ts:23) — every other arm states why
+ * nothing ran, so counting it would bill the task for a reviewer it never spent.
+ */
+const REVIEW_VERDICTS = new Set<GateOutcomeKind>(["passed", "failed"]);
+
+/**
+ * Fold the panel from parsed JournalEvent rows only. In particular, a review round is every
+ * gate-result whose typed gate field is `review` and whose outcome is a verdict, passed or failed.
+ * `review-raw-*` artifacts are unparseable-verdict captures, not round markers, and neither raw
+ * journal strings nor run-directory filenames participate in this count.
+ *
+ * A decline is not a round, and it is NOT readable off `data.skipped`: that field is one of four
+ * encodings the shipped record already writes, and the two it misses are both live on disk — a
+ * pre-R3 review decline states itself only as `{ pass: true, details: "skipped — …" }`, and a
+ * canonical row states it as `outcome.kind: "declined"`. Reading the flag alone bills both as funded
+ * rounds and can reorder the top four. `normalizeGateOutcome` is the ONE reader of all four
+ * encodings (outcome.ts:125), so the panel asks it rather than re-deriving a fifth answer; a row it
+ * cannot read stays `unavailable` and therefore uncounted, fail-closed. `replayMeasurement` is
+ * orthogonal to the outcome — a resume re-observing an interrupted round reports a real verdict —
+ * so it stays an explicit exclusion, the same clause journal.ts:110 uses.
+ */
+const foldTaskEffort = (tasks: readonly Task[], events: readonly JournalEvent[]): TaskEffort[] => {
+  const order = new Map(tasks.map((task, index) => [task.id, index]));
+  const effort = new Map(tasks.map((task) => [task.id, {
+    taskId: task.id,
+    dispatches: 0,
+    reviews: 0,
+    parks: 0,
+    total: 0,
+  }]));
+
+  for (const event of events) {
+    if (!event.taskId) continue;
+    const task = effort.get(event.taskId);
+    if (!task) continue;
+    if (event.event === "task-dispatch") task.dispatches += 1;
+    else if (event.event === "gate-result" && event.data.gate === "review"
+             && event.data.replayMeasurement !== true
+             && REVIEW_VERDICTS.has(normalizeGateOutcome(event.data.outcome ?? event.data).kind)) task.reviews += 1;
+    else if (event.event === "task-human") task.parks += 1;
+    task.total = task.dispatches + task.reviews + task.parks;
+  }
+
+  return [...effort.values()].sort((left, right) =>
+    right.total - left.total
+    || order.get(left.taskId)! - order.get(right.taskId)!
+  );
+};
+
+/**
+ * Prototype panel, fitted by the cockpit's display-cell authority before board-wide wrapping.
+ *
+ * `undefined` events mean this run's journal describes a DIFFERENT graph, so it funds no claim here.
+ * Folding it — or folding an empty array in its place — would state zero dispatches, reviews and
+ * parks for a run that recorded all three, which is unavailable evidence dressed as an answer. Same
+ * clause the verify claim uses (`verify unavailable`): no claim beats a false zero.
+ */
+const effortPanel = (
+  tasks: readonly Task[],
+  events: readonly JournalEvent[] | undefined,
+  columns: number,
+): string[] => {
+  if (!events) {
+    return [
+      ` ${title("WHERE THE EFFORT WENT")}`,
+      legend(`   dispatch · review · park counts unavailable — ${NOT_COMPARABLE_CLAIM}`),
+    ];
+  }
+  const top = foldTaskEffort(tasks, events).slice(0, 4);
+  const maxTotal = Math.max(1, ...top.map((task) => task.total));
+  const idColumns = Math.max(2, Math.min(16, Math.max(...top.map((task) => cellWidth(task.taskId)))));
+  const rows = top.map((task) => {
+    const counts = `${task.dispatches} dispatch · ${task.reviews} review · ${task.parks} park`;
+    const prefix = `    ${fitCells(task.taskId, idColumns)} `;
+    const barColumns = Math.min(46, Math.max(3,
+      columns - cellWidth(prefix) - 2 - cellWidth(counts),
+    ));
+    const dispatchEnd = Math.round((task.dispatches / maxTotal) * barColumns);
+    const reviewEnd = Math.round(((task.dispatches + task.reviews) / maxTotal) * barColumns);
+    const parkEnd = Math.round((task.total / maxTotal) * barColumns);
+    const stack = ok("█".repeat(dispatchEnd))
+      + warn("█".repeat(Math.max(0, reviewEnd - dispatchEnd)))
+      + fail("█".repeat(Math.max(0, parkEnd - reviewEnd)));
+    return `${prefix}${fitCells(stack, barColumns)}  ${counts}`;
+  });
+
+  return [
+    ` ${title("WHERE THE EFFORT WENT")}`,
+    legend(`   dispatches · review rounds · human parks · top ${top.length} of ${tasks.length} tasks`),
+    "",
+    ...rows,
+    "",
+    `   ${ok("█")} ${dim("dispatch")}  ${warn("█")} ${dim("review round")}  ${fail("█")} ${dim("human park")}`,
+  ];
+};
 
 // VIS-11 (v1.13): a liveness header for renderFrame — last journal event age + whether the recorded
 // daemon pid is still alive. Honest about unknowns: a pre-v1.13 journal with no pid renders "unknown",
@@ -867,6 +1023,15 @@ const renderFrame = (
   // (a recompiled graph's journal must not animate the wrong tasks); with no or stale journal the
   // dep-waiting cells still derive from the effective graph statuses.
   const activity = foldActivity(comparable ? events : [], effective.tasks);
+  // RULING-v189-scope §14c: a card answers BOTH supervisor questions. `foldActivity` names what a
+  // task waits FOR; this names what waits ON it. Read from `effective.tasks` — whose statuses are
+  // the journal's replay, never the compiled graph's — so a dependent the record says is done stops
+  // being named, and a task all of whose dependents are done acquires no entry at all.
+  const dependents = new Map<string, string[]>();
+  for (const task of effective.tasks) {
+    if (task.status === "done") continue;
+    for (const dep of task.deps) dependents.set(dep, [...(dependents.get(dep) ?? []), task.id]);
+  }
   const unicode = visual();
   const divider = unicode ? " · " : " / ";
   // SUP-01: derived by stat() alone, from THIS frame's clock. status stays a reader — nothing here
@@ -931,7 +1096,12 @@ const renderFrame = (
       const chain = gateChain(states, false);
       const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${surfaceTaskBox(st, merged)} ${t.id} `;
       const suffix = `  ${chain}${priorGraph ? ` ${PRIOR_GRAPH_MARKER}` : ""}  ${livePhase ? "running" : surfaceStatusWord(st)}${label}  ${assignCol}${pane ? `  pane ${pane}` : ""}`;
-      return `${prefix}${shortGoal(t.title, Math.max(0, width - prefix.length - suffix.length))}${suffix}`;
+      // The machine row carries the cockpit's own law (see LAYOUT_PRIORITY and the two-line card):
+      // identity is never what a crowded row sheds. `dep-waiting on …` grows with fan-in and alone
+      // can exceed the terminal width, and the pre-floor math paid for it out of the TITLE — 20 of
+      // 41 rows in a live 41-task run named no task at all. These rows already overflow `width`
+      // (a pane name is 60 columns on its own), so the floor costs wrapping, never the graph.
+      return `${prefix}${shortGoal(t.title, Math.max(MACHINE_TITLE_FLOOR, width - prefix.length - suffix.length))}${suffix}`;
     });
     const zone = journalRowsOnly ? `${divider}zone ${localZoneLabel(zoneReference)}` : "";
     const header = runId
@@ -1021,8 +1191,10 @@ const renderFrame = (
   const rows = cells.map((c, i) => {
     const { t, st, merged, failureKind, redTier, states, priorGraph, isStarved, phrase, channel, ctx, livePhase, pane } = c;
     const word = statusWord(c);
+    // The alarm reads the SAME evidence the detail phrase names — a worktree delta the daemon proved
+    // counts, or the card would flag a worker it just called alive one line below (OBS-538 review).
     const staleWorker = livePhase?.phase === "worker"
-      && workerOutputAge(livePhase, now, workerLiveness.get(t.id)) >= 60_000;
+      && workerSilenceMs(livePhase, now, workerLiveness.get(t.id)) >= 60_000;
     const stWord = staleWorker ? warn(word) : merged ? ok(word) : redTier ? fail(word) : st === "failed" || st === "human" ? warn(word) : word;
     // a fail names its gate in words right here — the one moment gate identity is needed on a row
     const f = failedGates(states);
@@ -1038,6 +1210,8 @@ const renderFrame = (
       : `  ${statusRow(taskVerdict(c), taskLabel)}`;
     // activity already names its channel for in-flight attempts — never repeat it
     const chain = gateChain(states, true);
+    // A finished task blocks nobody — the same journal-folded done-ness the map was built on.
+    const blocking = graphTaskStatus(st, t.status) === "done" ? [] : dependents.get(t.id) ?? [];
     const segments: DetailSegment[] = [
       ...(priorGraph ? [{ element: "progressCaption" as const, text: PRIOR_GRAPH_MARKER }] : []),
       ...(phrase
@@ -1048,6 +1222,10 @@ const renderFrame = (
             : [{ element: "secondaryHeader" as const, text: channel }]),
         ]
         : [{ element: "secondaryHeader" as const, text: channel }]),
+      // The waiting phrase's reverse direction, and structure for the same reason: a supervisor
+      // deciding what to unblock needs the names, so it wraps beside the blockers rather than being
+      // shed or folded into a count. A finished task blocks nobody.
+      ...(blocking.length ? [{ element: "journal" as const, text: `blocks ${blocking.join(", ")}` }] : []),
       ...(failureKind && !phrase?.includes(failureKind)
         ? [{ element: "progressCaption" as const, text: failureKind }]
         : []),
@@ -1063,9 +1241,10 @@ const renderFrame = (
     return [line1, line2, ""];
   }).flat();
   if (!nowLine.length) rows.pop(); // cards end blank-separated; drop the dangling one
+  const effort = effortPanel(g.tasks, record && !comparable ? undefined : events, boardColumns);
   return {
     content: boardRows(
-      [header, hr, gatesLegend, supervisionLegend, "", ...rows, ...nowLine],
+      [header, hr, gatesLegend, supervisionLegend, "", ...rows, ...nowLine, "", hr, "", ...effort],
       boardColumns,
     ).join("\n"),
     ...(hotPhase ? { hotPhase } : {}),

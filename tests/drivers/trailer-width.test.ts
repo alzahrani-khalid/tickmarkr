@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parseWorkerResult } from "../../src/adapters/prompt.js";
-import { TRAILER_SAFE_FLOOR_COLS, TRAILER_WIDTH_MARGIN, workerSplitDirection } from "../../src/drivers/herdr.js";
+import { BOARD_TARGET_COLS, boardSplitPlan, TRAILER_SAFE_FLOOR_COLS, TRAILER_WIDTH_MARGIN, workerSplitDirection, type BoardSplitPlan } from "../../src/drivers/herdr.js";
 
 const FIX = join(import.meta.dirname, "../fixtures/trailer-width");
 const MEAS = FIX;
@@ -73,5 +73,36 @@ describe("workerSplitDirection (43-MEASUREMENT.md licensed geometry)", () => {
     expect(TRAILER_WIDTH_MARGIN).toBe(2);
     // terminal 222 → half 111 ≥ 108+2 licenses right
     expect(workerSplitDirection(222, TRAILER_SAFE_FLOOR_COLS, TRAILER_WIDTH_MARGIN)).toBe("right");
+  });
+});
+
+// QUEUE-v194 criterion 1: the board is placed BESIDE the supervising seat with its own width
+// allocated first — the halving floor above governs worker trailers and not this pair (applying it
+// sent a 189-column tab's board below on 2026-08-18, corrected by the operator).
+describe("boardSplitPlan (board width first, beside the supervising seat)", () => {
+  // what the seat's ratio actually leaves the board — the plan's claim has to survive the arithmetic
+  // herdr will do with it, not just be asserted about itself.
+  const boardFromRatio = (callerCols: number, plan: BoardSplitPlan) => callerCols - Math.round(callerCols * (plan.ratio ?? 0));
+
+  test("the board split plan funds the board pane 108 to 112 columns with direction right for a 189-column caller and for a 220-column caller, so a proportional halving whose board width tracks the caller fails", () => {
+    for (const callerCols of [189, 220]) {
+      const plan = boardSplitPlan(callerCols);
+      expect(plan.direction).toBe("right");
+      expect(plan.boardCols).toBeGreaterThanOrEqual(108);
+      expect(plan.boardCols).toBeLessThanOrEqual(112);
+      // halving would fund 94 here and 110 there — the board's width does not track the caller's
+      expect(boardFromRatio(callerCols, plan)).toBe(plan.boardCols);
+      expect(boardFromRatio(callerCols, plan)).toBeGreaterThanOrEqual(108);
+    }
+    expect(BOARD_TARGET_COLS).toBe(110);
+  });
+
+  test("the board split plan directs down for a 140-column caller and for an unmeasurable caller, so a plan that squeezes the board under 108 columns instead of falling back to full width fails", () => {
+    for (const callerCols of [140, null]) {
+      const plan = boardSplitPlan(callerCols);
+      expect(plan.direction).toBe("down");
+      expect(plan.ratio).toBeUndefined(); // full width below the seat, never a squeezed side pane
+      expect(plan.boardCols).toBeNull();
+    }
   });
 });

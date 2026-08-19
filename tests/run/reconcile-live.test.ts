@@ -45,6 +45,7 @@ case "$1 $2" in
   "pane list") ${paneList} ;;
   "pane rename") printf '%s||%s|wT\\n' "$3" "$4" >> '${panesFile}'; echo '{}' ;;
   "pane split") echo '{"result":{"pane":{"pane_id":"w1:p7"}}}' ;;
+  "pane layout") echo '{"result":{"layout":{"area":{"width":220},"panes":[{"pane_id":"wT:pCALLER","rect":{"width":220}}]}}}' ;;
   "tab create") echo '{"result":{"tab":{"tab_id":"w1:tN"},"root_pane":{"pane_id":"w1:p9"}}}' ;;
   "pane close") grep -v "^$3|" '${panesFile}' > '${panesFile}.tmp' 2>/dev/null || :; mv '${panesFile}.tmp' '${panesFile}' 2>/dev/null || :; echo '{}' ;;
   "pane wait-output") exit 0 ;;
@@ -121,8 +122,9 @@ describe("HerdrDriver.reconcile (stubbed binary)", () => {
   test("narrator with a runId names the right-split watch pane canonically (T2 ownership contract)", async () => {
     const { bin, log } = makeReconcileStub([]);
     const d = new HerdrDriver(bin);
-    await d.narrator("/tmp", "tickmarkr status --watch", RUN);
-    expect(log()).toContain("pane split wT:pCALLER --direction right --no-focus");
+    await d.narrator("/tmp", `tickmarkr status --watch ${RUN}`, RUN);
+    expect(log()).toContain("pane layout --pane wT:pCALLER"); // board width is measured, not assumed
+    expect(log()).toContain("pane split wT:pCALLER --direction right --ratio 0.5 --no-focus");
     expect(log()).toContain(`pane rename w1:p7 ${owned("watch", "run", 0, RUN)}`);
   });
 });
@@ -556,7 +558,16 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
           T2: [{ shell: "true", result: { ok: true, summary: "other" } }],
         },
       },
-      "visibility:\n  worker: interactive\n  keepPanes: run\ntaskTimeoutMinutes: 0.2\n" +
+      // OBS-546: no taskTimeoutMinutes here. This test asserts pane REAPING, and it inherited a
+      // 0.2-minute value that the daemon turns into a 12s stall window (daemon.ts stallWindowMs).
+      // The scripted workers below do real git commits and run the real gate battery, so on a box
+      // that is busy — a live run, another suite — 12s expires and a demonstrably-active worker is
+      // declared stalled: `s.done` comes back one task short and the failure is charged to whatever
+      // diff happens to be under test (measured on runs 1560 and 1591, the second a DOCS task that
+      // cannot reach pane sweeping). A wall-clock deadline meeting a loaded box, billed as a content
+      // failure — OBS-534's class one layer down, OBS-54's one layer up. Timeout behaviour has its
+      // own tests; this one must not depend on how loaded the machine is.
+      "visibility:\n  worker: interactive\n  keepPanes: run\n" +
       "routing:\n  map:\n    implement:\n      pin: { via: seedfake, model: fake-1 }\n    chore:\n      pin: { via: fake, model: fake-1 }\n",
     );
     const { driver, live, sweeps, closedNames } = makeSeedDriver();

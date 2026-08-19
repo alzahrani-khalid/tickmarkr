@@ -2,6 +2,30 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.96 — dispatch truth
+
+This release is about the gap between what the harness claims and what it measured. `beatSupervision` and `SUPERVISION_BEAT_MS` had shipped with no caller, so `status` printed `orchestrator ARMED / overseer ABSENT / watch ABSENT` through an entire trial run while a real overseer worked it — two thirds of a supervision claim were constants dressed as measurements. `tickmarkr beat <tier>` now calls the shipped seam, the overseer skill's watcher loop calls the verb, and a tier's row renders armed, stale past the staleness ceiling of six beat intervals, or stood down — with the staleness boundary read off the shipped constant rather than asserted by the spec that described it.
+
+`tickmarkr verify` stops paying for its refusals. It had refused the same candidate twice — a dirty worktree, then a missing authed review channel — each time *after* a full ~10-minute baseline capture (602s, then 590s), because `captureBaseline` ran before either precondition was evaluated. Every precondition knowable from cheap local state is now validated in one phase ahead of the capture, with the existing messages and fail-closed semantics unchanged, and the cleanliness check enumerates every offending path (including untracked ones, which `git status --porcelain` hides when the operator's config sets `status.showUntrackedFiles=no`).
+
+Infra classification now reads execution rather than prose: whether a failure is infrastructure is decided by an oracle's own execution evidence, never by a judge's description of it. The gsd compiler refuses unreachable context references exactly as the native compiler already did — a parity gap, not a missing mechanism — and the authoring law now states, per driver, which side of a run inherits the operator's environment, so a spec author can no longer discover the asymmetry from a failing worker.
+
+One task was descoped in place rather than shipped: an `envFile` credential seam came back with a secret-disclosure regression — values, credentials included, interpolated into a multiplexer's `pane run` argv and therefore into the pane transcript — plus a hand-rolled dotenv parser that silently corrupted values it could not parse. A credential channel is a design with a threat model, not a config key, and it does not get designed at the end of a milestone. The authoring law that the original incident actually needed shipped instead, for the price of a paragraph.
+
+Known and filed, not fixed here: the dead-channel fast-kill concludes without consulting the CPU accountant the same loop already builds (a worker was declared dead while its own process tree held 219s of CPU running the suite the harness told it to budget), an undeliverable liveness nudge lifts that kill's hold, a signal-killed acceptance oracle is still reported as a content failure, and a merge still does not make a task done. No breaking changes.
+
+## v1.95 — verifier parity
+
+The verifier could not verify this repository, and had not been able to for four consecutive runs. `verifyIntegrationTip` ran the integration tip's battery with no ceiling argument — inheriting the flat 600s shell default — while holding the very baseline whose entry carried the derived `ceilingMs` of 1,800,021ms, and it never read the ceiling-kill result that `compareToBaseline` had always read. So every per-task gate passed while the tip was SIGKILLed at 601.7s, 601.6s, 601.9s and 601.7s, each time fingerprinted as `<unrecognized failure output>`. The suite genuinely needs about 712s under load: the flat ceiling was mathematically incapable of passing, and the fix was proven by the run it repaired — the same commands on the same machine ran 712.7s to completion with the tip verified, then verified twice more.
+
+A ceiling-killed baseline capture is now recorded as infrastructure rather than a red, keeping its duration so the derived ceiling still scales with the machine it measured, and an infra baseline forgives nothing — a suite that never finished cannot license a later failure. A third task was descoped on measured evidence: its refusal classifier called five of eight realistic judge refusals infrastructure, including an evaluated product defect, which would have taught the run to forgive real defects. No breaking changes.
+
+## v1.94 — the approved board
+
+This approved-board release finishes the tasks-redesign port at the shipped surface instead of replacing the operator-ratified two-line card with its prototype. The WHERE THE EFFORT WENT panel now closes the board with the four tasks carrying the most combined dispatch, review, and park work, folded from typed journal events and fitted through the cockpit's display-cell width authority. Task cards answer dependency truth in both directions: the blockers a waiting task needs and the unfinished dependents this task will unblock, with completed dependents falling away and the existing detail priority deciding what narrower frames shed.
+
+The watch pane is self-placing and run-bound. The daemon measures the supervising seat, funds the board's clean width first and places it beside that seat when the terminal can carry both, falling back to a full-width pane below rather than squeezing it; the command pins the board to the run id that spawned it instead of following whichever journal is newest. The shipped pane is now the surface the overseer looks for, so no hand-placed or hand-rolled overlay stands in for the product. No breaking changes.
+
 ## v1.93 — steering truth
 
 A skills-only release, and the first one authored by watching the supervision stack fail in production twice in one night. Every law in it was paid for by a measured incident in a live two-tier milestone run, then shipped into the trees the package actually carries — closing the gap the release is named for: lessons recorded in operator memory that never reached the shipped skill, re-earned at full price by every fresh hierarchy.

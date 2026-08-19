@@ -47,6 +47,14 @@ export function parseCriteria(text: string): AcceptanceItem[] {
 export const HUMAN_CHANNEL: BillingChannel = { adapter: "human", vendor: "human", model: "human", channel: "sub", tier: "frontier" };
 export const HUMAN_AUTHOR: Assignment = { adapter: "human", model: "human", channel: "sub", tier: "frontier" };
 
+// The battery's own dirty-worktree refusal, mirrored from run-gates.ts:220-232 — that check lives in
+// a closure this command cannot reach, and verify may not reshape it. run-gates stays the authority:
+// it re-checks at round entry and after every gate command, so a copy that ever drifted could only
+// refuse EARLY with a stale sentence — never let a dirty tree through.
+const DIRTY_WHY = `refusing to gate a dirty worktree: the shell gates run against the working tree while `
+  + `evidence, scope and the merge read commits, so these uncommitted changes would be gated `
+  + `and never merged (and the committed diff would never be run)`;
+
 // GATE-FIX-4 defect 1 (false-RED on macOS): os.tmpdir() returns /var/folders/…, a symlink into
 // /private/var — so a baseline captured under the repo path and a head battery run under the tmp
 // path disagree on every path-bearing fingerprint, and verify reds a green diff. graph.ts's
@@ -114,6 +122,51 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
 
   const commands = detectGateCommands(cwd, cfg);
 
+  // PRECONDITIONS (OBS-541) — every check that can refuse this candidate, evaluated together and
+  // BEFORE the baseline capture below. Both read cheap local state (one `git status`, the doctor
+  // cache), and both used to be read AFTER the capture: the dirty tree by runGates' own round-entry
+  // refusal, the review seat by the resolution that sat under it. That cost one full capture per
+  // refusal — measured at 602s and 590s on two refusals of the same candidate — to learn something
+  // knowable in 50ms. Messages, exit taxonomy and fail-closed semantics are unchanged; only the
+  // order is. Anything else that can refuse before a gate runs belongs in this phase, above capture.
+  // `--untracked-files=all` is load-bearing twice over: it overrides a repo/user
+  // `status.showUntrackedFiles=no` (under which untracked work is INVISIBLE and a dirty tree would
+  // capture and gate GREEN), and it enumerates nested files individually instead of collapsing them
+  // to a bare `?? dir/`, so the refusal names every offending path. The `.tickmarkr-*` exemption is
+  // unaffected — the harness's droppings are root-level files, never directories.
+  const status = await shGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=all", cwd);
+  const dirt = status.code !== 0
+    ? `git status failed (exit ${status.code}) — the worktree cannot be proven clean`
+    : status.stdout.split("\n").map((l) => l.trimEnd())
+      .filter((l) => l.trim() && !/^.. \.tickmarkr-[^/]*$/.test(l)).join("\n");
+  if (dirt) throw new Error(`${DIRTY_WHY}:\n${dirt}`);
+
+  // LLM seats only when a semantic gate will run.
+  let channels: BillingChannel[] = [];
+  let judgeChannels: BillingChannel[] | undefined;
+  let author: Assignment = HUMAN_AUTHOR;
+  const adapters = allAdapters();
+  if (wantAcceptance || wantReview) {
+    const health = readDoctor(cwd) ?? (await probeAll(adapters));
+    const pools = rolePools(cfg, adapters, health);
+    judgeChannels = pools.judge;
+    channels = pools.review;
+    if (values.author && values.author !== "human") {
+      const [adapter, ...rest] = values.author.split(":");
+      const model = rest.join(":");
+      const c = channels.find((ch) => ch.adapter === adapter && ch.model === model);
+      if (!c) {
+        throw new Error(`--author ${values.author} does not name a discoverable review channel — one of: ${channels.map(channelKey).join(", ") || "(none)"}`);
+      }
+      author = { adapter: c.adapter, model: c.model, channel: c.channel, tier: c.tier };
+    } else {
+      channels = [...channels, HUMAN_CHANNEL];
+    }
+    if (wantReview && !channels.some((c) => c.vendor !== "human")) {
+      throw new Error("review gate needs at least one authed LLM channel (run `tickmarkr doctor`) — or pass --no-review");
+    }
+  }
+
   // Baseline: --baseline file > cached capture for this merge-base > fresh capture on a detached
   // temp worktree of the merge-base (so pre-existing failures on base are forgiven, exactly as a run).
   // ALL verify state (cache, base worktree, artifacts) lives OUTSIDE the repo: verify gates the repo
@@ -139,32 +192,6 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
       writeFileSync(cachePath, JSON.stringify(baseline, null, 2));
     } finally {
       await removeWorktree(cwd, baseDir);
-    }
-  }
-
-  // LLM seats only when a semantic gate will run.
-  let channels: BillingChannel[] = [];
-  let judgeChannels: BillingChannel[] | undefined;
-  let author: Assignment = HUMAN_AUTHOR;
-  const adapters = allAdapters();
-  if (wantAcceptance || wantReview) {
-    const health = readDoctor(cwd) ?? (await probeAll(adapters));
-    const pools = rolePools(cfg, adapters, health);
-    judgeChannels = pools.judge;
-    channels = pools.review;
-    if (values.author && values.author !== "human") {
-      const [adapter, ...rest] = values.author.split(":");
-      const model = rest.join(":");
-      const c = channels.find((ch) => ch.adapter === adapter && ch.model === model);
-      if (!c) {
-        throw new Error(`--author ${values.author} does not name a discoverable review channel — one of: ${channels.map(channelKey).join(", ") || "(none)"}`);
-      }
-      author = { adapter: c.adapter, model: c.model, channel: c.channel, tier: c.tier };
-    } else {
-      channels = [...channels, HUMAN_CHANNEL];
-    }
-    if (wantReview && !channels.some((c) => c.vendor !== "human")) {
-      throw new Error("review gate needs at least one authed LLM channel (run `tickmarkr doctor`) — or pass --no-review");
     }
   }
 

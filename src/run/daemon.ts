@@ -191,6 +191,12 @@ export function formatSummary(s: RunSummary): string {
   return `done: ${s.done.length}, failed: ${s.failed.length}, human: ${s.human.length}, blocked: ${s.blocked.length}, pending: ${s.pending.length}\nintegration branch: ${s.branch}${tip}${outstanding}`;
 }
 
+/** The narrator's command, bound to THIS run. `status` takes exactly one positional and it is the
+ *  run id (cli/commands/status.ts positionalRunId), so naming it here is what stops the board from
+ *  following the newest journal in a repo that already carries a second, newer run — a board showing
+ *  the wrong run is a recorded incident (skills/tickmarkr-overseer/SKILL.md). */
+export const watchCommand = (runId: string): string => `tickmarkr status --watch ${runId}`;
+
 const MAX_ATTEMPTS = 10; // ponytail: hard cap so a pathological ladder can never loop forever
 
 // v1.85 T3 (retry economics): two repairs per engagement, then the fresh ladder. A repair re-uses the
@@ -1226,13 +1232,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // T6: open the narrator AFTER run-start/run-resume is journaled so the watch surface has a run to
   // show. driver.narrator is undefined on subprocess → no-op (subprocess spawns nothing). Swallowed:
   // a failed-to-open or later-dead watch pane never affects the run.
-  // OBS-103: hold the returned slot — narrator() adopts an already-open watch by its owned name
-  // (a prior daemon instance's, after a stop→resume cycle), so the run-end sweep below can retire
-  // it regardless of which instance split the pane.
+  // OBS-103: hold the returned slot — narrator() returns the run's board under its canonical owned
+  // name whichever way it got there (the herdr driver retires a survivor it finds and re-splits, so
+  // the live command is run-bound), and the run-end sweep below retires it by that name regardless
+  // of which daemon instance split the pane.
   const watchName = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
   let watchSlot: Slot | undefined;
   try {
-    watchSlot = await driver.narrator?.(repoRoot, "tickmarkr status --watch", runId);
+    watchSlot = await driver.narrator?.(repoRoot, watchCommand(runId), runId);
   } catch {
     /* cosmetic-only — the run proceeds without a live surface */
   }
@@ -1417,6 +1424,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // be able to tell "the suite found a defect" from "the runner never ran", and the merge
         // predicate's reason for refusing has to be legible in the ledger it refused from.
         ...(g.meta?.infra === true ? { infra: true } : {}),
+        // OBS-540: preserve terminal-vs-retryable infra exactly. normalizeGateOutcome deliberately
+        // defaults a legacy infra row to retryable, so dropping an explicit false here reverses the
+        // oracle's recorded verdict when any journal-backed reader reconstructs it.
+        ...(g.meta?.infra === true && typeof g.meta.retryable === "boolean"
+          ? { retryable: g.meta.retryable }
+          : {}),
         // R3 (OBS-186): a declined review is journal truth, not an absence. `skipped: true` alone
         // says a gate did not run; these say WHICH policy declined it and WHY, so a reader of the
         // ledger never has to infer participation from a details string. The green-skip branch that
@@ -2972,6 +2985,28 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           return;
         }
         break gateLoop;
+      }
+
+      // OBS-540: infra is a fail-closed NON-verdict, not quality degradation. Park with the blocker
+      // already journaled by onGate, before gateFails and before any ladder selection can fund an
+      // identical retry in the same environment. Parsed judge refusals never carry infra and keep
+      // flowing through the chargeable quality path below.
+      const infraFailure = results.find((g) => gateFailed(g) && g.meta?.infra === true);
+      if (infraFailure) {
+        await park(
+          t,
+          `${infraFailure.gate}: ${infraFailure.details}`,
+          "infra",
+          assignment,
+          attempt + 1,
+          startMs,
+          gateFails,
+          consults,
+          tokens,
+          metered,
+          retryMode,
+        );
+        return;
       }
 
       gateFails++; // this attempt's gates failed — the one place quality degradation is verified (never inferred from attempts)
