@@ -137,6 +137,8 @@ const sgr = (code: string) => (s: string) => visual() ? `\x1b[${code}m${s}${R}` 
 
 /** Brand green (ramp anchor 41) — the tickmark hue; also the ok/pass/authed verdict color. */
 export const brand = sgr(`38;5;${BRAND_RAMP[2]}`);
+/** Compact product chip — black ink on the terminal theme's ANSI green. */
+export const brandChip = sgr("30;42");
 /** Ok verdicts (pass/authed/green) render in the brand green ramp — same hue as the tickmark. */
 export const ok = brand;
 /** Fail verdicts (unauthed/red) — red, always paired with the ✗ shape. */
@@ -148,7 +150,7 @@ export const dim = sgr("2");
 /** Emphasis (titles, selection, the product name) — bold. */
 export const bold = sgr("1");
 /** Every semantic color token, for sweeps: each is TTY-gated and NO_COLOR-aware. */
-export const TOKENS = { brand, ok, fail, warn, dim, bold } as const;
+export const TOKENS = { brand, brandChip, ok, fail, warn, dim, bold } as const;
 
 /**
  * The glyph vocabulary — plain characters only; color layers on via tokens so

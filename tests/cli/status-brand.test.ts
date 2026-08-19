@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { BANNER } from "../../src/brand.js";
+import { brandChip } from "../../src/brand.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -16,6 +16,7 @@ import { cellWidth } from "../../src/tui/cockpit/width.js";
 const widthCalls = vi.hoisted(() => ({
   measured: [] as string[],
   wrapped: [] as string[],
+  fitted: [] as string[],
   // The NEGATIVE CONTROL, armed per render: the shipped renderer draws through a local UTF-16
   // code-unit width model — the measure this task deletes — instead of the cockpit authority. It
   // bills ANSI bytes and combining marks cells they never draw and under-bills a wide cluster.
@@ -48,8 +49,10 @@ vi.mock("../../src/tui/cockpit/width.js", async (importOriginal) => {
         ? widthCalls.localWrap(text, maxCells)
         : actual.wrapCells(text, maxCells, options);
     },
-    fitCells: (text: string, cells: number) =>
-      widthCalls.codeUnits ? widthCalls.localFit(text, cells) : actual.fitCells(text, cells),
+    fitCells: (text: string, cells: number) => {
+      widthCalls.fitted.push(text);
+      return widthCalls.codeUnits ? widthCalls.localFit(text, cells) : actual.fitCells(text, cells);
+    },
   };
 });
 const layoutOverride = vi.hoisted(() => ({
@@ -163,19 +166,16 @@ const boardRepo = (): string => {
 };
 
 const strip = (text: string): string => text.replace(/\x1b\[[0-9;]*m/gu, "");
-/** Wrapping inserts whitespace and nothing else, so a squashed frame reassembles a wrapped run. */
-const squash = (frame: string): string => strip(frame).replace(/\s+/gu, "");
-// The card's IDENTITY row: the id in its own column, right after the row's verdict box or glyph.
-// A card also names the dependents waiting on it, so a bare ` id ` search answers a blocker's
-// machinery line for the task it blocks — a line with no status word to measure an offset against.
-const cardHead = (frame: string, taskId: string): string =>
-  frame.split("\n").find((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(strip(line)))!;
-/** Where a card's status word starts — the same offset in cells, a different one in code units. */
-const statusOffset = (line: string, word: string): { cells: number; codeUnits: number } => {
-  const bare = strip(line);
-  const prefix = bare.slice(0, bare.lastIndexOf(word));
-  return { cells: cellWidth(prefix), codeUnits: prefix.length };
+const taskBlock = (frame: string, taskId: string): string => {
+  const lines = strip(frame).split("\n");
+  const start = lines.findIndex((line) => new RegExp(`^ {4}${taskId}(?:\\s|$)`).test(line));
+  if (start < 0) return "";
+  let end = start + 1;
+  while (end < lines.length && !/^ {4}T/u.test(lines[end]!)) end += 1;
+  return lines.slice(start, end).join("\n");
 };
+const taskHead = (frame: string, taskId: string): string =>
+  frame.split("\n").find((line) => new RegExp(`^ {4}(?:\\x1b\\[[\\d;]*m)*${taskId}(?:\\s|$)`).test(line))!;
 
 /** One bounded watch frame at a named terminal width, with the cockpit's own writes swallowed. */
 const boardFrame = async (repo: string, columns: number): Promise<string> => {
@@ -246,131 +246,53 @@ describe("T3 watch cockpit brand restyle", () => {
     return writes.join("");
   };
 
-  test("the watch frame renders the run title with emphasis on a tty", async () => {
+  test("the watch frame uses the approved themed-green chip and a dominant run id without the old four-row banner", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
     seed(repo);
     await withStdout(true, async () => {
       const out = await watchFrame(repo);
-      expect(out).toContain(BANNER); // banner plus dominant run title
-      expect(out).toContain("\x1b[1mrun run-brand\x1b[0m"); // title() emphasis on the run id
+      expect(out).toContain(brandChip(" tickmarkr "));
+      expect(out).toContain("\x1b[1mrun-brand\x1b[0m");
+      expect(out).not.toContain("spec in, verified work out.");
     });
   });
 
-  test("a done task row renders the ok glyph and a failed task row renders the fail glyph on a tty", async () => {
+  test("the approved table colors the done task id green and the failed task id red", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
     seed(repo);
     await withStdout(true, async () => {
       const out = await status([], repo);
-      const row = (id: string) => out.split("\n").find((line) => new RegExp(`\\b${id}\\b`).test(line))!;
-      expect(row("T1")).toContain("\x1b[38;5;41m✓\x1b[0m T1"); // ok() brand-green tickmark leads the done row
-      expect(row("T2")).toContain("\x1b[31m✗\x1b[0m T2"); // fail() red cross leads the failed row
+      expect(taskHead(out, "T1")).toContain("\x1b[38;5;41m");
+      expect(taskHead(out, "T2")).toContain("\x1b[31m");
     });
   });
 
-  test("status --watch renders one journal at 40 and 220 columns for a two-character task id and a schema-maximum 64-character ASCII id whose title carries wide and combining clusters, measuring every rendered line with the shared cockpit width authority rather than any local helper, and requiring structural dependency rows, so code-unit width, short-id fixtures or a helper the shipped command never calls all fail", async () => {
-    expect(BOARD_LONG_ID).toHaveLength(64); // the schema's maximum task id, whole
-    expect(cellWidth(BOARD_WIDE_TITLE)).not.toBe(BOARD_WIDE_TITLE.length); // the two models disagree
+  test("the shipped task table keeps its dependency column and every task identity at 40, 110 and 220 columns through the cockpit width authority", async () => {
+    expect(BOARD_LONG_ID).toHaveLength(64);
+    expect(cellWidth(BOARD_WIDE_TITLE)).not.toBe(BOARD_WIDE_TITLE.length);
     const repo = boardRepo();
 
-    for (const columns of [40, 220]) {
+    for (const columns of [40, 110, 220]) {
       widthCalls.measured.length = 0;
+      widthCalls.wrapped.length = 0;
+      widthCalls.fitted.length = 0;
       const frame = await boardFrame(repo, columns);
-      const measuredByRenderer = [...widthCalls.measured];
+      const plain = strip(frame);
 
-      // Every drawn line, measured in display cells by the shared authority — the cells a terminal
-      // actually advances, not bytes and not UTF-16 code units.
       for (const line of frame.split("\n")) {
         expect(cellWidth(line), `${columns} cols: ${strip(line)}`).toBeLessThanOrEqual(columns);
       }
-      // The measurement is the SHIPPED renderer's: it handed this title and this id to the
-      // authority itself. A local helper, or one the command never calls, records nothing.
-      expect(measuredByRenderer).toContain(BOARD_WIDE_TITLE);
-      expect(measuredByRenderer).toContain(BOARD_LONG_ID);
-      // Blocking dependencies are structural: every blocker is named at both widths, wrapped
-      // across rows when it must be, and never reduced to a `+N` count.
-      expect(squash(frame)).toContain(`dep-waitingonT9,${BOARD_LONG_ID}`);
+      expect(plain).toContain("deps");
+      expect(plain).toContain("WHERE THE EFFORT WENT");
+      const waiter = taskBlock(frame, "T3").replace(/\s+/gu, "");
+      expect(waiter).toContain("T9");
+      if (columns >= 110) expect(widthCalls.fitted).toContain(BOARD_WIDE_TITLE);
+      expect(widthCalls.wrapped.some((text) => text.includes(BOARD_LONG_ID))).toBe(true);
     }
 
-    // Column alignment is a cell fact. The wide/combining row lands its status word on the same
-    // cell as the ASCII rows and on a different code-unit offset — so a code-unit width model, or
-    // a fixture whose ids are all short enough to hide the id column, fails right here.
-    const wide = await boardFrame(repo, 220);
-    const heads: Array<[string, string]> = [["T9", "running"], [BOARD_LONG_ID, "running"], ["T3", "pending"]];
-    const offsets = heads.map(([id, word]) => statusOffset(cardHead(wide, id), word));
-    expect(new Set(offsets.map(({ cells }) => cells)).size).toBe(1);
-    expect(new Set(offsets.map(({ codeUnits }) => codeUnits)).size).toBeGreaterThan(1);
-  });
-
-  test("instrument the production status renderer at 40 and 220 columns and record calls into the exported cockpit width and layout authorities for every wide/combining line. Compare with a control using local code-unit width so copied constants, unused imports or local helpers produce a different frame", async () => {
-    const repo = boardRepo();
-    const frames = new Map<number, string>();
-    const controls = new Map<number, string>();
-    /** Real display cells of a frame's widest drawn line — measured by the authority, never bytes. */
-    const widest = (text: string): number =>
-      Math.max(...text.split("\n").map((line) => cellWidth(line)));
-
-    for (const columns of [40, 220]) {
-      widthCalls.measured.length = 0;
-      widthCalls.wrapped.length = 0;
-      const frame = await boardFrame(repo, columns);
-      frames.set(columns, frame);
-      const measured = [...widthCalls.measured];
-      const wrapped = [...widthCalls.wrapped];
-
-      // Recorded calls into the width authority for the wide/combining row and for the row whose
-      // dependencies are named: measured for its columns, then wrapped for its rows.
-      expect(measured).toContain(BOARD_WIDE_TITLE);
-      expect(wrapped.some((line) => line.includes(BOARD_LONG_ID))).toBe(true);
-      expect(wrapped.some((line) => line.includes("dep-waiting on T9"))).toBe(true);
-
-      // THE CONTROL FRAME: the same journal through the same shipped command, with a local
-      // code-unit width model armed in place of the authority — the hand-rolled `vw`/`pad`/`fit`
-      // this task refuses to carry. It draws a DIFFERENT frame at this width, in bytes and in
-      // shape: a copied constant, an unused import or a local helper cannot produce the board
-      // above.
-      const control = await controlFrame(repo, columns);
-      controls.set(columns, control);
-      expect(control, `${columns} cols`).not.toBe(frame);
-      expect(control.split("\n").length, `${columns} cols rows`).not.toBe(frame.split("\n").length);
-      // Different by being WRONG: the code-unit model bills every ANSI byte and every combining
-      // mark cells they never draw and under-bills wide clusters, so its board occupies a
-      // different number of REAL cells than the one the authority planned — while production's
-      // widest line still fits the columns it was given.
-      expect(widest(control), `${columns} cols control`).not.toBe(widest(frame));
-      expect(widest(frame), `${columns} cols production`).toBeLessThanOrEqual(columns);
-    }
-
-    // At the floor — the width where the model's error has nowhere to hide — the control's
-    // under-billed wide clusters overrun the terminal the frame was asked to fit; at 220 the same
-    // model instead wraps a line the authority knows fits, since zero-cell controls cost it bytes.
-    expect(widest(controls.get(40)!)).toBeGreaterThan(40);
-    expect(widest(controls.get(220)!)).toBeLessThan(widest(frames.get(220)!));
-
-    // The column floor is READ from the layout authority, never copied: moving it redraws the
-    // 40-column board at the floor the authority now states.
-    layoutOverride.columnFloor = 64;
-    const floored = await boardFrame(repo, 40);
-    layoutOverride.columnFloor = undefined;
-    expect(floored).not.toBe(frames.get(40));
-    expect(Math.max(...floored.split("\n").map(cellWidth))).toBeGreaterThan(40);
-    expect(Math.max(...frames.get(40)!.split("\n").map(cellWidth))).toBeLessThanOrEqual(40);
-
-    // The shed order is the layout authority's too. Lifting the context tile above the journal
-    // keeps it on a 40-column row that surrendered it before — and the dependency row, which sits
-    // above the shed tail either way, is named in full in both frames.
-    layoutOverride.priority = [
-      "keybar", "statusStrip", "primaryHeader", "progressBar",
-      "statTiles", "secondaryHeader", "journal", "progressCaption",
-    ];
-    const reordered = await boardFrame(repo, 40);
-    layoutOverride.priority = undefined;
-    expect(reordered).not.toBe(frames.get(40));
-    expect(squash(reordered)).toContain("ctx12345");
-    expect(squash(frames.get(40)!)).not.toContain("ctx12345");
-    for (const frame of [reordered, frames.get(40)!]) {
-      expect(squash(frame)).toContain(`dep-waitingonT9,${BOARD_LONG_ID}`);
-      for (const line of frame.split("\n")) expect(cellWidth(line)).toBeLessThanOrEqual(40);
-    }
+    // The control arms the exact deleted failure mode: local UTF-16 clipping on the same production
+    // path. Wide/combining data must produce different bytes from the grapheme-aware renderer.
+    expect(await controlFrame(repo, 110)).not.toBe(await boardFrame(repo, 110));
   });
 
   test("the watch footer renders as a single dim legend line on a tty", async () => {

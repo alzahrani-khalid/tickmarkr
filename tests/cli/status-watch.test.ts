@@ -113,17 +113,24 @@ const clockInZone = (iso: string, timeZone: string): string =>
     hourCycle: "h23",
   }).format(new Date(iso));
 
-// A card's IDENTITY row: the id in its own column, right after the row's verdict glyph. Since
-// v1.94 a card also names OTHER tasks — the dependents waiting on it — in its line-2 detail, so a
-// bare id search would answer a blocker's machinery line for the task it blocks.
-const row = (out: string, taskId: string) =>
-  out.split("\n").find((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(line))!;
-// v1.67: the TTY frame renders each task as a two-line card — line 1 identity+verdict, line 2
-// gate chain + machinery. card() joins both lines; row() still fences what belongs on line 1.
+// The approved table starts each task at column four. Continuation rows keep that id column blank,
+// so a task block runs until the next row whose first cell is populated.
+const taskRowIndex = (out: string, taskId: string): number =>
+  out.split("\n").findIndex((line) => {
+    const plain = line.replace(/\x1b\[[\d;]*m/g, "");
+    return new RegExp(`^ {4}${taskId}(?:\\s|$)`).test(plain)
+      || new RegExp(`^\\s+(?:\\[.\\]|[|/\\\\-])\\s+${taskId}\\b`).test(plain);
+  });
+const row = (out: string, taskId: string) => out.split("\n")[taskRowIndex(out, taskId)]!;
 const card = (out: string, taskId: string) => {
   const lines = out.split("\n");
-  const i = lines.findIndex((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(line));
-  return `${lines[i]}\n${lines[i + 1] ?? ""}`;
+  const start = taskRowIndex(out, taskId);
+  if (start < 0) return "";
+  const plainStart = lines[start]!.replace(/\x1b\[[\d;]*m/g, "");
+  if (!/^ {4}T\d+\b/u.test(plainStart)) return plainStart;
+  let end = start + 1;
+  while (end < lines.length && !/^ {4}T\d+\b/u.test(lines[end]!.replace(/\x1b\[[\d;]*m/g, ""))) end += 1;
+  return lines.slice(start, end).join(" ").replace(/\x1b\[[\d;]*m/g, "").replace(/\s+/gu, " ");
 };
 // the v1.34 ledger frame colorizes chips and task boxes — strip ANSI to fence glyphs/order, not styling
 const strip = (s: string) => s.replace(/\x1b\[[\d;]*m/g, "");
@@ -344,10 +351,10 @@ describe("status checklist rendering", () => {
     expect(row(mergedMachine, "T1")).toContain("[x] T1");
 
     await withTty(async () => {
-      const unmergedTty = strip(await status(["--watch"], unmergedRepo, { iterations: 1 }));
-      const mergedTty = strip(await status(["--watch"], mergedRepo, { iterations: 1 }));
-      expect(row(unmergedTty, "T1")).not.toContain("✓");
-      expect(row(mergedTty, "T1")).toContain("✓");
+      const unmergedTty = await status(["--watch"], unmergedRepo, { iterations: 1 });
+      const mergedTty = await status(["--watch"], mergedRepo, { iterations: 1 });
+      expect(row(unmergedTty, "T1")).not.toContain("\x1b[38;5;41mT1");
+      expect(row(mergedTty, "T1")).toContain("\x1b[38;5;41mT1");
     });
   });
 
@@ -467,9 +474,9 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       const out = await status([], repo);
       expect(strip(card(out, "T2"))).toMatch(/✓ ✗ ○ ○ ○ - -/);
-      expect(strip(row(out, "T2"))).toContain("pending"); // data plain — no off-palette status color
+      expect(card(out, "T2")).toContain("gate lint running");
       expect(card(out, "T2")).not.toContain("\x1b[36m");
-      expect(card(out, "T2").match(/fake:fake-2/g)).toHaveLength(1); // channel once per card, never repeated
+      expect(card(out, "T2").match(/fake:fake-/g)).toHaveLength(1); // clipped channel column, still rendered once
     });
   });
 
@@ -489,13 +496,13 @@ describe("status checklist rendering", () => {
       await withTty(async () => {
         const out = await status([], repo);
         expect(out).toContain("1/3 done");
-        expect(strip(row(out, "T1"))).toContain("✓ T1 done");
-        expect(strip(row(out, "T2"))).toContain("- T2 mixed");
-        // machinery lives on the card's second line, never crowding the title on line 1
-        expect(strip(card(out, "T2"))).toContain("attempt 1 in flight on fake:fake-2 since 08:00:00");
-        expect(strip(row(out, "T2"))).not.toContain("attempt 1 in flight");
-        expect(strip(row(out, "T3"))).toContain("- T3 waiting");
-        expect(card(out, "T3")).toContain("dep-waiting on T2"); // the unmet dep is named (OBS-104)
+        expect(strip(row(out, "T1"))).toContain("T1");
+        expect(strip(row(out, "T1"))).toContain("done");
+        expect(strip(row(out, "T2"))).toContain("T2");
+        expect(strip(row(out, "T2"))).toContain("mixed");
+        expect(card(out, "T2")).toContain("attempt 1 in flight on fake:fake-2 since 08:00:00");
+        expect(strip(row(out, "T3"))).toContain("T3");
+        expect(card(out, "T3")).toContain("dep-waiting on T2");
       });
     } finally {
       if (columns) Object.defineProperty(process.stdout, "columns", columns);
@@ -558,8 +565,8 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const plain = strip(await status([], repo));
-      expect(plain.split("gates: build · test · lint · evidence · scope · acceptance · review")).toHaveLength(2); // exactly once
-      expect(plain).not.toContain("B build"); // letter keys are gone from the TTY legend
+      expect(plain.split("gates   bu build  te test  li lint  ev evidence  sc scope  ac acceptance  re review")).toHaveLength(2);
+      expect(plain).not.toContain("B build");
     });
   });
 
@@ -573,8 +580,8 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T2"))).toContain("failed · test");
-      expect(strip(row(out, "T1"))).not.toContain("done ·"); // healthy rows carry no gate words
+      expect(card(out, "T2")).toContain("failed · test");
+      expect(card(out, "T1")).not.toContain("failed ·");
     });
   });
 
@@ -587,9 +594,9 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      // v1.67 cards: the verdict line carries the approval hint; the park kind is line-2 machinery
-      expect(strip(row(out, "T1"))).toContain("parked · awaiting approval");
-      expect(strip(card(out, "T1"))).toContain("parked (human-gate)");
+      expect(card(out, "T1")).toContain("parked");
+      expect(card(out, "T1")).toContain("awaiting approval");
+      expect(card(out, "T1")).toContain("parked (human-gate)");
     });
   });
 
@@ -602,8 +609,8 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T2"))).toContain("! T2");
-      expect(strip(row(out, "T2"))).not.toMatch(/✗|failed/);
+      expect(card(out, "T2")).toContain("warn · infra");
+      expect(card(out, "T2")).not.toContain("failed");
       expect(row(out, "T2")).not.toContain("\x1b[31m");
     });
   });
@@ -617,8 +624,8 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T2"))).toContain("✗ T2");
-      expect(strip(row(out, "T2"))).toContain("failed");
+      expect(card(out, "T2")).toContain("failed");
+      expect(card(out, "T2")).toContain("parked (ladder-exhausted)");
       expect(row(out, "T2")).toContain("\x1b[31m");
     });
   });
@@ -635,14 +642,13 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       const out = await status([], repo);
       for (const id of ["T2", "T3"]) {
-        expect(strip(row(out, id))).toContain(`✗ ${id}`);
-        expect(strip(row(out, id))).toContain("failed");
+        expect(card(out, id)).toContain("failed");
         expect(row(out, id)).toContain("\x1b[31m");
       }
     });
   });
 
-  test("test: the two-line card's second line names the task's recorded typed cause word for a warn-tier row", async () => {
+  test("test: the approved table's note column names the task's recorded typed cause word for a warn-tier row", async () => {
     const repo = mkRepo();
     seed(repo, [
       runStart(),
@@ -655,12 +661,11 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T2"))).not.toContain("dispatch");
-      expect(strip(card(out, "T2")).split("\n")[1]).toContain("dispatch");
+      expect(card(out, "T2")).toContain("dispatch");
     });
   });
 
-  test("test: the progress gauge fills red only when a red-tier row is present among the tasks, never for a set that is only running or warn-tier parked", async () => {
+  test("test: only a red-tier task id is painted red; running and warn-tier rows stay non-red", async () => {
     const warnRepo = mkRepo();
     seed(warnRepo, [
       runStart(),
@@ -680,10 +685,10 @@ describe("status checklist rendering", () => {
     ]);
 
     await withTty(async () => {
-      const warnHeader = (await status([], warnRepo)).split("\n").find((line) => line.includes("run run-watch"))!;
-      const redHeader = (await status([], redRepo)).split("\n").find((line) => line.includes("run run-watch"))!;
-      expect(warnHeader).not.toContain("\x1b[31m");
-      expect(redHeader).toContain("\x1b[31m");
+      const warnRow = row(await status([], warnRepo), "T2");
+      const redRow = row(await status([], redRepo), "T2");
+      expect(warnRow).not.toContain("\x1b[31m");
+      expect(redRow).toContain("\x1b[31m");
     });
   });
 
@@ -714,9 +719,10 @@ describe("status checklist rendering", () => {
     ]);
 
     await withTty(async () => {
-      const header = (await status(["--watch"], repo, { iterations: 1, sleep: async () => {} })).split("\n")[0]!;
-      expect(strip(header)).toContain("verify FAILED (test) → re-verifying (run attempt 2)");
-      expect(strip(header)).not.toContain("3/3 done");
+      const frame = strip(await status(["--watch"], repo, { iterations: 1, sleep: async () => {} }))
+        .replace(/\s+/gu, " ");
+      expect(frame).toContain("verify FAILED (test) → re-verifying (run attempt 2)");
+      expect(frame).not.toContain("3/3 done");
     });
   });
 
@@ -738,12 +744,10 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       for (const [repo, phase] of [[failedRepo, "FAILED (test)"], [pendingRepo, "pending"]] as const) {
-        const header = (await status([], repo)).split("\n").find((line) => line.includes("run run-watch"))!;
-        expect(strip(header)).toContain(`verify ${phase}`);
-        expect(strip(header)).toContain("3/3 tasks done · run not verified");
-        expect(strip(header)).not.toContain("3/3 done");
-        expect(header).not.toContain("\x1b[32m██████████");
-        expect(header).not.toContain("\x1b[32m3/3");
+        const frame = strip(await status([], repo)).replace(/\s+/gu, " ");
+        expect(frame).toContain(`verify ${phase}`);
+        expect(frame).toContain("3/3 tasks done · run not verified");
+        expect(frame).not.toContain("3/3 done");
       }
     });
   });
@@ -777,7 +781,7 @@ describe("status checklist rendering", () => {
       expect(legacy).not.toContain("verify passed");
       // the tally and every task row still read as they did — only the verdict segment differs
       for (const frame of [legacy, passed]) expect(frame).toContain("3/3 done");
-      expect(passed.replace("verify passed", "")).toBe(legacy.replace("verify unrecorded", ""));
+      for (const id of ["T1", "T2", "T3"]) expect(card(passed, id)).toBe(card(legacy, id));
     });
   });
 
@@ -815,8 +819,8 @@ describe("status checklist rendering", () => {
       const [first, second] = out.split("\n---\n");
       expect(strip(card(first!, "T2"))).toContain("judge · 2s elapsed");
       expect(strip(card(second!, "T2"))).toContain("judge · 5s elapsed");
-      expect(strip(row(first!, "T2"))).toContain("⠋ T2");
-      expect(strip(row(second!, "T2"))).toContain("⠙ T2");
+      expect(card(first!, "T2")).toContain("⠋ judge · 2s elapsed");
+      expect(card(second!, "T2")).toContain("⠙ judge · 5s elapsed");
     });
   });
 
@@ -885,10 +889,9 @@ describe("status checklist rendering", () => {
         sleep: async () => {},
         now: () => startedAt + 4_000,
       });
-      expect(strip(row(out, "T2"))).toContain("⠋ T2");
-      expect(strip(row(out, "T2"))).toContain("running");
-      expect(strip(row(out, "T2"))).not.toContain("pending");
-      expect(strip(card(out, "T2"))).toContain("worker · 4s elapsed · no output 4s");
+      expect(card(out, "T2")).toContain("⠋ worker · 4s elapsed");
+      expect(card(out, "T2")).not.toContain("pending");
+      expect(card(out, "T2")).toContain("worker · 4s elapsed · no output 4s");
     });
   });
 
@@ -967,7 +970,7 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       const out = await status([], repo);
-      expect(strip(row(out, "T1"))).toContain("awaiting approval");
+      expect(card(out, "T1")).toContain("awaiting approval");
     });
   });
 

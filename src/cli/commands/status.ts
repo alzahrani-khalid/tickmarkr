@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { BANNER, GLYPHS, type Verdict, dim, fail, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
+import { brandChip, dim, fail, GLYPHS, legend, ok, rule, title, warn } from "../../brand.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import {
@@ -29,7 +29,7 @@ import {
   deriveRunCockpitData,
   type TaskRow,
 } from "../../tui/cockpit/derive.js";
-import { COCKPIT_COLUMN_FLOOR, LAYOUT_PRIORITY } from "../../tui/cockpit/layout.js";
+import { COCKPIT_COLUMN_FLOOR } from "../../tui/cockpit/layout.js";
 import { cellWidth, fitCells, wrapCells } from "../../tui/cockpit/width.js";
 
 // ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
@@ -463,11 +463,6 @@ export const gateChain = (states: GateState[], unicode: boolean): string =>
     : `${GATE_KEYS[gate]}${gateBox(states[i]!, false)}`).join(" ");
 
 export const failedGates = (states: GateState[]): string[] => GATE_NAMES.filter((_, i) => states[i] === "fail");
-// plain-text form of the failed-gate words for column math; rendered with a dim dot + red names
-const failedSuffix = (states: GateState[]): string => {
-  const f = failedGates(states);
-  return f.length ? ` · ${f.join(", ")}` : "";
-};
 
 // a designed human gate parks the task BEFORE any gate result exists (daemon.ts execTask), so the
 // awaited approval is named from task state alone — never from gate results. Failed gates win the
@@ -495,28 +490,46 @@ export const shortGoal = (goal: string, max: number): string => {
 /** Columns the machine row always spends on the task title, however long its machinery segment runs. */
 const MACHINE_TITLE_FLOOR = 24;
 
-/**
- * A card's detail segments, named in the cockpit's own element vocabulary so the board carries no
- * shed order of its own: `LAYOUT_PRIORITY` is ordered highest-priority first, so its tail is what a
- * narrowing board surrenders, and it surrenders it from the end. The journal segment — where BOTH
- * directions of the graph edge are named, the blocking dependencies of a waiting task and the
- * dependents waiting on it — sits above that tail and is therefore never shed: it wraps instead, so
- * narrowing costs rows, never the graph's structure, and never turns a named task into a `+N` count.
- */
-type DetailSegment = { element: (typeof LAYOUT_PRIORITY)[number]; text: string };
+// The approved task board derives an area from files[] rather than adding another graph field.
+// Known tickmarkr domains keep their reviewed names; other repositories fall back to their first
+// meaningful path segment so the shipped surface never turns a foreign project into UNMAPPED rows.
+const TASK_AREA_RULES: readonly [string, readonly RegExp[]][] = [
+  ["SPEC", [/^src\/(compile|graph|plan)\//u]],
+  ["FLEET", [/^src\/(route|config|adapters)\//u]],
+  ["RUN", [/^src\/(run|drivers|eval)\//u]],
+  ["GATE", [/^src\/gates\//u]],
+  ["UI", [/^src\/(cli|tui|report)\//u, /^src\/brand\.ts/u]],
+  ["DOCS", [/^(docs|skills)\//u]],
+  ["REPO", [/^(scripts|schema)\//u, /^\.github\//u, /^tests\/(lint|repo|helpers)\//u, /^(vitest\.config|package\.json|tsconfig)/u]],
+];
 
-const detailText = (segments: readonly DetailSegment[], budget: number): string => {
-  const shedOrder = LAYOUT_PRIORITY.slice(LAYOUT_PRIORITY.indexOf("journal") + 1).reverse();
-  const shed = new Set<string>();
-  const compose = (): string => segments
-    .filter((segment) => segment.text.length > 0 && !shed.has(segment.element))
-    .map((segment) => segment.text)
-    .join(" · ");
-  for (const element of shedOrder) {
-    if (cellWidth(compose()) <= budget) break;
-    shed.add(element);
+const expandAreaBraces = (path: string): string[] => {
+  const match = /^(.*?)\{([^}]*)\}(.*)$/u.exec(path);
+  return match
+    ? match[2]!.split(",").flatMap((part) => expandAreaBraces(`${match[1]}${part.trim()}${match[3]}`))
+    : [path];
+};
+
+const areaForPath = (path: string): string => {
+  const candidates = [path, path.replace(/^tests\//u, "src/")];
+  for (const candidate of candidates) {
+    for (const [name, patterns] of TASK_AREA_RULES) {
+      if (patterns.some((pattern) => pattern.test(candidate))) return name;
+    }
   }
-  return compose();
+  const parts = path.replace(/^[!./]+/u, "").split("/").filter((part) => part && !/[*?[\]]/u.test(part));
+  const root = parts[0];
+  if (!root) return "UNMAPPED";
+  const domain = ["src", "app", "packages", "tests"].includes(root) && parts[1] ? parts[1]! : root;
+  return domain.replace(/\.[^.]+$/u, "").toUpperCase();
+};
+
+const taskArea = (task: Task): string => {
+  const paths = task.files.flatMap(expandAreaBraces);
+  if (paths.length === 0) return "—";
+  const primary = paths.filter((path) => !path.startsWith("tests/") && !path.startsWith("src/cli/"));
+  const source = primary.length ? primary : paths;
+  return [...new Set(source.map(areaForPath))].join("+");
 };
 
 /**
@@ -601,7 +614,7 @@ const effortPanel = (
 ): string[] => {
   if (!events) {
     return [
-      ` ${title("WHERE THE EFFORT WENT")}`,
+      `  ${ok("▌")} ${title("WHERE THE EFFORT WENT")}`,
       legend(`   dispatch · review · park counts unavailable — ${NOT_COMPARABLE_CLAIM}`),
     ];
   }
@@ -624,7 +637,7 @@ const effortPanel = (
   });
 
   return [
-    ` ${title("WHERE THE EFFORT WENT")}`,
+    `  ${ok("▌")} ${title("WHERE THE EFFORT WENT")}`,
     legend(`   dispatches · review rounds · human parks · top ${top.length} of ${tasks.length} tasks`),
     "",
     ...rows,
@@ -1116,135 +1129,158 @@ const renderFrame = (
     };
   }
 
-  // TTY: cockpit frame composed through src/brand.ts (CLI-DESIGN.md) — dominant run title,
-  // dim chrome, semantic color only on verdicts, completion gauge, and column-aligned status
-  // rows (pad plain text FIRST, colorize after: ANSI has zero display width and would corrupt
-  // padEnd math)
-  // The cockpit owns this board's column contract: `COCKPIT_COLUMN_FLOOR` is the narrowest board it
-  // plans, so below it the terminal — not a second floor stated here — decides what happens to the
-  // drawn rows. Every column figure below is derived from this one.
+  // TTY: the operator-approved task table. The daemon gives this surface a ~110-column pane first;
+  // narrower terminals keep the same facts in stacked rows. Every cut/wrap goes through width.ts.
   const boardColumns = Math.max(COCKPIT_COLUMN_FLOOR, width);
   const dot = dim(" · ");
-  const anyFailed = cells.some((c) => c.redTier);
-  const gaugeCells = 10;
-  const fill = total ? Math.round((done / total) * gaugeCells) : 0;
+  const separator = `  ${dim("│")}  `;
   const tipFailed = tipPhase?.state === "failed";
+  const anyFailed = cells.some((cell) => cell.redTier);
   const progressTone = anyFailed || tipFailed ? fail : tipPhase ? warn : ok;
-  const gauge = (fill ? progressTone("█".repeat(fill)) : "") + (fill < gaugeCells ? dim("░".repeat(gaugeCells - fill)) : "");
-  const live = liveness(events, now)
-    .replace(/\bdead\b/, fail("dead"))
-    .replace(/\bfinished\b/, dim("finished"))
-    .replace(/\balive\b/, ok("alive"))
-    .replaceAll(" · ", dot);
   const tally = tipPhase
     ? `${progressTone(`${done}/${total} tasks done`)}${dot}${progressTone("run not verified")}`
-    : `${done}/${total} done`;
-  // The prototype's header order, ported: identity, then what the run is worth (verdict and
-  // tally), then the instruments that decorate it. A board that must wrap keeps the decisive
-  // segments on the row an operator reads first; nothing is dropped to get there.
-  const header = ` ${[
-    title(runId ? `run ${runId}` : "tickmarkr"),
-    ...(runId ? [] : ["no runs yet"]),
+    : done === total && total > 0 ? ok(`${done}/${total} done`) : `${done}/${total} done`;
+  const live = liveness(events, now)
+    .replace(/\bdead\b/u, fail("dead"))
+    .replace(/\bfinished\b/u, dim("finished"))
+    .replace(/\balive\b/u, ok("alive"))
+    .replaceAll(" · ", dot);
+  const header = [
+    brandChip(" tickmarkr "),
+    title(runId ?? "no runs yet"),
+    tally,
+    ...(events.length ? [`${events.filter((event) => event.event === "run-resume").length} restarts`] : []),
+    ...(events.length ? [`${events.filter((event) => event.event === "escalation").length} escalations`] : []),
     ...(runId && supersededBy ? [warn(`superseded by ${supersededBy}`)] : []),
     ...(runId && !comparable ? [warn(NOT_COMPARABLE_NOTICE)] : []),
     ...(verify === undefined
       ? []
       : [verify === "verify passed" ? ok(verify) : tipFailed ? fail(verify) : warn(verify)]),
-    `${gauge} ${tipPhase ? tally : done === total && total > 0 ? ok(tally) : tally}`,
     ...(runId ? [live] : []),
     ...(journalRowsOnly ? [`zone ${localZoneLabel(zoneReference)}`] : []),
-  ].join(dot)}`;
-  const hr = rule(Math.min(boardColumns, 100));
-  // OBS-104 run-level now line: names the most recent journal event. TTY frame only — the non-TTY
-  // machine surface is byte-pinned (status-brand golden) and must not drift. Rendered BELOW the task
-  // rows: the line names task ids, and rows must stay the first id-bearing lines for grep consumers.
+  ].join(separator);
   const nowLine = activity.now ? [legend(`   now: ${activity.now}`)] : [];
-  const gatesLegend = legend(`   gates: ${GATE_NAMES.join(" · ")}`);
-  // Every known tier, beaten or not: a tier missing from this line would read as a healthy one.
   const supervisionLegend = legend(`   ${supervisionText(supervision)}`);
+  const taskSectionSummary = `${done} of ${total} merged · rows in graph order · gates left→right in pipeline order`;
+  const taskSection = `  ${ok("▌")} ${title("TASKS")}   ${dim(taskSectionSummary)}`;
+  const effortByTask = new Map(foldTaskEffort(g.tasks, record && !comparable ? [] : events)
+    .map((task) => [task.taskId, task]));
 
-  // Two-line card per task (operator request, v1.67): line 1 carries identity + verdict — glyph,
-  // id, title at full width, and only SHORT status words. Line 2 carries the machinery, dim and
-  // aligned under the title: gate chain, live activity phrase (or channel), ctx. Long channel names
-  // and activity phrases live on line 2 only, so they can never squeeze the title or wrap line 1.
-  const taskVerdict = (c: (typeof cells)[number]): Verdict =>
-    c.merged ? "pass" : c.redTier ? "fail" : c.st === "failed" || c.st === "human" ? "warn" : "neutral";
-  const statusWord = (c: (typeof cells)[number]): string =>
-    c.livePhase ? "running" : c.redTier ? "failed" : c.st === "failed" ? "warn" : surfaceStatusWord(c.st);
-  // Every column figure is display cells through the cockpit's width authority — never String
-  // length, which over-charges a wide cluster and bills a combining mark that draws nothing.
-  const idW = Math.max(...cells.map((c) => cellWidth(c.t.id)), 2);
-  // plain-text status suffixes for width math only — starved / failed gate names / approval hint
-  const suffixPlain = (c: (typeof cells)[number]): string =>
-    (c.isStarved ? " · starved" : "") + failedSuffix(c.states)
-    + humanGateSuffix(c.t, graphTaskStatus(c.st, c.t.status), c.states);
-  const stW = Math.max(...cells.map((c) => cellWidth(statusWord(c) + suffixPlain(c))));
-  const avail = Math.max(8, boardColumns - (5 + idW) - 2 - stW);
-  const titles = cells.map((c) => shortGoal(c.t.title, avail));
-  const titleW = Math.max(8, ...titles.map(cellWidth));
-  // Line 2 starts under the title column — but never past what the board can pay for: an id near
-  // the schema's 64-character maximum would otherwise indent the machinery clean off a narrow row.
-  const chainCells = cellWidth(gateChain(GATE_NAMES.map(() => "open"), true));
-  const indent = " ".repeat(
-    Math.max(0, Math.min(idW + 5, boardColumns - chainCells - 2)),
-  );
-  const rows = cells.map((c, i) => {
-    const { t, st, merged, failureKind, redTier, states, priorGraph, isStarved, phrase, channel, ctx, livePhase, pane } = c;
-    const word = statusWord(c);
-    // The alarm reads the SAME evidence the detail phrase names — a worktree delta the daemon proved
-    // counts, or the card would flag a worker it just called alive one line below (OBS-538 review).
-    const staleWorker = livePhase?.phase === "worker"
-      && workerSilenceMs(livePhase, now, workerLiveness.get(t.id)) >= 60_000;
-    const stWord = staleWorker ? warn(word) : merged ? ok(word) : redTier ? fail(word) : st === "failed" || st === "human" ? warn(word) : word;
-    // a fail names its gate in words right here — the one moment gate identity is needed on a row
-    const f = failedGates(states);
-    const human = humanGateSuffix(t, graphTaskStatus(st, t.status), states);
-    const statusCell = stWord +
-      (isStarved ? dot + fail("starved") : "") +
-      (f.length ? dot + fail(f.join(", ")) : "") +
-      (human ? dot + warn("awaiting approval") : "");
-    const taskTitle = titles[i]!;
-    const taskLabel = `${t.id.padEnd(idW)} ${taskTitle}${" ".repeat(titleW - cellWidth(taskTitle))}  ${statusCell}`;
-    const line1 = livePhase
-      ? `  ${(staleWorker ? warn : dim)(SPINNER[animationFrame % SPINNER.length]!)} ${taskLabel}`
-      : `  ${statusRow(taskVerdict(c), taskLabel)}`;
-    // activity already names its channel for in-flight attempts — never repeat it
-    const chain = gateChain(states, true);
-    // A finished task blocks nobody — the same journal-folded done-ness the map was built on.
+  const gateMatrix = (states: readonly GateState[]): string => states.map((state) => {
+    const glyph = gateBox(state, true);
+    const tone = state === "pass" ? ok : state === "fail" ? fail : dim;
+    return `${tone(glyph)}  `;
+  }).join("");
+  const gateHeader = GATE_NAMES.map((gate) => fitCells(gate.slice(0, 2), 3)).join("");
+  const noteFor = (cell: (typeof cells)[number]): string => {
+    const { t, st, merged, failureKind, redTier, states, priorGraph, isStarved, phrase, ctx, livePhase, pane } = cell;
+    const effort = effortByTask.get(t.id);
     const blocking = graphTaskStatus(st, t.status) === "done" ? [] : dependents.get(t.id) ?? [];
-    const segments: DetailSegment[] = [
-      ...(priorGraph ? [{ element: "progressCaption" as const, text: PRIOR_GRAPH_MARKER }] : []),
-      ...(phrase
-        ? [
-          { element: "journal" as const, text: phrase },
-          ...(phrase.includes(channel) || channel === "-"
-            ? []
-            : [{ element: "secondaryHeader" as const, text: channel }]),
-        ]
-        : [{ element: "secondaryHeader" as const, text: channel }]),
-      // The waiting phrase's reverse direction, and structure for the same reason: a supervisor
-      // deciding what to unblock needs the names, so it wraps beside the blockers rather than being
-      // shed or folded into a count. A finished task blocks nobody.
-      ...(blocking.length ? [{ element: "journal" as const, text: `blocks ${blocking.join(", ")}` }] : []),
-      ...(failureKind && !phrase?.includes(failureKind)
-        ? [{ element: "progressCaption" as const, text: failureKind }]
-        : []),
-      // A pane an operator can still open is structure, not decoration: it wraps like the blockers
-      // above it rather than being shed, because half an address is no address.
-      ...(pane ? [{ element: "journal" as const, text: `pane ${pane}` }] : []),
-      ...(ctx !== undefined ? [{ element: "statTiles" as const, text: `ctx ${ctx}` }] : []),
-    ];
-    const detail = detailText(segments, boardColumns - cellWidth(indent) - cellWidth(chain) - 2);
-    // A board narrow enough to surrender every detail segment ends the row at the gate chain: the
-    // separator is part of the segment it separates, never chrome left standing on its own.
-    const line2 = detail ? `${indent}${chain}  ${dim(detail)}` : `${indent}${chain}`;
-    return [line1, line2, ""];
-  }).flat();
-  if (!nowLine.length) rows.pop(); // cards end blank-separated; drop the dangling one
+    const failed = failedGates(states);
+    const human = humanGateSuffix(t, graphTaskStatus(st, t.status), states);
+    return [
+      livePhase ? `${SPINNER[animationFrame % SPINNER.length]} ${phrase ?? "running"}` : "",
+      !livePhase && isStarved ? "starved" : "",
+      !livePhase && !isStarved && !merged ? redTier ? "failed" : phrase ?? (st === "failed" ? "warn" : surfaceStatusWord(st)) : "",
+      redTier && phrase ? phrase : "",
+      priorGraph ? PRIOR_GRAPH_MARKER : "",
+      failed.length ? `failed · ${failed.join(", ")}` : "",
+      human ? "awaiting approval" : "",
+      !merged && failureKind && !phrase?.includes(failureKind) ? failureKind : "",
+      (effort?.parks ?? 0) >= 3 ? `parked ×${effort!.parks}` : "",
+      (effort?.reviews ?? 0) > 2 ? `${effort!.reviews} review rounds` : "",
+      blocking.length ? `blocks ${blocking.join(", ")}` : "",
+      pane ? `pane ${pane}` : "",
+      ctx !== undefined ? `ctx ${ctx}` : "",
+    ].filter(Boolean).join(" · ");
+  };
+
+  const staleWorker = (cell: (typeof cells)[number]): boolean =>
+    cell.livePhase?.phase === "worker"
+    && workerSilenceMs(cell.livePhase, now, workerLiveness.get(cell.t.id)) >= 60_000;
+  const tableRows = (): string[] => {
+    const idWidth = Math.min(8, Math.max(5, ...cells.map((cell) => cellWidth(cell.t.id))));
+    const areaWidth = 16;
+    const depsWidth = 14;
+    const gatesWidth = GATE_NAMES.length * 3;
+    const channelWidth = boardColumns >= 140 ? 22 : 12;
+    const attemptWidth = 5;
+    const noteWidth = boardColumns >= 140 ? 24 : boardColumns >= 120 ? 20 : 14;
+    const fixed = 4 + idWidth + areaWidth + depsWidth + gatesWidth + 2 + channelWidth + attemptWidth + noteWidth;
+    const taskWidth = boardColumns - fixed;
+    const fitColumn = (text: string, columns: number, gap = 2): string =>
+      fitCells(text, Math.max(1, columns - gap)) + " ".repeat(Math.min(gap, columns - 1));
+
+    if (taskWidth < 12) {
+      return cells.flatMap((cell) => {
+        const effort = effortByTask.get(cell.t.id);
+        const deps = cell.t.deps.length ? cell.t.deps.join(", ") : "—";
+        const tone = cell.redTier ? fail : cell.merged ? ok : staleWorker(cell) || cell.st === "failed" || cell.st === "human" ? warn : dim;
+        const machinery = [
+          `deps ${deps}`,
+          gateMatrix(cell.states),
+          cell.channel,
+          `att ${effort?.dispatches ?? 0}`,
+        ].join("  ");
+        return [
+          `    ${tone(cell.t.id)}  ${dim(taskArea(cell.t))}  ${sanitizeTaskText(cell.t.title)}`,
+          ...wrapCells(`    ${dim(machinery)}`, boardColumns, { continuationPrefix: "      " }),
+          ...wrapCells(`    ${dim(noteFor(cell))}`, boardColumns, { continuationPrefix: "      " }).filter((line) => line.trim()),
+          "",
+        ];
+      });
+    }
+
+    const headerRow = `    ${fitColumn("", idWidth, 1)}${fitColumn("area", areaWidth)}${fitColumn("deps", depsWidth)}${fitColumn("task", taskWidth)}${gateHeader}  ${fitColumn("channel", channelWidth)}${fitColumn("att", attemptWidth, 1)}note`;
+    const ruleRow = `    ${"─".repeat(boardColumns - 4)}`;
+    const rows = cells.flatMap((cell) => {
+      const effort = effortByTask.get(cell.t.id);
+      const columns = [
+        wrapCells(cell.t.id, idWidth - 1),
+        wrapCells(taskArea(cell.t), areaWidth - 2),
+        wrapCells(cell.t.deps.length ? cell.t.deps.join(", ") : "—", depsWidth - 2),
+        [sanitizeTaskText(cell.t.title)],
+        [gateMatrix(cell.states)],
+        [cell.channel],
+        [String(effort?.dispatches ?? 0)],
+        wrapCells(noteFor(cell), noteWidth),
+      ];
+      const height = Math.max(...columns.map((column) => column.length));
+      const idTone = cell.redTier ? fail : cell.merged ? ok : staleWorker(cell) || cell.st === "failed" || cell.st === "human" ? warn : dim;
+      const titleTone = cell.redTier || cell.livePhase || (effort?.parks ?? 0) >= 3 ? title : dim;
+      return Array.from({ length: height }, (_, index) =>
+        `    ${idTone(fitColumn(columns[0]![index] ?? "", idWidth, 1))}`
+        + dim(fitColumn(columns[1]![index] ?? "", areaWidth))
+        + dim(fitColumn(columns[2]![index] ?? "", depsWidth))
+        + titleTone(fitColumn(columns[3]![index] ?? "", taskWidth))
+        + fitCells(columns[4]![index] ?? "", gatesWidth)
+        + "  "
+        + dim(fitColumn(columns[5]![index] ?? "", channelWidth))
+        + dim(fitColumn(columns[6]![index] ?? "", attemptWidth, 1))
+        + dim(fitCells(columns[7]![index] ?? "", noteWidth))
+      );
+    });
+    return [legend(headerRow), dim(ruleRow), ...rows];
+  };
+  const gatesLegend = legend(`    gates   ${GATE_NAMES.map((gate) => `${gate.slice(0, 2)} ${gate}`).join("  ")}`);
+
   const effort = effortPanel(g.tasks, record && !comparable ? undefined : events, boardColumns);
   return {
     content: boardRows(
-      [header, hr, gatesLegend, supervisionLegend, "", ...rows, ...nowLine, "", hr, "", ...effort],
+      [
+        header,
+        ...nowLine,
+        supervisionLegend,
+        "",
+        taskSection,
+        "",
+        ...tableRows(),
+        gatesLegend,
+        "",
+        rule(boardColumns),
+        "",
+        ...effort,
+      ],
       boardColumns,
     ).join("\n"),
     ...(hotPhase ? { hotPhase } : {}),
@@ -1280,10 +1316,10 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {
   const namedRunId = positionalRunId(argv);
   if (argv.includes("--oneline")) return oneLine(cwd, namedRunId);
-  // cockpit surface: banner + frame on a TTY (doctor's pattern); pipes get the bare frame
+  // The task-table frame owns its compact one-line brand chip; the four-row global banner would
+  // create the second header the approved replacement removes.
   if (!argv.includes("--watch")) {
-    const { content } = renderFrame(cwd, opts.now?.() ?? Date.now(), 0, undefined, false, namedRunId);
-    return visual() ? BANNER + content : content;
+    return renderFrame(cwd, opts.now?.() ?? Date.now(), 0, undefined, false, namedRunId).content;
   }
 
   const eventStream = argv.some((arg) => arg === "--events" || arg === "--jsonl" || arg === "--decision-events");
@@ -1397,7 +1433,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
         frame = renderFrame(cwd, nowMs, i, workerLiveness, true, namedRunId);
         if (tty) {
           updateTitle(frame.hotPhase, nowMs);
-          process.stdout.write(`\x1b[2J\x1b[H${BANNER}${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);
+          process.stdout.write(`\x1b[2J\x1b[H${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);
         } else {
           process.stdout.write(frame.content + sep);
         }

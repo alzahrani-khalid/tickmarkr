@@ -2058,13 +2058,13 @@ describe("HYG-09 fleet hygiene (fake adapter, zero tokens)", () => {
 // — the run is unaffected. Drivers without the narrator method (subprocess, every stub above) spawn
 // nothing: driver.narrator?.() is a no-op there (criterion 3 = the whole suite above).
 describe("narrator pane (fake adapter, zero tokens)", () => {
-  test("herdr-style driver: opens exactly one watch pane at run start and never closes it", async () => {
+  test("herdr-style driver: opens exactly one watch pane only after run-start is journaled and before any worker", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
     );
     const inner = new SubprocessDriver();
-    const ops: { kind: string; name?: string; cmd?: string; msg?: string }[] = [];
+    const ops: { kind: string; name?: string; cmd?: string; msg?: string; journalEvent?: string }[] = [];
     const driver = {
       id: "herdr",
       interactive: true,
@@ -2082,7 +2082,11 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
       async close(s: { id: string; name: string; cwd: string }) { ops.push({ kind: "close", name: s.name }); return inner.close(s); },
       worktree: inner.worktree.bind(inner),
       async narrator(cwd: string, command: string) {
-        ops.push({ kind: "narrator-open", cmd: command });
+        ops.push({
+          kind: "narrator-open",
+          cmd: command,
+          journalEvent: Journal.open(cwd, "run-narr").read().at(-1)?.event,
+        });
         return inner.slot(cwd, "narrator-watch");
       },
     };
@@ -2092,6 +2096,7 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
     const opens = ops.filter((o) => o.kind === "narrator-open");
     expect(opens).toHaveLength(1);
     expect(opens[0]!.cmd).toBe(watchCommand("run-narr"));
+    expect(opens[0]!.journalEvent).toBe("run-start");
     // opened at run START — before the first worker slot is created
     const openIdx = ops.findIndex((o) => o.kind === "narrator-open");
     const firstWorker = ops.findIndex((o) => o.kind === "slot" && /-worker-/.test(o.name ?? ""));

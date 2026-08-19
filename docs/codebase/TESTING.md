@@ -37,7 +37,7 @@ tests/
 ├── drivers/        7 *.test.ts files (herdr, subprocess, env-seal, trailer-width, etc.)
 ├── e2e/            real-cli.test.ts          (gated, spends tokens — see below)
 ├── eval/           5 *.test.ts files         (fixture harness tests for the eval lab)
-├── fixtures/       codex-mcp-spinner/capture.ts (non-*.test.ts capture helper)
+├── fixtures/       codex-mcp-spinner/capture.ts (non-*.test.ts capture helper), kimi-staged-queue/ (captured screen + provenance, OBS-552 addendum)
 ├── gates/          13 *.test.ts files
 ├── graph/          4 *.test.ts files
 ├── helpers/        tmprepo.ts                (shared repo/graph fixtures, not a *.test.ts file)
@@ -50,6 +50,7 @@ tests/
 ├── route/          16 *.test.ts files (router, explore, failover, profile, etc.)
 ├── run/            29 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, environment, etc.)
 ├── scripts/        probe-rig.test.ts
+├── seat-send.test.ts  drives the SHIPPED skills/ delivery script against a fake `herdr` (OBS-552)
 ├── tui/            app active; legacy suites retired
 ├── setup.ts        (setupFiles in vitest.config.ts — global env seal, not a *.test.ts file)
 ├── skills-pipeline-layout.test.ts

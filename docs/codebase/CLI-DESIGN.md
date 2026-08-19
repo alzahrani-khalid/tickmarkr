@@ -28,17 +28,17 @@ a distinct glyph or word (✓ vs ○ vs ✗ vs ! vs -, authed vs unauthed), so e
 survives `NO_COLOR` and non-TTY byte-pinned output unambiguously.
 
 A system which recovers by design must render that recovery, not just its failures. In
-the live status frame, recoverable infrastructure and dispatch parks are amber attention
-rows whose second line names the recorded typed cause; red is reserved for verified work
-failure, an exhausted escalation ladder, or a task still unresolved after the run ends.
-The progress gauge follows the same cause-based severity, so availability noise alone can
-never turn completed progress red.
+the live status table, recoverable infrastructure and dispatch parks keep an amber task
+identity and name the recorded typed cause in the note column; red is reserved for
+verified work failure, an exhausted escalation ladder, or a task still unresolved after
+the run ends. Gate glyphs and cause words preserve the same distinction without color.
 
 ## Tokens (`TOKENS`)
 
 | Token | Renders | Use |
 |---|---|---|
 | `brand` | brand green (256-color ramp anchor 41, from `BRAND_RAMP`) | the tickmark hue; the product name accent |
+| `brandChip` | black ink on the terminal theme's ANSI green | compact `tickmarkr` identity in the daemon-owned task board |
 | `ok` | brand green ramp (same hue as `brand`) | pass/authed/green verdict words and glyphs |
 | `fail` | red | fail/unauthed verdict words and glyphs |
 | `warn` | amber | attention/warn/lint words and glyphs |

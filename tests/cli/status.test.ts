@@ -10,6 +10,7 @@ import { validateGraph, type RunGraph } from "../../src/graph/schema.js";
 import { foldActivity, type ActivityTask } from "../../src/run/activity.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 import { Journal } from "../../src/run/journal.js";
+import { cellWidth } from "../../src/tui/cockpit/width.js";
 
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-status-"));
 
@@ -19,11 +20,19 @@ const seedJournal = (repo: string, runId: string, events: JournalEvent[]) => {
   writeFileSync(join(dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
 };
 
-// A card's IDENTITY row: the id in its own column, right after the row's verdict glyph. Since
-// v1.94 a card also names OTHER tasks — the dependents waiting on it — in its line-2 detail, so a
-// bare id search would answer a blocker's machinery line for the task it blocks.
 const row = (out: string, taskId: string) =>
-  out.split("\n").find((line) => new RegExp(`^\\s*(?:\\[.\\]|\\S+)\\s+${taskId}\\b`).test(line))!;
+  out.split("\n").find((line) => {
+    const plain = line.replace(/\x1b\[[0-9;]*m/gu, "");
+    return new RegExp(`^ {4}${taskId}(?:\\s|$)`).test(plain)
+      || new RegExp(`^\\s+(?:\\[.\\]|[|/\\\\-])\\s+${taskId}\\b`).test(plain);
+  })!;
+const taskBlock = (out: string, taskId: string): string => {
+  const lines = out.split("\n");
+  const start = lines.findIndex((line) => new RegExp(`^ {4}${taskId}(?:\\s|$)`).test(line));
+  if (start < 0) return "";
+  const blank = lines.findIndex((line, index) => index > start && line.trim() === "");
+  return lines.slice(start, blank < 0 ? undefined : blank).join("\n");
+};
 
 // T3: seed a run-start whose recorded graphDefinitionHash matches the saved graph (comparable), so the
 // non-hash assertions (dep-waiting, context-sample, skipped gates) see the real replayed states rather
@@ -74,12 +83,10 @@ const renderBoard = async (g: RunGraph, tty: boolean, columns: number): Promise<
 };
 
 describe("task titles on the status board", () => {
-  test("every board row renders the task's title rather than its goal, proven member by member over the closed set of row shapes — a short-title fixture, a title-at-the-column-width fixture, a title-over-the-column-width fixture and a long-goal fixture whose goal never appears on the board", async () => {
-    // At 80 columns with two-character ids and four-character `done`, the task column is 67.
-    const taskColumnWidth = 67;
+  test("every approved-table task renders its title rather than its goal, including titles that wrap at the narrow layout", async () => {
     const shortTitle = "Short title";
-    const atWidthTitle = "W".repeat(taskColumnWidth);
-    const overWidthTitle = "O".repeat(taskColumnWidth + 1);
+    const atWidthTitle = "W".repeat(67);
+    const overWidthTitle = "O".repeat(68);
     const longGoal = `LONG_GOAL_MUST_NOT_RENDER ${"paragraph ".repeat(60)}`;
     const g = boardGraph([
       { id: "T1", title: shortTitle, goal: "SHORT_GOAL_MUST_NOT_RENDER" },
@@ -89,14 +96,14 @@ describe("task titles on the status board", () => {
     ]);
 
     const out = stripAnsi(await renderBoard(g, true, 80));
-    expect(row(out, "T1")).toContain(shortTitle);
-    expect(row(out, "T2")).toContain(atWidthTitle);
-    expect(row(out, "T3")).toContain(`${"O".repeat(taskColumnWidth - 3)}...`);
-    expect(row(out, "T4")).toContain("Long goal has a compact title");
-    for (const task of g.tasks) expect(out).not.toContain(task.goal);
+    for (const task of g.tasks) {
+      const block = taskBlock(out, task.id).replace(/\s+/gu, "");
+      expect(block).toContain(task.title.replace(/\s+/gu, ""));
+      expect(out).not.toContain(task.goal);
+    }
   });
 
-  test("no row wraps and no done marker appears twice, measured on the same 13-task graph that wraps 6 rows and duplicates the marker before the change", async () => {
+  test("the approved table keeps every drawn line within the terminal and renders one identity row per task", async () => {
     const width = 120;
     const tasks = Array.from({ length: 13 }, (_, index) => {
       const n = index + 1;
@@ -109,16 +116,15 @@ describe("task titles on the status board", () => {
       };
     });
     const g = boardGraph(tasks);
-    // Characterize the historical fixture independently: exactly six paragraph clauses exceed
-    // the old 106-character task column, while every schema title fits it naturally.
-    expect(g.tasks.filter((task) => task.goal.split(/[,;.?!]/, 1)[0]!.length > 106)).toHaveLength(6);
-    expect(g.tasks.every((task) => task.title.length < 106)).toBe(true);
-
     const out = stripAnsi(await renderBoard(g, true, width));
-    const rows = g.tasks.map((task) => row(out, task.id));
-    expect(rows).toHaveLength(13);
-    expect(rows.every((taskRow) => taskRow.length < width)).toBe(true);
-    for (const taskRow of rows) expect(taskRow.match(/\bdone\b/gu)).toHaveLength(1);
+    const table = out.slice(out.indexOf("area"), out.indexOf("gates   bu"));
+
+    for (const line of out.split("\n")) expect(cellWidth(line)).toBeLessThanOrEqual(width);
+    for (const task of g.tasks) {
+      expect(row(out, task.id)).toBeDefined();
+      expect(table.match(new RegExp(`^ {4}${task.id}(?:\\s|$)`, "gmu"))).toHaveLength(1);
+      expect(out).not.toContain(task.goal);
+    }
   });
 
   test("the piped non-TTY bytes change only in the goal-to-title substitution, proven by a byte comparison whose sole diff is that column", async () => {
@@ -134,11 +140,6 @@ describe("task titles on the status board", () => {
     expect(after).toBe(before.replace(oldColumn, newColumn));
   });
 
-  test("the task column renders no field whose shape does not fit the column the board gives it", () => {
-    const source = readFileSync(fileURLToPath(new URL("../../src/cli/commands/status.ts", import.meta.url)), "utf8");
-    const renderSites = [...source.matchAll(/shortGoal\((?:c\.)?t\.(title|goal)/gu)].map((match) => match[1]);
-    expect(renderSites).toEqual(["title", "title"]);
-  });
 
   test("task titles sanitize tabs and ECMA-48 controls before column measurement", async () => {
     // The printable form is exactly the 67-cell column. Raw control bytes must neither steal

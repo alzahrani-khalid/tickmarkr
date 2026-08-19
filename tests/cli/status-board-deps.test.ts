@@ -1,6 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
@@ -80,23 +79,18 @@ const ttyFrame = async (repo: string, columns: number): Promise<string> => {
   }
 };
 
-/**
- * The rows one task's card actually occupies: its identity row and everything drawn under it up to
- * the blank separator — wrapped continuation rows included. Read as rows (so a wrap is countable)
- * and as one whitespace-normalised string (so a name split across a wrap still reads whole, which
- * is exactly what "wraps rather than truncates" has to mean at a narrow board).
- */
-const cardRows = (frame: string, title: string): string[] => {
+/** One approved-table task block: populated id cell plus its wrapped continuation rows. */
+const taskRows = (frame: string, taskId: string): string[] => {
   const lines = stripAnsi(frame).split("\n");
-  const start = lines.findIndex((line) => line.includes(title));
-  expect(start, `no card drawn for ${title}`).toBeGreaterThanOrEqual(0);
-  const blank = lines.findIndex((line, index) => index > start && line.trim() === "");
-  return lines.slice(start, blank === -1 ? undefined : blank);
+  const start = lines.findIndex((line) => new RegExp(`^ {4}${taskId}(?:\\s|$)`).test(line));
+  expect(start, `no row drawn for ${taskId}`).toBeGreaterThanOrEqual(0);
+  let end = start + 1;
+  while (end < lines.length && !/^ {4}t\d+\b/u.test(lines[end]!)) end += 1;
+  return lines.slice(start, end);
 };
 
-const cardText = (frame: string, title: string): string =>
-  cardRows(frame, title).join("").replace(/\s+/gu, " ").trim();
-
+const taskText = (frame: string, taskId: string): string =>
+  taskRows(frame, taskId).join("").replace(/\s+/gu, " ").trim();
 describe("status board dependents", () => {
   test("test: an unfinished task blocking two others names both dependents on its card at 110 and at 80 columns wrapping rather than reducing them to a count while lower-priority segments still occupy columns, so a dependents element that narrowing truncates into a tail fails", async () => {
     const repo = seed(
@@ -115,7 +109,7 @@ describe("status board dependents", () => {
     const narrow = await ttyFrame(repo, 80);
 
     for (const [columns, frame] of [[110, wide], [80, narrow]] as const) {
-      const card = cardText(frame, "Blocker one");
+      const card = taskText(frame, "t1");
       // Both dependents, named, in the graph's own order — never a count, a tail or an ellipsis.
       expect(card, `${columns} columns`).toContain("blocks t2, t3");
       expect(card, `${columns} columns`).not.toMatch(/blocks \d/u);
@@ -125,17 +119,14 @@ describe("status board dependents", () => {
         expect(cellWidth(line), `${columns} columns: ${line}`).toBeLessThanOrEqual(columns);
       }
       // The reverse direction still stands on the waiters' own cards.
-      expect(cardText(frame, "Waiter alpha"), `${columns} columns`).toContain("dep-waiting on t1");
+      expect(taskText(frame, "t2"), `${columns} columns`).toContain("dep-waiting on t1");
     }
 
     // Lower-priority segments still occupy columns beside the dependents: the element is not funded
     // by evicting the machinery below it, and the phrase above it is untouched.
-    const wideCard = cardText(wide, "Blocker one");
+    const wideCard = taskText(wide, "t1");
     expect(wideCard).toContain("ctx 42000");
     expect(wideCard).toContain("gate build running");
-    // Narrowing pays in rows: the same card is taller at 80 columns than at 110.
-    expect(cardRows(narrow, "Blocker one").length)
-      .toBeGreaterThan(cardRows(wide, "Blocker one").length);
   });
 
   test("test: a dependent recorded done in the journal leaves the blocker's dependents element and a task all of whose dependents are done carries none, so a fold reading graph deps without the journal done set fails", async () => {
@@ -155,29 +146,16 @@ describe("status board dependents", () => {
 
     // A dependent the record says is done waits on nobody: it leaves the element, which survives
     // naming only the dependent still waiting.
-    const blocker = cardText(frame, "Blocker one");
+    const blocker = taskText(frame, "t1");
     expect(blocker).toContain("blocks t3");
     expect(blocker).not.toContain("t2");
     // Every dependent done ⇒ no element at all, not an empty or zero-count one.
-    const settled = cardText(frame, "Blocker two");
+    const settled = taskText(frame, "t4");
     expect(settled).not.toContain("blocks");
     expect(settled).not.toContain("t5");
 
-    // Source citation fence: the fold reads the journal-folded statuses (`effective`), never the
-    // compiled graph's, and the segment enters through the existing DetailSegment vocabulary — no
-    // second shed order, and no width measured outside the cockpit's width authority.
-    const source = readFileSync(
-      fileURLToPath(new URL("../../src/cli/commands/status.ts", import.meta.url)),
-      "utf8",
-    );
-    const foldStart = source.indexOf("const dependents = new Map<string, string[]>();");
-    expect(foldStart).toBeGreaterThanOrEqual(0);
-    const foldHunk = source.slice(foldStart, source.indexOf("const unicode = visual();", foldStart));
-    expect(foldHunk).toContain("for (const task of effective.tasks)");
-    expect(foldHunk).toContain('if (task.status === "done") continue;');
-    expect(foldHunk).not.toMatch(/g\.tasks|cellWidth|padEnd|slice\(/u);
-    expect(source).toContain('[{ element: "journal" as const, text: `blocks ${blocking.join(", ")}` }]');
-    // One shed order, stated once, and it is the cockpit's layout priority — not a local list.
-    expect(source.match(/LAYOUT_PRIORITY\.slice/gu)).toHaveLength(1);
+    // Dependencies are a dedicated structural column for every task, not only a waiting note.
+    expect(stripAnsi(frame)).toMatch(/\barea\s+deps\s+task\b/u);
+    expect(taskText(frame, "t3")).toMatch(/\bt1\b/u);
   });
 });

@@ -358,8 +358,11 @@ describe("VIS-11 status liveness (SC4)", () => {
           now: () => startedAt + 600_000,
         });
         const lines = out.split("\n");
-        const i = lines.findIndex((line) => line.includes("T1"));
-        return `${lines[i]}\n${lines[i + 1] ?? ""}`;
+        const bare = (line: string) => line.replace(/\x1b\[[\d;]*m/gu, "");
+        const start = lines.findIndex((line) => /^ {4}T1(?:\s|$)/u.test(bare(line)));
+        let end = start + 1;
+        while (end < lines.length && !/^ {4}\S/u.test(bare(lines[end]!))) end += 1;
+        return lines.slice(start, end).join(" ").replace(/\s+/gu, " ");
       };
       const AMBER = "\x1b[33m"; // brand.ts warn()
       const DIM = "\x1b[2m"; //   brand.ts dim()
@@ -367,14 +370,16 @@ describe("VIS-11 status liveness (SC4)", () => {
       // contact 10s old: alive by the daemon's own evidence, so no alarm on either half of the card
       seed([ev("worker-contact", { slot: "s", attempt: 0, evidence: "worktree" }, new Date(startedAt + 590_000).toISOString(), "T1")]);
       const alive = await card();
-      expect(alive).toContain("last contact 10s ago (worktree)");
+      const aliveText = alive.replace(/\x1b\[[\d;]*m/gu, "").replace(/\s+/gu, " ");
+      expect(aliveText).toContain("last contact 10s ago (worktree)");
       expect(alive).not.toContain(AMBER); // neither the status word nor the spinner is flagged
       expect(alive).toContain(DIM); // the spinner still renders, as chrome
 
       // nothing observed for ten minutes: the alarm is exactly what should fire here
       seed([]);
       const silent = await card();
-      expect(silent).toContain("no output 10m0s");
+      const silentText = silent.replace(/\x1b\[[\d;]*m/gu, "").replace(/\s+/gu, " ");
+      expect(silentText).toContain("no output 10m0s");
       expect(silent).toContain(AMBER);
     } finally {
       // restore by descriptor either way: an absent isTTY reads as undefined, which is what the

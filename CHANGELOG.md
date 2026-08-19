@@ -2,6 +2,21 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v1.97 — the approved task board
+
+The daemon-owned run board now renders the operator-approved task table instead of the evolved
+two-line cards: one themed-green `tickmarkr` chip; explicit area, dependency, task, seven-gate,
+channel, attempt, and note columns; and the existing typed WHERE THE EFFORT WENT fold. Dependencies
+are structural for every task rather than appearing only as a waiting note, while unfinished reverse
+dependents remain named in the note column. Narrow terminals stack the same facts instead of dropping
+them, and every fit still goes through the cockpit's grapheme-cell width authority.
+
+This is a clean watch-surface cutover. The old four-row banner and card frame no longer wrap
+`status` on a TTY; non-TTY status bytes remain the machine-readable form. The daemon lifecycle is
+unchanged and now pinned explicitly by a test at the boundary: the run-id-bound board opens only
+after `run-start` is in the journal, before the first worker, and the run-end reconciliation remains
+the owner of its pane. No manual `tickmarkr ui` pane stands in for the run board. No breaking changes.
+
 ## v1.96 — dispatch truth
 
 This release is about the gap between what the harness claims and what it measured. `beatSupervision` and `SUPERVISION_BEAT_MS` had shipped with no caller, so `status` printed `orchestrator ARMED / overseer ABSENT / watch ABSENT` through an entire trial run while a real overseer worked it — two thirds of a supervision claim were constants dressed as measurements. `tickmarkr beat <tier>` now calls the shipped seam, the overseer skill's watcher loop calls the verb, and a tier's row renders armed, stale past the staleness ceiling of six beat intervals, or stood down — with the staleness boundary read off the shipped constant rather than asserted by the spec that described it.
