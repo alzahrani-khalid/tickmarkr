@@ -1,4 +1,5 @@
 import type { WorkerResult } from "../adapters/types.js";
+import { classifyScopeOffenders, type ScopeCollateralVerdict } from "../compile/collateral.js";
 import { filesGlob } from "../graph/files-glob.js";
 import { shGitOk } from "../run/git.js";
 import type { GateResult } from "./types.js";
@@ -24,12 +25,18 @@ export function dispositionOffenders(offenders: string[], allowDeviations: strin
   return { hard, allowed };
 }
 
+/**
+ * OBS-547: `collateral` is this task's slice of the run's ONE full prediction map (computed at run
+ * start, uncapped — src/compile/collateral.ts). Absent ⇒ no classification, today's behaviour; the
+ * gate never computes a map of its own, so what it classifies on is always what the run predicted.
+ */
 export async function scopeGate(
   worktree: string,
   integrationTip: string,
   files: string[],
   result: WorkerResult,
   allowDeviations: string[] = [],
+  collateral?: { taskId: string; predicted: ReadonlyArray<string> },
 ): Promise<GateResult> {
   if (!files.length) return { gate: "scope", pass: true, details: "no file scope declared — unrestricted" };
   const baseRef = await scopeDiffBase(worktree, integrationTip);
@@ -44,5 +51,19 @@ export async function scopeGate(
   if (!hard.length) {
     return { gate: "scope", pass: true, details: `out-of-scope but operator-allowlisted:\n${allowed.join("\n")}${note}` };
   }
-  return { gate: "scope", pass: false, details: `out-of-scope edits not covered by scope.allowDeviations:\n${hard.join("\n")}${note}` };
+  // OBS-547: cross-reference at the red — the red supplies the paths, the prediction the classification.
+  const verdict: ScopeCollateralVerdict | undefined = collateral
+    ? classifyScopeOffenders(collateral.taskId, hard, collateral.predicted)
+    : undefined;
+  const classification = verdict?.authoring
+    ? `\nauthoring defect (OBS-547): the collateral lint named every one of these paths before dispatch. Repair:\n${verdict.repair}`
+    : verdict && verdict.missed.length
+      ? `\ncollateral lint did not predict: ${verdict.missed.join(", ")}`
+      : "";
+  return {
+    gate: "scope",
+    pass: false,
+    details: `out-of-scope edits not covered by scope.allowDeviations:\n${hard.join("\n")}${note}${classification}`,
+    ...(verdict ? { meta: { collateral: verdict } } : {}),
+  };
 }

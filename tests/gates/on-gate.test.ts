@@ -60,6 +60,16 @@ async function ctxFor(repo: string, base: string, task: ReturnType<typeof mkTask
   };
 }
 
+// v2.0 T2: the run-specific measurement keys, dropped for equality between two separate runs.
+const MEASURED = new Set(["durationMs", "load1Start", "load1End", "selectedDurationMs", "fullDurationMs", "invocations"]);
+const withoutMeasurement = (r: { results: { meta?: Record<string, unknown> }[] } & Record<string, unknown>) => ({
+  ...r,
+  results: r.results.map((g) => ({
+    ...g,
+    ...(g.meta ? { meta: Object.fromEntries(Object.entries(g.meta).filter(([k]) => !MEASURED.has(k))) } : {}),
+  })),
+});
+
 function traceOf(onGate: (e: GateEvent) => void | Promise<void>) {
   const trace: GateEvent[] = [];
   const hook = async (e: GateEvent) => { trace.push(e); await onGate(e); };
@@ -173,7 +183,10 @@ describe("VIS-08 onGate — start/end pairing + absent-hook identity", () => {
     const bare = await runGates(task, baseCtx);
     const { hook } = traceOf(() => {});
     const hooked = await runGates(task, { ...baseCtx, onGate: hook });
-    expect(hooked).toEqual(bare);
+    // v2.0 T2: the per-gate measurement (durationMs, the two load samples, the judge/review
+    // invocation spans) is a property of the RUN, not of the hook — two runs of the same round
+    // legitimately differ there. Everything the hook could actually change is compared verbatim.
+    expect(withoutMeasurement(hooked)).toEqual(withoutMeasurement(bare));
   });
 });
 

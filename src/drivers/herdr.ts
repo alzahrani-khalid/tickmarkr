@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, matchesOccupiedInputBox, missingInputStateDeclarations, shq, type InputBox } from "../adapters/types.js";
 import { consumePaneLaunchIntent, PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
-import { Journal } from "../run/journal.js";
+import { Journal, type JournalEvent } from "../run/journal.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
 import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
@@ -89,32 +89,30 @@ export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILE
 
 // The watch board's geometry, deliberately NOT the trailer floor above. `workerSplitDirection`
 // halves the caller and refuses a right split under 108+2 — that bound protects WORKER panes, which
-// print a trailer; the supervising seat + board pair does not. Applied to that pair on 2026-08-18 it
-// sent a 189-column tab's board BELOW the seat and the operator corrected it (QUEUE-v194 criterion 1;
-// skills/tickmarkr-overseer/SKILL.md: "the side placement outranks the halving floor"). So the board
-// is allocated its measured width FIRST and the seat keeps the remainder.
-export const BOARD_TARGET_COLS = 110; // §14a measured clean-render bound for the board
-export const BOARD_SEAT_FLOOR_COLS = 40; // the seat beside it still has to be usable
+// print a trailer; the supervising seat + board pair does not, and neither does the board's own
+// placement any more. Every width-derived variant of this placement has been wrong in the operator's
+// tab: the halving floor sent a 189-column board below the seat (2026-08-18), and the width-first
+// side split that replaced it puts the board and the narration shoulder to shoulder when the board is
+// the surface the operator reads and the narration is the rail beneath it. The placement is now ONE
+// record — the board stacked ABOVE the caller at full width, taking 72% of the height — and it is
+// invariant: no terminal width, measured or unmeasurable, can select a different arrangement.
+export const BOARD_HEIGHT_SHARE = 0.72; // board 72 / narration 28, the operator's stack
 
-export interface BoardSplitPlan {
-  direction: "right" | "down";
-  /** herdr's split ratio is the FIRST child's share and a right split's first child is the caller,
-   *  so this is what the SEAT keeps. Absent on `down` — the board then takes the full width. */
-  ratio?: number;
-  /** Columns the board gets under this plan; null when it takes the caller's whole width. */
-  boardCols: number | null;
+export interface BoardPlacement {
+  /** Always down: the split is vertical, so the board can own the caller's FULL width. */
+  direction: "down";
+  /** herdr's split ratio is the FIRST child's share, and a down split's first child is the TOP
+   *  region — the region the board occupies once it is swapped above the caller. */
+  ratio: number;
+  /** The new pane is swapped ABOVE the caller; the split alone would leave the board underneath. */
+  swap: "above";
 }
 
-/** Board-first placement beside the supervising seat: right only while the caller can fund the board
- *  its target AND leave the seat its floor; otherwise down at full width, never a squeezed board.
- *  An unmeasurable caller falls back to down like every other placement here (fail closed). */
-export function boardSplitPlan(
-  callerCols: number | null,
-  boardCols = BOARD_TARGET_COLS,
-  seatFloor = BOARD_SEAT_FLOOR_COLS,
-): BoardSplitPlan {
-  if (callerCols == null || callerCols < boardCols + seatFloor) return { direction: "down", boardCols: null };
-  return { direction: "right", ratio: Math.round(((callerCols - boardCols) / callerCols) * 1e4) / 1e4, boardCols };
+/** The single approved vertical-stack record. The caller's columns are accepted and deliberately
+ *  ignored: this signature is where width used to decide the arrangement, and the parameter stays
+ *  so that "the plan does not depend on it" is a property a caller (and a test) can exercise. */
+export function boardSplitPlan(_callerCols?: number | null): BoardPlacement {
+  return { direction: "down", ratio: BOARD_HEIGHT_SHARE, swap: "above" };
 }
 
 // VIS-04 role-tab + VIS-09 item 2 cap/overflow: live members of one ref-counted tab (a GENERATION);
@@ -189,6 +187,7 @@ export class HerdrDriver implements ExecutorDriver {
   // the caller launched tickmarkr elsewhere (process.cwd is not run identity). The repo itself is
   // also bound for judge/review/consult slots whose cwd is the root rather than a task worktree.
   private journalRoots = new Map<string, string>();
+  private narrate?: (event: JournalEvent) => void;
 
   // VIS-10: the run's workspace id, captured once at construction (the daemon inherits it from the
   // operator's env before the driver is built). Required at slot() time, never in the constructor —
@@ -220,7 +219,15 @@ export class HerdrDriver implements ExecutorDriver {
     if (!repoRoot) {
       throw new Error(`cannot journal dispatch-retry: slot ${slot.name} has no daemon repo binding for ${slot.cwd}`);
     }
-    Journal.open(repoRoot, owned.runId).append("dispatch-retry", owned.taskId, data);
+    // Bound to the live narration sink (`narrateWith`): this Journal is the driver's own — the
+    // daemon never appends this event and never sees it — so an unbound handle here persists the
+    // recovery to the file and the pipe while the operator's rail stays silent about it.
+    Journal.open(repoRoot, owned.runId, this.narrate).append("dispatch-retry", owned.taskId, data);
+  }
+
+  /** v1.99 T2: bind this driver's own journal writes to the run's live narration sink. */
+  narrateWith(narrate: (event: JournalEvent) => void): void {
+    this.narrate = narrate;
   }
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
@@ -319,6 +326,19 @@ export class HerdrDriver implements ExecutorDriver {
       return hit?.pane_id ?? null;
     } catch {
       return null;
+    }
+  }
+
+  // Is this pane id still in the listing? FAIL CLOSED: a listing we cannot read cannot prove a pane
+  // gone, and the caller uses this to decide whether a pane it tried to close is really off screen.
+  private async paneStillOpen(paneId: string): Promise<boolean> {
+    const r = await this.herdr(`pane list`);
+    if (r.code !== 0) return true;
+    try {
+      const panes = JSON.parse(r.stdout).result?.panes;
+      return !Array.isArray(panes) || panes.some((p: { pane_id?: string }) => p.pane_id === paneId);
+    } catch {
+      return true;
     }
   }
 
@@ -1138,17 +1158,16 @@ export class HerdrDriver implements ExecutorDriver {
     }).map((p) => p.pane_id!);
   }
 
-  // T2: the watch is a sibling of the daemon's own pane, never a separate tab — beside it when the
-  // tab can fund the board its width, below it at full width when it cannot. Its durable owned name
-  // is how a later daemon RECOGNIZES the board it must retire, so a run never stacks a second one.
+  // T2: the watch is a sibling of the daemon's own pane, never a separate tab — stacked ABOVE it at
+  // the caller's full width, always, whatever the terminal measures. Its durable owned name is how a
+  // later daemon RECOGNIZES the board it must retire, so a run never stacks a second one.
   private async watchSlot(cwd: string, name: string): Promise<Slot> {
     if (!this.ws) throw new Error("herdr watch placement requires HERDR_WORKSPACE_ID — refusing unseeded pane");
     if (!this.callerPane) throw new Error("herdr watch placement requires HERDR_PANE_ID — refusing untargeted split");
-    // Board width first (boardSplitPlan), measured off the caller through the driver's own layout
-    // read — never an unconditional right split, and never the worker halving rule.
-    const plan = boardSplitPlan(await this.paneWidth(this.callerPane));
-    const ratio = plan.ratio == null ? "" : ` --ratio ${plan.ratio}`;
-    const sp = await this.herdr(`pane split ${shq(this.callerPane)} --direction ${plan.direction}${ratio} --no-focus`);
+    // One invariant placement (boardSplitPlan): split the caller down, then swap the new pane above
+    // it. No layout read decides this — width chose the arrangement twice and was wrong twice.
+    const plan = boardSplitPlan();
+    const sp = await this.herdr(`pane split ${shq(this.callerPane)} --direction ${plan.direction} --ratio ${plan.ratio} --no-focus`);
     if (sp.code !== 0) throw new Error(`herdr watch split failed: ${sp.stderr || sp.stdout}`);
     let pane: string | undefined;
     try {
@@ -1157,20 +1176,66 @@ export class HerdrDriver implements ExecutorDriver {
       /* fail closed below */
     }
     if (typeof pane !== "string" || !pane) throw new Error(`herdr watch split returned no pane id: ${sp.stdout}`);
+    // The split leaves the board UNDER the caller; the swap is what makes the stack the requested
+    // one. Verified, not assumed: a swap that failed would leave a board below the narration while
+    // the daemon reported the geometry it asked for. Instead the split pane is closed and the failure
+    // propagates — the daemon swallows it and runs boardless, which is honest about what is on screen.
+    // `pane swap` answers a no-op with a ZERO exit and `changed:false` (herdr socket API: a swap it
+    // declined is a non-error response), so an exit code alone proves nothing about the geometry —
+    // that is exactly the path that would leave the board below the narration while the daemon
+    // reported the stack. The documented `changed` flag is the verification; anything else — a
+    // nonzero exit, `changed:false`, an unparseable result — fails closed.
+    const swapped = await this.herdr(`pane swap --source-pane ${shq(pane)} --target-pane ${shq(this.callerPane)}`);
+    let swapChanged: unknown;
+    try {
+      swapChanged = JSON.parse(swapped.stdout).result?.changed;
+    } catch {
+      /* fail closed below */
+    }
+    if (swapped.code !== 0 || swapChanged !== true) {
+      await this.discardSplit(
+        pane,
+        `herdr watch swap ${plan.swap} failed: ${
+          swapped.code !== 0
+            ? swapped.stderr || swapped.stdout
+            : `herdr reported no swap took place: ${swapped.stdout || swapped.stderr}`
+        }`,
+      );
+    }
     const renamed = await this.herdr(`pane rename ${shq(pane)} ${shq(name)}`);
     if (renamed.code !== 0 || await this.namedPaneId(name) !== pane) {
-      await this.herdr(`pane close ${shq(pane)}`);
-      throw new Error(`herdr watch rename failed: ${renamed.stderr || renamed.stdout}`);
+      await this.discardSplit(pane, `herdr watch rename failed: ${renamed.stderr || renamed.stdout}`);
     }
     const seed = await this.herdr(
       `pane run ${shq(pane)} ${shq(`cd ${shq(cwd)}; export HERDR_WORKSPACE_ID=${shq(this.ws)}; ${herdrSealShellPrefix()}`)}`,
       cwd,
     );
     if (seed.code !== 0) {
-      await this.herdr(`pane close ${shq(pane)}`);
-      throw new Error(`herdr watch seed failed: ${seed.stderr || seed.stdout}`);
+      await this.discardSplit(pane, `herdr watch seed failed: ${seed.stderr || seed.stdout}`);
     }
     return { id: pane, name, cwd };
+  }
+
+  // A board that could not be placed costs the OPERATOR a stray pane unless the split is really
+  // taken back, so every close is followed by a pane-list verification rather than issued and
+  // forgotten. A nonzero close and a success that frees nothing are both diagnosed from that same
+  // observation. The daemon swallows it either way and runs boardless — but never silently keeps a
+  // split the geometry it asked for does not include.
+  private async discardSplit(pane: string, why: string): Promise<never> {
+    const closed = await this.herdr(`pane close ${shq(pane)}`);
+    const stillOpen = await this.paneStillOpen(pane);
+    const orphan = stillOpen
+      ? closed.code !== 0
+        ? closed.stderr || closed.stdout || `exit ${closed.code}`
+        : "close reported success but the pane could not be proven absent from pane list"
+      : null;
+    if (orphan !== null) {
+      // The daemon swallows narrator failures whole (visibility is never a gate), so the thrown
+      // error dies in its catch. This line is the operator's only notice that a pane they did not
+      // ask for is still on their screen and that no process will take it back.
+      console.error(`tickmarkr: the watch split ${pane} survived its close (${orphan}) — close it by hand; the run continues boardless`);
+    }
+    throw new Error(orphan === null ? why : `${why} — and the split pane ${pane} survived its close (${orphan})`);
   }
 
   // T6 narrator: the run's single live status surface, RUNNING THE COMMAND THIS CALL SUPPLIED. Only

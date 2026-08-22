@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import { shGit } from "./git.js";
+
 // OBS-82: normalize known presentation tokens before measuring transcript extent or filtering an
 // LLM-bound transcript. This remains a closed allowlist — ANSI/VT escapes, braille-range spinner
 // glyphs, and elapsed-time tokens bound to time-unit suffixes. Every other byte passes through
@@ -27,6 +30,180 @@ export interface StallProgressSample {
   paneText: string;
   seedSubmitted?: boolean;
   contextTokens?: number;
+}
+
+// T2 (OBS-264): a CPU delta needs two samples separated in WALL CLOCK, and the CPU clock is
+// QUANTIZED: darwin's `ps` prints hundredths ("0:00.03"), linux's precise /proc clock advances in
+// jiffies. Equality across a window shorter than the quantum is not evidence of rest. Crossing 30
+// ticks means the tree burned <1 tick in 30, i.e. under ~3% of one core. This process-tree liveness
+// primitive lives here rather than in daemon.ts so lower-level gate waits can use it without closing
+// the daemon -> run-gates -> llm -> daemon dependency cycle.
+const HARVEST_CPU_FLAT_MS = 3_000;
+const HARVEST_CPU_FLAT_TICKS = 30;
+const WORKER_TREE_CPU_ACCOUNTING_POLL_MS = 100;
+const WORKER_TREE_CPU_UNMEASURABLE_SAMPLE_CAP = 20;
+
+let harvestCpuFlatMs: number | undefined;
+export function harvestCpuFlatWindowMs(resolutionMs: number): number {
+  return harvestCpuFlatMs ?? Math.max(HARVEST_CPU_FLAT_MS, resolutionMs * HARVEST_CPU_FLAT_TICKS);
+}
+
+/** Test seam — pin the quantization-aware flat window without changing production policy. */
+export function setHarvestCpuFlatMsForTests(ms: number): void {
+  harvestCpuFlatMs = ms;
+}
+
+export function resetHarvestCpuFlatMsForTests(): void {
+  harvestCpuFlatMs = undefined;
+}
+
+// `ps` CPU time: "[[dd-]hh:]mm:ss[.frac]". Anything else is a header or a row this parser must
+// not guess at. `frac` reports whether this host exposes sub-second digits so callers use the
+// sampled clock's quantum rather than assuming one.
+function parsePsCpu(raw: string): { ms: number; frac: boolean } | undefined {
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$/.exec(raw);
+  if (!m) return undefined;
+  const ms = ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60_000
+    + Math.round(Number(m[4]!) * 1000);
+  return { ms, frac: m[4]!.includes(".") };
+}
+
+interface WorkerTreeCpuSnapshot {
+  processes: Map<string, number>;
+  resolutionMs: number;
+}
+
+let linuxClockTickMs: Promise<number | undefined> | undefined;
+function linuxProcessCpuMs(pid: string, cwd: string): Promise<{ ms: number; resolutionMs: number } | undefined> {
+  if (!existsSync("/proc/self/stat")) return Promise.resolve(undefined);
+  // shGit, not sh: the accountant samples at 100ms cadence and must not run the operator's login
+  // profile (nvm/pyenv/direnv side effects included) on every sample.
+  linuxClockTickMs ??= shGit("getconf CLK_TCK", cwd, 15_000).then((r) => {
+    const ticks = r.code === 0 ? Number(r.stdout.trim()) : Number.NaN;
+    return Number.isFinite(ticks) && ticks > 0 ? 1_000 / ticks : undefined;
+  });
+  return linuxClockTickMs.then((resolutionMs) => {
+    if (resolutionMs === undefined) return undefined;
+    try {
+      // `/proc/<pid>/stat` fields 14-17 are user/system jiffies for the process and its waited-for
+      // children. Child totals retain tools that start and exit wholly between live-tree polls.
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      const ticks = Number(fields[11]) + Number(fields[12]) + Number(fields[13]) + Number(fields[14]);
+      return Number.isFinite(ticks) ? { ms: ticks * resolutionMs, resolutionMs } : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+}
+
+// Every non-seeded worker process descends from its attempt-unique dispatch script. One ps snapshot
+// finds that root and its descendants. An empty tree is measurable zero; a failed or unparseable
+// snapshot is undefined because missing evidence can never prove inactivity.
+async function workerTreeCpuSnapshot(marker: string, cwd: string): Promise<WorkerTreeCpuSnapshot | undefined> {
+  const snapshot = await shGit("ps -Awwo pid=,ppid=,time=,command=", cwd, 15_000);
+  if (snapshot.code !== 0) return undefined;
+  const rows: { pid: string; ppid: string; cpuMs: number; frac: boolean; cmd: string }[] = [];
+  for (const line of snapshot.stdout.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const cpu = parsePsCpu(m[3]!);
+    if (cpu !== undefined) rows.push({ pid: m[1]!, ppid: m[2]!, cpuMs: cpu.ms, frac: cpu.frac, cmd: m[4]! });
+  }
+  if (rows.length === 0) return undefined;
+  const tree = new Set(rows.filter((p) => p.cmd.includes(marker)).map((p) => p.pid));
+  // ps output is not topologically ordered; relax the parent -> child closure until stable.
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const p of rows) {
+      if (!tree.has(p.pid) && tree.has(p.ppid)) {
+        tree.add(p.pid);
+        grew = true;
+      }
+    }
+  }
+  const precise = new Map<string, number>();
+  let preciseResolutionMs: number | undefined;
+  for (const p of rows) {
+    if (!tree.has(p.pid)) continue;
+    const cpu = await linuxProcessCpuMs(p.pid, cwd);
+    precise.set(p.pid, cpu?.ms ?? p.cpuMs);
+    if (cpu !== undefined) preciseResolutionMs = cpu.resolutionMs;
+  }
+  if (preciseResolutionMs === undefined && existsSync("/proc/self/stat")) {
+    preciseResolutionMs = (await linuxProcessCpuMs(String(process.pid), cwd))?.resolutionMs;
+  }
+  return {
+    processes: precise,
+    resolutionMs: preciseResolutionMs ?? (rows.some((p) => p.frac) ? 10 : 1_000),
+  };
+}
+
+export async function workerTreeCpuMs(
+  marker: string,
+  cwd: string,
+): Promise<{ ms: number; resolutionMs: number } | undefined> {
+  const snapshot = await workerTreeCpuSnapshot(marker, cwd);
+  if (snapshot === undefined) return undefined;
+  return {
+    ms: [...snapshot.processes.values()].reduce((sum, cpuMs) => sum + cpuMs, 0),
+    resolutionMs: snapshot.resolutionMs,
+  };
+}
+
+// Sparse live-tree totals forget a tool's CPU as soon as it exits. This attempt-local accountant
+// instead accumulates each observed PID's delta and replaces only the live-PID cursor. Daemon workers
+// and gate workers deliberately share these semantics: the marker is the unique dispatch script,
+// an unreadable sample clears the current evidence, and stopped descendants remain in the total.
+export class WorkerTreeCpuAccountant {
+  private active = false;
+  private loop: Promise<void> | undefined;
+  private live = new Map<string, number>();
+  private totalMs = 0;
+  private gaps = 0;
+  private consecutiveGaps = 0;
+  private latest: { ms: number; resolutionMs: number } | undefined;
+
+  constructor(private marker: string, private cwd: string) {}
+
+  private async sample(): Promise<void> {
+    const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd);
+    if (snapshot === undefined) {
+      this.gaps++;
+      this.live.clear();
+      this.latest = undefined;
+      if (++this.consecutiveGaps >= WORKER_TREE_CPU_UNMEASURABLE_SAMPLE_CAP) this.active = false;
+      return;
+    }
+    this.consecutiveGaps = 0;
+    for (const [pid, cpuMs] of snapshot.processes) {
+      const prior = this.live.get(pid);
+      this.totalMs += prior === undefined || cpuMs < prior ? cpuMs : cpuMs - prior;
+    }
+    this.live = snapshot.processes;
+    this.latest = { ms: this.totalMs, resolutionMs: snapshot.resolutionMs };
+  }
+
+  async start(): Promise<void> {
+    if (this.active) return;
+    this.active = true;
+    await this.sample();
+    this.loop = (async () => {
+      while (this.active) {
+        await new Promise((resolve) => setTimeout(resolve, WORKER_TREE_CPU_ACCOUNTING_POLL_MS));
+        if (this.active) await this.sample();
+      }
+    })();
+  }
+
+  read(): { cpu: { ms: number; resolutionMs: number } | undefined; gaps: number } {
+    return { cpu: this.latest, gaps: this.gaps };
+  }
+
+  async stop(): Promise<void> {
+    this.active = false;
+    await this.loop;
+  }
 }
 
 // T1 (OBS-262): the rescue nudge's adapter scope — claude-code only (steering path proven,

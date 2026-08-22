@@ -45,6 +45,7 @@ case "$1 $2" in
   "pane list") ${paneList} ;;
   "pane rename") printf '%s||%s|wT\\n' "$3" "$4" >> '${panesFile}'; echo '{}' ;;
   "pane split") echo '{"result":{"pane":{"pane_id":"w1:p7"}}}' ;;
+  "pane swap") echo '{"result":{"changed":true}}' ;;
   "pane layout") echo '{"result":{"layout":{"area":{"width":220},"panes":[{"pane_id":"wT:pCALLER","rect":{"width":220}}]}}}' ;;
   "tab create") echo '{"result":{"tab":{"tab_id":"w1:tN"},"root_pane":{"pane_id":"w1:p9"}}}' ;;
   "pane close") grep -v "^$3|" '${panesFile}' > '${panesFile}.tmp' 2>/dev/null || :; mv '${panesFile}.tmp' '${panesFile}' 2>/dev/null || :; echo '{}' ;;
@@ -119,12 +120,13 @@ describe("HerdrDriver.reconcile (stubbed binary)", () => {
     await expect(garbage.reconcile(new Set(), RUN)).resolves.toBeUndefined();
   });
 
-  test("narrator with a runId names the right-split watch pane canonically (T2 ownership contract)", async () => {
+  test("narrator with a runId names the stacked-above watch pane canonically (T2 ownership contract)", async () => {
     const { bin, log } = makeReconcileStub([]);
     const d = new HerdrDriver(bin);
     await d.narrator("/tmp", `tickmarkr status --watch ${RUN}`, RUN);
-    expect(log()).toContain("pane layout --pane wT:pCALLER"); // board width is measured, not assumed
-    expect(log()).toContain("pane split wT:pCALLER --direction right --ratio 0.5 --no-focus");
+    expect(log()).not.toContain("pane layout --pane wT:pCALLER"); // v1.99 T2: width never picks the arrangement
+    expect(log()).toContain("pane split wT:pCALLER --direction down --ratio 0.72 --no-focus");
+    expect(log()).toContain("pane swap --source-pane w1:p7 --target-pane wT:pCALLER"); // board ABOVE the caller
     expect(log()).toContain(`pane rename w1:p7 ${owned("watch", "run", 0, RUN)}`);
   });
 });

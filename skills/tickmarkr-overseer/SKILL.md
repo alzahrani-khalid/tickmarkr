@@ -64,13 +64,15 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    **FIVE-TAB CANON (standing operator layout — corrected three times on 2026-07-27, layout approved
    2026-07-29, re-earned 2026-08-17):**
    - `OVERSEER` — you. Do not add a second live run surface: the daemon self-places the shipped board
-     beside the supervising seat that invokes the run.
-   - `ORCH` — the orchestrator and the daemon-placed, run-id-pinned shipped board beside it. **Look for
-     that `role: "watch"` pane; never hand-place or hand-roll a live run surface. Nothing else, ever: a
-     work seat NEVER splits into the ORCH tab.** Operator verbatim: *"in orch tab should be the orch and
-     the watcher only."* Re-earned 2026-08-17: a planning seat split beside the orchestrator, and the
-     operator caught it, again. The daemon owns the side placement and board-first width allocation;
-     neither the worker-pane halving floor nor an overseer split command places this pane.
+     ABOVE the supervising seat that invokes the run.
+   - `ORCH` — the orchestrator with the daemon-placed, run-id-pinned shipped board STACKED ABOVE it: the
+     board owns the tab's full width and the top 72% of its height, and the orchestrator's own narration
+     is the rail underneath. **Look for that `role: "watch"` pane; never hand-place or hand-roll a live
+     run surface. Nothing else, ever: a work seat NEVER splits into the ORCH tab.** Operator verbatim:
+     *"in orch tab should be the orch and the watcher only."* Re-earned 2026-08-17: a planning seat split
+     beside the orchestrator, and the operator caught it, again. The daemon owns this vertical stack and
+     places it the same way at every terminal width; neither the worker-pane halving floor, nor a
+     measured column count, nor an overseer split command places this pane.
    - Worker/seat tabs — tickmarkr opens ONE TAB PER TASK itself; GSD-leg seats get the same treatment
      (own tab, or a shared WORKERS tab), never the ORCH tab.
    - `CONSULT · <topic>` — ONE shared tab for ALL consultants of a round, side-by-side splits; never one
@@ -134,10 +136,12 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
 ### What the ORCHESTRATOR does, and what you require of it
 
 - **The live surface arrives with the run.** `tickmarkr run` is stdout-silent until run-end by design;
-  its daemon self-places one shipped `role: "watch"` board beside the supervising seat and pins that
-  board to the daemon's run id. **Look for the matching daemon-placed pane.** If it is absent, treat that
-  as a daemon/run liveness fault and use the normal recovery path; never hand-place, hand-roll, or launch
-  a replacement live surface.
+  its daemon self-places one shipped `role: "watch"` board ABOVE the supervising seat — full width, top
+  72% of the height, narration below — and pins that board to the daemon's run id. **Look for the matching
+  daemon-placed pane.** If it is absent, treat that as a daemon/run liveness fault and use the normal
+  recovery path; never hand-place, hand-roll, or launch a replacement live surface. A board the daemon
+  could not stack is not silently re-arranged: the split is closed and the run continues BOARDLESS, so an
+  absent board means the placement failed, never that it landed somewhere else in the tab.
 - **The journal is the source of truth**, not panes. Watchers go on `run-end` / `task-human` /
   `task-failed` / `consult-verdict`; never sleep-poll inside an agent turn. **Never key a watcher on an
   agent's `done`** — that is turn end and fires the moment a seat finishes acknowledging you.
@@ -551,10 +555,11 @@ orchestrator turn boundary.
     safe 53 → floor 108"*), and it splits right only while `paneWidth/2 ≥ 108 + 2` (`herdr.ts:494`),
     otherwise **down**. Apply the same test by hand: `herdr pane layout --pane <id>`, halve the width,
     and if the halves fall under the floor, split `--direction down`.
-  - **The daemon-placed ORCH board is outside this manual split rule.** The halving bound protects
-    worker-pane trailers; the daemon, not the overseer, places the run-id-pinned shipped board beside
-    the supervising seat and owns its board-first width allocation. Look for that pane and do not split,
-    place, or recreate it.
+  - **The daemon-placed ORCH board is outside this manual split rule — width does not place it at all.**
+    The halving bound protects worker-pane trailers; the board carries none. The daemon, not the overseer,
+    splits the supervising seat DOWN at ratio 0.72 and swaps the new pane ABOVE it (`boardSplitPlan`,
+    `src/drivers/herdr.ts`), so the board is full width and the narration is the rail beneath it at every
+    terminal width. Look for that pane and do not split, place, resize, or recreate it.
   - **Binary splits cannot produce an even 3-column row at any width.** 220 goes to 110/55/55 whichever
     pane you split. **At a 220-col terminal the width-derived cap is TWO side-by-side panes**; a third
     seat goes below one of them, or into its own tab. "Three panes" is a *height* heuristic

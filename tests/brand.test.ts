@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import * as brandModule from "../src/brand.js";
 import {
-  BANNER, COMPACT_LOCKUP, GLYPHS, PLAIN_COMPACT_LOCKUP, TOKENS,
+  BANNER, COMPACT_LOCKUP, GLYPHS, LIVE, LIVE_PALETTE, PLAIN_COMPACT_LOCKUP, TOKENS,
   kvRow, legend, paneDispatchCommand, rule, statusRow, title, toggleActive, toggleInactive,
 } from "../src/brand.js";
 
@@ -178,6 +178,64 @@ describe("design system — tokens", () => {
   test("the warn token renders amber on a tty", () => {
     onTTY();
     expect(TOKENS.warn("warn")).toBe("\x1b[33mwarn\x1b[0m");
+  });
+});
+
+describe("design system — live operator roles", () => {
+  test("test: the exported live role table deep-equals the five operator hex values with muted teal as brand while changing any channel or using a nearest ANSI index fails", () => {
+    const OPERATOR = {
+      brand: "#90C4A4",
+      running: "#5A76AE",
+      text: "#E6FDFF",
+      chrome: "#D9D7DD",
+      attention: "#B07BAC",
+    } as const;
+    expect(LIVE_PALETTE).toEqual(OPERATOR);
+
+    const roleTokens = {
+      brand: LIVE.brand,
+      running: LIVE.running,
+      text: LIVE.text,
+      chrome: LIVE.chrome,
+      attention: LIVE.attention,
+    } as const;
+    onTTY();
+    for (const [role, hex] of Object.entries(OPERATOR)) {
+      const channels = hex.slice(1).match(/.{2}/gu)!.map((channel) => Number.parseInt(channel, 16));
+      const rendered = roleTokens[role as keyof typeof roleTokens]("x");
+      expect(rendered, role).toBe(`\x1b[38;2;${channels.join(";")}mx\x1b[0m`);
+      expect(rendered, role).not.toMatch(/\x1b\[38;5;/u);
+    }
+
+    for (const [role, hex] of Object.entries(OPERATOR)) {
+      const channels = hex.slice(1).match(/.{2}/gu)!.map((channel) => Number.parseInt(channel, 16));
+      for (let channel = 0; channel < channels.length; channel += 1) {
+        const changed = [...channels];
+        changed[channel] = (changed[channel]! + 1) % 256;
+        const changedHex = `#${changed.map((value) => value.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+        expect({ ...OPERATOR, [role]: changedHex }, `${role} channel ${channel}`).not.toEqual(LIVE_PALETTE);
+      }
+    }
+
+    // The nearest-ANSI control is an INSTANCE of the substitution it must catch: the closest
+    // 256-colour index to each operator hex, rendered through the same helper shape a token would
+    // use. Every one of them is an approximation — off by at least one channel — and none of them
+    // produces the bytes the shipped token produces.
+    const NEAREST_ANSI: Record<keyof typeof OPERATOR, number> = {
+      brand: 151, running: 67, text: 195, chrome: 188, attention: 139,
+    };
+    const cubeChannels = (index: number): number[] => {
+      const levels = [0, 95, 135, 175, 215, 255];
+      const cube = index - 16;
+      return [Math.floor(cube / 36), Math.floor(cube / 6) % 6, cube % 6].map((step) => levels[step]!);
+    };
+    for (const [role, index] of Object.entries(NEAREST_ANSI) as [keyof typeof OPERATOR, number][]) {
+      const exact = OPERATOR[role].slice(1).match(/.{2}/gu)!.map((c) => Number.parseInt(c, 16));
+      const approximated = cubeChannels(index);
+      expect(approximated, `${role} index ${index} is an approximation`).not.toEqual(exact);
+      expect(roleTokens[role]("x"), role).not.toBe(`\x1b[38;5;${index}mx\x1b[0m`);
+      expect(roleTokens[role]("x"), role).not.toBe(`\x1b[38;2;${approximated.join(";")}mx\x1b[0m`);
+    }
   });
 });
 

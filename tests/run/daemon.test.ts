@@ -4,7 +4,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { execSync, spawn } from "node:child_process";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { kimiSessionId } from "../../src/adapters/kimi.js";
 import { type BillingChannel, shq } from "../../src/adapters/types.js";
@@ -3374,9 +3374,35 @@ describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
   });
 });
 
+// A deterministic flat worker-tree CPU reading, installed by overriding `ps` for every shell the
+// daemon forks. Unconditional on purpose: the point is that the CPU leg answers the same on a host
+// whose `ps` works and on one that denies it, so a test can vary the leg it actually means to test.
+function flatCpuProbe(): () => void {
+  const bashEnv = join(makeTestTempDir("tickmarkr-ps-flat-"), "bash-env");
+  writeFileSync(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+  const prior = process.env.BASH_ENV;
+  process.env.BASH_ENV = bashEnv;
+  return () => {
+    if (prior === undefined) delete process.env.BASH_ENV;
+    else process.env.BASH_ENV = prior;
+  };
+}
+
 // T1 (OBS-262/263, speed-spec §2): stall detection notices a dead or silent worker in minutes.
 // Interactive-driver integration tests over the scripted fake adapter — zero tokens, real worktrees.
 describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
+  // OBS-548 review (material): the fast-kill grew a CPU leg, and it fails OPEN — an unmeasurable
+  // reading stands the kill down and hands the pane back to the rolling window. Every case in this
+  // describe discriminates on a CHANNEL leg (row growth, worktree delta, nudge state, status), so
+  // the CPU reading must be a constant here rather than something each host answers differently:
+  // the managed macOS sandbox denies `ps` outright, which would hold every kill below until a
+  // 5- or 30-minute daemon window outlived the 120 s test budget. One unrelated row — the marker
+  // matches nothing, so the worker tree is empty and reads the probe's documented flat zero,
+  // "nothing of this worker is running". Same fixture the OBS-548 cases use, applied to all of them.
+  let restoreCpuProbe: () => void = () => {};
+  beforeEach(() => { restoreCpuProbe = flatCpuProbe(); });
+  afterEach(() => { restoreCpuProbe(); });
+
   // a stalled interactive TUI: prints once (early-launch liveness passes), never emits a trailer
   const STALLED = {
     consult: { action: "human", notes: "stalled worker" },
@@ -3562,6 +3588,33 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
       resetQuotaBannerSilentMsForTests();
     }
   }, 120_000);
+
+  // OBS-548, fourth clause: the arithmetic was settled before either probe ran. The prompt told
+  // every worker "Budget the full suite once" inside a stall window whose OUTPUT-silence gates are
+  // 300 s (600 s in practice, behind the nudge hold) — and this repository's own suite measures
+  // ~712 s. A worker obeying the harness's own instruction was killed by construction, which is
+  // OBS-534's shape one probe over. Gates already run build/test/lint themselves against a recorded
+  // baseline, so the suite was never the worker's to buy; what the worker owes inside the window is
+  // a commit and a trailer. Read off the prompt a dispatched worker actually received, never off the
+  // template — the contract is prepended at dispatch, and only the delivered file proves delivery.
+  test("test: the harness contract a dispatched worker receives puts the full suite on the gates and still demands a commit and completion trailer inside the stall window; a contract telling the worker to budget the full suite once fails", async () => {
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 7 })], {
+      tasks: { T1: [{ shell: `echo done > d.txt && ${COMMIT} d`, result: { ok: true, summary: "done" } }] },
+    });
+    await runDaemon(repo, { adapters: [fake], runId: "run-worker-contract" });
+    const prompt = readFileSync(join(tickmarkrDir(repo), "runs", "run-worker-contract", "prompts", "T1-a0.md"), "utf8");
+    const contract = prompt.split("\n").find((line) => line.includes("stall window"))!;
+
+    expect(contract).toContain("7 minute stall window"); // still the task's own window, named
+    // the suite belongs to the gates, and the worker is told so
+    expect(contract).toMatch(/gates run the full suite/i);
+    // …and never told to spend the window on one
+    expect(contract).not.toMatch(/budget the full suite/i);
+    // what it still owes inside that window is unchanged: a commit and the completion trailer
+    expect(contract).toMatch(/commit/i);
+    expect(contract).toMatch(/completion trailer/i);
+    expect(prompt).toContain("This harness is non-interactive"); // the rest of the contract is intact
+  }, 60_000);
 
   test("test: a worker with no trailer, no worktree delta and no output growth for five minutes is concluded dead and journaled as such", async () => {
     setDeadChannelFastKillMsForTests(1_500); // seam for the 5m fast-kill window
@@ -4459,6 +4512,71 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     });
   }, 120_000);
 
+  // OBS-548: the dead-channel fast-kill concluded on three CHANNEL-side legs — no trailer, an
+  // unchanged launch tree, no output growth — and read none of the CPU this same loop already
+  // measures. A worker holding 219,290 ms of tree CPU accruing at ~90 ms/s was declared dead at
+  // 607 s of silence: its verification pass discarded, its gates run on a partial harvest, a healthy
+  // channel demoted. The three runs below hold every one of those channel legs identical and vary
+  // ONLY the CPU reading, so the kill's own arithmetic is the single thing under test.
+  test("test: the fast-kill concludes a silent unchanged tree only when its measured worker-tree CPU is flat and stands down when that CPU is still accruing or cannot be measured; a kill that concludes without reading the measured CPU fails", async () => {
+    // A host that cannot answer `ps` at all — the managed sandbox in production, made deterministic
+    // here so the leg's THIRD state is exercised everywhere rather than only where `ps` is denied.
+    const denyPs = (): (() => void) => {
+      const bashEnv = join(makeTestTempDir("tickmarkr-ps-denied-"), "bash-env");
+      writeFileSync(bashEnv, "ps() { return 1; }\n");
+      const prior = process.env.BASH_ENV;
+      process.env.BASH_ENV = bashEnv;
+      return () => {
+        if (prior === undefined) delete process.env.BASH_ENV;
+        else process.env.BASH_ENV = prior;
+      };
+    };
+    // 3s flat window, the shipped value on a hundredths host: the burner below runs in short-lived
+    // children with ~800ms gaps, so a shorter window would read one gap as rest and answer the
+    // test's own question. 0.12m of stall window leaves the kill room to land long before expiry.
+    await withSeams(300, 3_000, async () => {
+      setDeadChannelFastKillMsForTests(100);
+      const run = async (runId: string, shell: string, cpu: "flat" | "accruing" | "denied") => {
+        const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.12 })], {
+          consult: { action: "human", notes: "a stalled worker parks" },
+          tasks: { T1: [{ shell }] }, // no trailer, no commit — the tree never changes after launch
+        });
+        const restore = cpu === "denied"
+          ? denyPs()
+          : await cpuProbeFallback(repo, runId, cpu === "flat" ? "flat" : "bursty");
+        try {
+          await runDaemon(repo, { adapters: [fake], runId, driver: hdriver() });
+        } finally {
+          restore();
+        }
+        return evsOf(repo, runId);
+      };
+
+      const flat = await run("run-fastkill-cpu-flat", "sleep 30", "flat");
+      const accruing = await run("run-fastkill-cpu-busy", burnInShortChildren(), "accruing");
+      const denied = await run("run-fastkill-cpu-denied", "sleep 30", "denied");
+
+      const rows = (evs: JournalEvent[], event: string) =>
+        evs.filter((e) => e.event === event && e.taskId === "T1");
+      const heldReasons = (evs: JournalEvent[]) => rows(evs, "worker-dead-held").map((e) => e.data.reason);
+
+      // flat CPU under a silent tracker and an unchanged tree: the channel really is dead
+      expect(rows(flat, "worker-dead")).toHaveLength(1);
+      // the death carries the reading it concluded on — a kill that never asked cannot record one
+      expect(rows(flat, "worker-dead")[0]!.data.cpuMs).toBe(0);
+      expect(rows(flat, "worker-dead")[0]!.data.cpuResolutionMs).toBeTypeOf("number");
+
+      // a live CPU delta is a live worker, by construction — the kill stands down and says why
+      expect(rows(accruing, "worker-dead")).toHaveLength(0);
+      expect(heldReasons(accruing)).toEqual(["cpu-accruing"]); // journaled once per attempt
+
+      // unmeasurable is never evidence a worker stopped: the fail-open contract the probe states
+      expect(rows(denied, "worker-dead")).toHaveLength(0);
+      expect(heldReasons(denied)).toEqual(["cpu-unmeasurable"]);
+      expect(rows(denied, "worker-harvest-unmeasurable").length).toBeGreaterThan(0);
+    });
+  }, 120_000);
+
   test("test: the synthesized no-trailer result is journaled as harvested, distinct from a worker-claimed ok", async () => {
     await withSeams(500, 200, async () => {
       const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], {
@@ -4807,21 +4925,29 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
 
   // Member: the dead-channel fast-kill. Its worktree clause and the harvest are mutually exclusive
   // by construction: committed work changes the launch tree, irrespective of whether a nudge can
-  // reach the pane. An unreachable pane holding commits is therefore concluded by the harvest and
-  // its existing work goes straight to gates instead of being misclassified as a dead empty tree.
+  // reach the pane. An unreachable pane holding commits is therefore never condemned as a dead
+  // empty tree, and its existing work goes straight to gates.
+  // OBS-548 moved the MECHANISM and left the claim standing. Until v1.97 a failed delivery LIFTED
+  // both holds — `(!nudgePending || nudgeFailed)` — so this pane was concluded 2.2 s after
+  // `worker-nudge-failed` and the delivery failure was itself the trigger, on precisely the
+  // population that has no input box to accept a nudge. Now both holds stand, so the pane rides its
+  // OWN rolling window and the no-trailer tail harvests the same commits off the same worktree:
+  // still harvested, still never condemned, but by the window rather than by the failure. The
+  // window is sized so that riding all of it is the cheap outcome and not a test timeout.
   test("an unreachable pane holding commits is harvested rather than condemned by failed delivery, and its work still gated", async () => {
-    const fixture = () => setupRepo([T("T1", { timeoutMinutes: 30 })], { // 30m window: the 120s budget proves it was never ridden
+    const fixture = (id: string) => setupRepo([T("T1", { timeoutMinutes: 0.1 })], { // 6s window, ridden in full
       consult: { action: "human", notes: "an unreachable pane must never reach a consult" },
-      tasks: { T1: [{ shell: `echo unreachable > u.txt && ${COMMIT} u` }] },
+      tasks: { T1: [{ shell: `echo ${id} > u.txt && ${COMMIT} u` }] },
     });
     await withSeams(300, 200, async () => {
       NUDGEABLE_ADAPTERS.add("fake");
       setNudgeTimingForTests(300, 400);
+      setDeadChannelFastKillMsForTests(1_500); // kill window well inside the 6s: an unheld kill fires at ~1.5s
       try {
-        // 1) failed delivery does not erase the committed tree evidence; the harvest concludes it
-        const killed = fixture();
+        // 1) the delivery fails, so neither hold lifts: no kill, no triad harvest, the window owns
+        //    the conclusion — and the committed tree is still what goes to gates.
+        const killed = fixture("unreachable");
         const restoreProbe = await cpuProbeFallback(killed.repo, "run-harvest-unreachable", "flat");
-        setDeadChannelFastKillMsForTests(1_500);
         let s: Awaited<ReturnType<typeof runDaemon>>;
         let waited = 0;
         try {
@@ -4836,30 +4962,38 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         }
         const evs = evsOf(killed.repo, "run-harvest-unreachable");
         expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(1);
-        expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
         expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
-        expect(waited).toBeLessThan(60_000); // seconds into a 30m window — the harvest owns the bound
+        expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
+        expect(waited).toBeGreaterThanOrEqual(6_000); // the rolling window was ridden, not short-circuited
         // the conclusion is still not a redispatch: the same worktree went to gates
         expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
         expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
         expect(s.done).toEqual(["T1"]);
 
-        // 2) the SAME fixture with the kill window out of reach reaches the identical conclusion,
-        // proving the fast-kill window cannot override worktree evidence after failed delivery.
-        const harvested = fixture();
-        const restoreHarvest = await cpuProbeFallback(harvested.repo, "run-harvest-unreachable-triad", "flat");
-        setDeadChannelFastKillMsForTests(10 * 60_000);
+        // 2) the SAME fixture with the adapter off the allowlist — nothing else changed, and the
+        //    seams are identical. No nudge is ever owed, so nothing is pending and nothing can fail
+        //    to deliver: the triad concludes on the very evidence leg 1 also had, far inside that
+        //    window. This is what makes leg 1's silence a HOLD rather than a fixture in which
+        //    nothing could ever have been concluded.
+        NUDGEABLE_ADAPTERS.delete("fake");
+        const free = fixture("free");
+        const restoreFree = await cpuProbeFallback(free.repo, "run-harvest-unreachable-free", "flat");
+        let freeWaited = 0;
         try {
-          await runDaemon(harvested.repo, {
-            adapters: [harvested.fake], runId: "run-harvest-unreachable-triad",
+          const startedAt = Date.now();
+          await runDaemon(free.repo, {
+            adapters: [free.fake], runId: "run-harvest-unreachable-free",
             driver: hdriver({ nudge: async () => false, notify: async () => {} }),
           });
+          freeWaited = Date.now() - startedAt;
         } finally {
-          restoreHarvest();
+          restoreFree();
         }
-        const triadEvs = evsOf(harvested.repo, "run-harvest-unreachable-triad");
-        expect(triadEvs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
-        expect(triadEvs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
+        const freeEvs = evsOf(free.repo, "run-harvest-unreachable-free");
+        expect(freeEvs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(0);
+        expect(freeEvs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
+        expect(freeEvs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
+        expect(freeWaited).toBeLessThan(6_000); // concluded by the triad, not by the window
       } finally {
         NUDGEABLE_ADAPTERS.delete("fake");
         resetNudgeTimingForTests();

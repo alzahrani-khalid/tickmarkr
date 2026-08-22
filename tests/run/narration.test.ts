@@ -58,7 +58,24 @@ describe("narration side-channel (fake adapter, zero tokens)", () => {
       const off = scripted();
       await runDaemon(off.repo, { adapters: [off.fake], runId: "run-byte" });
 
-      const maskTs = (s: string) => s.replace(/"ts":"[^"]*"/g, '"ts":"X"');
+      // The identity mask is allowed to erase a VALUE, never the field's existence. If production
+      // omits durationMs from either run, this oracle fails before normalizing the two ledgers.
+      for (const journal of [Journal.open(on.repo, "run-byte"), Journal.open(off.repo, "run-byte")]) {
+        for (const row of journal.read().filter((e) => e.event === "gate-result")) {
+          expect(Object.hasOwn(row.data, "durationMs")).toBe(true);
+          expect(typeof row.data.durationMs).toBe("number");
+        }
+      }
+
+      // v2.0 T2 (OBS-554): `ts` is no longer the only field the clock owns. A gate-result row now
+      // carries its own measurement — a wall-clock durationMs (its own, and one per judge/review
+      // invocation) and the host load samples bracketing it — which vary run to run for exactly the
+      // reason the ts mask exists. Presence and shape of that measurement are pinned over all seven
+      // gates in tests/run/gate-telemetry.test.ts; what THIS oracle asserts is that narration does
+      // not add, drop, reorder, or alter events, and a number the host clock chose cannot answer that.
+      const maskTs = (s: string) => s
+        .replace(/"ts":"[^"]*"/g, '"ts":"X"')
+        .replace(/"(durationMs|selectedDurationMs|fullDurationMs|load1Start|load1End)":-?[\d.e+-]+/g, '"$1":"X"');
       const onFile = maskTs(readFileSync(join(tickmarkrDir(on.repo), "runs", "run-byte", "journal.jsonl"), "utf8"));
       const offFile = maskTs(readFileSync(join(tickmarkrDir(off.repo), "runs", "run-byte", "journal.jsonl"), "utf8"));
       expect(onFile).toBe(offFile); // byte-identical except the unavoidable clock

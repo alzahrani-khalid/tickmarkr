@@ -2,12 +2,56 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { brandChip } from "../../src/brand.js";
+import { LIVE, LIVE_PALETTE } from "../../src/brand.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
+
+// The palette negative control still runs the shipped status renderer. Arming it swaps only the
+// live role implementations at their source, recreating the provisional board without rewriting a
+// completed frame (which would make the control independent of the renderer under test).
+const livePaletteControl = vi.hoisted(() => ({ provisional: false }));
+vi.mock("../../src/brand.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/brand.js")>();
+  const provisional = {
+    brand: "38;5;108",
+    pass: "38;5;108",
+    running: "38;5;245",
+    information: "38;5;245",
+    text: "38;5;253",
+    primaryText: "38;5;253",
+    chrome: "38;5;245",
+    secondaryText: "38;5;245",
+    attention: "38;5;180",
+    failure: "38;5;174",
+    chip: "38;5;253;48;5;236",
+  } satisfies Record<keyof typeof actual.LIVE, string>;
+  const live = Object.fromEntries(Object.entries(actual.LIVE).map(([role, token]) => [
+    role,
+    (text: string): string => {
+      const rendered = token(text);
+      return livePaletteControl.provisional && rendered !== text
+        ? `\x1b[${provisional[role as keyof typeof provisional]}m${text}\x1b[0m`
+        : rendered;
+    },
+  ])) as unknown as typeof actual.LIVE;
+  return { ...actual, LIVE: live };
+});
+
+// The board names the binary's version through the CLI's ONE version reader, so a mispackaged
+// installation is reachable from here: `stubVersion` swaps that reader for the length of a single
+// assertion and every other suite in this file keeps reading the real repository manifest.
+const versionStub = vi.hoisted(() => ({ read: undefined as (() => Promise<string>) | undefined }));
+vi.mock("../../src/cli/commands/version.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cli/commands/version.js")>();
+  return { version: async () => (versionStub.read ? versionStub.read() : actual.version()) };
+});
+const stubVersion = async (read: () => Promise<string>, body: () => Promise<void>): Promise<void> => {
+  versionStub.read = read;
+  try { await body(); } finally { versionStub.read = undefined; }
+};
 
 // T8: the cockpit's width and layout authorities are INSTRUMENTED here, never re-implemented. Both
 // wrappers call straight through, so every suite in this file sees the real frame; the recordings
@@ -246,24 +290,27 @@ describe("T3 watch cockpit brand restyle", () => {
     return writes.join("");
   };
 
-  test("the watch frame uses the approved themed-green chip and a dominant run id without the old four-row banner", async () => {
+  test("the watch frame uses the approved brand chip and a dominant run id without the old four-row banner", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
     seed(repo);
     await withStdout(true, async () => {
       const out = await watchFrame(repo);
-      expect(out).toContain(brandChip(" tickmarkr "));
-      expect(out).toContain("\x1b[1mrun-brand\x1b[0m");
+      // The chip wears the BRAND authority itself, not merely some live role: asserting it through
+      // LIVE.brand — whose bytes the role-table criterion pins to #90C4A4 — is what a chip that
+      // drifted onto chrome, text or its own hue cannot satisfy.
+      expect(out).toContain(LIVE.brand(" tickmarkr "));
+      expect(out).toContain(LIVE.text("run-brand"));
       expect(out).not.toContain("spec in, verified work out.");
     });
   });
 
-  test("the approved table colors the done task id green and the failed task id red", async () => {
+  test("the approved table colors the done task id teal and the failed task id amethyst", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
     seed(repo);
     await withStdout(true, async () => {
       const out = await status([], repo);
-      expect(taskHead(out, "T1")).toContain("\x1b[38;5;41m");
-      expect(taskHead(out, "T2")).toContain("\x1b[31m");
+      expect(taskHead(out, "T1")).toContain("\x1b[38;2;144;196;164m");
+      expect(taskHead(out, "T2")).toContain("\x1b[38;2;176;123;172m");
     });
   });
 
@@ -295,13 +342,146 @@ describe("T3 watch cockpit brand restyle", () => {
     expect(await controlFrame(repo, 110)).not.toBe(await boardFrame(repo, 110));
   });
 
+  // ── v1.99 T3: the exact operator palette, and the two-row brand lockup every TTY board wears.
+
+  test("test: the TTY watch frame live-colour set deep-equals the exported role table while the provisional frame control differs", async () => {
+    const renderedColours = (frame: string): Set<string> => {
+      const colours = new Set<string>();
+      const rgbHex = (channels: readonly number[]): string =>
+        `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+
+      for (const match of frame.matchAll(/\x1b\[([\d:;]*)m/gu)) {
+        const payload = match[1]!;
+        // Colon-delimited extended colours are valid SGR too. The live renderer does not emit
+        // them, so make their presence an explicit mismatch instead of silently overlooking them.
+        if (payload.includes(":")) {
+          colours.add(`colon-sgr:${payload}`);
+          continue;
+        }
+        const parameters = payload === "" ? [0] : payload.split(";").map(Number);
+        for (let index = 0; index < parameters.length; index += 1) {
+          const code = parameters[index]!;
+          if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
+            colours.add(`ansi16-foreground:${code}`);
+            continue;
+          }
+          if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) {
+            colours.add(`ansi16-background:${code}`);
+            continue;
+          }
+          if (code !== 38 && code !== 48) continue;
+
+          const plane = code === 38 ? "foreground" : "background";
+          const mode = parameters[index + 1];
+          if (mode === 5 && parameters[index + 2] !== undefined) {
+            colours.add(`ansi256-${plane}:${parameters[index + 2]}`);
+            index += 2;
+            continue;
+          }
+          if (mode === 2 && parameters.slice(index + 2, index + 5).length === 3) {
+            const hex = rgbHex(parameters.slice(index + 2, index + 5));
+            colours.add(plane === "foreground" ? hex : `truecolor-background:${hex}`);
+            index += 4;
+            continue;
+          }
+          colours.add(`unsupported-${plane}:${parameters.slice(index).join(";")}`);
+          break;
+        }
+      }
+      return colours;
+    };
+
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
+    seed(repo);
+    const board = await boardFrame(repo, 120);
+    const approvedColours = new Set(Object.values(LIVE_PALETTE));
+    expect(renderedColours(board)).toEqual(approvedColours);
+
+    // Poison the real frame with every standard/bright ANSI colour plus each extended foreground
+    // and background form. Every one must change the complete colour set; an extractor that only
+    // recognizes the production fixture's 38;2 form makes at least one of these controls vacuous.
+    const ansi16Codes = [
+      ...Array.from({ length: 8 }, (_, offset) => 30 + offset),
+      ...Array.from({ length: 8 }, (_, offset) => 90 + offset),
+      ...Array.from({ length: 8 }, (_, offset) => 40 + offset),
+      ...Array.from({ length: 8 }, (_, offset) => 100 + offset),
+    ].map(String);
+    const unauthorizedColourForms = [
+      ...ansi16Codes,
+      "38;2;255;0;0",
+      "38;5;108",
+      "48;2;144;196;164",
+      "48;5;108",
+      "38:2::144:196:164",
+      "48:5:108",
+    ];
+    for (const sgrCode of unauthorizedColourForms) {
+      expect(renderedColours(`${board}\x1b[${sgrCode}mX\x1b[0m`), sgrCode).not.toEqual(approvedColours);
+    }
+
+    livePaletteControl.provisional = true;
+    let provisionalFrame: string;
+    try {
+      provisionalFrame = await boardFrame(repo, 120);
+    } finally {
+      livePaletteControl.provisional = false;
+    }
+    const provisionalColours = renderedColours(provisionalFrame);
+    expect(provisionalColours).not.toEqual(approvedColours);
+    expect(provisionalColours).toContain("ansi256-background:236");
+  });
+
+  test("test: at forty, one hundred ten and two hundred twenty columns every TTY board places the running binary version directly below the tickmarkr brand and keeps every line within the measured width; a missing or same-line version fails", async () => {
+    // Longer than the chip and carrying both optional SemVer sections: the complete running
+    // version must size the gutter rather than being clipped to the repository fixture's width.
+    const semver = "12.34.56-rc.7+build.20260820";
+    const stamp = `v${semver}`;
+
+    // The lockup rule, stated once: brand on one row, the running version on the row directly
+    // below it and starting in the same column, and never on the brand's own row.
+    const lockedUp = (lines: readonly string[]): void => {
+      const brandRow = lines.findIndex((line) => line.includes("tickmarkr"));
+      expect(brandRow).toBeGreaterThanOrEqual(0);
+      expect(lines[brandRow]).not.toContain(stamp);
+      expect(lines[brandRow + 1] ?? "").toContain(stamp);
+      expect(lines[brandRow + 1]!.indexOf(stamp)).toBe(lines[brandRow]!.indexOf("tickmarkr"));
+    };
+
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
+    seed(repo);
+    await stubVersion(async () => semver, async () => {
+      for (const columns of [40, 110, 220]) {
+        const frame = await boardFrame(repo, columns);
+        lockedUp(strip(frame).split("\n"));
+        for (const line of frame.split("\n")) {
+          expect(cellWidth(line), `${columns} cols: ${strip(line)}`).toBeLessThanOrEqual(columns);
+        }
+      }
+    });
+
+    // The two boards that must fail it: one naming no version at all, one naming it inline.
+    expect(() => lockedUp([" tickmarkr   run-brand  1/3 done", "  rows in graph order"])).toThrow();
+    expect(() => lockedUp([` tickmarkr ${stamp}  run-brand`, "  rows in graph order"])).toThrow();
+
+    // …and the version the lockup names is the RUNNING binary's or nothing at all. A manifest that
+    // cannot be read, and one that parses but names no version, both reach the operator as the
+    // failure they are — never as a board rendering a placeholder version nobody can check.
+    await stubVersion(async () => { throw new Error("ENOENT: no such file, open package.json"); }, async () => {
+      await expect(status([], repo)).rejects.toThrow(/package\.json/u);
+    });
+    await stubVersion(async () => undefined as unknown as string, async () => {
+      await expect(status([], repo)).rejects.toThrow(/names no version/u);
+    });
+  });
+
   test("the watch footer renders as a single dim legend line on a tty", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
     seed(repo);
     await withStdout(true, async () => {
       const out = await watchFrame(repo);
       const footer = out.split("\n").at(-1)!;
-      expect(footer).toBe("\x1b[2m watching · refresh 2s · ^C to quit\x1b[0m"); // legend(): one dim line, nothing after it
+      // one chrome-role line, nothing after it — and it names the 500ms frame cadence it keeps
+      expect(footer).toBe(LIVE.chrome(" watching · refresh 0.5s · ^C to quit"));
     });
   });
 });

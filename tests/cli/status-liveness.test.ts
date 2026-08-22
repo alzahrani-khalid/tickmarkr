@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
+import { LIVE } from "../../src/brand.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -364,23 +365,25 @@ describe("VIS-11 status liveness (SC4)", () => {
         while (end < lines.length && !/^ {4}\S/u.test(bare(lines[end]!))) end += 1;
         return lines.slice(start, end).join(" ").replace(/\s+/gu, " ");
       };
-      const AMBER = "\x1b[33m"; // brand.ts warn()
-      const DIM = "\x1b[2m"; //   brand.ts dim()
+      const liveOpen = (token: (text: string) => string): string =>
+        token("").replace("\x1b[0m", "");
+      const ATTENTION = liveOpen(LIVE.attention);
+      const RUNNING = liveOpen(LIVE.running);
 
       // contact 10s old: alive by the daemon's own evidence, so no alarm on either half of the card
       seed([ev("worker-contact", { slot: "s", attempt: 0, evidence: "worktree" }, new Date(startedAt + 590_000).toISOString(), "T1")]);
       const alive = await card();
       const aliveText = alive.replace(/\x1b\[[\d;]*m/gu, "").replace(/\s+/gu, " ");
       expect(aliveText).toContain("last contact 10s ago (worktree)");
-      expect(alive).not.toContain(AMBER); // neither the status word nor the spinner is flagged
-      expect(alive).toContain(DIM); // the spinner still renders, as chrome
+      expect(alive).not.toContain(ATTENTION); // neither the status word nor the spinner is flagged
+      expect(alive).toContain(RUNNING); // healthy live identity uses the running role
 
       // nothing observed for ten minutes: the alarm is exactly what should fire here
       seed([]);
       const silent = await card();
       const silentText = silent.replace(/\x1b\[[\d;]*m/gu, "").replace(/\s+/gu, " ");
       expect(silentText).toContain("no output 10m0s");
-      expect(silent).toContain(AMBER);
+      expect(silent).toContain(ATTENTION);
     } finally {
       // restore by descriptor either way: an absent isTTY reads as undefined, which is what the
       // cockpit's `isTTY === true` gate already treats as "not a terminal"

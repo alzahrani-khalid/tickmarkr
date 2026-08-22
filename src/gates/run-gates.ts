@@ -1,5 +1,6 @@
-import { readFileSync } from "node:fs";
-import { posix } from "node:path";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { loadavg, tmpdir } from "node:os";
+import { join, posix } from "node:path";
 import { type Assignment, type BillingChannel, channelKey, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
@@ -15,6 +16,121 @@ import { scopeGate } from "./scope.js";
 import type { GateResult } from "./types.js";
 import { shGit } from "../run/git.js";
 import { type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
+
+// v2.0 T2 (OBS-554): the host one-minute load average — the decision variable the parked load-aware
+// scheduler would key on. Injectable so a test can state the load a gate ran under; production always
+// reads os.loadavg. Windows reports [0,0,0] and that is what gets recorded: an honest "unmeasurable
+// here" beats a number this module would have to invent.
+export type LoadProvider = () => number;
+const productionLoadProvider: LoadProvider = () => loadavg()[0] ?? 0;
+let loadProvider: LoadProvider = productionLoadProvider;
+
+/** Test seam — inject deterministic load samples; production always reads os.loadavg. */
+export function setLoadProviderForTests(provider: LoadProvider): void {
+  loadProvider = provider;
+}
+
+export function resetLoadProviderForTests(): void {
+  loadProvider = productionLoadProvider;
+}
+
+interface LlmDispatchClock {
+  channel: string;
+  preparedAt: number;
+  startedAtPath: string;
+  completedAtPath: string;
+  dir: string;
+}
+
+interface LlmDispatchSpan {
+  channel: string;
+  durationMs: number;
+}
+
+/**
+ * Instrument the adapter command itself, which is the first adapter-owned operation runLlm performs.
+ * acceptanceGate/reviewGate deliberately retain ownership of deterministic oracles, policy checks,
+ * diff reads and prompt construction; none of that preprocessing belongs to an LLM invocation span.
+ *
+ * Both stamps are written by the same shell immediately around the adapter command. That excludes
+ * pane-slot acquisition as well as runLlm's scratch cleanup and verdict parsing, without changing
+ * llm.ts's output contract. The subshell keeps an adapter command's `exit` from bypassing the end
+ * stamp, and the original exit status is preserved.
+ */
+function instrumentLlmAdapter(adapter: WorkerAdapter, clocks: LlmDispatchClock[]): WorkerAdapter {
+  return new Proxy(adapter, {
+    get(target, property) {
+      if (property === "headlessCommand") {
+        return (promptFile: string, model: string): string => {
+          const command = target.headlessCommand(promptFile, model);
+          const dir = mkdtempSync(join(tmpdir(), "tickmarkr-gate-invocation-"));
+          const startedAtPath = join(dir, "started-at");
+          const completedAtPath = join(dir, "completed-at");
+          clocks.push({
+            channel: channelKey({ adapter: target.id, model }),
+            preparedAt: Date.now(),
+            startedAtPath,
+            completedAtPath,
+            dir,
+          });
+          const stamp = (path: string) => `${shq(process.execPath)} -e ${shq('require("node:fs").writeFileSync(process.argv[1], String(Date.now()))')} ${shq(path)}`;
+          // End with a status-bearing subshell, not `exit`: pane mode appends its nonce-bound
+          // completion trailer on the next script line and must remain able to run it.
+          return `${stamp(startedAtPath)}; ( ${command} ); __tickmarkr_invocation_status=$?; ${stamp(completedAtPath)}; (exit $__tickmarkr_invocation_status)`;
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      // Real adapters may use private fields; bind their methods to the target rather than the Proxy.
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function finishLlmDispatches(clocks: LlmDispatchClock[]): LlmDispatchSpan[] {
+  return clocks.map((clock) => {
+    let startedAt = clock.preparedAt;
+    let completedAt = Date.now();
+    try {
+      const stampedStart = Number(readFileSync(clock.startedAtPath, "utf8"));
+      const stamped = Number(readFileSync(clock.completedAtPath, "utf8"));
+      if (Number.isFinite(stampedStart)) startedAt = stampedStart;
+      if (Number.isFinite(stamped) && stamped >= startedAt) completedAt = stamped;
+    } catch {
+      // A killed command may never reach its stamp; the gate return is the honest upper boundary.
+    } finally {
+      rmSync(clock.dir, { recursive: true, force: true });
+    }
+    return { channel: clock.channel, durationMs: completedAt - startedAt };
+  });
+}
+
+async function captureLlmDispatches<T>(
+  adapters: WorkerAdapter[],
+  run: (instrumented: WorkerAdapter[]) => Promise<T>,
+): Promise<{ value: T; outputs: string[]; invocations: LlmDispatchSpan[] }> {
+  const clocks: LlmDispatchClock[] = [];
+  try {
+    const captured = await captureLlmOutput(() => run(adapters.map((a) => instrumentLlmAdapter(a, clocks))));
+    return { ...captured, invocations: finishLlmDispatches(clocks) };
+  } catch (error) {
+    finishLlmDispatches(clocks);
+    throw error;
+  }
+}
+
+/**
+ * One gate's own measurement, taken WHERE THE GATE RUNS. `durationMs` sums that gate's execution
+ * intervals and nothing between them, so the composite `test` gate (a selected screen, then other
+ * gates, then the full suite) reports the two suites' cost rather than the span containing them —
+ * and no consumer has to re-derive a duration by subtracting journal timestamps, which measures the
+ * queue as well as the work. The load samples bracket the FIRST interval's start and the LAST
+ * interval's end: start is what a scheduler would have decided on, end is the state it left behind.
+ */
+export interface GateTelemetry {
+  durationMs: number;
+  load1Start: number;
+  load1End: number;
+}
 
 export type GateEvent =
   // T4 (OBS-265): `parentAt` stamps the two verdict gates that a round launches TOGETHER — judge and
@@ -48,6 +164,9 @@ export interface GateContext {
   // gate has failed for this task. Never a licence to merge on a subset: the merge-candidate round
   // re-runs the FULL suite on the same gated commit before this function reports green.
   selectTests?: boolean;
+  // OBS-547: this task's slice of the run's ONE full collateral map (uncapped, computed at run start
+  // in the daemon). The gate classifies its red against it; absent ⇒ no classification.
+  collateral?: ReadonlyArray<string>;
   onGate?: (e: GateEvent) => void | Promise<void>;
 }
 
@@ -157,13 +276,56 @@ export async function runGates(
   // exactly one `test` gate-result ever leaves a round, always carrying which suite spoke for it.
   // (A RED screen IS the verdict: the round ends there, so it is recorded immediately.)
   let heldTest: GateResult | undefined;
+  // v2.0 T2 (OBS-554): this round's per-gate measurement. Every interval a gate actually spends
+  // executing is added HERE, at the call site that runs it, so a gate that runs twice (the test
+  // gate's screen and its full suite) sums to its own cost and never to the span between them.
+  const spans = new Map<string, GateTelemetry>();
+  // The test gate's two halves, kept apart as well as summed: `durationMs` alone cannot say whether
+  // a slow round was a slow subset or a slow full suite, and the parked scheduler's threshold is
+  // defined over the full-suite cost.
+  let selectedDurationMs: number | undefined;
+  let fullDurationMs: number | undefined;
+  const measure = async <T>(gate: string, run: () => Promise<T>): Promise<T> => {
+    const at = Date.now();
+    const load1Start = loadProvider();
+    try {
+      return await run();
+    } finally {
+      const prior = spans.get(gate);
+      spans.set(gate, {
+        durationMs: (prior?.durationMs ?? 0) + (Date.now() - at),
+        load1Start: prior?.load1Start ?? load1Start,
+        load1End: loadProvider(),
+      });
+    }
+  };
+  // The measurement is attached at the ONE seam every result leaves this function through, so a
+  // path that forgets to measure is visibly missing its telemetry rather than carrying a fabricated
+  // zero. The daemon lifts these off `meta` onto the gate-result row (src/run/daemon.ts).
+  const withTelemetry = (result: GateResult): GateResult => {
+    const span = spans.get(result.gate);
+    if (!span) return result;
+    return {
+      ...result,
+      meta: {
+        ...result.meta,
+        ...span,
+        ...(result.gate === "test" && selectedDurationMs !== undefined ? { selectedDurationMs } : {}),
+        ...(result.gate === "test" && fullDurationMs !== undefined ? { fullDurationMs } : {}),
+      },
+    };
+  };
+
   const sequence = GATE_NAMES.filter((g) => enabled(g));
   const total = sequence.length;
   const indexOf = (gate: GateName) => sequence.indexOf(gate) + 1;
 
+  // The stamp lands here, on the ONE object that is both pushed and published, so the round's record
+  // and its event stream carry byte-identical results — an invariant the fixtures pin.
   const record = async (result: GateResult) => {
-    results.push(result);
-    await ctx.onGate?.({ phase: "end", gate: result.gate as GateName, result });
+    const stamped = withTelemetry(result);
+    results.push(stamped);
+    await ctx.onGate?.({ phase: "end", gate: stamped.gate as GateName, result: stamped });
   };
 
   const emitStart = async (gate: GateName, parentAt?: number) => {
@@ -177,7 +339,7 @@ export async function runGates(
     if (heldTest) {
       const held = heldTest;
       heldTest = undefined;
-      await ctx.onGate?.({ phase: "end", gate: "test", result: held });
+      await ctx.onGate?.({ phase: "end", gate: "test", result: held }); // stamped when it was held
     }
     const sorted = [...results].sort((a, b) => GATE_NAMES.indexOf(a.gate as GateName) - GATE_NAMES.indexOf(b.gate as GateName));
     // v1.87 T5: no round returns a MERGEABLE GREEN on a dirty tree. The battery is not the only gate
@@ -191,7 +353,7 @@ export async function runGates(
     if (last && sorted.every((r) => r.pass || r.meta?.skipped === true)) {
       const dirt = await dirtyWorktree();
       if (dirt) {
-        const refusal = dirtyRoundRefusal(last.gate as GateName, dirt);
+        const refusal = withTelemetry(dirtyRoundRefusal(last.gate as GateName, dirt));
         results[results.indexOf(last)] = refusal;
         sorted[sorted.length - 1] = refusal;
         await ctx.onGate?.({ phase: "end", gate: refusal.gate as GateName, result: refusal });
@@ -261,7 +423,13 @@ export async function runGates(
       // ponytail: compareToBaseline batches build/test/lint — their starts are emitted at iteration,
       // not at true execution start. They are collectively sub-second (measured), so the debounce
       // suppresses them anyway; split compareToBaseline only if a tool gate ever gets slow.
+      // ponytail: legacy runs build/test/lint in ONE compareToBaseline call, so there is one interval
+      // to measure and each of its gates carries it. Split it only if this branch ever stops batching.
+      const batchAt = Date.now();
+      const batchLoadStart = loadProvider();
       const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, toolGates);
+      const batch: GateTelemetry = { durationMs: Date.now() - batchAt, load1Start: batchLoadStart, load1End: loadProvider() };
+      for (const g of toolGates) spans.set(g, batch);
       // The same refusal AFTER the commands, because a green command can dirty the tree the check
       // above just proved clean. Batched, legacy cannot say WHICH command did it, so the refusal
       // lands on the last gate that had one — the round dies there either way. A red battery is
@@ -278,7 +446,9 @@ export async function runGates(
     // the full vitest suite before anyone reads its verdict.
     for (const g of toolGates) {
       await emitStart(g);
-      const [r] = await compareToBaseline(ctx.worktree, commands, ctx.baseline, [g]);
+      const [r] = await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g]));
+      // the screen's interval IS the test gate's first interval, so the split needs no second clock
+      if (g === "test" && selected) selectedDurationMs = spans.get("test")!.durationMs;
       // The pre-battery check proves the tree clean ONCE; a command that exits 0 having rewritten a
       // tracked file makes it dirty again, and every gate after it — including the next shell gate,
       // which would then run against bytes HEAD does not hold — inherits that. So re-check after each
@@ -296,8 +466,8 @@ export async function runGates(
         // green: held (see heldTest) so the full suite below can supersede it with ONE verdict.
         if (!screened.pass) await record(screened);
         else {
-          heldTest = screened;
-          results.push(screened);
+          heldTest = withTelemetry(screened);
+          results.push(heldTest);
         }
       } else {
         await record(r!);
@@ -333,11 +503,12 @@ export async function runGates(
   Object.freeze(allowDeviations);
 
   const scopeResult = (): Promise<GateResult> =>
-    scopeGate(ctx.worktree, ctx.baseRef, task.files, ctx.result, allowDeviations);
+    scopeGate(ctx.worktree, ctx.baseRef, task.files, ctx.result, allowDeviations,
+      ctx.collateral ? { taskId: task.id, predicted: ctx.collateral } : undefined);
 
   const runGate = async (gate: GateName, compute: () => Promise<GateResult>): Promise<void> => {
     await emitStart(gate);
-    await record(await compute());
+    await record(await measure(gate, compute));
   };
 
   /**
@@ -360,7 +531,7 @@ export async function runGates(
     const screened: GateResult[] = [];
     for (const [gate, compute] of [["evidence", evidenceResult], ["scope", scopeResult]] as const) {
       if (!enabled(gate)) continue;
-      screened.push(await compute());
+      screened.push(await measure(gate, compute));
       if (screened[screened.length - 1]!.pass) continue;
       for (const r of screened) {
         await emitStart(r.gate as GateName);
@@ -395,32 +566,41 @@ export async function runGates(
     // v1.19 (T2): testCmd threads the detected test runner to the gate so named-test oracles run
     // deterministically (filtered via -t) before any LLM judge dispatch.
     const invocations: JudgeInvocationEvidence[] = [];
+    // v2.0 T2 (OBS-554): one entry per JUDGE DISPATCH — primary and the GATE-09 retry alike. The gate's
+    // own durationMs is the pair's envelope and cannot answer what the parked ceiling recalibration
+    // asks ("how long does ONE healthy judge invocation take?"), so the invocations are kept apart.
+    // Separate from `invocations` above deliberately: that array is transcript evidence and records
+    // one entry per CAPTURED OUTPUT, so a dispatch that produced none contributes nothing to it.
+    const invocationSpans: Array<{ channel: string; durationMs: number }> = [];
     const invokeJudge = async (
       adapter: WorkerAdapter,
       model: string,
       via: typeof jvia,
     ): Promise<GateResult> => {
-      const started = Date.now();
-      const captured = await captureLlmOutput(() =>
+      const captured = await captureLlmDispatches([adapter], ([instrumented]) =>
         acceptanceGate(
           task,
           ctx.worktree,
           ctx.baseRef,
-          { adapter, model },
+          { adapter: instrumented!, model },
           via,
           { testCmd: ctx.commands.test, diffCap: ctx.cfg.gates.diffCap },
         ));
-      const channel = channelKey({ adapter: adapter.id, model });
+      // The instrumented adapter is reached only by runLlm. Deterministic oracles and diff-cap exits
+      // never call headlessCommand, so they produce no clock and cannot manufacture an invocation.
+      invocationSpans.push(...captured.invocations);
       const unparseable = captured.value.meta?.unparseable === true;
       // acceptanceGate has exactly one runLlm call. Keep the map shape so a future deterministic early
       // return (zero outputs) stays telemetry-free instead of manufacturing a judge invocation.
-      for (const output of captured.outputs) {
+      for (const [index, output] of captured.outputs.entries()) {
+        const span = captured.invocations[index];
+        if (!span) continue;
         invocations.push({
           taskId: task.id,
-          channel,
+          channel: span.channel,
           outcome: unparseable ? "failed" : "done",
           judgeOutcome: unparseable ? "unparseable" : "parseable",
-          durationMs: Date.now() - started,
+          durationMs: span.durationMs,
           ...(unparseable ? { transcript: output } : {}),
         });
       }
@@ -465,12 +645,27 @@ export async function runGates(
       a = await invokeJudge(retryAdapter, retry.model, retryJvia);
       a = { ...a, meta: { ...a.meta, judgeRetry: { flaked: flakedKey, retried: channelKey({ adapter: retry.adapter, model: retry.model }) } } };
     }
-    return { result: a, invocations };
+    // No dispatch, no key: a deterministic-oracle round writes no `invocations` field rather than an
+    // empty array a reader could mistake for "measured, and it cost nothing".
+    return { result: invocationSpans.length ? { ...a, meta: { ...a.meta, invocations: invocationSpans } } : a, invocations };
   };
 
   // cross-vendor review
   const runReview = async (): Promise<GateResult> => {
-    let rv = await reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, ctx.adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir);
+    // v2.0 T2: per-dispatch spans, exactly as the judge keeps them. A round that re-asks a second
+    // seat spends two invocations, and one blended span cannot tell a slow reviewer from two.
+    // A pick that found NO eligible seat dispatched nothing, so it contributes no invocation.
+    const invocations: Array<{ channel: string; durationMs: number }> = [];
+    // Dispatch is PROVEN, never inferred: captureLlmOutput records one output per runLlm return, so an
+    // empty capture means reviewGate returned before asking anyone — a policy skip, a pre-dispatch diff
+    // cap, or no eligible seat. Reading `noEligibleReviewer` alone missed the first two and invented
+    // an "unknown" span for each.
+    const dispatch = async (run: (adapters: WorkerAdapter[]) => Promise<GateResult>): Promise<GateResult> => {
+      const captured = await captureLlmDispatches(ctx.adapters, run);
+      invocations.push(...captured.invocations);
+      return captured.value;
+    };
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir));
     // OBS-193: an unparseable review verdict retries the REVIEW exactly once on a different reviewer —
     // never the worker (GATE-09's judge-retry shape: straight-line single `if`, meta-only detection,
     // the flaked verdict never enters results). The exclusion rides reviewGate's own excludeReviewers
@@ -481,16 +676,16 @@ export async function runGates(
       const retryVia = ctx.via
         ? { ...ctx.via, nameFor: (role: "judge" | "review", adapter: string) => ctx.via!.nameFor(role, adapter) + "-r1" }
         : undefined;
-      const second = await reviewGate(
-        task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, ctx.adapters, ctx.cfg,
+      const second = await dispatch((adapters) => reviewGate(
+        task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
         retryVia, [...(ctx.excludeReviewers ?? []), flaked], ctx.artifactDir,
-      );
+      ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
         rv = { ...second, meta: { ...second.meta, reviewRetry: { flaked, retried } } };
       }
     }
-    return rv;
+    return invocations.length ? { ...rv, meta: { ...rv.meta, invocations } } : rv;
   };
 
   // v1.87 T5: the refusal is the FIRST thing a round does, whatever that round is configured to run.
@@ -500,8 +695,14 @@ export async function runGates(
   // oracles judged uncommitted state, on a commit whose diff nobody had run. One check at the top, and
   // no shell-executing gate path is reachable on a dirty tree. It lands on the first gate of this
   // round's sequence: the round dies there, exactly as it does on a red command.
+  // The check runs BEFORE any gate, so on a clean tree it belongs to no gate: charging every round's
+  // first gate for it would inflate the one measurement the parked recalibrations key on. It becomes
+  // that gate's interval only on the path where it IS what the gate did — the refusal below.
+  const entryAt = Date.now();
+  const entryLoad = loadProvider();
   const entryDirt = sequence.length ? await dirtyWorktree() : undefined;
   if (entryDirt) {
+    spans.set(sequence[0]!, { durationMs: Date.now() - entryAt, load1Start: entryLoad, load1End: loadProvider() });
     await emitStart(sequence[0]!);
     await record(dirtyRefusal(sequence[0]!, entryDirt));
     return done();
@@ -539,8 +740,8 @@ export async function runGates(
     // whichever adapter is slower no longer decides when the other one runs.
     if (enabled("acceptance")) await emitStart("acceptance", parentAt);
     if (enabled("review")) await emitStart("review", parentAt);
-    const judging = enabled("acceptance") ? runAcceptance() : undefined;
-    const reviewing = enabled("review") ? runReview() : undefined;
+    const judging = enabled("acceptance") ? measure("acceptance", runAcceptance) : undefined;
+    const reviewing = enabled("review") ? measure("review", runReview) : undefined;
     // Attach BOTH publication handlers before awaiting either. Dispatch concurrency alone is not
     // enough: an acceptance-first await withholds a completed review behind a slow/hung judge and a
     // process death can lose that already-earned verdict. The returned result is still sorted into
@@ -554,13 +755,13 @@ export async function runGates(
     // Legacy serial walk — frozen, and reachable only from the fixtures that pin it.
     if (enabled("acceptance")) {
       await emitStart("acceptance");
-      const judged = await runAcceptance();
+      const judged = await measure("acceptance", runAcceptance);
       await withJudgeInvocationEvidence(judged.invocations, () => record(judged.result));
       if (failed()) return done();
     }
     if (enabled("review")) {
       await emitStart("review");
-      await record(await runReview());
+      await record(await measure("review", runReview));
     }
     return done();
   }
@@ -575,11 +776,12 @@ export async function runGates(
     // This is the last shell command a round can run — the judge's named-test oracle (acceptance.ts)
     // may have run one before it, and every gate between the battery and here reads commits only, so
     // a clean tree HERE is what makes "the gated commit is the tested tree" true at merge time.
-    const [full] = await compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"]);
+    const [full] = await measure("test", () => compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"]));
+    fullDurationMs = spans.get("test")!.durationMs - (selectedDurationMs ?? 0);
     const dirt = full!.pass ? await dirtyWorktree() : undefined;
-    const merged = dirt
+    const merged = withTelemetry(dirt
       ? dirtyRefusal("test", dirt, ctx.commands.test!)
-      : { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } };
+      : { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } });
     results[results.findIndex((r) => r.gate === "test")] = merged;
     heldTest = undefined;
     await ctx.onGate?.({ phase: "end", gate: "test", result: merged });

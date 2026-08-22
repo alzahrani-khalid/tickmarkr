@@ -23,6 +23,17 @@ export function graphDefinitionHash(g: RunGraph): string {
   return createHash("sha256").update(JSON.stringify({ version: g.version, spec: g.spec, tasks: definitions })).digest("hex").slice(0, 16);
 }
 
+// OBS-543: cross-run evidence belongs to the artifact one task describes, not to the whole compiled
+// graph. A sibling task, dependency, routing hint or status change therefore cannot expire a useful
+// finding; changing the goal, write surface or acceptance contract does. Keep the full digest here:
+// unlike graphDefinitionHash this value is persisted beside evidence and is the fail-closed join a
+// later run uses, so there is no benefit in making collision diagnosis less explicit.
+export function taskContentDigest(task: Pick<Task, "goal" | "files" | "acceptance">): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ goal: task.goal, files: task.files, acceptance: task.acceptance }))
+    .digest("hex");
+}
+
 export function tickmarkrDir(repoRoot: string): string {
   const dir = join(repoRoot, stateDirName(repoRoot));
   mkdirSync(dir, { recursive: true });
@@ -68,7 +79,16 @@ export function addEvidence(
   id: string,
   patch: { commits?: string[]; artifacts?: string[]; gateResults?: unknown[] },
 ): RunGraph {
-  getTask(g, id);
+  const subject = getTask(g, id);
+  const digest = taskContentDigest(subject);
+  // This is the graph-evidence boundary where a gate result meets the task it measured. Stamp a
+  // copy, never mutate the gate result runGates returned: callers still use that live object for
+  // predicates, while durable evidence gains the content identity a later run can compare.
+  const gateResults = (patch.gateResults ?? []).map((result) =>
+    result !== null && typeof result === "object" && !Array.isArray(result)
+      ? { ...result, taskContentDigest: digest }
+      : result,
+  );
   return {
     ...g,
     tasks: g.tasks.map((t) =>
@@ -78,7 +98,7 @@ export function addEvidence(
             evidence: {
               commits: [...t.evidence.commits, ...(patch.commits ?? [])],
               artifacts: [...t.evidence.artifacts, ...(patch.artifacts ?? [])],
-              gateResults: [...t.evidence.gateResults, ...(patch.gateResults ?? [])],
+              gateResults: [...t.evidence.gateResults, ...gateResults],
             },
           }
         : t,

@@ -2,6 +2,31 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.0 — evidence consulted, watch quieted, velocity measured
+
+Three unpublished milestones ship together as the 2.0 marker release; nothing here breaks the CLI
+surface or the on-disk run contract.
+
+**v1.98 — evidence loop.** The harness already recorded the evidence and did not consult it; now it
+does. Review findings survive their journal and are carried forward to the next attempt, gate
+failures get a cause taxonomy before anything is retried, collateral predictions outlive plan time,
+and the CPU accountant is read by the kill path that runs beside it.
+
+**v1.99 — quiet live watch.** The run board redraws at 500ms with a nonblocking single-flight
+scrape, always shows the running version directly below the brand, and adopts the operator's exact
+five-color live palette with attention states distinguished by glyph (█/▒/▓), never by color alone.
+The raw journal wall is replaced by a compact styled event rail that launches below the board in a
+72/28 full-width vertical stack; TTY narration suppresses contact/status noise while piped output
+stays byte-identical.
+
+**v2.0 — velocity.** Dead review and judge channels are concluded by a measured 12-minute
+inactivity policy (window derived from 96 journaled healthy invocations, p95 + 1m; stated
+false-kill exposure at most 4.2% on the output leg, and only a live channel's CPU can extend the
+wait) instead of burning the full 15-minute ceiling — a dead reviewer pair now costs 24 minutes,
+not 30, with recalibration driven by data the same release starts collecting: every gate-result row
+carries duration, start/end load, capacity, and per-invocation review/judge spans. Invocation
+clocks bracket only the adapter dispatch, so the new telemetry cannot be poisoned by gate overhead.
+
 ## v1.97 — the approved task board
 
 The daemon-owned run board now renders the operator-approved task table instead of the evolved

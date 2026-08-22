@@ -1,5 +1,7 @@
 import { describe, expect, test } from "vitest";
-import { collateralLints, newDirectoryLints, sourceScopeLints } from "../../src/compile/collateral.js";
+import {
+  classifyScopeOffenders, collateralHits, collateralLints, newDirectoryLints, sourceScopeLints,
+} from "../../src/compile/collateral.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -118,6 +120,59 @@ describe("collateralLints (plan-time OBS-12/21 scan)", () => {
 
     expect(lint).toContain("21 total");
     expect(lint).not.toContain(pastCapPath);
+  });
+});
+
+describe("OBS-547 — the map the scope gate classifies on", () => {
+  // 25 collateral hits: the display shows 20, so hits 21-25 are exactly the case that went unread.
+  const capBitingRepo = () => makeRepo({
+    "src/adapters/codex.ts": "export const codex = {};\n",
+    ...Object.fromEntries(
+      Array.from({ length: 25 }, (_, i) => [
+        `tests/adapters/codex-${String(i).padStart(2, "0")}.test.ts`,
+        'import "../../src/adapters/codex.js";\n',
+      ]),
+    ),
+    "tests/adapters/unrelated.test.ts": 'import "../../src/adapters/other.js";\n',
+  });
+
+  test("test: the full collateral map classifies its hidden 21st hit as authoring while a path absent from that map records a miss; a classifier bounded by the display cap fails", () => {
+    const repo = capBitingRepo();
+    const hits = collateralHits([task("T2", ["src/adapters/codex.ts"])], repo).get("T2") ?? [];
+    expect(hits).toHaveLength(25);
+
+    const hidden = hits[20]!; // the 21st — computed, and never displayed
+    expect(collateralLints([task("T2", ["src/adapters/codex.ts"])], repo)[0]).not.toContain(hidden);
+
+    const onFullMap = classifyScopeOffenders("T2", [hidden], hits);
+    expect(onFullMap.authoring).toBe(true);
+    expect(onFullMap.predicted).toEqual([hidden]);
+    expect(onFullMap.missed).toEqual([]);
+    expect(onFullMap.repair).toBe(`add ${hidden} to T2.files[]`);
+
+    // the same red against the DISPLAYED subset: the prediction is thrown away and the worker charged
+    const onDisplayedSubset = classifyScopeOffenders("T2", [hidden], hits.slice(0, 20));
+    expect(onDisplayedSubset.authoring).toBe(false);
+    expect(onDisplayedSubset.missed).toEqual([hidden]);
+
+    // a path the map never named is a MISS, recorded — not an authoring park
+    const unpredicted = classifyScopeOffenders("T2", ["tests/cockpit/demo.test.ts"], hits);
+    expect(unpredicted.authoring).toBe(false);
+    expect(unpredicted.missed).toEqual(["tests/cockpit/demo.test.ts"]);
+    expect(unpredicted.predicted).toEqual([]);
+
+    // one predicted + one missed is still not authoring: the mixed red keeps the quality accounting
+    expect(classifyScopeOffenders("T2", [hidden, "tests/cockpit/demo.test.ts"], hits).authoring).toBe(false);
+  });
+
+  test("test: when the collateral display cap bites its line states that hidden hits remain retained and a matching scope red will print the path with its files repair; a count with no route fails", () => {
+    const repo = capBitingRepo();
+    const [lint] = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
+
+    expect(lint).toContain("25 total");
+    expect(lint).toMatch(/retained/i); // the hidden hits are kept, not discarded at the cap
+    expect(lint).toMatch(/scope red/i); // and this is where they surface
+    expect(lint).toContain("files[] repair"); // carrying the repair, not just a number
   });
 });
 

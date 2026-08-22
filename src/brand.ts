@@ -152,6 +152,55 @@ export const bold = sgr("1");
 /** Every semantic color token, for sweeps: each is TTY-gated and NO_COLOR-aware. */
 export const TOKENS = { brand, brandChip, ok, fail, warn, dim, bold } as const;
 
+// ── operator live-surface palette (v1.99) ───────────────────────────────────
+// The tokens above remain the global design system for one-shot surfaces. LIVE is the closed
+// five-colour system for long-running operator surfaces. Semantic aliases below deliberately share
+// renderers: glyphs and words retain the distinction between pass/brand, running/information,
+// chrome/secondary text, and attention/failure when colour is unavailable.
+
+/** Exact operator-approved live colours. Values stay hex so the authority is inspectable. */
+export const LIVE_PALETTE = {
+  /** muted teal — brand identity and pass */
+  brand: "#90C4A4",
+  /** cornflower blue — running state and information */
+  running: "#5A76AE",
+  /** ice — primary text */
+  text: "#E6FDFF",
+  /** cloud — chrome and secondary text */
+  chrome: "#D9D7DD",
+  /** amethyst — attention and failure */
+  attention: "#B07BAC",
+} as const;
+
+export type LiveRole = keyof typeof LIVE_PALETTE;
+type LiveHex = (typeof LIVE_PALETTE)[LiveRole];
+
+const liveSgr = (hex: LiveHex): ((s: string) => string) => {
+  const channels = hex.slice(1).match(/.{2}/gu)!.map((channel) => Number.parseInt(channel, 16));
+  return sgr(`38;2;${channels.join(";")}`);
+};
+
+const liveBrand = liveSgr(LIVE_PALETTE.brand);
+const liveRunning = liveSgr(LIVE_PALETTE.running);
+const liveText = liveSgr(LIVE_PALETTE.text);
+const liveChrome = liveSgr(LIVE_PALETTE.chrome);
+const liveAttention = liveSgr(LIVE_PALETTE.attention);
+
+/** Semantic live tokens. Aliases are intentional; no token introduces a sixth colour. */
+export const LIVE = {
+  brand: liveBrand,
+  pass: liveBrand,
+  running: liveRunning,
+  information: liveRunning,
+  text: liveText,
+  primaryText: liveText,
+  chrome: liveChrome,
+  secondaryText: liveChrome,
+  attention: liveAttention,
+  failure: liveAttention,
+  chip: liveBrand,
+} as const;
+
 /**
  * The glyph vocabulary — plain characters only; color layers on via tokens so
  * shape survives NO_COLOR. Bracket toggles ([x]/[ ]) are forbidden on every surface.

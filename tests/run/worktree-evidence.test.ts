@@ -1,21 +1,53 @@
 import { execSync } from "node:child_process";
 import { chmodSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test } from "vitest";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import {
   NUDGEABLE_ADAPTERS,
   resetDeadChannelFastKillMsForTests,
+  resetHarvestCpuFlatMsForTests,
+  resetHarvestSilentMsForTests,
   resetNudgeTimingForTests,
   resetObserveBudgetBytesForTests,
   runDaemon,
   setDeadChannelFastKillMsForTests,
+  setHarvestCpuFlatMsForTests,
+  setHarvestSilentMsForTests,
   setNudgeTimingForTests,
   setObserveBudgetBytesForTests,
 } from "../../src/run/daemon.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
-import { setupRepo, T } from "../helpers/tmprepo.js";
+import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
+
+// OBS-548: the fast-kill now has a CPU leg, so every case that asserts a kill (or its absence)
+// needs a reading it did not have to negotiate with the host for. `ps` is denied outright in the
+// managed macOS sandbox and merely noisy everywhere else, and neither is this file's question —
+// these cases discriminate on WORKTREE evidence and nudge delivery, with CPU held constant. One
+// unrelated row: the marker matches nothing, so the worker tree is empty and reads a flat zero,
+// which is the probe's documented "nothing of this worker is running". Installed for EVERY case in
+// the file (review: a fixture applied only where it was newly needed leaves its siblings
+// host-dependent), so no case can pass merely because this host could not answer `ps`.
+let cpuProbeCalls = (): number => 0;
+function flatCpuProbe(): () => void {
+  const dir = makeTestTempDir("tickmarkr-ps-flat-");
+  const bashEnv = join(dir, "bash-env");
+  const calls = join(dir, "calls");
+  writeFileSync(calls, "");
+  writeFileSync(bashEnv, "ps() { printf x >> \"$TICKMARKR_TEST_PS_CALLS\"; echo '1 1 0:00.00 unrelated-process'; }\n");
+  const prior = { bashEnv: process.env.BASH_ENV, calls: process.env.TICKMARKR_TEST_PS_CALLS };
+  process.env.BASH_ENV = bashEnv;
+  process.env.TICKMARKR_TEST_PS_CALLS = calls;
+  cpuProbeCalls = () => readFileSync(calls, "utf8").length;
+  return () => {
+    if (prior.bashEnv === undefined) delete process.env.BASH_ENV;
+    else process.env.BASH_ENV = prior.bashEnv;
+    if (prior.calls === undefined) delete process.env.TICKMARKR_TEST_PS_CALLS;
+    else process.env.TICKMARKR_TEST_PS_CALLS = prior.calls;
+    cpuProbeCalls = () => 0;
+  };
+}
 
 const STALLED = {
   consult: { action: "human", notes: "controlled stalled worker" },
@@ -65,15 +97,22 @@ const eventsOf = (repo: string, runId: string): JournalEvent[] => Journal.open(r
 const taskEventTime = (events: JournalEvent[], event: string): number =>
   Date.parse(events.find((row) => row.event === event && row.taskId === "T1")!.ts);
 
+let restoreCpuProbe: () => void = () => {};
+beforeEach(() => { restoreCpuProbe = flatCpuProbe(); });
+
 afterEach(() => {
+  restoreCpuProbe();
   NUDGEABLE_ADAPTERS.delete("fake");
   resetDeadChannelFastKillMsForTests();
+  resetHarvestCpuFlatMsForTests();
+  resetHarvestSilentMsForTests();
   resetNudgeTimingForTests();
   resetObserveBudgetBytesForTests();
 });
 
 test("the observation runDaemon makes of a worker worktree differs between two reads for a content swap between two untracked files, a chmod +x on an untracked file, an edit inside an already-untracked file, and a git add of a modified tracked file, and is identical across two reads of an untouched tree, so a signature missing path identity, mode, untracked content or index state cannot pass", async () => {
   setDeadChannelFastKillMsForTests(60);
+  setHarvestCpuFlatMsForTests(50); // the kill's CPU leg, pinned: this case discriminates on the TREE
 
   const run = async (name: string, setup: TreeSetup, act?: TreeAction) => {
     const runId = `run-worktree-signature-${name}`;
@@ -128,10 +167,11 @@ test("the observation runDaemon makes of a worker worktree differs between two r
   }
   expect(untouched.some((row) => row.event === "worker-contact" && row.data.evidence === "worktree")).toBe(false);
   expect(untouched.filter((row) => row.event === "worker-dead" && row.taskId === "T1")).toHaveLength(1);
-}, 30_000);
+}, 60_000);
 
 test("an observation runDaemon cannot complete is recorded unreadable and never unchanged, exercised with an unreadable path inside the worktree, a symlink whose target lies outside it, and a tree exceeding the observation's own read budget, against a genuinely unchanged tree of the same shape, where all three survive the fast-kill window and only the unchanged one is journaled worker-dead", async () => {
   setDeadChannelFastKillMsForTests(60);
+  setHarvestCpuFlatMsForTests(50); // as above: CPU held flat so the READABILITY of the tree is the variable
 
   const run = async (name: string, setup: TreeSetup, budget?: number) => {
     resetObserveBudgetBytesForTests();
@@ -167,7 +207,7 @@ test("an observation runDaemon cannot complete is recorded unreadable and never 
   }
   expect(unchanged.some((row) => row.event === "contact-unreadable")).toBe(false);
   expect(unchanged.filter((row) => row.event === "worker-dead" && row.taskId === "T1")).toHaveLength(1);
-}, 30_000);
+}, 60_000);
 
 test("a worktree change runDaemon detects rearms the stall window and not only the journal, with a stall window shorter than the nudge grace a worker whose tree changes once just before the old deadline is concluded only at a new deadline measured from that change, while the identical worker whose tree never changes is concluded at the old deadline, so a contact row written without moving the progress clock fails", async () => {
   NUDGEABLE_ADAPTERS.add("fake");
@@ -246,3 +286,73 @@ test("with every worker-side input held constant, the same worktree delta, the s
   expect(delivered.nudgeCalls).toBe(1);
   expect(failed.nudgeCalls).toBe(2);
 }, 30_000);
+
+// OBS-548: the nudge inversion, and it is what set the timing of the measured false death — the
+// kill fired 2.2 seconds after `worker-nudge-failed`. `nudgeFailed` LIFTED the hold, so a delivery
+// failure was the trigger; and the population that cannot accept a nudge (a worker inside one long
+// foreground command has no input box) is exactly the population most likely to be legitimately
+// silent. The hold is on the daemon still having an ACTION to take, and an undelivered action is
+// still owed. What must NOT change is the pane nobody was ever going to steer: a non-nudgeable
+// adapter has no hold to lift, so its flat evidence legs conclude exactly as before.
+test("test: an undeliverable nudge leaves the fast-kill and harvest holds standing while a non-nudgeable pane whose evidence legs are all flat still concludes; a delivery failure that lifts either hold fails", async () => {
+  setNudgeTimingForTests(80, 200); // nudge gate below the kill window: the nudge always gets first crack
+  setDeadChannelFastKillMsForTests(300);
+  setHarvestSilentMsForTests(150);
+  setHarvestCpuFlatMsForTests(50);
+  // one committing worker for the harvest hold, one silent worker for the fast-kill hold
+  const COMMITTED = {
+    consult: { action: "human", notes: "controlled committed worker" },
+    tasks: { T1: [{ shell: `echo carried > carried.txt && ${COMMIT} carried` }] },
+  };
+
+  const run = async (name: string, config: typeof STALLED, nudgeable: boolean) => {
+    const runId = `run-nudge-hold-${name}`;
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.08 })], config);
+    let nudgeCalls = 0;
+    if (nudgeable) NUDGEABLE_ADAPTERS.add("fake"); else NUDGEABLE_ADAPTERS.delete("fake");
+    const cpuCallsBefore = cpuProbeCalls();
+    try {
+      await runDaemon(repo, {
+        adapters: [fake],
+        runId,
+        driver: evidenceDriver(nudgeable ? { nudge: async () => { nudgeCalls++; return false; } } : {}),
+      });
+    } finally {
+      NUDGEABLE_ADAPTERS.delete("fake");
+    }
+    return { events: eventsOf(repo, runId), nudgeCalls, cpuCalls: cpuProbeCalls() - cpuCallsBefore };
+  };
+
+  const killHeld = await run("kill-undeliverable", STALLED, true);
+  const killConcludes = await run("kill-nonnudgeable", STALLED, false);
+  const harvestHeld = await run("harvest-undeliverable", COMMITTED, true);
+  const harvestConcludes = await run("harvest-nonnudgeable", COMMITTED, false);
+
+  const rows = (r: { events: JournalEvent[] }, event: string) =>
+    r.events.filter((row) => row.event === event && row.taskId === "T1");
+
+  // the delivery really did fail, twice, in both nudgeable runs — the latch under test is armed
+  expect(killHeld.nudgeCalls).toBe(2);
+  expect(harvestHeld.nudgeCalls).toBe(2);
+  expect(rows(killHeld, "worker-nudge-failed")).toHaveLength(1);
+  expect(rows(harvestHeld, "worker-nudge-failed")).toHaveLength(1);
+  expect(rows(killHeld, "worker-nudge")).toHaveLength(0);
+
+  // both holds stand: the failure is a delivery outcome, never proof the channel is dead
+  expect(rows(killHeld, "worker-dead")).toHaveLength(0);
+  expect(rows(harvestHeld, "worker-harvest")).toHaveLength(0);
+  // A hold gates the shared instrument too: neither reader is eligible, so a long held window
+  // must not fork the accountant's shell + ps sampler ten times a second for no possible reader.
+  expect(killHeld.cpuCalls).toBe(0);
+  expect(harvestHeld.cpuCalls).toBe(0);
+  // and holding costs only the window, never the work — the trailer-less tail still gates the commits
+  expect(rows(harvestHeld, "worker-result-harvested")).toHaveLength(1);
+
+  // the pane that was never nudgeable has no hold to lift and concludes on the same flat legs
+  expect(killConcludes.cpuCalls).toBeGreaterThan(0);
+  expect(harvestConcludes.cpuCalls).toBeGreaterThan(0);
+  expect(rows(killConcludes, "worker-dead")).toHaveLength(1);
+  expect(rows(killConcludes, "worker-nudge-failed")).toHaveLength(0);
+  expect(rows(harvestConcludes, "worker-harvest")).toHaveLength(1);
+  expect(rows(harvestConcludes, "worker-harvest")[0]!.data.commits).toBe(1);
+}, 120_000);

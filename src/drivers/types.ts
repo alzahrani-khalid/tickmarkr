@@ -1,3 +1,4 @@
+import type { JournalEvent } from "../run/journal.js";
 // group: role-tab consolidation (VIS-04) — same-group slots share one ref-counted tab (herdr only)
 export interface Slot { id: string; name: string; cwd: string; tabId?: string; group?: string }
 export type NotifyTier = "routine" | "attention" | "decision";
@@ -154,9 +155,16 @@ export interface ExecutorDriver {
   nudge?(slot: Slot, message: string): Promise<boolean>;
   notify(msg: string, opts?: NotifyOpts): Promise<void>;
   close(slot: Slot): Promise<void>;
+  // v1.99 T2: bind this driver's OWN journal writes to the live narration sink. A driver journals
+  // events the daemon never sees — `dispatch-retry` is written by the driver from inside a recovery,
+  // through a Journal it opens itself — so without this binding those events reach the file and the
+  // pipe but never the operator's rail. The command that owns the run (run.ts / resume.ts) calls it
+  // with the same sink it hands the daemon. Optional — subprocess journals nothing of its own.
+  narrateWith?(narrate: (event: JournalEvent) => void): void;
   worktree(repo: string, branch: string, baseRef: string): Promise<string>;
-  // T6 narrator: one live status surface per run (herdr only). Opens a rightward split beside the
-  // invoking daemon pane, runs the given command, and returns the slot for run-end close. Omitted on
+  // T6 narrator: one live status surface per run (herdr only). Splits the invoking daemon pane down
+  // and swaps the new pane ABOVE it — the board is full width with the narration rail beneath it, at
+  // every terminal width — runs the given command, and returns the slot for run-end close. Omitted on
   // subprocess (no panes) — the daemon's optional-chain call is a no-op there. Cosmetic-only by
   // contract: the daemon swallows any failure so a dead/failed watch pane never affects the run.
   // T2: runId names the pane canonically (tickmarkr:watch:run:0:<runId>) so reconcile can own or reuse it.

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parseWorkerResult } from "../../src/adapters/prompt.js";
-import { BOARD_TARGET_COLS, boardSplitPlan, TRAILER_SAFE_FLOOR_COLS, TRAILER_WIDTH_MARGIN, workerSplitDirection, type BoardSplitPlan } from "../../src/drivers/herdr.js";
+import { BOARD_HEIGHT_SHARE, boardSplitPlan, TRAILER_SAFE_FLOOR_COLS, TRAILER_WIDTH_MARGIN, workerSplitDirection, type BoardPlacement } from "../../src/drivers/herdr.js";
 
 const FIX = join(import.meta.dirname, "../fixtures/trailer-width");
 const MEAS = FIX;
@@ -76,33 +76,37 @@ describe("workerSplitDirection (43-MEASUREMENT.md licensed geometry)", () => {
   });
 });
 
-// QUEUE-v194 criterion 1: the board is placed BESIDE the supervising seat with its own width
-// allocated first — the halving floor above governs worker trailers and not this pair (applying it
-// sent a 189-column tab's board below on 2026-08-18, corrected by the operator).
-describe("boardSplitPlan (board width first, beside the supervising seat)", () => {
-  // what the seat's ratio actually leaves the board — the plan's claim has to survive the arithmetic
-  // herdr will do with it, not just be asserted about itself.
-  const boardFromRatio = (callerCols: number, plan: BoardSplitPlan) => callerCols - Math.round(callerCols * (plan.ratio ?? 0));
+// v1.99 T2: the board is no longer placed by width at all. Two width-derived arrangements shipped
+// and both were wrong in the operator's tab — the halving floor sent a 189-column board below the
+// seat, and the width-first side split put the board shoulder to shoulder with the narration it is
+// supposed to sit above. The plan is now one record: stacked above the caller, full width, 72% of
+// the height, whatever the terminal measures.
+describe("boardSplitPlan (the invariant vertical stack)", () => {
+  // the closed matrix: the incident geometry, the two widths the side split used to switch between,
+  // a degenerate terminal, and the unmeasurable caller every earlier plan fell back on.
+  const CALLER_WIDTH_MATRIX: (number | null)[] = [null, 0, 2, 40, 108, 140, 149, 150, 189, 220, 400];
 
-  test("the board split plan funds the board pane 108 to 112 columns with direction right for a 189-column caller and for a 220-column caller, so a proportional halving whose board width tracks the caller fails", () => {
-    for (const callerCols of [189, 220]) {
-      const plan = boardSplitPlan(callerCols);
-      expect(plan.direction).toBe("right");
-      expect(plan.boardCols).toBeGreaterThanOrEqual(108);
-      expect(plan.boardCols).toBeLessThanOrEqual(112);
-      // halving would fund 94 here and 110 there — the board's width does not track the caller's
-      expect(boardFromRatio(callerCols, plan)).toBe(plan.boardCols);
-      expect(boardFromRatio(callerCols, plan)).toBeGreaterThanOrEqual(108);
-    }
-    expect(BOARD_TARGET_COLS).toBe(110);
-  });
+  test("test: the board-placement plan remains invariant across the closed caller-width matrix and equals the single approved vertical-stack record, whereas any width-sensitive record fails", () => {
+    const APPROVED: BoardPlacement = { direction: "down", ratio: 0.72, swap: "above" };
+    expect(boardSplitPlan()).toEqual(APPROVED); // the plan an unmeasured caller gets
+    expect(BOARD_HEIGHT_SHARE).toBe(0.72); // board 72 / narration 28
 
-  test("the board split plan directs down for a 140-column caller and for an unmeasurable caller, so a plan that squeezes the board under 108 columns instead of falling back to full width fails", () => {
-    for (const callerCols of [140, null]) {
-      const plan = boardSplitPlan(callerCols);
-      expect(plan.direction).toBe("down");
-      expect(plan.ratio).toBeUndefined(); // full width below the seat, never a squeezed side pane
-      expect(plan.boardCols).toBeNull();
+    for (const callerCols of CALLER_WIDTH_MATRIX) {
+      expect(boardSplitPlan(callerCols), String(callerCols)).toEqual(APPROVED);
     }
+    // ONE record across the whole matrix — deep-equality per width would still pass if the plan
+    // merely happened to agree pairwise, so the distinct-record count is what is asserted.
+    const distinct = new Set(CALLER_WIDTH_MATRIX.map((cols) => JSON.stringify(boardSplitPlan(cols))));
+    expect(distinct).toEqual(new Set([JSON.stringify(APPROVED)]));
+
+    // the control: a width-sensitive record — the shipped v1.94 plan, board width allocated first —
+    // answers the same matrix with more than one arrangement and is not the approved stack at all.
+    const widthSensitive = (callerCols: number | null) =>
+      callerCols == null || callerCols < 150
+        ? { direction: "down", boardCols: null }
+        : { direction: "right", ratio: Math.round(((callerCols - 110) / callerCols) * 1e4) / 1e4, boardCols: 110 };
+    const controlRecords = new Set(CALLER_WIDTH_MATRIX.map((cols) => JSON.stringify(widthSensitive(cols))));
+    expect(controlRecords.size).toBeGreaterThan(1); // width picked the arrangement — the defect
+    expect(widthSensitive(220)).not.toEqual(APPROVED);
   });
 });

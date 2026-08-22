@@ -1,14 +1,21 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, test } from "vitest";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { Assignment, Invocation } from "../../src/adapters/types.js";
 import type { Task } from "../../src/graph/schema.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import {
+  resetDeadChannelFastKillMsForTests,
+  resetHarvestCpuFlatMsForTests,
+  runDaemon,
+  setDeadChannelFastKillMsForTests,
+  setHarvestCpuFlatMsForTests,
+} from "../../src/run/daemon.js";
 import { classifyWorkerResultCause } from "../../src/run/journal.js";
 import { Journal } from "../../src/run/journal.js";
-import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 function idriver(overrides: Record<string, unknown> = {}): ExecutorDriver {
   const inner = new SubprocessDriver();
@@ -358,4 +365,69 @@ describe("OBS-53/OBS-57 citations in source", () => {
     expect(daemon).toMatch(/OBS-57/);
     expect(router).toMatch(/OBS-57/);
   });
+});
+
+describe("a fast-kill death names the fast-kill (OBS-548)", () => {
+  afterEach(() => {
+    resetDeadChannelFastKillMsForTests();
+    resetHarvestCpuFlatMsForTests();
+  });
+
+  // The CPU leg the kill now reads must return the same answer on every host, because this pair's
+  // question is which MECHANISM the death is attributed to, not whether `ps` can be read. One
+  // unrelated row: the marker matches nothing, so the worker tree is empty and reads a flat zero.
+  const flatCpuProbe = (): (() => void) => {
+    const bashEnv = join(makeTestTempDir("tickmarkr-ps-flat-"), "bash-env");
+    writeFileSync(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+    const prior = process.env.BASH_ENV;
+    process.env.BASH_ENV = bashEnv;
+    return () => {
+      if (prior === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = prior;
+    };
+  };
+
+  // OBS-548 addendum, and it is checkable arithmetic: T4's repair attempt died at 693 s of silence
+  // inside a 1,800,000 ms stall window — 18.5 minutes still unspent — and recorded
+  // `cause:"stall-timeout"`. The kill came from the fast-kill window the instant a failed nudge
+  // lifted its hold. So the ONE record a repair brief and a consult read named a mechanism that
+  // could not have fired, and the next worker was briefed to fix a stall that never happened.
+  // Fourth conflation in the taxonomy OBS-53 opened. The two runs below differ ONLY in which
+  // window is the short one, so the cause has nothing else to be derived from.
+  test("test: a fast-kill death records its own worker-result cause while a worker killed by real rolling-window expiry still records stall-timeout; a fast-kill recorded as stall-timeout fails", async () => {
+    setHarvestCpuFlatMsForTests(200);
+    const restoreCpu = flatCpuProbe();
+    const run = async (runId: string, fastKillMs: number, timeoutMinutes: number) => {
+      setDeadChannelFastKillMsForTests(fastKillMs);
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes })], {
+        consult: { action: "human", notes: "a stalled worker parks" },
+        tasks: { T1: [{ shell: "sleep 30" }] }, // no trailer, no commit, no worktree delta
+      });
+      const driver = idriver({
+        waitOutput: async () => { await new Promise((r) => setTimeout(r, 50)); return false; },
+        read: async () => "working-on-it", // constant frame: zero output growth
+        status: async () => "working",
+      });
+      await runDaemon(repo, { adapters: [fake], runId, driver });
+      return Journal.open(repo, runId).read();
+    };
+
+    // the fast-kill window is the short one — the rolling window has 5 minutes still unspent
+    const fastKilled = await run("run-cause-fast-kill", 500, 5);
+    // and the mirror: no fast-kill can fire inside this window, so the rolling window is the killer
+    const timedOut = await run("run-cause-stall", 60_000, 0.05);
+    restoreCpu();
+
+    const causeOf = (evs: ReturnType<Journal["read"]>) =>
+      evs.find((e) => e.event === "worker-result" && e.taskId === "T1")!.data.cause;
+    const killed = (evs: ReturnType<Journal["read"]>) =>
+      evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1");
+
+    expect(killed(fastKilled)).toHaveLength(1); // the fast-kill really is what ended this attempt
+    expect(causeOf(fastKilled)).toBe("dead-channel");
+    expect(causeOf(fastKilled)).not.toBe("stall-timeout");
+
+    expect(killed(timedOut)).toHaveLength(0); // nothing but the window could have ended this one
+    expect(causeOf(timedOut)).toBe("stall-timeout");
+  }, 120_000);
 });

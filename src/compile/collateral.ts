@@ -7,8 +7,12 @@ import {
 } from "../config/config.js";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 
-// Advisory plan-time scan only (OBS-12/13/14/21, OBS-76). NEVER expands files[], fails compile,
-// or feeds the scope gate — a warning the author acts on. Plain-text (no AST), capped + sorted.
+// Advisory scan (OBS-12/13/14/21, OBS-76). NEVER expands files[] or fails compile — a warning the
+// author acts on. Plain-text (no AST), capped + sorted for DISPLAY only.
+// OBS-547: the collateral prediction is no longer plan-time-only. The daemon computes one full
+// (uncapped) map per run and hands each task's slice to its scope gate, which classifies a red
+// against it — the prediction never causes a refusal, it only says whether a red the gate already
+// found was foreseeable (authoring defect) or not (chargeable quality failure).
 
 /** Max files walked per root (sorted walk; rest ignored). */
 const MAX_WALK_FILES = 400;
@@ -97,15 +101,20 @@ function makeReader(repoRoot: string): (rel: string) => string | null {
 }
 
 /**
- * Return human-readable scope-lint lines for plan output (no `!` prefix — plan owns that).
- * Each line names the task id and at least one missing collateral test path.
+ * OBS-547: the FULL per-task collateral prediction, uncapped. ONE map is computed per run (daemon.ts,
+ * at run start) and handed whole to the scope gate, so a hit the plan display hides is still there
+ * when the gate asks about it. The lint lines below are a capped VIEW of this same map — never a
+ * second scan. Tasks with no hits are absent.
  */
-export function collateralLints(tasks: ReadonlyArray<Pick<Task, "id" | "files">>, repoRoot: string): string[] {
+export function collateralHits(
+  tasks: ReadonlyArray<Pick<Task, "id" | "files">>,
+  repoRoot: string,
+): Map<string, string[]> {
+  const map = new Map<string, string[]>();
   const testFiles = walkCode(repoRoot, "tests");
-  if (!testFiles.length) return [];
+  if (!testFiles.length) return map;
 
   const read = makeReader(repoRoot);
-  const lines: string[] = [];
   for (const t of tasks) {
     // OBS-22: scopeGate accepts picomatch globs; advisory collateral warnings must agree.
     const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
@@ -121,13 +130,59 @@ export function collateralLints(tasks: ReadonlyArray<Pick<Task, "id" | "files">>
       if (text === null) continue;
       if (mentions(text, needles)) hits.push(tf);
     }
-    if (!hits.length) continue;
     // deterministic: walk already sorted; stable list
+    if (hits.length) map.set(t.id, hits);
+  }
+  return map;
+}
+
+/** The verbatim repair an authoring defect owes: the files[] lines the spec is missing. */
+export function filesRepair(taskId: string, paths: ReadonlyArray<string>): string {
+  return paths.map((p) => `add ${p} to ${taskId}.files[]`).join("\n");
+}
+
+export interface ScopeCollateralVerdict {
+  /** every hard offender was predicted ⇒ authoring defect, repair pre-written, no attempt charged */
+  authoring: boolean;
+  /** the offenders the map had already named */
+  predicted: string[];
+  /** the offenders it had not — the lint's blind spots, recorded as evidence rather than folklore */
+  missed: string[];
+  repair: string;
+}
+
+/**
+ * OBS-547: cross-reference at the RED. The gate supplies specificity (the paths actually touched),
+ * the prediction supplies classification — so there are no false positives to fear and no refusal to
+ * author. Feed this the FULL map for the task: a classifier bounded by the display cap calls a
+ * predicted 21st hit a quality failure.
+ */
+export function classifyScopeOffenders(
+  taskId: string,
+  hard: ReadonlyArray<string>,
+  predicted: ReadonlyArray<string>,
+): ScopeCollateralVerdict {
+  const named = new Set(predicted);
+  const hit = hard.filter((f) => named.has(f));
+  const missed = hard.filter((f) => !named.has(f));
+  return { authoring: hard.length > 0 && missed.length === 0, predicted: hit, missed, repair: filesRepair(taskId, hit) };
+}
+
+/**
+ * Return human-readable scope-lint lines for plan output (no `!` prefix — plan owns that).
+ * Each line names the task id and at least one missing collateral test path.
+ */
+export function collateralLints(tasks: ReadonlyArray<Pick<Task, "id" | "files">>, repoRoot: string): string[] {
+  const lines: string[] = [];
+  for (const [id, hits] of collateralHits(tasks, repoRoot)) {
     const listed = hits.slice(0, MAX_HITS_PER_TASK).join(", ");
+    // OBS-547: the cap hides names, never predictions. Say so, and say where the hidden ones surface —
+    // a count with no route is exactly what left one run's victim unreadable.
     const tail = hits.length > MAX_HITS_PER_TASK
-      ? ` (${hits.length} total; capped at ${MAX_HITS_PER_TASK} shown)`
+      ? ` (${hits.length} total; ${MAX_HITS_PER_TASK} shown, ${hits.length - MAX_HITS_PER_TASK} capped out of view`
+        + ` but RETAINED for the scope gate — a matching scope red prints the hidden path with its files[] repair)`
       : "";
-    lines.push(`${t.id}: likely collateral tests not in files[]: ${listed}${tail}`);
+    lines.push(`${id}: likely collateral tests not in files[]: ${listed}${tail}`);
   }
   return lines;
 }

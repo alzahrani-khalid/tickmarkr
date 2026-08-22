@@ -8,6 +8,7 @@ import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TR
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
 import { type Assignment, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
+import { collateralHits, type ScopeCollateralVerdict } from "../compile/collateral.js";
 import {
   DEFAULT_DIFF_CAP, globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
@@ -18,20 +19,36 @@ import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/type
 import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
 import { runGates, type GateEvent } from "../gates/run-gates.js";
 import type { GateResult } from "../gates/types.js";
-import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus } from "../graph/graph.js";
+import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest } from "../graph/graph.js";
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
 import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, runWithForkBudget, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, pendingRepairFindings, phaseForGate, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
 import { nextChannel, route } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
-import { NUDGEABLE_ADAPTERS, PANE_READ_ROWS, StallProgressTracker, stallSnapshotBannerRows } from "./stall.js";
+import {
+  harvestCpuFlatWindowMs,
+  NUDGEABLE_ADAPTERS,
+  PANE_READ_ROWS,
+  StallProgressTracker,
+  stallSnapshotBannerRows,
+  WorkerTreeCpuAccountant,
+} from "./stall.js";
 import { armSupervision, type ArmedSupervision } from "./supervision.js";
+
+// Compatibility exports for the daemon liveness tests and existing consumers. The implementation
+// lives in stall.ts so gate dispatch can depend on it without importing the daemon.
+export {
+  harvestCpuFlatWindowMs,
+  resetHarvestCpuFlatMsForTests,
+  setHarvestCpuFlatMsForTests,
+  workerTreeCpuMs,
+} from "./stall.js";
 
 export interface RunOptions {
   runId?: string;
@@ -260,6 +277,13 @@ function narrowRepairBattery(failing: GateResult[]): boolean {
   return false;
 }
 
+// v2.0 T2 (OBS-554): the measurement keys run-gates stamps on a GateResult, lifted verbatim onto the
+// gate row. One list, one lift — both onGate sites record through the same helper.
+const GATE_TELEMETRY_KEYS = ["durationMs", "load1Start", "load1End", "selectedDurationMs", "fullDurationMs", "invocations"] as const;
+
+const gateMeasurement = (meta: Record<string, unknown> = {}): Record<string, unknown> =>
+  Object.fromEntries(GATE_TELEMETRY_KEYS.filter((k) => meta[k] !== undefined).map((k) => [k, meta[k]]));
+
 /**
  * T4 (OBS-265): the journal with the review objections a round did NOT hinge on removed. Judge and
  * review are now launched together, so a round can journal a failed review that the serial walk would
@@ -429,40 +453,6 @@ export function setHarvestSilentMsForTests(ms: number): void {
 export function resetHarvestSilentMsForTests(): void {
   harvestSilentMs = HARVEST_SILENT_MS;
 }
-// A CPU delta needs two samples separated in WALL CLOCK, and the CPU clock is QUANTIZED: darwin's
-// `ps` prints hundredths ("0:00.03"), linux's prints whole seconds ("00:00:01"). Equality across a
-// window shorter than the quantum is not evidence of anything — a worker throttled to a low duty
-// cycle accrues less than one tick per sample and reads flat while genuinely working. So the flat
-// observation must span the LARGER of a floor and this many ticks of the clock actually in use:
-// crossing 30 ticks means the tree burned <1 tick in 30, i.e. under ~3% of one core. On a
-// hundredths host that is a 3s window; on a whole-second host it is 30s — still nothing against the
-// ~15m redispatch it replaces. Resolution is read off the sampled rows, never assumed.
-const HARVEST_CPU_FLAT_MS = 3_000;
-const HARVEST_CPU_FLAT_TICKS = 30;
-// Once the flat window opens, retain descendants often enough to observe brief tool processes that
-// can start and exit between the daemon's ordinary wait slices. This sampler exists only during an
-// eligible silence window; it is stopped on progress or as soon as the worker wait concludes.
-const HARVEST_CPU_ACCOUNTING_POLL_MS = 100;
-// T2 review (material): that 100ms cadence forks a shell plus `ps` ten times a second, and on a host
-// where `ps` is unsupported or denied (the managed-sandbox class) EVERY sample fails — tens of
-// thousands of processes per silent attempt, multiplied by daemon concurrency, for a probe that can
-// never conclude anything. Persistent failure is structural, not transient, so the sampler STOPS
-// after this many consecutive unreadable snapshots. It stays stopped for the silence window it was
-// started for: read() then reports no CPU, the triad refuses to conclude and journals the gap, and a
-// later window (after real progress clears the accountant) starts a fresh one that pays the same
-// bounded probe again.
-const HARVEST_CPU_UNMEASURABLE_SAMPLE_CAP = 20;
-let harvestCpuFlatMs: number | undefined;
-export function harvestCpuFlatWindowMs(resolutionMs: number): number {
-  return harvestCpuFlatMs ?? Math.max(HARVEST_CPU_FLAT_MS, resolutionMs * HARVEST_CPU_FLAT_TICKS);
-}
-/** Test seam — pin the flat window so a probe case need not sit through a real one. */
-export function setHarvestCpuFlatMsForTests(ms: number): void {
-  harvestCpuFlatMs = ms;
-}
-export function resetHarvestCpuFlatMsForTests(): void {
-  harvestCpuFlatMs = undefined;
-}
 // Once the silence gate is met the CPU probe owns the poll cadence: the trailer-wait slice is 30s,
 // so two samples would otherwise cost a minute of wall clock apiece. Below the gate the only rule
 // is not to sleep PAST it — at the shipped 5m gate that changes no slice a worker sees today.
@@ -592,160 +582,6 @@ export async function verifyIntegrationTipCached(
     }
   }
   return tipFailed;
-}
-
-// `ps` CPU time: "[[dd-]hh:]mm:ss[.frac]" (darwin prints "0:00.03", linux "00:00:01", both print
-// "1-02:03:04" past a day). Anything else is a header or a row this parser must not guess at.
-// `frac` reports whether THIS host prints sub-second digits — the quantum the flat window is sized
-// against, measured rather than assumed (a darwin sample is 10ms, a linux one 1000ms).
-function parsePsCpu(raw: string): { ms: number; frac: boolean } | undefined {
-  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$/.exec(raw);
-  if (!m) return undefined;
-  const ms = ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60_000 + Math.round(Number(m[4]!) * 1000);
-  return { ms, frac: m[4]!.includes(".") };
-}
-
-interface WorkerTreeCpuSnapshot {
-  processes: Map<string, number>;
-  resolutionMs: number;
-}
-
-let linuxClockTickMs: Promise<number | undefined> | undefined;
-function linuxProcessCpuMs(pid: string, cwd: string): Promise<{ ms: number; resolutionMs: number } | undefined> {
-  if (!existsSync("/proc/self/stat")) return Promise.resolve(undefined);
-  // shGit, not sh: the accountant samples this path at a 100ms cadence, and a LOGIN shell would
-  // re-run the operator's profile (nvm/pyenv/direnv side effects included) on every sample.
-  linuxClockTickMs ??= shGit("getconf CLK_TCK", cwd, 15_000).then((r) => {
-    const ticks = r.code === 0 ? Number(r.stdout.trim()) : Number.NaN;
-    return Number.isFinite(ticks) && ticks > 0 ? 1_000 / ticks : undefined;
-  });
-  return linuxClockTickMs.then((resolutionMs) => {
-    if (resolutionMs === undefined) return undefined;
-    try {
-      // `/proc/<pid>/stat` fields 14-17 are user/system jiffies for the process and its waited-for
-      // children. The child totals retain tools that start and exit wholly between live-tree polls.
-      // Split after the LAST ')' because comm may contain spaces or parentheses; field 3 is rest[0].
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-      const ticks = Number(fields[11]) + Number(fields[12]) + Number(fields[13]) + Number(fields[14]);
-      return Number.isFinite(ticks) ? { ms: ticks * resolutionMs, resolutionMs } : undefined;
-    } catch {
-      return undefined; // process exited between ps ancestry capture and the precise CPU read
-    }
-  });
-}
-
-// T2 (OBS-264): the triad's CPU leg. Every non-seeded process of an attempt descends from that
-// attempt's own dispatch script, whose path is unique — print, argv-interactive and resume launches
-// all start there. (interactive-seed is intentionally fail-open below because its adapter-owned
-// launch bypasses this script.) ONE `ps` snapshot finds the root and all current descendants:
-// the agent CLI is a CHILD of the script's shell, so the root's own TIME never moves while the CLI
-// thinks. `resolutionMs` is the sampled clock's quantum, which sizes the caller's flat window.
-// Returns 0 when nothing matches: a worker whose process tree is gone is the strongest possible
-// "not working". Returns undefined when the snapshot itself failed or parsed to nothing —
-// unmeasurable CPU is never evidence a worker stopped, and the caller refuses to conclude on it.
-async function workerTreeCpuSnapshot(marker: string, cwd: string): Promise<WorkerTreeCpuSnapshot | undefined> {
-  // shGit, not sh: same login-shell cost as the CLK_TCK probe above — `ps` needs no profile.
-  const snapshot = await shGit("ps -Awwo pid=,ppid=,time=,command=", cwd, 15_000);
-  if (snapshot.code !== 0) return undefined;
-  const rows: { pid: string; ppid: string; cpuMs: number; frac: boolean; cmd: string }[] = [];
-  for (const line of snapshot.stdout.split("\n")) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
-    if (!m) continue;
-    const cpu = parsePsCpu(m[3]!);
-    if (cpu !== undefined) rows.push({ pid: m[1]!, ppid: m[2]!, cpuMs: cpu.ms, frac: cpu.frac, cmd: m[4]! });
-  }
-  if (rows.length === 0) return undefined;
-  const tree = new Set(rows.filter((p) => p.cmd.includes(marker)).map((p) => p.pid));
-  // `ps` output is not topologically ordered — relax the parent→child closure until it stops growing.
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const p of rows) {
-      if (!tree.has(p.pid) && tree.has(p.ppid)) { tree.add(p.pid); grew = true; }
-    }
-  }
-  const precise = new Map<string, number>();
-  let preciseResolutionMs: number | undefined;
-  for (const p of rows) {
-    if (!tree.has(p.pid)) continue;
-    const cpu = await linuxProcessCpuMs(p.pid, cwd);
-    precise.set(p.pid, cpu?.ms ?? p.cpuMs);
-    if (cpu !== undefined) preciseResolutionMs = cpu.resolutionMs;
-  }
-  // Even an empty worker tree needs the host's actual measurement quantum: on Linux the /proc
-  // jiffy clock remains available after the worker exits, while `ps time` only prints whole seconds.
-  if (preciseResolutionMs === undefined && existsSync("/proc/self/stat")) {
-    preciseResolutionMs = (await linuxProcessCpuMs(String(process.pid), cwd))?.resolutionMs;
-  }
-  return {
-    processes: precise,
-    resolutionMs: preciseResolutionMs ?? (rows.some((p) => p.frac) ? 10 : 1_000),
-  };
-}
-
-export async function workerTreeCpuMs(marker: string, cwd: string): Promise<{ ms: number; resolutionMs: number } | undefined> {
-  const snapshot = await workerTreeCpuSnapshot(marker, cwd);
-  if (snapshot === undefined) return undefined;
-  return {
-    ms: [...snapshot.processes.values()].reduce((sum, cpuMs) => sum + cpuMs, 0),
-    resolutionMs: snapshot.resolutionMs,
-  };
-}
-
-// Sparse live-tree totals forget a tool's CPU as soon as that tool exits. This attempt-local
-// accountant instead adds each observed process's CPU DELTA to a monotonic total and replaces only
-// the live-PID cursor on each sample. When a PID disappears, its contribution stays in `totalMs`;
-// if that PID is later reused, its fresh total is added from zero because it left `live` in between.
-class WorkerTreeCpuAccountant {
-  private active = false;
-  private loop: Promise<void> | undefined;
-  private live = new Map<string, number>();
-  private totalMs = 0;
-  private gaps = 0;
-  private consecutiveGaps = 0;
-  private latest: { ms: number; resolutionMs: number } | undefined;
-
-  constructor(private marker: string, private cwd: string) {}
-
-  private async sample(): Promise<void> {
-    const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd);
-    if (snapshot === undefined) {
-      this.gaps++;
-      this.live.clear();
-      this.latest = undefined;
-      // Stop forking `ps` at 10Hz once the host has proved it cannot answer — see the cap's comment.
-      if (++this.consecutiveGaps >= HARVEST_CPU_UNMEASURABLE_SAMPLE_CAP) this.active = false;
-      return;
-    }
-    this.consecutiveGaps = 0;
-    for (const [pid, cpuMs] of snapshot.processes) {
-      const prior = this.live.get(pid);
-      this.totalMs += prior === undefined || cpuMs < prior ? cpuMs : cpuMs - prior;
-    }
-    this.live = snapshot.processes;
-    this.latest = { ms: this.totalMs, resolutionMs: snapshot.resolutionMs };
-  }
-
-  async start(): Promise<void> {
-    if (this.active) return;
-    this.active = true;
-    await this.sample();
-    this.loop = (async () => {
-      while (this.active) {
-        await new Promise((resolve) => setTimeout(resolve, HARVEST_CPU_ACCOUNTING_POLL_MS));
-        if (this.active) await this.sample();
-      }
-    })();
-  }
-
-  read(): { cpu: { ms: number; resolutionMs: number } | undefined; gaps: number } {
-    return { cpu: this.latest, gaps: this.gaps };
-  }
-
-  async stop(): Promise<void> {
-    this.active = false;
-    await this.loop;
-  }
 }
 
 async function commitsAheadOf(base: string, wt: string): Promise<string[]> {
@@ -1003,6 +839,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let releaseApprovalSerialization: (() => void) | undefined;
   try {
   let graph = loadGraph(repoRoot);
+  // One bounded snapshot supplies every dispatch. On resume the current journal still participates
+  // in the fold so its task-done/ordinary-approval events can retire older evidence, but findings it
+  // produced are suppressed: same-run feedback already replays those bytes and must not deliver them
+  // twice. Evidence from genuinely earlier runs remains available to a resumed fresh dispatch.
+  const priorRunEvidence = readPriorRunEvidence(repoRoot, graph.tasks, { suppressRunId: runId });
   // GATE-FIX-4 defect 4 (no-op run refusal): a fresh run on a graph with nothing dispatchable used
   // to journal {run-start, run-end} with zero dispatches — and downstream readers (greenness exit,
   // status, notify) treat that run-end as completion, so an all-terminal graph "went green" having
@@ -1229,6 +1070,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     for (const w of await detectVacuousOracles(repoRoot, graph.tasks)) journal.append("baseline-warning", w.taskId, { ...w });
   }
 
+  // OBS-547: ONE full per-task collateral prediction for the whole run, computed here — uncapped, and
+  // handed whole to every scope gate below (never recomputed at a red, never the plan's 20-item view).
+  // Persisted beside baseline.json and RELOADED on resume (same reason baseline is): the prediction is
+  // pre-dispatch state, and rescanning a repository the run has since edited would let an offender flip
+  // between predicted and missed across stop/amend/resume. Missing file (pre-OBS-547 journal) ⇒ scan and
+  // pin it now, so every later resume of this run agrees with this one.
+  const collateralPath = join(journal.dir, "collateral.json");
+  const pinnedCollateral = opts.resume && existsSync(collateralPath)
+    ? new Map<string, string[]>(Object.entries(JSON.parse(readFileSync(collateralPath, "utf8")) as Record<string, string[]>))
+    : null;
+  const collateral = pinnedCollateral ?? collateralHits(graph.tasks, repoRoot);
+  if (!pinnedCollateral) writeFileSync(collateralPath, JSON.stringify(Object.fromEntries(collateral), null, 2));
+
   // T6: open the narrator AFTER run-start/run-resume is journaled so the watch surface has a run to
   // show. driver.narrator is undefined on subprocess → no-op (subprocess spawns nothing). Swallowed:
   // a failed-to-open or later-dead watch pane never affects the run.
@@ -1321,10 +1175,62 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     saveGraph(repoRoot, graph);
     journal.append("task-human", t.id, { reason, kind });
     if (assignment) {
-      journal.telemetry({ taskId: t.id, shape: t.shape, adapter: assignment.adapter, model: assignment.model, channel: assignment.channel, attempts, outcome: "human", durationMs: Date.now() - startMs, parkKind: kind, gateFails, consults, tokens, meteredAttempts: tokens ? metered : undefined, retryMode });
+      // OBS-547: `metered` counts CHARGEABLE metered attempts, so an unchargeable dispatch passes 0 and
+      // the count is omitted rather than written as 0 or as `1` beside `attempts: 0` — a row claiming
+      // more metered attempts than it charges reports as "floor: 1/0 attempts metered". tokens stay
+      // (the spend was real); tokens-without-a-count is the already-modelled degraded ⇒ floor row.
+      journal.telemetry({ taskId: t.id, shape: t.shape, adapter: assignment.adapter, model: assignment.model, channel: assignment.channel, attempts, outcome: "human", durationMs: Date.now() - startMs, parkKind: kind, gateFails, consults, tokens, meteredAttempts: tokens && metered ? metered : undefined, retryMode });
     }
     await reconcile({ spareLiveLlm: true }); // task-human is a terminal event — sweep, sparing sibling tasks' live LLM panes
     await driver.notify(`tickmarkr ${runId}: ${t.id} needs a human — ${reason}`, { tier: "attention" });
+  };
+
+  // OBS-547: cross-reference a scope red against the prediction this run already computed. Every hard
+  // offender predicted ⇒ an AUTHORING defect whose repair is pre-written: journal the classification
+  // with the verbatim files[] lines and park unchargeable. It owes nothing to the quality machinery —
+  // no chargeable attempt, no gateFails, no escalation, no ladder rung — and `scope-authoring` is what
+  // makes a resume replay agree (journal.ts replayResumeState). One unpredicted offender keeps today's
+  // chargeable behaviour and records the miss, so the lint's blind spots accumulate as evidence rather
+  // than folklore. ONE disposition for BOTH paths that observe a red — the ordinary attempt and the
+  // resume gate replay: which code path noticed the red must never decide who pays for it. Returns
+  // true when it parked; the caller then returns without charging anything.
+  // `attempts` is the count of CHARGEABLE attempts before this dispatch — never this dispatch's own
+  // count. The two callers arrive at it differently (the attempt loop's index already excludes the
+  // dispatch in flight; a gate replay's rs.attempts already includes it), and the ordinal journaled
+  // below is derived from it here so both paths number the same dispatch identically.
+  const dispositionScopeRed = async (t: Task, results: GateResult[], assignment: Assignment | null,
+    attempts: number, startMs: number, gateFails: number, consults: number, tokens: TokenUsage | undefined,
+    metered: number, retryMode: RetryMode): Promise<boolean> => {
+    const scopeRed = results.find((g) => g.gate === "scope" && gateFailed(g));
+    const verdict = scopeRed?.meta?.collateral as ScopeCollateralVerdict | undefined;
+    if (!verdict) return false;
+    if (verdict.authoring) {
+      journal.append("scope-authoring", t.id, {
+        gate: "scope",
+        predicted: verdict.predicted,
+        repair: verdict.repair,
+        attempt: attempts + 1,
+        chargeable: false,
+        // The dispatch was PHYSICALLY metered even though nobody is charged for it. Physical metering
+        // is recorded here, separately, so the telemetry row can stay chargeable-consistent: passing
+        // this count on would print `meteredAttempts: 1` beside `attempts: 0`.
+        ...(tokens ? { tokens, meteredDispatches: metered } : {}),
+        ...(assignment ? { channel: channelKey(assignment) } : {}),
+      });
+      await driver.notify(`tickmarkr ${runId}: ${t.id} scope red was PREDICTED — authoring defect, no attempt charged`, { tier: "attention" });
+      await park(t, `scope: every out-of-scope path was predicted by the collateral lint before dispatch — authoring defect, not a worker failure. Repair:\n${verdict.repair}`,
+        "authoring", assignment, attempts, startMs, gateFails, consults, tokens, 0, retryMode);
+      return true;
+    }
+    if (verdict.missed.length) {
+      journal.append("collateral-miss", t.id, {
+        gate: "scope",
+        unpredicted: verdict.missed,
+        predicted: verdict.predicted,
+        attempt: attempts + 1,
+      });
+    }
+    return false;
   };
 
   const execTask = async (t: Task): Promise<void> => {
@@ -1355,6 +1261,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // fresh-budget release, prefer nextChannel over the surviving tried-list so burned channels are
     // not re-tried first (consult bans / prior failovers survive the release).
     const rs = resume.get(t.id);
+    const contentDigest = taskContentDigest(t);
     if (rs?.lastAssignment && rs.attempts > 0
         && channels.some((c) => channelKey(c) === channelKey(rs.lastAssignment!))
         && !demotedChannels.has(channelKey(rs.lastAssignment!))) {
@@ -1444,7 +1351,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         ...(g.meta?.fullSuite === true ? { fullSuite: true } : {}),
         // A finding's path is its own evidence path. Do not pass task scope here: a declaration says
         // where work is allowed, not where this verdict found the defect.
-        ...(blocking ? { findings: structuredFindings(g.gate, g.details) } : {}),
+        ...(blocking ? {
+          taskContentDigest: contentDigest,
+          findings: structuredFindings(g.gate, g.details),
+        } : {}),
+        // v2.0 T2 (OBS-554): the gate's OWN measurement, lifted verbatim from the meta run-gates
+        // stamped WHERE THE GATE RAN. Nothing here re-derives a duration by subtracting journal
+        // timestamps — that would measure this row's queue as well as its work. It rides the
+        // gate-result row itself because that IS the row a recalibration reads: a measurement kept
+        // in a side stream is one join away from the verdict it explains, and the two can drift.
+        // A gate run-gates did not measure contributes NO field rather than a fabricated zero — for
+        // every recalibration this telemetry funds, a gap is honest and a zero is a lie. The
+        // seven-gate closed set is asserted end-to-end in tests/run/gate-telemetry.test.ts.
+        ...gateMeasurement(g.meta),
       });
     };
     // R3 (OBS-186): judge ‖ review are launched together and publish in COMPLETION order
@@ -1485,9 +1404,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // in resume state. The journal already holds the upheld review's bytes; no reset of attempt or
     // channel state can take them away, on any path, including `resume --retry-failed`.
     const upheldFeedback = upheldFeedbackByTask(journal.read()).get(t.id) ?? rs?.upheldFeedback;
-    let feedback = upheldFeedback
+    const carriedEvidence = priorRunEvidence.findings
+      .filter((finding) => finding.taskId === t.id)
+      .map(formatPriorFindingEvidence)
+      .join("\n\n");
+    const withCarriedEvidence = (brief: string): string => {
+      if (!carriedEvidence || brief.includes(carriedEvidence)) return brief;
+      return brief ? `${brief}\n\n${carriedEvidence}` : carriedEvidence;
+    };
+    let feedback = withCarriedEvidence(upheldFeedback
       ? `The operator UPHELD the reviewer's findings — address them without discarding landed work.\nreview: ${upheldFeedback}`
-      : "";
+      : "");
     let ladderIdx = 0;
     let modeFallbackNoted = false; // v1.2: journal the interactive→print fallback once per task, not per attempt
     let gateFails = 0; // TEL-02: incremented ONLY where feedback is built from failing gates — never derived from attempts (quota failovers bump attempts too, Pitfall 6)
@@ -1746,6 +1673,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const { results } = await runGates(resumedTask, {
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
           commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
+          collateral: collateral.get(t.id) ?? [],
           // a recheck re-verifies a human's release: it never selects tests down, it runs the suite.
           pipeline: "v185",
           via: cfg.visibility.llm === "pane"
@@ -1779,6 +1707,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         graph = addEvidence(graph, t.id, { commits: approvedCommits, gateResults: results });
         saveGraph(repoRoot, graph);
         if (!results.every(gateSatisfied)) {
+          // OBS-547: disposition FIRST, and through the same helper the ordinary attempt path uses. A
+          // crash between a journaled scope red and its classification must not turn a predicted red
+          // into a charged one just because a resume is what observed it.
+          // rs.attempts COUNTS the interrupted dispatch this replay is judging; the chargeable
+          // attempts behind it are one fewer. Passing the count itself would number the same dispatch
+          // one higher here than on the ordinary path and bill an attempt the fresh path forgives.
+          // UNLESS an earlier resume already journaled the classification and died before its park:
+          // replayResumeState() has then ALREADY taken that dispatch back, so subtracting again would
+          // erase an EARLIER chargeable attempt and attribute the park to the assignment the rewind
+          // restored. Ask the journal which state this is, and take the classified dispatch's own
+          // assignment back with it.
+          const classified = journal.classifiedDispatch(t.id);
+          if (await dispositionScopeRed(t, results, classified?.assignment ?? gateAuthor,
+            classified ? (rs?.attempts ?? 0) : Math.max(0, (rs?.attempts ?? 0) - 1),
+            startMs, gateFails, consults, tokens, metered, retryMode)) return;
           gateFails++;
           // Observed green gates are only measurements. If the resumed suffix is red, preserve that
           // result in the journal and return to the ordinary attempt/consult ladder, which rebuilds
@@ -1806,7 +1749,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
         graph = setStatus(graph, t.id, "done");
         saveGraph(repoRoot, graph);
-        journal.append("task-done", t.id, { attempts: rs?.attempts ?? 0, assignment: gateAuthor });
+        journal.append("task-done", t.id, {
+          attempts: rs?.attempts ?? 0, assignment: gateAuthor, taskContentDigest: contentDigest,
+        });
         journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
         journal.telemetry({
           taskId: t.id, shape: t.shape, adapter: gateAuthor.adapter, model: gateAuthor.model,
@@ -2031,7 +1976,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const promptFile = writePrompt(journal.dir, t, attempt, feedback, nonce);
       // OBS-56: state the non-interactive, one-pass finish contract and the OBS-54 stall budget in every
       // worker prompt, not only consult retry guidance. Prepended so prompt.ts's completion trailer stays last.
-      const workerContract = `## Harness contract\n- This harness is non-interactive: make one continuous pass; do not stop for questions or follow-up input.\n- You have a ${taskTimeoutMinutes} minute stall window. Budget the full suite once, then commit and emit the completion trailer before it expires.\n- Each test: acceptance criterion must exist as a vitest test whose OWN title (the leaf, not counting enclosing describe titles) is the criterion string verbatim — never shortened, never decorated. Nesting under describe() is allowed.`; // OBS-64; OBS-511: leaf-title rule stated where the worker reads it
+      const workerContract = `## Harness contract\n- This harness is non-interactive: make one continuous pass; do not stop for questions or follow-up input.\n- You have a ${taskTimeoutMinutes} minute stall window. The gates run the full suite for you — never spend this window on one; commit your work and emit the completion trailer inside it.\n- Each test: acceptance criterion must exist as a vitest test whose OWN title (the leaf, not counting enclosing describe titles) is the criterion string verbatim — never shortened, never decorated. Nesting under describe() is allowed.`; // OBS-64; OBS-511: leaf-title rule stated where the worker reads it; OBS-548: the suite is the GATES' job — this repo's own suite outlasts the output-silence windows the daemon polices, so a worker obeying "budget the full suite" was killed by construction
       // OBS-47: state the worktree layout contract in the worker prompt (cheap-tier workers were
       // committing/deleting node_modules and tripping the scope gate). The harness re-asserts the link
       // itself before gates regardless of what the worker does with it.
@@ -2099,30 +2044,44 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         unmeasurableNoted = true;
         journal.append("worker-harvest-unmeasurable", t.id, { slot: slot.name, attempt, reason });
       };
-      const harvestConcludes = async (silentMs: number): Promise<boolean> => {
-        if (silentMs < harvestSilentMs) {
+      // OBS-548: ONE instrument, TWO readers. The harvest triad asks this accountant whether a
+      // COMMITTED worker is at rest; the dead-channel fast-kill asks whether a SILENT worker is
+      // alive at all — and until v1.97 the kill asked nothing, so a tree holding 219,290 ms of
+      // CPU accruing at ~90 ms/s was declared dead while this very accountant ran beside it in the
+      // same loop. Both readers arm through `armCpuLeg` and read through `readCpuLeg`: a per-reader
+      // lifecycle would let one tear the sampler down inside the other's window, and a restarted
+      // accountant re-bases its monotonic total and can then never read flat.
+      // "accruing" also covers NOT YET PROVEN FLAT — until the flat window closes, the tree has not
+      // been observed at rest, and no reader may conclude on it.
+      type CpuLeg =
+        | { state: "flat"; cpu: { ms: number; resolutionMs: number } }
+        | { state: "accruing" | "unmeasurable" };
+      // The CPU leg needs a marker in the worker's own argv, and every launch path puts this
+      // attempt's dispatch script there EXCEPT interactiveSeed: runInteractiveSeed launches the
+      // TUI directly, by a command the ADAPTER owns (seed.launch(model)) which tickmarkr cannot
+      // make attempt-unique and must deliver verbatim. A marker that matches nothing reads as
+      // zero CPU — precisely the false "flat" that would harvest a worker mid-turn — so a seeded
+      // attempt has no measurable CPU leg and neither reader ever concludes it. The other half of
+      // OBS-264 is untouched there: when its window does expire with commits on the worktree, the
+      // no-trailer tail gates them instead of buying a fresh worker to re-produce them.
+      const armCpuLeg = async (armed: boolean): Promise<void> => {
+        if (!armed) {
           await cpuAccountant?.stop();
           cpuAccountant = undefined;
           cpuFlat = undefined;
           cpuGapCount = 0;
-          return false;
+          return;
         }
-        // The CPU leg needs a marker in the worker's own argv, and every launch path puts this
-        // attempt's dispatch script there EXCEPT interactiveSeed: runInteractiveSeed launches the
-        // TUI directly, by a command the ADAPTER owns (seed.launch(model)) which tickmarkr cannot
-        // make attempt-unique and must deliver verbatim. A marker that matches nothing reads as
-        // zero CPU — precisely the false "flat" that would harvest a worker mid-turn — so a seeded
-        // attempt has no measurable CPU leg and the triad never concludes it. The other half of
-        // OBS-264 is untouched there: when its window does expire with commits on the worktree, the
-        // no-trailer tail gates them instead of buying a fresh worker to re-produce them.
+        if (hasSeed || cpuAccountant !== undefined) return;
+        cpuAccountant = new WorkerTreeCpuAccountant(dispatchScript, wt);
+        await cpuAccountant.start();
+      };
+      const readCpuLeg = (): CpuLeg => {
         if (hasSeed) {
           noteUnmeasurable("interactive-seed launch is not in the probed process tree");
-          return false;
+          return { state: "unmeasurable" };
         }
-        if (cpuAccountant === undefined) {
-          cpuAccountant = new WorkerTreeCpuAccountant(dispatchScript, wt);
-          await cpuAccountant.start();
-        }
+        if (cpuAccountant === undefined) return { state: "unmeasurable" }; // no window open: nothing measured yet
         const observation = cpuAccountant.read();
         if (observation.gaps !== cpuGapCount) {
           cpuGapCount = observation.gaps;
@@ -2136,19 +2095,26 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // structural hole as the seeded launch, and must not be the one that stays silent.
           cpuFlat = undefined;
           noteUnmeasurable("the worker process snapshot could not be read");
-          return false;
+          return { state: "unmeasurable" };
         }
         const now = Date.now();
         if (cpu.ms !== cpuFlat?.ms) {
           cpuFlat = { ms: cpu.ms, since: now };
-          return false;
+          return { state: "accruing" };
         }
-        if (now - cpuFlat.since < harvestCpuFlatWindowMs(cpu.resolutionMs)) return false;
+        return now - cpuFlat.since < harvestCpuFlatWindowMs(cpu.resolutionMs)
+          ? { state: "accruing" }
+          : { state: "flat", cpu };
+      };
+      const harvestConcludes = async (silentMs: number): Promise<boolean> => {
+        if (silentMs < harvestSilentMs) return false;
+        const leg = readCpuLeg();
+        if (leg.state !== "flat") return false;
         const carried = await commitsAheadOf(taskBase, wt);
         if (carried.length === 0) return false; // nothing landed: not this branch's population
         journal.append("worker-harvest", t.id, {
           slot: slot.name, attempt, commits: carried.length,
-          silentMs, cpuMs: cpu.ms, cpuResolutionMs: cpu.resolutionMs,
+          silentMs, cpuMs: leg.cpu.ms, cpuResolutionMs: leg.cpu.resolutionMs,
         });
         return true;
       };
@@ -2190,6 +2156,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let output: string;
       let exitCode: number | null;
       let timedOut = false;
+      // OBS-548 addendum: the mechanism that fired is what the repair brief and the consult read.
+      // A fast-kill lands with the rolling window nowhere near expiry (measured: 693 s of silence
+      // inside a 1,800,000 ms window), so the trailer-less tail's stall-timeout fallback named a
+      // window that could not have killed anything and briefed the next worker to fix a stall that
+      // never happened. Fourth conflation in the taxonomy OBS-53 opened.
+      let deadChannelKilled = false;
       // T2 review: print mode's "the exit marker appeared". Kept apart from `finished` (the
       // trailer) but still needed by the keepPanes decision below, whose contract is about a
       // subprocess tree that REACHED its exit marker, not about what the worker claimed.
@@ -2222,7 +2194,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         });
         if (keepOpen) keptSlots.push(slot);
         else await closeSlot(slot);
-        feedback = `delivery readiness failed after ${error.waitedMs}ms; pane transcript:\n${error.transcript}`;
+        feedback = withCarriedEvidence(`delivery readiness failed after ${error.waitedMs}ms; pane transcript:\n${error.transcript}`);
         const step = r.ladder[Math.min(ladderIdx++, r.ladder.length - 1)];
         journal.append("escalation", t.id, { step, attempt: attempt + 1 });
         await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${step}`, { tier: "attention" });
@@ -2321,6 +2293,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // lastProgressAt — see the kill below.
           let quotaStreak = 0;
           let rowSaturationHeld = false; // journaled once per attempt when the kill stands down
+          let cpuHeld = false; // likewise for the CPU leg's stand-down (OBS-548)
           while (Date.now() - lastProgressAt < stallWindowMs) {
             const sliceStart = Date.now();
             const remaining = stallWindowMs - (sliceStart - lastProgressAt);
@@ -2449,6 +2422,30 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // daemon has nothing left to do — the pane falls back under the fast-kill and page
             // watchdogs like any other, instead of riding the whole rolling window untended.
             const nudgePending = nudgeable && (!nudged || nudgeDeadline !== undefined);
+            // T1 review fix: the kill's "no output growth" leg clocks off the RAW growth signals,
+            // never lastProgressAt alone — the flat-token rule (stall.ts) deliberately suppresses
+            // the re-arm report on row growth once tokens stick, and contextTokens is sticky across
+            // read misses, so a metered non-nudgeable adapter (pi) streaming rows under a stale
+            // counter presented a frozen lastProgressAt and was killed mid-work. lastRowGrowthAt is
+            // recorded on every high-water advance, suppressed or not; token growth already rides
+            // lastProgressAt. Either one advancing is output growth.
+            const lastOutputGrowthAt = Math.max(stallProgress.lastRowGrowthAt ?? 0, lastProgressAt);
+            // Everything the fast-kill can decide from the CHANNEL, evaluated before the CPU leg is
+            // asked for anything: the kill's own probe costs a `ps` every 100ms, so an ineligible
+            // slice must not pay for it. The CPU reading is consulted at the kill itself, below.
+            const fastKillEligible = !stallProgress.rowSignalSaturated
+              && !nudgePending && !nudgeFailed
+              && sliceNow - lastOutputGrowthAt >= deadChannelFastKillMs
+              && worktreeSinceLaunch === "unchanged";
+            const harvestCpuEligible = !nudgePending && !nudgeFailed
+              && sliceNow - lastProgressAt >= harvestSilentMs;
+            // OBS-548: ONE accountant serves both readers, so its lifecycle is decided once per
+            // slice from BOTH windows. Arming per-reader let the harvest's own "not silent enough
+            // yet" branch stop the sampler the fast-kill had just started, and a restarted
+            // accountant re-bases its monotonic total — the leg could then never read flat. The
+            // accountant also carries the readers' nudge holds: when neither reader may conclude,
+            // there is no reason to fork its 10 Hz process snapshots through the remaining window.
+            await armCpuLeg(harvestCpuEligible || fastKillEligible);
             // T2 (OBS-264): the liveness triad CONCLUDES the wait on finished work — commits ahead
             // of the task base (this attempt's own AND any carried forward — see the eligibility
             // comment at the dispatch site), a flat worker-tree CPU delta, and >= harvestSilentMs
@@ -2461,10 +2458,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // claude-code worker before the rescue could fire, leaving T1's nudge dead code for
             // exactly the committed-and-stalled population OBS-264 is about. Holding concludes at
             // ~14m (nudge + grace) rather than ~36m — nearly all of the OBS-264 win, and a worker
-            // that only needed a submit answers with a full trailer instead of partial work. An
-            // ANSWERED or twice-undeliverable nudge leaves nothing pending, so the triad governs
-            // again; the hold is on a pending daemon ACTION, never on the adapter being nudgeable.
-            if ((!nudgePending || nudgeFailed) && await harvestConcludes(sliceNow - lastProgressAt)) break;
+            // that only needed a submit answers with a full trailer instead of partial work.
+            // An ANSWERED nudge leaves nothing pending, so the triad governs again; the hold is on a
+            // pending daemon ACTION, never on the adapter being nudgeable.
+            // OBS-548: an UNDELIVERABLE nudge holds too. A worker inside one long foreground command
+            // has no input box, so it is the population that CANNOT be nudged and is also the one
+            // most likely to be legitimately silent — letting its delivery failure lift the hold made
+            // the failure itself the trigger. `:357-359` already reads a false driver.nudge return as
+            // a delivery outcome, "not proof of an unreachable channel"; unreachable is not at rest.
+            if (!nudgePending && !nudgeFailed && await harvestConcludes(sliceNow - lastProgressAt)) break;
             // T1 (R1 dead-channel fast-kill): no trailer, an unchanged launch tree, and no output growth
             // for the fast-kill window — the channel is dead, so conclude NOW
             // (journaled) and let the existing no-trailer tail classify and route the attempt.
@@ -2495,20 +2497,30 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               rowSaturationHeld = true;
               journal.append("worker-dead-held", t.id, { slot: slot.name, attempt, reason: "row-signal-saturated" });
             }
-            // T1 review fix: the kill's "no output growth" leg clocks off the RAW growth signals,
-            // never lastProgressAt alone — the flat-token rule (stall.ts) deliberately suppresses
-            // the re-arm report on row growth once tokens stick, and contextTokens is sticky across
-            // read misses, so a metered non-nudgeable adapter (pi) streaming rows under a stale
-            // counter presented a frozen lastProgressAt and was killed mid-work. lastRowGrowthAt is
-            // recorded on every high-water advance, suppressed or not; token growth already rides
-            // lastProgressAt. Either one advancing is output growth.
-            const lastOutputGrowthAt = Math.max(stallProgress.lastRowGrowthAt ?? 0, lastProgressAt);
-            if (!stallProgress.rowSignalSaturated
-              && (!nudgePending || nudgeFailed)
-              && sliceNow - lastOutputGrowthAt >= deadChannelFastKillMs
-              && worktreeSinceLaunch === "unchanged") {
-              journal.append("worker-dead", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastOutputGrowthAt });
-              break;
+            // OBS-548: the FOURTH leg, and the one the daemon already measured. The three legs above
+            // are all channel-side: they say a pane stopped talking. The tree's CPU says whether
+            // anything is still WORKING, and the harvest triad forty lines up refuses exactly this
+            // conclusion without it — "a worker that is merely thinking still burns CPU and is never
+            // concluded here". A live CPU delta is a live worker, by construction; an UNMEASURABLE
+            // reading keeps the fail-open contract the probe already states (undefined is never
+            // evidence a worker stopped), so on a host whose `ps` cannot be read the fast-kill stands
+            // down and the rolling window owns the pane, exactly as pre-T1.
+            if (fastKillEligible) {
+              const leg = readCpuLeg();
+              if (leg.state === "flat") {
+                deadChannelKilled = true;
+                journal.append("worker-dead", t.id, {
+                  slot: slot.name, attempt, silentMs: sliceNow - lastOutputGrowthAt,
+                  cpuMs: leg.cpu.ms, cpuResolutionMs: leg.cpu.resolutionMs,
+                });
+                break;
+              }
+              if (!cpuHeld) {
+                cpuHeld = true;
+                journal.append("worker-dead-held", t.id, {
+                  slot: slot.name, attempt, reason: leg.state === "accruing" ? "cpu-accruing" : "cpu-unmeasurable",
+                });
+              }
             }
             if (nudgeable && !nudged && sliceNow - lastProgressAt >= nudgeAfterSilentMs) {
               nudged = true;
@@ -2665,6 +2677,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // steer, driver.nudge is never consulted on this path), so there is no pending daemon
           // action for the triad to preempt — the asymmetry with the interactive call site above is
           // the absence of the thing being held for, not an oversight.
+          await armCpuLeg(Date.now() - lastProgressAt >= harvestSilentMs);
           if (await harvestConcludes(Date.now() - lastProgressAt)) break;
         }
         output = await driver.read(slot, 500);
@@ -2700,7 +2713,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (attemptUsage) { tokens = addUsage(tokens, attemptUsage); metered++; }
       let result = settleParsed ?? adapter.parse(output, nonce);
       const workerFinished = finished;
-      const workerCause = classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut });
+      const workerCause = classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut, deadChannel: deadChannelKilled });
       journal.append("worker-result", t.id, {
         ok: result.ok, summary: result.summary, deviations: result.deviations, finished: workerFinished, exitCode,
         mode: interactive ? "interactive" : "print", ...(workerCause ? { cause: workerCause } : {}),
@@ -2923,6 +2936,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         ({ results, commits } = await runGates(t, {
           worktree: wt, baseRef: taskBase, result, author: assignment,
           commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
+          collateral: collateral.get(t.id) ?? [],
           pipeline: "v185", selectTests: !testGateFailed,
           via: cfg.visibility.llm === "pane"
             ? {
@@ -2963,7 +2977,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           graph = setStatus(graph, t.id, "done");
           saveGraph(repoRoot, graph);
-          journal.append("task-done", t.id, { attempts: attempt + 1, assignment });
+          journal.append("task-done", t.id, {
+            attempts: attempt + 1, assignment, taskContentDigest: contentDigest,
+          });
           journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
           // firstAttemptOk/gateFails/consults are recorded FACTS, not policy — a parkKind:"stall" row is
           // recorded but NOT quality-negative in v1.6; Phase 12 owns reward policy, so flipping it later needs zero data migration.
@@ -3009,11 +3025,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         return;
       }
 
+      // OBS-547: who pays for this red is decided by the run's collateral prediction (see
+      // dispositionScopeRed) — an authoring defect parks unchargeable before any accounting below.
+      if (await dispositionScopeRed(t, results, assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode)) return;
+
       gateFails++; // this attempt's gates failed — the one place quality degradation is verified (never inferred from attempts)
       // v1.53 T3: prefer the CLI's own session id captured from this attempt's output (kimi's resume
       // trailer) over the harness slot name; absent hook or no capture keeps today's slot-name id.
       retrySession = { channel: channelKey(assignment), id: adapter.sessionIdFrom?.(output) ?? sessionId, contextTokens };
-      feedback = results.filter(gateFailed).map((g) => `${g.gate}: ${g.details}`).join("\n\n");
+      feedback = withCarriedEvidence(results.filter(gateFailed).map((g) => `${g.gate}: ${g.details}`).join("\n\n"));
       // OBS-189/G3 (park-economics patch): a request-changes review is a findings brief, not a worker
       // defect — the fix attempt stays on the same channel with the findings as feedback and consumes
       // no escalation-ladder rung. Bounded by the engagement round cap at the top of this loop.

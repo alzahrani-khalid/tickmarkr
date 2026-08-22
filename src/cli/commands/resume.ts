@@ -2,8 +2,8 @@ import { loadConfig } from "../../config/config.js";
 import { pickDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
 import { type RunSummary, formatSummary, runDaemon } from "../../run/daemon.js";
-import { formatJournalNarration } from "../../run/journal.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
+import { narrationSink, bindNarration } from "./run.js";
 
 const summaryGreen = (s: RunSummary) =>
   s.failed.length === 0 && s.human.length === 0 && s.blocked.length === 0 && s.pending.length === 0
@@ -27,13 +27,19 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
   if (collisions.length) {
     throw new Error(collisions.map(denyPreferCollisionLine).join("; "));
   }
+  const narrate = narrationSink(runId);
   const s = await runDaemon(cwd, {
     runId,
     resume: true,
     graphChanged,
     retryFailed,
-    driver: pickDriver(cfg),
-    narrate: (event) => console.log(formatJournalNarration(event)),
+    // bound to the same sink the daemon gets, so a driver-journaled recovery reaches this rail too
+    driver: bindNarration(pickDriver(cfg), narrate),
+    // v1.99 T2: the ONE narration sink — the quiet rail on a TTY, the raw journal formatter on a
+    // pipe. A resumed run meets the same surface a fresh one does; printing the raw formatter here
+    // would leave `resume` as the last place the old unfiltered dump survives. Bound to the run id
+    // the operator named, so a resumed run's lifecycle rows name THIS run and not a generic word.
+    narrate,
   });
   const out = `resumed ${s.runId} — ${formatSummary(s)}`;
   return { out, code: summaryGreen(s) ? 0 : 2 };

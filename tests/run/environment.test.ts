@@ -1,13 +1,16 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { AuthHealth, BillingChannel, WorkerAdapter } from "../../src/adapters/types.js";
 import type { TickmarkrConfig } from "../../src/config/config.js";
 import { runDaemon } from "../../src/run/daemon.js";
-import { type RunEnvironment, UNKNOWN_ADAPTER_VERSION } from "../../src/run/environment.js";
-import { Journal } from "../../src/run/journal.js";
+import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { environmentComparable, recordedEnvironment } from "../../src/report/compare.js";
+import { type RunEnvironment, UNKNOWN_ADAPTER_VERSION, runEnvironment } from "../../src/run/environment.js";
+import { DEFAULT_FORK_CAP, deriveForkCap, FORK_CAP_ENV, runWithForkBudget } from "../../src/run/git.js";
+import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, reapTestTempDirs, setupRepo, T } from "../helpers/tmprepo.js";
 
 // v1.70 T2: the run-start journal event stamps the run's environment identity — the running tickmarkr
@@ -82,6 +85,77 @@ describe("run-start environment identity (fake adapter, zero tokens)", () => {
     expect(env.adapterVersions.fake).toBe("fake");
   });
 }, 120000);
+
+// v2.0 T2 (OBS-554): a load reading is uninterpretable without the capacity it was taken against, so
+// the run-start environment records the host core count and the run-scoped vitest fork cap. Both come
+// through providers, which is what lets a journal replayed on ANOTHER host reconstruct the parked
+// scheduler's threshold from the record instead of from the machine doing the reading.
+describe("run environment capacity (v2.0 T2)", () => {
+  test("test: the run environment record carries the host core count & the effective fork cap from injected providers so a hardcoded or absent capacity fails", async () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    // A host this process is not: 64 cores, a cap of 7. Neither number is derivable from the machine
+    // running the suite, so a hardcoded constant or a re-read of THIS host cannot produce them.
+    const injected = runEnvironment(cfg, [], {}, { cores: () => 64, forkCap: () => 7 });
+    expect(injected.cores).toBe(64);
+    expect(injected.forkCap).toBe(7);
+
+    // A DIFFERENT injected host must move both numbers — a record that ignored its providers and
+    // stamped one fixed capacity would return 64/7 again here.
+    const other = runEnvironment(cfg, [], {}, { cores: () => 3, forkCap: () => 1 });
+    expect({ cores: other.cores, forkCap: other.forkCap }).toEqual({ cores: 3, forkCap: 1 });
+
+    // absent capacity fails: both keys are present on every minted record, and present as numbers.
+    for (const env of [injected, other]) {
+      expect(Object.keys(env)).toEqual(expect.arrayContaining(["cores", "forkCap"]));
+      expect([typeof env.cores, typeof env.forkCap]).toEqual(["number", "number"]);
+    }
+
+    // The report comparator replays the journal rather than calling runEnvironment again. Capacity
+    // must survive that parse, and either axis changing makes two otherwise-identical runs a mismatch.
+    const asRunStart = (environment: RunEnvironment): JournalEvent[] => [{
+      ts: "2026-08-22T00:00:00.000Z",
+      event: "run-start",
+      data: { environment },
+    }];
+    const replayed = recordedEnvironment(asRunStart(injected));
+    expect(replayed).toEqual(injected);
+    expect(environmentComparable(replayed, recordedEnvironment(asRunStart({ ...injected, cores: 63 }))))
+      .toEqual({ comparable: false, reason: "mismatch", recorded: injected.configHash });
+    expect(environmentComparable(replayed, recordedEnvironment(asRunStart({ ...injected, forkCap: 8 }))))
+      .toEqual({ comparable: false, reason: "mismatch", recorded: injected.configHash });
+    // A half-stamped capacity pair is malformed, not an old capacity-free journal.
+    const { forkCap: _missing, ...halfStamped } = injected;
+    expect(recordedEnvironment(asRunStart(halfStamped))).toBeUndefined();
+
+    // and the DEFAULTS are the two surfaces production already uses — the same availableParallelism
+    // deriveForkCap divides, and the cap a gate suite ACTUALLY runs under. That second one is not
+    // simply the derived number: `sh` lets an operator export of VITEST_MAX_FORKS win (src/run/git.ts),
+    // so the record has to follow the same precedence or it describes a host this run never used.
+    const prior = process.env[FORK_CAP_ENV];
+    const restore = () => { if (prior === undefined) delete process.env[FORK_CAP_ENV]; else process.env[FORK_CAP_ENV] = prior; };
+    try {
+      delete process.env[FORK_CAP_ENV];
+      const production = runEnvironment(cfg, [], {});
+      expect(production.cores).toBe(availableParallelism());
+      expect(production.forkCap).toBe(Number(DEFAULT_FORK_CAP));
+      const concurrency = 2;
+      const inRun = await runWithForkBudget(concurrency, async () => runEnvironment(cfg, [], {}));
+      expect(inRun.forkCap).toBe(deriveForkCap(concurrency));
+      expect(inRun.forkCap).not.toBe(Number(DEFAULT_FORK_CAP)); // the run's cap, not the fallback
+
+      // operator-wins: with an export in place, the run's derived cap is NOT what children get. The
+      // override is derived from this host's own cap so it can never coincide with it — on any box,
+      // a record that ignored the export reports a different number than the one children inherit.
+      const override = deriveForkCap(concurrency) + 1;
+      process.env[FORK_CAP_ENV] = String(override);
+      const overridden = await runWithForkBudget(concurrency, async () => runEnvironment(cfg, [], {}));
+      expect(overridden.forkCap).toBe(override);
+      expect(overridden.forkCap).not.toBe(deriveForkCap(concurrency));
+    } finally {
+      restore();
+    }
+  });
+});
 
 describe("shared test temp-directory teardown", () => {
   test("test: a directory created through the helper during a test no longer exists after the suite teardown runs", () => {

@@ -35,9 +35,33 @@ function swapExact<T>(obj: T, from: string, to: string): T {
   return obj;
 }
 
+// v2.0 T2 (OBS-554): a gate-result row carries its own measurement — the gate's wall-clock
+// durationMs (plus per-invocation spans for judge/review, and the test gate's two halves) bracketed
+// by host load samples. Same standing as `ts` above and `durationMs` in normTelemetry below:
+// notifications could in principle make a gate slower or land it on a busier host; they cannot
+// change what it does. That the measurement is PRESENT on all seven gates is pinned by
+// tests/run/gate-telemetry.test.ts — this oracle only asks whether notifying changed the run.
+const MEASURED = new Set(["durationMs", "selectedDurationMs", "fullDurationMs", "load1Start", "load1End"]);
+function maskMeasured<T>(obj: T): T {
+  if (Array.isArray(obj)) return obj.map(maskMeasured) as T;
+  if (obj && typeof obj === "object") {
+    return Object.fromEntries(
+      Object.entries(obj).map(([k, v]) => [k, MEASURED.has(k) ? "<MEASURED>" : maskMeasured(v)]),
+    ) as T;
+  }
+  return obj;
+}
+
 function normJournal(events: JournalEvent[], runId: string, baseRef: string, taskId = "T1") {
   return events.map((e, i) => {
     let row = { ...e, ts: String(i) };
+    if (row.event === "gate-result") {
+      // Mask values only after proving the row carried one. Two equally missing durationMs fields
+      // must fail this identity oracle rather than normalize into a false equality.
+      expect(Object.hasOwn(row.data, "durationMs")).toBe(true);
+      expect(typeof row.data.durationMs).toBe("number");
+      row = { ...row, data: maskMeasured(row.data) };
+    }
     row = swapExact(row, runId, "<RUNID>");
     row = swapExact(row, `tickmarkr/${runId}`, "tickmarkr/<RUNID>");
     row = swapExact(row, `tickmarkr/${runId}--${taskId}`, "tickmarkr/<RUNID>--T1");

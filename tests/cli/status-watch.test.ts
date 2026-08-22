@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
+import { GLYPHS, LIVE } from "../../src/brand.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
@@ -134,6 +135,7 @@ const card = (out: string, taskId: string) => {
 };
 // the v1.34 ledger frame colorizes chips and task boxes — strip ANSI to fence glyphs/order, not styling
 const strip = (s: string) => s.replace(/\x1b\[[\d;]*m/g, "");
+const liveOpen = (token: (text: string) => string): string => token("").replace("\x1b[0m", "");
 const ts = "2026-07-14T08:00:00.000Z";
 const runStart = (): JournalEvent => ({ ts, event: "run-start", data: { pid: process.pid, graphDefinitionHash: DEF_HASH } });
 const dispatch = (taskId: string, model: string): JournalEvent => ({
@@ -353,8 +355,8 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       const unmergedTty = await status(["--watch"], unmergedRepo, { iterations: 1 });
       const mergedTty = await status(["--watch"], mergedRepo, { iterations: 1 });
-      expect(row(unmergedTty, "T1")).not.toContain("\x1b[38;5;41mT1");
-      expect(row(mergedTty, "T1")).toContain("\x1b[38;5;41mT1");
+      expect(row(unmergedTty, "T1")).not.toContain(`${liveOpen(LIVE.pass)}T1`);
+      expect(row(mergedTty, "T1")).toContain(`${liveOpen(LIVE.pass)}T1`);
     });
   });
 
@@ -611,7 +613,7 @@ describe("status checklist rendering", () => {
       const out = await status([], repo);
       expect(card(out, "T2")).toContain("warn · infra");
       expect(card(out, "T2")).not.toContain("failed");
-      expect(row(out, "T2")).not.toContain("\x1b[31m");
+      expect(row(out, "T2")).toContain(liveOpen(LIVE.attention));
     });
   });
 
@@ -626,7 +628,7 @@ describe("status checklist rendering", () => {
       const out = await status([], repo);
       expect(card(out, "T2")).toContain("failed");
       expect(card(out, "T2")).toContain("parked (ladder-exhausted)");
-      expect(row(out, "T2")).toContain("\x1b[31m");
+      expect(row(out, "T2")).toContain(liveOpen(LIVE.failure));
     });
   });
 
@@ -643,7 +645,7 @@ describe("status checklist rendering", () => {
       const out = await status([], repo);
       for (const id of ["T2", "T3"]) {
         expect(card(out, id)).toContain("failed");
-        expect(row(out, id)).toContain("\x1b[31m");
+        expect(row(out, id)).toContain(liveOpen(LIVE.failure));
       }
     });
   });
@@ -665,7 +667,7 @@ describe("status checklist rendering", () => {
     });
   });
 
-  test("test: only a red-tier task id is painted red; running and warn-tier rows stay non-red", async () => {
+  test("the red and warn tiers share the one attention role and are told apart by their words, while a running row wears the running role", async () => {
     const warnRepo = mkRepo();
     seed(warnRepo, [
       runStart(),
@@ -683,13 +685,167 @@ describe("status checklist rendering", () => {
       { ts, event: "task-human", taskId: "T2", data: { reason: "escalation ladder exhausted", kind: "ladder-exhausted" } },
       dispatch("T3", "fake-3"),
     ]);
+    const runningRepo = mkRepo();
+    seed(runningRepo, [
+      runStart(),
+      dispatch("T1", "fake-1"),
+      phaseStart("T1", "worker", ts),
+    ]);
 
     await withTty(async () => {
       const warnRow = row(await status([], warnRepo), "T2");
       const redRow = row(await status([], redRepo), "T2");
-      expect(warnRow).not.toContain("\x1b[31m");
-      expect(redRow).toContain("\x1b[31m");
+      const runningRow = row(await status([], runningRepo, { now: () => Date.parse(ts) + 4_000 }), "T1");
+      expect(warnRow).toContain(liveOpen(LIVE.attention));
+      expect(redRow).toContain(liveOpen(LIVE.failure));
+      expect(liveOpen(LIVE.attention)).toBe(liveOpen(LIVE.failure));
+      expect(strip(warnRow)).toContain(`${GLYPHS.attention} warn`);
+      expect(strip(redRow)).toContain(`${GLYPHS.fail} failed`);
+      expect(runningRow).toContain(liveOpen(LIVE.running));
     });
+  });
+
+  test("test: attention and failure remain distinguishable by glyph under the shared amethyst color and NO_COLOR keeps every live token plain; a color-only distinction or styled plain output fails", async () => {
+    const warnRepo = mkRepo();
+    seed(warnRepo, [
+      runStart(),
+      dispatch("T2", "fake-2"), // OBS-206: the dispatch that died — see the cause-word test above
+      { ts, event: "task-failed", taskId: "T2", data: { error: "delivery refused", kind: "dispatch", attempts: 0 } },
+    ]);
+    const redRepo = mkRepo();
+    seed(redRepo, [
+      runStart(),
+      { ts, event: "task-human", taskId: "T2", data: { reason: "escalation ladder exhausted", kind: "ladder-exhausted" } },
+    ]);
+
+    // The colour-only control is an INSTANCE of the substitution it must catch: under this palette
+    // attention and failure ARE one colour, so a row that leaned on hue alone would be byte-identical
+    // to its counterpart. Colour cannot carry this distinction; only the glyph can.
+    expect(LIVE.attention("x")).toBe(LIVE.failure("x"));
+
+    await withTty(async () => {
+      const warn = card(await status([], warnRepo), "T2");
+      const red = card(await status([], redRepo), "T2");
+      // `card` already strips ANSI: these are the shipped rows with the amethyst taken off.
+      expect(warn).toContain(`${GLYPHS.attention} warn`);
+      expect(warn).not.toContain(`${GLYPHS.fail} failed`);
+      expect(red).toContain(`${GLYPHS.fail} failed`);
+      expect(red).not.toContain(`${GLYPHS.attention} warn`);
+      expect(new Set([warn, red]).size).toBe(2);
+    });
+
+    // The header is the OTHER live attention/failure call site, and it has two of them: the done
+    // tally and the separate verify segment. Both wear the one amethyst whether the tip is merely
+    // unverified or verifiably failed, so both lead with their own glyph — otherwise the identical
+    // `tasks done · run not verified` text is all an operator gets from either state.
+    const pendingRepo = mkRepo();
+    seed(pendingRepo, [tipRunStart(), ...completedTaskEvents(), { ts, event: "merge", taskId: "T3", data: {} }]);
+    const failedRepo = mkRepo();
+    seed(failedRepo, [
+      tipRunStart(),
+      ...completedTaskEvents(),
+      { ts, event: "merge", taskId: "T3", data: {} },
+      tipFailure("test"),
+      failedTipRunEnd(),
+    ]);
+    // The lockup gutter drops out the same way the tally tests above drop it: the version cell
+    // beside a wrapped fact is layout, not a break in the claim.
+    const headerText = (frame: string): string => strip(frame)
+      .split("\n")
+      .map((line) => line.replace(/^ v\d+\.\d+\.\d+\S*/u, ""))
+      .join("\n")
+      .replace(/\s+/gu, " ");
+
+    await withTty(async () => {
+      const pending = headerText(await status([], pendingRepo));
+      const failed = headerText(await status([], failedRepo));
+      expect(pending).toContain(`${GLYPHS.attention} 3/3 tasks done`);
+      expect(pending).toContain(`${GLYPHS.attention} verify pending`);
+      expect(pending).not.toContain(GLYPHS.fail);
+      expect(failed).toContain(`${GLYPHS.fail} 3/3 tasks done`);
+      expect(failed).toContain(`${GLYPHS.fail} verify FAILED`);
+      expect(failed).not.toContain(`${GLYPHS.attention} 3/3 tasks done`);
+    });
+
+    // The same law on the live effort panel, where the review and park segments are ADJACENT and
+    // wear the one amethyst: in the bar and in its legend markers only SHAPE separates a reviewer's
+    // rounds from a human park, so a panel drawing both with one glyph is unreadable and fails here.
+    const effortRepo = mkRepo();
+    seed(effortRepo, [
+      runStart(),
+      dispatch("T2", "fake-2"),
+      gate("T2", "review", true),
+      gate("T2", "review", false),
+      { ts, event: "task-human", taskId: "T2", data: { reason: "escalation ladder exhausted", kind: "ladder-exhausted" } },
+    ]);
+    // Every styled run of a line as (opening escape, text): the amethyst runs are the segments the
+    // colour cannot tell apart, read off the rendered frame rather than off the implementation.
+    const amethystShapes = (line: string): Set<string> => new Set(
+      [...line.matchAll(/\x1b\[([\d;]*)m([^\x1b]*)/gu)]
+        .filter((run) => `\x1b[${run[1]!}m` === liveOpen(LIVE.attention))
+        .flatMap((run) => [...run[2]!.trim()]),
+    );
+    const panelLines = (frame: string): { bar: string; legend: string } => {
+      const lines = frame.split("\n");
+      const bar = lines.find((line) => /1 dispatch · 2 review · 1 park/u.test(strip(line)))!;
+      const legendLine = lines.find((line) => /dispatch {2}.*review round {2}.*human park/u.test(strip(line)))!;
+      expect(bar, "effort bar row").toBeDefined();
+      expect(legendLine, "effort legend row").toBeDefined();
+      return { bar, legend: legendLine };
+    };
+
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    Object.defineProperty(process.stdout, "columns", { configurable: true, value: 110 });
+    try {
+      await withTty(async () => {
+        const { bar, legend: legendRow } = panelLines(await status([], effortRepo));
+        expect(amethystShapes(bar).size, "review and park bar segments").toBe(2);
+        expect(amethystShapes(legendRow).size, "review and park legend markers").toBe(2);
+        // …and the dispatch segment keeps its own shape too: three segments, three glyphs.
+        const barGlyphs = new Set(strip(bar).replace(/[^\u2580-\u259f]/gu, ""));
+        expect(barGlyphs.size, "dispatch, review and park bar shapes").toBe(3);
+      });
+    } finally {
+      if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+      else delete (process.stdout as { columns?: number }).columns;
+    }
+
+    // NO_COLOR on a TTY hands the operator the byte-pinned plain surface, which is preserved as it
+    // was. Read off the RENDERED rows, not off tokens handed their own text: this is the surface an
+    // operator actually sees, and the law is that it stays plain AND stays legible. Its glyph
+    // vocabulary is ASCII by pin — "uses ASCII boxes without ANSI when NO_COLOR or stdout is not a
+    // TTY" forbids ✗ here outright — so what separates the two tiers on this surface is the tier
+    // word the renderer already writes. A token that styled here would corrupt plain output exactly
+    // as it corrupts a pipe, and a row that had leaned on the amethyst would arrive indistinguishable.
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const previous = process.env.NO_COLOR;
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    process.env.NO_COLOR = "1";
+    try {
+      for (const [name, token] of Object.entries(LIVE)) expect(token("sample"), name).toBe("sample");
+      expect(LIVE.attention(GLYPHS.attention)).toBe(GLYPHS.attention);
+      expect(LIVE.failure(GLYPHS.fail)).toBe(GLYPHS.fail);
+      const plainWarn = row(await status([], warnRepo), "T2");
+      const plainRed = row(await status([], redRepo), "T2");
+      for (const [name, plain] of [["warn", plainWarn], ["failure", plainRed]] as const) {
+        expect(plain, name).not.toContain("\x1b[");
+        expect(plain, name).not.toMatch(/[\u2713\u2717]/u); // the ASCII pin: no ✓/✗ on this surface
+      }
+      expect(plainWarn).toContain("failed");
+      expect(plainRed).toContain("parked");
+      expect(plainWarn).not.toBe(plainRed);
+      for (const repo of [warnRepo, redRepo, pendingRepo, failedRepo]) {
+        expect(await status([], repo)).not.toContain("\x1b[");
+      }
+    } finally {
+      if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+      if (previous === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = previous;
+    }
+
+    // …and a pipe, the other nonvisual surface, is byte-consumed the same way.
+    for (const [name, token] of Object.entries(LIVE)) expect(token("sample"), name).toBe("sample");
   });
 
   test("test: a journal whose last run-end carries a failed tip verification renders the failed gate by name in the status header", async () => {
@@ -719,7 +875,13 @@ describe("status checklist rendering", () => {
     ]);
 
     await withTty(async () => {
+      // The brand lockup occupies a two-row gutter on the left of the header; the run's facts are
+      // its right column. Drop that gutter so this reads the fact column itself — the version cell
+      // sitting beside a wrapped fact is layout, not a break in the claim.
       const frame = strip(await status(["--watch"], repo, { iterations: 1, sleep: async () => {} }))
+        .split("\n")
+        .map((line) => line.replace(/^ v\d+\.\d+\.\d+\S*/u, ""))
+        .join("\n")
         .replace(/\s+/gu, " ");
       expect(frame).toContain("verify FAILED (test) → re-verifying (run attempt 2)");
       expect(frame).not.toContain("3/3 done");
@@ -744,7 +906,13 @@ describe("status checklist rendering", () => {
 
     await withTty(async () => {
       for (const [repo, phase] of [[failedRepo, "FAILED (test)"], [pendingRepo, "pending"]] as const) {
-        const frame = strip(await status([], repo)).replace(/\s+/gu, " ");
+        // Same lockup-gutter drop as the sibling test above: the version cell sitting beside a
+        // wrapped fact is layout, not a break in the claim.
+        const frame = strip(await status([], repo))
+          .split("\n")
+          .map((line) => line.replace(/^ v\d+\.\d+\.\d+\S*/u, ""))
+          .join("\n")
+          .replace(/\s+/gu, " ");
         expect(frame).toContain(`verify ${phase}`);
         expect(frame).toContain("3/3 tasks done · run not verified");
         expect(frame).not.toContain("3/3 done");
@@ -1064,6 +1232,135 @@ describe("status checklist rendering", () => {
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;
     }
+  });
+
+  // ── v1.99 T1: the board's two clocks. The journal frame is cheap and redraws on a 500ms cadence;
+  // scraping a worker's pane crosses the herdr socket, keeps its own 2s budget, and runs off the
+  // redraw path entirely. Both tests state their assertion once and then apply that same assertion
+  // to the shape this task deletes, so a reverted implementation fails them rather than passing.
+
+  test("test: two watched journal frames are scheduled five hundred milliseconds apart while the old two-second interval fails the cadence assertion", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), dispatch("T1", "fake-1")]);
+    const scheduled: number[] = [];
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await status(["--watch"], repo, {
+        iterations: 3,
+        sleep: async (ms) => { scheduled.push(ms); },
+      });
+    } finally {
+      write.mockRestore();
+    }
+
+    const fiveHundredApart = (gaps: readonly number[]): void => {
+      expect(gaps.length).toBeGreaterThan(0);
+      for (const gap of gaps) expect(gap).toBe(500);
+    };
+    expect(scheduled).toHaveLength(2); // three frames, two gaps between them
+    fiveHundredApart(scheduled);
+    // the same assertion against the cadence this task replaces — a 2s loop is not a 500ms one
+    expect(() => fiveHundredApart([2000, 2000])).toThrow();
+  });
+
+  test("test: a worker-output scrape delayed beyond one frame cannot delay the next journal redraw and no second scrape overlaps it; a loop that awaits scraping before redrawing fails", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), dispatch("T1", "fake-1"), phaseStart("T1", "worker", ts)]);
+
+    // A scrape that hangs far beyond one frame — the wedged pane this design exists for.
+    let release = (): void => {};
+    const hung = new Promise<void>((resolve) => { release = resolve; });
+    let inFlight = 0;
+    let overlaps = 0;
+    let scrapes = 0;
+    const scrape = async (): Promise<string> => {
+      scrapes += 1;
+      inFlight += 1;
+      if (inFlight > 1) overlaps += 1;
+      await hung;
+      inFlight -= 1;
+      return "worker output";
+    };
+
+    let clock = Date.parse(ts);
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    let rendered: string[] = [];
+    try {
+      rendered = (await status(["--watch"], repo, {
+        iterations: 8, // 3.5s of frames — the 2s scrape budget elapses twice while the first hangs
+        sleep: async (ms) => { clock += ms; },
+        now: () => clock,
+        readWorkerOutput: scrape,
+      })).split("\n---\n");
+    } finally {
+      write.mockRestore();
+    }
+
+    expect(rendered).toHaveLength(8); // every frame drew while the first scrape was still hanging
+    expect(scrapes).toBe(1); // the budget came round twice and refused to start a second read
+    expect(overlaps).toBe(0);
+
+    // The control: a loop that awaits the scrape before its next redraw. Given the SAME hung
+    // scrape it never reaches frame two, however many frame budgets elapse.
+    let redraws = 0;
+    const awaitingLoop = (async () => {
+      for (let frame = 0; frame < 8; frame += 1) {
+        redraws += 1;
+        await hung;
+      }
+    })();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(redraws).toBe(1);
+
+    release();
+    await awaitingLoop;
+
+    // TWO workers, not one: the first pane read rejects immediately while the second stays hung.
+    // A fail-fast join (Promise.all) settles on the rejection and drops the single-flight guard
+    // with a read still outstanding, so the next budget starts an overlapping scrape.
+    const twoWorkerRepo = mkRepo();
+    seed(twoWorkerRepo, [
+      runStart(),
+      dispatch("T1", "fake-1"),
+      dispatch("T2", "fake-2"),
+      phaseStart("T1", "worker", ts),
+      phaseStart("T2", "worker", ts),
+    ]);
+
+    let releaseSecond = (): void => {};
+    const stillHung = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    let pending = 0;
+    let secondOverlaps = 0;
+    const reads: string[] = [];
+    const mixed = async (taskId: string): Promise<string> => {
+      reads.push(taskId);
+      if (taskId === "T1") throw new Error("pane read failed"); // rejects at once
+      pending += 1;
+      if (pending > 1) secondOverlaps += 1;
+      await stillHung; // …while this one never returns
+      pending -= 1;
+      return "worker output";
+    };
+
+    let mixedClock = Date.parse(ts);
+    const mixedWrite = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await status(["--watch"], twoWorkerRepo, {
+        iterations: 8, // the 2s budget elapses twice while T2's read is still outstanding
+        sleep: async (ms) => { mixedClock += ms; },
+        now: () => mixedClock,
+        readWorkerOutput: mixed,
+      });
+    } finally {
+      mixedWrite.mockRestore();
+    }
+
+    expect(reads).toEqual(["T1", "T2"]); // one batch only — no later budget joined the hung read
+    expect(secondOverlaps).toBe(0);
+
+    releaseSecond();
+    await stillHung;
   });
 
   test("test: a required human decision emits one machine-readable event carrying the exact approval command and an evidence pointer", async () => {

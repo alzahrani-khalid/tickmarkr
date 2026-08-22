@@ -233,20 +233,30 @@ function tail(out: string, n = 8): string {
 }
 
 /**
- * OBS-540: classify only bytes produced by the deterministic oracle process. A nonzero command with
- * an infra-only output shape returned no product verdict, so it remains fail-closed but cannot be
- * billed as a diff failure. Judge reasons never reach this helper: the judge path starts after the
- * deterministic loop and a parsed refusal is an evaluated quality verdict whatever its prose says.
+ * OBS-540/551: classify only execution evidence produced by the deterministic oracle process. That
+ * includes its output, exit status and runner-reported test count — never judge-authored prose. A
+ * nonzero command with an infra-only output shape, one of the enumerated signal exits, or a zero-run
+ * report without a failure identity returned no product verdict, so it remains fail-closed but cannot
+ * be billed as a diff failure. A parsed judge refusal is an evaluated quality verdict whatever its
+ * prose says. As in baseline classification, a named regression remains a verdict even if teardown
+ * later exits through a signal.
  */
 function oracleExecutionFailure(label: string, code: number, stdout: string, stderr: string): GateResult {
   const output = [stderr, stdout].filter((part) => part.length > 0).join("\n");
   const classification = classifyFailureOutput(output);
-  if (classification === "infra") {
+  const signalName = code === 143 ? "SIGTERM" : code === 137 ? "SIGKILL" : undefined;
+  const signalKilled = signalName !== undefined && classification !== "regression";
+  const signalEvidence = signalKilled
+    ? `signal-shaped exit ${code} (${signalName}); `
+    : "";
+  const zeroRun = testsRan(output) === 0 && classification !== "regression";
+  const zeroRunEvidence = zeroRun ? "the runner reported zero tests run and no failure identity; " : "";
+  if (classification === "infra" || signalKilled || zeroRun) {
     return {
       gate: "acceptance",
       pass: false,
-      details: `oracle failed: ${label} (exit ${code}) — infrastructure blocked execution before a verdict; this oracle verified nothing${tail(output)}`,
-      meta: { cause: "oracle-execution", classification, infra: true, retryable: false },
+      details: `oracle failed: ${label} (exit ${code}) — ${signalEvidence || zeroRunEvidence}infrastructure blocked execution before a verdict; this oracle verified nothing${tail(output)}`,
+      meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false },
     };
   }
   return {

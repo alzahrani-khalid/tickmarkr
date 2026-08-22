@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { brandChip, dim, fail, GLYPHS, legend, ok, rule, title, warn } from "../../brand.js";
+import { GLYPHS, LIVE } from "../../brand.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import {
@@ -31,9 +31,45 @@ import {
 } from "../../tui/cockpit/derive.js";
 import { COCKPIT_COLUMN_FLOOR } from "../../tui/cockpit/layout.js";
 import { cellWidth, fitCells, wrapCells } from "../../tui/cockpit/width.js";
+import { version } from "./version.js";
 
-// ponytail: fixed 2s refresh; promote to config.visibility.* only when an operator asks.
-const REFRESH_MS = 2000;
+// The board is a LIVE surface, so it draws through brand.ts's operator role map and never the vivid
+// one-shot tokens. Semantic aliases can share a colour, but every board cell, gate mark, effort bar,
+// header and footer styles through one of the five exported authorities.
+const ok = LIVE.pass;
+const running = LIVE.running;
+const information = LIVE.information;
+const fail = LIVE.failure;
+const warn = LIVE.attention;
+const dim = LIVE.secondaryText;
+const title = LIVE.primaryText;
+const legend = LIVE.secondaryText;
+const rule = (columns: number): string => LIVE.chrome("─".repeat(columns));
+
+// Two clocks, deliberately unequal. The journal frame is cheap — a single file read and a fold — so
+// it redraws on a 500ms cadence and the board feels live. Scraping a worker's pane is neither cheap
+// nor bounded: it crosses the herdr socket and can hang on a wedged pane, so it keeps its own 2s
+// budget and runs OFF the redraw path (see scheduleWorkerScrape). A slow scrape updates liveness
+// one frame late; it never delays a frame, and it never overlaps itself.
+// ponytail: fixed cadences; promote to config.visibility.* only when an operator asks.
+const FRAME_MS = 500;
+const SCRAPE_MS = 2000;
+
+// The binary's own version, read ONCE when status starts (see `status`), then carried into every
+// frame: a board redrawing twice a second must not pay a manifest read per frame, and the version
+// it names must not change under the operator mid-run. It reads through the SAME manifest reader
+// `tickmarkr version` prints from — one version answer for the whole CLI — and a manifest that
+// cannot be read, cannot be parsed, or names no version PROPAGATES rather than resolving to a
+// placeholder: a board that cannot name its own binary is a broken installation, and the board's
+// whole job is to state what is true. A rendered `vunknown` would be a claim about the binary
+// nobody could check.
+const readBinaryVersion = async (): Promise<string> => {
+  const semver = await version();
+  if (typeof semver !== "string" || semver === "") {
+    throw new Error("package.json names no version — reinstall tickmarkr");
+  }
+  return semver;
+};
 // The claim leads, the guidance follows: an incomparable journal is named in three words a wrapped
 // board keeps on one row, and the remedy trails it. Both surfaces state the claim; nothing derived
 // from such a journal — task states, gate outcomes, tip verification — may be presented as this
@@ -452,7 +488,7 @@ const gateSnapshot = (task: Task, events: JournalEvent[], rehashAt?: number): Ga
 export const gateStates = (task: Task, events: JournalEvent[]): GateState[] =>
   gateSnapshot(task, events).states;
 
-// verdict semantics only: pass brand green, fail red, skip/open dim chrome — everything else stays quiet
+// Verdict semantics only: pass uses brand teal, failure uses amethyst, and skip/open use chrome.
 const GATE_STATE_TOKEN: Record<GateState, (s: string) => string> = { pass: ok, fail, skip: dim, open: dim };
 
 // TTY cells are bare glyphs in fixed GATE_NAMES order — gate identity lives once in the frame
@@ -599,6 +635,11 @@ const foldTaskEffort = (tasks: readonly Task[], events: readonly JournalEvent[])
   );
 };
 
+// Attention (review) and failure (park) wear the ONE amethyst, so the bar segments and their legend
+// markers carry the distinction in SHAPE: a full block for dispatch, light shade for a review round,
+// dark shade for a human park. Same display width, so the fitted bar keeps its measured columns.
+const EFFORT_GLYPH = { dispatch: "\u2588", review: "\u2592", park: "\u2593" } as const;
+
 /**
  * Prototype panel, fitted by the cockpit's display-cell authority before board-wide wrapping.
  *
@@ -630,9 +671,9 @@ const effortPanel = (
     const dispatchEnd = Math.round((task.dispatches / maxTotal) * barColumns);
     const reviewEnd = Math.round(((task.dispatches + task.reviews) / maxTotal) * barColumns);
     const parkEnd = Math.round((task.total / maxTotal) * barColumns);
-    const stack = ok("█".repeat(dispatchEnd))
-      + warn("█".repeat(Math.max(0, reviewEnd - dispatchEnd)))
-      + fail("█".repeat(Math.max(0, parkEnd - reviewEnd)));
+    const stack = ok(EFFORT_GLYPH.dispatch.repeat(dispatchEnd))
+      + warn(EFFORT_GLYPH.review.repeat(Math.max(0, reviewEnd - dispatchEnd)))
+      + fail(EFFORT_GLYPH.park.repeat(Math.max(0, parkEnd - reviewEnd)));
     return `${prefix}${fitCells(stack, barColumns)}  ${counts}`;
   });
 
@@ -642,7 +683,7 @@ const effortPanel = (
     "",
     ...rows,
     "",
-    `   ${ok("█")} ${dim("dispatch")}  ${warn("█")} ${dim("review round")}  ${fail("█")} ${dim("human park")}`,
+    `   ${ok(EFFORT_GLYPH.dispatch)} ${dim("dispatch")}  ${warn(EFFORT_GLYPH.review)} ${dim("review round")}  ${fail(EFFORT_GLYPH.park)} ${dim("human park")}`,
   ];
 };
 
@@ -983,6 +1024,9 @@ const recordedDone = (tasks: readonly Task[], rows: Map<string, TaskRow>): numbe
 
 const renderFrame = (
   cwd: string,
+  // No default: the version is the binary's, resolved once by its caller, and a frame that had to
+  // invent one would be naming a version nobody can check.
+  binaryVersion: string,
   now = Date.now(),
   animationFrame = 0,
   workerLiveness = new Map<string, WorkerLiveness>(),
@@ -1137,16 +1181,18 @@ const renderFrame = (
   const tipFailed = tipPhase?.state === "failed";
   const anyFailed = cells.some((cell) => cell.redTier);
   const progressTone = anyFailed || tipFailed ? fail : tipPhase ? warn : ok;
+  // Attention and failure wear the ONE amethyst here too, so the header leads with its own glyph:
+  // ✗ once a verdict is in, ! while the tip is still unverified. Colour cannot carry this.
+  const progressGlyph = anyFailed || tipFailed ? GLYPHS.fail : GLYPHS.attention;
   const tally = tipPhase
-    ? `${progressTone(`${done}/${total} tasks done`)}${dot}${progressTone("run not verified")}`
-    : done === total && total > 0 ? ok(`${done}/${total} done`) : `${done}/${total} done`;
+    ? `${progressTone(`${progressGlyph} ${done}/${total} tasks done`)}${dot}${progressTone("run not verified")}`
+    : done === total && total > 0 ? ok(`${done}/${total} done`) : information(`${done}/${total} done`);
   const live = liveness(events, now)
     .replace(/\bdead\b/u, fail("dead"))
     .replace(/\bfinished\b/u, dim("finished"))
-    .replace(/\balive\b/u, ok("alive"))
+    .replace(/\balive\b/u, running("alive"))
     .replaceAll(" · ", dot);
-  const header = [
-    brandChip(" tickmarkr "),
+  const facts = [
     title(runId ?? "no runs yet"),
     tally,
     ...(events.length ? [`${events.filter((event) => event.event === "run-resume").length} restarts`] : []),
@@ -1155,10 +1201,36 @@ const renderFrame = (
     ...(runId && !comparable ? [warn(NOT_COMPARABLE_NOTICE)] : []),
     ...(verify === undefined
       ? []
-      : [verify === "verify passed" ? ok(verify) : tipFailed ? fail(verify) : warn(verify)]),
+      : [verify === "verify passed"
+        ? ok(verify)
+        : tipFailed ? fail(`${GLYPHS.fail} ${verify}`) : warn(`${GLYPHS.attention} ${verify}`)]),
     ...(runId ? [live] : []),
     ...(journalRowsOnly ? [`zone ${localZoneLabel(zoneReference)}`] : []),
   ].join(separator);
+  // The brand lockup is two rows and stays two rows at every width: the muted chip, and the running
+  // binary's version directly beneath it. The run's own facts continue to the right of both rows and
+  // wrap under themselves — the version can never be pushed off its row by a fact that grew, which
+  // is the whole point of wrapping the facts against their own column rather than the board's.
+  const chipText = " tickmarkr ";
+  const versionText = ` v${binaryVersion}`;
+  const chipCells = cellWidth(chipText);
+  const versionCells = cellWidth(versionText);
+  const lockupCells = Math.max(chipCells, versionCells);
+  const lockupGap = "  ";
+  const lockupGapCells = cellWidth(lockupGap);
+  const factColumns = Math.max(1, boardColumns - lockupCells - lockupGapCells);
+  // No continuation prefix: the lockup gutter below already indents every fact row, so the fact
+  // column starts at the same cell on all of them.
+  const factLines = wrapCells(facts, factColumns);
+  const besideLockup = (lead: string, factLine: string | undefined): string =>
+    factLine === undefined ? lead : `${lead}${lockupGap}${factLine}`;
+  const fillLockup = (lead: string, cells: number): string =>
+    `${lead}${" ".repeat(lockupCells - cells)}`;
+  const headerRows = [
+    besideLockup(fillLockup(LIVE.chip(chipText), chipCells), factLines[0]),
+    besideLockup(fillLockup(dim(versionText), versionCells), factLines[1]),
+    ...factLines.slice(2).map((line) => `${" ".repeat(lockupCells + lockupGapCells)}${line}`),
+  ];
   const nowLine = activity.now ? [legend(`   now: ${activity.now}`)] : [];
   const supervisionLegend = legend(`   ${supervisionText(supervision)}`);
   const taskSectionSummary = `${done} of ${total} merged · rows in graph order · gates left→right in pipeline order`;
@@ -1181,7 +1253,15 @@ const renderFrame = (
     return [
       livePhase ? `${SPINNER[animationFrame % SPINNER.length]} ${phrase ?? "running"}` : "",
       !livePhase && isStarved ? "starved" : "",
-      !livePhase && !isStarved && !merged ? redTier ? "failed" : phrase ?? (st === "failed" ? "warn" : surfaceStatusWord(st)) : "",
+      // Attention and failure wear the ONE amethyst, so the tier word leads with its own glyph —
+      // ! for warn, ✗ for failed. That is the distinction that survives NO_COLOR and a pipe.
+      !livePhase && !isStarved && !merged
+        ? redTier
+          ? `${GLYPHS.fail} failed`
+          : st === "failed" || st === "human"
+            ? `${GLYPHS.attention} ${phrase ?? (st === "failed" ? "warn" : surfaceStatusWord(st))}`
+            : phrase ?? surfaceStatusWord(st)
+        : "",
       redTier && phrase ? phrase : "",
       priorGraph ? PRIOR_GRAPH_MARKER : "",
       failed.length ? `failed · ${failed.join(", ")}` : "",
@@ -1215,7 +1295,15 @@ const renderFrame = (
       return cells.flatMap((cell) => {
         const effort = effortByTask.get(cell.t.id);
         const deps = cell.t.deps.length ? cell.t.deps.join(", ") : "—";
-        const tone = cell.redTier ? fail : cell.merged ? ok : staleWorker(cell) || cell.st === "failed" || cell.st === "human" ? warn : dim;
+        const tone = cell.redTier
+          ? fail
+          : cell.merged
+            ? ok
+            : staleWorker(cell) || cell.st === "failed" || cell.st === "human"
+              ? warn
+              : cell.livePhase || cell.st === "running"
+                ? running
+                : dim;
         const machinery = [
           `deps ${deps}`,
           gateMatrix(cell.states),
@@ -1246,7 +1334,15 @@ const renderFrame = (
         wrapCells(noteFor(cell), noteWidth),
       ];
       const height = Math.max(...columns.map((column) => column.length));
-      const idTone = cell.redTier ? fail : cell.merged ? ok : staleWorker(cell) || cell.st === "failed" || cell.st === "human" ? warn : dim;
+      const idTone = cell.redTier
+        ? fail
+        : cell.merged
+          ? ok
+          : staleWorker(cell) || cell.st === "failed" || cell.st === "human"
+            ? warn
+            : cell.livePhase || cell.st === "running"
+              ? running
+              : dim;
       const titleTone = cell.redTier || cell.livePhase || (effort?.parks ?? 0) >= 3 ? title : dim;
       return Array.from({ length: height }, (_, index) =>
         `    ${idTone(fitColumn(columns[0]![index] ?? "", idWidth, 1))}`
@@ -1268,7 +1364,7 @@ const renderFrame = (
   return {
     content: boardRows(
       [
-        header,
+        ...headerRows,
         ...nowLine,
         supervisionLegend,
         "",
@@ -1316,10 +1412,12 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {
   const namedRunId = positionalRunId(argv);
   if (argv.includes("--oneline")) return oneLine(cwd, namedRunId);
-  // The task-table frame owns its compact one-line brand chip; the four-row global banner would
+  // ONE manifest read per invocation, here — every frame below names this same version.
+  const binaryVersion = await readBinaryVersion();
+  // The task-table frame owns its own two-row brand lockup; the four-row global banner would
   // create the second header the approved replacement removes.
   if (!argv.includes("--watch")) {
-    return renderFrame(cwd, opts.now?.() ?? Date.now(), 0, undefined, false, namedRunId).content;
+    return renderFrame(cwd, binaryVersion, opts.now?.() ?? Date.now(), 0, undefined, false, namedRunId).content;
   }
 
   const eventStream = argv.some((arg) => arg === "--events" || arg === "--jsonl" || arg === "--decision-events");
@@ -1347,11 +1445,18 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
         }
       }
     : undefined);
-  const observeWorkerOutput = async (active: LivePhase[], runId: string | undefined, observedAt: number) => {
+  // Retiring a task that is no longer running is bookkeeping over data already in hand, so it stays
+  // on the frame path where the board can rely on it every redraw.
+  const retireInactiveWorkers = (active: LivePhase[]) => {
     const activeIds = new Set(active.map((phase) => phase.taskId));
     for (const taskId of workerLiveness.keys()) if (!activeIds.has(taskId)) workerLiveness.delete(taskId);
+  };
+  const scrapeWorkerOutput = async (active: LivePhase[], runId: string | undefined, observedAt: number) => {
     if (!readWorkerOutput || !runId) return;
-    await Promise.all(active.map(async (phase) => {
+    // allSettled, never all: Promise.all resolves the moment ONE pane read rejects, which would
+    // clear the single-flight guard while a sibling read is still hung on its socket and let the
+    // next budget start a second, overlapping scrape. Every read must settle before the guard drops.
+    await Promise.allSettled(active.map(async (phase) => {
       const output = await readWorkerOutput(phase.taskId, phase.attempt, runId);
       if (output === undefined) return;
       const snapshot = normalizeStallSnapshot(output);
@@ -1372,6 +1477,20 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
       }
       prior.snapshot = snapshot;
     }));
+  };
+  // The scrape's own clock, and the reason a hung pane cannot freeze the board: it is STARTED here
+  // and never awaited, so the frame loop walks straight past it. `scrapeInFlight` is what keeps a
+  // scrape that outlives its budget from being joined by a second one — a wedged pane read would
+  // otherwise accumulate one outstanding socket read per elapsed budget for as long as it hangs.
+  let scrapeInFlight = false;
+  let lastScrapeAt = Number.NEGATIVE_INFINITY;
+  const scheduleWorkerScrape = (frame: RenderedFrame, observedAt: number) => {
+    if (scrapeInFlight || observedAt - lastScrapeAt < SCRAPE_MS) return;
+    scrapeInFlight = true;
+    lastScrapeAt = observedAt;
+    void scrapeWorkerOutput(frame.workerPhases, frame.runId, observedAt)
+      .catch(() => undefined)
+      .finally(() => { scrapeInFlight = false; });
   };
   let decisionRunId: string | undefined;
   let journalCursor = 0;
@@ -1430,18 +1549,21 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
           if (bounded) eventLines.push(line);
         }
       } else {
-        frame = renderFrame(cwd, nowMs, i, workerLiveness, true, namedRunId);
+        frame = renderFrame(cwd, binaryVersion, nowMs, i, workerLiveness, true, namedRunId);
         if (tty) {
           updateTitle(frame.hotPhase, nowMs);
-          process.stdout.write(`\x1b[2J\x1b[H${frame.content}\n${legend(` watching · refresh ${REFRESH_MS / 1000}s · ^C to quit`)}`);
+          process.stdout.write(`\x1b[2J\x1b[H${frame.content}\n${legend(` watching · refresh ${FRAME_MS / 1000}s · ^C to quit`)}`);
         } else {
           process.stdout.write(frame.content + sep);
         }
         if (bounded) frames.push(frame.content);
       }
       if (i + 1 < iterations) {
-        if (frame) await observeWorkerOutput(frame.workerPhases, frame.runId, nowMs);
-        await sleep(REFRESH_MS);
+        if (frame) {
+          retireInactiveWorkers(frame.workerPhases);
+          scheduleWorkerScrape(frame, nowMs);
+        }
+        await sleep(FRAME_MS);
       }
     }
   } finally {

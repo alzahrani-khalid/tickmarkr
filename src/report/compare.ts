@@ -31,7 +31,19 @@ export function recordedEnvironment(events: JournalEvent[]): RunEnvironment | un
       if (typeof v !== "string") return undefined;
       adapterVersions[k] = v;
     }
-    return { tickmarkrVersion: o.tickmarkrVersion, configHash: o.configHash, adapterVersions };
+    // Capacity arrived in v2.0 as a pair. Two absent fields are an honest older record; one without
+    // the other is a malformed new record and fails closed instead of being compared as legacy.
+    const hasCores = Object.hasOwn(o, "cores");
+    const hasForkCap = Object.hasOwn(o, "forkCap");
+    if (hasCores !== hasForkCap) return undefined;
+    if (hasCores && (typeof o.cores !== "number" || !Number.isFinite(o.cores) || o.cores <= 0
+      || typeof o.forkCap !== "number" || !Number.isFinite(o.forkCap) || o.forkCap <= 0)) return undefined;
+    return {
+      tickmarkrVersion: o.tickmarkrVersion,
+      configHash: o.configHash,
+      adapterVersions,
+      ...(hasCores ? { cores: o.cores as number, forkCap: o.forkCap as number } : {}),
+    };
   }
   return undefined;
 }
@@ -43,7 +55,8 @@ function envFingerprint(env: RunEnvironment): string {
 }
 
 function envEqual(a: RunEnvironment, b: RunEnvironment): boolean {
-  if (a.tickmarkrVersion !== b.tickmarkrVersion || a.configHash !== b.configHash) return false;
+  if (a.tickmarkrVersion !== b.tickmarkrVersion || a.configHash !== b.configHash
+    || a.cores !== b.cores || a.forkCap !== b.forkCap) return false;
   const ak = Object.keys(a.adapterVersions).sort();
   const bk = Object.keys(b.adapterVersions).sort();
   if (ak.length !== bk.length) return false;

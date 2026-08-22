@@ -8,7 +8,9 @@ import { acceptanceGate } from "../../src/gates/acceptance.js";
 import * as llm from "../../src/gates/llm.js";
 import { dewrapPaneVerdict, extractJson, extractVerdictJson, runHeadless } from "../../src/gates/llm.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { makeRepo } from "../helpers/tmprepo.js";
+import { runDaemon } from "../../src/run/daemon.js";
+import { Journal } from "../../src/run/journal.js";
+import { COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 
 const task = validateGraph({
   version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
@@ -384,6 +386,71 @@ describe("acceptanceGate — deterministic oracles (T2)", () => {
     expect(r.details).not.toMatch(/unparseable/i); // the judge was never dispatched
   });
 
+  test("test: acceptance oracles terminated by SIGTERM 143 or SIGKILL 137 record terminal infrastructure non-verdicts naming the signal; a real assertion failure in the same suite still records a chargeable quality red", async () => {
+    const { repo, base } = repoWithDiff();
+    const named = task([{ oracle: "test", test: "reports an oracle verdict" }]);
+    const cases = [
+      { code: 143, signal: "SIGTERM" },
+      { code: 137, signal: "SIGKILL" },
+    ];
+
+    for (const { code, signal } of cases) {
+      const r = await acceptanceGate(named, repo, base, { adapter: noCall(), model: "fake-1" }, undefined, {
+        testCmd: `bash -c 'printf "%s\\n" " ↓ |suite| tests/oracle.test.ts (1 test | 1 skipped)" "      Tests  0 passed | 1 skipped (1)"; exit ${code}'`,
+      });
+      expect(r).toMatchObject({
+        gate: "acceptance",
+        pass: false,
+        meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false },
+      });
+      expect(r.details).toContain(`exit ${code}`);
+      expect(r.details).toContain(signal);
+      expect(r.details).toContain("verified nothing");
+    }
+
+    const assertion = await acceptanceGate(named, repo, base, { adapter: noCall(), model: "fake-1" }, undefined, {
+      testCmd: "bash -c 'printf \"%s\\n\" \"FAIL  tests/oracle.test.ts > reports an oracle verdict\" \"AssertionError: expected true to be false\" \"      Tests  1 failed (1)\"; exit 143'",
+    });
+    expect(assertion).toMatchObject({ gate: "acceptance", pass: false });
+    expect(assertion.details).toContain("AssertionError");
+    expect(assertion.meta?.infra).not.toBe(true);
+    expect(assertion.meta?.retryable).toBeUndefined();
+
+    for (const code of [128, 255]) {
+      const ordinaryFailure = await acceptanceGate(named, repo, base, { adapter: noCall(), model: "fake-1" }, undefined, {
+        testCmd: `bash -c 'exit ${code}'`,
+      });
+      expect(ordinaryFailure).toMatchObject({ gate: "acceptance", pass: false });
+      expect(ordinaryFailure.details).toContain(`exit ${code}`);
+      expect(ordinaryFailure.details).not.toContain("signal-shaped");
+      expect(ordinaryFailure.meta?.infra).not.toBe(true);
+    }
+  });
+
+  test("test: a runner reporting zero tests run and no failure identity classifies as infrastructure on a nonzero exit; an assertion failure carrying the same nonzero exit still charges its attempt", async () => {
+    const { repo, base } = repoWithDiff();
+    const named = task([{ oracle: "test", test: "reports an oracle verdict" }]);
+    const zeroRun = await acceptanceGate(named, repo, base, { adapter: noCall(), model: "fake-1" }, undefined, {
+      testCmd: "bash -c 'printf \"%s\\n\" \" ↓ |suite| tests/oracle.test.ts (4 tests | 4 skipped)\" \"      Tests  0 passed | 4 skipped (4)\"; exit 7'",
+    });
+    expect(zeroRun).toMatchObject({
+      gate: "acceptance",
+      pass: false,
+      meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false },
+    });
+    expect(zeroRun.details).toContain("zero tests run");
+    expect(zeroRun.details).toContain("verified nothing");
+
+    const assertion = await acceptanceGate(named, repo, base, { adapter: noCall(), model: "fake-1" }, undefined, {
+      testCmd: "bash -c 'printf \"%s\\n\" \"FAIL  tests/oracle.test.ts > reports an oracle verdict\" \"AssertionError: expected one to equal two\" \"      Tests  1 failed (1)\"; exit 7'",
+    });
+    expect(assertion).toMatchObject({ gate: "acceptance", pass: false });
+    expect(assertion.details).toContain("exit 7");
+    expect(assertion.details).toContain("AssertionError");
+    expect(assertion.meta?.infra).not.toBe(true);
+    expect(assertion.meta?.retryable).toBeUndefined();
+  });
+
   test("command oracle exits non-zero → fails before any LLM judge dispatch", async () => {
     const { repo, base } = repoWithDiff();
     const r = await acceptanceGate(task([{ oracle: "command", command: "printf 'boom\\n' >&2; exit 7" }]), repo, base, { adapter: noCall(), model: "fake-1" });
@@ -704,3 +771,57 @@ describe("acceptanceGate — only-judge warning (T2)", () => {
     expect(r.meta).toMatchObject({ unparseable: true });
   });
 });
+
+test("test: a signal-killed oracle red neither increments the run loop's gate-failure count nor funds a fresh ladder rung; an evaluated assertion failure at the same gate does both", async () => {
+  const signal = setupRepo(
+    [T("T1", { acceptance: [{ oracle: "command", command: "exit 143" }] })],
+    { tasks: { T1: [{ shell: `echo landed > landed.txt && ${COMMIT} landed`, result: { ok: true, summary: "landed" } }] } },
+  );
+  const signalSummary = await runDaemon(signal.repo, { adapters: [signal.fake], runId: "run-oracle-signal-infra" });
+  expect(signalSummary.human).toEqual(["T1"]);
+
+  const signalEvents = Journal.open(signal.repo, "run-oracle-signal-infra").read();
+  const signalRed = signalEvents.find((event) =>
+    event.event === "gate-result" && event.taskId === "T1" && event.data.gate === "acceptance"
+  );
+  expect(signalRed?.data).toMatchObject({ pass: false, infra: true, retryable: false });
+  expect(String(signalRed?.data.details)).toContain("SIGTERM");
+  expect(signalEvents.filter((event) => event.event === "task-dispatch" && event.taskId === "T1")).toHaveLength(1);
+  expect(signalEvents.some((event) => event.event === "escalation" && event.taskId === "T1")).toBe(false);
+  expect(Journal.open(signal.repo, "run-oracle-signal-infra").readTelemetry().find((row) => row.taskId === "T1")?.gateFails).toBe(0);
+
+  const assertionCommand = `case "$(cat marker.txt)" in
+    one) printf '%s\\n' 'AssertionError: marker one failed'; exit 1 ;;
+    two) printf '%s\\n' 'AssertionError: marker two failed'; exit 1 ;;
+    three) printf '%s\\n' 'AssertionError: marker three failed'; exit 1 ;;
+    *) exit 0 ;;
+  esac`;
+  const assertion = setupRepo(
+    [T("T1", { acceptance: [{ oracle: "command", command: assertionCommand }] })],
+    { tasks: { T1: [
+      { shell: `echo one > marker.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } },
+      { shell: `echo two > marker.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } },
+      { shell: `echo three > marker.txt && ${COMMIT} three`, result: { ok: true, summary: "three" } },
+      { shell: `echo pass > marker.txt && ${COMMIT} pass`, result: { ok: true, summary: "pass" } },
+    ] } },
+  );
+  const assertionSummary = await runDaemon(assertion.repo, { adapters: [assertion.fake], runId: "run-oracle-assertion-quality" });
+  expect(assertionSummary.done).toEqual(["T1"]);
+
+  const assertionEvents = Journal.open(assertion.repo, "run-oracle-assertion-quality").read();
+  const assertionReds = assertionEvents.filter((event) =>
+    event.event === "gate-result" && event.taskId === "T1"
+      && event.data.gate === "acceptance" && event.data.pass === false
+  );
+  expect(assertionReds).toHaveLength(3);
+  expect(assertionReds.every((event) => event.data.infra === undefined)).toBe(true);
+  expect(assertionReds.every((event) => String(event.data.details).includes("AssertionError"))).toBe(true);
+  expect(Journal.open(assertion.repo, "run-oracle-assertion-quality").readTelemetry().find((row) => row.taskId === "T1")?.gateFails).toBe(3);
+
+  const escalations = assertionEvents.filter((event) => event.event === "escalation" && event.taskId === "T1");
+  expect(escalations.slice(0, 2).map((event) => event.data.repair)).toEqual([1, 2]);
+  expect(escalations[2]?.data).toMatchObject({ step: "retry" });
+  expect(escalations[2]?.data.repair).toBeUndefined();
+  const dispatches = assertionEvents.filter((event) => event.event === "task-dispatch" && event.taskId === "T1");
+  expect(dispatches[3]?.data.retryMode).toBe("fresh");
+}, 120_000);

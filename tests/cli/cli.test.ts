@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { dispatch, USAGE } from "../../src/cli/index.js";
 import { parse } from "yaml";
 import { compile } from "../../src/cli/commands/compile.js";
@@ -57,8 +58,24 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ENTRY = join(ROOT, "dist/cli/index.js");
 
 describe("tickmarkr help", () => {
+  // The built-cli project runs bin.test.ts (the one mid-suite `npm run build`) and this file in ONE
+  // fork, but their ORDER comes from vitest's duration cache under node_modules — which in a
+  // tickmarkr worktree is a symlink into the shared root node_modules, so a sibling run can hand this
+  // file the first slot. And `pretest` cannot be relied on to have built dist either: an npmrc
+  // carrying `ignore-scripts=true` (the operator's does) skips it silently. When both fall the wrong
+  // way ENTRY simply does not exist and every spawnCli below exits 1 with MODULE_NOT_FOUND and empty
+  // stdout — a red that says nothing about the CLI. Build it here when it is missing: this file owns
+  // the entry it spawns rather than inheriting it from whoever happened to run first.
+  beforeAll(() => {
+    if (!existsSync(ENTRY)) execFileSync("npm", ["run", "build"], { cwd: ROOT, stdio: "pipe" });
+  }, 300_000);
+
   beforeEach(() => {
     process.env.TICKMARKR_BUILT_CLI_ENTRY = ENTRY;
+  });
+
+  test("test: the built CLI entry every spawnCli test targets exists before the first spawn, whatever order the built-cli project scheduled this file in", () => {
+    expect(existsSync(ENTRY)).toBe(true);
   });
   test.each(["help", "-h", "--help"])("%s prints USAGE on stdout and exits 0", async (cmd) => {
     const r = await dispatch(cmd, []);

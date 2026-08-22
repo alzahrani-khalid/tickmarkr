@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import { channelKey, TokenUsageSchema, type Assignment } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
-import { stateDirName, tickmarkrDir } from "../graph/graph.js";
-import { GATE_NAMES, TIERS, type GateName, type TaskStatus } from "../graph/schema.js";
+import { stateDirName, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
+import { GATE_NAMES, TIERS, type GateName, type Task, type TaskStatus } from "../graph/schema.js";
 import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
 import {
   DecisionEventSchema,
@@ -230,6 +230,117 @@ export function structuredFindings(gate: string, details: string, _scopeFiles: s
     push(`${gate}:unclassified`, head, "");
   }
   return rows;
+}
+
+// OBS-543/OBS-549: the shared, schema-free cross-run facts. They remain journal information — never
+// graph status and never a gate predicate. `taskContentDigest` is intentionally repeated on each fact
+// instead of adding a graph schema field or sidecar: it is the identity of the evidence, not task state.
+export interface PriorRunJournal {
+  runId: string;
+  events: JournalEvent[];
+}
+
+export interface PriorFindingEvidence {
+  runId: string;
+  taskId: string;
+  gate: "acceptance" | "review";
+  taskContentDigest: string;
+  finding: StructuredFinding;
+}
+
+export interface PriorMergeEvidence {
+  runId: string;
+  taskId: string;
+  commit: string;
+  taskContentDigest: string;
+}
+
+export interface PriorRunEvidence {
+  findings: PriorFindingEvidence[];
+  merges: PriorMergeEvidence[];
+}
+
+const findingRows = (event: JournalEvent, gate: "acceptance" | "review"): StructuredFinding[] => {
+  if (Array.isArray(event.data.findings)) {
+    const rows = event.data.findings.filter((finding): finding is StructuredFinding => {
+      if (finding === null || typeof finding !== "object") return false;
+      const row = finding as Record<string, unknown>;
+      return typeof row.class === "string" && typeof row.path === "string"
+        && typeof row.symbol === "string" && typeof row.note === "string"
+        && typeof row.fingerprint === "string";
+    });
+    if (rows.length > 0) return rows;
+  }
+  // Compatibility for hand-written/additive journals: the daemon always emits `findings`, but a
+  // digest-bound blocking row still has truthful evidence in details and must not vanish because its
+  // optional structured projection was lost. Missing DIGEST remains fail-closed below.
+  return typeof event.data.details === "string" ? structuredFindings(gate, event.data.details) : [];
+};
+
+/**
+ * Pure chronological fold over already-bounded journals. Its retirement set is deliberately closed:
+ * task completion or any ordinary approval retires prior findings; review-upheld retains them. A
+ * dispatch failure, a later run-start, a pass, or a merge is inert. Completion is digest-scoped, so
+ * proof for one version of a task cannot clear evidence for another version that reused the id.
+ */
+export function foldPriorEvidence(runs: readonly PriorRunJournal[]): PriorRunEvidence {
+  const unresolved = new Map<string, PriorFindingEvidence>();
+  const merges: PriorMergeEvidence[] = [];
+  const clearTask = (taskId: string, digest?: string) => {
+    for (const [key, evidence] of unresolved) {
+      if (evidence.taskId === taskId && (digest === undefined || evidence.taskContentDigest === digest)) {
+        unresolved.delete(key);
+      }
+    }
+  };
+
+  for (const run of runs) {
+    // task-done immediately precedes merge in daemon journals. This per-run association lets the
+    // existing merge row stay byte-compatible while the stamped completion supplies its task identity.
+    const completedDigest = new Map<string, string>();
+    for (const event of run.events) {
+      const taskId = event.taskId;
+      if (!taskId) continue;
+      if (event.event === "task-approved") {
+        if (event.data.release !== REVIEW_UPHELD_RELEASE) clearTask(taskId);
+        continue;
+      }
+      if (event.event === "task-done") {
+        const digest = event.data.taskContentDigest;
+        if (typeof digest === "string") {
+          clearTask(taskId, digest);
+          completedDigest.set(taskId, digest);
+        } else {
+          completedDigest.delete(taskId);
+        }
+        continue;
+      }
+      if (event.event === "merge") {
+        const digest = completedDigest.get(taskId);
+        const commit = event.data.commit;
+        if (digest && typeof commit === "string" && /^[0-9a-f]{40}$/i.test(commit)) {
+          merges.push({ runId: run.runId, taskId, commit, taskContentDigest: digest });
+        }
+        continue;
+      }
+      const gate = event.data.gate;
+      const digest = event.data.taskContentDigest;
+      if (event.event !== "gate-result" || event.data.pass !== false || event.data.skipped === true
+          || (gate !== "acceptance" && gate !== "review") || typeof digest !== "string") continue;
+      for (const finding of findingRows(event, gate)) {
+        const evidence: PriorFindingEvidence = {
+          runId: run.runId, taskId, gate, taskContentDigest: digest, finding,
+        };
+        unresolved.set(`${taskId}\0${digest}\0${finding.fingerprint}`, evidence);
+      }
+    }
+  }
+  return { findings: [...unresolved.values()], merges };
+}
+
+/** One rendering shared verbatim by compile diagnostics and the fresh worker's feedback seam. */
+export function formatPriorFindingEvidence(evidence: PriorFindingEvidence): string {
+  return `Prior-run EVIDENCE (not a verdict) from ${evidence.runId} ${evidence.gate}: ${evidence.finding.note}`;
 }
 
 // v1.85 T3: volatile tokens carry no information about WHY a gate failed — ~663m across 5 runs went to
@@ -467,8 +578,12 @@ const DispatchAssignmentSchema = z.object({
   tier: z.enum(TIERS),
 });
 
+// OBS-547: "authoring" is a scope red every one of whose offenders the collateral map had already
+// named — a missing files[] line, not a worker quality failure. It is deliberately absent from the
+// routing profile's QUALITY_FAIL_PARKS (route/profile.ts): the channel did nothing wrong.
 export const PARK_KINDS = ["human-gate", "ladder-exhausted", "attempt-cap", "gate-fail", "quota",
-  "reroute-exhausted", "setup", "stall", "merge-conflict", "tip-moved", "infra", "dispatch"] as const;
+  "reroute-exhausted", "setup", "stall", "merge-conflict", "tip-moved", "infra", "dispatch",
+  "authoring"] as const;
 export type ParkKind = (typeof PARK_KINDS)[number];
 // v1.85 T3: "repair" is a third dispatch mode beside the v1.29 session pair — a fix-only attempt that
 // carries the failing findings and the diff CONTENT of the work already landed, instead of re-buying
@@ -476,7 +591,11 @@ export type ParkKind = (typeof PARK_KINDS)[number];
 export const RETRY_MODES = ["resume", "fresh", "repair"] as const;
 export type RetryMode = (typeof RETRY_MODES)[number];
 
-export const WORKER_RESULT_CAUSES = ["provider-death", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer"] as const;
+// OBS-548: "dead-channel" is the fourth conflation OBS-53 opened, named. The dead-channel fast-kill
+// concludes a worker while the rolling stall window still has most of its time left, so labelling it
+// stall-timeout points every downstream reader — the repair brief, the consult — at a mechanism that
+// cannot have fired.
+export const WORKER_RESULT_CAUSES = ["provider-death", "dead-channel", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer"] as const;
 export type WorkerResultCause = (typeof WORKER_RESULT_CAUSES)[number];
 
 // Status consumes the routing profile's existing quality split directly: verified park kinds classify
@@ -546,10 +665,15 @@ export function classifyWorkerResultCause(opts: {
   exitCode: number | null;
   summary: string;
   timedOut: boolean;
+  /** OBS-548: the daemon's dead-channel fast-kill ended this attempt, not the rolling stall window. */
+  deadChannel?: boolean;
 }): WorkerResultCause | undefined {
   if (opts.ok && opts.finished) return undefined;
   // v1.89 T7: a provider-outage signature is independent of trailer state and has its own remedy.
   if (PROVIDER_OUTAGE_RE.test(opts.output)) return "provider-death";
+  // OBS-548: the fast-kill is its own mechanism and outranks every trailer-derived field below —
+  // those all bottom out in stall-timeout, which is the one thing this death is NOT.
+  if (opts.deadChannel) return "dead-channel";
   // A stall kill is distinguished by its timeout signal, before any trailer-derived result fields.
   if (opts.timedOut) return "stall-timeout";
   if (opts.summary === "unparseable TICKMARKR_RESULT trailer") return "malformed-trailer";
@@ -799,6 +923,37 @@ export function readAllTelemetry(repoRoot: string, lastK: number, opts: { after?
 // ponytail: fixed 50-run window; promote to a routing.learned.* config knob only if operators need to tune it.
 export const RUNS_WINDOW = 50;
 
+// OBS-543/OBS-549 use the same documented recency budget the routing profile already trusts. There is
+// one directory enumeration and one journal read per selected run; both compile history and fresh-run
+// feedback consume this function's folded result, so neither grows an unbounded or second reader.
+export const PRIOR_JOURNAL_RUN_WINDOW = RUNS_WINDOW;
+
+export function readPriorRunEvidence(
+  repoRoot: string,
+  tasks: readonly Pick<Task, "id" | "goal" | "files" | "acceptance">[],
+  opts: { suppressRunId?: string } = {},
+): PriorRunEvidence {
+  const dir = runsDir(repoRoot);
+  if (!existsSync(dir)) return { findings: [], merges: [] };
+  const runIds = readdirSync(dir)
+    .filter((runId) => runId.startsWith("run-") && existsSync(join(dir, runId, "journal.jsonl")))
+    .sort()
+    .slice(-PRIOR_JOURNAL_RUN_WINDOW);
+  const folded = foldPriorEvidence(runIds.map((runId) => ({
+    runId,
+    events: readJsonl(join(dir, runId, "journal.jsonl")) as JournalEvent[],
+  })));
+  const current = new Map(tasks.map((task) => [task.id, taskContentDigest(task)]));
+  return {
+    findings: folded.findings.filter((evidence) =>
+      evidence.runId !== opts.suppressRunId
+      && current.get(evidence.taskId) === evidence.taskContentDigest),
+    merges: folded.merges.filter((evidence) =>
+      evidence.runId !== opts.suppressRunId
+      && current.get(evidence.taskId) === evidence.taskContentDigest),
+  };
+}
+
 // VIS-03 reset cursor — one trimmed runId line at .tickmarkr/profile-since; absent/empty ⇒ undefined.
 // Opaque: used ONLY in the runId > comparison above, never a shell or path join beyond .tickmarkr/.
 export function readProfileCursor(repoRoot: string): string | undefined {
@@ -992,9 +1147,40 @@ export class Journal {
   // logged attempt 0 two ms after run-resume). Count === max+1 on clean journals and is truthful on
   // corrupted ones. tried is the ordered dedup of channelKey(assignment) across dispatches (≡ the
   // pre-kill tried list). lastAssignment is the last well-formed dispatched assignment.
+  /**
+   * OBS-547: the task's latest dispatch IFF a `scope-authoring` event already closed it — the state a
+   * crash between that classification and the park that follows it leaves behind. replayResumeState()
+   * has already rewound that dispatch, so a resumed gate replay must neither take it back a second time
+   * (which erases an EARLIER chargeable attempt) nor attribute the park to the assignment the rewind
+   * restored. null ⇒ the latest dispatch is unclassified: today's accounting, unchanged.
+   */
+  classifiedDispatch(taskId: string): { assignment?: Assignment } | null {
+    let outstanding: { assignment?: Assignment } | null = null;
+    let classified: { assignment?: Assignment } | null = null;
+    for (const e of this.read()) {
+      if (e.taskId !== taskId) continue;
+      if (e.event === "task-dispatch") {
+        const parsed = DispatchAssignmentSchema.safeParse(e.data.assignment);
+        outstanding = parsed.success ? { assignment: parsed.data } : {}; // malformed: closable, unattributable
+        classified = null;
+      } else if (e.event === "scope-authoring" && outstanding) {
+        classified = outstanding; // a duplicate classification closes nothing more (same rule as the replay)
+        outstanding = null;
+      }
+    }
+    return classified;
+  }
+
   replayResumeState(): Map<string, ResumeState> {
     const m = new Map<string, ResumeState>();
     const pendingReroute = new Set<string>(); // reroute verdicts not yet cleared by a later dispatch
+    // OBS-547: what the last dispatch ADDED, so a scope-authoring event can take it back. An
+    // unchargeable dispatch must replay as if it never happened — no attempt counted, no channel burned.
+    const lastDispatch = new Map<string, {
+      addedKey?: string;
+      prevAssignment?: Assignment;
+      consumedReroute: boolean;
+    }>();
     const lastReviewFail = new Map<string, string>(); // OBS-189: newest failed review details per task
     for (const e of this.read()) {
       if (!e.taskId) continue;
@@ -1004,19 +1190,43 @@ export class Journal {
       }
       if (e.event === "task-dispatch") {
         // A subsequent dispatch clears the pending reroute — the reroute was acted on pre-kill.
-        pendingReroute.delete(e.taskId);
+        const consumedReroute = pendingReroute.delete(e.taskId);
         let st = m.get(e.taskId);
         if (!st) { st = { attempts: 0, tried: [] }; m.set(e.taskId, st); }
         st.attempts++; // COUNT, never max(data.attempt)+1 — see rationale above
         const parsed = DispatchAssignmentSchema.safeParse(e.data.assignment);
         if (parsed.success) {
           const key = channelKey(parsed.data);
-          if (!st.tried.includes(key)) st.tried.push(key);
+          const added = !st.tried.includes(key);
+          if (added) st.tried.push(key);
+          lastDispatch.set(e.taskId, {
+            ...(added ? { addedKey: key } : {}),
+            prevAssignment: st.lastAssignment,
+            consumedReroute,
+          });
           st.lastAssignment = parsed.data;
         } else {
+          lastDispatch.set(e.taskId, { prevAssignment: st.lastAssignment, consumedReroute });
           // fail closed: malformed assignment still COUNTS (above) but adds nothing to tried and
           // poisons only lastAssignment (a malformed LAST dispatch must not be restored).
           st.lastAssignment = undefined;
+        }
+      } else if (e.event === "scope-authoring") {
+        // OBS-547: the dispatch this event closes was an authoring defect — the spec is missing a
+        // files[] line and the worker was never at fault. Rewind its accounting so a resume neither
+        // charges the attempt nor treats its channel as burned.
+        // Idempotent: undo the OUTSTANDING dispatch or nothing. A crash between this append and the
+        // park that follows it makes a resume classify again and append a duplicate — the duplicate has
+        // no dispatch left to take back, and an unconditional decrement would erase an EARLIER
+        // chargeable attempt instead (the clamp at zero only hides that when there is no earlier one).
+        const st = m.get(e.taskId);
+        const undo = lastDispatch.get(e.taskId);
+        if (st && undo) {
+          st.attempts = Math.max(0, st.attempts - 1);
+          if (undo.addedKey) st.tried = st.tried.filter((k) => k !== undo.addedKey);
+          st.lastAssignment = undo.prevAssignment;
+          if (undo.consumedReroute) pendingReroute.add(e.taskId);
+          lastDispatch.delete(e.taskId);
         }
       } else if (e.event === "consult-verdict" && e.data.action === "reroute") {
         // A reroute bans the in-force channel; retry/decompose/human verdicts ban nothing (D-03).

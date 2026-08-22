@@ -792,6 +792,16 @@ acceptance is required on every task (a nested list of observable outcomes).
     - Enumerating one axis exhaustively is what hides the others. A spec that guards PARTIAL coverage
       site-by-site, member-by-member, can be defeated wholesale by CONDITIONAL coverage, which leaves
       every enumeration satisfied. After you enumerate, ask what a single flag would do to the whole set.
+    - EVERY CRITERION NAMES THE PAIR IT DISCRIMINATES: the correct case that MUST PASS, and the
+      neighbouring plausible-wrong or false-clean case that MUST FAIL. Two easy examples that both pass are
+      not discrimination — they are two ways of being green, and the wrong half is the whole point: it is
+      what a reader would mistake for the mechanism, its VOCABULARY without its behaviour. Measured three
+      times in three days, each a criterion that pinned vocabulary instead of the discriminating case: a
+      suite that pinned an alarm's text while the alarm itself went unpinned; an export asserted SOMEWHERE,
+      which says nothing about the environment a process actually receives; and a gate green on "infra is
+      what execution says" while a signalled oracle still charged an attempt. Each was satisfied exactly as
+      written and each shipped the defect. If you cannot name the case that must FAIL, you have named a
+      topic, not a criterion — and the "so X fails" clause that ends a good criterion is where it goes.
     - A criterion that names a behaviour must name the VALUE AT WHICH IT WOULD BREAK. Every criterion is a
       claim about a variable — a status, a width, a count, an arrival time — and if it does not say which
       value of that variable is the hard one, THE TEST WILL CHOOSE THE EASY ONE AND BE GREEN. Measured: a

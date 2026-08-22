@@ -3,8 +3,31 @@ import { parseArgs } from "node:util";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { compileSource } from "../../compile/index.js";
 import { saveGraph, stateDirName } from "../../graph/graph.js";
+import { formatPriorFindingEvidence, readPriorRunEvidence, type PriorMergeEvidence } from "../../run/journal.js";
+import { shGit } from "../../run/git.js";
 import { acquireRunLock, releaseRunLock } from "../../run/lock.js";
 import { harnessLine, resolveHarness } from "../harness.js";
+
+async function mergedPendingDiagnostics(
+  cwd: string,
+  pending: ReadonlySet<string>,
+  merges: readonly PriorMergeEvidence[],
+): Promise<string[]> {
+  const head = await shGit("git rev-parse HEAD", cwd);
+  const base = head.code === 0 ? head.stdout.trim() : "";
+  if (!/^[0-9a-f]{40}$/i.test(base)) return [];
+  const lines: string[] = [];
+  for (const taskId of pending) {
+    const candidates = merges.filter((merge) => merge.taskId === taskId).reverse();
+    for (const merge of candidates) {
+      const ancestor = await shGit(`git merge-base --is-ancestor ${merge.commit} ${base}`, cwd);
+      if (ancestor.code !== 0) continue;
+      lines.push(`${taskId}: merged in run ${merge.runId}; compiles as pending (plan not marked done) — this dispatch rebuilds it`);
+      break; // one pure-information line per pending task, newest reachable merge wins
+    }
+  }
+  return lines;
+}
 
 // v1.89 T4: harnessFrom is the resolver's INPUT (see plan.ts); the default is the INVOKED entrypoint
 // (`process.argv[1]`, the bin symlink), never this module's own url — that names an internal module.
@@ -26,6 +49,15 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
     values.type as "speckit" | "prd" | "gsd" | "native" | undefined,
     cwd, // repo root: gsd stores context[0] repo-relative so workers resolve it inside their worktree
   );
+  // One bounded read supplies both cross-run surfaces: unresolved findings below and merge facts for
+  // the ancestry check. Neither fact mutates the compiled graph; status and every readiness predicate
+  // remain the source compiler's answer.
+  const prior = readPriorRunEvidence(cwd, g.tasks);
+  const mergedPending = await mergedPendingDiagnostics(
+    cwd,
+    new Set(g.tasks.filter((task) => task.status === "pending").map((task) => task.id)),
+    prior.merges,
+  );
   const stateDir = stateDirName(cwd);
   if (!values["dry-run"]) {
     // HARD-01 / Sol #3: hold the same link(2) run lock as the daemon around saveGraph so compile
@@ -44,5 +76,11 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
   const diagnostics = scopeLints.length
     ? `\nscope lints:\n${scopeLints.map((lint) => `  ! ${lint}`).join("\n")}`
     : "";
-  return `${harnessLine(resolveHarness(harnessFrom))}\n${summary}${diagnostics}`;
+  const priorFindings = prior.findings.length
+    ? `\nprior-run evidence:\n${prior.findings.map((finding) => `  ${formatPriorFindingEvidence(finding)}`).join("\n")}`
+    : "";
+  const mergeHistory = mergedPending.length
+    ? `\nmerge history:\n${mergedPending.map((line) => `  ${line}`).join("\n")}`
+    : "";
+  return `${harnessLine(resolveHarness(harnessFrom))}\n${summary}${diagnostics}${priorFindings}${mergeHistory}`;
 }

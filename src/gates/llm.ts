@@ -7,6 +7,11 @@ import type { WorkerAdapter } from "../adapters/types.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { sh } from "../run/git.js";
+import {
+  harvestCpuFlatWindowMs,
+  normalizeStallSnapshot,
+  WorkerTreeCpuAccountant,
+} from "../run/stall.js";
 
 export const GATE_PANE_SEP = " · ";
 
@@ -124,6 +129,44 @@ export interface GateVia {
 
 const llmOutputCapture = new AsyncLocalStorage<string[]>();
 
+// v2.0 T1 (OBS-555): the empirical healthy-duration p95 is 10.6 minutes. The smallest whole
+// minute above it plus the specified one-minute margin is twelve minutes. This default remains
+// strictly below BOTH unchanged 900_000ms production dispatch timeouts: JUDGE_TIMEOUT_MS in
+// acceptance.ts and reviewGate's literal timeout in review.ts. Scope's 300_000ms call is not a
+// verdict gate and retains its existing one-wait behavior.
+export const GATE_INACTIVITY_WINDOW_MS = 12 * 60_000;
+const GATE_WAIT_SLICE_MS = 30_000;
+let gateInactivityWindowMs = GATE_INACTIVITY_WINDOW_MS;
+
+/** Test seam — shrink only the calibrated inactivity window; production always reads 12 minutes. */
+export function setGateInactivityWindowMsForTests(ms: number): void {
+  gateInactivityWindowMs = ms;
+}
+
+export function resetGateInactivityWindowMsForTests(): void {
+  gateInactivityWindowMs = GATE_INACTIVITY_WINDOW_MS;
+}
+
+export interface GateCpuAccountant {
+  start(): Promise<void>;
+  read(): { cpu: { ms: number; resolutionMs: number } | undefined; gaps: number };
+  stop(): Promise<void>;
+}
+
+export type GateCpuAccountantFactory = (marker: string, cwd: string) => GateCpuAccountant;
+const productionGateCpuAccountant: GateCpuAccountantFactory =
+  (marker, cwd) => new WorkerTreeCpuAccountant(marker, cwd);
+let gateCpuAccountantFactory = productionGateCpuAccountant;
+
+/** Test seam for deterministic measurable/activity/gap samples without platform-specific ps output. */
+export function setGateCpuAccountantFactoryForTests(factory: GateCpuAccountantFactory): void {
+  gateCpuAccountantFactory = factory;
+}
+
+export function resetGateCpuAccountantFactoryForTests(): void {
+  gateCpuAccountantFactory = productionGateCpuAccountant;
+}
+
 // OBS-132: acceptance.ts owns verdict parsing and is deliberately byte-untouched. This async-scoped
 // recorder lets run-gates observe the exact output that acceptance parsed without changing runLlm's
 // return value or leaking concurrent tasks into one another. Callers retain output only when the
@@ -163,6 +206,8 @@ export async function runViaDriver(
   timeoutMs = 300000,
 ): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
+  let slot: Slot | undefined;
+  let accountant: GateCpuAccountant | undefined;
   try {
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
@@ -175,17 +220,87 @@ export async function runViaDriver(
       adapter.headlessCommand(pf, model),
       gateExitTrailer(nonce),
     ].join("\n"));
-    const slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
+    slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
     via.onSlot?.(slot);
     await via.driver.run(slot, paneDispatchCommand(scriptPath));
     // nonce-suffixed exit only: a displayed bare "TICKMARKR_EXIT:" or another call's marker must not
     // false-complete — same guard the worker path uses (daemon.ts:330-331).
-    await via.driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, timeoutMs, { regex: true });
-    const out = await via.driver.read(slot, 400);
-    if (!via.keep) await via.driver.close(slot);
+    const exitPattern = `TICKMARKR_EXIT_${nonce}:\\d`;
+    let out: string;
+    const gatePrompt = prompt.startsWith("TICKMARKR-JUDGE") || prompt.startsWith("TICKMARKR-REVIEW");
+    if (!gatePrompt) {
+      await via.driver.waitOutput(slot, exitPattern, timeoutMs, { regex: true });
+      out = await via.driver.read(slot, 400);
+    } else {
+      // Review and judge waits are sliced so the two-leg inactivity policy can observe the pane and
+      // the exact dispatch script's process tree between waits. The accountant retains short-lived
+      // descendants with the same semantics as daemon workers; llm.ts depends only on stall.ts.
+      accountant = gateCpuAccountantFactory(scriptPath, cwd);
+      await accountant.start();
+      const startedAt = Date.now();
+      out = await via.driver.read(slot, 400);
+      let priorSnapshot = normalizeStallSnapshot(out);
+      const anchoredAt = Date.now();
+      let quietSince = anchoredAt;
+      const initialCpu = accountant.read();
+      let priorCpuMs = initialCpu.cpu?.ms;
+      let priorGaps = initialCpu.gaps;
+      let cpuFlatSince = initialCpu.cpu === undefined ? undefined : anchoredAt;
+      while (Date.now() - startedAt < timeoutMs) {
+        const remaining = timeoutMs - (Date.now() - startedAt);
+        // The adaptive test-window arm keeps a seam-adjusted case sliced too; production stays 30s.
+        const sliceMs = Math.max(1, Math.min(GATE_WAIT_SLICE_MS, Math.ceil(gateInactivityWindowMs / 4), remaining));
+        const matched = await via.driver.waitOutput(slot, exitPattern, sliceMs, { regex: true });
+        const raw = await via.driver.read(slot, 400);
+        out = raw;
+        // waitOutput is the driver's authoritative marker match. The raw check covers drivers whose
+        // wait timed out at the same boundary the marker landed; either way a trailer completes
+        // normally and is never mistaken for inactivity.
+        if (matched || new RegExp(exitPattern).test(raw)) break;
+
+        const now = Date.now();
+        const snapshot = normalizeStallSnapshot(raw);
+        if (snapshot !== priorSnapshot) {
+          priorSnapshot = snapshot;
+          quietSince = now;
+        }
+
+        const observation = accountant.read();
+        const cpu = observation.cpu;
+        if (observation.gaps !== priorGaps || cpu === undefined) {
+          // Missing evidence is a hold-open signal, never guessed inactivity. A later measurable
+          // sample starts a fresh complete window rather than inheriting quiet time across the gap.
+          priorGaps = observation.gaps;
+          priorCpuMs = undefined;
+          cpuFlatSince = undefined;
+          quietSince = now;
+          continue;
+        }
+        if (priorCpuMs === undefined || cpu.ms !== priorCpuMs) {
+          // Any process-tree CPU movement holds the call open and re-arms both clocks. Equality only
+          // becomes "flat" after the existing resolution-aware quantum window has elapsed.
+          priorCpuMs = cpu.ms;
+          cpuFlatSince = now;
+          quietSince = now;
+          continue;
+        }
+        const cpuFlatFor = now - (cpuFlatSince ?? now);
+        const snapshotQuietFor = now - quietSince;
+        if (cpuFlatFor >= harvestCpuFlatWindowMs(cpu.resolutionMs)
+          && snapshotQuietFor >= gateInactivityWindowMs) {
+          break;
+        }
+      }
+    }
     return dewrapPaneVerdict(out, nonce);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    try {
+      await accountant?.stop();
+      if (slot && !via.keep) await via.driver.close(slot);
+    } finally {
+      // Unconditional and synchronous: a stop/close failure must not leak this call's prompt and script.
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 }
 
