@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, probeAll, readDoctor } from "../../adapters/registry.js";
 import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
-import { pickDriver } from "../../drivers/index.js";
+import { parseDriverOverride, pickDriver } from "../../drivers/index.js";
 import type { ExecutorDriver } from "../../drivers/types.js";
 import { loadGraph } from "../../graph/graph.js";
 import { type TaskStatus } from "../../graph/schema.js";
@@ -422,6 +422,9 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     const n = Number(values.concurrency);
     if (!Number.isInteger(n) || n <= 0) throw new Error(`--concurrency must be a positive integer (got ${values.concurrency})`);
   }
+  // Keep invalid input at the argv boundary. In particular, do not cast a string into the closed
+  // driver union and accidentally turn an unknown explicit choice into auto-selection.
+  const driverOverride = parseDriverOverride(values.driver);
   if (values.quality && values.mode !== undefined) {
     throw new Error("--quality is a compatibility alias for --mode partner-led and cannot be combined with an explicit --mode — pass one or the other");
   }
@@ -470,7 +473,7 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     const s = await runDaemon(cwd, {
       runId,
       concurrency: values.concurrency ? Number(values.concurrency) : undefined,
-      driver: bindNarration(pickDriver(cfg, values.driver as "auto" | "herdr" | "subprocess" | undefined), narrate),
+      driver: bindNarration(pickDriver(cfg, driverOverride), narrate),
       mode: flagMode,
       supersedes: values.supersedes,
       narrate,

@@ -6,7 +6,8 @@
 > database, no backend services, and no network APIs — this is a stated invariant in `CLAUDE.md`
 > ("state is files + git only"). What would normally be "external integrations" in a web app are,
 > here, **subprocess CLIs**: seven AI coding-agent CLIs it dispatches work to, plus the `herdr` terminal
-> multiplexer CLI it optionally uses as an execution driver. Every integration in this document is a
+> multiplexer CLI it optionally uses as an execution driver and the `orca` CLI it uses as an
+> explicit-selection one. Every integration in this document is a
 > local binary invoked with `spawn`/`bash -lc`, never an HTTP call.
 
 ## APIs & External Services
@@ -86,6 +87,16 @@ The native Claude Code integration remains fully supported. Repositories with `.
   - `herdr pane close <pane>` - best-effort teardown (`:85-88`)
 - Every LLM call site (worker, acceptance judge, cross-vendor review, stall-consult) can run as a visible named herdr pane when `visibility.llm: "pane"` is set (`DEFAULT_CONFIG` defaults to `"headless"`, `src/config/config.ts:325`); headless is the default, pane is the opt-in (`src/gates/llm.ts` `runHeadless` vs `runViaDriver`)
 
+**orca (Orca app CLI) — explicit selection only:**
+- Selected only when the operator names it: `--driver orca` or `driver: orca` (`DRIVER_CHOICES`, `src/drivers/index.ts:7`; validated at the argv boundary by `parseDriverOverride`, `:11-15`). `pickDriver`'s `auto` fallback resolves to `HerdrDriver` or `SubprocessDriver` and **never** to `OrcaDriver` (`:22-28`), so orca is never inherited from an ambient env var the way `HERDR_ENV=1` selects herdr — and an unreachable orca is never silently substituted with a hidden subprocess worker after that explicit choice (`:24-26`)
+- `OrcaDriver` (`src/drivers/orca.ts`) shells out to the `orca` binary for terminal lifecycle only — `terminal create|list|read|send|wait|show|close` plus `status` for runtime identity — all through one shared envelope parser that fails closed on an `ok:false` refusal (`ORCA_RESPONSE_FAMILIES`, `:35-36`)
+- `--worktree` takes a **selector**, so every call names `path:<abs>` and verifies the checkout that came back; letting `active`/`current` resolve whatever the UI has focused would hand orca the isolation the worktree exists for (`src/drivers/orca.ts` header, T2)
+- **tickmarkr retains worktrees, gates and merge authority; orca supplies visible terminals only:**
+  - *Worktrees* — `OrcaDriver.worktree()` (`src/drivers/orca.ts:960-962`) calls tickmarkr's own `createWorktree` (`src/run/git.ts:214-221`) and hands orca the resulting path as a `path:` selector; orca never creates, moves or removes a checkout
+  - *Gates* — the seven-gate battery (`build test lint evidence scope acceptance review`, `src/graph/schema.ts`, driven by `src/gates/run-gates.ts`) runs in tickmarkr's own process against the commits in that worktree, identically under every driver; a driver has no gate seam to influence
+  - *Merge* — only green tasks are consolidated, by `mergeTask` (`src/run/merge.ts:59`), onto the run-scoped `tickmarkr/<runId>` branch (`integrationBranch`, `:34-36`) and never onto `main` (CLAUDE.md invariant); orca has no merge path
+- Smoke-tested against a real Orca by `tests/e2e/orca-smoke.e2e.test.ts`, which is doubly self-gated (`TICKMARKR_E2E=1` **and** the production reachability probe), launches no agent CLI, and reports the absence of either as a runner-visible vitest skip of its live leg (`ctx.skip()`, counted under `skipped`) rather than as a pass
+
 ## Data Storage
 
 **Databases:**
@@ -136,7 +147,7 @@ The native Claude Code integration remains fully supported. Repositories with `.
 - None required for basic operation (`compile`/`plan`/`doctor` work with zero env vars).
 
 **Optional env vars:**
-- `HERDR_ENV=1` - enables the herdr visible-pane driver
+- `HERDR_ENV=1` - enables the herdr visible-pane driver (there is no orca equivalent: orca is selected by name, never by environment)
 - `TICKMARKR_FAKE_SCRIPT=<path>` - enables the deterministic fake adapter (tests only)
 - `TICKMARKR_E2E=1` - unskips the real-CLI e2e suite
 - `XDG_CONFIG_HOME=<dir>` - relocates the global config directory

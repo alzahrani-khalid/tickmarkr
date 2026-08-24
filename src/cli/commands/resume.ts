@@ -1,5 +1,6 @@
+import { parseArgs } from "node:util";
 import { loadConfig } from "../../config/config.js";
-import { pickDriver } from "../../drivers/index.js";
+import { parseDriverOverride, pickDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
 import { type RunSummary, formatSummary, runDaemon } from "../../run/daemon.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
@@ -10,13 +11,23 @@ const summaryGreen = (s: RunSummary) =>
   && s.tipVerify !== "failed";
 
 export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
-  const runId = argv[0];
-  if (!runId) throw new Error("usage: tickmarkr resume <run-id> [--graph-changed] [--retry-failed]");
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      "graph-changed": { type: "boolean" },
+      "retry-failed": { type: "boolean" },
+      driver: { type: "string" },
+    },
+    allowPositionals: true,
+  });
+  const runId = positionals[0];
+  if (!runId) throw new Error("usage: tickmarkr resume <run-id> [--graph-changed] [--retry-failed] [--driver <auto|herdr|subprocess|orca>]");
+  const driverOverride = parseDriverOverride(values.driver);
   // T3: --graph-changed is the operator's audited release of the engagement-identity guard (Sol #2 /
   // Fable F2) — the daemon refuses a mismatched/unbound journal unless this is set, then journals a
   // graph-rehash event naming both hashes. Strip the flag before runId resolution so a bare id still wins.
-  const graphChanged = argv.includes("--graph-changed");
-  const retryFailed = argv.includes("--retry-failed");
+  const graphChanged = values["graph-changed"] ?? false;
+  const retryFailed = values["retry-failed"] ?? false;
   const cfg = loadConfig(cwd);
   // v1.87 T3 (OBS-162, twice-carried workaround): the preflight runs AFTER the graph is read and
   // sees only the shapes the resumed graph carries. A deny∩prefer collision on a shape no resumed
@@ -34,7 +45,7 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     graphChanged,
     retryFailed,
     // bound to the same sink the daemon gets, so a driver-journaled recovery reaches this rail too
-    driver: bindNarration(pickDriver(cfg), narrate),
+    driver: bindNarration(pickDriver(cfg, driverOverride), narrate),
     // v1.99 T2: the ONE narration sink — the quiet rail on a TTY, the raw journal formatter on a
     // pipe. A resumed run meets the same surface a fresh one does; printing the raw formatter here
     // would leave `resume` as the last place the old unfiltered dump survives. Bound to the run id

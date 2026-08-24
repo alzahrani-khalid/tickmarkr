@@ -35,6 +35,10 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    status, and either ADOPT the
    existing orchestrator (updated brief, re-armed watchers) or, if the old hierarchy is dead, archive the
    stale brief and build fresh.
+   **An adopted seat ANNOUNCES itself, in the same act as re-arming:** tell the adopted orchestrator the
+   fresh seat is live (verified send: probe token + read-back). Through the gap its view of your tier read
+   STALE, and a tier that believes it is unsupervised escalates into a file nobody is reading. Earned
+   2026-08-22: a fresh seat re-armed all four watchers and announced nothing until the operator asked.
    ⚠ **Adopting a hierarchy silently adopts its EXECUTOR CHOICE.** The P92→P98 GSD drift propagated
    exactly this way: each overseer read the prior brief, reproduced "the same two-leg pattern as the
    last three phases", and the unruled bypass of the engine became load-bearing through repetition.
@@ -240,6 +244,9 @@ is a lossy summary nobody trusts while a clean session re-oriented from disk-ver
 **Do the same for yourself before you are forced to**: write the handoff while your judgment is still
 good, not after. If your own context cannot be read by the watcher, say so to the operator and ask for the
 number — an unmeasured budget is not a small budget.
+**Every handoff's re-arm list ends with the announce step from Setup 0** — inform the surviving
+orchestrator the fresh seat is live — or the next seat re-arms silently beside a tier that still
+believes it is alone.
 
 ## Supervising GSD legs — when the mission dispatches `/gsd:*` instead of `tickmarkr run`
 

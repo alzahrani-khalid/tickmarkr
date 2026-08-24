@@ -51,6 +51,16 @@ const makeIO = () => {
 
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 
+// Same streams, minus the listener methods: init-app reads that absence as a legacy output and
+// turns on Ink's debug frame mode, which writes one COMPLETE frame per keypress instead of
+// throttling. Description copy shown only while the cursor sits on a row is otherwise a frame
+// the throttle is free to drop.
+const makeFrameIO = () => {
+  const io = makeIO();
+  const { isTTY, columns, rows, write } = io.output as unknown as Record<string, unknown>;
+  return { ...io, output: { isTTY, columns, rows, write } as unknown as NodeJS.WriteStream };
+};
+
 const fields = (over: Partial<InitWizardFields> = {}): InitWizardFields => ({
   driver: "auto",
   concurrency: 3,
@@ -60,8 +70,7 @@ const fields = (over: Partial<InitWizardFields> = {}): InitWizardFields => ({
   ...over,
 });
 
-const run = (f: InitWizardFields, keys: string[]) => {
-  const io = makeIO();
+const run = (f: InitWizardFields, keys: string[], io = makeIO()) => {
   const result = runInitWizardApp({ fields: f, input: io.input, output: io.output, initialInput: keys });
   return { result, io };
 };
@@ -78,6 +87,22 @@ describe("init wizard act 1", () => {
       installSkills: true,
       installDocs: false,
     });
+  });
+
+  test("the guided init driver cycle offers orca with orca-specific environment copy and auto still described as herdr-else-subprocess while the shipped cycle limited to auto, herdr and subprocess fails", async () => {
+    // three cycles from the seeded auto: herdr → subprocess → orca. A cycle holding only
+    // auto/herdr/subprocess wraps back to auto here and never renders the orca copy.
+    const { result, io } = run(fields(), [KEYS.space, KEYS.space, KEYS.space, ...TO_CONTINUE, KEYS.enter], makeFrameIO());
+    const outcome = await result;
+    expect(outcome.kind).toBe("continue");
+    if (outcome.kind === "continue") expect(outcome.overlay.driver).toBe("orca");
+
+    const frames = strip(io.writes.join(""));
+    // orca's own environment — its terminals, and that only an explicit choice reaches it
+    expect(frames).toContain("orca: visible terminals in the Orca app");
+    expect(frames).toContain("an explicit choice, never auto's");
+    // auto's meaning is untouched by the fourth driver
+    expect(frames).toContain("auto: herdr when HERDR_ENV=1, else subprocess");
   });
 
   test("cycling driver twice from auto lands on subprocess", async () => {

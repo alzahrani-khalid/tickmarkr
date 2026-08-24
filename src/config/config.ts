@@ -301,7 +301,7 @@ const ShapeGateParticipationSchema = z
 
 export const TickmarkrConfigSchema = z.object({
   concurrency: z.number().int().positive(),
-  driver: z.enum(["auto", "herdr", "subprocess"]),
+  driver: z.enum(["auto", "herdr", "subprocess", "orca"]),
   integrationBranchPrefix: z
     .string()
     .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/, "must be branch-safe (letters/digits/._/-, no spaces or shell metacharacters)")
@@ -766,7 +766,7 @@ export type InitConfigOverlay = {
 export function configTemplate(overlay?: InitConfigOverlay): string {
   const base = `# tickmarkr config overlay — merges over built-in defaults (repo beats global beats defaults)
 # concurrency: 3
-# driver: auto            # auto | herdr | subprocess
+# driver: auto            # auto | herdr | subprocess | orca
 # taskTimeoutMinutes: 30
 # contextWarnTokens: 170000   # v1.23: journal+notify once per attempt when live worker context crosses this (status shows the sample)
 # setup: npm ci --prefer-offline   # run in each fresh task worktree before dispatch

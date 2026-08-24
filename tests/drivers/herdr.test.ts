@@ -73,15 +73,18 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   // pane registry (unlabelled until a rename) — otherwise `pane list` could never witness a split the
   // driver failed to close, and every close-verification would be vacuously satisfied.
   const paneSplit = opts.splitFails ? "exit 1" : `printf '%s -\n' 'w1:p7' >> '${panes}'; echo '{"result":{"pane":{"pane_id":"w1:p7"}}}'`;
-  // `pane swap` is what puts the board ABOVE the caller after the down split. herdr answers it with
-  // the documented `changed` flag: swapFails is a swap it errors on, swapNoChange is the one that
-  // matters more — a ZERO exit reporting `changed:false`, i.e. nothing moved and the board is still
-  // under the narration while the exit code says everything went fine.
+  // `pane swap` is what puts the board ABOVE the caller after the down split. The flag lives at
+  // `result.swap.changed` — this fixture previously hand-wrote `result.changed`, the same wrong
+  // shape the driver read, so the suite validated the defect instead of catching it (OBS-561: the
+  // board died at birth on every real run while these tests were green). Shape captured verbatim
+  // from herdr 0.8.0; tests/drivers/herdr-swap-shape.test.ts pins it. swapFails is a swap it errors
+  // on, swapNoChange is the one that matters more — a ZERO exit reporting `changed:false`, i.e.
+  // nothing moved and the board is still under the narration while the exit code says it went fine.
   const paneSwap = opts.swapFails
     ? "exit 1"
     : opts.swapNoChange
-      ? `echo '{"result":{"changed":false,"reason":"panes are not siblings"}}'`
-      : `echo '{"result":{"changed":true}}'`;
+      ? `echo '{"result":{"swap":{"changed":false,"reason":"panes are not siblings"}},"type":"pane_swap"}'`
+      : `echo '{"result":{"swap":{"changed":true,"source_pane_id":"w1:p7","target_pane_id":"wTEST:pCALLER"}},"type":"pane_swap"}'`;
   const paneLayout = opts.layoutFails ? "exit 1" : `w=${opts.paneCols ?? 222}; pid=""; for a in "$@"; do case "$a" in --pane) shift; pid="$1";; esac; done; [ -z "$pid" ] && pid=w1:p42; echo "{\\"result\\":{\\"layout\\":{\\"area\\":{\\"width\\":$w},\\"panes\\":[{\\"pane_id\\":\\"$pid\\",\\"rect\\":{\\"width\\":$w}}]}}}"`;
   // pane rename <pane> <name>: register the durable label ($3=pane, $4=label). renameFails rejects the
   // SPLIT pane's rename only (w1:p7) — the old agent-rename fixture hit joins, not the tabSlot root — so

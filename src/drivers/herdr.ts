@@ -1186,9 +1186,11 @@ export class HerdrDriver implements ExecutorDriver {
     // reported the stack. The documented `changed` flag is the verification; anything else — a
     // nonzero exit, `changed:false`, an unparseable result — fails closed.
     const swapped = await this.herdr(`pane swap --source-pane ${shq(pane)} --target-pane ${shq(this.callerPane)}`);
+    // Flag lives at `result.swap.changed` (verbatim 0.8.0); see herdr-swap-shape.test.ts.
     let swapChanged: unknown;
     try {
-      swapChanged = JSON.parse(swapped.stdout).result?.changed;
+      const result = JSON.parse(swapped.stdout).result;
+      swapChanged = result?.swap?.changed ?? result?.changed;
     } catch {
       /* fail closed below */
     }

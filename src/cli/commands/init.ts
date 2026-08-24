@@ -14,11 +14,14 @@ import { assembleFleetEditor } from "./fleet.js";
 
 const SCAFFOLD_SPEC = "tickmarkr.spec.md";
 
-// Operator-approved (2026-07-17) environments footer — three rows; no npm install for herdr
-// (npm package "herdr" is a reserved 0.0.0 placeholder as of that date).
+// Operator-approved (2026-07-17) environments footer — no npm install for herdr (npm package
+// "herdr" is a reserved 0.0.0 placeholder as of that date). The orca row joins it with the v2.1
+// driver: it is a THIRD execution surface an operator selects outright — `auto` still resolves
+// herdr-else-subprocess and never picks it, so the footer names it beside the other two choices.
 const ENVIRONMENTS_FOOTER = [
   "environments:",
   "  herdr — the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev",
+  "  orca — visible terminals in the Orca app — an explicit driver choice: set driver: orca (auto never picks it) · https://onorca.dev",
   "  claude code — tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
   "  anywhere — no herdr? same fail-closed gates, headless subprocess driver",
 ].join("\n");

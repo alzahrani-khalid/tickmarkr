@@ -6,15 +6,18 @@ import { detectPackageManager, turboContinueFindings } from "../../gates/baselin
 import { version } from "./version.js";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
+import { shq } from "../../adapters/types.js";
 import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
+import { parseEnvelope } from "../../drivers/orca.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
 import { LIVEBENCH_TABLE_DATE, readCachedCatalog, refreshCatalogCommand, type CatalogReadResult } from "../../adapters/catalog-remote.js";
+import { sh, type ShResult } from "../../run/git.js";
 
 /** Where a newer `table_<date>.csv` is discovered — the deployed site builds filenames by
  *  concatenation and publishes no index, so the release listing is the only enumerable surface. */
@@ -35,7 +38,63 @@ export type DoctorOpts = {
   /** init's between-acts surface: status rows only — the model matrix and inline drift stay
    *  behind `tickmarkr doctor` (files are still written; only the RETURNED string shrinks). */
   compact?: boolean;
+  /** Test seam for the same `orca status --json` transport production invokes. */
+  orcaStatusProbe?: (cwd: string, binary: string) => Promise<ShResult>;
+  /** Test seam for shell-path discovery; absence remains a normal doctor row, never an exception. */
+  resolveOrcaBinary?: (cwd: string) => string | undefined;
 };
+
+type OrcaCapability = { verdict: "pass" | "fail"; detail: string };
+
+/**
+ * Orca's status body is deliberately interpreted by T1's one shared envelope parser. Doctor owns
+ * only capability presentation: it may classify an absent executable, but it never invents a second
+ * permissive JSON reader for a malformed or refused status response.
+ *
+ * Capability-row `detail` stays hermetic — never `OrcaError.message`, which embeds volatile CLI
+ * stderr (Electron timestamps), so the row is byte-stable across runs.
+ */
+export async function probeOrcaCapability(cwd: string, opts: Pick<DoctorOpts, "orcaStatusProbe" | "resolveOrcaBinary"> = {}): Promise<OrcaCapability> {
+  const binary = opts.resolveOrcaBinary ? opts.resolveOrcaBinary(cwd) : resolveShellBinary("orca", cwd).resolved;
+  if (!binary) return { verdict: "fail", detail: "CLI not installed" };
+
+  let response: ShResult;
+  try {
+    response = await (opts.orcaStatusProbe ?? ((probeCwd, executable) =>
+      sh(`${shq(executable)} status --json`, probeCwd, 10_000)))(cwd, binary);
+  } catch {
+    // The seam (or the shell) never reaching a verdict is a failed probe, never an exception out of
+    // doctor: an absent or sick runtime must still render its row.
+    return { verdict: "fail", detail: "CLI installed but runtime probe failed" };
+  }
+
+  try {
+    // Do this before accepting the process result: Orca's documented refused transport is rc=1
+    // with an ok:false envelope on stdout, and parseEnvelope preserves that refusal fail-closed.
+    const envelope = parseEnvelope("status", response.stdout);
+    if (response.code !== 0 || response.timedOut) {
+      return {
+        verdict: "fail",
+        detail: `CLI installed but runtime probe failed — orca status exited ${response.code}${response.timedOut ? " after timeout" : ""}`,
+      };
+    }
+    const runtime = envelope.result.runtime;
+    const reachable = typeof runtime === "object" && runtime !== null && !Array.isArray(runtime)
+      ? (runtime as Record<string, unknown>).reachable
+      : undefined;
+    if (reachable === true) return { verdict: "pass", detail: `runtime reachable (${envelope.runtimeId})` };
+    if (reachable === false) return { verdict: "fail", detail: "CLI installed but runtime unreachable" };
+    return { verdict: "fail", detail: "CLI installed but runtime probe failed — status carries no reachability proof" };
+  } catch {
+    // Only the shared parser reads this body. Every shape it rejects — unparseable, non-object,
+    // ok:false refusal, no result, or absent/`none` `_meta.runtimeId` — is a FAILED probe, never
+    // an unreachable-runtime claim: a doctor that re-read those bytes with its own permissive
+    // reader would call malformed metadata "installed but unreachable". Unreachable is proven only
+    // by a well-formed envelope that says `reachable:false` (the shape a live orca CLI emits with
+    // its runtime down — tests/helpers/fake-orca.ts).
+    return { verdict: "fail", detail: "CLI installed but runtime probe failed" };
+  }
+}
 
 /**
  * Q122s (TRIAL T-OBS-3): tickmarkr provisions run worktrees INSIDE the repo
@@ -406,6 +465,11 @@ export async function doctor(
     }
   }
   if (trustNa.length) rows.push(`  ${dim("=")} ${dim(`n/a (${trustNa.length}): ${trustNa.join(", ")}`)}`);
+  // Orca is an explicit choice, so its health is capability information rather than an auto-routing
+  // input. A failed probe never changes pickDriver's auto ordering or substitutes subprocess.
+  const orca = await probeOrcaCapability(cwd, opts);
+  rows.push(legend("execution runtime:"));
+  rows.push(alignedStatusRow(orca.verdict, "orca", orca.detail));
   for (const [role, sel] of [["judge", cfg.judge], ["consult", cfg.consult]] as const) {
     if (!health[sel.adapter]?.installed) {
       rows.push(attentionRow(`${role} runs on ${sel.adapter}:${sel.model} — NOT installed; that gate will fail closed until you install it or remap cfg.${role}`));

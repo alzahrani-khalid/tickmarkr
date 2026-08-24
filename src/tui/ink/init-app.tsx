@@ -10,7 +10,17 @@ import { clip, INK, inkInput, inkOutput, KeyBar, padCell, Pointer } from "./fram
 // any value the schema does not know.
 type Driver = NonNullable<InitConfigOverlay["driver"]>;
 type VisibilityLlm = NonNullable<NonNullable<InitConfigOverlay["visibility"]>["llm"]>;
-const DRIVERS: readonly Driver[] = ["auto", "herdr", "subprocess"];
+const DRIVERS: readonly Driver[] = ["auto", "herdr", "subprocess", "orca"];
+
+// One line per driver, shown for the value currently selected: four environments no longer fit on
+// a single description row at 80 columns (the shipped three already clipped), and orca is an
+// EXPLICIT choice — `auto` still means herdr-else-subprocess and never reaches for it.
+const DRIVER_DESC: Record<Driver, string> = {
+  auto: "auto: herdr when HERDR_ENV=1, else subprocess — never orca",
+  herdr: "herdr: every worker runs in a visible pane you can watch and unblock",
+  subprocess: "subprocess: headless child processes — no cockpit, same fail-closed gates",
+  orca: "orca: visible terminals in the Orca app — an explicit choice, never auto's",
+};
 const VISIBILITY: readonly VisibilityLlm[] = ["pane", "headless"];
 
 export type InitWizardFields = {
@@ -34,9 +44,9 @@ type Section = "Run" | "Skills";
 type Row = { id: "driver" | "concurrency" | "visibility" | "skills" | "docs" | "continue"; section?: Section; label: string; desc: string };
 
 // Three fields, one toggle, one action — a descriptor array, deliberately not a forms framework.
-function buildRows(offerSkills: boolean): Row[] {
+function buildRows(offerSkills: boolean, driver: Driver): Row[] {
   const rows: Row[] = [
-    { id: "driver", section: "Run", label: "Driver", desc: "auto: herdr when HERDR_ENV=1, else subprocess · herdr: visible panes · subprocess: headless child processes" },
+    { id: "driver", section: "Run", label: "Driver", desc: DRIVER_DESC[driver] },
     { id: "concurrency", section: "Run", label: "Concurrency", desc: "parallel task batteries per run — min 1; an empty or zero entry reverts on leave" },
     {
       id: "visibility",
@@ -65,7 +75,6 @@ function buildRows(offerSkills: boolean): Row[] {
 
 export function InitWizardApp({ fields, frameColumns = 74 }: { fields: InitWizardFields; frameColumns?: number }) {
   const { exit } = useApp();
-  const rows = buildRows(fields.offerSkills);
   const [cursor, setCursor] = useState(0);
   const cursorRef = useRef(0);
   const driverRef = useRef(fields.driver);
@@ -76,6 +85,8 @@ export function InitWizardApp({ fields, frameColumns = 74 }: { fields: InitWizar
   const lastValidConcurrencyRef = useRef(fields.concurrency);
   const typedRef = useRef(false);
   const doneRef = useRef(false);
+  // Built per render so the description row follows the driver the cursor last cycled to.
+  const rows = buildRows(fields.offerSkills, driverRef.current);
   const [, setRevision] = useState(0);
   const bump = () => setRevision((n) => n + 1);
 

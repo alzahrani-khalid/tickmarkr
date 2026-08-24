@@ -2,6 +2,34 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.1 — the orca driver
+
+tickmarkr can drive [Orca](https://orca.computer) worktrees the way it drives herdr panes: a second
+execution surface behind the same driver contract, chosen explicitly rather than inferred. Session
+and read integrity, terminal placement and reconcile ownership, driver selection with the doctor
+row, a real-orca smoke, and guided-init discovery all ship. Nothing on the herdr path changes
+shape, and the run/merge contract is untouched.
+
+The run board is also fixed: it read the swap-confirmation flag at `result.changed` while herdr
+answers `result.swap.changed`, so every successful board placement was judged failed and the split
+was discarded — the board died at birth on every run, journal-silent. The test fixture had
+hand-written that same invented shape, so the suite validated the defect instead of catching it;
+the fixture is now a verbatim capture and carries the pre-fix expression as a falsification control.
+
+**Known in this release, fixed in 2.1.1:**
+
+- **Live worker liveness under the orca driver is not wired.** Orca is selectable and runs work, but
+  `tickmarkr status --watch` shows no worker liveness for orca runs — the shipped path cannot yet
+  resolve an orca worker through its journaled locator. Runs, gates and merges are unaffected.
+- **Under herdr 0.8.0, a healthy interactive worker can be falsely concluded.** Alt-screen panes
+  read empty through the scrollback sources, so the daemon's output high-water never advances; the
+  silence nudge fires and the stall timeout concludes "no trailer" on a worker that is still
+  committing. **Workaround: set `driver: subprocess` in `.tickmarkr/config.yaml`** — worker panes
+  become invisible, gates and merges are unaffected. Do not pin herdr back; the fix belongs here.
+- **Long or verbose workers can exit without their machine trailer.** This is fail-closed, not a
+  correctness break: a missing trailer is treated as an untrusted claim and the engine runs every
+  gate itself. It surfaces as `clean-exit-no-trailer` in the journal.
+
 ## v2.0 — evidence consulted, watch quieted, velocity measured
 
 Three unpublished milestones ship together as the 2.0 marker release; nothing here breaks the CLI

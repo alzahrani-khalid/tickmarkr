@@ -45,7 +45,7 @@ usage: tickmarkr <command>
   scope <intent> draft a compiled native spec beside an answered intent (--force to overwrite)
   plan          dry-run routing table + cost estimate + floor lints
   eval          run checked-in fixtures against every channel in isolated temp repos
-  run           execute the graph (--concurrency N --driver herdr|subprocess --route-strict)
+  run           execute the graph (--concurrency N --driver auto|herdr|subprocess|orca --route-strict; orca runs only when named)
   status        live run state
   verify        run the gate battery standalone against merge-base(--base, HEAD)..HEAD — no daemon, one verdict (--base main --criteria <file> | --task <id> [--files <glob>] [--author adapter:model] [--no-review] [--json])
   resume <id>   continue a run from its journal

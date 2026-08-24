@@ -31,6 +31,8 @@ const NON_TTY_DOCTOR_PIN = `tickmarkr doctor — capability matrix:
   ✗ herdr          not detected — subprocess driver will be used
 workspace trust:
   = n/a (5): claude-code, codex, cursor-agent, opencode, pi
+execution runtime:
+  ✗ orca           CLI not installed
 attention (8):
   ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! codex: no model-list surface — seeds stamped 2026-07-09; verify manually
