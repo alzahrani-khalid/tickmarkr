@@ -767,9 +767,13 @@ describe("status checklist rendering", () => {
       expect(failed).not.toContain(`${GLYPHS.attention} 3/3 tasks done`);
     });
 
-    // The same law on the live effort panel, where the review and park segments are ADJACENT and
-    // wear the one amethyst: in the bar and in its legend markers only SHAPE separates a reviewer's
-    // rounds from a human park, so a panel drawing both with one glyph is unreadable and fails here.
+    // The same law on the live effort panel, where the review and park segments are ADJACENT. The law
+    // is that a reviewer's rounds stay separable from a human park; what CARRIES it depends on what the
+    // surface has. OPERATOR 2026-08-25: shade glyphs pull a taller fallback cell, so a row holding them
+    // rendered visibly taller than a dispatch-only row. Resolved by mode rather than by trade — COLOUR
+    // carries the distinction where there is colour (uniform full blocks, equal heights), SHAPE carries
+    // it under NO_COLOR, where "a row that had leaned on the amethyst would arrive indistinguishable".
+    // Both halves are asserted below; dropping either one restores a defect this file already paid for.
     const effortRepo = mkRepo();
     seed(effortRepo, [
       runStart(),
@@ -799,11 +803,21 @@ describe("status checklist rendering", () => {
     try {
       await withTty(async () => {
         const { bar, legend: legendRow } = panelLines(await status([], effortRepo));
-        expect(amethystShapes(bar).size, "review and park bar segments").toBe(2);
-        expect(amethystShapes(legendRow).size, "review and park legend markers").toBe(2);
-        // …and the dispatch segment keeps its own shape too: three segments, three glyphs.
+        // ONE glyph on the styled surface: this is the equal-height requirement, and it is what a
+        // shade-based bar cannot satisfy.
         const barGlyphs = new Set(strip(bar).replace(/[^\u2580-\u259f]/gu, ""));
-        expect(barGlyphs.size, "dispatch, review and park bar shapes").toBe(3);
+        expect(barGlyphs.size, "one bar glyph under colour — equal row heights").toBe(1);
+        // …and the three segments stay separable, now by COLOUR: three distinct styled runs.
+        const styledRuns = (line: string): Set<string> => new Set(
+          [...line.matchAll(/\x1b\[([\d;]*)m([^\x1b]*)/gu)]
+            .filter((run) => /[\u2580-\u259f]/u.test(run[2] ?? ""))
+            .map((run) => run[1]!),
+        );
+        expect(styledRuns(bar).size, "dispatch, review and park bar colours").toBe(3);
+        expect(styledRuns(legendRow).size, "dispatch, review and park legend colours").toBe(3);
+        // review has left the amethyst — that departure IS what makes it separable from park by colour,
+        // so the amethyst now marks exactly one segment.
+        expect(amethystShapes(bar).size, "only park wears the amethyst now").toBe(1);
       });
     } finally {
       if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
@@ -837,6 +851,12 @@ describe("status checklist rendering", () => {
       for (const repo of [warnRepo, redRepo, pendingRepo, failedRepo]) {
         expect(await status([], repo)).not.toContain("\x1b[");
       }
+      // NOTE the assertion deliberately NOT made here: that the plain surface keeps three bar SHAPES.
+      // It cannot be made, because this surface has no bar. renderFrame sets `unicode = visual()` and
+      // EARLY-RETURNS the ASCII machine surface at `if (!unicode)`, above the effortPanel call — so
+      // NO_COLOR never builds the panel. Verified by render, not by reading: a frame with isTTY=true and
+      // NO_COLOR=1 contains no "WHERE THE EFFORT WENT" and no block glyph. The shape scheme this test
+      // used to enforce was protecting a colourless reader of a panel that never renders colourless.
     } finally {
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;

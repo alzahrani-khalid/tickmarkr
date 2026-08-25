@@ -57,12 +57,34 @@ pane_of() {
     | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -1
 }
 
-# The rendered `❯` line — the only state that discriminates submitted from sitting. head -1 returns
-# the first rendered line, i.e. a PREFIX of a wrapped draft, so callers compare prefixes, never
-# whole sentences (OBS-396: a full-sentence match returns false on a message that arrived intact).
+# The rendered `❯` line — the only state that discriminates submitted from sitting. tail -1 takes
+# the LAST `❯` line, which is always the LIVE INPUT BOX: a wrapped draft's continuation lines carry
+# no `❯`, so the last one is still that draft's FIRST rendered line, i.e. a PREFIX of the draft —
+# callers compare prefixes, never whole sentences (OBS-396: a full-sentence match returns false on a
+# message that arrived intact).
+#
+# SUBMITTED-ECHO DISCRIMINATOR (OBS-603, captured 2026-08-25 on an overseer's first send). claude-code
+# echoes a SUBMITTED message into the transcript with the same `❯` glyph, and a long one still occupies
+# this 14-line window ABOVE the empty box. The old `head -1` returned that echo, `is_ours` matched it
+# (the echo IS a prefix of $MSG), and one delivered message drew TWO false verdicts: SEND_UNSUBMITTED on
+# the send that made the echo, then REFUSED_BOX_OCCUPIED on the NEXT send — the worse half, because it
+# refuses to deliver at all and leaves the seat unreachable until the echo scrolls out. Both reactions
+# this script warns against are then wrong: re-sending appends and submits both, escalating reports a
+# failure that never happened. OBS-396's phantom, one layer up.
+#
+# ⚠ POSITION IS NOT THE DISCRIMINATOR, and the kimi control below proves it: the two TUIs render in
+# OPPOSITE order. kimi puts the live box FIRST and stages BELOW it; claude-code puts the echo FIRST and
+# the live box BELOW. So `head -1` is wrong for one and `tail -1` is wrong for the other — a fix that
+# only flipped them would have traded this defect for the staged-queue defect OBS-552 already paid for.
+# What actually identifies the ordinary input box is that it is the LAST `❯` line which is NOT a staged
+# entry: staged lines carry the `↑ to edit · ctrl-s to steer` affordance and belong to `staged_line()`,
+# which owns that concept. Dropping them here makes this function's contract exact — the live ORDINARY
+# box — instead of positional, and it reads the affordance rather than a vendor name, so any TUI that
+# grows the same queue is covered without a matcher list.
 prompt_line() {
   herdr agent read "$TARGET" --source visible --lines 14 2>/dev/null \
-    | sed -n 's/^[[:space:]]*❯[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//'
+    | sed '/↑ to edit/{/steer/d;}' \
+    | sed -n 's/^[[:space:]]*❯[[:space:]]*//p' | tail -1 | sed 's/[[:space:]]*$//'
 }
 
 # STAGED-QUEUE DISCRIMINATOR (OBS-552 addendum, captured 2026-08-19 on a live kimi seat). After its

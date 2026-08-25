@@ -73,7 +73,12 @@ function makeStub(waitExit = 0, opts: StubOpts = {}): { bin: string; log: string
   // pane registry (unlabelled until a rename) — otherwise `pane list` could never witness a split the
   // driver failed to close, and every close-verification would be vacuously satisfied.
   const paneSplit = opts.splitFails ? "exit 1" : `printf '%s -\n' 'w1:p7' >> '${panes}'; echo '{"result":{"pane":{"pane_id":"w1:p7"}}}'`;
-  // `pane swap` is what puts the board ABOVE the caller after the down split. The flag lives at
+  // ⚠ THE BOARD NO LONGER SWAPS (2026-08-25): it is split to the RIGHT of the caller in one
+  // operation, so no test drives swapFails/swapNoChange any more. The fixture is kept, unused, for
+  // the response shape it records — deleting it would mean editing the StubOpts mega-line, which is
+  // the likeliest merge conflict on this file while a task owns it. Delete both with the next edit
+  // that touches that line for its own reasons.
+  // `pane swap` is what USED TO PUT the board ABOVE the caller after the down split. The flag lives at
   // `result.swap.changed` — this fixture previously hand-wrote `result.changed`, the same wrong
   // shape the driver read, so the suite validated the defect instead of catching it (OBS-561: the
   // board died at birth on every real run while these tests were green). Shape captured verbatim
@@ -1615,27 +1620,27 @@ describe("pickDriver", () => {
 });
 
 // T2 watch pane: one live status surface per run — split off the invoking orchestrator pane and
-// stacked ABOVE it, never a separate tab. A second request for the same canonical watch name must
+// placed BESIDE it, never a separate tab. A second request for the same canonical watch name must
 // reuse it.
 describe("HerdrDriver narrator pane (T2)", () => {
-  const STACK_SPLIT = "pane split wTEST:pCALLER --direction down --ratio 0.72 --no-focus";
+  const SIDE_SPLIT = "pane split wTEST:pCALLER --direction right --ratio 0.5 --no-focus";
 
-  test("narrator stacks its board above the invoking pane; a second daemon retires that board and re-splits it", async () => {
+  test("narrator places its board beside the invoking pane; a second daemon retires that board and re-splits it", async () => {
     const { bin, log, cwd } = makeStub(0, { tab: true, incTabs: true });
     const d = new HerdrDriver(bin);
     const first = await d.narrator(cwd, "tickmarkr status --watch run-watch", "run-watch");
     const second = await new HerdrDriver(bin).narrator(cwd, "tickmarkr status --watch run-watch", "run-watch");
     const calls = readFileSync(log, "utf8");
-    expect(calls).toContain(STACK_SPLIT); // full width, 72% of the height, every time
-    expect(calls).toContain("pane swap --source-pane w1:p7 --target-pane wTEST:pCALLER"); // board above
+    expect(calls).toContain(SIDE_SPLIT); // beside the caller, half the width, every time
+    expect(calls).not.toContain("pane swap"); // a right split needs none — the board lands right
     expect(calls).toContain("pane rename w1:p7 tickmarkr:watch:run:0:run-watch");
     expect(calls).not.toContain("tab create");
     // ONE live board throughout: the second daemon closed the board it found BEFORE splitting its own,
     // rather than adopting a pane whose running command it cannot read (the stub recycles the pane id).
     expect(calls.split("\n").filter((l) => /^pane (split|close) /.test(l))).toEqual([
-      STACK_SPLIT,
+      SIDE_SPLIT,
       "pane close w1:p7",
-      STACK_SPLIT,
+      SIDE_SPLIT,
     ]);
     // the watch is a shell dispatch like any other: atomic, nonce-acknowledged, never typed — and
     // EVERY board that goes live is launched with the run-bound command this call supplied.
@@ -1682,31 +1687,15 @@ describe("HerdrDriver narrator pane (T2)", () => {
   // operator watched the board sit below the narration. So the swap is verified, the cleanup close is
   // verified too (a close that fails, or reports success and frees nothing, leaves the operator the
   // stray split the daemon claims it took back), and a failure costs the board rather than the truth.
-  test("test: a failed board-above swap closes the new split and runs no watch command while a successful swap runs exactly one run-bound watch command in the named board pane", async () => {
+  test("test: a split the driver cannot finish is closed and runs no watch command, while a successful placement runs exactly one run-bound watch command in the named board pane", async () => {
     // `pane list` witnesses live panes here: the split registers w1:p7 the moment herdr returns it,
     // so "the split is gone" is read off the fixture's own pane registry, not off the close call.
     const listed = (stub: { panes: string }) => readFileSync(stub.panes, "utf8").split("\n").filter((l) => l.startsWith("w1:p7 "));
 
-    // BOTH ways herdr declines the swap, judged identically. The second is the one an exit-code
-    // check waves through: `pane swap` answers a swap it did not perform with a ZERO exit and
-    // `changed:false`, so a driver that trusts the exit status renames and launches a board sitting
-    // BELOW the narration while reporting the stack it asked for.
-    for (const [why, opts] of [
-      ["a swap herdr errors on", { swapFails: true }],
-      ["a zero-exit swap that reports changed:false", { swapNoChange: true }],
-    ] as const) {
-      const failed = makeStub(0, { tab: true, ...opts });
-      await expect(
-        new HerdrDriver(failed.bin).narrator(failed.cwd, "tickmarkr status --watch run-board", "run-board"),
-        why,
-      ).rejects.toThrow(/swap above failed/i); // propagates; the daemon swallows and runs boardless
-      const failedCalls = readFileSync(failed.log, "utf8");
-      expect(failedCalls, why).toContain("pane swap --source-pane w1:p7 --target-pane wTEST:pCALLER");
-      expect(failedCalls, why).toContain("pane close w1:p7"); // the split pane does not survive it
-      expect(listed(failed), why).toEqual([]); // …and it is really gone, not merely asked to go
-      expect(failedCalls, why).not.toContain("pane rename w1:p7"); // never named a board it lacks
-      expect(failedCalls, why).not.toMatch(/status --watch run-board/); // and nothing launched in it
-    }
+    // The swap-decline cases that used to live here are GONE WITH THE SWAP, not skipped: a right
+    // split lands the board beside the caller in one operation, so there is no second call that can
+    // report success while moving nothing. What remains below is the failure that still exists —
+    // a split pane that must be cleaned up, here triggered by the rename that follows the split.
 
     // the two ways a cleanup close leaves the split on screen. Neither may be swallowed: the failure
     // the operator is told about has to be the one their tab actually shows.
@@ -1714,7 +1703,7 @@ describe("HerdrDriver narrator pane (T2)", () => {
       ["a close herdr rejects", { paneCloseFails: true }],
       ["a close that reports success and frees nothing", { paneCloseNoop: true }],
     ] as const) {
-      const stuck = makeStub(0, { tab: true, swapFails: true, ...opts });
+      const stuck = makeStub(0, { tab: true, renameFails: true, ...opts });
       const warned: string[] = [];
       const console0 = console.error;
       console.error = (...a: unknown[]) => void warned.push(a.join(" "));
@@ -1722,7 +1711,7 @@ describe("HerdrDriver narrator pane (T2)", () => {
         await expect(
           new HerdrDriver(stuck.bin).narrator(stuck.cwd, "tickmarkr status --watch run-board", "run-board"),
           why,
-        ).rejects.toThrow(/swap above failed[\s\S]*split pane w1:p7 survived its close/i);
+        ).rejects.toThrow(/rename failed[\s\S]*split pane w1:p7 survived its close/i);
       } finally {
         console.error = console0;
       }
@@ -1739,12 +1728,12 @@ describe("HerdrDriver narrator pane (T2)", () => {
     const ok = makeStub(0, { tab: true });
     const slot = await new HerdrDriver(ok.bin).narrator(ok.cwd, "tickmarkr status --watch run-board", "run-board");
     const okCalls = readFileSync(ok.log, "utf8");
-    expect(okCalls).toContain(STACK_SPLIT);
-    expect(okCalls).toContain("pane swap --source-pane w1:p7 --target-pane wTEST:pCALLER");
+    expect(okCalls).toContain(SIDE_SPLIT);
+    expect(okCalls).not.toContain("pane swap"); // one operation places it; nothing to verify after
     expect(slot).toEqual({ id: "w1:p7", name: "tickmarkr:watch:run:0:run-board", cwd: ok.cwd });
     expect(okCalls).toContain("pane rename w1:p7 tickmarkr:watch:run:0:run-board"); // the named board pane
     expect(okCalls.match(/pane run w1:p7 printf .*tickmarkr status --watch run-board/g)).toHaveLength(1);
-    expect(okCalls).not.toContain("pane close w1:p7"); // a board that swapped is kept, not closed
+    expect(okCalls).not.toContain("pane close w1:p7"); // a board that placed is kept, not closed
     expect(listed(ok)).toContain("w1:p7 tickmarkr:watch:run:0:run-board"); // the board is live and named
     // the placement never asks how wide the caller is again — width chose the arrangement twice and
     // was wrong twice, so no layout read of the caller pane remains on this path.

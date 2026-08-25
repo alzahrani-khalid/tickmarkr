@@ -38,6 +38,27 @@ export const DIST_COUPLED_TESTS = [
 
 export const SIGNAL_REAPER_TESTS = ["tests/run/reconcile-live.test.ts"];
 
+// OBS-618: the fork budget tickmarkr already sets, that nothing on this side ever read.
+// `src/run/git.ts` writes VITEST_MAX_FORKS (FORK_CAP_ENV, DEFAULT_FORK_CAP "6") into EVERY child it
+// spawns — gate batteries, baseline capture, tip verify — and derives it from the run's concurrency so
+// one run's suites divide the machine by that run's number. But **vitest has no VITEST_MAX_FORKS**, and
+// this config never read it, so the cap was a NO-OP: gate suites ran at vitest's default (~cores-1; an
+// 18-core machine measured 19-23 concurrent forks) while the daemon believed it had capped them at 6.
+//
+// Each fork spawns daemons that themselves spawn `git`, so the counts MULTIPLY and exhaust the fork
+// table. `spawn EAGAIN` then surfaces inside a test as `expected [] to have a length of N` — a resource
+// failure wearing an assertion failure's clothes. Six gates died that way in one run, across two tasks
+// with no shared file (T1, T3) and two vendors (claude, codex), at load1 as low as 2.21.
+//
+// Read ONLY when the variable is present and sane, so a developer's plain `npm test` keeps full
+// parallelism and only tickmarkr's own children are capped — which is exactly what the daemon intended
+// to be true all along. This is not the "cap chosen without evidence" the v1.60 scope consult forbade;
+// the evidence is above, and the number is the daemon's own.
+const FORK_CAP = Number.parseInt(process.env.VITEST_MAX_FORKS ?? "", 10);
+const FORK_CAP_POOL = Number.isFinite(FORK_CAP) && FORK_CAP > 0
+  ? { poolOptions: { forks: { maxForks: FORK_CAP } } }
+  : {};
+
 // Report-26 birpc-starver class (Q72s): on the 2-core hosted runner the single vitest worker
 // starves its own birpc channel under long SYNCHRONOUS work — first 4/4 deterministic
 // end-of-suite kills (docs-truth member sweep, remedied by async spawn), then run 31452816678
@@ -66,6 +87,9 @@ export default defineConfig({
           name: "suite",
           include: ["tests/**/*.test.ts"],
           exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS, ...SYNC_HEAVY_TESTS],
+          // the only PARALLEL project — the other three already pin singleFork, so this is the one
+          // that was running at ~cores-1 while the daemon believed it had said 6.
+          ...FORK_CAP_POOL,
         },
       },
       {

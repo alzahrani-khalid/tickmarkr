@@ -120,13 +120,15 @@ describe("HerdrDriver.reconcile (stubbed binary)", () => {
     await expect(garbage.reconcile(new Set(), RUN)).resolves.toBeUndefined();
   });
 
-  test("narrator with a runId names the stacked-above watch pane canonically (T2 ownership contract)", async () => {
+  test("narrator with a runId names the side-by-side watch pane canonically (T2 ownership contract)", async () => {
     const { bin, log } = makeReconcileStub([]);
     const d = new HerdrDriver(bin);
     await d.narrator("/tmp", `tickmarkr status --watch ${RUN}`, RUN);
     expect(log()).not.toContain("pane layout --pane wT:pCALLER"); // v1.99 T2: width never picks the arrangement
-    expect(log()).toContain("pane split wT:pCALLER --direction down --ratio 0.72 --no-focus");
-    expect(log()).toContain("pane swap --source-pane w1:p7 --target-pane wT:pCALLER"); // board ABOVE the caller
+    // 6c624ab9: the board is split to the RIGHT of the caller, and the swap is GONE — a right split
+    // lands the new pane beside the caller in ONE operation, so there is no second call to verify.
+    expect(log()).toContain("pane split wT:pCALLER --direction right --ratio 0.5 --no-focus");
+    expect(log()).not.toContain("pane swap"); // nothing to swap: the split already placed it
     expect(log()).toContain(`pane rename w1:p7 ${owned("watch", "run", 0, RUN)}`);
   });
 });

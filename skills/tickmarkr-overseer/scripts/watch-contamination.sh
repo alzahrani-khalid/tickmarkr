@@ -1,5 +1,5 @@
 #!/bin/bash
-# watch-contamination.sh — wake the AUTHORITY seat when a gate VERDICT may be contaminated.
+# watch-contamination.sh â wake the AUTHORITY seat when a gate VERDICT may be contaminated.
 #
 # Operator, 2026-08-07: "that is the kind of job I need overseer to be vigilant about."
 #
@@ -30,7 +30,7 @@ INFRA_RE='vitest-worker|Timeout calling|JS heap out of memory|ENOMEM|EAGAIN|spaw
 
 load1() { uptime | sed 's/.*load averages*: *//' | awk '{print $1}' | tr -d ','; }
 # Count real vitest runners only. `pgrep -f vitest` over-counts by an order: it matches the WORD
-# in any argv — worker prompts, VITEST_MAX_FORKS in shell strings (measured 7 vs 2 real, 2026-08-10).
+# in any argv â worker prompts, VITEST_MAX_FORKS in shell strings (measured 7 vs 2 real, 2026-08-10).
 # [v] keeps the pattern from matching its own grep. Forked workers retitle to "node (vitest N)" (comm).
 vitest_n() { ps -axo comm,command 2>/dev/null | grep -Ec 'node_modules/(\.bin/)?[v]itest|[v]itest/dist/|\([v]itest [0-9]+\)'; }
 
@@ -47,7 +47,11 @@ while [ "$elapsed" -lt "$CAP" ]; do
   elapsed=$((elapsed + POLL))
 
   L=$(load1); V=$(vitest_n)
-  Li=${L%%.*}; [ -z "$Li" ] && Li=0
+  # OBS-585: strip at the first NON-DIGIT, never at "." - a locale that renders the load average
+  # with U+066B (3٫48) or a comma leaves the period-strip a no-op, the numeric test below then
+  # errors, and its 2>/dev/null hides that, so the LOAD trigger dies silently at every load.
+  # Proven against the incident this watcher exists for: 35٫26 vs ceiling 24 never fired.
+  Li=$(printf %s "$L" | sed "s/[^0-9].*//"); [ -z "$Li" ] && Li=0
 
   if [ -f "$J" ]; then
     seen=$(cat "$STATE" 2>/dev/null); [ -z "$seen" ] && seen=0
@@ -63,7 +67,7 @@ while [ "$elapsed" -lt "$CAP" ]; do
         task=$(printf '%s' "$hit" | sed -n 's/.*"taskId":"\([^"]*\)".*/\1/p')
         gate=$(printf '%s' "$hit" | sed -n 's/.*"gate":"\([^"]*\)".*/\1/p')
         echo "CONTAMINATED_VERDICT task=$task gate=$gate load=$L vitest=$V"
-        echo "  an infra fingerprint appeared in a FAILED gate — this red is not evidence about the diff"
+        echo "  an infra fingerprint appeared in a FAILED gate â this red is not evidence about the diff"
         echo "  ruling owed: is the attempt chargeable? (OBS-426: infra failures are not)"
         exit 0
       fi
@@ -77,4 +81,4 @@ while [ "$elapsed" -lt "$CAP" ]; do
   fi
 done
 
-echo "WATCH_CAP_REACHED load=$(load1) vitest=$(vitest_n) — no contaminated verdict seen in ${CAP}s"
+echo "WATCH_CAP_REACHED load=$(load1) vitest=$(vitest_n) â no contaminated verdict seen in ${CAP}s"

@@ -364,10 +364,30 @@ export function ceilingKillResult(gate: string, r: ShResult, ceilingMs: number):
   };
 }
 
+/**
+ * OBS-612: the capture gets its OWN ceiling, thirty minutes, and it is not the shell default.
+ *
+ * `captureBaseline` used to call `sh(cmd, cwd)` with no ceiling argument, so it inherited
+ * `DEFAULT_SHELL_TIMEOUT_MS` (600s) — while every CONSUMER of the result sizes its ceiling with
+ * `effectiveCeilingMs`. A repo whose suite runs longer than ten minutes therefore had its capture
+ * SIGKILLed every single time, recording `{infra: true, fingerprints: []}`, and `freshFailures`
+ * correctly forgives nothing for an infra entry. The result is a baseline that forgives nothing on a
+ * repo that has pre-existing failures — every task gate reds on failures the diff did not cause.
+ *
+ * Measured before it was fixed: EIGHT consecutive runs of this repository, 2026-08-20 to 2026-08-25,
+ * every one killed within 325ms of 600000ms on a suite that needs ~700s. That tight a cluster is a
+ * hard timeout, not variable failure. Each of those captures dutifully computed and stored
+ * `ceilingMs ≈ 1800000` — the right answer — which the next run never read.
+ *
+ * A capture is a MEASUREMENT of how long the suite takes; giving it the same ceiling as an ordinary
+ * shell asks it to finish faster than the thing it is measuring.
+ */
+export const CAPTURE_CEILING_MS = 1_800_000;
+
 export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   for (const [name, cmd] of Object.entries(commands)) {
-    const r = await sh(cmd, cwd);
+    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS);
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
     // ponytail: a capture that was itself killed records the ceiling as its "measurement", which
     // scales the next ceiling up — the right direction for a suite that never finished once.
@@ -382,6 +402,16 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
     // it is the one thing the kill did establish — and still scales the next ceiling up.
     // `timedOut` is set in exactly one place (git.ts's kill timer), so no ordinary exit reaches here.
     if (r.timedOut === true) {
+      // OBS-612: SAY SO. An unbaselinable command is invisible on every surface — `status` reports
+      // gates and supervision, never "your baseline forgives nothing" — so eight runs of this repo
+      // passed through here in silence while every later gate paid for it. The operator reads this
+      // line at run start, BEFORE any task gate reds, which is the whole point: the failure is
+      // otherwise indistinguishable from a repo that simply has flaky tests.
+      console.error(
+        `tickmarkr: baseline capture for "${name}" was killed at its ${CAPTURE_CEILING_MS}ms ceiling — `
+        + `it recorded NO fingerprints, so nothing is forgiven and every gate will treat a pre-existing `
+        + `failure as a fresh one. Raise the ceiling or shorten the command.`,
+      );
       base.commands[name] = { infra: true, fingerprints: [], durationMs, ceilingMs: effectiveCeilingMs({ durationMs }) };
       continue;
     }

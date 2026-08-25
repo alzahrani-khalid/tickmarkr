@@ -635,10 +635,34 @@ const foldTaskEffort = (tasks: readonly Task[], events: readonly JournalEvent[])
   );
 };
 
-// Attention (review) and failure (park) wear the ONE amethyst, so the bar segments and their legend
-// markers carry the distinction in SHAPE: a full block for dispatch, light shade for a review round,
-// dark shade for a human park. Same display width, so the fitted bar keeps its measured columns.
-const EFFORT_GLYPH = { dispatch: "\u2588", review: "\u2592", park: "\u2593" } as const;
+// ONE glyph for every segment, distinction by COLOUR. This was shade-based — full block for dispatch,
+// light shade for a review round, dark shade for a human park — because attention and failure share the
+// ONE amethyst and shape was their only discriminator. OPERATOR 2026-08-25, with a screenshot: the rows
+// rendered at DIFFERENT HEIGHTS. A row carrying the shade glyphs pulls a fallback font whose cell box is
+// taller, so the whole line grows and its full blocks stretch with it — T1 (dispatch+review+park) stood
+// visibly taller than T3 (dispatch only). Same display WIDTH was verified and preserved; nobody checked
+// height, and the fitted-column arithmetic cannot see it.
+//
+// So review moves off amethyst onto `information` (cornflower) — an EXISTING token. Deliberately not a
+// new amber: brand.ts calls the five live colours operator-approved and says "no token introduces a
+// sixth colour", and a bar chart is not the place to spend that.
+//
+// The shape scheme existed so a reader WITHOUT colour could still separate a review round from a human
+// park. That reader does not exist on this panel. `renderFrame` computes `const unicode = visual()`
+// (`visual()` = `isTTY === true && NO_COLOR === undefined`) and, when it is false, EARLY-RETURNS the
+// ASCII machine/CI surface at the `if (!unicode)` branch — which sits ABOVE the `effortPanel(...)` call
+// below, so the panel is never built on that path. Measured before it was explained: a frame rendered
+// with isTTY=true and NO_COLOR=1 contains no "WHERE THE EFFORT WENT" and no block glyph at all.
+// (The `--watch` loop has its own `visual()` gate; that one is NOT what suppresses this panel, and the
+// non-watch path reaches renderFrame unconditionally.) So the shades were paying an accessibility cost
+// on a surface that cannot render colourless, and a conditional to restore them under NO_COLOR would
+// have been an unreachable branch (the v1.80 injected-clock lesson: the fix for that is deletion).
+//
+// One glyph, three colours. Review moves off amethyst onto `information` (cornflower) — an EXISTING
+// token, deliberately not a new amber: brand.ts calls the five live colours operator-approved and says
+// "no token introduces a sixth colour". Every row now draws the same block, which is what makes the
+// rows equal height.
+const EFFORT_GLYPH = { dispatch: "\u2588", review: "\u2588", park: "\u2588" } as const;
 
 /**
  * Prototype panel, fitted by the cockpit's display-cell authority before board-wide wrapping.
@@ -672,7 +696,7 @@ const effortPanel = (
     const reviewEnd = Math.round(((task.dispatches + task.reviews) / maxTotal) * barColumns);
     const parkEnd = Math.round((task.total / maxTotal) * barColumns);
     const stack = ok(EFFORT_GLYPH.dispatch.repeat(dispatchEnd))
-      + warn(EFFORT_GLYPH.review.repeat(Math.max(0, reviewEnd - dispatchEnd)))
+      + information(EFFORT_GLYPH.review.repeat(Math.max(0, reviewEnd - dispatchEnd)))
       + fail(EFFORT_GLYPH.park.repeat(Math.max(0, parkEnd - reviewEnd)));
     return `${prefix}${fitCells(stack, barColumns)}  ${counts}`;
   });
@@ -683,7 +707,7 @@ const effortPanel = (
     "",
     ...rows,
     "",
-    `   ${ok(EFFORT_GLYPH.dispatch)} ${dim("dispatch")}  ${warn(EFFORT_GLYPH.review)} ${dim("review round")}  ${fail(EFFORT_GLYPH.park)} ${dim("human park")}`,
+    `   ${ok(EFFORT_GLYPH.dispatch)} ${dim("dispatch")}  ${information(EFFORT_GLYPH.review)} ${dim("review round")}  ${fail(EFFORT_GLYPH.park)} ${dim("human park")}`,
   ];
 };
 

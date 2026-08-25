@@ -23,7 +23,10 @@ import { COMMIT, authedModels, makeTestTempDir, setupRepo, T } from "../helpers/
 
 const CORES = availableParallelism();
 /** The guarantee, restated independently of the implementation. */
-const expectedCap = (concurrency: number) => Math.max(1, Math.floor(CORES / concurrency));
+// OBS-618: the guarantee now divides by the SPAWN FAN-OUT as well as by concurrency, because one
+// vitest fork can hold a daemon and that daemon's git child. Restated here independently of the
+// implementation — if this line and git.ts's formula are edited to agree by copying, the pin is dead.
+const expectedCap = (concurrency: number) => Math.max(1, Math.floor(CORES / (concurrency * 3)));
 
 const logCmd = (log: string) => `printf '%s\\n' "\${${FORK_CAP_ENV}-unset}" >> ${log}`;
 
@@ -182,16 +185,28 @@ describe("per-run fork budget (fake adapter, zero tokens)", () => {
       .toBe(CORES > 1 ? CORES - 1 : 1);
     expect(points[2]).toBeGreaterThan(CORES);
 
-    for (const concurrency of points) {
+    // ⚠ OBS-618: THE THREE POINTS ABOVE CANNOT DISCRIMINATE THE FORMULA. At concurrency >= CORES-1
+    // both the old floor(cores/concurrency) and the current floor(cores/(concurrency*3)) bottom out
+    // at the minimum of 1, so every observed cap is 1 under EITHER and the run proves only that
+    // SOMETHING propagated. A low-concurrency point is what makes this test bite: at concurrency 2 on
+    // any machine with >= 12 cores the two formulas give different numbers, and the cap that reaches
+    // the gate shells is compared against the independent restatement — so a revert in git.ts OR a
+    // silent edit of expectedCap reds here, which comparing the implementation to itself never could.
+    const discriminating = CORES >= 12 ? [2] : [];
+    for (const concurrency of discriminating) {
+      expect(expectedCap(concurrency), `concurrency ${concurrency} must not read as the old floor(cores/concurrency)`)
+        .not.toBe(Math.max(1, Math.floor(CORES / concurrency)));
+    }
+
+    for (const concurrency of [...discriminating, ...points]) {
       const r = budgetRepo(`formula-${concurrency}`);
       await start(r, concurrency);
       const cap = expectedCap(concurrency);
       expect(cap, `cap at concurrency ${concurrency} is at least one`).toBeGreaterThanOrEqual(1);
-      expect(cap, `cap at concurrency ${concurrency} is floor(${CORES}/${concurrency})`)
-        .toBe(Math.max(1, Math.floor(CORES / concurrency)));
-      // The guarantee the formula exists to buy: total test parallelism across the run.
-      expect(cap * concurrency, `total parallelism at concurrency ${concurrency}`)
-        .toBeLessThanOrEqual(Math.max(CORES, concurrency));
+      // OBS-618: the guarantee the formula exists to buy is a bound on PROCESSES, not on forks —
+      // one vitest fork can hold a daemon and that daemon's git child.
+      expect(cap * concurrency * 3, `total process demand at concurrency ${concurrency}`)
+        .toBeLessThanOrEqual(Math.max(CORES, concurrency * 3));
       expectRun(`concurrency ${concurrency} (cores ${CORES})`, r, cap);
     }
   }, 600000);

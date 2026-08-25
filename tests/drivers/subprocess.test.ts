@@ -140,7 +140,10 @@ describe("SubprocessDriver", () => {
     delete process.env[FORK_CAP_ENV];
     try {
       const cores = availableParallelism();
-      const cap = String(Math.max(1, Math.floor(cores / 4)));
+      // OBS-618: the guarantee divides by the SPAWN FAN-OUT as well as by concurrency — one vitest
+      // fork can hold a daemon and that daemon's git child, so counting forks under-counted the
+      // processes the fork table actually sees. Restated here independently of git.ts on purpose.
+      const cap = String(Math.max(1, Math.floor(cores / (4 * 3))));
       await runWithForkBudget(4, async () => {
         expect(sealHerdrEnv(process.env)[FORK_CAP_ENV]).toBe(cap);
         expect(herdrSealShellPrefix(process.env)).toMatch(new RegExp(`export ${FORK_CAP_ENV}='?${cap}'?;`));

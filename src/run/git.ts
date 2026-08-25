@@ -36,14 +36,34 @@ export const DEFAULT_FORK_CAP = "6";
 const forkBudget = new AsyncLocalStorage<string>();
 
 /**
- * cap = max(1, floor(cores / concurrency)). Total test parallelism is then cap × concurrency, which
- * never exceeds max(cores, concurrency): at or below the core count the floor keeps the product
- * under `cores`, and above it the floor is 0 so the minimum of 1 pins the product to `concurrency`
- * itself. (The tempting `cap × concurrency ≤ cores` is unsatisfiable once concurrency > cores —
- * a run cannot give a suite less than one fork.)
+ * OBS-618: how many PROCESSES one vitest fork can hold at its peak — the fork, a daemon it spawns,
+ * and that daemon's own `git` child. The previous formula counted FORKS and assumed one process
+ * each, which is the assumption this suite violates by design: its tests spawn daemons that spawn
+ * git, so demand is a MULTIPLE of the cap and the fork table sees that multiple, not the cap.
+ *
+ * Measured, not guessed: on an 18-core machine at `concurrency: 1` the old formula authorised 18
+ * forks. Six gate batteries across two tasks with no shared file (T1, T3) and two vendors (claude,
+ * codex) then died on `spawn EAGAIN` — at load1 as low as 2.21, so this is fork-table exhaustion and
+ * not CPU saturation. 18 ÷ 3 = 6, which is exactly the value `DEFAULT_FORK_CAP` was already set to;
+ * the number was right and only the derivation was missing.
+ */
+export const SPAWN_FANOUT = 3;
+
+/**
+ * cap = max(1, floor(cores / (concurrency × SPAWN_FANOUT))). Total PROCESS demand is then
+ * cap × concurrency × SPAWN_FANOUT, which stays at or under `cores` wherever the floor is non-zero,
+ * and the `max(1, …)` pins it to one fork per run when the machine is too small to divide — a run
+ * cannot give a suite less than one fork.
+ *
+ * Portable by construction: `availableParallelism()` reports the CPUs actually usable by this
+ * process (it honours CPU affinity), so a 2-core CI runner derives 1, an 18-core workstation derives
+ * 6, and a 64-core host derives 21 — no machine is named anywhere and no value is pinned.
+ * ⚠ It is a FLOOR of 1, never 0: on a small host the cap stops dividing and the protection this
+ * provides runs out. That is the honest bound — a 2-core runner at concurrency 1 gets one fork and
+ * the fan-out is then bounded by the suite itself, not by us.
  */
 export const deriveForkCap = (concurrency: number, cores: number = availableParallelism()): number =>
-  Math.max(1, Math.floor(cores / Math.max(1, concurrency)));
+  Math.max(1, Math.floor(cores / (Math.max(1, concurrency) * SPAWN_FANOUT)));
 
 /** Run `fn` with the fork budget this run's resolved concurrency implies. */
 export const runWithForkBudget = <T>(concurrency: number, fn: () => Promise<T>): Promise<T> =>

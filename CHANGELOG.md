@@ -4,6 +4,21 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.1** — a patch that fixes what was making this repository's own gates unreliable, plus two
+operator-facing cockpit corrections.
+
+- The run board is placed to the RIGHT of the orchestrator pane instead of stacked above it, and the
+  effort bars draw one uniform glyph so rows cannot render at different heights. Both are visible
+  changes to the live board.
+- `captureBaseline` gets its own thirty-minute ceiling. It previously inherited the 600s shell
+  default while every consumer of its result sized its own ceiling separately, so on any repository
+  whose suite runs longer than ten minutes the capture was killed every time, recorded no
+  fingerprints, and left every gate forgiving nothing. It now also says so when it is killed.
+- The `VITEST_MAX_FORKS` budget the daemon writes into every child is finally read, and the cap is
+  derived from processes rather than forks — one fork can hold a daemon and that daemon's git child,
+  so counting forks under-counted what the fork table sees. Cap scales with the machine.
+- `seat-send.sh` no longer reports a delivered message as unsent when the receiving TUI echoes it.
+
 tickmarkr can drive [Orca](https://orca.computer) worktrees the way it drives herdr panes: a second
 execution surface behind the same driver contract, chosen explicitly rather than inferred. Session
 and read integrity, terminal placement and reconcile ownership, driver selection with the doctor

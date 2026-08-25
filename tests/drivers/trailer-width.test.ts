@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parseWorkerResult } from "../../src/adapters/prompt.js";
-import { BOARD_HEIGHT_SHARE, boardSplitPlan, TRAILER_SAFE_FLOOR_COLS, TRAILER_WIDTH_MARGIN, workerSplitDirection, type BoardPlacement } from "../../src/drivers/herdr.js";
+import { BOARD_WIDTH_SHARE, boardSplitPlan, TRAILER_SAFE_FLOOR_COLS, TRAILER_WIDTH_MARGIN, workerSplitDirection, type BoardPlacement } from "../../src/drivers/herdr.js";
 
 const FIX = join(import.meta.dirname, "../fixtures/trailer-width");
 const MEAS = FIX;
@@ -81,15 +81,18 @@ describe("workerSplitDirection (43-MEASUREMENT.md licensed geometry)", () => {
 // seat, and the width-first side split put the board shoulder to shoulder with the narration it is
 // supposed to sit above. The plan is now one record: stacked above the caller, full width, 72% of
 // the height, whatever the terminal measures.
-describe("boardSplitPlan (the invariant vertical stack)", () => {
+describe("boardSplitPlan (the invariant side-by-side placement)", () => {
   // the closed matrix: the incident geometry, the two widths the side split used to switch between,
   // a degenerate terminal, and the unmeasurable caller every earlier plan fell back on.
   const CALLER_WIDTH_MATRIX: (number | null)[] = [null, 0, 2, 40, 108, 140, 149, 150, 189, 220, 400];
 
-  test("test: the board-placement plan remains invariant across the closed caller-width matrix and equals the single approved vertical-stack record, whereas any width-sensitive record fails", () => {
-    const APPROVED: BoardPlacement = { direction: "down", ratio: 0.72, swap: "above" };
+  test("test: the board-placement plan remains invariant across the closed caller-width matrix and equals the single approved side-by-side record, whereas any width-sensitive record fails", () => {
+    // The ARRANGEMENT changed on operator instruction 2026-08-25 (board to the RIGHT of the caller,
+    // no swap); the INVARIANCE this test was built to defend did not, and is what the matrix below
+    // still proves. The width-sensitive control is retained unchanged for exactly that reason.
+    const APPROVED: BoardPlacement = { direction: "right", ratio: 0.5 };
     expect(boardSplitPlan()).toEqual(APPROVED); // the plan an unmeasured caller gets
-    expect(BOARD_HEIGHT_SHARE).toBe(0.72); // board 72 / narration 28
+    expect(BOARD_WIDTH_SHARE).toBe(0.5); // narration 50 / board 50
 
     for (const callerCols of CALLER_WIDTH_MATRIX) {
       expect(boardSplitPlan(callerCols), String(callerCols)).toEqual(APPROVED);

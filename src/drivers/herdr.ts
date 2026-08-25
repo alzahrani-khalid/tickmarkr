@@ -93,26 +93,38 @@ export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILE
 // placement any more. Every width-derived variant of this placement has been wrong in the operator's
 // tab: the halving floor sent a 189-column board below the seat (2026-08-18), and the width-first
 // side split that replaced it puts the board and the narration shoulder to shoulder when the board is
-// the surface the operator reads and the narration is the rail beneath it. The placement is now ONE
-// record — the board stacked ABOVE the caller at full width, taking 72% of the height — and it is
-// invariant: no terminal width, measured or unmeasurable, can select a different arrangement.
-export const BOARD_HEIGHT_SHARE = 0.72; // board 72 / narration 28, the operator's stack
+// the surface the operator reads and the narration is the rail beneath it. The placement is ONE
+// record and it is invariant: no terminal width, measured or unmeasurable, can select a different
+// arrangement. THAT invariance is the hard-won part and it is unchanged here.
+//
+// What the record SAYS changed on operator instruction (2026-08-25): the board sits to the RIGHT of
+// the caller, not stacked above it. The vertical stack gave the board 72% of the HEIGHT at full
+// width, and in the operator's own tab that was mostly empty board over a squeezed narration rail —
+// a task table is a handful of rows, so height was the axis it did not need and the narration did.
+// Side by side spends the axis the board actually uses.
+//
+// ⚠ This is NOT a return to the width-derived placement that was wrong twice. Those variants let the
+// MEASURED width choose the arrangement, so the same run rendered differently in different terminals
+// and neither operator nor test could name one expected geometry. This record is constant: every
+// caller width gets `right`, and `boardSplitPlan` still ignores the columns it is handed. The
+// invariance test's width-sensitive control still fails, which is the property that mattered.
+export const BOARD_WIDTH_SHARE = 0.5; // narration 50 / board 50, side by side
 
 export interface BoardPlacement {
-  /** Always down: the split is vertical, so the board can own the caller's FULL width. */
-  direction: "down";
-  /** herdr's split ratio is the FIRST child's share, and a down split's first child is the TOP
-   *  region — the region the board occupies once it is swapped above the caller. */
+  /** Always right: the board sits BESIDE the caller, so the narration keeps a column of its own. */
+  direction: "right";
+  /** herdr's split ratio is the FIRST child's share, and a right split's first child is the LEFT
+   *  region — the caller's, i.e. the narration. The board takes the remainder, on the right.
+   *  Measured against a live herdr 2026-08-25: a 256-col caller split right at 0.5 leaves the caller
+   *  at x=36 w=128 and puts the NEW pane at x=164 w=128. */
   ratio: number;
-  /** The new pane is swapped ABOVE the caller; the split alone would leave the board underneath. */
-  swap: "above";
 }
 
-/** The single approved vertical-stack record. The caller's columns are accepted and deliberately
+/** The single approved side-by-side record. The caller's columns are accepted and deliberately
  *  ignored: this signature is where width used to decide the arrangement, and the parameter stays
  *  so that "the plan does not depend on it" is a property a caller (and a test) can exercise. */
 export function boardSplitPlan(_callerCols?: number | null): BoardPlacement {
-  return { direction: "down", ratio: BOARD_HEIGHT_SHARE, swap: "above" };
+  return { direction: "right", ratio: BOARD_WIDTH_SHARE };
 }
 
 // VIS-04 role-tab + VIS-09 item 2 cap/overflow: live members of one ref-counted tab (a GENERATION);
@@ -1158,14 +1170,15 @@ export class HerdrDriver implements ExecutorDriver {
     }).map((p) => p.pane_id!);
   }
 
-  // T2: the watch is a sibling of the daemon's own pane, never a separate tab — stacked ABOVE it at
-  // the caller's full width, always, whatever the terminal measures. Its durable owned name is how a
+  // T2: the watch is a sibling of the daemon's own pane, never a separate tab — placed to the RIGHT
+  // of it, always, whatever the terminal measures. Its durable owned name is how a
   // later daemon RECOGNIZES the board it must retire, so a run never stacks a second one.
   private async watchSlot(cwd: string, name: string): Promise<Slot> {
     if (!this.ws) throw new Error("herdr watch placement requires HERDR_WORKSPACE_ID — refusing unseeded pane");
     if (!this.callerPane) throw new Error("herdr watch placement requires HERDR_PANE_ID — refusing untargeted split");
-    // One invariant placement (boardSplitPlan): split the caller down, then swap the new pane above
-    // it. No layout read decides this — width chose the arrangement twice and was wrong twice.
+    // One invariant placement (boardSplitPlan): split the caller RIGHT. No layout read decides this —
+    // width chose the arrangement twice and was wrong twice. No swap: a right split already lands the
+    // new pane — the board — beside the caller, so there is no second operation to verify.
     const plan = boardSplitPlan();
     const sp = await this.herdr(`pane split ${shq(this.callerPane)} --direction ${plan.direction} --ratio ${plan.ratio} --no-focus`);
     if (sp.code !== 0) throw new Error(`herdr watch split failed: ${sp.stderr || sp.stdout}`);
@@ -1176,34 +1189,12 @@ export class HerdrDriver implements ExecutorDriver {
       /* fail closed below */
     }
     if (typeof pane !== "string" || !pane) throw new Error(`herdr watch split returned no pane id: ${sp.stdout}`);
-    // The split leaves the board UNDER the caller; the swap is what makes the stack the requested
-    // one. Verified, not assumed: a swap that failed would leave a board below the narration while
-    // the daemon reported the geometry it asked for. Instead the split pane is closed and the failure
-    // propagates — the daemon swallows it and runs boardless, which is honest about what is on screen.
-    // `pane swap` answers a no-op with a ZERO exit and `changed:false` (herdr socket API: a swap it
-    // declined is a non-error response), so an exit code alone proves nothing about the geometry —
-    // that is exactly the path that would leave the board below the narration while the daemon
-    // reported the stack. The documented `changed` flag is the verification; anything else — a
-    // nonzero exit, `changed:false`, an unparseable result — fails closed.
-    const swapped = await this.herdr(`pane swap --source-pane ${shq(pane)} --target-pane ${shq(this.callerPane)}`);
-    // Flag lives at `result.swap.changed` (verbatim 0.8.0); see herdr-swap-shape.test.ts.
-    let swapChanged: unknown;
-    try {
-      const result = JSON.parse(swapped.stdout).result;
-      swapChanged = result?.swap?.changed ?? result?.changed;
-    } catch {
-      /* fail closed below */
-    }
-    if (swapped.code !== 0 || swapChanged !== true) {
-      await this.discardSplit(
-        pane,
-        `herdr watch swap ${plan.swap} failed: ${
-          swapped.code !== 0
-            ? swapped.stderr || swapped.stdout
-            : `herdr reported no swap took place: ${swapped.stdout || swapped.stderr}`
-        }`,
-      );
-    }
+    // No swap step to verify any more. The stack needed one — the split landed the board UNDER the
+    // caller and only the swap made the geometry the requested one, so a `pane swap` that no-opped
+    // with a ZERO exit could leave a board below the narration while the daemon reported the stack;
+    // the `changed` flag existed to catch exactly that. A right split places the board where it
+    // belongs in ONE operation that either returns a pane id or throws above, so there is no
+    // second-operation gap left to fail closed on.
     const renamed = await this.herdr(`pane rename ${shq(pane)} ${shq(name)}`);
     if (renamed.code !== 0 || await this.namedPaneId(name) !== pane) {
       await this.discardSplit(pane, `herdr watch rename failed: ${renamed.stderr || renamed.stdout}`);

@@ -49,6 +49,20 @@ function flatCpuProbe(): () => void {
   };
 }
 
+// OBS-607: the fast-kill cannot conclude inside ONE poll slice — slice one arms the CPU
+// accountant (which reads `cpu-accruing`, never flat) and only slice two can read it flat. A slice
+// is pinned to stallWindowMs/2 (daemon.ts:2300), so a two-slice verdict costs the WHOLE window and
+// the only slack is whatever is left of the first half after slice one's own work: four `git`
+// observation spawns, the accountant's start, a `ps` snapshot, a status read and a pane read.
+// Measured on an idle host, the verdict lands at 391ms of a 360ms window with the accountant armed
+// at 218ms — 142ms of slack for six process spawns. Under the suite's fork pressure that slack is
+// spent, slice two never starts, and the control reports "expected [] to have a length of 1" as if
+// the daemon had refused to kill a dead channel. 0.02min holds the same two-slice shape with ~560ms
+// of slack (measured: armed 639ms, verdict 1234ms). The DISCRIMINATORS are untouched — the kill
+// still fires at 60ms of silence against a 50ms flat-CPU window, both far below this window — so a
+// change in the daemon's verdict still fails here; only the room to reach the verdict grew.
+const FAST_KILL_WINDOW_MINUTES = 0.02;
+
 const STALLED = {
   consult: { action: "human", notes: "controlled stalled worker" },
   tasks: { T1: [{ shell: "echo working-on-it; sleep 5" }] },
@@ -97,6 +111,23 @@ const eventsOf = (repo: string, runId: string): JournalEvent[] => Journal.open(r
 const taskEventTime = (events: JournalEvent[], event: string): number =>
   Date.parse(events.find((row) => row.event === event && row.taskId === "T1")!.ts);
 
+// OBS-607: the two control cases below assert that a readable, UNCHANGED tree is journaled
+// worker-dead. Two of the kill's four legs are SUBPROCESS readings — the tree observation (four
+// `git` spawns per slice) and the CPU accountant (a `ps` snapshot per sample) — and under the
+// suite's own fork pressure either can fail to spawn (EAGAIN). The daemon then stands down
+// FAIL-CLOSED and names the reason: an unreadable tree is not an unchanged one, and unmeasurable
+// CPU is not a resting worker. Both stand-downs leave the control with NO worker-dead — byte for
+// byte the empty array a genuine regression leaves — so the premise is asserted first and the two
+// can never again be confused. `cpu-accruing` is the ordinary first-slice reading (the accountant
+// has just been armed and has not yet proven flat), not a stand-down.
+const infraStandDowns = (events: JournalEvent[]): string[] => events
+  .filter((row) => row.taskId === "T1"
+    && (row.event === "contact-unreadable"
+      || (row.event === "worker-dead-held" && (row.data as { reason?: string }).reason !== "cpu-accruing")))
+  .map((row) => (row.data as { reason?: string }).reason ?? row.event);
+const PREMISE = "the fast-kill stood down on an unreadable or unmeasurable probe: this repetition never "
+  + "observed the tree it is asserting about, so this is a spawn/resource failure, NOT the invariant";
+
 let restoreCpuProbe: () => void = () => {};
 beforeEach(() => { restoreCpuProbe = flatCpuProbe(); });
 
@@ -116,7 +147,7 @@ test("the observation runDaemon makes of a worker worktree differs between two r
 
   const run = async (name: string, setup: TreeSetup, act?: TreeAction) => {
     const runId = `run-worktree-signature-${name}`;
-    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.006 })], STALLED);
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: FAST_KILL_WINDOW_MINUTES })], STALLED);
     await runDaemon(repo, {
       adapters: [fake],
       runId,
@@ -166,6 +197,7 @@ test("the observation runDaemon makes of a worker worktree differs between two r
     expect(events.some((row) => row.event === "worker-dead" && row.taskId === "T1"), name).toBe(false);
   }
   expect(untouched.some((row) => row.event === "worker-contact" && row.data.evidence === "worktree")).toBe(false);
+  expect(infraStandDowns(untouched), PREMISE).toEqual([]);
   expect(untouched.filter((row) => row.event === "worker-dead" && row.taskId === "T1")).toHaveLength(1);
 }, 60_000);
 
@@ -177,7 +209,7 @@ test("an observation runDaemon cannot complete is recorded unreadable and never 
     resetObserveBudgetBytesForTests();
     if (budget !== undefined) setObserveBudgetBytesForTests(budget);
     const runId = `run-worktree-unreadable-${name}`;
-    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.006 })], STALLED);
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: FAST_KILL_WINDOW_MINUTES })], STALLED);
     await runDaemon(repo, { adapters: [fake], runId, driver: evidenceDriver({ setup }) });
     return eventsOf(repo, runId);
   };
@@ -206,6 +238,7 @@ test("an observation runDaemon cannot complete is recorded unreadable and never 
     expect(taskEventTime(events, "worker-result") - taskEventTime(events, "worker-launch"), name).toBeGreaterThan(250);
   }
   expect(unchanged.some((row) => row.event === "contact-unreadable")).toBe(false);
+  expect(infraStandDowns(unchanged), PREMISE).toEqual([]);
   expect(unchanged.filter((row) => row.event === "worker-dead" && row.taskId === "T1")).toHaveLength(1);
 }, 60_000);
 

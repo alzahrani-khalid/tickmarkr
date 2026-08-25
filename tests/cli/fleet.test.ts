@@ -1694,9 +1694,21 @@ review:
     const row = (model: string, channel: string) =>
       JSON.stringify({ taskId: "T1", shape: "docs", adapter: "fake", model, channel, attempts: 1, outcome: "done", durationMs: 1000, gateFails: 0, consults: 0 });
     writeFileSync(join(runDir, "telemetry.jsonl"), [...Array(6).fill(row("fake-1", "sub")), row("fake-2", "api")].join("\n") + "\n");
-    const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + "\x03", ["--global-dir", isolatedGlobal()]);
-    expect(out).toBe("fleet: quit without writing");
+    // OBS-607: this compares TWO RENDERED FRAMES — the Shapes row and the picker's rank-1 row — so
+    // both must actually paint. A one-chunk drive does not guarantee that: the runtime coalesces a
+    // render-timing-dependent number of frames, and under the suite's own fork pressure the Shapes
+    // frame and the picker frame collapse into one, leaving `docsRows` empty and the comparison
+    // reading `undefined` as if the two had disagreed. Split the writes and PROVE each frame
+    // painted before pressing the key that replaces it — the same contract the neighbouring
+    // shapes-economics drives already state. Nothing about the comparison itself is relaxed.
+    const { io, writes, input } = makeIO();
+    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    input.write(TO_DOCS);
+    await settle(() => docsRows(writes).some((l) => /fake:fake-\d/.test(l)));
+    input.write(KEYS.p);
+    await settle(() => strip(writes.join("")).includes("pin · docs"));
+    input.write("\x03");
+    expect(await done).toBe("fleet: quit without writing");
     const rowRouted = /fake:fake-\d/.exec(docsRows(writes).at(-1) ?? "")?.[0]; // the docs shape row
     const picker = writes.find((f) => strip(f).includes("pin · docs"))!;
     const rank1 = /fake:fake-\d/.exec(pointerLine(picker))?.[0]; // picker cursor starts on rank-1

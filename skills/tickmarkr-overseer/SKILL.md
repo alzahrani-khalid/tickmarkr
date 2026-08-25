@@ -69,9 +69,10 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    2026-07-29, re-earned 2026-08-17):**
    - `OVERSEER` — you. Do not add a second live run surface: the daemon self-places the shipped board
      ABOVE the supervising seat that invokes the run.
-   - `ORCH` — the orchestrator with the daemon-placed, run-id-pinned shipped board STACKED ABOVE it: the
-     board owns the tab's full width and the top 72% of its height, and the orchestrator's own narration
-     is the rail underneath. **Look for that `role: "watch"` pane; never hand-place or hand-roll a live
+   - `ORCH` — the orchestrator with the daemon-placed, run-id-pinned shipped board BESIDE it: the board
+     takes the RIGHT half of the tab and the orchestrator's own narration keeps the LEFT half. (It was a
+     full-width board above a narration rail until 2026-08-25; the operator changed it, because a task
+     table is a few rows and it was spending height it did not need while squeezing the narration.) **Look for that `role: "watch"` pane; never hand-place or hand-roll a live
      run surface. Nothing else, ever: a work seat NEVER splits into the ORCH tab.** Operator verbatim:
      *"in orch tab should be the orch and the watcher only."* Re-earned 2026-08-17: a planning seat split
      beside the orchestrator, and the operator caught it, again. The daemon owns this vertical stack and
@@ -140,8 +141,8 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
 ### What the ORCHESTRATOR does, and what you require of it
 
 - **The live surface arrives with the run.** `tickmarkr run` is stdout-silent until run-end by design;
-  its daemon self-places one shipped `role: "watch"` board ABOVE the supervising seat — full width, top
-  72% of the height, narration below — and pins that board to the daemon's run id. **Look for the matching
+  its daemon self-places one shipped `role: "watch"` board BESIDE the supervising seat — the right half
+  of the tab, narration on the left — and pins that board to the daemon's run id. **Look for the matching
   daemon-placed pane.** If it is absent, treat that as a daemon/run liveness fault and use the normal
   recovery path; never hand-place, hand-roll, or launch a replacement live surface. A board the daemon
   could not stack is not silently re-arranged: the split is closed and the run continues BOARDLESS, so an
@@ -347,6 +348,21 @@ they are left implicit:
   - Five distinct send failures in one leg — front-truncation, sitting unsubmitted, two silent losses,
     a probe that mistook its own echo for a reply — is what a prose send protocol costs under load:
     run `scripts/seat-send.sh` instead.
+- **A `pane run` into a pane whose FOREGROUND is busy is a DELAYED command, not a lost one.** The
+  shell buffers the line and executes it the instant the foreground process exits — which, when that
+  process is a run daemon, means *at run-end*, unattended, possibly hours later. Measured 2026-08-24: a
+  resume typed into the run pane while the daemon still held it fired by itself at the next run-end;
+  the seat that sent it read the later activity as an unattributed injection and nearly declared the
+  pane compromised. Two consequences: **check the target pane's foreground before sending** (a live
+  daemon owns it — send from your own shell instead), and **before attributing any unexplained
+  activity to an intruder, ask what YOU left buffered there.** The benign explanation is the common
+  one, and the alarming one costs a false security incident.
+- **A compound command that `cd`s POISONS every later relative path in the same call.** The Bash tool's
+  working directory persists, so `cd /tmp && …` followed by `cat .planning/x` silently reads the wrong
+  tree. Measured twice on 2026-08-24: once reading a worktree's config and nearly authoring a duplicate
+  fix for interims that were present all along, once failing a release export script that existed.
+  **State reads during supervision use ABSOLUTE paths**, and a read that contradicts what you believe
+  is a cue to check your cwd before you rewrite your model of the world.
 - **Guard-before-Enter** (race-safe prompt answering): chain with `&&` — pane get shows `blocked` && pane
   read shows the expected option under the cursor && only then send-keys. If no longer `blocked`, someone
   already answered; do nothing.
@@ -408,6 +424,24 @@ tier ages to `STALE` (never `ABSENT`) within six beats, which is the state that 
 Stand down explicitly when you hand off, or a deliberate exit reads as a death. Same rule as rule 29
 below, now with a conventional path the other tier already reads: `tickmarkr status` shows it.
 
+⚠ **THE LOOP ABOVE BINDS TO A PROCESS, NOT TO A SEAT — and that is a defect this skill shipped.**
+The beat keeps running while its *session* lives, so a loop started by a seat that has since been
+cleared, re-briefed, or replaced keeps beating that tier's file forever. Measured 2026-08-24
+(OBS-583): a **2d20h** orphan loop from a predecessor seat held `orchestrator ARMED` through a
+**three-hour window in which no orchestrator was alive**, and it would have silently re-armed a
+recorded stand-down within 10 seconds. On the same sweep the overseer tier had **three** beat loops,
+one owned by an unrelated session. So:
+- **At every adopt, clear, or re-brief, sweep for pre-existing loops on YOUR tier before arming one**
+  (`pgrep -f "tickmarkr beat <tier>"`), trace each to its parent session, and kill the **loop only**
+  — never the parent — then verify the parent survived.
+- **`ARMED` is a claim about a process, not about a seat.** Before trusting any tier's `ARMED`, ask
+  whose session owns the beater; a tier can be armed and seatless, which is *worse* than ABSENT
+  because it reads as coverage (rule 11's outliving-its-trigger failure, in beat form).
+- Stand-down must kill the loop **and** run `--stand-down`; the second without the first is undone
+  by the next tick.
+The product fix (a seat-bound or sentinel-terminated beat, armed and stood down in one act) is
+queued; until it ships, this sweep is the guard.
+
 Arm the bundled watcher as its OWN Bash call with `run_in_background` — chaining it after other commands
 with `&` orphans it from the wake chain. It prints one wake reason and exits; re-arm after every wake.
 
@@ -427,6 +461,21 @@ mid-work — reading files, context climbing. So a status-keyed watcher can both
 worker** and **fire on a working one**, and neither failure announces itself. The bundled watcher inherits
 this; so does any `herdr agent wait`. It is still worth arming — it catches vanished panes and real
 blocks — but **never treat its silence as evidence a worker is healthy.**
+**A THIRD failure of the same proxy, and it hits the SUPERVISING seat, not a worker: a session wedged
+on a provider error or a CLI auto-update reports `working` forever.** Measured 2026-08-24: an
+orchestrator took an API 529 mid-turn, its frame froze with the error rendered, and `agent_status`
+read `working` across ten minutes while nothing advanced — and its own last transcript line claimed a
+resume it had never issued, which disk falsified (journal ended at `run-end`, no lock, no daemon).
+Nothing in a watcher set aimed at the RUN can see this: a wake delivered to a wedged seat's queue
+reaches nobody. Two cheap guards, both of which this seat lacked:
+- **Poll the supervised seat's VIEWPORT for a persistent error frame** — the same text present in two
+  reads minutes apart is the tell; one read cannot distinguish a frozen frame from a live one.
+- **Falsify the seat's own claims against disk at every state change it reports.** A wedged or
+  context-exhausted seat narrates intentions as completions. The lock, the journal's last row, and the
+  process table settle it in one command.
+When it fires: interrupt (Esc, bounded), have the seat correct the false record in writing rather than
+silently, then handoff + `/clear` + fresh brief BEFORE it takes the next boundary — a seat that just
+mis-reported its own state is not the seat to hand a release decision to.
 Two keys that do not lie, in order of strength:
 - **The daemon's own waiter.** What `herdr pane wait-output` is matching on tells you the phase from the
   harness's state machine rather than from a status field: a `--match` on a readiness banner means the
@@ -708,6 +757,17 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
 
 **Instruments**
 
+10a. **A CONTROL NAMES THE PROPERTY IT VERIFIES, NEVER AN INSTANCE OF IT** — and when it names an
+    instance, the seat that wrote it must correct the CONTROL rather than let it stop lawful work.
+    Measured 2026-08-24: a ruling armed *"the dispatch must resolve to `codex:gpt-5.6-terra` — anything
+    else, STOP"*, when the property the control existed to prove was *"a lawful channel OUTSIDE the
+    task's tried set, admitted by the amended floor."* Marginal-cost routing correctly picked a
+    cheaper mid-tier channel that satisfied the property completely — never tried, proven on the same
+    run — and the letter of the control said halt. **An over-specified control converts a working
+    mechanism into a false stop, and the seat under it will obey.** Write the property; if you catch
+    yourself naming a channel, a model, a pid or a hash, ask what that instance is standing in for.
+    The converse holds too: **a control loose enough to pass on the wrong thing is worse** — the fix is
+    precision about the property, not about the example.
 11. **For any guard whose failure is SILENCE — detector, lint, watcher, gate, alarm branch — the acceptance
     test is a POSITIVE CONTROL, not a clean run.** A zero cannot distinguish *nothing is broken* from *the
     instrument is blind* from *the check does not exist*. Remove the condition it should catch and confirm
@@ -736,7 +796,19 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     it as a defect — and was corrected forty minutes later when the watcher fired normally, having been
     alive throughout. Two hypotheses (`ps` truncation; multi-column truncation) were formed and killed by
     measurement first, and the first falsification was itself run against the wrong `ps` form. **Use
-    `pgrep -f <token>`, or read the lock's own pid.** The general rule: **an exclusion filter is exactly as
+    `pgrep -f <token>`, or read the lock's own pid.**
+    ⚠ **AND `pgrep -f` HAS ITS OWN INVERSE FAILURE, so the recommended fix is not free: it matches the
+    ARGV OF THE SHELL RUNNING IT.** A probe written as `pgrep -f "npm test"` is itself a process whose
+    command line contains `npm test`, so it returns its own shell — a PHANTOM that looks exactly like the
+    contamination you are hunting. Measured 2026-08-25: a load-ceiling wake was investigated, a second
+    `npm test` "outside the gate's worktree" was found, and it was the probe. It had vanished by the next
+    command, which is the tell — a real second suite does not exit between two reads. The escalation would
+    have been a false contamination alarm during a task's last attempt.
+    Discriminate before you believe a hit: **resolve each pid's `cwd` AND drop any whose own command
+    contains the probe** (`pgrep`/`bash -c`), or match a pattern the target has and the probe cannot —
+    the binary's real path rather than the words you typed. `grep -v grep` fails toward *not there*;
+    `pgrep -f` fails toward *there twice*, and this direction gets ACTED ON, which is worse.
+    The general rule: **an exclusion filter is exactly as
     dangerous as an over-broad inclusion filter, and it fails in the direction that reads as "not there" —
     which is the direction that gets acted on.**
     Two corollaries: **re-arm a wake-and-exit watcher as the same turn's LAST act**, not the next turn's

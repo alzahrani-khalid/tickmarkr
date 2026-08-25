@@ -220,4 +220,46 @@ describe("seat-send.sh delivery outcomes (OBS-552)", () => {
     const twin = join(ROOT, ".claude/skills/tickmarkr-overseer/scripts/seat-send.sh");
     if (existsSync(twin)) expect(readFileSync(twin)).toEqual(shipped);
   });
+
+  // OBS-603 — the THIRD member of the "something other than a live draft renders on a ❯ line" class
+  // that the staged-queue and ghost discriminators already cover. claude-code echoes a SUBMITTED
+  // message into the transcript with the same ❯ glyph, ABOVE the live input box, and a long one still
+  // occupies the 14-line window. `head -1` returned that echo and produced TWO false verdicts against
+  // one delivered message: SEND_UNSUBMITTED on the send that made the echo, then REFUSED_BOX_OCCUPIED
+  // on the NEXT send — which is the worse half, because it refuses to deliver at all and leaves the
+  // seat unreachable until the echo scrolls out. Both reactions the script warns against are then
+  // wrong: re-sending appends and submits both, escalating reports a failure that never happened.
+  // The live box is ALWAYS the LAST ❯ line, so tail -1 is correct in both states.
+  // Captured screen: tests/fixtures/claude-submitted-echo/.
+  describe("submitted-echo screen (captured claude-code negative control, OBS-603)", () => {
+    const FIXTURE = join(ROOT, "tests/fixtures/claude-submitted-echo/pane-read.txt");
+    // the fixture's echoed message, whose rendered first line must be a PREFIX of the message under test
+    const ECHOED_MSG =
+      "OVSR-ADOPT-2011: fresh OVERSEER live in wZ:pBX (tab 'OVERSEER 2.1.1') after an operator /clear;" +
+      " predecessor stood down 12:40. YOU KEEP THE LOOP - I have touched no compile/plan/run/resume/approve" +
+      " and will not. Verified from disk, not from your report: graph T1 files[] carries" +
+      " tests/run/notify-identity.test.ts (surface 20); daemon pid 36490 alive with cwd in-repo.";
+
+    test("a submitted message's own echo is not read as a draft sitting unsent", () => {
+      const stub = makeStub({ prompt: "ok", status: "working", readFixture: FIXTURE });
+      const r = run(stub, "w1:p9", ECHOED_MSG);
+      expect(r.code).toBe(0);
+      expect(r.out).toMatch(/^QUEUED_BEHIND_TURN /); // working seat, empty box => queued, not sitting
+      expect(r.out).not.toContain("SEND_UNSUBMITTED");
+    });
+
+    test("the echo does not read as an OCCUPIED box — the next directive still delivers", () => {
+      const stub = makeStub({ prompt: "ok", status: "working", readFixture: FIXTURE });
+      const r = run(stub, "w1:p9", ECHOED_MSG);
+      expect(r.out).not.toContain("REFUSED_BOX_OCCUPIED");
+      expect(calls(stub.log).filter((l) => l.startsWith("agent prompt"))).toHaveLength(1);
+    });
+
+    test("an idle seat with the same screen reports plain delivery", () => {
+      const stub = makeStub({ prompt: "ok", status: "idle", readFixture: FIXTURE });
+      const r = run(stub, "w1:p9", ECHOED_MSG);
+      expect(r.code).toBe(0);
+      expect(r.out).toMatch(/^DELIVERED_SUBMITTED /);
+    });
+  });
 });
