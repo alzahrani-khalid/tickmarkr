@@ -110,8 +110,16 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
 
   const wantAcceptance = acceptance.length > 0 && !values["no-acceptance"];
   const wantReview = !values["no-review"];
+  // A gate that enforced nothing must not print a green row. `files` has exactly three sources —
+  // explicit --files, a compiled task's own files[], or nothing — and only the third leaves the
+  // allowlist empty, where scopeGate passes as "no file scope declared — unrestricted"
+  // (scope.ts:41). An honest `details` string is no defence: the ROW is what gets quoted, and
+  // quoting it launders a check that never ran. So scope filters on availability exactly as
+  // acceptance and review do below — the report omits the gate rather than crediting one that
+  // gated no allowlist. (Narrowing the empty allowlist to the changed set is the same green row by
+  // another mechanism, and hides the same fact.)
   const gates = GATE_NAMES.filter((g): g is GateName =>
-    (g !== "acceptance" || wantAcceptance) && (g !== "review" || wantReview));
+    (g !== "acceptance" || wantAcceptance) && (g !== "review" || wantReview) && (g !== "scope" || files.length > 0));
 
   const task: Task = {
     id: "VERIFY", title: "standalone verification", goal, shape: "implement", complexity: 5,

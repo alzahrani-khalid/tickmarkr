@@ -35,6 +35,16 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    status, and either ADOPT the
    existing orchestrator (updated brief, re-armed watchers) or, if the old hierarchy is dead, archive the
    stale brief and build fresh.
+   ⚠ **VERIFY EVERY INHERITED WATCHER FROM THE PROCESS TABLE BEFORE YOU TRUST IT — re-arming your own
+   watchers is NOT enough, and a seat told only to re-arm its own is told the wrong thing.** An inherited
+   *"watcher armed"* line is a claim, not a watcher: it is a report by a seat that no longer exists, which
+   is strictly WEAKER than the live seat's report rule 11 already forbids trusting — and it reads as
+   settled fact. So at every adopt, walk the predecessor's watchers by class — **journal watchers,
+   artifact watchers, dialog watchers and beat loops, which is the closed set a session owns** — probe
+   each from the process table yourself (`pgrep -f <token>`, discriminated per rule 11), and re-arm every
+   one the table does not show. Earned 2026-08-25 (OBS-622): a handoff recorded *"artifact watcher armed"*
+   over two live consult verdicts; at adopt the only `watch-artifacts.sh` on the machine belonged to a
+   different repository, and nothing had been watching either file.
    **An adopted seat ANNOUNCES itself, in the same act as re-arming:** tell the adopted orchestrator the
    fresh seat is live (verified send: probe token + read-back). Through the gap its view of your tier read
    STALE, and a tier that believes it is unsupervised escalates into a file nobody is reading. Earned
@@ -550,6 +560,15 @@ that hang is byte-identical to a seat still working. The script prints each unfi
 last line on every timeout heartbeat — read it there, and when in doubt `tail -1` the artifact, never
 the transcript's claim about it.
 
+**An ABSENT artifact ALONE cannot discriminate a working producer from a dead watcher.** A producer still
+working and a watcher that died with its seat write byte-identical evidence — nothing — so a missing file
+is one signal carrying at least three meanings (still working, watcher dead, producer dead), and it is
+**never** evidence that the watcher is still waiting. Reading it that way infers an instrument's liveness
+from the silence it was built to sit through. Settle it with two probes that do not share a failure:
+the watcher from the process table, the producer from its pane or seat status. Measured 2026-08-25
+(OBS-622): both consultants were live and had written nothing, so the artifact side could not see that
+nothing was watching them.
+
 **Arm it in the same call as the spawn, not the next one.** A watcher armed "after I finish this step"
 leaves a gap exactly as wide as however long you stay busy, and you will be busy — you just spawned work.
 **Measured 2026-08-06 (OBS-369): two consult verdicts, 30KB and 12.8KB, sat COMPLETE with their markers
@@ -677,6 +696,50 @@ orchestrator turn boundary.
    fix helps ONE operator and leaves every other user with the defect. If an overlay is the interim, it
    says so in writing and names its removal condition.
 
+8. **A SHIPPED VERSION IS NOT DONE UNTIL THE STATE IT LEAVES BEHIND IS CLEAN.** Publishing is the loud
+   half; the quiet half is that the NEXT seat inherits either the truth or a confident lie. Run this
+   before you stand down from any release — **operator instruction, 2026-08-25: *"overseer should always
+   leave clean state after a version is shipped"***. Every line below is a defect that actually happened
+   on the release that produced this rule.
+
+   - **REWRITE THE MEMORY INDEX FIRST, and read it back.** Minutes after `2.1.1` hit npm, the index line
+     a fresh session loads still read *"⛔ 2.1.1 CANNOT ship from run …2011"* — true when written, and by
+     then the exact opposite of the truth. **The index is what everyone loads and the body is what nobody
+     opens** (Evidence rule 25), so a stale index is not a cosmetic lag; it is the most-read wrong
+     sentence in the project. State what shipped, what did NOT, and the first three things the next seat
+     should do.
+   - **VERIFY EVERY ID THE CODE NOW CITES ACTUALLY EXISTS.** A release lands source comments citing
+     ledger ids. One of that release's entries was written by a heredoc in a command that then timed out
+     — the entry survived, but nothing had checked. `grep -c '^## OBS-<id>'` for each id the diff
+     introduced. A citation pointing at nothing is the defect the ledger itself files (OBS-604), shipped
+     into `src/`.
+   - **KILL THE BEAT LOOP *AND* RUN `--stand-down`.** Either alone is worse than neither: the loop
+     without the stand-down re-arms a tier you retired within 10s, and the stand-down without the loop
+     is undone by the next tick. Verify `status` reads `DISARMED` — which means *handed off*, distinct
+     from `STALE` (armed then died) and `ABSENT` (never armed).
+   - **RECORD YOUR WATCHERS AS DYING WITH THIS SESSION — never as "armed".** A written stand-down or
+     handoff may NOT carry the bare wording *"watcher armed"* for anything this seat owns: that form
+     states an act and lets the successor read a fact, and it survived into a handoff exactly once before
+     costing two unwatched consult verdicts (OBS-622). The admissible form names the lifetime and the
+     work it leaves the successor — *"watchers armed by this session (journal, artifact, dialog, beat);
+     they die with it — re-arm on adopt"* — and, per rule 11, says which tier's watchers were NOT armed.
+     A detached watcher is the one exception and must be labelled as such, with its heartbeat file, since
+     it outlives the seat instead.
+   - **SWEEP THE PANES THE RUN LEFT.** A daemon killed by a signal flushes its journal and releases its
+     lock but **does not clean up its worker panes or its board**. Two orphaned worker panes and a dead
+     board pane sat in the operator's tab bar until he screenshotted them. Verify each is inert first
+     (no agent, nothing running in its worktree) and confirm the WORK is on its branch — then close.
+     Emptied tabs disappear on their own.
+   - **CORRECT EVERY TAB LABEL.** `ORCH · 2.1.1 T1 regate` was still on screen hours after that regate
+     ended. Tab labels are how the operator reads fleet state; a stale one is a false status report.
+   - **LEAVE THE TREE CLEAN AND SAY WHAT IS UNMERGED.** Name the branches that hold real but ungated
+     work, so the next seat neither discards nor trusts them. *"Zero merges, T1/T3 branches ungated, T5
+     never dispatched"* is a handoff; *"the run ended"* is not.
+
+   ⚠ **The half of this that is NOT operator discipline must be QUEUED, not absorbed:** a daemon that
+   orphans its panes on SIGTERM is a PRODUCT defect and belongs in `src/**`. Sweeping by hand every time
+   is the local remedy, and per rule 7 it says so in writing and names its removal condition.
+
 ---
 
 ## Briefing a seat to audit a security-shaped check — phrasing matters
@@ -787,6 +850,14 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     owns it** — "watchers alive" is the one claim a seat cannot verify about itself. Measured 2026-08-06:
     an orchestrator sat `idle` through three merges and two dispatches with no journal watcher in the
     process table, while its own last report read *"daemon, board, sweeper, watcher all alive"* (OBS-366).
+    **STATE THE LIFETIME, because an unstated one is read as the mission's: a session-scoped watcher DIES
+    WITH THE SEAT THAT ARMED IT.** Every watcher a seat arms — journal, artifact, dialog, beat loop — is
+    session-scoped unless it was deliberately detached (`ppid 1`, the heartbeat form below), so `/clear`,
+    a crash, an adopt or a stand-down ends it, and **a handoff is the one moment the arming seat stops
+    existing** — which is exactly when its watchers are most likely to be believed. The inverse failure is
+    the same root read the other way: a DETACHED loop outlives its seat and holds a tier `ARMED` with
+    nobody home (OBS-583). Neither direction may be assumed; the lifetime is a property of how the watcher
+    was launched, and it belongs in writing next to every claim that one is armed.
     **And the process-table probe has a standard idiom that DEFEATS it, so the rule above needs one more
     line to be usable.** Never probe for a watcher with `ps … | grep <token> | grep -v grep`: a poll-grep
     watcher carries the word `grep` in its own argv, so the filter whose job is removing the *probing* grep

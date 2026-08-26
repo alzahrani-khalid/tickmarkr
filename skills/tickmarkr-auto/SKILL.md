@@ -45,9 +45,26 @@ Before `tickmarkr compile` or `tickmarkr run`, compare the installed binary agai
 
 1. Run `tickmarkr version` (one line, machine-parseable).
 2. Read the `version` field from the repository's `package.json`.
-3. If the binary is **older on major.minor** than the repo (e.g. binary `1.36.x` vs repo `1.38.x`), **stop immediately** and tell the operator to update the global install (`npm i -g tickmarkr@latest`) or link the repo binary. Do not compile, plan, or run on hope.
+3. If the binary and repository do not **agree on the entire version** (including the patch; e.g. binary `2.1.0` vs repo `2.1.1`), **stop immediately** and tell the operator to update the global install (`npm i -g tickmarkr@latest`) or link the repo binary. Do not compile, plan, or run on hope.
 
 A stale binary silently skips daemon gates shipped in newer releases — the v1.38 run exposed this when a global `1.36.0` binary missed the daemon tip-verify gate entirely (OBS-38). Preflight failure is always stop-and-report; never proceed-and-hope.
+
+### No run may be live in THIS repository
+
+The version check above is only half the preflight. Before `compile` or `run`, confirm no run is already
+live **in this repository**:
+
+1. Lead with this repository's own `.tickmarkr/graph.lock`. Read its recorded holder pid.
+2. Treat the lock as held by a LIVE run until `kill -0 <pid>` proves that holder dead.
+3. **Never require a machine-wide process pattern to be empty.** A lawful run in another repository — or
+   the probing shell's own argv — matches such a pattern, so an empty result is not evidence of safety
+   and a non-empty one is not evidence of danger.
+4. If you use a process probe as secondary evidence, exclude the probing process itself, resolve every
+   candidate's own working directory (for example `lsof -a -p <pid> -d cwd`), and count only candidates
+   whose cwd is **this repository root**.
+
+The invariant this protects is per-repository — *never run two tickmarkr runs in the same repository
+concurrently* — so a machine-wide check answers a question nobody asked and blocks work that is lawful.
 
 ## Verified handoffs (agent-to-agent messaging)
 

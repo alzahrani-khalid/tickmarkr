@@ -4,6 +4,15 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.2** — a patch about the distance between what a record claims and what it checked. `verify
+--criteria` no longer prints a green `scope` row for an allowlist it never applied — it omits the gate
+rather than crediting one that gated nothing. The scaffolded version preflight now checks *this*
+repository's own run lock instead of requiring a machine-wide process pattern to be empty (a lawful run
+in another repository, or the probing shell's own argv, both matched it), and it compares the **entire**
+version rather than `major.minor`, so a binary one patch behind is a stop. And the overseer guidance
+gains the rule that an inherited watcher claim is a claim, not a watcher: a handoff records the arming,
+while the process died with the seat that armed it.
+
 **v2.1.1** — a patch that fixes what was making this repository's own gates unreliable, plus two
 operator-facing cockpit corrections.
 

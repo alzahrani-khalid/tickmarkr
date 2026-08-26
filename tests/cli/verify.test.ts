@@ -38,7 +38,7 @@ const captured = (repo: string) => existsSync(verifyStateDir(repo));
 describe("tickmarkr verify — standalone gate battery", () => {
   afterEach(() => { delete process.env.TICKMARKR_FAKE_SCRIPT; });
 
-  test("green diff verifies end-to-end without a daemon: battery + evidence + scope pass, exit 0", async () => {
+  test("green diff verifies end-to-end without a daemon: battery + evidence pass, exit 0", async () => {
     const repo = repoWithBranch();
     const r = await verify(["--no-review"], repo);
     expect(r.code).toBe(0);

@@ -108,7 +108,7 @@ Outside multi-agent environments, run the loop directly.
 
 ### Version preflight
 
-Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version\`, read \`package.json\` version, and if the binary is older on major.minor, stop and tell the operator to update. Never proceed on hope — stale binaries silently skip daemon gates. Also verify no run is live before starting one: \`pgrep -f "tickmarkr (run|resume)"\` must be empty — match the process, not one install path (\`dist/cli/index.js\` alone misses global and homebrew installs), and treat a held \`.tickmarkr/graph.lock\` as a live run until its holder pid is proven dead.
+Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version\`, read \`package.json\` version, and stop if the versions differ anywhere (major, minor, or patch); the binary and repository must agree on the entire version, so binary \`2.1.0\` versus repository \`2.1.1\` is a stop. Tell the operator to update or link the correct binary. Never proceed on hope — stale binaries silently skip daemon gates. Also verify no run is live in this repository before starting one: lead with this repository's \`.tickmarkr/graph.lock\`, read its holder pid, and treat it as live until \`kill -0 <pid>\` proves that holder dead. Never require a machine-wide process pattern to be empty: a lawful run in another repository — or the probing shell's own argv — can match. If you use a process probe as secondary evidence, exclude the probing process, resolve every candidate's own cwd (for example with \`lsof -a -p <pid> -d cwd\`), and count only candidates whose cwd is this repository root.
 
 ### Tip-verify-before-green
 

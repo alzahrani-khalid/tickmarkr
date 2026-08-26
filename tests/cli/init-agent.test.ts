@@ -20,6 +20,14 @@ const agentDocsSection = (repo: string, doc = "AGENTS.md") => {
   return text.slice(begin, end + "<!-- tickmarkr:agent-docs end -->".length);
 };
 
+const versionPreflight = (agentDocs: string) => {
+  const begin = agentDocs.indexOf("### Version preflight");
+  const end = agentDocs.indexOf("### Tip-verify-before-green", begin);
+  expect(begin).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(begin);
+  return agentDocs.slice(begin, end);
+};
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("tickmarkr init --agent skills location (T3)", () => {
@@ -175,6 +183,71 @@ describe("tickmarkr init --agent portable docs (T3)", () => {
     expect(text).toMatch(/keep me above/);
     expect(text).toMatch(/keep me below/);
     expect(text.match(/tickmarkr:agent-docs begin/g)).toHaveLength(1);
+  });
+});
+
+describe("tickmarkr init --agent preflight authority (T3)", () => {
+  test("test: the scaffolded agent-docs block leads its live-run check with this repository's own graph lock so a tickmarkr run executing elsewhere does not read as live here while scaffolded text checking a machine-wide process pattern fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+
+    await runInit(repo, "--agent", "--docs");
+
+    const preflight = versionPreflight(agentDocsSection(repo));
+    const lock = preflight.indexOf(".tickmarkr/graph.lock");
+    const machineWideProbe = preflight.indexOf("machine-wide process pattern");
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(machineWideProbe).toBeGreaterThan(lock);
+    expect(preflight).toMatch(/read its holder pid/);
+    expect(preflight).toContain("kill -0 <pid>");
+    expect(preflight).toMatch(/lawful run in another repository/);
+    expect(preflight).toMatch(/probing shell's own argv/);
+    expect(preflight).toMatch(/resolve every candidate's own cwd/);
+    expect(preflight).toMatch(/whose cwd is this repository root/);
+    expect(preflight).not.toContain('pgrep -f "tickmarkr (run|resume)"` must be empty');
+  });
+
+  test("test: the scaffolded agent-docs block requires binary and repository to agree on the entire version so a binary trailing by one patch stops the loop while scaffolded text comparing only major and minor fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+
+    await runInit(repo, "--agent", "--docs");
+
+    const preflight = versionPreflight(agentDocsSection(repo));
+    expect(preflight).toMatch(/versions differ anywhere \(major, minor, or patch\)/);
+    expect(preflight).toMatch(/must agree on the entire version/);
+    expect(preflight).toMatch(/binary `2\.1\.0` versus repository `2\.1\.1` is a stop/);
+    expect(preflight).not.toMatch(/older on major\.minor/);
+  });
+
+  test("both driving skills carrying their own version preflight state the same whole-version stop rule so a patch-level gap stops them while a skill still telling the operator to stop only when the binary is older on major and minor fails", () => {
+    const wholeVersionRule = "If the binary and repository do not **agree on the entire version** "
+      + "(including the patch; e.g. binary `2.1.0` vs repo `2.1.1`), **stop immediately**";
+
+    for (const name of ["tickmarkr-auto", "tickmarkr-loop"]) {
+      const text = skill(name).toString("utf8");
+      expect(text).toContain(wholeVersionRule);
+      expect(text).not.toMatch(/older on major\.minor/);
+    }
+  });
+
+  test("this repository's own rendered guidance files carry both the repository-scoped live-run check and the whole-version stop rule while a change fixing only the scaffold a new repository would receive fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const scaffolded = agentDocsSection(repo);
+
+    for (const doc of ["CLAUDE.md"]) {
+      const rendered = agentDocsSection(ROOT, doc);
+      expect(rendered).toBe(scaffolded);
+      const preflight = versionPreflight(rendered);
+      expect(preflight.indexOf(".tickmarkr/graph.lock"))
+        .toBeLessThan(preflight.indexOf("machine-wide process pattern"));
+      expect(preflight).toMatch(/resolve every candidate's own cwd/);
+      expect(preflight).toMatch(/must agree on the entire version/);
+      expect(preflight).toMatch(/binary `2\.1\.0` versus repository `2\.1\.1` is a stop/);
+      expect(preflight).not.toMatch(/older on major\.minor/);
+    }
   });
 });
 
