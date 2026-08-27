@@ -361,7 +361,9 @@ test("enumerate production registry construction before and after the change: om
     ]),
   );
   const expectedBeforeDigests = {
-    "claude-code": "08f3afe932f5a598d09bd7808030aab413c60e8970d43866e72c802707c6cd31",
+    // v2.1.3 T7: repinned when the interactive/resume builders gained `--prompt-suggestions false`
+    // (ghost-text suppression at the source). The tuple bytes really did change; the pin is doing its job.
+    "claude-code": "1344964a87c7d3be6edef139a0ceafe73d54b9b951aa41fdbcf806a4944cf9a8",
     codex: "22b0e5652c1674629ea5d32db5fe14d4d6a10569702770acbd86e1e9cb8c2078",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",

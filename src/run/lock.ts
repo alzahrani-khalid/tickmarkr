@@ -53,6 +53,19 @@ export function shouldRefuse(i: Pick<Inspection, "garbage" | "dead">): boolean {
   return i.garbage || !i.dead;
 }
 
+// LOCK-04, PID-SCOPED: the same decision table, in the shape a caller holding only a pid can consume.
+// Every other liveness export here takes a repository root, so a reader with a pid off a journal row
+// had no seam to reach and wrote the four lines itself — twice. One copy was faithful; the other
+// treated ANY thrown error as death, so a daemon owned by another user (EPERM) read dead there and
+// alive here. A rule that forbids a second `process.kill(pid, 0)` without exporting a usable
+// predicate produces exactly those copies, so this is the predicate. no throw ⇒ ALIVE; ESRCH ⇒ the
+// only proof-positive death; ANY other errno (EPERM = alive-but-not-ours, EINVAL, …) ⇒ ALIVE,
+// because none of them is evidence of death and this table fails closed toward alive.
+export function isPidLive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (k) { return (k as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+
 // statSync throws ENOENT when no lock exists — callers treat that as "not held".
 function inspect(p: string): Inspection {
   const st = statSync(p); // single stat: both the heartbeat mtime and the reclaim-guard inode
@@ -61,11 +74,8 @@ function inspect(p: string): Inspection {
   const parsed = PayloadSchema.safeParse(readPayload(p));
   const garbage = !parsed.success; // LOCK-01: its own state — shouldRefuse refuses it unconditionally; only `tickmarkr unlock` removes it
   const pid = parsed.success ? parsed.data.pid : undefined;
-  let dead = pid === undefined; // harmless fallback for the garbage row — garbage short-circuits shouldRefuse before this is read
-  if (pid !== undefined) {
-    try { process.kill(pid, 0); dead = false; } // no throw ⇒ ALIVE
-    catch (k) { dead = (k as NodeJS.ErrnoException).code === "ESRCH"; } // ESRCH ⇒ dead; EPERM ⇒ ALIVE
-  }
+  // harmless fallback for the garbage row — garbage short-circuits shouldRefuse before this is read
+  const dead = pid === undefined ? true : !isPidLive(pid);
   return { pid, runId: parsed.success ? parsed.data.runId : undefined, garbage, dead, expired, mtimeMs, ino: st.ino };
 }
 
@@ -189,9 +199,10 @@ export async function acquireApprovalSerialization(repoRoot: string, runId: stri
 }
 
 // LOCK-04: the owner the decision table sees, read-only, for callers that need the pid as well as
-// the answer. inspect() owns pid-liveness (ESRCH dead / EPERM alive / garbage fail-closed); a second
-// `process.kill(pid, 0)` anywhere else would be a second copy of that rule, free to drift. undefined
-// ⇒ no lock at all — never conflate that with a lock whose recorded owner is dead.
+// the answer. inspect() owns pid-liveness (ESRCH dead / EPERM alive / garbage fail-closed) and reads
+// it from isPidLive above; a second `process.kill(pid, 0)` anywhere else would be a second copy of
+// that rule, free to drift — a caller holding only a pid consumes isPidLive, never its own probe.
+// undefined ⇒ no lock at all — never conflate that with a lock whose recorded owner is dead.
 export function runLockOwner(repoRoot: string): { pid?: number; runId?: string; live: boolean } | undefined {
   let insp: Inspection;
   try { insp = inspect(lockPath(repoRoot)); }

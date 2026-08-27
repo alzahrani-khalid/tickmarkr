@@ -267,7 +267,7 @@ describe("T3 watch cockpit brand restyle", () => {
         "tickmarkr status / run run-brand / last event 10m ago / daemon pid unknown / 1/3 done\n" +
         "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
         // no watcher has ever beaten in this fixture, and every tier says so rather than being omitted
-        "  supervision: orchestrator ABSENT / overseer ABSENT / watch ABSENT\n" +
+        "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +
         "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
         "  [!] T2 failed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2 / ctx 1234\n" +
         "  [ ] T3 starved  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -",

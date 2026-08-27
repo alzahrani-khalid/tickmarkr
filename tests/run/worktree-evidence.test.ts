@@ -272,6 +272,14 @@ test("a worktree change runDaemon detects rearms the stall window and not only t
 
   const unchanged = await run(false);
   const changed = await run(true);
+  // OBS-688: the premise, asserted BEFORE the first subtraction and not after it. Two of this
+  // case's legs are subprocess readings, and a refused spawn makes the daemon stand down
+  // fail-closed — leaving no worker-result/worker-contact row at all, so `taskEventTime` would
+  // throw an anonymous type error off `undefined.ts` and bury an infrastructure failure as a
+  // nameless crash. The sibling cases above were guarded and this one was missed; a guard placed
+  // after the arithmetic is already too late, because the throw has happened.
+  expect(infraStandDowns(unchanged), PREMISE).toEqual([]);
+  expect(infraStandDowns(changed), PREMISE).toEqual([]);
   const unchangedDuration = taskEventTime(unchanged, "worker-result") - taskEventTime(unchanged, "worker-launch");
   const changedContact = taskEventTime(changed, "worker-contact");
   const changedEnd = taskEventTime(changed, "worker-result");

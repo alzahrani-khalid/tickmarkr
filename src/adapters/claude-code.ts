@@ -217,7 +217,7 @@ export const claudeCode: WorkerAdapter = {
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("claude-code", cfg),
   // v1.65 T3: every flag the command builders below hardcode — doctor checks `claude --help` still
   // lists each (all present on claude 2.x, verified 2026-07-22). Advisory only, never routing.
-  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r"] },
+  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r", "--prompt-suggestions"] },
   // --strict-mcp-config --mcp-config '{"mcpServers":{}}': pin the MCP surface to empty so fresh-worktree
   // workers/gates don't load project .mcp.json servers (herdr scrapes dialogs as idle — v1.4 incident,
   // memory tickmarkr-worker-mcp-dialog-stall). Live-verified 2026-07-10 on claude 2.1.205 (operator check):
@@ -232,12 +232,27 @@ export const claudeCode: WorkerAdapter = {
   // HYG-03 / OBS-137: the residual first-entry dialog is workspace trust, not MCP config loading.
   // Claude's only store is global last-writer-wins ~/.claude.json, so tickmarkr still does not seed it;
   // the daemon safely answers only the exact adapter-declared dialog once per slot.
+  //
+  // v2.1.3 T7 --prompt-suggestions false: claude paints a PREDICTED next prompt into the editor after
+  // a turn. On a pane it is pixel-identical to a seat's own unsubmitted draft, so every occupancy
+  // reader downstream — the input-box occupiedMatch above, the stall watchdog that sweeps for a
+  // parked turn — reads the vendor's ghost text as work in progress and waits out its window on a
+  // worker that is idle. Suppressed at the SOURCE instead: the two builders that seed a real terminal
+  // are exactly these (interactive, resume); the -p builder has no editor to paint into and is out of
+  // scope. Live-checked against claude 2.1.246: the flag parses and `false` is an allowed choice
+  // ("Allowed choices are true, false, 1, 0, yes, no, on, off").
+  // Placement is NOT free: --mcp-config above is variadic and eats the next positional (2026-07-10
+  // live check ate the prompt), and --prompt-suggestions takes an OPTIONAL value — appended directly
+  // before the prompt it would swallow it the same way. So the setting's value is always followed by
+  // another flag, never by the prompt positional.
   interactiveCommand: (promptFile: string, model: string) =>
-    `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+    `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   trustDialog: CLAUDE_TRUST_DIALOG,
   inputBox: CLAUDE_INPUT_BOX,
+  // A resumed attempt lands in the same painted editor, so it carries the same ghost-text suppression
+  // and the same value-then-flag placement.
   resumeCommand: (sessionId: string, promptFile: string, model: string) =>
-    `claude -r ${shq(sessionId)} --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+    `claude -r ${shq(sessionId)} --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },

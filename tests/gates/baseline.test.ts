@@ -2,9 +2,9 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { captureBaseline, compareToBaseline, detectGateCommands, detectPackageManager, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
+import { captureBaseline, classifyFailureOutput, compareToBaseline, detectGateCommands, detectPackageManager, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../../src/route/router.js";
-import { DEFAULT_SHELL_TIMEOUT_MS, type ShResult } from "../../src/run/git.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, sh, type ShResult } from "../../src/run/git.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 // The ceiling a battery runs under is an ARGUMENT to the shell, and an argument is only observable at
@@ -27,6 +27,110 @@ vi.mock("../../src/run/git.js", async (importOriginal) => {
       return stubbed ? Promise.resolve(stubbed) : actual.sh(cmd, cwd, timeoutMs);
     },
   };
+});
+
+const OXLINT = join(import.meta.dirname, "..", "..", "node_modules", ".bin", "oxlint");
+// Oxlint 1.74 changed its implicit reporter to a graphical diagnostic. Its `agent` reporter is the
+// path-first default form this regression was captured against; invoke that real reporter explicitly
+// so the test remains a binary-output drill instead of a transcription coupled to a version default.
+const oxlintDefault = (files: string) => `${JSON.stringify(OXLINT)} ${files} --deny no-console --format agent`;
+
+test("test: a lint runner's real default output fingerprints one entry per diagnostic and classifies as a regression where each line opens with a file path followed by a position followed by the word error; the single constant marker standing for every unreadable failure today fails", async () => {
+  const repo = makeRepo({
+    "first.js": "console.log('first');\n",
+    "second.js": "console.log('second');\n",
+  });
+  const result = await sh(oxlintDefault("first.js second.js"), repo);
+  const raw = `${result.stdout}\n${result.stderr}`;
+
+  expect(result.code).toBe(1);
+  expect(raw).toMatch(/^first\.js:\d+:\d+: error\b/m);
+  expect(raw).toMatch(/^second\.js:\d+:\d+: error\b/m);
+  expect(fingerprint(raw).toSorted()).toEqual([
+    "first.js:#:#: error eslint(no-console): Unexpected console statement. help: Delete this console statement.",
+    "second.js:#:#: error eslint(no-console): Unexpected console statement. help: Delete this console statement.",
+  ]);
+  expect(fingerprint(raw)).not.toContain(UNRECOGNIZED_FAILURE);
+  expect(classifyFailureOutput(raw)).toBe("regression");
+});
+
+test("test: a line that merely mentions a file position inside a sentence contributes no fingerprint; a recognizer anchored loosely enough to match it manufactures a fresh failure out of ordinary runner prose and fails", () => {
+  const failure = "FAIL tests/existing.test.ts > existing failure";
+  const prose = "the runner merely mentions src/example.ts:12:7: error while explaining its output grammar";
+
+  expect(fingerprint(`${failure}\n${prose}`)).toEqual(fingerprint(failure));
+  expect(classifyFailureOutput(prose)).toBeUndefined();
+});
+
+test("test: two lint runs differing by exactly one new diagnostic produce different fingerprint sets so a baseline holding one pre-existing lint error stops forgiving the new one; a recognizer leaving both runs at one constant forgives it and fails", async () => {
+  const repo = makeRepo({ "existing.js": "console.log('existing');\n" });
+  const commands = { lint: oxlintDefault("*.js") };
+  const baseline = await captureBaseline(repo, commands);
+
+  expect(baseline.commands.lint.fingerprints).toHaveLength(1);
+  expect((await compareToBaseline(repo, commands, baseline, ["lint"]))[0]).toMatchObject({ pass: true });
+
+  writeFileSync(join(repo, "new.js"), "console.log('new');\n");
+  const current = await sh(commands.lint, repo);
+  const currentFingerprints = fingerprint(`${current.stdout}\n${current.stderr}`);
+  expect(currentFingerprints).toHaveLength(2);
+  expect(currentFingerprints).not.toEqual(baseline.commands.lint.fingerprints);
+
+  const [gate] = await compareToBaseline(repo, commands, baseline, ["lint"]);
+  expect(gate).toMatchObject({ pass: false, meta: { classification: "regression" } });
+  expect(gate.details).toContain("new.js:#:#: error");
+});
+
+test("this repository's own lint script selects the output format the shipped recognizer already reads and the recognizer carries a comment naming that script change as the local remedy and itself as the shipped fix, so a diff changing only the script fails", () => {
+  const root = join(import.meta.dirname, "..", "..");
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: { lint: string } };
+  const source = readFileSync(join(root, "src", "gates", "baseline.ts"), "utf8");
+
+  expect(pkg.scripts.lint).toMatch(/\boxlint\b.*--format\s+stylish\b/);
+  expect(source).toMatch(/local remedy/);
+  expect(source).toMatch(/shipped fix/);
+  expect(source).toMatch(/PATH_FIRST_LINTER_ERROR_RE/);
+});
+
+test("test: a baseline capture over a runner that names per-file durations records the command's own wall clock the sum of those durations their ratio and the single longest file; a record carrying the wall clock alone fails", async () => {
+  shSpy.stub = (cmd) => cmd === "timed-runner"
+    ? {
+        code: 0,
+        stdout: [
+          " ✓ tests/quick.test.ts (2 tests) 120ms",
+          " ✓ |sync-heavy| tests/slow.test.ts (1 test) 1.5s",
+        ].join("\n"),
+        stderr: "",
+        durationMs: 1_000,
+      }
+    : undefined;
+  try {
+    const entry = (await captureBaseline("/tmp/tickmarkr-timing", { test: "timed-runner" })).commands.test;
+    expect(entry.durationMs).toBe(1_000);
+    expect(entry.fileDurationSumMs).toBe(1_620);
+    expect(entry.impliedParallelism).toBeCloseTo(1.62);
+    expect(entry.longestFile).toEqual({ file: "tests/slow.test.ts", durationMs: 1_500 });
+  } finally {
+    shSpy.stub = undefined;
+  }
+});
+
+test("test: a baseline capture over a runner naming no per-file durations records the wall clock and marks the other three unavailable; a record normalizing an unmeasurable sum to zero reads as perfect parallelism and fails", async () => {
+  shSpy.stub = (cmd) => cmd === "untimed-runner"
+    ? { code: 0, stdout: "3 checks passed\n", stderr: "", durationMs: 250 }
+    : undefined;
+  try {
+    const entry = (await captureBaseline("/tmp/tickmarkr-timing", { test: "untimed-runner" })).commands.test;
+    expect(entry.durationMs).toBe(250);
+    expect(entry).toMatchObject({
+      fileDurationSumMs: null,
+      impliedParallelism: null,
+      longestFile: null,
+    });
+    expect(entry.fileDurationSumMs).not.toBe(0);
+  } finally {
+    shSpy.stub = undefined;
+  }
 });
 
 describe("fingerprint", () => {

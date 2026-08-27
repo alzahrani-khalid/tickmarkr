@@ -80,6 +80,36 @@ export const DEFAULT_SHELL_TIMEOUT_MS = 600000;
 // disagreeing with itself). On a timeout it is the elapsed time at the kill, not the ceiling.
 export interface ShResult { code: number; stdout: string; stderr: string; timedOut?: boolean; durationMs?: number }
 
+/**
+ * OBS-688: every gate, every baseline capture and every tip verification reaches the machine through
+ * this one seam, and the seam took its spawn from the standard library directly — so the one failure
+ * it must handle, the kernel REFUSING the fork, was unreachable from a fixture and could only be
+ * described. It is injectable here for exactly that reason; production always holds `spawn` itself.
+ * Undefined-until-set, never captured at module load: the standard library binding stays read at
+ * CALL time, exactly as before this seam existed, so a suite that mocks `node:child_process` without
+ * a `spawn` export still imports this module (tests/adapters/pi-auth.test.ts does).
+ */
+let spawnChild: typeof spawn | undefined;
+export const setSpawnForTests = (fn: typeof spawn): void => { spawnChild = fn; };
+export const resetSpawnForTests = (): void => { spawnChild = undefined; };
+
+/**
+ * A refusal is NOT evidence about the work: the command never started, so nothing ran, and a retry
+ * cannot repeat a side effect. That argument is the whole safety case for retrying here, and it
+ * holds for exactly one closed case — the kernel refused the fork for a temporary resource shortage
+ * (EAGAIN: the fork table is full, which a gate burst does to a box twice in one night). Every
+ * other spawn error is a standing fact about the machine — a missing interpreter above all — and
+ * retrying it buys nothing while delaying every genuine failure by the whole backoff, so it returns
+ * on the first read. The retry is also gated on the child having produced NO byte and never having
+ * emitted `spawn`: past either, a command has run and re-running it is a side effect, never a retry.
+ */
+const RETRYABLE_SPAWN_CODE = "EAGAIN";
+export const SPAWN_ATTEMPT_LIMIT = 4;
+export const SPAWN_RETRY_BACKOFF_MS = 50;
+
+/** A spawn the machine refused before the command started; carries the error for the caller. */
+interface SpawnRefusal { refused: NodeJS.ErrnoException }
+
 // stdin "ignore": same class as HARD-05 / SubprocessDriver — never leave an open pipe a child can block on
 // (pi -p / codex exec wait for stdin EOF). timedOut distinguishes SIGKILL-timeout from a real nonzero exit.
 function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Promise<ShResult> {
@@ -91,14 +121,14 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // OBS-110: apply the run's own fork cap only when the operator has not already set one.
   if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = resolvedForkCap();
-  return new Promise((resolve) => {
+  const attempt = (): Promise<ShResult | SpawnRefusal> => new Promise((resolve) => {
     const startedAt = Date.now();
     // detached: bash gets its own process group so a timeout can kill the whole tree —
     // SIGKILLing bash alone orphans grandchildren (codex/pi) that hold the stdio pipes
     // open, so "close" never fires and the promise wedges forever (v1.33.1 init hang).
-    const p = spawn("bash", [login ? "-lc" : "-c", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stdout = "", stderr = "";
-    let timedOut = false, done = false;
+    let timedOut = false, done = false, started = false;
     const finish = (code: number, err?: string) => {
       if (done) return;
       done = true;
@@ -109,13 +139,35 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
       timedOut = true;
       try { process.kill(-p.pid!, "SIGKILL"); } catch { p.kill("SIGKILL"); }
     }, timeoutMs);
+    p.on("spawn", () => { started = true; }); // the command exists from here on — never retryable past it
     p.stdout!.on("data", (d) => (stdout += d));
     p.stderr!.on("data", (d) => (stderr += d));
-    p.on("error", (e) => finish(127, String(e)));
+    p.on("error", (e: NodeJS.ErrnoException) => {
+      if (!done && !started && !stdout && !stderr && e.code === RETRYABLE_SPAWN_CODE) {
+        done = true;
+        clearTimeout(timer);
+        resolve({ refused: e });
+        return;
+      }
+      finish(127, String(e));
+    });
     p.on("close", (code) => finish(code ?? 1));
     // "close" waits for stdio to drain; a surviving pipe-holder must not outlive the timeout
     p.on("exit", (code) => { if (timedOut) finish(code ?? 1); });
   });
+  return (async () => {
+    const startedAt = Date.now();
+    for (let n = 1; ; n++) {
+      const r = await attempt();
+      if (!("refused" in r)) return r;
+      // Bounded, and the bound is what makes a persisting shortage a REPORTED failure rather than a
+      // wedged daemon: past it the caller gets the refusal's own text under exit 127, as before.
+      if (n >= SPAWN_ATTEMPT_LIMIT) {
+        return { code: 127, stdout: "", stderr: String(r.refused), durationMs: Date.now() - startedAt };
+      }
+      await new Promise((wake) => setTimeout(wake, SPAWN_RETRY_BACKOFF_MS * n));
+    }
+  })();
 }
 
 export function sh(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<ShResult> {

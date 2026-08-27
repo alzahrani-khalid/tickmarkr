@@ -1208,7 +1208,7 @@ describe("status checklist rendering", () => {
     const golden =
       "tickmarkr status / run run-watch / last event 10m ago / daemon pid unknown / 1/3 done\n" +
       "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
-      "  supervision: orchestrator ABSENT / overseer ABSENT / watch ABSENT\n" +
+      "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +
       "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
       "  [!] T2 mixed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
       "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";

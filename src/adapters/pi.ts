@@ -36,6 +36,102 @@ export function parsePiModels(raw: string): string[] {
     .filter((id) => MODEL_ID_RE.test(id));
 }
 
+// Newest-first by mtime, capped — mtime picks WHICH files to scan, never a record's cursor.
+// Shared by collectUsage (spend) and readPiServedModels (v2.1.3 T7): same store, same bounds.
+function sessionFileStats(dir: string): { f: string; m: number }[] {
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .map((f) => {
+      const path = join(dir, f);
+      try {
+        return { f: path, m: statSync(path).mtimeMs };
+      } catch {
+        return undefined; // a stat failure just drops that file
+      }
+    })
+    .filter((x): x is { f: string; m: number } => x !== undefined);
+}
+
+function newestSessionFiles(entries: { f: string; m: number }[]): string[] {
+  return [...entries].sort((a, b) => b.m - a.m).slice(0, MAX_SESSION_FILES).map((x) => x.f);
+}
+
+// v2.1.3 T7: pi records the model it was ACTUALLY served in message.responseModel, and writes that
+// field ONLY where it differs from the pinned message.model (measured over this machine's whole
+// store: 213 assistant records, 213 of them differing, zero agreeing — the field is the discrepancy).
+// Nothing in the shipped tree read it, so a silent substitution (pinned zai/glm-5.2, served glm-5.3)
+// reached tier, price and review-diversity decisions unremarked.
+// The neighbouring wrong answer is cheap and green: reporting message.model as the served model
+// agrees with every ordinary record and detects exactly nothing. The other one is worse — treating
+// an ABSENT responseModel as a mismatch alarms on every ordinary turn in the store.
+// FAIL OPEN everywhere (detection is advisory, like listModels — never fails a probe), and bound the
+// scan the way collectUsage beside it bounds one: newest MAX_SESSION_FILES by mtime across the whole
+// store, MAX_SESSION_BYTES per file. MODEL_ID_RE gates both names — they land in operator-facing text.
+export interface ServedModelDrift {
+  pinned: string;
+  served: string;
+}
+
+// ponytail: three distinct pairs is the note's ceiling — raise it if a real store ever shows more.
+const MAX_DRIFT_PAIRS = 3;
+
+export function readPiServedModels(): ServedModelDrift[] {
+  const root = join(homedir(), ".pi", "agent", "sessions");
+  let files: string[];
+  try {
+    files = newestSessionFiles(
+      readdirSync(root).flatMap((slug) => {
+        try {
+          return sessionFileStats(join(root, slug));
+        } catch {
+          return []; // not a directory / unreadable ⇒ skip
+        }
+      }),
+    );
+  } catch {
+    return []; // no store ⇒ nothing to report
+  }
+  const out: ServedModelDrift[] = [];
+  const seen = new Set<string>();
+  for (const file of files) {
+    let text: string;
+    try {
+      text = readFileSync(file, "utf8").slice(0, MAX_SESSION_BYTES);
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      let recRaw: unknown;
+      try {
+        recRaw = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (recRaw === null || typeof recRaw !== "object" || Array.isArray(recRaw)) continue;
+      const rec = recRaw as { type?: unknown; message?: { role?: unknown; model?: unknown; responseModel?: unknown } };
+      if (rec.type !== "message" || rec.message?.role !== "assistant") continue;
+      const pinned = rec.message?.model;
+      const served = rec.message?.responseModel;
+      // absent responseModel === the two agree. Never a mismatch, never an alarm.
+      if (typeof served !== "string" || typeof pinned !== "string" || served === pinned) continue;
+      if (!MODEL_ID_RE.test(served) || !MODEL_ID_RE.test(pinned)) continue;
+      const key = `${pinned}\u0000${served}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ pinned, served });
+      if (out.length >= MAX_DRIFT_PAIRS) return out;
+    }
+  }
+  return out;
+}
+
+// The probe's note clause, or "" when the store reports no discrepancy at all.
+export function servedModelNote(drifts: ServedModelDrift[] = readPiServedModels()): string {
+  if (drifts.length === 0) return "";
+  return `served-model drift: ${drifts.map((d) => `pinned ${d.pinned} served ${d.served}`).join(", ")}`;
+}
+
 export const pi: WorkerAdapter = {
   id: "pi",
   // FLEET-04: cross-vendor review honesty — GLM's provider (pi's own label is "zai"; either is
@@ -45,9 +141,17 @@ export const pi: WorkerAdapter = {
   probe: async () => {
     const h = probeVersion("pi");
     if (!h.installed) return h;
+    // The store is local and independently useful: preserve its advisory even when the network/auth
+    // capability call below fails. A failed model listing must not erase evidence of a substitution.
+    const drift = servedModelNote();
     const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000 });
-    if (r.error || r.status !== 0) return h;
-    return { ...h, servable: parsePiModels(r.stdout || ""), note: "auth verified via pi --list-models (free; auth-filtered by pi)" };
+    if (r.error || r.status !== 0) {
+      return drift ? { ...h, note: `${h.note ? `${h.note}; ` : ""}${drift}` } : h;
+    }
+    // v2.1.3 T7: the probe is the production caller that already reads this store, and doctor/fleet
+    // already render its note — so the served-model discrepancy is reported where it is already read.
+    const note = `auth verified via pi --list-models (free; auth-filtered by pi)${drift ? `; ${drift}` : ""}`;
+    return { ...h, servable: parsePiModels(r.stdout || ""), note };
   },
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("pi", cfg),
   // v1.65 T3: every flag the command builders below hardcode — verified in `pi --help` 2026-07-22.
@@ -88,25 +192,14 @@ export const pi: WorkerAdapter = {
       const real = realpathSync(cwd);
       const slug = "-" + real.replaceAll("/", "-") + "--";
       const dir = join(homedir(), ".pi", "agent", "sessions", slug);
-      const files = readdirSync(dir)
-        .filter((f) => f.endsWith(".jsonl"))
-        .map((f) => {
-          try {
-            return { f, m: statSync(join(dir, f)).mtimeMs };
-          } catch {
-            return undefined;
-          }
-        })
-        .filter((x): x is { f: string; m: number } => x !== undefined)
-        .sort((a, b) => b.m - a.m)
-        .slice(0, MAX_SESSION_FILES);
+      const files = newestSessionFiles(sessionFileStats(dir));
 
       let input = 0, output = 0, kept = false;
       let cacheRead: number | undefined, cacheWrite: number | undefined;
-      for (const { f } of files) {
+      for (const f of files) {
         let text: string;
         try {
-          text = readFileSync(join(dir, f), "utf8").slice(0, MAX_SESSION_BYTES);
+          text = readFileSync(f, "utf8").slice(0, MAX_SESSION_BYTES);
         } catch {
           continue;
         }

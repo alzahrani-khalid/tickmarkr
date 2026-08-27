@@ -237,7 +237,20 @@ describe("tickmarkr init --agent preflight authority (T3)", () => {
     await runInit(repo, "--agent", "--docs");
     const scaffolded = agentDocsSection(repo);
 
-    for (const doc of ["CLAUDE.md"]) {
+    // ROOT carries rendered guidance only in the private dev repo; the export deliberately ships no
+    // guidance file, so this assertion has no subject there and threw ENOENT on every public CI run.
+    // Discriminate POSITIVELY on the export script (present privately, absent in the export) and assert
+    // the export's own contract instead, so this never silently skips in either context.
+    if (!existsSync(join(ROOT, "scripts/export-public.sh"))) {
+      for (const doc of ["CLAUDE.md", "AGENTS.md"]) expect(existsSync(join(ROOT, doc))).toBe(false);
+      return;
+    }
+    // EVERY guidance file present at ROOT must carry the identical generated block. Asserting only
+    // CLAUDE.md is how AGENTS.md — gitignored, so invisible to `git status` — kept both pre-2.1.2
+    // preflight defects after the tracked copy was fixed, and launched a consult under the stale text.
+    const present = ["CLAUDE.md", "AGENTS.md"].filter((doc) => existsSync(join(ROOT, doc)));
+    expect(present.length).toBeGreaterThan(0);
+    for (const doc of present) {
       const rendered = agentDocsSection(ROOT, doc);
       expect(rendered).toBe(scaffolded);
       const preflight = versionPreflight(rendered);
@@ -247,6 +260,9 @@ describe("tickmarkr init --agent preflight authority (T3)", () => {
       expect(preflight).toMatch(/must agree on the entire version/);
       expect(preflight).toMatch(/binary `2\.1\.0` versus repository `2\.1\.1` is a stop/);
       expect(preflight).not.toMatch(/older on major\.minor/);
+      // the two-clause green rule recorded run 2119 (human=[T2]) as GREEN; the daemon's own predicate
+      // also requires failed/human/blocked/pending all empty. Reverting to the short form fails here.
+      expect(rendered).toMatch(/`failed`, `human`, `blocked` and `pending` buckets are every one of them empty/);
     }
   });
 });

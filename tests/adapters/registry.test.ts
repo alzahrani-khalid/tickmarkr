@@ -774,6 +774,45 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
     expect(helpOf).not.toHaveBeenCalled(); // uninstalled ⇒ not even a help spawn
   });
 
+  // v2.1.3 T7: the check above is ONE-WAY — it walks the DECLARED list and looks for each entry in the
+  // command strings. A flag the builders gained but nobody declared is invisible to it, so the probe
+  // silently stops watching `claude --help` for that flag's drift. This closes the other direction.
+  test("test: every flag these builders hardcode is declared for the capability probe including the newly added one; a declaration list left unchanged still satisfies the one-way honesty check that only reads declared flags and fails", () => {
+    const builders = (a: WorkerAdapter) => [
+      a.headlessCommand("/tmp/p.md", "m"),
+      a.interactiveCommand("/tmp/p.md", "m") ?? "",
+      a.resumeCommand?.("sid", "/tmp/p.md", "m") ?? "",
+    ].join("\n");
+    // every token these builders emit that a CLI would parse as a flag
+    const usedFlags = (cmd: string) =>
+      new Set(cmd.split(/\s+/).filter((t) => /^--?[A-Za-z][A-Za-z0-9-]*$/.test(t)));
+
+    const used = usedFlags(builders(claudeCode));
+    const declared = claudeCode.hardcodedFlags!.flags;
+    expect(used.has("--prompt-suggestions")).toBe(true); // the newly added one is actually in use
+    for (const f of used) expect(declared, `claude uses ${f}`).toContain(f);
+
+    // the declaration list left unchanged: exactly what shipped before the setting was added.
+    const UNCHANGED = ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r"];
+    expect(UNCHANGED).not.toContain("--prompt-suggestions");
+    // the one-way check reads ONLY declared flags — so the stale list is green on every one of them
+    // and reports nothing at all about the flag it is missing.
+    const oneWayHonest = (list: string[]) => list.every((f) => used.has(f));
+    expect(oneWayHonest(UNCHANGED)).toBe(true);
+    expect(oneWayHonest(declared)).toBe(true);
+    // and the drift probe, which reads the same declared list, never even asks claude --help about it
+    const asked: string[] = [];
+    const stale = { ...claudeCode, id: "claude-code", hardcodedFlags: { binary: "claude", flags: UNCHANGED } } as WorkerAdapter;
+    flagDriftWarnings([stale], { "claude-code": { installed: true, authed: true, models: [] } }, () => {
+      asked.push("help");
+      return UNCHANGED.join(" ");
+    });
+    expect(asked).toEqual(["help"]);
+    // this direction is the one that catches it: a used-but-undeclared flag
+    const undeclared = [...used].filter((f) => !UNCHANGED.includes(f));
+    expect(undeclared).toEqual(["--prompt-suggestions"]);
+  });
+
   test("every adapter whose command strings hardcode flags declares those flags for the probe", () => {
     const tokens = (s: string) => new Set(s.split(/[^A-Za-z0-9_-]+/));
     for (const a of [claudeCode, codex, cursorAgent, opencode, pi, grok, kimi]) {

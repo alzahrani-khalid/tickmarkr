@@ -15,6 +15,12 @@ export interface BaselineCommand {
   missingCommand?: boolean;
   /** What this command actually took at capture, on a pristine tree. Absent in pre-v1.90 baselines. */
   durationMs?: number;
+  /** Sum of the per-file durations named by the runner; null when its output names none. */
+  fileDurationSumMs?: number | null;
+  /** fileDurationSumMs / durationMs — average implied file concurrency, not a configured fork count. */
+  impliedParallelism?: number | null;
+  /** The slowest per-file entry named by the runner; null when per-file timing is unavailable. */
+  longestFile?: BaselineFileDuration | null;
   /** The ceiling that measurement implies, persisted so every later battery uses the same number. */
   ceilingMs?: number;
   /**
@@ -22,6 +28,11 @@ export interface BaselineCommand {
    * the entry carries a CAUSE and no verdict: no exit code, no fingerprints, nothing forgivable.
    */
   infra?: true;
+}
+
+export interface BaselineFileDuration {
+  file: string;
+  durationMs: number;
 }
 
 export interface Baseline {
@@ -58,6 +69,12 @@ const SUMMARY_FAIL_RE = /^\s*(?:Tests?\s+(?:Files?\s+)?(?:\d+|#)\s+failed|#\s+fa
 const ERROR_ANCHOR_RE = /^\s*(?:Error|[A-Za-z_$][\w$]*Error):\s+\S/;
 const TSC_ERROR_RE = /^\s*\S.*\((?:\d+|#),(?:\d+|#)\):\s+error\s+[A-Z]+(?:\d+|#):/i; // tsc
 const LINTER_ERROR_RE = /^\s*(?:\d+|#):(?:\d+|#)\s+error\s+\S/; // eslint stylish
+// T5: package.json selecting oxlint's stylish format is this repository's local remedy because the
+// existing LINTER_ERROR_RE already reads it. PATH_FIRST_LINTER_ERROR_RE is the shipped fix: it reads
+// the default `path:line:column: error …` form for every user without requiring their script to change.
+// Keep the path at line start — accepting a position mid-sentence turns ordinary runner prose into a
+// manufactured fresh failure.
+const PATH_FIRST_LINTER_ERROR_RE = /^\s*\S+:(?:\d+|#):(?:\d+|#):\s+error\b(?:\s+\S)?/;
 // The failure shapes non-Vitest runners name their tests with: pytest's short summary
 // (`FAILED tests/t.py::test_x - AssertionError`, `ERROR tests/t.py::fixture`), go test
 // (`--- FAIL: TestFoo (0.00s)`), TAP / node:test (`not ok 1 - name`, whose summary line lands in
@@ -131,7 +148,7 @@ const namesFailureEitherForm = (l: string): boolean => {
 };
 const isFailureShaped = (l: string) =>
   namesFailure(l) || SUMMARY_FAIL_RE.test(l) || ERROR_ANCHOR_RE.test(l)
-  || TSC_ERROR_RE.test(l) || LINTER_ERROR_RE.test(l) || X_GLYPH_FAIL_RE.test(l);
+  || TSC_ERROR_RE.test(l) || LINTER_ERROR_RE.test(l) || PATH_FIRST_LINTER_ERROR_RE.test(l) || X_GLYPH_FAIL_RE.test(l);
 const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 
 // T9 — the infra/regression discriminator. A runner that died because the MACHINE ran out of
@@ -167,6 +184,33 @@ export function classifyFailureOutput(output: string): FailureClassification | u
 }
 
 const normalizeLine = (l: string) => l.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
+
+// Vitest's default reporter names file durations as
+// `✓ |project| tests/example.test.ts (12 tests) 1.23s` (❯ for a red file). The runner may be
+// turbo-prefixed, but a test-name timing has no parenthesized file tally and therefore cannot enter
+// this measurement. These are observations of runner output, not a promise that every runner exposes
+// them — callers record null, never zero, when no line matches.
+const FILE_DURATION_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)[✓✔×❯]\s+(?:\|[^|\r\n]+\|\s+)?(\S+)\s+\([^\r\n)]*\)\s+(\d+(?:\.\d+)?)\s*(ms|s|m)\b/;
+
+const durationUnitMs = (unit: string): number => unit === "m" ? 60_000 : unit === "s" ? 1_000 : 1;
+
+function fileTiming(output: string, wallClockMs: number): Pick<BaselineCommand, "fileDurationSumMs" | "impliedParallelism" | "longestFile"> {
+  const files: BaselineFileDuration[] = [];
+  for (const line of output.split("\n")) {
+    const match = FILE_DURATION_RE.exec(line.replace(ANSI_RE, ""));
+    if (!match) continue;
+    const durationMs = Number(match[2]) * durationUnitMs(match[3]);
+    if (Number.isFinite(durationMs)) files.push({ file: match[1], durationMs });
+  }
+  if (!files.length) return { fileDurationSumMs: null, impliedParallelism: null, longestFile: null };
+  const fileDurationSumMs = files.reduce((sum, entry) => sum + entry.durationMs, 0);
+  const longestFile = files.reduce((longest, entry) => entry.durationMs > longest.durationMs ? entry : longest);
+  return {
+    fileDurationSumMs,
+    impliedParallelism: wallClockMs > 0 ? fileDurationSumMs / wallClockMs : null,
+    longestFile,
+  };
+}
 
 // A failing command whose output holds no shape any runner here names. The marker is content-free and
 // constant: downstream consumers (tip verify journals fingerprint counts) still see that the command
@@ -412,16 +456,26 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `it recorded NO fingerprints, so nothing is forgiven and every gate will treat a pre-existing `
         + `failure as a fresh one. Raise the ceiling or shorten the command.`,
       );
-      base.commands[name] = { infra: true, fingerprints: [], durationMs, ceilingMs: effectiveCeilingMs({ durationMs }) };
+      base.commands[name] = {
+        infra: true,
+        fingerprints: [],
+        durationMs,
+        fileDurationSumMs: null,
+        impliedParallelism: null,
+        longestFile: null,
+        ceilingMs: effectiveCeilingMs({ durationMs }),
+      };
       continue;
     }
+    const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
     base.commands[name] = {
       exitCode: r.code,
       // a command that exits 0 has no failures to fingerprint — recording any would be a lie the
       // compare step then has to forgive
-      fingerprints: r.code === 0 ? [] : fingerprint((r.stdout + "\n" + r.stderr).split(cwd).join("")),
+      fingerprints: r.code === 0 ? [] : fingerprint(raw),
       missingCommand: missingConfiguredCommand(cmd, r),
       durationMs,
+      ...fileTiming(raw, durationMs),
       ceilingMs: effectiveCeilingMs({ durationMs }),
     };
   }

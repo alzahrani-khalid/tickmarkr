@@ -1,8 +1,10 @@
+import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
-import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, createWorktree, gitHead, linkNodeModules, removeWorktree, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { afterEach, describe, expect, test } from "vitest";
+import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, createWorktree, gitHead, linkNodeModules, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -70,6 +72,61 @@ describe("sh", () => {
       else process.env.HOME = oldHome;
     }
   });
+});
+
+
+// OBS-688: the machine refusing a fork is not evidence about the work — the command never started.
+// It happened twice in one night behind a waived flake, and it is unreachable from a fixture while
+// the seam holds `spawn` from the standard library directly, so the seam is injected here. The fake
+// child mirrors what node hands back on a refused spawn: streams exist, no `spawn` event ever fires,
+// and the error arrives asynchronously (measured against a real ENOENT spawn, which the third case
+// below uses unfaked rather than describing).
+const refusedSpawn = (code: string) => {
+  const child = new EventEmitter() as unknown as ReturnType<typeof spawn>;
+  Object.assign(child, { stdout: new EventEmitter(), stderr: new EventEmitter(), kill: () => true });
+  const err = Object.assign(new Error(`spawn bash ${code}`), { code, syscall: "spawn bash" });
+  setImmediate(() => child.emit("error", err));
+  return child;
+};
+
+describe("spawn refusal at the one shell seam (OBS-688)", () => {
+  afterEach(() => resetSpawnForTests());
+
+  test("a spawn the operating system refuses for a temporary resource shortage before the command starts is retried and the caller receives the command's own exit status and output; a seam returning the spawn error on the first refusal fails", async () => {
+    let calls = 0;
+    setSpawnForTests(((file, args, opts) => {
+      calls += 1;
+      return calls === 1 ? refusedSpawn("EAGAIN") : spawn(file, args as string[], opts as object);
+    }) as typeof spawn);
+    const r = await sh("echo out; echo err >&2; exit 3", "/tmp");
+    expect(calls).toBe(2); // the refusal was retried, not reported
+    expect(r.code).toBe(3); // ...and the caller sees the COMMAND's status, never the seam's 127
+    expect(r.stdout.trim()).toBe("out");
+    expect(r.stderr.trim()).toBe("err");
+  }, 10000);
+
+  test("the retry is bounded and a refusal persisting past that bound returns the spawn error rather than looping; an unbounded retry that never returns fails", async () => {
+    let calls = 0;
+    setSpawnForTests((() => { calls += 1; return refusedSpawn("EAGAIN"); }) as typeof spawn);
+    const r = await sh("echo never-runs", "/tmp"); // an unbounded retry never resolves and times this case out
+    expect(calls).toBe(SPAWN_ATTEMPT_LIMIT);
+    expect(SPAWN_ATTEMPT_LIMIT).toBeGreaterThan(1); // a "bound" of one is no retry at all
+    expect(r.code).toBe(127);
+    expect(r.stderr).toMatch(/EAGAIN/); // the refusal's own text, carried out to the caller
+  }, 10000);
+
+  test("a spawn refused because the interpreter does not exist is returned immediately with no retry; a seam retrying every spawn error delays every genuine failure and fails", async () => {
+    let calls = 0;
+    // a REAL refusal: node itself raises ENOENT for this binary, so nothing about it is modelled
+    setSpawnForTests(((_file, args, opts) => {
+      calls += 1;
+      return spawn("tickmarkr-no-such-interpreter", args as string[], opts as object);
+    }) as typeof spawn);
+    const r = await sh("echo never-runs", "/tmp");
+    expect(calls).toBe(1); // a seam retrying every spawn error would spend the whole backoff here
+    expect(r.code).toBe(127);
+    expect(r.stderr).toMatch(/ENOENT/);
+  }, 10000);
 });
 
 describe("routing env scrub at the spawn seam (OBS-74)", () => {

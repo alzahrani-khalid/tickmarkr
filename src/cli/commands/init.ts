@@ -112,7 +112,7 @@ Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version\`, re
 
 ### Tip-verify-before-green
 
-A run is green only when the run-end event exists in the journal AND tip verify is not "failed". Never report green to the operator, tab titles, or records until both hold.
+A run is green only when ALL of these hold: the run-end event exists in the journal, tip verify is not "failed", AND the run-end summary's \`failed\`, \`human\`, \`blocked\` and \`pending\` buckets are every one of them empty. The shorter "run-end plus tip verify" form is NOT sufficient: a run ending \`done=[T1,T3,T4] human=[T2] tipVerify=passed\` is a closed PARTIAL run — three of four delivered, one parked — and calling it green is how a park becomes invisible. Never report green to the operator, tab titles, or records until every clause holds; when one does not, name the bucket that is not empty.
 
 ### Verified handoffs
 
@@ -208,6 +208,23 @@ function skillDrift(cwd: string): SkillDrift[] {
 
 // Name what drifted. "stale" alone sends the reader to diff three directories by hand, and the file that
 // matters is usually the one they never knew shipped.
+// The GENERATED GUIDANCE BLOCK goes stale by exactly the shape skillDrift exists for: the package
+// moves, the rendered copy does not, and nothing in the repo changes to hint at it. Worse than a skill,
+// because a doc the host reads as law can be gitignored — this project's own AGENTS.md kept two
+// superseded preflight rules (patch-version drift tolerated, a machine-wide process match required)
+// through the very release that fixed the tracked copy, and a consultation was launched under the stale
+// text with nobody able to see it. Same rule as skillDrift: a doc that was never written is not drift.
+const docsDrift = (cwd: string): string[] =>
+  hostTargets(cwd).map(({ docPath }) => docPath).filter((docPath) => {
+    if (!existsSync(docPath)) return false;
+    const current = readFileSync(docPath, "utf8");
+    const begin = current.indexOf(DOCS_BEGIN);
+    if (begin < 0) return false; // no block installed here — --docs writes one, that is not drift
+    const end = current.indexOf(DOCS_END, begin);
+    if (end < 0) return true; // a truncated block is stale by definition
+    return current.slice(begin, end + DOCS_END.length) !== AGENT_DOCS.trimEnd();
+  });
+
 const describeDrift = (d: SkillDrift) => [
   d.missing.length ? `missing ${d.missing.join(", ")}` : "",
   d.modified.length ? `modified ${d.modified.join(", ")}` : "",
@@ -374,6 +391,15 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   if (!values.agent) {
     for (const d of skillDrift(cwd)) {
       notes.push(`stale ${join(d.dir, "SKILL.md")} — ${describeDrift(d)}; run tickmarkr init --agent --force to refresh it`);
+    }
+  }
+  // Same reasoning, one layer up — and the refresh command is `--agent --force`, the same one the skill
+  // note names. `--docs` governs only the APPEND path for a repo with no block yet; replacing an existing
+  // block is gated on force (see the marked-region branch in installAgentFiles). Naming `--docs` here
+  // would send the reader to a flag that silently does nothing for the case they are in.
+  if (!(values.agent && values.force)) {
+    for (const docPath of docsDrift(cwd)) {
+      notes.push(`stale ${docPath} — its tickmarkr guidance block does not match this version; run tickmarkr init --agent --force to refresh it`);
     }
   }
 

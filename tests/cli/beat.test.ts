@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -43,7 +43,7 @@ describe("SUP-04 tickmarkr beat", () => {
     // line the P99 run printed for a whole milestone while a live overseer watched it.
     expect(supervisionLine(await status([], repo))).toContain("overseer ABSENT");
 
-    const out = await beat(["overseer"], repo);
+    const out = await beat(["overseer", "--seat", "OVSR-w1:p2"], repo);
 
     expect(out).toContain("overseer");
     const line = supervisionLine(await status([], repo));
@@ -55,7 +55,7 @@ describe("SUP-04 tickmarkr beat", () => {
 
   test("test: a tier whose newest beat has aged past the staleness ceiling of six beat intervals renders stale, while one aged past a single interval still renders armed, so a renderer that alarms on one missed beat or never leaves absent fails", async () => {
     const repo = seedRepo(mkRepo());
-    await beat(["overseer"], repo);
+    await beat(["overseer", "--seat", "OVSR-w1:p2"], repo);
 
     // BOTH sides of the module's forgiveness window, because each side falsifies a DIFFERENT renderer.
     // One interval past the last beat the seat has missed its cadence and nothing more: a renderer that
@@ -87,12 +87,12 @@ describe("SUP-04 tickmarkr beat", () => {
     // recurring beater surviving the invocation would rewrite the beat ten seconds after the
     // stand-down and flip DISARMED back to ARMED, with the immediate check below none the wiser.
     const scheduled = vi.spyOn(globalThis, "setInterval");
-    await beat(["overseer"], repo);
+    await beat(["overseer", "--seat", "OVSR-w1:p2"], repo);
     expect(scheduled).not.toHaveBeenCalled();
     scheduled.mockRestore();
     expect(supervisionLine(await status([], repo))).toContain("overseer ARMED");
 
-    await beat(["overseer", "--stand-down"], repo);
+    await beat(["overseer", "--stand-down", "--seat", "OVSR-w1:p2"], repo);
 
     const line = supervisionLine(await status([], repo));
     expect(line).not.toContain("overseer ARMED");
@@ -103,7 +103,7 @@ describe("SUP-04 tickmarkr beat", () => {
     expect(later).toContain("overseer DISARMED");
     expect(later).not.toContain("overseer ARMED");
     // and arming again after a stand-down is not blocked by the marker left behind
-    await beat(["overseer"], repo);
+    await beat(["overseer", "--seat", "OVSR-w1:p2"], repo);
     expect(supervisionLine(await status([], repo))).toContain("overseer ARMED");
   });
 
@@ -115,15 +115,42 @@ describe("SUP-04 tickmarkr beat", () => {
     // that was never recorded, which is the same fail-open the tier exists to catch, one layer up.
     mkdirSync(supervisionBeatPath(repo, "overseer"), { recursive: true });
 
-    await expect(beat(["overseer"], repo)).rejects.toThrow();
+    await expect(beat(["overseer", "--seat", "OVSR-w1:p2"], repo)).rejects.toThrow();
 
     expect(supervisionLine(await status([], repo))).toContain("overseer UNREADABLE");
   });
 
   test("an unknown tier is refused with the usage line rather than writing a beat nobody reads", async () => {
     const repo = seedRepo(mkRepo());
-    await expect(beat(["nonesuch"], repo)).rejects.toThrow(/orchestrator\|overseer\|watch/);
+    await expect(beat(["nonesuch"], repo)).rejects.toThrow(/orchestrator-context/);
     await expect(beat([], repo)).rejects.toThrow(/no tier/);
     expect(supervisionLine(await status([], repo))).toContain("overseer ABSENT");
+  });
+
+  test("test: the beat verb refuses a tier carrying no declared seat identity and writes no beat file; a beat that declares one makes status name that seat beside the tier's state; a record holding only the tier its one-shot process id and an instant leaves armed unattributable and fails", async () => {
+    const refusedRepo = seedRepo(mkRepo());
+    const refusedPath = supervisionBeatPath(refusedRepo, "overseer-context");
+
+    await expect(beat(["overseer-context"], refusedRepo)).rejects.toThrow(/--seat <identity>/);
+    expect(existsSync(refusedPath)).toBe(false);
+    expect(supervisionLine(await status([], refusedRepo))).toContain("overseer-context ABSENT");
+
+    const named = await beat(["overseer-context", "--seat", "OVSR-w1:p2"], refusedRepo);
+    expect(named).toContain("ARMED as OVSR-w1:p2");
+    expect(supervisionLine(await status([], refusedRepo)))
+      .toContain("overseer-context ARMED (OVSR-w1:p2)");
+
+    // The measured false-positive shape: tier + a one-shot pid + an instant cannot identify a seat.
+    // Something does occupy the path, so the reader reports it as unreadable evidence rather than
+    // claiming either ARMED coverage or that the tier was never armed.
+    const legacyRepo = seedRepo(mkRepo());
+    const legacyPath = supervisionBeatPath(legacyRepo, "orchestrator-context");
+    mkdirSync(join(tickmarkrDir(legacyRepo), "supervision"), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({
+      tier: "orchestrator-context", pid: 424242, beatAt: new Date().toISOString(),
+    }) + "\n");
+    const line = supervisionLine(await status([], legacyRepo));
+    expect(line).toContain("orchestrator-context UNREADABLE");
+    expect(line).not.toContain("orchestrator-context ARMED");
   });
 });

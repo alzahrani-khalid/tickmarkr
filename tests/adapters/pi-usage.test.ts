@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { pi } from "../../src/adapters/pi.js";
+import { pi, readPiServedModels, type ServedModelDrift, servedModelNote } from "../../src/adapters/pi.js";
 import { addUsage } from "../../src/adapters/types.js";
 
 // SPEND-10: zero-token test — synthetic ~/.pi/agent/sessions/<slug>/*.jsonl under a temp HOME.
@@ -224,5 +224,199 @@ describe("pi.collectUsage — THE BITING TEST: multi-attempt cursor fold is A+B+
     ]);
 
     expect(collect(cwd, Tr)).toEqual({ input: 7, output: 4 });
+  });
+});
+
+
+// v2.1.3 T7 — pi states the model it was SERVED in message.responseModel, and writes that field only
+// where it differs from the pinned message.model. Zero-token: the probe's two spawns (`pi --version`,
+// `pi --list-models`) are answered by a stub `pi` first on PATH — the real binary is never invoked and
+// no model turn happens — while HOME points at the same synthetic session store the rig above plants.
+type Rec = { model: string; responseModel?: string };
+
+// VERBATIM capture (pi 0.80.x, ~/.pi/agent/sessions, record b292aa13 of 2026-08-19T11:34:50.797Z):
+// the drifting record as pi actually writes it — pinned glm-5.2, served glm-5.3.
+const DRIFTED: Rec = { model: "glm-5.2", responseModel: "glm-5.3" };
+// An ordinary turn from the same store: the two agree, so pi writes no responseModel at all.
+const ORDINARY: Rec = { model: "glm-5.2" };
+
+const servedMsg = (tsISO: string, rec: Rec) => ({
+  type: "message",
+  id: "msg-served",
+  parentId: "parent",
+  timestamp: tsISO,
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text: "ok" }],
+    api: "openai-completions",
+    provider: "zai",
+    model: rec.model,
+    usage: { input: 1354, output: 3, cacheRead: 2624, cacheWrite: 0 },
+    stopReason: "stop",
+    ...(rec.responseModel !== undefined ? { responseModel: rec.responseModel } : {}),
+  },
+});
+
+// Both neighbours below read the SAME planted store the shipped reader reads, off the same bytes on
+// disk. The only thing that differs between them and the shipped reader is one expression: which
+// field each takes as "the model that was served". That keeps the falsification honest — a neighbour
+// built out of an in-memory array would be a strawman, green because it never met the records.
+function readWith(servedOf: (m: Record<string, unknown>) => unknown): ServedModelDrift[] {
+  const root = join(HOME, ".pi", "agent", "sessions");
+  const out: ServedModelDrift[] = [];
+  for (const slug of readdirSync(root)) {
+    for (const f of readdirSync(join(root, slug))) {
+      for (const line of readFileSync(join(root, slug, f), "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        let recRaw: unknown;
+        try {
+          recRaw = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const rec = recRaw as { type?: unknown; message?: Record<string, unknown> };
+        if (rec.type !== "message" || rec.message?.role !== "assistant") continue;
+        const pinned = rec.message.model;
+        const served = servedOf(rec.message);
+        if (typeof pinned !== "string" || served === pinned) continue;
+        out.push({ pinned, served: typeof served === "string" ? served : "unknown" });
+      }
+    }
+  }
+  return out;
+}
+
+// The neighbouring wrong answer: read the served model off message.model. It agrees with the honest
+// reader on every ordinary record — and on the drifting one too, which is exactly the defect.
+const pinnedAsServed = () => readWith((m) => m.model);
+
+// The other neighbour: treat an absent responseModel as a mismatch (undefined ⇒ never equal ⇒ alarm).
+const absentIsMismatch = () => readWith((m) => m.responseModel);
+
+describe("pi.probe — the model pi was served (v2.1.3 T7)", () => {
+  let ORIG_PATH: string | undefined;
+  let ORIG_LIST_MODELS_FAIL: string | undefined;
+
+  beforeEach(() => {
+    ORIG_PATH = process.env.PATH;
+    ORIG_LIST_MODELS_FAIL = process.env.TICKMARKR_TEST_PI_LIST_MODELS_FAIL;
+    delete process.env.TICKMARKR_TEST_PI_LIST_MODELS_FAIL;
+    const bin = join(HOME, "bin");
+    mkdirSync(bin, { recursive: true });
+    const stub = join(bin, "pi");
+    writeFileSync(stub, [
+      "#!/bin/sh",
+      `case "$1" in`,
+      `  --version) echo "0.80.6 (stub)"; exit 0;;`,
+      `  --list-models) if [ "$TICKMARKR_TEST_PI_LIST_MODELS_FAIL" = "1" ]; then echo "auth failed" >&2; exit 7; fi; printf 'provider model\\nzai glm-5.2\\n'; exit 0;;`,
+      "esac",
+      "exit 1",
+      "",
+    ].join("\n"));
+    chmodSync(stub, 0o755);
+    process.env.PATH = `${bin}:${ORIG_PATH ?? ""}`;
+  });
+  afterEach(() => {
+    if (ORIG_PATH === undefined) delete process.env.PATH;
+    else process.env.PATH = ORIG_PATH;
+    if (ORIG_LIST_MODELS_FAIL === undefined) delete process.env.TICKMARKR_TEST_PI_LIST_MODELS_FAIL;
+    else process.env.TICKMARKR_TEST_PI_LIST_MODELS_FAIL = ORIG_LIST_MODELS_FAIL;
+  });
+
+  test("test: a session record whose served model differs from the pinned model makes the capability probe report both names; a probe reporting the pinned model as the served one is green on that record and on every ordinary one and fails", async () => {
+    const cwd = scratch();
+    plantSession(cwd, [sessionHeader(cwd), servedMsg(T1, ORDINARY), servedMsg(T2, DRIFTED)]);
+
+    expect(readPiServedModels()).toEqual([{ pinned: "glm-5.2", served: "glm-5.3" }]);
+    const health = await pi.probe();
+    expect(health.installed).toBe(true);
+    // BOTH names, or the report says nothing an operator could act on
+    expect(health.note).toContain("glm-5.2");
+    expect(health.note).toContain("glm-5.3");
+
+    // the neighbour: green on the drifting record and on every ordinary one — it raises no false
+    // alarm anywhere, and it never names the model that was actually served, so it fails the above.
+    expect(pinnedAsServed()).toEqual([]);
+    expect(servedModelNote(pinnedAsServed())).not.toContain("glm-5.3");
+    expect(servedModelNote(pinnedAsServed())).toBe("");
+  });
+
+  test("a failed model-list capability call still reports locally recorded served-model drift", async () => {
+    const cwd = scratch();
+    plantSession(cwd, [sessionHeader(cwd), servedMsg(T1, DRIFTED)]);
+    process.env.TICKMARKR_TEST_PI_LIST_MODELS_FAIL = "1";
+
+    const health = await pi.probe();
+    expect(health.installed).toBe(true);
+    expect(health.note).toContain("glm-5.2");
+    expect(health.note).toContain("glm-5.3");
+  });
+
+  test("valid JSON primitives in a session file are ignored without aborting the capability probe", async () => {
+    const cwd = scratch();
+    plantSession(cwd, [sessionHeader(cwd), null, servedMsg(T1, DRIFTED)]);
+
+    expect(readPiServedModels()).toEqual([{ pinned: "glm-5.2", served: "glm-5.3" }]);
+    const health = await pi.probe();
+    expect(health.note).toContain("glm-5.2");
+    expect(health.note).toContain("glm-5.3");
+  });
+
+  test("test: session records carrying no served-model field report no discrepancy at all; a reader treating an absent field as a mismatch alarms on every ordinary turn and fails", async () => {
+    const cwd = scratch();
+    plantSession(cwd, [sessionHeader(cwd), servedMsg(T1, ORDINARY), servedMsg(T2, ORDINARY), servedMsg(T3, ORDINARY)]);
+
+    expect(readPiServedModels()).toEqual([]);
+    const health = await pi.probe();
+    expect(health.note).toBe("auth verified via pi --list-models (free; auth-filtered by pi)");
+    expect(health.note).not.toMatch(/served-model drift/);
+
+    // the neighbour, reading those same three ordinary records off the same files: an absent field
+    // taken as a mismatch fires on EVERY one of them, and the note it builds is indistinguishable
+    // from a real discrepancy.
+    expect(absentIsMismatch()).toHaveLength(3);
+    expect(servedModelNote(absentIsMismatch())).toContain("served-model drift");
+
+    // and it is not merely noisy. Add one genuinely drifting record to the same store: the shipped
+    // reader reports that one pair and nothing else, while the neighbour buries it among three false
+    // alarms — so an operator reading its note cannot tell the real substitution from the ordinary turns.
+    plantSession(cwd, [sessionHeader(cwd), servedMsg(T3, DRIFTED)], [], "drift.jsonl");
+    expect(readPiServedModels()).toEqual([{ pinned: "glm-5.2", served: "glm-5.3" }]);
+    expect(absentIsMismatch()).toHaveLength(4);
+  });
+
+  test("the scan is bounded like the usage reader beside it, and fails open with no store at all", async () => {
+    // no ~/.pi at all under this temp HOME
+    expect(readPiServedModels()).toEqual([]);
+    const cwd = scratch();
+    plantSession(cwd, [sessionHeader(cwd), servedMsg(T1, DRIFTED)], [`{"type":"message","message":{"role":"assistant","model":"glm-5.2","responseModel"`]);
+    // torn line dropped, valid record still read
+    expect(readPiServedModels()).toEqual([{ pinned: "glm-5.2", served: "glm-5.3" }]);
+    // an id that could reach operator-facing text is refused by the shared charset gate
+    plantSession(cwd, [sessionHeader(cwd), servedMsg(T1, { model: "glm-5.2", responseModel: "glm-5.3; rm -rf /" })], [], "y.jsonl");
+    expect(readPiServedModels().some((d) => d.served.includes("rm -rf"))).toBe(false);
+  });
+
+  // The bound is the point of the task, so prove it the only way that varies with the question:
+  // hold the BYTES fixed and move the one input the bound reads — the file's mtime. A test that only
+  // planted one drifting file would be green whether the window were 20 files or unbounded.
+  test("the scan reads only the newest MAX_SESSION_FILES, exactly like the usage reader beside it", () => {
+    const cwd = scratch();
+    const dir = slugDir(cwd);
+    const stamp = (f: string, secs: number) => utimesSync(join(dir, f), secs, secs);
+
+    // one drifting session, then MAX_SESSION_FILES (20) ordinary ones all newer than it
+    plantSession(cwd, [sessionHeader(cwd), servedMsg(T1, DRIFTED)], [], "drift.jsonl");
+    stamp("drift.jsonl", 1_000_000);
+    for (let i = 0; i < 20; i++) {
+      plantSession(cwd, [sessionHeader(cwd), servedMsg(T1, ORDINARY)], [], `n${i}.jsonl`);
+      stamp(`n${i}.jsonl`, 2_000_000 + i);
+    }
+    // pushed out of the newest-20 window ⇒ never opened ⇒ nothing to report
+    expect(readPiServedModels()).toEqual([]);
+
+    // the very same file, byte-for-byte unchanged, now the newest: it is read and the drift is named.
+    stamp("drift.jsonl", 3_000_000);
+    expect(readPiServedModels()).toEqual([{ pinned: "glm-5.2", served: "glm-5.3" }]);
   });
 });

@@ -1,4 +1,5 @@
 import { channelKey } from "../../adapters/types.js";
+import { isPidLive } from "../../run/lock.js";
 import type {
   ComponentState,
   JournalRow,
@@ -280,15 +281,6 @@ function elapsedReading(first: string, last: string): string {
   const remainder = seconds % 60;
   const padded = (part: number) => String(part).padStart(2, "0");
   return `${padded(hours)}:${padded(minutes)}:${padded(remainder)}`;
-}
-
-function defaultDaemonLiveness(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function latestLifecycle(events: readonly CaptureEvent[]): RunLifecycle {
@@ -991,7 +983,10 @@ export function deriveRunCockpitData(
   const pid = daemonPid(events);
   const alive = lifecycle !== "active"
     ? false
-    : pid !== undefined && (options.isDaemonAlive ?? defaultDaemonLiveness)(pid);
+    // lock.ts's isPidLive is the ONE pid-liveness table. The local copy this replaced treated ANY
+    // thrown probe error as death, so a daemon owned by another user (EPERM) read dead here and
+    // alive in the lock — the cockpit called a live run interrupted.
+    : pid !== undefined && (options.isDaemonAlive ?? isPidLive)(pid);
   const interrupted = !alive;
   const tasks = deriveTasks(events, interrupted);
   const taskFacts = [...tasks.values()];

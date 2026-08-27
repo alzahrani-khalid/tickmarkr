@@ -28,34 +28,57 @@ import {
 // evidence: stop calling it and the tier ages into STALE on its own.
 export async function beat(argv: string[], cwd = process.cwd()): Promise<string> {
   const standDown = argv.includes("--stand-down");
-  const named = argv.find((a) => !a.startsWith("--"));
+  const seat = seatOf(argv);
+  const named = argv.find((a, i) => !a.startsWith("--") && argv[i - 1] !== "--seat");
   if (!isTier(named)) {
     throw new Error(
-      `usage: tickmarkr beat <${SUPERVISION_TIERS.join("|")}> [--stand-down] — got ${named ? `\`${named}\`` : "no tier"}`,
+      `usage: tickmarkr beat <${SUPERVISION_TIERS.join("|")}> --seat <identity> [--stand-down] — got ${named ? `\`${named}\`` : "no tier"}`,
     );
   }
-  if (standDown) return standDownTier(cwd, named);
+  // SUP-05: NO SEAT, NO BEAT — and the refusal comes before any write, so a refused invocation leaves
+  // the tier exactly as it found it. This verb is one-shot: the pid it would otherwise record has
+  // already exited by the time anyone reads the record, so tier + pid + instant is a beat nobody can
+  // attribute to a seat. Measured 2026-08-26: a consult seat ran the documented loop verbatim and the
+  // board read that tier ARMED with no seat of that tier having armed anything, and a seatless ARMED
+  // reads as coverage — worse than ABSENT, because ABSENT sends someone to look.
+  if (!seat) {
+    throw new Error(
+      `${named} needs --seat <identity> — a beat that names no seat arms a tier nobody occupies` +
+        " (pass the seat's own pane id or agent name)",
+    );
+  }
+  if (standDown) return standDownTier(cwd, named, seat);
   // Clear a stand-down marker left by an earlier session BEFORE beating: a valid marker outranks every
   // beat that does not strictly follow it, and two writes landing in the same millisecond do not. An
   // uncleared marker would render DISARMED while this verb claimed ARMED, so the removal is unguarded
   // too — `force` makes the ordinary "no marker" case a no-op, and anything else is a real failure.
   rmSync(supervisionStandDownPath(cwd, named), { force: true, recursive: true });
-  beatSupervision(cwd, named);
-  return `${named} ARMED — beat again every ${SUPERVISION_BEAT_MS / 1_000}s; the tier reads STALE ${SUPERVISION_STALE_MS / 1_000}s after the last beat`;
+  beatSupervision(cwd, named, seat);
+  return `${named} ARMED as ${seat} — beat again every ${SUPERVISION_BEAT_MS / 1_000}s; the tier reads STALE ${SUPERVISION_STALE_MS / 1_000}s after the last beat`;
+}
+
+/** `--seat <identity>` or `--seat=<identity>`; blank and missing are the same answer — none. */
+function seatOf(argv: string[]): string | undefined {
+  const inline = argv.find((a) => a.startsWith("--seat="))?.slice("--seat=".length);
+  const spaced = argv[argv.indexOf("--seat") + 1];
+  const seat = (inline ?? (argv.includes("--seat") ? spaced : undefined))?.trim();
+  return seat && !seat.startsWith("--") ? seat : undefined;
 }
 
 // Stand-down is a RECORDED act, not a silence: the marker tells a reader this watcher left on purpose,
 // so the tier reads DISARMED rather than ageing out as a death. Published atomically — written aside,
 // renamed over — because a torn marker is rejected by the reader, and a rejected stand-down reports a
 // deliberate hand-off as a death.
-function standDownTier(repoRoot: string, tier: SupervisionTier): string {
+function standDownTier(repoRoot: string, tier: SupervisionTier, seat: string): string {
   tickmarkrDir(repoRoot); // the write path DOES create — markers land inside the gitignored state dir
   const p = supervisionStandDownPath(repoRoot, tier);
   const tmp = `${p}.${process.pid}.tmp`;
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(tmp, JSON.stringify({ tier, pid: process.pid, disarmedAt: new Date().toISOString() }) + "\n");
+  // The marker names the seat for the same reason the beat does: "someone stood this tier down" is not
+  // a hand-off anyone can act on, and on a seat tier the reader rejects an anonymous one outright.
+  writeFileSync(tmp, JSON.stringify({ tier, seat, pid: process.pid, disarmedAt: new Date().toISOString() }) + "\n");
   renameSync(tmp, p);
-  return `${tier} DISARMED — hand-off recorded; status reads it stood down, not dead`;
+  return `${tier} DISARMED — ${seat} handed off; status reads it stood down, not dead`;
 }
 
 const isTier = (v: string | undefined): v is SupervisionTier =>

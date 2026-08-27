@@ -324,9 +324,13 @@ describe("export workflow correctness — the exported CI stands alone", () => {
 
   test("the export commit author email is the noreply identity rather than the personal address", { timeout: 180_000 }, () => {
     const c = getCandidate();
-    // the export commit is the root commit in both contexts: candidate (sole commit) and public repo
-    const rootCommit = execSync("git rev-list --max-parents=0 HEAD", { cwd: c.root, encoding: "utf8" }).trim().split("\n")[0];
-    const email = execSync(`git log -1 --format=%ae ${rootCommit}`, { cwd: c.root, encoding: "utf8" }).trim();
+    // The export commit is HEAD in both contexts: the candidate tree (sole commit) and the public repo
+    // (newest export). It is NOT the root commit — that premise held only for the very first export and
+    // has been false since v1.60, so `--max-parents=0` pinned this guard to v1.59's commit and it would
+    // have passed for any identity used since. It fired on 2.1.2 only because CI's shallow checkout makes
+    // the grafted HEAD look parentless. Assert HEAD: correct in both contexts, and actually live.
+    const exportCommit = execSync("git rev-parse HEAD", { cwd: c.root, encoding: "utf8" }).trim();
+    const email = execSync(`git log -1 --format=%ae ${exportCommit}`, { cwd: c.root, encoding: "utf8" }).trim();
     expect(email).toBe(NOREPLY_IDENTITY);
     expect(email).not.toMatch(/gmail\.com$/);
   });

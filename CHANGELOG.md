@@ -4,6 +4,30 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.3** — a milestone about supervision telling the truth about itself. Eight tasks, all gated green,
+cross-vendor throughout.
+
+- The **context tier names the seat it is watching**, beats only what it actually read, and stands down
+  when it leaves. A beat that outlived its session used to hold a tier `ARMED` with nobody home; a
+  supervising tier can now tell *armed* from *armed-and-seatless*.
+- **`status` never reports a phase the daemon is not alive to be in.** It previously contradicted itself
+  — narrating a live phase from a journal whose daemon had died.
+- **Every lane that runs the suite divides the machine the same way.** Three workflows invoked the test
+  runner with three different fork budgets; the odd one out was `release.yml`, which is the one the
+  public export ships.
+- **The daemon suite splits without losing a test.** `tests/run/daemon.test.ts` was 4,641 lines; it is now
+  four focused files (`retry`, `harvest`, `fleet-and-gates`, `stall`) with the same assertions.
+- **The baseline records what it measured and classifies what it read**, so a gate can tell a pre-existing
+  failure from one the diff introduced, and an infrastructure red from a real one.
+- **A spawn the machine refused is retried**, and where it still lands it is named rather than reported as
+  a worker defect.
+- **An adapter reports the model it was actually served.** A session whose served model differs from the
+  pinned one now says so — and the advisory survives a `--list-models` that times out or exits nonzero,
+  which is exactly when an operator most needs it. A malformed advisory record no longer aborts `doctor`.
+- **The release path refuses a mirror whose identity guard is not installed**, closing the personal
+  address that reached tag author and committer fields.
+
+
 **v2.1.2** — a patch about the distance between what a record claims and what it checked. `verify
 --criteria` no longer prints a green `scope` row for an allowlist it never applied — it omits the gate
 rather than crediting one that gated nothing. The scaffolded version preflight now checks *this*

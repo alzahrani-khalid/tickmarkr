@@ -40,7 +40,7 @@
 - `npm run build` (`tsc -p tsconfig.json`) is the only enforced static check — TypeScript `strict: true`, target `ES2022`, module `NodeNext`.
 
 **Linting:**
-- oxlint 1.74.0 via `npm run lint` (`package.json:33`) — no config file in-repo; CI runs it in `.github/workflows/ci.yml`. TypeScript strict mode (`npm run build`) is the compile-time guardrail; oxlint is the style/safety pass.
+- oxlint 1.74.0 via `npm run lint` (`package.json:33`) — configured by the tracked `.oxlintrc.json`; CI runs it in `.github/workflows/ci.yml`. TypeScript strict mode (`npm run build`) is the compile-time guardrail; oxlint is the style/safety pass.
 
 **Module system:**
 - ESM only (`"type": "module"` in `package.json`), `moduleResolution: NodeNext`. Every relative import must include the literal `.js` extension even though the source is `.ts`: `import { validateGraph } from "../graph/schema.js"`. This is required by NodeNext, not a style choice — omitting it breaks the build.

@@ -67,8 +67,8 @@ Per release:
 3. In the **public** repository (the mirror), tag the export commit and push the tag:
 
    ```bash
-   git tag -a v2.1.2 -m "v2.1.2"
-   git push origin v2.1.2
+   git tag -a v2.1.3 -m "v2.1.3"
+   git push origin v2.1.3
    ```
 
 4. The tag push runs `release.yml` in the public repository:
@@ -153,10 +153,13 @@ Private documentation pages (`.planning/`, `docs/superpowers/`, `docs/analysis/`
 
 The public repository maintains **append-only history** with one commit per release. Instead of force-pushing, each export is committed on top of a persistent clone by the script itself:
 
-1. Clone the public repository (one time):
+1. Clone the public repository (one time), then immediately install and drill its identity guard.
+   This is a prerequisite of using the mirror: Git hooks are **not cloned**, and `--onto` refuses
+   a mirror without the guard.
 
    ```bash
-   git clone git@github.com:alzahrani-khalid/tickmarkr.git tickmarkr-public-mirror
+   git clone git@github.com:alzahrani-khalid/tickmarkr.git /path/to/tickmarkr-public-mirror
+   bash .planning/install-mirror-hooks.sh /path/to/tickmarkr-public-mirror
    ```
 
 2. For each release, run the export in mirror publish mode:

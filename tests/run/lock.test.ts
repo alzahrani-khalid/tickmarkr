@@ -1,14 +1,33 @@
 import { spawn, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { compile } from "../../src/cli/commands/compile.js";
-import { tickmarkrDir } from "../../src/graph/graph.js";
+import { status } from "../../src/cli/commands/status.js";
+import { saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { validateGraph } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
-import { acquireRunLock, isRunLockLive, releaseRunLock, shouldRefuse } from "../../src/run/lock.js";
+import { acquireRunLock, isPidLive, isRunLockLive, releaseRunLock, shouldRefuse } from "../../src/run/lock.js";
+import { deriveRunCockpitData } from "../../src/tui/cockpit/derive.js";
 import { COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
+
+// LOCK-04 pid seam: the table itself is exercised unmocked everywhere else in this file. This wrapper
+// exists so ONE test can change the table's answer and watch the two surfaces that consume it move —
+// a consumer that kept its own `process.kill(pid, 0)` cannot move, which is the drift being fenced.
+// `forced` is undefined for every other test, so they see the real predicate.
+const table = vi.hoisted(() => ({ forced: undefined as boolean | undefined }));
+vi.mock("../../src/run/lock.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/run/lock.js")>();
+  return { ...actual, isPidLive: (pid: number) => table.forced ?? actual.isPidLive(pid) };
+});
+
+// The copy two callers wrote by hand: ANY thrown probe error is read as death. Kept here as the
+// falsifier — it is what these tests must be able to catch.
+const anyThrowIsDeath = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+};
 
 // zero-token: real foreign pids only (spawnSync("true") = reaped-dead, spawn("sleep") = live), no CLIs.
 const STALE_PAST = 600_000; // 10 min > STALE_MS (60s) — the "expired heartbeat" fixture
@@ -333,5 +352,86 @@ describe("compile acquires graph lock around saveGraph (T5)", () => {
     spy.mockRestore();
     expect(existsSync(lockOf(repo))).toBe(false);
     expect(isRunLockLive(repo)).toBe(false);
+  });
+});
+
+// LOCK-04, pid-scoped. lock.ts stated that its inspection is the one decision table and that a second
+// `process.kill(pid, 0)` elsewhere would be a copy free to drift — while exporting only
+// REPOSITORY-scoped helpers, so a caller holding a pid off a journal row had no seam to consume and
+// wrote the four lines itself. Two did. The cockpit's copy swallowed every error, so a daemon owned
+// by another user read dead there and alive in the lock.
+describe("LOCK-04 pid-scoped seam — one predicate for every pid-liveness call site", () => {
+  const runStartRaw = (pid: number) =>
+    JSON.stringify({ ts: "2026-08-26T00:00:00.000Z", event: "run-start", data: { pid } }) + "\n";
+
+  // The cockpit's answer, read off the only field it publishes: an active run whose daemon is alive
+  // is `running`; the same journal with a dead daemon is `interrupted`.
+  const cockpitStatus = (pid: number) =>
+    deriveRunCockpitData({ fileName: "run-20260826-000000.journal.jsonl", raw: runStartRaw(pid) }, "0.0.0-test").status;
+
+  // The live status board's answer, in the words it prints to the operator.
+  const boardLine = async (pid: number): Promise<string> => {
+    const repo = tmp();
+    saveGraph(repo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "a", goal: "a", shape: "implement", complexity: 3, acceptance: ["a"] }],
+    }));
+    const dir = join(tickmarkrDir(repo), "runs", "run-seam");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "journal.jsonl"), runStartRaw(pid));
+    return status([], repo);
+  };
+
+  test("a pid whose signal probe is refused for permission reads live through the exported predicate so a daemon owned by another user is never called dead while a probe treating any thrown error as death fails", () => {
+    // pid 1 (launchd/init) is alive and owned by root: kill(1, 0) is REFUSED EPERM for an
+    // unprivileged user. Assert the fixture itself — a probe that never throws proves nothing here.
+    let code: string | undefined;
+    try { process.kill(1, 0); } catch (e) { code = (e as NodeJS.ErrnoException).code; }
+    expect(code).toBe("EPERM");
+
+    expect(isPidLive(1)).toBe(true); // EPERM is not evidence of death
+
+    // the hand-written copy, on the same pid: it calls a live daemon dead.
+    expect(anyThrowIsDeath(1)).toBe(false);
+    expect(anyThrowIsDeath(1)).not.toBe(isPidLive(1));
+
+    // and the two still agree where death is PROVABLE — so the disagreement above is EPERM alone,
+    // not a predicate that answers "live" to everything.
+    const reaped = spawnSync("true").pid!;
+    expect(isPidLive(reaped)).toBe(false);
+    expect(anyThrowIsDeath(reaped)).toBe(false);
+  });
+
+  test("the cockpit and the live status board both answer pid liveness through that one exported predicate so changing the table changes every answer while a caller keeping its own probe disagrees with the table", async () => {
+    const reaped = spawnSync("true").pid!; // provably dead (ESRCH)
+
+    // Baseline, table unchanged: each surface reports what the real table says about its pid.
+    expect(cockpitStatus(1)).toBe("running");
+    expect(await boardLine(1)).toContain("daemon pid 1 alive");
+    expect(cockpitStatus(reaped)).toBe("interrupted");
+    expect(await boardLine(reaped)).toContain(`daemon pid ${reaped} dead`);
+
+    // Change the TABLE, touch neither surface. Both must move — including against what their own
+    // probe would have said about these very pids, which is what makes this more than a restatement.
+    try {
+      table.forced = true;
+      expect(cockpitStatus(reaped)).toBe("running");
+      expect(await boardLine(reaped)).toContain(`daemon pid ${reaped} alive`);
+      table.forced = false;
+      expect(cockpitStatus(1)).toBe("interrupted");
+      expect(await boardLine(1)).toContain("daemon pid 1 dead");
+    } finally {
+      table.forced = undefined;
+    }
+
+    // The falsifier: a consumer keeping its own probe cannot move with the table — it answers the
+    // same thing before, during and after the change, and is wrong about the EPERM pid throughout.
+    try {
+      table.forced = true;
+      expect(anyThrowIsDeath(1)).toBe(false);
+      expect(anyThrowIsDeath(1)).not.toBe(isPidLive(1));
+    } finally {
+      table.forced = undefined;
+    }
   });
 });

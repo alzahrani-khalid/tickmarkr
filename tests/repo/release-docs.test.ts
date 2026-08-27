@@ -12,6 +12,7 @@ const CHANGELOG_MD = join(ROOT, "CHANGELOG.md");
 const PACKAGE_JSON = join(ROOT, "package.json");
 const RELEASE_YML = join(ROOT, ".github/workflows/release.yml");
 const EXPORT_SCRIPT = join(ROOT, "scripts/export-public.sh");
+const MIRROR_HOOK_INSTALLER = join(ROOT, ".planning/install-mirror-hooks.sh");
 const PUBLIC_HTTPS = "https://github.com/alzahrani-khalid/tickmarkr.git";
 const PUBLIC_SSH = "git@github.com:alzahrani-khalid/tickmarkr.git";
 
@@ -91,6 +92,20 @@ describe("release documentation", () => {
       );
       expect(content).toContain(
         "**Do not force-push:** Public history is append-only. Force-pushing orphans external forks and invalidates open pull requests. Each release is one new commit on top of `main`."
+      );
+    });
+
+    test("the release runbook names the installer as a prerequisite of the mirror clone beside the clone step, so a runbook mentioning it only as advice after the push fails", () => {
+      const content = readFile(RELEASING_MD);
+      const cloneStep = content.match(
+        /1\. Clone the public repository[\s\S]*?(?=\n2\. For each release)/
+      );
+      expect(cloneStep, "the one-time mirror clone step is missing").toBeTruthy();
+      expect(cloneStep![0]).toContain("prerequisite");
+      expect(cloneStep![0]).toContain("Git hooks are **not cloned**");
+      expect(cloneStep![0]).toContain("bash .planning/install-mirror-hooks.sh");
+      expect(content.indexOf("bash .planning/install-mirror-hooks.sh")).toBeLessThan(
+        content.indexOf("push origin main")
       );
     });
   });
@@ -175,11 +190,16 @@ describe("release documentation", () => {
       execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@test.local", ...args], {
         cwd, encoding: "utf8",
       }).trim();
+    const installMirrorIdentityGuard = (mirrorPath: string) =>
+      execFileSync("bash", [MIRROR_HOOK_INSTALLER, mirrorPath], {
+        cwd: ROOT, encoding: "utf8",
+      });
 
     let originDir: string;
     let mirror: string;
     let originMain: string;
     let divergentSha: string;
+    let publishOutput: string;
     const cleanup: string[] = [];
 
     beforeAll(() => {
@@ -200,13 +220,14 @@ describe("release documentation", () => {
       // origin while git's standard insteadOf rewrite sends fetches to the synthetic local remote.
       git(mirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
       git(mirror, "config", `url.${originDir}.insteadOf`, PUBLIC_HTTPS);
+      installMirrorIdentityGuard(mirror);
       // diverge the mirror locally — the script must discard this via reset to origin/main
       writeFileSync(join(mirror, "divergent.txt"), "local-only divergence\n");
       git(mirror, "add", "-A");
       git(mirror, "commit", "-q", "--no-gpg-sign", "-m", "local divergence");
       divergentSha = git(mirror, "rev-parse", "HEAD");
 
-      execFileSync("bash", [EXPORT_SCRIPT, "--onto", mirror], {
+      publishOutput = execFileSync("bash", [EXPORT_SCRIPT, "--onto", mirror], {
         cwd: privRepo,
         encoding: "utf8",
         env: { ...process.env, TMPDIR: base },
@@ -247,6 +268,13 @@ describe("release documentation", () => {
       );
       // the version is read from the export tree's manifest, not the private checkout's
       expect(readFile(EXPORT_SCRIPT)).toContain('"$EXPORT_DIR/package.json"');
+    });
+
+    test("test: a mirror carrying the installed guard is written and handed over for push, so a check refusing every mirror halts working machinery and fails", () => {
+      expect(existsSync(join(mirror, ".git", "hooks", "pre-push"))).toBe(true);
+      expect(git(mirror, "rev-parse", "HEAD~1")).toBe(originMain);
+      expect(publishOutput).toContain("mirror commit:");
+      expect(publishOutput).toContain("review the mirror diff, then push manually");
     });
 
     describe("--onto target guard", () => {
@@ -336,6 +364,7 @@ describe("release documentation", () => {
         git(base, "clone", "-q", publicOrigin, publicMirror);
         git(publicMirror, "remote", "set-url", "origin", PUBLIC_SSH);
         git(publicMirror, "config", `url.${publicOrigin}.insteadOf`, PUBLIC_SSH);
+        installMirrorIdentityGuard(publicMirror);
 
         const result = runOnto(src, publicMirror);
         expect(result.status).toBe(0);
@@ -343,6 +372,39 @@ describe("release documentation", () => {
         expect(result.stderr).toMatch(/insteadOf rewrites the mirror origin/);
         expect(result.stderr).toContain("configured: " + PUBLIC_SSH);
         expect(git(publicMirror, "log", "-1", "--format=%s")).toBe("tickmarkr 9.9.9 — public export");
+      });
+
+      test("test: the export script refuses to write a mirror whose identity guard is absent and names the installer that repairs it, so writing a fresh clone that carries no hook and handing it over for push fails", () => {
+        const src = makeSourceRepo();
+        const publicOrigin = makeRepo({ "previous-release.txt": "must survive\n" });
+        const base = mkdtempSync(join(tmpdir(), "tickmarkr-unguarded-mirror-"));
+        cleanup2.push(publicOrigin, base);
+        const freshMirror = join(base, "mirror");
+        git(base, "clone", "-q", publicOrigin, freshMirror);
+        git(freshMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
+        git(freshMirror, "config", `url.${publicOrigin}.insteadOf`, PUBLIC_HTTPS);
+        const before = git(freshMirror, "rev-parse", "HEAD");
+        expect(existsSync(join(freshMirror, ".git", "hooks", "pre-push"))).toBe(false);
+
+        const result = runOnto(src, freshMirror);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/identity guard is absent/i);
+        expect(result.stderr).toContain(".planning/install-mirror-hooks.sh");
+        expect(git(freshMirror, "rev-parse", "HEAD")).toBe(before);
+        expect(existsSync(join(freshMirror, "previous-release.txt"))).toBe(true);
+      });
+
+      test("test: the refusal reports the guard's absence and never compares an address itself, so an export script re-implementing the identity comparison keeps a second copy of a rule the hook already owns and fails", () => {
+        const script = readFile(EXPORT_SCRIPT);
+        const guard = script.match(
+          /mirror_identity_guard_installed\(\) \{[\s\S]*?\n\}[\s\S]*?if ! mirror_identity_guard_installed; then[\s\S]*?\n  fi/
+        );
+        expect(guard, "mirror identity guard presence check not found").toBeTruthy();
+        expect(guard![0]).toMatch(/identity guard is absent/i);
+        expect(guard![0]).toContain(".planning/install-mirror-hooks.sh");
+        expect(guard![0]).not.toMatch(
+          /@|user\.email|%(?:ae|ce)|\bauthor\b|\bcommitter\b|\bDENY\b|\bGLOBAL_ID\b|git (?:log|show|rev-list)/i
+        );
       });
 
       test("refuses a mirror subdirectory instead of partially replacing that repository", () => {
@@ -424,6 +486,7 @@ describe("release documentation", () => {
         git(base, "clone", "-q", failOrigin, failMirror);
         git(failMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
         git(failMirror, "config", `url.${failOrigin}.insteadOf`, PUBLIC_HTTPS);
+        installMirrorIdentityGuard(failMirror);
 
         // Snapshot the clean state before planting the hook
         const beforeSha = git(failMirror, "rev-parse", "HEAD");
@@ -478,6 +541,7 @@ describe("release documentation", () => {
         git(base, "clone", "-q", guardOrigin, guardMirror);
         git(guardMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
         git(guardMirror, "config", `url.${guardOrigin}.insteadOf`, PUBLIC_HTTPS);
+        installMirrorIdentityGuard(guardMirror);
 
         const beforeSha = git(guardMirror, "rev-parse", "HEAD");
 
@@ -518,6 +582,7 @@ describe("release documentation", () => {
         git(publicMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
         // Configure an insteadOf rewrite so EFFECTIVE_ORIGIN differs from MIRROR_ORIGIN
         git(publicMirror, "config", `url.${publicOrigin}.insteadOf`, PUBLIC_HTTPS);
+        installMirrorIdentityGuard(publicMirror);
 
         const result = runOnto(src, publicMirror);
         expect(result.status).toBe(0);
@@ -548,6 +613,7 @@ describe("release documentation", () => {
           git(base, "clone", "-q", bareOrigin, reMirror);
           git(reMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
           git(reMirror, "config", `url.${bareOrigin}.insteadOf`, PUBLIC_HTTPS);
+          installMirrorIdentityGuard(reMirror);
 
           const first = runOnto(src, reMirror);
           expect(first.status).toBe(0);
@@ -602,6 +668,7 @@ describe("release documentation", () => {
         git(base, "clone", "-q", localOrigin, rewrittenMirror);
         git(rewrittenMirror, "remote", "set-url", "origin", PUBLIC_HTTPS);
         git(rewrittenMirror, "config", `url.${localOrigin}.insteadOf`, PUBLIC_HTTPS);
+        installMirrorIdentityGuard(rewrittenMirror);
 
         const result = runOnto(src, rewrittenMirror);
         // Shipped policy is the retained warning: the rewrite is detected (the note names the

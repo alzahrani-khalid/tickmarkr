@@ -21,6 +21,7 @@ import {
   runHasEnded,
   type TaskPhase,
 } from "../../run/journal.js";
+import { isPidLive } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
@@ -734,6 +735,21 @@ const daemonPid = (events: JournalEvent[]): number | undefined => {
   return undefined;
 };
 
+// One pid-scoped reading per frame. The journal can prove an owner alive, prove it dead, or carry
+// no probeable identity at all; only ESRCH (reported by lock.ts's shared predicate as false) is proof
+// of death. Keeping that third state explicit is what lets pre-identity journals retain their phase
+// markers without claiming that an unknown daemon is alive.
+type DaemonLiveness =
+  | { state: "alive"; pid: number }
+  | { state: "dead"; pid: number }
+  | { state: "unknown" };
+
+const daemonLiveness = (events: JournalEvent[]): DaemonLiveness => {
+  const pid = daemonPid(events);
+  if (pid === undefined) return { state: "unknown" };
+  return { state: isPidLive(pid) ? "alive" : "dead", pid };
+};
+
 const terminalFailureCause = (events: JournalEvent[]): string | undefined => {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]!;
@@ -921,20 +937,17 @@ const keepPanesSetting = (cwd: string): TickmarkrConfig["visibility"]["keepPanes
   }
 };
 
-const liveness = (events: JournalEvent[], now = Date.now()): string => {
+const liveness = (events: JournalEvent[], daemon: DaemonLiveness, now = Date.now()): string => {
   const last = events.at(-1);
   if (!last) return "last event unknown · daemon pid unknown";
   const age = fmtAge(now - Date.parse(last.ts));
-  const pid = daemonPid(events);
   const cause = terminalFailureCause(events);
-  if (pid === undefined) return `last event ${age} ago · daemon pid unknown${cause ? ` · ${cause}` : ""}`;
+  if (daemon.state === "unknown") return `last event ${age} ago · daemon pid unknown${cause ? ` · ${cause}` : ""}`;
   // a dead pid after run-end is a clean exit, not a crash — "dead" is only alarming (red) while
   // the run is still incomplete (operator's crash indicator)
   const ended = events.some((e) => e.event === "run-end");
-  let state: string;
-  try { process.kill(pid, 0); state = "alive"; } // no throw ⇒ alive
-  catch (k) { state = (k as NodeJS.ErrnoException).code === "ESRCH" ? (ended ? "finished" : "dead") : "alive"; } // EPERM ⇒ alive
-  return `last event ${age} ago · daemon pid ${pid} ${state}${cause ? ` · ${cause}` : ""}`;
+  const state = daemon.state === "alive" ? "alive" : ended ? "finished" : "dead";
+  return `last event ${age} ago · daemon pid ${daemon.pid} ${state}${cause ? ` · ${cause}` : ""}`;
 };
 
 type RenderedFrame = {
@@ -1061,6 +1074,9 @@ const renderFrame = (
   const record = readRunRecord(cwd, g, namedRunId);
   const runId = record?.runId;
   const events = record?.events ?? [];
+  // The header and every live-phase consumer share this exact process reading. Proved death retires
+  // stale phase markers; unknown identity deliberately does not, preserving pre-identity journals.
+  const daemon = daemonLiveness(events);
   const comparable = record?.comparable ?? false;
   const rehashAt = record?.rehashAt;
   const assignments = new Map<string, string>();
@@ -1131,7 +1147,7 @@ const renderFrame = (
     ? workerPaneLocators(events, runId, keepPanesSetting(cwd))
     : new Map<string, string>();
   const taskIds = new Set(g.tasks.map((task) => task.id));
-  const phases = comparable ? livePhases(events) : new Map<string, LivePhase>();
+  const phases = comparable && daemon.state !== "dead" ? livePhases(events) : new Map<string, LivePhase>();
   for (const taskId of phases.keys()) if (!taskIds.has(taskId)) phases.delete(taskId);
   const hotPhase = [...phases.values()].sort((a, b) => a.order - b.order).at(-1);
 
@@ -1186,7 +1202,7 @@ const renderFrame = (
     });
     const zone = journalRowsOnly ? `${divider}zone ${localZoneLabel(zoneReference)}` : "";
     const header = runId
-      ? `tickmarkr status${divider}run ${runId}${zone}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, now).replaceAll(" · ", divider)}${verify ? `${divider}${verify}` : ""}${divider}${tipPhase ? `${done}/${total} tasks done${divider}run not verified` : `${done}/${total} done`}`
+      ? `tickmarkr status${divider}run ${runId}${zone}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, daemon, now).replaceAll(" · ", divider)}${verify ? `${divider}${verify}` : ""}${divider}${tipPhase ? `${done}/${total} tasks done${divider}run not verified` : `${done}/${total} done`}`
       : `tickmarkr status${zone}${divider}no runs yet${divider}${done}/${total} done`;
     const legendLine = `  gates: ${GATE_NAMES.map((gate) => `${GATE_KEYS[gate]} ${gate}`).join(divider)}`;
     return {
@@ -1211,7 +1227,7 @@ const renderFrame = (
   const tally = tipPhase
     ? `${progressTone(`${progressGlyph} ${done}/${total} tasks done`)}${dot}${progressTone("run not verified")}`
     : done === total && total > 0 ? ok(`${done}/${total} done`) : information(`${done}/${total} done`);
-  const live = liveness(events, now)
+  const live = liveness(events, daemon, now)
     .replace(/\bdead\b/u, fail("dead"))
     .replace(/\bfinished\b/u, dim("finished"))
     .replace(/\balive\b/u, running("alive"))

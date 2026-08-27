@@ -220,3 +220,38 @@ describe("registry + doctor", () => {
     expect(chans.some((c) => c.adapter === "codex")).toBe(false); // not installed → no channels
   });
 });
+
+// v2.1.3 T7 — claude paints a PREDICTED next prompt into the editor after a turn. On a pane that ghost
+// text is pixel-identical to a seat's own unsubmitted draft, so every occupancy reader downstream is
+// fooled by it. Suppressed at the SOURCE (the builders that seed a real terminal) rather than at the
+// watcher that sweeps for the stall it causes.
+describe("claude ghost-text suppression at the source (v2.1.3 T7)", () => {
+  const SETTING = "--prompt-suggestions false";
+  // The prompt is the LAST token these builders emit. --prompt-suggestions takes an OPTIONAL value, so
+  // — exactly like the variadic --mcp-config guarded above, which live-ate the prompt on 2026-07-10 —
+  // the token after its value must be another flag, never the positional prompt.
+  const settingIsFollowedByAnotherFlag = (cmd: string) => /--prompt-suggestions \S+ --?[A-Za-z]/.test(cmd);
+
+  test("test: the interactive builder and the resume builder each carry the setting that disables the vendor's prompt suggestions and each still places a flag between that setting's value and the prompt positional; a builder appending the setting immediately before the prompt fails", () => {
+    // the closed enumeration of builders that seed a real terminal is exactly these two
+    const seedsATerminal = [
+      claudeCode.interactiveCommand("/tmp/p.md", "fable") as string,
+      claudeCode.resumeCommand!("prior-session", "/tmp/p.md", "fable") as string,
+    ];
+    for (const c of seedsATerminal) {
+      expect(c).toContain(SETTING);
+      expect(c).toMatch(/"\$\(cat '\/tmp\/p\.md'\)"$/); // the prompt really is the trailing positional
+      expect(settingIsFollowedByAnotherFlag(c), c).toBe(true);
+    }
+    // the print builder has no editor to paint into — out of scope, and left alone
+    expect(claudeCode.headlessCommand("/tmp/p.md", "fable")).not.toContain("--prompt-suggestions");
+
+    // the neighbouring wrong shape: same setting, same value, appended immediately before the prompt.
+    // It reads as "the flag is present" to any toContain check and still eats the prompt.
+    for (const c of seedsATerminal) {
+      const appended = `${c.replace(` ${SETTING}`, "")}`.replace(/ ("\$\(cat[^"]*\)")$/, ` ${SETTING} $1`);
+      expect(appended).toContain(SETTING);
+      expect(settingIsFollowedByAnotherFlag(appended), appended).toBe(false);
+    }
+  });
+});

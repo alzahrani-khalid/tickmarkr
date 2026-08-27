@@ -103,7 +103,7 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    fraction (`ORCH · v1.19 4/5`, updated on every task-done); tickmarkr opens ONE TAB PER TASK, labelled
    with the task id and holding that task's worker plus its judge/review/consult panes (tickmarkr
    updates it). Never long context strings or ✓-chains.
-2. **Orchestrator**: Launch the orchestrator with your agent host. Spawning on current herdr is two-step — the one-shot `agent start --cwd` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138): first create the pane with `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <version>"` and parse `result.root_pane.pane_id` from its JSON, then start the agent in it. For Claude Code, use `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions` (append `--model <m>` after the `--` if the operator has a policy). For Codex, use `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` (add `--model <m>` to specify the model). The unsandboxed flag is REQUIRED: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation — do not downgrade it. Workers you never spawn — tickmarkr spawns its own visible worker panes. Auxiliary agents you do spawn (consultants, reviewers, scouts) follow the same forms: never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions`, and a read-only codex consultant may use `--sandbox read-only`.
+2. **Orchestrator**: Launch the orchestrator with your agent host. Spawning on current herdr is two-step — the one-shot `agent start --cwd` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138): first create the pane with `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <version>"` and parse `result.root_pane.pane_id` from its JSON, then start the agent in it. For Claude Code, use `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions` (append `--model <m>` after the `--` if the operator has a policy). For Codex, use `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` (add `--model <m>` to specify the model). The unsandboxed flag is REQUIRED: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation — do not downgrade it. Workers you never spawn — tickmarkr spawns its own visible worker panes. Auxiliary agents you do spawn (consultants, reviewers, scouts) follow the same forms: never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions --settings '{"promptSuggestionEnabled":false}'`, and a read-only codex consultant may use `--sandbox read-only`. **That `--settings` pair is not cosmetic and it is not optional:** claude-code's AUTOSUGGEST renders context-plausible ghost text into an idle seat's prompt line that is BYTE-IDENTICAL to a typed draft in text-format reads (OBS-482), so a supervising tier cannot tell a seat's own unsent work from a rendering artifact without `agent read --format ansi`. Turning the suggester off at spawn removes the ambiguity at its source instead of paying for the discrimination at every read. Verified against the shipped binary: `claude --settings '{"promptSuggestionEnabled":false}' -p …` exits 0 with a real response, and the key appears in the binary's own settings schema. **For kimi, pass `-y`** (`herdr agent start <name> --kind kimi --pane <id> -- -y`) — the adapter already launches its own workers that way (`src/adapters/kimi.ts:204`), and a kimi seat spawned without it sits on an approval prompt having done nothing. **Herdr cannot see that state**: it reports a kimi pane as `agent_status: working` with `screen_detection_skipped: true` while the prompt is up, so the BLOCKED-STATE watcher below is blind on this vendor and the spawn flag is the ONLY control. Every vendor you spawn needs its auto-approve form named here; a vendor absent from this list is a seat that will hang.
 3. **Standing instructions travel as a brief FILE, never as pane text** — PTY input truncates at ~1024B and a
    truncated brief silently drops policy. Write the full brief to `<repo>/.tickmarkr/overseer/ORCH-BRIEF.md`
    (inside the tickmarkr state dir — already self-gitignored, no exclude step needed), then send one line:
@@ -255,6 +255,17 @@ is a lossy summary nobody trusts while a clean session re-oriented from disk-ver
 **Do the same for yourself before you are forced to**: write the handoff while your judgment is still
 good, not after. If your own context cannot be read by the watcher, say so to the operator and ask for the
 number — an unmeasured budget is not a small budget.
+
+```bash
+.claude/skills/tickmarkr-overseer/scripts/watch-context.sh orchestrator <orchestrator-agent-or-pane> 60 75 <handoff-file>
+.claude/skills/tickmarkr-overseer/scripts/watch-context.sh overseer <overseer-agent-or-pane> 60 75 <handoff-file>
+```
+
+The first argument chooses the closed per-seat tier (`orchestrator-context` or `overseer-context`),
+and every beat names the second argument as that tier's seat. The watcher beats only after reading a
+rendered percentage, keeps beating on the supervision cadence even when its requested poll is slower,
+continues past WARN to ACT, and records a stand-down on each controlled exit. A killed watcher alone
+leaves its last beat to age into `STALE`.
 **Every handoff's re-arm list ends with the announce step from Setup 0** — inform the surviving
 orchestrator the fresh seat is live — or the next seat re-arms silently beside a tier that still
 believes it is alone.
@@ -406,7 +417,7 @@ they are left implicit:
   authors** — the seat's own draft, an operator, another agent's `agent send` (writes WITHOUT Enter),
   and claude-code's AUTOSUGGEST, which renders context-plausible ghost text BYTE-IDENTICAL to a typed
   draft in text-format reads (OBS-482). The check is mechanical and only works at observation time:
-  `agent read --format ansi` — dim/grey SGR around the text = autosuggest ghost, NOT input. Measured
+  `agent read --format ansi --source visible` — dim/grey SGR (`ESC[2m`) around the text = autosuggest ghost, NOT input. ⚠ **`--source` is load-bearing and its natural choice is the wrong one.** `--source detection` is the plain-text buffer used for agent detection: it strips ANSI *entirely*, so `--format ansi --source detection` returns ZERO escape sequences and every string reads as un-styled — i.e. as real typed input. Measured 2026-08-26 on a live orchestrator: `detection` returned 0 escapes and the ghost read as a genuine unsubmitted draft; `visible` returned 100 escapes and the same line came back `ESC[0mESC[2m…`, dim, ghost. **A probe that cannot render the evidence cannot fail**, so check the capture contains escapes at all before believing its answer — that is rule 11 aimed at your own instrument. Measured
   2026-08-17 (D-206): an unattributed instruction was found in an orchestrator's box, superseded
   defensively, and its origin stayed UNRESOLVED — the one probe that discriminates was not taken while
   the text still sat there. An origin question you can close in ten seconds at the pane becomes
@@ -424,9 +435,13 @@ The beat is one shipped command and the loop is yours, run from the repo root as
 `run_in_background` Bash call:
 
 ```bash
-cd <repo> && while :; do tickmarkr beat overseer; sleep 10; done   # 10s = SUPERVISION_BEAT_MS
-tickmarkr beat overseer --stand-down                               # at stand-down, in the same act
+cd <repo> && while :; do tickmarkr beat overseer --seat <overseer-agent-or-pane>; sleep 10; done
+tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down  # after stopping that loop
 ```
+
+The pre-2.1.3 forms `while :; do tickmarkr beat overseer; sleep 10; done` and
+`tickmarkr beat overseer --stand-down` are preserved here only as migration warnings: both are now
+rejected because neither declares which seat the tier speaks for. Do not copy or run them.
 
 One beat per invocation, deliberately: the loop is what proves the seat is alive, so a command that
 kept beating on its own would keep reporting a dead seat as healthy. Stop the loop — or die — and the
@@ -434,7 +449,10 @@ tier ages to `STALE` (never `ABSENT`) within six beats, which is the state that 
 Stand down explicitly when you hand off, or a deliberate exit reads as a death. Same rule as rule 29
 below, now with a conventional path the other tier already reads: `tickmarkr status` shows it.
 
-⚠ **THE LOOP ABOVE BINDS TO A PROCESS, NOT TO A SEAT — and that is a defect this skill shipped.**
+⚠ **THE LOOP ABOVE NAMES A SEAT BUT STILL BINDS ITS LIFETIME TO A PROCESS — and that distinction is
+load-bearing.** The command refuses an anonymous beat, and `status` renders the declared seat beside
+the tier state; a legacy tier+pid+instant record cannot be attributed and reads `UNREADABLE`, never
+`ARMED`. Naming the seat does not make the shell loop stop when that seat leaves.
 The beat keeps running while its *session* lives, so a loop started by a seat that has since been
 cleared, re-briefed, or replaced keeps beating that tier's file forever. Measured 2026-08-24
 (OBS-583): a **2d20h** orphan loop from a predecessor seat held `orchestrator ARMED` through a
@@ -444,13 +462,13 @@ one owned by an unrelated session. So:
 - **At every adopt, clear, or re-brief, sweep for pre-existing loops on YOUR tier before arming one**
   (`pgrep -f "tickmarkr beat <tier>"`), trace each to its parent session, and kill the **loop only**
   — never the parent — then verify the parent survived.
-- **`ARMED` is a claim about a process, not about a seat.** Before trusting any tier's `ARMED`, ask
-  whose session owns the beater; a tier can be armed and seatless, which is *worse* than ABSENT
-  because it reads as coverage (rule 11's outliving-its-trigger failure, in beat form).
+- **`ARMED (<seat>)` is an attributable claim, not proof that the named seat is still alive.** Before
+  trusting it, ask whose session owns the beater; an orphan loop can keep naming a departed seat
+  (rule 11's outliving-its-trigger failure, in beat form).
 - Stand-down must kill the loop **and** run `--stand-down`; the second without the first is undone
   by the next tick.
-The product fix (a seat-bound or sentinel-terminated beat, armed and stood down in one act) is
-queued; until it ships, this sweep is the guard.
+The remaining product fix (a sentinel-terminated beat, armed and stood down in one act) is queued;
+until it ships, this sweep is the guard.
 
 Arm the bundled watcher as its OWN Bash call with `run_in_background` — chaining it after other commands
 with `&` orphans it from the wake chain. It prints one wake reason and exits; re-arm after every wake.
@@ -499,10 +517,15 @@ Two keys that do not lie, in order of strength:
 will keep producing this stall, and a sweeper that has been running since 04:40 is evidence the gap was
 visible and got swept instead of fixed.
 
-**Every seat you spawn gets THREE watchers armed in the SAME call that spawns it — ARTIFACT,
-BLOCKED-STATE, and PENDING-INPUT.** Each is blind to what the others catch: the artifact watcher cannot see
-a stall, the blocked watcher cannot see a finish, and neither can see a seat sitting **idle with
-unsubmitted text in its own prompt**.
+**Every seat you spawn gets FOUR watchers armed in the SAME call that spawns it — ARTIFACT,
+BLOCKED-STATE, PENDING-INPUT, and CONTEXT.** Each is blind to what the others catch: the artifact watcher cannot
+see a stall, the blocked watcher cannot see a finish, neither can see a seat sitting **idle with
+unsubmitted text in its own prompt**, and none of them can see a seat running out of context.
+**CONTEXT was mandated in prose above and omitted from this list, so it shipped in 2.1.2 and was never armed
+once** — an overseer ran nine hours at 86% unable to read its own number. Arm
+`scripts/watch-context.sh` here, by name, like the other three. Note also that BLOCKED-STATE relies on
+Herdr's `agent_status`, which is unreliable for vendors whose screen detection is skipped (kimi) — for
+those, the spawn-time auto-approve flag is the control, not this watcher.
 
 ```bash
 .claude/skills/tickmarkr-overseer/scripts/watch-pending-input.sh <agent|pane> [poll-s] [cap-s] [confirm-polls]

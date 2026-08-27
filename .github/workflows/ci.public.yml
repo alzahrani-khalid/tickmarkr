@@ -49,6 +49,8 @@ jobs:
       # back to classification, never into the timeout.
       - run: npx vitest run --project sync-heavy
         env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
 
   test-macos:
@@ -72,4 +74,6 @@ jobs:
       # same serial sync-heavy step as the ubuntu job (RULING-1890-CI-DESIGN option c)
       - run: npx vitest run --project sync-heavy
         env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"

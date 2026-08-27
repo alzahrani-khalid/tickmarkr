@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, utimesSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -235,6 +235,34 @@ describe("tickmarkr init --agent", () => {
     expect(docs).toMatch(/Never run two tickmarkr runs/);
     expect(docs).toMatch(/never trust a worker's completion claim/i);
     expect(out).toContain("appended tickmarkr agent docs");
+  });
+
+  // The control is the instance: this repo's own AGENTS.md kept "older on major.minor" — a preflight
+  // rule superseded by the whole-version stop — through the release that fixed the tracked copy. The
+  // file is gitignored, so no diff, no status, no review saw it, and a consultation ran under it.
+  test("a guidance block that no longer matches the installed version is reported stale on a plain init, and --docs silences it by refreshing", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const doc = join(repo, "AGENTS.md");
+
+    // negative control: a freshly written block is NOT drift
+    expect(await runInit(repo)).not.toContain("does not match this version");
+
+    const fresh = readFileSync(doc, "utf8");
+    expect(fresh).toContain("must agree on the entire version");
+    writeFileSync(doc, fresh.replace("must agree on the entire version", "may be older on major.minor"));
+
+    const stale = await runInit(repo);
+    expect(stale).toContain("does not match this version");
+    expect(stale).toContain(doc);
+    expect(stale).toContain("tickmarkr init --agent --force");
+
+    // the refresh path owns the fix and must not also nag about what it is fixing. `--docs` is NOT
+    // that path: it governs only the append-a-missing-block case, so it must still report the drift.
+    expect(await runInit(repo, "--docs")).toContain("does not match this version");
+    expect(await runInit(repo, "--agent", "--force")).not.toContain("does not match this version");
+    expect(readFileSync(doc, "utf8")).toContain("must agree on the entire version");
   });
 
   test("non-TTY keeps an existing skill and docs, installs the missing skill, and names opt-in flags", async () => {
