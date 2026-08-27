@@ -23,9 +23,9 @@ import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHa
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
-import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, runWithForkBudget, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, runWithForkBudget, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingReviewFindings, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
@@ -39,7 +39,6 @@ import {
   stallSnapshotBannerRows,
   WorkerTreeCpuAccountant,
 } from "./stall.js";
-import { armSupervision, type ArmedSupervision } from "./supervision.js";
 
 // Compatibility exports for the daemon liveness tests and existing consumers. The implementation
 // lives in stall.ts so gate dispatch can depend on it without importing the daemon.
@@ -73,11 +72,6 @@ export interface RunOptions {
   // v1.54 T2: test seam — replaces process.exit in the termination reaper (the vitest process must
   // survive a synthetic signal). Production omits it and the reaper exits the process.
   exit?: (code: number) => void;
-  // T16: arm the orchestrator supervision tier for the life of the run. Defaults ON — production
-  // never sets it. `false` is the CONTROL: a run that is otherwise identical and arms nothing, so a
-  // tier that reads ARMED under a real run proves the RUNTIME armed it rather than something else
-  // in the fixture having written a beat.
-  supervise?: boolean;
 }
 
 // v1.51 T2: mode sources — run flag > spec front-matter > repo config > global config > default.
@@ -821,14 +815,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // subprocess, so the optional-chain open below is a no-op there). Cosmetic-only: any failure is
   // swallowed (never affects the run); the operator closes a surviving watch pane.
   const lock = acquireRunLock(repoRoot, runId);
-  // T16: the orchestrator seat IS this daemon, so this is where the tier gets armed — the writer half
-  // T3 shipped had no caller outside its own tests, which made the reader honest and useless: it read
-  // ABSENT for the entire life of every run. Armed immediately after the lock (the first instant this
-  // process owns the run) and held to the last, so the beat's span is the run's span. armSupervision
-  // never throws, so an unwritable beat can never take a run down; it is deregistered in BOTH exits
-  // below, because the signal reaper exits the process before the finally can run.
-  const supervision: ArmedSupervision | undefined =
-    opts.supervise === false ? undefined : armSupervision(repoRoot, "orchestrator");
+  // D10: the lock is this daemon's liveness record and already carries its pid; status prints that
+  // identity beside the supervision row. The `orchestrator` tier belongs exclusively to the seated
+  // supervisor, so a run never beats or stands down that seat's record on the daemon's behalf.
   // v1.54 T2: declared before the try so the finally can always deregister (a throw before
   // registration leaves it undefined — the guard below covers that path).
   let onTermination: ((sig: NodeJS.Signals) => void) | undefined;
@@ -951,7 +940,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           try { await driver.reconcile?.(new Set(), runId); } catch { /* cosmetic — visibility is never a gate */ }
         }
-        supervision?.disarm(); // T16: same reason as the lock — this seat stood down, it did not die
         releaseRunLock(repoRoot); // the process dies at exit() below — the finally never runs on this path
       }
       abortRun(new Error(`terminated by ${sig}`));
@@ -1244,6 +1232,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       await park(t, `humanGate: "${t.title}" requires approval before dispatch`, "human-gate", null, 0, startMs);
       return;
     }
+
+    // The driver owns how a checkout is created, but runDaemon owns the destructive transition:
+    // every task-checkout recreation passes through this wrapper before any driver can remove the
+    // old path. A preservation failure throws and therefore leaves the old checkout in place. The
+    // row is deliberately written before the later worktree-recreation row so the journal cannot
+    // describe only the commits it carried while omitting uncommitted work the removal destroyed.
+    const recreateTaskWorktree = async (taskBranch: string, taskBase: string, priorWt: string) => {
+      const ref = await preserveWorktree(priorWt);
+      if (ref) journal.append("worktree-preserved", t.id, { ref });
+      return driver.worktree(repoRoot, taskBranch, taskBase);
+    };
 
     const r = route(t, cfg, channels, profile, undefined, demotedChannels);
     for (const lint of r.lints) journal.append("routing-lint", t.id, { lint });
@@ -1552,7 +1551,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const priorTaskTip = await gitHead(priorWt);
       const priorTaskSubject = await gateCommitSubject(taskBase, priorTaskTip, priorWt);
       const commitsToCarry = await commitsAheadOf(taskBase, priorWt);
-      const wt = await driver.worktree(repoRoot, taskBranch, taskBase);
+      const wt = await recreateTaskWorktree(taskBranch, taskBase, priorWt);
       const carriedCommits = await cherryPickCommits(wt, commitsToCarry);
       // Reuse is about the tree the gates will actually inspect. The integration tip may have moved
       // while the daemon was down, so compare after recreating the task on today's taskBase rather
@@ -1851,6 +1850,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const brief = journaledRows.join("\n\n");
         feedback = feedback ? `${brief}\n\n${feedback}` : brief;
       }
+      // T6: both carries above are ATTEMPT-scoped — the funded repair is spent at the next
+      // worker-launch (and budgeted at two), and the journaled brief is reset there too, so it hands
+      // this dispatch only the LAST attempt's bytes. An unresolved review finding is a property of the
+      // TASK: the moment one attempt fails for an unrelated reason — a red build, a refused tree, or a
+      // death that journals no gate row at all — the finding is in neither carry and the next worker
+      // re-derives the task from the spec and lands on the same gap the reviewer already anchored.
+      // Re-derived from the journal on EVERY dispatch and retired only by a review that passes on this
+      // task (journal.ts `outstandingReviewFindings`). Appended row-wise, because this round's own
+      // feedback or a repair brief may already quote a finding and repeating it helps no worker.
+      const outstandingFindings = outstandingReviewFindings(journaledSoFar, t.id);
+      const unquoted = outstandingFindings.filter((f) => !feedback.includes(f.note));
+      if (unquoted.length > 0) {
+        const brief = ["## Outstanding review findings — a review has NOT passed on these yet",
+          ...unquoted.map((f) => `- ${f.path}: ${f.note}`)].join("\n");
+        feedback = feedback ? `${feedback}\n\n${brief}` : brief;
+      }
       retryMode = repairFindings
         ? "repair"
         : priorSession
@@ -1873,22 +1888,29 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       lastContextTokens = undefined;
       graph = setStatus(graph, t.id, "running");
       saveGraph(repoRoot, graph);
-      journal.append("task-dispatch", t.id, { assignment, attempt, provenance: dispatchProvenance(r.provenance), retryMode });
+      // T6: a dispatch that carries an outstanding finding says so, and names it. Without this the
+      // ledger cannot tell a carried dispatch from an amnesiac one — the exact question a run that
+      // spends two frontier attempts re-deriving a known defect has to be able to answer afterwards.
+      journal.append("task-dispatch", t.id, {
+        assignment, attempt, provenance: dispatchProvenance(r.provenance), retryMode,
+        ...(outstandingFindings.length > 0 ? { carriedFindings: outstandingFindings } : {}),
+      });
       journal.phaseStart(t.id, "worker", { attempt, assignment });
 
       const taskBase = await integrationHead(intWt); // deps are merged → visible to this task
       const taskBranch = `${branch}--${t.id}`; // "--": a ref can't nest under the existing integration branch (locked decision 10)
       const priorWt = worktreePath(repoRoot, taskBranch);
-      const commitsToCarry = existsSync(priorWt) ? await commitsAheadOf(taskBase, priorWt) : [];
-      const wt = await driver.worktree(repoRoot, taskBranch, taskBase);
+      const recreating = existsSync(priorWt);
+      const commitsToCarry = recreating ? await commitsAheadOf(taskBase, priorWt) : [];
+      const wt = await recreateTaskWorktree(taskBranch, taskBase, priorWt);
       // OBS-58: quota-failover and every retry recreate the task worktree from the integration tip —
       // cherry-pick prior attempts' landed commits forward so a failover dispatch cannot silently
       // orphan work a consult already verified as landed.
       let carriedCommits: string[] = [];
       if (commitsToCarry.length > 0) {
         carriedCommits = await cherryPickCommits(wt, commitsToCarry);
-        journal.append("worktree-recreation", t.id, { attempted: commitsToCarry, carried: carriedCommits });
       }
+      if (recreating) journal.append("worktree-recreation", t.id, { attempted: commitsToCarry, carried: carriedCommits });
       // T2 review (material): harvest eligibility is "does this WORKTREE carry unverified work",
       // measured against taskBase — the same base the fast-kill's delta probe and the gates
       // themselves use. It was measured against this attempt's post-carry HEAD, which excluded
@@ -2962,6 +2984,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (results.some((g) => g.gate === "test" && !g.pass)) testGateFailed = true;
 
         if (results.every(gateSatisfied)) {
+          // T6: every gate — the review included — is satisfied on this commit, so the failure brief
+          // this loop is still holding describes nothing outstanding. It is dropped HERE, before the
+          // merge, because a conflict below sends the task around the attempt loop again: a brief kept
+          // across that retry hands the next worker findings a later review has since passed on, while
+          // `carriedFindings` — re-derived from the journal, which retired them — is correctly empty,
+          // leaving that dispatch's row indistinguishable from an amnesiac one. Rebuilt exactly as the
+          // gate-fail brief is, so prior-RUN evidence (retired by its own rule, not by this reviewer)
+          // survives and only this run's settled findings go.
+          feedback = withCarriedEvidence("");
           const m = await mergeSerial(taskBranch, t, gated);
           if (m.tipMoved) {
             journal.append("tip-moved", t.id, m.tipMoved);
@@ -3272,9 +3303,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       process.removeListener("SIGINT", onTermination);
       process.removeListener("SIGTERM", onTermination);
     }
-    // T16: every other exit — normal end, throw, termination unwind. disarm() is idempotent, so the
-    // signal path having already stood the tier down changes nothing here.
-    supervision?.disarm();
     try {
       releaseRunLock(repoRoot);
     } finally {

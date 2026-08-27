@@ -60,7 +60,7 @@ afterEach(() => {
 describe("supervision tier liveness", () => {
   test("test: a tier with a heartbeat written inside the staleness ceiling reads ARMED, and the same tier reads STALE once that ceiling has passed without another beat", () => {
     const repo = mkRepo();
-    beatSupervision(repo, "orchestrator");
+    beatSupervision(repo, "orchestrator", "ORCH-w1:p1");
 
     // fresh, real clock
     const fresh = readTierLiveness(repo, "orchestrator");
@@ -82,7 +82,7 @@ describe("supervision tier liveness", () => {
     expect(died.beatAgeMs).toBeGreaterThan(SUPERVISION_STALE_MS);
 
     // and a beat brings the same tier back — STALE is a reading, not a latch
-    beatSupervision(repo, "orchestrator");
+    beatSupervision(repo, "orchestrator", "ORCH-w1:p1");
     expect(readTierLiveness(repo, "orchestrator").state).toBe("ARMED");
   });
 
@@ -96,7 +96,7 @@ describe("supervision tier liveness", () => {
 
     // ABSENT carries no age; STALE always carries one — the two do not share a shape
     expect(absent.beatAgeMs).toBeUndefined();
-    beatSupervision(repo, "overseer");
+    beatSupervision(repo, "overseer", "OVSR-w1:p2");
     expireBeat(repo, "overseer");
     const stale = readTierLiveness(repo, "overseer");
     expect(stale.state).toBe("STALE");
@@ -142,7 +142,7 @@ describe("supervision tier liveness", () => {
     // process table would answer these the other way round; the file state decides both.
     const nonexistent = 999_999_999; // above every platform's pid_max — no such process, ever
     writeBeat(repo, "watch", JSON.stringify({ tier: "watch", pid: nonexistent }));
-    writeBeat(repo, "overseer", JSON.stringify({ tier: "overseer", pid: process.pid }));
+    writeBeat(repo, "overseer", JSON.stringify({ tier: "overseer", seat: "OVSR-w1:p2", pid: process.pid }));
     expireBeat(repo, "overseer");
 
     expect(readTierLiveness(repo, "watch").state).toBe("ARMED"); // dead pid, fresh beat
@@ -150,8 +150,8 @@ describe("supervision tier liveness", () => {
 
     // There is no name in the record to match against an argv, and an unreadable payload is still a
     // beat: the state survives bytes no process-name matcher could parse.
-    writeBeat(repo, "orchestrator", "not json at all — grep would find nothing here\n");
-    expect(readTierLiveness(repo, "orchestrator").state).toBe("ARMED");
+    writeBeat(repo, "watch", "not json at all — grep would find nothing here\n");
+    expect(readTierLiveness(repo, "watch").state).toBe("ARMED");
 
     expect(kill).not.toHaveBeenCalled();
     // and the hoisted node:child_process tripwire above never fired — no ps, no pgrep, no argv match
@@ -170,7 +170,7 @@ describe("supervision tier liveness", () => {
     const repo = mkRepo();
     const beat = supervisionBeatPath(repo, "overseer");
     // Production writer, production loop — only the interval is compressed so the test is not slow.
-    const armed = armSupervision(repo, "overseer", 20);
+    const armed = armSupervision(repo, "overseer", 20, "OVSR-w1:p2");
     try {
       expect(readTierLiveness(repo, "overseer").state).toBe("ARMED"); // armed at instant zero, not one interval later
       const first = readFileSync(beat, "utf8");
@@ -195,5 +195,34 @@ describe("supervision tier liveness", () => {
     expect(all.map((t) => t.tier)).toEqual([...SUPERVISION_TIERS]);
     expect(all.filter((t) => t.state === "ABSENT")).toHaveLength(SUPERVISION_TIERS.length - 1);
     expect(all.find((t) => t.tier === "watch")?.state).toBe("ARMED");
+  });
+
+  test("test: a record naming no seat on either supervising tier reads as unreadable evidence while the same record naming one reads armed for that seat; a reader accepting an anonymous record on those tiers reports coverage no seat is providing and fails", () => {
+    const repo = mkRepo();
+    for (const [tier, seat] of [["orchestrator", "ORCH-w1:p1"], ["overseer", "OVSR-w1:p2"]] as const) {
+      writeBeat(repo, tier, JSON.stringify({ tier, pid: 424242, beatAt: new Date().toISOString() }) + "\n");
+      const anonymous = readTierLiveness(repo, tier);
+      expect(anonymous.state, tier).toBe("UNREADABLE");
+      expect(anonymous.seat, tier).toBeUndefined();
+
+      writeBeat(repo, tier, JSON.stringify({ tier, seat, pid: 424242, beatAt: new Date().toISOString() }) + "\n");
+      expect(readTierLiveness(repo, tier)).toMatchObject({ tier, state: "ARMED", seat });
+    }
+  });
+
+  test("test: an attempt to write a supervising tier's beat without a seat identity is refused before anything is written so the tier is left exactly as it was found; a writer recording an anonymous beat there re-opens the hole the reader just closed and fails", () => {
+    const repo = mkRepo();
+    for (const [tier, seat] of [["orchestrator", "ORCH-w1:p1"], ["overseer", "OVSR-w1:p2"]] as const) {
+      beatSupervision(repo, tier, seat);
+      const path = supervisionBeatPath(repo, tier);
+      const before = readFileSync(path);
+      const beforeStat = statSync(path);
+
+      expect(() => beatSupervision(repo, tier)).toThrow(/seat identity/);
+
+      expect(readFileSync(path)).toEqual(before);
+      expect(statSync(path).mtimeMs).toBe(beforeStat.mtimeMs);
+      expect(readTierLiveness(repo, tier)).toMatchObject({ tier, state: "ARMED", seat });
+    }
   });
 });

@@ -61,11 +61,33 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
   const burnInShortChildren = (iterations = 12) =>
     `for i in {1..${iterations}}; do node -e ${shq("const end = Date.now() + 120; while (Date.now() < end) { /* burn */ }")}; sleep 0.8; done`;
 
+  // OBS-707: a burn the tree accrues in its OWN process, in shell builtins only — no fork, so no
+  // sample has to land while some child is alive for the reading to be positive. A process's CPU
+  // time is CUMULATIVE, so once this has run the tree's total stays positive however quiet the
+  // worker then goes: a conclusion drawn over such a tree records a MEASURED total, and the
+  // exact-zero readings the old assertions pinned were only ever the empty sum of a tree that had
+  // already exited before anything sampled it — a value suite-parallel contention moves (10 and
+  // 100 on 2.1.2's two CI platforms, 10, 110 and 1 on 2.1.3's).
+  const BURN_IN_ROOT = "{ i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done; }";
+
+  // A host that cannot answer `ps` at all — the managed sandbox in production, made deterministic
+  // here so the UNREADABLE reading is exercised everywhere rather than only where `ps` is denied.
+  const denyPs = (): (() => void) => {
+    const bashEnv = join(makeTestTempDir("tickmarkr-ps-denied-"), "bash-env");
+    writeFileSync(bashEnv, "ps() { return 1; }\n");
+    const prior = process.env.BASH_ENV;
+    process.env.BASH_ENV = bashEnv;
+    return () => {
+      if (prior === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = prior;
+    };
+  };
+
   // The managed macOS test sandbox denies `ps` even to child processes. Production and ordinary CI
   // use the live process tree; only that named environmental gap gets a deterministic snapshot
   // source with the same shape: a persistent root plus 120ms child burners that disappear between
   // the daemon's ~1s observations. The fast accountant's 100ms samples see and retain them.
-  const cpuProbeFallback = async (repo: string, runId: string, mode: "flat" | "bursty" = "bursty"): Promise<() => void> => {
+  const cpuProbeFallback = async (repo: string, runId: string, mode: "flat" | "bursty" | "quiet" = "bursty"): Promise<() => void> => {
     if (await workerTreeCpuMs("tickmarkr-cpu-probe-capability", repo) !== undefined) return () => {};
     const dir = makeTestTempDir("tickmarkr-ps-fallback-");
     const script = join(dir, "ps.mjs");
@@ -78,9 +100,15 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       'const started = existsSync(process.env.TICKMARKR_TEST_PS_STATE) ? Number(readFileSync(process.env.TICKMARKR_TEST_PS_STATE, "utf8")) : now;',
       'writeFileSync(process.env.TICKMARKR_TEST_PS_STATE, String(started));',
       'const phase = (now - started) % 1000;',
-      mode === "bursty"
-        ? 'const rows = [`100 1 0:00.00 ${process.env.TICKMARKR_TEST_PS_MARKER}`, "101 100 0:00.00 fake-agent"];'
-        : 'const rows = ["999 1 0:00.00 unrelated-process"];',
+      // "flat": no row carries the marker — the probed tree is EMPTY and its total is the empty sum.
+      // "quiet": the marker's own process, holding CPU it burned before falling quiet and never
+      // moving again. "bursty": the same root plus a grandchild that comes and goes between the
+      // daemon's sparse observations.
+      mode === "flat"
+        ? 'const rows = ["999 1 0:00.00 unrelated-process"];'
+        : mode === "quiet"
+          ? 'const rows = [`100 1 0:00.42 ${process.env.TICKMARKR_TEST_PS_MARKER}`];'
+          : 'const rows = [`100 1 0:00.00 ${process.env.TICKMARKR_TEST_PS_MARKER}`, "101 100 0:00.00 fake-agent"];',
       mode === "bursty"
         ? 'if (phase >= 400 && phase <= 700) rows.push("102 101 0:00.20 short-lived-burner");'
         : "",
@@ -129,35 +157,56 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     expect(harvestCpuFlatWindowMs(1_000)).toBeGreaterThan(harvestCpuFlatWindowMs(10));
   });
 
-  test("an absent process tree reads as zero CPU, never as an unreadable snapshot", async () => {
+  test("test: a marker matching no live process yields a measurable reading while a snapshot that cannot be read yields none at all; a probe answering the empty tree the way it answers an unreadable one erases the distinction the conclusion depends on and fails", async () => {
     // The probe's two "no number" readings are opposites, and the triad turns on telling them
-    // apart: 0 means nothing of this worker is running — the strongest at-rest signal there is, and
-    // what every concluded harvest actually sees — while undefined means UNMEASURABLE and is
-    // journaled rather than concluded on. A marker matching no process must produce the first; were
-    // it ever to produce undefined, the triad would fall silent on exactly the finished, exited
-    // workers OBS-264 is about, and the feature would be gone with only a journal line to say so.
+    // apart: a MEASURABLE reading means the snapshot was read and nothing of this worker was in it
+    // — the strongest at-rest signal there is — while undefined means UNMEASURABLE and is journaled
+    // rather than concluded on. A marker matching no process must produce the first; were it ever to
+    // produce undefined, the triad would fall silent on exactly the finished, exited workers OBS-264
+    // is about, and the feature would be gone with only a journal line to say so.
+    // OBS-707: what this case exists to pin is that discrimination, not the arithmetic that the
+    // empty sum happens to be. Asserting the empty tree at exactly zero states a fact about summing
+    // no rows, and states it in the one place a loaded runner can also make true by accident.
+    const marker = `tickmarkr-no-live-process-${randomBytes(16).toString("hex")}`;
     const restoreProbe = await cpuProbeFallback(process.cwd(), "unused", "flat");
-    let cpu: Awaited<ReturnType<typeof workerTreeCpuMs>>;
+    let empty: Awaited<ReturnType<typeof workerTreeCpuMs>>;
     try {
-      const marker = `tickmarkr-no-live-process-${randomBytes(16).toString("hex")}`;
-      cpu = await workerTreeCpuMs(marker, process.cwd());
+      empty = await workerTreeCpuMs(marker, process.cwd());
     } finally {
       restoreProbe();
     }
-    expect(cpu).toBeDefined();
-    expect(cpu!.ms).toBe(0);
-    expect([10, 1_000]).toContain(cpu!.resolutionMs); // the quantum is read off the rows, not assumed
+    const restoreDeny = denyPs();
+    let unreadable: Awaited<ReturnType<typeof workerTreeCpuMs>>;
+    try {
+      unreadable = await workerTreeCpuMs(marker, process.cwd());
+    } finally {
+      restoreDeny();
+    }
+
+    // the empty tree: a reading, at the quantum it was read at
+    expect(empty).toBeDefined();
+    expect(Number.isFinite(empty!.ms)).toBe(true);
+    expect(empty!.ms).toBeGreaterThanOrEqual(0);
+    expect([10, 1_000]).toContain(empty!.resolutionMs); // the quantum is read off the rows, not assumed
+    // the unreadable snapshot: no reading at all — missing evidence can never prove inactivity
+    expect(unreadable).toBeUndefined();
+    // demonstrated rather than claimed: a probe that answered the empty tree the way it answers an
+    // unreadable one would erase the distinction, and this is the assertion that would then hold
+    expect(() => expect(empty).toBeUndefined()).toThrow();
   });
 
-  test("test: a silent worker with commits ahead of base and a flat CPU delta is concluded and its worktree goes to gates without a redispatch", async () => {
+  test("test: a harvest concluded over a worker tree that accrued processor time before falling quiet records that positive total beside the resolution it was read at and still concludes; the exact-zero form of that same row reds against this same fixture, which the case demonstrates rather than claims: that form fails", async () => {
     await withSeams(500, 200, async () => {
       // 5m stall window: if the triad did not conclude this wait, the 120s test budget would expire
-      // long before the window did. The worker commits, prints no trailer, and exits — flat CPU.
+      // long before the window did. The worker commits, prints no trailer, burns measurable CPU and
+      // then goes quiet WITHOUT exiting — the shape every real harvested stall has and the one the
+      // triad reads: what a conclusion turns on is FLATNESS across the window, never a total of
+      // zero. A tree that burned before falling quiet is flat at a POSITIVE total.
       const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], {
         consult: { action: "human", notes: "a harvested attempt must never reach a consult" },
-        tasks: { T1: [{ shell: `echo harvested > h.txt && ${COMMIT} h` }] },
+        tasks: { T1: [{ shell: `echo harvested > h.txt && ${COMMIT} h && ${BURN_IN_ROOT} && sleep 30` }] },
       });
-      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-ok", "flat");
+      const restoreProbe = await cpuProbeFallback(repo, "run-harvest-ok", "quiet");
       let s: Awaited<ReturnType<typeof runDaemon>>;
       try {
         s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-ok", driver: hdriver() });
@@ -170,7 +219,15 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       const concluded = evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1");
       expect(concluded).toHaveLength(1); // the triad ended the wait, not the window
       expect(concluded[0]!.data.commits).toBe(1);
-      expect(concluded[0]!.data.cpuMs).toBe(0); // the worker's process tree was gone
+      // the conclusion carries the reading it was drawn on, at the quantum that reading was taken
+      // at — a harvest that never asked the accountant could record neither
+      const cpuMs = concluded[0]!.data.cpuMs as number;
+      expect(cpuMs).toBeGreaterThan(0);
+      expect([10, 1_000]).toContain(concluded[0]!.data.cpuResolutionMs);
+      // OBS-707, demonstrated rather than claimed: the exact-zero form of this same row reds
+      // against this same fixture — it asserts a total the tree never had, and only an unloaded
+      // runner whose worker exited before anything sampled it ever made it true
+      expect(() => expect(cpuMs).toBe(0)).toThrow();
       // the carried worktree went to gates on THIS attempt — one dispatch, no fresh worker
       expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
       expect(evs.some((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "evidence" && e.data.pass === true)).toBe(true);
@@ -546,19 +603,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
   // 607 s of silence: its verification pass discarded, its gates run on a partial harvest, a healthy
   // channel demoted. The three runs below hold every one of those channel legs identical and vary
   // ONLY the CPU reading, so the kill's own arithmetic is the single thing under test.
-  test("test: the fast-kill concludes a silent unchanged tree only when its measured worker-tree CPU is flat and stands down when that CPU is still accruing or cannot be measured; a kill that concludes without reading the measured CPU fails", async () => {
-    // A host that cannot answer `ps` at all — the managed sandbox in production, made deterministic
-    // here so the leg's THIRD state is exercised everywhere rather than only where `ps` is denied.
-    const denyPs = (): (() => void) => {
-      const bashEnv = join(makeTestTempDir("tickmarkr-ps-denied-"), "bash-env");
-      writeFileSync(bashEnv, "ps() { return 1; }\n");
-      const prior = process.env.BASH_ENV;
-      process.env.BASH_ENV = bashEnv;
-      return () => {
-        if (prior === undefined) delete process.env.BASH_ENV;
-        else process.env.BASH_ENV = prior;
-      };
-    };
+  test("test: a dead-channel conclusion drawn over a tree that accrued processor time before falling quiet records that positive total while a tree still accruing is held instead of concluded; the exact-zero form of that row reds against this fixture and fails", async () => {
     // 3s flat window, the shipped value on a hundredths host: the burner below runs in short-lived
     // children with ~800ms gaps, so a shorter window would read one gap as rest and answer the
     // test's own question. 0.12m of stall window leaves the kill room to land long before expiry.
@@ -571,7 +616,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         });
         const restore = cpu === "denied"
           ? denyPs()
-          : await cpuProbeFallback(repo, runId, cpu === "flat" ? "flat" : "bursty");
+          : await cpuProbeFallback(repo, runId, cpu === "flat" ? "quiet" : "bursty");
         try {
           await runDaemon(repo, { adapters: [fake], runId, driver: hdriver() });
         } finally {
@@ -580,7 +625,9 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         return evsOf(repo, runId);
       };
 
-      const flat = await run("run-fastkill-cpu-flat", "sleep 30", "flat");
+      // the flat tree BURNS first and only then falls quiet: flatness is the reading the kill draws
+      // on, and a tree that worked before going silent is flat at a positive total
+      const flat = await run("run-fastkill-cpu-flat", `${BURN_IN_ROOT}; sleep 30`, "flat");
       const accruing = await run("run-fastkill-cpu-busy", burnInShortChildren(), "accruing");
       const denied = await run("run-fastkill-cpu-denied", "sleep 30", "denied");
 
@@ -591,8 +638,14 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       // flat CPU under a silent tracker and an unchanged tree: the channel really is dead
       expect(rows(flat, "worker-dead")).toHaveLength(1);
       // the death carries the reading it concluded on — a kill that never asked cannot record one
-      expect(rows(flat, "worker-dead")[0]!.data.cpuMs).toBe(0);
+      const deadCpuMs = rows(flat, "worker-dead")[0]!.data.cpuMs as number;
+      expect(deadCpuMs).toBeGreaterThan(0);
       expect(rows(flat, "worker-dead")[0]!.data.cpuResolutionMs).toBeTypeOf("number");
+      // OBS-707, demonstrated rather than claimed: the exact-zero form of this row reds against
+      // this fixture. It was never asserting the property the kill reads — flatness across the
+      // window — only that no sample had caught the tree working, which suite-parallel contention
+      // decides (2.1.2 CI: 10 on macOS, 100 on ubuntu; 2.1.3 CI: 10, 110 and 1)
+      expect(() => expect(deadCpuMs).toBe(0)).toThrow();
 
       // a live CPU delta is a live worker, by construction — the kill stands down and says why
       expect(rows(accruing, "worker-dead")).toHaveLength(0);

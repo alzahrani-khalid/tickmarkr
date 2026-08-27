@@ -63,23 +63,34 @@ Per release:
    cites a dead table. Fetch tables from `livebench.ai`, never `raw.githubusercontent.com` — same
    filename, 15 fewer models on raw.
 2. In the private repository: bump `version` in `package.json`, commit, and run the export in
-   mirror publish mode (below). Review the mirror commit, then push the mirror's `main`.
-3. In the **public** repository (the mirror), tag the export commit and push the tag:
+   mirror publish mode (below). Review the mirror commit, then push the mirror's `main`:
 
    ```bash
-   git tag -a v2.1.3 -m "v2.1.3"
-   git push origin v2.1.3
+   git -C /path/to/tickmarkr-public-mirror show --stat
+   git -C /path/to/tickmarkr-public-mirror push origin HEAD:main
    ```
 
-4. The tag push runs `release.yml` in the public repository:
+3. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that
+   exact mirror `main` push to report green for the exported commit. Both the `test` and
+   `test-macos` jobs must be green. Match the run's head SHA to the mirror's `HEAD`; a red or
+   missing run is a hard stop, and the tag does not exist yet.
+4. Only after that full-suite proof is green, in the **public** repository (the mirror), tag the
+   export commit and push the tag:
+
+   ```bash
+   git tag -a v2.1.4 -m "v2.1.4"
+   git push origin v2.1.4
+   ```
+
+5. The tag push runs `release.yml` in the public repository:
    - `npm install -g npm@11` (OIDC trusted publishing needs a current npm)
    - `npm ci`
    - `npm run build`
    - `npm run lint`
    - `npx vitest run --project built-cli --project signal-reaper` (artifact-scoped release gate —
-     the full suite outgrew the 2-core runner's fixed 60s vitest RPC window and died at teardown
-     with every test green, four consecutive runs on 2026-08-11; full-suite truth lives in
-     `ci.public.yml` and the pre-tag proof battery on the exported tree)
+     it proves only the built CLI and signal-reaper scope it runs, not full-suite green; the
+     teardown RPC timeout is real, but release trees have also carried genuine assertion failures
+     this subset does not run. Full-suite truth is the required green pre-tag `CI (public)` run)
    - `npm publish --provenance --access public` (only if all checks pass)
 
 Publish is fail-closed: a failing build, lint, or test blocks publication.
@@ -94,13 +105,16 @@ registry shows the new version:
 2. `tickmarkr version` must report exactly the just-published version. A mismatch is a hard
    stop: diagnose the publish or the install — never leave the machine half-updated (a stale
    binary silently skips daemon gates; see the version preflight in the agent docs).
-3. `tickmarkr init --agent --force --docs` in every active tickmarkr workspace (this
-   repository and each consumer repository) to refresh the scaffolded `.agents`/`.claude`
-   skills and agent-docs blocks to the shipped versions. The `--agent` flag is required:
-   plain `init --force` skips the skill install entirely when scaffolds already exist
-   (verified live on the first run of this ritual). Stale scaffolded skills in a consumer
-   repository have carried defective launch guidance before (OBS-99) — the refresh closes
-   that class.
+3. In the active consumer workspaces `SentioQ` and `quranic-insights`, run
+   `tickmarkr init --agent --force --docs` to refresh the scaffolded `.agents`/`.claude`
+   skills and agent-docs blocks to the shipped versions. Keep the deliberately frozen
+   `Intl-Dossier-V2.0` consumer excluded until its owning ruling is lifted. The `--agent` flag
+   is required: plain `init --force` skips the skill install entirely when scaffolds already
+   exist (verified live on the first run of this ritual). Stale scaffolded skills in a consumer
+   repository have carried defective launch guidance before (OBS-99) — the refresh closes that
+   class. Do not run this scaffold-refresh step in the tickmarkr source repository: its tracked
+   scaffold sources can be newer than the installed package build, and `--force` here has reverted
+   tracked source to that installed build and silently deleted a committed guard harvest (OBS-584).
 
 ## Public GitHub export (squashed snapshot)
 

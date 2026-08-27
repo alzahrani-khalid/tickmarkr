@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
-import { describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { kimiSessionId } from "../../../src/adapters/kimi.js";
 import { shq } from "../../../src/adapters/types.js";
@@ -14,7 +14,7 @@ import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../.
 import { validateGraph } from "../../../src/graph/schema.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../../src/run/git.js";
-import { activeRetryBan, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, pendingRepairFindings, recordedTaskFailureKind, structuredFindings, UNIDENTIFIED, type JournalEvent } from "../../../src/run/journal.js";
+import { activeRetryBan, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
 import { COMMIT, authedModels, setupRepo, T } from "../../helpers/tmprepo.js";
 
 
@@ -967,6 +967,50 @@ describe("per-task timeout override (OBS-37b)", () => {
     expect(Date.now() - t0).toBeLessThan(8_000); // T1 short override; T2 uses 5m default and finishes quickly
   }, 30_000);
 
+  test("a run whose worker dies leaving scoped files uncommitted journals a `worktree-preserved` row naming a reference that resolves; the row precedes the recreation row it protects against; a journal carrying only what the recreation carried reads complete over a destroyed half: it fails", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { files: ["base.txt", "loose.txt", "new-dir/deep.txt", "done.txt"] })],
+      {
+        tasks: { T1: [
+          {
+            shell: "printf 'dying tracked\\n' > base.txt; printf 'dying loose\\n' > loose.txt; mkdir -p new-dir; printf 'dying deep\\n' > new-dir/deep.txt; exit 1",
+          },
+          {
+            shell: `test "$(cat base.txt)" = base && test ! -e loose.txt && test ! -e new-dir/deep.txt && echo done > done.txt && ${COMMIT} done`,
+            result: { ok: true, summary: "fresh attempt completed" },
+          },
+        ] },
+        consult: { action: "retry", notes: "retry after the worker death" },
+      },
+    );
+    const runId = "run-preserve-worker-death";
+    const summary = await runDaemon(repo, { adapters: [fake], runId });
+    expect(summary.done).toEqual(["T1"]);
+
+    const events = Journal.open(repo, runId).read();
+    const preservedAt = events.findIndex((e) => e.event === "worktree-preserved" && e.taskId === "T1");
+    const recreationAt = events.findIndex((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+    expect(preservedAt).toBeGreaterThanOrEqual(0);
+    expect(recreationAt).toBeGreaterThan(preservedAt);
+    const ref = events[preservedAt]!.data.ref;
+    expect(typeof ref).toBe("string");
+    expect((await shOk(`git rev-parse --verify '${ref}^{commit}'`, repo)).trim()).toMatch(/^[0-9a-f]{40,64}$/);
+    expect(await shOk(`git show '${ref}:base.txt'`, repo)).toBe("dying tracked\n");
+    expect(await shOk(`git show '${ref}:loose.txt'`, repo)).toBe("dying loose\n");
+    expect(await shOk(`git show '${ref}:new-dir/deep.txt'`, repo)).toBe("dying deep\n");
+    expect(events[recreationAt]!.data).toMatchObject({ attempted: [], carried: [] });
+  }, 30_000);
+
+  test("one preservation step stands between every recreation of a task checkout and the removal it performs, so a diff that preserves at one of the two recreation sites and leaves the other destroying fails", () => {
+    const source = readFileSync(join(import.meta.dirname, "..", "..", "..", "src", "run", "daemon.ts"), "utf8");
+    expect(source.match(/await recreateTaskWorktree\(taskBranch, taskBase, priorWt\)/g)).toHaveLength(2);
+    expect(source.match(/driver\.worktree\(repoRoot, taskBranch, taskBase\)/g)).toHaveLength(1);
+    const preserveAt = source.indexOf("await preserveWorktree(priorWt)");
+    const removeAt = source.indexOf("return driver.worktree(repoRoot, taskBranch, taskBase)");
+    expect(preserveAt).toBeGreaterThanOrEqual(0);
+    expect(removeAt).toBeGreaterThan(preserveAt);
+  });
+
   test("OBS-58: a retry worktree recreation carries a prior attempt's cleanly-applying commit forward", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
@@ -1718,4 +1762,274 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     expect(dispatchError).toBe("Error: pane wedged: dispatch never registered");
     expect(prompt).toContain(`dispatch: ${dispatchError}`);
   }, 240_000);
+});
+
+// T6: a review finding is a property of the TASK. Both carries the daemon had were ATTEMPT-scoped —
+// the funded repair (spent at the next worker-launch, budgeted at two per engagement) and the
+// journaled failure brief (reset at that same launch) — so the moment one attempt failed for a reason
+// the reviewer never named, the outstanding finding stopped travelling and every later dispatch
+// re-derived the task from the spec and landed on the same gap the reviewer had already anchored.
+const FINDING = "`applyMarker` in src/mark.ts writes the wrong column";
+const evsOf = (repo: string, runId: string) => Journal.open(repo, runId).read();
+const promptPath = (repo: string, runId: string, attempt: number) =>
+  join(tickmarkrDir(repo), "runs", runId, "prompts", `T1-a${attempt}.md`);
+
+describe("T6 outstanding review findings (fake adapter, zero tokens)", () => {
+  const runId = "run-outstanding-finding";
+
+  // The worker dispatch that dies BEFORE any worker runs — OBS-253's shape, and the death the goal
+  // names: no worker-result, no gate row of any kind, so the attempt produces no verdict at all.
+  const deathOnWorkerDispatch = (nth: number): ExecutorDriver => {
+    const inner = new SubprocessDriver();
+    let seen = 0;
+    return {
+      id: "dispatch-death",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      async run(slot: Slot, cmd: string) {
+        const worker = slot.name.startsWith("tickmarkr:worker:") || slot.name.includes("-worker-");
+        if (worker && ++seen === nth) throw new Error("pane wedged: dispatch never registered");
+        await inner.run(slot, cmd);
+      },
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+    } as ExecutorDriver;
+  };
+
+  // ONE run, the shape the goal describes end to end:
+  //   a0 commits            → the reviewer anchors a material finding (repair 1 of 2 is funded)
+  //   a1 repairs, breaks the test gate → the round fails for a reason that never mentions the finding
+  //   a2 dies at dispatch   → no worker-result, no gate result: no verdict at all
+  //   resume --retry-failed → the dispatch after the death, rebuilt by a FRESH process from the
+  //                           journal alone, so no loop-local brief can answer for it
+  let repo = "";
+  let evs: JournalEvent[] = [];
+  let dispatches: JournalEvent[] = [];
+  let briefAfterUnrelatedFailure = "";
+  let briefAfterNoVerdict = "";
+
+  beforeAll(async () => {
+    const s = setupRepo(
+      [T("T1")],
+      {
+        review: { approve: false, findings: [{ note: FINDING, severity: "material" }] },
+        consult: { action: "retry", notes: "unused — the failures here are gate and dispatch failures" },
+        tasks: { T1: [
+          { shell: `mkdir -p src && echo one > src/mark.ts && ${COMMIT} m1`, result: { ok: true, summary: "a0" } },
+          { shell: `echo broken > broken.txt && ${COMMIT} b1`, result: { ok: true, summary: "a1" } },
+          { shell: `git rm -q broken.txt && ${COMMIT} b2`, result: { ok: true, summary: "a2" } },
+        ] },
+      },
+      "gates: { test: 'test ! -f broken.txt' }\n",
+    );
+    repo = s.repo;
+    await runDaemon(repo, { adapters: [s.fake], runId, driver: deathOnWorkerDispatch(3) });
+    briefAfterUnrelatedFailure = readFileSync(promptPath(repo, runId, 2), "utf8");
+    // `--retry-failed` re-dispatches the dead attempt as attempt 0. A stale prompt must not be able
+    // to answer for it: the bytes asserted below have to be the ones this retry wrote.
+    writeFileSync(promptPath(repo, runId, 0), "STALE — the retry must rebuild this brief\n");
+    await runDaemon(repo, { adapters: [s.fake], runId, resume: true, retryFailed: true });
+    briefAfterNoVerdict = readFileSync(promptPath(repo, runId, 0), "utf8");
+    evs = evsOf(repo, runId);
+    dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+  }, 300_000);
+
+  test("test: a task whose review recorded an outstanding finding and whose next attempt then fails for a reason that never mentions it hands the dispatch after that one the finding's own text; a brief carrying the previous attempt's failure bytes alone omits it and fails", () => {
+    expect(dispatches).toHaveLength(4);
+    // the reviewer recorded the finding on attempt 0, and it has drawn no passing review since
+    const reviewFail = evs.find((e) => e.event === "gate-result" && e.taskId === "T1"
+      && e.data.gate === "review" && e.data.pass === false)!;
+    expect(String(reviewFail.data.details)).toContain(FINDING);
+    // attempt 1 then failed the TEST gate — a reason that never mentions the finding, and one that
+    // returns the battery before review is even launched, so the finding drew no second row.
+    const attempt1 = evs.slice(evs.indexOf(dispatches[1]!), evs.indexOf(dispatches[2]!));
+    const failed1 = attempt1.filter((e) => e.event === "gate-result" && e.data.pass === false);
+    expect(failed1.map((e) => e.data.gate)).toEqual(["test"]);
+    expect(JSON.stringify(failed1)).not.toContain("applyMarker");
+
+    // the CONTROL: the previous attempt's failure bytes are all the journaled brief carries, and it
+    // omits the finding entirely — a dispatch built from them alone is an amnesia dispatch.
+    const beforeDispatch = evs.slice(0, evs.indexOf(dispatches[2]!));
+    const lastAttemptBytes = journaledFailureBrief(beforeDispatch, "T1").join("\n\n");
+    expect(lastAttemptBytes).toContain("test: ");
+    expect(lastAttemptBytes).not.toContain("applyMarker");
+    // and the funded repair — the ONE dispatch that carries findings today — carries the test
+    // findings for this round, not the reviewer's: its budget was spent on the unrelated failure.
+    expect(pendingRepairFindings(beforeDispatch, "T1")).toContain("test: ");
+    expect(pendingRepairFindings(beforeDispatch, "T1")).not.toContain("applyMarker");
+
+    // yet the dispatch AFTER that one is handed the finding's own text, verbatim
+    expect(briefAfterUnrelatedFailure).toContain(FINDING);
+    expect(outstandingReviewFindings(beforeDispatch, "T1").map((f) => f.note)).toEqual([FINDING]);
+  });
+
+  test("test: an attempt that produces no verdict at all still leaves the outstanding finding on the following dispatch; a carry reading only the last attempt's gate results finds none there so it carries nothing: it fails", () => {
+    // attempt 2 died at dispatch: no worker ever read a word, so there is no worker-result and no
+    // gate result of any kind — the attempt produced no verdict at all.
+    const deadAttempt = evs.slice(evs.indexOf(dispatches[2]!), evs.indexOf(dispatches[3]!));
+    expect(deadAttempt.some((e) => e.event === "worker-result")).toBe(false);
+    expect(deadAttempt.filter((e) => e.event === "gate-result")).toEqual([]);
+    expect(recordedTaskFailureKind(evs.slice(0, evs.indexOf(dispatches[3]!)), "T1")).toBe("dispatch");
+
+    // the CONTROL: a carry that reads the last attempt's gate results finds none there, so it
+    // carries nothing about the finding — the whole reason the run re-derives a known defect.
+    const beforeRetry = evs.slice(0, evs.indexOf(dispatches[3]!));
+    expect(JSON.stringify(journaledFailureBrief(beforeRetry, "T1"))).not.toContain("applyMarker");
+
+    // the finding is a property of the task, so it is still outstanding and rides this dispatch —
+    // rebuilt by a FRESH process from the journal alone, with a stale prompt overwritten to prove it
+    expect(outstandingReviewFindings(beforeRetry, "T1").map((f) => f.note)).toEqual([FINDING]);
+    expect(briefAfterNoVerdict).not.toContain("STALE");
+    expect(briefAfterNoVerdict).toContain(FINDING);
+  });
+
+  test("test: the journal row for a dispatch carrying an outstanding finding names that finding; a row recording the dispatch without naming it leaves a carried dispatch indistinguishable from an amnesiac one: it fails", () => {
+    const carried = (e: JournalEvent) => (e.data.carriedFindings as StructuredFinding[] | undefined) ?? [];
+    // the CONTROL: attempt 0 dispatched before any review spoke, so nothing was outstanding and its
+    // row names nothing. That is what makes the rows below evidence rather than decoration — a row
+    // shape that never names a finding cannot tell a carried dispatch from an amnesiac one.
+    expect(dispatches[0]!.data.carriedFindings).toBeUndefined();
+
+    // every dispatch after the reviewer spoke names the finding it carries — by the reviewer's own
+    // bytes AND by the stable identity a later reader can match rounds on.
+    for (const row of dispatches.slice(1)) {
+      expect(carried(row).map((f) => f.note)).toEqual([FINDING]);
+      expect(carried(row).map((f) => f.fingerprint)).toEqual(["review:material|src/mark.ts|applyMarker"]);
+    }
+    // including the two the goal indicts: the dispatch after an unrelated failure, and the one after
+    // an attempt that produced no verdict at all.
+    expect(carried(dispatches[2]!)).toHaveLength(1);
+    expect(carried(dispatches[3]!)).toHaveLength(1);
+    // and the row's identity is the one the gate journaled, not a re-parse minted at dispatch time
+    const reviewFail = evs.find((e) => e.event === "gate-result" && e.taskId === "T1"
+      && e.data.gate === "review" && e.data.pass === false)!;
+    expect((reviewFail.data.findings as StructuredFinding[]).map((f) => f.fingerprint))
+      .toContain(carried(dispatches[3]!)[0]!.fingerprint);
+  });
+});
+
+// T6 (repair): the other half of "a property of the TASK" — a finding travels until it is SETTLED,
+// and then it must stop. Both halves have to be measured on a real dispatch: the fold can be perfect
+// while the daemon still hands the next worker a settled finding out of a loop-local brief no reset
+// clears, and that dispatch's row — re-derived from the journal, which correctly retired it — names
+// nothing, so the ledger reads it as amnesiac while the prompt is anything but.
+describe("T6 a settled review finding stops travelling (fake adapter, zero tokens)", () => {
+  const runId = "run-finding-retired";
+
+  // ONE task, two runs, the whole life of a finding:
+  //   run A  a0/a1 draw the SAME material finding twice → the engagement's review round cap parks it
+  //   approve --uphold → the operator sides WITH the reviewer and funds one fixed attempt
+  //   run B  a2 carries the finding (an uphold funds it, it does not settle it), fixes it, and every
+  //          gate — review included — passes … and the merge then hits a sibling's conflicting commit,
+  //          so the consult retries and a2's own brief is handed to a3 unless something clears it.
+  let repo = "";
+  let evs: JournalEvent[] = [];
+  let dispatches: JournalEvent[] = [];
+  let briefUpheld = "";
+  let briefAfterPass = "";
+
+  beforeAll(async () => {
+    const s = setupRepo(
+      [T("T1")],
+      {
+        review: { approve: false, findings: [{ note: FINDING, severity: "material" }] },
+        tasks: { T1: [
+          { shell: `mkdir -p src && echo one > src/mark.ts && ${COMMIT} m1`, result: { ok: true, summary: "a0" } },
+          { shell: `echo two >> src/mark.ts && ${COMMIT} m2`, result: { ok: true, summary: "a1" } },
+        ] },
+      },
+    );
+    repo = s.repo;
+    await runDaemon(repo, { adapters: [s.fake], runId });
+    await approve([runId, "T1", "--uphold", "--by", "op"], repo);
+
+    // run B's reviewer APPROVES. The worker's own step commits the sibling change into the live
+    // integration worktree — the ordinary way a merge conflicts (someone else landed first), made
+    // deterministic: taskBase is stamped before the worker runs, so this moves the tip underneath it.
+    const intWt = worktreePath(repo, `tickmarkr/${runId}`);
+    writeFileSync(s.scriptPath, JSON.stringify({
+      judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
+      review: { approve: true, issues: [] },
+      consult: { action: "retry", notes: "a sibling landed first — rebase onto the new tip and re-land" },
+      tasks: { T1: [
+        { shell: `echo worker > shared.txt && ${COMMIT} w1`
+          + ` && echo sibling > ${shq(join(intWt, "shared.txt"))}`
+          + ` && git -C ${shq(intWt)} add -A && git -C ${shq(intWt)} commit --no-gpg-sign -m sibling`,
+          result: { ok: true, summary: "a2 — fixed the reviewer's finding" } },
+        { shell: `echo settled > shared.txt && ${COMMIT} w2`, result: { ok: true, summary: "a3" } },
+      ] },
+    }));
+    await runDaemon(repo, { adapters: [new FakeAdapter(s.scriptPath)], runId, resume: true });
+
+    evs = evsOf(repo, runId);
+    dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
+    briefUpheld = readFileSync(promptPath(repo, runId, dispatches[2]!.data.attempt as number), "utf8");
+    briefAfterPass = readFileSync(promptPath(repo, runId, dispatches[3]!.data.attempt as number), "utf8");
+  }, 300_000);
+
+  test("test: once a later review passes on that task the finding stops appearing on subsequent dispatches; a carry that appends every finding a task ever drew repeats a resolved one forever and fails", () => {
+    // the finding survived the operator's uphold — an uphold FUNDS the fix, it does not accept the
+    // diff, so the very dispatch sent to fix it is handed it, by text and by the row's own name.
+    expect(dispatches).toHaveLength(4);
+    expect(briefUpheld).toContain(FINDING);
+    expect((dispatches[2]!.data.carriedFindings as StructuredFinding[]).map((f) => f.note)).toEqual([FINDING]);
+
+    // then a REAL later review passed on this task, and the merge conflict below is what sends the
+    // task around the loop again — the one reachable path from a passing review to a new dispatch.
+    const a2 = evs.slice(evs.indexOf(dispatches[2]!), evs.indexOf(dispatches[3]!));
+    expect(a2.some((e) => e.event === "gate-result" && e.data.gate === "review" && e.data.pass === true)).toBe(true);
+    expect(a2.some((e) => e.event === "merge-conflict")).toBe(true);
+
+    // the dispatch AFTER that passing review carries the finding nowhere: not in its brief, and not
+    // in its row — the two have to agree, or a carried dispatch and an amnesiac one look alike.
+    expect(briefAfterPass).not.toContain(FINDING);
+    expect(briefAfterPass).not.toContain("applyMarker");
+    expect(dispatches[3]!.data.carriedFindings).toBeUndefined();
+    const beforeRetry = evs.slice(0, evs.indexOf(dispatches[3]!));
+    expect(outstandingReviewFindings(beforeRetry, "T1")).toEqual([]);
+    // A fresh daemon seeds its prompt from these two journal folds. Both must retire the uphold on
+    // the passing review; otherwise the resume-state fallback re-injects a finding the task settled.
+    expect(upheldFeedbackByTask(beforeRetry).get("T1")).toBeUndefined();
+    expect(Journal.open(repo, runId).replayResumeState().get("T1")?.upheldFeedback).toBeUndefined();
+
+    // the CONTROL, and the reason this is measured on a dispatch rather than on the fold alone: the
+    // journal still HOLDS every finding the task ever drew, and the process that built this brief had
+    // just written the finding into the previous one. A carry that appends what the task ever drew —
+    // or one that lets a brief survive the review that settled it — repeats it here and forever.
+    const everDrawn = beforeRetry.filter((e) => e.taskId === "T1" && e.event === "gate-result"
+      && e.data.gate === "review" && e.data.pass === false)
+      .flatMap((e) => e.data.findings as StructuredFinding[]);
+    expect(everDrawn.map((f) => f.note)).toEqual([FINDING, FINDING]);
+  });
+
+  test("test: an approval that funds another dispatch is not an approval that settles the reviewer's finding", () => {
+    const ev = (event: string, data: Record<string, unknown> = {}, taskId = "T1"): JournalEvent =>
+      ({ ts: "2026-08-01T00:00:00.000Z", event, taskId, data });
+    const details = `reviewer fake:fake-2 (fake-b): requested changes (1 material)\n- [material] ${FINDING}`;
+    const reviewFail = ev("gate-result", { gate: "review", pass: false, details, findings: structuredFindings("review", details) });
+    const drawn = [reviewFail, ev("worker-launch"), ev("gate-result", { gate: "test", pass: true, details: "exit 0" })];
+    const still = (extra: JournalEvent) => outstandingReviewFindings([...drawn, extra], "T1").map((f) => f.note);
+
+    // outstanding across a launch and a passing gate that is not the review …
+    expect(outstandingReviewFindings(drawn, "T1").map((f) => f.note)).toEqual([FINDING]);
+    // … and restating it in a later round carries it ONCE, by fingerprint, not once per round
+    expect(outstandingReviewFindings([...drawn, reviewFail, ev("worker-launch")], "T1")).toHaveLength(1);
+    // a review that DECLINED to run states no verdict, so it neither adds nor retires
+    expect(still(ev("gate-result", { gate: "review", details: "policy declined", skipped: true }))).toEqual([FINDING]);
+
+    // Only ONE approval settles a review finding: the operator accepting the diff the reviewer
+    // rejected. Every other approval buys a dispatch and says nothing about the objection — reading
+    // "approved" as "settled" drops the finding at the exact moment someone paid to have it fixed.
+    expect(still(ev("task-approved", { by: "op", release: REVIEW_UPHELD_RELEASE, gate: "review" }))).toEqual([FINDING]);
+    expect(still(ev("task-approved", { by: "op", release: "attempt-cap" }))).toEqual([FINDING]);
+    expect(still(ev("task-approved", { by: "op", release: "recheck" }))).toEqual([FINDING]);
+    expect(still(ev("task-approved", { by: "op" }))).toEqual([FINDING]); // a pre-dispatch human gate
+    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "test" }))).toEqual([FINDING]);
+    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([]);
+  });
 });

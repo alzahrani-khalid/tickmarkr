@@ -1,5 +1,4 @@
-import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,7 +25,7 @@ import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { COMMIT, authedModels, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
-import { spawnCli, assertCliSuccess, assertCliExit, type BuiltCliResult } from "../helpers/built-cli.js";
+import { spawnCli, assertCliSuccess, assertCliExit, prepareBuiltCli, newestMtimeMs, ENTRY, type BuiltCliResult } from "../helpers/built-cli.js";
 import vitestConfig, { DIST_COUPLED_TESTS } from "../../vitest.config.js";
 
 // only fake is installed+authed, so discoverChannels yields fake channels ONLY — routing can never
@@ -55,7 +54,6 @@ function repoWithPrd(): string {
 }
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const ENTRY = join(ROOT, "dist/cli/index.js");
 
 describe("tickmarkr help", () => {
   // The built-cli project runs bin.test.ts (the one mid-suite `npm run build`) and this file in ONE
@@ -64,10 +62,11 @@ describe("tickmarkr help", () => {
   // file the first slot. And `pretest` cannot be relied on to have built dist either: an npmrc
   // carrying `ignore-scripts=true` (the operator's does) skips it silently. When both fall the wrong
   // way ENTRY simply does not exist and every spawnCli below exits 1 with MODULE_NOT_FOUND and empty
-  // stdout — a red that says nothing about the CLI. Build it here when it is missing: this file owns
-  // the entry it spawns rather than inheriting it from whoever happened to run first.
+  // stdout — a red that says nothing about the CLI. So this file owns the entry it spawns rather than
+  // inheriting it from whoever happened to run first — and it owns it by CURRENCY, not by mere
+  // existence, through the same shared preparation version.test.ts uses.
   beforeAll(() => {
-    if (!existsSync(ENTRY)) execFileSync("npm", ["run", "build"], { cwd: ROOT, stdio: "pipe" });
+    prepareBuiltCli();
   }, 300_000);
 
   beforeEach(() => {
@@ -520,6 +519,110 @@ describe("built-cli helper (OBS-96 piece 1)", () => {
       durationMs: 14500,
     };
     expect(() => assertCliSuccess(failed, "slow failure")).toThrow(/elapsed: 14500ms/);
+  });
+
+  // --- currency drills: the entry is owned by CURRENCY, not presence ---------------------------
+  // A stale entry satisfies an existence test, no build runs, and the red that follows is an
+  // assertion diff reading as a genuine command-line regression — on a release tree, the most
+  // expensive place to read it. Each drill carries the negative control it must beat.
+  const T0 = 1_700_000_000_000; // fixed: Date.now() would make the fixture's own age the variable
+  const setMtime = (path: string, ms: number) => utimesSync(path, ms / 1000, ms / 1000);
+  // entry + a source tree with one file at the top and one nested below it
+  const currencyFixture = () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-currency-"));
+    const srcDir = join(dir, "src");
+    const nested = join(srcDir, "cli", "commands");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(srcDir, "index.ts"), "top\n");
+    writeFileSync(join(nested, "version.ts"), "nested\n");
+    const entry = join(dir, "dist", "cli", "index.js");
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "built\n");
+    return { dir, srcDir, entry, top: join(srcDir, "index.ts"), nested: join(nested, "version.ts") };
+  };
+  // the comparison this task replaces: it can only see whether the entry is there at all
+  const existenceOnlyWouldBuild = (entry: string) => !existsSync(entry);
+
+  test("test: an entry whose modification time predates the newest source file makes the shared preparation run its build step while an entry newer than every source file makes it run none; a preparation deciding on existence alone runs none in both cases and fails", () => {
+    const f = currencyFixture();
+    try {
+      const built: string[] = [];
+      for (const src of [f.top, f.nested]) setMtime(src, T0);
+
+      setMtime(f.entry, T0 - 60_000); // built before the last source edit — stale
+      expect(prepareBuiltCli({ entry: f.entry, srcDir: f.srcDir, build: () => built.push("stale") })).toBe(true);
+      const existenceOnStale = existenceOnlyWouldBuild(f.entry);
+
+      setMtime(f.entry, T0 + 60_000); // built after every source edit — current
+      expect(prepareBuiltCli({ entry: f.entry, srcDir: f.srcDir, build: () => built.push("current") })).toBe(false);
+      const existenceOnCurrent = existenceOnlyWouldBuild(f.entry);
+
+      expect(built).toEqual(["stale"]); // built exactly once, for the stale entry
+
+      // control: existence alone reads both entries as fine, so it skips the build the stale case
+      // needs — the two cases are indistinguishable to it, which is how the 2.1.3 red was authored.
+      expect([existenceOnStale, existenceOnCurrent]).toEqual([false, false]);
+      expect(existenceOnStale).not.toBe(true);
+    } finally {
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("test: an absent entry still makes that preparation run its build step; a currency comparison that forgets the missing case leaves the first spawn with no entry at all and fails", () => {
+    const f = currencyFixture();
+    try {
+      for (const src of [f.top, f.nested]) setMtime(src, T0);
+      rmSync(f.entry);
+
+      // control: a comparison written only for the stale case — a missing entry has no mtime to
+      // compare, it reads as "nothing older than the source", and it returns "no build needed".
+      const forgetsMissing = (entry: string, srcDir: string) =>
+        newestMtimeMs(srcDir) > (statSync(entry, { throwIfNoEntry: false })?.mtimeMs ?? Number.POSITIVE_INFINITY);
+      expect(forgetsMissing(f.entry, f.srcDir)).toBe(false);
+      expect(existsSync(f.entry)).toBe(false); // …so the first spawn would have no entry at all
+
+      expect(prepareBuiltCli({ entry: f.entry, srcDir: f.srcDir, build: () => writeFileSync(f.entry, "built\n") })).toBe(true);
+      expect(existsSync(f.entry)).toBe(true);
+    } finally {
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("test: a source file nested below the top of the source tree and newer than the entry still makes it build; a comparison reading only the files directly under the source root misses it and fails", () => {
+    const f = currencyFixture();
+    try {
+      setMtime(f.top, T0 - 120_000);
+      setMtime(f.entry, T0 - 60_000);
+      setMtime(f.nested, T0); // the only edit newer than the entry, two levels down
+
+      // control: a scan of the files directly under src/ — src/cli/ is a directory, not a file, so
+      // the edit inside it is invisible and the stale entry is graded as current.
+      const shallowOnlyWouldBuild = (entry: string, srcDir: string) => {
+        const entryMtimeMs = statSync(entry).mtimeMs;
+        return readdirSync(srcDir, { withFileTypes: true })
+          .filter((e) => e.isFile())
+          .some((e) => statSync(join(srcDir, e.name)).mtimeMs > entryMtimeMs);
+      };
+      expect(shallowOnlyWouldBuild(f.entry, f.srcDir)).toBe(false);
+
+      const built: string[] = [];
+      expect(prepareBuiltCli({ entry: f.entry, srcDir: f.srcDir, build: () => built.push("nested") })).toBe(true);
+      expect(built).toEqual(["nested"]);
+    } finally {
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("both test files that spawn the built entry take it from that one shared preparation, so a diff adding the currency comparison to one setup hook while the other still decides on existence alone fails", () => {
+    for (const rel of ["tests/cli/cli.test.ts", "tests/cli/version.test.ts"]) {
+      const src = readFileSync(join(ROOT, rel), "utf8");
+      // the setup hook calls the shared preparation with no arguments of its own…
+      expect(src).toMatch(/beforeAll\(\(\) => \{\s*prepareBuiltCli\(\);\s*\}/);
+      // …and decides nothing locally: no file-local build step, and no existence test standing in
+      // for the currency comparison.
+      expect(src).not.toMatch(/\[\s*["']run["'],\s*["']build["']\s*\]/);
+      expect(src).not.toMatch(/if\s*\(!?\s*existsSync\(ENTRY\)\)/);
+    }
   });
 
   test("test: every built-CLI assertion in both test files runs through the shared helper rather than a raw spawnSync assertion", () => {

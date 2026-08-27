@@ -124,6 +124,20 @@ function extractWriteDirectives(body: string, storedPath: string): WriteDirectiv
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
+function summaryCompletionStatus(planFile: string): unknown {
+  const summaryFile = join(dirname(planFile), `${basename(planFile).replace(/-PLAN\.md$/, "")}-SUMMARY.md`);
+  if (!existsSync(summaryFile)) return undefined;
+  try {
+    const content = readFileSync(summaryFile, "utf8");
+    const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---/.exec(content);
+    if (!fmMatch) return undefined;
+    const fm = parseYaml(fmMatch[1]);
+    return isPlainObject(fm) ? fm.status : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // schema-legal, branch-safe id segment: dots etc. → dashes; no "--" runs (task-branch separator)
 // or trailing dash — the id schema rejects both
 const sanitize = (s: string): string =>
@@ -197,7 +211,11 @@ function compileOne(file: string, storedPath: string) {
 
   const taskCount = [...body.matchAll(/<task[\s>]/g)].length;
   const humanGate = fm.autonomous === false || /<task type="checkpoint:/.test(body);
-  const done = existsSync(join(dirname(file), `${basename(file).replace(/-PLAN\.md$/, "")}-SUMMARY.md`));
+  const summaryStatus = summaryCompletionStatus(file);
+  // GSD source rule (`/gsd:quick status`): a SUMMARY is complete only when its frontmatter says
+  // `status: complete`; when `status` is absent it reports `INCOMPLETE`. The compiler must preserve
+  // that distinction because an artifact can record a reviewed failure rather than completion.
+  const done = summaryStatus === "complete";
 
   const files = strings(fm.files_modified).map((f) => f.replace(/^\.\//, ""));
   assertWriteScope(file, `P${key}`, files, extractWriteDirectives(body, storedPath));

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { filesGlob } from "../../src/graph/files-glob.js";
@@ -6,6 +6,7 @@ import { describe, expect, test, vi } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
 import { compileGsd } from "../../src/compile/gsd.js";
 import { compileSource } from "../../src/compile/index.js";
+import { readyTasks } from "../../src/graph/graph.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const PHASE = "fixtures/gsd-sample/07-live-check";
@@ -52,7 +53,7 @@ describe("compileGsd (committed fixture phase)", () => {
     expect(p1.complexity).toBe(5); // 2·tasks + truths
     expect(p1.humanGate).toBe(false);
     expect(p2.humanGate).toBe(true); // checkpoint task → humanGate
-    expect(p3.status).toBe("done"); // sibling SUMMARY.md = GSD's completion marker
+    expect(p3.status).toBe("done"); // sibling SUMMARY.md explicitly declares status: complete
     expect(p1.status).toBe("pending");
   });
 
@@ -74,6 +75,64 @@ describe("compileGsd (committed fixture phase)", () => {
     const g = compileGsd(join(PHASE, "07-02-PLAN.md"));
     expect(g.tasks.map((t) => t.id)).toEqual(["P07-02"]);
     expect(g.tasks[0].deps).toEqual([]); // 07-01 is outside this graph
+  });
+});
+
+describe("GSD summary completion fails closed", () => {
+  test("a phase whose summary declares a passing completion status compiles that task done while the same phase with that declaration removed compiles it not done; a derivation reading the summary's presence marks both done and fails", () => {
+    const dir = scratchPhase("25-summary-complete", {
+      "25-01-PLAN.md": plan("plan: 1", `<objective>\nComplete work. x\n</objective>\n\n${doneTask("work passed")}`),
+      "25-01-SUMMARY.md": "---\nstatus: complete\n---\n\n# Passing handoff\n",
+    });
+
+    expect(compileGsd(dir).tasks[0].status).toBe("done");
+    writeFileSync(join(dir, "25-01-SUMMARY.md"), "---\nreview: accepted\n---\n\n# Handoff without completion status\n");
+    expect(compileGsd(dir).tasks[0].status).toBe("pending");
+  });
+
+  test("a summary recording a reviewed red handoff compiles its task not done though the file sits at the canonical name; a derivation that lets the artifact recording a failure mark the work complete fails", () => {
+    const dir = scratchPhase("26-summary-red", {
+      "26-01-PLAN.md": plan("plan: 1", `<objective>\nReview risky work. x\n</objective>\n\n${doneTask("review passed")}`),
+      "26-01-SUMMARY.md": "---\nstatus: failed\nreviewed: true\n---\n\n# Reviewed red handoff\n",
+    });
+
+    expect(compileGsd(dir).tasks[0].status).toBe("pending");
+  });
+
+  test("a summary carrying no frontmatter at all compiles its task not done so an unreadable completion record fails closed; a derivation treating evidence it could not read as a pass fails", () => {
+    const dir = scratchPhase("27-summary-no-frontmatter", {
+      "27-01-PLAN.md": plan("plan: 1", `<objective>\nRead completion evidence. x\n</objective>\n\n${doneTask("evidence passed")}`),
+      "27-01-SUMMARY.md": "# Narrative only\n\nThis file declares no completion status.\n",
+    });
+
+    expect(compileGsd(dir).tasks[0].status).toBe("pending");
+  });
+
+  test("a task this rule leaves not done keeps every dependent guarded behind it out of the set a run could dispatch; a red summary that makes a destructive dependent dispatchable fails", () => {
+    const dir = scratchPhase("28-red-guard", {
+      "28-01-PLAN.md": plan("plan: 1", `<objective>\nReview the guard. x\n</objective>\n\n${doneTask("guard passed")}`),
+      "28-01-SUMMARY.md": "---\nstatus: failed\nreviewed: true\n---\n\n# Guard review failed\n",
+      "28-02-PLAN.md": plan(
+        'plan: 2\ndepends_on: ["28-01"]',
+        `<objective>\nDestroy the first protected resource. x\n</objective>\n\n${doneTask("resource destroyed")}`,
+      ),
+      "28-03-PLAN.md": plan(
+        'plan: 3\ndepends_on: ["28-01"]',
+        `<objective>\nDestroy the second protected resource. x\n</objective>\n\n${doneTask("resource destroyed")}`,
+      ),
+    });
+    const graph = compileGsd(dir);
+
+    expect(graph.tasks[0].status).toBe("pending");
+    expect(readyTasks(graph).map((task) => task.id)).toEqual(["P28-01"]);
+  });
+
+  test("the derivation records at its own site that an absent completion status is not completion and cites the source system's rule saying so, so a diff changing this flag without that reason fails", () => {
+    const source = readFileSync(new URL("../../src/compile/gsd.ts", import.meta.url), "utf8");
+    const derivation = source.match(/\/\/ GSD source rule \(`\/gsd:quick status`\):[\s\S]*?const done = summaryStatus === "complete";/)?.[0];
+
+    expect(derivation).toContain("when `status` is absent it reports `INCOMPLETE`");
+    expect(derivation).toContain("an artifact can record a reviewed failure rather than completion");
   });
 });
 

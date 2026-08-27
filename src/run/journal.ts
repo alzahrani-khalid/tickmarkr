@@ -124,6 +124,12 @@ export function upheldFeedbackByTask(events: JournalEvent[]): Map<string, string
     if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
         && typeof e.data.details === "string") {
       lastReviewFail.set(e.taskId, e.data.details);
+    } else if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === true
+               && e.data.skipped !== true) {
+      // A later review pass settles the upheld finding. Retire both the active brief and the failed
+      // verdict it came from so a still-later approval cannot resurrect already-settled feedback.
+      upheld.delete(e.taskId);
+      lastReviewFail.delete(e.taskId);
     } else if (e.event === "task-approved") {
       // any later approval supersedes: a plain accept-the-diff approval retires the uphold brief.
       if (e.data.release === REVIEW_UPHELD_RELEASE) {
@@ -550,6 +556,44 @@ export function journaledFailureBrief(events: JournalEvent[], taskId: string): s
     }
   }
   return rows;
+}
+
+/**
+ * T6: the review findings still OUTSTANDING on a task. A review finding is a property of the TASK,
+ * not of the attempt that drew it: it stays outstanding until a later review PASSES on the task (or
+ * an operator approval settles it), and it therefore travels on EVERY dispatch until then.
+ *
+ * The two carries beside this one are attempt-scoped by construction and both lose it. The funded
+ * repair (`pendingRepairFindings`) is spent at the next `worker-launch` and is budgeted at two per
+ * engagement; `journaledFailureBrief` is reset at that same launch, so it hands the next brief only
+ * the LAST attempt's bytes. The moment one attempt fails for an unrelated reason — a red build, a
+ * refused tree, or a death that produces no verdict at all and journals no gate row whatsoever — the
+ * outstanding finding is in neither carry, and the run re-derives the task from the spec and lands on
+ * the same gap the reviewer already anchored.
+ *
+ * Retirement is closed and narrow: a review that PASSED, or the one approval that accepts the review
+ * gate itself (`GATE_SATISFIED_RELEASE` stamped `gate: "review"` — the operator taking the diff the
+ * reviewer rejected). Every other approval RETAINS. `--uphold` funds an attempt to FIX the findings;
+ * `--recheck` and an attempt-cap release fund another dispatch and say nothing about the reviewer's
+ * objection; a plain human-gate approval predates any review; a gate-satisfied release naming some
+ * other gate settled that gate, not this one. Reading "approved" as "settled" is how a still-open
+ * finding was dropped at the exact moment the operator paid for another attempt to fix it. A review
+ * that DECLINED (`skipped`) is not a verdict and neither adds nor retires — fail closed. Findings are
+ * keyed by fingerprint, so a reviewer restating one across rounds carries it once, not once per round.
+ */
+export function outstandingReviewFindings(events: JournalEvent[], taskId: string): StructuredFinding[] {
+  const open = new Map<string, StructuredFinding>();
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "task-approved") {
+      if (e.data.release === GATE_SATISFIED_RELEASE && e.data.gate === "review") open.clear();
+      continue;
+    }
+    if (e.event !== "gate-result" || e.data.gate !== "review" || e.data.skipped === true) continue;
+    if (e.data.pass !== false) open.clear(); // a later review PASSED on this task: nothing is outstanding
+    else for (const finding of findingRows(e, "review")) open.set(finding.fingerprint, finding);
+  }
+  return [...open.values()];
 }
 
 /** The findings a funded repair must carry into the next dispatch, or undefined if none is pending. */
@@ -1173,6 +1217,10 @@ export class Journal {
 
   replayResumeState(): Map<string, ResumeState> {
     const m = new Map<string, ResumeState>();
+    const events = this.read();
+    // Keep the legacy resume-state field aligned with the journal-authoritative prompt-time fold.
+    // In particular, a review pass after an uphold must erase the fallback daemon.ts may consult.
+    const activeUpheldFeedback = upheldFeedbackByTask(events);
     const pendingReroute = new Set<string>(); // reroute verdicts not yet cleared by a later dispatch
     // OBS-547: what the last dispatch ADDED, so a scope-authoring event can take it back. An
     // unchargeable dispatch must replay as if it never happened — no attempt counted, no channel burned.
@@ -1182,7 +1230,7 @@ export class Journal {
       consumedReroute: boolean;
     }>();
     const lastReviewFail = new Map<string, string>(); // OBS-189: newest failed review details per task
-    for (const e of this.read()) {
+    for (const e of events) {
       if (!e.taskId) continue;
       if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
           && typeof e.data.details === "string") {
@@ -1267,6 +1315,11 @@ export class Journal {
         if (!st.tried.includes(key)) st.tried.push(key);
         st.lastAssignment = undefined;
       }
+    }
+    for (const [taskId, st] of m) {
+      const feedback = activeUpheldFeedback.get(taskId);
+      if (feedback) st.upheldFeedback = feedback;
+      else delete st.upheldFeedback;
     }
     return m;
   }

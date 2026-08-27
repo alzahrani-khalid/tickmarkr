@@ -144,10 +144,10 @@ describe("VIS-11 status liveness (SC4)", () => {
     const repo = mkRepo();
     seedGraph(repo);
     seedJournal(repo, [ev("run-start", { pid: process.pid })]);
-    // Exactly ONE tier has ever beaten, and one of the others armed and then died — the surface must
-    // still name all three, because a tier it omitted would be read as one that is fine.
-    beatSupervision(repo, "orchestrator");
-    beatSupervision(repo, "overseer");
+    // Exactly TWO tiers have ever beaten, and one of them armed and then died — the surface must
+    // still name all five, because a tier it omitted would be read as one that is fine.
+    beatSupervision(repo, "orchestrator", "ORCH-w1:p1");
+    beatSupervision(repo, "overseer", "OVSR-w1:p2");
     const dead = new Date(Date.now() - SUPERVISION_STALE_MS - 1_000);
     utimesSync(supervisionBeatPath(repo, "overseer"), dead, dead);
 

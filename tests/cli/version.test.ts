@@ -1,14 +1,12 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { version } from "../../src/cli/commands/version.js";
 import { dispatch, USAGE } from "../../src/cli/index.js";
-import { spawnCli, assertCliSuccess } from "../helpers/built-cli.js";
+import { spawnCli, assertCliSuccess, prepareBuiltCli, ENTRY } from "../helpers/built-cli.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const ENTRY = join(ROOT, "dist/cli/index.js");
 const PKG_PATH = join(ROOT, "package.json");
 const LOCK_PATH = join(ROOT, "package-lock.json");
 const PKG_VERSION = JSON.parse(readFileSync(PKG_PATH, "utf8")).version as string;
@@ -16,15 +14,14 @@ const PRIOR_RELEASE_VERSION = "1.78.0";
 const RELEASING_PATH = join(ROOT, "RELEASING.md");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
-// A fresh worktree has no dist/, and `ignore-scripts=true` npm config skips the pretest build,
-// so build on demand when this file runs outside the full suite (where bin.test.ts rebuilds).
+// A fresh worktree has no dist/, and `ignore-scripts=true` npm config skips the pretest build, so
+// build on demand when this file runs outside the full suite. The decision — missing OR stale, not
+// merely missing — lives in the shared helper, so it cannot be repaired here while the other
+// spawning file keeps grading against yesterday's binary.
 // OBS-96-safe: this file is inside the serialized dist-coupled fork, so nothing races the emit.
-// execFileSync, not spawnSync: the shared-helper hygiene guard pins raw spawnSync in this file,
-// and this is a build step, not a built-CLI assertion.
 beforeAll(() => {
-  if (existsSync(ENTRY)) return;
-  execFileSync("npm", ["run", "build"], { cwd: ROOT, stdio: "pipe" });
-}, 180_000);
+  prepareBuiltCli();
+}, 300_000);
 
 describe("tickmarkr version", () => {
   beforeEach(() => {

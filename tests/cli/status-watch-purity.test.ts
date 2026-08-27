@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, saveGraph, stateDirName } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -109,7 +109,7 @@ describe("VIS-07 status --watch purity (D-02)", () => {
   test("reading supervision tiers neither beats for an armed tier nor materializes an absent one", async () => {
     const repo = mkRepo();
     seed(repo);
-    beatSupervision(repo, "orchestrator"); // one tier armed; the other two have no record at all
+    beatSupervision(repo, "orchestrator", "ORCH-w1:p1"); // one tier armed; every other tier has no record
     const before = snapshot(repo);
     expect(before.paths).toContain("supervision/orchestrator.beat");
     expect(before.paths).not.toContain("supervision/overseer.beat");
@@ -121,6 +121,38 @@ describe("VIS-07 status --watch purity (D-02)", () => {
     // identical inode, mtime and path set: the armed beat was not refreshed and no absent tier
     // gained a file merely by being read three times.
     expect(snapshot(repo)).toEqual(before);
+  });
+
+  // SUP-06: the board arms its OWN tier, and the fence that keeps that from becoming a reader beating
+  // for a watcher is the bounded/unbounded split — every case above renders a BOUNDED number of frames,
+  // so a beat on that path would report every dead tier healthy from any of them.
+  test("test: a bounded render writes no beat for any tier and leaves the supervision records byte-identical while the unbounded board writes exactly its own; a board arming on the bounded path makes the reader beat on the watcher's behalf and fails", async () => {
+    const repo = mkRepo();
+    seed(repo);
+    beatSupervision(repo, "orchestrator", "ORCH-w1:p1"); // foreign records the board must leave exactly as it found
+    beatSupervision(repo, "overseer", "OVSR-w1:p2");
+    const before = snapshot(repo);
+    const foreign = (snap: Snap) =>
+      snap.entries.filter((e) => e.path.startsWith("supervision/") && !e.path.startsWith("supervision/watch."));
+
+    await status(["--watch"], repo, { iterations: 3, sleep: async () => {} });
+
+    // The bounded reader: not one beat for any tier, and the supervision records byte-for-byte intact.
+    expect(snapshot(repo)).toEqual(before);
+    expect(snapshot(repo).paths).not.toContain("supervision/watch.beat");
+
+    const quiet = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await status(["--watch"], repo, {
+        sleep: async () => { throw new Error("board closed"); },
+      }).catch(() => undefined);
+    } finally { quiet.mockRestore(); }
+
+    // The unbounded board: its own tier's record, and nothing else's.
+    const after = snapshot(repo);
+    expect(after.paths).toContain("supervision/watch.beat");
+    expect(after.paths.filter((p) => !before.paths.includes(p)).every((p) => p.startsWith("supervision/watch."))).toBe(true);
+    expect(foreign(after)).toEqual(foreign(before));
   });
 
   test("the stream is pure formatting over journal truth with no new state, service, or storage", async () => {

@@ -4,6 +4,30 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.4** — the suite tells the truth, the release proves it before the tag, and nothing destroys work
+it is holding. Eight tasks across two gated runs, cross-vendor throughout; three of them reached the
+review cap on real findings and merged on upheld attempts.
+
+- **Timing assertions assert the property that was measured.** Three exact-zero process-CPU assertions
+  and one read-the-frame-too-early assertion had made the full suite non-deterministic under its own
+  parallel load — the same assertions that turned public CI red on six consecutive releases.
+- **The built-CLI suite rebuilds when its entry is stale**, not only when it is missing, so new
+  assertions are never graded against yesterday's binary.
+- **A live-board test survives the width at which its header wraps.** The one CI-only red 2.1.3 shipped
+  was deterministic: a six-digit process id wrapped the board's fact column into the brand lockup.
+- **The release proves the suite before the irreversible act.** The runbook now pushes the mirror, waits
+  for the full-suite `CI (public)` run to be green on that exact commit, and only then tags; the
+  artifact-scoped publish gate says what it does and does not prove.
+- **Work the engine is holding is preserved before the engine destroys it.** A worker that dies with
+  uncommitted changes leaves a durable ref — via a temporary index outside the repository, because
+  `git stash create -u` silently omits untracked files — journaled before the worktree is recreated.
+- **An unresolved review finding travels on every later dispatch**, not only on a funded repair inside
+  the repair budget, and it retires when a later review passes.
+- **The live board reports on its own supervision tier, in both directions**: armed while it lives,
+  armed-then-lost when it dies, never-armed when nothing beat it.
+- **One writer per supervision tier.** The run daemon no longer arms the orchestrator tier itself; a
+  seatless record on a supervising tier reads unreadable, never armed.
+
 **v2.1.3** — a milestone about supervision telling the truth about itself. Eight tasks, all gated green,
 cross-vendor throughout.
 

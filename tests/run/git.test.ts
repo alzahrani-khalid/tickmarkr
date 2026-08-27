@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, createWorktree, gitHead, linkNodeModules, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, createWorktree, gitHead, linkNodeModules, preserveWorktree, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -229,6 +229,78 @@ describe("worktrees", () => {
     // recreating the same lane resets it instead of failing
     const wt2 = await createWorktree(repo, "tickmarkr/run-1--T1", base);
     expect(existsSync(wt2)).toBe(true);
+  });
+
+  test("recreating a checkout that holds three uncommitted paths — a modified tracked file; an untracked file; an untracked file inside a directory absent from HEAD — leaves a durable reference whose tree carries all three at their exact bytes; a capture taken through the stash object this seat reached for by hand loses the untracked pair silently: that capture fails", async () => {
+    const repo = makeRepo({ "tracked.bin": "head\n" });
+    const base = await gitHead(repo);
+    const branch = "tickmarkr/preserve-three--T1";
+    const wt = await createWorktree(repo, branch, base);
+    const bytes = {
+      "tracked.bin": Buffer.from([0x00, 0x74, 0x72, 0x61, 0x63, 0x6b, 0xff]),
+      "loose.bin": Buffer.from([0x6c, 0x6f, 0x6f, 0x73, 0x65, 0x00, 0xfe]),
+      "new-dir/deep.bin": Buffer.from([0xfd, 0x64, 0x65, 0x65, 0x70, 0x00]),
+    };
+    writeFileSync(join(wt, "tracked.bin"), bytes["tracked.bin"]);
+    writeFileSync(join(wt, "loose.bin"), bytes["loose.bin"]);
+    mkdirSync(join(wt, "new-dir"));
+    writeFileSync(join(wt, "new-dir", "deep.bin"), bytes["new-dir/deep.bin"]);
+
+    // Control on the exact tempting command: `-u` is merely accepted by `stash create`; neither
+    // ordinary untracked path becomes a parent/tree entry, and git exits successfully while losing both.
+    const stash = (await shGitOk("git stash create -u", wt)).trim();
+    expect(stash).toMatch(/^[0-9a-f]{40,64}$/);
+    expect(execFileSync("git", ["cat-file", "blob", `${stash}:tracked.bin`], { cwd: wt }))
+      .toEqual(bytes["tracked.bin"]);
+    expect((await shGit(`git cat-file -e ${stash}:loose.bin`, wt)).code).not.toBe(0);
+    expect((await shGit(`git cat-file -e ${stash}:new-dir/deep.bin`, wt)).code).not.toBe(0);
+
+    const ref = await preserveWorktree(wt);
+    expect(ref).toMatch(/^refs\/tickmarkr\/preserved\/[0-9a-f]{40,64}$/);
+    for (const [path, expected] of Object.entries(bytes)) {
+      expect(readFileSync(join(wt, path))).toEqual(expected); // capture is byte-inert before removal
+    }
+
+    await createWorktree(repo, branch, base); // removes the old checkout
+    expect((await shGitOk(`git rev-parse --verify '${ref}^{commit}'`, repo)).trim()).toMatch(/^[0-9a-f]{40,64}$/);
+    for (const [path, expected] of Object.entries(bytes)) {
+      expect(execFileSync("git", ["cat-file", "blob", `${ref}:${path}`], { cwd: repo })).toEqual(expected);
+    }
+  });
+
+  test("the working tree the recreation hands back is the fresh checkout it always was and the preservation leaves no staged residue behind it, so a preservation that writes through the repository's own index and carries its own scratch file into the preserved tree fails", async () => {
+    const repo = makeRepo({ "tracked.txt": "head\n" });
+    const base = await gitHead(repo);
+    const branch = "tickmarkr/preserve-clean-index--T1";
+    const wt = await createWorktree(repo, branch, base);
+    writeFileSync(join(wt, "tracked.txt"), "working bytes\n");
+    writeFileSync(join(wt, "loose.txt"), "untracked bytes\n");
+    const before = {
+      tracked: readFileSync(join(wt, "tracked.txt")),
+      loose: readFileSync(join(wt, "loose.txt")),
+    };
+
+    const ref = await preserveWorktree(wt);
+    expect(ref).toBeDefined();
+    expect(readFileSync(join(wt, "tracked.txt"))).toEqual(before.tracked);
+    expect(readFileSync(join(wt, "loose.txt"))).toEqual(before.loose);
+    expect(await shGitOk("git diff --cached --name-only", wt)).toBe("");
+    expect((await shGitOk(`git ls-tree -r --name-only ${ref}`, wt)).trim().split("\n").sort())
+      .toEqual(["loose.txt", "tracked.txt"]); // no repository-local temporary index staged itself
+
+    const fresh = await createWorktree(repo, branch, base);
+    expect(readFileSync(join(fresh, "tracked.txt"), "utf8")).toBe("head\n");
+    expect(existsSync(join(fresh, "loose.txt"))).toBe(false);
+    expect(await shGitOk("git status --porcelain --untracked-files=all", fresh)).toBe("");
+    expect(await shGitOk("git diff --cached --name-only", fresh)).toBe("");
+  });
+
+  test("recreating a checkout that holds nothing uncommitted writes no reference at all; a preservation firing on every dispatch buries the deaths that matter under references nobody reads: it fails", async () => {
+    const repo = makeRepo({ "tracked.txt": "head\n" });
+    const wt = await createWorktree(repo, "tickmarkr/preserve-clean--T1", await gitHead(repo));
+    expect(await shGitOk("git for-each-ref --format='%(refname)' refs/tickmarkr/preserved", repo)).toBe("");
+    expect(await preserveWorktree(wt)).toBeUndefined();
+    expect(await shGitOk("git for-each-ref --format='%(refname)' refs/tickmarkr/preserved", repo)).toBe("");
   });
 
   test("metacharacter branch never executes shell injection (HARD-01)", async () => {

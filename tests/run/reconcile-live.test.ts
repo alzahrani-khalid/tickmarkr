@@ -12,10 +12,18 @@ import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type OwnedName, type Slot, type SlotOpts } from "../../src/drivers/types.js";
 import { rolePaneNameFromPrompt } from "../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, tickmarkrDir } from "../../src/graph/graph.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import {
+  resetDeadChannelFastKillMsForTests,
+  resetHarvestCpuFlatMsForTests,
+  resetHarvestSilentMsForTests,
+  runDaemon,
+  setDeadChannelFastKillMsForTests,
+  setHarvestCpuFlatMsForTests,
+  setHarvestSilentMsForTests,
+} from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
-import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 const owned = (role: OwnedName["role"], taskId: string, attempt: number, runId: string) =>
   formatOwnedName({ role, taskId, attempt, runId });
@@ -482,13 +490,26 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
     }
   }
 
-  function makeSeedDriver() {
+  function makeSeedDriver(nonSeedDelayMs = 0) {
     const inner = new SubprocessDriver();
     const live = new Set<string>();
     const byId = new Map<string, string>();
+    const outputById = new Map<string, string>();
     const sweeps: { desired: string[]; closed: string[] }[] = [];
     const closedNames: string[] = [];
-    let buf = "banner\nTUI ready\n> ";
+    const waitSlices = new Map<string, number>();
+    const dispatchReturnedAt = new Map<string, number>();
+    const outputArrivedAt = new Map<string, number>();
+
+    const paneTask = (slot: Slot) => parseOwnedName(byId.get(slot.id) ?? slot.name)?.taskId;
+    const paneRole = (slot: Slot) => parseOwnedName(byId.get(slot.id) ?? slot.name)?.role;
+    const appendOutput = (slot: Slot, output: string) => {
+      outputById.set(slot.id, `${outputById.get(slot.id) ?? ""}${output}`);
+    };
+    const matches = (slot: Slot, pattern: string, regex?: boolean) => {
+      const output = outputById.get(slot.id) ?? "";
+      return regex ? new RegExp(pattern).test(output) : output.includes(pattern);
+    };
 
     const driver: ExecutorDriver = {
       id: "seed-reconcile",
@@ -498,6 +519,7 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
         const paneName = o?.owned ? formatOwnedName(o.owned) : name;
         live.add(paneName);
         byId.set(s.id, paneName);
+        outputById.set(s.id, "banner\nTUI ready\n> ");
         return { ...s, name: paneName, cwd };
       },
       run: async (s: Slot, cmd: string) => {
@@ -507,29 +529,46 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
         }
         if (cmd.startsWith("read ")) {
           const promptFile = cmd.slice(5);
-          buf += `\n${cmd}\n`;
+          appendOutput(s, `\n${cmd}\n`);
           execSync(`echo done > done.txt && ${COMMIT} done`, { cwd: s.cwd });
           const nonce = /TICKMARKR_RESULT_([0-9a-z]+)/.exec(readFileSync(promptFile, "utf8"))?.[1] ?? "";
           if (nonce) {
-            buf += `TICKMARKR_RESULT_${nonce} {"ok":true,"summary":"seeded","deviations":[]}\n`;
+            appendOutput(s, `TICKMARKR_RESULT_${nonce} {"ok":true,"summary":"seeded","deviations":[]}\n`);
           }
           return;
         }
         // gate/consult scripts and regular interactive dispatch scripts
         const m = /^bash '(.+)'$/.exec(cmd);
         if (m) {
-          try {
-            buf += execSync(`bash ${JSON.stringify(m[1])}`, { cwd: s.cwd, encoding: "utf8" });
-          } catch {
-            /* gate failures are reflected in the empty buffer */
+          const runScript = () => {
+            try {
+              appendOutput(s, execSync(`bash ${JSON.stringify(m[1])}`, { cwd: s.cwd, encoding: "utf8" }));
+            } catch {
+              /* gate failures are reflected in the empty buffer */
+            }
+            if (paneRole(s) === "worker") outputArrivedAt.set(paneTask(s) ?? s.name, Date.now());
+          };
+          if (paneRole(s) === "worker" && paneTask(s) === "T2" && nonSeedDelayMs > 0) {
+            setTimeout(runScript, nonSeedDelayMs);
+            dispatchReturnedAt.set("T2", Date.now());
+          } else {
+            runScript();
           }
         }
       },
-      waitOutput: async (_s: Slot, pattern: string, _ms: number, o?: { regex?: boolean }) =>
-        o?.regex ? new RegExp(pattern).test(buf) : buf.includes(pattern),
+      waitOutput: async (s: Slot, pattern: string, ms: number, o?: { regex?: boolean }) => {
+        if (paneRole(s) === "worker" && paneTask(s) === "T2") {
+          waitSlices.set("T2", (waitSlices.get("T2") ?? 0) + 1);
+        }
+        const deadline = Date.now() + ms;
+        while (!matches(s, pattern, o?.regex) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+        }
+        return matches(s, pattern, o?.regex);
+      },
       waitAgentStatus: async () => true,
       status: async () => "unknown",
-      read: async (_s: Slot, lines: number) => buf.split("\n").slice(-lines).join("\n"),
+      read: async (s: Slot, lines: number) => (outputById.get(s.id) ?? "").split("\n").slice(-lines).join("\n"),
       notify: async () => {},
       close: async (s: Slot) => {
         const n = byId.get(s.id) ?? s.name;
@@ -550,16 +589,19 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
       },
     };
 
-    return { driver, live, sweeps, closedNames };
+    return { driver, live, sweeps, closedNames, waitSlices, dispatchReturnedAt, outputArrivedAt };
   }
 
-  test("a completed seed-mode attempt's worker pane is closed by the same post-run sweep that closes any other completed worker pane", async () => {
+  // Repair layer 1/2 — CASE FIXTURE. The pane-reaping case must supply valid work for both worker
+  // channels. Its old T2 script returned success without a commit, so the evidence gate journaled
+  // a red and the escalation ladder—not pane reconciliation—eventually moved T2 off its fake pin.
+  const runSeedSweep = async (runId: string, nonSeedDelayMs = 0) => {
     const { repo, fake, scriptPath } = setupRepo(
       [T("T1"), T("T2", { shape: "chore" }) ],
       {
         tasks: {
           T1: [{ shell: "true", result: { ok: true, summary: "seeded" } }],
-          T2: [{ shell: "true", result: { ok: true, summary: "other" } }],
+          T2: [{ shell: `echo other > other.txt && ${COMMIT} other`, result: { ok: true, summary: "other" } }],
         },
       },
       // OBS-546: no taskTimeoutMinutes here. This test asserts pane REAPING, and it inherited a
@@ -574,11 +616,77 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
       "visibility:\n  worker: interactive\n  keepPanes: run\n" +
       "routing:\n  map:\n    implement:\n      pin: { via: seedfake, model: fake-1 }\n    chore:\n      pin: { via: fake, model: fake-1 }\n",
     );
-    const { driver, live, sweeps, closedNames } = makeSeedDriver();
-    const s = await runDaemon(repo, { adapters: [new SeedFakeAdapter(scriptPath), fake], runId: "run-seed-sweep", driver });
+    const world = makeSeedDriver(nonSeedDelayMs);
+    const summary = await runDaemon(repo, { adapters: [new SeedFakeAdapter(scriptPath), fake], runId, driver: world.driver });
+    return { repo, summary, events: Journal.open(repo, runId).read(), ...world };
+  };
+
+  test("test: the seed-sweep case's non-seed task reaches done on its own pinned channel at its first attempt and its journal carries no escalation row for that task; a case reaching done only after a consult verdict is discarded as advisory fails", async () => {
+    const { summary, events } = await runSeedSweep("run-seed-sweep-first-attempt");
+
+    expect(summary.done).toEqual(["T1", "T2"]);
+    const dispatches = events.filter((event) => event.event === "task-dispatch" && event.taskId === "T2");
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0]!.data.attempt).toBe(0);
+    expect(dispatches[0]!.data.assignment).toMatchObject({ adapter: "fake", model: "fake-1", channel: "sub" });
+    const done = events.find((event) => event.event === "task-done" && event.taskId === "T2");
+    expect(done?.data).toMatchObject({ attempts: 1, assignment: { adapter: "fake", model: "fake-1", channel: "sub" } });
+    expect(events.filter((event) => event.event === "escalation" && event.taskId === "T2")).toHaveLength(0);
+    expect(events.filter((event) => event.event === "consult-verdict" && event.taskId === "T2")).toHaveLength(0);
+  }, 30_000);
+
+  test("test: that case still ends with both tasks done and both worker panes closed where its worker's output arrives a second after the dispatch call returns; a driver answering inside that call never enters a wait slice at all and fails", async () => {
+    const runId = "run-seed-sweep-delayed";
+    const { summary, events, live, closedNames, waitSlices, dispatchReturnedAt, outputArrivedAt } = await runSeedSweep(runId, 1_000);
+
+    expect(summary.done).toEqual(["T1", "T2"]);
+    expect(events.filter((event) => event.event === "task-dispatch" && event.taskId === "T2"))
+      .toHaveLength(1);
+    expect(events.filter((event) => event.event === "escalation" && event.taskId === "T2"))
+      .toHaveLength(0);
+    expect(waitSlices.get("T2")).toBeGreaterThan(0);
+    expect(outputArrivedAt.get("T2")! - dispatchReturnedAt.get("T2")!).toBeGreaterThanOrEqual(900);
+    const w1 = owned("worker", "T1", 0, runId);
+    const w2 = owned("worker", "T2", 0, runId);
+    expect(live.has(w1)).toBe(false);
+    expect(live.has(w2)).toBe(false);
+    expect(closedNames).toContain(w1);
+    expect(closedNames).toContain(w2);
+  }, 30_000);
+
+  test("test: with the daemon's liveness ceilings compressed below that arrival the delayed worker is never concluded dead and the run completes both tasks; a ceiling treating an unmeasurable probe as death kills a worker that is merely slow and fails", async () => {
+    const bashEnv = join(makeTestTempDir("tickmarkr-seed-sweep-ps-denied-"), "bash-env");
+    writeFileSync(bashEnv, "ps() { return 1; }\n");
+    const priorBashEnv = process.env.BASH_ENV;
+    process.env.BASH_ENV = bashEnv;
+    setDeadChannelFastKillMsForTests(1_500);
+    setHarvestSilentMsForTests(1_500);
+    setHarvestCpuFlatMsForTests(1_500);
+    try {
+      const { summary, events } = await runSeedSweep("run-seed-sweep-liveness", 4_000);
+      expect(summary.done).toEqual(["T1", "T2"]);
+      expect(events.filter((event) => event.event === "task-dispatch" && event.taskId === "T2"))
+        .toHaveLength(1);
+      expect(events.filter((event) => event.event === "worker-dead" && event.taskId === "T2")).toHaveLength(0);
+      expect(events.filter((event) => event.event === "dead-channel-failover" && event.taskId === "T2"))
+        .toHaveLength(0);
+      expect(events.some((event) => event.event === "worker-dead-held"
+        && event.taskId === "T2" && event.data.reason === "cpu-unmeasurable")).toBe(true);
+    } finally {
+      resetDeadChannelFastKillMsForTests();
+      resetHarvestSilentMsForTests();
+      resetHarvestCpuFlatMsForTests();
+      if (priorBashEnv === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = priorBashEnv;
+    }
+  }, 30_000);
+
+  test("a completed seed-mode attempt's worker pane is closed by the same post-run sweep that closes any other completed worker pane", async () => {
+    const runId = "run-seed-sweep";
+    const { summary: s, live, sweeps, closedNames } = await runSeedSweep(runId);
     expect(s.done).toEqual(["T1", "T2"]);
-    const w1 = owned("worker", "T1", 0, "run-seed-sweep");
-    const w2 = owned("worker", "T2", 0, "run-seed-sweep");
+    const w1 = owned("worker", "T1", 0, runId);
+    const w2 = owned("worker", "T2", 0, runId);
     expect(live.has(w1)).toBe(false);
     expect(live.has(w2)).toBe(false);
     expect(closedNames).toContain(w1);

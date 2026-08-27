@@ -25,7 +25,7 @@ import { isPidLive } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
-import { readSupervision, supervisionText } from "../../run/supervision.js";
+import { armSupervision, readSupervision, supervisionText } from "../../run/supervision.js";
 import {
   deriveRunCockpitData,
   type TaskRow,
@@ -144,6 +144,9 @@ export type StatusOpts = {
   readWorkerOutput?: (taskId: string, attempt: number, runId: string) => Promise<string | undefined>;
   webhookUrl?: string;
   postWebhook?: DecisionWebhookPost;
+  /** How often the live board rewrites its own `watch` beat. Fixtures choose it so a death drill can
+   *  watch the record STOP inside a test's patience; unset means SUPERVISION_BEAT_MS. */
+  supervisionBeatMs?: number;
 };
 
 export const GATE_KEYS = { build: "B", test: "T", lint: "L", evidence: "E", scope: "S", acceptance: "A", review: "R" } as const;
@@ -1555,6 +1558,20 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     }
     return fresh;
   };
+  // SUP-06: the live board IS the `watch` tier, so it is the only process that can beat it — which is
+  // why that tier could only ever print ABSENT about itself while every other seat had a beater. A word
+  // one tier can only ever say in one of its five states trains every reader to skip it.
+  //
+  // Armed ONLY when UNBOUNDED. A bounded render is a READER, and the purity fence (D-02: a bounded
+  // --watch leaves .tickmarkr/ byte-identical) is exactly the test that catches a reader beating on a
+  // watcher's behalf, which would report every dead tier healthy. Armed BEFORE the first frame, so the
+  // board's own first print already names its tier armed rather than one interval later.
+  //
+  // The handle is HELD and stood down in the finally. Discarding it is not a smaller version of this —
+  // it INVERTS it: armSupervision's interval outlives the board in any host that outlives one board, so
+  // a dead board keeps writing and reads ARMED. That is the over-claiming direction, the one an operator
+  // acts on, and the one this instrument exists to close.
+  const armed = bounded ? undefined : armSupervision(cwd, "watch", opts.supervisionBeatMs);
   let titleSaved = false;
   const restoreTitle = () => {
     if (!titleSaved) return;
@@ -1607,6 +1624,14 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
       }
     }
   } finally {
+    // Stops the interval as well as recording the hand-off: a board that returns must not leave a
+    // timer beating for it. A board that is KILLED never reaches here, its beat ages out, and the
+    // tier reads STALE — armed-then-lost, which is the truth about a killed board.
+    // Boards OVERLAP — a second pane is one keystroke away — and the stand-down marker speaks for the
+    // whole tier, so this hand-off is recorded only when no other board is still present (see
+    // armSupervision's presence files). Otherwise the first pane closed would render the second
+    // pane's own tier down while it is drawing frames.
+    armed?.disarm();
     if (titleSaved) {
       process.removeListener("exit", restoreTitle);
       restoreTitle();

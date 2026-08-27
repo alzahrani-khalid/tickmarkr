@@ -25,6 +25,33 @@ function getCurrentVersion(): string {
   return pkg.version;
 }
 
+function publishGateComment(): string {
+  const content = readFile(RELEASE_YML);
+  const match = content.match(
+    /((?:[ \t]*#[^\n]*\n)+)[ \t]*- run: npx vitest run --project built-cli --project signal-reaper/
+  );
+  expect(match, "the artifact-scoped publish gate needs its adjacent explanation").toBeTruthy();
+  return match![1];
+}
+
+function perReleaseSteps(): string {
+  const content = readFile(RELEASING_MD);
+  const match = content.match(/Per release:\n([\s\S]*?)(?=\n## Post-publish local sync)/);
+  expect(match, "the per-release runbook section is missing").toBeTruthy();
+  return match![1];
+}
+
+function postPublishScaffoldStep(): string {
+  const content = readFile(RELEASING_MD);
+  const section = content.match(
+    /## Post-publish local sync \(mandatory\)\n([\s\S]*?)(?=\n## Public GitHub export)/
+  );
+  expect(section, "the post-publish local-sync section is missing").toBeTruthy();
+  const step = section![1].match(/(?:^|\n)3\. ([\s\S]*)$/);
+  expect(step, "the post-publish scaffold-refresh step is missing").toBeTruthy();
+  return step![1];
+}
+
 describe("release documentation", () => {
   describe("RELEASING.md", () => {
     test("the releasing documentation describes committing each export on top of a persistent clone of the public repository instead of a recurring force push", () => {
@@ -108,6 +135,66 @@ describe("release documentation", () => {
         content.indexOf("push origin main")
       );
     });
+
+    test("test: the runbook's release steps place the mirror main push before a wait on the full-suite workflow reporting green and the tag push after it, compared by position in the document rather than by presence; a runbook naming the wait anywhere after the tag step fails", () => {
+      const steps = perReleaseSteps();
+      const mirrorPush = steps.indexOf(
+        "git -C /path/to/tickmarkr-public-mirror push origin HEAD:main"
+      );
+      const fullSuiteWait = steps.indexOf(
+        "Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run"
+      );
+      // OBS-713: the tag example tracks the package version by a separate gate (version.test.ts), so
+      // locating it by a version literal reds this test on every release bump. Match the SHAPE.
+      const tagPush = steps.search(/git push origin v\d+\.\d+\.\d+\b/);
+
+      expect(mirrorPush, "the mirror main push step is missing").toBeGreaterThanOrEqual(0);
+      expect(fullSuiteWait, "the full-suite workflow wait is missing").toBeGreaterThanOrEqual(0);
+      expect(tagPush, "the tag push step is missing").toBeGreaterThanOrEqual(0);
+      expect(mirrorPush).toBeLessThan(fullSuiteWait);
+      expect(fullSuiteWait).toBeLessThan(tagPush);
+      expect(steps.lastIndexOf(
+        "Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run"
+      )).toBe(fullSuiteWait);
+      expect(steps.slice(tagPush)).not.toContain(
+        "Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run"
+      );
+    });
+
+    test("test: the workflow the runbook waits on is triggered by a push to the branch the runbook pushes, read from the parsed workflow definition rather than from prose; a runbook waiting on a workflow no such push triggers can never go green and fails", () => {
+      const steps = perReleaseSteps();
+      const mirrorPush = steps.match(
+        /git -C \/path\/to\/tickmarkr-public-mirror push origin ([^\s#]+):([^\s#]+)/
+      );
+      const wait = steps.match(
+        /Wait for the \[`([^`]+)`\]\((\.github\/workflows\/[^)]+\.ya?ml)\) workflow run/
+      );
+      expect(mirrorPush, "the runbook must name the pushed mirror branch").toBeTruthy();
+      expect(wait, "the runbook must link the workflow it waits on").toBeTruthy();
+
+      const workflow = parseYaml(readFile(join(ROOT, wait![2]))) as {
+        name?: string;
+        on?: { push?: { branches?: string | string[] } };
+      };
+      expect(workflow.name).toBe(wait![1]);
+      expect(workflow.on?.push, `${wait![2]} needs a push trigger`).toBeTruthy();
+      const configuredBranches = Array.isArray(workflow.on!.push!.branches)
+        ? workflow.on!.push!.branches
+        : [workflow.on!.push!.branches];
+      expect(configuredBranches).toContain(mirrorPush![2]);
+    });
+
+    test("test: the post-publish scaffold-refresh step names the consumer workspaces it applies to and states this repository's exclusion with its reason; a step whose scope still reads as this repository and each consumer repository fails", () => {
+      const step = postPublishScaffoldStep();
+      expect(step).toContain("tickmarkr init --agent --force --docs");
+      expect(step).toContain("`SentioQ`");
+      expect(step).toContain("`quranic-insights`");
+      expect(step).not.toMatch(/this\s+repository\s+and\s+(?:each|every)\s+consumer\s+repository/i);
+      expect(step).toMatch(/Do not run this scaffold-refresh step in the tickmarkr source repository/i);
+      expect(step).toMatch(
+        /tracked\s+scaffold sources.*installed package build.*reverted\s+tracked source.*installed build.*silently deleted a committed guard harvest/is
+      );
+    });
   });
 
   describe("CHANGELOG.md", () => {
@@ -176,6 +263,23 @@ describe("release documentation", () => {
         expect(comment).not.toMatch(/restore the flag|pending the squashed public export|stays private/i);
         expect(comment).not.toMatch(/provenance.*(when|until|pending|requires a PUBLIC)/i);
       }
+    });
+
+    test("the publish gate's comment states, beside the teardown-timeout evidence it already carries, that release trees have carried genuine assertion failures the subset does not run, so a comment left explaining the substitution by infrastructure alone fails", () => {
+      const comment = publishGateComment();
+      expect(comment).toMatch(/teardown.*timeout/is);
+      expect(comment).toMatch(/release trees.*genuine assertion failures/is);
+      expect(comment).toMatch(/artifact-scoped\s*#?\s*\n?\s*#?\s*subset does not run/is);
+      expect(comment).toMatch(/v2\.1\.2.*three such failures/is);
+      expect(comment).toMatch(/same failures on ubuntu and macOS/is);
+    });
+
+    test("that comment's ledger citation is qualified so it names exactly one of the two findings this project issued under that identifier, so a citation left ambiguous points a reader at either and fails", () => {
+      const comment = publishGateComment();
+      expect(comment.match(/\bOBS-148\b/g)).toHaveLength(1);
+      expect(comment).toContain(
+        "OBS-148 (release-runner CPU-starvation finding, 2026-07-24)"
+      );
     });
   });
 

@@ -1,4 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, type Stats } from "node:fs";
+import {
+  mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, type Stats,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 
@@ -35,8 +38,9 @@ export const SUPERVISION_FUTURE_GRACE_MS = 1_000;
 // SUP-05: CONTEXT is per SEAT, so its tiers are per seat too. One shared `context` tier would be read
 // by both supervising seats and beaten by whichever of them still had a watcher, so a live overseer
 // watcher would render the dead orchestrator one as armed — the mask this whole instrument exists to
-// remove. The enumeration is CLOSED at one tier per supervising seat: orchestrator and overseer.
-// `watch` beats nowhere on this tree and stays ABSENT, which is what ABSENT means.
+// remove. The enumeration is CLOSED at one supervision tier and one context tier per supervising
+// seat: orchestrator and overseer. `watch` is the sole process-owned tier and is armed seatlessly by
+// the live unbounded board.
 export const SUPERVISION_TIERS = [
   "orchestrator", "orchestrator-context", "overseer", "overseer-context", "watch",
 ] as const;
@@ -48,7 +52,9 @@ export type SupervisionTier = (typeof SUPERVISION_TIERS)[number];
 // to a seat. Measured 2026-08-26: a consult seat of another tier ran the documented beat loop and the
 // board read that tier armed with no seat of that tier having armed anything. ARMED-and-seatless reads
 // as coverage, which is worse than ABSENT, so on these tiers a record that names no seat is not a beat.
-export const SUPERVISION_SEAT_TIERS = ["orchestrator-context", "overseer-context"] as const;
+export const SUPERVISION_SEAT_TIERS = [
+  "orchestrator", "orchestrator-context", "overseer", "overseer-context",
+] as const;
 
 export type SeatTier = (typeof SUPERVISION_SEAT_TIERS)[number];
 
@@ -76,17 +82,56 @@ export interface TierLiveness {
 
 // PURE path math: stateDirName, never tickmarkrDir — the latter mkdirs the state dir and writes its
 // .gitignore, so routing a READER through it would make status create the very tree it reports on.
+const supervisionDir = (repoRoot: string): string =>
+  join(repoRoot, stateDirName(repoRoot), "supervision");
+
 export const supervisionBeatPath = (repoRoot: string, tier: SupervisionTier): string =>
-  join(repoRoot, stateDirName(repoRoot), "supervision", `${tier}.beat`);
+  join(supervisionDir(repoRoot), `${tier}.beat`);
 
 /** Where a watcher records that it STOOD DOWN. Its own file: the beat keeps meaning only "alive". */
 export const supervisionStandDownPath = (repoRoot: string, tier: SupervisionTier): string =>
-  join(repoRoot, stateDirName(repoRoot), "supervision", `${tier}.standdown`);
+  join(supervisionDir(repoRoot), `${tier}.standdown`);
+
+// SUP-06: PRESENCE — one file per ARMED WATCHER, because a tier may legitimately have more than one.
+// Two boards watch one repo the moment an operator opens a second pane, and the tier is armed while
+// EITHER of them lives. The stand-down marker speaks for the whole tier, so the first board out
+// writing it renders the second board's own tier DISARMED until that board's next beat — a live seat
+// reported down, which is the under-claiming half of exactly the lie this instrument exists to remove.
+// So the marker is written only by the LAST watcher out, and these files are how it knows it is last.
+// Freshness decides presence, never a process table (SUP-02): a watcher that is killed cannot remove
+// its own file, and an unremoved file ages past the same ceiling a beat does and stops counting.
+const presencePrefix = (tier: SupervisionTier): string => `${tier}.live.`;
+
+const supervisionPresencePath = (repoRoot: string, tier: SupervisionTier, id: string): string =>
+  join(supervisionDir(repoRoot), `${presencePrefix(tier)}${id}`);
+
+/** Every presence file on this tier, by name. Missing directory ⇒ nobody is present. */
+const presenceNames = (repoRoot: string, tier: SupervisionTier): string[] => {
+  try { return readdirSync(supervisionDir(repoRoot)).filter((n) => n.startsWith(presencePrefix(tier))); }
+  catch { return []; }
+};
+
+/**
+ * Stale peers observed in ONE directory snapshot, or undefined when that same snapshot saw a live
+ * one. A later arm has a new id and is deliberately absent from the returned cleanup set.
+ */
+function stalePeersIfLast(repoRoot: string, tier: SupervisionTier, id: string, now = Date.now()): string[] | undefined {
+  const own = `${presencePrefix(tier)}${id}`;
+  const stale: string[] = [];
+  for (const name of presenceNames(repoRoot, tier)) {
+    if (name === own) continue;
+    try {
+      if (now - statSync(join(supervisionDir(repoRoot), name)).mtimeMs <= SUPERVISION_STALE_MS) return undefined;
+      stale.push(name);
+    } catch { /* a vanished peer needs no cleanup and is not evidence of a live watcher */ }
+  }
+  return stale;
+}
 
 // WRITER — a watcher's own call, on its own tier, every SUPERVISION_BEAT_MS. Never a reader's: the
 // purity fence (status --watch leaves the state dir byte-identical) is the test that catches a reader
 // that beats on the watcher's behalf, which would report every dead tier as healthy.
-export function beatSupervision(repoRoot: string, tier: SupervisionTier, seat?: string): void {
+function writeSupervisionBeat(repoRoot: string, tier: SupervisionTier, seat?: string, armId?: string): void {
   // A seat tier may not be armed anonymously, and the refusal belongs HERE rather than only in the
   // verb: any caller that could write a seatless record could arm a tier nobody occupies.
   if (isSeatTier(tier) && !seat?.trim()) {
@@ -97,8 +142,15 @@ export function beatSupervision(repoRoot: string, tier: SupervisionTier, seat?: 
   mkdirSync(dirname(p), { recursive: true });
   writeFileSync(
     p,
-    JSON.stringify({ tier, ...(seat ? { seat } : {}), pid: process.pid, beatAt: new Date().toISOString() }) + "\n",
+    JSON.stringify({
+      tier, ...(seat ? { seat } : {}), ...(armId ? { armId } : {}),
+      pid: process.pid, beatAt: new Date().toISOString(),
+    }) + "\n",
   );
+}
+
+export function beatSupervision(repoRoot: string, tier: SupervisionTier, seat?: string): void {
+  writeSupervisionBeat(repoRoot, tier, seat);
 }
 
 /** Handle a watcher holds for as long as it is supervising; disarm stands it down and is idempotent. */
@@ -113,9 +165,11 @@ export interface ArmedSupervision {
 // an unref'd interval that never holds the watcher's event loop open, and a beat failure that is
 // swallowed rather than crashing the watcher — an unwritten beat ages out and reads STALE, which is
 // the truth. The FIRST beat is swallowed on the same rule: a cosmetic instrument that could not write
-// must not take the run down with it. NOT called from `status`: status is a reader (its purity fence
-// is a test); the in-repo callsite is runDaemon, which arms the orchestrator tier for the life of
-// the run. A tier nobody arms reads ABSENT — exactly what ABSENT means, not a false "healthy".
+// must not take the watcher down with it. The sole production in-repo callsite is `status --watch`
+// when UNBOUNDED, which arms `watch` seatlessly for the life of the board — a bounded render is a
+// reader and arms nothing, which is the purity fence D-02 tests. Supervising seats write their named
+// tiers through the shipped beat verb instead. A tier nobody arms reads ABSENT — exactly what ABSENT
+// means, not a false "healthy".
 //
 // Arming CLEARS any prior stand-down record: a tier that stood down and armed again is armed, and a
 // marker left behind by the last run would otherwise report the live one as stood down forever.
@@ -131,33 +185,54 @@ export function armSupervision(
   // as stood down. Recursive because the path is ours: whatever occupies it is not our marker.
   try { rmSync(supervisionStandDownPath(repoRoot, tier), { force: true, recursive: true }); }
   catch { /* uncleared: the reader validates the marker and a newer beat outranks it — never masked */ }
-  try { beatSupervision(repoRoot, tier, seat); }
-  catch { /* repo gone / disk full / no seat — the tier reads ABSENT rather than crashing its watcher */ }
-  const timer = setInterval(() => {
-    try { beatSupervision(repoRoot, tier, seat); } catch { /* repo gone / disk full — let the beat expire */ }
-  }, beatMs);
+  // This watcher's own identity fences BOTH its presence and its stand-down against every later arm.
+  // pid alone collides between two boards in one host (and after pid reuse); a UUID never aliases the
+  // stale presence of a killed process that a later last-one-out cleanup may already have observed.
+  const id = `${process.pid}.${randomUUID()}`;
+  const presence = supervisionPresencePath(repoRoot, tier, id);
+  // Presence is refreshed with the beat, so it ages by the same clock and needs no separate loop.
+  const mark = () => {
+    try {
+      writeSupervisionBeat(repoRoot, tier, seat, id); // creates the directory presence is written into
+      writeFileSync(presence, JSON.stringify({ tier, pid: process.pid, id }) + "\n");
+    } catch { /* repo gone / disk full / no seat — the tier ages out rather than crashing its watcher */ }
+  };
+  mark();
+  const timer = setInterval(mark, beatMs);
   timer.unref();
   let stoodDown = false;
   return {
-    // Stand down: stop beating AND say so. Idempotent because the daemon disarms from more than one
-    // exit path (its signal reaper exits the process before the finally can run), and the recorded
-    // instant belongs to the first stand-down.
+    // Stand down: stop beating AND say so. Idempotence lets a watcher safely share cleanup across
+    // multiple exit paths; the recorded instant belongs to the first stand-down.
     disarm: () => {
       if (stoodDown) return;
       stoodDown = true;
       clearInterval(timer);
+      try { rmSync(presence, { force: true, recursive: true }); } catch { /* ages out on its own */ }
+      // The marker speaks for the TIER, so only the last watcher out may write one: a peer still
+      // present means the tier is not down, and saying it is would render that live board's own tier
+      // DISARMED. The snapshot also fixes the cleanup set: a board arming after this decision receives
+      // a new id, so this older board can neither sweep its presence nor claim its beat stood down.
+      const stalePeers = stalePeersIfLast(repoRoot, tier, id);
+      if (stalePeers === undefined) return;
       // Published ATOMICALLY — written aside, renamed over — so no reader can ever meet a half-written
       // marker. A torn marker is rejected anyway (see readStandDown), but a stand-down that reads as
       // garbage is a stand-down that reports as a death, and the rename costs one line.
       const p = supervisionStandDownPath(repoRoot, tier);
-      const tmp = `${p}.${process.pid}.tmp`;
+      const tmp = `${p}.${id}.tmp`;
       try {
         mkdirSync(dirname(p), { recursive: true });
         writeFileSync(tmp, JSON.stringify({
-          tier, ...(seat ? { seat } : {}), pid: process.pid, disarmedAt: new Date().toISOString(),
+          tier, ...(seat ? { seat } : {}), armId: id,
+          pid: process.pid, disarmedAt: new Date().toISOString(),
         }) + "\n");
         renameSync(tmp, p);
       } catch { /* unrecordable stand-down ages out as STALE — pessimistic, which is the safe way to fail */ }
+      // Sweep only stale names in the pre-publication snapshot. Re-reading here used to catch and
+      // delete a newer board that armed between the peer check and this older board's rename.
+      for (const name of stalePeers) {
+        try { rmSync(join(supervisionDir(repoRoot), name), { force: true, recursive: true }); } catch { /* next sweep */ }
+      }
     },
   };
 }
@@ -173,8 +248,8 @@ export function readTierLiveness(repoRoot: string, tier: SupervisionTier, now = 
   return beatLiveness(tier, readBeat(repoRoot, tier), now);
 }
 
-/** What a beat record yields: when it was written, and the seat it names when it names one. */
-type BeatRecord = { mtimeMs: number; seat?: string } | "ABSENT" | "UNREADABLE";
+/** What a beat record yields: when it was written, its seat, and its armed-watcher fence when named. */
+type BeatRecord = { mtimeMs: number; seat?: string; armId?: string } | "ABSENT" | "UNREADABLE";
 
 // The beat's inode, or why there is no age to derive from it. Split out so the stand-down ranking below
 // reads the SAME mtime this derivation does rather than a second, later stat of a moving record.
@@ -194,17 +269,23 @@ function readBeat(repoRoot: string, tier: SupervisionTier): BeatRecord {
   // is not evidence that nobody armed the tier). On a SEAT tier it is the opposite: a record naming no
   // seat leaves the tier armed and unattributable, which reads as coverage no seat is providing, so
   // it is UNREADABLE — something is there and no beat any reader can attribute comes out of it.
-  const seat = beatSeat(p);
+  const { seat, armId } = beatMetadata(p);
   if (isSeatTier(tier) && seat === undefined) return "UNREADABLE";
-  return { mtimeMs: st.mtimeMs, ...(seat !== undefined ? { seat } : {}) };
+  return {
+    mtimeMs: st.mtimeMs,
+    ...(seat !== undefined ? { seat } : {}),
+    ...(armId !== undefined ? { armId } : {}),
+  };
 }
 
-/** The seat a record declares, or undefined for any record that declares none this reader can use. */
-function beatSeat(path: string): string | undefined {
+/** Optional metadata declared by a beat; its mtime remains the only source of age. */
+function beatMetadata(path: string): { seat?: string; armId?: string } {
   try {
-    const rec = JSON.parse(readFileSync(path, "utf8")) as { seat?: unknown };
-    return typeof rec?.seat === "string" && rec.seat.trim() ? rec.seat : undefined;
-  } catch { return undefined; } // unparseable bytes name no seat — the caller decides what that means
+    const rec = JSON.parse(readFileSync(path, "utf8")) as { seat?: unknown; armId?: unknown };
+    const seat = typeof rec?.seat === "string" && rec.seat.trim() ? rec.seat : undefined;
+    const armId = typeof rec?.armId === "string" && rec.armId.trim() ? rec.armId : undefined;
+    return { ...(seat !== undefined ? { seat } : {}), ...(armId !== undefined ? { armId } : {}) };
+  } catch { return {}; } // unparseable bytes name no seat or arm — the caller decides what that means
 }
 
 function beatLiveness(tier: SupervisionTier, beat: BeatRecord, now: number): TierLiveness {
@@ -231,7 +312,7 @@ function beatLiveness(tier: SupervisionTier, beat: BeatRecord, now: number): Tie
 function readStandDown(
   repoRoot: string,
   tier: SupervisionTier,
-): { mtimeMs: number; seat?: string } | "NONE" | "UNREADABLE" {
+): { mtimeMs: number; seat?: string; armId?: string } | "NONE" | "UNREADABLE" {
   const p = supervisionStandDownPath(repoRoot, tier);
   let st: Stats;
   try {
@@ -242,27 +323,43 @@ function readStandDown(
   }
   if (!st.isFile()) return "UNREADABLE";
   let seat: string | undefined;
+  let armId: string | undefined;
   try {
-    const rec = JSON.parse(readFileSync(p, "utf8")) as { tier?: unknown; disarmedAt?: unknown; seat?: unknown };
+    const rec = JSON.parse(readFileSync(p, "utf8")) as {
+      tier?: unknown; disarmedAt?: unknown; seat?: unknown; armId?: unknown;
+    };
     if (rec?.tier !== tier) return "UNREADABLE";
     if (typeof rec.disarmedAt !== "string" || Number.isNaN(Date.parse(rec.disarmedAt))) return "UNREADABLE";
     seat = typeof rec.seat === "string" && rec.seat.trim() ? rec.seat : undefined;
+    armId = typeof rec.armId === "string" && rec.armId.trim() ? rec.armId : undefined;
     // A seat tier's hand-off names WHICH seat left, on the same rule as its beat: an anonymous
     // stand-down on a per-seat tier says a watcher left without saying whose, so it is no record.
     if (isSeatTier(tier) && seat === undefined) return "UNREADABLE";
   } catch { return "UNREADABLE"; } // unparseable or unreadable bytes — not a stand-down anyone can read
-  return { mtimeMs: st.mtimeMs, ...(seat !== undefined ? { seat } : {}) };
+  return {
+    mtimeMs: st.mtimeMs,
+    ...(seat !== undefined ? { seat } : {}),
+    ...(armId !== undefined ? { armId } : {}),
+  };
 }
 
 // THE TIER'S STATE — what every surface and every operator reads. A valid stand-down outranks the beat:
 // the watcher that wrote it is gone ON PURPOSE, and its last beat ages out exactly like a dead one's
-// would. It outranks the beat it FOLLOWED and no other — a beat stamped after the marker was written by
-// a watcher that armed again, so a marker some failed cleanup left behind can never mask a live tier.
+// would. It outranks the beat it FOLLOWED and no other — a later timestamp OR a FRESH different
+// armed-watcher identity is another arm, so a marker whose rename lost that race cannot mask a live
+// watcher. Once that foreign beat is stale, a newer clean hand-off must win: otherwise overlapping
+// boards closed in last-beater-first order would leave the tier reporting a death forever.
 export function supervisionStatus(repoRoot: string, tier: SupervisionTier, now = Date.now()): TierLiveness {
   const beat = readBeat(repoRoot, tier);
   const standDown = readStandDown(repoRoot, tier);
   if (standDown === "UNREADABLE") return { tier, state: "UNREADABLE" };
-  if (standDown !== "NONE" && !(typeof beat === "object" && beat.mtimeMs > standDown.mtimeMs)) {
+  const beatOutranksStandDown = standDown !== "NONE" && typeof beat === "object" && (
+    beat.mtimeMs > standDown.mtimeMs || (
+      now - beat.mtimeMs <= SUPERVISION_STALE_MS &&
+      beat.armId !== undefined && standDown.armId !== undefined && beat.armId !== standDown.armId
+    )
+  );
+  if (standDown !== "NONE" && !beatOutranksStandDown) {
     // the seat that stood down is named by the marker, falling back to whatever its last beat named
     const seat = standDown.seat ?? (typeof beat === "object" ? beat.seat : undefined);
     return { tier, state: "DISARMED", ...(seat !== undefined ? { seat } : {}) };

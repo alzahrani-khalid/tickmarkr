@@ -1389,25 +1389,75 @@ review:
     expect(picker).toContain("— floor cheap (config floors), marginal-cost auto (cheapest sufficient");
   });
 
-  test("picking a candidate writes a pin for that shape into the overlay diff", async () => {
+  // OBS-707: a rendered frame does not reach an assertion the instant the editor returns. The
+  // runtime coalesces renders on its own schedule, and a host under its own suite's parallel load
+  // stretches that arbitrarily — the ancestor of the case below asked the frame stream for the
+  // overlay diff at return time and got the header frame (`tickmarkr fleet · probe 5m old · mod…`)
+  // on public CI, on the 2.1.2 and 2.1.3 tags. Model the delay explicitly rather than hoping the
+  // host supplies one: every frame the editor writes lands on THIS stream a beat after it was
+  // written, so an instant read is provably reading the past whatever the host's load. The
+  // settled-frame idiom the escape-path case already uses — poll the fact, never the instant — is
+  // what survives it. (A shared delayed-frame mode across every frame-asserting suite is CE-1,
+  // queued for 2.1.5; this stays local to the enumerated site.)
+  //
+  // The delay is a GATE this test opens, never a timer a contended host can outrun: a wall-clock
+  // arrival window would itself be decided by load — an editor run longer than the window would
+  // hand the diff frame over before returning and the instant-read negative control would go
+  // green — which is the very defect this case exists to close. Nothing reaches `frames` until
+  // release() is called, so the instant read is reading the past by construction, at any load.
+  const delayedFrames = (io: FleetIO, writes: string[]) => {
+    const frames: string[] = [];
+    const held: string[] = [];
+    let released = false;
+    const inner = io.output!.write.bind(io.output);
+    io.output!.write = (chunk: string) => {
+      const before = writes.length;
+      const kept = inner(chunk);
+      // mirror only what the mock itself kept — cursor codes and repeats are not frames
+      if (writes.length > before) {
+        if (released) setTimeout(() => frames.push(chunk), 0);
+        else held.push(chunk);
+      }
+      return kept;
+    };
+    // released a beat later, on the runtime's own schedule: the reader still has to poll the fact
+    // rather than read an instant, exactly as it must against a host that coalesces renders
+    const release = () => {
+      released = true;
+      const queued = held.splice(0);
+      setTimeout(() => frames.push(...queued), 0);
+    };
+    return { frames, release };
+  };
+
+  test("test: a pin picked through the candidate list reaches the rendered overlay diff and the written overlay even where the frames arrive delayed; the same pick asserted on the frame stream as it stands the instant the editor returns fails under that delay", async () => {
     const { repo, adapter } = setup();
-    queueAnswers("y");
     const { io, writes, input } = makeIO();
+    const { frames, release } = delayedFrames(io, writes);
+    queueAnswers("y");
     const out = await drive(
       repo, adapter, io,
       TO_DOCS + KEYS.p + KEYS.down + KEYS.enter + KEYS.w,
       ["--global-dir", isolatedGlobal()],
     );
     expect(out).toMatch(/^fleet: wrote /);
-    // the picked candidate lands on the shape row immediately after the pick
-    expect(docsRows(writes).some((l) => l.includes("fake:fake-2 (api, frontier)"))).toBe(true);
-    const all = strip(writes.join(""));
+    // the pick reached disk regardless: the mechanism never depended on when a frame arrives
+    expect(parsedOverlay(repo).routing.map.docs.pin).toEqual({ via: "fake", model: "fake-2" });
+    // demonstrated rather than claimed: the frame stream as it stands the instant the editor
+    // returned does not carry the diff, and this is the assertion form that read it there
+    expect(() => expect(strip(frames.join(""))).toContain("+routing:")).toThrow();
+
+    // settled: poll the fact until the frames arrive, exactly as the escape-path case does
+    release();
+    await settle(() => strip(frames.join("")).includes("+      pin:"));
+    const all = strip(frames.join(""));
     expect(all).toContain("+routing:");
     expect(all).toContain("+    docs:");
     expect(all).toContain("+      pin:");
     expect(all).toContain("via: fake");
     expect(all).toContain("model: fake-2");
-    expect(parsedOverlay(repo).routing.map.docs.pin).toEqual({ via: "fake", model: "fake-2" });
+    // the picked candidate lands on the shape row after the pick
+    expect(docsRows(frames).some((l) => l.includes("fake:fake-2 (api, frontier)"))).toBe(true);
     // the pick exit path inherits the OBS-70 close contract
     expect(input.isPaused()).toBe(true);
     expect(input.listenerCount("keypress")).toBe(0);
@@ -1622,7 +1672,10 @@ review:
     expect(await done).toBe("fleet: quit without writing");
   });
 
-  test("test: the escape path asserts the settled cursor row and passes across delayed frame timings", async () => {
+  // Repair layer 2/2 — ASSERTION SYNCHRONIZATION. This escape-path observation uses the same
+  // release gate as the sibling overlay-diff case above; no wall-clock settle window decides when
+  // the post-Escape frame becomes eligible for the assertion.
+  test("test: the escape path's settled row is observed through the same release gate its sibling case already uses, so the stream as it stands the instant the escape key is written does not carry that row while the post-release poll does; an assertion satisfied by that instant read fails", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
@@ -1634,13 +1687,18 @@ review:
     const shapeFrame = (f: string) => strip(f).includes("Shapes  routed under");
     const rowBefore = pointerLine(io.writes.filter(shapeFrame).at(-1)!);
     expect(rowBefore).toContain("fake:fake-1");
-    const mark = io.writes.length;
+    // Install the sibling's gate only after the picker is open. `frames` can therefore contain
+    // only the post-Escape stream, never the identical pre-picker Shapes row captured above.
+    const { frames, release } = delayedFrames(io.io, io.writes);
     io.input.write(KEYS.escape);
-    // Assert the post-Escape cursor-row identity itself. Polling that fact tolerates a delayed close frame;
-    // filtering from mark excludes the pre-picker row, while a real move to another shape never satisfies it.
+    // Instant read: the release gate is still closed, so satisfying the row assertion here is the bug.
+    const escapedShapeRows = () => frames.filter(shapeFrame).map(pointerLine);
     const escapedShapeRow = () => pointerLine(
-      io.writes.slice(mark).filter(shapeFrame).at(-1) ?? "",
+      frames.filter(shapeFrame).at(-1) ?? "",
     );
+    expect(escapedShapeRows()).not.toContain(rowBefore);
+    release();
+    // Post-release: poll the fact itself; a real move to another shape never satisfies it.
     await expect.poll(escapedShapeRow, { interval: 5, timeout: 2_000 }).toBe(rowBefore);
     io.input.write(KEYS.q);
     expect(await done).toBe("fleet: quit without writing");

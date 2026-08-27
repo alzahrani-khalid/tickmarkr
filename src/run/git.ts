@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { availableParallelism } from "node:os";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { availableParallelism, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
@@ -282,6 +282,48 @@ const resolveTaskBranch = async (repo: string, branch: string): Promise<string> 
   const integration = await resolveIntegrationBranch(repo, branch.slice(0, split));
   return `${integration}${branch.slice(split)}`;
 };
+
+/**
+ * Preserve the bytes an existing checkout holds before recreation removes it.
+ *
+ * `git stash create` cannot do this job: its apparent `-u` argument is accepted as a message and
+ * untracked files never enter the stash object. Build the snapshot through a disposable index
+ * instead. The index starts at HEAD (so no unrelated residue from the checkout's real index enters
+ * the tree), stages the complete working tree including ordinary untracked paths, and lives outside
+ * the repository so it cannot stage itself. None of these plumbing commands writes the checkout or
+ * its real index.
+ *
+ * The returned ref is the durable recovery handle. A clean checkout returns undefined and creates
+ * neither a commit nor a ref, keeping meaningful deaths visible rather than minting one ref per
+ * ordinary dispatch.
+ */
+export async function preserveWorktree(cwd: string): Promise<string | undefined> {
+  if (!existsSync(cwd)) return undefined;
+  const scratch = mkdtempSync(join(tmpdir(), "tickmarkr-preserve-index-"));
+  const index = join(scratch, "index");
+  const withIndex = (command: string) => `GIT_INDEX_FILE=${shq(index)} ${command}`;
+  try {
+    await shGitOk(withIndex("git read-tree HEAD"), cwd);
+    await shGitOk(withIndex("git add -A -- ."), cwd);
+    const tree = (await shGitOk(withIndex("git write-tree"), cwd)).trim();
+    const headTree = (await shGitOk("git rev-parse 'HEAD^{tree}'", cwd)).trim();
+    if (tree === headTree) return undefined;
+
+    // Do not depend on consumer-level identity configuration: this is an engine recovery object,
+    // not an authored project commit. Its HEAD parent makes the preserved tree directly inspectable.
+    const identity = "GIT_AUTHOR_NAME=tickmarkr GIT_AUTHOR_EMAIL=tickmarkr@localhost "
+      + "GIT_COMMITTER_NAME=tickmarkr GIT_COMMITTER_EMAIL=tickmarkr@localhost";
+    const commit = (await shGitOk(
+      `${identity} git commit-tree ${shq(tree)} -p HEAD -m ${shq("tickmarkr: preserve uncommitted worktree")}`,
+      cwd,
+    )).trim();
+    const ref = `refs/tickmarkr/preserved/${commit}`;
+    await shGitOk(`git update-ref ${shq(ref)} ${shq(commit)}`, cwd);
+    return ref;
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
 
 export async function createWorktree(repo: string, branch: string, baseRef: string): Promise<string> {
   branch = await resolveTaskBranch(repo, branch);
