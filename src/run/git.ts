@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
@@ -128,11 +129,15 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
     // open, so "close" never fires and the promise wedges forever (v1.33.1 init hang).
     const p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stdout = "", stderr = "";
-    let timedOut = false, done = false, started = false;
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let timedOut = false, done = false, started = false, outputSeen = false;
     const finish = (code: number, err?: string) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      stdout += stdoutDecoder.end();
+      stderr += stderrDecoder.end();
       resolve({ code, stdout, stderr: err ?? stderr, timedOut, durationMs: Date.now() - startedAt });
     };
     const timer = setTimeout(() => {
@@ -140,10 +145,21 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
       try { process.kill(-p.pid!, "SIGKILL"); } catch { p.kill("SIGKILL"); }
     }, timeoutMs);
     p.on("spawn", () => { started = true; }); // the command exists from here on — never retryable past it
-    p.stdout!.on("data", (d) => (stdout += d));
-    p.stderr!.on("data", (d) => (stderr += d));
+    // OBS-716: one stateful decoder per stream carries an incomplete UTF-8 sequence into that
+    // stream's next pipe chunk; decoding each chunk through string concatenation corrupts bytes at
+    // kernel-chosen boundaries. A deterministic fixture proves this decoder correct rather than
+    // proving every caller byte-safe: real chunk boundaries are the kernel's to choose, so timing
+    // still decides whether a chunk-local decoder exposes the defect in any particular run.
+    p.stdout!.on("data", (d) => {
+      if (d.length > 0) outputSeen = true;
+      stdout += stdoutDecoder.write(d);
+    });
+    p.stderr!.on("data", (d) => {
+      if (d.length > 0) outputSeen = true;
+      stderr += stderrDecoder.write(d);
+    });
     p.on("error", (e: NodeJS.ErrnoException) => {
-      if (!done && !started && !stdout && !stderr && e.code === RETRYABLE_SPAWN_CODE) {
+      if (!done && !started && !outputSeen && e.code === RETRYABLE_SPAWN_CODE) {
         done = true;
         clearTimeout(timer);
         resolve({ refused: e });

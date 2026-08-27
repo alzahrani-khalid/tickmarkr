@@ -4,7 +4,9 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { fingerprint } from "../../src/gates/baseline.js";
 import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, createWorktree, gitHead, linkNodeModules, preserveWorktree, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -71,6 +73,133 @@ describe("sh", () => {
       if (oldHome === undefined) delete process.env.HOME;
       else process.env.HOME = oldHome;
     }
+  });
+});
+
+
+interface ChunkPlan {
+  stdout?: Buffer[];
+  stderr?: Buffer[];
+  code?: number;
+}
+
+// The real pipe boundary is nondeterministic. This injected child emits the exact chunk plan before
+// `close`, which is the child_process contract the capture seam consumes.
+const spawnWithChunks = (plans: ChunkPlan[]): typeof spawn => {
+  let call = 0;
+  return ((_file, _args, _opts) => {
+    const plan = plans[call++];
+    if (!plan) throw new Error(`no chunk plan for spawn ${call}`);
+    const child = new EventEmitter() as unknown as ReturnType<typeof spawn>;
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    Object.assign(child, { stdout, stderr, kill: () => true });
+    setImmediate(() => {
+      child.emit("spawn");
+      for (const chunk of plan.stdout ?? []) stdout.emit("data", chunk);
+      for (const chunk of plan.stderr ?? []) stderr.emit("data", chunk);
+      child.emit("close", plan.code ?? 0);
+    });
+    return child;
+  }) as typeof spawn;
+};
+
+const chunksAt = (bytes: Buffer, offset: number): Buffer[] => [bytes.subarray(0, offset), bytes.subarray(offset)];
+const chunkLocalDecode = (chunks: Buffer[]): string => chunks.map((chunk) => chunk.toString("utf8")).join("");
+
+describe("UTF-8 capture at the one shell seam (OBS-716)", () => {
+  afterEach(() => resetSpawnForTests());
+
+  test("test: a command whose output carries a three-byte box-drawing character delivered as two chunks that split it is captured equal in length and content to the bytes the command wrote; a reader decoding each chunk alone returns three extra bytes where the split falls after two of those bytes and six where it falls after one: it fails", async () => {
+    const written = Buffer.from("left ┌ right");
+    const boxStart = Buffer.byteLength("left ");
+    const afterTwo = chunksAt(written, boxStart + 2);
+    const afterOne = chunksAt(written, boxStart + 1);
+    setSpawnForTests(spawnWithChunks([{ stdout: afterTwo }]));
+
+    const captured = await sh("fixture controls this command", "/tmp");
+    expect(captured.stdout).toBe(written.toString("utf8"));
+    expect(Buffer.byteLength(captured.stdout)).toBe(written.length);
+    expect(Buffer.byteLength(chunkLocalDecode(afterTwo)) - written.length).toBe(3);
+    expect(Buffer.byteLength(chunkLocalDecode(afterOne)) - written.length).toBe(6);
+  });
+
+  test("test: the same forced split on the error stream is captured equal in length and content to what the command wrote; a repair that carries the partial only on the output stream leaves every value derived from the error stream corrupt and fails", async () => {
+    const written = Buffer.from("Error: ┌ stderr failure\n");
+    const split = chunksAt(written, Buffer.byteLength("Error: ") + 1);
+    setSpawnForTests(spawnWithChunks([{ stderr: split, code: 1 }]));
+
+    const captured = await sh("fixture controls this command", "/tmp");
+    const joined = `${captured.stdout}\n${captured.stderr}`;
+    const corruptStderr = chunkLocalDecode(split);
+    const corruptJoined = `\n${corruptStderr}`;
+    expect(captured.stderr).toBe(written.toString("utf8"));
+    expect(Buffer.byteLength(captured.stderr)).toBe(written.length);
+    expect(joined).not.toBe(corruptJoined);
+    expect(fingerprint(joined)).not.toEqual(fingerprint(corruptJoined));
+  });
+
+  test("test: one failure written twice byte-for-byte yields the same failure shape a gate derives from the two streams joined where the pipe delivers it whole once and split mid-character once; split-dependent error characters that make two identical failures compare unequal disable the identical-retry ban and fail", async () => {
+    const written = Buffer.from("Error: ┌ same failure\n");
+    const split = chunksAt(written, Buffer.byteLength("Error: ") + 1);
+    setSpawnForTests(spawnWithChunks([
+      { stderr: [written], code: 1 },
+      { stderr: split, code: 1 },
+    ]));
+
+    const whole = await sh("fixture controls first command", "/tmp");
+    const chunked = await sh("fixture controls second command", "/tmp");
+    const gateShape = (result: { stdout: string; stderr: string }) =>
+      fingerprint(`${result.stdout}\n${result.stderr}`).join("\n");
+    const wholeShape = gateShape(whole);
+    const chunkedShape = gateShape(chunked);
+    expect(chunkedShape).toBe(wholeShape);
+
+    const gateDetails = (shape: string) => `new failure fingerprints vs baseline:\n${shape}`;
+    const correctedEvents: JournalEvent[] = [wholeShape, chunkedShape].map((shape, index) => ({
+      ts: `2026-08-27T00:00:0${index}.000Z`,
+      event: "gate-result",
+      taskId: "T1",
+      data: { gate: "test", pass: false, details: gateDetails(shape) },
+    }));
+    expect(identicalGateFailures(correctedEvents, "T1", "test", normalizeGateFailure(gateDetails(chunkedShape))))
+      .toBe(GATE_FINGERPRINT_CAP);
+
+    const corruptShape = fingerprint(`\n${chunkLocalDecode(split)}`).join("\n");
+    const corruptEvents: JournalEvent[] = [wholeShape, corruptShape].map((shape, index) => ({
+      ts: `2026-08-27T00:01:0${index}.000Z`,
+      event: "gate-result",
+      taskId: "T1",
+      data: { gate: "test", pass: false, details: gateDetails(shape) },
+    }));
+    expect(corruptShape).not.toBe(wholeShape);
+    expect(identicalGateFailures(corruptEvents, "T1", "test", normalizeGateFailure(gateDetails(corruptShape))))
+      .toBeLessThan(GATE_FINGERPRINT_CAP);
+  });
+
+  test("test: a stream carrying multi-byte characters is captured exactly at every byte offset the boundary could fall on and with no split at all; a reader correct only where the boundary lands between characters passes the unsplit control alone and fails", async () => {
+    const written = Buffer.from("A¢┌😀Z");
+    const plans: ChunkPlan[] = [];
+    for (let offset = 1; offset < written.length; offset++) plans.push({ stdout: chunksAt(written, offset) });
+    plans.push({ stdout: [written] });
+    setSpawnForTests(spawnWithChunks(plans));
+
+    for (let offset = 1; offset < written.length; offset++) {
+      const captured = await sh(`fixture controls split ${offset}`, "/tmp");
+      expect(captured.stdout, `split at byte ${offset}`).toBe(written.toString("utf8"));
+      expect(Buffer.byteLength(captured.stdout), `split at byte ${offset}`).toBe(written.length);
+    }
+    const unsplit = await sh("fixture controls unsplit", "/tmp");
+    expect(unsplit.stdout).toBe(written.toString("utf8"));
+    expect(chunkLocalDecode([written])).toBe(unsplit.stdout);
+    expect(Array.from({ length: written.length - 1 }, (_, index) => index + 1)
+      .some((offset) => chunkLocalDecode(chunksAt(written, offset)) !== unsplit.stdout)).toBe(true);
+  });
+
+  test("the capture site records that a passing case proves this decoder correct rather than proving every caller byte-safe, because chunk boundaries are the kernel's to choose, so a diff claiming the class closed without naming what timing still decides fails", () => {
+    const source = readFileSync(new URL("../../src/run/git.ts", import.meta.url), "utf8");
+    expect(source).toMatch(/proves this decoder correct rather than\s+\/\/ proving every caller byte-safe/);
+    expect(source).toMatch(/chunk boundaries are the kernel's to choose, so timing\s+\/\/ still decides/);
   });
 });
 

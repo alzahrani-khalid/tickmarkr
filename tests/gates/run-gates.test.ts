@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -277,6 +277,36 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
 // a claim about ordering, and the same fixture with a clean tree runs all three.
 // ---------------------------------------------------------------------------------------------
 let t5RepoTemplate: string | undefined;
+let t5Calls = 0;
+
+// OBS-717 DIAGNOSTIC — tests-only scaffolding, NOT a fix, and it changes no fixture behaviour.
+// Once in six full-suite runs the cpSync below threw `ENOENT, No such file or directory
+// '<dest>/.git/objects'` (native cpSync shape, naming the DESTINATION) and it has never been
+// reproduced in 26 targeted iterations, nor under a 6-fork probe against the leaked $TMPDIR
+// (that amplifier hypothesis was measured and refuted). The remaining mechanisms are separated
+// by three answers nobody has ever held at the moment of the throw, so capture them there:
+// is the TEMPLATE still present, was the DESTINATION never created or created-and-partial, and
+// what did the errno actually say. Runs ONLY on throw; the original error is rethrown untouched
+// — never swallowed, never retried.
+// REMOVAL CONDITION: delete this block and the try/catch when OBS-717 is discriminated and fixed.
+function obs717Diagnostic(err: unknown, template: string, repo: string, call: number): string {
+  const list = (p: string): string => {
+    try { return JSON.stringify(readdirSync(p)); } catch (e) { return `<unreadable: ${(e as Error).message}>`; }
+  };
+  const count = (p: string): string => {
+    try { return String(readdirSync(p).length); } catch (e) { return `<unreadable: ${(e as Error).message}>`; }
+  };
+  const e = err as NodeJS.ErrnoException;
+  const objects = join(template, ".git", "objects");
+  return [
+    `OBS-717 DIAGNOSTIC — cpSync threw on makeT5Repo call #${call} of this file`,
+    `  error     code=${e?.code} errno=${e?.errno} syscall=${e?.syscall} path=${e?.path}`,
+    `  error     message=${e instanceof Error ? e.message : String(err)}`,
+    `  TEMPLATE  ${template} exists=${existsSync(template)} .git/objects=${existsSync(objects)} objectEntries=${count(objects)}`,
+    `  DEST      ${repo} exists=${existsSync(repo)} .git=${existsSync(join(repo, ".git"))} listing=${list(repo)}`,
+    `  TMPDIR    ${tmpdir()} entries=${count(tmpdir())}`,
+  ].join("\n");
+}
 
 function makeT5Repo(): string {
   t5RepoTemplate ??= makeRepo({
@@ -287,7 +317,13 @@ function makeT5Repo(): string {
     ".gitignore": "battery.log\n",
   });
   const repo = makeTestTempDir("tickmarkr-t5-repo-");
-  cpSync(t5RepoTemplate, repo, { recursive: true });
+  const call = ++t5Calls; // …so the report can say FIRST call of the file or a later one
+  try {
+    cpSync(t5RepoTemplate, repo, { recursive: true });
+  } catch (err) {
+    console.error(obs717Diagnostic(err, t5RepoTemplate, repo, call));
+    throw err;
+  }
   return repo;
 }
 
