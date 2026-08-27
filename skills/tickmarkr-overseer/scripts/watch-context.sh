@@ -81,7 +81,7 @@ handoff_fresh() {
   [ -f "$HANDOFF" ] || return 1
   local age now mt
   now=$(date +%s)
-  mt=$(stat -f %m "$HANDOFF" 2>/dev/null || stat -c %Y "$HANDOFF" 2>/dev/null) || return 1
+  mt=$(stat -c %Y "$HANDOFF" 2>/dev/null || stat -f %m "$HANDOFF" 2>/dev/null) || return 1
   age=$((now - mt))
   [ "$age" -le "$MAXAGE" ]
 }
