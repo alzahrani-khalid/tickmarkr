@@ -65,12 +65,21 @@ describe("config", () => {
     expect(grok["grok-composer-2.5-fast"]).toBe("cheap");
   });
 
-  // MODEL-10 overlay-dedup: re-adding grok- lines to .tickmarkr/config.yaml reddens this.
+  // MODEL-10 overlay-dedup: re-adding a DEFAULT grok seed to .tickmarkr/config.yaml reddens this.
+  // It asserts DUPLICATION, which is what the name says — not the absence of every `grok-` line.
+  // The old form was `/^\s*grok-/m`, and it was over-broad in the one direction that matters: a grok
+  // model the catalog newly carries, written into the overlay by `tickmarkr fleet` itself, is not a
+  // duplicate of anything. Measured 2026-08-28 — `grok-4.6` (absent from DEFAULT_CONFIG, added by a
+  // fleet write) reddened this repo's own suite, so a shipped command and this guard disagreed about
+  // a lawful overlay. A guard must forbid the thing it is named for and nothing wider.
   test("MODEL-10: repo overlay must not duplicate grok seeds", () => {
     const overlay = join(process.cwd(), ".tickmarkr", "config.yaml");
-    if (!existsSync(overlay)) return; // gitignored — absent on fresh clones/CI
+    if (!existsSync(overlay)) return; // absent on fresh clones, and excluded from the public export
     const yaml = readFileSync(overlay, "utf8");
-    expect(yaml).not.toMatch(/^\s*grok-/m);
+    const seeded = Object.keys(DEFAULT_CONFIG.tiers.grok.models);
+    const duplicated = seeded.filter((m) =>
+      new RegExp(`^\\s*${m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:`, "m").test(yaml));
+    expect(duplicated).toEqual([]);
   });
 
   // HYG-06 (v1.12): this test MUST NOT pin operator-local overlay VALUES. It previously asserted

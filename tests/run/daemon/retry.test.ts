@@ -14,7 +14,7 @@ import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../.
 import { validateGraph } from "../../../src/graph/schema.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../../src/run/git.js";
-import { activeRetryBan, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
+import { activeRetryBan, deferredReviewFindings, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
 import { COMMIT, authedModels, setupRepo, T } from "../../helpers/tmprepo.js";
 
 
@@ -2030,6 +2030,248 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
     expect(still(ev("task-approved", { by: "op", release: "recheck" }))).toEqual([FINDING]);
     expect(still(ev("task-approved", { by: "op" }))).toEqual([FINDING]); // a pre-dispatch human gate
     expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "test" }))).toEqual([FINDING]);
+    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([]);
+  });
+});
+
+// T2 (deferrals): the reviewer's `defer` channel is documented in the review prompt as a concern that
+// is "recorded in the review, never dropped". It was recorded in ONE details string and dropped from
+// everything else — the journal landed structured findings only on a BLOCKING row, and the fold that
+// decides what the next dispatch carries cleared its whole open set the moment any review passed. So a
+// task merged carrying a defect its own reviewer had named, in no place a later reader or a later
+// worker looks. The two retirements below must stay distinguishable: a blocking finding a passing
+// review genuinely settled, and a deferral that same passing review created and nothing has addressed.
+//
+// Repair note (attempt 2): this block's first gate red was `[vitest-worker]: Timeout calling
+// "onTaskUpdate"` with NO assertion headline — the birpc-starver class vitest.config.ts documents,
+// where the host answers worker RPC between reporter/coverage rendering and the fixed 60s worker->host
+// timeout fires with every test green. It is NOT a verdict on this work: measured here, the block costs
+// ~2.3s of this file's ~65s, and the full suite ran green (264 files / 3584 tests, zero RPC timeouts)
+// under `VITEST_MAX_FORKS=6` at load average 20-32 on 18 cores. The discriminator is the headline: an
+// assertion red at load is real, an assertion-free red at load is infra. Do not shrink this block to
+// chase it — every attempt below is load-bearing (a1 breaks the TEST gate on purpose so the round's own
+// feedback quotes neither finding, which is what makes the brief assertion read off the journal alone).
+// Both fields deliberately span physical lines. review.ts renders their JSON strings into prose, so
+// this pins the journal projection to logical finding boundaries instead of the first newline.
+const DEFERRED = "`markColumn` in src/mark.ts is named for a row, not a column\nand the name is misleading at call sites";
+const RATIONALE = "cosmetic rename no caller depends on\nand it is not worth another review round";
+const DEFERRED_FINGERPRINT = "review:deferred/minor|src/mark.ts|markColumn";
+const OPEN_HEADING = "## Outstanding review findings — a review has NOT passed on these yet";
+const DEFER_HEADING = "## Deferred review findings — a reviewer ACCEPTED these with a rationale and did NOT block on them";
+
+// the block a heading owns: everything up to the blank line that separates it from the next block.
+const sectionUnder = (brief: string, heading: string): string => {
+  const i = brief.indexOf(heading);
+  if (i === -1) return "";
+  const rest = brief.slice(i + heading.length);
+  const end = rest.indexOf("\n\n");
+  return rest.slice(0, end === -1 ? undefined : end);
+};
+
+describe("T2 a passing review does not drop what it deferred (fake adapter, zero tokens)", () => {
+  const runId = "run-deferred-finding";
+
+  // ONE task, two runs, the whole life of a deferral beside a blocking finding it must not be fused with:
+  //   run A  a0 the reviewer BLOCKS on a material finding and DEFERS a second one with a rationale
+  //          a1 breaks the test gate — the battery stops before review, so the round's own feedback
+  //             quotes neither finding and the next brief must carry both on the journal's evidence
+  //          a2 draws the same review again → two failing review rounds → the engagement's cap parks it
+  //   approve --uphold → funds one fixed attempt; an uphold settles nothing
+  //   run B  a3 fixes the material finding; the review PASSES while restating the deferral
+  let repo = "";
+  let evs: JournalEvent[] = [];
+  let briefAfterUnrelatedFailure = "";
+  let briefAfterReviewFail = "";
+
+  beforeAll(async () => {
+    const s = setupRepo(
+      [T("T1")],
+      {
+        review: { approve: false, findings: [
+          { note: FINDING, severity: "material" },
+          { note: DEFERRED, severity: "minor", defer: true, rationale: RATIONALE },
+        ] },
+        consult: { action: "retry", notes: "unused — the failures here are gate failures" },
+        tasks: { T1: [
+          { shell: `mkdir -p src && echo one > src/mark.ts && ${COMMIT} m1`, result: { ok: true, summary: "a0" } },
+          { shell: `echo broken > broken.txt && ${COMMIT} b1`, result: { ok: true, summary: "a1" } },
+          { shell: `git rm -q broken.txt && ${COMMIT} b2`, result: { ok: true, summary: "a2" } },
+        ] },
+      },
+      "gates: { test: 'test ! -f broken.txt' }\n",
+    );
+    repo = s.repo;
+    await runDaemon(repo, { adapters: [s.fake], runId });
+    // the dispatch AFTER the test-gate round: its own feedback quotes neither finding, so whatever it
+    // says about them it says on the journal's evidence alone. Read here, before run B can reuse a
+    // prompt path for the same attempt number.
+    const runA = evsOf(repo, runId);
+    const afterTestFail = runA.slice(
+      runA.findIndex((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false),
+    ).find((e) => e.event === "task-dispatch" && e.taskId === "T1")!;
+    briefAfterUnrelatedFailure = readFileSync(promptPath(repo, runId, afterTestFail.data.attempt as number), "utf8");
+    // and the ORDINARY path: the dispatch immediately after the failing review, whose own raw bytes
+    // quote both findings. This is the common case — nothing unrelated has to fail for a worker to
+    // be handed a deferral, so the truthful heading has to hold here or it holds almost nowhere.
+    const afterReviewFail = runA.slice(
+      runA.findIndex((e) => e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false),
+    ).find((e) => e.event === "task-dispatch" && e.taskId === "T1")!;
+    briefAfterReviewFail = readFileSync(promptPath(repo, runId, afterReviewFail.data.attempt as number), "utf8");
+
+    await approve([runId, "T1", "--uphold", "--by", "op"], repo);
+    // run B's reviewer APPROVES — and restates the concern it is still not blocking on.
+    writeFileSync(s.scriptPath, JSON.stringify({
+      judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
+      review: { approve: true, findings: [{ note: DEFERRED, severity: "minor", defer: true, rationale: RATIONALE }] },
+      consult: { action: "retry", notes: "unused" },
+      tasks: { T1: [
+        { shell: `echo two >> src/mark.ts && ${COMMIT} m3`, result: { ok: true, summary: "a3 — fixed the material finding" } },
+      ] },
+    }));
+    await runDaemon(repo, { adapters: [new FakeAdapter(s.scriptPath)], runId, resume: true });
+    evs = evsOf(repo, runId);
+  }, 300_000);
+
+  const passingReviewRow = () => evs.filter((e) => e.event === "gate-result" && e.taskId === "T1"
+    && e.data.gate === "review" && e.data.pass === true).at(-1)!;
+
+  test("test: a review that passes while recording a deferred finding lands that finding on its own journal row structured, so a reader matching rounds has an identity and not a prose blob; a row that carries the deferral only inside its details text leaves every structured reader blind and: it fails", () => {
+    const row = passingReviewRow();
+    expect(row).toBeDefined();
+    // the row is a PASS — the projection that used to be the ONLY writer of structured findings fires
+    // exclusively on a blocking row, so on this one it wrote nothing and the prose below was the whole
+    // record: the reviewer's own bytes, with no identity any later round could be matched against.
+    expect(row.data.pass).toBe(true);
+    expect(String(row.data.details)).toContain(DEFERRED);
+    expect(String(row.data.details)).toContain(RATIONALE);
+
+    const rows = row.data.findings as StructuredFinding[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.class).toBe("review:deferred/minor");
+    expect(rows[0]!.path).toBe("src/mark.ts");
+    expect(rows[0]!.symbol).toBe("markColumn");
+    expect(rows[0]!.fingerprint).toBe(DEFERRED_FINGERPRINT);
+    expect(rows[0]!.note).toBe(DEFERRED);
+    expect(rows[0]!.rationale).toBe(RATIONALE); // accepted WITH its complete rationale, separate from identity
+    // and the identity a later reader matches rounds on is the row's own, not one re-parsed at read time
+    expect(outstandingReviewFindings(evs, "T1").map((f) => f.fingerprint)).toEqual([DEFERRED_FINGERPRINT]);
+    // the CONTROL: this is not blanket noise on every green row — a passing gate with nothing deferred
+    // still carries no findings, so the presence of the array IS the deferral and not decoration.
+    const otherGreens = evs.filter((e) => e.event === "gate-result" && e.taskId === "T1"
+      && e.data.pass === true && e.data.gate !== "review");
+    expect(otherGreens.length).toBeGreaterThan(0);
+    expect(otherGreens.every((e) => e.data.findings === undefined)).toBe(true);
+  });
+
+  test("test: the fold that decides what a dispatch carries retains a passing review's own deferred finding and retires the blocking findings that same review settled, so the two retirements are visible apart in one journal; a fold clearing both, or retaining both, collapses them and: it fails", () => {
+    const passIdx = evs.indexOf(passingReviewRow());
+    // BEFORE the passing review both are outstanding: the material one the reviewer blocked on, and
+    // the deferral it recorded in the same verdict.
+    const before = outstandingReviewFindings(evs.slice(0, passIdx), "T1");
+    expect(before.map((f) => f.note)).toEqual([FINDING, DEFERRED]);
+
+    // AFTER it, exactly one survives — and it is the one nothing has addressed. A fold that clears
+    // both drops a defect the reviewer named; a fold that retains both hands the next worker a
+    // blocking finding a review has already passed on.
+    const after = outstandingReviewFindings(evs.slice(0, passIdx + 1), "T1");
+    expect(after.map((f) => f.fingerprint)).toEqual([DEFERRED_FINGERPRINT]);
+    expect(after[0]!.note).toBe(DEFERRED);
+    expect(after[0]!.rationale).toBe(RATIONALE);
+
+    // and the retention does not depend on that pass RESTATING it. A later review that passes while
+    // saying nothing about the deferral is SILENT about it, not settling it: nothing fixed the
+    // concern, and a reviewer waving work through is not the operator release that accepts it.
+    // Retiring on omission would drop the finding on the very next round — the same silent drop by
+    // a different door, and one no fixture that always restates the deferral can see.
+    const silentPass: JournalEvent = { ts: "2026-08-01T00:00:00.000Z", event: "gate-result", taskId: "T1",
+      data: { gate: "review", pass: true, details: "reviewer fake:fake-2 (fake-b): approved" } };
+    expect(outstandingReviewFindings([...evs.slice(0, passIdx + 1), silentPass], "T1").map((f) => f.fingerprint))
+      .toEqual([DEFERRED_FINGERPRINT]);
+
+    // the CONTROL, and why the retirement is a decision rather than an absence: the same journal still
+    // HOLDS the material finding, structured, on the rows that drew it — twice.
+    const everBlocked = evs.slice(0, passIdx)
+      .filter((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "review" && e.data.pass === false)
+      .flatMap((e) => e.data.findings as StructuredFinding[])
+      .filter((f) => f.note.includes(FINDING));
+    expect(everBlocked.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("test: the dispatch brief presents a deferred finding as accepted-with-rationale and a blocking one as awaiting a passing review, each under a heading true of it; one heading covering both restates about the deferral the falsehood this task removes and: it fails", () => {
+    // the CONTROL: the round before this dispatch failed on `test` alone — the battery returns before
+    // review even launches — so this brief's own feedback quotes neither finding and both headings
+    // below are written off the journal's evidence.
+    expect(briefAfterUnrelatedFailure).toContain("test: ");
+    const open = sectionUnder(briefAfterUnrelatedFailure, OPEN_HEADING);
+    const deferred = sectionUnder(briefAfterUnrelatedFailure, DEFER_HEADING);
+    expect(open).not.toBe("");
+    expect(deferred).not.toBe("");
+
+    // the blocking finding is awaiting a passing review, and appears ONLY there …
+    expect(open).toContain(FINDING);
+    expect(open).not.toContain(DEFERRED);
+    // … and the deferral is presented as accepted, with the rationale it was accepted on, ONLY there.
+    expect(deferred).toContain(DEFERRED);
+    expect(deferred).toContain(RATIONALE);
+    expect(deferred).not.toContain(FINDING);
+
+    // The SAME truth on the ordinary immediate review-repair retry, and this is the harder half: that
+    // round's own raw review bytes quote BOTH findings, and they ride in under a repair brief that
+    // says "fix ONLY what these findings name". Deduping the heading away because the note is
+    // "already quoted" leaves the deferral standing as blocking — the falsehood, restated. So the
+    // blocking finding is quoted there truthfully, and the deferral appears nowhere before its own
+    // heading.
+    expect(briefAfterReviewFail).toContain("## Repair attempt — fix ONLY what these findings name");
+    expect(briefAfterReviewFail).toContain(FINDING);
+    expect(sectionUnder(briefAfterReviewFail, DEFER_HEADING)).toContain(DEFERRED);
+    expect(briefAfterReviewFail.split(DEFER_HEADING)[0]).not.toContain(DEFERRED);
+    expect(sectionUnder(briefAfterReviewFail, DEFER_HEADING)).toContain(RATIONALE);
+  });
+
+  test("test: the operator release that accepts the review gate itself clears a deferred finding, and an attempt-cap release, a recheck, a plain human gate and a release naming another gate each keep it; reading any approval as a settle drops a finding the operator never saw and: it fails", () => {
+    const ev = (event: string, data: Record<string, unknown> = {}, taskId = "T1"): JournalEvent =>
+      ({ ts: "2026-08-01T00:00:00.000Z", event, taskId, data });
+    const details = `reviewer fake:fake-2 (fake-b): approved (1 deferred)\n- [deferred/minor] ${DEFERRED} — rationale: ${RATIONALE}`;
+    const passed = ev("gate-result", { gate: "review", pass: true, details, findings: deferredReviewFindings(details) });
+    const drawn = [passed, ev("worker-launch"), ev("gate-result", { gate: "test", pass: true, details: "exit 0" })];
+    const still = (extra: JournalEvent) => outstandingReviewFindings([...drawn, extra], "T1").map((f) => f.fingerprint);
+
+    // outstanding across a launch and a passing gate that is not the review …
+    expect(outstandingReviewFindings(drawn, "T1").map((f) => f.fingerprint)).toEqual([DEFERRED_FINGERPRINT]);
+    // … and a reviewer restating the same deferral round after round carries it ONCE, by fingerprint:
+    // its bound is the release below, never a round count that lets deferrals accumulate.
+    expect(outstandingReviewFindings([...drawn, passed, ev("worker-launch"), passed], "T1")).toHaveLength(1);
+
+    // No explicit backticked/callable symbol: the stable fallback comes from the note alone. A later
+    // review can revise a multiline rationale without changing identity or accumulating another row;
+    // Map.set re-seats the concern with the newest accepted explanation.
+    const proseNote = "src/mark.ts uses a misleading label for the selected column";
+    const firstRationale = "safe to leave while callers still use the old name";
+    const revisedRationale = "the label remains cosmetic\nand the compatibility caller still needs it";
+    const deferredPass = (rationale: string): JournalEvent => {
+      const detail = `reviewer fake:fake-2 (fake-b): approved (1 deferred)\n- [deferred/minor] ${proseNote} — rationale: ${rationale}`;
+      return ev("gate-result", { gate: "review", pass: true, details: detail, findings: deferredReviewFindings(detail) });
+    };
+    const first = deferredReviewFindings(String(deferredPass(firstRationale).data.details))[0]!;
+    const revised = deferredReviewFindings(String(deferredPass(revisedRationale).data.details))[0]!;
+    expect(first.note).toBe(proseNote);
+    expect(first.rationale).toBe(firstRationale);
+    expect(revised.fingerprint).toBe(first.fingerprint);
+    const reseated = outstandingReviewFindings(
+      [deferredPass(firstRationale), ev("worker-launch"), deferredPass(revisedRationale)], "T1",
+    );
+    expect(reseated).toHaveLength(1);
+    expect(reseated[0]!.note).toBe(proseNote);
+    expect(reseated[0]!.rationale).toBe(revisedRationale);
+
+    // Only ONE approval settles it: the operator accepting the review gate itself — the moment a human
+    // actually looked at what the reviewer waved through. Every other approval funds a dispatch and
+    // says nothing about the deferral, so reading it as a settle drops a finding the operator never saw.
+    expect(still(ev("task-approved", { by: "op", release: REVIEW_UPHELD_RELEASE, gate: "review" }))).toEqual([DEFERRED_FINGERPRINT]);
+    expect(still(ev("task-approved", { by: "op", release: "attempt-cap" }))).toEqual([DEFERRED_FINGERPRINT]);
+    expect(still(ev("task-approved", { by: "op", release: "recheck" }))).toEqual([DEFERRED_FINGERPRINT]);
+    expect(still(ev("task-approved", { by: "op" }))).toEqual([DEFERRED_FINGERPRINT]); // a pre-dispatch human gate
+    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "test" }))).toEqual([DEFERRED_FINGERPRINT]);
     expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([]);
   });
 });

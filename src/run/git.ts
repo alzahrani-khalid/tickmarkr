@@ -73,13 +73,90 @@ export const runWithForkBudget = <T>(concurrency: number, fn: () => Promise<T>):
 /** The cap owned by the run on this async context; the standalone default outside one. */
 export const resolvedForkCap = (): string => forkBudget.getStore() ?? DEFAULT_FORK_CAP;
 
+/**
+ * T7: the CAPACITY a suite verdict was measured under — the fork cap the command's child actually
+ * received, and the core count that cap was divided from. Two verdicts are comparable only when both
+ * numbers match: a run resumed at a different concurrency divides the same machine by a different
+ * number, so a green measured in that other world is not evidence about this one.
+ *
+ * This pair is the WHOLE comparable identity, and the load averages a gate row already carries beside
+ * it are deliberately NOT part of it — no reader below ever feeds a load sample into the comparison.
+ * The capacity is deterministic and resolved here, where the child's environment is built. The load
+ * endpoints are neither: they are two samples taken at a gate's boundaries, and a gate's INTERIOR is
+ * invisible to them — on this milestone's own run a gate's interior reached well over twice what
+ * either of its own endpoints saw. So matching capacity establishes only that two measurements
+ * divided the same machine by the same number. It says nothing about whether the machine was calm.
+ */
+export interface RunCapacity { forkCap: number; cores: number }
+
+export type CapacityRead =
+  | { state: "present"; capacity: RunCapacity }
+  | { state: "absent" }
+  | { state: "malformed" };
+
+const positiveInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
+
+/**
+ * Three states, never two. A record carrying NO capacity is an older record from before this stamp
+ * existed: it keeps exactly the verdict it has today. A record carrying a capacity it cannot state —
+ * half the pair, an empty container, a zero, a negative, an unparseable value — is a NEWER record
+ * that is malformed, and reading it as an older one is how a fail-closed guard stops firing silently.
+ */
+export function readCapacity(value: unknown): CapacityRead {
+  if (value === undefined) return { state: "absent" };
+  if (value === null || typeof value !== "object") return { state: "malformed" };
+  const { forkCap, cores } = value as Record<string, unknown>;
+  return positiveInt(forkCap) && positiveInt(cores)
+    ? { state: "present", capacity: { forkCap, cores } }
+    : { state: "malformed" };
+}
+
+/**
+ * May a verdict recorded under `recorded` be reused — forgiven, cached, replayed — by a session
+ * running under `current`? Absent → yes, unchanged. Present and identical → yes. Malformed, a
+ * different capacity, or a current capacity the caller could not state → no.
+ */
+export function sameCapacity(recorded: unknown, current: RunCapacity | undefined): boolean {
+  const read = readCapacity(recorded);
+  if (read.state === "absent") return true;
+  if (read.state === "malformed" || current === undefined) return false;
+  return read.capacity.forkCap === current.forkCap && read.capacity.cores === current.cores;
+}
+
+export const describeCapacity = (value: unknown): string => {
+  const read = readCapacity(value);
+  return read.state === "present"
+    ? `fork cap ${read.capacity.forkCap} of ${read.capacity.cores} cores`
+    : read.state === "absent" ? "an unrecorded capacity" : "a malformed capacity";
+};
+
+/**
+ * The capacity a child spawned on THIS async context would receive: the same precedence `shell`
+ * applies below — an operator export of the cap wins over the run's own derived value — beside the
+ * cores it was divided from. A caller holding a command's own result reads the capacity off THAT
+ * result (`ShResult.capacity`, stamped where the child's environment was built); this is for the
+ * decisions taken BEFORE any child exists — a cache hit, a reuse predicate.
+ */
+export const resolvedCapacity = (): RunCapacity => ({
+  forkCap: Number(FORK_CAP_ENV in process.env ? process.env[FORK_CAP_ENV] : resolvedForkCap()),
+  cores: availableParallelism(),
+});
+
 /** The shipped shell ceiling: the fallback every caller gets when nothing measured a better one. */
 export const DEFAULT_SHELL_TIMEOUT_MS = 600000;
 
 // durationMs is the child's own wall clock, measured at this one seam so no caller has to bracket its
 // own Date.now() around a shell (two callers bracketing differently is how a "measured" number starts
 // disagreeing with itself). On a timeout it is the elapsed time at the kill, not the ceiling.
-export interface ShResult { code: number; stdout: string; stderr: string; timedOut?: boolean; durationMs?: number }
+export interface ShResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  timedOut?: boolean;
+  durationMs?: number;
+  /** T7: the capacity THIS child ran under, stamped where its environment was built (see `shell`). */
+  capacity?: RunCapacity;
+}
 
 /**
  * OBS-688: every gate, every baseline capture and every tip verification reaches the machine through
@@ -122,6 +199,13 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // OBS-110: apply the run's own fork cap only when the operator has not already set one.
   if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = resolvedForkCap();
+  // T7: the capacity every result of this shell carries, read HERE — off the environment the child
+  // is about to receive, after the precedence above has settled. An operator export is already in
+  // `env`, so what gets recorded is the operator's number, which is the case a release was re-taken
+  // for; re-deriving the run's own budget after the command returned would stamp a cap no child ran
+  // under. `Number` of an unparseable export is NaN, which every reader treats as malformed and
+  // therefore fails closed — the honest direction when the cap in play cannot be stated.
+  const capacity: RunCapacity = { forkCap: Number(env[FORK_CAP_ENV]), cores: availableParallelism() };
   const attempt = (): Promise<ShResult | SpawnRefusal> => new Promise((resolve) => {
     const startedAt = Date.now();
     // detached: bash gets its own process group so a timeout can kill the whole tree —
@@ -138,7 +222,7 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
       clearTimeout(timer);
       stdout += stdoutDecoder.end();
       stderr += stderrDecoder.end();
-      resolve({ code, stdout, stderr: err ?? stderr, timedOut, durationMs: Date.now() - startedAt });
+      resolve({ code, stdout, stderr: err ?? stderr, timedOut, durationMs: Date.now() - startedAt, capacity });
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -179,7 +263,7 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
       // Bounded, and the bound is what makes a persisting shortage a REPORTED failure rather than a
       // wedged daemon: past it the caller gets the refusal's own text under exit 127, as before.
       if (n >= SPAWN_ATTEMPT_LIMIT) {
-        return { code: 127, stdout: "", stderr: String(r.refused), durationMs: Date.now() - startedAt };
+        return { code: 127, stdout: "", stderr: String(r.refused), durationMs: Date.now() - startedAt, capacity };
       }
       await new Promise((wake) => setTimeout(wake, SPAWN_RETRY_BACKOFF_MS * n));
     }

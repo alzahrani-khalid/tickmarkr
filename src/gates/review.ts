@@ -4,7 +4,7 @@ import { type Assignment, type BillingChannel, channelKey, shq, type WorkerAdapt
 import {
   criticalPathHits, DEFAULT_DIFF_CAP, DEFAULT_REVIEW_CRITICAL_PATHS, declaredReviewPolicy,
   isReviewLeafPath, raiseReviewPolicy, type ReviewPolicy, REVIEW_VERSION_MIRRORS,
-  type TickmarkrConfig, TIER_RANK,
+  type TickmarkrConfig, TIER_RANK, type Tier,
 } from "../config/config.js";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
@@ -236,6 +236,7 @@ export function pickReviewer(
   channels: BillingChannel[],
   exclude: string[] = [], // v1.1 failover: reviewer channels that already produced garbage for this task
   prefer: string[] = [], // v1.53 T2: review.prefer — reorders eligible channels, never changes eligibility
+  floor?: Tier, // task-declared only; config floors govern workers and must not silently move review seats
 ): BillingChannel | null {
   // FLEET-05 success criterion 2: an author not resolvable in the channel list yields NO reviewer.
   // The old `?? author.adapter` fallback compared an adapter id to vendor names, matched nothing, and
@@ -248,7 +249,10 @@ export function pickReviewer(
       // two independent axes: different vendor AND different base-model identity (ADDED TO the vendor
       // rule, never replacing it — a future edit can't silently drop either). The diversity filter runs
       // BEFORE preference ranking: prefer sorts survivors only, so no entry can resurrect an excluded channel.
-      .filter((c) => c.vendor !== authorChannel.vendor && modelId(c.model) !== modelId(author.model) && !exclude.includes(channelKey(c)))
+      .filter((c) => c.vendor !== authorChannel.vendor
+        && modelId(c.model) !== modelId(author.model)
+        && !exclude.includes(channelKey(c))
+        && (floor === undefined || TIER_RANK[c.tier] >= TIER_RANK[floor]))
       .sort((a, b) => reviewPreferIndex(a, prefer) - reviewPreferIndex(b, prefer) || TIER_RANK[b.tier] - TIER_RANK[a.tier] || marginalCostRank(a) - marginalCostRank(b))[0] ?? null
   );
 }
@@ -257,6 +261,20 @@ export function pickReviewer(
 // reviewer infrastructure dying mid-flight; a malformed verdict is a parse defect. Neither is
 // evidence about the WORK, which is why run-gates retries the review, never the worker (OBS-193).
 export type ReviewUnparseableCause = VerdictUnparseableCause;
+
+/**
+ * This shows the reviewer what the task DECLARED, never what the diff may actually reach. The diff
+ * remains a separate stated input, so whether its touched paths fit the declaration stays a reviewer
+ * judgement rather than a guarantee made by this renderer.
+ */
+export function renderDeclaredWriteScope(files: ReadonlyArray<string>): string {
+  if (files.length === 0) {
+    return "## Declared write scope\nUnrestricted: this task declared no write-scope patterns.";
+  }
+  return `## Declared write scope
+The task DECLARED these write-scope patterns:
+${files.map((path) => `- ${path}`).join("\n")}`;
+}
 
 export async function reviewGate(
   task: Task,
@@ -345,13 +363,19 @@ export async function reviewGate(
     policy: "full" satisfies ReviewPolicy,
     ...(promotedBy ? { promotedFrom: declaredPolicy, promotedBy } : {}),
   };
-  const reviewer = pickReviewer(author, channels, excludeReviewers ?? [], cfg.review.prefer ?? []);
+  // A reviewer floor is opt-in at the task. Applying cfg.routing.floors here would change the
+  // historical seat for every task that never asked for review-tier coupling.
+  const reviewerFloor = task.routingHints?.floor;
+  const reviewer = pickReviewer(author, channels, excludeReviewers ?? [], cfg.review.prefer ?? [], reviewerFloor);
   if (!reviewer) {
     // meta.noEligibleReviewer lets run-gates' review-retry keep the ORIGINAL unparseable result when
     // the retry finds no second seat — a truthful cause beats a synthetic no-reviewer failure.
+    const reason = reviewerFloor
+      ? `no cross-vendor reviewer available at or above task-declared ${reviewerFloor} floor (diversity rule)`
+      : "no cross-vendor reviewer available (diversity rule)";
     return cfg.review.required
-      ? { gate: "review", pass: false, details: "no cross-vendor reviewer available (diversity rule); set review.required:false to waive", meta: { noEligibleReviewer: true } }
-      : { gate: "review", pass: true, details: "WARNING: no cross-vendor reviewer available — review waived by config", meta: { noEligibleReviewer: true } };
+      ? { gate: "review", pass: false, details: `${reason}; set review.required:false to waive`, meta: { noEligibleReviewer: true, ...(reviewerFloor ? { reviewerFloor } : {}) } }
+      : { gate: "review", pass: true, details: `WARNING: ${reason} — review waived by config`, meta: { noEligibleReviewer: true, ...(reviewerFloor ? { reviewerFloor } : {}) } };
   }
   const measuredDiff = await fetchTaskDiff(worktree, baseRef);
   // Keep the reader payload identical to the text charged to the strict cap:
@@ -371,6 +395,8 @@ ${COMPLETION_FAKING_CHECKLIST}
 ## Acceptance criteria
 ${task.acceptance.map((a) => `- ${renderAcceptanceItem(a)}`).join("\n")}
 
+${renderDeclaredWriteScope(task.files)}
+
 ## Diff
 \`\`\`diff
 ${diff}
@@ -388,12 +414,20 @@ Respond with ONLY this JSON:
 Approve iff no material finding remains; an empty findings list is a clean approval.
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
+  let concludedOnInactivity = false;
   const raw = await runLlm(
     getAdapter(reviewer.adapter, adapters),
     reviewer.model,
     prompt,
     worktree,
-    via ? { driver: via.driver, keep: via.keep, onSlot: via.onSlot, name: via.nameFor("review", reviewer.adapter), label: via.labelFor("review") } : undefined,
+    via ? {
+      driver: via.driver,
+      keep: via.keep,
+      onSlot: via.onSlot,
+      name: via.nameFor("review", reviewer.adapter),
+      label: via.labelFor("review"),
+      onInactivity: () => { concludedOnInactivity = true; },
+    } : undefined,
     // frontier reviewers routinely need >5min on a configured-cap-sized diff, and `claude -p` buffers all
     // output until completion — runLlm's 300s default killed reviews mid-flight, returning empty
     // stdout that read as "unparseable" and escalated to re-implementation of green code
@@ -417,14 +451,22 @@ The top-level comments array is optional. Use it only for actionable line-anchor
         saved = undefined; // persistence is evidence, not a gate input — never fail the gate on it
       }
     }
-    const failure = cause === "malformed-verdict"
+    const failure = concludedOnInactivity
+      ? "review dispatch concluded on the inactivity policy without a structurally valid nonce-bound response; output unparseable"
+      : cause === "malformed-verdict"
       ? "review output unparseable"
       : "review dispatch failed — no structurally valid nonce-bound response; output unparseable";
     return {
       gate: "review",
       pass: false,
       details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; cause: ${cause}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
-      meta: { ...policyMeta, reviewer: channelKey(reviewer), unparseable: true, cause },
+      meta: {
+        ...policyMeta,
+        reviewer: channelKey(reviewer),
+        unparseable: true,
+        cause,
+        ...(concludedOnInactivity ? { classification: "infra", infra: true } : {}),
+      },
     };
   }
   const decided = findings !== null

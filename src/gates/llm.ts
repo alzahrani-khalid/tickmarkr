@@ -117,6 +117,10 @@ export interface LlmVia {
   label?: string; // dedicated role-tab label (SUP-01), e.g. "REVIEW T2"; undefined → tab named after the slot
   keep?: boolean; // true → leave the pane open after reading (visibility.keepPanes)
   onSlot?: (slot: Slot) => void; // lets the daemon register kept slots for run-end cleanup
+  // The inactivity policy is transport provenance, not responder text. Gate callers that need to
+  // classify a no-answer result receive it through this callback, so a reviewer cannot forge the
+  // infrastructure marking by printing a magic string in its own output.
+  onInactivity?: () => void;
 }
 
 export interface GateVia {
@@ -288,6 +292,7 @@ export async function runViaDriver(
         const snapshotQuietFor = now - quietSince;
         if (cpuFlatFor >= harvestCpuFlatWindowMs(cpu.resolutionMs)
           && snapshotQuietFor >= gateInactivityWindowMs) {
+          via.onInactivity?.();
           break;
         }
       }

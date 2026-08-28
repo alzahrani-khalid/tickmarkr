@@ -682,7 +682,17 @@ export async function runGates(
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
-        rv = { ...second, meta: { ...second.meta, reviewRetry: { flaked, retried } } };
+        rv = {
+          ...second,
+          // `details` is lifted onto the journal's gate-result row; meta.reviewRetry is not. Keep the
+          // re-route visible in the result text a reader actually opens, including on a red retry.
+          details: `review re-route: ${flaked} produced no parseable verdict; replaced by ${retried}\n${second.details}`,
+          meta: { ...second.meta, reviewRetry: { flaked, retried } },
+        };
+      } else if (task.routingHints?.floor) {
+        // Preserve the original no-answer cause when no replacement exists, but name the declared
+        // floor that correctly refused a lower-tier fallback.
+        rv = { ...rv, details: `${rv.details}\nreview re-route refused: ${second.details}` };
       }
     }
     return invocations.length ? { ...rv, meta: { ...rv.meta, invocations } } : rv;

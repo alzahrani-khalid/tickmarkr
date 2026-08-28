@@ -7,6 +7,7 @@ import {
   type AcceptanceItem, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, renderAcceptanceItem, SHAPES, TIERS,
   type RunGraph, type Task, validateGraph,
 } from "../graph/schema.js";
+import { criterionReadsOnly } from "./collateral.js";
 import { CompileError, inferShape, sha256 } from "./common.js";
 
 // OBS-170/OBS-184: `context:` is a promise to the worker, and nothing ever checked it could be kept.
@@ -207,28 +208,59 @@ function renderedObservables(text: string): { exact: string[]; denominators: str
 }
 
 function criterionScopeFinding(
-  task: Pick<Task, "id" | "files" | "acceptance">,
+  task: Pick<Task, "id" | "files" | "acceptance"> & Partial<Pick<Task, "context">>,
   text: string,
   criterion: number,
   id: string,
   tests: HeadTest[],
 ): AuthoringLintFinding | undefined {
   if (task.files.length === 0) return undefined; // empty files[] is deliberately unrestricted
-  const inScope = filesGlob(task.files.map((entry) => entry.replace(/^\.\//, ""))); // Q120s shared matcher
+  const strip = (entry: string) => entry.replace(/^\.\//, ""); // Q120s shared matcher below
+  const inFiles = filesGlob(task.files.map(strip));
+  const context = (task.context ?? []).map(strip);
+  const inContext = context.length ? filesGlob(context) : () => false;
+  // THE RULE AT THIS SITE: `files:` clears a named path outright, because it is write authority and
+  // write authority covers reading too. `context:` clears one ONLY for a criterion that reads it and
+  // does not change it — a read declaration is not a second write surface, and unioning it in unconditionally
+  // would promote read authority to write authority for exactly the criterion that asks for the
+  // change. The question is asked per PATH — each occurrence of each declared path must carry its own
+  // affirmative read relation. A write elsewhere in the criterion therefore cannot revoke a named
+  // dependency's read exemption, and a read elsewhere cannot confer one on a path being changed. It
+  // is the same target-specific question the symbol-ownership rule asks (collateral.ts), and it fails
+  // closed: any phrasing that does not prove the criterion reads the path is refused, as it was before
+  // this check consulted the declaration at all. Keyed on NAMES: only a path literally written in files[]
+  // or context[] is matched, so a dependency the author described conceptually and never wrote out
+  // stays invisible to this check. That closes the false-positive direction only — a path in neither
+  // declaration is refused exactly as before.
+  const declared = (path: string) => inFiles(path) || (inContext(path) && criterionReadsOnly(text, path));
   const named = namedCriterionPaths(text, tests);
   const { exact, denominators } = renderedObservables(text);
   const asserting = tests.filter((test) =>
     exact.some((token) => test.text.includes(token))
       || denominators.some((denominator) => new RegExp(`(?:^|\\D)\\d+/${denominator}(?:\\D|$)`).test(test.text)),
   ).map((test) => test.path);
-  const missing = [...new Set([...named, ...asserting])].filter((path) => !inScope(path));
+  const missing = [...new Set([...named, ...asserting])].filter((path) => !declared(path));
   if (missing.length === 0) return undefined;
+  // The remedy names the authority the criterion actually needs. A criterion that only READS the
+  // producer is repaired by context[]; instructing its author to widen files[] is the product
+  // emitting the unsafe workaround itself. Only a criterion that requires CHANGING the producer is
+  // told to widen the write surface.
+  const readMissing = missing.filter((path) => criterionReadsOnly(text, path));
+  const writeMissing = missing.filter((path) => !criterionReadsOnly(text, path));
+  const remedy = [
+    readMissing.length === 0 ? "" : `the criterion only reads ${readMissing.length === 1 ? "it" : "them"} `
+      + `(${readMissing.join(", ")}), so add ${readMissing.length === 1 ? "it" : "them"} to context[] — `
+      + `files[] would grant write authority this criterion never asks for`,
+    writeMissing.length === 0 ? "" : `the criterion requires changing ${writeMissing.length === 1 ? "it" : "them"} `
+      + `(or does not establish a read-only relation) (${writeMissing.join(", ")}), so add `
+      + `${writeMissing.length === 1 ? "it" : "them"} to files[]`,
+  ].filter(Boolean).join("; ");
   return {
     code: "criterion-scope",
     fixtureId: id,
     taskId: task.id,
     criterion,
-    detail: `criterion names asserting file${missing.length === 1 ? "" : "s"} outside expanded files[]: ${missing.join(", ")}`,
+    detail: `criterion names asserting file${missing.length === 1 ? "" : "s"} outside expanded files[] and context[]: ${missing.join(", ")} — ${remedy}`,
   };
 }
 

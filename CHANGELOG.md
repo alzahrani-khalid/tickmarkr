@@ -4,6 +4,33 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.5** — review-channel parity: the reviewer is shown what the task declared, a reviewer that
+says nothing costs nothing, and every suite verdict carries the capacity it was measured under. Seven
+tasks, one gated run, cross-vendor throughout; two reached the review cap on real findings and merged
+on upheld attempts.
+
+- **The reviewer is shown the scope the task declared.** The review prompt was built without it, so a
+  reviewer graded a diff against a boundary it could not see.
+- **A review that passes does not drop what it deferred.** A pass carried its material findings and
+  discarded its deferrals, which is where "documented limitation" quietly became "closed".
+- **A silent reviewer costs no attempt, is named, and cannot grade below the task's floor.** A reviewer
+  that returned nothing had been charged to the worker as a failed attempt.
+- **The scope lints read the read dependencies a task declared**, so a task that only reads a file is
+  no longer told to declare write authority over it.
+- **A baseline captured while the machine was starved forgives nothing.** A baseline taken under load
+  recorded pre-existing failures that were not pre-existing, and forgave real ones thereafter.
+- **A bare run of the suite gets the fork budget every lane already pins**, so an unpinned invocation
+  no longer competes with itself for cores.
+- **A gate verdict carries the capacity it was measured under, and no reuse crosses a changed one.**
+  Two greens from different fork caps were indistinguishable in the evidence, and a cached verdict
+  could be reused across a capacity change.
+
+Alongside the run, the supervision skill's own instruments: the mutual-clear protocol gains a return
+leg — a returning seat announces itself with its watcher inventory, and a clear order carries an
+expected-return deadline, because until now a cleared seat and a dead one produced the same silence.
+Its context watcher no longer refuses auxiliary seats, and alarms when it goes blind instead of ageing
+quietly.
+
 **v2.1.4** — the suite tells the truth, the release proves it before the tag, and nothing destroys work
 it is holding. Eight tasks across two gated runs, cross-vendor throughout; three of them reached the
 review cap on real findings and merged on upheld attempts.

@@ -190,14 +190,95 @@ export function collateralLints(tasks: ReadonlyArray<Pick<Task, "id" | "files">>
 // v1.53 T4 (OBS-76): needles are code-shaped tokens only (camelCase / snake_case) — plain prose
 // words never match, so prose-only criteria yield zero needles instead of alarm-fatigue noise.
 // ponytail: token heuristic, not AST symbol resolution — promote after a version of precision data.
-function criteriaSymbols(acceptance: Task["acceptance"]): string[] {
-  const out = new Set<string>();
+function criteriaSymbolTexts(acceptance: Task["acceptance"]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
   for (const item of acceptance) {
-    for (const tok of renderAcceptanceItem(item).match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) ?? []) {
-      if (tok.includes("_") || /[a-z][A-Z]/.test(tok)) out.add(tok);
+    const text = renderAcceptanceItem(item);
+    for (const tok of text.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) ?? []) {
+      if (!tok.includes("_") && !/[a-z][A-Z]/.test(tok)) continue;
+      const texts = out.get(tok) ?? [];
+      if (!texts.includes(text)) texts.push(text);
+      out.set(tok, texts);
     }
   }
-  return [...out].sort();
+  return out;
+}
+
+function criteriaSymbols(acceptance: Task["acceptance"]): string[] {
+  return [...criteriaSymbolTexts(acceptance).keys()].sort();
+}
+
+// These are affirmative READ relations, not a list of things that are not writes. The distinction
+// is the fail-closed boundary: an unknown predicate never earns context[] authority. A target is
+// readable when it is the object of an explicit observation (`reading ownedTable`) or the subject
+// of an explicitly pre-existing state (`ownedTable already publishes`). An unqualified declarative
+// predicate (`ownedTable returns two rows`) is deliberately absent because it can demand a change.
+const DIRECT_READ_BEFORE = /\b(?:consult|consults|consulting|inspect|inspects|inspecting|read|reads|reading|reference|references|referencing)\s+(?:(?:the|an?)\s+)?(?:(?:current|existing|unchanged)\s+)?$/i;
+const PREEXISTING_STATE_AFTER = /^\s*(?:(?:and|or)\s+\S+\s+)*(?:(?:,\s*)?which\s+)?(?:already|currently)\s+(?:carries|carry|contains?|declares?|defines?|exposes?|holds?|owns?|provides?|publish|publishes|returns?|supplies|supply|yields?)\b/i;
+const PASSIVE_READ_AFTER = /^\s+(?:is|remains)\s+(?:read|referenced|unchanged|untouched|as[- ]is)\b/i;
+// Once a target-local read has been established, a same-clause continuation can revoke it. These
+// vetoes are structural rather than an attempted exhaustive list of write verbs: an action followed
+// by `it` / `them` / `the same ...` is target-directed but ambiguous, and a coordinated passive
+// participle inherits the target as its subject. Both therefore fail closed. The scan stops at an
+// actual sentence/clause boundary; a dot inside a later path is not one.
+const TARGET_ANAPHOR_AFTER_COORDINATOR = /\b(?:and|or|then|before|after|while)\b[^,;.!?\n]{0,80}\b(?:it|them|those|the\s+same(?:\s+[A-Za-z][A-Za-z0-9_-]*)?)\b/i;
+const TARGET_PASSIVE_AFTER_SUBJECT_READ = /\b(?:and|or|then|before|after)\s+(?:then\s+)?(?:(?:is|gets?|becomes?|being)\s+)?[A-Za-z]+(?:ed|en)\b/i;
+
+function sameClauseAfterTarget(after: string): string {
+  const boundary = after.search(/[;!?\n]|\.(?=\s|$)/);
+  return boundary === -1 ? after : after.slice(0, boundary);
+}
+
+function targetOccurrences(text: string, target: string): number[] {
+  if (!target) return [];
+  const out: number[] = [];
+  const wordAtStart = /[A-Za-z0-9_]/.test(target[0]!);
+  const wordAtEnd = /[A-Za-z0-9_]/.test(target[target.length - 1]!);
+  for (let at = text.indexOf(target); at !== -1; at = text.indexOf(target, at + target.length)) {
+    const before = text[at - 1];
+    const after = text[at + target.length];
+    if (wordAtStart && before !== undefined && /[A-Za-z0-9_]/.test(before)) continue;
+    if (wordAtEnd && after !== undefined && /[A-Za-z0-9_]/.test(after)) continue;
+    out.push(at);
+  }
+  return out;
+}
+
+/**
+ * Does every mention of `target` have an explicit, target-local READ relation?
+ *
+ * A `context:` entry grants READ authority and nothing else, so both blocking paths have to ask this
+ * before honouring one. Fail-closed by construction: every occurrence must match one of the narrow
+ * read forms below. Absence from a write-verb list is never evidence. Thus `ownedTable returns two`
+ * and the unlisted `ownedTable sorts the rows it already publishes` are refused, while an unrelated
+ * write in `the consumer adds a cache while reading ownedTable` does not revoke ownedTable's read
+ * authority. A target mentioned twice, once for reading and once ambiguously, is refused.
+ *
+ * This is intentionally a lexical representation rather than prose understanding. Keyed on NAMES:
+ * only the literal target is classified, so a dependency described conceptually stays invisible and
+ * an unfamiliar read phrasing stays refused. That closes the false-positive direction only; widen
+ * the affirmative grammar only with a control that goes red first.
+ */
+export function criterionReadsOnly(text: string, target: string): boolean {
+  const occurrences = targetOccurrences(text, target);
+  return occurrences.length > 0 && occurrences.every((at) => {
+    // Backticks quote the target, not the relation, so discard only the adjacent delimiters.
+    const before = text.slice(Math.max(0, at - 96), at).replace(/`$/, "");
+    const after = text.slice(at + target.length).replace(/^`/, "");
+    const preexisting = PREEXISTING_STATE_AFTER.exec(after);
+    const passive = PASSIVE_READ_AFTER.exec(after);
+    if (!DIRECT_READ_BEFORE.test(before) && !preexisting && !passive) return false;
+
+    const clause = sameClauseAfterTarget(after);
+    if (TARGET_ANAPHOR_AFTER_COORDINATOR.test(clause)) return false;
+
+    // A subject-position read (`target is read` / `target already publishes`) leaves the target as
+    // the inherited subject of a coordinated passive: `... and then rewritten by the consumer` is
+    // a change demand, not a read. Object-position reads need the anaphor veto above instead.
+    const subjectRead = preexisting ?? passive;
+    return !subjectRead
+      || !TARGET_PASSIVE_AFTER_SUBJECT_READ.test(clause.slice(subjectRead[0].length));
+  });
 }
 
 const ARCH_PAGES = ["docs/codebase/ARCHITECTURE.md", "docs/codebase/STRUCTURE.md"];
@@ -574,12 +655,12 @@ function walkAllCode(repoRoot: string): { files: string[]; unreadable: string[] 
  * rather than trust a partial scan.
  */
 export function symbolOwnershipErrors(
-  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "acceptance">>,
+  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "acceptance"> & Partial<Pick<Task, "context">>>,
   repoRoot: string,
 ): string[] {
   const perTask = tasks
-    .map((t) => ({ t, symbols: criteriaSymbols(t.acceptance ?? []) }))
-    .filter((x) => x.symbols.length);
+    .map((t) => ({ t, bySymbol: criteriaSymbolTexts(t.acceptance ?? []) }))
+    .filter((x) => x.bySymbol.size);
   if (!perTask.length) return [];
   const { files: codeFiles, unreadable } = walkAllCode(repoRoot);
 
@@ -591,7 +672,7 @@ export function symbolOwnershipErrors(
   for (const u of unreadable) errors.push(incomplete(u));
 
   // resolve each symbol to its definition site(s) once, shared across tasks
-  const allSymbols = [...new Set(perTask.flatMap((x) => x.symbols))];
+  const allSymbols = [...new Set(perTask.flatMap((x) => [...x.bySymbol.keys()]))];
   const res = new Map(allSymbols.map((s) => [s, definitionRe(s)]));
   const sites = new Map<string, string[]>(allSymbols.map((s) => [s, []]));
   for (const cf of codeFiles) {
@@ -607,14 +688,47 @@ export function symbolOwnershipErrors(
     }
   }
 
-  for (const { t, symbols } of perTask) {
+  for (const { t, bySymbol } of perTask) {
     // OBS-22: scopeGate accepts picomatch globs; ownership must agree.
     const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
-    for (const sym of symbols) {
+    // THE RULE AT THIS SITE: a `context:`
+    // entry declares a path the worker may READ, so it answers "can the worker satisfy a criterion
+    // that only reads this symbol" (yes) and never "may the worker change it" (no — that authority
+    // comes from files[] alone). Hence the exemption is conditional on the criteria that actually
+    // name the symbol, and it is asked of the SYMBOL, not of the sentence: `criterionReadsOnly` fails
+    // closed, so a criterion demanding the symbol CHANGE — and any phrasing that does not prove it
+    // reads the symbol — is still refused, and still told to widen files[] where the change is what
+    // it asks for. An unrelated in-scope write does not change that per-symbol answer. Keyed on NAMES:
+    // only a path literally written in context[] is seen here, so a
+    // read dependency an author described in prose remains invisible to this lint. That closes the
+    // false-positive direction only — nothing here narrows what the rule refuses.
+    const declaredContext = (t.context ?? []).map((f) => f.replace(/^\.\//, ""));
+    const readable = declaredContext.length ? filesGlob(declaredContext) : () => false;
+    for (const [sym, texts] of bySymbol) {
       const defs = sites.get(sym) ?? [];
       if (defs.length !== 1) continue; // unknown or ambiguous — silent by ruling
       const site = defs[0]!;
       if (scoped(site)) continue; // defined inside the task's own write surface
+      const writes = !texts.every((text) => criterionReadsOnly(text, sym));
+      if (readable(site) && !writes) continue; // read authority is declared and read authority is all it needs
+      if (readable(site)) {
+        errors.push(
+          `${t.id}: criterion identifier "${sym}" is defined only in ${site}, which is declared in `
+          + `context[] but not in files[] — a context: entry grants READ authority only, and this `
+          + `criterion requires changing "${sym}"; add ${site} to files[] or reword the criterion to `
+          + `require only reading it (OBS-248).`,
+        );
+        continue;
+      }
+      if (!writes) {
+        errors.push(
+          `${t.id}: criterion identifier "${sym}" is defined only in ${site}, which is in neither `
+          + `files[] nor context[] — the criterion only reads "${sym}", so declare ${site} in `
+          + `context[]; widening files[] would grant write authority this criterion never asks for `
+          + `(OBS-248).`,
+        );
+        continue;
+      }
       errors.push(
         `${t.id}: criterion identifier "${sym}" is defined only in ${site}, which is not in files[] — `
         + `add ${site} to files[] or reword the criterion; a worker scoped to files[] cannot satisfy a `
@@ -704,6 +818,11 @@ function activeReviewParticipation(repoRoot: string): ReviewParticipation {
  * symbol-ownership lint and the participation config, and defaults to the invocation directory —
  * correct for the CLI/daemon, which compile from inside the target repo.
  *
+ * The read declaration (`context:`) rides on this parameter, on the task objects themselves — the
+ * aggregator never infers it from the repo, the config, or a sibling task. It is OPTIONAL: a caller
+ * whose task objects carry no `context` gets byte-identical verdicts to the ones it got before the
+ * field existed, because an absent declaration grants no authority at all.
+ *
  * KNOWN GAP (R2 review, T6/T7 scope): the compile seam in src/compile/index.ts
  * (`enforceTaskUnitContract`) does not thread `compileSource`'s `root` argument into this call, so a
  * PROGRAMMATIC compile whose target repo differs from process.cwd() resolves the wrong root and can
@@ -715,7 +834,9 @@ function activeReviewParticipation(repoRoot: string): ReviewParticipation {
  * than an unreviewed one. The compile lint is the early warning; the gate is the fail-closed backstop.
  */
 export function taskUnitContractErrors(
-  tasks: ReadonlyArray<Pick<Task, "id" | "goal" | "files" | "deps" | "acceptance" | "shape">>,
+  tasks: ReadonlyArray<
+    Pick<Task, "id" | "goal" | "files" | "deps" | "acceptance" | "shape"> & Partial<Pick<Task, "context">>
+  >,
   repoRoot: string = process.cwd(),
   review: ReviewParticipation = activeReviewParticipation(repoRoot),
 ): string[] {

@@ -23,9 +23,9 @@ import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHa
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
-import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, runWithForkBudget, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, type RunCapacity, sameCapacity, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingReviewFindings, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode } from "./journal.js";
+import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingReviewFindings, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, renderStructuredReviewFinding, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
@@ -327,6 +327,11 @@ function repairBrief(findings: string, diff: string, baseRef: string): string {
 // no-ceiling behavior; an operator may narrow only the next engagement on the approval that releases it.
 const REVIEW_ROUND_CAP = 2;
 
+// T2: one heading per fact. The first is owed a passing review; the second already drew one and was
+// accepted with the reviewer's own rationale, which travels beside (but never changes) its identity.
+const OUTSTANDING_FINDINGS_HEADING = "## Outstanding review findings — a review has NOT passed on these yet";
+const DEFERRED_FINDINGS_HEADING = "## Deferred review findings — a reviewer ACCEPTED these with a rationale and did NOT block on them; do not re-litigate, fix only if your change touches them";
+
 // OBS-419: the newest approval starts the current engagement, so it is also the sole authority for
 // that engagement's optional ceiling. Stop at the newest approval even when the field is absent: a
 // later ordinary release restores the module default instead of inheriting an older operator limit.
@@ -465,6 +470,23 @@ export function commandsHash(commands: Record<string, string>): string {
 }
 
 /**
+ * T7: a cycle also carries EVERY capacity its own rows recorded — the start row's and each verdict
+ * row's, one entry per row, never a single value the start row speaks for. A start row states the
+ * world the cycle INTENDED to run in; the row that carries a green is the one that measured it, and
+ * a cycle whose rows disagree (or whose verdict row is malformed) is not a cycle whose green anyone
+ * can carry forward. A pre-T7 cycle contributes `undefined`s, which is why an older journal keeps
+ * carrying its green forward exactly as it does today.
+ */
+interface VerifyCycle {
+  tip: string;
+  cmdHash: string;
+  gates: Set<string>;
+  failed: boolean;
+  forgiven: boolean;
+  capacities: unknown[];
+}
+
+/**
  * T4 (OBS-266): the journal's LAST verification cycle — the (tip, cmdHash) pair the most recent run
  * of the verify commands spoke for, the gates it got a pass from, and whether anything failed in it.
  *
@@ -475,8 +497,8 @@ export function commandsHash(commands: Record<string, string>): string {
  * so a cycle cut short by a killed process is missing gates and can never satisfy the caller. A
  * legacy event (no tip/cmdHash) is unattributable and breaks the chain outright.
  */
-function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string; gates: Set<string>; failed: boolean; forgiven: boolean } | undefined {
-  let cur: { tip: string; cmdHash: string; gates: Set<string>; failed: boolean; forgiven: boolean } | undefined;
+function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
+  let cur: VerifyCycle | undefined;
   let afterRunEnd = false;
   for (const e of events) {
     // New journals delimit every attempt explicitly. run-end is the legacy delimiter: it starts a
@@ -485,7 +507,7 @@ function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string
     if (e.event === "tip-verify-start") {
       const { tip, cmdHash } = e.data;
       cur = typeof tip === "string" && typeof cmdHash === "string"
-        ? { tip, cmdHash, gates: new Set(), failed: false, forgiven: false }
+        ? { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [e.data.capacity] }
         : undefined;
       afterRunEnd = false;
       continue;
@@ -502,9 +524,14 @@ function lastVerifyCycle(events: JournalEvent[]): { tip: string; cmdHash: string
       continue;
     }
     if (!cur || afterRunEnd || cur.tip !== tip || cur.cmdHash !== cmdHash) {
-      cur = { tip, cmdHash, gates: new Set(), failed: false, forgiven: false };
+      cur = { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [] };
     }
     afterRunEnd = false;
+    // T7: EVERY verdict row's own capacity, not just the start row's. The start row is a statement of
+    // intent written before a single command ran; the green this cache would carry forward lives on
+    // these rows, so a row whose capacity differs from the session's — or which is malformed — has to
+    // be able to sink the cycle by itself.
+    cur.capacities.push(e.data.capacity);
     if (e.event === "tip-verify-failed") cur.failed = true;
     else {
       cur.gates.add(gate);
@@ -536,23 +563,31 @@ export async function verifyIntegrationTipCached(
 ): Promise<boolean> {
   const cmdHash = commandsHash(commands);
   const tip = await gitHead(intWt);
+  // T7: the capacity this session's verify children WOULD run under — the third thing a carried
+  // green must match, beside the tip and the command set. A cached verdict is the one place a green
+  // crosses a session boundary with nothing re-run, and a session resumed at a different concurrency
+  // divides the machine by a different number: that green was established in another world, so it is
+  // not carried forward and the commands run again. A pre-T7 cycle records no capacity and keeps
+  // exactly the behaviour it has today.
+  const capacity = resolvedCapacity();
   const porcelain = await shGit("git status --porcelain", intWt);
   const clean = porcelain.code === 0 && porcelain.stdout.trim() === "";
   const last = lastVerifyCycle(journal.read());
   const cached = last !== undefined && !last.failed && !last.forgiven && last.tip === tip && last.cmdHash === cmdHash
-    && Object.keys(commands).every((g) => last.gates.has(g));
+    && Object.keys(commands).every((g) => last.gates.has(g))
+    && last.capacities.every((recorded) => sameCapacity(recorded, capacity));
   // A pair can be verified red and then green without either SHA or command hash changing (for
   // example, an external service or ignored fixture recovers). Delimit attempts explicitly so that
   // the earlier red cannot remain latched into the later complete green cycle.
-  journal.append("tip-verify-start", undefined, { tip, cmdHash, gates: Object.keys(commands), cached: clean && cached });
+  journal.append("tip-verify-start", undefined, { tip, cmdHash, capacity, gates: Object.keys(commands), cached: clean && cached });
   if (clean && cached) {
-    journal.append("tip-verify-cached", undefined, { tip, cmdHash, gates: Object.keys(commands) });
+    journal.append("tip-verify-cached", undefined, { tip, cmdHash, capacity, gates: Object.keys(commands) });
     // The skip must not read as a red. Every surface derives the tip's verdict from this cycle's
     // `tip-verify` events (cockpit derive.ts tipVerificationPassed: a run-end claiming "passed" with
     // ZERO events is fail-closed to FALSE), so a carried-forward green still journals its per-gate
     // pass — `cached: true` keeps it honest about not having re-run the command.
     for (const gate of Object.keys(commands)) {
-      journal.append("tip-verify", undefined, { gate, cmd: commands[gate], pass: true, exitCode: 0, cached: true, tip, cmdHash });
+      journal.append("tip-verify", undefined, { gate, cmd: commands[gate], pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity });
     }
     return false;
   }
@@ -560,7 +595,7 @@ export async function verifyIntegrationTipCached(
   for (const r of await verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline)) {
     if (r.pass) {
       // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
-      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash });
+      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash, capacity });
     } else {
       journal.append("tip-verify-failed", undefined, {
         gate: r.gate,
@@ -571,6 +606,7 @@ export async function verifyIntegrationTipCached(
         lastMergedTask: opts.lastMergedTask,
         tip,
         cmdHash,
+        capacity,
       });
       tipFailed = true;
     }
@@ -990,6 +1026,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const replayedGateResults = resumeLifecycleOpen
     ? journal.replayCurrentAttemptGateResults()
     : new Map<string, CurrentAttemptGateReplay>();
+  // T7: the capacity THIS session resolved — read inside the run's fork budget, so it is the number
+  // every shell this run spawns will divide the machine by. Recorded evidence from another session
+  // is only reusable against this.
+  const sessionCapacity: RunCapacity = resolvedCapacity();
   const replayedExclusions = opts.resume ? journal.replayExcludedChannels() : new Set<string>();
   if (opts.resume) {
     // v1.53 T5: a superseded run is dead — resuming it beside its successor is the exact
@@ -1309,6 +1349,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     let gateSubject: { commit: string; attempt: number; replayMeasurement?: true } | undefined;
     const journalGateResult = (g: GateResult) => {
       const blocking = gateFailed(g) && (g.gate === "review" || g.gate === "acceptance");
+      // T2: a review that PASSED while DEFERRING a concern still recorded a defect — the prompt
+      // promises the deferral is recorded and never dropped, and a details string is not a record a
+      // later round can match. The blocking projection above is the only writer of structured
+      // findings today, so on this row it writes nothing and every structured reader goes blind.
+      // Same shape, same identity, on the passing row: the verdict is untouched (`pass` stays true),
+      // only the projection widens to the rows the reviewer itself classified as deferred.
+      const deferred = !blocking && g.gate === "review" && g.pass === true
+        ? deferredReviewFindings(g.details)
+        : [];
       // R3 (OBS-186): a gate that DECLINED has no verdict to state, and this row is the ONE seam every
       // fold outside this file shares. Writing `pass: false` for a decline is what turned a skip into
       // a failure at all of them at once — the engagement round budget (reviewRoundsSinceApproval,
@@ -1353,6 +1402,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         ...(blocking ? {
           taskContentDigest: contentDigest,
           findings: structuredFindings(g.gate, g.details),
+        } : deferred.length > 0 ? {
+          taskContentDigest: contentDigest,
+          findings: deferred,
         } : {}),
         // v2.0 T2 (OBS-554): the gate's OWN measurement, lifted verbatim from the meta run-gates
         // stamped WHERE THE GATE RAN. Nothing here re-derives a duration by subtracting journal
@@ -1363,6 +1415,27 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // every recalibration this telemetry funds, a gap is honest and a zero is a lie. The
         // seven-gate closed set is asserted end-to-end in tests/run/gate-telemetry.test.ts.
         ...gateMeasurement(g.meta),
+        // T7: the capacity the gate's own command child ran under, lifted verbatim from the result
+        // the battery produced — read where the shell built that child's environment, never
+        // re-derived from the run's own budget, which would answer a different number than the
+        // operator's export did. It is this row's only COMPARABLE identity: the two load samples
+        // beside it are endpoint reads of a gate whose interior neither of them saw, so no reader
+        // compares them, and matching capacity never claims the machine was calm. A gate that ran
+        // no command carries nothing — it divided nothing.
+        //
+        // `dirtiedBy` is the one hole in that lift: run-gates REPLACES a green battery verdict with
+        // a refusal when the command left the worktree dirty (run-gates.ts, three sites: the legacy
+        // batch, the per-command loop and the merge-candidate full suite), and the refusal is a
+        // fresh verdict object carrying nothing off the result it replaced. That command's child DID
+        // run, so its row still owes the world it ran in. `sessionCapacity` is that world and not a
+        // re-derivation of it: it applies the same precedence `shell` does — an operator export
+        // first — and was read inside the same fork budget every gate child of this run is spawned
+        // under, so it is by construction the number that child received. The flag is set only where
+        // a command of THIS gate ran and dirtied the tree, so the round-entry refusal (no command
+        // ran) and the round-end withdrawal (lands on a gate that runs no command) still carry
+        // nothing.
+        ...(g.capacity ? { capacity: g.capacity }
+          : g.meta?.dirtiedBy === g.gate ? { capacity: sessionCapacity } : {}),
       });
     };
     // R3 (OBS-186): judge ‖ review are launched together and publish in COMPLETION order
@@ -1644,7 +1717,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const canonicalCurrentCommit = currentTaskSubject === replayedGates!.commit;
         const recreatedLegacyCommit = priorTaskTip === replayedGates!.commit
           && priorTaskSubject === currentTaskSubject;
-        let reusable = exactCurrentCommit || canonicalCurrentCommit || recreatedLegacyCommit;
+        // T7: the commit says the gates would inspect the same TREE; it says nothing about the
+        // machine they measured it on. A resume is a new session and may have resolved a different
+        // concurrency, so the rows behind a replayed green must also have been measured under the
+        // capacity this session resolved — otherwise a contiguous green prefix spans two worlds.
+        // Rows from before this stamp carry no capacity and replay exactly as they do today.
+        const replayedCapacities = priorEvents
+          .filter((e) => e.event === "gate-result" && e.taskId === t.id && e.data.commit === replayedGates!.commit)
+          .map((e) => e.data.capacity);
+        const sameWorld = replayedCapacities.every((recorded) => sameCapacity(recorded, sessionCapacity));
+        if (!sameWorld) {
+          journal.append("gate-replay-capacity-changed", t.id, {
+            commit: replayedGates!.commit, recorded: replayedCapacities, resolved: sessionCapacity,
+          });
+        }
+        let reusable = sameWorld && (exactCurrentCommit || canonicalCurrentCommit || recreatedLegacyCommit);
         const reused: GateName[] = [];
         const declaredGates = GATE_NAMES.filter((gate) => t.gates.includes(gate));
         for (const gate of declaredGates) {
@@ -1860,10 +1947,38 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // task (journal.ts `outstandingReviewFindings`). Appended row-wise, because this round's own
       // feedback or a repair brief may already quote a finding and repeating it helps no worker.
       const outstandingFindings = outstandingReviewFindings(journaledSoFar, t.id);
-      const unquoted = outstandingFindings.filter((f) => !feedback.includes(f.note));
-      if (unquoted.length > 0) {
-        const brief = ["## Outstanding review findings — a review has NOT passed on these yet",
-          ...unquoted.map((f) => `- ${f.path}: ${f.note}`)].join("\n");
+      // T2: the two are different facts about the work and no one heading is true of both. A finding
+      // the reviewer DEFERRED was accepted with a rationale by a review that did not block on it; a
+      // blocking one is still waiting for a review to pass. Filing the deferral under the blocking
+      // heading tells the next worker a passing review is owed on a concern that already drew one —
+      // the exact falsehood this carry exists to remove, restated in the brief that carries it.
+      //
+      // The de-dup below is BLOCKING-ONLY on purpose. A review round's raw bytes quote every finding
+      // it recorded, deferrals included, and those bytes ride into the very next dispatch under the
+      // repair brief's "fix ONLY what these findings name" — so on the ordinary immediate retry the
+      // deferral is already stated, and stated AS BLOCKING. Suppressing its heading there because it
+      // is "already quoted" leaves exactly the falsehood. A quoted BLOCKING finding is quoted
+      // truthfully, so that one still de-dups; a deferral is instead CUT from the raw bytes and
+      // restated once, under the only heading true of it.
+      const deferredRows = outstandingFindings.filter(isDeferredFinding);
+      const withoutDeferrals = (text: string) => deferredRows.reduce(
+        (brief, finding) => brief.replaceAll(renderStructuredReviewFinding(finding), ""),
+        text,
+      ).replace(/\n{3,}/g, "\n\n").trim();
+      feedback = withoutDeferrals(feedback);
+      if (repairFindings !== undefined) repairFindings = withoutDeferrals(repairFindings);
+      const briefs: Array<[string, StructuredFinding[]]> = [
+        [OUTSTANDING_FINDINGS_HEADING, outstandingFindings.filter((f) => !isDeferredFinding(f) && !feedback.includes(f.note))],
+        [DEFERRED_FINDINGS_HEADING, deferredRows],
+      ];
+      for (const [heading, rows] of briefs) {
+        if (rows.length === 0) continue;
+        const brief = [heading, ...rows.map((f) => {
+          const rationale = f.rationale === undefined
+            ? ""
+            : `\n  Rationale: ${f.rationale}`;
+          return `- ${f.path}: ${f.note}${rationale}`;
+        })].join("\n");
         feedback = feedback ? `${feedback}\n\n${brief}` : brief;
       }
       retryMode = repairFindings

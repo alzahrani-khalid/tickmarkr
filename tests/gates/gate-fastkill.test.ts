@@ -162,6 +162,56 @@ afterEach(() => {
 });
 
 describe("v2.0 calibrated gate inactivity policy", () => {
+  test("test: a review whose wait concludes on the inactivity policy instead of on a completion trailer returns a result carrying the infrastructure marking the park predicate reads, so a gate that got no answer is not charged to the worker; the same silence returning an unparseable verdict with no marking is charged and: it fails", async () => {
+    setGateInactivityWindowMsForTests(20);
+    setHarvestCpuFlatMsForTests(0);
+    useCpuModes("flat");
+    const driver = new ProbeDriver([{ trailerAfterMs: Number.POSITIVE_INFINITY, verdict: reviewVerdict }]);
+    const script = fakeScript();
+    const worker = new NamedFake(script, "fake", "fake-a");
+    const silent = new NamedFake(script, "fake-b", "fake-b");
+    const channels: BillingChannel[] = [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
+      { adapter: "fake-b", vendor: "fake-b", model: "fake-b-1", channel: "sub", tier: "frontier" },
+    ];
+    const { repo, base } = repoWithCommit();
+    const task = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "h" },
+      tasks: [{
+        id: "T1", title: "silent review", goal: "gate it", shape: "implement", complexity: 8,
+        files: ["a.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"],
+        acceptance: [{ oracle: "command", command: "true" }],
+      }],
+    }).tasks[0]!;
+    const baseCtx = {
+      worktree: repo,
+      baseRef: base,
+      result: { ok: true, summary: "done", deviations: [], raw: "" },
+      author,
+      commands: {},
+      baseline: await captureBaseline(repo, {}),
+      channels,
+      adapters: [worker, silent],
+      cfg: structuredClone(DEFAULT_CONFIG),
+    };
+
+    const timed = await runGates(task, { ...baseCtx, via: gateVia(driver) });
+    const timedReview = timed.results.find((result) => result.gate === "review");
+    expect(driver.slots).toHaveLength(1);
+    expect(timedReview).toMatchObject({
+      pass: false,
+      meta: { unparseable: true, classification: "infra", infra: true },
+    });
+
+    // The same responder bytes without an inactivity-policy conclusion are an ordinary
+    // unparseable verdict: still red, but not infrastructure and therefore chargeable.
+    const ordinary = await runGates(task, { ...baseCtx, adapters: [worker, new NamedFake(fakeScript(), "fake-b", "fake-b")] });
+    const ordinaryReview = ordinary.results.find((result) => result.gate === "review");
+    expect(ordinaryReview).toMatchObject({ pass: false, meta: { unparseable: true } });
+    expect(ordinaryReview?.meta?.infra).toBeUndefined();
+  });
+
   test("test: a runViaDriver gate wait with a frozen snapshot and a cpu-flat dispatched tree and no trailer concludes at the inactivity window not the full timeout", async () => {
     setGateInactivityWindowMsForTests(24);
     setHarvestCpuFlatMsForTests(0);

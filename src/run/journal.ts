@@ -147,11 +147,14 @@ export function upheldFeedbackByTask(events: JournalEvent[]): Map<string, string
 // v1.85 T3 (ruling R4 identity): one blocking finding, identified by CLASS + canonical PATH + stable
 // SYMBOL. Line numbers are evidence, never identity — the same defect one line lower is the same
 // finding. `note` keeps the reviewer's/judge's own bytes so the structure is additive, never lossy.
+// A deferred review's rationale is verdict context, not identity: keeping it in its own field lets a
+// reviewer revise the explanation without minting a second outstanding concern.
 export interface StructuredFinding {
   class: string;
   path: string;
   symbol: string;
   note: string;
+  rationale?: string;
   fingerprint: string;
 }
 
@@ -160,10 +163,11 @@ export interface StructuredFinding {
 export const UNIDENTIFIED = "<unidentified>";
 
 const ANCHORED_RE = /^- (\S+?):(\d+) — (.*)$/;        // "## Anchored review" rows (llm.ts)
-const REVIEW_ROW_RE = /^- \[([^\]]+)\] (.*)$/;         // "- [material] …" (review.ts)
+const REVIEW_ROW_START_RE = /^- \[([^\]\r\n]+)\] /gm; // "- [material] …" (review.ts)
 const JUDGE_ROW_RE = /^✗ ([\w.-]+): (.*)$/;            // "✗ c1: …" (acceptance.ts) — id, then reason
 const PATH_RE = /\b((?:[\w.@~+-]+\/)+[\w.@~+-]+\.\w{1,6})\b/;
 const LINE_REF_RE = /(:\d+(?::\d+)?\b)|(\bline \d+\b)/gi;
+const REVIEW_RATIONALE_SEPARATOR = " — rationale: ";
 
 // ponytail: repo-relative tail from the first known top-level directory — enough to make an absolute
 // worktree path and its repo-relative twin the same identity. Widen the marker list if a run ever
@@ -191,10 +195,51 @@ function identifierIn(note: string): string {
 // code identity still has one stable identity of its own: its own words, with the volatile tokens
 // swept out so line/path churn cannot mint a new symbol for the same finding. It is the reviewer's
 // own bytes, never a guess, and it can never fuse two different findings into one.
-function toFinding(cls: string, note: string, path: string, symbol: string): StructuredFinding {
+function toFinding(cls: string, note: string, path: string, symbol: string, rationale?: string): StructuredFinding {
   const p = path || UNIDENTIFIED;
   const s = symbol || normalizeGateFailure(note) || UNIDENTIFIED;
-  return { class: cls, path: p, symbol: s, note, fingerprint: `${cls}|${p}|${s}` };
+  return {
+    class: cls, path: p, symbol: s, note,
+    ...(rationale !== undefined ? { rationale } : {}),
+    fingerprint: `${cls}|${p}|${s}`,
+  };
+}
+
+interface ReviewDetailFinding {
+  label: string;
+  note: string;
+  rationale?: string;
+}
+
+/**
+ * Decode review.ts's row rendering without treating physical lines as findings. A review finding's
+ * note and rationale are JSON strings before rendering and may therefore contain newlines; the next
+ * typed row (or the anchored-review block) is the record boundary. The fixed rationale separator is
+ * removed before identity is computed, so changing only why a concern was accepted re-seats it.
+ */
+function reviewDetailFindings(details: string): ReviewDetailFinding[] {
+  const anchoredAt = details.indexOf("\n\n## Anchored review");
+  let prose = anchoredAt === -1 ? details : details.slice(0, anchoredAt);
+  const inconsistencyAt = prose.search(/\nreview (?:finding|verdict) inconsistent:/);
+  if (inconsistencyAt !== -1) prose = prose.slice(0, inconsistencyAt);
+  const starts = [...prose.matchAll(REVIEW_ROW_START_RE)];
+  return starts.map((start, i) => {
+    const contentStart = start.index! + start[0].length;
+    const contentEnd = starts[i + 1]?.index ?? prose.length;
+    let content = prose.slice(contentStart, contentEnd);
+    // The newline before the next typed row is framing, while every earlier newline belongs to the
+    // reviewer's field. At EOF/anchored-review there is no framing newline to remove.
+    if (starts[i + 1] && content.endsWith("\n")) content = content.slice(0, -1);
+    const deferred = String(start[1]).startsWith("deferred/");
+    const separatorAt = deferred ? content.indexOf(REVIEW_RATIONALE_SEPARATOR) : -1;
+    return separatorAt === -1
+      ? { label: start[1]!, note: content }
+      : {
+          label: start[1]!,
+          note: content.slice(0, separatorAt),
+          rationale: content.slice(separatorAt + REVIEW_RATIONALE_SEPARATOR.length),
+        };
+  });
 }
 
 /**
@@ -212,18 +257,19 @@ function toFinding(cls: string, note: string, path: string, symbol: string): Str
 export function structuredFindings(gate: string, details: string, _scopeFiles: string[] = []): StructuredFinding[] {
   const lines = details.split("\n");
   const rows: StructuredFinding[] = [];
-  const push = (cls: string, note: string, ownPath: string, fallbackSymbol = "") => {
+  const push = (cls: string, note: string, ownPath: string, fallbackSymbol = "", rationale?: string) => {
     const own = canonicalPath(ownPath || PATH_RE.exec(note)?.[1] || "");
     const sym = identifierIn(note) || fallbackSymbol;
-    rows.push(toFinding(cls, note, own, sym));
+    rows.push(toFinding(cls, note, own, sym, rationale));
   };
+  if (gate === "review") {
+    for (const finding of reviewDetailFindings(details)) {
+      push(`review:${finding.label}`, finding.note, "", "", finding.rationale);
+    }
+  }
   for (const line of lines) {
     const a = ANCHORED_RE.exec(line);
     if (a) { push(`${gate}:anchored`, a[3]!, a[1]!); continue; }
-    if (gate === "review") {
-      const r = REVIEW_ROW_RE.exec(line);
-      if (r) { push(`review:${r[1]!}`, r[2]!, ""); continue; }
-    }
     if (gate === "acceptance") {
       const j = JUDGE_ROW_RE.exec(line);
       // the criterion id IS a stable symbol for an unmet acceptance criterion — the same criterion is
@@ -236,6 +282,33 @@ export function structuredFindings(gate: string, details: string, _scopeFiles: s
     push(`${gate}:unclassified`, head, "");
   }
   return rows;
+}
+
+// v2.1.5 T2: the reviewer's DEFERRAL channel, kept structured. `classifyReviewFindings`
+// (gates/review.ts) renders a deferred finding as `- [deferred/<severity>] <note> — rationale: …`.
+// The parser above preserves multiline fields and separates rationale from identity; an older journal
+// whose row holds only prose still degrades through the same parse rather than to nothing. A deferred
+// finding is a concern the reviewer SAW and chose not to block on; it is not a concern that was fixed.
+const DEFERRED_CLASS_RE = /^review:deferred\b/;
+
+export function isDeferredFinding(finding: StructuredFinding): boolean {
+  return DEFERRED_CLASS_RE.test(finding.class);
+}
+
+/**
+ * The findings a PASSING review DEFERRED — the rows a blocking-only projection drops on the floor.
+ * A passing review's details are prose; without this the deferral has no identity a later round can
+ * match, and every structured reader of the journal is blind to a defect the reviewer itself named.
+ */
+export function deferredReviewFindings(details: string): StructuredFinding[] {
+  return structuredFindings("review", details).filter(isDeferredFinding);
+}
+
+/** The exact review.ts details fragment represented by a structured review finding. */
+export function renderStructuredReviewFinding(finding: StructuredFinding): string {
+  const label = finding.class.startsWith("review:") ? finding.class.slice("review:".length) : finding.class;
+  const rationale = finding.rationale === undefined ? "" : `${REVIEW_RATIONALE_SEPARATOR}${finding.rationale}`;
+  return `- [${label}] ${finding.note}${rationale}`;
 }
 
 // OBS-543/OBS-549: the shared, schema-free cross-run facts. They remain journal information — never
@@ -273,6 +346,7 @@ const findingRows = (event: JournalEvent, gate: "acceptance" | "review"): Struct
       const row = finding as Record<string, unknown>;
       return typeof row.class === "string" && typeof row.path === "string"
         && typeof row.symbol === "string" && typeof row.note === "string"
+        && (row.rationale === undefined || typeof row.rationale === "string")
         && typeof row.fingerprint === "string";
     });
     if (rows.length > 0) return rows;
@@ -580,6 +654,19 @@ export function journaledFailureBrief(events: JournalEvent[], taskId: string): s
  * finding was dropped at the exact moment the operator paid for another attempt to fix it. A review
  * that DECLINED (`skipped`) is not a verdict and neither adds nor retires — fail closed. Findings are
  * keyed by fingerprint, so a reviewer restating one across rounds carries it once, not once per round.
+ *
+ * v2.1.5 T2: a passing review settles the findings it BLOCKED on. It does not settle the ones it
+ * DEFERRED — those it saw, declined to block on, and recorded a rationale for, and nothing has fixed
+ * them. So a pass retires the blocking set and re-seats its own deferrals, and the two retirements
+ * stay distinguishable: the blocking finding is gone, the deferral travels on as accepted work.
+ *
+ * A deferral's bound is the SAME single release as a blocking finding's — the operator accepting the
+ * review gate itself (`GATE_SATISFIED_RELEASE` stamped `gate: "review"`), the one approval in which a
+ * human actually looked at what the reviewer waved through. It is deliberately NOT bounded by a round
+ * count or by a time window: both retire a finding by arithmetic nobody read, which is the silent drop
+ * this fold exists to refuse. Nor can it accumulate — a reviewer restating the same path/note round
+ * after round re-seats ONE fingerprint, and a revised rationale replaces the prior rationale on that
+ * row. N rounds of the same concern therefore carry the newest accepted explanation once, not N rows.
  */
 export function outstandingReviewFindings(events: JournalEvent[], taskId: string): StructuredFinding[] {
   const open = new Map<string, StructuredFinding>();
@@ -590,8 +677,15 @@ export function outstandingReviewFindings(events: JournalEvent[], taskId: string
       continue;
     }
     if (e.event !== "gate-result" || e.data.gate !== "review" || e.data.skipped === true) continue;
-    if (e.data.pass !== false) open.clear(); // a later review PASSED on this task: nothing is outstanding
-    else for (const finding of findingRows(e, "review")) open.set(finding.fingerprint, finding);
+    if (e.data.pass !== false) {
+      // a later review PASSED on this task: every finding it BLOCKED on is settled …
+      for (const [key, finding] of open) if (!isDeferredFinding(finding)) open.delete(key);
+      // … and no deferral is, whether or not this pass restated it. A pass is silent about a
+      // deferral it does not mention: the concern is unfixed either way, and the reviewer that
+      // waved it through is not the release that accepts it. Retiring on omission would drop it on
+      // the very next round — the same silent drop by a different door.
+      for (const finding of findingRows(e, "review").filter(isDeferredFinding)) open.set(finding.fingerprint, finding);
+    } else for (const finding of findingRows(e, "review")) open.set(finding.fingerprint, finding);
   }
   return [...open.values()];
 }

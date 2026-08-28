@@ -2,8 +2,22 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
-import { DEFAULT_SHELL_TIMEOUT_MS, sh, type ShResult } from "../run/git.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShResult } from "../run/git.js";
 import type { GateResult } from "./types.js";
+
+/**
+ * T7: the capacity a gate's own command ran under rides the RESULT, beside the verdict it explains,
+ * rather than inside `meta` — `meta` is a machine-readable extras bag several callers compare
+ * wholesale, and identity that a later session keys reuse on does not belong in a bag. Declared here,
+ * at the one producer, because only a battery gate has a command whose child received a fork cap:
+ * every other gate leaves the field absent, which is the honest reading of "this gate divided
+ * nothing". The daemon lifts it verbatim onto the journal's gate row (src/run/daemon.ts).
+ */
+declare module "./types.js" {
+  interface GateResult {
+    capacity?: RunCapacity;
+  }
+}
 
 export interface BaselineCommand {
   /**
@@ -24,8 +38,15 @@ export interface BaselineCommand {
   /** The ceiling that measurement implies, persisted so every later battery uses the same number. */
   ceilingMs?: number;
   /**
-   * OBS-534 (T2): the capture was SIGKILLed at its ceiling. It never finished asking the question, so
-   * the entry carries a CAUSE and no verdict: no exit code, no fingerprints, nothing forgivable.
+   * T7: the capacity this command's capture child ran under — the fork cap it received and the cores
+   * that cap was divided from. Absent in every pre-T7 baseline, which is exactly what makes those
+   * entries keep their current forgiveness; a MALFORMED one fails closed instead (git.ts readCapacity).
+   */
+  capacity?: RunCapacity;
+  /**
+   * The capture did not return a trustworthy verdict: it was SIGKILLed at its ceiling, or its output
+   * proves the machine was exhausted while it ran. The entry therefore carries a CAUSE and no
+   * verdict: no exit code, no fingerprints, nothing forgivable.
    */
   infra?: true;
 }
@@ -164,6 +185,10 @@ const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 // this runner-output classifier rather than applied to any judge-authored reason text. A real test
 // failure still dominates below because one regression-shaped line makes the whole output regression.
 const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable|Token not found in system keyring|Process from config\.webServer was not able to start/i;
+// Capture invalidation is deliberately narrower than the gate's infrastructure vocabulary above:
+// keyring/config-webServer startup failures remain gate concerns, while this policy is specifically
+// for evidence that the capture ran while the machine was resource-starved.
+const CAPTURE_EXHAUSTION_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable/i;
 // A named error CLASS ("AssertionError", "TypeError", "MyDomainError") — never bare "Error", which
 // is what an errno report itself is headed with (`Error: spawn EAGAIN`). The prefix is required.
 const ERROR_CLASS_RE = /\b[A-Za-z][A-Za-z0-9]*Error\b/;
@@ -182,6 +207,19 @@ export function classifyFailureOutput(output: string): FailureClassification | u
   if (lines.some(namesRegression)) return "regression";
   return lines.some(isInfraLine) ? "infra" : undefined;
 }
+
+/**
+ * Capture validity asks a different question from gate classification. At a gate, one genuine
+ * regression line must outrank adjacent errno evidence so a real defect is never laundered as infra.
+ * At capture, any such evidence invalidates the whole measurement: once the machine was exhausted,
+ * no failure in that incomplete environment can safely become pre-existing forgiveness. Keep this
+ * separate from `classifyFailureOutput` so changing capture policy cannot move gate verdicts.
+ */
+const captureHasInvalidatingInfra = (output: string): boolean => output
+  .split("\n")
+  .map((l) => l.replace(ANSI_RE, ""))
+  .filter((l) => !PASS_LINE_RE.test(l))
+  .some((l) => CAPTURE_EXHAUSTION_RE.test(l));
 
 const normalizeLine = (l: string) => l.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 
@@ -428,6 +466,16 @@ export function ceilingKillResult(gate: string, r: ShResult, ceilingMs: number):
  */
 export const CAPTURE_CEILING_MS = 1_800_000;
 
+const invalidCaptureEntry = (durationMs: number): BaselineCommand => ({
+  infra: true,
+  fingerprints: [],
+  durationMs,
+  fileDurationSumMs: null,
+  impliedParallelism: null,
+  longestFile: null,
+  ceilingMs: effectiveCeilingMs({ durationMs }),
+});
+
 export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   for (const [name, cmd] of Object.entries(commands)) {
@@ -456,18 +504,24 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `it recorded NO fingerprints, so nothing is forgiven and every gate will treat a pre-existing `
         + `failure as a fresh one. Raise the ceiling or shorten the command.`,
       );
-      base.commands[name] = {
-        infra: true,
-        fingerprints: [],
-        durationMs,
-        fileDurationSumMs: null,
-        impliedParallelism: null,
-        longestFile: null,
-        ceilingMs: effectiveCeilingMs({ durationMs }),
-      };
+      base.commands[name] = invalidCaptureEntry(durationMs);
       continue;
     }
     const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
+    // Run 2137: the child exited and printed ordinary FAIL/AssertionError lines, so the gate-side
+    // discriminator correctly called the mixed output a regression. But the same output also said
+    // `spawn EAGAIN`: the machine had run out of processes while the pristine-tree measurement was
+    // being taken. A capture cannot know which red lines predated that shortage and which it caused,
+    // so none may become a fingerprint every later task gets to forgive.
+    if (captureHasInvalidatingInfra(raw)) {
+      console.error(
+        `tickmarkr: baseline capture for "${name}" completed with process/resource-exhaustion evidence — `
+        + `it recorded NO exit-code verdict and NO fingerprints, so nothing is forgiven for this command; `
+        + `the measurement cannot distinguish a pre-existing failure from one caused by exhaustion.`,
+      );
+      base.commands[name] = invalidCaptureEntry(durationMs);
+      continue;
+    }
     base.commands[name] = {
       exitCode: r.code,
       // a command that exits 0 has no failures to fingerprint — recording any would be a lie the
@@ -477,6 +531,9 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
       durationMs,
       ...fileTiming(raw, durationMs),
       ceilingMs: effectiveCeilingMs({ durationMs }),
+      // T7: the world this measurement was taken in, so a later reader can ask whether its own world
+      // is the same one. Recorded from THIS command's own shell result, never re-derived here.
+      ...(r.capacity ? { capacity: r.capacity } : {}),
     };
   }
   const names = Object.keys(commands);
@@ -562,17 +619,28 @@ export async function compareToBaseline(
     const entry = baseline.commands[name];
     const ceilingMs = effectiveCeilingMs(entry);
     const r = await sh(cmd, cwd, ceilingMs);
+    // T7: every verdict below carries the capacity ITS OWN command ran under, taken off the shell
+    // result rather than re-derived after the fact. The skip row above ran no command and therefore
+    // states no capacity — a row that never divided the machine must not claim that it did.
+    const record = (g: GateResult): void => {
+      results.push(r.capacity ? { ...g, capacity: r.capacity } : g);
+    };
+    // …and whether the entry that would forgive this command was measured in the same world. A
+    // baseline captured under a different fork cap forgives nothing: its fingerprints describe a
+    // machine divided by a different number. Absent capacity (every pre-T7 baseline) still forgives
+    // exactly as it does today; a malformed one fails closed (git.ts sameCapacity).
+    const comparable = sameCapacity(entry?.capacity, r.capacity);
     // Q24: the kill is read BEFORE the exit code is interpreted at all. A SIGKILLed battery has
     // whatever partial output it had flushed — typically no failure shape — so every path below
     // would otherwise turn a timeout into a claim about the work: "no recognizable failure lines"
     // when the baseline was green, or a forgiven pre-existing red when it was not. Neither is true.
     const killed = ceilingKillResult(name, r, ceilingMs);
     if (killed) {
-      results.push(killed);
+      record(killed);
       continue;
     }
     if (r.code === 0) {
-      results.push({ gate: name, pass: true, details: "exit 0" });
+      record({ gate: name, pass: true, details: "exit 0" });
       continue;
     }
     const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
@@ -583,7 +651,7 @@ export async function compareToBaseline(
     // exactly where it belongs: on failures the runner actually reported and the baseline already had.
     const classification = classifyFailureOutput(raw);
     if (classification === "infra") {
-      results.push({
+      record({
         gate: name,
         pass: false,
         details: `exit ${r.code} on infrastructure alone — the runner never completed a suite, so this gate verified nothing:\n${unrecognizedEvidence(raw) || raw.trim().split("\n").slice(0, 10).join("\n")}`,
@@ -609,7 +677,7 @@ export async function compareToBaseline(
         ? `the baseline capture for this command was killed at its ceiling and recorded no verdict, so nothing here is forgivable — it now exits ${r.code} with no recognizable failure lines — failing closed`
         : `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`;
       const evidence = unrecognizedEvidence(raw);
-      results.push({
+      record({
         gate: name,
         pass: false,
         details: evidence ? `${closed}\nunrecognized output:\n${evidence}` : closed,
@@ -620,10 +688,26 @@ export async function compareToBaseline(
     if (failing.length) {
       const headlined = headlineDetails(raw, failing);
       const meta = { ...headlined.meta, ...(classification ? { classification } : {}) };
-      results.push({ gate: name, pass: false, details: headlined.details, ...(Object.keys(meta).length ? { meta } : {}) });
+      record({ gate: name, pass: false, details: headlined.details, ...(Object.keys(meta).length ? { meta } : {}) });
       continue;
     }
-    results.push({
+    // T7: everything below this line is forgiveness, and forgiveness is the one verdict that reads a
+    // record from another session. The failures are all baseline-recorded — but recorded under a
+    // capacity this command did not run under, so they are not evidence that these failures
+    // pre-existed the diff. A red does not become a green on fingerprints from a world it was not
+    // measured in; the operator gets both worlds named.
+    if (!comparable) {
+      record({
+        gate: name,
+        pass: false,
+        details: `exit ${r.code}; every failure is recorded in the baseline, but that capture ran under `
+          + `${describeCapacity(entry?.capacity)} and this command ran under ${describeCapacity(r.capacity)} — `
+          + `forgiveness across a changed capacity is not evidence, so this fails closed`,
+        meta: { capacityMismatch: true, ...(classification ? { classification } : {}) },
+      });
+      continue;
+    }
+    record({
       gate: name,
       pass: true,
       details: `exit ${r.code} but only pre-existing failures (forgiven)${

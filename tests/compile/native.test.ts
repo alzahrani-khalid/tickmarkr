@@ -5,7 +5,7 @@ import { execSync } from "node:child_process";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
 import { compileSource } from "../../src/compile/index.js";
-import { classifyContextPath, TICKMARKR_NATIVE_MARKER, specTemplate } from "../../src/compile/native.js";
+import { classifyContextPath, compileNative, TICKMARKR_NATIVE_MARKER, specTemplate } from "../../src/compile/native.js";
 import { GraphValidationError, validateGraph } from "../../src/graph/schema.js";
 
 function compileNativeText(body: string, marker = "tickmarkr") {
@@ -475,6 +475,142 @@ test("criterion-scope lint errors when a criterion names a file or a `52/64`-for
     writeFileSync(spec, source(criterion, true));
     expect(compileSource(spec, "native").tasks[0].files, criterion).toContain("tests/render.test.ts");
   }
+});
+
+// T4: the criterion-scope lint consulted files[] only, so a criterion naming a producer the task
+// declared as a READ dependency was refused as if the task had to mutate it — and the refusal told
+// the author to add that producer to files[], i.e. the product itself emitting the unsafe workaround.
+// This lint's failure mode is silence, so every test here carries its own red control.
+describe("criterion-scope reads the declared read dependencies (T4)", () => {
+  const spec = (context: string | null, criterion: string) => {
+    const file = join(mkdtempSync(join(tmpdir(), "tickmarkr-read-dep-")), "read-dep.spec.md");
+    writeFileSync(file, `<!-- tickmarkr:spec -->
+## T1: Consume the producer
+- goal: consume what the producer already emits
+- files: src/consumer.ts
+${context === null ? "" : `- context: ${context}\n`}- acceptance:
+  - judge: ${criterion}
+`);
+    return file;
+  };
+
+  test("a spec whose criterion names a path declared only as a read dependency compiles, and the identical spec with that path struck from the read declaration throws the criterion-scope compile error naming it, so the control goes red before the change and green after; a check verified by a clean run alone proves nothing and: it fails", () => {
+    const criterion = "the consumer resolves every row through the table that src/producer.ts already publishes";
+
+    // the control FIRST: with no read declaration the path is in neither surface and the lint throws
+    const control = spec(null, criterion);
+    expect(() => compileNative(control)).toThrow(CompileError);
+    expect(() => compileNative(control)).toThrow(/authoring-lint\[criterion-scope\]/);
+    expect(() => compileNative(control)).toThrow(/src\/producer\.ts/);
+
+    // …and the same spec with the path declared as a read dependency compiles
+    const declared = compileNative(spec("src/producer.ts", criterion));
+    expect(declared.tasks[0].files).toEqual(["src/consumer.ts"]);
+    expect(declared.tasks[0].context).toEqual(["src/producer.ts"]);
+  });
+
+  test("the criterion-scope refusal names context[] for a reading criterion and files[] for a changing one", () => {
+    const reads = spec(null, "the consumer resolves every row through the table that src/producer.ts already publishes");
+    expect(() => compileNative(reads)).toThrow(/add it to context\[\]/);
+    expect(() => compileNative(reads)).toThrow(/never asks for/);
+
+    const changes = spec(null, "src/producer.ts emits the normalized row and the consumer replays it");
+    expect(() => compileNative(changes)).toThrow(/add it to files\[\]/);
+    expect(() => compileNative(changes)).not.toThrow(/add it to context\[\]/);
+
+    // A read followed by a same-target write is still a write criterion, including when the target
+    // is referred to anaphorically after its sole literal mention.
+    for (const mixed of [
+      "src/producer.ts is read and then rewritten by the consumer",
+      "the consumer reads src/producer.ts and updates it",
+      "reading src/producer.ts and rewriting it",
+    ]) {
+      expect(() => compileNative(spec(null, mixed)), mixed).toThrow(/add it to files\[\]/);
+      expect(() => compileNative(spec(null, mixed)), mixed).not.toThrow(/add it to context\[\]/);
+    }
+  });
+
+  // A path-only criterion has no enabling symbol, so symbol ownership can never back this site up:
+  // if criterion-scope honoured `context:` unconditionally, a criterion demanding the producer CHANGE
+  // would compile off a read declaration and nothing downstream would catch it. The declaration is
+  // therefore honoured per path and only for a criterion that reads it.
+  test("a context-only path is refused when the criterion says to change it, and the refusal names files[]", () => {
+    const declared = spec("src/producer.ts", "src/producer.ts emits the normalized row and the consumer replays it");
+    expect(() => compileNative(declared)).toThrow(/authoring-lint\[criterion-scope\]/);
+    expect(() => compileNative(declared)).toThrow(/src\/producer\.ts/);
+    expect(() => compileNative(declared)).toThrow(/add it to files\[\]/);
+
+    // fail-closed, not verb-listed: a change demand carrying no listed write verb is refused too…
+    const unlisted = spec("src/producer.ts", "src/producer.ts must now return two rows instead of one");
+    expect(() => compileNative(unlisted)).toThrow(/authoring-lint\[criterion-scope\]/);
+    // Declarative and unlisted mutations fail closed: neither is evidence of a read relation.
+    const declarative = spec("src/producer.ts", "src/producer.ts returns two normalized rows");
+    expect(() => compileNative(declarative)).toThrow(/authoring-lint\[criterion-scope\]/);
+    const unlistedVerb = spec(
+      "src/producer.ts",
+      "src/producer.ts sorts the rows it already publishes",
+    );
+    expect(() => compileNative(unlistedVerb)).toThrow(/authoring-lint\[criterion-scope\]/);
+    for (const mixed of [
+      "src/producer.ts is read and then rewritten by the consumer",
+      "the consumer reads src/producer.ts and updates it",
+      "reading src/producer.ts and rewriting it",
+    ]) {
+      expect(() => compileNative(spec("src/producer.ts", mixed)), mixed)
+        .toThrow(/authoring-lint\[criterion-scope\]/);
+      expect(() => compileNative(spec("src/producer.ts", mixed)), mixed).toThrow(/add it to files\[\]/);
+    }
+    // A write elsewhere does not revoke the named producer's explicit read relation.
+    const elsewhere = spec("src/producer.ts", "the consumer adds a cache while reading src/producer.ts");
+    expect(compileNative(elsewhere).tasks[0].context).toEqual(["src/producer.ts"]);
+    const elsewhereControl = spec(null, "the consumer adds a cache while reading src/producer.ts");
+    expect(() => compileNative(elsewhereControl)).toThrow(/add it to context\[\]/);
+    // …and so is a bare mention with no read relation at all: silence is not permission.
+    const silent = spec("src/producer.ts", "the consumer and src/producer.ts agree on the row shape");
+    expect(() => compileNative(silent)).toThrow(/authoring-lint\[criterion-scope\]/);
+
+    // the control that keeps the refusals above from being vacuous: the reading criterion compiles
+    expect(compileNative(spec(
+      "src/producer.ts",
+      "the consumer resolves every row through the table that src/producer.ts already publishes",
+    )).tasks[0].context).toEqual(["src/producer.ts"]);
+  });
+
+  // One criterion naming two declared producers, one changed: only the changed target loses the
+  // exemption. This is the per-path boundary; sentence-wide write detection emits an unsafe remedy
+  // for the producer that is merely read.
+  test("a change demand costs only its target the read exemption", () => {
+    const file = join(mkdtempSync(join(tmpdir(), "tickmarkr-read-dep-pair-")), "pair.spec.md");
+    writeFileSync(file, `<!-- tickmarkr:spec -->
+## T1: Consume the producers
+- goal: consume what the producers publish
+- files: src/consumer.ts
+- context: src/reader.ts, src/writer.ts
+- acceptance:
+  - judge: src/writer.ts emits the normalized row that src/reader.ts already publishes
+`);
+    let message = "";
+    try {
+      compileNative(file);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/authoring-lint\[criterion-scope\]/);
+    expect(message).toContain("src/writer.ts");
+    expect(message).not.toMatch(/outside expanded[^\n]*src\/reader\.ts/);
+    expect(message).toMatch(/add it to files\[\]/);
+
+    // the control: strike the change demand and the same two declarations carry the criterion
+    writeFileSync(file, `<!-- tickmarkr:spec -->
+## T1: Consume the producers
+- goal: consume what the producers publish
+- files: src/consumer.ts
+- context: src/reader.ts, src/writer.ts
+- acceptance:
+  - judge: the consumer replays the row src/writer.ts already publishes beside the one src/reader.ts already publishes
+`);
+    expect(compileNative(file).tasks[0].context).toEqual(["src/reader.ts", "src/writer.ts"]);
+  });
 });
 
 // OBS-170/OBS-184: `context:` entries reached workers split at annotation commas and unvalidated.

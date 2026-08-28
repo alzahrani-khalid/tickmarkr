@@ -1,4 +1,5 @@
 import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/config";
+import { DEFAULT_FORK_CAP } from "./src/run/git.js";
 
 // v1.22 T3 / OBS-17: seal herdr control-plane vars before workers fork so the suite never inherits
 // HERDR_ENV=1 (or a live socket) from the operator's shell. Tests may re-set these explicitly
@@ -50,14 +51,13 @@ export const SIGNAL_REAPER_TESTS = ["tests/run/reconcile-live.test.ts"];
 // failure wearing an assertion failure's clothes. Six gates died that way in one run, across two tasks
 // with no shared file (T1, T3) and two vendors (claude, codex), at load1 as low as 2.21.
 //
-// Read ONLY when the variable is present and sane, so a developer's plain `npm test` keeps full
-// parallelism and only tickmarkr's own children are capped — which is exactly what the daemon intended
-// to be true all along. This is not the "cap chosen without evidence" the v1.60 scope consult forbade;
-// the evidence is above, and the number is the daemon's own.
-const FORK_CAP = Number.parseInt(process.env.VITEST_MAX_FORKS ?? "", 10);
-const FORK_CAP_POOL = Number.isFinite(FORK_CAP) && FORK_CAP > 0
-  ? { poolOptions: { forks: { maxForks: FORK_CAP } } }
-  : {};
+// A bare local invocation must use the same standalone default as the daemon rather than silently
+// returning to vitest's core-count fan-out. A sane lane/operator override still wins; an absent,
+// empty, zero, negative, or non-numeric value falls back to the daemon default.
+export const resolveForkCap = (value: string | undefined): number => {
+  const supplied = Number(value);
+  return Number.isFinite(supplied) && supplied > 0 ? supplied : Number(DEFAULT_FORK_CAP);
+};
 
 // Report-26 birpc-starver class (Q72s): on the 2-core hosted runner the single vitest worker
 // starves its own birpc channel under long SYNCHRONOUS work — first 4/4 deterministic
@@ -69,7 +69,7 @@ const FORK_CAP_POOL = Number.isFinite(FORK_CAP) && FORK_CAP > 0
 // never carries their sync work; locally they simply serialize in one fork.
 export const SYNC_HEAVY_TESTS = ["tests/cockpit/sweep.test.ts", "tests/docs-truth-testing.test.ts"];
 
-export default defineConfig({
+export const createVitestConfig = (forkCapValue: string | undefined) => defineConfig({
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
     testTimeout: 20000,
@@ -89,7 +89,7 @@ export default defineConfig({
           exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS, ...SYNC_HEAVY_TESTS],
           // the only PARALLEL project — the other three already pin singleFork, so this is the one
           // that was running at ~cores-1 while the daemon believed it had said 6.
-          ...FORK_CAP_POOL,
+          poolOptions: { forks: { maxForks: resolveForkCap(forkCapValue) } },
         },
       },
       {
@@ -147,3 +147,5 @@ export default defineConfig({
     },
   },
 });
+
+export default createVitestConfig(process.env.VITEST_MAX_FORKS);

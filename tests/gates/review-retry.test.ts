@@ -12,7 +12,7 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq, type Assignment, type BillingChannel } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
-import { reviewGate } from "../../src/gates/review.js";
+import { pickReviewer, reviewGate } from "../../src/gates/review.js";
 import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -53,6 +53,7 @@ class SilentReviewer extends FakeAdapter {
 class BindingReviewer extends FakeAdapter {
   id = "fake-c";
   vendor = "fake-vc";
+  calls = 0;
   private cPath: string;
 
   constructor(scriptPath: string) {
@@ -61,6 +62,7 @@ class BindingReviewer extends FakeAdapter {
   }
 
   headlessCommand(promptFile: string, model: string): string {
+    this.calls++;
     const base = super.headlessCommand(promptFile, model);
     const nodeScript = `(function(){
       const fs = require("fs");
@@ -116,6 +118,85 @@ const gateCtx = async (repo: string, base: string, adapters: FakeAdapter[], chan
 });
 
 describe("review retry — unparseable verdict re-asks a different reviewer, never the worker (OBS-193)", () => {
+  test("test: a reviewer that answers with a genuine request for changes carries no infrastructure marking however its verdict is shaped, so a real rejection still charges the worker; a repair marking every failing review as infrastructure launders a red into a park and: it fails", async () => {
+    const { repo, base } = repoWithCommit();
+    const legacy = new BindingReviewer(scriptWith({ review: { approve: false, issues: ["real defect"] } }));
+    const classified = new BindingReviewer(scriptWith({
+      review: { approve: true, findings: [{ note: "real defect", severity: "material", defer: false }] },
+    }));
+
+    for (const reviewer of [legacy, classified]) {
+      const result = await reviewGate(
+        mkTask(), repo, base, author, [chAuthor, chSecond], [new FakeAdapter(scriptWith({})), reviewer], DEFAULT_CONFIG,
+      );
+      expect(result.pass).toBe(false);
+      expect(result.details).toMatch(/real defect/);
+      expect(result.meta?.infra).toBeUndefined();
+      expect(result.meta?.classification).not.toBe("infra");
+    }
+  });
+
+  test("test: when a silent seat is replaced the review result's own recorded text names the seat that went silent and the seat that replaced it, so the journaled row a reader opens says a re-route happened; a re-route recorded only in a field the row never carries leaves that row silent and: it fails", async () => {
+    const worker = new FakeAdapter(scriptWith({}));
+    const silent = new SilentReviewer(scriptWith({}));
+    const replacement = new BindingReviewer(scriptWith({ review: { approve: true, issues: [] } }));
+    const { repo, base } = repoWithCommit();
+    const { results } = await runGates(
+      mkTask(),
+      await gateCtx(repo, base, [worker, silent, replacement], [chAuthor, chGarbage, chSecond]),
+    );
+    const review = results.find((result) => result.gate === "review")!;
+    const journaledRow = { gate: review.gate, pass: review.pass, details: review.details };
+
+    expect(review.pass).toBe(true);
+    expect(journaledRow.details).toContain("fake-b:fake-b-1");
+    expect(journaledRow.details).toContain("fake-c:fake-c-1");
+    expect(journaledRow.details).toMatch(/re-route/);
+  });
+
+  test("test: a task declaring a frontier floor is graded only at or above that tier, and where the diversity rules leave no such seat the gate fails closed naming the floor as the reason; a picker that sorts by tier without refusing below it still seats a mid-tier grader after the frontier seat flakes and: it fails", async () => {
+    const worker = new FakeAdapter(scriptWith({}));
+    const flakedFrontier = new GarbageReviewer(scriptWith({ review: { approve: true } }));
+    const midReplacement = new BindingReviewer(scriptWith({ review: { approve: true, issues: [] } }));
+    const channels = [chAuthor, chGarbage, chSecond];
+    const task = mkTask({ routingHints: { floor: "frontier" } });
+    const { repo, base } = repoWithCommit();
+
+    expect(pickReviewer(author, channels, ["fake-b:fake-b-1"], [], "frontier")).toBeNull();
+    const { results } = await runGates(
+      task,
+      await gateCtx(repo, base, [worker, flakedFrontier, midReplacement], channels),
+    );
+    const review = results.find((result) => result.gate === "review")!;
+    expect(review.pass).toBe(false);
+    expect(review.details).toMatch(/frontier floor/);
+    expect(review.meta?.reviewer).toBe("fake-b:fake-b-1");
+    expect(midReplacement.calls).toBe(0);
+  });
+
+  test("test: a task declaring no floor selects the same reviewer it selects today and the existing single cross-channel replacement keeps its seat, so the floor is opt-in; a floor taken from config for every task moves seats on tasks that declared nothing and: it fails", async () => {
+    const worker = new FakeAdapter(scriptWith({}));
+    const flakedFrontier = new GarbageReviewer(scriptWith({ review: { approve: true } }));
+    const midReplacement = new BindingReviewer(scriptWith({ review: { approve: true, issues: [] } }));
+    const channels = [chAuthor, chGarbage, chSecond];
+    const task = mkTask();
+    const { repo, base } = repoWithCommit();
+    const ctx = await gateCtx(repo, base, [worker, flakedFrontier, midReplacement], channels);
+    const cfg = structuredClone(ctx.cfg);
+    cfg.routing.floors.implement = "frontier";
+
+    expect(task.routingHints?.floor).toBeUndefined();
+    expect(pickReviewer(author, channels)).toEqual(chGarbage);
+    const { results } = await runGates(task, { ...ctx, cfg });
+    const review = results.find((result) => result.gate === "review")!;
+    expect(review.pass).toBe(true);
+    expect(review.meta?.reviewRetry).toEqual({
+      flaked: "fake-b:fake-b-1",
+      retried: "fake-c:fake-c-1",
+    });
+    expect(midReplacement.calls).toBe(1);
+  });
+
   test("garbage first seat → retried once on the second seat; the flaked verdict never enters results", async () => {
     const worker = new FakeAdapter(scriptWith({}));
     const garbage = new GarbageReviewer(scriptWith({ review: { approve: true } })); // nonce-less ⇒ unparseable

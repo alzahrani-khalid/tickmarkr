@@ -48,6 +48,28 @@ function repoWithCommit() {
   return { repo, base };
 }
 
+async function captureReviewPrompt(task = mkTask()): Promise<string> {
+  const { repo, base } = repoWithCommit();
+  const fake = fakeWith({ review: { approve: true, issues: [] } });
+  const command = fake.headlessCommand.bind(fake);
+  let prompt = "";
+  fake.headlessCommand = (promptFile, model) => {
+    prompt = readFileSync(promptFile, "utf8");
+    return command(promptFile, model);
+  };
+  await reviewGate(task, repo, base, author, CH, [fake], DEFAULT_CONFIG);
+  return prompt;
+}
+
+function promptSection(prompt: string, heading: string): string {
+  const marker = `## ${heading}\n`;
+  const start = prompt.indexOf(marker);
+  if (start < 0) return "";
+  const body = start + marker.length;
+  const end = prompt.indexOf("\n\n## ", body);
+  return prompt.slice(body, end < 0 ? undefined : end).trim();
+}
+
 describe("pickReviewer", () => {
   test("picks a different vendor; null when none exists", () => {
     expect(pickReviewer(author, CH)?.vendor).toBe("fake-b");
@@ -516,6 +538,70 @@ describe("R3 review participation is path-keyed", () => {
 });
 
 describe("reviewGate", () => {
+
+  test("test: a reviewer that authors its verdict from the review prompt alone names a path the task declared and the diff never touched, so the verdict text is producible only by a reviewer that was shown the declaration; the same reviewer against a prompt carrying diff and criteria only cannot name it and returns a verdict that does not: it fails", async () => {
+    const declaredButUntouched = "src/declared-but-untouched.ts";
+    const prompt = await captureReviewPrompt(mkTask({
+      files: ["a.txt", declaredButUntouched],
+      acceptance: ["the changed file remains valid"],
+    }));
+    const reviewFromPromptAlone = (input: string) => {
+      const declared = promptSection(input, "Declared write scope")
+        .split("\n").filter((line) => line.startsWith("- ")).map((line) => line.slice(2));
+      const touched = [...input.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map((match) => match[2]!);
+      const untouched = declared.find((path) => !touched.includes(path));
+      return untouched
+        ? { approve: false, findings: [{ note: `Declared path ${untouched} was not touched by the diff.`, severity: "material" }] }
+        : { approve: true, findings: [] };
+    };
+
+    const authored = reviewFromPromptAlone(prompt);
+    const diffAndCriteriaOnly = [
+      "## Acceptance criteria",
+      promptSection(prompt, "Acceptance criteria"),
+      "",
+      "## Diff",
+      promptSection(prompt, "Diff"),
+    ].join("\n");
+    const guessed = reviewFromPromptAlone(diffAndCriteriaOnly);
+
+    expect(JSON.stringify(authored)).toContain(declaredButUntouched);
+    expect(guessed.approve).toBe(true);
+    expect(JSON.stringify(guessed)).not.toContain(declaredButUntouched);
+  });
+
+  test("test: the declared scope and the set of paths the diff touched are separately readable in the prompt where the two differ, so a reviewer deferring on scope can cite the declaration rather than the touched set; a prompt rendering only one of the two reproduces the run 2253 premise and: it fails", async () => {
+    const declaredButUntouched = "src/declared-but-untouched.ts";
+    const prompt = await captureReviewPrompt(mkTask({ files: ["a.txt", declaredButUntouched] }));
+    const declared = promptSection(prompt, "Declared write scope")
+      .split("\n").filter((line) => line.startsWith("- ")).map((line) => line.slice(2));
+    const diff = promptSection(prompt, "Diff");
+    const touched = [...diff.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map((match) => match[2]!);
+    const carriesBothInputs = (input: string) =>
+      promptSection(input, "Declared write scope").length > 0 && promptSection(input, "Diff").length > 0;
+
+    expect(declared).toEqual(["a.txt", declaredButUntouched]);
+    expect(touched).toEqual(["a.txt"]);
+    expect(carriesBothInputs(prompt)).toBe(true);
+    expect(carriesBothInputs(`## Declared write scope\n${promptSection(prompt, "Declared write scope")}`)).toBe(false);
+    expect(carriesBothInputs(`## Diff\n${diff}`)).toBe(false);
+  });
+
+  test("test: a task declaring no write scope renders an explicit unrestricted statement rather than an empty section, because unrestricted and nothing-in-scope are opposite instructions to a reviewer; a renderer emitting an empty section satisfies a presence check and: it fails", async () => {
+    const prompt = await captureReviewPrompt(mkTask({ files: [] }));
+    const section = promptSection(prompt, "Declared write scope");
+    const presenceOnly = (input: string) => input.includes("## Declared write scope\n");
+    const saysUnrestricted = (input: string) => /## Declared write scope\n[^\n]*unrestricted/i.test(input);
+
+    expect(presenceOnly(prompt)).toBe(true);
+    expect(section).toMatch(/^Unrestricted\b/i);
+    expect(section).toMatch(/declared no write.scope/i);
+    expect(section).not.toMatch(/^- /m);
+
+    const emptySection = prompt.replace(section, "");
+    expect(presenceOnly(emptySection)).toBe(true);
+    expect(saysUnrestricted(emptySection)).toBe(false);
+  });
 
   // v1.64 gate-integrity: the cross-vendor review prompt carries the same completion-faking checklist
   // as the acceptance judge, so reviewers hunt the concrete shortcuts by name.

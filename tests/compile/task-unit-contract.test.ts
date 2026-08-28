@@ -319,6 +319,136 @@ describe("R2 symbol ownership (OBS-248)", () => {
   });
 });
 
+// T4: `context:` is the read declaration, and the two blocking compile paths consulted only the
+// write surface. Widening what they READ must never widen what they ACCEPT — the tests below pin
+// both directions, each with the red control that proves the check ran at all.
+describe("R2 symbol ownership and the read declaration (T4)", () => {
+  const withContext = (t: ReturnType<typeof unit>, context: string[]) => ({ ...t, context });
+
+  test("a criterion naming a symbol whose one definition sits in a path declared as a read dependency compiles where the criterion requires reading that symbol, and is still refused where the criterion requires changing it, so read authority never silently becomes write authority; a blanket widening admits both and: it fails", () => {
+    const root = fakeRepo({
+      "src/produce/table.ts": "export function ownedTable() { return 1; }\n",
+      "src/consume/rows.ts": "export const unrelated = 1;\n",
+    });
+    const reading = [
+      "every row resolves through the regions ownedTable already publishes",
+      "the consumer adds a cache while reading ownedTable",
+      "the caller writes its own index over the rows ownedTable already publishes",
+    ];
+    const changing = [
+      "ownedTable grows the row spans and emits them as first-class members",
+      "ownedTable must now return two rows instead of one",
+      "ownedTable no longer carries the region column",
+      "ownedTable returns two rows",
+      "ownedTable sorts the rows it already publishes",
+      "ownedTable is read and then rewritten by the consumer",
+      "the consumer reads ownedTable and updates it",
+      "reading ownedTable and rewriting it",
+      "the regions and ownedTable agree on the row shape",
+    ];
+
+    // The red controls FIRST: without the declaration every target-local read is still refused.
+    for (const text of reading) {
+      const errs = symbolOwnershipErrors([
+        unit("T1", ["src/consume/rows.ts"], [oracle("judge", text)]),
+      ], root);
+      expect(errs, text).toHaveLength(1);
+      expect(errs[0], text).toContain("context[]");
+    }
+
+    // Declaring the site clears each target-local read, including criteria changing the consumer.
+    for (const text of reading) {
+      expect(symbolOwnershipErrors([
+        withContext(
+          unit("T1", ["src/consume/rows.ts"], [oracle("judge", text)]),
+          ["src/produce/table.ts"],
+        ),
+      ], root), text).toEqual([]);
+    }
+
+    // It does NOT clear any target mutation or ambiguous relation — silence is not authority.
+    const still = symbolOwnershipErrors([
+      withContext(
+        unit("T1", ["src/consume/rows.ts"], [oracle("judge", changing[0]!)]),
+        ["src/produce/table.ts"],
+      ),
+    ], root);
+    expect(still).toHaveLength(1);
+    expect(still[0]).toContain("ownedTable");
+    expect(still[0]).toContain("src/produce/table.ts");
+    expect(still[0]).toContain("READ authority only");
+    expect(still[0]).toContain("files[]"); // the remedy for a criterion that must change the symbol
+
+    // No finite write list participates: declarative/unlisted mutations and ambiguity all stay red.
+    for (const text of changing) {
+      const errs = symbolOwnershipErrors([
+        withContext(unit("T1", ["src/consume/rows.ts"], [oracle("judge", text)]), ["src/produce/table.ts"]),
+      ], root);
+      expect(errs, text).toHaveLength(1);
+      expect(errs[0], text).toContain("ownedTable");
+    }
+  });
+
+  test("a criterion naming a path in neither the write surface nor the read declaration is still refused by both blocking paths, so widening what the check reads never widens what it accepts; a repair that admits any named path because one was declared somewhere: it fails", () => {
+    // path A is declared as a read dependency; path B is declared nowhere. Both are named.
+    const root = fakeRepo({
+      "src/produce/table.ts": "export function ownedTable() { return 1; }\n",
+      "src/produce/other.ts": "export function strangerTable() { return 1; }\n",
+      "src/consume/rows.ts": "export const unrelated = 1;\n",
+    });
+    const errs = symbolOwnershipErrors([
+      withContext(
+        unit("T1", ["src/consume/rows.ts"], [
+          oracle("judge", "every row resolves through the regions ownedTable and strangerTable already publish"),
+        ]),
+        ["src/produce/table.ts"],
+      ),
+    ], root);
+    expect(errs).toHaveLength(1); // ownedTable is declared and clears; strangerTable is not and does not
+    expect(errs[0]).toContain("strangerTable");
+    expect(errs[0]).toContain("src/produce/other.ts");
+    expect(errs[0]).not.toContain("ownedTable");
+
+    // the same rule at the other blocking path: criterion-scope refuses the undeclared path only
+    const spec = join(mkdtempSync(join(tmpdir(), "tickmarkr-neither-")), "neither.spec.md");
+    const source = (criterion: string) => `<!-- tickmarkr:spec -->
+## T1: Consume
+- goal: consume what the producers publish
+- files: src/consumer.ts
+- context: src/declared.ts
+- acceptance:
+  - judge: ${criterion}
+`;
+    writeFileSync(spec, source("the consumer replays every row src/declared.ts already publishes"));
+    expect(compileNative(spec).tasks[0].id).toBe("T1"); // declared → accepted
+    writeFileSync(spec, source("the consumer replays every row src/undeclared.ts already publishes"));
+    expect(() => compileNative(spec)).toThrow(/criterion-scope/);
+    expect(() => compileNative(spec)).toThrow(/src\/undeclared\.ts/);
+  });
+
+  test("the task-unit aggregator receives a task's read declaration through its own parameter, and a task object carrying none behaves exactly as it does today, so every existing caller keeps its verdict; an aggregator inferring the declaration from anywhere else: it fails", () => {
+    const root = fakeRepo({
+      "src/produce/table.ts": "export function ownedTable() { return 1; }\n",
+      "src/consume/rows.ts": "export const unrelated = 1;\n",
+    });
+    const bare = unit("T1", ["src/consume/rows.ts"], [
+      oracle("judge", "every row resolves through the regions ownedTable already publishes"),
+    ]);
+
+    // a task object with no `context` key at all — the shape every existing caller passes
+    expect(Object.hasOwn(bare, "context")).toBe(false);
+    const today = taskUnitContractErrors([bare], root);
+    expect(today).toHaveLength(1);
+    expect(today[0]).toContain("ownedTable");
+
+    // the SAME task carrying the read declaration on the aggregator's own parameter clears it —
+    // nothing about the repo, the config or a sibling task changed, only the parameter
+    expect(taskUnitContractErrors([{ ...bare, context: ["src/produce/table.ts"] }], root)).toEqual([]);
+    // an empty declaration is not a declaration: the verdict is the bare one, byte for byte
+    expect(taskUnitContractErrors([{ ...bare, context: [] }], root)).toEqual(today);
+  });
+});
+
 describe("R2 calibration corpus", () => {
   test("v1.84's original T1 fails all applicable lints and v1.79's tasks pass them — the calibration corpus is pinned", () => {
     const root = process.cwd();

@@ -23,7 +23,10 @@ vi.mock("../../src/run/git.js", async (importOriginal) => {
   };
 });
 
-afterEach(() => { shSpy.stub = undefined; });
+afterEach(() => {
+  shSpy.stub = undefined;
+  vi.restoreAllMocks();
+});
 
 // T9: infra must never mask a regression. The discriminator lives in compareToBaseline, so this
 // suite drives the REAL gate — a shell script emitting the output, the gate running it, and the
@@ -144,5 +147,88 @@ describe("a killed baseline capture is infra, not a red baseline (OBS-534)", () 
     const forgiven = await gateOver([KNOWN], { commands: { test: { exitCode: 1, fingerprints: fingerprint(KNOWN) } } });
     expect(forgiven.pass).toBe(true);
     expect(forgiven.details).toContain("forgiven");
+  });
+});
+
+describe("a resource-starved baseline capture is invalid even when the child exits", () => {
+  const CAPTURED_FAILURE = "FAIL tests/shared.test.ts > pre-existing or exhaustion-induced";
+  const ASSERTION = "AssertionError: expected the worker to spawn";
+
+  const captureCompleted = async (lines: string[], code = 1) => {
+    const repo = makeRepo({ "base.txt": "base\n" });
+    shSpy.stub = (cmd) => cmd === "run capture"
+      ? { code, stdout: `${lines.join("\n")}\n`, stderr: "", durationMs: 2_137 }
+      : undefined;
+    return { repo, baseline: await captureBaseline(repo, { test: "run capture" }) };
+  };
+
+  test("test: a completed capture whose output carries process-exhaustion evidence records the same third state the ceiling-kill path records — a cause, no exit code and no fingerprints — so nothing is forgiven for that command; a capture recording an exit code and fingerprints from that output hands every later gate free forgiveness and: it fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { baseline } = await captureCompleted([
+      "Error: spawn EAGAIN",
+      "    at ChildProcess.spawn (node:internal/child_process:421:11)",
+    ]);
+
+    expect(baseline.commands.test).toMatchObject({
+      infra: true,
+      fingerprints: [],
+      durationMs: 2_137,
+    });
+    expect(baseline.commands.test).not.toHaveProperty("exitCode");
+  });
+
+  test("test: that capture records the third state even when its output ALSO names a test-level failure, which is run 2137's own shape, because a measurement taken under exhaustion cannot separate a pre-existing failure from one the exhaustion caused; reusing the gate-side rule where one regression line outvotes the errno evidence reproduces that capture and: it fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { baseline } = await captureCompleted([
+      "Error: spawn EAGAIN",
+      CAPTURED_FAILURE,
+      ASSERTION,
+    ]);
+
+    expect(baseline.commands.test?.infra).toBe(true);
+    expect(baseline.commands.test?.exitCode).toBeUndefined();
+    expect(baseline.commands.test?.fingerprints).toEqual([]);
+
+    // A later healthy run reporting the same test failure must be charged. Recording the mixed
+    // capture as an ordinary red baseline stores these fingerprints and incorrectly forgives it.
+    const later = await gateOver([CAPTURED_FAILURE, ASSERTION], baseline);
+    expect(later.pass).toBe(false);
+    expect(later.details).toContain("tests/shared.test.ts");
+  });
+
+  test("test: a capture whose output names a test-level failure and carries no exhaustion evidence still records its exit code and its fingerprints, so genuine pre-existing failures stay forgivable; a repair voiding every red capture makes every task pay for failures its diff did not cause and: it fails", async () => {
+    const { baseline } = await captureCompleted([CAPTURED_FAILURE, ASSERTION]);
+
+    expect(baseline.commands.test?.infra).toBeUndefined();
+    expect(baseline.commands.test?.exitCode).toBe(1);
+    expect(baseline.commands.test?.fingerprints).toEqual(fingerprint(`${CAPTURED_FAILURE}\n${ASSERTION}\n`));
+
+    const later = await gateOver([CAPTURED_FAILURE, ASSERTION], baseline);
+    expect(later.pass).toBe(true);
+    expect(later.details).toContain("forgiven");
+  });
+
+  test("test: the gate side keeps its existing verdicts unchanged on both an exhaustion-only output and an output mixing exhaustion with a real failure, so this changes what a capture records and never what a gate concludes; a shared edit that moves the gate's answer on the mixed case: it fails", async () => {
+    const exhaustionOnly = await gateOver(["Error: spawn EAGAIN"]);
+    expect(exhaustionOnly.pass).toBe(false);
+    expect(exhaustionOnly.meta?.classification).toBe("infra");
+    expect(exhaustionOnly.meta?.infra).toBe(true);
+
+    const mixed = await gateOver(["Error: spawn EAGAIN", CAPTURED_FAILURE, ASSERTION]);
+    expect(mixed.pass).toBe(false);
+    expect(mixed.meta?.classification).toBe("regression");
+    expect(mixed.meta?.infra).toBeUndefined();
+  });
+
+  test("the operator is told at capture time, on the channel the ceiling-kill path already writes to, which command forgives nothing and why, so a run whose baseline verifies nothing is distinguishable from a repository with flaky tests before any task gate reds; a silent third state fails", async () => {
+    const operatorLine = vi.spyOn(console, "error").mockImplementation(() => {});
+    await captureCompleted(["Error: spawn EAGAIN"]);
+
+    expect(operatorLine).toHaveBeenCalledTimes(1);
+    const message = operatorLine.mock.calls[0]?.join(" ") ?? "";
+    expect(message).toContain('baseline capture for "test"');
+    expect(message).toContain("process/resource-exhaustion evidence");
+    expect(message).toContain("nothing is forgiven for this command");
+    expect(message).toContain("cannot distinguish a pre-existing failure from one caused by exhaustion");
   });
 });

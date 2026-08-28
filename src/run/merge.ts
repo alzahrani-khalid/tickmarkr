@@ -12,7 +12,7 @@ import {
   freshFailures,
 } from "../gates/baseline.js";
 import { tickmarkrDir } from "../graph/graph.js";
-import { gitHead, linkNodeModules, resolveIntegrationBranch, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
+import { describeCapacity, gitHead, linkNodeModules, resolveIntegrationBranch, sameCapacity, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
 
 export interface TipVerifyResult {
   gate: string;
@@ -138,7 +138,13 @@ export async function verifyIntegrationTip(
     // Battery parity on the infra rule too (T9): infrastructure-only output means the runner never
     // completed a suite — nothing was verified, so nothing is forgivable, however familiar its
     // fingerprints. Stricter-than-battery edge kept: unreadable output never forgives.
-    const forgiven = r.code !== 0 && baselineRed && failing.length === 0 && !unreadable && cause !== "infra";
+    // T7: the SECOND reader of a baseline entry, and the same rule as the battery's (baseline.ts).
+    // Evidence crosses a session boundary here — the capture that would forgive this red is very
+    // often the previous session's — so a capture taken under a different resolved capacity forgives
+    // nothing at the tip either. An absent capacity is a pre-T7 baseline and keeps today's verdict.
+    const comparable = sameCapacity(entry?.capacity, r.capacity);
+    const forgiven = r.code !== 0 && baselineRed && failing.length === 0 && !unreadable && cause !== "infra"
+      && comparable;
     const pass = r.code === 0 || forgiven;
     if (!pass) writeFileSync(artifact, raw);
     results.push({
@@ -149,7 +155,11 @@ export async function verifyIntegrationTip(
       fingerprints: r.code !== 0 ? fingerprint(stripped) : [],
       details: r.code === 0 ? "exit 0"
         : forgiven ? `exit ${r.code} but only baseline-recorded failures (forgiven vs baseline)`
-        : `exit ${r.code}`,
+        : !comparable && baselineRed && failing.length === 0
+          ? `exit ${r.code}; every failure is baseline-recorded, but that capture ran under `
+            + `${describeCapacity(entry?.capacity)} and this verification ran under ${describeCapacity(r.capacity)} `
+            + `— forgiveness across a changed capacity is not evidence`
+          : `exit ${r.code}`,
       ...(forgiven ? { forgiven: true } : {}),
       ...(cause ? { cause } : {}),
       ...(pass ? {} : { artifact }),
