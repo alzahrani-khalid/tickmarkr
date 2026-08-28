@@ -1,7 +1,8 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { type Baseline, captureBaseline, compareToBaseline, fingerprint } from "../../src/gates/baseline.js";
+import { type Baseline, captureBaseline, classifyFailureOutput, compareToBaseline, fingerprint, freshFailures } from "../../src/gates/baseline.js";
+import { gateSatisfied } from "../../src/run/daemon.js";
 import type { ShResult } from "../../src/run/git.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -34,6 +35,7 @@ afterEach(() => {
 // wired to nothing, cannot make these pass.
 
 const RED_BASELINE: Baseline = { commands: { test: { exitCode: 1, fingerprints: [] } } };
+const BIRPC_DEATH = 'Error: [birpc] rpc is closed, cannot call "onTaskUpdate"';
 
 /** Run the test gate over a script that prints `lines` and exits 1, and return its GateResult. */
 async function gateOver(lines: string[], baseline: Baseline = RED_BASELINE) {
@@ -44,6 +46,56 @@ async function gateOver(lines: string[], baseline: Baseline = RED_BASELINE) {
 }
 
 describe("baseline failure classification (real gate, zero tokens)", () => {
+  test("test: a fresh-failure set whose only lines are the birpc RPC-death fingerprint classifies infra, and the same set with one AssertionError line added classifies regression", async () => {
+    const known = "FAIL tests/known.test.ts > pre-existing assertion";
+    const baseline: Baseline = {
+      commands: { test: { exitCode: 1, fingerprints: fingerprint(known) } },
+    };
+
+    // The complete output still names the known failure. Only the fresh diff is infrastructure, so
+    // classifying the complete output would charge a worker for a runner channel that died.
+    const infra = await gateOver([known, BIRPC_DEATH], baseline);
+    expect(infra).toMatchObject({ pass: false, meta: { classification: "infra", infra: true } });
+
+    const freshInfra = freshFailures(baseline.commands.test, `${known}\n${BIRPC_DEATH}`).failing;
+    expect(freshInfra).toEqual([BIRPC_DEATH]);
+    expect(classifyFailureOutput(freshInfra.join("\n"))).toBe("infra");
+
+    const assertion = "AssertionError: expected true to be false";
+    const regression = await gateOver([known, BIRPC_DEATH, assertion], baseline);
+    expect(regression.pass).toBe(false);
+    expect(regression.meta?.classification).toBe("regression");
+    expect(regression.meta?.infra).toBeUndefined();
+  });
+
+  test("test: a fresh-failure line carrying an infra fingerprint and a named failing test on that same line classifies regression, so adjacent errno evidence never launders a real defect", async () => {
+    const sameLine = `FAIL tests/new.test.ts > preserves the assertion beside ${BIRPC_DEATH}`;
+    const result = await gateOver([sameLine]);
+
+    expect(result.pass).toBe(false);
+    expect(result.meta?.classification).toBe("regression");
+    expect(result.meta?.infra).toBeUndefined();
+  });
+
+  test("test: a fresh-failure set of ordinary assertion failures with no fingerprint anywhere classifies regression and is charged, which is the false-clean case this task must not break", async () => {
+    const result = await gateOver([
+      "AssertionError: expected 1 to be 2",
+      "TypeError: value is not iterable",
+    ]);
+
+    expect(result.pass).toBe(false);
+    expect(result.meta?.classification).toBe("regression");
+    expect(result.meta?.infra).toBeUndefined();
+  });
+
+  test("test: a test gate result classified infra is not merge-satisfying, so a suite that never completed cannot reach the integration branch as a pass", async () => {
+    const result = await gateOver([BIRPC_DEATH]);
+
+    expect(result).toMatchObject({ pass: false, meta: { classification: "infra", infra: true } });
+    expect(gateSatisfied(result)).toBe(false);
+    expect(gateSatisfied({ ...result, pass: true })).toBe(false);
+  });
+
   test('test: compareToBaseline classifies "AssertionError after spawn EAGAIN" as regression and "spawn EAGAIN" as infra, then repeats with AssertionError and EAGAIN on separate lines; assert the recorded gate result classification so a test-only regex or disabled discriminator fails', async () => {
     // One line carrying BOTH tokens. The errno is present, but the line names a test-level failure,
     // so the output is a regression — laundering it into "infra" is how a real defect gets forgiven.

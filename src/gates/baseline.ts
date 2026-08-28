@@ -184,7 +184,7 @@ const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 // shapes are emitted by the process that was asked to run the oracle; they are deliberately kept in
 // this runner-output classifier rather than applied to any judge-authored reason text. A real test
 // failure still dominates below because one regression-shaped line makes the whole output regression.
-const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable|Token not found in system keyring|Process from config\.webServer was not able to start/i;
+const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable|Token not found in system keyring|Process from config\.webServer was not able to start|\[birpc\] rpc is closed, cannot call\b/i;
 // Capture invalidation is deliberately narrower than the gate's infrastructure vocabulary above:
 // keyring/config-webServer startup failures remain gate concerns, while this policy is specifically
 // for evidence that the capture ran while the machine was resource-starved.
@@ -195,6 +195,12 @@ const ERROR_CLASS_RE = /\b[A-Za-z][A-Za-z0-9]*Error\b/;
 const isInfraLine = (l: string) =>
   INFRA_RE.test(l) && !ERROR_CLASS_RE.test(l) && !namesFailure(l) && !SUMMARY_FAIL_RE.test(l);
 const namesRegression = (l: string) => (isFailureShaped(l) || ERROR_CLASS_RE.test(l)) && !isInfraLine(l);
+// Infrastructure signatures must enter the fingerprint diff too. Otherwise a signature such as
+// birpc's assertion-free RPC death is classified correctly in the raw output but collapses to the
+// content-free UNRECOGNIZED_FAILURE marker before the fresh-failure path can ask the same classifier.
+// This does not make the vocabulary open-ended: INFRA_RE is still the one closed list, and
+// classifyFailureOutput's ERROR_CLASS_RE/namesFailure vetoes still decide mixed lines.
+const isFingerprintShaped = (l: string) => isFailureShaped(l) || INFRA_RE.test(l);
 
 export type FailureClassification = "regression" | "infra";
 
@@ -270,9 +276,9 @@ export function fingerprint(output: string): string[] {
   // prefixed form keeps fingerprinting too (baseline-recorded package-level reds stay forgivable).
   const shaped: string[] = [];
   for (const l of lines) {
-    if (isFailureShaped(l)) shaped.push(l);
+    if (isFingerprintShaped(l)) shaped.push(l);
     const stripped = stripTurboPrefix(l);
-    if (stripped !== undefined && !PASS_LINE_RE.test(stripped) && isFailureShaped(stripped)) shaped.push(stripped);
+    if (stripped !== undefined && !PASS_LINE_RE.test(stripped) && isFingerprintShaped(stripped)) shaped.push(stripped);
   }
   if (!shaped.length) return lines.some((l) => l.trim()) ? [UNRECOGNIZED_FAILURE] : [];
   return [...new Set(shaped.map(normalizeLine))];
@@ -644,21 +650,6 @@ export async function compareToBaseline(
       continue;
     }
     const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
-    // T9: classify BEFORE the baseline diff, and record it on every nonzero result. An infra-only
-    // exit means the runner never completed a suite, so there is nothing to forgive and nothing
-    // verified — it fails, and `meta.infra` marks it so the merge predicate cannot read it as a
-    // satisfied gate even if some future producer reports it as a pass. Baseline forgiveness stays
-    // exactly where it belongs: on failures the runner actually reported and the baseline already had.
-    const classification = classifyFailureOutput(raw);
-    if (classification === "infra") {
-      record({
-        gate: name,
-        pass: false,
-        details: `exit ${r.code} on infrastructure alone — the runner never completed a suite, so this gate verified nothing:\n${unrecognizedEvidence(raw) || raw.trim().split("\n").slice(0, 10).join("\n")}`,
-        meta: { classification, infra: true },
-      });
-      continue;
-    }
     // OBS-278: only a failure SHAPE is a verdict — everything fingerprint() keeps is one, except the
     // unrecognized-output marker, which is evidence for the operator and never grounds to reject.
     // ponytail: ceiling — a runner whose failure output holds no shape above and whose baseline is
@@ -667,6 +658,25 @@ export async function compareToBaseline(
     // that runner's position rule (leading verdict + identifier, or identifier + separator + trailing
     // verdict); loosening back to vocabulary re-opens OBS-278.
     const { failing, unreadable } = freshFailures(entry, raw);
+    // T9: classify the FRESH diff before charging it. The complete runner output can legitimately
+    // contain a baseline-recorded assertion beside a newly introduced infrastructure death; letting
+    // that known assertion outvote the fresh birpc line turns machine failure into a worker defect.
+    // `classifyFailureOutput` remains the single discriminator. When there is no fresh fingerprint,
+    // retain the whole-output read so a repeated infra abort can never be baseline-forgiven as green.
+    const freshClassification = failing.length ? classifyFailureOutput(failing.join("\n")) : undefined;
+    const classification = freshClassification ?? (!failing.length ? classifyFailureOutput(raw) : undefined);
+    if (classification === "infra") {
+      const evidence = failing.length
+        ? failing.slice(0, 10).join("\n")
+        : unrecognizedEvidence(raw) || raw.trim().split("\n").slice(0, 10).join("\n");
+      record({
+        gate: name,
+        pass: false,
+        details: `exit ${r.code}; the fresh failures carry infrastructure evidence alone — the runner never completed a suite, so this gate verified nothing:\n${evidence}`,
+        meta: { classification, infra: true },
+      });
+      continue;
+    }
     // OBS-534 (T2): only a recorded VERDICT can be forgiven. A green baseline has no red to forgive,
     // and neither has a capture that was killed at its ceiling — it recorded a cause instead, so it
     // fails closed on the same branch rather than reading as "only pre-existing failures". Legacy

@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
 import { buildDossierPrompt, type Dossier } from "../../src/run/consult.js";
-import { ATTEMPT_CAP_RELEASE, appendProfileDiscount, engagementComparable, formatJournalNarration, gateResultJournalData, Journal, newRunId, parseRunId, readAllTelemetry, readProfileDiscounts, recordedGraphDefinitionHash, TelemetryRowSchema } from "../../src/run/journal.js";
+import { ATTEMPT_CAP_RELEASE, appendProfileDiscount, engagementComparable, formatJournalNarration, gateResultJournalData, Journal, newRunId, parseRunId, readAllTelemetry, readProfileDiscounts, recordedGraphDefinitionHash, REVIEW_UPHELD_RELEASE, TelemetryRowSchema } from "../../src/run/journal.js";
 import { foldPairIntegrity, type DecisionEventWrite } from "../../src/run/protocol.js";
 import { MASK, redactSecrets } from "../../src/run/redact.js";
 
@@ -37,6 +37,45 @@ const allocateInFreshProcess = (repoRoot: string, instant: string, timezone = "U
   expect(result.status, result.stderr).toBe(0);
   return result.stdout.trim();
 };
+
+test("test: the run-end record names every preserved ref in the run with its task id, and names none when the run preserved nothing", () => {
+  const root = mkdtempSync(join(tmpdir(), "tickmarkr-preserved-end-"));
+  const preserved = Journal.create(root, "run-preserved-end");
+  const refs = [
+    { taskId: "T2", ref: "refs/tickmarkr/preserved/222bbb" },
+    { taskId: "T1", ref: "refs/tickmarkr/preserved/111aaa" },
+  ];
+  for (const { taskId, ref } of refs) preserved.append("worktree-preserved", taskId, { ref });
+  preserved.append("run-end", undefined, { done: [], failed: [] });
+
+  expect(preserved.read().at(-1)?.data.preservedRefs).toEqual(refs.map(({ taskId, ref }) => ({
+    taskId,
+    ref,
+    diffCommand: `git diff '${ref}^!'`,
+  })));
+
+  const plain = Journal.create(root, "run-plain-end");
+  plain.append("run-start");
+  plain.append("run-end", undefined, { done: [], failed: [] });
+  expect(plain.read().at(-1)?.data).not.toHaveProperty("preservedRefs");
+});
+
+test("test: a resume that restores upheld feedback names the task it was restored for, and a resume with no upheld feedback names no task", () => {
+  const root = mkdtempSync(join(tmpdir(), "tickmarkr-upheld-restore-"));
+  const upheld = Journal.create(root, "run-upheld-restore");
+  upheld.append("gate-result", "T1", { gate: "review", pass: false, details: "retain the passing work" });
+  upheld.append("task-approved", "T1", { release: REVIEW_UPHELD_RELEASE });
+  upheld.append("resume-restore", "T1", { attempts: 0 });
+  const restored = upheld.read().at(-1)!;
+  expect(restored.data.upheldFeedbackRestoredFor).toBe("T1");
+  expect(formatJournalNarration(restored)).toContain("upheld feedback restored for T1");
+
+  const plain = Journal.create(root, "run-plain-restore");
+  plain.append("resume-restore", "T2", { attempts: 1 });
+  const unrestored = plain.read().at(-1)!;
+  expect(unrestored.data).not.toHaveProperty("upheldFeedbackRestoredFor");
+  expect(formatJournalNarration(unrestored)).not.toContain("upheld feedback restored for T2");
+});
 
 describe("journal", () => {
   test("newRunId shape", () => {

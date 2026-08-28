@@ -9,7 +9,7 @@ import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/gr
 import { validateGraph, type RunGraph } from "../../src/graph/schema.js";
 import { foldActivity, type ActivityTask } from "../../src/run/activity.js";
 import type { JournalEvent } from "../../src/run/journal.js";
-import { Journal } from "../../src/run/journal.js";
+import { Journal, REVIEW_UPHELD_RELEASE } from "../../src/run/journal.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
 
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-status-"));
@@ -81,6 +81,54 @@ const renderBoard = async (g: RunGraph, tty: boolean, columns: number): Promise<
   saveGraph(repo, g);
   return withStatusSurface(tty, columns, () => status([], repo));
 };
+
+test("test: status names the preserved ref and a runnable git diff command for a task whose journal carries worktree-preserved, and renders no ref line for a task without one", async () => {
+  const repo = mkRepo();
+  const g = boardGraph([
+    { id: "T1", title: "preserved task", goal: "preserved task" },
+    { id: "T2", title: "ordinary task", goal: "ordinary task" },
+  ]);
+  saveGraph(repo, g);
+  const ref = "refs/tickmarkr/preserved/abc123";
+  seedJournal(repo, "run-preserved-status", [
+    startFor(g),
+    ev("worktree-preserved", "T1", { ref }),
+  ]);
+
+  const out = await status([], repo);
+  expect(out).toContain(`preserved worktree — T1 — ${ref}`);
+  expect(out).toContain(`git diff '${ref}^!'`);
+  expect(out).not.toContain("preserved worktree — T2");
+
+  const ttyOut = stripAnsi(await withStatusSurface(true, 120, () => status([], repo)));
+  expect(ttyOut).toContain(`preserved worktree — T1 — ${ref}`);
+  expect(ttyOut).toContain(`git diff '${ref}^!'`);
+
+  const plainRepo = mkRepo();
+  saveGraph(plainRepo, g);
+  seedJournal(plainRepo, "run-no-preserved-status", [startFor(g)]);
+  expect(await status([], plainRepo)).not.toContain("preserved worktree");
+});
+
+test("test: a task carrying both a preserved ref and upheld feedback surfaces both, so neither reduction masks the other", async () => {
+  const repo = mkRepo();
+  const g = boardGraph([{ id: "T1", title: "recover both", goal: "recover both" }]);
+  saveGraph(repo, g);
+  const ref = "refs/tickmarkr/preserved/def456";
+  seedJournal(repo, "run-both-recoveries", [
+    startFor(g),
+    ev("gate-result", "T1", { gate: "review", pass: false, details: "keep the tested behavior" }),
+    ev("task-approved", "T1", { release: REVIEW_UPHELD_RELEASE }),
+    ev("run-resume"),
+    ev("resume-restore", "T1"),
+    ev("worktree-preserved", "T1", { ref }),
+  ]);
+
+  const out = await status([], repo);
+  expect(out).toContain(`preserved worktree — T1 — ${ref}`);
+  expect(out).toContain(`git diff '${ref}^!'`);
+  expect(out).toContain("upheld feedback restored for T1");
+});
 
 describe("task titles on the status board", () => {
   test("every approved-table task renders its title rather than its goal, including titles that wrap at the narrow layout", async () => {

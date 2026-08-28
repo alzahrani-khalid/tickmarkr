@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import { channelKey, TokenUsageSchema, type Assignment } from "../adapters/types.js";
+import { channelKey, shq, TokenUsageSchema, type Assignment } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import { stateDirName, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, TIERS, type GateName, type Task, type TaskStatus } from "../graph/schema.js";
@@ -96,6 +96,29 @@ export const REVIEW_UPHELD_RELEASE = "review-upheld" as const;
 // so the corrected declaration is the thing that earns the green. Budget semantics match attempt-cap
 // (fresh attempts, tried survives) because the park cost the task its remaining budget.
 export const RECHECK_RELEASE = "recheck" as const;
+
+export interface PreservedRef {
+  ref: string;
+  diffCommand: string;
+}
+
+// OBS-738: one authority for every recovery surface. The ref is accepted only from the row that
+// preservation itself writes; task-human prose, branch heads and commit history are deliberately
+// absent from this fold. Keep every row in journal order — one task can be recreated more than once,
+// and the terminal record owes the operator every resulting recovery handle, not merely the newest.
+export function preservedRefsByTask(events: JournalEvent[]): Map<string, PreservedRef[]> {
+  const byTask = new Map<string, PreservedRef[]>();
+  for (const event of events) {
+    if (event.event !== "worktree-preserved" || !event.taskId || typeof event.data.ref !== "string"
+        || event.data.ref === "") continue;
+    const ref = event.data.ref;
+    byTask.set(event.taskId, [
+      ...(byTask.get(event.taskId) ?? []),
+      { ref, diffCommand: `git diff ${shq(`${ref}^!`)}` },
+    ]);
+  }
+  return byTask;
+}
 
 // OBS-189: review rounds are scoped to the current ENGAGEMENT — the stretch since the newest operator
 // approval for the task. A whole-journal count re-parks an upheld task before its funded attempt can
@@ -1198,19 +1221,37 @@ export class Journal {
       ? undefined
       : DecisionEventSchema.parse({ ...eventOrDecision, ts: new Date().toISOString() });
     const event = decisionRow?.event ?? eventOrDecision as string;
+    const rowTaskId = decisionRow && "taskId" in decisionRow ? decisionRow.taskId : taskId;
     const inputData = decisionRow?.data ?? data;
+    // OBS-738: terminal and resume records reduce the journal that precedes them. Neither re-derives
+    // recovery facts from task-human prose: preserved refs come from preservedRefsByTask, and the
+    // upheld brief comes from the established prompt/replay reducer.
+    const priorEvents = event === "run-end" || event === "resume-restore" ? this.read() : [];
+    const reducedData = event === "run-end"
+      ? (() => {
+          const preservedRefs = [...preservedRefsByTask(priorEvents)].flatMap(([preservedTaskId, refs]) =>
+            refs.map(({ ref, diffCommand }) => ({ taskId: preservedTaskId, ref, diffCommand })));
+          return preservedRefs.length > 0 ? { ...inputData, preservedRefs } : inputData;
+        })()
+      : event === "resume-restore" && rowTaskId && upheldFeedbackByTask(priorEvents).has(rowTaskId)
+        ? {
+            ...inputData,
+            upheldFeedbackRestoredFor: rowTaskId,
+            summary: `upheld feedback restored for ${rowTaskId}`,
+          }
+        : inputData;
     const evidence = judgePersistence.getStore();
     const failed = evidence?.invocations.filter((invocation) => invocation.transcript !== undefined) ?? [];
     const persistedData = event === "judge-retry" && failed.length > 0
       ? {
-          ...inputData,
+          ...reducedData,
           transcript: failed[0]!.transcript,
           ...(failed[1] ? { retryTranscript: failed[1].transcript } : {}),
         }
-      : inputData;
-    const row: JournalEvent = decisionRow ?? {
-      ts: new Date().toISOString(), event, ...(taskId ? { taskId } : {}), data: persistedData,
-    };
+      : reducedData;
+    const row: JournalEvent = decisionRow
+      ? { ...decisionRow, data: persistedData }
+      : { ts: new Date().toISOString(), event, ...(taskId ? { taskId } : {}), data: persistedData };
     // T3 secret redaction: only the persisted bytes are masked — the caller's data stays untouched in
     // memory. The narrator receives the persisted (masked) row so a pane sink never shows a credential.
     const line = redactSecrets(JSON.stringify(row));

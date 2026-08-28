@@ -643,6 +643,35 @@ type WorktreeObservation =
 
 type WorktreeComparison = "changed" | "unchanged" | "unreadable";
 
+type WorkerProcessTree = "empty" | "running" | "unmeasurable";
+
+// A CPU total cannot prove a tree empty: a newly launched live process can still have a measured
+// total of zero at the host's clock resolution. This probe asks the narrower cardinality question
+// OBS-737 needs. A readable process table with no marker root is measured empty; a failed or empty
+// table is unmeasurable. Descendants are closed over PPID because not every child retains the
+// dispatch-script marker in its own argv.
+async function observeWorkerProcessTree(marker: string, cwd: string): Promise<WorkerProcessTree> {
+  const snapshot = await shGit("ps -Awwo pid=,ppid=,command=", cwd, 15_000);
+  if (snapshot.code !== 0) return "unmeasurable";
+  const rows: { pid: string; ppid: string; command: string }[] = [];
+  for (const line of snapshot.stdout.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (match) rows.push({ pid: match[1]!, ppid: match[2]!, command: match[3]! });
+  }
+  if (rows.length === 0) return "unmeasurable";
+  const tree = new Set(rows.filter((row) => row.command.includes(marker)).map((row) => row.pid));
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const row of rows) {
+      if (!tree.has(row.pid) && tree.has(row.ppid)) {
+        tree.add(row.pid);
+        grew = true;
+      }
+    }
+  }
+  return tree.size === 0 ? "empty" : "running";
+}
+
 const OBSERVE_CHUNK_BYTES = 64 * 1024;
 const OBSERVE_BUDGET_BYTES = 256 * 1024 * 1024;
 let observeBudgetBytes = OBSERVE_BUDGET_BYTES;
@@ -722,6 +751,27 @@ async function boundedGitObservation(command: string, worktree: string, budget: 
   const result = await shGit(`set -o pipefail; ${command} | head -c ${budget + 1}`, worktree);
   if (result.code !== 0 || Buffer.byteLength(result.stdout) > budget) return undefined;
   return result.stdout;
+}
+
+// "No worktree delta" means no staged/unstaged/untracked bytes AND no commits beyond the task's
+// dispatch base. Both reads are bounded and preserve the observer's third state: a failed probe is
+// unreadable, never clean.
+async function observeWorktreeDelta(base: string, worktree: string): Promise<WorktreeComparison> {
+  let budget = observeBudgetBytes;
+  const status = await boundedGitObservation(
+    "GIT_OPTIONAL_LOCKS=0 git status --porcelain=v1 -z --untracked-files=all",
+    worktree,
+    budget,
+  );
+  if (status === undefined) return "unreadable";
+  budget -= Buffer.byteLength(status);
+  const ahead = await boundedGitObservation(
+    `GIT_OPTIONAL_LOCKS=0 git rev-list --count ${shq(base)}..HEAD`,
+    worktree,
+    budget,
+  );
+  if (ahead === undefined || !/^\d+$/.test(ahead.trim())) return "unreadable";
+  return status.length === 0 && ahead.trim() === "0" ? "unchanged" : "changed";
 }
 
 // The signature has four git-owned inputs: HEAD, staged blob/mode/path identity, porcelain path and
@@ -1198,10 +1248,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
   // gateFails/consults are execTask-scoped counters passed in so a park row is a rich verified-failure
   // observation (e.g. ladder-exhausted + gateFails:4); every task-human row has a closed kind, never prose alone.
-  const park = async (t: Task, reason: string, kind: ParkKind, assignment: Assignment | null, attempts: number, startMs: number, gateFails = 0, consults = 0, tokens?: TokenUsage, metered = 0, retryMode: RetryMode = "fresh") => {
+  const park = async (t: Task, reason: string, kind: ParkKind, assignment: Assignment | null, attempts: number, startMs: number, gateFails = 0, consults = 0, tokens?: TokenUsage, metered = 0, retryMode: RetryMode = "fresh", details: Record<string, unknown> = {}) => {
     graph = setStatus(graph, t.id, "human");
     saveGraph(repoRoot, graph);
-    journal.append("task-human", t.id, { reason, kind });
+    journal.append("task-human", t.id, { ...details, reason, kind });
     if (assignment) {
       // OBS-547: `metered` counts CHARGEABLE metered attempts, so an unchargeable dispatch passes 0 and
       // the count is omitted rather than written as 0 or as `1` beside `attempts: 0` — a row claiming
@@ -1282,6 +1332,24 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const ref = await preserveWorktree(priorWt);
       if (ref) journal.append("worktree-preserved", t.id, { ref });
       return driver.worktree(repoRoot, taskBranch, taskBase);
+    };
+
+    // A dead worker with a clean checkout still needs a durable recovery handle: there may be no
+    // pane left to identify even the commit it was dispatched from. preserveWorktree deliberately
+    // creates no ref for ordinary clean recreations, so this exceptional terminal path pins HEAD
+    // explicitly under the same recovery namespace. Reconfirm the delta immediately before the
+    // ref write; a change or unreadable recheck withdraws the park.
+    const preserveDeadWorker = async (worktree: string, taskBase: string): Promise<{
+      state: WorktreeComparison;
+      ref?: string;
+    }> => {
+      const state = await observeWorktreeDelta(taskBase, worktree);
+      if (state !== "unchanged") return { state };
+      const head = await gitHead(worktree);
+      const ref = `refs/tickmarkr/preserved/${head}`;
+      const updated = await shGit(`git update-ref ${shq(ref)} ${shq(head)}`, worktree);
+      if (updated.code !== 0) throw new Error(`could not preserve dead worker HEAD at ${ref}: ${updated.stderr || updated.stdout}`);
+      return { state, ref };
     };
 
     const r = route(t, cfg, channels, profile, undefined, demotedChannels);
@@ -2304,6 +2372,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // subprocess tree that REACHED its exit marker, not about what the worker claimed.
       let processExited = false;
       let earlyLaunchDead = false;
+      let deadWorkerPark: { ref: string; reason: string } | undefined;
       let settleParsed: WorkerResult | undefined;
       let seedResult: InteractiveSeedResult | undefined;
       // v1.22 T5 / OBS-19: auto-answer a fingerprint-matched trust dialog exactly once per slot.
@@ -2431,6 +2500,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           let quotaStreak = 0;
           let rowSaturationHeld = false; // journaled once per attempt when the kill stands down
           let cpuHeld = false; // likewise for the CPU leg's stand-down (OBS-548)
+          let paneReadHeld = false;
+          let paneStatusHeld = false;
           while (Date.now() - lastProgressAt < stallWindowMs) {
             const sliceStart = Date.now();
             const remaining = stallWindowMs - (sliceStart - lastProgressAt);
@@ -2457,7 +2528,35 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 break;
               }
             }
-            const paneText = await driver.read(slot, PANE_READ_ROWS);
+            // A failed pane read is absence of evidence, never evidence of an absent pane. Keep the
+            // rolling taskTimeoutMinutes window as the backstop and name the held probe once.
+            let paneText: string;
+            try {
+              paneText = await driver.read(slot, PANE_READ_ROWS);
+            } catch (error) {
+              // Preserve the pre-existing exception path when the independent status probe still
+              // sees a pane. The outer attempt finally owns accountant cleanup on that path. Only
+              // an undetectable status makes the read failure relevant to the death detector, and
+              // that genuinely unmeasurable pair fails open to the rolling timeout.
+              let paneUndetectable = true;
+              try {
+                paneUndetectable = await driver.status(slot) === "unknown";
+              } catch {
+                // Two unreadable pane probes are still unmeasurable, never proof of death.
+              }
+              if (!paneUndetectable) throw error;
+              if (!paneReadHeld) {
+                paneReadHeld = true;
+                journal.append("worker-dead-held", t.id, {
+                  slot: slot.name, attempt, reason: "pane-read-unreadable",
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+              await armCpuLeg(false);
+              const spent = Date.now() - sliceStart;
+              if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
+              continue;
+            }
             if (paneText.length > 0) everHadOutput = true;
             // OBS-117 (v1.71 T6): zero raw output by the early-launch deadline is a dead channel now.
             if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
@@ -2521,7 +2620,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // gate held. page on "idle" too: herdr's blocked-scrape is strict and proved flaky
             // for TUI dialogs (live check: cursor's trust dialog scraped as idle).
             // "unknown"/"working" never page.
-            const st = await driver.status(slot);
+            let st: string;
+            try {
+              st = await driver.status(slot);
+            } catch (error) {
+              if (!paneStatusHeld) {
+                paneStatusHeld = true;
+                journal.append("worker-dead-held", t.id, {
+                  slot: slot.name, attempt, reason: "pane-status-unreadable",
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+              await armCpuLeg(false);
+              const spent = Date.now() - sliceStart;
+              if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
+              continue;
+            }
             if (st !== lastStatus) {
               lastStatus = st;
               journal.append("worker-status", t.id, { slot: slot.name, status: st, attempt });
@@ -2559,6 +2673,92 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // daemon has nothing left to do — the pane falls back under the fast-kill and page
             // watchdogs like any other, instead of riding the whole rolling window untended.
             const nudgePending = nudgeable && (!nudged || nudgeDeadline !== undefined);
+
+            // OBS-737: disposition for the one fully measured death state. `unknown` alone is not
+            // absence (status parsing can fail), and an empty read alone is not absence (a live pane
+            // can be quiet); together they are the existing driver-level pane absence witness. The
+            // process probe and both worktree observations retain their own third states. Only the
+            // explicit conjunction parks; every other state falls through to the unchanged rolling
+            // timeout below. Seeded launches are excluded because their process marker is knowingly
+            // unmeasurable (armCpuLeg documents that contract above).
+            const paneAbsentCandidate = st === "unknown" && paneText.trim().length === 0;
+            // A subprocess can exit between waitOutput and read while its stdout is still draining.
+            // Confirm emptiness in this same poll before paying for `ps`; then confirm once more
+            // after the process probe yielded the event loop. Any bytes or read error withdraw the
+            // absence witness, so a fast completed worker cannot be parked in that drain race.
+            let paneAbsent = paneAbsentCandidate;
+            if (paneAbsent) {
+              try {
+                const confirmation = await driver.read(slot, PANE_READ_ROWS);
+                paneAbsent = confirmation.trim().length === 0;
+                if (!paneAbsent) {
+                  everHadOutput = true;
+                  if (stallProgress.observe({ paneText: confirmation, contextTokens })) lastProgressAt = Date.now();
+                }
+              } catch (error) {
+                paneAbsent = false;
+                if (!paneReadHeld) {
+                  paneReadHeld = true;
+                  journal.append("worker-dead-held", t.id, {
+                    slot: slot.name, attempt, reason: "pane-read-unreadable",
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              }
+            }
+            const processTree = paneAbsent && worktreeSinceLaunch === "unchanged" && !hasSeed
+              ? await observeWorkerProcessTree(dispatchScript, wt)
+              : "unmeasurable";
+            if (processTree === "empty") {
+              try {
+                const confirmation = await driver.read(slot, PANE_READ_ROWS);
+                paneAbsent = confirmation.trim().length === 0;
+                if (!paneAbsent) {
+                  everHadOutput = true;
+                  if (stallProgress.observe({ paneText: confirmation, contextTokens })) lastProgressAt = Date.now();
+                }
+              } catch (error) {
+                paneAbsent = false;
+                if (!paneReadHeld) {
+                  paneReadHeld = true;
+                  journal.append("worker-dead-held", t.id, {
+                    slot: slot.name, attempt, reason: "pane-read-unreadable",
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              }
+            }
+            const worktreeDelta = processTree === "empty"
+              && paneAbsent ? await observeWorktreeDelta(taskBase, wt)
+              : "unreadable";
+            // The first process snapshot can race a just-starting child after the dispatch pane
+            // disappeared. Re-read it after the pane and worktree legs have both held: preservation
+            // is terminal, so a process appearing in that interval must withdraw the park rather
+            // than be orphaned by it. The final worktree recheck remains inside preserveDeadWorker.
+            const confirmedProcessTree = worktreeDelta === "unchanged"
+              ? await observeWorkerProcessTree(dispatchScript, wt)
+              : "unmeasurable";
+            const deathCertain = paneAbsent
+              && processTree === "empty"
+              && confirmedProcessTree === "empty"
+              && worktreeDelta === "unchanged";
+            if (deathCertain) {
+              const preservation = await preserveDeadWorker(wt, taskBase);
+              if (!preservation.ref) {
+                journal.append("worker-dead-held", t.id, {
+                  slot: slot.name, attempt, reason: `worktree-${preservation.state}`,
+                });
+                continue;
+              }
+              const ref = preservation.ref;
+              const reason = `worker is unambiguously dead: pane absent, process tree empty, and worktree unchanged; preserved at ${ref}`;
+              deadWorkerPark = { ref, reason };
+              journal.append("worktree-preserved", t.id, { ref });
+              journal.append("worker-dead-held", t.id, {
+                slot: slot.name, attempt, reason: "unambiguous-worker-death", ref,
+              });
+              break;
+            }
             // T1 review fix: the kill's "no output growth" leg clocks off the RAW growth signals,
             // never lastProgressAt alone — the flat-token rule (stall.ts) deliberately suppresses
             // the re-arm report on row growth once tokens stick, and contextTokens is sticky across
@@ -2729,7 +2929,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (!finished && exitCode === null) {
             // timed out (or only ever saw false positives): harvest whatever the pane holds now
             timedOut = Date.now() - lastProgressAt >= stallWindowMs;
-            output = await driver.read(slot, PANE_READ_ROWS);
+            try {
+              output = await driver.read(slot, PANE_READ_ROWS);
+            } catch {
+              // The poll loop already recorded the unreadable pane. Retain the last readable bytes
+              // so this ambiguous path still reaches the ordinary timeout/consult backstop.
+            }
             finished = new RegExp(trailerPattern(nonce)).test(output);
             const exit = exitRe.exec(output);
             exitCode = exit ? Number(exit[1]) : null;
@@ -2848,6 +3053,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // an absent record leaves `tokens`/`metered` untouched (never a materialized zero).
       const attemptUsage = adapter.collectUsage?.(wt, attemptStart);
       if (attemptUsage) { tokens = addUsage(tokens, attemptUsage); metered++; }
+      if (deadWorkerPark) {
+        await park(
+          t, deadWorkerPark.reason, "stall", assignment, attempt + 1, startMs,
+          gateFails, consults, tokens, metered, retryMode, { ref: deadWorkerPark.ref },
+        );
+        return;
+      }
       let result = settleParsed ?? adapter.parse(output, nonce);
       const workerFinished = finished;
       const workerCause = classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut, deadChannel: deadChannelKilled });

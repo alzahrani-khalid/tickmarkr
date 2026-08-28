@@ -8,6 +8,7 @@ import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
 import { tickmarkrDir } from "../../../src/graph/graph.js";
 import { EARLY_LAUNCH_LIVENESS_MS, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE } from "../../../src/run/daemon.js";
 import { Journal } from "../../../src/run/journal.js";
+import { shGit } from "../../../src/run/git.js";
 import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests } from "../../../src/run/stall.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
@@ -803,4 +804,127 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
       resetRowRearmTokenFlatMsForTests();
     }
   }, 120_000);
+
+  test("test: a worker whose pane is absent and process tree empty and worktree unchanged raises task-human within one poll and does not wait taskTimeoutMinutes", async () => {
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 30 })], STALLED);
+    let polls = 0;
+    const driver = idriver({
+      waitOutput: async () => { polls++; await new Promise((r) => setTimeout(r, 20)); return false; },
+      read: async () => "",
+      status: async () => "unknown",
+      notify: async () => {},
+    });
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-t2-dead-one-poll", driver });
+
+    expect(summary.human).toEqual(["T1"]);
+    expect(polls).toBe(1);
+    const events = Journal.open(repo, "run-t2-dead-one-poll").read();
+    expect(events.some((e) => e.event === "task-human" && e.taskId === "T1")).toBe(true);
+    expect(events.some((e) => e.event === "worker-result" && e.taskId === "T1")).toBe(false);
+  }, 30_000);
+
+  test("test: a worker whose pane is absent but whose worktree carries a delta is held rather than parked, so an ambiguous death still fails open to the backstop timer", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { timeoutMinutes: 0.01 })],
+      { consult: { action: "human", notes: "backstop owned the ambiguous worker" },
+        tasks: { T1: [{ shell: "echo scratch > scratch.txt && echo working-on-it" }] } },
+    );
+    let wroteDelta = false;
+    const driver = idriver({
+      read: async (slot: Slot) => {
+        if (!wroteDelta) {
+          wroteDelta = true;
+          writeFileSync(join(slot.cwd, "scratch.txt"), "scratch\n");
+        }
+        return "";
+      },
+      status: async () => "unknown",
+      notify: async () => {},
+    });
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-t2-dead-delta-held", driver });
+
+    expect(summary.human).toEqual(["T1"]);
+    const events = Journal.open(repo, "run-t2-dead-delta-held").read();
+    expect(events.find((e) => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+    expect(events.some((e) => e.event === "worker-dead-held" && e.data.reason === "unambiguous-worker-death")).toBe(false);
+  }, 30_000);
+
+  test("a process tree that appears during the death probe withdraws the park and leaves the timeout backstop reachable", async () => {
+    const runId = "run-t2-dead-process-held";
+    const { repo, fake } = setupRepo(
+      [T("T1", { timeoutMinutes: 0.01 })],
+      { consult: { action: "human", notes: "backstop owned the live process" },
+        tasks: { T1: [{ shell: "echo working-on-it" }] } },
+    );
+    const marker = join(tickmarkrDir(repo), "runs", runId, "prompts", "T1-a0.sh");
+    const probeDir = makeTestTempDir("tickmarkr-ps-running-");
+    const bashEnv = join(probeDir, "bash-env");
+    const firstProbe = join(probeDir, "first-probe");
+    writeFileSync(bashEnv, [
+      "ps() {",
+      `  if [ -f '${firstProbe}' ]; then echo '4242 1 bash ${marker}';`,
+      `  else : > '${firstProbe}'; echo '1 1 unrelated-process'; fi`,
+      "}",
+      "",
+    ].join("\n"));
+    process.env.BASH_ENV = bashEnv;
+    const driver = idriver({
+      read: async () => "",
+      status: async () => "unknown",
+      notify: async () => {},
+    });
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId, driver });
+
+    expect(summary.human).toEqual(["T1"]);
+    const events = Journal.open(repo, runId).read();
+    expect(events.find((e) => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+    expect(events.some((e) => e.event === "task-human" && e.data.ref !== undefined)).toBe(false);
+  }, 30_000);
+
+  test("test: a worker whose pane is absent and process tree empty but whose pane read errored is held rather than parked, because an unreadable probe is not evidence of death", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { timeoutMinutes: 0.01 })],
+      { consult: { action: "human", notes: "backstop owned the unreadable worker" },
+        tasks: { T1: [{ shell: "echo working-on-it" }] } },
+    );
+    let reads = 0;
+    const driver = idriver({
+      read: async () => {
+        if (reads++ === 0) return "";
+        throw new Error("pane read probe failed");
+      },
+      status: async () => "unknown",
+      notify: async () => {},
+    });
+
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-t2-dead-pane-unreadable", driver });
+
+    expect(summary.human).toEqual(["T1"]);
+    const events = Journal.open(repo, "run-t2-dead-pane-unreadable").read();
+    expect(events.find((e) => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+    expect(events.filter((e) => e.event === "worker-dead-held" && e.data.reason === "pane-read-unreadable")).toHaveLength(1);
+    expect(events.some((e) => e.event === "worker-dead-held" && e.data.reason === "unambiguous-worker-death")).toBe(false);
+  }, 30_000);
+
+  test("test: the task-human row raised for a dead worker names the preserved ref path and the reason kind, so an operator can diff the preserved work without the pane", async () => {
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 30 })], STALLED);
+    const driver = idriver({
+      read: async () => "",
+      status: async () => "unknown",
+      notify: async () => {},
+    });
+
+    await runDaemon(repo, { adapters: [fake], runId: "run-t2-dead-ref", driver });
+
+    const events = Journal.open(repo, "run-t2-dead-ref").read();
+    const parked = events.find((e) => e.event === "task-human" && e.taskId === "T1");
+    expect(parked?.data).toMatchObject({ kind: "stall" });
+    expect(parked?.data.ref).toMatch(/^refs\/tickmarkr\/preserved\/[0-9a-f]{40,64}$/);
+    expect(parked?.data.reason).toContain(parked?.data.ref);
+    expect(events.find((e) => e.event === "worktree-preserved" && e.taskId === "T1")?.data.ref).toBe(parked?.data.ref);
+    expect((await shGit(`git rev-parse --verify '${parked?.data.ref}^{commit}'`, repo)).code).toBe(0);
+  }, 30_000);
 });

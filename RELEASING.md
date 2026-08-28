@@ -78,8 +78,8 @@ Per release:
    export commit and push the tag:
 
    ```bash
-   git tag -a v2.1.5 -m "v2.1.5"
-   git push origin v2.1.5
+   git tag -a v2.1.6 -m "v2.1.6"
+   git push origin v2.1.6
    ```
 
 5. The tag push runs `release.yml` in the public repository:

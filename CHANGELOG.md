@@ -4,6 +4,24 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.6** — the harness tells you what it already knows: four gated tasks on one run, closed green
+4/4 with tip verify passed and every bucket empty. The theme is that the daemon already held the facts
+its operator was guessing at, and now says them out loud.
+
+- **A test-gate red that is infrastructure alone costs the worker no attempt.** Fresh infra failures are
+  classified rather than charged, so a machine that ran out of file descriptors no longer spends a
+  task's repair budget. Infrastructure signatures now enter the fingerprint diff too, so a signature
+  like birpc's assertion-free RPC death cannot collapse to a content-free marker before the fresh-failure
+  path can ask the same classifier.
+- **An unambiguously dead worker is parked for a human, not waited out.** A dead pane observation is
+  confirmed and its process tree reconfirmed before the daemon acts, and the park names the command that
+  releases it — replacing a silent stall-timeout with a decision the operator can act on.
+- **The preserved ref and the upheld feedback are surfaced where a reader already looks.** Recovery facts
+  reach the journal and the status board instead of living only in a worktree nobody opens, and preserved
+  diff revisions are quoted so a ref with shell-significant characters survives the round trip.
+- **`tickmarkr stats` answers which channel delivers, across every run.** Routing history stops being a
+  per-run anecdote.
+
 **v2.1.5** — review-channel parity: the reviewer is shown what the task declared, a reviewer that
 says nothing costs nothing, and every suite verdict carries the capacity it was measured under. Seven
 tasks, one gated run, cross-vendor throughout; two reached the review cap on real findings and merged

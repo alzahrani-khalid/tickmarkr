@@ -17,9 +17,11 @@ import {
   type JournalEvent,
   engagementComparable,
   isQualityFailureParkKind,
+  preservedRefsByTask,
   recordedTaskFailureKind,
   runHasEnded,
   type TaskPhase,
+  upheldFeedbackByTask,
 } from "../../run/journal.js";
 import { isPidLive } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
@@ -1154,6 +1156,23 @@ const renderFrame = (
   for (const taskId of phases.keys()) if (!taskIds.has(taskId)) phases.delete(taskId);
   const hotPhase = [...phases.values()].sort((a, b) => a.order - b.order).at(-1);
 
+  // OBS-738: recovery facts stay on the journal's two established reducers. The prefix fold keeps an
+  // older journal equally readable by asking upheldFeedbackByTask what was active at that exact
+  // restore boundary; current resume-restore rows additionally carry the same task for narration.
+  const preservedRefs = preservedRefsByTask(events);
+  const restoredUpheldFeedback = new Set(events.flatMap((event, index) =>
+    event.event === "resume-restore" && event.taskId
+      && upheldFeedbackByTask(events.slice(0, index)).has(event.taskId)
+      ? [event.taskId]
+      : []));
+  const recoveryLinesForTask = (taskId: string): string[] => [
+    ...(preservedRefs.get(taskId) ?? []).flatMap(({ ref, diffCommand }) => [
+      `preserved worktree — ${taskId} — ${ref}`,
+      `  ${diffCommand}`,
+    ]),
+    ...(restoredUpheldFeedback.has(taskId) ? [`upheld feedback restored for ${taskId}`] : []),
+  ].map(sanitizeTaskText);
+
   const cells = renderedTasks.map((t) => {
     const folded = journalRowsOnly && comparable ? taskRows.get(t.id) : undefined;
     const st: SurfaceTaskState = folded?.state ?? replayed?.get(t.id) ?? t.status;
@@ -1192,7 +1211,7 @@ const renderFrame = (
   if (!unicode) {
     // machine/CI surface — journals without phase-start stay byte-identical; new phase-aware frames
     // use an ASCII spinner so pipes never receive terminal-only braille/ANSI.
-    const rows = cells.map(({ t, st, merged, label, assignCol, livePhase, states, priorGraph, pane }) => {
+    const rows = cells.flatMap(({ t, st, merged, label, assignCol, livePhase, states, priorGraph, pane }) => {
       const chain = gateChain(states, false);
       const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${surfaceTaskBox(st, merged)} ${t.id} `;
       const suffix = `  ${chain}${priorGraph ? ` ${PRIOR_GRAPH_MARKER}` : ""}  ${livePhase ? "running" : surfaceStatusWord(st)}${label}  ${assignCol}${pane ? `  pane ${pane}` : ""}`;
@@ -1201,7 +1220,10 @@ const renderFrame = (
       // can exceed the terminal width, and the pre-floor math paid for it out of the TITLE — 20 of
       // 41 rows in a live 41-task run named no task at all. These rows already overflow `width`
       // (a pane name is 60 columns on its own), so the floor costs wrapping, never the graph.
-      return `${prefix}${shortGoal(t.title, Math.max(MACHINE_TITLE_FLOOR, width - prefix.length - suffix.length))}${suffix}`;
+      return [
+        `${prefix}${shortGoal(t.title, Math.max(MACHINE_TITLE_FLOOR, width - prefix.length - suffix.length))}${suffix}`,
+        ...recoveryLinesForTask(t.id).map((line) => `    ${line}`),
+      ];
     });
     const zone = journalRowsOnly ? `${divider}zone ${localZoneLabel(zoneReference)}` : "";
     const header = runId
@@ -1402,6 +1424,12 @@ const renderFrame = (
     return [legend(headerRow), dim(ruleRow), ...rows];
   };
   const gatesLegend = legend(`    gates   ${GATE_NAMES.map((gate) => `${gate.slice(0, 2)} ${gate}`).join("  ")}`);
+  const recoveryLines = cells.flatMap((cell) => recoveryLinesForTask(cell.t.id));
+  const recoverySection = recoveryLines.length === 0 ? [] : [
+    "",
+    `  ${ok("▌")} ${title("RECOVERY")}`,
+    ...recoveryLines.map((line) => legend(`    ${line}`)),
+  ];
 
   const effort = effortPanel(g.tasks, record && !comparable ? undefined : events, boardColumns);
   return {
@@ -1414,6 +1442,7 @@ const renderFrame = (
         taskSection,
         "",
         ...tableRows(),
+        ...recoverySection,
         gatesLegend,
         "",
         rule(boardColumns),

@@ -47,7 +47,14 @@ jobs:
       # red, in their own serial step with a generous timeout (project sync-heavy,
       # vitest.config.ts). NOT an absorber: a new red here that is not the birpc class goes
       # back to classification, never into the timeout.
+      # OBS-744: INDEPENDENT of the step above. That step exits nonzero on the birpc teardown,
+      # and without this the serial sync-heavy step is SKIPPED — so the lane silently runs a
+      # reduced subset exactly when a release is being graded. Measured at the v2.1.5 tag gate:
+      # step 7 failed on BOTH jobs, step 8 skipped on BOTH, and clause 5 could only be met by
+      # invoking D27 clause 2's local substitution — the concession this line exists to retire.
+      # It cannot mask a red: this step's own conclusion is still graded.
       - run: npx vitest run --project sync-heavy
+        if: always()
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
@@ -72,7 +79,14 @@ jobs:
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
       # same serial sync-heavy step as the ubuntu job (RULING-1890-CI-DESIGN option c)
+      # OBS-744: INDEPENDENT of the step above. That step exits nonzero on the birpc teardown,
+      # and without this the serial sync-heavy step is SKIPPED — so the lane silently runs a
+      # reduced subset exactly when a release is being graded. Measured at the v2.1.5 tag gate:
+      # step 7 failed on BOTH jobs, step 8 skipped on BOTH, and clause 5 could only be met by
+      # invoking D27 clause 2's local substitution — the concession this line exists to retire.
+      # It cannot mask a red: this step's own conclusion is still graded.
       - run: npx vitest run --project sync-heavy
+        if: always()
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"

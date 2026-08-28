@@ -14,6 +14,7 @@ import { report } from "./commands/report.js";
 import { resume } from "./commands/resume.js";
 import { run } from "./commands/run.js";
 import { scope } from "./commands/scope.js";
+import { stats } from "./commands/stats.js";
 import { status } from "./commands/status.js";
 import { ui } from "./commands/ui.js";
 import { unlock } from "./commands/unlock.js";
@@ -27,7 +28,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS: CommandMap = {
-  init, doctor, fleet, compile, scope, plan, run, status, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
+  init, doctor, fleet, compile, scope, plan, run, status, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
 };
 
 const VERSION_FLAGS = new Set(["version", "--version", "-v"]);
@@ -47,6 +48,7 @@ usage: tickmarkr <command>
   eval          run checked-in fixtures against every channel in isolated temp repos
   run           execute the graph (--concurrency N --driver auto|herdr|subprocess|orca --route-strict; orca runs only when named)
   status        live run state
+  stats         all-run channel delivery, red, rescue, author and reviewer statistics
   verify        run the gate battery standalone against merge-base(--base, HEAD)..HEAD — no daemon, one verdict (--base main --criteria <file> | --task <id> [--files <glob>] [--author adapter:model] [--no-review] [--json])
   resume <id>   continue a run from its journal
   report <id>   cost/quality report (--md for committable execution record)
