@@ -346,6 +346,12 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     expect(source).toContain("banner=$(printf '%s\\n' \"$screen\"");
     expect(source).toContain("\"$banner\" | grep -oE '[0-9]+%'");
     expect(source).not.toContain("\"$screen\" | grep -oE '[0-9]+%'");
-    expect(readFileSync(TWIN)).toEqual(shipped);
+    // OBS-793: the `.claude/` twin is a PRIVATE-TREE convenience that the export deliberately
+    // excludes (`scripts/export-public.sh`, `:(exclude).claude`), so it does not exist in the shipped
+    // tree, in the public repository, or in any consumer checkout. Assert byte-identity wherever the
+    // twin IS present — which is every seat that edits either copy — and skip where it cannot be.
+    // An UNGUARDED read passes here and throws ENOENT in the shipped tree: v2.1.7's first public CI
+    // run failed on exactly this line, on BOTH ubuntu and macos, while the private suite was green.
+    if (existsSync(TWIN)) expect(readFileSync(TWIN)).toEqual(shipped);
   });
 });
