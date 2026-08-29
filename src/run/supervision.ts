@@ -17,8 +17,8 @@ import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 //
 // SUP-02: the beat mtime is the ONLY input. Nothing here reads a process table and nothing matches a
 // process name — a poll-grep watcher carries `grep` in its own argv, so the filter that removes the
-// probing grep removes the watched one. The payload records a pid for an OPERATOR to read off a STALE
-// record; the derivation never consults it, so a reused, dead or unreadable pid changes no state.
+// probing grep removes the watched one. The payload's exitedWriterPid identifies the one-shot writer
+// for an OPERATOR reading a STALE record; no derivation consults it, so its value changes no state.
 // Zero new deps — node:fs stdlib, exactly as lock.ts.
 
 /** How often a watcher rewrites its own tier's beat. */
@@ -31,6 +31,8 @@ export const SUPERVISION_STALE_MS = 6 * SUPERVISION_BEAT_MS;
 // millisecond into the future. A second of slack covers even a coarse filesystem. Anything past it
 // is SKEW, and skew is the one direction this instrument may not fail in: see readTierLiveness.
 export const SUPERVISION_FUTURE_GRACE_MS = 1_000;
+/** Context watchers act at 75% unless their invocation declares another threshold. */
+export const SUPERVISION_DEFAULT_THRESHOLD_PCT = 75;
 
 // The supervision seats this harness has. An unlisted tier is an INVISIBLE tier, which is the failure
 // mode itself — an auditor read "no watchers were ever armed" off a surface that named none. Adding a
@@ -78,6 +80,17 @@ export interface TierLiveness {
   beatAgeMs?: number;
   /** The seat the record names, when it names one. Always present on a seat tier that is not ABSENT. */
   seat?: string;
+  /** The alarm's durable duty, orthogonal to whether its watcher is armed, stale or stood down. */
+  clearOwedSince?: string;
+  /** The latch exists but cannot be decoded; never mistaken for no duty owed. */
+  clearOwedUnreadable?: true;
+}
+
+/** A watcher observation that can raise or discharge the seat's clear obligation. */
+export interface SupervisionBeatObservation {
+  armId: string;
+  pct: number;
+  thresholdPct: number;
 }
 
 // PURE path math: stateDirName, never tickmarkrDir — the latter mkdirs the state dir and writes its
@@ -91,6 +104,10 @@ export const supervisionBeatPath = (repoRoot: string, tier: SupervisionTier): st
 /** Where a watcher records that it STOOD DOWN. Its own file: the beat keeps meaning only "alive". */
 export const supervisionStandDownPath = (repoRoot: string, tier: SupervisionTier): string =>
   join(supervisionDir(repoRoot), `${tier}.standdown`);
+
+/** The independent latch a stand-down cannot overwrite or remove. */
+const supervisionObligationPath = (repoRoot: string, tier: SupervisionTier): string =>
+  join(supervisionDir(repoRoot), `${tier}.clear-owed`);
 
 // SUP-06: PRESENCE — one file per ARMED WATCHER, because a tier may legitimately have more than one.
 // Two boards watch one repo the moment an operator opens a second pane, and the tier is armed while
@@ -128,29 +145,125 @@ function stalePeersIfLast(repoRoot: string, tier: SupervisionTier, id: string, n
   return stale;
 }
 
+type ClearObligation = {
+  clearOwedSince: string;
+  armId: string;
+  thresholdPct: number;
+} | "NONE" | "UNREADABLE";
+
+/** Read the latch without creating, touching or repairing it. */
+function readClearObligation(repoRoot: string, tier: SupervisionTier): ClearObligation {
+  const p = supervisionObligationPath(repoRoot, tier);
+  let st: Stats;
+  try {
+    st = statSync(p);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "NONE" : "UNREADABLE";
+  }
+  if (!st.isFile()) return "UNREADABLE";
+  try {
+    const rec = JSON.parse(readFileSync(p, "utf8")) as {
+      tier?: unknown; clearOwedSince?: unknown; armId?: unknown; thresholdPct?: unknown;
+    };
+    if (rec?.tier !== tier) return "UNREADABLE";
+    if (typeof rec.clearOwedSince !== "string" || Number.isNaN(Date.parse(rec.clearOwedSince))) return "UNREADABLE";
+    if (typeof rec.armId !== "string" || !rec.armId.trim()) return "UNREADABLE";
+    if (typeof rec.thresholdPct !== "number" || !Number.isFinite(rec.thresholdPct)
+        || rec.thresholdPct < 0 || rec.thresholdPct > 100) return "UNREADABLE";
+    return { clearOwedSince: rec.clearOwedSince, armId: rec.armId, thresholdPct: rec.thresholdPct };
+  } catch { return "UNREADABLE"; }
+}
+
+/** Publish a crossing atomically; a firing replacement inherits the original duty's instant. */
+function raiseClearObligation(
+  repoRoot: string,
+  tier: SupervisionTier,
+  armId: string,
+  thresholdPct: number,
+): void {
+  const existing = readClearObligation(repoRoot, tier);
+  if (typeof existing === "object" && existing.armId === armId) return;
+  if (existing === "UNREADABLE") {
+    throw new Error(`${tier} clear obligation is unreadable — refusing to overwrite a duty that may still be owed`);
+  }
+  const p = supervisionObligationPath(repoRoot, tier);
+  const tmp = `${p}.${process.pid}.${randomUUID()}.tmp`;
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(tmp, JSON.stringify({
+    tier, armId, thresholdPct,
+    clearOwedSince: typeof existing === "object" ? existing.clearOwedSince : new Date().toISOString(),
+  }) + "\n");
+  renameSync(tmp, p);
+}
+
+/** Only a different arm observed below the firing threshold proves the old seat was cleared. */
+function dischargeClearObligation(
+  repoRoot: string,
+  tier: SupervisionTier,
+  observation: SupervisionBeatObservation,
+): void {
+  const existing = readClearObligation(repoRoot, tier);
+  if (existing === "UNREADABLE") {
+    throw new Error(`${tier} clear obligation is unreadable — refusing to erase a duty that may still be owed`);
+  }
+  if (typeof existing === "object" && existing.armId !== observation.armId
+      && observation.pct < existing.thresholdPct) {
+    rmSync(supervisionObligationPath(repoRoot, tier), { force: true });
+  }
+}
+
+function validateObservation(observation: SupervisionBeatObservation): void {
+  if (!observation.armId.trim()) throw new Error("a supervision observation needs a non-empty arm identity");
+  for (const [name, value] of [["pct", observation.pct], ["threshold-pct", observation.thresholdPct]] as const) {
+    if (!Number.isFinite(value) || value < 0 || value > 100) {
+      throw new Error(`--${name} must be a number from 0 through 100`);
+    }
+  }
+}
+
 // WRITER — a watcher's own call, on its own tier, every SUPERVISION_BEAT_MS. Never a reader's: the
 // purity fence (status --watch leaves the state dir byte-identical) is the test that catches a reader
 // that beats on the watcher's behalf, which would report every dead tier as healthy.
-function writeSupervisionBeat(repoRoot: string, tier: SupervisionTier, seat?: string, armId?: string): void {
+function writeSupervisionBeat(
+  repoRoot: string,
+  tier: SupervisionTier,
+  seat?: string,
+  armId?: string,
+  observation?: SupervisionBeatObservation,
+): void {
   // A seat tier may not be armed anonymously, and the refusal belongs HERE rather than only in the
   // verb: any caller that could write a seatless record could arm a tier nobody occupies.
   if (isSeatTier(tier) && !seat?.trim()) {
     throw new Error(`${tier} is a per-seat tier — a beat must declare the seat identity it speaks for`);
   }
+  if (observation !== undefined) validateObservation(observation);
   tickmarkrDir(repoRoot); // the write path DOES create — beats land inside the gitignored state dir
   const p = supervisionBeatPath(repoRoot, tier);
   mkdirSync(dirname(p), { recursive: true });
+  // Raise before the beat so a later beat failure cannot hide a duty; discharge only after the
+  // below-threshold observation exists on disk.
+  if (observation !== undefined && observation.pct >= observation.thresholdPct) {
+    raiseClearObligation(repoRoot, tier, observation.armId, observation.thresholdPct);
+  }
   writeFileSync(
     p,
     JSON.stringify({
       tier, ...(seat ? { seat } : {}), ...(armId ? { armId } : {}),
-      pid: process.pid, beatAt: new Date().toISOString(),
+      ...(observation !== undefined ? { pct: observation.pct, thresholdPct: observation.thresholdPct } : {}),
+      exitedWriterPid: process.pid, beatAt: new Date().toISOString(),
     }) + "\n",
   );
+  if (observation !== undefined) dischargeClearObligation(repoRoot, tier, observation);
 }
 
-export function beatSupervision(repoRoot: string, tier: SupervisionTier, seat?: string): void {
-  writeSupervisionBeat(repoRoot, tier, seat);
+export function beatSupervision(
+  repoRoot: string,
+  tier: SupervisionTier,
+  seat?: string,
+  observation?: SupervisionBeatObservation,
+): void {
+  writeSupervisionBeat(repoRoot, tier, seat, undefined, observation);
 }
 
 /** Handle a watcher holds for as long as it is supervising; disarm stands it down and is idempotent. */
@@ -186,7 +299,7 @@ export function armSupervision(
   try { rmSync(supervisionStandDownPath(repoRoot, tier), { force: true, recursive: true }); }
   catch { /* uncleared: the reader validates the marker and a newer beat outranks it — never masked */ }
   // This watcher's own identity fences BOTH its presence and its stand-down against every later arm.
-  // pid alone collides between two boards in one host (and after pid reuse); a UUID never aliases the
+  // A process id alone collides between two boards in one host (and after reuse); a UUID never aliases the
   // stale presence of a killed process that a later last-one-out cleanup may already have observed.
   const id = `${process.pid}.${randomUUID()}`;
   const presence = supervisionPresencePath(repoRoot, tier, id);
@@ -194,7 +307,7 @@ export function armSupervision(
   const mark = () => {
     try {
       writeSupervisionBeat(repoRoot, tier, seat, id); // creates the directory presence is written into
-      writeFileSync(presence, JSON.stringify({ tier, pid: process.pid, id }) + "\n");
+      writeFileSync(presence, JSON.stringify({ tier, exitedWriterPid: process.pid, id }) + "\n");
     } catch { /* repo gone / disk full / no seat — the tier ages out rather than crashing its watcher */ }
   };
   mark();
@@ -224,7 +337,7 @@ export function armSupervision(
         mkdirSync(dirname(p), { recursive: true });
         writeFileSync(tmp, JSON.stringify({
           tier, ...(seat ? { seat } : {}), armId: id,
-          pid: process.pid, disarmedAt: new Date().toISOString(),
+          exitedWriterPid: process.pid, disarmedAt: new Date().toISOString(),
         }) + "\n");
         renameSync(tmp, p);
       } catch { /* unrecordable stand-down ages out as STALE — pessimistic, which is the safe way to fail */ }
@@ -237,6 +350,11 @@ export function armSupervision(
   };
 }
 
+/** Arm the live status board's own tier through the normal supervision writer and lifecycle. */
+export function armWatchSupervision(repoRoot: string, beatMs: number = SUPERVISION_BEAT_MS): ArmedSupervision {
+  return armSupervision(repoRoot, "watch", beatMs);
+}
+
 // BEAT DERIVATION — pure, and the only thing that reads the beat. One statSync: never creates,
 // touches or reaps the record it reports on, and never creates the directory that holds it. ONLY a
 // missing path is ABSENT: ENOENT (no beat file) and ENOTDIR (nothing that could hold one) mean no
@@ -245,7 +363,7 @@ export function armSupervision(
 // never silently ARMED. Callers wanting the TIER's state want supervisionStatus below; this answers
 // the narrower question "does the beat say alive", which is all a beat can ever say.
 export function readTierLiveness(repoRoot: string, tier: SupervisionTier, now = Date.now()): TierLiveness {
-  return beatLiveness(tier, readBeat(repoRoot, tier), now);
+  return withClearObligation(repoRoot, tier, beatLiveness(tier, readBeat(repoRoot, tier), now));
 }
 
 /** What a beat record yields: when it was written, its seat, and its armed-watcher fence when named. */
@@ -304,6 +422,19 @@ function beatLiveness(tier: SupervisionTier, beat: BeatRecord, now: number): Tie
   return { tier, state: beatAgeMs > SUPERVISION_STALE_MS ? "STALE" : "ARMED", beatAgeMs, ...named };
 }
 
+/** Add the independent duty without replacing or reinterpreting the watcher's state. */
+function withClearObligation(
+  repoRoot: string,
+  tier: SupervisionTier,
+  liveness: TierLiveness,
+): TierLiveness {
+  const obligation = readClearObligation(repoRoot, tier);
+  if (obligation === "NONE") return liveness;
+  return obligation === "UNREADABLE"
+    ? { ...liveness, clearOwedUnreadable: true }
+    : { ...liveness, clearOwedSince: obligation.clearOwedSince };
+}
+
 // A stand-down is only what a watcher RECORDED, so the record has to READ as one: a regular file whose
 // payload names this tier and the instant it stood down. Path existence is not proof — a directory, a
 // torn write or a stray file at that path says nothing about any watcher, and calling one of those a
@@ -352,7 +483,7 @@ function readStandDown(
 export function supervisionStatus(repoRoot: string, tier: SupervisionTier, now = Date.now()): TierLiveness {
   const beat = readBeat(repoRoot, tier);
   const standDown = readStandDown(repoRoot, tier);
-  if (standDown === "UNREADABLE") return { tier, state: "UNREADABLE" };
+  if (standDown === "UNREADABLE") return withClearObligation(repoRoot, tier, { tier, state: "UNREADABLE" });
   const beatOutranksStandDown = standDown !== "NONE" && typeof beat === "object" && (
     beat.mtimeMs > standDown.mtimeMs || (
       now - beat.mtimeMs <= SUPERVISION_STALE_MS &&
@@ -362,9 +493,11 @@ export function supervisionStatus(repoRoot: string, tier: SupervisionTier, now =
   if (standDown !== "NONE" && !beatOutranksStandDown) {
     // the seat that stood down is named by the marker, falling back to whatever its last beat named
     const seat = standDown.seat ?? (typeof beat === "object" ? beat.seat : undefined);
-    return { tier, state: "DISARMED", ...(seat !== undefined ? { seat } : {}) };
+    return withClearObligation(repoRoot, tier, {
+      tier, state: "DISARMED", ...(seat !== undefined ? { seat } : {}),
+    });
   }
-  return beatLiveness(tier, beat, now);
+  return withClearObligation(repoRoot, tier, beatLiveness(tier, beat, now));
 }
 
 /** Every KNOWN tier, always — a tier omitted from this list would read as one that is fine. */
@@ -376,4 +509,8 @@ export const readSupervision = (repoRoot: string, now = Date.now()): TierLivenes
 // both that something is beating and who is behind it, which is the pair an operator needs to act. A
 // row with no seat to name renders exactly as it always did.
 export const supervisionText = (tiers: readonly TierLiveness[], divider = " · "): string =>
-  `supervision: ${tiers.map((t) => `${t.tier} ${t.state}${t.seat ? ` (${t.seat})` : ""}`).join(divider)}`;
+  `supervision: ${tiers.map((t) =>
+    `${t.tier} ${t.state}${t.seat ? ` (${t.seat})` : ""}` +
+    `${t.clearOwedSince ? ` CLEAR-OWED since ${t.clearOwedSince}` : ""}` +
+    `${t.clearOwedUnreadable ? " CLEAR-OWED unreadable" : ""}`
+  ).join(divider)}`;

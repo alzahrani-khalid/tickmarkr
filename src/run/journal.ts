@@ -15,6 +15,7 @@ import {
   type JournalSourceRow,
   type TrackedJournalRow,
 } from "./protocol.js";
+import { normalizeGateOutcome } from "./outcome.js";
 import { redactSecrets } from "./redact.js";
 
 export interface JournalEvent {
@@ -32,6 +33,23 @@ export function phaseForGate(gate: GateName): TaskPhase {
   return `gate:${gate}`;
 }
 
+/** The pipe projects the same normalized gate outcome as the TTY rail. The selected-test field only
+ * chooses the held outcome's operator noun after the accessor has classified it; it is not a second
+ * verdict read. */
+const journalGateDetail = (data: Record<string, unknown>): string | undefined => {
+  if (typeof data.gate !== "string") return undefined;
+  switch (normalizeGateOutcome(data).kind) {
+    case "passed":
+      return `${data.gate} passed`;
+    case "failed":
+      return `${data.gate} failed`;
+    case "held":
+      return Array.isArray(data.selectedTests) ? `${data.gate} selected-test screen` : `${data.gate} held`;
+    default:
+      return data.gate;
+  }
+};
+
 export function formatJournalNarration({ event, taskId, data }: JournalEvent): string {
   const assignment = data.assignment as Record<string, unknown> | undefined;
   const direct = [data.summary, data.reason, data.error, data.step, data.action, data.lint, data.branch, data.from]
@@ -43,7 +61,9 @@ export function formatJournalNarration({ event, taskId, data }: JournalEvent): s
         ? `${data.gate} failed${typeof data.lastMergedTask === "string" ? ` after ${data.lastMergedTask}` : ""}`
         : event === "tip-verify"
           ? `${data.gate} passed`
-          : `${data.gate}${data.pass === true ? " passed" : data.pass === false ? " failed" : ""}`
+          : event === "gate-result"
+            ? journalGateDetail(data)
+            : `${data.gate}`
       : typeof data.code === "number" ? `exit ${data.code}`
         : typeof data.pid === "number" ? `pid ${data.pid}`
           : typeof data.baseRef === "string" ? `base ${data.baseRef.slice(0, 12)}`

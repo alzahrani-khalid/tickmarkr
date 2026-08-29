@@ -158,6 +158,17 @@ describe("desiredPanes", () => {
 describe("panesToClose (workspace-aware fleet fold)", () => {
   const ws = "wT";
 
+  it("test: the reconcile fold given an empty ended-run set closes nothing, so the caller supplies the knowledge and the fold invents none", () => {
+    const old = formatOwnedName({ role: "worker", taskId: "T9", attempt: 0, runId: "run-old" });
+    expect(panesToClose(
+      [{ name: old, paneId: "p-old", tabId: "t-old", workspaceId: ws }],
+      new Set(),
+      ws,
+      runId,
+      { endedRunIds: new Set() },
+    )).toEqual([]);
+  });
+
   it("closes an in-workspace owned-but-undesired pane and reports its tab", () => {
     const superseded = formatOwnedName({ role: "worker", taskId: "T2", attempt: 0, runId });
     const out = panesToClose(
@@ -169,9 +180,11 @@ describe("panesToClose (workspace-aware fleet fold)", () => {
     expect(out).toEqual([{ paneId: "p1", tabId: "t1" }]);
   });
 
-  // the 2026-07-13 'WORKERS - T3' scenario, generalized: an OLDER run's owned worker pane sitting in
-  // a FOREIGN workspace is a leftover just as much as one sitting in the current workspace is.
-  it("closes an owned worker pane from an OLDER run sitting in a FOREIGN workspace", () => {
+  // OBS-769 — REPLACES "closes an owned worker pane from an OLDER run sitting in a FOREIGN
+  // workspace". That rule read a foreign workspace as a leftover yard; it is another run's home.
+  // Two runs in two repositories are lawful (the lock is per-repository) and each gets its own
+  // herdr workspace, so the old rule made every concurrent pair kill each other's LIVE workers.
+  it("never touches ANOTHER run's pane in another workspace, however old that run's id looks", () => {
     const olderLeftover = formatOwnedName({ role: "worker", taskId: "T9", attempt: 0, runId: "run-old" });
     const out = panesToClose(
       [{ name: olderLeftover, paneId: "p3", tabId: "t2", workspaceId: "wForeign" }],
@@ -179,7 +192,50 @@ describe("panesToClose (workspace-aware fleet fold)", () => {
       ws,
       runId,
     );
-    expect(out).toEqual([{ paneId: "p3", tabId: "t2" }]);
+    expect(out).toEqual([]);
+  });
+
+  // The defect AS AN INSTANCE, not as a principle: the verbatim fleet snapshot of 2026-08-28
+  // 23:42:40Z. Run ...2958 held two live workers in wZ; the Intl-Dossier run held a live worker in
+  // w0. Note the ids — w0's run STARTED EARLIER (23:05:56 vs 23:28:06), which is why "close the
+  // older run's panes" is not the repair: it licenses exactly the kill that landed.
+  it("OBS-769: two concurrent runs in two workspaces never appear in each other's close list", () => {
+    const MINE = "run-20260828-232806-0000000000002958";
+    const THEIRS = "run-20260828-230556-0000000000000064";
+    const fleet = [
+      { name: formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId: MINE }), paneId: "wZ:pMB", tabId: "wZ:tFD", workspaceId: "wZ" },
+      { name: formatOwnedName({ role: "worker", taskId: "T5", attempt: 0, runId: MINE }), paneId: "wZ:pMA", tabId: "wZ:tFC", workspaceId: "wZ" },
+      { name: formatOwnedName({ role: "worker", taskId: "TX", attempt: 0, runId: THEIRS }), paneId: "w0:pD9", tabId: "w0:t8B", workspaceId: "w0" },
+    ];
+    // their mid-run sweep — this is the call that closed wZ:pMA/wZ:pMB at 23:42:40.351/.392
+    expect(panesToClose(fleet, new Set([formatOwnedName({ role: "worker", taskId: "TX", attempt: 0, runId: THEIRS })]), "w0", THEIRS, { spareLiveLlm: true })).toEqual([]);
+    // our run-end sweep, empty desired set — this is the call that closed w0's pane 65 at 23:43:34.096
+    expect(panesToClose(fleet, new Set(), "wZ", MINE)).toEqual([
+      { paneId: "wZ:pMB", tabId: "wZ:tFD" },
+      { paneId: "wZ:pMA", tabId: "wZ:tFC" },
+    ]);
+  });
+
+  // OBS-772 — THE AXIS EVERY FIXTURE ABOVE HELD CONSTANT. All of them vary workspaceId, so none can
+  // see a driver that has only ONE. OrcaDriver passes a single ORCA_SPACE as the workspaceId for every
+  // checkout AND as `ws` (orca.ts), so `workspaceId !== ws` is never true there: before the runId line
+  // this is the OBS-769 kill reproduced exactly, with the geometry removed. A pin that never varies the
+  // axis the defect lives on cannot fail on it — which is why the first fix shipped reading as complete.
+  it("OBS-772: two concurrent runs sharing ONE workspaceId (Orca) never appear in each other's close list", () => {
+    const ORCA = "orca";
+    const MINE = "run-20260829-010749-0000000000003010";
+    const THEIRS = "run-20260829-003127-0000000000000065";
+    const mine = formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId: MINE });
+    const theirs = formatOwnedName({ role: "worker", taskId: "TX", attempt: 0, runId: THEIRS });
+    const fleet = [
+      { name: mine, paneId: "p-mine", tabId: "t-mine", workspaceId: ORCA },
+      { name: theirs, paneId: "p-theirs", tabId: "t-theirs", workspaceId: ORCA },
+    ];
+    // their mid-run sweep must not reach ours
+    expect(panesToClose(fleet, new Set([theirs]), ORCA, THEIRS, { spareLiveLlm: true })).toEqual([]);
+    // ours must not reach theirs — AND must still reclaim our own undesired pane, or the fix is a mute
+    // rather than a fix. That second clause is the leg that separates "fixed" from "disabled".
+    expect(panesToClose(fleet, new Set(), ORCA, MINE)).toEqual([{ paneId: "p-mine", tabId: "t-mine" }]);
   });
 
   it("never touches this run's own pane sitting in another workspace", () => {

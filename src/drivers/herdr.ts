@@ -1262,16 +1262,17 @@ export class HerdrDriver implements ExecutorDriver {
     });
   }
 
-  // OBS-17 T2 / v1.22b T1: close every tickmarkr-owned pane that should not exist (superseded attempts,
-  // killed-daemon orphans, leftovers from OLDER runs) — in this run's workspace OR misplaced in any
-  // other one — then reap the tabs those closes emptied. Ownership is decided ONLY by parseOwnedName
-  // (drivers/types.ts panesToClose) — foreign names never become candidates, in any workspace; a pane
-  // this same run legitimately holds elsewhere is left alone (only run age marks a misplaced pane
-  // garbage). spareLiveLlm: same-run judge/review/consult panes have no journal row while live (their
+  // OBS-17 T2 / v1.22b T1: close THIS RUN'S OWN tickmarkr-owned panes that should not exist
+  // (superseded attempts, killed-daemon orphans of this run), in this run's workspace, then reap the
+  // tabs those closes emptied. Ownership is decided ONLY by parseOwnedName (drivers/types.ts
+  // panesToClose) — foreign names never become candidates. OBS-769/OBS-772/OBS-777: the sweep does
+  // NOT reach other workspaces and reaches another runId only when the daemon's repository-scoped
+  // snapshot proves that run ended. Run age is not consulted and never was. spareLiveLlm: same-run
+  // judge/review/consult panes have no journal row while live (their
   // events land after the verdict is read), so mid-run sweeps spare them; boundary sweeps (start/
   // resume/end) run with nothing in flight and take them too. Cosmetic by contract: every failure —
   // herdr gone, pane vanished mid-sweep, unparseable listing — is swallowed; this method never throws.
-  async reconcile(desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean }): Promise<void> {
+  async reconcile(desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean; endedRunIds?: Set<string> }): Promise<void> {
     try {
       if (!this.ws) return;
       // 0.7.5: enumerate owned panes from `pane list` (labels), not `agent list` (detected agents only).

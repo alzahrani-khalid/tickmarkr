@@ -184,7 +184,18 @@ const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 // shapes are emitted by the process that was asked to run the oracle; they are deliberately kept in
 // this runner-output classifier rather than applied to any judge-authored reason text. A real test
 // failure still dominates below because one regression-shaped line makes the whole output regression.
-const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable|Token not found in system keyring|Process from config\.webServer was not able to start|\[birpc\] rpc is closed, cannot call\b/i;
+// OBS-791: `[vitest-worker]: Timeout calling "<method>"` is the SAME birpc mechanism one layer up.
+// Vitest's bundled birpc has a fixed 60s DEFAULT_TIMEOUT with no override (fixed upstream only in
+// vitest 4.x), so a suite whose tests all pass can still die at teardown when the worker->host RPC
+// window closes. `.github/workflows/release.yml` has forgiven this exact fingerprint since 2026-08-11
+// while this classifier called it a regression — the product charged a worker for the failure the
+// release gate was written to forgive. The METHOD NAME IS DELIBERATELY NOT PINNED: the timeout is a
+// property of the RPC window, not of `onTaskUpdate`, and pinning one method would forgive a run and
+// charge its sibling for the same infrastructure event. This stays a CLOSED signature — the
+// `[vitest-worker]: ` prefix is vitest's own RPC layer and never user assertion text — and the
+// per-line vetoes below are untouched, so one real failure anywhere still makes the whole output a
+// regression.
+const INFRA_RE = /\bE(?:AGAIN|MFILE|NFILE|NOMEM|NOSPC)\b|JavaScript heap out of memory|Cannot allocate memory|Resource temporarily unavailable|Token not found in system keyring|Process from config\.webServer was not able to start|\[birpc\] rpc is closed, cannot call\b|\[vitest-worker\]: Timeout calling\b/i;
 // Capture invalidation is deliberately narrower than the gate's infrastructure vocabulary above:
 // keyring/config-webServer startup failures remain gate concerns, while this policy is specifically
 // for evidence that the capture ran while the machine was resource-starved.

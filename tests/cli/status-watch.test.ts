@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { GLYPHS, LIVE } from "../../src/brand.js";
 import { status } from "../../src/cli/commands/status.js";
+import { narrationRow } from "../../src/cli/commands/run.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
@@ -479,6 +480,31 @@ describe("status checklist rendering", () => {
       expect(card(out, "T2")).toContain("gate lint running");
       expect(card(out, "T2")).not.toContain("\x1b[36m");
       expect(card(out, "T2").match(/fake:fake-/g)).toHaveLength(1); // clipped channel column, still rendered once
+    });
+  });
+
+  test("test: the narration tone and the board filter derive the same kind for a row whose explicit outcome field disagrees with its bare fields", async () => {
+    const gateResult = {
+      ts,
+      event: "gate-result",
+      taskId: "T1",
+      data: {
+        gate: "build",
+        pass: true,
+        outcome: { kind: "failed", reason: "explicit failure beats stale pass" },
+      },
+    } satisfies JournalEvent;
+    const rail = strip(narrationRow(gateResult, "run-watch", 160)!);
+    expect(rail.startsWith(`${GLYPHS.fail} `)).toBe(true);
+    expect(rail).toContain("build failed");
+
+    const repo = mkRepo();
+    seed(repo, [runStart(), dispatch("T1", "fake-1"), gateResult]);
+    await withTty(async () => {
+      const task = card(await status([], repo), "T1");
+      expect(task).toMatch(/✗ ○ ○ ○ ○ - -/u);
+      expect(task).not.toMatch(/✓ ○ ○ ○ ○ - -/u);
+      expect(task).toContain("failed · build");
     });
   });
 

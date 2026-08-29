@@ -9,7 +9,7 @@ import { type RunSummary, formatSummary, resolveRunMode, runDaemon } from "../..
 import { isRunLockLive } from "../../run/lock.js";
 import { route, type ExploreContext, NO_EXPLORE_ENV } from "../../route/router.js";
 import { formatJournalNarration, loadRoutingProfile, newRunId, type JournalEvent } from "../../run/journal.js";
-import { normalizeGateOutcome } from "../../run/outcome.js";
+import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { GLYPHS, LIVE } from "../../brand.js";
 import { cellWidth, fitCells } from "../../tui/cockpit/width.js";
 
@@ -168,7 +168,7 @@ const runEndTone = (data: Record<string, unknown>): RailTone => {
 /** A gate row's non-failure is spelled across `pass`, `skipped`, `verdict` and `infra`, and a row may
  *  state NONE of them (src/run/outcome.ts) — so the rail reads the canonical outcome rather than
  *  collapsing a decline, a held screen or a dead runner into the green a bare `pass` read gives them. */
-const GATE_OUTCOME_TONES: Record<string, RailTone> = {
+const GATE_OUTCOME_TONES: Record<GateOutcomeKind, RailTone> = {
   passed: "pass", failed: "fail", skipped: "neutral", declined: "neutral",
   held: "attention", unavailable: "attention", infra: "attention",
 };
@@ -177,7 +177,7 @@ const railTone = (event: JournalEvent, fallback: RailTone): RailTone => {
   if (event.event === "run-end") return runEndTone(event.data);
   // `gate-result` is the one event whose data IS a gate result; every other row carrying a `gate`
   // names a gate without reporting one (a start, a reuse, a retry) and keeps its declared tone.
-  if (event.event === "gate-result") return GATE_OUTCOME_TONES[normalizeGateOutcome(event.data).kind] ?? fallback;
+  if (event.event === "gate-result") return GATE_OUTCOME_TONES[normalizeGateOutcome(event.data).kind];
   const verdict = event.data.pass ?? event.data.ok;
   return verdict === true ? "pass" : verdict === false ? "fail" : fallback;
 };
@@ -242,7 +242,24 @@ const railSalient = (data: Record<string, unknown>): string[] =>
  * This is one detail vocabulary stated twice, so `brand-surfaces.test.ts` pins the two against each
  * other over the whole event corpus: the pipe's bytes must equal event/taskId/THIS detail put through
  * the formatter's legacy squeeze-and-slice. A ladder that drifts fails there rather than in a tab.
+ * Gate-result verdict words are the deliberate exception: the pipe is byte-frozen, while the TTY rail
+ * names the normalized outcome so a held selected-test screen is not narrated as a pass.
  */
+const gateResultDetail = (data: Record<string, unknown>): string | undefined => {
+  if (typeof data.gate !== "string") return undefined;
+  switch (normalizeGateOutcome(data).kind) {
+    case "passed":
+      return `${data.gate} passed`;
+    case "failed":
+      return `${data.gate} failed`;
+    case "held":
+      // The kind is already normalized; the selected-test list only chooses this surface noun.
+      return Array.isArray(data.selectedTests) ? `${data.gate} selected-test screen` : `${data.gate} held`;
+    default:
+      return data.gate;
+  }
+};
+
 const formatterDetail = ({ event, data }: JournalEvent): string | undefined => {
   const assignment = data.assignment as Record<string, unknown> | undefined;
   const direct = [data.summary, data.reason, data.error, data.step, data.action, data.lint, data.branch, data.from]
@@ -255,7 +272,8 @@ const formatterDetail = ({ event, data }: JournalEvent): string | undefined => {
       return `${data.gate} failed${typeof data.lastMergedTask === "string" ? ` after ${data.lastMergedTask}` : ""}`;
     }
     if (event === "tip-verify") return `${data.gate} passed`;
-    return `${data.gate}${data.pass === true ? " passed" : data.pass === false ? " failed" : ""}`;
+    if (event === "gate-result") return gateResultDetail(data);
+    return `${data.gate}`;
   }
   if (typeof data.code === "number") return `exit ${data.code}`;
   if (typeof data.pid === "number") return `pid ${data.pid}`;

@@ -39,38 +39,73 @@ function skillNames(root: string): string[] {
     .sort();
 }
 
+function skillFiles(root: string): string[] {
+  const files: string[] = [];
+  const visit = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else files.push(relative(root, path));
+    }
+  };
+  visit(root);
+  return files.sort();
+}
+
 /**
- * OBS-35: every name present in BOTH skills/ and .claude/skills/ must be a symlink
- * in .claude/skills resolving into skills/ with byte-identical content.
+ * OBS-35: every file in a skill present in BOTH skills/ and .claude/skills/ must resolve to or
+ * contain the same bytes as its canonical counterpart. Installed-only names and files are findings
+ * until the live-tree assertion below records the deliberate .claude-only decisions.
  */
 export function checkSkillsSingleSource(canonicalDir: string, installedDir: string): Violation[] {
-  const canonical = new Set(skillNames(canonicalDir));
+  const canonicalNames = new Set(skillNames(canonicalDir));
+  const installedNames = skillNames(installedDir);
   const violations: Violation[] = [];
 
-  for (const name of skillNames(installedDir)) {
-    if (!canonical.has(name)) continue;
-    const installedPath = join(installedDir, name, "SKILL.md");
-    const canonicalPath = join(canonicalDir, name, "SKILL.md");
-    const stat = lstatSync(installedPath);
-
-    if (!stat.isSymbolicLink()) {
-      violations.push({ name, reason: "not a symlink — real file shadows canonical skill" });
+  for (const name of installedNames) {
+    if (!canonicalNames.has(name)) {
+      violations.push({ name, reason: "installed-only skill requires an explicit decision" });
       continue;
     }
 
-    const linkTarget = readlinkSync(installedPath);
-    // From .claude/skills/<name>/SKILL.md up to repo root, then into skills/.
-    const expectedRel = join("..", "..", "..", "skills", name, "SKILL.md");
-    if (linkTarget !== expectedRel) {
-      violations.push({ name, reason: `symlink target ${linkTarget!} !== ${expectedRel}` });
-    }
+    const canonicalRoot = join(canonicalDir, name);
+    const installedRoot = join(installedDir, name);
+    const canonicalFiles = new Set(skillFiles(canonicalRoot));
+    const installedFiles = new Set(skillFiles(installedRoot));
 
-    if (realpathSync(installedPath) !== realpathSync(canonicalPath)) {
-      violations.push({ name, reason: "symlink does not resolve to canonical SKILL.md" });
-    }
+    for (const file of [...new Set([...canonicalFiles, ...installedFiles])].sort()) {
+      const prefix = file === "SKILL.md" ? "" : `${file}: `;
+      if (!canonicalFiles.has(file)) {
+        violations.push({ name, reason: `${prefix}installed-only file requires an explicit decision` });
+        continue;
+      }
+      if (!installedFiles.has(file)) {
+        violations.push({ name, reason: `${prefix}missing from installed tree` });
+        continue;
+      }
 
-    if (!readFileSync(installedPath).equals(readFileSync(canonicalPath))) {
-      violations.push({ name, reason: "content drift vs skills/" });
+      const installedPath = join(installedRoot, file);
+      const canonicalPath = join(canonicalRoot, file);
+      const stat = lstatSync(installedPath);
+
+      if (file === "SKILL.md" && !stat.isSymbolicLink()) {
+        violations.push({ name, reason: "not a symlink — real file shadows canonical skill" });
+      }
+
+      if (stat.isSymbolicLink()) {
+        const linkTarget = readlinkSync(installedPath);
+        const expectedRel = relative(dirname(installedPath), canonicalPath);
+        if (linkTarget !== expectedRel) {
+          violations.push({ name, reason: `${prefix}symlink target ${linkTarget} !== ${expectedRel}` });
+        }
+        if (realpathSync(installedPath) !== realpathSync(canonicalPath)) {
+          violations.push({ name, reason: `${prefix}symlink does not resolve to canonical file` });
+        }
+      }
+
+      if (!readFileSync(installedPath).equals(readFileSync(canonicalPath))) {
+        violations.push({ name, reason: `${prefix}content drift vs skills/` });
+      }
     }
   }
 
@@ -111,6 +146,50 @@ describe("OBS-44 exported-tree guard", () => {
         name,
         reason: "content drift vs skills/",
       });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("test: a shared skill directory whose script differs between the canonical and installed trees fails the guard, so editing one copy of a duplicated script can no longer pass", () => {
+    const root = mkdtempSync(join(tmpdir(), "skills-ss-script-drift-"));
+    try {
+      const canonicalDir = join(root, "skills");
+      const installedDir = join(root, ".claude/skills");
+      const name = "duplicated-script";
+      const canonicalRoot = join(canonicalDir, name);
+      const installedRoot = join(installedDir, name);
+      mkdirSync(join(canonicalRoot, "scripts"), { recursive: true });
+      mkdirSync(join(installedRoot, "scripts"), { recursive: true });
+      writeFileSync(join(canonicalRoot, "SKILL.md"), "canonical\n");
+      symlinkSync(relative(installedRoot, join(canonicalRoot, "SKILL.md")), join(installedRoot, "SKILL.md"));
+      writeFileSync(join(canonicalRoot, "scripts/watch.sh"), "same\n");
+      writeFileSync(join(installedRoot, "scripts/watch.sh"), "same\n");
+      expect(checkSkillsSingleSource(canonicalDir, installedDir)).toEqual([]);
+
+      writeFileSync(join(canonicalRoot, "scripts/watch.sh"), "canonical changed\n");
+      expect(checkSkillsSingleSource(canonicalDir, installedDir)).toContainEqual({
+        name,
+        reason: "scripts/watch.sh: content drift vs skills/",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("test: a skill name present only in the installed tree is reported as an explicit decision rather than skipped, so an orphan is visible instead of invisible", () => {
+    const root = mkdtempSync(join(tmpdir(), "skills-ss-orphan-"));
+    try {
+      const canonicalDir = join(root, "skills");
+      const installedDir = join(root, ".claude/skills");
+      mkdirSync(canonicalDir, { recursive: true });
+      mkdirSync(join(installedDir, "installed-only"), { recursive: true });
+      writeFileSync(join(installedDir, "installed-only", "SKILL.md"), "local\n");
+
+      expect(checkSkillsSingleSource(canonicalDir, installedDir)).toEqual([{
+        name: "installed-only",
+        reason: "installed-only skill requires an explicit decision",
+      }]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -156,8 +235,22 @@ describe.skipIf(skipReason !== undefined)(suiteName, () => {
     }
   });
 
-  test("live tree: shared skill names in .claude/skills are symlinks into skills/", () => {
-    expect(checkSkillsSingleSource(CANONICAL, INSTALLED)).toEqual([]);
+  test("live tree: shared files match and every .claude-only orphan has an explicit decision", () => {
+    const explicitInstalledOnly: Violation[] = [
+      {
+        name: "tickmarkr-overseer",
+        reason: "scripts/check-admission-records.sh: installed-only file requires an explicit decision",
+      },
+      {
+        name: "tickmarkr-overseer",
+        reason: "scripts/journal-pretty.sh: installed-only file requires an explicit decision",
+      },
+      ...["tkr", "tkr-doctor", "tkr-help", "tkr-init", "tkr-loop"].map((name) => ({
+        name,
+        reason: "installed-only skill requires an explicit decision",
+      })),
+    ];
+    expect(checkSkillsSingleSource(CANONICAL, INSTALLED)).toEqual(explicitInstalledOnly);
   });
 
   test("drift guard fails when a real file shadows a canonical skill", () => {

@@ -1,7 +1,7 @@
 // OBS-17 T2: live reconciliation — the daemon sweeps tickmarkr-owned panes to the journal-derived
 // desired set at every safe point, and the herdr driver closes owned-but-undesired panes plus the
 // tabs those closes emptied. Foreign panes, operator tabs, and other workspaces are never touched.
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -87,7 +87,7 @@ const RUN = "run-now";
 const fleet: StubAgent[] = [
   { name: owned("worker", "T2", 1, RUN), pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "wT" }, // desired — keep
   { name: owned("worker", "T2", 0, RUN), pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "wT" }, // superseded — close
-  { name: owned("worker", "T9", 0, "run-old"), pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "wT" }, // older run — close + tab
+  { name: owned("worker", "T9", 0, "run-old"), pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "wT" }, // older run — SPARED since OBS-772 (was: close + tab)
   { name: "orchestrator", pane_id: "w1:p4", tab_id: "w1:t3", workspace_id: "wT" }, // foreign — never
   { pane_id: "w1:p4b", tab_id: "w1:t3", workspace_id: "wT" }, // nameless shell — never
   { name: owned("consult", "T5", 0, RUN), pane_id: "w1:p5", tab_id: "w1:t4", workspace_id: "wT" }, // same-run consult
@@ -95,14 +95,27 @@ const fleet: StubAgent[] = [
 ];
 
 describe("HerdrDriver.reconcile (stubbed binary)", () => {
-  test("closes owned-but-undesired panes (superseded attempt + older run) and only the tabs those closes emptied", async () => {
+  // OBS-777 restores this test's original subject with explicit ended-run authority. OBS-772 still
+  // protects every older run absent from that set, so no pane age or shared workspace can imply death.
+  // It asserted that an owned leftover from an OLDER RUN OF THE SAME REPOSITORY, in the SAME WORKSPACE,
+  // is reclaimed. That is not an exotic case: it is OBS-17's FOUNDING one — "a killed daemon can't
+  // close its slots" — the entire reason this sweep exists. `owned.runId !== runId` now spares it,
+  // because a dead run's orphan and a LIVE run's worker are indistinguishable from a pure fold over a
+  // pane listing, and getting that wrong closed a stranger's live workers twice in one night
+  // (OBS-769). So the sweep no longer reclaims ANY previous run's panes; they stay up until the
+  // operator closes them.
+  // This was a suspension, not a narrowing. OBS-777 restores it by having the CALLER pass
+  // `opts.endedRunIds` — a Set the daemon computes once at run start from this repository's own
+  // `run-end` journals and dead lock holders. The fold stays pure, a foreign repository's runId is
+  // never resolvable and so is spared by construction, and no driver learns anything about workspaces.
+  test("closes this run's own superseded attempt and an explicitly ended older run's leftover, while only the tabs those closes emptied are reaped", async () => {
     const { bin, log } = makeReconcileStub(fleet);
     const d = new HerdrDriver(bin);
-    await d.reconcile(new Set([owned("worker", "T2", 1, RUN)]), RUN, { spareLiveLlm: true });
+    await d.reconcile(new Set([owned("worker", "T2", 1, RUN)]), RUN, { spareLiveLlm: true, endedRunIds: new Set(["run-old"]) });
     const calls = log();
-    expect(calls).toContain("pane close w1:p1"); // superseded attempt of the current run
-    expect(calls).toContain("pane close w1:p3"); // leftover from an OLDER run of the same repo
-    expect(calls).toContain("tab close w1:t2"); // p3's tab emptied by the close → reaped
+    expect(calls).toContain("pane close w1:p1"); // superseded attempt of the current run — STILL closes
+    expect(calls).toContain("pane close w1:p3"); // OBS-777: the caller proved this older run ended
+    expect(calls).toContain("tab close w1:t2");
     expect(calls).not.toContain("tab close w1:t1"); // desired sibling p2 keeps its tab alive
     expect(calls).not.toContain("pane close w1:p2"); // desired
     expect(calls).not.toContain("pane close w1:p4"); // foreign agent (operator's)
@@ -182,10 +195,12 @@ function paneWorld(seed: string[] = [], opts: { missClose?: boolean; capWaitMs?:
       return inner.close(s);
     },
     worktree: inner.worktree.bind(inner),
-    async reconcile(desired: Set<string>) {
+    async reconcile(desired: Set<string>, activeRunId: string, reconcileOpts) {
       const closed: string[] = [];
       for (const name of live) {
-        if (parseOwnedName(name) && !desired.has(name)) {
+        const owner = parseOwnedName(name);
+        if (owner && !desired.has(name)
+            && (owner.runId === activeRunId || reconcileOpts?.endedRunIds?.has(owner.runId))) {
           live.delete(name);
           closed.push(name);
         }
@@ -195,6 +210,45 @@ function paneWorld(seed: string[] = [], opts: { missClose?: boolean; capWaitMs?:
   };
   return { driver, live, ops, sweeps };
 }
+
+describe("cross-run reconciliation authority", () => {
+  test("test: a pane owned by a run with a journalled run-end is closed, while a pane owned by a run with no run-end and a live lock holder is left alone, so reclamation returns without re-arming the cross-run kill", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    const endedRunId = "run-ended-owner";
+    const ended = Journal.create(repo, endedRunId);
+    ended.append("run-start", undefined, { pid: process.pid });
+    ended.append("run-end", undefined, {});
+    const liveRunId = "run-live-owner";
+    Journal.create(repo, liveRunId).append("run-start", undefined, { pid: process.pid });
+    const endedPane = owned("worker", "T9", 0, endedRunId);
+    const livePane = owned("worker", "T8", 0, liveRunId);
+    const world = paneWorld([endedPane, livePane]);
+
+    await expect(runDaemon(repo, { adapters: [fake], runId: "run-reclaimer", driver: world.driver })).resolves.toMatchObject({ done: ["T1"] });
+    expect(world.live.has(endedPane)).toBe(false);
+    expect(world.live.has(livePane)).toBe(true);
+  });
+
+  test("test: a pane owned by a run whose lock holder is dead and whose journal has no run-end is closed, so a killed daemon's slots are reclaimed rather than left forever", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    const crashedRunId = "run-crashed-owner";
+    const dead = spawnSync("true").pid!;
+    Journal.create(repo, crashedRunId).append("run-start", undefined, { pid: dead });
+    writeFileSync(join(tickmarkrDir(repo), "graph.lock"), JSON.stringify({ pid: dead, runId: crashedRunId, startedAt: Date.now() }));
+    const orphan = owned("worker", "T9", 0, crashedRunId);
+    const world = paneWorld([orphan]);
+
+    await expect(runDaemon(repo, { adapters: [fake], runId: "run-dead-reclaimer", driver: world.driver })).resolves.toMatchObject({ done: ["T1"] });
+    expect(Journal.open(repo, crashedRunId).read().some((event) => event.event === "run-end")).toBe(false);
+    expect(world.live.has(orphan)).toBe(false);
+  });
+});
 
 describe("daemon reconciliation at safe points (fake adapter, zero tokens)", () => {
   test("resume after a simulated daemon kill closes the orphaned worker pane of the superseded attempt (2026-07-13 scenario)", async () => {

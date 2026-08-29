@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { beat } from "../../src/cli/commands/beat.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import {
   SUPERVISION_BEAT_MS,
@@ -13,6 +14,7 @@ import {
   readSupervision,
   readTierLiveness,
   supervisionBeatPath,
+  supervisionStatus,
   supervisionText,
 } from "../../src/run/supervision.js";
 
@@ -186,6 +188,52 @@ describe("supervision tier liveness", () => {
     expect(readTierLiveness(repo, "overseer", last + SUPERVISION_STALE_MS).state).toBe("ARMED");
     expect(readTierLiveness(repo, "overseer", last + SUPERVISION_STALE_MS + 1).state).toBe("STALE");
     expect(readTierLiveness(repo, "watch").state).toBe("ABSENT"); // an unarmed tier stayed unarmed
+  });
+
+  test("test: an obligation recorded at a threshold crossing survives a stand-down written after it, so firing the alarm cannot clear the duty the alarm raised", async () => {
+    const repo = mkRepo();
+    await beat([
+      "overseer-context", "--seat", "OVSR-w1:p2", "--arm-id", "arm-before-clear",
+      "--pct", "55", "--threshold-pct", "50",
+    ], repo);
+    const raised = supervisionStatus(repo, "overseer-context");
+    expect(raised.clearOwedSince).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+
+    await beat(["overseer-context", "--seat", "OVSR-w1:p2", "--stand-down"], repo);
+    expect(supervisionStatus(repo, "overseer-context")).toMatchObject({
+      state: "DISARMED",
+      clearOwedSince: raised.clearOwedSince,
+    });
+  });
+
+  test("test: a beat carrying a new arm identity below the threshold discharges the obligation; a beat reusing the previous arm identity does not", () => {
+    const repo = mkRepo();
+    beatSupervision(repo, "overseer-context", "OVSR-w1:p2", {
+      armId: "arm-before-clear", pct: 55, thresholdPct: 50,
+    });
+    const owedSince = supervisionStatus(repo, "overseer-context").clearOwedSince;
+
+    beatSupervision(repo, "overseer-context", "OVSR-w1:p2", {
+      armId: "arm-before-clear", pct: 3, thresholdPct: 50,
+    });
+    expect(supervisionStatus(repo, "overseer-context").clearOwedSince).toBe(owedSince);
+
+    // A replacement firing at its own lower threshold inherits the latch instead of clearing it just
+    // because its reading is below the old threshold. It cannot discharge its own duty afterward.
+    beatSupervision(repo, "overseer-context", "OVSR-w1:p2", {
+      armId: "firing-replacement", pct: 45, thresholdPct: 40,
+    });
+    expect(supervisionStatus(repo, "overseer-context").clearOwedSince).toBe(owedSince);
+
+    beatSupervision(repo, "overseer-context", "OVSR-w1:p2", {
+      armId: "firing-replacement", pct: 3, thresholdPct: 40,
+    });
+    expect(supervisionStatus(repo, "overseer-context").clearOwedSince).toBe(owedSince);
+
+    beatSupervision(repo, "overseer-context", "OVSR-w1:p2", {
+      armId: "cleared-replacement", pct: 3, thresholdPct: 40,
+    });
+    expect(supervisionStatus(repo, "overseer-context").clearOwedSince).toBeUndefined();
   });
 
   test("readSupervision returns every known tier in the declared order, beaten or not", () => {

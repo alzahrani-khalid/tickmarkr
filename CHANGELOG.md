@@ -4,6 +4,36 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.7** — one answer, everywhere: nine gated tasks on one run, closed green 9/9 with tip verify
+passed and every bucket empty. The theme is that the supervision surfaces stopped disagreeing with each
+other — one accessor decides what a gate outcome means, every reader routes through it, and the records
+a supervisor reads stop asserting things the product cannot know.
+
+- **A task that cannot pass is refused before a worker starts.** Compile now reports cross-task ownership
+  collisions — a source file whose dedicated test no task owns, and multi-owned files that are not
+  dependency-ordered. It found an unowned test on its first run that two reviewers had missed by hand.
+- **One accessor decides what a gate outcome means, and every surface routes through it.** The journal,
+  the statistics, the narration and the board derived the same row independently and could drift apart;
+  a held selected-test screen now reads as a screen everywhere rather than sharing the word `passed`
+  with a full-suite green.
+- **A supervision record cannot manufacture a death.** The beat record's process id read dead on a live
+  tier essentially always — a one-shot write cannot complete unless the process it names is exiting — so
+  liveness is read from beat freshness, and the field says what it is.
+- **The watch tier tells the truth about itself**, and a crashed run's own panes are reclaimed again
+  without ever reaching another run's: reclamation is authorised by a repository-scoped snapshot of runs
+  proven ended, so a cosmetic sweep still cannot close a live worker's pane.
+- **The context watcher refuses to guess.** A watcher that cannot read a percentage reports unreadable
+  and says so, instead of borrowing a number from scrollback or a fleet counter. It also stopped being
+  blind on every real seat: its banner selector required a vendor id at line start and a lowercase name,
+  while the rendered line begins with a glyph and reads `Opus`.
+- **A teardown RPC timeout is infrastructure, not a regression.** `[vitest-worker]: Timeout calling …`
+  is the same fixed-window birpc death the classifier already forgave one layer down. The release gate
+  had forgiven this fingerprint since 2026-08-11 while the classifier charged it, so the product billed
+  a worker for the failure the release workflow was written to excuse.
+  ⚠ Historical journal rows written before the infra stamp existed carry that evidence only in their
+  text, and now count as real reds rather than infra reds — a deliberate trade for cross-reader
+  agreement, not an oversight.
+
 **v2.1.6** — the harness tells you what it already knows: four gated tasks on one run, closed green
 4/4 with tip verify passed and every bucket empty. The theme is that the daemon already held the facts
 its operator was guessing at, and now says them out loud.

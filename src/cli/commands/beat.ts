@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { tickmarkrDir } from "../../graph/graph.js";
 import {
   SUPERVISION_BEAT_MS,
+  SUPERVISION_DEFAULT_THRESHOLD_PCT,
   SUPERVISION_STALE_MS,
   SUPERVISION_TIERS,
   beatSupervision,
@@ -26,18 +27,27 @@ import {
 // reads UNREADABLE. Here the writes are unguarded: a failure leaves the process with a non-zero exit
 // and a message instead of a claim. The LOOP belongs to the caller, which is what makes the beat
 // evidence: stop calling it and the tier ages into STALE on its own.
+const VALUE_OPTIONS = ["--seat", "--arm-id", "--pct", "--threshold-pct"] as const;
+
 export async function beat(argv: string[], cwd = process.cwd()): Promise<string> {
   const standDown = argv.includes("--stand-down");
   const seat = seatOf(argv);
-  const named = argv.find((a, i) => !a.startsWith("--") && argv[i - 1] !== "--seat");
+  const pct = percentageOf(argv, "--pct");
+  const thresholdPct = percentageOf(argv, "--threshold-pct") ?? SUPERVISION_DEFAULT_THRESHOLD_PCT;
+  const armId = optionOf(argv, "--arm-id");
+  const named = argv.find((a, i) =>
+    !a.startsWith("--") && !(VALUE_OPTIONS as readonly string[]).includes(argv[i - 1] ?? "")
+  );
   if (!isTier(named)) {
     throw new Error(
-      `usage: tickmarkr beat <${SUPERVISION_TIERS.join("|")}> --seat <identity> [--stand-down] — got ${named ? `\`${named}\`` : "no tier"}`,
+      `usage: tickmarkr beat <${SUPERVISION_TIERS.join("|")}> --seat <identity> ` +
+        `[--arm-id <identity> --pct <0..100> --threshold-pct <0..100>] [--stand-down] — ` +
+        `got ${named ? `\`${named}\`` : "no tier"}`,
     );
   }
   // SUP-05: NO SEAT, NO BEAT — and the refusal comes before any write, so a refused invocation leaves
-  // the tier exactly as it found it. This verb is one-shot: the pid it would otherwise record has
-  // already exited by the time anyone reads the record, so tier + pid + instant is a beat nobody can
+  // the tier exactly as it found it. This verb is one-shot: the exitedWriterPid it records has
+  // already exited by the time anyone reads the record, so tier + writer + instant is a beat nobody can
   // attribute to a seat. Measured 2026-08-26: a consult seat ran the documented loop verbatim and the
   // board read that tier ARMED with no seat of that tier having armed anything, and a seatless ARMED
   // reads as coverage — worse than ABSENT, because ABSENT sends someone to look.
@@ -53,16 +63,37 @@ export async function beat(argv: string[], cwd = process.cwd()): Promise<string>
   // uncleared marker would render DISARMED while this verb claimed ARMED, so the removal is unguarded
   // too — `force` makes the ordinary "no marker" case a no-op, and anything else is a real failure.
   rmSync(supervisionStandDownPath(cwd, named), { force: true, recursive: true });
-  beatSupervision(cwd, named, seat);
+  beatSupervision(cwd, named, seat, pct === undefined ? undefined : { armId: armId ?? seat, pct, thresholdPct });
   return `${named} ARMED as ${seat} — beat again every ${SUPERVISION_BEAT_MS / 1_000}s; the tier reads STALE ${SUPERVISION_STALE_MS / 1_000}s after the last beat`;
 }
 
 /** `--seat <identity>` or `--seat=<identity>`; blank and missing are the same answer — none. */
 function seatOf(argv: string[]): string | undefined {
-  const inline = argv.find((a) => a.startsWith("--seat="))?.slice("--seat=".length);
-  const spaced = argv[argv.indexOf("--seat") + 1];
-  const seat = (inline ?? (argv.includes("--seat") ? spaced : undefined))?.trim();
+  const seat = optionOf(argv, "--seat")?.trim();
   return seat && !seat.startsWith("--") ? seat : undefined;
+}
+
+/** A `--name value` or `--name=value` option, excluding a missing value or the next flag. */
+function optionOf(argv: string[], name: string): string | undefined {
+  const inline = argv.find((a) => a.startsWith(`${name}=`))?.slice(name.length + 1).trim();
+  const spaced = argv[argv.indexOf(name) + 1]?.trim();
+  const value = inline ?? (argv.includes(name) ? spaced : undefined);
+  return value && !value.startsWith("--") ? value : undefined;
+}
+
+function percentageOf(argv: string[], name: "--pct" | "--threshold-pct"): number | undefined {
+  const raw = optionOf(argv, name);
+  if (raw === undefined) {
+    if (argv.includes(name) || argv.some((a) => a.startsWith(`${name}=`))) {
+      throw new Error(`${name} needs a number from 0 through 100`);
+    }
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    throw new Error(`${name} must be a number from 0 through 100`);
+  }
+  return value;
 }
 
 // Stand-down is a RECORDED act, not a silence: the marker tells a reader this watcher left on purpose,
@@ -76,7 +107,9 @@ function standDownTier(repoRoot: string, tier: SupervisionTier, seat: string): s
   mkdirSync(dirname(p), { recursive: true });
   // The marker names the seat for the same reason the beat does: "someone stood this tier down" is not
   // a hand-off anyone can act on, and on a seat tier the reader rejects an anonymous one outright.
-  writeFileSync(tmp, JSON.stringify({ tier, seat, pid: process.pid, disarmedAt: new Date().toISOString() }) + "\n");
+  writeFileSync(tmp, JSON.stringify({
+    tier, seat, exitedWriterPid: process.pid, disarmedAt: new Date().toISOString(),
+  }) + "\n");
   renameSync(tmp, p);
   return `${tier} DISARMED — ${seat} handed off; status reads it stood down, not dead`;
 }

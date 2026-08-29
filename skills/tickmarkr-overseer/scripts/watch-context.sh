@@ -20,15 +20,15 @@
 # than absent. Four rules the shipped version broke, each of which made the tier lie:
 #   1. BEAT ON THE SUPERVISION CADENCE, NOT ON THE POLL. Beats gap by TICK (below), never by POLL, so a
 #      poll interval above the supervision beat interval cannot leave the tier stale half of every cycle.
-#   2. BEAT ONLY AFTER A SUCCESSFUL READ. A watcher that cannot see its seat's percentage is not
-#      watching it; beating anyway reports coverage it is not providing, and the tier must age out.
+#   2. BEAT AFTER EVERY SUCCESSFUL SCREEN READ. A missing percentage is an explicit UNREADABLE
+#      observation: it must keep the live watcher armed but can never reach warn or act. Only a failed
+#      screen read withholds the beat, because then the watcher cannot see its seat at all.
 #   3. WARN DOES NOT EXIT. Warn precedes act, so exiting at warn meant the act was never reached and the
 #      last beat aged into a permanent stale — gradual growth never reached the auto-clear path at all.
 #   4. EVERY TERMINAL EXIT STANDS THE TIER DOWN, so a watcher that finished reads DISARMED, not dead.
 #      Only a killed watcher reads STALE, which is exactly what STALE means.
-#   5. A BLIND READ ALARMS (OBS-739). Ageing the tier is visible only to someone already reading the beat
-#      table; the seat that armed this watcher must be TOLD its instrument went blind. Silence and health
-#      must never look alike.
+#   5. AN UNREADABLE FIELD REPORTS ITSELF (OBS-739/780). Silence, health and a trustworthy percentage
+#      are three different states. UNREADABLE stays supervised but never authorises a destructive act.
 #
 # usage: watch-context.sh <role-slug> <agent|pane> <warn-pct> <act-pct> [handoff-file] [poll-s] [cap-s]
 #   <role-slug> is ANY seat role — orchestrator, overseer, surgeon, consult — and names the tier
@@ -63,8 +63,8 @@ TIER="${ROLE}-context"
 
 
 # The supervision beat interval (SUPERVISION_BEAT_MS = 10s). The loop ticks at the beat cadence or the
-# caller's poll, whichever is SHORTER: a beat may only follow a successful read (rule 2), so the read
-# cadence is the floor on the beat cadence, and the tier's freshness is never the caller's to widen.
+# caller's poll, whichever is SHORTER. Every successful screen read beats; its result is either a
+# percentage safe to compare or the explicit UNREADABLE state.
 BEAT_EVERY=5
 TICK=$(( POLL < BEAT_EVERY ? POLL : BEAT_EVERY ))
 [ "$TICK" -ge 1 ] 2>/dev/null || TICK=1   # a zero or junk poll would spin, not watch
@@ -100,16 +100,18 @@ stand_down() { tickmarkr beat "$TIER" --stand-down --seat "$SEAT" >/dev/null 2>&
 # record the hand-off. A killed watcher never runs it, which is the one case that must read STALE.
 trap stand_down EXIT
 
-# The seat's own rendered truth. Prefer a line carrying a context marker so a percentage elsewhere on
-# screen cannot be mistaken for the gauge — but NEVER require one: the ✳ marker the shipped version
-# anchored on is rendered by a single vendor, so every other seat read empty, beat anyway and slept to
-# its cap while its tier claimed coverage. The last percentage in the statusline window is the fallback.
+# The seat's rendered truth lives on the model banner. Select that line first, then read a percentage
+# only from it: a bare numeric search across the visible window can borrow an old N% from scrollback
+# when a long live-run segment pushes the real field past the pane's visible width (OBS-780).
 context_pct() {
-  local screen marked
+  local screen banner pct
   screen=$(herdr agent read "$TARGET" --source visible --lines 8 2>/dev/null) || return 1
-  marked=$(printf '%s\n' "$screen" | grep -iE '✳|context' | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
-  [ -n "$marked" ] && { printf '%s\n' "$marked"; return 0; }
-  printf '%s\n' "$screen" | grep -oE '[0-9]+%' | tail -1 | tr -d '%'
+  banner=$(printf '%s\n' "$screen" |
+    grep -Ei '(^|[^[:alnum:]])(claude|opus|sonnet|haiku|gpt|gemini|glm|kimi|grok|composer|openai|zai)[[:alnum:]_./-]*([[:space:]]|$)' |
+    tail -1)
+  [ -n "$banner" ] || { printf 'UNREADABLE\n'; return 0; }
+  pct=$(printf '%s\n' "$banner" | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
+  [ -n "$pct" ] && printf '%s\n' "$pct" || printf 'UNREADABLE\n'
 }
 
 handoff_fresh() {
@@ -144,35 +146,47 @@ act_on() {
 
 warned=0
 elapsed=0
-blind=0            # seconds in the current unreadable spell (OBS-739)
+blind=0            # seconds in the current failed-read spell (OBS-739)
 blind_alarmed=0
+unreadable_reported=0
 BLIND_ALARM_S="${TKR_BLIND_ALARM_S:-120}"
 while [ "$elapsed" -lt "$CAP" ]; do
-  P=$(context_pct)
+  if ! P=$(context_pct); then P=""; fi
   if [ -z "$P" ]; then
-    # Rule 2: no reading, no beat. The tier ages to STALE and a supervisor comes looking, which is the
-    # truth about a watcher that cannot see the seat it was armed on.
-    #
-    # Rule 5 (OBS-739): ALARM ON THE BLIND READ. Ageing a tier is not enough — it is only visible to
-    # someone already reading the beat table, and the measured failure was a watcher ALIVE AND BLIND for
-    # hours because the run's own status text pushed the percentage off the statusline. An instrument
-    # that cannot report its own absence is worse than none: the seat believes it has coverage and stops
-    # looking. So say so on stdout, where the supervising seat is actually woken. Once per blind spell,
-    # not every tick — a repeating alarm trains the reader to ignore it.
+    # The screen read itself failed: no observation, no beat. The tier ages to STALE and the watcher
+    # alarms once, because an instrument that cannot see its seat must never look healthy.
+    unreadable_reported=0
     blind=$((blind + TICK))
     if [ "$blind" -ge "$BLIND_ALARM_S" ] && [ "$blind_alarmed" -eq 0 ]; then
       blind_alarmed=1
-      echo "CONTEXT_BLIND $TARGET — no percentage readable for ${blind}s; tier ${TIER} is ALIVE AND BLIND"
-      echo "  this watcher is NOT providing coverage: read the seat by hand and re-arm on a clear statusline"
-      echo "  do NOT substitute the token total — '∑ Nk tok' is cumulative SPEND, not context fill"
+      echo "CONTEXT_BLIND $TARGET — screen unreadable for ${blind}s; tier ${TIER} is ALIVE AND BLIND"
+      echo "  this watcher is NOT providing coverage: read the seat by hand and repair the screen read"
     fi
     sleep "$TICK"; elapsed=$((elapsed + TICK)); continue
   fi
-  # a successful read closes the blind spell and re-arms the alarm for the next one
+
+  if [ "$P" = "UNREADABLE" ]; then
+    # The screen read succeeded, so keep the watcher armed. The absent field is still not a number:
+    # report it once per spell and never let it flow into warn or act.
+    if [ "$blind_alarmed" -eq 1 ]; then
+      echo "CONTEXT_BLIND_CLEARED $TARGET — screen readable again after ${blind}s blind"
+    fi
+    blind=0; blind_alarmed=0
+    beat
+    if [ "$unreadable_reported" -eq 0 ]; then
+      unreadable_reported=1
+      echo "CONTEXT_UNREADABLE $TARGET — model banner has no visible percentage; no warn or act authorised"
+    fi
+    sleep "$TICK"; elapsed=$((elapsed + TICK)); continue
+  fi
+
+  if [ "$unreadable_reported" -eq 1 ]; then
+    echo "CONTEXT_UNREADABLE_CLEARED $TARGET — percentage readable again at ${P}%"
+  fi
   if [ "$blind_alarmed" -eq 1 ]; then
     echo "CONTEXT_BLIND_CLEARED $TARGET — percentage readable again at ${P}% after ${blind}s blind"
   fi
-  blind=0; blind_alarmed=0
+  blind=0; blind_alarmed=0; unreadable_reported=0
   beat
 
   if [ "$P" -ge "$ACT" ] 2>/dev/null; then
@@ -190,4 +204,4 @@ while [ "$elapsed" -lt "$CAP" ]; do
   sleep "$TICK"; elapsed=$((elapsed + TICK))
 done
 
-echo "WATCH_CAP_REACHED $TARGET context=$(context_pct)% — no threshold crossed in ${CAP}s"
+echo "WATCH_CAP_REACHED $TARGET — no threshold crossed in ${CAP}s"

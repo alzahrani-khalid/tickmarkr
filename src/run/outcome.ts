@@ -129,7 +129,14 @@ export function normalizeGateOutcome(source: unknown): GateOutcome {
   }
   const row = source as Record<string, unknown>;
 
-  // `kind` selects the canonical format. It must validate as exactly one canonical arm without any
+  // A gate-result data wrapper states its canonical verdict in `outcome`. Consumers may pass either
+  // the wrapper or the outcome itself; both must read the same kind even if stale bare fields remain.
+  if (hasOwn(row, "outcome")) {
+    if (isGateOutcome(row.outcome)) return row.outcome;
+    return { kind: "unavailable", reason: reasonOf(row, "malformed gate result: invalid explicit outcome") };
+  }
+
+  // `kind` selects the canonical outcome object. It must validate as exactly one canonical arm without any
   // legacy truth discriminator; otherwise continuing through the legacy branches could reinterpret a
   // contradictory dual-write as passed, failed or infra. Mixed and malformed canonical rows stay
   // explicitly unavailable, retaining any reason/details the producer did manage to state.

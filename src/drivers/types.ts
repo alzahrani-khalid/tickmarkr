@@ -73,30 +73,69 @@ export function isForeignName(name: string): boolean {
 export interface FleetAgent { name?: string; paneId?: string; tabId?: string; workspaceId?: string }
 
 // v1.22b T1: workspace-aware fold over a fleet snapshot — decides which owned task panes are garbage
-// right now. In-workspace: the existing desired-set/spareLiveLlm sweep (OBS-17 T2). Out-of-workspace:
-// an owned pane from a DIFFERENT run is a misplaced leftover (bug, foreign actor, pre-VIS-10 relic)
-// and closes regardless of `desired`; an owned pane from THIS run elsewhere is left alone — a live
-// run can legitimately hold panes across workspaces, so only run age marks a misplaced pane garbage.
+// right now: the desired-set/spareLiveLlm sweep (OBS-17 T2), scoped to THIS RUN'S OWN panes (by runId,
+// OBS-772) in THIS RUN'S OWN WORKSPACE (OBS-769). Both conditions, and neither alone is the rule.
 // Watch panes are operator-owned after run end and are reclaimed by the next run; foreign names
-// (parseOwnedName fails) are never candidates, in any workspace.
+// (parseOwnedName fails) are never candidates.
+//
+// OBS-769 — WHY THE SWEEP STOPS AT THE WORKSPACE BOUNDARY. It used to close an owned pane carrying
+// any OTHER runId in any other workspace, unconditionally, as a "misplaced leftover". Two tickmarkr
+// runs in two repositories are lawful (the lock forbids two runs in ONE repository, not on one
+// machine) and herdr gives each its own workspace — so that branch made every pair of concurrent
+// runs kill each other's LIVE workers. Measured 2026-08-28: the run in w0 closed run ...2958's
+// panes at 23:42:40.351/.392, and 53s later ...2958's own task-human sweep closed w0's live codex
+// worker at 23:43:34.096. ...2958 ended 0/8. The death detector cannot see it: closing the pane
+// makes paneAbsent, processTree, confirmedProcessTree and worktreeDelta true by ONE cause, and a
+// closed pane can never accrue the CPU that the `cpu-accruing` hold reads.
+// The comment this replaces claimed "only run age marks a misplaced pane garbage" — there was no age
+// check in the code, and age is the wrong predicate anyway: w0's run STARTED EARLIER than ...2958,
+// so an age rule would have licensed exactly the kill that landed. Run age says nothing about
+// liveness, and a sweeping daemon cannot read another repository's run state. The workspace is the
+// only ownership boundary available without cross-repo I/O, so it is the one enforced.
+// Cost, named: an orphan pane from a dead run stranded in a workspace no later run opens is now left
+// for the operator. That is cosmetic (`reconcile` is cosmetic by contract — "visibility is never a
+// gate"), and a cosmetic cleanup must never be able to kill a live worker.
+// OBS-772 — WHY THE runId LINE EXISTS, AND WHY THE WORKSPACE LINE ALONE WAS NOT THE FIX. The first
+// repair was workspace-scoped only, and its own comment dismissed the residue — "two runs sharing one
+// workspace would still sweep each other" — as unreachable, on the reasoning that one workspace per run
+// is herdr's placement. That reasoned from ONE driver to the whole product. OrcaDriver has no workspace
+// dimension at all: orca.ts passes a single ORCA_SPACE as the workspaceId for EVERY checkout and as
+// `ws`, so `workspaceId !== ws` is never true there and every foreign pane fell straight through. Orca
+// users had zero protection while the defect read as fixed. The runId line is the real rule and it is
+// driver-agnostic: reconcile exists to clean up THIS RUN's panes, and a leftover from a dead run is
+// exactly what cannot be told from a live run's pane without liveness data this process does not have.
+// Both lines are kept — the workspace line preserves the pre-existing sparing of this run's own panes
+// in another workspace, which the runId line alone would not.
+// ⚠ WHAT THE runId LINE COST BEFORE OBS-777 — SUSPENDED, NOT NARROWED, and the price was larger than
+// it read. Sparing every other runId suspended OBS-17's FOUNDING use case: "a killed daemon can't
+// close its slots". This sweep was built to reclaim exactly those orphans, but could not reclaim ANY
+// previous run's panes. Three separate pins asserted the old behaviour (reconcile.test.ts,
+// orca-placement.test.ts,
+// reconcile-live.test.ts); all three were changed deliberately, and the third is why this paragraph
+// exists rather than a shorter one — two flipped pins is a trade, three is a pattern.
+// OBS-777 RESTORES that reclamation: the CALLER passes `opts.endedRunIds`, a Set the daemon computes
+// ONCE at run start from this repository's own `run-end` journals and dead lock holders. This fold
+// stays pure — it gains one optional field, not a repo root — a foreign repository's runId is never
+// resolvable and so stays spared by construction, and no driver learns about workspaces.
+// ponytail: two conditions, no geometry reasoning, nothing driver-specific. `reconcile` is cosmetic by
+// contract, and a cosmetic cleanup must never be able to kill a live worker — which is why the
+// ended-run authority is the only safe way to restore the sweep without reviving the cross-run kill.
 export function panesToClose(
   agents: FleetAgent[],
   desired: Set<string>,
   ws: string,
   runId: string,
-  opts?: { spareLiveLlm?: boolean },
+  opts?: { spareLiveLlm?: boolean; endedRunIds?: Set<string> },
 ): { paneId: string; tabId?: string }[] {
   const out: { paneId: string; tabId?: string }[] = [];
   for (const a of agents) {
     if (typeof a.name !== "string" || typeof a.paneId !== "string") continue;
     const owned = parseOwnedName(a.name);
     if (!owned || owned.role === "watch") continue;
-    if (a.workspaceId === ws) {
-      if (desired.has(a.name)) continue;
-      if (opts?.spareLiveLlm && owned.runId === runId && (owned.role === "judge" || owned.role === "review" || owned.role === "consult")) continue;
-    } else if (owned.runId === runId) {
-      continue; // this run's own pane in another workspace — never touched
-    }
+    if (owned.runId !== runId && !opts?.endedRunIds?.has(owned.runId)) continue;
+    if (a.workspaceId !== ws) continue; // OBS-769: another workspace is another run's business
+    if (desired.has(a.name)) continue;
+    if (opts?.spareLiveLlm && owned.runId === runId && (owned.role === "judge" || owned.role === "review" || owned.role === "consult")) continue;
     out.push({ paneId: a.paneId, tabId: a.tabId });
   }
   return out;
@@ -176,5 +215,5 @@ export interface ExecutorDriver {
   // lifecycle events lag the journal (a live consult has no journal row until its verdict lands).
   // Cosmetic by contract: implementations swallow every failure and never throw. Omitted on
   // subprocess (no panes) — the daemon's optional-chain call is a no-op there.
-  reconcile?: (desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean }) => Promise<void>;
+  reconcile?: (desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean; endedRunIds?: Set<string> }) => Promise<void>;
 }

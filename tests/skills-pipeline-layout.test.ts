@@ -95,4 +95,22 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
     expect(loopContent).toContain('--dangerously-bypass-approvals-and-sandbox')
     expect(autoContent).toContain('--dangerously-bypass-approvals-and-sandbox')
   })
+
+  it('the shipped overseer skill states that a standing instruction records the premise whose falsification revokes it, and the pipeline layout test asserts that section is present so the rule cannot be dropped silently', () => {
+    const overseerPath = path.join(process.cwd(), 'skills', 'tickmarkr-overseer', 'SKILL.md')
+    const content = fs.readFileSync(overseerPath, 'utf-8')
+
+    expect(content).toContain('A standing instruction carries its revocation premise')
+    expect(content).toMatch(/standing rule[\s\S]*states the premise that makes it true/i)
+    expect(content).toMatch(/observation that\s+would falsify that premise and revoke the rule/i)
+  })
+
+  it('the shipped overseer skill directs a tier liveness read at beat freshness and a loop liveness read at the process payload, so neither is read from a recorded pid', () => {
+    const overseerPath = path.join(process.cwd(), 'skills', 'tickmarkr-overseer', 'SKILL.md')
+    const content = fs.readFileSync(overseerPath, 'utf-8')
+
+    expect(content).toMatch(/tier's liveness is read from beat freshness/i)
+    expect(content).toMatch(/loop's liveness is read from the live process payload/i)
+    expect(content).toMatch(/Neither liveness claim is read from a recorded pid/i)
+  })
 })

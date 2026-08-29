@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test, vi } from "vitest";
@@ -69,6 +69,19 @@ const seed = (repo: string, livePhase = false) => {
 
 // D-02: bounded --watch is a pure reader — mtime + inode + path-set under .tickmarkr/ unchanged.
 describe("VIS-07 status --watch purity (D-02)", () => {
+  test("test: a status render with no supervision directory present leaves the directory absent, so reading the board never creates the state it reports", async () => {
+    const repo = mkRepo();
+    seed(repo);
+    const dir = join(repo, stateDirName(repo), "supervision");
+
+    expect(existsSync(dir)).toBe(false);
+    const out = await status([], repo);
+
+    expect(out).toContain("supervision:");
+    expect(out).toContain("watch ABSENT");
+    expect(existsSync(dir)).toBe(false);
+  });
+
   test("iterations:3 watch leaves .tickmarkr/ snapshot identical", async () => {
     const repo = mkRepo();
     console.error("VIS-07 purity fixture:", repo); // provenance for WATCH-DRILLS (D-13)

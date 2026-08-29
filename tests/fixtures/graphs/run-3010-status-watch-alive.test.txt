@@ -1,18 +1,10 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, test, vi } from "vitest";
-import { status } from "../../src/cli/commands/status.js";
-import {
-  SUPERVISION_TIERS,
-  readSupervision,
-  supervisionBeatPath,
-  supervisionText,
-  type TierLiveness,
-} from "../../src/run/supervision.js";
+import { describe, expect, it } from "vitest";
 
 async function spawnStatusWatch(binary: string, entry: string, cwd: string, binaryArgs: string[] = []) {
   const child = spawn(binary, [...binaryArgs, entry, "status", "--watch"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -30,60 +22,6 @@ describe("status --watch process liveness (OBS-11)", () => {
     const entry = fileURLToPath(new URL("../../src/cli/index.ts", import.meta.url));
 
     await expect(spawnStatusWatch(join(repo, "missing-tsx"), entry, repo)).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  test("test: a live board writes its own tier record and that tier renders live rather than absent, so the only process that can beat the tier does beat it", async () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-watch-"));
-    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-    writeFileSync(
-      join(repo, ".tickmarkr", "graph.json"),
-      JSON.stringify({
-        version: 1,
-        spec: { source: "prd", paths: ["x"], hash: "0".repeat(64) },
-        tasks: [
-          {
-            id: "T1",
-            title: "t",
-            goal: "g",
-            shape: "docs",
-            complexity: 1,
-            deps: [],
-            files: [],
-            context: [],
-            acceptance: ["a"],
-            gates: ["build", "test", "lint", "evidence", "scope"],
-            status: "pending",
-          },
-        ],
-      }),
-    );
-    const printed: string[] = [];
-    const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
-      printed.push(typeof chunk === "string" ? chunk : String(chunk));
-      return true;
-    });
-    let live: TierLiveness[] | undefined;
-    let beats: string[] | undefined;
-
-    try {
-      await status(["--watch"], repo, {
-        sleep: async () => {
-          live = readSupervision(repo);
-          beats = SUPERVISION_TIERS.filter((tier) => existsSync(supervisionBeatPath(repo, tier)));
-          throw new Error("board closed");
-        },
-      }).catch(() => undefined);
-    } finally {
-      spy.mockRestore();
-    }
-
-    const frames = printed.filter((chunk) => chunk.includes("supervision:"));
-    expect(frames).toHaveLength(1);
-    expect(frames[0]).toContain("watch ARMED");
-    expect(frames[0]).not.toContain("watch ABSENT");
-    expect(beats).toEqual(["watch"]);
-    expect(live?.find((tier) => tier.tier === "watch")?.state).toBe("ARMED");
-    expect(supervisionText(live ?? [])).toContain("watch ARMED");
   });
 
   it("a real --watch process is still alive after several refresh intervals", async () => {

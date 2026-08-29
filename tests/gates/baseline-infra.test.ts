@@ -36,6 +36,11 @@ afterEach(() => {
 
 const RED_BASELINE: Baseline = { commands: { test: { exitCode: 1, fingerprints: [] } } };
 const BIRPC_DEATH = 'Error: [birpc] rpc is closed, cannot call "onTaskUpdate"';
+/**
+ * OBS-791: the fingerprint `.github/workflows/release.yml` has forgiven since 2026-08-11 while this
+ * classifier called it a regression. Captured from the workflow's own comment, not composed here.
+ */
+const WORKER_RPC_TIMEOUT = 'Error: [vitest-worker]: Timeout calling "onTaskUpdate"';
 
 /** Run the test gate over a script that prints `lines` and exits 1, and return its GateResult. */
 async function gateOver(lines: string[], baseline: Baseline = RED_BASELINE) {
@@ -63,6 +68,32 @@ describe("baseline failure classification (real gate, zero tokens)", () => {
 
     const assertion = "AssertionError: expected true to be false";
     const regression = await gateOver([known, BIRPC_DEATH, assertion], baseline);
+    expect(regression.pass).toBe(false);
+    expect(regression.meta?.classification).toBe("regression");
+    expect(regression.meta?.infra).toBeUndefined();
+  });
+
+  test("test: the vitest worker RPC timeout the release gate forgives classifies infra rather than regression, and the same set with one AssertionError added still classifies regression, so a teardown death is not charged to a diff and a real failure is never laundered by one", async () => {
+    const known = "FAIL tests/known.test.ts > pre-existing assertion";
+    const baseline: Baseline = {
+      commands: { test: { exitCode: 1, fingerprints: fingerprint(known) } },
+    };
+
+    // The exact literal release.yml forgives. Before OBS-791 this returned "regression", so the
+    // product charged a worker for the failure the release gate was written to forgive.
+    const infra = await gateOver([known, WORKER_RPC_TIMEOUT], baseline);
+    expect(infra).toMatchObject({ pass: false, meta: { classification: "infra", infra: true } });
+
+    const fresh = freshFailures(baseline.commands.test, `${known}\n${WORKER_RPC_TIMEOUT}`).failing;
+    expect(fresh).toEqual([WORKER_RPC_TIMEOUT]);
+    expect(classifyFailureOutput(fresh.join("\n"))).toBe("infra");
+
+    // The method name is not pinned: the fixed 60s birpc window is a property of the RPC layer, so
+    // forgiving one method and charging its sibling for the same event would be arbitrary.
+    expect(classifyFailureOutput('Error: [vitest-worker]: Timeout calling "onCollected"')).toBe("infra");
+
+    // The veto that must survive: one real failure anywhere outvotes the infrastructure evidence.
+    const regression = await gateOver([known, WORKER_RPC_TIMEOUT, "AssertionError: expected true to be false"], baseline);
     expect(regression.pass).toBe(false);
     expect(regression.meta?.classification).toBe("regression");
     expect(regression.meta?.infra).toBeUndefined();

@@ -60,6 +60,11 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    OPERATOR LAYOUT/CONVENTION rather than a shipped milestone — names like `*-discipline`, `*-drill`,
    `*-parity`, `*-least-permission`, `context-reset-*`, `consults-*`, `agent-*`, `*-tab-layout`,
    `*-visible-*`, `*-panes*`, `user-tabs-*`.
+   **A standing instruction carries its revocation premise.** Every standing rule you lift from memory,
+   handoff or a live correction states the premise that makes it true and the concrete observation that
+   would falsify that premise and revoke the rule. If you cannot name the falsifier, you have written a
+   preference, not standing supervision law. When the falsifier arrives, retire or amend the rule in the
+   shipped skill in the same act; do not leave successors to obey a rule whose reason is already false.
    **Earned 2026-08-04, expensively.** That directory held `…-falsification-drill-discipline.md`, written
    three weeks earlier: *"a gate or grep-pin is assumed WRONG until a falsification drill proves it bites…
    run the drill that should redden it and SEE the red before trusting green."* That is Evidence discipline
@@ -565,6 +570,10 @@ cleared, re-briefed, or replaced keeps beating that tier's file forever. Measure
 **three-hour window in which no orchestrator was alive**, and it would have silently re-armed a
 recorded stand-down within 10 seconds. On the same sweep the overseer tier had **three** beat loops,
 one owned by an unrelated session. So:
+- **Split the liveness reads.** A tier's liveness is read from beat freshness in the repository status
+  path; a loop's liveness is read from the live process payload that is emitting that beat (`tickmarkr
+  beat <tier> --seat <seat>` in this repo). Neither liveness claim is read from a recorded pid: a pid
+  recorded earlier can be stale, reused, or detached from the beat now holding the tier green.
 - **At every adopt, clear, or re-brief, sweep for pre-existing loops on YOUR tier before arming one**
   (`pgrep -f "tickmarkr beat <tier>"`), trace each to its parent session, and kill the **loop only**
   — never the parent — then verify the parent survived.

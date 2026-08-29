@@ -10,6 +10,7 @@ import { validateGraph } from "../src/graph/schema.js";
 import {
   SUPERVISION_BEAT_MS,
   SUPERVISION_STALE_MS,
+  beatSupervision,
   supervisionBeatPath,
   supervisionStandDownPath,
   supervisionStatus,
@@ -27,23 +28,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = join(ROOT, "skills/tickmarkr-overseer/scripts/watch-context.sh");
 const TWIN = join(ROOT, ".claude/skills/tickmarkr-overseer/scripts/watch-context.sh");
 
-/** The model banner is the statusline location that owns the context percentage. */
-const MARKED = (pct: number) => `  claude-opus-5  ${pct}%  main*  ~/repo`;
+/** A statusline that renders a percentage the way one vendor does (the marker) and one that does not. */
+const MARKED = (pct: number) => `  ✳ Cogitating… (${pct}% context left)`;
+const UNMARKED = (pct: number) => `  claude-opus-5  ${pct}%  main*  ~/repo`;
 const NO_PCT = "  claude-opus-5  main*  ~/repo  (no gauge rendered)";
-/**
- * OBS-785: a REAL statusline, captured verbatim from a live seat on 2026-08-29, not composed here.
- * The invented `MARKED` format above is why the shipped selector could be green in tests and blind on
- * every real pane: it begins with the vendor id, while a real line begins with a GLYPH and names the
- * model "Opus 5". Three independent properties defeated the merged regex — the line-start anchor, the
- * missing `opus` alternative, and CASE. Keep this byte-exact; normalising it re-opens the hole.
- * It also carries `\u2211 1.2M tok` (cumulative SPEND) and `\u2b22 9/9` (a fleet counter), the two
- * fields OBS-780 records being misread as a context percentage.
- */
-const REAL_CAPTURED_STATUSLINE =
-  "  \u2733 Opus 5 (1M context) \u2502 \u2442 fix/obs-769-cross-run-pane-close \u2502 "
-  + "\u23f8 parked 8/9 T9\u23f8 tip\u2713 \u2502 \u2211 1.2M tok \u2502 \u2b22 9/9 \u2502 \u2588\u2588\u258a\u2500\u2500\u2500\u2500\u2500 35% \u2502 \u25b8 tickmarkr";
-
-const TRUNCATED_LIVE_RUN = `  claude-opus-5  live-run=${"task-routing-and-gate-status/".repeat(8)}`;
 
 const seedRepo = (): string => {
   const repo = mkdtempSync(join(tmpdir(), "tickmarkr-watch-context-"));
@@ -219,63 +207,33 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     expect(stamps[stamps.length - 1]! - stamps[0]!).toBeLessThan(120_000);
   }, 60_000);
 
-  test("test: the percentage is read from a REAL captured statusline that begins with a glyph and names Opus, so a selector that is green against an invented banner cannot ship blind to every live seat", async () => {
+  test("test: a seat whose statusline renders no percentage produces no beat at all so its tier ages to stale; the same seat rendering one beats and reads armed; a watcher that beats on an empty read then sleeps to its cap fails", async () => {
     const repo = seedRepo();
-    const handoff = join(repo, "HANDOFF.md");
-    writeFileSync(handoff, "safe state\n");
-    const stub = makeStub(repo, REAL_CAPTURED_STATUSLINE);
-    const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "1", "1", handoff, "1", "600"]);
+    // the tier was armed earlier by this same seat, so what follows is ageing, not never-armed
+    beatSupervision(repo, "overseer-context", "OVSR-w1:p2");
+    const beatPath = supervisionBeatPath(repo, "overseer-context");
+    expire(beatPath);
+    const armedAt = statSync(beatPath).mtimeMs;
 
-    // The whole defect was reporting UNREADABLE on a line a human reads at a glance.
-    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_ACT"), { timeout: 20_000, interval: 100 });
-    expect(w.out()).not.toContain("CONTEXT_UNREADABLE");
-    // 35 is the gauge, not the 1.2M spend total and not the 9/9 fleet counter beside it.
-    expect(w.out()).toContain("35%");
-    w.proc.kill("SIGKILL");
-  }, 30_000);
-
-  test("test: a pane whose statusline carries no percentage field reports unreadable and orders nothing", async () => {
-    const repo = seedRepo();
-    const handoff = join(repo, "HANDOFF.md");
-    writeFileSync(handoff, "safe state\n");
+    // A statusline with no percentage on it at all — the shipped read anchored on a marker only one
+    // vendor renders, so this is every other vendor's seat, every cycle.
     const stub = makeStub(repo, NO_PCT);
-    const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "1", "1", handoff, "1", "600"],
-      { TKR_AUTO_CLEAR: "1", TKR_CLEAR_SETTLE_S: "0" });
-
-    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_UNREADABLE"), { timeout: 20_000, interval: 100 });
-    expect(w.out()).not.toContain("CONTEXT_WARN");
-    expect(w.out()).not.toContain("CONTEXT_ACT");
-    expect(calls(stub).filter((line) => line.includes("agent prompt"))).toEqual([]);
-    expect(beats(stub, "overseer-context").length).toBeGreaterThan(0);
-    w.proc.kill("SIGKILL");
-  }, 30_000);
-
-  test("test: a pane whose statusline carries no percentage field but whose scrollback contains an earlier percentage still reports unreadable, so a borrowed number cannot become a crossing", async () => {
-    const repo = seedRepo();
-    const handoff = join(repo, "HANDOFF.md");
-    writeFileSync(handoff, "safe state\n");
-    const stub = makeStub(repo, `earlier progress report: 91%\n${NO_PCT}`);
-    const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "1", "1", handoff, "1", "600"],
-      { TKR_AUTO_CLEAR: "1", TKR_CLEAR_SETTLE_S: "0" });
-
-    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_UNREADABLE"), { timeout: 20_000, interval: 100 });
-    expect(w.out()).not.toContain("CONTEXT_WARN");
-    expect(w.out()).not.toContain("CONTEXT_ACT");
-    expect(calls(stub).filter((line) => line.includes("agent prompt"))).toEqual([]);
-    w.proc.kill("SIGKILL");
-  }, 30_000);
-
-  test("test: a statusline carrying a long live-run segment that pushes the percentage past the visible width reports unreadable rather than declining to beat, so the tier stops ageing to stale during exactly the work the watcher exists to cover", async () => {
-    const repo = seedRepo();
-    const stub = makeStub(repo, TRUNCATED_LIVE_RUN);
     const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "60", "75", "", "1", "600"]);
 
-    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_UNREADABLE"), { timeout: 20_000, interval: 100 });
-    expect(beats(stub, "overseer-context").length).toBeGreaterThan(0);
-    expect(supervisionStatus(repo, "overseer-context").state).toBe("ARMED");
-    expect(w.out()).not.toContain("CONTEXT_ACT");
+    // it keeps LOOKING (three reads, not one read then a sleep to the cap) and beats NOTHING
+    await vi.waitFor(() => expect(calls(stub).filter((l) => l.includes("agent read")).length)
+      .toBeGreaterThanOrEqual(3), { timeout: 20_000, interval: 100 });
+    expect(beats(stub, "overseer-context")).toHaveLength(0);
+    expect(statSync(beatPath).mtimeMs).toBe(armedAt); // not one byte written over the aged record
+    expect(supervisionLine(await status([], repo))).toContain("overseer-context STALE");
+
+    // the SAME seat, now rendering a gauge without the vendor marker: read succeeds, so it beats
+    stub.render(UNMARKED(31));
+    await vi.waitFor(() => expect(supervisionStatus(repo, "overseer-context").state).toBe("ARMED"),
+      { timeout: 20_000, interval: 100 });
+    expect(supervisionLine(await status([], repo))).toContain("overseer-context ARMED (OVSR-w1:p2)");
     w.proc.kill("SIGKILL");
-  }, 30_000);
+  }, 60_000);
 
   test("test: a percentage sequence rising through the warn threshold to the act threshold emits a warn line naming the file it will re-brief from and afterwards performs the act; a watcher exiting at warn never reaches the act and fails", async () => {
     const repo = seedRepo();
@@ -339,13 +297,11 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     }
   }, 90_000);
 
-  test("the diff anchors the percentage read to the model banner rather than widening a bare numeric pattern, and leaves both copies of the script byte-identical", () => {
+  test("the shipped script and its tracked twin under .claude are byte-identical", () => {
     const shipped = readFileSync(SCRIPT);
-    const source = shipped.toString("utf8");
     expect(shipped.byteLength).toBeGreaterThan(0);
-    expect(source).toContain("banner=$(printf '%s\\n' \"$screen\"");
-    expect(source).toContain("\"$banner\" | grep -oE '[0-9]+%'");
-    expect(source).not.toContain("\"$screen\" | grep -oE '[0-9]+%'");
-    expect(readFileSync(TWIN)).toEqual(shipped);
+    // OBS: this twin is a COPY, not the symlink SKILL.md is, so an edit to one alone leaves this
+    // repository's own seats running the old script — the same fence tests/seat-send.test.ts keeps.
+    if (existsSync(TWIN)) expect(readFileSync(TWIN)).toEqual(shipped);
   });
 });

@@ -40,7 +40,8 @@ Before `tickmarkr compile` or `tickmarkr run`, compare the installed binary agai
 
 1. Run `tickmarkr version` (one line, machine-parseable).
 2. Read the `version` field from the repository's `package.json`.
-3. If the binary and repository do not **agree on the entire version** (including the patch; e.g. binary `2.1.0` vs repo `2.1.1`), **stop immediately** and tell the operator to update the global install (`npm i -g tickmarkr@latest`) or link the repo binary. Do not compile, plan, or run on hope.
+3. If the binary and repository do not **agree on the entire version** (including the patch; e.g. binary `2.1.0` vs repo `2.1.1`), **stop immediately** and tell the operator to update the global install (`npm i -g tickmarkr@latest`), or to install this repository's build as a REAL COPY — `npm pack`, then `npm i -g ./<tarball>`. Do not compile, plan, or run on hope.
+   > ⚠ **Never `npm i -g .` on the repository directory, and never link it.** npm SYMLINKS a directory install, which makes the working tree itself the machine-wide binary: every later build — including a gate's own `npm run build` — silently hot-swaps the CLI for every repository on the machine, with no version change to notice it by. Measured 2026-08-29: a verify build gate rewrote the shared binary while another repository's daemon was mid-run against it, and a positive control that rebuilds at a pre-fix ref would have installed the very defect it was proving fixed, machine-wide (OBS-771). Verify an install by comparing the global and repo **inodes** — they must DIFFER — never by `tickmarkr version`, which cannot go red when nothing is bumped.
 
 A stale binary silently skips daemon gates shipped in newer releases — the v1.38 run exposed this when a global `1.36.0` binary missed the daemon tip-verify gate entirely (OBS-38). Preflight failure is always stop-and-report; never proceed-and-hope.
 

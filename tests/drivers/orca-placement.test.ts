@@ -185,7 +185,14 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     expect(existsSync(worktreePath(repo, delegatedBranch))).toBe(false); // nothing where the daemon looks
   });
 
-  test("test: reconcile closes an undesired owned-titled terminal of the current run and an owned-titled leftover from an older run while a pre-existing foreign-titled terminal and a live foreign lookalike survive; sparing the old-run owned terminal or closing either foreign control fails", async () => {
+  // OBS-772 CHANGED THIS TEST'S SUBJECT, and the change is a real loss, not a cleanup. It used to
+  // assert that an owned leftover from an OLDER run is reclaimed — the argument FOR the unscoped
+  // listing, made right below in the scoped-listing control. `owned.runId !== runId` now spares it,
+  // because a dead run's orphan and a LIVE run's worker are the same bytes to this process: on Orca
+  // every checkout shares one ORCA_SPACE, so the sweep that reclaimed `t_old` is the same sweep that
+  // closed a stranger's live worker (OBS-769/772). Cross-run reclamation is given up deliberately;
+  // stranded leftovers are the operator's to close. The foreign controls are unchanged.
+  test("test: reconcile closes an undesired owned-titled terminal OF THIS RUN, while an owned-titled leftover from an OLDER run, a pre-existing foreign-titled terminal and a live foreign lookalike all survive; closing the old-run terminal or either foreign control fails", async () => {
     const DESIRED = owned("T1", 0, RUN);
     const UNDESIRED = owned("T9", 0, RUN);
     const OLD = owned("T4", 1, "run-older");
@@ -209,13 +216,15 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     expect(fake.calls.filter((c) => c[1] === "list")).toEqual([
       ["terminal", "list", "--include-visual-layouts", "--limit", "10000", "--json"],
     ]);
-    // Owned-and-undesired closes whichever run created it; everything else is still there.
-    expect(fake.calls.filter((c) => c[1] === "close").map((c) => c[3]).sort()).toEqual(["t_old", "t_undesired"]);
-    expect(fake.terminals.map((t) => t.handle).sort()).toEqual(["t_desired", "t_foreign", "t_lookalike"]);
+    // Owned-and-undesired closes ONLY when this run created it (OBS-772); everything else survives,
+    // `t_old` now included. The second assertion is the leg that keeps this from becoming a mute:
+    // `t_undesired` must still close, or the sweep has stopped doing its job rather than been scoped.
+    expect(fake.calls.filter((c) => c[1] === "close").map((c) => c[3]).sort()).toEqual(["t_undesired"]);
+    expect(fake.terminals.map((t) => t.handle).sort()).toEqual(["t_desired", "t_foreign", "t_lookalike", "t_old"].sort());
 
-    // Control — sparing the old-run leftover. It is exactly what a worktree-scoped listing produces:
-    // the leftover sits in a checkout this run never knew, so a scoped sweep cannot see it at all,
-    // and no later sweep ever will either. Instance, not assertion: run the scoped listing.
+    // Control — the scoped listing, kept because it still shows something true: a worktree-scoped
+    // sweep cannot even SEE the old-run leftover. Post-OBS-772 the unscoped sweep spares it too, so
+    // the two now agree on `t_old` and differ only in what they can observe. Instance, not assertion.
     const scoped = new FakeOrca({ terminals: seed() });
     const scopedList = await scoped.exec(
       ["terminal", "list", "--worktree", `path:${WT_A}`, "--include-visual-layouts", "--limit", "10000", "--json"],

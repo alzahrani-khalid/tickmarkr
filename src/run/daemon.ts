@@ -1,6 +1,6 @@
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
-import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readlinkSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { stringify } from "yaml";
@@ -19,7 +19,7 @@ import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/type
 import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
 import { runGates, type GateEvent } from "../gates/run-gates.js";
 import type { GateResult } from "../gates/types.js";
-import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest } from "../graph/graph.js";
+import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
@@ -27,7 +27,7 @@ import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallComm
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingReviewFindings, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, renderStructuredReviewFinding, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
-import { acquireApprovalSerialization, acquireRunLock, releaseRunLock } from "./lock.js";
+import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
 import { nextChannel, route } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
@@ -883,6 +883,31 @@ function recordFatalRunEnd(journal: Journal, runId: string, branch: string, err:
   }
 }
 
+// OBS-777: the fleet fold cannot distinguish an orphan from another repository's live worker. Give
+// it one repository-scoped snapshot instead: terminal journals are ended, and an open lifecycle is
+// ended only when the shared lock predicate can prove its last recorded daemon pid dead.
+function endedRunIdsForReconcile(repoRoot: string): Set<string> {
+  const ended = new Set<string>();
+  const dir = join(tickmarkrDir(repoRoot), "runs");
+  if (!existsSync(dir)) return ended;
+  let runIds: string[];
+  try { runIds = readdirSync(dir); } catch { return ended; }
+  for (const runId of runIds) {
+    try {
+      const events = Journal.open(repoRoot, runId).read();
+      if (runHasEnded(events)) {
+        ended.add(runId);
+        continue;
+      }
+      const lifecycle = [...events].reverse().find((event) =>
+        (event.event === "run-start" || event.event === "run-resume")
+        && Number.isInteger(event.data.pid) && (event.data.pid as number) > 0);
+      if (lifecycle && !isPidLive(lifecycle.data.pid as number)) ended.add(runId);
+    } catch { /* incomplete or foreign run directory — it proves nothing */ }
+  }
+  return ended;
+}
+
 export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promise<RunSummary> {
   // v1.51 T2 / OBS-89 (v1.60): retired --quality env seam. Mode resolution owns premium routing;
   // route() no longer reads the retired env at all, so the old entrypoint scrub is gone with it.
@@ -901,6 +926,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // subprocess, so the optional-chain open below is a no-op there). Cosmetic-only: any failure is
   // swallowed (never affects the run); the operator closes a surviving watch pane.
   const lock = acquireRunLock(repoRoot, runId);
+  const endedRunIds = endedRunIdsForReconcile(repoRoot); // one snapshot for every sweep this caller makes
   // D10: the lock is this daemon's liveness record and already carries its pid; status prints that
   // identity beside the supervision row. The `orchestrator` tier belongs exclusively to the seated
   // supervisor, so a run never beats or stands down that seat's record on the daemon's behalf.
@@ -1001,7 +1027,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // Termination (SIGINT/SIGTERM): record the daemon-controlled exit before closing every live slot,
   // reconcile owned panes against an EMPTY
   // desired set (herdr panes not in memory; panesToClose spares foreign names, watch panes, and
-  // other runs' panes by construction), release the run lock, then exit. There is still no run-end,
+  // live/unknown other runs' panes by construction), release the run lock, then exit. There is still no run-end,
   // so stop-amend-resume keeps resuming; exit-cause distinguishes this deliberate stop from an
   // observer-classified abrupt death. keepPanes:"forever" (the
   // keep-everything debug override) preserves panes but still releases the lock and exits.
@@ -1024,7 +1050,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           for (const s of liveSlots) { // closeSlot only deletes the element being visited — safe during Set iteration
             try { await closeSlot(s); } catch { /* cosmetic — reconcile is the backstop */ }
           }
-          try { await driver.reconcile?.(new Set(), runId); } catch { /* cosmetic — visibility is never a gate */ }
+          try { await driver.reconcile?.(new Set(), runId, { endedRunIds }); } catch { /* cosmetic — visibility is never a gate */ }
         }
         releaseRunLock(repoRoot); // the process dies at exit() below — the finally never runs on this path
       }
@@ -1206,7 +1232,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // herdr's watches bookkeeping lives in close(), and a raw pane-close in the sweep would
       // leave narrator() a stale cache) — the driver always sees it as desired; its lifecycle is
       // decided here from the fold alone.
-      await driver.reconcile?.(new Set([...desired, watchName]), runId, opts);
+      await driver.reconcile?.(new Set([...desired, watchName]), runId, { ...opts, endedRunIds });
       // OBS-103: when the fold retires the watch (run-end boundary), close the narrator. The
       // decision keys on the run identity in the pane name — narrator() adopts a prior daemon
       // instance's pane under the same owned name, so a stop→resume cycle's leftover narrator
@@ -1221,7 +1247,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       /* cosmetic — visibility is never a gate */
     }
   };
-  await reconcile(); // run start/resume boundary: nothing in flight — full sweep, incl. older runs' leftovers
+  // run start/resume boundary: nothing in flight, so the sweep takes this run's judge/review/consult
+  // panes too. OBS-777: the one startup snapshot lets it reclaim only older runs proven ended, while
+  // every live or unknown run remains spared.
+  await reconcile();
 
   // v1.4 self-reference guard: a random nonce on the worker trailer AND exit marker. Displayed
   // source/diffs (e.g. a worker editing tickmarkr's own prompt.ts/daemon.ts) can't know it, so an echoed

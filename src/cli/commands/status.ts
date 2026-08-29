@@ -27,7 +27,7 @@ import { isPidLive } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
-import { armSupervision, readSupervision, supervisionText } from "../../run/supervision.js";
+import { armWatchSupervision, readSupervision, supervisionText } from "../../run/supervision.js";
 import {
   deriveRunCockpitData,
   type TaskRow,
@@ -160,6 +160,18 @@ const RESTORE_TERMINAL_TITLE = "\x1b[23;0t";
 const decisionEvidence = (stateDir: string, runId: string, sequence: number): string =>
   `${stateDir}/runs/${runId}/journal.jsonl#L${sequence}`;
 
+type DecisionGateVerdict = "passed" | "failed" | "skipped" | "unknown";
+
+const DECISION_GATE_VERDICTS: Record<GateOutcomeKind, DecisionGateVerdict> = {
+  passed: "passed",
+  failed: "failed",
+  skipped: "skipped",
+  declined: "skipped",
+  held: "unknown",
+  unavailable: "unknown",
+  infra: "unknown",
+};
+
 // v1.79 T4: a deterministic JSONL projection over journal truth. Sequence/evidence come from the
 // append-only line position, timestamps and claims come from the row, and no watcher-local clock or
 // filesystem write participates. Re-reading the same bytes therefore returns the same event bytes.
@@ -181,13 +193,7 @@ export const decisionEventsFromJournal = (
     return [{ ...base, type: "phase-change" as const, tier: "routine" as const, phase: event.data.phase }];
   }
   if (event.event === "gate-result" && typeof event.data.gate === "string") {
-    const verdict = event.data.skipped === true
-      ? "skipped" as const
-      : event.data.pass === true
-        ? "passed" as const
-        : event.data.pass === false
-          ? "failed" as const
-          : "unknown" as const;
+    const verdict = DECISION_GATE_VERDICTS[normalizeGateOutcome(event.data).kind];
     return [{
       ...base,
       type: "gate-verdict" as const,
@@ -473,6 +479,14 @@ type GateSnapshot = {
   priorGraph: boolean;
 };
 
+const GATE_OUTCOME_STATES: Partial<Record<GateOutcomeKind, "pass" | "fail" | "skip">> = {
+  // The board state is a rendering vocabulary over the normalized outcome, not another field reader.
+  passed: "pass",
+  failed: "fail",
+  skipped: "skip",
+  declined: "skip",
+};
+
 const gateSnapshot = (task: Task, events: JournalEvent[], rehashAt?: number): GateSnapshot => {
   const outcomes = new Map<string, { state: "pass" | "fail" | "skip"; eventIndex: number }>();
   const start = attemptStartIdx(events, task.id);
@@ -480,9 +494,8 @@ const gateSnapshot = (task: Task, events: JournalEvent[], rehashAt?: number): Ga
     for (let eventIndex = start; eventIndex < events.length; eventIndex++) {
       const e = events[eventIndex]!;
       if (e.taskId !== task.id || e.event !== "gate-result" || typeof e.data.gate !== "string") continue;
-      if (e.data.skipped === true) outcomes.set(e.data.gate, { state: "skip", eventIndex });
-      else if (e.data.pass === true) outcomes.set(e.data.gate, { state: "pass", eventIndex });
-      else if (e.data.pass === false) outcomes.set(e.data.gate, { state: "fail", eventIndex });
+      const state = GATE_OUTCOME_STATES[normalizeGateOutcome(e.data).kind];
+      if (state) outcomes.set(e.data.gate, { state, eventIndex });
     }
   }
   return {
@@ -630,7 +643,7 @@ const foldTaskEffort = (tasks: readonly Task[], events: readonly JournalEvent[])
     if (event.event === "task-dispatch") task.dispatches += 1;
     else if (event.event === "gate-result" && event.data.gate === "review"
              && event.data.replayMeasurement !== true
-             && REVIEW_VERDICTS.has(normalizeGateOutcome(event.data.outcome ?? event.data).kind)) task.reviews += 1;
+             && REVIEW_VERDICTS.has(normalizeGateOutcome(event.data).kind)) task.reviews += 1;
     else if (event.event === "task-human") task.parks += 1;
     task.total = task.dispatches + task.reviews + task.parks;
   }
@@ -1600,7 +1613,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   // it INVERTS it: armSupervision's interval outlives the board in any host that outlives one board, so
   // a dead board keeps writing and reads ARMED. That is the over-claiming direction, the one an operator
   // acts on, and the one this instrument exists to close.
-  const armed = bounded ? undefined : armSupervision(cwd, "watch", opts.supervisionBeatMs);
+  const armed = bounded ? undefined : armWatchSupervision(cwd, opts.supervisionBeatMs);
   let titleSaved = false;
   const restoreTitle = () => {
     if (!titleSaved) return;

@@ -1,8 +1,8 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { classifyFailureOutput } from "../../gates/baseline.js";
 import { stateDirName } from "../../graph/graph.js";
 import { Journal } from "../../run/journal.js";
+import { normalizeGateOutcome } from "../../run/outcome.js";
 
 // The operator-facing schema is deliberately closed. Adding a fact to the table therefore requires
 // adding it here as a conscious compatibility change, rather than letting incidental journal fields
@@ -79,15 +79,6 @@ const reviewerFrom = (data: Record<string, unknown>): string | undefined => {
   if (typeof data.reviewer === "string" && data.reviewer.trim()) return data.reviewer.trim();
   if (typeof data.details !== "string") return undefined;
   return /\breviewer(?:\s+|:\s*)([\w@./+-]+:[\w@./+-]+)/iu.exec(data.details)?.[1];
-};
-
-const redEvidence = (data: Record<string, unknown>): string => {
-  const fingerprints = Array.isArray(data.fingerprints)
-    ? data.fingerprints.filter((value): value is string => typeof value === "string")
-    : [];
-  const prose = [data.details, data.error, data.reason]
-    .filter((value): value is string => typeof value === "string");
-  return [...fingerprints, ...prose].join("\n");
 };
 
 const historyFor = (tasks: Map<string, TaskHistory>, taskId: string): TaskHistory => {
@@ -189,10 +180,9 @@ export function collectChannelStats(cwd = process.cwd()): StatsReport {
         const reviewer = reviewerFrom(event.data);
         if (reviewer) channel.reviewers.add(reviewer);
       }
-      if (event.data.pass !== false) continue;
-      const infra = event.data.infra === true || classifyFailureOutput(redEvidence(event.data)) === "infra";
-      if (infra) channel.infraReds += 1;
-      else channel.realReds += 1;
+      const outcome = normalizeGateOutcome(event.data);
+      if (outcome.kind === "infra") channel.infraReds += 1;
+      else if (outcome.kind === "failed") channel.realReds += 1;
     }
 
     // A rescue is task-matched, not attempt-matched: one edge says the failed author and delivering

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -10,6 +10,7 @@ import {
   SUPERVISION_BEAT_MS,
   SUPERVISION_STALE_MS,
   readSupervision,
+  readTierLiveness,
   supervisionBeatPath,
   supervisionText,
 } from "../../src/run/supervision.js";
@@ -51,6 +52,20 @@ describe("SUP-04 tickmarkr beat", () => {
     expect(line).not.toContain("overseer ABSENT");
     // the verb writes ONE tier: a beat that armed every row would make the surface unfalsifiable
     expect(line).toContain("watch ABSENT");
+  });
+
+  test("test: a beat record written by a one-shot beat names its writer under a field whose name states the writer has exited, and liveness derives from beat freshness alone, so two reads seconds apart cannot disagree about a tier that never stopped", async () => {
+    const repo = seedRepo(mkRepo());
+    await beat(["overseer", "--seat", "OVSR-w1:p2"], repo);
+
+    const path = supervisionBeatPath(repo, "overseer");
+    const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    expect(record.exitedWriterPid).toBe(process.pid);
+    expect(record).not.toHaveProperty("pid");
+
+    const writtenAt = statSync(path).mtimeMs;
+    expect(readTierLiveness(repo, "overseer", writtenAt + 1_000).state).toBe("ARMED");
+    expect(readTierLiveness(repo, "overseer", writtenAt + 3_000).state).toBe("ARMED");
   });
 
   test("test: a tier whose newest beat has aged past the staleness ceiling of six beat intervals renders stale, while one aged past a single interval still renders armed, so a renderer that alarms on one missed beat or never leaves absent fails", async () => {

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { type RunGraph, type SpecSource, validateGraph } from "../graph/schema.js";
 import { taskUnitContractErrors } from "./collateral.js";
+import { ownershipFindings, renderOwnershipFinding } from "./ownership.js";
 import { CompileError } from "./common.js";
 import { compileGsd, isGsdPhaseDir } from "./gsd.js";
 import { compileNative, TICKMARKR_NATIVE_MARKER } from "./native.js";
@@ -56,8 +57,8 @@ function enforceTaskUnitContract(g: RunGraph, src: string): RunGraph {
   return g;
 }
 
-export function finalizePlan(plan: PlanIR, src: string): RunGraph {
-  const graph = validateGraph({
+export function finalizePlan(plan: PlanIR, src: string, repoRoot?: string): RunGraph {
+  const graph = enforceTaskUnitContract(validateGraph({
     version: plan.version,
     ...(plan.mode !== undefined ? { mode: plan.mode } : {}),
     spec: {
@@ -67,8 +68,16 @@ export function finalizePlan(plan: PlanIR, src: string): RunGraph {
       ...(plan.base !== undefined ? { base: plan.base } : {}),
     },
     tasks: plan.tasks,
-  });
-  return enforceTaskUnitContract(graph, src);
+  }), src);
+  // overseer-217: report-only in 2.1.7. The 2.1.8 removal condition is one real authored-graph run
+  // plus a measured false-positive rate for the conventional source-name → test-name mapping.
+  // Until then this warning MUST NOT become a compile abort: a heuristic cannot deadlock compile.
+  if (repoRoot) {
+    for (const finding of ownershipFindings(graph.tasks, repoRoot)) {
+      console.warn(renderOwnershipFinding(finding));
+    }
+  }
+  return graph;
 }
 
 function compilePlan(src: string, type?: SourceType, root?: string): PlanIR {
@@ -100,5 +109,5 @@ export function compileSource(
   root?: string,
   beforeFinalize: PlanFinalizationHook = (plan) => plan,
 ): RunGraph {
-  return finalizePlan(beforeFinalize(compilePlan(src, type, root)), src);
+  return finalizePlan(beforeFinalize(compilePlan(src, type, root)), src, root);
 }

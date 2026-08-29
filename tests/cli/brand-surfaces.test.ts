@@ -540,6 +540,44 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     }
   });
 
+  test("test: a gate result carrying a selected-test list renders narration detail naming a screen rather than the word passed", () => {
+    onTTY();
+    const row = stripAnsi(narrationRow({
+      ts: "t",
+      event: "gate-result",
+      taskId: "T1",
+      data: {
+        gate: "test",
+        pass: true,
+        selectedTests: ["tests/cli/brand-surfaces.test.ts"],
+        details: "1 passed",
+      },
+    }, 160)!);
+
+    expect(row).toContain("test selected-test screen");
+    expect(row).not.toContain("test passed");
+    expect(row).not.toMatch(/\bpassed\b/u);
+  });
+
+  test("test: a full-suite pass still renders passed, so the two greens stop sharing one string", () => {
+    onTTY();
+    const row = stripAnsi(narrationRow({
+      ts: "t",
+      event: "gate-result",
+      taskId: "T1",
+      data: {
+        gate: "test",
+        pass: true,
+        selectedTests: ["tests/cli/brand-surfaces.test.ts"],
+        fullSuite: true,
+        details: "full suite passed",
+      },
+    }, 160)!);
+
+    expect(row).toContain("test passed");
+    expect(row).not.toContain("selected-test screen");
+  });
+
   test("run-scoped rows name the run the sink is bound to, so two runs' lifecycle rails are distinguishable and a generic identity fails", () => {
     onTTY();
     // The daemon hands `narrate` one event and nothing else, and NONE of the run-scoped lifecycle

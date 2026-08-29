@@ -71,42 +71,6 @@ const VOCABULARY: GateOutcome[] = [
   { kind: "infra", reason: "Error: spawn EAGAIN", retryable: true },
 ];
 
-test("a gate result whose explicit outcome field disagrees with its bare fields resolves to one kind through the accessor, so a row cannot be kept by one reader and painted by another", () => {
-  const bareRow = { gate: "review", pass: true };
-  const wrappedRow = {
-    ...bareRow,
-    outcome: { kind: "declined", reason: "reviewPolicy declined this gate" },
-  };
-  expect(normalizeGateOutcome(bareRow).kind).toBe("passed");
-  expect(normalizeGateOutcome(wrappedRow).kind).toBe("declined");
-  expect(normalizeGateOutcome(wrappedRow)).toEqual(wrappedRow.outcome);
-});
-
-test("a held selected-test screen and a full-suite pass resolve to different kinds, so the two greens stop sharing one string at the source", () => {
-  const held = normalizeGateOutcome({
-    gate: "test",
-    pass: true,
-    selectedTests: ["tests/run/outcome-projections.test.ts"],
-    details: "selected test screen passed",
-  });
-  const full = normalizeGateOutcome({
-    gate: "test",
-    pass: true,
-    selectedTests: ["tests/run/outcome-projections.test.ts"],
-    fullSuite: true,
-    details: "full suite passed",
-  });
-  expect(held.kind).toBe("held");
-  expect(full.kind).toBe("passed");
-  expect(held.kind).not.toBe(full.kind);
-});
-
-test("the diff leaves the exported kind list unchanged, so this task cannot break a reader it does not own", () => {
-  expect([...GATE_OUTCOME_KINDS]).toEqual([
-    "passed", "failed", "skipped", "declined", "held", "unavailable", "infra",
-  ]);
-});
-
 // Deliberately titled verbatim at TOP LEVEL: the shipped acceptance gate runs the criterion through
 // `testFilterPattern`, whose leaf-anchored `(^| )…$` matches the criterion as the complete trailing
 // segment of Vitest's runner-visible full name (acceptance.ts — OBS-511 widened it through describe
