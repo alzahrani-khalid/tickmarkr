@@ -1,7 +1,8 @@
+import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, test } from "vitest";
 import { dispatch as dispatchCommand } from "../../src/cli/index.js";
 import { status } from "../../src/cli/commands/status.js";
@@ -10,6 +11,7 @@ import { validateGraph, type RunGraph } from "../../src/graph/schema.js";
 import { foldActivity, type ActivityTask } from "../../src/run/activity.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 import { Journal, REVIEW_UPHELD_RELEASE } from "../../src/run/journal.js";
+import { acquireRunLock, releaseRunLock } from "../../src/run/lock.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
 
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-status-"));
@@ -80,6 +82,54 @@ const renderBoard = async (g: RunGraph, tty: boolean, columns: number): Promise<
   const repo = mkRepo();
   saveGraph(repo, g);
   return withStatusSurface(tty, columns, () => status([], repo));
+};
+
+const spawnLockHolder = async (repo: string, runId: string) => {
+  const root = fileURLToPath(new URL("../..", import.meta.url));
+  const lockModule = pathToFileURL(join(root, "src", "run", "lock.ts")).href;
+  const script = [
+    `import { acquireRunLock } from ${JSON.stringify(lockModule)};`,
+    `acquireRunLock(${JSON.stringify(repo)}, ${JSON.stringify(runId)});`,
+    `process.stdout.write("locked\\n");`,
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const tsxLoader = join(root, "node_modules", "tsx", "dist", "loader.mjs");
+  const child = spawn(process.execPath, ["--import", tsxLoader, "--eval", script], {
+    cwd: repo,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error(`lock holder did not acquire ${runId}; stdout=${stdout} stderr=${stderr}`)));
+    }, 5_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      if (stdout.includes("locked\n")) finish(resolve);
+    });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.once("error", (error) => finish(() => reject(error)));
+    child.once("exit", (code, signal) => {
+      finish(() => reject(new Error(`lock holder exited before acquire: code=${code} signal=${signal} stderr=${stderr}`)));
+    });
+  });
+  return child;
+};
+
+const killAndWait = async (child: ReturnType<typeof spawn>): Promise<void> => {
+  const exited = child.exitCode !== null || child.signalCode !== null
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => { child.once("exit", () => resolve()); });
+  child.kill("SIGKILL");
+  await exited;
 };
 
 test("test: status names the preserved ref and a runnable git diff command for a task whose journal carries worktree-preserved, and renders no ref line for a task without one", async () => {
@@ -604,6 +654,82 @@ describe("status <runId> reports the run you named", () => {
     const implicitWatch = await status(["--watch"], repo, { iterations: 1, now: fixedNow, sleep: async () => {} });
     const explicitWatch = await status(["--watch", "run-20260102-000000"], repo, { iterations: 1, now: fixedNow, sleep: async () => {} });
     expect(implicitWatch).toBe(explicitWatch);
+  });
+
+  test("test: while the repository lock names a live run whose directory has no journal yet, the board reports that run rather than the newest finished run", async () => {
+    const { repo, g } = oneTaskRepo();
+    const finishedRun = "run-20260102-000000";
+    const liveRun = "run-20260103-000000";
+    seedJournal(repo, finishedRun, [
+      startFor(g),
+      { ts: "2026-07-31T23:59:00.000Z", event: "run-end", data: { done: [], failed: [], human: [], blocked: [], pending: ["T1"] } },
+    ]);
+    Journal.create(repo, liveRun);
+    acquireRunLock(repo, liveRun);
+    try {
+      const out = await status([], repo, { now: fixedNow });
+      expect(out).toContain(`run ${liveRun}`);
+      expect(out).not.toContain(`run ${finishedRun}`);
+    } finally {
+      releaseRunLock(repo);
+    }
+  });
+
+  test("test: with no lock held, the board reports the newest run that has a journal, so a finished run stays readable", async () => {
+    const { repo, g } = oneTaskRepo();
+    seedJournal(repo, "run-20260101-000000", [startFor(g)]);
+    seedJournal(repo, "run-20260102-000000", [
+      startFor(g),
+      { ts: "2026-07-31T23:59:00.000Z", event: "run-end", data: { done: [], failed: [], human: [], blocked: [], pending: ["T1"] } },
+    ]);
+    Journal.create(repo, "run-20260103-000000");
+
+    const out = await status([], repo, { now: fixedNow });
+
+    expect(out).toContain("run run-20260102-000000");
+    expect(out).not.toContain("run-20260101-000000");
+    expect(out).not.toContain("run-20260103-000000");
+  });
+
+  test("test: a lock whose recorded holder is dead selects the newest journalled run rather than the run that dead holder names", async () => {
+    const { repo, g } = oneTaskRepo();
+    const journalledRun = "run-20260102-000000";
+    const deadLockedRun = "run-20260103-000000";
+    seedJournal(repo, journalledRun, [
+      startFor(g),
+      { ts: "2026-07-31T23:59:00.000Z", event: "run-end", data: { done: [], failed: [], human: [], blocked: [], pending: ["T1"] } },
+    ]);
+    Journal.create(repo, deadLockedRun);
+    const holder = await spawnLockHolder(repo, deadLockedRun);
+    await killAndWait(holder);
+
+    const out = await status([], repo, { now: fixedNow });
+
+    expect(out).toContain(`run ${journalledRun}`);
+    expect(out).not.toContain(`run ${deadLockedRun}`);
+  });
+
+  test("test: an explicitly named run id remains the run the board reports even while a different run holds the live lock", async () => {
+    const { repo, g } = oneTaskRepo();
+    const namedRun = "run-20260101-000000";
+    const newestRun = "run-20260102-000000";
+    const liveRun = "run-20260103-000000";
+    seedJournal(repo, namedRun, [
+      startFor(g),
+      { ts: "2026-07-31T23:59:00.000Z", event: "task-done", taskId: "T1", data: { attempts: 1 } },
+    ]);
+    seedJournal(repo, newestRun, [startFor(g)]);
+    Journal.create(repo, liveRun);
+    acquireRunLock(repo, liveRun);
+    try {
+      const out = await status([namedRun], repo, { now: fixedNow });
+      expect(out).toContain(`run ${namedRun}`);
+      expect(out).not.toContain(newestRun);
+      expect(out).not.toContain(liveRun);
+      expect(row(out, "T1")).toMatch(/\bdone\b/);
+    } finally {
+      releaseRunLock(repo);
+    }
   });
 
   test("watch mode follows the named run across refreshes and never re-resolves to latest, proven over the closed set of refresh shapes — a newer-run-starting fixture, an ended-run fixture and an unchanged-run fixture", async () => {

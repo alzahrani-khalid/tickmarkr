@@ -2,7 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { type RunGraph, type SpecSource, validateGraph } from "../graph/schema.js";
 import { taskUnitContractErrors } from "./collateral.js";
-import { ownershipFindings, renderOwnershipFinding } from "./ownership.js";
+import { blocksCompile, ownershipFindings, renderOwnershipFinding } from "./ownership.js";
 import { CompileError } from "./common.js";
 import { compileGsd, isGsdPhaseDir } from "./gsd.js";
 import { compileNative, TICKMARKR_NATIVE_MARKER } from "./native.js";
@@ -69,12 +69,24 @@ export function finalizePlan(plan: PlanIR, src: string, repoRoot?: string): RunG
     },
     tasks: plan.tasks,
   }), src);
-  // overseer-217: report-only in 2.1.7. The 2.1.8 removal condition is one real authored-graph run
-  // plus a measured false-positive rate for the conventional source-name → test-name mapping.
-  // Until then this warning MUST NOT become a compile abort: a heuristic cannot deadlock compile.
+  // overseer-217 removal condition, now paid: on this milestone's authored graph the conventional
+  // name map emitted 21 raw unowned-test findings; review found 1 real and 20 false, while intersecting
+  // with a direct import or command-entry spawn retained the real one and left 0 false positives. That
+  // is a precision measurement, NOT a recall claim. The prior halted semantic-contract class has no
+  // name/import/ownership relation (one of its three members has no matching literal anywhere), so this
+  // rule could not have caught it and does not claim to. The promoted rule already earned a true positive
+  // during authoring: assigning the plan command to oracle-preflight left two dedicated plan tests unowned.
   if (repoRoot) {
-    for (const finding of ownershipFindings(graph.tasks, repoRoot)) {
+    const findings = ownershipFindings(graph.tasks, repoRoot);
+    const blocking = findings.filter(blocksCompile);
+    for (const finding of findings.filter((item) => !blocksCompile(item))) {
       console.warn(renderOwnershipFinding(finding));
+    }
+    if (blocking.length > 0) {
+      throw new CompileError(
+        `${src} violates cross-task test ownership (${blocking.length} error${blocking.length === 1 ? "" : "s"}):\n`
+          + blocking.map((finding) => `  - ${renderOwnershipFinding(finding)}`).join("\n"),
+      );
     }
   }
   return graph;

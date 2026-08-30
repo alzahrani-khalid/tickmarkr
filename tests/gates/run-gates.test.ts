@@ -215,9 +215,9 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
     expect(results.some((r) => r.gate === "build" || r.gate === "test" || r.gate === "lint")).toBe(false);
   });
 
-  // The other half of the screen: it is a screen, not a reordering. A green one must leave the round
-  // exactly as it found it — one journaled verdict per gate, in GATE_NAMES order, and one battery.
-  test("a green screen journals each gate once, in canonical order, and buys the battery once", async () => {
+  // The other half of the screen: a green one leaves exactly one verdict per gate and one battery.
+  // The stream reports execution order; done() independently preserves declaration order in results.
+  test("a round whose commands all pass writes build, lint and test to the witness log in that order", async () => {
     const repo = makeRepo({
       "src/a.ts": "export const a = 1;\n",
       "witness.sh": "echo \"$1\" >> battery.log\n",
@@ -244,19 +244,19 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
     });
 
     expect(results.every((r) => r.pass)).toBe(true);
-    expect(stream).toEqual(DETERMINISTIC.flatMap((g) => [`${g}:start`, `${g}:end`]));
-    expect(readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n")).toEqual(["build", "test", "lint"]);
+    expect(stream).toEqual(["build", "lint", "evidence", "scope", "test"].flatMap((g) => [`${g}:start`, `${g}:end`]));
+    expect(readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n")).toEqual(["build", "lint", "test"]);
   });
 
-  test("the battery stops at its first failing command instead of buying the rest", async () => {
-    const repo = makeRepo({ "a.txt": "x\n", "witness.sh": "echo \"$1\" >> battery.log\n; exit 0\n" });
+  test("the battery witness log names the build command and the lint command but no test command when the lint command reds, so a cheap red is reached before an expensive test run is bought", async () => {
+    const repo = makeRepo({ "a.txt": "x\n", ".gitignore": "battery.log\n" });
     const baseRef = await gitHead(repo);
     writeFileSync(join(repo, "a.txt"), "y\n");
     commitAll(repo, "work");
-    const commands = { build: "sh -c 'echo build >> battery.log; exit 1'", test: "sh -c 'echo test >> battery.log'", lint: "sh -c 'echo lint >> battery.log'" };
+    const commands = { build: "echo build >> battery.log", test: "echo test >> battery.log", lint: "sh -c 'echo lint >> battery.log; exit 1'" };
     const cfg = structuredClone(DEFAULT_CONFIG);
     cfg.judge.adapter = "fake";
-    const baseline = await captureBaseline(repo, { ...commands, build: "sh -c 'exit 0'" }); // green build at baseline
+    const baseline = await captureBaseline(repo, { ...commands, lint: "true" });
     rmSync(join(repo, "battery.log"), { force: true });
 
     const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
@@ -264,9 +264,9 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
     });
-    expect(results.find((r) => r.gate === "build")?.pass).toBe(false);
-    expect(readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n")).toEqual(["build"]);
-    expect(results.some((r) => r.gate === "lint")).toBe(false);
+    expect(results.find((r) => r.gate === "lint")?.pass).toBe(false);
+    expect(readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n")).toEqual(["build", "lint"]);
+    expect(results.some((r) => r.gate === "test")).toBe(false);
   });
 });
 
@@ -400,9 +400,9 @@ describe("v1.87 T5 — a dirty worktree is not gatable (the runtime refuses what
   test("test: a clean worktree runs the shell gates unchanged, proving the refusal is scoped to the dirty case and not a blanket block", async () => {
     const { results, journaled, stream, battery } = await witnessRound({}); // the same fixture, committed
 
-    expect(battery).toEqual(["build", "test", "lint"]); // every command really ran, in order
-    expect(journaled).toEqual(DETERMINISTIC.map((g) => `${g}:pass`));
-    expect(stream).toEqual(DETERMINISTIC.flatMap((g) => [`${g}:start`, `${g}:end`]));
+    expect(battery).toEqual(["build", "lint", "test"]); // every command really ran, in order
+    expect(journaled).toEqual(["build", "lint", "evidence", "scope", "test"].map((g) => `${g}:pass`));
+    expect(stream).toEqual(["build", "lint", "evidence", "scope", "test"].flatMap((g) => [`${g}:start`, `${g}:end`]));
     expect(results.map((r) => r.gate)).toEqual(DETERMINISTIC);
     expect(results.every((r) => r.pass)).toBe(true);
     expect(results.some((r) => r.meta?.dirtyWorktree === true)).toBe(false);
@@ -812,7 +812,7 @@ function corpusRepo(): { repo: string; baseRef: Promise<string> } {
 const argvLines = (repo: string) => readFileSync(join(repo, "argv.log"), "utf8").split("\n").slice(0, -1);
 
 describe("T4 — selection is a round's economy, never a merge's licence (OBS-265)", () => {
-  test("a selected-test round that passes still forces the full suite on the merge-candidate round, and a selection miss costs one round, never a merge, proven across a diff-shape corpus of >=5 members — a source file with a direct test mirror, a file reached only by transitive import, a test file itself, a file with no covering tests, and a renamed or deleted file", async () => {
+  test("a diff pairing one changed source file with one changed file no test can reach selects only the tests covering that source file", async () => {
     const corpus: Array<{ shape: string; mutate: (repo: string) => void; selected?: string[] }> = [
       {
         shape: "a source file with a direct test mirror",
@@ -830,6 +830,14 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
         selected: ["tests/b.test.ts"],
       },
       {
+        shape: "a covered source paired with a file no test can reach",
+        mutate: (r) => {
+          writeFileSync(join(r, "src/a.ts"), "import { deep } from \"./deep.js\";\nexport const a = () => deep() + 22;\n");
+          writeFileSync(join(r, "src/orphan.ts"), "export const orphan = () => 33;\n");
+        },
+        selected: ["tests/a.test.ts"],
+      },
+      {
         shape: "a file with no covering tests",
         mutate: (r) => writeFileSync(join(r, "src/orphan.ts"), "export const orphan = () => 33;\n"),
         selected: undefined, // nothing covers it, so nothing but the whole suite can speak for it
@@ -840,7 +848,7 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
         selected: undefined, // the old path's coverage is gone — unattributable
       },
     ];
-    expect(corpus).toHaveLength(5);
+    expect(corpus).toHaveLength(6);
 
     for (const member of corpus) {
       const { repo, baseRef } = corpusRepo();
@@ -896,6 +904,19 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
     expect(missedTest.pass).toBe(false); // and the full suite is what the round reports
     expect(missed.results.every((r) => r.pass)).toBe(false); // never a merge — the miss cost this round only
   }, 60_000);
+
+  test("a diff whose git status names a rename still runs the full suite, so softening a whole-function precondition instead of the per-file return reds", async () => {
+    const { repo, baseRef } = corpusRepo();
+    git(repo, "mv src/old.ts src/renamed.ts");
+    commitAll(repo, "rename");
+    const { results } = await gates(
+      { gates: DETERMINISTIC, files: ["**"] }, repo, await baseRef, { test: "sh run.sh" },
+      { selectTests: true },
+    );
+    const testGate = results.find((r) => r.gate === "test")!;
+    expect(testGate.meta?.selectedTests).toBeUndefined();
+    expect(argvLines(repo).slice(1)).toEqual([""]);
+  });
 
   // The corpus above pins the merge-candidate exit. This is the OTHER one: a round whose verdict gate
   // goes red never reaches the full suite, so the selected screen is all that ran — and it must still
@@ -1133,7 +1154,7 @@ describe("T4 — merged-task invariants under the reordered pipeline", () => {
       // the daemon's own round, end to end: deterministic gates retain their sequence; the two
       // independently-published verdicts each land once in whichever fulfillment order is true.
       const gateNames = gateEvents.map((e) => e.data.gate as string);
-      expect(gateNames.slice(0, 5)).toEqual(["build", "test", "lint", "evidence", "scope"]);
+      expect(gateNames.slice(0, 5)).toEqual(["build", "lint", "evidence", "scope", "test"]);
       expect(gateNames.slice(5).sort()).toEqual(["acceptance", "review"]);
       // the round's parallelism reaches the JOURNAL, not just the gate stream. The marker is the
       // gate stream's shared parentAt reduced to a run-identical boolean: two runs of one graph still

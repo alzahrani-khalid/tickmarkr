@@ -1,11 +1,15 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, posix } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
 import type { Task } from "../graph/schema.js";
 import { collateralHits } from "./collateral.js";
 
+export type OwnershipCorroboration =
+  | { kind: "direct-import"; source: string }
+  | { kind: "command-entry-spawn"; source: string; entry: "src/cli/index.ts" };
+
 export type OwnershipFinding =
-  | { code: "unowned-test"; test: string; taskIds: string[]; detail: string }
+  | { code: "unowned-test"; test: string; taskIds: string[]; corroboration?: OwnershipCorroboration; detail: string }
   | { code: "test-path-outside-allowlist"; taskId: string; test: string; path: string; detail: string }
   | { code: "unordered-context-write"; taskId: string; ownerTaskId: string; path: string; detail: string };
 
@@ -31,20 +35,84 @@ function testSources(repoRoot: string): TestSource[] {
   }
 }
 
-// Conventional, not universal: status-watch-alive.test.ts is dedicated to status.ts even though it
-// reaches that command through the CLI entry point. Keep this heuristic advisory until authored-graph
-// measurements establish its false-positive rate.
+// Conventional, not universal: a name match supplies candidates only. Compile may refuse one when the
+// test itself also supplies one of the two corroborating edges below; the raw name mapping stays data.
+type NamedSource = { taskId: string; source: string };
 
-function namedSourceTasks(test: string, tasks: readonly Task[]): string[] {
+function namedSources(test: string, tasks: readonly Task[]): NamedSource[] {
   const stem = basename(test).replace(/\.test\.ts$/, "");
-  const ids = new Set<string>();
+  const matches = new Map<string, NamedSource>();
   for (const task of tasks) {
     for (const entry of task.files.map(normalize).filter((path) => path.startsWith("src/") && !/[*?{[]/.test(path))) {
       const source = basename(entry, extname(entry));
-      if (stem === source || stem.startsWith(`${source}-`)) ids.add(task.id);
+      if (stem === source || stem.startsWith(`${source}-`)) {
+        matches.set(`${task.id}:${entry}`, { taskId: task.id, source: entry });
+      }
     }
   }
-  return [...ids];
+  return [...matches.values()];
+}
+
+const moduleKey = (path: string): string => normalize(path).replace(/\.(?:[cm]?[jt]sx?)$/, "");
+
+function directImportSpecifiers(text: string): string[] {
+  // Comments cannot create an edge. Keep strings intact because they are the import target.
+  const source = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const specifiers = new Set<string>();
+  for (const match of source.matchAll(/\bimport\s+(?:type\s+)?(?:[\w$*{},\s]+?\s+from\s+)?["']([^"']+)["']/g)) {
+    specifiers.add(match[1]);
+  }
+  for (const match of source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) {
+    specifiers.add(match[1]);
+  }
+  return [...specifiers];
+}
+
+function directlyImports(test: TestSource, source: string): boolean {
+  // DIRECT is load-bearing: do not walk through imported helpers. src/run/journal.ts alone has 84
+  // test importers in the measured tree, so transitive closure would recreate the raw alarm flood.
+  const target = moduleKey(source);
+  return directImportSpecifiers(test.text).some((specifier) => {
+    const imported = specifier.startsWith(".")
+      ? posix.normalize(posix.join(posix.dirname(test.path), specifier))
+      : specifier.startsWith("src/") ? specifier : "";
+    return imported !== "" && moduleKey(imported) === target;
+  });
+}
+
+function invokesChildProcessSpawn(text: string): boolean {
+  const source = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const bindings = new Set<string>();
+  for (const match of source.matchAll(/\bimport\s*{([^}]*)}\s*from\s*["'](?:node:)?child_process["']/g)) {
+    for (const member of match[1].split(",")) {
+      const binding = member.trim().match(/^spawn(?:Sync)?(?:\s+as\s+([A-Za-z_$][\w$]*))?$/);
+      if (binding) bindings.add(binding[1] ?? member.trim());
+    }
+  }
+  for (const match of source.matchAll(/\bimport\s*\*\s*as\s*([A-Za-z_$][\w$]*)\s*from\s*["'](?:node:)?child_process["']/g)) {
+    if (new RegExp(`\\b${match[1]}\\.spawn(?:Sync)?\\s*\\(`).test(source)) return true;
+  }
+  return [...bindings].some((binding) => new RegExp(`\\b${binding}\\s*\\(`).test(source));
+}
+
+function mentionsCommandEntry(text: string): boolean {
+  return /(?:^|\/)src\/cli\/index\.(?:ts|js)\b/.test(text)
+    || /["'`]src["'`]\s*,\s*["'`]cli["'`]\s*,\s*["'`]index\.(?:ts|js)["'`]/.test(text);
+}
+
+function corroboration(test: TestSource, matches: readonly NamedSource[]): OwnershipCorroboration | undefined {
+  // A .test.ts-shaped collateral fixture is not by itself a dedicated test. Requiring a runner leaf
+  // keeps import-only scan fixtures advisory while every executable subject in the measured union stays.
+  const executable = test.text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  if (!/\b(?:test|it)(?:\.(?:concurrent|each|fails|only|skip|todo))*\s*\(/.test(executable)) return undefined;
+  for (const match of matches) {
+    if (directlyImports(test, match.source)) return { kind: "direct-import", source: match.source };
+  }
+  if (invokesChildProcessSpawn(test.text) && mentionsCommandEntry(test.text)) {
+    const command = matches.find(({ source }) => /^src\/cli\/commands\/[^/]+\.(?:[cm]?[jt]sx?)$/.test(source));
+    if (command) return { kind: "command-entry-spawn", source: command.source, entry: "src/cli/index.ts" };
+  }
+  return undefined;
 }
 
 function repositoryPaths(text: string): string[] {
@@ -72,11 +140,12 @@ function dependencyOrdered(a: Task, b: Task, byId: ReadonlyMap<string, Task>): b
 }
 
 /**
- * Advisory cross-task ownership check. Findings are data: callers may report them, but this checker
- * never throws and never changes the graph.
+ * Cross-task ownership evidence. Findings are data: this checker never throws or changes the graph;
+ * the compile seam promotes only a corroborated unowned-test finding and reports every other shape.
  */
 export function ownershipFindings(tasks: readonly Task[], repoRoot: string): OwnershipFinding[] {
   const sources = testSources(repoRoot);
+  const sourceByPath = new Map(sources.map((source) => [source.path, source]));
   const byId = new Map(tasks.map((task) => [task.id, task]));
   const indexed = tasks.map((task) => {
     const files = task.files.map(normalize);
@@ -92,6 +161,7 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
   const predictedBy = new Map<string, Set<string>>();
   for (const [taskId, hits] of collateralHits(tasks, repoRoot)) {
     for (const hit of hits) {
+      if (!sourceByPath.has(hit)) continue;
       const ids = predictedBy.get(hit) ?? new Set<string>();
       ids.add(taskId);
       predictedBy.set(hit, ids);
@@ -99,7 +169,7 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
   }
   for (const source of sources) {
     const ids = predictedBy.get(source.path) ?? new Set<string>();
-    for (const taskId of namedSourceTasks(source.path, tasks)) ids.add(taskId);
+    for (const { taskId } of namedSources(source.path, tasks)) ids.add(taskId);
     if (ids.size > 0) predictedBy.set(source.path, ids);
   }
 
@@ -107,11 +177,17 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
   for (const [test, taskIds] of predictedBy) {
     if (owners(test).length === 0) {
       const ids = [...taskIds].sort();
+      const source = sourceByPath.get(test)!;
+      const evidence = corroboration(source, namedSources(test, tasks));
       findings.push({
         code: "unowned-test",
         test,
         taskIds: ids,
-        detail: `${test} is a dedicated test of source owned by ${ids.join(", ")} but no task owns the test`,
+        ...(evidence ? { corroboration: evidence } : {}),
+        detail: `${test} is a dedicated test of source owned by ${ids.join(", ")} but no task owns the test`
+          + (evidence?.kind === "direct-import" ? `; it imports ${evidence.source} directly`
+            : evidence?.kind === "command-entry-spawn"
+              ? `; it spawns ${evidence.entry} to exercise ${evidence.source}` : ""),
       });
     }
   }
@@ -152,4 +228,8 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
 
 export function renderOwnershipFinding(finding: OwnershipFinding): string {
   return `tickmarkr: ownership-lint[${finding.code}]: ${finding.detail}`;
+}
+
+export function blocksCompile(finding: OwnershipFinding): boolean {
+  return finding.code === "unowned-test" && finding.corroboration !== undefined;
 }

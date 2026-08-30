@@ -135,6 +135,59 @@ export interface VitestListedTest {
   projectName?: string;
 }
 
+export type VitestListResult =
+  | { status: "listed"; tests: VitestListedTest[] }
+  | { status: "failed"; error: string };
+
+const VitestListedTestsSchema = z.array(z.object({
+  name: z.string(),
+  file: z.string(),
+  projectName: z.string().optional(),
+}));
+
+export async function listVitestTests(cwd: string): Promise<VitestListResult> {
+  const result = await sh(`${shq(join(cwd, "node_modules/.bin/vitest"))} list --json`, cwd);
+  if (result.code !== 0) {
+    return { status: "failed", error: (result.stderr || result.stdout || `exit ${result.code}`).trim() };
+  }
+  try {
+    const start = result.stdout.indexOf("[");
+    if (start < 0) return { status: "failed", error: "runner emitted no JSON test listing" };
+    const parsed = VitestListedTestsSchema.safeParse(JSON.parse(result.stdout.slice(start)));
+    return parsed.success
+      ? { status: "listed", tests: parsed.data }
+      : { status: "failed", error: z.prettifyError(parsed.error) };
+  } catch (error) {
+    return { status: "failed", error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export interface NamedTestAudit {
+  criterion: string;
+  matches: VitestListedTest[];
+}
+
+export function auditNamedTestOracles(
+  items: readonly AcceptanceItem[],
+  listedTests: readonly VitestListedTest[],
+): NamedTestAudit[] {
+  const runnerNames = listedTests.map((listed) => ({
+    listed,
+    fullName: listed.name.split(" > ").join(" "),
+  }));
+  return items.flatMap((item) => {
+    if (typeof item !== "object" || item.oracle !== "test") return [];
+    return [{
+      criterion: item.test,
+      // OBS-511: mirror the gate's leaf-anchored suffix rule — this denominator must count
+      // exactly the tests the shipped -t filter would select.
+      matches: runnerNames
+        .filter(({ fullName }) => fullName === item.test || fullName.endsWith(` ${item.test}`))
+        .map(({ listed }) => listed),
+    }];
+  });
+}
+
 export type AcceptanceCorpusAuditResult =
   | {
     specPath: string;
@@ -171,32 +224,18 @@ export function auditAcceptanceCorpus(
   corpusRoot: string,
   listedTests: readonly VitestListedTest[],
 ): AcceptanceCorpusAuditResult[] {
-  const runnerNames = listedTests.map((listed) => ({
-    listed,
-    fullName: listed.name.split(" > ").join(" "),
-  }));
   const results: AcceptanceCorpusAuditResult[] = [];
   for (const specPath of corpusSpecPaths(corpusRoot)) {
     try {
       const graph = compileNative(specPath);
       for (const task of graph.tasks) {
         for (const item of task.acceptance) {
+          const namedTest = auditNamedTestOracles([item], listedTests)[0];
           results.push({
             specPath,
             status: "parsed",
             item,
-            ...(typeof item === "object" && item.oracle === "test"
-              ? {
-                namedTest: {
-                  criterion: item.test,
-                  // OBS-511: mirror the gate's leaf-anchored suffix rule — the audit's denominator
-                  // must count exactly the tests the -t filter would select, or doctor and gate disagree.
-                  matches: runnerNames
-                    .filter(({ fullName }) => fullName === item.test || fullName.endsWith(` ${item.test}`))
-                    .map(({ listed }) => listed),
-                },
-              }
-              : {}),
+            ...(namedTest ? { namedTest } : {}),
           });
         }
       }

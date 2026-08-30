@@ -8,7 +8,7 @@ import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnin
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { shq } from "../../adapters/types.js";
 import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
-import { tickmarkrDir, stateDirName } from "../../graph/graph.js";
+import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
@@ -18,6 +18,7 @@ import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adap
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
 import { LIVEBENCH_TABLE_DATE, readCachedCatalog, refreshCatalogCommand, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 import { sh, type ShResult } from "../../run/git.js";
+import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 
 /** Where a newer `table_<date>.csv` is discovered — the deployed site builds filenames by
  *  concatenation and publishes no index, so the release listing is the only enumerable surface. */
@@ -42,6 +43,8 @@ export type DoctorOpts = {
   orcaStatusProbe?: (cwd: string, binary: string) => Promise<ShResult>;
   /** Test seam for shell-path discovery; absence remains a normal doctor row, never an exception. */
   resolveOrcaBinary?: (cwd: string) => string | undefined;
+  /** Test seam for the runner-owned JSON listing used by the acceptance-oracle report row. */
+  listTests?: (cwd: string) => Promise<VitestListResult>;
 };
 
 type OrcaCapability = { verdict: "pass" | "fail"; detail: string };
@@ -407,6 +410,29 @@ export async function doctor(
     const healthy = h.installed && (a.id !== kimi.id || h.authed);
     return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
   });
+  if (existsSync(graphPath(cwd))) {
+    try {
+      const graph = loadGraph(cwd);
+      const items = graph.tasks.flatMap((task) => task.acceptance);
+      if (items.some((item) => typeof item === "object" && item.oracle === "test")) {
+        const listing = await (opts.listTests ?? listVitestTests)(cwd);
+        if (listing.status === "failed") {
+          rows.push(alignedStatusRow("fail", "acceptance-oracles", `runner listing failed — ${listing.error.split("\n")[0]}`));
+        } else {
+          const audited = auditNamedTestOracles(items, listing.tests);
+          const resolved = audited.filter((row) => row.matches.length === 1).length;
+          const verdict = resolved === audited.length ? "pass" : "fail";
+          rows.push(alignedStatusRow(
+            verdict,
+            "acceptance-oracles",
+            `${resolved}/${audited.length} resolved — each resolved oracle's shipped filter matches exactly one runner-listed test`,
+          ));
+        }
+      }
+    } catch (error) {
+      rows.push(alignedStatusRow("fail", "acceptance-oracles", `graph unreadable — ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }
   if (catalog.warning) {
     rows.push(attentionRow(`model catalog cache unreadable — ${catalog.warning}; using vendored fallback (advisory — routing unchanged)`));
   }

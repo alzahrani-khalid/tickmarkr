@@ -90,12 +90,12 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
   }, 120000);
 
   // The composite path, staged so the three intervals are separable by construction: the SELECTED
-  // screen sleeps 0.5s (the test command sees its file arguments), the `lint` gate that runs between
-  // the screen and the merge-candidate suite sleeps 1.2s, and the FULL suite sleeps 1.6s (no
+  // screen sleeps 0.5s (the test command sees its file arguments), the `acceptance` gate that runs
+  // between the screen and the merge-candidate suite sleeps 1.2s, and the FULL suite sleeps 1.6s (no
   // arguments). A summing-the-wrong-thing implementation is arithmetically visible: full-only reports
   // ~1.6s, wait-inclusive reports ~3.3s, and only the two test intervals sum to ~2.1s.
   const SELECTED_MS = 500;
-  const LINT_MS = 1200;
+  const INTERVENING_MS = 1200;
   const FULL_MS = 1600;
 
   test("test: a delayed selected screen beside a separately delayed intervening gate beside a delayed full suite journals a test durationMs summing only the two test intervals so full-only or wait-inclusive counting fails", async () => {
@@ -103,17 +103,20 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     // so ONE configured command gives the screen and the suite different, known costs.
     const testCmd = `sh -c 'if [ $# -gt 0 ]; then sleep ${SELECTED_MS / 1000}; else sleep ${FULL_MS / 1000}; fi' tkr`;
     const fixture = setupRepo(
-      [T("T1")],
+      [T("T1", { acceptance: [
+        { oracle: "command", command: `sleep ${INTERVENING_MS / 1000}`, text: "delayed intervening gate" },
+        "done",
+      ] })],
       // the worker's only change is a TEST file, so coveringTests attributes the diff and the round
       // runs a selection instead of falling back to the full suite
       { tasks: { T1: [{ shell: `echo "// worker" > covered.test.js && ${COMMIT} covered`, result: { ok: true, summary: "done" } }] } },
-      `gates: { test: "${testCmd}", lint: "sleep ${LINT_MS / 1000}" }\n`,
+      `gates: { test: "${testCmd}" }\n`,
     );
     await runDaemon(fixture, "run-telemetry-composite");
     const { repo } = fixture;
     const rows = gateRows(repo, "run-telemetry-composite");
     const testRows = rows.filter((r) => r.gate === "test");
-    const lint = rows.find((r) => r.gate === "lint")!;
+    const intervening = rows.find((r) => r.gate === "acceptance")!;
     const events = Journal.open(repo, "run-telemetry-composite").read();
 
     // one logical `test` row per round, and it really is the composite one: the screen ran a subset
@@ -122,7 +125,7 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     const row = testRows[0]!;
     expect(row.selectedTests).toEqual(["covered.test.js"]);
     expect(row.fullSuite).toBe(true);
-    expect(lint.durationMs).toBeGreaterThanOrEqual(LINT_MS); // the intervening gate really was delayed
+    expect(intervening.durationMs).toBeGreaterThanOrEqual(INTERVENING_MS); // the intervening gate really was delayed
 
     const duration = row.durationMs;
     const selected = row.selectedDurationMs as number;
@@ -137,14 +140,14 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     expect(duration).toBeGreaterThanOrEqual(SELECTED_MS + FULL_MS);
     // wait-inclusive counting fails: the intervening gate's 1.2s sat BETWEEN the two intervals and is
     // excluded, so the sum stays under the span that would have swallowed it
-    expect(duration).toBeLessThan(SELECTED_MS + FULL_MS + LINT_MS);
+    expect(duration).toBeLessThan(SELECTED_MS + FULL_MS + INTERVENING_MS);
 
     // and it is measured where the gate runs, not re-derived: the journal span from the round's first
     // `test` phase-start to its verdict is strictly larger, because it contains everything in between
     const firstTestStart = events.find((e) => e.event === "phase-start" && e.data.gate === "test")!;
     const verdict = events.find((e) => e.event === "gate-result" && e.data.gate === "test")!;
     const journalSpan = Date.parse(verdict.ts) - Date.parse(firstTestStart.ts);
-    expect(journalSpan).toBeGreaterThan(duration + LINT_MS);
+    expect(journalSpan).toBeGreaterThan(duration + INTERVENING_MS);
   }, 180000);
 
   test("test: review & acceptance rows carry per-invocation durations & channels covering primary & retry so a single blended span fails", async () => {

@@ -215,6 +215,29 @@ describe("tickmarkr init", () => {
     expect(readFileSync(join(repo, legacySpec), "utf8")).toBe(legacy);
     expect(out).toContain(`wrote ${join(repo, "tickmarkr.spec.md")}`);
   });
+
+  test("test: the spec file a fresh init writes tells an author to pin a literal a worker could otherwise choose, to quantify universally where a list could be incomplete, and to replay a recorded incident for a prose artefact", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+
+    await runInit(repo);
+
+    const spec = readFileSync(join(repo, "tickmarkr.spec.md"), "utf8");
+    expect(spec).toContain("PICK THE CRITERION FORM FROM WHO COULD BE WRONG");
+    expect(spec).toMatch(/WORKER could be wrong[^.]*pin the exact\s+literal/s);
+    expect(spec).toMatch(/AUTHOR could be wrong by omitting a member from a list[^;]*quantify universally/s);
+    expect(spec).toMatch(/REVIEWER could be wrong about a prose artefact[^;]*replay a recorded incident/s);
+  });
+
+  test("test: the spec file a fresh init writes tells an author that a text sweep produces a candidate list and only running the change enumerates the real blocker set", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+
+    await runInit(repo);
+
+    const spec = readFileSync(join(repo, "tickmarkr.spec.md"), "utf8");
+    expect(spec).toContain("A text sweep produces a candidate list; only running the change enumerates the real blocker set.");
+  });
 });
 
 describe("tickmarkr init --agent", () => {

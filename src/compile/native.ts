@@ -853,6 +853,20 @@ acceptance is required on every task (a nested list of observable outcomes).
       hard value anywhere in the domain, the criterion asserts a universal that may be FALSE ABOUT THE
       WORLD — bound it or say where it stops holding, rather than demanding a value that does not exist.
 
+  PICK THE CRITERION FORM FROM WHO COULD BE WRONG:
+    - When the WORKER could be wrong because it can choose the value, use "test:" and pin the exact
+      literal it could otherwise choose; an example selected by its implementer proves only itself.
+    - When the AUTHOR could be wrong by omitting a member from a list, quantify universally over the
+      authoritative closed set; a hand-written enumeration can repeat the same omission as the code.
+    - When the REVIEWER could be wrong about a prose artefact, use "judge:" to replay a recorded incident
+      against the changed prose; a keyword check proves vocabulary, not that the artefact prevents a repeat.
+
+  PRE-SCOPE BY TEXT, ENUMERATE BLOCKERS BY EXECUTION:
+    - Before assigning files[], sweep text across the repository tree for names, callers, tests and prose.
+      A text sweep produces a candidate list; only running the change enumerates the real blocker set.
+      Keep the candidates for scope, then execute the production path and full gates before declaring the
+      set closed — this milestone paid a halted run to learn that the two populations are not identical.
+
   WHICH SIDE OF A RUN INHERITS ENVIRONMENT — AND IT DEPENDS ON THE DRIVER (OBS-542):
     - Gate commands and "command:"/"test:" oracles INHERIT THE DAEMON'S ENVIRONMENT. They are children of
       the daemon, so launching it as \`bash -c 'set -a; . .env.test; set +a; exec tickmarkr run'\` reaches

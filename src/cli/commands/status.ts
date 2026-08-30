@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { GLYPHS, LIVE } from "../../brand.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../config/config.js";
@@ -17,13 +17,14 @@ import {
   type JournalEvent,
   engagementComparable,
   isQualityFailureParkKind,
+  parseRunId,
   preservedRefsByTask,
   recordedTaskFailureKind,
   runHasEnded,
   type TaskPhase,
   upheldFeedbackByTask,
 } from "../../run/journal.js";
-import { isPidLive } from "../../run/lock.js";
+import { isPidLive, runLockOwner } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
@@ -1018,19 +1019,55 @@ type RunRecord = {
   rehashAt?: number;
 };
 
+// runLockOwner is the single lock payload/liveness reader. Its current path helper also initializes
+// .tickmarkr metadata; an engine-written lock necessarily passed through that initializer already, so
+// status avoids invoking it in stripped reader-purity fixtures where no engine lock can exist.
+const canReadRunLockOwner = (cwd: string): boolean =>
+  existsSync(join(cwd, stateDirName(cwd), ".gitignore"));
+
+const reportableLockRunId = (owner: ReturnType<typeof runLockOwner>): string | undefined => {
+  if (!owner?.live || owner.runId === undefined) return undefined;
+  try {
+    return parseRunId(owner.runId);
+  } catch {
+    // Repository-wide locks can be held for non-run work such as compile; those are not a status run.
+    return undefined;
+  }
+};
+
+const readRunJournalRaw = (cwd: string, runId: string, allowMissingJournal: boolean): string => {
+  const dir = join(cwd, stateDirName(cwd), "runs", runId);
+  try {
+    return readFileSync(join(dir, "journal.jsonl"), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (allowMissingJournal) return "";
+      throw new Error(`no journal for ${runId} at ${dir}`);
+    }
+    throw error;
+  }
+};
+
 /**
  * ONE journal read per answer, and every claim about the run folded from THOSE bytes — the board's
  * task rows, activity, phases, gates, liveness and tip verification, and the compact one-line form
  * alike. A second read is what lets two snapshots be presented as one state: a line the daemon
  * appends between them pairs a task count from one instant with a verdict from another.
  *
- * An explicit <runId> is a resolution, not a hint: `Journal.open` refuses an id without a readable
- * journal, so status fails loudly naming that id instead of rendering any other run.
+ * An explicit <runId> is a resolution, not a hint: it refuses an id without a readable journal, so
+ * status fails loudly naming that id instead of rendering any other run. The implicit form first
+ * asks the repository lock accessor which run is live, then falls back to the newest journalled run;
+ * a lock-selected run may still be in the directory-before-first-journal window, which renders as an
+ * empty snapshot for that run rather than borrowing the previous run's journal.
  */
 const readRunRecord = (cwd: string, graph: RunGraph, namedRunId?: string): RunRecord | undefined => {
-  const runId = namedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
+  const explicitRunId = namedRunId === undefined ? undefined : parseRunId(namedRunId);
+  const lockedRunId = explicitRunId === undefined && canReadRunLockOwner(cwd)
+    ? reportableLockRunId(runLockOwner(cwd))
+    : undefined;
+  const runId = explicitRunId ?? lockedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
   if (!runId) return undefined;
-  const raw = readFileSync(join(Journal.open(cwd, runId).dir, "journal.jsonl"), "utf8");
+  const raw = readRunJournalRaw(cwd, runId, lockedRunId === runId);
   const events = parseJournalSnapshot(raw);
   // The resume comparator is the fail-closed baseline; a matching graph-rehash is the daemon's
   // append-only audit that authorizes this status replay after stop-amend-resume.
@@ -1581,14 +1618,18 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   let journalCursor = 0;
   const consumeDecisionEvents = (): DecisionEvent[] => {
     // A named run is followed, never re-resolved: --watch <runId> keeps reporting that run even as
-    // newer runs start. Only the no-argument form tracks latest, as before.
-    const runId = namedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
+    // newer runs start. The no-argument form tracks the live lock first, then latest journal.
+    const explicitRunId = namedRunId === undefined ? undefined : parseRunId(namedRunId);
+    const lockedRunId = explicitRunId === undefined && canReadRunLockOwner(cwd)
+      ? reportableLockRunId(runLockOwner(cwd))
+      : undefined;
+    const runId = explicitRunId ?? lockedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
     if (!runId) return [];
     if (decisionRunId !== runId) {
       decisionRunId = runId;
       journalCursor = 0;
     }
-    const journalEvents = Journal.open(cwd, runId).read();
+    const journalEvents = parseJournalSnapshot(readRunJournalRaw(cwd, runId, lockedRunId === runId));
     if (journalEvents.length < journalCursor) journalCursor = 0;
     const fresh = decisionEventsFromJournal(journalEvents, runId, stateDirName(cwd))
       .filter((event) => event.sequence > journalCursor);

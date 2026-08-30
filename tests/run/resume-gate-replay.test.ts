@@ -199,7 +199,7 @@ test("a gate result recorded against a commit the task no longer carries is re-r
     const unchangedEvents = await resume(unchanged);
     expect(unchangedEvents.filter((event) => event.event === "gate-reused").map((event) => event.data.gate))
       .toEqual(["build"]);
-    expect(markerLines(unchanged.marker)[0]).toBe("test");
+    expect(markerLines(unchanged.marker)[0]).toBe("lint");
 
     const changed = await seedResume("run-commit-changed", [[{ gate: "build", pass: true }]]);
     writeFileSync(join(changed.taskWorktree, "changed.txt"), "a different task tip\n");
@@ -240,7 +240,7 @@ test("replaySatisfiedGates receives current-attempt failed-gate journals with no
     );
     expect(typed.journal.replaySatisfiedGates().get("T1")).toBe("build");
     await resume(typed);
-    expect(markerLines(typed.marker)[0]).toBe("test");
+    expect(markerLines(typed.marker)[0]).toBe("lint");
   }, 120_000);
 
 test("a daemon-controlled restart writes exit-cause \"deliberate\" before leaving, while the next resume after a process killed before run-end writes exit-cause \"unclean\" from durable lock/journal evidence; a reader distinguishes both without requiring the dead process to write", async () => {
@@ -331,7 +331,7 @@ test("a prior-attempt pass plus current-attempt failure resumes at the failed ga
     const passedEvents = await resume(passed);
     expect(passedEvents.filter((event) => event.event === "gate-reused").map((event) => event.data.gate))
       .toEqual(["build"]);
-    expect(markerLines(passed.marker)[0]).toBe("test");
+    expect(markerLines(passed.marker)[0]).toBe("lint");
 
     const released = await seedResume(
       "run-attempt-current-released",
@@ -339,5 +339,5 @@ test("a prior-attempt pass plus current-attempt failure resumes at the failed ga
       { by: "operator", release: "gate-satisfied", gate: "build" },
     );
     await resume(released);
-    expect(markerLines(released.marker)[0]).toBe("test");
+    expect(markerLines(released.marker)[0]).toBe("lint");
   }, 120_000);

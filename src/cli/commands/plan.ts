@@ -3,16 +3,20 @@ import { formatModelAuthLine, contextWindowLints, modelLints, preferEntryLints, 
 import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { parseArgs } from "node:util";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
+import { classifyContextPath } from "../../compile/native.js";
 import { DEFAULT_CONFIG, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK } from "../../config/config.js";
 import { loadGraph } from "../../graph/graph.js";
+import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
 import { resolveRunMode } from "../../run/daemon.js";
 import { excludedChannels, exclusionLine } from "../../route/preference.js";
 import { staffLedEvidence } from "../../route/profile.js";
 import { route, RoutingError } from "../../route/router.js";
+import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 import { modelId } from "../../gates/review.js";
 import { loadRoutingProfile } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
-import type { BillingChannel, WorkerAdapter } from "../../adapters/types.js";
+import { shq, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
+import { shGit } from "../../run/git.js";
 
 // T4 (v1.50): TTY-only brand pass — the title helper frames the routing table, lint/unroutable
 // markers carry the attention glyph, section labels dim to chrome (the doctor/status system).
@@ -35,6 +39,66 @@ const fleetCanCrossVendorReview = (channels: BillingChannel[]) => {
   return false;
 };
 
+export type PlanOpts = {
+  listTests?: (cwd: string) => Promise<VitestListResult>;
+};
+
+type TaskInputFinding = {
+  taskId: string;
+  severity: "refuse" | "warn";
+  detail: string;
+};
+
+const NAMED_CRITERION_PATH = /(?:^|[\s("'`])((?:src|tests|fixtures|scripts)\/[A-Za-z0-9_@{}*?.,/+-]+\.(?:tsx|ts|jsx|json|js|mjs|cjs|md|txt))(?![A-Za-z0-9])/g;
+
+async function taskInputFindings(tasks: readonly Task[], cwd: string): Promise<TaskInputFinding[]> {
+  const pathsByTask = tasks.map((task) => {
+    const paths = new Set(task.files.map((path) => path.replace(/^\.\//, "")));
+    for (const item of task.acceptance) {
+      const texts = typeof item === "string"
+        ? [item]
+        : [renderAcceptanceItem(item), ...Object.values(item).filter((value): value is string => typeof value === "string")];
+      for (const text of texts) {
+        for (const match of text.matchAll(NAMED_CRITERION_PATH)) paths.add(match[1]!);
+      }
+    }
+    return { task, paths: [...paths] };
+  });
+  if (pathsByTask.every(({ paths }) => paths.length === 0)) return [];
+
+  const [tree, diff] = await Promise.all([
+    shGit("git ls-tree --full-tree -r --name-only -z HEAD", cwd),
+    shGit("git diff --name-only -z HEAD --", cwd),
+  ]);
+  if (tree.code !== 0 || diff.code !== 0) return [];
+
+  const tracked = new Set(tree.stdout.split("\0").filter(Boolean));
+  const changed = new Set(diff.stdout.split("\0").filter(Boolean));
+  const findings: TaskInputFinding[] = [];
+  for (const { task, paths } of pathsByTask) {
+    for (const path of paths) {
+      const state = classifyContextPath(path, tracked, cwd);
+      if (state.kind === "untracked") {
+        findings.push({
+          taskId: task.id,
+          severity: "refuse",
+          detail: `task path ${JSON.stringify(path)} exists in the working tree but no commit holds it`,
+        });
+      } else if (
+        state.kind === "ok"
+        && (changed.has(path) || [...changed].some((candidate) => candidate.startsWith(`${path}/`)))
+      ) {
+        findings.push({
+          taskId: task.id,
+          severity: "warn",
+          detail: `tracked path ${JSON.stringify(path)} differs from HEAD — run git restore -- ${shq(path)} to discard the divergence, or commit it before dispatch`,
+        });
+      }
+    }
+  }
+  return findings;
+}
+
 // v1.89 T4: harnessFrom is the resolver's INPUT — a caller (the byte-pinned goldens) fixes the location
 // and keeps this machine's absolute paths out of a fixture. The default is the INVOKED entrypoint,
 // `process.argv[1]`: the bin symlink a global install puts on PATH, which resolves to dist/cli/index.js.
@@ -45,6 +109,7 @@ export async function plan(
   cwd = process.cwd(),
   adapters: WorkerAdapter[] = allAdapters(),
   harnessFrom: string | undefined = process.argv[1],
+  opts: PlanOpts = {},
 ): Promise<string> {
   // ponytail: hardcoded 24h TTL — promote to config when an operator asks. mtime is the signal because
   // doctor.json has no probe timestamp and a schema field would break the existing-files compat invariant.
@@ -56,6 +121,33 @@ export async function plan(
     throw new Error(`--mode must be one of ${ROUTING_MODES.join(" | ")} (got ${values.mode})`);
   }
   const g = loadGraph(cwd);
+  const oracleRefusals = new Map<string, string[]>();
+  if (g.tasks.some((task) => task.acceptance.some((item) => typeof item === "object" && item.oracle === "test"))) {
+    const listing = await (opts.listTests ?? listVitestTests)(cwd);
+    for (const task of g.tasks) {
+      const refusals: string[] = [];
+      if (listing.status === "failed") {
+        if (task.acceptance.some((item) => typeof item === "object" && item.oracle === "test")) {
+          refusals.push(`acceptance oracle unresolved — runner listing failed: ${listing.error.split("\n")[0]}`);
+        }
+      } else {
+        for (const audit of auditNamedTestOracles(task.acceptance, listing.tests)) {
+          if (audit.matches.length === 0) {
+            refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches zero runner-listed test names`);
+          } else if (audit.matches.length > 1) {
+            refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches ${audit.matches.length} runner-listed test names`);
+          }
+        }
+      }
+      if (refusals.length) oracleRefusals.set(task.id, refusals);
+    }
+  }
+  const inputFindings = await taskInputFindings(g.tasks, cwd);
+  const inputRefusals = new Map<string, string[]>();
+  for (const finding of inputFindings) {
+    if (finding.severity !== "refuse") continue;
+    inputRefusals.set(finding.taskId, [...(inputRefusals.get(finding.taskId) ?? []), finding.detail]);
+  }
   const { cfg, mode, source } = resolveRunMode(cwd, { flag: values.mode as RoutingMode | undefined, spec: g.mode });
   // readDoctor cache path: staleness line only fires here (probeAll fallback is fresh by construction).
   const cached = readDoctor(cwd);
@@ -151,6 +243,11 @@ export async function plan(
   let cost = 0;
   const routed: RoutedAssignment[] = [];
   for (const t of g.tasks) {
+    const refusals = [...(oracleRefusals.get(t.id) ?? []), ...(inputRefusals.get(t.id) ?? [])];
+    if (refusals.length) {
+      lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! pre-dispatch refusal — ${refusals.join("; ")}`);
+      continue;
+    }
     try {
       const r = route(t, cfg, channels, dispatchProfile);
       routed.push({ taskId: t.id, adapter: r.assignment.adapter, model: r.assignment.model });
@@ -187,6 +284,10 @@ export async function plan(
       if (d) lines.push(d);
       lints.push(`${t.id}: unroutable — ${msg}`);
     }
+  }
+  const inputWarnings = inputFindings.filter((finding) => finding.severity === "warn");
+  if (inputWarnings.length) {
+    lines.push("", "input warnings:", ...inputWarnings.map((finding) => `  ! ${finding.taskId}: ${finding.detail}`));
   }
   lines.push("", `est. cost (API channels only, rough): ~$${cost.toFixed(2)} + judge/review/consult calls`);
   // VIS-04: summary only when a profile is active AND something deviates. Labeled by the switch — off = preview.

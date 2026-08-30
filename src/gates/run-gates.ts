@@ -243,10 +243,10 @@ async function coveringTests(worktree: string, baseRef: string): Promise<string[
       continue;
     }
     const covering = tests.filter((t) => reachOf(t).has(file));
-    if (!covering.length) return undefined; // nothing covers this file — only the full suite can speak for it
+    if (!covering.length) continue; // nothing covers this file — keep every attributable selection already accumulated
     for (const t of covering) selected.add(t);
   }
-  return [...selected].sort();
+  return selected.size ? [...selected].sort() : undefined;
 }
 
 /**
@@ -362,7 +362,7 @@ export async function runGates(
     return { results: sorted, commits };
   };
 
-  const toolGates = (["build", "test", "lint"] as const).filter(enabled);
+  const toolGates = (["build", "lint"] as const).filter(enabled);
 
   /**
    * v1.87 T5: the shell gates run their commands against the WORKING TREE, while evidence, scope,
@@ -416,26 +416,26 @@ export async function runGates(
     meta: { dirtyWorktree: true, dirtyAtRoundEnd: true },
   });
 
-  // build/test/lint vs the shared baseline
-  const runBattery = async (commands: Record<string, string>, selected?: string[]): Promise<void> => {
-    if (!toolGates.length) return;
+  // shell tools vs the shared baseline
+  const runBattery = async (commands: Record<string, string>, selected?: string[], gates: readonly GateName[] = toolGates): Promise<void> => {
+    if (!gates.length) return;
     if (!v185) {
-      // ponytail: compareToBaseline batches build/test/lint — their starts are emitted at iteration,
+      // ponytail: compareToBaseline batches adjacent tools — their starts are emitted at iteration,
       // not at true execution start. They are collectively sub-second (measured), so the debounce
       // suppresses them anyway; split compareToBaseline only if a tool gate ever gets slow.
-      // ponytail: legacy runs build/test/lint in ONE compareToBaseline call, so there is one interval
+      // ponytail: legacy runs adjacent tools in ONE compareToBaseline call, so there is one interval
       // to measure and each of its gates carries it. Split it only if this branch ever stops batching.
       const batchAt = Date.now();
       const batchLoadStart = loadProvider();
-      const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, toolGates);
+      const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, [...gates]);
       const batch: GateTelemetry = { durationMs: Date.now() - batchAt, load1Start: batchLoadStart, load1End: loadProvider() };
-      for (const g of toolGates) spans.set(g, batch);
+      for (const g of gates) spans.set(g, batch);
       // The same refusal AFTER the commands, because a green command can dirty the tree the check
       // above just proved clean. Batched, legacy cannot say WHICH command did it, so the refusal
       // lands on the last gate that had one — the round dies there either way. A red battery is
       // reported as the red it is: the round already ends, and the command output is the better lead.
       const dirt = toolResults.every((r) => r.pass) ? await dirtyWorktree() : undefined;
-      const blame = dirt ? [...toolGates].reverse().find((g) => commands[g]) : undefined;
+      const blame = dirt ? [...gates].reverse().find((g) => commands[g]) : undefined;
       for (const r of toolResults) {
         await emitStart(r.gate as GateName);
         await record(r.gate === blame ? dirtyRefusal(blame!, dirt!, commands[blame!]!) : r);
@@ -443,8 +443,8 @@ export async function runGates(
       return;
     }
     // T4 (OBS-265): one command at a time, stopping at the first red — a failed build no longer buys
-    // the full vitest suite before anyone reads its verdict.
-    for (const g of toolGates) {
+    // any later tool before anyone reads its verdict.
+    for (const g of gates) {
       await emitStart(g);
       const [r] = await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g]));
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
@@ -517,9 +517,9 @@ export async function runGates(
    * screen IS the round's verdict: what it produced is journaled (in the order it ran) and the round
    * ends there, so a drive-by out-of-scope edit costs <1s instead of the whole battery.
    *
-   * A green screen changes nothing downstream. The recorded sequence stays GATE_NAMES order, so the
-   * journal, `tickmarkr report`, the surfaces, and resume's GATE_NAMES walk over already-satisfied
-   * gates all keep reading exactly one order.
+   * A green screen changes nothing downstream. The returned record stays in GATE_NAMES order while
+   * the event stream reports the order gates actually ran; resume's GATE_NAMES walk over satisfied
+   * records therefore keeps declaration order without making the live stream lie about execution.
    *
    * ponytail: the price of that is re-reading two git checks (~40ms) in their canonical positions
    * rather than teaching every consumer of the gate stream a second order. Both reads see the same
@@ -527,7 +527,7 @@ export async function runGates(
    * for. Charge it only when there IS a battery command to protect.
    */
   const screenBlocks = async (): Promise<boolean> => {
-    if (!toolGates.some((g) => ctx.commands[g])) return false;
+    if (!toolGates.some((g) => ctx.commands[g]) && !(enabled("test") && ctx.commands.test)) return false;
     const screened: GateResult[] = [];
     for (const [gate, compute] of [["evidence", evidenceResult], ["scope", scopeResult]] as const) {
       if (!enabled(gate)) continue;
@@ -720,15 +720,7 @@ export async function runGates(
 
   if (v185 && await screenBlocks()) return done();
 
-  // A non-final round may run only the tests covering its own diff; the merge-candidate round below
-  // pays the full suite anyway, so a selection that misses costs a round and can never merge.
-  const selected = v185 && ctx.selectTests && enabled("test") && ctx.commands.test
-    ? await coveringTests(ctx.worktree, ctx.baseRef)
-    : undefined;
-  await runBattery(
-    selected ? { ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, selected) } : ctx.commands,
-    selected,
-  );
+  await runBattery(ctx.commands);
   if (failed()) return done();
   if (enabled("evidence")) {
     await runGate("evidence", evidenceResult);
@@ -738,6 +730,14 @@ export async function runGates(
     await runGate("scope", scopeResult);
     if (failed()) return done();
   }
+  // A non-final round may run only the tests covering its own diff; the merge-candidate round below
+  // pays the full suite anyway, so a selection that misses costs a round and can never merge.
+  const selected = v185 && ctx.selectTests && enabled("test") && ctx.commands.test
+    ? await coveringTests(ctx.worktree, ctx.baseRef)
+    : undefined;
+  await runBattery(selected ? { ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, selected) } : ctx.commands,
+    selected, enabled("test") ? ["test"] : []);
+  if (failed()) return done();
 
   if (v185 && (enabled("acceptance") || enabled("review"))) {
     // Judge and review are launched TOGETHER (96m of serialization over 5 runs). Enforcement is

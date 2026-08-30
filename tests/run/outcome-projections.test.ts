@@ -110,8 +110,6 @@ test("the diff leaves the exported kind list unchanged, so this task cannot brea
 // Deliberately titled verbatim at TOP LEVEL: the shipped acceptance gate runs the criterion through
 // `testFilterPattern`, whose leaf-anchored `(^| )…$` matches the criterion as the complete trailing
 // segment of Vitest's runner-visible full name (acceptance.ts — OBS-511 widened it through describe
-// prefixes). The leaf title itself must equal the criterion; a compiler-stripped `test:` marker left
-// in the title still makes the selector match zero tests.
 test("closed GateOutcome table drives normalizeGateOutcome over every vocabulary member and over legacy review-skip, baseline-skip, infra-retryable, held and malformed rows, where passed and failed controls remain unchanged and every reason is retained, so collapsing non-failure into pass or unknown into clean fails", async () => {
   // The vocabulary half. The table must name EVERY member — a member added to the union without a
   // sample here fails this line, so the table cannot silently stop being closed.

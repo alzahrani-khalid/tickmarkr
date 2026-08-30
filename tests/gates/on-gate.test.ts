@@ -146,16 +146,17 @@ describe("VIS-08 onGate — failing exit (D-05)", () => {
   });
 });
 
-describe("VIS-08 GATE_NAMES order contract on phase:start sequence", () => {
-  test("all-gates pass: start order deep-equals GATE_NAMES.filter(enabled)", async () => {
+describe("VIS-08 execution and declaration order contracts", () => {
+  test("an all-gates round emits its test start event after its scope start event and returns its results in declaration order, so a stream still claiming declaration order reds", async () => {
     const { repo, base } = repoWithCommit();
     const task = mkTask({ gates: [...GATE_NAMES], files: [] });
     const fake = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: { approve: true, issues: [] } });
     const commands = { build: "true", test: "true", lint: "true" };
     const { trace, hook } = traceOf(() => {});
-    await runGates(task, { ...(await ctxFor(repo, base, task, fake, commands)), onGate: hook });
+    const result = await runGates(task, { ...(await ctxFor(repo, base, task, fake, commands)), onGate: hook });
     const starts = trace.filter((e) => e.phase === "start").map((e) => e.gate);
-    expect(starts).toEqual(GATE_NAMES.filter((g) => task.gates.includes(g)));
+    expect(starts).toEqual(["build", "lint", "evidence", "scope", "test", "acceptance", "review"]);
+    expect(result.results.map((gate) => gate.gate)).toEqual(GATE_NAMES);
     expect(trace.length).toBeGreaterThan(0);
   });
 });
