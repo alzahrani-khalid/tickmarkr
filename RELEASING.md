@@ -78,7 +78,7 @@ Per release:
    export commit and push the tag:
 
    ```bash
-   git tag -a v2.1.8 -m "v2.1.8"
+   git tag -a v2.1.9 -m "v2.1.9"
    git push origin v2.1.8
    ```
 

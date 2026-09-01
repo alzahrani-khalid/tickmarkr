@@ -6,8 +6,9 @@ import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, m
 import { consumePaneLaunchIntent, PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
 import { Journal, type JournalEvent } from "../run/journal.js";
+import { readSupervision } from "../run/supervision.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
-import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
+import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type NotifyOpts, type OwnedName, type PanesToCloseOpts, type Slot, type SlotOpts } from "./types.js";
 
 // VIS-09 P43-03: adopted safety floor from 43-MEASUREMENT.md (narrowest safe 53 → floor 108).
 export const TRAILER_SAFE_FLOOR_COLS = 108;
@@ -80,6 +81,18 @@ export class DeliveryCorruptedError extends Error {
 }
 
 export type DriverJournal = (event: string, slotName: string, data: Record<string, unknown>) => void;
+
+interface PaneListRow {
+  label?: string;
+  pane_id?: string;
+  tab_id?: string;
+  workspace_id?: string;
+}
+
+interface ReconcileJournalHandle {
+  repoRoot: string;
+  journal: Journal;
+}
 
 /** First-generation join direction from measured trailer-safe floor (43-MEASUREMENT.md). */
 export function workerSplitDirection(paneCols: number | null, safeFloor = TRAILER_SAFE_FLOOR_COLS, margin = TRAILER_WIDTH_MARGIN): "right" | "down" {
@@ -235,6 +248,79 @@ export class HerdrDriver implements ExecutorDriver {
     // daemon never appends this event and never sees it — so an unbound handle here persists the
     // recovery to the file and the pipe while the operator's rail stays silent about it.
     Journal.open(repoRoot, owned.runId, this.narrate).append("dispatch-retry", owned.taskId, data);
+  }
+
+  private openRunJournal(runId: string): ReconcileJournalHandle | undefined {
+    const roots = new Set(this.journalRoots.values());
+    roots.add(process.cwd());
+    for (const repoRoot of roots) {
+      try {
+        return { repoRoot, journal: Journal.open(repoRoot, runId, this.narrate) };
+      } catch {
+        /* try the next known root */
+      }
+    }
+    return undefined;
+  }
+
+  private liveSupervisionSeats(repoRoot: string): Set<string> {
+    const seats = new Set<string>();
+    for (const tier of readSupervision(repoRoot)) {
+      if (tier.state === "ARMED" && tier.seat) seats.add(tier.seat);
+    }
+    return seats;
+  }
+
+  private journalReconcile(
+    handle: ReconcileJournalHandle | undefined,
+    event: string,
+    taskId: string | undefined,
+    data: Record<string, unknown>,
+  ): void {
+    try {
+      handle?.journal.append(event, taskId, data);
+    } catch {
+      /* reconcile remains cosmetic even when its audit row cannot be written */
+    }
+  }
+
+  private paneReconcileData(
+    pane: { paneId: string; tabId?: string },
+    label: string,
+    ownedName: OwnedName,
+    sweeperRunId: string,
+  ): Record<string, unknown> {
+    return {
+      paneId: pane.paneId,
+      ...(pane.tabId !== undefined ? { tabId: pane.tabId } : {}),
+      label,
+      ownedName,
+      ownedRunId: ownedName.runId,
+      runId: sweeperRunId,
+      sweeperRunId,
+    };
+  }
+
+  private parsePaneList(
+    handle: ReconcileJournalHandle | undefined,
+    runId: string,
+    stdout: string,
+    stage: "pre-close" | "post-close",
+  ): PaneListRow[] | null {
+    try {
+      const panes = JSON.parse(stdout).result?.panes;
+      if (!Array.isArray(panes)) throw new Error("pane list returned no panes array");
+      return panes;
+    } catch (error) {
+      this.journalReconcile(handle, "pane-reconcile-list-failed", undefined, {
+        runId,
+        sweeperRunId: runId,
+        stage,
+        error: error instanceof Error ? error.message : String(error),
+        stdout,
+      });
+      return null;
+    }
   }
 
   /** v1.99 T2: bind this driver's own journal writes to the run's live narration sink. */
@@ -1272,36 +1358,106 @@ export class HerdrDriver implements ExecutorDriver {
   // events land after the verdict is read), so mid-run sweeps spare them; boundary sweeps (start/
   // resume/end) run with nothing in flight and take them too. Cosmetic by contract: every failure —
   // herdr gone, pane vanished mid-sweep, unparseable listing — is swallowed; this method never throws.
-  async reconcile(desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean; endedRunIds?: Set<string> }): Promise<void> {
+  async reconcile(desired: Set<string>, runId: string, opts?: PanesToCloseOpts): Promise<void> {
+    const journalHandle = this.openRunJournal(runId);
     try {
       if (!this.ws) return;
       // 0.7.5: enumerate owned panes from `pane list` (labels), not `agent list` (detected agents only).
       // panesToClose skips any pane whose label doesn't parse as tickmarkr-owned (orchestrator/operator
       // shells, undetected agents), so a fuller pane listing never widens the blast radius.
       const list = await this.herdr("pane list");
-      const panes: { label?: string; pane_id?: string; tab_id?: string; workspace_id?: string }[] =
-        JSON.parse(list.stdout).result?.panes ?? [];
+      if (list.code !== 0) {
+        this.journalReconcile(journalHandle, "pane-reconcile-list-failed", undefined, {
+          runId,
+          sweeperRunId: runId,
+          stage: "pre-close",
+          exitCode: list.code,
+          error: list.stderr || list.stdout || `exit ${list.code}`,
+        });
+        return;
+      }
+      const panes = this.parsePaneList(journalHandle, runId, list.stdout, "pre-close");
+      if (panes === null) return;
+      const liveSeats = journalHandle ? this.liveSupervisionSeats(journalHandle.repoRoot) : new Set<string>();
+      for (const seat of opts?.liveSeats ?? []) liveSeats.add(seat);
       const toClose = panesToClose(
         panes.map((p) => ({ name: p.label, paneId: p.pane_id, tabId: p.tab_id, workspaceId: p.workspace_id })),
         desired,
         this.ws,
         runId,
-        opts,
+        { ...opts, liveSeats },
+      );
+      const paneById = new Map(
+        panes
+          .filter((p) => typeof p.pane_id === "string")
+          .map((p) => [p.pane_id!, p] as const),
       );
       const touched = new Set<string>();
       for (const c of toClose) {
-        if (typeof c.tabId === "string") touched.add(c.tabId);
-        await this.herdr(`pane close ${shq(c.paneId)}`); // best-effort — a vanished pane is already reconciled
+        const listed = paneById.get(c.paneId);
+        const label = typeof listed?.label === "string" ? listed.label : "";
+        const ownedName = parseOwnedName(label);
+        if (!ownedName) {
+          this.journalReconcile(journalHandle, "pane-reconcile-close-failed", undefined, {
+            paneId: c.paneId,
+            ...(c.tabId !== undefined ? { tabId: c.tabId } : {}),
+            label,
+            runId,
+            sweeperRunId: runId,
+            error: "pane selected for reconcile no longer has a parseable owned label",
+          });
+          continue;
+        }
+        const data = this.paneReconcileData(c, label, ownedName, runId);
+        const closed = await this.herdr(`pane close ${shq(c.paneId)}`);
+        if (closed.code === 0) {
+          if (typeof c.tabId === "string") touched.add(c.tabId);
+          this.journalReconcile(journalHandle, "pane-reconcile-close", ownedName.taskId, data);
+        } else {
+          this.journalReconcile(journalHandle, "pane-reconcile-close-failed", ownedName.taskId, {
+            ...data,
+            exitCode: closed.code,
+            error: closed.stderr || closed.stdout || `exit ${closed.code}`,
+          });
+        }
       }
       if (touched.size === 0) return;
       // a tab our closes emptied was ours by construction (a tab with operator panes still has panes)
       const pl = await this.herdr("pane list");
+      if (pl.code !== 0) {
+        this.journalReconcile(journalHandle, "pane-reconcile-list-failed", undefined, {
+          runId,
+          sweeperRunId: runId,
+          stage: "post-close",
+          exitCode: pl.code,
+          error: pl.stderr || pl.stdout || `exit ${pl.code}`,
+        });
+        return;
+      }
+      const alivePanes = this.parsePaneList(journalHandle, runId, pl.stdout, "post-close");
+      if (alivePanes === null) return;
       const alive = new Set(
-        (JSON.parse(pl.stdout).result?.panes ?? []).map((p: { tab_id?: string }) => p.tab_id),
+        alivePanes.map((p) => p.tab_id),
       );
-      for (const tab of touched) if (!alive.has(tab)) await this.herdr(`tab close ${shq(tab)}`);
-    } catch {
-      /* cosmetic — visibility hygiene never fails the run */
+      for (const tab of touched) {
+        if (alive.has(tab)) continue;
+        const closed = await this.herdr(`tab close ${shq(tab)}`);
+        if (closed.code !== 0) {
+          this.journalReconcile(journalHandle, "tab-reconcile-close-failed", undefined, {
+            tabId: tab,
+            runId,
+            sweeperRunId: runId,
+            exitCode: closed.code,
+            error: closed.stderr || closed.stdout || `exit ${closed.code}`,
+          });
+        }
+      }
+    } catch (error) {
+      this.journalReconcile(journalHandle, "pane-reconcile-failed", undefined, {
+        runId,
+        sweeperRunId: runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

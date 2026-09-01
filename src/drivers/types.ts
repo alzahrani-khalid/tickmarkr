@@ -120,18 +120,25 @@ export interface FleetAgent { name?: string; paneId?: string; tabId?: string; wo
 // ponytail: two conditions, no geometry reasoning, nothing driver-specific. `reconcile` is cosmetic by
 // contract, and a cosmetic cleanup must never be able to kill a live worker — which is why the
 // ended-run authority is the only safe way to restore the sweep without reviving the cross-run kill.
+export interface PanesToCloseOpts {
+  spareLiveLlm?: boolean;
+  endedRunIds?: Set<string>;
+  liveSeats?: Set<string>;
+}
+
 export function panesToClose(
   agents: FleetAgent[],
   desired: Set<string>,
   ws: string,
   runId: string,
-  opts?: { spareLiveLlm?: boolean; endedRunIds?: Set<string> },
+  opts?: PanesToCloseOpts,
 ): { paneId: string; tabId?: string }[] {
   const out: { paneId: string; tabId?: string }[] = [];
   for (const a of agents) {
     if (typeof a.name !== "string" || typeof a.paneId !== "string") continue;
     const owned = parseOwnedName(a.name);
     if (!owned || owned.role === "watch") continue;
+    if (opts?.liveSeats?.has(a.name)) continue;
     if (owned.runId !== runId && !opts?.endedRunIds?.has(owned.runId)) continue;
     if (a.workspaceId !== ws) continue; // OBS-769: another workspace is another run's business
     if (desired.has(a.name)) continue;
@@ -215,5 +222,5 @@ export interface ExecutorDriver {
   // lifecycle events lag the journal (a live consult has no journal row until its verdict lands).
   // Cosmetic by contract: implementations swallow every failure and never throw. Omitted on
   // subprocess (no panes) — the daemon's optional-chain call is a no-op there.
-  reconcile?: (desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean; endedRunIds?: Set<string> }) => Promise<void>;
+  reconcile?: (desired: Set<string>, runId: string, opts?: PanesToCloseOpts) => Promise<void>;
 }

@@ -4,6 +4,26 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 ## v2.1 — the orca driver
 
+**v2.1.9** — the record keeps what it knows. The theme is that supervision surfaces stop asserting things
+the product cannot know, and a sweep records what it did.
+
+- **A pane sweep records what it closed, what it failed to close, and refuses to close a live seat.**
+  Reconcile now journals one event per pane close, each carrying that pane's own id, the owned name parsed
+  from its label, and the runId it received; a close that fails is journaled against the pane it was
+  attempting, so the path records the action or its failure and never neither. A pane whose label an armed
+  supervision beat names is left alone.
+- **The spike-scoping rule ships where spec-authoring law already lives** — in the spec template `init`
+  writes, rather than only in operator notes.
+- **The overseer skill ships the journal watcher it already prescribed.** The bundled watcher now covers
+  all four events it told you to watch (`run-end`, `task-human`, `task-failed`, `consult-verdict`) instead
+  of prescribing them and shipping none.
+- **The context watcher reads context FILL from the session record, not the rendered screen** — and names
+  the mechanism: fill and cumulative spend differ by a factor that grows with session length, so a
+  cumulative figure read as a percentage misreports a fresh session as nearly full.
+- **Void conditions on pre-commitments, a two-reads liveness test for process probes, and a
+  rename-replace rule** for editing a watcher script while watchers are armed (a bash script read by byte
+  offset is corrupted by an in-place edit, comment-only included).
+
 **v2.1.7** — one answer, everywhere: nine gated tasks on one run, closed green 9/9 with tip verify
 passed and every bucket empty. The theme is that the supervision surfaces stopped disagreeing with each
 other — one accessor decides what a gate outcome means, every reader routes through it, and the records

@@ -38,6 +38,8 @@
 #   TKR_HANDOFF_MAX_AGE_S  how fresh "fresh" is (default 900).
 #   TKR_CLEAR_SETTLE_S     seconds to let a cleared seat settle before the re-brief (default 6).
 #   TKR_BLIND_ALARM_S      seconds unreadable before CONTEXT_BLIND alarms (default 120).
+#   TKR_CONTEXT_WINDOW     context window in tokens. Set it when the banner does not name one;
+#                          NEVER guessed — a wrong denominator makes every warn and act line wrong.
 
 set -u
 ROLE="${1:?supervising seat role required: orchestrator|overseer}"
@@ -100,10 +102,96 @@ stand_down() { tickmarkr beat "$TIER" --stand-down --seat "$SEAT" >/dev/null 2>&
 # record the hand-off. A killed watcher never runs it, which is the one case that must read STALE.
 trap stand_down EXIT
 
-# The seat's rendered truth lives on the model banner. Select that line first, then read a percentage
-# only from it: a bare numeric search across the visible window can borrow an old N% from scrollback
-# when a long live-run segment pushes the real field past the pane's visible width (OBS-780).
-context_pct() {
+# ── WHERE THE NUMBER COMES FROM, and this is the whole 2.1.7-series lesson ────────────────────────────
+# The shipped version read a TERMINAL RENDERING and nothing else. Every context-measurement failure of
+# that series is downstream of that one choice: a rendering can be truncated by pane width, can push the
+# real field out of the visible window, and can leave a stale N% in scrollback for a bare numeric search
+# to borrow (OBS-780). **The value is not on the screen. It is in the session JSONL**, which is exact,
+# append-only, and indifferent to how wide the pane is.
+#
+# ⚠ NAME THE QUANTITY, because two numbers live in that file and they differ by two orders of magnitude:
+#   * CONTEXT FILL  = the LAST usage-bearing record's input_tokens + cache_creation + cache_read.
+#     This is what is in the window right now. **This is the only one a clear threshold may use.**
+#   * CUMULATIVE CONSUMPTION = the same sum added up over every record, plus output.
+#     Measured 2026-08-31 on two live sessions in this workspace: **118.5x the fill over 175
+#     usage records, and 28.4x over 35.**
+#     ⛔ **THE FACTOR IS NOT A CONSTANT — IT GROWS WITH SESSION LENGTH**, because cumulative adds a
+#     term per request while fill is what ONE request holds. The two numbers above are two points on
+#     that curve, NOT a range and NOT a property of the quantity. **Never quote a single figure as
+#     "the" ratio**, and never average two: a longer session yields a larger one, without limit.
+#     The banner shows this one too, as `sum N tok`, right beside the fill percentage.
+#   **Quoting fill as consumption, or consumption as fill, is wrong by that factor. Say which you mean.**
+#
+# ⛔ AND THE DENOMINATOR IS NOT IN THE JSONL. Its `model` field reads `claude-opus-5` with no context-size
+# suffix, so a 200k default would have read three live 1M seats here at 106%, 150% and 90% — the 150% seat
+# would have been auto-cleared on the first tick. **A window is resolved explicitly or read once from the
+# banner; it is never assumed.** Reading a per-session CONSTANT once from the fragile surface, and the
+# per-tick VARIABLE from the robust one, is the trade this makes.
+# Calibrated 2026-08-31 against three live seats: banner 21/30/18% vs JSONL fill 21.2/30.0/17.9%. Same
+# quantity, same direction, same denominator — so the existing WARN/ACT thresholds carry over unchanged.
+
+CTX_JSONL=""
+CTX_WINDOW="${TKR_CONTEXT_WINDOW:-0}"
+
+# TARGET is an agent name or a pane id; `herdr agent list` carries both, plus the session uuid that names
+# the JSONL. The uuid is unique, so glob for it rather than reconstructing the project-dir slug — a slug
+# rule is a second thing that can rot.
+resolve_jsonl() {
+  local sid
+  sid=$(herdr agent list 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+t = sys.argv[1]
+for a in d.get("result", {}).get("agents", []):
+    if t in (a.get("pane_id"), a.get("name")):
+        print((a.get("agent_session") or {}).get("value") or "")
+        break
+' "$TARGET" 2>/dev/null) || return 1
+  [ -n "$sid" ] || return 1
+  CTX_JSONL=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -1)
+  [ -n "$CTX_JSONL" ]
+}
+
+# The banner names its own window ("Opus 5 (1M context)"). Read it ONCE; it cannot change mid-session.
+resolve_window() {
+  [ "$CTX_WINDOW" -gt 0 ] 2>/dev/null && return 0
+  local w
+  w=$(herdr agent read "$TARGET" --source visible --lines 8 2>/dev/null |
+      grep -oEi '\(([0-9]+(\.[0-9]+)?)[KM] context\)' | tail -1 |
+      grep -oEi '[0-9]+(\.[0-9]+)?[KM]') || return 1
+  case "$w" in
+    *[Kk]) CTX_WINDOW=$(awk -v n="${w%[Kk]}" 'BEGIN{printf "%d", n*1000}') ;;
+    *[Mm]) CTX_WINDOW=$(awk -v n="${w%[Mm]}" 'BEGIN{printf "%d", n*1000000}') ;;
+    *) return 1 ;;
+  esac
+  [ "$CTX_WINDOW" -gt 0 ] 2>/dev/null
+}
+
+jsonl_pct() {
+  [ -n "$CTX_JSONL" ] && [ -f "$CTX_JSONL" ] && [ "$CTX_WINDOW" -gt 0 ] 2>/dev/null || return 1
+  python3 -c '
+import sys, json
+path, window = sys.argv[1], int(sys.argv[2])
+fill = 0
+with open(path, encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        try: rec = json.loads(line)
+        except Exception: continue
+        usage = (rec.get("message") or {}).get("usage")
+        if not isinstance(usage, dict): continue
+        # CONTEXT FILL — this request s window occupancy. Never a running total.
+        n = sum(int(usage.get(k) or 0) for k in
+                ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        if n: fill = n
+if not fill: sys.exit(1)
+print(int(round(fill * 100.0 / window)))
+' "$CTX_JSONL" "$CTX_WINDOW" 2>/dev/null
+}
+
+# The banner path stays as the FALLBACK, unchanged: select the model line first, then read a percentage
+# only from it, so a bare numeric search cannot borrow an old N% from scrollback (OBS-780).
+banner_pct() {
   local screen banner pct
   screen=$(herdr agent read "$TARGET" --source visible --lines 8 2>/dev/null) || return 1
   banner=$(printf '%s\n' "$screen" |
@@ -112,6 +200,12 @@ context_pct() {
   [ -n "$banner" ] || { printf 'UNREADABLE\n'; return 0; }
   pct=$(printf '%s\n' "$banner" | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
   [ -n "$pct" ] && printf '%s\n' "$pct" || printf 'UNREADABLE\n'
+}
+
+context_pct() {
+  local p
+  if p=$(jsonl_pct) && [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  banner_pct
 }
 
 handoff_fresh() {
@@ -143,6 +237,17 @@ act_on() {
   echo "  make it write the handoff FIRST, then clear"
   exit 0
 }
+
+# Resolve the JSONL source ONCE, and SAY which surface is in use. A watcher that silently fell back to
+# the fragile path looks identical to one on the robust path, and the difference is the whole point.
+if resolve_jsonl && resolve_window; then
+  echo "CONTEXT_SOURCE jsonl $TARGET — CONTEXT FILL from $CTX_JSONL against a ${CTX_WINDOW}-token window"
+  echo "  this is FILL (what is in the window now), never cumulative consumption — measured 28x and 118x"
+  echo "  apart here, and that factor GROWS with session length; never quote one figure as the ratio"
+else
+  echo "CONTEXT_SOURCE banner $TARGET — JSONL unresolved (session=${CTX_JSONL:-none} window=${CTX_WINDOW})"
+  echo "  falling back to the rendered banner; set TKR_CONTEXT_WINDOW to use the JSONL"
+fi
 
 warned=0
 elapsed=0

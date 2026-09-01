@@ -60,6 +60,75 @@ function carriesEveryExistingLaw(section: string): boolean {
   return EXISTING_CRITERION_LAWS.every((law) => section.includes(law));
 }
 
+function spikeSection(written: string): string {
+  return written.slice(
+    written.indexOf("PRE-SCOPE BY TEXT, ENUMERATE BLOCKERS BY EXECUTION:"),
+    written.indexOf("WHICH SIDE OF A RUN INHERITS ENVIRONMENT"),
+  );
+}
+
+function statesSpikeTrigger(section: string): boolean {
+  return /Could a test this task does not own be asserting the\s+thing I am changing\?/i.test(section)
+    && /I'D HAVE TO GREP TO KNOW" IS YES/i.test(section);
+}
+
+function statesSpikeCaveat(section: string): boolean {
+  return /spike measures ONE implementation/i.test(section)
+    && /does NOT make its reds the closed blocker set/i.test(section)
+    && /worker taking a different route can\s+still red on unowned collateral/i.test(section)
+    && /PLAN\s+DEFECT, NEVER A RETRY/i.test(section);
+}
+
+function statesSpikeCost(section: string): boolean {
+  return /Measured price: 518 s implement \+ 831 s suite = 1,348 s ≈ 22\.5 min/.test(section)
+    && /"Far cheaper than the alternative"\s+is WITHDRAWN on the direct leg/i.test(section)
+    && /on the direct leg the\s+two are EQUAL/i.test(section);
+}
+
+function statesSpikeNonApplication(section: string): boolean {
+  return /Do NOT run the spike for a change that is purely additive and unwinds cheaply/i.test(section)
+    && /bounded by\s+the expense of a late defect, not by novelty/i.test(section);
+}
+
+describe("spec template — spike contract before scope", () => {
+  test("test: the template a freshly initialised repository receives states the trigger as a question about a test the task does not own and rules that needing to grep in order to answer it is a yes; wording that asks only whether the change is risky leaves the author to judge scope by feel and fails", async () => {
+    const section = spikeSection(await initialisedSpec());
+
+    expect(statesSpikeTrigger(section)).toBe(true);
+
+    const riskyOnly = "SPIKE-THE-CONTRACT-THEN-SCOPE: If this change feels risky, run a spike first.";
+    expect(riskyOnly).not.toMatch(/test this task does not own/i);
+    expect(statesSpikeTrigger(riskyOnly)).toBe(false);
+  });
+
+  test("test: the template states that a spike measures one implementation, so a worker taking a different route can still red on unowned collateral and that remains a plan defect rather than a retry; text presenting the spike's result as the closed blocker set fails", async () => {
+    const section = spikeSection(await initialisedSpec());
+
+    expect(statesSpikeCaveat(section)).toBe(true);
+
+    const closedSet = "A spike closes the blocker set; rerun any worker that finds more collateral.";
+    expect(statesSpikeCaveat(closedSet)).toBe(false);
+  });
+
+  test("test: the template carries the measured cost and records that the cheaper-than-the-alternative claim is withdrawn on the direct leg; a cost stated as a saving rather than as a price gets the rule run on every task and fails", async () => {
+    const section = spikeSection(await initialisedSpec());
+
+    expect(statesSpikeCost(section)).toBe(true);
+
+    const saving = "The spike is far cheaper than the alternative, saving a halted run.";
+    expect(statesSpikeCost(saving)).toBe(false);
+  });
+
+  test("test: the template names the case where the rule must not be run — a change that is purely additive and unwinds cheaply — so the rule is bounded by the expense of a late defect rather than by novelty; text without a stated non-application fails", async () => {
+    const section = spikeSection(await initialisedSpec());
+
+    expect(statesSpikeNonApplication(section)).toBe(true);
+
+    const noBound = "Run the spike for new observable contracts.";
+    expect(statesSpikeNonApplication(noBound)).toBe(false);
+  });
+});
+
 describe("spec template — a criterion names the pair it discriminates", () => {
   test("test: the spec template a freshly initialised repository writes requires every criterion to name the case that must pass and the neighbouring case that must fail; wording asking only for two examples fails", async () => {
     const section = criterionSection(await initialisedSpec());
@@ -95,6 +164,22 @@ describe("spec template — a criterion names the pair it discriminates", () => 
       expect(demandsBothHalvesOfThePair(rewrite)).toBe(true);
       expect(carriesEveryExistingLaw(rewrite)).toBe(false);
     }
+  });
+
+  test("test: the template still carries every criterion-quality law it held before, including the pair-discrimination rule and the stub-satisfiability question; a rewrite that drops or weakens one while adding the new section fails", async () => {
+    const written = await initialisedSpec();
+    const section = criterionSection(written);
+
+    expect(spikeSection(written)).toContain("SPIKE-THE-CONTRACT-THEN-SCOPE");
+    expect(demandsBothHalvesOfThePair(section)).toBe(true);
+    expect(carriesEveryExistingLaw(section)).toBe(true);
+
+    const dropsStub = section.replace(STUB_QUESTION, "");
+    expect(carriesEveryExistingLaw(dropsStub)).toBe(false);
+
+    const weakensPair = section.replace("neighbouring plausible-wrong or false-clean case that MUST FAIL", "neighbouring plausible case");
+    expect(weakensPair).not.toBe(section);
+    expect(demandsBothHalvesOfThePair(weakensPair)).toBe(false);
   });
 });
 

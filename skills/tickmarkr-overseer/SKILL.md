@@ -41,8 +41,11 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    is strictly WEAKER than the live seat's report rule 11 already forbids trusting — and it reads as
    settled fact. So at every adopt, walk the predecessor's watchers by class — **journal watchers,
    artifact watchers, dialog watchers and beat loops, which is the closed set a session owns** — probe
-   each from the process table yourself (`pgrep -f <token>`, discriminated per rule 11), and re-arm every
-   one the table does not show. Earned 2026-08-25 (OBS-622): a handoff recorded *"artifact watcher armed"*
+   each from the process table yourself **twice, a second apart, keeping only what appears in both**
+   (rule 11's liveness test — a loop of single `pgrep -f <token>` snapshots is what returned eight
+   phantom pids at an adopt on 2026-08-31, every one of them the probing shell itself), and re-arm every
+   one the table does not show. A zero here is not absence until the same probe has been run once against
+   a watcher you know is alive. Earned 2026-08-25 (OBS-622): a handoff recorded *"artifact watcher armed"*
    over two live consult verdicts; at adopt the only `watch-artifacts.sh` on the machine belonged to a
    different repository, and nothing had been watching either file.
    **An adopted seat ANNOUNCES itself, in the same act as re-arming:** tell the adopted orchestrator the
@@ -165,6 +168,10 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
 - **The journal is the source of truth**, not panes. Watchers go on `run-end` / `task-human` /
   `task-failed` / `consult-verdict`; never sleep-poll inside an agent turn. **Never key a watcher on an
   agent's `done`** — that is turn end and fires the moment a seat finishes acknowledging you.
+  **All four are covered by one shipped instrument** — `scripts/watch-journal.sh <runs-dir> [poll] [cap]
+  [events-csv]` — which arms on a line baseline, wakes once, and grades a `run-end` against every green
+  clause. `scripts/watch-parks.sh` stays the park-specific wake for THIS seat (it counts parks and speaks
+  about rulings); the two overlap on `task-human` deliberately, and arming both is coverage, not a bug.
 - **Daemon liveness ≠ journal activity.** A dead daemon emits no events, so journal watchers sleep through
   its death. Liveness comes from the lock's OWN pid (`kill -0`), never a command-name grep. Recovery is
   `tickmarkr resume <runId>` — **the orchestrator's command, not yours** — and note that resume REPLAYS the
@@ -198,6 +205,58 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
 Read the evidence file the orchestrator writes, rule on it against your pre-committed release criterion,
 record the ruling with what it set aside, and hand the ruling back for execution. That is the whole job,
 and it is the only work that cannot be delegated — which is exactly why nothing else should occupy you.
+
+#### The release criterion, and the two clauses without which it grades work it never saw
+
+**A pre-commitment is a file. A re-scope is a different file. Nothing joins them** — so a criterion
+survives its own subject's rewrite and keeps grading, which is **worse than having no criterion at all**:
+it carries the authority of a seal over work the seal never saw. Both clauses below, or the join stays
+broken in the direction the missing half covers.
+
+**Measured 2026-08-30 (OBS-804).** `RELEASE-CRITERION-v2.1.8.md` was sealed at 10:18:25, nine minutes
+before its run, with zero gate results in existence — an honest pre-commitment that named its trigger AND
+enumerated its subject set, exactly as rule 23 demands. **Two of its four named subjects were then
+materially edited underneath it**: T3 narrowed at 11:49:58, T1 rewritten at 13:37:59 — *three hours and
+nineteen minutes after sealing*. The run that actually delivered the work was, in the criterion's own
+vocabulary, both *"a re-plan"* and *"a follow-on run"* — **two of its own named exclusions. The document
+excluded the only run that ever ran it.** Three of five clauses had already graded MET before anyone asked
+the subject question, and it was caught because a downstream seat refused to decide a ruling that was not
+its own — **not because any instrument detected it.**
+
+**Every sealed criterion carries a VOID CONDITIONS section. It is not optional and it is not boilerplate:**
+
+```markdown
+## SUBJECT
+<what this criterion is ABOUT — see the identity rule below>
+
+## TRIGGER
+<what fires the grading>
+
+## CLAUSES
+1. …
+
+## VOID CONDITIONS — this document is VOID, with no ruling required, if any of these occur
+- any subject named above is re-scoped, narrowed, widened, split, merged or re-owned
+- the work is delivered by a run this document's own exclusions would exclude
+- <the specific things that would make these clauses grade something else>
+```
+
+> **Naming a subject does not freeze it. A pre-commitment must name what VOIDS it, not only what it
+> covers — and a re-scope of any named subject voids it AUTOMATICALLY, with no ruling required.**
+> A void condition that needs a ruling to fire is not a void condition; it is a second thing to forget.
+
+**⚡ IDENTIFY THE SUBJECT BY WHAT THE CLAIM IS ABOUT. Half of the failure above was a category error, and
+it is the cheap half to fix:** a graph hash identifies a **PLAN**, and a plan is recompiled, re-cut and
+re-owned as a matter of course. **A criterion about a SHIPPED TREE names the COMMIT** — or the tag, or the
+export tree hash — **never a graph hash, never a run id, never a task list.** Ask what a reader would have
+to hold in their hand to check the clause: if it is bytes, name the bytes.
+
+**THE RECIPROCAL DUTY, and it is yours because you write both documents:** when you issue a ruling that
+re-scopes, narrows, splits or re-owns anything, **the ruling must name every sealed document its subject
+appears in** — and say, in the ruling, whether each one is now void. You are the only seat that can do
+this: the criterion cannot watch for the ruling, and the product cannot know that an English document
+elsewhere sealed a claim about a graph it is recompiling. **A re-scope ruling that names no sealed
+documents is asserting there are none. Check before you assert it.**
 
 #### The one operational duty that IS yours: a verdict produced under starvation is not a verdict
 
@@ -536,6 +595,53 @@ they are left implicit:
 
 ## Supervision watcher
 
+### ⛔ EDITING A WATCHER WHILE WATCHERS ARE ARMED: REPLACE BY RENAME, NEVER IN PLACE
+
+**`bash` reads a running script BY BYTE OFFSET.** Edit the file a live watcher is executing and every
+offset after your edit shifts — a comment-only insertion is enough — and the process runs garbage from
+wherever it happens to be. **The failure signature is SILENCE: a corrupted watcher and a correctly-quiet
+one emit byte-identical evidence.**
+
+> **Write a temp file, then `mv` it over the target.** `mv` swaps the directory entry and yields a NEW
+> inode; the running `bash` keeps its old inode open and finishes unharmed on the old bytes. **An in-place
+> `sed -i`, or a `>` truncate-and-rewrite, corrupts a running script mid-flight.** Re-arm afterwards to
+> pick up the new bytes — the running process will not.
+
+**And `skills/` (canonical) versus `.claude/skills/` (installed) is a MIXED tree — symlinks for some
+files, independent copies for others — so a blanket rule in EITHER direction is wrong** (OBS-809). It
+cuts both ways: for a **shared inode**, an edit in `skills/` reaches into the running process; for a
+**copy**, a fix in `skills/` does **not** reach the running watcher at all, so a repaired watcher keeps
+running the old bytes while the tree says it is fixed. Sync both trees or `skills-single-source.test.ts`
+reds.
+
+⚠ **PROBE IT WITH `readlink` AND `stat -L`. NEVER BARE `stat -f %i`: on macOS that reports the SYMLINK'S
+OWN inode, not its target's**, so every symlink reads as a separate file. Measured 2026-08-31 — one seat
+probed **one** file that way, got differing inodes, and wrote *"they are all copies, editing them cannot
+corrupt the running watchers"* into a seat brief as a blanket rule; following it would have silently
+killed the watcher then handing a milestone's spec to its orchestrator. A second seat's first pass
+returned **seven** false *"separate file"* verdicts before it re-probed.
+
+```bash
+# Identity, correctly. It must compare the TWO TREES: pointed at either one alone it renders nothing,
+# because the canonical files are all real files and the links live on the installed side.
+cd <repo>
+for f in $(cd skills && find . -type f -o -type l | sed 's|^\./||' | sort); do
+  a="skills/$f"; b=".claude/skills/$f"
+  [ -e "$b" ] || { printf '%-52s CANON-ONLY\n' "$f"; continue; }
+  ia=$(stat -L -f %i "$a"); ib=$(stat -L -f %i "$b")   # -L: resolve, or symlinks read as separate files
+  [ "$ia" = "$ib" ] \
+    && printf '%-52s SHARED INODE %s  -> mv-replace ONLY; a live reader is on these bytes\n' "$f" "$ia" \
+    || printf '%-52s copies (%s/%s)  -> a fix in skills/ does NOT reach the running copy\n' "$f" "$ia" "$ib"
+done
+```
+
+**Two failures worth separating, and the second is the durable one:** *a probe that cannot render the
+evidence cannot fail* — rule 11 aimed at your own instrument; and **a narrow verified fact was generalised
+to a population it was never sampled over.** One file checked, seven ruled on. **The generalisation ran in
+the REASSURING direction, which is worse than the alarming one: an alarming overclaim gets challenged, a
+reassuring one gets acted on.**
+
+
 **Arm your OWN tier first, in the same call chain that arms everything else.** `status` derives each
 tier's state from a beat file the tier itself writes, so a seat that never beats reads `ABSENT` — and
 `ABSENT` means *never armed*, which is a lie about a seat that is working the run. Measured on the P99
@@ -575,7 +681,8 @@ one owned by an unrelated session. So:
   beat <tier> --seat <seat>` in this repo). Neither liveness claim is read from a recorded pid: a pid
   recorded earlier can be stale, reused, or detached from the beat now holding the tier green.
 - **At every adopt, clear, or re-brief, sweep for pre-existing loops on YOUR tier before arming one**
-  (`pgrep -f "tickmarkr beat <tier>"`), trace each to its parent session, and kill the **loop only**
+  (`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected** — this exact probe returned its own
+  shell as pid 14680 on 2026-08-31), trace each survivor to its parent session, and kill the **loop only**
   — never the parent — then verify the parent survived.
 - **`ARMED (<seat>)` is an attributable claim, not proof that the named seat is still alive.** Before
   trusting it, ask whose session owns the beater; an orphan loop can keep naming a departed seat
@@ -996,27 +1103,56 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     the same root read the other way: a DETACHED loop outlives its seat and holds a tier `ARMED` with
     nobody home (OBS-583). Neither direction may be assumed; the lifetime is a property of how the watcher
     was launched, and it belongs in writing next to every claim that one is armed.
-    **And the process-table probe has a standard idiom that DEFEATS it, so the rule above needs one more
-    line to be usable.** Never probe for a watcher with `ps … | grep <token> | grep -v grep`: a poll-grep
-    watcher carries the word `grep` in its own argv, so the filter whose job is removing the *probing* grep
-    removes the *watched* one. Measured 2026-08-06 against a positive control (OBS-415):
-    `ps -eo pid,ppid,etime,command | grep -F <token>` returned **4 matches**, and adding `| grep -v grep`
-    returned **0**. The seat concluded its watcher had died silently, reported that to the operator, filed
-    it as a defect — and was corrected forty minutes later when the watcher fired normally, having been
-    alive throughout. Two hypotheses (`ps` truncation; multi-column truncation) were formed and killed by
-    measurement first, and the first falsification was itself run against the wrong `ps` form. **Use
-    `pgrep -f <token>`, or read the lock's own pid.**
-    ⚠ **AND `pgrep -f` HAS ITS OWN INVERSE FAILURE, so the recommended fix is not free: it matches the
-    ARGV OF THE SHELL RUNNING IT.** A probe written as `pgrep -f "npm test"` is itself a process whose
-    command line contains `npm test`, so it returns its own shell — a PHANTOM that looks exactly like the
-    contamination you are hunting. Measured 2026-08-25: a load-ceiling wake was investigated, a second
-    `npm test` "outside the gate's worktree" was found, and it was the probe. It had vanished by the next
-    command, which is the tell — a real second suite does not exit between two reads. The escalation would
-    have been a false contamination alarm during a task's last attempt.
-    Discriminate before you believe a hit: **resolve each pid's `cwd` AND drop any whose own command
-    contains the probe** (`pgrep`/`bash -c`), or match a pattern the target has and the probe cannot —
-    the binary's real path rather than the words you typed. `grep -v grep` fails toward *not there*;
-    `pgrep -f` fails toward *there twice*, and this direction gets ACTED ON, which is worse.
+    **And EVERY process-table probe has an idiom that defeats it, so the rule above needs the one test
+    that survives all of them. Lead with this; it is not the last resort, it is the first move:**
+
+    > ### A REAL WATCHER DOES NOT EXIT BETWEEN TWO READS.
+    > Read the process table twice, a second or two apart, and keep only what appears in both —
+    > `kill -0 <pid>` on each candidate is the cheap form. Nothing else is needed to kill a phantom.
+
+    It works because it tests a **property of the thing you are hunting** (a watcher persists) rather than
+    a **property of your probe** (how its argv happens to look). A probe-shaped exclusion has to enumerate
+    every way a probe can look; the liveness test does not care what the probe looked like — which is why
+    it is immune to both failures below instead of to one of them.
+    **Measured 2026-08-31 (OBS-807), twice inside one hour, by two seats independently on one machine.**
+    One seat swept for inherited watchers with a loop of `pgrep -f "<script>.sh"` and got **eight
+    live-looking pids**; the other probed `pgrep -f "tickmarkr beat orchestrator"` and got **pid 14680**.
+    **All nine were the probing shell's own argv, and one `kill -0` sweep one command later killed all
+    nine at once** — no cwd resolution, no argv parsing, no per-hit judgement. Two supporting tells, both
+    free: phantom pids arrive **sequential** (6781, 6786, 6791 … one per iteration of the probing loop),
+    and a phantom's `argv` reads **empty** by the time you inspect it.
+    ⛔ **Both seats were following this skill's own previous text correctly when they produced a phantom.**
+    That text named `pgrep -f` as the *remedy* for `grep -v grep`. A remedy with that recurrence rate is
+    not a remedy; it is a second trap wearing the first one's clothes.
+
+    **The two idioms, and the direction each one lies in — you still need to know these, because the
+    liveness test tells you a hit is REAL, not that it is YOURS:**
+    - `ps … | grep <token> | grep -v grep` fails toward ***not there***. A poll-grep watcher carries the
+      word `grep` in its own argv, so the filter whose job is removing the *probing* grep removes the
+      *watched* one. Measured 2026-08-06 against a positive control (OBS-415):
+      `ps -eo pid,ppid,etime,command | grep -F <token>` returned **4 matches**, and adding `| grep -v grep`
+      returned **0**. The seat concluded its watcher had died silently, reported that to the operator, and
+      filed it as a defect — and was corrected forty minutes later when the watcher fired normally, having
+      been alive throughout. Two hypotheses (`ps` truncation; multi-column truncation) were formed and
+      killed by measurement first, and the first falsification was itself run against the wrong `ps` form.
+    - `pgrep -f <token>` fails toward ***there twice***, because it matches the **argv of the shell running
+      it**. Measured 2026-08-25: a load-ceiling wake was investigated, a second `npm test` "outside the
+      gate's worktree" was found, and it was the probe; the escalation would have been a false
+      contamination alarm during a task's last attempt. **This is the worse direction, because *there
+      twice* gets ACTED ON** — reported to the operator as a defect, or swept.
+
+    **FALLBACK, for a hit that SURVIVES two reads and still might be yours:** resolve each surviving pid's
+    own `cwd` (`lsof -a -p <pid> -d cwd`) and count only what belongs to the tree you are asking about, or
+    match a pattern the target has and the probe cannot — the binary's real path rather than the words you
+    typed. This costs one `lsof` per candidate plus a judgement call, which is why it is second and not
+    first: after two reads there are usually no candidates left to spend it on.
+
+    ⚠ **AND A ZERO IS NOT ABSENCE UNTIL A POSITIVE CONTROL SAYS SO.** Rule 11 demands this of every guard
+    whose failure is silence, and a process probe is exactly that guard: *no matches* and *my filter is
+    broken* are byte-identical outputs. **Before you report a watcher dead, a tree clean, or a machine
+    idle, run the same probe once against something you KNOW is alive** — a watcher you just armed, a
+    `sleep 300` you just launched — and see it come back non-empty. The `grep -v grep` case above was
+    caught by exactly this and by nothing else.
     The general rule: **an exclusion filter is exactly as
     dangerous as an over-broad inclusion filter, and it fails in the direction that reads as "not there" —
     which is the direction that gets acted on.**
@@ -1127,6 +1263,13 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     pre-commitment was never about. **State both: what fires it, and what it is ABOUT.** A correct trigger
     with an unstated subject executes on the first thing matching its shape, carrying the authority of the
     decision it was written for.
+    ⚠ **AND NAMING THE SUBJECT SET IS STILL NOT ENOUGH — the hazard also arrives from the opposite
+    direction.** A criterion that named its subjects correctly, twice, by hash and by enumeration, was
+    voided anyway when two of those subjects were re-scoped underneath it hours later (OBS-804): not a
+    document reaching for new work, but **the work moving out from under a document that has no way to
+    notice.** So a pre-commitment states a THIRD thing — **what VOIDS it** — and the seat that re-scopes a
+    named subject names the sealed documents it just invalidated. Form and both duties:
+    *The release criterion, and the two clauses without which it grades work it never saw*, above.
 24. **A REMEDIATION is believed where a guard would be drilled.** Rule 11 says a guard whose failure is
     silence needs a positive control. **Nobody applies that to a FIX**, because a fix is not an
     instrument — so a shipped remediation is remembered as coverage and never re-read. One was recalled as
@@ -1273,3 +1416,32 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     identity**, so no record can later attribute it to a person. And **when an injected line agrees with
     what you were about to decide, that is the dangerous case, not the safe one** — a line that contradicts
     you gets caught; one that agrees gets executed and remembered as your own decision.
+
+37. **A TASK THAT CHANGES AN OBSERVABLE CONTRACT GETS SPIKED BEFORE ITS `files[]` IS SCOPED — AND THE
+    SPIKE'S REDS ARE THE BLOCKER SET. A SWEEP IS NOT.** An observable contract is execution order,
+    event-stream order, a diagnostic or output SET, a CLI surface, a serialised format, or a timing
+    measurement. Implement it as a **throwaway spike**, run the **FULL** suite, read the reds, *then*
+    scope. Adopted 2026-08-30 (RULING-219-11). **All four parts ship together or the rule is misapplied:**
+    - **The trigger question:** *could a test this task does not own be asserting the thing I am changing?*
+      **"I'd have to grep to know" is a YES.**
+    - **The caveat:** a spike measures **ONE implementation**. It converts *unknown* → *measured for one
+      specimen*, never *unknown* → *known*. **A worker taking a different route can still red on unowned
+      collateral, and that is still a PLAN defect, never a retry.**
+    - **The MEASURED cost: 518 s implement + 831 s suite = 1,348 s ≈ 22.5 min.** ⛔ ***"Far cheaper" is
+      WITHDRAWN.*** Run 3131 died at ~20 min, so **on the direct leg the two are EQUAL**; the spike wins
+      only on what it AVOIDS downstream — a halt, a sweep, a re-scope, five rulings, a second compile and
+      plan. ⚡ **Therefore it pays only where a late plan defect is EXPENSIVE TO UNWIND.** Where a defect
+      would surface and fix cheaply, **the spike is pure overhead: do not run it.** That the economics and
+      the trigger name the same class, derived independently — one from a stopwatch, one from a taxonomy —
+      is the best evidence this rule is real, and it is why neither half may be quoted without the other.
+    - **The sweep matrix, as the REASON a better sweep is not the remedy** (RULING-219-09): concept **2/3**,
+      symbol **1/3**, union **3/3 on files but only 2/3 on ACTIONABLE SIGNAL** — `gate-telemetry`'s single
+      symbol hit is an order-INSENSITIVE sorted comparison at `:54` that correct triage *discards*, while
+      the failing test at `:101` references it not at all. ⚠ **Rigorous triage makes that discard MORE
+      likely, not less.** The sweep does not fail from sloppiness, so it cannot be fixed with care.
+
+    **Corroboration from the same halt:** of 13 stale-order carriers, the **9** answered from real
+    execution were all proven; the only **2** labelled *"inspection, not execution"* were exactly the 2 the
+    suite never reached. **Evidence quality tracked execution coverage with no exceptions**, while every
+    sweep-based estimate — *"~15"*, *"13"*, *"union 3/3"* — was wrong, and one 512 s suite run gave the
+    right answer (**3**) first time.

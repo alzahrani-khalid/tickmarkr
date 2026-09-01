@@ -91,20 +91,58 @@ test("test: a criterion matching exactly one runner listed test name plans witho
   expect(doctorOutput).toMatch(/✓ acceptance-oracles\s+1\/1 resolved/);
 });
 
-test("test: plan refuses a graph whose task names a path the working tree holds and no commit holds, naming that path", async () => {
-  const repo = preflightRepo(["plain criterion"], ["src/local-only.ts"]);
-  mkdirSync(join(repo, "src"), { recursive: true });
-  writeFileSync(join(repo, "src/local-only.ts"), "export const local = true;\n");
+test("test: a graph whose test-oracle criterion matches no runner-listed test makes the doctor row report fail and name how many oracles resolved out of how many were audited; a row that reports pass whenever the listing itself succeeded fails", async () => {
+  const repo = preflightRepo([
+    { oracle: "test", test: "first oracle" },
+    { oracle: "test", test: "second oracle" },
+    { oracle: "test", test: "missing oracle" },
+  ]);
 
-  const output = await plan([], repo, [adapter]);
+  const output = await doctor(["--"], repo, [adapter], {
+    banner: false,
+    listTests: listed("test: first oracle", "test: second oracle"),
+  });
 
-  expect(output).toContain("pre-dispatch refusal");
-  expect(output).toContain('task path "src/local-only.ts" exists in the working tree but no commit holds it');
+  expect(output).toMatch(/✗ acceptance-oracles\s+2\/3 resolved/);
+  expect(output).not.toMatch(/✓ acceptance-oracles/);
 });
 
-test("test: plan accepts a graph whose task names a path absent from the working tree and from every commit, and warns without refusing when a tracked path's working copy differs", async () => {
-  const absentRepo = preflightRepo(["plain criterion"], ["src/future.ts"]);
-  const absent = await plan([], absentRepo, [adapter]);
+test("test: a runner listing that fails makes the doctor row report fail and carry the runner's own first error line; a row that treats an unavailable listing as nothing to audit reports pass on no evidence and fails", async () => {
+  const repo = preflightRepo([{ oracle: "test", test: "unavailable oracle" }]);
+  const output = await doctor(["--"], repo, [adapter], {
+    banner: false,
+    listTests: async () => ({ status: "failed", error: "runner unavailable\nsecondary detail" }),
+  });
+
+  expect(output).toMatch(/✗ acceptance-oracles\s+runner listing failed — runner unavailable/);
+  expect(output).not.toMatch(/✓ acceptance-oracles/);
+  expect(output).not.toContain("secondary detail");
+});
+
+test("test: a task naming a tracked path that is clean at HEAD produces no input finding at all, while the same path modified in the working tree produces exactly one finding of warn severity; a preflight that cannot separate those two outcomes cannot tell a legal input from a divergent one and fails", async () => {
+  const repo = preflightRepo(
+    ["plain criterion"],
+    ["src/tracked.ts"],
+    { "src/tracked.ts": "export const value = 1;\n" },
+  );
+
+  const clean = await plan([], repo, [adapter]);
+  writeFileSync(join(repo, "src/tracked.ts"), "export const value = 2;\n");
+  const dirty = await plan([], repo, [adapter]);
+
+  expect(clean).not.toContain("input warnings:");
+  expect(clean).not.toContain("pre-dispatch refusal");
+  expect(clean).not.toContain('tracked path "src/tracked.ts" differs from HEAD');
+  expect(dirty).not.toContain("pre-dispatch refusal");
+  expect(dirty.match(/input warnings:/g)).toHaveLength(1);
+  expect(dirty.match(/tracked path "src\/tracked\.ts" differs from HEAD/g)).toHaveLength(1);
+});
+
+test("test: a task naming an untracked path produces exactly one finding of refuse severity; the plan refuses on it; the warn case does not refuse; a preflight whose enumerated warn outcome shares refuse's behaviour fails", async () => {
+  const untrackedRepo = preflightRepo(["plain criterion"], ["src/local-only.ts"]);
+  mkdirSync(join(untrackedRepo, "src"), { recursive: true });
+  writeFileSync(join(untrackedRepo, "src/local-only.ts"), "export const local = true;\n");
+  const untracked = await plan([], untrackedRepo, [adapter]);
 
   const dirtyRepo = preflightRepo(
     ["plain criterion"],
@@ -114,10 +152,12 @@ test("test: plan accepts a graph whose task names a path absent from the working
   writeFileSync(join(dirtyRepo, "src/tracked.ts"), "export const value = 2;\n");
   const dirty = await plan([], dirtyRepo, [adapter]);
 
-  expect(absent).not.toContain("pre-dispatch refusal");
+  expect(untracked.match(/pre-dispatch refusal/g)).toHaveLength(1);
+  expect(untracked.match(/task path "src\/local-only\.ts" exists in the working tree but no commit holds it/g)).toHaveLength(1);
+  expect(untracked).not.toContain("input warnings:");
   expect(dirty).not.toContain("pre-dispatch refusal");
-  expect(dirty).toContain('tracked path "src/tracked.ts" differs from HEAD');
-  expect(dirty).toContain("git restore -- 'src/tracked.ts'");
+  expect(dirty.match(/input warnings:/g)).toHaveLength(1);
+  expect(dirty.match(/tracked path "src\/tracked\.ts" differs from HEAD/g)).toHaveLength(1);
 });
 
 test("test: a graph whose acceptance items are every one of them a plain string and whose tasks declare no files plans without refusal, so neither new refusal fires on the fixture corpus that predates them", async () => {

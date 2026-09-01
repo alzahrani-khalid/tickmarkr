@@ -866,6 +866,22 @@ acceptance is required on every task (a nested list of observable outcomes).
       A text sweep produces a candidate list; only running the change enumerates the real blocker set.
       Keep the candidates for scope, then execute the production path and full gates before declaring the
       set closed — this milestone paid a halted run to learn that the two populations are not identical.
+    - SPIKE-THE-CONTRACT-THEN-SCOPE trigger question: COULD A TEST THIS TASK DOES NOT OWN BE ASSERTING THE
+      THING I AM CHANGING? "I'D HAVE TO GREP TO KNOW" IS YES. This applies to observable contracts:
+      execution order, event-stream order, diagnostics/output sets, CLI surface, serialised formats, or
+      timing measurements. If yes, implement the change as a throwaway spike, run the full suite, read the
+      reds, THEN scope files[].
+    - Caveat: a spike measures ONE implementation. It converts unknown collateral into
+      measured-for-one-specimen collateral; it does NOT make its reds the closed blocker set for every
+      route. A worker taking a different route can still red on unowned collateral; that remains a PLAN
+      DEFECT, NEVER A RETRY.
+    - Measured price: 518 s implement + 831 s suite = 1,348 s ≈ 22.5 min. "Far cheaper than the alternative"
+      is WITHDRAWN on the direct leg: a direct failed run died at about 20 min, so on the direct leg the
+      two are EQUAL. The spike only pays when it avoids downstream halt, sweep, re-scope, rulings, and
+      another compile+plan.
+    - Do NOT run the spike for a change that is purely additive and unwinds cheaply. The rule is bounded by
+      the expense of a late defect, not by novelty; where the defect would surface and fix cheaply, the spike
+      is pure overhead.
 
   WHICH SIDE OF A RUN INHERITS ENVIRONMENT — AND IT DEPENDS ON THE DRIVER (OBS-542):
     - Gate commands and "command:"/"test:" oracles INHERIT THE DAEMON'S ENVIRONMENT. They are children of
