@@ -3,6 +3,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,8 +23,8 @@ import {
   unifiedYamlDiff,
 } from "../../src/config/config.js";
 import { JournalRowPanel } from "../../src/tui/cockpit/components.js";
-import { approve } from "../../src/cli/commands/approve.js";
-import { Journal } from "../../src/run/journal.js";
+import { approvalRunOwner, approve, type ApprovalRunOwner } from "../../src/cli/commands/approve.js";
+import { Journal, PARK_KINDS } from "../../src/run/journal.js";
 import {
   applySetupDecisionsKey,
   deriveParkedDecisions,
@@ -33,6 +34,8 @@ import {
   recordSetupDecisionOutcome,
   SetupCockpitFrame,
   SetupDecisionsSurface,
+  setupDecisionConfirmLines,
+  setupDecisionVerbs,
   type ParkedDecision,
   type SetupDecisionCommand,
 } from "../../src/tui/cockpit/setup-cockpit.js";
@@ -580,11 +583,15 @@ function journalEvents(journalPath: string): {
     .map((line) => JSON.parse(line));
 }
 
+/** A run nobody is running: the finished-run branch, where resume IS the enactment. */
+const FINISHED_RUN: ApprovalRunOwner = { runId: "run-decisions", live: false };
+
 async function drawDecisions(
   decisions: readonly ParkedDecision[],
   session = initialSetupDecisionsSession(),
   columns = 140,
   journalFile = ".tickmarkr/runs/run-decisions/journal.jsonl",
+  run: ApprovalRunOwner = FINISHED_RUN,
 ): Promise<string> {
   return renderComponent(createElement(SetupDecisionsSurface, {
     decisions,
@@ -592,6 +599,7 @@ async function drawDecisions(
     columns,
     actor: "operator",
     journalFile,
+    run,
   }), columns);
 }
 
@@ -616,7 +624,7 @@ describe("setup tab decisions surface", () => {
     expect(frame).not.toContain("T3 ·");
     // a surface that can write advertises only what it has: both verbs, named
     // (the selected row is T1, a review park, where uphold exists)
-    expect(frame).toContain("a Approve · u Uphold");
+    expect(frame).toContain("w Waive · u Uphold · r Recheck");
 
     // On a park whose last failed gate is not review the command must refuse
     // uphold, so the verb leaves the keybar and the key is inert.
@@ -629,6 +637,7 @@ describe("setup tab decisions surface", () => {
     expect(decisions[1]!.failedGate).toBeUndefined();
     const movedFrame = await drawDecisions(decisions, moved.session);
     expect(movedFrame).toContain("a Approve");
+    expect(movedFrame).not.toContain("Waive");
     expect(movedFrame).not.toContain("Uphold");
     const upheld = applySetupDecisionsKey(moved.session, { input: "u", key: {} }, decisions);
     expect(upheld.session.confirming).toBeNull();
@@ -669,7 +678,7 @@ describe("setup tab decisions surface", () => {
     expect((await drawDecisions(zwjDecisions, initialSetupDecisionsSession(), 120)).includes(zwjTask)).toBe(true);
   });
 
-  test("test: the approve key on a parked row opens a confirm inset naming the task, the actor, the file and the effect, and the journal file stays byte-identical until the confirm key", async () => {
+  test("test: the waive key on a gate-fail parked row opens a confirm inset naming the task, the actor, the file and the effect, and the journal file stays byte-identical until the confirm key", async () => {
     const { root, journalPath } = decisionsRepo("run-decisions-confirm");
     parkOnReview(Journal.create(root, "run-decisions-confirm"), "T4");
     const journalFile = ".tickmarkr/runs/run-decisions-confirm/journal.jsonl";
@@ -678,23 +687,23 @@ describe("setup tab decisions surface", () => {
     const before = readFileSync(journalPath, "utf8");
     const opened = applySetupDecisionsKey(
       initialSetupDecisionsSession(),
-      { input: "a", key: {} },
+      { input: "w", key: {} },
       decisions,
     );
     expect(opened.command).toBeUndefined();
-    expect(opened.session.confirming).toEqual({ verb: "approve", taskId: "T4" });
+    expect(opened.session.confirming).toEqual({ verb: "waive", taskId: "T4" });
 
     const frame = await drawDecisions(decisions, opened.session, 140, journalFile);
-    expect(frame).toContain("CONFIRM APPROVE");
+    expect(frame).toContain("CONFIRM WAIVE");
     expect(frame).toContain("task   T4");
     expect(frame).toContain("actor  operator");
     expect(frame).toContain(`file   ${journalFile}`);
-    expect(frame).toContain("y approve · n cancel");
+    expect(frame).toContain("y waive · n cancel");
     expect(readFileSync(journalPath, "utf8")).toBe(before);
 
     // Even the confirm key itself only names the write; nothing touches the file.
     const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
-    expect(confirmed.command).toEqual({ verb: "approve", taskId: "T4" });
+    expect(confirmed.command).toEqual({ verb: "waive", taskId: "T4" });
     expect(confirmed.session.confirming).toBeNull();
     expect(readFileSync(journalPath, "utf8")).toBe(before);
 
@@ -714,7 +723,7 @@ describe("setup tab decisions surface", () => {
     expect(recorded!.data.release).toBe("gate-satisfied");
     expect(recorded!.data.gate).toBe("review");
     expect(frame).toContain(
-      `effect appends one task-approved event with release ${String(recorded!.data.release)}`
+      `effect disposition waive-gate; appends release ${String(recorded!.data.release)}`
         + ` for gate ${String(recorded!.data.gate)}`,
     );
     expect(frame).toContain(`it marks gate ${String(recorded!.data.gate)} satisfied`);
@@ -728,7 +737,7 @@ describe("setup tab decisions surface", () => {
     const decisions = deriveParkedDecisions(Journal.open(root, "run-decisions-approve"));
     const opened = applySetupDecisionsKey(
       initialSetupDecisionsSession(),
-      { input: "a", key: {} },
+      { input: "w", key: {} },
       decisions,
     );
     const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
@@ -743,15 +752,18 @@ describe("setup tab decisions surface", () => {
     expect(approvals).toHaveLength(1);
     expect(approvals[0]!.data.release).toBe("gate-satisfied");
     expect(approvals[0]!.data.by).toBe("operator");
-    if (outcome.ok) expect(outcome.write.release).toBe("gate-satisfied");
+    if (outcome.ok) {
+      expect(outcome.write.release).toBe("gate-satisfied");
+      expect(outcome.write.disposition).toBe("waive-gate");
+    }
 
     const written = recordSetupDecisionOutcome(initialSetupDecisionsSession(), outcome);
-    const writtenFrame = await drawDecisions(decisions, written, 140, journalFile);
+    const writtenFrame = await drawDecisions(decisions, written, 240, journalFile);
     if (outcome.ok) expect(writtenFrame).toContain(outcome.message);
 
     // the second approve is refused by the production command; the surface draws
     // the command's own string, exactly
-    const expected = await approve(["run-decisions-approve", "T4", "--by", "operator"], root)
+    const expected = await approve(["run-decisions-approve", "T4", "--waive", "--by", "operator"], root)
       .then(
         () => {
           throw new Error("expected the command to refuse");
@@ -762,7 +774,7 @@ describe("setup tab decisions surface", () => {
     expect(refusal.ok).toBe(false);
     if (!refusal.ok) expect(refusal.refusal).toBe(expected);
     const refused = recordSetupDecisionOutcome(written, refusal);
-    const refusedFrame = await drawDecisions(decisions, refused, 140, journalFile);
+    const refusedFrame = await drawDecisions(decisions, refused, 240, journalFile);
     expect(refusedFrame).toContain(expected);
     // the refusal appended nothing
     expect(
@@ -807,7 +819,7 @@ describe("setup tab decisions surface", () => {
     expect(session.writes).toHaveLength(1);
     const frame = await drawDecisions(decisions, session, 140, journalFile);
     expect(frame).toContain("PENDING WRITES");
-    expect(frame).toContain("uphold T7 · release review-upheld · by operator");
+    expect(frame).toContain("uphold T7 · disposition fund-fixed-attempt · release review-upheld · by operator");
     expect(frame).not.toContain("nothing written this session");
   });
 
@@ -822,8 +834,8 @@ describe("setup tab decisions surface", () => {
 
     const quietFrame = await drawDecisions(none);
     expect(quietFrame).toContain("nothing needs you now — no task is parked on a human gate");
-    expect(quietFrame).toContain("approve releases it");
-    expect(quietFrame).toContain("uphold sides with the reviewer");
+    expect(quietFrame).toContain("approve dispatches");
+    expect(quietFrame).toContain("waive accepts a gate");
 
     // "no ACTIONABLE park" is the trigger, not "no park": a journal holding
     // only tombstone parks is still a surface nothing needs the operator for.
@@ -839,8 +851,8 @@ describe("setup tab decisions surface", () => {
     expect(onlyTombstones.map((decision) => decision.tombstone)).toEqual([true]);
     const tombstoneFrame = await drawDecisions(onlyTombstones);
     expect(tombstoneFrame).toContain("nothing needs you now — no task is parked on a human gate");
-    expect(tombstoneFrame).toContain("approve releases it");
-    expect(tombstoneFrame).toContain("uphold sides with the reviewer");
+    expect(tombstoneFrame).toContain("approve dispatches");
+    expect(tombstoneFrame).toContain("waive accepts a gate");
 
     // an actionable park displaces the empty state rather than joining it
     const parked = Journal.create(root, "run-decisions-quiet-parked");
@@ -880,7 +892,7 @@ describe("setup tab decisions surface", () => {
     // the pointer and both verbs belong to the actionable park instead
     const actionableRow = frame.split("\n").find((line) => line.includes("T14 ·"))!;
     expect(actionableRow).toContain(GLYPHS.pointer);
-    expect(frame).toContain("a Approve · u Uphold");
+    expect(frame).toContain("w Waive · u Uphold · r Recheck");
 
     // no key reaches the tombstone: the pointer cannot move onto it, and the
     // verbs name the actionable park no matter how far the pointer is pushed
@@ -893,7 +905,7 @@ describe("setup tab decisions surface", () => {
       ).session;
     }
     const before = readFileSync(journalPath, "utf8");
-    for (const verb of ["a", "u"] as const) {
+    for (const verb of ["w", "u", "r"] as const) {
       const named = applySetupDecisionsKey(session, { input: verb, key: {} }, decisions);
       expect(named.session.confirming?.taskId).toBe("T14");
       const confirmed = applySetupDecisionsKey(
@@ -908,7 +920,7 @@ describe("setup tab decisions surface", () => {
     // and the production command agrees: it refuses the tombstone's id outright
     await expect(
       approve(["run-decisions-tombstone", "T13", "--uphold", "--by", "operator"], root),
-    ).rejects.toThrow(/--uphold applies to a review rejection/);
+    ).rejects.toThrow(/--uphold applies to a review gate-fail park/);
   });
 
   test("test: cancelling the confirm leaves the journal byte-identical, asserted on the file", async () => {
@@ -919,7 +931,7 @@ describe("setup tab decisions surface", () => {
     const before = readFileSync(journalPath, "utf8");
     const opened = applySetupDecisionsKey(
       initialSetupDecisionsSession(),
-      { input: "a", key: {} },
+      { input: "w", key: {} },
       decisions,
     );
     expect(opened.session.confirming).not.toBeNull();
@@ -934,6 +946,165 @@ describe("setup tab decisions surface", () => {
     expect(escaped.command).toBeUndefined();
     expect(escaped.session.confirming).toBeNull();
     expect(readFileSync(journalPath, "utf8")).toBe(before);
+  });
+
+  test("test: the cockpit keeps the closed verb set approve waive uphold and recheck and executeSetupDecision maps them respectively to no decision flag --waive --uphold and --recheck so a non-review gate-fail park offers waive and recheck, a review gate-fail park additionally offers uphold, and every non-tombstone park of every other kind in the daemon's closed park-kind set offers approve and keeps one confirmable decision whose execution appends one task-approved event, while an implementation that offers any verb on a human-gate park whose reason marks it a tombstone, deletes uphold, or routes any gate-fail key through flag-free approve fails", async () => {
+    const { root } = decisionsRepo("run-cockpit-verbs");
+    const journal = Journal.create(root, "run-cockpit-verbs");
+    journal.append("gate-result", "gate-scope", { gate: "scope", pass: false, details: "scope" });
+    journal.append("task-human", "gate-scope", { kind: "gate-fail", reason: "scope" });
+    parkOnReview(journal, "gate-review");
+    journal.append("task-human", "tomb", { kind: "human-gate", reason: "tombstone, never dispatched" });
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail")) {
+      journal.append("task-human", `park-${kind}`, { kind, reason: `park ${kind}` });
+    }
+    const decisions = deriveParkedDecisions(Journal.open(root, "run-cockpit-verbs"));
+    expect(new Set(decisions.flatMap((decision) => setupDecisionVerbs(decision)))).toEqual(new Set(["approve", "waive", "uphold", "recheck"]));
+    expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === "gate-scope")!)).toEqual(["waive", "recheck"]);
+    expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === "gate-review")!)).toEqual(["waive", "uphold", "recheck"]);
+    expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === "tomb")!)).toEqual([]);
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail")) {
+      expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === `park-${kind}`)!)).toEqual(["approve"]);
+    }
+
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail")) {
+      const taskId = `park-${kind}`;
+      const selection = decisions.filter((decision) => !decision.tombstone).findIndex((decision) => decision.taskId === taskId);
+      const opened = applySetupDecisionsKey({ ...initialSetupDecisionsSession(), selection }, { input: "a", key: {} }, decisions);
+      expect(opened.session.confirming).toEqual({ verb: "approve", taskId });
+      const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
+      expect(confirmed.command).toEqual({ verb: "approve", taskId });
+      const outcome = await executeSetupDecision(confirmed.command!, { cwd: root, runId: "run-cockpit-verbs", by: "operator" });
+      expect(outcome.ok).toBe(true);
+      const approvals = journal.read().filter((event) => event.event === "task-approved" && event.taskId === taskId);
+      expect(approvals).toHaveLength(1);
+      expect(approvals[0]!.data.release).toBe(kind === "attempt-cap" ? "attempt-cap" : undefined);
+      if (outcome.ok) expect(outcome.write.disposition).toBe(kind === "attempt-cap" ? "fresh-budget" : "dispatch");
+    }
+
+    const mapRun = "run-cockpit-verb-map";
+    const mapJournal = Journal.create(root, mapRun);
+    mapJournal.append("task-human", "approve", { kind: "human-gate", reason: "go" });
+    mapJournal.append("gate-result", "waive", { gate: "scope", pass: false, details: "red" });
+    mapJournal.append("task-human", "waive", { kind: "gate-fail", reason: "red" });
+    mapJournal.append("gate-result", "uphold", { gate: "review", pass: false, details: "red" });
+    mapJournal.append("task-human", "uphold", { kind: "gate-fail", reason: "red" });
+    mapJournal.append("gate-result", "recheck", { gate: "scope", pass: false, details: "red" });
+    mapJournal.append("task-human", "recheck", { kind: "gate-fail", reason: "red" });
+    const commands = [
+      { verb: "approve" as const, taskId: "approve", release: undefined },
+      { verb: "waive" as const, taskId: "waive", release: "gate-satisfied" },
+      { verb: "uphold" as const, taskId: "uphold", release: "review-upheld" },
+      { verb: "recheck" as const, taskId: "recheck", release: "recheck" },
+    ];
+    for (const command of commands) {
+      const outcome = await executeSetupDecision(command, { cwd: root, runId: mapRun, by: "operator" });
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) expect(outcome.write.release).toBe(command.release);
+    }
+    expect(mapJournal.read().filter((event) => event.event === "task-approved")).toHaveLength(commands.length);
+  });
+
+  test("test: every confirmable park-and-verb pair displays the exact disposition its confirmed command appends — approve on attempt-cap fresh-budget, approve on every other non-gate-fail kind dispatch, waive waive-gate, recheck re-dispatch and uphold fund-fixed-attempt — and executing that confirmation returns the same token, while an allowed but wrong token or a verb-only inset fails", async () => {
+    const { root } = decisionsRepo("run-cockpit-dispositions");
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "attempt-cap")) {
+      const lines = setupDecisionConfirmLines({ verb: "approve", taskId: `x-${kind}` }, { taskId: `x-${kind}`, kind, parkedAt: "00:00:00", attempts: 0, tombstone: false }, "op", "journal", FINISHED_RUN);
+      expect(lines.join("\n")).toContain("disposition dispatch");
+    }
+    expect(setupDecisionConfirmLines({ verb: "approve", taskId: "cap" }, { taskId: "cap", kind: "attempt-cap", parkedAt: "00:00:00", attempts: 0, tombstone: false }, "op", "journal", FINISHED_RUN).join("\n"))
+      .toContain("disposition fresh-budget");
+    expect(setupDecisionConfirmLines({ verb: "waive", taskId: "waive" }, { taskId: "waive", kind: "gate-fail", failedGate: "scope", parkedAt: "00:00:00", attempts: 0, tombstone: false }, "op", "journal", FINISHED_RUN).join("\n"))
+      .toContain("disposition waive-gate");
+    expect(setupDecisionConfirmLines({ verb: "recheck", taskId: "recheck" }, { taskId: "recheck", kind: "gate-fail", failedGate: "scope", parkedAt: "00:00:00", attempts: 0, tombstone: false }, "op", "journal", FINISHED_RUN).join("\n"))
+      .toContain("disposition re-dispatch");
+    expect(setupDecisionConfirmLines({ verb: "uphold", taskId: "uphold" }, { taskId: "uphold", kind: "gate-fail", failedGate: "review", parkedAt: "00:00:00", attempts: 0, tombstone: false }, "op", "journal", FINISHED_RUN).join("\n"))
+      .toContain("disposition fund-fixed-attempt");
+
+    const runId = "run-cockpit-dispositions";
+    const journal = Journal.create(root, runId);
+    journal.append("task-human", "approve", { kind: "human-gate", reason: "go" });
+    journal.append("task-human", "cap", { kind: "attempt-cap", reason: "cap" });
+    for (const [taskId, gate] of [["waive", "scope"], ["recheck", "scope"], ["uphold", "review"]] as const) {
+      journal.append("gate-result", taskId, { gate, pass: false, details: "red" });
+      journal.append("task-human", taskId, { kind: "gate-fail", reason: "red" });
+    }
+    const cases = [
+      { verb: "approve" as const, taskId: "approve", disposition: "dispatch" },
+      { verb: "approve" as const, taskId: "cap", disposition: "fresh-budget" },
+      { verb: "waive" as const, taskId: "waive", disposition: "waive-gate" },
+      { verb: "recheck" as const, taskId: "recheck", disposition: "re-dispatch" },
+      { verb: "uphold" as const, taskId: "uphold", disposition: "fund-fixed-attempt" },
+    ];
+    for (const command of cases) {
+      const outcome = await executeSetupDecision(command, { cwd: root, runId, by: "operator" });
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) expect(outcome.write.disposition).toBe(command.disposition);
+    }
+  });
+
+  // The inset predicts an effect BEFORE the write, so it carries the same obligation the command's
+  // own message does: a live daemon sweeps this approval at its next task boundary, and sending that
+  // operator to `tickmarkr resume` would prescribe a second run in this repository — forbidden — for
+  // work already scheduled. Liveness is read through approve.ts's own helper, never a second copy.
+  test("the confirm inset names the live daemon's next task boundary while this run's lock owner is alive, and names the resume command only once no live owner holds it, over every confirmable verb", async () => {
+    const runId = "run-cockpit-enactment";
+    const { root } = decisionsRepo(runId);
+    const journal = Journal.create(root, runId);
+    journal.append("task-human", "approve", { kind: "human-gate", reason: "go" });
+    journal.append("task-human", "cap", { kind: "attempt-cap", reason: "cap" });
+    for (const [taskId, gate] of [["waive", "scope"], ["recheck", "scope"], ["uphold", "review"]] as const) {
+      journal.append("gate-result", taskId, { gate, pass: false, details: "red" });
+      journal.append("task-human", taskId, { kind: "gate-fail", reason: "red" });
+    }
+    const decisions = deriveParkedDecisions(Journal.open(root, runId));
+    const commands = [
+      { verb: "approve" as const, taskId: "approve", enacts: "dispatch it" },
+      { verb: "approve" as const, taskId: "cap", enacts: "dispatch it on a fresh attempt budget" },
+      { verb: "waive" as const, taskId: "waive", enacts: "continue past the approved gate" },
+      { verb: "recheck" as const, taskId: "recheck", enacts: "re-dispatch against the full gate suite" },
+      { verb: "uphold" as const, taskId: "uphold", enacts: "dispatch a fixed attempt carrying the findings" },
+    ];
+    const linesFor = (command: SetupDecisionCommand, run: ApprovalRunOwner): string =>
+      setupDecisionConfirmLines(
+        command,
+        decisions.find((decision) => decision.taskId === command.taskId),
+        "op",
+        "journal",
+        run,
+      ).join("\n");
+
+    // LIVE: this process is the run's recorded lock owner, so the boundary sweep is the enactment
+    const lock = join(root, ".tickmarkr", "graph.lock");
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, runId, startedAt: Date.now() }));
+    const live = approvalRunOwner(root, runId);
+    expect(live).toEqual({ runId, live: true });
+    for (const command of commands) {
+      const text = linesFor(command, live);
+      expect(text).toContain(`the live daemon enacts this at its next task boundary — it will ${command.enacts}`);
+      expect(text).not.toContain("resume");
+    }
+    // the surface draws the owner it is handed rather than a built-in assumption
+    const confirming = { ...initialSetupDecisionsSession(), confirming: { verb: "approve" as const, taskId: "approve" } };
+    const liveFrame = await drawDecisions(decisions, confirming, 240, "journal", live);
+    expect(liveFrame).toContain("enacts this at its next task boundary");
+    expect(liveFrame).not.toContain("resume");
+
+    // FINISHED: no live owner, so resume IS the enactment and the inset says so, with the run id
+    rmSync(lock);
+    const finished = approvalRunOwner(root, runId);
+    expect(finished).toEqual({ runId, live: false });
+    for (const command of commands) {
+      const text = linesFor(command, finished);
+      expect(text).toContain(`run \`tickmarkr resume ${runId}\` to ${command.enacts}`);
+      expect(text).not.toContain("next task boundary");
+    }
+    expect(await drawDecisions(decisions, confirming, 240, "journal", finished))
+      .toContain(`tickmarkr resume ${runId}`);
+
+    // a LIVE daemon running a DIFFERENT run holds the same repository-wide lock and sweeps nothing
+    // here — it is not this run's enactor, and the inset must not name it as one
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, runId: "run-some-other", startedAt: Date.now() }));
+    expect(approvalRunOwner(root, runId)).toEqual({ runId, live: false });
   });
 });
 

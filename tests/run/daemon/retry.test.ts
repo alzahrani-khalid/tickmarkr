@@ -14,7 +14,7 @@ import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../.
 import { validateGraph } from "../../../src/graph/schema.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../../src/run/git.js";
-import { activeRetryBan, deferredReviewFindings, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
+import { activeRetryBan, deferredReviewFindings, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingConsultGuidance, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
 import { COMMIT, authedModels, setupRepo, T } from "../../helpers/tmprepo.js";
 
 
@@ -1773,6 +1773,69 @@ const FINDING = "`applyMarker` in src/mark.ts writes the wrong column";
 const evsOf = (repo: string, runId: string) => Journal.open(repo, runId).read();
 const promptPath = (repo: string, runId: string, attempt: number) =>
   join(tickmarkrDir(repo), "runs", runId, "prompts", `T1-a${attempt}.md`);
+
+test("test: a revival holding both an upheld review and consult guidance carries both briefs each exactly once while a carry that swaps or duplicates either brief fails", async () => {
+  const runId = "run-consult-upheld-carry";
+  const consultGuidance = "Re-run from the amended task definition.\nKeep the reviewer fix in place.";
+  const consultReason = "the parked task needs the amended scope and the upheld fix";
+  const consultNotes = "RAW CONSULT NOTES: do not paste this prose into the worker brief";
+  const reviewDetails = `reviewer fake:fake-2 (fake-b): requested changes (1 material)\n- [material] ${FINDING}`;
+  const { repo, fake } = setupRepo(
+    [T("T1")],
+    {
+      tasks: {
+        T1: [{ shell: `mkdir -p src && echo fixed > src/mark.ts && ${COMMIT} fixed`, result: { ok: true, summary: "fixed" } }],
+      },
+    },
+  );
+  const j = Journal.create(repo, runId);
+  j.append("run-start", undefined, {
+    baseRef: await gitHead(repo),
+    commands: {},
+    graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
+  });
+  writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+  j.append("gate-result", "T1", {
+    gate: "review",
+    pass: false,
+    details: reviewDetails,
+    findings: structuredFindings("review", reviewDetails),
+  });
+  j.append("task-approved", "T1", { by: "op", release: REVIEW_UPHELD_RELEASE, gate: "review" });
+  j.append("consult-verdict", "T1", {
+    action: "human",
+    reason: consultReason,
+    guidance: consultGuidance,
+    notes: consultNotes,
+  });
+  j.append("task-human", "T1", { kind: "gate-fail", reason: "parked after consult" });
+
+  const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  expect(summary.done).toEqual(["T1"]);
+  const evs = evsOf(repo, runId);
+  const dispatch = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").at(-1)!;
+  expect(dispatch.data.carriedConsultGuidance).toEqual({
+    action: "human",
+    reason: consultReason,
+    guidance: consultGuidance,
+  });
+  expect((dispatch.data.carriedFindings as StructuredFinding[]).map((f) => f.note)).toEqual([FINDING]);
+  expect(outstandingConsultGuidance(evs.slice(0, evs.indexOf(dispatch)), "T1")).toEqual({
+    action: "human",
+    reason: consultReason,
+    guidance: consultGuidance,
+  });
+
+  const prompt = readFileSync(promptPath(repo, runId, dispatch.data.attempt as number), "utf8");
+  const count = (needle: string) => prompt.split(needle).length - 1;
+  expect(count("The operator UPHELD the reviewer's findings")).toBe(1);
+  expect(count(FINDING)).toBe(1);
+  expect(count("- Action: human")).toBe(1);
+  expect(count(`- Reason: ${consultReason}`)).toBe(1);
+  expect(count("- Re-run from the amended task definition.")).toBe(1);
+  expect(count("- Keep the reviewer fix in place.")).toBe(1);
+  expect(prompt).not.toContain(consultNotes);
+}, 120_000);
 
 describe("T6 outstanding review findings (fake adapter, zero tokens)", () => {
   const runId = "run-outstanding-finding";

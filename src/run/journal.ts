@@ -201,6 +201,49 @@ export interface StructuredFinding {
   fingerprint: string;
 }
 
+const CONSULT_ACTIONS = ["retry", "reroute", "decompose", "human"] as const;
+export type ConsultGuidanceAction = (typeof CONSULT_ACTIONS)[number];
+
+export interface ConsultGuidanceCarry {
+  action: ConsultGuidanceAction;
+  reason?: string;
+  guidance?: string;
+}
+
+const consultAction = (action: unknown): ConsultGuidanceAction | undefined =>
+  typeof action === "string" && (CONSULT_ACTIONS as readonly string[]).includes(action)
+    ? action as ConsultGuidanceAction
+    : undefined;
+
+/**
+ * The newest structured consult prescription still open for this task. A consult park is only a
+ * pause: graph-changed revival can dispatch a fresh worker without a live `applyVerdict()` frame, so
+ * prompt-build re-derives the worker-facing bullets from the journal. Notes are deliberately excluded:
+ * they are audit prose, and OBS-37a says workers get only structured reason/guidance rendered by
+ * `renderRetryGuidance()`.
+ */
+export function outstandingConsultGuidance(events: JournalEvent[], taskId: string): ConsultGuidanceCarry | undefined {
+  let carry: ConsultGuidanceCarry | undefined;
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "consult-verdict") {
+      const action = consultAction(e.data.action);
+      const reason = typeof e.data.reason === "string" && e.data.reason.trim() ? e.data.reason : undefined;
+      const guidance = typeof e.data.guidance === "string" && e.data.guidance.trim() ? e.data.guidance : undefined;
+      carry = action && (reason || guidance)
+        ? {
+            action,
+            ...(reason ? { reason } : {}),
+            ...(guidance ? { guidance } : {}),
+          }
+        : undefined;
+    } else if (e.event === "task-done" || e.event === "merge") {
+      carry = undefined;
+    }
+  }
+  return carry;
+}
+
 // Reserved for a finding whose OWN evidence names no path. Reporting a blank path a reader would take
 // for a resolved one is the silent-lie shape the gates exist to refuse, so the field says so outright.
 export const UNIDENTIFIED = "<unidentified>";
@@ -1479,15 +1522,26 @@ export class Journal {
     return m;
   }
 
-  // OBS-130: gate satisfaction is authority, not an inferred daemon state. Only an explicit
-  // task-approved event with the typed release marker and a known gate enters this fold. A daemon-made
-  // gate-satisfied event, a prior pass/fail result, malformed data, or another task's approval is inert.
+  // OBS-130/OBS-571: gate satisfaction is authority, not an inferred daemon state. Only an explicit
+  // task-approved event with the typed release marker and a known gate enters this fold. Authority is
+  // scoped to that approval: any later approval supersedes it, and the worktree-recreation row written
+  // before the approved gate suffix runs consumes it at enactment. A daemon-made gate-satisfied event,
+  // a prior pass/fail result, malformed data, or another task's approval is inert.
   replaySatisfiedGates(): Map<string, GateName> {
     const satisfied = new Map<string, GateName>();
     for (const e of this.read()) {
-      if (e.event !== "task-approved" || !e.taskId || e.data.release !== GATE_SATISFIED_RELEASE) continue;
-      if (typeof e.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(e.data.gate)) {
-        satisfied.set(e.taskId, e.data.gate as GateName);
+      if (!e.taskId) continue;
+      if (e.event === "worktree-recreation") {
+        satisfied.delete(e.taskId);
+        continue;
+      }
+      if (e.event === "task-approved") {
+        satisfied.delete(e.taskId);
+        if (e.data.release === GATE_SATISFIED_RELEASE
+            && typeof e.data.gate === "string"
+            && (GATE_NAMES as readonly string[]).includes(e.data.gate)) {
+          satisfied.set(e.taskId, e.data.gate as GateName);
+        }
       }
     }
     return satisfied;

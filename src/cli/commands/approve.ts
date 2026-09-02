@@ -1,9 +1,36 @@
 import { userInfo } from "node:os";
 import { GATE_NAMES } from "../../graph/schema.js";
 import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE } from "../../run/journal.js";
+
+export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
+export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
+
+/**
+ * What each disposition's release actually buys — the clause every operator-facing sentence about
+ * this approval ends on. One table, because two surfaces say it: this command's own message, and the
+ * setup cockpit's pre-write confirm inset, which predicts the effect BEFORE the write. A prediction
+ * that can drift from the write is worth less than none, so neither surface writes the phrase itself.
+ */
+export const APPROVAL_ENACTS: Record<ApprovalDisposition, string> = {
+  dispatch: "dispatch it",
+  "waive-gate": "continue past the approved gate",
+  "re-dispatch": "re-dispatch against the full gate suite",
+  "fund-fixed-attempt": "dispatch a fixed attempt carrying the findings",
+  "fresh-budget": "dispatch it on a fresh attempt budget",
+};
+
+export function approvalDispositionForRelease(release: unknown): ApprovalDisposition {
+  if (release === GATE_SATISFIED_RELEASE) return "waive-gate";
+  if (release === RECHECK_RELEASE) return "re-dispatch";
+  if (release === REVIEW_UPHELD_RELEASE) return "fund-fixed-attempt";
+  if (release === ATTEMPT_CAP_RELEASE) return "fresh-budget";
+  return "dispatch";
+}
 import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
 
-// GATE-08 (v1.12): approve a parked human gate so the next `tickmarkr resume <runId>` dispatches it.
+// GATE-08 (v1.12): approve a parked human gate so the run dispatches it — the live daemon owning this
+// run enacts the release at its next task boundary (v2.2 T3), and only a run with no live owner waits
+// for the next `tickmarkr resume <runId>`.
 //
 // The approval is a JOURNAL EVENT (task-approved) carrying who and when — it touches ONLY the
 // append-only journal. Writing it into tickmarkr's compiled graph artifact would be silently erased by
@@ -20,27 +47,61 @@ import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
 //
 // Who/when is truthful, not dressed-up auth (D-03): default actor os.userInfo().username; --by overrides
 // for delegated approval; optional --reason; the event's ts (stamped by Journal.append) is the when.
-// OBS-189: `--uphold` is the second decision a review park offers. Plain approve accepts the diff the
-// reviewer rejected (gate-satisfied); --uphold sides WITH the reviewer and funds ONE fixed worker
-// attempt carrying the findings — the park costs an attempt, never the run.
+// OBS-189/OBS-567: gate-fail parks require a named decision. `--waive` accepts the rejected
+// diff (gate-satisfied); plain approve refuses instead of silently waiving; `--uphold` sides WITH
+// the reviewer and funds ONE fixed worker attempt carrying the findings — the park costs an attempt,
+// never the run.
 //
-// T14: the runtime ACCEPTS an approval against a live daemon exactly as against a finished run —
-// daemon.ts builds its approved set once at startup and never re-reads it (deliberate: replay
-// determinism). So the accepted decision may be inert for that run, and until now the only disclosure
-// was a "run resume" suggestion inside this string, restated nowhere afterwards. The run lock already
-// records the owning pid, so the answer is available and was simply not consulted: every approval now
-// closes on a DISPOSITION drawn from a two-token vocabulary printed in a JSON status line, and the
-// run's completion record names every approval that never reached a dispatch. Liveness comes from
-// lock.ts's runLockOwner — the same
-// inspect() the acquire/unlock decision table uses, never a second `process.kill(pid, 0)` here, and
-// never the lock FILE's presence (a stale lock whose recorded pid is dead is not a live run).
+// T14, amended by v2.2 T3: the runtime ACCEPTS an approval against a live daemon exactly as against a
+// finished run, and the live daemon now SWEEPS accepted approvals at every task boundary — so the
+// owner of this run enacts the decision itself, and the approval is no longer inert for that run.
+// Every approval still closes on a DISPOSITION drawn from the five-token vocabulary printed in a JSON
+// status line — `deferred-live` keeps its established machine token, and only its TEXT changes — but
+// the ENACTMENT half of each message is now chosen from the run lock: a live owner is told the boundary
+// sweep will act, and `tickmarkr resume <runId>` is printed ONLY when this run has no live owner. Telling the operator of a live run to resume would prescribe a second run in the same
+// repository — the invariant forbids it, and it would contend for the live daemon's graph.lock over an
+// approval that has already dispatched. What a boundary sweep still cannot enact is an approval that
+// lands after the last boundary (during tip verify): the run's completion record names that one, and
+// every other approval that never reached a dispatch, as `approvalDisposition: "outstanding"`.
+// Liveness and the enactment sentence are both stated once, below (ownedByLiveDaemon /
+// approvalEnactment), because the setup cockpit predicts the same effect before writing and a
+// prediction free to drift from the write is worth less than none.
 //
 export type ApprovalStatus = "deferred-live" | "recorded-no-owner";
 
+/** Which run, and whether a LIVE daemon owns THAT run — the two facts an enactment sentence needs. */
+export interface ApprovalRunOwner { runId: string; live: boolean }
+
+// THE liveness rule, written once. The lock is REPOSITORY-wide, so a live owner of some OTHER run is
+// not an owner of this one and sweeps none of its approvals — claiming otherwise is the same
+// falsehood in a new shape. Liveness itself comes from lock.ts's runLockOwner (the same inspect() the
+// acquire/unlock decision table uses), never a second `process.kill(pid, 0)`, and never the lock
+// FILE's presence: a stale lock whose recorded pid is dead is not a live run.
+const ownedByLiveDaemon = (owner: ReturnType<typeof runLockOwner>, runId: string): ApprovalRunOwner =>
+  ({ runId, live: owner?.live === true && owner.runId === runId });
+
+/** The same read `approve` performs, for surfaces that must predict an enactment before writing. */
+export function approvalRunOwner(cwd: string, runId: string): ApprovalRunOwner {
+  return ownedByLiveDaemon(runLockOwner(cwd), runId);
+}
+
+/**
+ * The one sentence that says who enacts this release and what it buys. A live owner's approval is
+ * already scheduled — it rides that daemon's next task boundary — so it must NOT be told to resume:
+ * a second run in the same repository is forbidden, and it would contend for the live daemon's
+ * graph.lock over an approval that has already dispatched.
+ */
+export function approvalEnactment(token: ApprovalDisposition, run: ApprovalRunOwner): string {
+  return run.live
+    ? `the live daemon enacts this at its next task boundary — it will ${APPROVAL_ENACTS[token]}`
+    : `run \`tickmarkr resume ${run.runId}\` to ${APPROVAL_ENACTS[token]}`;
+}
+
 /** The production command registered in COMMANDS; its returned bytes are what the CLI prints. */
 export async function approve(argv: string[], cwd = process.cwd()): Promise<string> {
-  const { runId, taskId, by, reason, uphold, recheck, reviewRoundCeiling } = parseArgs(argv);
-  if (uphold && recheck) throw new Error("--uphold and --recheck are different decisions — pass one");
+  const { runId, taskId, by, reason, waive, uphold, recheck, reviewRoundCeiling } = parseArgs(argv);
+  const decisions = [waive, uphold, recheck].filter(Boolean).length;
+  if (decisions > 1) throw new Error("--waive, --uphold and --recheck are different decisions — pass one");
   const serialization = await acquireApprovalSerialization(cwd, runId);
 
   try {
@@ -67,15 +128,16 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     }
   }
   const lastHuman = events[lastHumanIndex];
+  const capPark = lastHuman?.data.kind === ATTEMPT_CAP_RELEASE;
+  const gateFailPark = lastHuman?.data.kind === "gate-fail";
+  const failedGate = gateFailPark ? failedGateForNewestPark(events, taskId, lastHumanIndex) : undefined;
+  if (gateFailPark && !failedGate) {
+    throw new Error(`task ${taskId} is parked on gate-fail but has no failed gate result on the newest park — refusing to infer one`);
+  }
+
   if (uphold) {
-    // Fail-closed on the DATA: uphold applies only when the newest failed gate is the review gate —
-    // any other gate has no reviewer to uphold. Never inferred from the park's prose.
-    const lastFailed = events.slice(0, lastHumanIndex).reverse().find((e) =>
-      e.event === "gate-result" && e.taskId === taskId && e.data.pass === false
-      && typeof e.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(e.data.gate),
-    )?.data.gate as string | undefined;
-    if (lastFailed !== "review") {
-      throw new Error(`--uphold applies to a review rejection; ${taskId}'s last failed gate is ${lastFailed ?? "none"} — refusing`);
+    if (!gateFailPark || failedGate !== "review") {
+      throw new Error(`--uphold applies to a review gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
       by,
@@ -85,15 +147,11 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       gate: "review",
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return disposition(cwd, runId, `upheld the reviewer for ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to dispatch a fixed attempt carrying the findings`, serialization.contended);
+    return disposition(cwd, runId, "fund-fixed-attempt", `upheld the reviewer for ${taskId} in ${runId} — by ${by}`, serialization.contended);
   }
-  const capPark = lastHuman?.data.kind === ATTEMPT_CAP_RELEASE;
-  const gateFailPark = lastHuman?.data.kind === "gate-fail";
   if (recheck) {
-    // OBS-203: fail-closed on the PARK KIND — only a gate-fail park has a gate to re-run. Refusing
-    // elsewhere keeps --recheck from becoming a silent budget reset on a pre-dispatch human gate.
-    if (!gateFailPark) {
-      throw new Error(`--recheck applies to a gate-fail park; ${taskId}'s park kind is ${lastHuman?.data.kind ?? "none"} — refusing`);
+    if (!gateFailPark || !failedGate) {
+      throw new Error(`--recheck applies to a gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
       by,
@@ -102,16 +160,26 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       release: RECHECK_RELEASE,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return disposition(cwd, runId, `re-checking ${taskId} in ${runId} — by ${by}; no gate marked satisfied, run \`tickmarkr resume ${runId}\` to re-dispatch against the full gate suite`, serialization.contended);
+    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; failed gate ${failedGate}; no gate marked satisfied`, serialization.contended);
   }
-  const failedGate = gateFailPark
-    ? events.slice(0, lastHumanIndex).reverse().find((e) =>
-        e.event === "gate-result" && e.taskId === taskId && e.data.pass === false
-        && typeof e.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(e.data.gate),
-      )?.data.gate as string | undefined
-    : undefined;
-  if (gateFailPark && !failedGate) {
-    throw new Error(`task ${taskId} is parked on gate-fail but has no failed gate result — refusing to infer one`);
+  if (waive) {
+    if (!gateFailPark || !failedGate) {
+      throw new Error(`--waive applies to a gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
+    }
+    journal.append("task-approved", taskId, {
+      by,
+      ...(reason ? { reason } : {}),
+      via: "cli",
+      release: GATE_SATISFIED_RELEASE,
+      gate: failedGate,
+      ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
+    });
+    return disposition(cwd, runId, "waive-gate", `waived failed gate ${failedGate} for ${taskId} in ${runId} — by ${by}`, serialization.contended);
+  }
+  if (gateFailPark) {
+    const choices = [`--waive (disposition waive-gate)`, `--recheck (disposition re-dispatch)`];
+    if (failedGate === "review") choices.push(`--uphold (disposition fund-fixed-attempt)`);
+    throw new Error(`task ${taskId} is parked on failed gate ${failedGate}; plain approve has disposition only for non-gate parks — pass ${choices.join(" or ")}`);
   }
 
   journal.append("task-approved", taskId, {
@@ -120,9 +188,9 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     via: "cli",
     ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     ...(capPark ? { release: ATTEMPT_CAP_RELEASE } : {}),
-    ...(failedGate ? { release: GATE_SATISFIED_RELEASE, gate: failedGate } : {}),
   });
-  return disposition(cwd, runId, `approved ${taskId} in ${runId} — by ${by}; run \`tickmarkr resume ${runId}\` to ${failedGate ? "continue past the approved gate" : "dispatch it"}`, serialization.contended);
+  const token = capPark ? "fresh-budget" : "dispatch";
+  return disposition(cwd, runId, token, `approved ${taskId} in ${runId} — by ${by}`, serialization.contended);
   } finally {
     serialization.release();
   }
@@ -131,20 +199,31 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
 // The status is command OUTPUT, not a typed sibling result: the registered approve function returns
 // one primitive string and the dispatcher prints those bytes unchanged. A compact sentinel followed
 // by JSON makes the contract unambiguous to machines without widening the shared command result type.
-// No-lock approvals keep their historical one-line result for the cockpit; a dead recorded owner and
-// a command delayed behind terminalization both emit recorded-no-owner.
-function disposition(cwd: string, runId: string, message: string, contended: boolean): string {
+// No-lock approvals keep their historical one-line result for the cockpit; a dead recorded owner, a
+// live owner executing some OTHER run, and a command delayed behind terminalization all emit
+// recorded-no-owner — none of them is a daemon that will sweep this run's approvals.
+//
+// The ENACTMENT half of the message is completed here because only here is liveness known: the call
+// sites carry the decision, not the answer to who will act on it. `deferred-live` keeps its v1.89
+// token — machine consumers parse it — while its TEXT now names the boundary sweep, and the `resume`
+// field it used to carry unconditionally is withheld from the live branch it would misdirect.
+function disposition(cwd: string, runId: string, token: ApprovalDisposition, message: string, contended: boolean): string {
   const owner = runLockOwner(cwd);
+  const run = ownedByLiveDaemon(owner, runId);
   const resume = `tickmarkr resume ${runId}`;
-  if (!owner && !contended) return message;
-  const status: ApprovalStatus = owner?.live ? "deferred-live" : "recorded-no-owner";
+  const out = `approval disposition ${token}: ${message}; ${approvalEnactment(token, run)}`;
+  if (!owner && !contended) return out;
+  const status: ApprovalStatus = run.live ? "deferred-live" : "recorded-no-owner";
   const record = {
     status,
-    resume,
+    disposition: token,
+    // The recovery command is claimed only where it IS the enactment. A live owner's approval is
+    // already scheduled, and a resume would contend for that daemon's graph.lock.
+    ...(run.live ? {} : { resume }),
     ...(owner?.pid === undefined ? {} : { ownerPid: owner.pid }),
     ...(owner?.runId === undefined ? {} : { ownerRunId: owner.runId }),
   };
-  return `${message}\nTICKMARKR_APPROVAL ${JSON.stringify(record)}`;
+  return `${out}\nTICKMARKR_APPROVAL ${JSON.stringify(record)}`;
 }
 
 interface ParsedArgs {
@@ -152,12 +231,13 @@ interface ParsedArgs {
   taskId: string;
   by: string;
   reason?: string;
+  waive: boolean;
   uphold: boolean;
   recheck: boolean;
   reviewRoundCeiling?: number;
 }
 
-const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
+const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--waive|--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
 
 // hand-parsed argv — no CLI framework (house style). Positionals are runId then taskId; decision,
 // ceiling, actor and reason are flags. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
@@ -165,6 +245,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   let by: string | undefined;
   let reason: string | undefined;
+  let waive = false;
   let uphold = false;
   let recheck = false;
   let reviewRoundCeiling: number | undefined;
@@ -176,6 +257,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else if (a === "--reason") {
       reason = argv[++i];
       if (!reason) throw new Error(USAGE);
+    } else if (a === "--waive") {
+      waive = true;
     } else if (a === "--uphold") {
       uphold = true;
     } else if (a === "--recheck") {
@@ -195,5 +278,18 @@ function parseArgs(argv: string[]): ParsedArgs {
   if (!runId || !taskId) {
     throw new Error(USAGE);
   }
-  return { runId, taskId, by: by ?? userInfo().username, reason, uphold, recheck, reviewRoundCeiling };
+  return { runId, taskId, by: by ?? userInfo().username, reason, waive, uphold, recheck, reviewRoundCeiling };
+}
+
+function failedGateForNewestPark(events: ReturnType<Journal["read"]>, taskId: string, lastHumanIndex: number): string | undefined {
+  for (let i = lastHumanIndex - 1; i >= 0; i -= 1) {
+    const event = events[i]!;
+    if (event.taskId !== taskId) continue;
+    if (event.event === "task-approved" || event.event === "task-human" || event.event === "task-dispatch") return undefined;
+    if (event.event === "gate-result" && event.data.pass === false
+        && typeof event.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(event.data.gate)) {
+      return event.data.gate;
+    }
+  }
+  return undefined;
 }

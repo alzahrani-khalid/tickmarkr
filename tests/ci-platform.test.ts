@@ -10,15 +10,22 @@ const workflowPaths = [".github/workflows/ci.yml", ".github/workflows/ci.public.
   existsSync(join(repoRoot, p)),
 );
 if (workflowPaths.length === 0) throw new Error("no CI workflow definitions found to assert on");
-// The coverage gate is split (RULING-1890-CI-DESIGN option c): the main run carries every
-// project except sync-heavy, whose birpc-starving members run as their own serial step.
-// Both commands are load-bearing — a lane missing the serial step runs a reduced subset.
-const gateCommands = [
+const splitGateCommands = [
   "npm run build",
   "npm run lint",
   "npm run test:coverage -- --project suite --project built-cli --project signal-reaper",
   "npx vitest run --project sync-heavy",
 ];
+const publicGateCommands = [
+  "npm run build",
+  "npm run lint",
+  `set -o pipefail
+npm run test:coverage 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+`,
+  `sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log"`,
+];
+const gateCommandsFor = (path: string): string[] =>
+  path.endsWith("ci.public.yml") ? publicGateCommands : splitGateCommands;
 
 type Workflow = {
   jobs?: Record<string, WorkflowJob>;
@@ -55,7 +62,7 @@ describe("CI platform lanes", () => {
       const jobs = jobsFor(path);
       const macLane = Object.values(jobs).find((job) => job["runs-on"] === "macos-latest");
       expect(macLane, `${path} needs a macOS lane`).toBeDefined();
-      expect(runCommands(macLane!)).toEqual(expect.arrayContaining(gateCommands));
+      expect(runCommands(macLane!)).toEqual(expect.arrayContaining(gateCommandsFor(path)));
     }
   });
 

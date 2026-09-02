@@ -2,6 +2,35 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.2 — what a revived worker is told
+
+**v2.2.0** — a released, revived, or re-dispatched task is told the truth about its own state, and the
+daemon acts on approvals while it is alive. Delivered by one gated run (6/6) plus true cross-vendor
+verifies on the tasks whose in-run reviews turned out to be same-vendor; one of those verifies rejected
+and its fix went through the standalone battery before anything reached `main`.
+
+- **`approve` states its disposition before acting.** A plain approve of a gate-fail park refuses instead
+  of silently marking the failed gate satisfied; the closed verb set (`approve`, `--waive`, `--uphold`,
+  `--recheck`) maps to one disposition each, printed before the record is appended, and the setup cockpit
+  offers only the verbs that apply to the park it shows.
+- **The live daemon consumes approvals at task boundaries.** An approval accepted while the run is live
+  dispatches the released task at the next boundary instead of waiting hours for a resume; run-end records
+  `approvalDisposition` (`complete`, or `outstanding` naming the tasks) so an accepted-but-never-dispatched
+  approval can no longer hide. The approve command and the cockpit say so — a live run is never told to
+  resume; the `deferred-live` status token is unchanged for scripts that parse it.
+- **An uphold funds what it claims and a waiver never rides forward** — the replayed satisfied-gate fold is
+  pinned at the daemon level: a funded fixed attempt carries the findings; a waived gate does not survive
+  into the next attempt.
+- **A revived worker is told what the consult prescribed.** A consult verdict that parks a task journals
+  its guidance, and the next dispatch of that task carries it in the brief instead of starting blind.
+- **A promised context path exists where the worker reads it.** Context entries committed after the base
+  are materialized into the run state before dispatch, byte-identical to their committed blobs; an entry
+  that resolves to nothing, a traversal segment anywhere in the path, a symlink, or an unreadable ancestor
+  is omitted with a journaled `context-missing` rather than aborting dispatch; literal paths containing
+  `[`, `]`, `{` or `}` are files, not patterns.
+- **Compile lint expands braces before naming directories**, so a `files[]` entry like
+  `tests/{run,cli}/x.test.ts` no longer warns about a new top-level directory named `{run,cli}`.
+
 ## v2.1 — the orca driver
 
 **v2.1.9** — the record keeps what it knows. The theme is that supervision surfaces stop asserting things

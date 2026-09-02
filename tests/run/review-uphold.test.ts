@@ -5,11 +5,17 @@
 // fresh journal (re-executing every green task) the only escape.
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import type { TickmarkrConfig } from "../../src/config/config.js";
+import type { BillingChannel } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
-import { runDaemon } from "../../src/run/daemon.js";
-import { Journal, reviewRoundsSinceApproval, type JournalEvent } from "../../src/run/journal.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
+import { captureBaseline } from "../../src/gates/baseline.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
+import { runDaemon, type RunSummary } from "../../src/run/daemon.js";
+import { gitHead, shOk } from "../../src/run/git.js";
+import { GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, reviewRoundsSinceApproval, type JournalEvent } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 const ev = (event: string, taskId: string, data: Record<string, unknown> = {}): JournalEvent =>
@@ -103,3 +109,208 @@ describe("approve --uphold round trip — a park costs one attempt, never a run 
     expect(evs.some((e) => e.event === "merge" && e.taskId === "T1")).toBe(true);
   }, 120_000);
 });
+
+interface PostApprovalUpholdResult {
+  completedJournal: Journal;
+  fundedEvents: JournalEvent[];
+  fundedSummary: RunSummary;
+  prompt: string;
+  staleEvents: JournalEvent[];
+  staleSummary: RunSummary;
+}
+
+async function postApprovalUpholdScenario(): Promise<PostApprovalUpholdResult> {
+  const runId = "run-post-approval-uphold";
+  const commands = { build: "true", test: "true", lint: "true" };
+  const { repo, fake, scriptPath } = setupRepo(
+    [T("T1", {
+      complexity: 8,
+      files: ["**"],
+      gates: ["build", "test", "lint", "evidence", "scope", "acceptance", "review"],
+      acceptance: [{ oracle: "command", command: "true" }],
+    })],
+    {
+      review: { approve: false, issues: ["stat tile mislabeled"] },
+      tasks: {
+        T1: [{
+          shell: `echo fixed >> work.txt && ${COMMIT} fixed`,
+          result: { ok: true, summary: "fixed the stat tile" },
+        }],
+      },
+    },
+    `gates: { build: "true", test: "true", lint: "true" }\n`,
+  );
+  const baseRef = await gitHead(repo);
+  const branch = `tickmarkr/${runId}`;
+  const taskBranch = `${branch}--T1`;
+  const priorWt = await new SubprocessDriver().worktree(repo, taskBranch, baseRef);
+  writeFileSync(join(priorWt, "work.txt"), "stale\n");
+  await shOk("git add work.txt && git commit --no-gpg-sign -m stale", priorWt);
+
+  const baseline = await captureBaseline(repo, commands);
+  const journal = Journal.create(repo, runId);
+  journal.append("run-start", undefined, {
+    baseRef,
+    commands,
+    branch,
+    graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
+  });
+  journal.append("task-dispatch", "T1", {
+    assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    attempt: 0,
+  });
+  journal.append("worker-result", "T1", {
+    ok: true,
+    summary: "stale work",
+    deviations: [],
+  });
+  journal.phaseStart("T1", "gates");
+  journal.append("gate-result", "T1", {
+    gate: "build",
+    pass: false,
+    details: "operator waived this build failure",
+  });
+  journal.append("task-human", "T1", { reason: "build failed", kind: "gate-fail" });
+  writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline));
+  await approve([runId, "T1", "--waive", "--by", "operator"], repo);
+
+  const staleStart = journal.read().length;
+  const staleSummary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  const staleEvents = Journal.open(repo, runId).read().slice(staleStart);
+  await approve([runId, "T1", "--uphold", "--by", "operator"], repo);
+
+  const script = JSON.parse(readFileSync(scriptPath, "utf8")) as Record<string, unknown>;
+  writeFileSync(scriptPath, JSON.stringify({ ...script, review: { approve: true, issues: [] } }));
+  const fundedStart = Journal.open(repo, runId).read().length;
+  const fundedSummary = await runDaemon(repo, {
+    adapters: [new FakeAdapter(scriptPath)],
+    runId,
+    resume: true,
+  });
+  const completedJournal = Journal.open(repo, runId);
+  return {
+    completedJournal,
+    fundedEvents: completedJournal.read().slice(fundedStart),
+    fundedSummary,
+    prompt: readFileSync(join(completedJournal.dir, "prompts", "T1-a0.md"), "utf8"),
+    staleEvents,
+    staleSummary,
+  };
+}
+
+describe("post-approval review uphold consumes an earlier waiver (OBS-571)", () => {
+  let scenario: PostApprovalUpholdResult;
+
+  beforeAll(async () => {
+    scenario = await postApprovalUpholdScenario();
+  }, 120_000);
+
+  test("test: resume after an uphold on a task re-parked post-approval dispatches a worker carrying the upheld review findings and gates its new commits with build and test present while the shipped gates-only battery on the stale commit with the waived gate skipped fails", () => {
+    expect(scenario.staleSummary.human).toEqual(["T1"]);
+    expect(scenario.staleEvents.some((e) => e.event === "task-dispatch")).toBe(false);
+    expect(scenario.staleEvents.some((e) => e.event === "gate-result" && e.data.gate === "build")).toBe(false);
+    expect(scenario.staleEvents.some((e) => e.event === "gate-result" && e.data.gate === "test")).toBe(true);
+    expect(scenario.staleEvents.some((e) =>
+      e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
+    )).toBe(true);
+
+    expect(scenario.fundedSummary.done).toEqual(["T1"]);
+    expect(scenario.fundedEvents.some((e) => e.event === "task-dispatch")).toBe(true);
+    expect(scenario.prompt).toMatch(/UPHELD/);
+    expect(scenario.prompt).toMatch(/stat tile mislabeled/);
+    expect(scenario.fundedEvents.some((e) => e.event === "gate-result" && e.data.gate === "build")).toBe(true);
+    expect(scenario.fundedEvents.some((e) => e.event === "gate-result" && e.data.gate === "test")).toBe(true);
+  });
+
+  test("test: a gate waived for one enactment is run again on any later attempt's new commits so a funded attempt's battery includes the previously waived gate while a waiver that carries into commits it never released fails", () => {
+    const staleCommit = scenario.staleEvents.find((e) =>
+      e.event === "gate-result" && e.data.gate === "test"
+    )?.data.commit;
+    const fundedBuild = scenario.fundedEvents.find((e) =>
+      e.event === "gate-result" && e.data.gate === "build"
+    );
+    const fundedTest = scenario.fundedEvents.find((e) =>
+      e.event === "gate-result" && e.data.gate === "test"
+    );
+
+    expect(scenario.completedJournal.replaySatisfiedGates().size).toBe(0);
+    expect(fundedBuild?.data.pass).toBe(true);
+    expect(fundedTest?.data.pass).toBe(true);
+    expect(fundedBuild?.data.commit).toBe(fundedTest?.data.commit);
+    expect(fundedBuild?.data.commit).not.toBe(staleCommit);
+  });
+});
+
+class OneChannelFake extends FakeAdapter {
+  channels(_cfg: TickmarkrConfig): BillingChannel[] {
+    return [{ adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" }];
+  }
+}
+
+const approvalCommands = (reason: string): string[] =>
+  [...reason.matchAll(/`(tickmarkr approve [^`]+)`/g)].map((m) => m[1]!);
+
+async function identicalFailureParkReason(): Promise<string> {
+  const { repo, scriptPath } = setupRepo(
+    [T("T1", { acceptance: [{ oracle: "command", command: "true" }] })],
+    {
+      consult: { action: "retry", notes: "try again" },
+      tasks: { T1: [{ shell: "true", result: { ok: true, summary: "no commits" } }] },
+    },
+  );
+  const summary = await runDaemon(repo, { adapters: [new OneChannelFake(scriptPath)], runId: "run-identical-reason" });
+  expect(summary.human).toEqual(["T1"]);
+  return String(Journal.open(repo, "run-identical-reason").read().find((e) => e.event === "task-human" && e.taskId === "T1")?.data.reason);
+}
+
+async function reviewCapParkReason(): Promise<string> {
+  const { repo, fake } = setupRepo(
+    [T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
+    {
+      review: { approve: false, issues: ["still wrong"] },
+      tasks: { T1: [{ shell: `echo v >> f.txt && ${COMMIT} v`, result: { ok: true, summary: "v" } }] },
+    },
+  );
+  const summary = await runDaemon(repo, { adapters: [fake], runId: "run-review-cap-reason" });
+  expect(summary.human).toEqual(["T1"]);
+  return String(Journal.open(repo, "run-review-cap-reason").read().find((e) => e.event === "task-human" && e.taskId === "T1")?.data.reason);
+}
+
+async function releaseFromPrintedCommand(command: string, gate: "review" | "test" | "evidence") {
+  const [, , runId, taskId, ...flags] = command.split(" ");
+  const { repo } = setupRepo([T(taskId)], { tasks: {} });
+  const j = Journal.create(repo, runId);
+  j.append("gate-result", taskId, { gate, pass: false, details: `${gate} failed` });
+  j.append("task-human", taskId, { kind: "gate-fail", reason: "parked" });
+  await approve([runId, taskId, ...flags], repo);
+  return Journal.open(repo, runId).read().find((e) => e.event === "task-approved" && e.taskId === taskId)!;
+}
+
+test("test: every daemon-authored gate-fail park reason — the post-approval, review-round-cap and identical-failure-ban parks, never a consult verdict's own text — keeps its shipped reason identity, review round cap (N) reached this engagement, post-approval gate failed and identical failure twice this engagement, with executable tickmarkr approve commands appended carrying --waive and --recheck and additionally --uphold on a review gate-fail, so invoking each command exactly as printed appends its matching release and no flag-free approve command is advertised, while commands replacing the reason, token-only prose, or the shipped bare-approve prescription fails", async () => {
+  const postApproval = (await postApprovalUpholdScenario()).staleEvents
+    .find((e) => e.event === "task-human" && e.taskId === "T1")!;
+  const reasons = [
+    { reason: String(postApproval.data.reason), gate: "review" as const, uphold: true },
+    { reason: await reviewCapParkReason(), gate: "review" as const, uphold: true },
+    { reason: await identicalFailureParkReason(), gate: "evidence" as const, uphold: false },
+  ];
+
+  expect(reasons[0]!.reason).toContain("post-approval gate failed");
+  expect(reasons[1]!.reason).toMatch(/review round cap \(\d+\) reached this engagement/);
+  expect(reasons[2]!.reason).toContain("identical evidence failure twice this engagement");
+
+  for (const { reason, gate, uphold } of reasons) {
+    const commands = approvalCommands(reason);
+    expect(commands.some((command) => / --waive\b/.test(command))).toBe(true);
+    expect(commands.some((command) => / --recheck\b/.test(command))).toBe(true);
+    expect(commands.some((command) => / --uphold\b/.test(command))).toBe(uphold);
+    expect(commands.every((command) => / --(waive|recheck|uphold)\b/.test(command))).toBe(true);
+    expect(commands.some((command) => /^tickmarkr approve \S+ \S+$/.test(command))).toBe(false);
+    for (const command of commands) {
+      const approval = await releaseFromPrintedCommand(command, gate);
+      if (command.includes("--waive")) expect(approval.data.release).toBe(GATE_SATISFIED_RELEASE);
+      if (command.includes("--recheck")) expect(approval.data.release).toBe(RECHECK_RELEASE);
+      if (command.includes("--uphold")) expect(approval.data.release).toBe(REVIEW_UPHELD_RELEASE);
+    }
+  }
+}, 180_000);

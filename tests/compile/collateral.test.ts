@@ -261,6 +261,84 @@ const EXISTING_DIR_FIXTURE = {
 };
 
 describe("newDirectoryLints (plan-time OBS-108 source directory sweep)", () => {
+  test("test: the new-top-level-directory lint expands brace groups before deriving directories so a files pattern spanning two existing directories inside one brace group warns for neither while the shipped prefix split reporting a brace fragment as a directory fails", () => {
+    const repo = makeRepo({
+      ...EXISTING_DIR_FIXTURE,
+      "src/another/file.ts": "export const another = 1;\n",
+    });
+
+    expect(newDirectoryLints(
+      [{ id: "T1", files: ["src/{existing/one.ts,another/two.ts}"] }],
+      repo,
+    )).toEqual([]);
+  });
+
+  test("test: a brace group spanning an existing and a genuinely new top-level directory warns only for the new one named without brace characters while a lint that misses the new directory once braces are involved fails", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+
+    const lints = newDirectoryLints(
+      [{ id: "T2", files: ["src/{existing/one.ts,newmodule/two.ts}"] }],
+      repo,
+    );
+
+    expect(lints).toHaveLength(1);
+    expect(lints[0]).toContain("new top-level source directory src/newmodule/");
+    expect(lints[0]).not.toMatch(/[{}]/);
+    expect(lints[0]).not.toContain("src/existing/");
+  });
+
+  test("test: a nested brace group and a brace range expand through the same matcher the files scope uses so their warnings name real directories while a one-level comma splitter printing nonsense for nested or range shapes fails", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+
+    const lints = newDirectoryLints(
+      [{
+        id: "T3",
+        files: [
+          "src/{existing/file.ts,{nested-a/one.ts,nested-b/two.ts}}",
+          "src/range{1..3}/file.ts",
+        ],
+      }],
+      repo,
+    );
+
+    expect(lints).toHaveLength(1);
+    expect(lints[0]).toContain(
+      "new top-level source directories src/nested-a/, src/nested-b/, src/range1/, src/range2/, src/range3/",
+    );
+    expect(lints[0]).not.toMatch(/[{}]/);
+    expect(lints[0]).not.toContain("..");
+    expect(lints[0]).not.toContain("src/existing/");
+  });
+
+  test("test: a punctuation range inside a brace group expands through the same matcher the files scope uses so the pattern src/range{!..#}/file.ts warns for the three expanded directories named without brace characters while a range grammar narrower than that matcher which leaves the group unexpanded and prints the brace fragment as a directory fails", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+
+    const lints = newDirectoryLints(
+      [{ id: "T4", files: ["src/range{!..#}/file.ts"] }],
+      repo,
+    );
+
+    expect(lints).toHaveLength(1);
+    expect(lints[0]).toContain("new top-level source directories src/range!/, src/range\"/, src/range#/");
+    expect(lints[0]).not.toMatch(/[{}]/);
+    expect(lints[0]).not.toContain("!..#");
+  });
+
+  test("test: an escaped comma inside a brace group binds its member so a two-member group whose first member is foo then an escaped comma then bar and whose second member is baz warns for src/foo,bar/ and src/baz/ and nothing else while a splitter that drops the escaped member or rejects it with its backslash retained fails", () => {
+    const repo = makeRepo(EXISTING_DIR_FIXTURE);
+
+    const lints = newDirectoryLints(
+      [{ id: "T5", files: ["src/{foo\\,bar,baz}/x.ts"] }],
+      repo,
+    );
+
+    expect(lints).toHaveLength(1);
+    expect(lints[0]).toContain("new top-level source directories src/baz/, src/foo,bar/");
+    expect(lints[0]).not.toMatch(/[{}\\]/);
+    expect(lints[0]).not.toContain("src/foo/");
+    expect(lints[0]).not.toContain("src/bar/");
+  });
+
   test("test: the plan lint flags a task whose file scope introduces a new top-level source directory without the architecture pages", () => {
     const repo = makeRepo(EXISTING_DIR_FIXTURE);
     const lints = newDirectoryLints(

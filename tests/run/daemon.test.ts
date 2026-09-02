@@ -13,7 +13,7 @@ import { DeliveryReadinessError } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
 import { gatePaneName } from "../../src/gates/llm.js";
-import { graphDefinitionHash, loadGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead, shOk, worktreePath } from "../../src/run/git.js";
 import { Journal, recordedTaskFailureKind } from "../../src/run/journal.js";
@@ -774,7 +774,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(verdict.data.notes).toBe("seat fake2 answered");
   });
 
-  test("v1.39 OBS-37a: consult retry prompt gets bullet guidance, not raw consult prose; journal keeps full verdict", async () => {
+  test("test: runDaemon gives structured retry bullets to both a worker dispatched after graph-changed revival of a consult-parked task and the ordinary live consult-retry control, while the shipped fresh revival omitting guidance and either path embedding raw consult notes fail", async () => {
     const distinctive = "CONSULT VERDICT: herdr must never see this distinctive prose echoed in a worker prompt";
     const { repo, fake } = setupRepo(
       [T("T1")],
@@ -811,7 +811,61 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
       guidance: "Commit a real file.\nStay inside declared paths.",
       notes: distinctive,
     });
-  });
+
+    const parkedNotes = "RAW CONSULT PARK NOTES: scope amendment narrative must not be pasted into the worker prompt";
+    const { repo: revivedRepo, fake: parkedFake, scriptPath } = setupRepo(
+      [T("T1")],
+      {
+        consult: {
+          action: "human",
+          reason: "the graph still describes the old scope",
+          guidance: "Apply the spec amendment.\nThen implement only the declared file.",
+          notes: parkedNotes,
+        },
+        tasks: {
+          T1: [
+            { shell: "true", result: { ok: true, summary: "nothing 1" } },
+            { shell: "true", result: { ok: true, summary: "nothing 2" } },
+            { shell: "true", result: { ok: true, summary: "nothing 3" } },
+          ],
+        },
+      },
+    );
+    const revivedRunId = "run-consult-graph-revival";
+    const parked = await runDaemon(revivedRepo, { adapters: [parkedFake], runId: revivedRunId });
+    expect(parked.human).toEqual(["T1"]);
+
+    const graph = loadGraph(revivedRepo);
+    saveGraph(revivedRepo, {
+      ...graph,
+      spec: { ...graph.spec, hash: "h2" },
+      tasks: graph.tasks.map((task) => task.id === "T1"
+        ? { ...task, goal: `${task.goal} after amendment`, status: "pending", evidence: { commits: [], artifacts: [], gateResults: [] } }
+        : task),
+    });
+    writeFileSync(scriptPath, JSON.stringify({
+      judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
+      review: { approve: true, issues: [] },
+      consult: { action: "human", reason: "unused", guidance: "unused", notes: "unused" },
+      tasks: {
+        T1: [{ shell: `echo revived > revived.txt && ${COMMIT} revived`, result: { ok: true, summary: "revived" } }],
+      },
+    }));
+
+    const revived = await runDaemon(revivedRepo, { adapters: [new FakeAdapter(scriptPath)], runId: revivedRunId, resume: true, graphChanged: true });
+    expect(revived.done).toEqual(["T1"]);
+    const revivedEvents = Journal.open(revivedRepo, revivedRunId).read();
+    const revivedDispatch = revivedEvents.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").at(-1)!;
+    const revivedPrompt = readFileSync(
+      join(tickmarkrDir(revivedRepo), "runs", revivedRunId, "prompts", `T1-a${revivedDispatch.data.attempt as number}.md`),
+      "utf8",
+    );
+    expect(revivedPrompt).toContain("- Action: human");
+    expect(revivedPrompt).toContain("- Reason: the graph still describes the old scope");
+    expect(revivedPrompt).toContain("- Apply the spec amendment.");
+    expect(revivedPrompt).toContain("- Then implement only the declared file.");
+    expect(revivedPrompt).not.toContain(parkedNotes);
+  }, 180_000);
 
   test("v1.1: pane-mode runs judge/review via named driver slots; keepPanes=run closes all by run end", async () => {
     const { repo, fake } = setupRepo(

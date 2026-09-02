@@ -60,6 +60,13 @@ describe("consult", () => {
     expect(bullets).toContain("- Touch only declared paths.");
     expect(bullets).not.toContain(distinctive);
     expect(bullets).not.toContain("herdr must never");
+
+    const aliased = renderRetryGuidance({
+      action: "retry",
+      notes: "Commit real changes.",
+      guidance: "Commit real changes.",
+    });
+    expect(aliased.match(/Commit real changes/g)).toHaveLength(1);
   });
 
   test("v1.39 OBS-37a: legacy notes-only verdict still renders as bullets", () => {

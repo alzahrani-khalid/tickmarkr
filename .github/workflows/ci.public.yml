@@ -31,34 +31,23 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # full suite, coverage-gated — includes the export-boundary manifest suite, which in the
-      # public tree validates the current git index and never skips
+      # Full-suite proof: one unfiltered, coverage-gated invocation runs all four projects. The
+      # sync-heavy project keeps its config-level single-fork isolation inside this invocation.
       # OBS-156: serialize on the 2-core hosted runner. OBS-148 fixed release.yml only, so this
       # job starved a different load-sensitive test on every release (v1.78 herdr READINESS,
       # v1.79 daemon tip-verify artifact) while Release passed on the identical commit.
-      # Report-26: the sync-heavy project runs as its own serial step below, so the main
-      # suite's single worker never carries the birpc-starving members.
-      - run: npm run test:coverage -- --project suite --project built-cli --project signal-reaper
+      - name: Run full-suite coverage proof
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:coverage 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
-      # RULING-1890-CI-DESIGN option (c): the birpc-starver class members with a produced CI
-      # red, in their own serial step with a generous timeout (project sync-heavy,
-      # vitest.config.ts). NOT an absorber: a new red here that is not the birpc class goes
-      # back to classification, never into the timeout.
-      # OBS-744: INDEPENDENT of the step above. That step exits nonzero on the birpc teardown,
-      # and without this the serial sync-heavy step is SKIPPED — so the lane silently runs a
-      # reduced subset exactly when a release is being graded. Measured at the v2.1.5 tag gate:
-      # step 7 failed on BOTH jobs, step 8 skipped on BOTH, and clause 5 could only be met by
-      # invoking D27 clause 2's local substitution — the concession this line exists to retire.
-      # It cannot mask a red: this step's own conclusion is still graded.
-      - run: npx vitest run --project sync-heavy
+      - name: Assert collected test-file count
         if: always()
-        env:
-          TICKMARKR_CI_LEAN_REPORTERS: "1"
-          VITEST_MAX_FORKS: "1"
-          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log"
 
   test-macos:
     if: github.repository == 'alzahrani-khalid/tickmarkr'
@@ -72,22 +61,16 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # OBS-156: same serialization as the ubuntu job — macos hosted runners are 2-core too
-      - run: npm run test:coverage -- --project suite --project built-cli --project signal-reaper
+      # Same unfiltered four-project coverage proof and serialization as ubuntu.
+      - name: Run full-suite coverage proof
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:coverage 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
-      # same serial sync-heavy step as the ubuntu job (RULING-1890-CI-DESIGN option c)
-      # OBS-744: INDEPENDENT of the step above. That step exits nonzero on the birpc teardown,
-      # and without this the serial sync-heavy step is SKIPPED — so the lane silently runs a
-      # reduced subset exactly when a release is being graded. Measured at the v2.1.5 tag gate:
-      # step 7 failed on BOTH jobs, step 8 skipped on BOTH, and clause 5 could only be met by
-      # invoking D27 clause 2's local substitution — the concession this line exists to retire.
-      # It cannot mask a red: this step's own conclusion is still graded.
-      - run: npx vitest run --project sync-heavy
+      - name: Assert collected test-file count
         if: always()
-        env:
-          TICKMARKR_CI_LEAN_REPORTERS: "1"
-          VITEST_MAX_FORKS: "1"
-          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log"

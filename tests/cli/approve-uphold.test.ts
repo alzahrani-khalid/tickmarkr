@@ -38,7 +38,7 @@ describe("tickmarkr approve --uphold (OBS-189, zero-token)", () => {
     j.append("task-human", "T1", { kind: "gate-fail", reason: "operator decision required" });
 
     await expect(approve(["run-uphold-refuse", "T1", "--uphold"], repo))
-      .rejects.toThrow(/--uphold applies to a review rejection/);
+      .rejects.toThrow(/--uphold applies to a review gate-fail park/);
     expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
   });
 

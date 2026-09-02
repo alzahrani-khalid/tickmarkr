@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { compareToBaseline } from "../../src/gates/baseline.js";
 import { gateSatisfied, runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
-import { COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
+import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 // T9: the merge predicate. `gateSatisfied` decides whether a task's gate battery authorizes a merge
 // to the integration branch, and it is the ONLY place that can tell an honest report of an
@@ -20,6 +20,21 @@ const repoWithTestGate = (cmd: string) => setupRepo([T("T1")], oneTask("T1"), st
 // The two runners under test. Neither is a mock: each is the shell the gate actually executes.
 const INFRA_RUNNER = "printf '%s\\n' 'Error: spawn EAGAIN' >&2; exit 1"; // died on the machine, no suite completed
 const COMPLETED_RUNNER = "printf '%s\\n' ' Tests  0 failed | 3 passed (3)'; exit 0"; // ran, zero failures
+
+test("test: replaySatisfiedGates keeps a gate-satisfied entry only while it is the task's newest approval so a later uphold or recheck approval clears it while the shipped fold that lets a stale waiver persist across a later uphold fails", () => {
+  const repo = makeTestTempDir("tickmarkr-waiver-approval-");
+  const journal = Journal.create(repo, "run-waiver-newest-approval");
+
+  journal.append("task-approved", "T1", { by: "operator", release: "gate-satisfied", gate: "build" });
+  journal.append("task-approved", "T2", { by: "operator", release: "gate-satisfied", gate: "lint" });
+  expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "build"], ["T2", "lint"]]));
+
+  journal.append("task-approved", "T1", { by: "operator", release: "review-upheld" });
+  expect(journal.replaySatisfiedGates()).toEqual(new Map([["T2", "lint"]]));
+
+  journal.append("task-approved", "T2", { by: "operator", release: "recheck" });
+  expect(journal.replaySatisfiedGates()).toEqual(new Map());
+});
 
 describe("merge satisfaction of an infra-only gate result (fake adapter, zero tokens)", () => {
   test("test: a test gate whose runner exited nonzero on infrastructure alone with no completed suite does not read as merge-satisfied, exercised against that run and against a genuinely completed zero-failure run, because classifying the failure into infra metadata while still reporting a pass authorizes the merge anyway", async () => {

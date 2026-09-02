@@ -70,16 +70,20 @@ Per release:
    git -C /path/to/tickmarkr-public-mirror push origin HEAD:main
    ```
 
-3. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that
-   exact mirror `main` push to report green for the exported commit. Both the `test` and
-   `test-macos` jobs must be green. Match the run's head SHA to the mirror's `HEAD`; a red or
-   missing run is a hard stop, and the tag does not exist yet.
-4. Only after that full-suite proof is green, in the **public** repository (the mirror), tag the
-   export commit and push the tag:
+3. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run — the **full-suite
+   proof** triggered by that exact mirror `main` push — to report green for the exported commit. In each of the `test`
+   and `test-macos` jobs, that proof runs all four Vitest projects in one unfiltered,
+   coverage-gated invocation and count-asserts its reported collected test-file total against the
+   tracked test-file tree. Both jobs must be green. Match the run's head SHA to the mirror's
+   `HEAD`; a red or missing run is a hard stop, and the tag does not exist yet. This proves the
+   exported tree was fully collected on those two CI jobs; it does not make the post-tag workflow
+   rerun the full suite or automatically bind publication to the recorded pre-tag proof.
+4. Only after that count-asserted full-suite proof is green, in the **public** repository (the
+   mirror), tag the export commit and push the tag:
 
    ```bash
-   git tag -a v2.1.9 -m "v2.1.9"
-   git push origin v2.1.8
+   git tag -a v2.2.0 -m "v2.2.0"
+   git push origin v2.2.0
    ```
 
 5. The tag push runs `release.yml` in the public repository:
@@ -88,9 +92,11 @@ Per release:
    - `npm run build`
    - `npm run lint`
    - `npx vitest run --project built-cli --project signal-reaper` (artifact-scoped release gate —
-     it proves only the built CLI and signal-reaper scope it runs, not full-suite green; the
-     teardown RPC timeout is real, but release trees have also carried genuine assertion failures
-     this subset does not run. Full-suite truth is the required green pre-tag `CI (public)` run)
+     it proves only the built CLI and signal-reaper scope it runs. It does not rerun or establish
+     the four-project, tree-count-asserted full-suite proof from step 3, nor verify that proof is on
+     record for this exact SHA; matching the pre-tag run remains the operator's required manual
+     precondition. The teardown RPC timeout is real, but release trees have also carried genuine
+     assertion failures this subset does not run)
    - `npm publish --provenance --access public` (only if all checks pass)
 
 Publish is fail-closed: a failing build, lint, or test blocks publication.

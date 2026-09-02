@@ -33,6 +33,28 @@ describe("journal corpus compat (Phase 46, criterion 3)", () => {
     expect(Object.keys(expected).sort()).toEqual(fixtureRuns);
   });
 
+  test("test: historical journals holding a gate-satisfied release with no later approval replay task statuses byte-identical against the frozen corpus while a replay that rejects or reorders the legacy rows fails", () => {
+    for (const runId of fixtureRuns) {
+      const actualBytes = JSON.stringify(Object.fromEntries([...loadFixture(runId).replayStatuses()].sort()));
+      const expectedBytes = JSON.stringify(Object.fromEntries(
+        Object.entries((expected as Record<string, Record<string, unknown>>)[runId]!).sort(),
+      ));
+      expect(actualBytes).toBe(expectedBytes);
+    }
+
+    const legacy = Journal.create(mkdtempSync(join(tmpdir(), "gate-satisfied-legacy-")), "run-gate-satisfied-legacy");
+    const rows = [
+      { ts: "2026-01-01T00:00:00.000Z", event: "task-dispatch", taskId: "T-legacy", data: {} },
+      { ts: "2026-01-01T00:00:01.000Z", event: "task-human", taskId: "T-legacy", data: { reason: "gate failed" } },
+      { ts: "2026-01-01T00:00:02.000Z", event: "task-approved", taskId: "T-legacy", data: { release: "gate-satisfied", gate: "build" } },
+      { ts: "2026-01-01T00:00:03.000Z", event: "run-resume", data: {} },
+    ];
+    writeFileSync(join(legacy.dir, "journal.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+    expect(JSON.stringify(Object.fromEntries(legacy.replayStatuses()))).toBe('{"T-legacy":"pending"}');
+    expect(legacy.replaySatisfiedGates()).toEqual(new Map([["T-legacy", "build"]]));
+  });
+
   for (const runId of fixtureRuns) {
     test(`replayStatuses over ${runId} matches the frozen expected-statuses snapshot (machine diff)`, () => {
       const j = loadFixture(runId);

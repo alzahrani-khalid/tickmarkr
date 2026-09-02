@@ -2,11 +2,11 @@ import { existsSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { approve } from "../../src/cli/commands/approve.js";
+import { type ApprovalDisposition, approve } from "../../src/cli/commands/approve.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
-import { Journal } from "../../src/run/journal.js";
+import { Journal, PARK_KINDS } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 const countApproved = (dir: string, runId: string): number =>
@@ -31,7 +31,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     const first = await runDaemon(repo, { adapters: [fake], runId });
     expect(first.human).toEqual(["T1"]);
 
-    await approve([runId, "T1", "--by", "operator"], repo);
+    await approve([runId, "T1", "--waive", "--by", "operator"], repo);
     const beforeResume = Journal.open(repo, runId).read();
     const dispatchesBefore = beforeResume.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").length;
     const judgmentsBefore = beforeResume.filter((e) =>
@@ -59,7 +59,7 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     j.append("gate-result", "T2", { gate: "review", pass: false, details: "review failed" });
     j.append("task-human", "T2", { kind: "gate-fail", reason: "operator decision required" });
 
-    await approve(["run-scoped-gate-approval", "T1", "--by", "operator"], repo);
+    await approve(["run-scoped-gate-approval", "T1", "--waive", "--by", "operator"], repo);
 
     const approvals = j.read().filter((e) => e.event === "task-approved");
     expect(approvals).toHaveLength(1);
@@ -235,5 +235,97 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     await approve(["run-unknown-kind", "T1"], repo);
     const approved = Journal.open(repo, "run-unknown-kind").read().find((e) => e.event === "task-approved")!;
     expect(approved.data.release).toBeUndefined();
+  });
+
+  test("test: plain approve on a gate-fail park refuses naming the failed gate and every applicable disposition option — waive-gate and re-dispatch on a non-review gate and additionally fund-fixed-attempt when the failed gate is review — and appends no event while plain approve on a pre-dispatch human gate and on an attempt-cap park still appends its release so the shipped silent gate-satisfied waiver fails", async () => {
+    const { repo } = setupRepo([T("T1"), T("T2"), T("T3"), T("T4")], { tasks: {} });
+    const j = Journal.create(repo, "run-plain-dispositions");
+    j.append("gate-result", "T1", { gate: "acceptance", pass: false, details: "red" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "gate failed" });
+    j.append("gate-result", "T2", { gate: "review", pass: false, details: "changes" });
+    j.append("task-human", "T2", { kind: "gate-fail", reason: "review failed" });
+    j.append("task-human", "T3", { kind: "human-gate", reason: "needs approval" });
+    j.append("task-human", "T4", { kind: "attempt-cap", reason: "cap" });
+
+    await expect(approve(["run-plain-dispositions", "T1"], repo))
+      .rejects.toThrow(/failed gate acceptance.*waive-gate.*re-dispatch/);
+    await expect(approve(["run-plain-dispositions", "T2"], repo))
+      .rejects.toThrow(/failed gate review.*waive-gate.*re-dispatch.*fund-fixed-attempt/);
+    expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
+
+    expect(await approve(["run-plain-dispositions", "T3", "--by", "op"], repo)).toContain("disposition dispatch");
+    expect(await approve(["run-plain-dispositions", "T4", "--by", "op"], repo)).toContain("disposition fresh-budget");
+    expect(j.read().filter((e) => e.event === "task-approved").map((e) => e.data.release)).toEqual([undefined, "attempt-cap"]);
+  });
+
+  test("test: approve --waive on a gate-fail park appends the gate-satisfied release naming the failed gate and prints the waive-gate disposition while --waive on any other park kind refuses without appending", async () => {
+    const nonGateKinds = PARK_KINDS.filter((kind) => kind !== "gate-fail");
+    const { repo } = setupRepo([T("T1"), ...nonGateKinds.map((kind) => T(`park-${kind}`))], { tasks: {} });
+    const j = Journal.create(repo, "run-waive");
+    j.append("gate-result", "T1", { gate: "scope", pass: false, details: "scope red" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "gate failed" });
+    for (const kind of nonGateKinds) {
+      j.append("task-human", `park-${kind}`, { kind, reason: `park ${kind}` });
+    }
+
+    const out = await approve(["run-waive", "T1", "--waive", "--by", "op"], repo);
+    expect(out).toContain("disposition waive-gate");
+    expect(j.read().find((e) => e.event === "task-approved" && e.taskId === "T1")?.data)
+      .toMatchObject({ release: "gate-satisfied", gate: "scope", by: "op" });
+
+    for (const kind of nonGateKinds) {
+      await expect(approve(["run-waive", `park-${kind}`, "--waive"], repo)).rejects.toThrow(/--waive applies to a gate-fail park/);
+    }
+    expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(1);
+  });
+
+  test("test: every decision flag binds to the newest park so --uphold on an attempt-cap park that follows an older rechecked review failure refuses without appending and any two of waive uphold and recheck passed together refuse with no event appended while the shipped parser that validates uphold against the newest historical failed gate and rejects only uphold with recheck fails", async () => {
+    const { repo } = setupRepo([T("T1"), T("T2")], { tasks: {} });
+    const j = Journal.create(repo, "run-newest-park");
+    j.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" }, attempt: 0 });
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "old review" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review failed" });
+    await approve(["run-newest-park", "T1", "--recheck"], repo);
+    j.append("task-human", "T1", { kind: "attempt-cap", reason: "cap after recheck" });
+    const before = j.read().filter((e) => e.event === "task-approved").length;
+    await expect(approve(["run-newest-park", "T1", "--uphold"], repo))
+      .rejects.toThrow(/newest park is attempt-cap/);
+    expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(before);
+
+    j.append("gate-result", "T2", { gate: "review", pass: false, details: "review" });
+    j.append("task-human", "T2", { kind: "gate-fail", reason: "review failed" });
+    for (const flags of [["--waive", "--uphold"], ["--waive", "--recheck"], ["--uphold", "--recheck"]]) {
+      await expect(approve(["run-newest-park", "T2", ...flags], repo)).rejects.toThrow(/different decisions/);
+    }
+    expect(j.read().filter((e) => e.event === "task-approved" && e.taskId === "T2")).toHaveLength(0);
+  });
+
+  test("test: every accepted approval prints the disposition token its appended release maps to under the closed mapping — absent release dispatch, gate-satisfied waive-gate, recheck re-dispatch, review-upheld fund-fixed-attempt, attempt-cap fresh-budget — and the TICKMARKR_APPROVAL record carries the same token whenever it is emitted while a token chosen from message prose, a token outside the vocabulary, or a mapping that swaps any pair fails", async () => {
+    const { repo } = setupRepo([T("dispatch"), T("waive"), T("recheck"), T("uphold"), T("cap")], { tasks: {} });
+    const j = Journal.create(repo, "run-token-map");
+    writeFileSync(join(tickmarkrDir(repo), "graph.lock"), JSON.stringify({ pid: process.pid, runId: "run-token-map", startedAt: Date.now() }));
+    const cases: Array<[string, string[], ApprovalDisposition]> = [
+      ["dispatch", [], "dispatch"],
+      ["waive", ["--waive"], "waive-gate"],
+      ["recheck", ["--recheck"], "re-dispatch"],
+      ["uphold", ["--uphold"], "fund-fixed-attempt"],
+      ["cap", [], "fresh-budget"],
+    ];
+    j.append("task-human", "dispatch", { kind: "human-gate", reason: "go" });
+    for (const taskId of ["waive", "recheck"]) {
+      j.append("gate-result", taskId, { gate: "acceptance", pass: false, details: "red" });
+      j.append("task-human", taskId, { kind: "gate-fail", reason: "gate" });
+    }
+    j.append("gate-result", "uphold", { gate: "review", pass: false, details: "changes" });
+    j.append("task-human", "uphold", { kind: "gate-fail", reason: "review" });
+    j.append("task-human", "cap", { kind: "attempt-cap", reason: "cap" });
+
+    for (const [taskId, flags, disposition] of cases) {
+      const out = await approve(["run-token-map", taskId, ...flags, "--by", "op"], repo);
+      expect(out).toContain(`disposition ${disposition}`);
+      const record = JSON.parse(out.split("\n").find((line) => line.startsWith("TICKMARKR_APPROVAL "))!.slice("TICKMARKR_APPROVAL ".length));
+      expect(record.disposition).toBe(disposition);
+      expect(["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"]).toContain(record.disposition);
+    }
   });
 });

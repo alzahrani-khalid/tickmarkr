@@ -283,6 +283,146 @@ export function criterionReadsOnly(text: string, target: string): boolean {
 
 const ARCH_PAGES = ["docs/codebase/ARCHITECTURE.md", "docs/codebase/STRUCTURE.md"];
 
+// files[] is deliberately small, but a brace range can still be broad. If a pattern exceeds
+// this advisory budget, fail open instead of printing an unexpanded brace fragment as a directory.
+const MAX_BRACE_EXPANSIONS = 256;
+const RANGE_CHAR_START = 32;
+const RANGE_CHAR_END = 126;
+
+function isEscaped(input: string, index: number): boolean {
+  let backslashes = 0;
+  for (let i = index - 1; i >= 0 && input[i] === "\\"; i--) backslashes++;
+  return backslashes % 2 === 1;
+}
+
+function unescapeGlobLiteral(input: string): string {
+  return input.replace(/\\(.)/g, "$1");
+}
+
+function rangeParts(body: string): string[] | undefined {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let sawRange = false;
+
+  for (let i = 0; i < body.length - 1; i++) {
+    if (isEscaped(body, i)) continue;
+    const ch = body[i];
+    if (ch === "{") {
+      depth++;
+      continue;
+    }
+    if (ch === "}") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (ch !== "." || body[i + 1] !== "." || isEscaped(body, i + 1) || depth !== 0) continue;
+    parts.push(body.slice(start, i));
+    i++;
+    start = i + 1;
+    sawRange = true;
+  }
+
+  if (!sawRange) return undefined;
+  parts.push(body.slice(start));
+  return parts;
+}
+
+function rangeAlternatives(body: string): string[] | undefined {
+  const parts = rangeParts(body);
+  if (!parts) return undefined;
+
+  const source = `[${parts.map(unescapeGlobLiteral).sort().join("-")}]`;
+  let re: RegExp;
+  try {
+    re = new RegExp(`^${source}$`);
+  } catch {
+    return [];
+  }
+
+  const out: string[] = [];
+  for (let code = RANGE_CHAR_START; code <= RANGE_CHAR_END; code++) {
+    const ch = String.fromCharCode(code);
+    if (re.test(ch)) out.push(ch);
+    if (out.length > MAX_BRACE_EXPANSIONS) return [];
+  }
+  return out;
+}
+
+function braceAlternatives(body: string): string[] | undefined {
+  const alternatives: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let hasComma = false;
+  for (let i = 0; i < body.length; i++) {
+    if (isEscaped(body, i)) continue;
+    const ch = body[i];
+    if (ch === "{") {
+      depth++;
+      continue;
+    }
+    if (ch === "}") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (ch !== "," || depth !== 0) continue;
+    alternatives.push(body.slice(start, i));
+    start = i + 1;
+    hasComma = true;
+  }
+  if (hasComma) {
+    alternatives.push(body.slice(start));
+    return alternatives;
+  }
+  return rangeAlternatives(body);
+}
+
+function expandableBrace(pattern: string): { start: number; end: number; alternatives: string[] } | undefined {
+  const opens: number[] = [];
+  let unsupported: { start: number; end: number; alternatives: string[] } | undefined;
+  for (let i = 0; i < pattern.length; i++) {
+    if (isEscaped(pattern, i)) continue;
+    if (pattern[i] === "{") {
+      opens.push(i);
+      continue;
+    }
+    if (pattern[i] !== "}" || !opens.length) continue;
+    const start = opens.pop()!;
+    const alternatives = braceAlternatives(pattern.slice(start + 1, i));
+    if (alternatives === undefined) continue;
+    if (alternatives.length === 0) {
+      unsupported ??= { start, end: i, alternatives };
+      continue;
+    }
+    return { start, end: i, alternatives };
+  }
+  return unsupported;
+}
+
+function expandFilesPattern(pattern: string): string[] {
+  const pending = [pattern];
+  const expanded = new Set<string>();
+  let visited = 0;
+
+  while (pending.length) {
+    const candidate = pending.pop()!;
+    if (++visited > MAX_BRACE_EXPANSIONS) return [];
+    const brace = expandableBrace(candidate);
+    if (!brace) {
+      expanded.add(unescapeGlobLiteral(candidate));
+      continue;
+    }
+    if (brace.alternatives.length === 0) continue;
+    if (pending.length + brace.alternatives.length > MAX_BRACE_EXPANSIONS) return [];
+    for (const alternative of brace.alternatives) {
+      pending.push(candidate.slice(0, brace.start) + alternative + candidate.slice(brace.end + 1));
+    }
+  }
+
+  const scoped = filesGlob(pattern);
+  return [...expanded].filter((candidate) => scoped(candidate));
+}
+
 function topLevelSrcDir(file: string): string | undefined {
   const parts = file.replace(/^\.\//, "").replace(/\/+$/, "").split("/");
   if (parts[0] !== "src" || parts.length < 2 || !parts[1]) return undefined;
@@ -316,9 +456,12 @@ export function newDirectoryLints(
     const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
     const newDirs = new Set<string>();
     for (const f of t.files) {
-      const dir = topLevelSrcDir(f);
-      if (!dir || existing.has(dir)) continue;
-      newDirs.add(`src/${dir}/`);
+      const normalized = f.replace(/^\.\//, "");
+      for (const expanded of expandFilesPattern(normalized)) {
+        const dir = topLevelSrcDir(expanded);
+        if (!dir || existing.has(dir)) continue;
+        newDirs.add(`src/${dir}/`);
+      }
     }
     if (!newDirs.size) continue;
     const missing = ARCH_PAGES.filter((p) => !scoped(p));

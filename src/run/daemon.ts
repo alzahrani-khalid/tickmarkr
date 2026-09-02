@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
-import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { stringify } from "yaml";
 import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
@@ -19,13 +20,14 @@ import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/type
 import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
 import { runGates, type GateEvent } from "../gates/run-gates.js";
 import type { GateResult } from "../gates/types.js";
+import { filesGlob } from "../graph/files-glob.js";
 import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
 import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, type RunCapacity, sameCapacity, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingReviewFindings, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, renderStructuredReviewFinding, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, renderStructuredReviewFinding, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
@@ -157,12 +159,16 @@ const DISPATCH_ENACTMENT = new Set(["task-dispatch", "repair-dispatch"]);
 const GATE_SATISFIED_ENACTMENT = "worktree-recreation";
 
 /**
- * T14: approvals the run accepted and never acted on. `approved` above is built ONCE at startup —
- * deliberately, replay determinism depends on it — so an approval written while the daemon is live is
- * inert for that run. Without this the run-end record stated only buckets and tipVerify, both
- * accurate, over a milestone that was silently incomplete: run …230 ended tipVerify "passed" with two
- * upheld approvals and zero subsequent dispatches. Scored per task on its NEWEST approval: a later
- * approval is the live decision, and the events that answer it are the ones after it.
+ * T14, amended by v2.2 T3: approvals the run accepted and never acted on. `approved` above is still
+ * built ONCE at startup — replay determinism depends on it — but a live approval is no longer inert:
+ * the boundary sweep in the task loop releases what lands while the daemon runs, so an approval
+ * written mid-run is normally enacted by this run. ONE window survives, and it is the reason this
+ * fold still exists: an approval accepted after the task loop exits — during tip verify, before the
+ * run-end sample below — meets no further boundary, so nothing can release it before this run ends.
+ * Without this the run-end record stated only buckets and tipVerify, both accurate, over a milestone
+ * that was silently incomplete: run …230 ended tipVerify "passed" with two upheld approvals and zero
+ * subsequent dispatches. Scored per task on its NEWEST approval: a later approval is the live
+ * decision, and the events that answer it are the ones after it.
  */
 export function outstandingApprovals(events: JournalEvent[]): string[] {
   const newest = new Map<string, number>();
@@ -811,6 +817,207 @@ function compareWorktrees(before: WorktreeObservation, after: WorktreeObservatio
   return before.signature === after.signature ? "unchanged" : "changed";
 }
 
+const CONTEXT_GLOB_CHARS = /[*?{[]/;
+const MATERIALIZED_CONTEXT_BYTES = 256 * 1024 * 1024;
+
+type MaterializedContextOutcome =
+  | { kind: "keep"; entry: string }
+  | { kind: "materialized"; entry: string; normalized: string; destination: string; bytes: number }
+  | { kind: "missing"; path: string; reason: string };
+
+function containedIn(root: string, path: string): boolean {
+  const fromRoot = relative(resolve(root), resolve(path));
+  return fromRoot === "" || (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot));
+}
+
+function normalizeContextPath(entry: string): string | undefined {
+  if (entry.includes("\0")) return undefined;
+  const repositoryPath = entry.replace(/\\/g, "/");
+  if (posix.isAbsolute(repositoryPath) || repositoryPath.split("/").includes("..")) return undefined;
+  const normalized = posix.normalize(repositoryPath).replace(/\/+$/, "");
+  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) return undefined;
+  return normalized;
+}
+
+function workerFilesystemEntries(worktree: string): string[] {
+  const entries: string[] = [];
+  const visit = (dir: string, prefix: string): void => {
+    let dirents;
+    try {
+      dirents = readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      const rel = relative(worktree, dir).split(sep).join(posix.sep) || ".";
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`context filesystem observation failed at ${rel}: ${message}`);
+    }
+    for (const dirent of dirents) {
+      if (dirent.name === ".git") continue;
+      const rel = prefix ? `${prefix}/${dirent.name}` : dirent.name;
+      entries.push(rel);
+      if (dirent.isDirectory()) visit(join(dir, dirent.name), rel);
+    }
+  };
+  visit(worktree, "");
+  return entries;
+}
+
+function exactContextResolvesInWorktree(entry: string, normalized: string, worktree: string): boolean {
+  const fullPath = join(worktree, normalized);
+  try {
+    const stat = lstatSync(fullPath);
+    if (stat.isSymbolicLink()) return false;
+    if (stat.isDirectory()) return true;
+    return !/\/+$/.test(entry) && stat.isFile() && worktreeHeadHasRegularBlob(worktree, normalized);
+  } catch (error) {
+    if (["EACCES", "ELOOP", "ENOENT", "ENOTDIR", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
+    throw error;
+  }
+}
+
+function patternContextResolvesInWorktree(normalized: string, worktree: string): boolean {
+  const match = filesGlob(normalized);
+  return workerFilesystemEntries(worktree).some((path) => match(path));
+}
+
+function regularBlobObjectId(repoRoot: string, ref: string, normalized: string): string | undefined {
+  let tree = "";
+  try {
+    tree = execFileSync("git", ["-C", repoRoot, "ls-tree", "-z", ref, "--", normalized], {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+    });
+  } catch {
+    return undefined;
+  }
+  const row = tree.split("\0")
+    .filter(Boolean)
+    .map((line) => /^(\d{6}) (\w+) ([0-9a-f]+)\t([\s\S]*)$/.exec(line))
+    .find((match) => match?.[4] === normalized);
+  if (!row || row[2] !== "blob" || (row[1] !== "100644" && row[1] !== "100755")) return undefined;
+  return row[3]!;
+}
+
+function worktreeHeadHasRegularBlob(worktree: string, normalized: string): boolean {
+  return regularBlobObjectId(worktree, "HEAD", normalized) !== undefined;
+}
+
+function committedRegularBlob(repoRoot: string, normalized: string): { bytes: Buffer } | undefined {
+  const objectId = regularBlobObjectId(repoRoot, "HEAD", normalized);
+  if (!objectId) return undefined;
+  try {
+    const bytes = execFileSync("git", ["-C", repoRoot, "cat-file", "blob", objectId], {
+      encoding: "buffer",
+      maxBuffer: MATERIALIZED_CONTEXT_BYTES,
+    });
+    return { bytes };
+  } catch {
+    return undefined;
+  }
+}
+
+function materializedContextDestination(root: string, task: Task, attempt: number, normalized: string): string {
+  const key = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+  const leaf = basename(normalized).replace(/[^A-Za-z0-9._-]/g, "_") || "context";
+  const destination = join(root, task.id, `a${attempt}`, `${key}-${leaf}`);
+  if (!containedIn(root, destination)) throw new Error(`materialized context destination escapes context subtree: ${normalized}`);
+  return destination;
+}
+
+function ensureDirectoryWithoutSymlink(path: string): void {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    mkdirSync(path, { mode: 0o700 });
+    stat = lstatSync(path);
+  }
+  if (stat.isSymbolicLink()) throw new Error(`materialized context destination ancestor is a symlink: ${path}`);
+  if (!stat.isDirectory()) throw new Error(`materialized context destination ancestor is not a directory: ${path}`);
+}
+
+function ensureContainedContextParent(root: string, destination: string): void {
+  const rootAbs = resolve(root);
+  const destAbs = resolve(destination);
+  if (!containedIn(rootAbs, destAbs)) throw new Error("materialized context destination escapes context subtree");
+  const parent = dirname(destAbs);
+
+  ensureDirectoryWithoutSymlink(rootAbs);
+  const relParent = relative(rootAbs, parent);
+  let current = rootAbs;
+  for (const segment of relParent.split(sep).filter(Boolean)) {
+    current = join(current, segment);
+    ensureDirectoryWithoutSymlink(current);
+  }
+
+  if (!containedIn(realpathSync(rootAbs), realpathSync(parent))) {
+    throw new Error("materialized context destination realpath escapes context subtree");
+  }
+}
+
+function writeContainedContextFile(root: string, destination: string, bytes: Buffer): void {
+  if (!containedIn(root, destination)) throw new Error("materialized context destination escapes context subtree");
+  ensureContainedContextParent(root, destination);
+  const fd = openSync(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+  try {
+    writeFileSync(fd, bytes);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+async function materializeContextEntry(
+  repoRoot: string,
+  worktree: string,
+  contextRoot: string,
+  task: Task,
+  attempt: number,
+  entry: string,
+): Promise<MaterializedContextOutcome> {
+  const normalized = normalizeContextPath(entry);
+  if (!normalized) return { kind: "missing", path: entry, reason: "invalid-path" };
+
+  if (exactContextResolvesInWorktree(entry, normalized, worktree)) return { kind: "keep", entry };
+
+  const blob = committedRegularBlob(repoRoot, normalized);
+  if (blob) {
+    const destination = materializedContextDestination(contextRoot, task, attempt, normalized);
+    writeContainedContextFile(contextRoot, destination, blob.bytes);
+    return { kind: "materialized", entry: destination, normalized, destination, bytes: blob.bytes.length };
+  }
+
+  if (CONTEXT_GLOB_CHARS.test(entry)) {
+    if (patternContextResolvesInWorktree(normalized, worktree)) return { kind: "keep", entry };
+    return { kind: "missing", path: entry, reason: "unresolved-pattern" };
+  }
+  if (/\/+$/.test(entry)) return { kind: "missing", path: entry, reason: "unresolved-pattern" };
+
+  return { kind: "missing", path: entry, reason: "no-committed-regular-blob" };
+}
+
+async function taskWithMaterializedContext(repoRoot: string, journal: Journal, worktree: string, task: Task, attempt: number): Promise<Task> {
+  if (task.context.length === 0) return task;
+  const contextRoot = resolve(journal.dir, "context");
+  const context: string[] = [];
+  for (const entry of task.context) {
+    const prepared = await materializeContextEntry(repoRoot, worktree, contextRoot, task, attempt, entry);
+    if (prepared.kind === "missing") {
+      journal.append("context-missing", task.id, { path: prepared.path, reason: prepared.reason });
+    } else {
+      context.push(prepared.entry);
+      if (prepared.kind === "materialized") {
+        journal.append("context-materialized", task.id, {
+          path: entry,
+          normalized: prepared.normalized,
+          destination: prepared.destination,
+          bytes: prepared.bytes,
+        });
+      }
+    }
+  }
+  return { ...task, context };
+}
+
 async function cherryPickCommits(wt: string, commits: string[]): Promise<string[]> {
   const carried: string[] = [];
   for (const hash of commits) {
@@ -1085,10 +1292,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     journal.append("lock-reclaimed", undefined, lock.reclaimed); // HARD-02 audit trail
   }
   // GATE-08 (v1.12): the humanGate guard consults this run's journaled approvals, not just the compiled
-  // flag. Built ONCE at startup from the journal; a fresh run's journal is empty ⇒ empty set ⇒ unapproved
-  // gates park exactly as today. (D-02 step 3 — the load-bearing change: a command + event WITHOUT this
-  // guard change ships a no-op; the task replays to pending, re-enters execTask, and re-parks.)
-  const approved = new Set(journal.read().filter((e) => e.event === "task-approved" && e.taskId).map((e) => e.taskId as string));
+  // flag. Startup approvals seed the first scheduling pass; live approvals are folded at task
+  // boundaries below so a sibling can release parked work without waiting for run-end + resume.
+  const approvalStartupEvents = journal.read();
+  const approved = new Set(approvalStartupEvents.filter((e) => e.event === "task-approved" && e.taskId).map((e) => e.taskId as string));
+  let approvalSweepCursor = approvalStartupEvents.length;
   const commands = detectGateCommands(repoRoot, cfg);
 
   let baseRef: string;
@@ -1097,9 +1305,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // Empty Map on fresh runs — every seed below conditions on resume.get(t.id), never on opts.resume (the
   // GATE-08 lesson at the humanGate guard: condition on the data, not the code path). Dead-code
   // equivalence to the router.ts:194 profile⇒undefined pattern: no map entry ⇒ today's literal.
-  const resume = opts.resume ? journal.replayResumeState() : new Map<string, ResumeState>();
-  const satisfiedGates = opts.resume ? journal.replaySatisfiedGates() : new Map<string, GateName>();
-  const replayedGateResults = resumeLifecycleOpen
+  let resume = opts.resume ? journal.replayResumeState() : new Map<string, ResumeState>();
+  let satisfiedGates = opts.resume ? journal.replaySatisfiedGates() : new Map<string, GateName>();
+  let replayedGateResults = resumeLifecycleOpen
     ? journal.replayCurrentAttemptGateResults()
     : new Map<string, CurrentAttemptGateReplay>();
   // T7: the capacity THIS session resolved — read inside the run's fork budget, so it is the number
@@ -1198,8 +1406,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let watchSlot: Slot | undefined;
   try {
     watchSlot = await driver.narrator?.(repoRoot, watchCommand(runId), runId);
-  } catch {
-    /* cosmetic-only — the run proceeds without a live surface */
+  } catch (error) {
+    journal.append("watch-placement-failed", undefined, { error: error instanceof Error ? error.message : String(error) });
   }
 
   const intWt = await ensureIntegration(repoRoot, branch, baseRef);
@@ -1277,6 +1485,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
   // gateFails/consults are execTask-scoped counters passed in so a park row is a rich verified-failure
   // observation (e.g. ladder-exhausted + gateFails:4); every task-human row has a closed kind, never prose alone.
+  const gateFailApprovalReason = (taskId: string, identity: string, includeUphold = false): string => {
+    const commands = [
+      `tickmarkr approve ${runId} ${taskId} --waive`,
+      `tickmarkr approve ${runId} ${taskId} --recheck`,
+      ...(includeUphold ? [`tickmarkr approve ${runId} ${taskId} --uphold`] : []),
+    ];
+    return `${identity} — release with ${commands.map((command) => `\`${command}\``).join(" or ")}`;
+  };
+
   const park = async (t: Task, reason: string, kind: ParkKind, assignment: Assignment | null, attempts: number, startMs: number, gateFails = 0, consults = 0, tokens?: TokenUsage, metered = 0, retryMode: RetryMode = "fresh", details: Record<string, unknown> = {}) => {
     graph = setStatus(graph, t.id, "human");
     saveGraph(repoRoot, graph);
@@ -1338,6 +1555,36 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       });
     }
     return false;
+  };
+
+  const sweepLiveApprovals = (): void => {
+    const events = journal.read();
+    const approvals = events.slice(approvalSweepCursor)
+      .filter((e) => e.event === "task-approved" && e.taskId);
+    approvalSweepCursor = events.length;
+    if (approvals.length === 0) return;
+
+    resume = journal.replayResumeState();
+    satisfiedGates = journal.replaySatisfiedGates();
+    replayedGateResults = resumeLifecycleOpen
+      ? journal.replayCurrentAttemptGateResults()
+      : new Map<string, CurrentAttemptGateReplay>();
+    let changed = false;
+    for (const e of approvals) {
+      const taskId = e.taskId!;
+      approved.add(taskId);
+      if (e.data.release !== GATE_SATISFIED_RELEASE) replayedGateResults.delete(taskId);
+      try {
+        const task = getTask(graph, taskId);
+        if (task.status === "human" || task.status === "failed") {
+          graph = setStatus(graph, taskId, "pending");
+          changed = true;
+        }
+      } catch {
+        // Unknown task in a stale journal: approval replay is inert, like the other journal folds.
+      }
+    }
+    if (changed) saveGraph(repoRoot, graph);
   };
 
   const execTask = async (t: Task): Promise<void> => {
@@ -1910,7 +2157,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // result in the journal and return to the ordinary attempt/consult ladder, which rebuilds
           // feedback from those rows. Only an operator-authorized gate release parks on a new red.
           if (!satisfiedGate) break gateLoop;
-          await park(t, "post-approval gate failed", "gate-fail", gateAuthor, rs?.attempts ?? 0,
+          await park(t, gateFailApprovalReason(t.id, "post-approval gate failed", results.some((g) => g.gate === "review" && gateFailed(g))), "gate-fail", gateAuthor, rs?.attempts ?? 0,
             startMs, gateFails, consults, tokens, metered, retryMode);
           return;
         }
@@ -1973,7 +2220,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // survives the reset and governs only those further rounds. Absence preserves the module default.
       const reviewRoundCap = approvedReviewRoundCeiling(journal.read(), t.id) ?? REVIEW_ROUND_CAP;
       if (attempt > 0 && reviewRoundsDrawn() >= reviewRoundCap) {
-        await park(t, `review round cap (${reviewRoundCap}) reached this engagement — \`tickmarkr approve\` accepts the diff past review; \`tickmarkr approve --uphold\` funds one fixed attempt carrying the findings`, "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
+        await park(t, gateFailApprovalReason(t.id, `review round cap (${reviewRoundCap}) reached this engagement`, true), "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       // OBS-57: a demoted channel must not be re-dispatched on consult retry or provider requeue.
@@ -2008,7 +2255,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           gate: banned, from: channelKey(assignment), to: next ? channelKey(next) : null,
         });
         if (!next) {
-          await park(t, `identical ${banned} failure twice this engagement — an identical retry is banned and no untried channel is left`,
+          await park(t, gateFailApprovalReason(t.id, `identical ${banned} failure twice this engagement — an identical retry is banned and no untried channel is left`),
             "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
           return;
         }
@@ -2078,6 +2325,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         })].join("\n");
         feedback = feedback ? `${feedback}\n\n${brief}` : brief;
       }
+      const carriedConsultGuidance = outstandingConsultGuidance(journaledSoFar, t.id);
+      if (carriedConsultGuidance) {
+        const consultBrief = renderRetryGuidance({ ...carriedConsultGuidance, notes: "" });
+        if (consultBrief && !feedback.includes(consultBrief)) {
+          feedback = feedback ? `${feedback}\n\n${consultBrief}` : consultBrief;
+        }
+      }
       retryMode = repairFindings
         ? "repair"
         : priorSession
@@ -2106,6 +2360,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       journal.append("task-dispatch", t.id, {
         assignment, attempt, provenance: dispatchProvenance(r.provenance), retryMode,
         ...(outstandingFindings.length > 0 ? { carriedFindings: outstandingFindings } : {}),
+        ...(carriedConsultGuidance ? { carriedConsultGuidance } : {}),
       });
       journal.phaseStart(t.id, "worker", { attempt, assignment });
 
@@ -2207,7 +2462,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           return;
         }
       }
-      const promptFile = writePrompt(journal.dir, t, attempt, feedback, nonce);
+      const promptTask = await taskWithMaterializedContext(repoRoot, journal, wt, t, attempt);
+      const promptFile = writePrompt(journal.dir, promptTask, attempt, feedback, nonce);
       // OBS-56: state the non-interactive, one-pass finish contract and the OBS-54 stall budget in every
       // worker prompt, not only consult retry guidance. Prepended so prompt.ts's completion trailer stays last.
       const workerContract = `## Harness contract\n- This harness is non-interactive: make one continuous pass; do not stop for questions or follow-up input.\n- You have a ${taskTimeoutMinutes} minute stall window. The gates run the full suite for you — never spend this window on one; commit your work and emit the completion trailer inside it.\n- Each test: acceptance criterion must exist as a vitest test whose OWN title (the leaf, not counting enclosing describe titles) is the criterion string verbatim — never shortened, never decorated. Nesting under describe() is allowed.`; // OBS-64; OBS-511: leaf-title rule stated where the worker reads it; OBS-548: the suite is the GATES' job — this repo's own suite outlasts the output-silence windows the daemon polices, so a worker obeying "budget the full suite" was killed by construction
@@ -3556,6 +3812,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // v1.54 T2: a signal that landed while nothing was racing `aborted` (empty inflight window)
     // must still stop the run before it can dispatch more work or write run-end.
     if (termSignal) throw new Error(`terminated by ${termSignal}`);
+    sweepLiveApprovals();
     const ready = readyTasks(graph)
       .filter((t) => !inflight.has(t.id))
       .slice(0, Math.max(0, concurrency - inflight.size));

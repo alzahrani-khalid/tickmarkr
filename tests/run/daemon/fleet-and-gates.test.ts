@@ -62,7 +62,7 @@ async function seedGateSatisfiedResume(
   }
   journal.append("task-human", "T1", { reason: "gate failed", kind: "gate-fail" });
   writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline));
-  await approve([runId, "T1", "--by", "test"], repo);
+  await approve([runId, "T1", "--waive", "--by", "test"], repo);
   return { repo, fake, suiteLog };
 }
 
@@ -628,8 +628,8 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
     expect(opens[0]).not.toContain("run-zz-newer"); // never the bare, newest-journal-following command
   });
 
-  test("a narrator that fails to open never affects the run (cosmetic-only, swallowed)", async () => {
-    const { repo, fake } = setupRepo(
+  test("test: a narrator placement failure journals a watch-placement-failed event carrying the thrown message while a driver without a narrator journals nothing so a failed and a never-attempted board are no longer byte-identical in the journal", async () => {
+    const failing = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
     );
@@ -648,8 +648,31 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
       worktree: inner.worktree.bind(inner),
       async narrator() { throw new Error("herdr tab create failed"); },
     };
-    const s = await runDaemon(repo, { adapters: [fake], runId: "run-narr-fail", driver });
+    const s = await runDaemon(failing.repo, { adapters: [failing.fake], runId: "run-narr-fail", driver });
     expect(s.done).toEqual(["T1"]); // the run succeeded despite the narrator failure
+    expect(Journal.open(failing.repo, "run-narr-fail").read().some((e) =>
+      e.event === "watch-placement-failed" && e.data.error === "herdr tab create failed"
+    )).toBe(true);
+
+    const never = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
+    );
+    const noNarrator = {
+      id: "subprocess",
+      interactive: false,
+      status: inner.status.bind(inner),
+      slot: inner.slot.bind(inner),
+      run: inner.run.bind(inner),
+      waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      read: inner.read.bind(inner),
+      notify: inner.notify.bind(inner),
+      close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+    };
+    await runDaemon(never.repo, { adapters: [never.fake], runId: "run-narr-none-journal", driver: noNarrator });
+    expect(Journal.open(never.repo, "run-narr-none-journal").read().some((e) => e.event === "watch-placement-failed")).toBe(false);
   });
 
   test("a driver without narrator (subprocess-style) spawns nothing new", async () => {

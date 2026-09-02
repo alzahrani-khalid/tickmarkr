@@ -39,6 +39,7 @@ const PUBLIC_EXACT = new Set([
   "tsconfig.json",
   "vitest.config.ts",
   ".github/pull_request_template.md",
+  "scripts/assert-test-file-count.sh",
   "scripts/emit-schema.ts",
   "scripts/probe-rig.mjs",
   "specs/export-selftest.spec.md", // the generated stub — the ONLY specs/ path that ships
@@ -208,6 +209,7 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       "src/compile/gsd.ts",
       "schema/rungraph.schema.json",
       "assets/mark.svg",
+      "scripts/assert-test-file-count.sh",
       "scripts/emit-schema.ts",
       "scripts/probe-rig.mjs",
       "skills/tickmarkr-loop/SKILL.md",

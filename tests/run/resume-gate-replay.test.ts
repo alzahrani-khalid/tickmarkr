@@ -243,6 +243,69 @@ test("replaySatisfiedGates receives current-attempt failed-gate journals with no
     expect(markerLines(typed.marker)[0]).toBe("lint");
   }, 120_000);
 
+test("test: a waiver is consumed by the worktree-recreation row journaled as its enactment so a run killed after that row and before any later approval or park resumes with the formerly waived gate running while a fold that clears the waiver only on a later task-approved or task-human row replays the dead waiver and fails", () => {
+  const journal = Journal.create(
+    makeTestTempDir("tickmarkr-waiver-enacted-"),
+    "run-waiver-enacted-then-killed",
+  );
+  journal.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0 });
+  journal.append("worker-result", "T1", {
+    ok: true, summary: "landed", deviations: [], finished: true, exitCode: 0,
+  });
+  journal.phaseStart("T1", "gates");
+  journal.append("gate-result", "T1", {
+    gate: "build", pass: false, details: "exit 1", commit: "waived-commit", attempt: 0,
+  });
+  journal.append("task-human", "T1", { reason: "build failed", kind: "gate-fail" });
+  journal.append("task-approved", "T1", {
+    by: "operator", release: "gate-satisfied", gate: "build",
+  });
+  expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "build"]]));
+
+  journal.append("worktree-recreation", "T1", {
+    attempted: ["waived-commit"], carried: ["waived-commit"],
+  });
+
+  // This is the durable fast-kill boundary consumed by runDaemon on resume. The executable resume
+  // oracle immediately above pins that no satisfied gate means build runs; keep this test focused on
+  // the fold input so it adds no second repository/worktree process fan-out to the full suite.
+  expect(journal.read().at(-1)?.event).toBe("worktree-recreation");
+  expect(journal.replaySatisfiedGates()).toEqual(new Map());
+});
+
+test("test: a task re-parked after its waiver was enacted resumes with no gate marked satisfied so the new park's own release decides afresh while a waiver surviving its own enactment into the next engagement fails", () => {
+  const journal = Journal.create(
+    makeTestTempDir("tickmarkr-waiver-reparked-"),
+    "run-waiver-enacted-then-reparked",
+  );
+  journal.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0 });
+  journal.append("task-human", "T1", { reason: "gate failed", kind: "gate-fail" });
+  journal.append("task-approved", "T1", {
+    by: "operator", release: "gate-satisfied", gate: "build",
+  });
+  expect(journal.replayStatuses().get("T1")).toBe("pending");
+  expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "build"]]));
+
+  journal.append("worktree-recreation", "T1", {
+    attempted: ["waived-commit"], carried: ["waived-commit"],
+  });
+  expect(journal.replaySatisfiedGates()).toEqual(new Map());
+
+  journal.append("task-human", "T1", {
+    reason: "post-approval gate failed", kind: "gate-fail",
+  });
+  journal.append("run-resume", undefined, { pid: 222_222 });
+
+  expect(journal.replayStatuses().get("T1")).toBe("human");
+  expect(journal.replaySatisfiedGates()).toEqual(new Map());
+
+  journal.append("task-approved", "T1", {
+    by: "operator", release: "gate-satisfied", gate: "test",
+  });
+  expect(journal.replayStatuses().get("T1")).toBe("pending");
+  expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "test"]]));
+});
+
 test("a daemon-controlled restart writes exit-cause \"deliberate\" before leaving, while the next resume after a process killed before run-end writes exit-cause \"unclean\" from durable lock/journal evidence; a reader distinguishes both without requiring the dead process to write", async () => {
     const deliberateRunId = "run-exit-deliberate";
     const deliberate = setupRepo(

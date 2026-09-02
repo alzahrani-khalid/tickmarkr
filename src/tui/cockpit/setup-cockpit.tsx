@@ -9,11 +9,19 @@ import {
   type ReactNode,
 } from "react";
 import { parse } from "yaml";
-import { approve } from "../../cli/commands/approve.js";
+import {
+  approvalDispositionForRelease,
+  approvalEnactment,
+  approvalRunOwner,
+  approve,
+  type ApprovalDisposition,
+  type ApprovalRunOwner,
+} from "../../cli/commands/approve.js";
 import {
   ATTEMPT_CAP_RELEASE,
   GATE_SATISFIED_RELEASE,
   Journal,
+  RECHECK_RELEASE,
   REVIEW_UPHELD_RELEASE,
 } from "../../run/journal.js";
 import {
@@ -1278,6 +1286,19 @@ export function actionableDecisions(
  * replay is the production one (`Journal.replayStatuses`) so this surface and
  * `tickmarkr status` can never disagree about what is parked.
  */
+function failedGateForNewestPark(events: ReturnType<Journal["read"]>, taskId: string, parkedIndex: number): string | undefined {
+  for (let index = parkedIndex - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.taskId !== taskId) continue;
+    if (event.event === "task-approved" || event.event === "task-human" || event.event === "task-dispatch") return undefined;
+    if (event.event === "gate-result" && event.data.pass === false
+        && typeof event.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(event.data.gate)) {
+      return event.data.gate;
+    }
+  }
+  return undefined;
+}
+
 export function deriveParkedDecisions(
   journal: Journal,
 ): readonly ParkedDecision[] {
@@ -1295,14 +1316,7 @@ export function deriveParkedDecisions(
       else if (event.event === "task-human") parkedIndex = index;
     }
     const parked = parkedIndex >= 0 ? events[parkedIndex] : undefined;
-    // The same rule the production approve command applies: the newest failed
-    // gate-result before the newest task-human controls what approve records
-    // and whether uphold exists at all. Never inferred from the park's prose.
-    const failedGate = events.slice(0, Math.max(0, parkedIndex)).reverse().find((event) =>
-      event.event === "gate-result" && event.taskId === taskId && event.data.pass === false
-      && typeof event.data.gate === "string"
-      && (GATE_NAMES as readonly string[]).includes(event.data.gate)
-    )?.data.gate as string | undefined;
+    const failedGate = failedGateForNewestPark(events, taskId, parkedIndex);
     const kind = typeof parked?.data.kind === "string" ? parked.data.kind : "human-gate";
     const reason = typeof parked?.data.reason === "string" ? parked.data.reason : undefined;
     decisions.push({
@@ -1320,8 +1334,7 @@ export function deriveParkedDecisions(
   return decisions;
 }
 
-/** The two decisions a parked task offers — the production command's two verbs. */
-export type SetupDecisionVerb = "approve" | "uphold";
+export type SetupDecisionVerb = "approve" | "waive" | "uphold" | "recheck";
 
 /** A decision the operator has named but not yet confirmed. */
 export type SetupDecisionCommand = {
@@ -1335,6 +1348,7 @@ export type SetupDecisionWrite = {
   readonly verb: SetupDecisionVerb;
   /** The release marker read back from the recorded task-approved event. */
   readonly release: string | undefined;
+  readonly disposition: ApprovalDisposition;
   readonly by: string;
 };
 
@@ -1368,8 +1382,15 @@ export type SetupDecisionsKeyResult = {
  * inert and the keybar does not advertise it — the surface never promises a
  * decision the command must refuse.
  */
+export function setupDecisionVerbs(decision: ParkedDecision): readonly SetupDecisionVerb[] {
+  if (decision.tombstone) return [];
+  if (decision.kind !== "gate-fail") return ["approve"];
+  if (decision.failedGate === undefined) return [];
+  return decision.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
+}
+
 export function upholdAvailable(decision: ParkedDecision): boolean {
-  return decision.failedGate === "review";
+  return setupDecisionVerbs(decision).includes("uphold");
 }
 
 /**
@@ -1411,23 +1432,27 @@ export function applySetupDecisionsKey(
       },
     };
   }
-  if (event.input === "a" || event.input === "u") {
+  const verb = ({ a: "approve", w: "waive", u: "uphold", r: "recheck" } as const)[event.input ?? ""];
+  if (verb !== undefined) {
     const decision = decisions[selection];
-    if (decision === undefined) return { session };
-    if (event.input === "u" && !upholdAvailable(decision)) return { session };
+    if (decision === undefined || !setupDecisionVerbs(decision).includes(verb)) return { session };
     return {
       session: {
         ...session,
         selection,
-        confirming: {
-          verb: event.input === "a" ? "approve" : "uphold",
-          taskId: decision.taskId,
-        },
+        confirming: { verb, taskId: decision.taskId },
       },
     };
   }
   return { session };
 }
+
+const decisionFlag = (verb: SetupDecisionVerb): string[] => {
+  if (verb === "waive") return ["--waive"];
+  if (verb === "uphold") return ["--uphold"];
+  if (verb === "recheck") return ["--recheck"];
+  return [];
+};
 
 export type SetupDecisionOutcome =
   | {
@@ -1459,7 +1484,7 @@ export async function executeSetupDecision(
       [
         runId,
         command.taskId,
-        ...(command.verb === "uphold" ? ["--uphold"] : []),
+        ...decisionFlag(command.verb),
         "--by",
         by,
       ],
@@ -1474,11 +1499,12 @@ export async function executeSetupDecision(
         break;
       }
     }
+    const disposition = approvalDispositionForRelease(release);
     return {
       ok: true,
       command,
       message,
-      write: { taskId: command.taskId, verb: command.verb, release, by },
+      write: { taskId: command.taskId, verb: command.verb, release, disposition, by },
     };
   } catch (error) {
     return {
@@ -1512,44 +1538,51 @@ function decisionRowText(decision: ParkedDecision): string {
  * append — the release markers are the command's own constants, so this text
  * cannot drift from the write. An effect the operator cannot read here is an
  * effect this surface does not have.
+ *
+ * WHO enacts it is the command's own sentence (`approvalEnactment`), read from
+ * the same run-owner fact: predicting "the next resume" over a LIVE run was
+ * true only while the daemon read approvals once at startup. It now sweeps them
+ * at every task boundary, so that prediction would send the operator to start a
+ * second run in this repository — forbidden — for work already scheduled.
  */
 function decisionEffectLines(
   command: SetupDecisionCommand,
   decision: ParkedDecision | undefined,
+  run: ApprovalRunOwner,
 ): readonly string[] {
+  if (command.verb === "waive") {
+    const gate = decision?.failedGate;
+    return gate === undefined ? ["effect none — waive refuses without a failed gate"] : [
+      `effect disposition waive-gate; appends release ${GATE_SATISFIED_RELEASE} for gate ${gate}`,
+      `it marks gate ${gate} satisfied; it does NOT mark the task done`,
+      approvalEnactment("waive-gate", run),
+    ];
+  }
+  if (command.verb === "recheck") {
+    return [
+      `effect disposition re-dispatch; appends release ${RECHECK_RELEASE}`,
+      "it marks no gate satisfied",
+      approvalEnactment("re-dispatch", run),
+    ];
+  }
   if (command.verb === "uphold") {
     return [
-      `effect appends one task-approved event with release ${REVIEW_UPHELD_RELEASE};`
-        + " the next resume funds one fixed attempt carrying the findings",
-      "it does NOT mark the task done or pass any gate",
+      `effect disposition fund-fixed-attempt; appends release ${REVIEW_UPHELD_RELEASE}`,
+      approvalEnactment("fund-fixed-attempt", run),
     ];
   }
   if (decision?.kind === "gate-fail") {
-    if (decision.failedGate === undefined) {
-      // The command's own refusal, predicted: no write is promised here.
-      return [
-        "effect none — the command refuses: parked on gate-fail"
-          + " but no failed gate result is recorded",
-      ];
-    }
-    const gate = decision.failedGate;
-    return [
-      `effect appends one task-approved event with release ${GATE_SATISFIED_RELEASE}`
-        + ` for gate ${gate}; the next resume continues past the approved gate`,
-      `it marks gate ${gate} satisfied; it does NOT mark the task done`,
-    ];
+    return ["effect none — approve is not offered on gate-fail parks; choose waive, recheck or uphold"];
   }
   if (decision?.kind === ATTEMPT_CAP_RELEASE) {
     return [
-      `effect appends one task-approved event with release ${ATTEMPT_CAP_RELEASE};`
-        + ` the next resume dispatches ${command.taskId} with a fresh attempt budget`,
-      "it does NOT mark the task done or pass any gate",
+      `effect disposition fresh-budget; appends release ${ATTEMPT_CAP_RELEASE}`,
+      approvalEnactment("fresh-budget", run),
     ];
   }
   return [
-    "effect appends one task-approved event with no release;"
-      + ` the next resume dispatches ${command.taskId}`,
-    "it does NOT mark the task done or pass any gate",
+    `effect disposition dispatch; appends one task-approved event with no release`,
+    approvalEnactment("dispatch", run),
   ];
 }
 
@@ -1562,11 +1595,12 @@ export function setupDecisionConfirmLines(
   decision: ParkedDecision | undefined,
   actor: string,
   journalFile: string,
+  run: ApprovalRunOwner,
 ): readonly string[] {
   return [
     `task   ${command.taskId}${decision === undefined ? "" : ` · ${decision.kind} · attempt ${decision.attempts}`}`,
     `actor  ${actor}`,
-    ...decisionEffectLines(command, decision),
+    ...decisionEffectLines(command, decision, run),
     `file   ${journalFile} · append only`,
     `y ${command.verb} · n cancel`,
   ];
@@ -1580,8 +1614,13 @@ function setupDecisionsKeybar(
   if (session.confirming !== null) return "y Confirm · n Cancel";
   if (decisions.length === 0) return "q Quit";
   const selected = Math.min(session.selection, decisions.length - 1);
-  const uphold = upholdAvailable(decisions[selected]!) ? " · u Uphold" : "";
-  return `↑↓ Move · a Approve${uphold} · q Quit`;
+  const verbs = setupDecisionVerbs(decisions[selected]!).map((verb) => ({
+    approve: "a Approve",
+    waive: "w Waive",
+    uphold: "u Uphold",
+    recheck: "r Recheck",
+  })[verb]).join(" · ");
+  return `↑↓ Move · ${verbs} · q Quit`;
 }
 
 /**
@@ -1592,7 +1631,7 @@ function setupDecisionsKeybar(
  */
 const DECISIONS_TAB_LINE =
   `tab ${DECISIONS_TAB_HINT} · journal-parked human decisions`
-  + " · approve and uphold are its only writes";
+  + " · approve waive uphold and recheck are its only writes";
 
 /**
  * What the section says when no park needs the operator. It names its own
@@ -1601,8 +1640,8 @@ const DECISIONS_TAB_LINE =
  */
 const DECISIONS_EMPTY_STATE = [
   "nothing needs you now — no task is parked on a human gate",
-  "a task that parks on one appears here with its two decisions —"
-    + " approve releases it, uphold sides with the reviewer",
+  "a task that parks on one appears here with its decisions —"
+    + " approve dispatches, waive accepts a gate, uphold funds a fix, recheck re-runs",
 ] as const;
 
 /**
@@ -1618,12 +1657,15 @@ export function SetupDecisionsSurface({
   columns,
   actor,
   journalFile,
+  run,
 }: {
   decisions: readonly ParkedDecision[];
   session: SetupDecisionsSession;
   columns: number;
   actor: string;
   journalFile: string;
+  /** Who enacts a confirmed write — read from the run lock, never assumed. */
+  run: ApprovalRunOwner;
 }): ReactElement {
   const inner = Math.max(1, Math.floor(columns) - 4);
   const actionable = actionableDecisions(decisions);
@@ -1668,6 +1710,7 @@ export function SetupDecisionsSurface({
             decisions.find((decision) => decision.taskId === confirming.taskId),
             actor,
             journalFile,
+            run,
           ).map((line) => (
             <BodyText key={line}>{fitCells(line, inner)}</BodyText>
           ))}
@@ -1680,7 +1723,8 @@ export function SetupDecisionsSurface({
           : session.writes.map((write) => (
             <BodyText key={`${write.verb}:${write.taskId}`}>
               {fitCells(
-                `${write.verb} ${write.taskId} · release ${write.release ?? "none"} · by ${write.by}`,
+                `${write.verb} ${write.taskId} · disposition ${write.disposition}`
+                  + ` · release ${write.release ?? "none"} · by ${write.by}`,
                 inner,
               )}
             </BodyText>
@@ -1732,6 +1776,9 @@ function SetupDecisionsApp({
       columns={stdout.columns ?? 80}
       actor={actor}
       journalFile={join(stateDirName(cwd), "runs", runId, "journal.jsonl")}
+      // read per render, not once at mount: a daemon can start or end while the
+      // operator is deciding, and the inset must not promise the wrong enactor.
+      run={approvalRunOwner(cwd, runId)}
     />
   );
 }

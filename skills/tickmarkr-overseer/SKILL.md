@@ -487,6 +487,12 @@ they are left implicit:
    were authed on 2026-08-17 while every seat ran claude). Priority when independence is scarce:
    **verifier > checker > planner > executors** — the independent seat goes cross-vendor
    (`herdr agent start … --kind codex`), ruled at dispatch, never debated under time pressure.
+   **A codex seat inside a git WORKTREE cannot commit and cannot write outside the worktree** (OBS-824, measured
+   twice on 2026-09-01): its sandbox pins writes to the worktree's own path, and a worktree's `.git` is a FILE pointing
+   at the main repository's object store, so every `git commit` from inside it is refused. Brief such a seat to leave its
+   report INSIDE the worktree and to commit nothing — the overseer commits from the main checkout — or give the work to a
+   claude seat, or to a throwaway CLONE (a real `.git` directory). A brief that tells a codex-in-worktree seat to commit
+   buys a stall, not a commit.
 4. **Gate every exec lane with the shipped battery, not hand-rolled greps.**
    `tickmarkr verify --base <ref> --criteria <file>` is the standalone form of the engine's own gates —
    build/test/lint diffed against a recorded baseline, evidence, scope, plus the semantic judges — one

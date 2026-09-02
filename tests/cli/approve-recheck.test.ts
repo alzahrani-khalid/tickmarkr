@@ -76,14 +76,14 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     await expect(approve(["run-recheck-contract", "T1", "--uphold", "--recheck"], repo))
       .rejects.toThrow(/different decisions/);
     await expect(approve(["run-recheck-contract", "T1", "--uphold"], repo))
-      .rejects.toThrow(/last failed gate is scope/);
+      .rejects.toThrow(/failed gate scope/);
     expect(scopePark.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
 
     const unmatched = Journal.create(repo, "run-recheck-unmatched");
     unmatched.append("task-dispatch", "T1", { assignment, attempt: 0 });
     unmatched.append("task-human", "T1", { kind: "reroute-exhausted", reason: "no failed gate" });
     await expect(approve(["run-recheck-unmatched", "T1", "--recheck"], repo))
-      .rejects.toThrow(/park kind is reroute-exhausted/);
+      .rejects.toThrow(/newest park is reroute-exhausted/);
     expect(unmatched.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
   });
 });
