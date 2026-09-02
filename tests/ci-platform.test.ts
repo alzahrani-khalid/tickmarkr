@@ -78,9 +78,12 @@ describe("CI platform lanes", () => {
   });
 
   test("test: every step of every workflow definition present in this checkout whose run command invokes the test runner carries both the lean-reporter key and the fork-cap key, enumerated from the parsed workflow rather than from a list of known steps; an enumerator keyed on the coverage invocation alone misses two steps and fails", () => {
-    const coverageSteps = testRunnerSteps.filter(({ step }) => step.run!.includes("test:coverage"));
-    expect(testRunnerSteps.length, "coverage invocations must not be the whole runner-step enumeration")
-      .toBeGreaterThan(coverageSteps.length);
+    // The matcher must recognise plain runner forms as well as the coverage form — asserted on the
+    // commands themselves, not by counting steps: the public export ships only ci.public.yml, whose
+    // every runner step IS a coverage invocation, so a step-count guard reds the exported tree alone.
+    expect(invokesTestRunner("npx vitest run --project sync-heavy"), "plain vitest form").toBe(true);
+    expect(invokesTestRunner(publicGateCommands[2]!), "coverage form").toBe(true);
+    expect(invokesTestRunner("npm run build"), "non-runner command").toBe(false);
 
     for (const { path, jobName, stepIndex, step } of testRunnerSteps) {
       const source = `${path} job ${jobName} step ${stepIndex + 1}`;
