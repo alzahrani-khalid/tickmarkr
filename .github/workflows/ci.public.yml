@@ -31,23 +31,36 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # Full-suite proof: one unfiltered, coverage-gated invocation runs all four projects. The
-      # sync-heavy project keeps its config-level single-fork isolation inside this invocation.
-      # OBS-156: serialize on the 2-core hosted runner. OBS-148 fixed release.yml only, so this
-      # job starved a different load-sensitive test on every release (v1.78 herdr READINESS,
+      # Full-suite proof in TWO invocations (OBS-829, measured 2026-09-01/02 on four collapses): a
+      # host stall on the 2-core runner times out a parallel `suite` worker's onTaskUpdate rpc and
+      # vitest throws BEFORE dispatching the three single-fork projects, whose files then vanish
+      # unnamed and unfailed. Running those three in their own `if: always()` invocation means a
+      # throw in `suite` cannot lose them, and the count oracle sums both logs against the tracked
+      # tree. OBS-156: serialize on the 2-core hosted runner. OBS-148 fixed release.yml only, so
+      # this job starved a different load-sensitive test on every release (v1.78 herdr READINESS,
       # v1.79 daemon tip-verify artifact) while Release passed on the identical commit.
-      - name: Run full-suite coverage proof
+      - name: Run coverage proof (parallel suite project)
         shell: bash
         run: |
           set -o pipefail
-          npm run test:coverage 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+          npm run test:coverage -- --project suite 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      - name: Run single-fork projects (independent of the step above)
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          npx vitest run --project sync-heavy --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
       - name: Assert collected test-file count
         if: always()
-        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log"
+        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
 
   test-macos:
     if: github.repository == 'alzahrani-khalid/tickmarkr'
@@ -61,16 +74,26 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # Same unfiltered four-project coverage proof and serialization as ubuntu.
-      - name: Run full-suite coverage proof
+      # Same two-invocation proof and serialization as ubuntu (the lane-equality test pins it).
+      - name: Run coverage proof (parallel suite project)
         shell: bash
         run: |
           set -o pipefail
-          npm run test:coverage 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+          npm run test:coverage -- --project suite 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      - name: Run single-fork projects (independent of the step above)
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          npx vitest run --project sync-heavy --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
       - name: Assert collected test-file count
         if: always()
-        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log"
+        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"

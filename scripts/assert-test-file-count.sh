@@ -2,11 +2,21 @@
 
 set -u
 
-output_file=${1-}
-if [ "$#" -ne 1 ] || [ ! -r "$output_file" ]; then
+# Usage: assert-test-file-count.sh <vitest-output-log>... — one log per invocation; every log must
+# carry exactly one "Test Files ... (N)" summary; the N values are SUMMED and compared with the
+# tracked test-file count. OBS-829: the full suite runs as two invocations (the parallel `suite`
+# project under coverage, the three single-fork projects plain) so a worker rpc timeout in the first
+# cannot silently drop the second's files — the oracle therefore reads both logs.
+if [ "$#" -lt 1 ]; then
   printf '%s\n' "COUNT_ORACLE RED expected=UNREADABLE actual=UNREADABLE"
   exit 1
 fi
+for output_file in "$@"; do
+  if [ ! -r "$output_file" ]; then
+    printf '%s\n' "COUNT_ORACLE RED expected=UNREADABLE actual=UNREADABLE"
+    exit 1
+  fi
+done
 
 repo_root=$(git rev-parse --show-toplevel) || {
   printf '%s\n' "COUNT_ORACLE RED expected=UNREADABLE actual=UNREADABLE"
@@ -25,7 +35,9 @@ if ! git -C "$repo_root" ls-files 'tests/*.test.ts' > "$expected_file"; then
 fi
 expected=$(awk 'END { print NR }' "$expected_file")
 
-if actual=$(awk '
+actual=0
+for output_file in "$@"; do
+if value=$(awk '
   {
     line = $0
     escape = sprintf("%c", 27)
@@ -44,11 +56,12 @@ if actual=$(awk '
     }
   }
 ' "$output_file"); then
-  :
+  actual=$((actual + value))
 else
   printf '%s\n' "COUNT_ORACLE RED expected=$expected actual=UNREADABLE"
   exit 1
 fi
+done
 
 if [ "$actual" -eq "$expected" ]; then
   printf '%s\n' "COUNT_ORACLE GREEN expected=$expected actual=$actual"

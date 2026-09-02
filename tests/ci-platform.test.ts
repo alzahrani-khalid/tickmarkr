@@ -20,9 +20,12 @@ const publicGateCommands = [
   "npm run build",
   "npm run lint",
   `set -o pipefail
-npm run test:coverage 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+npm run test:coverage -- --project suite 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
 `,
-  `sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log"`,
+  `set -o pipefail
+npx vitest run --project sync-heavy --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+`,
+  `sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"`,
 ];
 const gateCommandsFor = (path: string): string[] =>
   path.endsWith("ci.public.yml") ? publicGateCommands : splitGateCommands;

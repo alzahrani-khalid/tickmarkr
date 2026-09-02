@@ -72,9 +72,10 @@ Per release:
 
 3. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run — the **full-suite
    proof** triggered by that exact mirror `main` push — to report green for the exported commit. In each of the `test`
-   and `test-macos` jobs, that proof runs all four Vitest projects in one unfiltered,
-   coverage-gated invocation and count-asserts its reported collected test-file total against the
-   tracked test-file tree. Both jobs must be green. Match the run's head SHA to the mirror's
+   and `test-macos` jobs, that proof runs the parallel `suite` project under coverage and the three
+   single-fork projects in a second, independent invocation (OBS-829: a worker rpc timeout in the
+   first must not silently drop the second), and count-asserts the SUM of both reported collected
+   test-file totals against the tracked test-file tree. Both jobs must be green. Match the run's head SHA to the mirror's
    `HEAD`; a red or missing run is a hard stop, and the tag does not exist yet. This proves the
    exported tree was fully collected on those two CI jobs; it does not make the post-tag workflow
    rerun the full suite or automatically bind publication to the recorded pre-tag proof.
