@@ -33,7 +33,7 @@
 # usage: watch-context.sh <role-slug> <agent|pane> <warn-pct> <act-pct> [handoff-file] [poll-s] [cap-s]
 #   <role-slug> is ANY seat role — orchestrator, overseer, surgeon, consult — and names the tier
 #   `<role>-context`. It is deliberately NOT a closed set: see OBS-730 at the guard below.
-#   TKR_AUTO_CLEAR=1   at act-pct WITH a fresh handoff, send /clear and re-brief instead of waking.
+#   TKR_AUTO_CLEAR=1   at act-pct WITH a fresh handoff, auto-clear orchestrator/overseer; other roles wake only.
 #   TKR_REBRIEF=<path> the file the re-briefed seat is told to read (defaults to the handoff).
 #   TKR_HANDOFF_MAX_AGE_S  how fresh "fresh" is (default 900).
 #   TKR_CLEAR_SETTLE_S     seconds to let a cleared seat settle before the re-brief (default 6).
@@ -221,7 +221,7 @@ handoff_fresh() {
 act_on() {
   local P="$1"
   if handoff_fresh; then
-    if [ "${TKR_AUTO_CLEAR:-0}" = "1" ]; then
+    if [ "${TKR_AUTO_CLEAR:-0}" = "1" ] && { [ "$ROLE" = "orchestrator" ] || [ "$ROLE" = "overseer" ]; }; then
       herdr agent prompt "$TARGET" "/clear" >/dev/null 2>&1
       sleep "$SETTLE"
       herdr agent prompt "$TARGET" "Read ${REBRIEF} and continue exactly where it says. Your context was cleared at ${P}% against that handoff; it is current as of $(date '+%H:%M'). Do not reconstruct from memory — everything you need is on disk." >/dev/null 2>&1

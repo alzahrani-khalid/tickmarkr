@@ -1752,6 +1752,9 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
 
     // the retry reproduces the upheld finding BYTES — never a heading over an empty section
     const prompt = readFileSync(promptPath, "utf8");
+    expect(existsSync(join(tickmarkrDir(repo), "runs", runId, "prompts", "T1-a0-engagement-0.md"))).toBe(true);
+    expect(readFileSync(join(tickmarkrDir(repo), "runs", runId, "prompts", "T1-a0-engagement-1.md"), "utf8"))
+      .toBe("STALE — no dispatch happened\n");
     expect(prompt).not.toContain("STALE");
     expect(prompt).toContain("## Previous attempt failed gates — fix these specifically");
     expect(prompt).toContain("The operator UPHELD the reviewer's findings");

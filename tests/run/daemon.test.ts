@@ -730,7 +730,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     }
   }
 
-  test("the daemon passes its doctor filtered channels to consult", async () => {
+  test("test: every consult-verdict journal row names the adapter and model of the seat that answered alongside the vendor its channel carries whereas a verdict row without provenance or one stamping the pinned seat when a prefer seat answered fails", async () => {
     // Pin's scripted verdict PARKS the task; the fake2 prefer seat's verdict retries it. done=["T1"]
     // therefore proves consult received the daemon's channel list (an unpassed list ⇒ empty live set ⇒
     // pin answers ⇒ human park), and the doctor-unauthed fake3 seat must be skipped without invocation.
@@ -769,9 +769,14 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(fake2.consultModels.length).toBeGreaterThan(0);
     expect(new Set(fake2.consultModels)).toEqual(new Set(["fake-9"]));
     expect(fake3.consultModels).toEqual([]); // doctor-filtered seat skipped without an invocation
-    const verdict = Journal.open(repo, "run-consult-channels").read().find((e) => e.event === "consult-verdict")!;
-    expect(verdict.data.action).toBe("retry");
-    expect(verdict.data.notes).toBe("seat fake2 answered");
+    const verdicts = Journal.open(repo, "run-consult-channels").read().filter((event) => event.event === "consult-verdict");
+    expect(verdicts.length).toBeGreaterThan(0);
+    for (const verdict of verdicts) {
+      expect(verdict.data).toMatchObject({
+        action: "retry", notes: "seat fake2 answered",
+        adapter: "fake2", model: "fake-9", vendor: "fake2",
+      });
+    }
   });
 
   test("test: runDaemon gives structured retry bullets to both a worker dispatched after graph-changed revival of a consult-parked task and the ordinary live consult-retry control, while the shipped fresh revival omitting guidance and either path embedding raw consult notes fail", async () => {
@@ -810,6 +815,9 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
       reason: "evidence gate empty twice",
       guidance: "Commit a real file.\nStay inside declared paths.",
       notes: distinctive,
+      adapter: "fake",
+      model: "fake-1",
+      vendor: "fake-a",
     });
 
     const parkedNotes = "RAW CONSULT PARK NOTES: scope amendment narrative must not be pasted into the worker prompt";
@@ -926,6 +934,33 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
       .map((e) => String((e.data as { details?: string }).details));
     expect(details.some((d) => /unparseable/.test(d))).toBe(true); // first review: garbage, fail-closed
     expect(details.some((d) => /no cross-vendor reviewer available/.test(d))).toBe(true); // retry: corpse excluded
+  });
+
+  test("test: a gate note event delivered through the gate event callback is appended verbatim as a journal row of that event name under its task so a reviewer-empty-output note carrying bytes 1 appears in the journal whereas a daemon that drops the note phase or rewrites its payload fails", async () => {
+    const { repo, fake, scriptPath } = setupRepo(
+      [T("T1", { complexity: 8 })],
+      {
+        consult: { action: "human", notes: "stop after the empty reviewer" },
+        tasks: { T1: [{ shell: `echo one > f.txt && ${COMMIT} one`, result: { ok: true, summary: "1" } }] },
+      },
+      "review:\n  prefer: [empty]\n",
+    );
+    class EmptyReviewer extends FakeAdapter {
+      override id = "empty";
+      override vendor = "empty";
+      override async probe() {
+        return { installed: true, authed: true, version: "empty", models: ["empty-1"], modelAuth: authedModels(["empty-1"]) };
+      }
+      override channels(): BillingChannel[] {
+        return [{ adapter: this.id, vendor: this.vendor, model: "empty-1", channel: "sub", tier: "cheap" }];
+      }
+      override headlessCommand(): string { return "true"; }
+    }
+    const runId = "run-gate-note";
+    await runDaemon(repo, { adapters: [fake, new EmptyReviewer(scriptPath)], runId });
+    const note = Journal.open(repo, runId).read().find((event) =>
+      event.event === "reviewer-empty-output" && event.taskId === "T1");
+    expect(note?.data).toEqual({ reviewer: "empty:empty-1", bytes: 1 });
   });
 
   test("v1.1: retried gates get attempt-unique pane names (herdr agent_name_taken regression)", async () => {

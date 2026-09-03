@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { claudeCode } from "../../src/adapters/claude-code.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import { type Assignment, type BillingChannel, declaredInputBoxForWorkerName, shq } from "../../src/adapters/types.js";
+import { type Assignment, type BillingChannel, declaredInputBoxForWorkerName, shq, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
@@ -1386,4 +1386,69 @@ describe("R3 participation is path-keyed and the nudge reaches the adapter allow
       else process.env.HERDR_WORKSPACE_ID = prevWs;
     }
   }, 120_000);
+});
+
+describe("review empty-output note", () => {
+  const reviewOnlyGates = ["build", "test", "lint", "evidence", "scope", "review"] as const;
+  const authorSeat: Assignment = { adapter: "author", model: "author-m", channel: "sub", tier: "frontier" };
+
+  function reviewerAdapter(id: string, response: "empty" | string): WorkerAdapter {
+    return {
+      id,
+      vendor: id,
+      trustDialog: { kind: "none", reason: "test adapter renders no TUI" },
+      probe: async () => ({ installed: true, authed: true, models: ["m"] }),
+      channels: () => [],
+      headlessCommand: (promptFile: string) => {
+        if (response === "empty") return "true";
+        const nonce = /VERDICT_NONCE:\s*([0-9a-f]+)/i.exec(readFileSync(promptFile, "utf8"))?.[1] ?? "";
+        return `printf %s ${shq(response.replace("__NONCE__", nonce))}`;
+      },
+      invoke: () => ({ command: "true" }),
+      parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+    };
+  }
+
+  async function reviewRound(first: WorkerAdapter, prefer: string[]) {
+    const { repo, baseRef } = repoWithCommit();
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.review.prefer = prefer;
+    const reviewChannels: BillingChannel[] = [
+      { adapter: "author", vendor: "author", model: "author-m", channel: "sub", tier: "frontier" },
+      { adapter: first.id, vendor: first.id, model: `${first.id}-m`, channel: "sub", tier: "frontier" },
+      { adapter: "good", vendor: "good", model: "good-m", channel: "sub", tier: "frontier" },
+    ];
+    const events: GateEvent[] = [];
+    const out = await runGates(mkTask({ gates: [...reviewOnlyGates], files: ["a.txt"] }), {
+      worktree: repo,
+      baseRef,
+      author: authorSeat,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands: {},
+      baseline: await captureBaseline(repo, {}),
+      channels: reviewChannels,
+      adapters: [first, reviewerAdapter("good", '{"nonce":"__NONCE__","approve":true,"findings":[]}')],
+      cfg,
+      pipeline: "v185",
+      onGate: (e) => { events.push(e); },
+    });
+    return { out, events };
+  }
+
+  test("test: a reviewer that returns one byte makes the review round emit a note event reviewer-empty-output carrying the reviewer key and bytes 1 through the gate event callback and write a re-route details line saying the reviewer produced EMPTY output whereas a malformed verdict keeps the no parseable verdict wording without any note so a gate that folds both causes into one text fails", async () => {
+    const empty = await reviewRound(reviewerAdapter("empty", "empty"), ["empty", "good"]);
+    expect(empty.events.find((e) => e.phase === "note")).toMatchObject({
+      gate: "review",
+      name: "reviewer-empty-output",
+      payload: { reviewer: "empty:empty-m", bytes: 1 },
+    });
+    expect(empty.out.results.find((r) => r.gate === "review")?.details).toContain("produced EMPTY output");
+
+    const malformed = await reviewRound(
+      reviewerAdapter("malformed", '{"nonce":"__NONCE__","approve":true,'),
+      ["malformed", "good"],
+    );
+    expect(malformed.events.some((e) => e.phase === "note")).toBe(false);
+    expect(malformed.out.results.find((r) => r.gate === "review")?.details).toContain("produced no parseable verdict");
+  });
 });

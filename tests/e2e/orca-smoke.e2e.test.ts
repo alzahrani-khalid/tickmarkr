@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { shq } from "../../src/adapters/types.js";
 import { USAGE } from "../../src/cli/index.js";
 import { DRIVER_CHOICES } from "../../src/drivers/index.js";
-import { canonicalWorktreePath, OrcaDriver, OrcaError, parseEnvelope, terminalWorktree, type OrcaExec } from "../../src/drivers/orca.js";
+import { canonicalWorktreePath, OrcaDriver, OrcaError, parseEnvelope, resolveOrcaCliBinary, terminalWorktree, type OrcaExec } from "../../src/drivers/orca.js";
 import type { Slot } from "../../src/drivers/types.js";
 import { removeWorktree, sh, shGit, shOk, type ShResult } from "../../src/run/git.js";
 
@@ -68,6 +68,8 @@ interface SmokeObservations {
   createReceiptWorktree?: string;
   /** the nonce trailer came back contiguous and byte-exact through OrcaDriver reads */
   trailerObserved: boolean;
+  /** driver.status() deliberately exercised an elapsed terminal wait against the installed Orca */
+  elapsedWaitExercised: boolean;
   /** the runtime identity that ANSWERED the create — orca handles are runtime-scoped, so this is
    *  the only identity against which this handle's presence or absence means anything */
   createRuntimeId?: string;
@@ -97,6 +99,7 @@ export function smokeVerdict(o: SmokeObservations): { status: SmokeStatus; reaso
   if (!o.reachable) return { status: "skipped", reasons: [o.unreachable ?? "orca runtime is not reachable"] };
   const reasons: string[] = [];
   if (!o.trailerObserved) reasons.push("no byte-exact nonce trailer observed through OrcaDriver reads");
+  if (!o.elapsedWaitExercised) reasons.push("no elapsed terminal wait exercised through OrcaDriver status");
   if (o.smokeWorktree === undefined || o.createReceiptWorktree !== o.smokeWorktree) {
     reasons.push(`create receipt bound to ${o.createReceiptWorktree ?? "no worktree"}, not the smoke's ${o.smokeWorktree ?? "unknown"}`);
   }
@@ -126,10 +129,31 @@ export function recordingExec(tape: OrcaCall[], run: typeof sh = sh): OrcaExec {
   return async (args, cwd, timeoutMs) => {
     // Bounded by default — the driver leaves timeoutMs undefined on `status` and the reads, and
     // sh's 600s default is twice the live leg's ceiling (CALL_TIMEOUT_MS).
-    const result = await run(["orca", ...args].map(shq).join(" "), cwd, timeoutMs ?? CALL_TIMEOUT_MS);
+    const binary = resolveOrcaCliBinary(cwd) ?? "orca";
+    const result = await run([binary, ...args].map(shq).join(" "), cwd, timeoutMs ?? CALL_TIMEOUT_MS);
     tape.push({ args, result });
     return result;
   };
+}
+
+function elapsedWaitSeen(tape: OrcaCall[]): boolean {
+  return tape.some(({ args, result }) => {
+    if (args[0] !== "terminal" || args[1] !== "wait" || !args.includes("tui-idle") || result.code !== 1) return false;
+    try {
+      const body = JSON.parse(result.stdout) as Record<string, unknown>;
+      const error = typeof body.error === "object" && body.error !== null ? body.error as Record<string, unknown> : {};
+      const wait = typeof body.result === "object" && body.result !== null
+        ? (body.result as Record<string, unknown>).wait
+        : undefined;
+      return (body.ok === false && error.code === "timeout")
+        || (body.ok === true
+          && typeof wait === "object"
+          && wait !== null
+          && (wait as Record<string, unknown>).satisfied === false);
+    } catch {
+      return false;
+    }
+  });
 }
 
 function createReceipt(tape: OrcaCall[]): { handle?: string; worktree?: string; runtimeId?: string } {
@@ -233,6 +257,7 @@ export async function runOrcaSmoke(opts: {
     gate: opts.gate ?? process.env.TICKMARKR_E2E === "1",
     reachable: false,
     trailerObserved: false,
+    elapsedWaitExercised: false,
     listedBeforeClose: false,
     terminalClosed: false,
   };
@@ -284,6 +309,8 @@ export async function runOrcaSmoke(opts: {
     observations.createRuntimeId = receipt.runtimeId;
     // waitOutput tolerates renderer wrapping; the unpaged read is the byte-exact leg.
     const matched = await driver.waitOutput(slot, TRAILER, TRAILER_TIMEOUT_MS);
+    await driver.status(slot);
+    observations.elapsedWaitExercised = elapsedWaitSeen(tape);
     observations.trailerObserved = matched && (await driver.read(slot, 200)).includes(TRAILER);
     if (receipt.handle === undefined) throw new Error("the create receipt carries no handle — no close can be proven against it");
     if (receipt.runtimeId === undefined) throw new Error("the create receipt carries no runtime identity — its handle is scoped to nothing provable");
@@ -367,6 +394,7 @@ export async function liveLeg(ctx: SkipChannel, smoke: SmokeResult): Promise<"sk
   expect(smoke.reasons, "smoke reasons must be empty to pass").toEqual([]);
   expect(smoke.status).toBe("passed");
   expect(smoke.observations.trailerObserved).toBe(true);
+  expect(smoke.observations.elapsedWaitExercised).toBe(true);
   expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.smokeWorktree);
   expect(smoke.observations.listedBeforeClose).toBe(true);
   expect(smoke.observations.terminalClosed).toBe(true);
@@ -392,6 +420,7 @@ describe("e2e: orca driver smoke", () => {
       smokeWorktree: "/tmp/smoke-wt",
       createReceiptWorktree: "/tmp/smoke-wt",
       trailerObserved: true,
+      elapsedWaitExercised: true,
       createRuntimeId: "rt-1",
       listedBeforeRuntimeId: "rt-1",
       listedBeforeClose: true,
@@ -400,6 +429,7 @@ describe("e2e: orca driver smoke", () => {
     };
     expect(smokeVerdict(green).status).toBe("passed");
     expect(smokeVerdict({ ...green, trailerObserved: false }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, elapsedWaitExercised: false }).status).toBe("failed");
     expect(smokeVerdict({ ...green, createReceiptWorktree: "/tmp/some-other-wt" }).status).toBe("failed");
     expect(smokeVerdict({ ...green, createReceiptWorktree: undefined }).status).toBe("failed");
     expect(smokeVerdict({ ...green, terminalClosed: false }).status).toBe("failed");
@@ -420,6 +450,7 @@ describe("e2e: orca driver smoke", () => {
     if (smoke.status !== "skipped") {
       expect(smoke.status, `live smoke: ${smoke.reasons.join(" · ")}`).toBe("passed");
       expect(smoke.observations.trailerObserved).toBe(true);
+      expect(smoke.observations.elapsedWaitExercised).toBe(true);
       expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.smokeWorktree);
       expect(smoke.observations.listedBeforeClose).toBe(true);
       expect(smoke.observations.terminalClosed).toBe(true);
@@ -428,7 +459,7 @@ describe("e2e: orca driver smoke", () => {
     }
   }, LIVE_LEG_TIMEOUT_MS);
 
-  test("without the e2e gate or without a reachable runtime the smoke skips as skipped rather than passing while a smoke that silently passes when orca is absent fails", async (ctx) => {
+  test("the e2e smoke exercises an elapsed terminal wait on the installed Orca deliberately so it reports skipped as a loud tri-state result rather than a silent pass when no runtime answers as the diff shows in the changed smoke hunks", async (ctx) => {
     const ungated = await runOrcaSmoke({ gate: false });
     expect(ungated.status).toBe("skipped");
     expect(ungated.reasons).toEqual(["TICKMARKR_E2E is not 1"]);
@@ -468,6 +499,7 @@ describe("e2e: orca driver smoke", () => {
       smokeWorktree: "/tmp/smoke-wt",
       createReceiptWorktree: "/tmp/smoke-wt",
       trailerObserved: true,
+      elapsedWaitExercised: true,
       listedBeforeClose: true,
       terminalClosed: true,
     };

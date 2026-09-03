@@ -788,6 +788,7 @@ acceptance is required on every task (a nested list of observable outcomes).
                  - command: <shell>   (oracle: command — exit code)
                  - test: <name>       (oracle: test — named test)
                  - judge: <rubric>    (oracle: judge — LLM-judged, free text)
+                 A judge criterion carries ONE claim; a semicolon-joined criterion warns — split its clauses.
                  - <plain text>       (compat: compiles as judge oracle, warns)
 
   HARD BOUNDS — these FAIL the compile, they do not warn:
@@ -903,6 +904,7 @@ acceptance is required on every task (a nested list of observable outcomes).
   ORDERING AND OWNERSHIP:
     - Every path has exactly ONE owning task. Two tasks writing one file must be ORDERED by deps, or the
       loser's work is silently dropped when the integration tip advances.
+    - A task changing what the daemon DOES must own every surface that TELLS the operator what the daemon does.
     - A file one task CREATES cannot be "context:" for another — only deps: carries it, and that extends to
       the task that PRODUCES a value, not just the file's existence.
     - Deleting or renaming a symbol is a cross-task contract. Sweep for consumers by symbol AND by what the

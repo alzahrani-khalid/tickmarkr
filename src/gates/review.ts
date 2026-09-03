@@ -442,6 +442,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     // OBS-196: name the cause and persist the raw bytes — a ruled-on "unparseable" without its
     // evidence cannot be audited, and a cutoff must never be indistinguishable from a parse defect.
     const cause: ReviewUnparseableCause = classifyVerdictCause(raw, nonce, "approve");
+    const bytes = Buffer.byteLength(raw, "utf8");
     let saved: string | undefined;
     if (artifactDir) {
       try {
@@ -465,6 +466,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
         reviewer: channelKey(reviewer),
         unparseable: true,
         cause,
+        ...(cause === "empty-output" ? { bytes } : {}),
         ...(concludedOnInactivity ? { classification: "infra", infra: true } : {}),
       },
     };

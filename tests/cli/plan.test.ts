@@ -682,16 +682,36 @@ describe("v1.86 T3 autoPrefer deleted — plan and doctor surfaces", () => {
 describe("v1.89 T4 harness banner — production default", () => {
   test("plan with no supplied location names the invoked entrypoint, not the command module it happens to live in", async () => {
     const out = await plan([], mkRepo());
-    expect(out.split("\n")[2]).toBe(harnessLine(resolveHarness(process.argv[1]!)));
+    expect(out.split("\n")[3]).toBe(harnessLine(resolveHarness(process.argv[1]!)));
     // the regression this guards: import.meta.url here names src/cli/commands/plan.ts (dist/…/plan.js
     // once built), an internal module — never the harness a user actually invoked.
-    expect(out.split("\n")[2]).not.toContain(realpathSync(join(import.meta.dirname, "../../src/cli/commands/plan.ts")));
+    expect(out.split("\n")[3]).not.toContain(realpathSync(join(import.meta.dirname, "../../src/cli/commands/plan.ts")));
   });
 
   test("the harness banner precedes the routing table and leaves the mode line where it was", async () => {
     const lines = (await plan([], mkRepo())).split("\n");
     expect(lines[1].startsWith("mode: ")).toBe(true); // other suites index this line
-    expect(lines[2].startsWith("harness: ")).toBe(true);
-    expect(lines.findIndex((l) => l.trimStart().startsWith("T1"))).toBeGreaterThan(2);
+    expect(lines[2].startsWith("driver: ")).toBe(true);
+    expect(lines[3].startsWith("harness: ")).toBe(true);
+    expect(lines.findIndex((l) => l.trimStart().startsWith("T1"))).toBeGreaterThan(3);
   });
+});
+
+test("test: plan prints exactly one driver line naming the resolved driver alongside its evidence for a config driver or an auto pick under HERDR_ENV or an auto pick without it whereas a plan that prints no driver line or two fails", async () => {
+  const prior = process.env.HERDR_ENV;
+  const line = async (repo: string) => (await plan([], repo)).split("\n").filter((value) => value.startsWith("driver: "));
+  try {
+    const configured = mkRepo();
+    withOverlay(configured, "driver: orca\n");
+    expect(await line(configured)).toEqual(["driver: orca (config)"]);
+
+    process.env.HERDR_ENV = "1";
+    expect(await line(mkRepo())).toEqual(["driver: auto → herdr (HERDR_ENV=1)"]);
+
+    delete process.env.HERDR_ENV;
+    expect(await line(mkRepo())).toEqual(["driver: auto → subprocess (HERDR_ENV unset)"]);
+  } finally {
+    if (prior === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = prior;
+  }
 });

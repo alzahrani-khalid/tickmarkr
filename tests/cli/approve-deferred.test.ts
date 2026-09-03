@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
-import { type ApprovalDisposition, type ApprovalStatus, approve } from "../../src/cli/commands/approve.js";
+import { approvalEnactment, approvalRunOwner, type ApprovalDisposition, type ApprovalStatus, approve } from "../../src/cli/commands/approve.js";
 import { COMMANDS, dispatch } from "../../src/cli/index.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { formatSummary, outstandingApprovals, runDaemon } from "../../src/run/daemon.js";
@@ -10,12 +10,12 @@ import { GATE_SATISFIED_RELEASE, type JournalEvent, Journal } from "../../src/ru
 import { runLockOwner } from "../../src/run/lock.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
-// T14: an approval the runtime ACCEPTS against a live daemon may be inert for that run — daemon.ts
-// builds its approved set once at startup and never re-reads it (deliberate: replay determinism).
-// These tests pin the two disclosures that were missing: the disposition at the moment of approval,
-// derived from the run lock's own recorded owner pid; and the run's completion record naming every
-// accepted approval that never reached a dispatch, with a recovery command claimed only over the ids
-// it can actually release.
+// T14, amended by v2.2 T3: the live daemon sweeps accepted approvals at every task boundary, so an
+// approval that lands while the task loop is still turning is enacted by that run. The approval that
+// lands after the last boundary, during tip verify, is the one that stays outstanding because no
+// further sweep remains before run-end. These tests pin both the disposition at approval time,
+// derived from the run lock's recorded owner, and the completion record that names any accepted
+// approval left outstanding.
 //
 // Every test here is TOP-LEVEL with a verbatim title: the acceptance oracle filters with a leaf-anchored
 // `-t '(^| )…$'` over vitest's full name (OBS-511 widened it through describe prefixes), so the test's
@@ -121,6 +121,46 @@ const twoGateRepo = (extraCfg = "") => setupRepo(
 // still owns after its last task boundary: an approval accepted there can never be swept, which is
 // the only way to produce a real `outstanding` record now that live approvals are enacted.
 const TIP_VERIFY_GATE = `gates: { test: "true" }\n`;
+
+test("test: approve against a run whose repository lock is held by a live daemon owning a different run prints a third enactment sentence naming that other run as the reason the release waits for resume after it ends so its status record carries no deferred-live token or resume command whereas the shipped two-state owner that prints run tickmarkr resume there fails", async () => {
+  const runId = "run-awaiting-owner";
+  const ownerRunId = "run-live-owner";
+  const repo = parkedRun(runId);
+  plantLock(repo, { pid: process.pid, runId: ownerRunId, startedAt: Date.now() });
+
+  const out = await approve([runId, "T1", "--by", "operator"], repo);
+
+  expect(out).toContain(`release recorded; live run \`${ownerRunId}\` holds the repository lock`);
+  expect(out).toContain(`resume \`${runId}\` after it ends to dispatch it`);
+  expect(out).not.toContain(`tickmarkr resume ${runId}`);
+  expect(printedStatus(out)).toEqual({
+    status: "recorded-no-owner",
+    disposition: "dispatch",
+    ownerPid: process.pid,
+    ownerRunId,
+  });
+  expect(approvalBytes(repo, runId)).toHaveLength(1);
+});
+
+test("test: approvalEnactment renders three distinct sentences from one owner object for a live owner of this run or a live owner of another run or no owner so every surface calling it agrees whereas an enactment that collapses the other-run case into no owner fails", () => {
+  const runId = "run-enactment";
+  const liveRepo = parkedRun(runId);
+  const blockedRepo = parkedRun(runId);
+  const finishedRepo = parkedRun(runId);
+  plantLock(liveRepo, { pid: process.pid, runId, startedAt: Date.now() });
+  plantLock(blockedRepo, { pid: process.pid, runId: "run-blocking", startedAt: Date.now() });
+
+  const live = approvalRunOwner(liveRepo, runId);
+  const blocked = approvalRunOwner(blockedRepo, runId);
+  const finished = approvalRunOwner(finishedRepo, runId);
+  const sentences = [live, blocked, finished].map((owner) => approvalEnactment("dispatch", owner));
+
+  expect(new Set(sentences).size).toBe(3);
+  expect(sentences[0]).toContain("the live daemon enacts this at its next task boundary");
+  expect(sentences[1]).toContain("live run `run-blocking` holds the repository lock");
+  expect(sentences[1]).toContain(`resume \`${runId}\` after it ends`);
+  expect(sentences[2]).toContain(`run \`tickmarkr resume ${runId}\``);
+});
 
 test("`tickmarkr approve` run while the run's lock pid is ALIVE prints that the live daemon enacts the release at the next task boundary and prints NO `tickmarkr resume` instruction in any of its five disposition messages, while the same command against a finished run (no live owner) still prints the `tickmarkr resume <runId>` instruction — one test drives both branches through the real approve entrypoint and fails if either message is wrong or if a live approval is told to resume", async () => {
   const runId = "run-disposition";

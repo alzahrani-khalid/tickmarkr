@@ -19,6 +19,15 @@ async function initialisedSpec(): Promise<string> {
 
 afterEach(() => vi.restoreAllMocks());
 
+const DAEMON_SURFACE_LAW =
+  "A task changing what the daemon DOES must own every surface that TELLS the operator what the daemon does.";
+const SINGLE_CLAIM_LAW =
+  "A judge criterion carries ONE claim; a semicolon-joined criterion warns — split its clauses.";
+
+function statesDaemonAndJudgeLaws(written: string): boolean {
+  return written.includes(DAEMON_SURFACE_LAW) && written.includes(SINGLE_CLAIM_LAW);
+}
+
 // The section authors are pointed at. Slicing it keeps every assertion below about the criterion law
 // itself, never about the same words appearing somewhere else in the template.
 function criterionSection(written: string): string {
@@ -89,6 +98,21 @@ function statesSpikeNonApplication(section: string): boolean {
   return /Do NOT run the spike for a change that is purely additive and unwinds cheaply/i.test(section)
     && /bounded by\s+the expense of a late defect, not by novelty/i.test(section);
 }
+
+describe("spec template — daemon surfaces and single-claim judges", () => {
+  test("test: the spec template a fresh tickmarkr init writes states in its ordering law that a task changing what the daemon does must own every surface that tells the operator what the daemon does and states beside the judge oracle that a judge criterion carries one claim so a semicolon-joined criterion warns whereas a template missing either sentence fails", async () => {
+    const written = await initialisedSpec();
+
+    expect(statesDaemonAndJudgeLaws(written)).toBe(true);
+    expect(written.indexOf(SINGLE_CLAIM_LAW)).toBeGreaterThan(written.indexOf("- judge: <rubric>"));
+    expect(written.indexOf(SINGLE_CLAIM_LAW)).toBeLessThan(written.indexOf("- <plain text>"));
+    expect(written.indexOf(DAEMON_SURFACE_LAW)).toBeGreaterThan(written.indexOf("ORDERING AND OWNERSHIP:"));
+
+    for (const missing of [DAEMON_SURFACE_LAW, SINGLE_CLAIM_LAW]) {
+      expect(statesDaemonAndJudgeLaws(written.replace(missing, ""))).toBe(false);
+    }
+  });
+});
 
 describe("spec template — spike contract before scope", () => {
   test("test: the template a freshly initialised repository receives states the trigger as a question about a test the task does not own and rules that needing to grep in order to answer it is a yes; wording that asks only whether the change is risky leaves the author to judge scope by feel and fails", async () => {

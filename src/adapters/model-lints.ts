@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG, type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
 import { filesGlob } from "../graph/files-glob.js";
 import type { Task } from "../graph/schema.js";
+import { piModelVendor } from "./pi.js";
 import { buildTaskPrompt } from "./prompt.js";
 import { channelKey, MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "./types.js";
 import { resolveCatalogModel, type CatalogModelEvidence, type CatalogReadResult } from "./catalog-remote.js";
@@ -545,6 +546,14 @@ export function modelLints(
   const lints: string[] = [];
   for (const adapter of adapters) {
     const id = adapter.id;
+    if (id === "pi" && adapter.channels) {
+      for (const channel of adapter.channels(cfg)) {
+        const expected = cfg.tiers.pi?.modelOverrides?.[channel.model]?.vendor ?? piModelVendor(channel.model);
+        if (expected && channel.vendor !== expected) {
+          lints.push(`pi: ${channel.model} channel vendor ${channel.vendor} disagrees with provider vendor ${expected} — set tiers.pi.modelOverrides.${channel.model}.vendor to ${expected}`);
+        }
+      }
+    }
     if (!adapter.listModels) {
       // v1.90 / OBS-504: the seeds-stamped wording presumes a seeded tier table. agy ships routable
       // but UNCLASSIFIED (no listModels, no seed models) — for that shape the honest sentence names

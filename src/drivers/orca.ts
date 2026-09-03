@@ -9,7 +9,7 @@ import { formatOwnedName, panesToClose, type ExecutorDriver, type NotifyOpts, ty
 // worktrees, routing, gates, journal and merges; orca supplies visible terminals only. Everything
 // here is bound by the 1.4.186 conformance spike
 // (.planning/assessments/2026-08-21-orca-driver-conformance.md, CONFORMANCE-END) and the
-// recorded refusal transport (process rc 1 + ok:false on stdout):
+// 1.4.195 drift capture (.planning/assessments/2026-09-02-orca-1.4.195-capture/):
 //
 //  - reads arrive as `result.terminal.tail` line arrays with line-indexed cursors and a `status`
 //    field on the same object (C2); a CLOSED terminal answers ok:true with its own dead record
@@ -36,7 +36,12 @@ import { formatOwnedName, panesToClose, type ExecutorDriver, type NotifyOpts, ty
 export const ORCA_RESPONSE_FAMILIES = ["status", "create", "list", "read", "send", "wait", "show", "close"] as const;
 export type OrcaFamily = (typeof ORCA_RESPONSE_FAMILIES)[number];
 
+export const ORCA_FIXTURE_VERSION = "1.4.195";
+export const ORCA_CLI_COMMAND_ENV = "ORCA_CLI_COMMAND";
 export const STALE_HANDLE_CODE = "terminal_handle_stale";
+export const TERMINAL_GONE_CODE = "terminal_gone";
+export const STALE_HANDLE_CODES = new Set([STALE_HANDLE_CODE, TERMINAL_GONE_CODE]);
+export const WAIT_TIMEOUT_CODE = "timeout";
 export const NOT_WRITABLE_CODE = "terminal_not_writable";
 /** The ONLY terminal status that licenses reading a terminal's bytes or its agent state. */
 export const RUNNING_STATUS = "running";
@@ -95,6 +100,25 @@ export interface OrcaEnvelope {
 
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v ? v : undefined;
+}
+
+export interface OrcaBinaryResolverOpts {
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  platform?: NodeJS.Platform;
+  resolve?: (bin: string, cwd: string) => { resolved?: string };
+}
+
+/**
+ * One Orca CLI name decision for both the driver and doctor. Linux desktop systems can have
+ * GNOME's screen-reader `orca` on PATH, so outside an Orca terminal the app CLI is `orca-ide`.
+ */
+export function resolveOrcaCliBinary(cwd = process.cwd(), opts: OrcaBinaryResolverOpts = {}): string | undefined {
+  const env = opts.env ?? process.env;
+  const explicit = env[ORCA_CLI_COMMAND_ENV]?.trim();
+  if (explicit) return explicit;
+  const platform = opts.platform ?? process.platform;
+  const selected = platform === "linux" && env.TERM_PROGRAM !== "Orca" ? "orca-ide" : "orca";
+  return opts.resolve ? opts.resolve(selected, cwd).resolved : selected;
 }
 
 /**
@@ -259,6 +283,8 @@ interface OrcaSlotState {
 
 export interface OrcaDriverOpts {
   bin?: string;
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  platform?: NodeJS.Platform;
   exec?: OrcaExec;
   time?: OrcaTimeSource;
   pageLines?: number;
@@ -280,7 +306,7 @@ export class OrcaDriver implements ExecutorDriver {
   private probeStalenessMs: number;
 
   constructor(opts: OrcaDriverOpts = {}) {
-    this.bin = opts.bin ?? "orca";
+    this.bin = opts.bin ?? resolveOrcaCliBinary(process.cwd(), { env: opts.env, platform: opts.platform }) ?? "orca";
     // Config values flow into a shell here: every argv element is quoted, always.
     this.exec = opts.exec ?? ((args, cwd, timeoutMs) => {
       return sh([this.bin, ...args].map(shq).join(" "), cwd, timeoutMs);
@@ -302,14 +328,13 @@ export class OrcaDriver implements ExecutorDriver {
     // diagnostic is never discarded before the one shared parser reports it.
     const raw = [r.stdout, r.stderr ? `STDERR: ${r.stderr}` : ""].filter(Boolean).join("\n");
     if (r.code !== 0) {
-      // Recorded 1.4.186 refusal transport: the process exits rc 1 with the STRUCTURED ok:false
+      // Recorded refusal transport: the process exits rc 1 with the STRUCTURED ok:false
       // body on stdout. Parse it so the refusal CODE survives (terminal_handle_stale,
       // terminal_not_writable) — everything downstream that recovers on a code depends on this
-      // branch. The one documented exception is an elapsed `terminal wait`: it exits 1 but carries
-      // an ok:true, `wait.satisfied:false` receipt. It remains the shared parser's success path;
-      // waitCondition() validates its identity, handle, condition and running status before it
-      // becomes the normal `false` result. Any other ok:true body on a nonzero exit stays a
-      // transport failure (a shell/runtime crash can leave stale stdout behind).
+      // branch. Elapsed `terminal wait` has two recorded transports: 1.4.186's ok:true,
+      // `wait.satisfied:false` receipt and 1.4.195's ok:false/code:timeout refusal. Each remains
+      // scoped to wait only; any other ok:true body on a nonzero exit stays a transport failure (a
+      // shell/runtime crash can leave stale stdout behind).
       try {
         const env = parseEnvelope(family, r.stdout, raw);
         const wait = env.result.wait;
@@ -325,6 +350,23 @@ export class OrcaDriver implements ExecutorDriver {
           return env;
         }
       } catch (e) {
+        if (
+          family === "wait"
+          && r.code === 1
+          && !r.timedOut
+          && e instanceof OrcaError
+          && e.code === WAIT_TIMEOUT_CODE
+          && e.runtimeId
+          && e.runtimeId !== "none"
+        ) {
+          const handle = args[args.indexOf("--terminal") + 1];
+          const condition = args[args.indexOf("--for") + 1];
+          return {
+            result: { wait: { handle, condition, satisfied: false, status: RUNNING_STATUS } },
+            runtimeId: e.runtimeId,
+            raw,
+          };
+        }
         // The refusal code lives in stdout alone, but the raw bytes propagated to the caller must
         // still be the COMBINED stream — stderr can carry the diagnostic that explains the refusal.
         if (e instanceof OrcaError && !(e instanceof OrcaUnavailableError) && e.code !== undefined) {
@@ -448,6 +490,10 @@ export class OrcaDriver implements ExecutorDriver {
     st.handle = handle;
     // The handle is bound to the runtime identity that ANSWERED its create.
     st.runtimeId = env.runtimeId;
+    const surface = str(term.surface);
+    if (surface !== undefined && surface !== "visible") {
+      await this.notify(`tickmarkr orca terminal created on ${surface} surface`, { tier: "attention" });
+    }
   }
 
   // ---- handle identity and restart recovery ----------------------------------------------------
@@ -508,7 +554,7 @@ export class OrcaDriver implements ExecutorDriver {
               await relist(e.runtimeId, e.raw);
               continue;
             }
-            if (e.code === STALE_HANDLE_CODE) {
+            if (STALE_HANDLE_CODES.has(e.code)) {
               await relist(e.runtimeId, e.raw);
               continue;
             }

@@ -12,7 +12,7 @@ import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/gr
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
-import { parseEnvelope } from "../../drivers/orca.js";
+import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
@@ -47,7 +47,7 @@ export type DoctorOpts = {
   listTests?: (cwd: string) => Promise<VitestListResult>;
 };
 
-type OrcaCapability = { verdict: "pass" | "fail"; detail: string };
+type OrcaCapability = { verdict: "pass" | "fail" | "warn"; detail: string };
 
 /**
  * Orca's status body is deliberately interpreted by T1's one shared envelope parser. Doctor owns
@@ -58,7 +58,9 @@ type OrcaCapability = { verdict: "pass" | "fail"; detail: string };
  * stderr (Electron timestamps), so the row is byte-stable across runs.
  */
 export async function probeOrcaCapability(cwd: string, opts: Pick<DoctorOpts, "orcaStatusProbe" | "resolveOrcaBinary"> = {}): Promise<OrcaCapability> {
-  const binary = opts.resolveOrcaBinary ? opts.resolveOrcaBinary(cwd) : resolveShellBinary("orca", cwd).resolved;
+  const binary = opts.resolveOrcaBinary
+    ? opts.resolveOrcaBinary(cwd)
+    : resolveOrcaCliBinary(cwd, { resolve: (bin, dir) => resolveShellBinary(bin, dir) });
   if (!binary) return { verdict: "fail", detail: "CLI not installed" };
 
   let response: ShResult;
@@ -85,7 +87,16 @@ export async function probeOrcaCapability(cwd: string, opts: Pick<DoctorOpts, "o
     const reachable = typeof runtime === "object" && runtime !== null && !Array.isArray(runtime)
       ? (runtime as Record<string, unknown>).reachable
       : undefined;
-    if (reachable === true) return { verdict: "pass", detail: `runtime reachable (${envelope.runtimeId})` };
+    if (reachable === true) {
+      const appVersion = typeof runtime === "object" && runtime !== null && !Array.isArray(runtime)
+        ? (runtime as Record<string, unknown>).appVersion
+        : undefined;
+      if (typeof appVersion !== "string" || !appVersion) {
+        return { verdict: "warn", detail: `runtime reachable (${envelope.runtimeId}, appVersion absent; fixture pin ${ORCA_FIXTURE_VERSION})` };
+      }
+      const detail = `runtime reachable (${envelope.runtimeId}, appVersion ${appVersion}; fixture pin ${ORCA_FIXTURE_VERSION})`;
+      return { verdict: appVersion === ORCA_FIXTURE_VERSION ? "pass" : "warn", detail };
+    }
     if (reachable === false) return { verdict: "fail", detail: "CLI installed but runtime unreachable" };
     return { verdict: "fail", detail: "CLI installed but runtime probe failed — status carries no reachability proof" };
   } catch {

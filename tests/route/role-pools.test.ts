@@ -171,9 +171,15 @@ describe("v1.87 T2 role-scoped channel pools", () => {
     const v = await consult(
       dossier, consultCfg(["a-1"]), [alpha.adapter, beta.adapter, omega.adapter],
       new SubprocessDriver(), "/tmp", runDir(),
-      { channels: [{ adapter: "alpha" }, { adapter: "beta" }] as BillingChannel[] },
+      { channels: [
+        { adapter: "alpha", vendor: "alpha-vendor", model: "a-1", channel: "sub", tier: "frontier" },
+        { adapter: "beta", vendor: "beta-vendor", model: "b-1", channel: "sub", tier: "frontier" },
+      ] },
     );
-    expect(v).toEqual({ action: "retry", notes: "seat beta" });
+    expect(v).toEqual({
+      action: "retry", notes: "seat beta",
+      adapter: "beta", model: "b-1", vendor: "beta-vendor",
+    });
     expect(alpha.calls).toEqual([]);
     expect(beta.calls).toEqual(["b-1"]);
 

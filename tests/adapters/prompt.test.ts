@@ -1,5 +1,8 @@
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { buildTaskPrompt, classifyDeadChannel, parseWorkerResult, trailerPattern } from "../../src/adapters/prompt.js";
+import { buildTaskPrompt, classifyDeadChannel, parseWorkerResult, trailerPattern, writePrompt } from "../../src/adapters/prompt.js";
 import { validateGraph } from "../../src/graph/schema.js";
 
 const N = "testnonce"; // fixed nonce for direct-call tests; the daemon uses a random per-run one
@@ -67,6 +70,17 @@ describe("buildTaskPrompt", () => {
     expect(rule).not.toMatch(/\bunless\b/i);
     expect(rule).not.toMatch(/\b(?:ask|request)\b/i);
     expect(p).not.toContain("unless the operator's config allowlists that path");
+  });
+
+  test("test: writePrompt over a path already holding a brief copies the existing bytes to an engagement-suffixed sibling before writing the fixed path so after approve --uphold plus resume both engagements attempt-0 briefs exist under prompts with the fixed path holding the newest whereas the shipped overwrite that loses the first brief or a rename that leaves the fixed path stale fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-prompt-archive-"));
+    const fixed = writePrompt(dir, task, 0, "first engagement", "first");
+    const first = readFileSync(fixed);
+    expect(writePrompt(dir, task, 0, "upheld engagement", "second")).toBe(fixed);
+    expect(readFileSync(fixed, "utf8")).toContain("upheld engagement");
+    const archived = readdirSync(join(dir, "prompts")).filter((name) => name.startsWith("T1-a0-engagement-"));
+    expect(archived).toHaveLength(1);
+    expect(readFileSync(join(dir, "prompts", archived[0]!))).toEqual(first);
   });
 });
 

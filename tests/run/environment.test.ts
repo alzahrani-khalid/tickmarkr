@@ -84,6 +84,23 @@ describe("run-start environment identity (fake adapter, zero tokens)", () => {
     expect(env.adapterVersions.noversion).toBe(UNKNOWN_ADAPTER_VERSION); // "unknown", not fabricated
     expect(env.adapterVersions.fake).toBe("fake");
   });
+
+  test("test: the run-start journal row carries driver alongside driverEvidence alongside distFingerprint alongside channelsByRole listing the worker judge review and consult pools by channel key as well as a graph.json in the run directory byte-identical to the state graph the daemon loaded whereas a row carrying only one unqualified channels list or a re-serialised graph fails", async () => {
+    const { repo, fake } = setupRepo([T("T1")], oneTask("T1"));
+    const graphBytes = readFileSync(join(repo, ".tickmarkr", "graph.json"));
+    const runId = "run-start-complete-record";
+    await runDaemon(repo, { adapters: [fake], runId, driverOverride: "subprocess" });
+    const journal = Journal.open(repo, runId);
+    const start = journal.read().find((event) => event.event === "run-start")!;
+    expect(start.data.driver).toBe("subprocess");
+    expect(start.data.driverEvidence).toBe("subprocess (--driver)");
+    expect(start.data.distFingerprint).toEqual(expect.any(String));
+    expect(Object.keys(start.data.channelsByRole as object)).toEqual(["worker", "judge", "review", "consult"]);
+    for (const role of ["worker", "judge", "review", "consult"]) {
+      expect((start.data.channelsByRole as Record<string, string[]>)[role]).toEqual(expect.arrayContaining(["fake:fake-1"]));
+    }
+    expect(readFileSync(join(journal.dir, "graph.json"))).toEqual(graphBytes);
+  });
 }, 120000);
 
 // v2.0 T2 (OBS-554): a load reading is uninterpretable without the capacity it was taken against, so

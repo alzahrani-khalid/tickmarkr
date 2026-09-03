@@ -250,6 +250,34 @@ describe("model auth probes", () => {
     });
   });
 
+  test("test: a model probe whose retry exits nonzero showing EMFILE in its output records probeError EMFILE keeping authed true when the prior doctor verdict was authed or authed false when no prior verdict exists whereas the shipped probe that records authed false naming the errno as its reason fails", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-probe-error-"));
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const fake = new FakeAdapter(script);
+    (fake as WorkerAdapter & { probeConcurrency: number }).probeConcurrency = 1;
+    const calls = new Map<string, number>();
+    vi.spyOn(fake, "headlessCommand").mockImplementation((_prompt, model) => {
+      calls.set(model, (calls.get(model) ?? 0) + 1);
+      return calls.get(model) === 1 ? "printf transient; exit 1" : "printf 'node: Error: spawn EMFILE'; exit 1";
+    });
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.tiers.fake = { vendor: "fake", channel: "sub", models: { "fake-prior": "mid", "fake-none": "cheap" } };
+    const health = await probeAll([fake]);
+    writeDoctor(repo, {
+      fake: { installed: true, authed: true, models: [], modelAuth: { "fake-prior": { authed: true, probedAt: "2026-07-01T00:00:00.000Z" } } },
+    });
+
+    await probeModels(cfg, repo, [fake], health);
+
+    const prior = health.fake.modelAuth!["fake-prior"];
+    const none = health.fake.modelAuth!["fake-none"];
+    expect(prior).toMatchObject({ authed: true, probeError: "EMFILE" });
+    expect(none).toMatchObject({ authed: false, probeError: "EMFILE" });
+    expect("reason" in prior).toBe(false);
+    expect("reason" in none).toBe(false);
+  });
+
   test("T2: caps per-adapter probe concurrency at 2", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-concurrency-"));
     const script = join(repo, "fake.json");
@@ -528,6 +556,24 @@ describe("model auth probes", () => {
       expect(health.fake.modelAuth?.[model]?.reason, model).toContain(text);
     }
   });
+
+  test("test: a probe that fails on an auth denial without an errno still records authed false without probeError so the errno state cannot launder a real 403 whereas a classifier that reads every nonzero exit as a probe error fails", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-denial-not-probe-error-"));
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const fake = new FakeAdapter(script);
+    let calls = 0;
+    vi.spyOn(fake, "headlessCommand").mockImplementation(() =>
+      ++calls === 1 ? "printf transient; exit 1" : "printf 'HTTP 403 Forbidden'; exit 1");
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.tiers.fake = { vendor: "fake", channel: "sub", models: { "fake-403": "mid" } };
+    const health = await probeAll([fake]);
+
+    await probeModels(cfg, repo, [fake], health);
+
+    expect(health.fake.modelAuth?.["fake-403"]).toMatchObject({ authed: false, reason: "HTTP 403 Forbidden" });
+    expect(health.fake.modelAuth?.["fake-403"].probeError).toBeUndefined();
+  });
 });
 
 describe("model auth discovery", () => {
@@ -567,6 +613,32 @@ describe("model auth discovery", () => {
 
     expect(discoverChannels(DEFAULT_CONFIG, [adapter], health)).toEqual([]);
     expect(discoverChannels(legacyCfg, [adapter], health)).toEqual([]);
+  });
+
+  test("test: modelAuthExclusions names a probe-error exclusion as probe-error carrying the errno rather than the unauthed reason so discoverChannels keeps a channel whose last known authed verdict survived a probe error whereas a matrix that drops that channel from the pools fails", () => {
+    const multi = {
+      id: "fake",
+      channels: () => [
+        { adapter: "fake", vendor: "fake", model: "fake-keep", channel: "sub" as const, tier: "mid" as const },
+        { adapter: "fake", vendor: "fake", model: "fake-drop", channel: "sub" as const, tier: "mid" as const },
+      ],
+    } as unknown as WorkerAdapter;
+    const health = {
+      fake: {
+        installed: true,
+        authed: true,
+        models: [],
+        modelAuth: {
+          "fake-keep": { authed: true, probeError: "EMFILE" as const, probedAt: "2026-07-16T00:00:00.000Z" },
+          "fake-drop": { authed: false, probeError: "ENOSPC" as const, probedAt: "2026-07-16T00:00:00.000Z" },
+        },
+      },
+    };
+
+    expect(discoverChannels(DEFAULT_CONFIG, [multi], health).map((c) => c.model)).toEqual(["fake-keep"]);
+    expect(modelAuthExclusions(DEFAULT_CONFIG, [multi], health)).toEqual([
+      { key: "fake:fake-drop", adapter: "fake", reason: "probe-error (ENOSPC)", probedAt: "2026-07-16T00:00:00.000Z" },
+    ]);
   });
 });
 

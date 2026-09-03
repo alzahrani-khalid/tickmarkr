@@ -87,4 +87,42 @@ describe("GATE-FIX-4 DEFECT 4 — turbo-prefixed per-test failures fingerprint",
     // embedded `Error:` into a shape this line never had at line start
     expect(fingerprint("src/x.ts:12: Error: boom")).toEqual([UNRECOGNIZED_FAILURE]);
   });
+
+  test("turbo-prefixed vitest echo blocks do not invalidate baseline capture", async () => {
+    const repo = makeRepo({
+      "run.sh": [
+        "printf '%s\\n' 'intake-backend:test:  stdout | tests/run/gate-satisfaction.test.ts > merge satisfaction > prints expected failure'",
+        "printf '%s\\n' 'intake-backend:test:  Error: spawn EAGAIN'",
+        "printf '%s\\n' 'intake-backend:test:'",
+        "printf '%s\\n' 'intake-backend:test:  stderr | tests/run/gate-satisfaction.test.ts > merge satisfaction > prints expected failure' >&2",
+        "printf '%s\\n' 'intake-backend:test:  Resource temporarily unavailable' >&2",
+        "printf '%s\\n' 'intake-backend:test:' >&2",
+        "printf '%s\\n' 'FAIL tests/real.test.ts > pre-existing red'",
+        "exit 1",
+      ].join("\n"),
+      "runner.sh": [
+        "printf '%s\\n' 'intake-backend:test:  stdout | tests/run/gate-satisfaction.test.cts > merge satisfaction > prints expected failure'",
+        "printf '%s\\n' 'intake-backend:test:  Error: spawn EAGAIN'",
+        "printf '%s\\n' 'intake-backend:test:'",
+        "printf '%s\\n' 'intake-backend:test:  Error: spawn EAGAIN'",
+        "exit 1",
+      ].join("\n"),
+    });
+
+    const base = await captureBaseline(repo, { test: "bash run.sh", lint: "bash runner.sh" });
+
+    expect(base.commands.test.infra).toBeUndefined();
+    expect(base.commands.test.exitCode).toBe(1);
+    expect(base.commands.test.fingerprints).toContain("FAIL tests/real.test.ts > pre-existing red");
+    expect(base.commands.lint).toMatchObject({
+      infra: true,
+      fingerprints: [],
+      invalidatingLines: ["intake-backend:test:  Error: spawn EAGAIN"],
+    });
+    expect(fingerprint([
+      "intake-backend:test:  stdout | tests/run/gate-satisfaction.test.cts > merge satisfaction > prints expected failure",
+      "intake-backend:test:  Error: spawn EAGAIN",
+      "intake-backend:test:",
+    ].join("\n"))).toEqual([]);
+  });
 });

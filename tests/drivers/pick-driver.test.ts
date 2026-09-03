@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate } from "../../src/config/config.js";
-import { pickDriver } from "../../src/drivers/index.js";
+import { driverEvidence, pickDriver } from "../../src/drivers/index.js";
 import { OrcaDriver } from "../../src/drivers/orca.js";
 import type { OrcaExec } from "../../src/drivers/orca.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
@@ -31,19 +31,32 @@ describe("pickDriver", () => {
   test("test: pickDriver returns the orca driver for an explicit orca override and for config driver orca while auto under HERDR_ENV=1 still returns herdr and auto without it returns subprocess even when the orca probe reports reachable", async () => {
     const overrideDriver = pickDriver(DEFAULT_CONFIG, "orca");
     expect(overrideDriver).toBeInstanceOf(OrcaDriver);
+    expect(driverEvidence(DEFAULT_CONFIG, overrideDriver, "orca")).toBe("orca (--driver)");
 
     const configDriver = pickDriver({ ...DEFAULT_CONFIG, driver: "orca" });
     expect(configDriver).toBeInstanceOf(OrcaDriver);
+    expect(driverEvidence({ ...DEFAULT_CONFIG, driver: "orca" }, configDriver)).toBe("orca (config)");
 
     wireOrcaExec(configDriver as OrcaDriver, new FakeOrca().exec);
 
-    await withHerdrEnv("1", () => expect(pickDriver(DEFAULT_CONFIG).id).toBe("herdr"));
+    await withHerdrEnv("1", () => {
+      const driver = pickDriver(DEFAULT_CONFIG);
+      expect(driver.id).toBe("herdr");
+      expect(driverEvidence(DEFAULT_CONFIG, driver)).toBe("auto → herdr (HERDR_ENV=1)");
+      const overridden = pickDriver(DEFAULT_CONFIG, "subprocess");
+      expect(driverEvidence(DEFAULT_CONFIG, overridden)).toBe("subprocess (--driver)");
+      expect(driverEvidence(DEFAULT_CONFIG, new SubprocessDriver())).toBe("auto → subprocess (runtime)");
+    });
     await withHerdrEnv(undefined, async () => {
       // Reachability is asserted HERE, so the auto verdict below is taken while a reachable orca
       // runtime demonstrably answers: auto ordering is herdr-or-subprocess and orca health is not
       // an input to it.
       await expect((configDriver as OrcaDriver).probeRuntime("/tmp")).resolves.toBe("rt-1");
-      expect(pickDriver(DEFAULT_CONFIG).id).toBe("subprocess");
+      const driver = pickDriver(DEFAULT_CONFIG);
+      expect(driver.id).toBe("subprocess");
+      expect(driverEvidence(DEFAULT_CONFIG, driver)).toBe("auto → subprocess (HERDR_ENV unset)");
+      const overridden = pickDriver(DEFAULT_CONFIG, "herdr");
+      expect(driverEvidence(DEFAULT_CONFIG, overridden)).toBe("herdr (--driver)");
     });
   });
 

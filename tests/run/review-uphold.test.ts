@@ -87,6 +87,8 @@ describe("approve --uphold round trip — a park costs one attempt, never a run 
     // engagement cap 2: two review rounds ran, then the park — no third dispatch, no consult
     expect(parked.filter((e) => e.event === "task-dispatch").length).toBe(2);
     expect(String(parked.find((e) => e.event === "task-human")?.data.reason)).toMatch(/--uphold/);
+    const prompts = join(Journal.open(repo, runId).dir, "prompts");
+    const firstEngagementPrompt = readFileSync(join(prompts, "T1-a0.md"));
 
     const msg = await approve([runId, "T1", "--uphold", "--by", "operator"], repo);
     expect(msg).toMatch(/upheld the reviewer/);
@@ -102,7 +104,8 @@ describe("approve --uphold round trip — a park costs one attempt, never a run 
     // exactly ONE funded attempt on top of the two parked rounds — never a fresh journal
     expect(evs.filter((e) => e.event === "task-dispatch").length).toBe(3);
     // the funded attempt's prompt carries the upheld findings as its brief
-    const prompt = readFileSync(join(Journal.open(repo, runId).dir, "prompts", "T1-a0.md"), "utf8");
+    const prompt = readFileSync(join(prompts, "T1-a0.md"), "utf8");
+    expect(readFileSync(join(prompts, "T1-a0-engagement-0.md"))).toEqual(firstEngagementPrompt);
     expect(prompt).toMatch(/UPHELD/);
     expect(prompt).toMatch(/stat tile mislabeled/);
     expect(evs.some((e) => e.event === "consult-verdict")).toBe(false);

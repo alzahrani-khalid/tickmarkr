@@ -179,6 +179,7 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
     () => {
       const candidate = getCandidate();
       expect(candidate.paths.length).toBeGreaterThan(100);
+      expect(candidate.paths).not.toContain("scripts/verify-export.sh");
       const rejected = candidate.paths.filter((p) => !accepts(p)).map((p) => `${p} (${privateClass(p) ?? "not allowlisted"})`);
       expect(rejected).toEqual([]);
       expect(secretFindings(candidate.root, candidate.paths)).toEqual([]);
@@ -264,6 +265,7 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       // fail closed: unclassified paths are rejected, not tolerated
       "docs/finisher-enforcement.md",
       "scripts/export-public.sh",
+      "scripts/verify-export.sh",
       "scripts/measure-trailer-width.mjs",
       "unclassified-new-top-level.md",
     ];

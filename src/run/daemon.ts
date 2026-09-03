@@ -15,6 +15,7 @@ import {
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
 } from "../config/config.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
+import { driverEvidence, type DriverChoice } from "../drivers/index.js";
 import { herdrSealShellPrefix, SubprocessDriver } from "../drivers/subprocess.js";
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
@@ -23,6 +24,7 @@ import type { GateResult } from "../gates/types.js";
 import { filesGlob } from "../graph/files-glob.js";
 import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
+import { distFingerprint } from "../cli/commands/version.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
 import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, type RunCapacity, sameCapacity, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
@@ -66,6 +68,7 @@ export interface RunOptions {
   retryFailed?: boolean;
   concurrency?: number;
   driver?: ExecutorDriver;
+  driverOverride?: DriverChoice;
   adapters?: WorkerAdapter[];
   globalDir?: string;
   // v1.51 T2: run-flag routing mode (--mode / the --quality alias) — the strongest mode source.
@@ -1367,11 +1370,25 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     baseRef = await gitHead(repoRoot);
     baseline = await captureBaseline(repoRoot, commands);
     writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline, null, 2));
+    writeFileSync(join(journal.dir, "graph.json"), readFileSync(join(tickmarkrDir(repoRoot), "graph.json")));
     // v1.70 T2: environment identity beside the graph/branch identity — running tickmarkr version,
     // loaded-config hash, and the probed CLI version of each adapter holding a channel in the run,
     // gathered through the existing probe/config-load paths (no second mechanism).
     const environment = runEnvironment(cfg, channels, health);
-    journal.append("run-start", undefined, { pid: process.pid, baseRef, commands, channels: channels.map(channelKey), branch, graphDefinitionHash: graphDefinitionHash(graph), mode: rm.mode.mode, modeSource: rm.source, environment, ...(prior ? { supersedes: prior.runId } : {}) }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
+    journal.append("run-start", undefined, {
+      pid: process.pid, baseRef, commands, channels: channels.map(channelKey),
+      channelsByRole: {
+        worker: pools.worker.map(channelKey),
+        judge: pools.judge.map(channelKey),
+        review: pools.review.map(channelKey),
+        consult: pools.consult.map(channelKey),
+      },
+      driver: driver.id,
+      driverEvidence: driverEvidence(cfg, driver, opts.driverOverride),
+      distFingerprint: distFingerprint(),
+      branch, graphDefinitionHash: graphDefinitionHash(graph), mode: rm.mode.mode, modeSource: rm.source,
+      environment, ...(prior ? { supersedes: prior.runId } : {}),
+    }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
     runStarted = true;
     // v1.53 T5: mark the prior run AFTER this run's run-start exists, so the prior journal never
     // names a successor that has no journal. Append-only — the prior journal is never rewritten.
@@ -1903,6 +1920,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const applyVerdict = async (v: ConsultVerdict, attempts: number, trigger: ParkKind): Promise<boolean> => {
       journal.append("consult-verdict", t.id, {
         action: v.action, notes: v.notes,
+        adapter: v.adapter ?? "unknown", model: v.model ?? "unknown", vendor: v.vendor ?? "unknown",
         ...(v.reason ? { reason: v.reason } : {}),
         ...(v.guidance ? { guidance: v.guidance } : {}),
         ...(v.excludeAdapter ? { excludeAdapter: v.excludeAdapter } : {}),
@@ -2120,6 +2138,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             if (e.phase === "start") {
               notePhaseStart(e);
               journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total, ...(e.parentAt === undefined ? {} : { parallel: true }) });
+              return;
+            }
+            if (e.phase === "note") {
+              journal.append(e.name, t.id, e.payload);
               return;
             }
             const g = e.result;
@@ -3534,6 +3556,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total, ...(e.parentAt === undefined ? {} : { parallel: true }) });
           return;
         }
+        if (e.phase === "note") {
+          journal.append(e.name, t.id, e.payload);
+          return;
+        }
         const g = e.result;
         inParallelOrder(g.gate as GateName, () => {
           // GATE-09 (ROADMAP SC-4): journal every judge retry as an attributable event — which gate flaked,
@@ -3748,7 +3774,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (await applyVerdict(v, attempt + 1, "gate-fail")) continue;
           return;
         }
-        journal.append("consult-verdict", t.id, { action: v.action, notes: v.notes, capAdvisory: true });
+        journal.append("consult-verdict", t.id, {
+          action: v.action, notes: v.notes,
+          adapter: v.adapter ?? "unknown", model: v.model ?? "unknown", vendor: v.vendor ?? "unknown",
+          capAdvisory: true,
+        });
       }
 
       // v1.85 T3: a narrow battery over fully carried commits earns a REPAIR (decided above) — the

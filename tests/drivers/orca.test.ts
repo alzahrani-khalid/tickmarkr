@@ -9,7 +9,10 @@ import {
   OrcaUnavailableError,
   ORCA_RESPONSE_FAMILIES,
   parseEnvelope,
+  STALE_HANDLE_CODE,
+  STALE_HANDLE_CODES,
   STATUS_GOVERNED_METHODS,
+  TERMINAL_GONE_CODE,
   type OrcaFamily,
 } from "../../src/drivers/orca.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
@@ -46,6 +49,41 @@ const OK_FALSE = '{"ok":false,"error":{"code":"runtime_unreachable","message":"o
 const MISSING_RUNTIME = '{"ok":true,"result":{},"_meta":{}}';
 
 describe("OrcaDriver", () => {
+  test("test: status answers unknown for a running terminal or idle once tui-idle is satisfied under both recorded elapsed transports the 1.4.195 default of rc 1 ok false error code timeout as well as the selectable 1.4.186 satisfied false receipt whereas a wait refusal carrying any other code still fails closed so the shipped driver that throws on every 1.4.195 non-idle poll fails", async () => {
+    for (const opts of [{}, { elapsedWaitTransport: "1.4.186-satisfied-false" as const }]) {
+      const { fake, driver } = rig(opts);
+      const slot = await bound(driver, fake, ["working"]);
+      expect(await driver.status(slot)).toBe("unknown");
+
+      fake.last()!.tuiIdle = true;
+      expect(await driver.status(slot)).toBe("idle");
+    }
+
+    const refusingFake = new FakeOrca();
+    const refusingDriver = new OrcaDriver({
+      exec: async (args, cwd, timeoutMs) => {
+        if (args[0] === "terminal" && args[1] === "wait" && args.includes("tui-idle")) {
+          return {
+            code: 1,
+            stdout: JSON.stringify({
+              ok: false,
+              error: { code: "wait_refused", message: "not a timeout" },
+              _meta: { runtimeId: refusingFake.runtimeId },
+            }),
+            stderr: "",
+          };
+        }
+        return refusingFake.exec(args, cwd, timeoutMs);
+      },
+      time: steppedTime(),
+    });
+    const slot = await bound(refusingDriver, refusingFake, ["working"]);
+    const err = await refusingDriver.status(slot).then((v) => v, (e: unknown) => e);
+    expect(err).toBeInstanceOf(OrcaError);
+    expect((err as OrcaError).family).toBe("wait");
+    expect((err as OrcaError).code).toBe("wait_refused");
+  });
+
   test("test: waitOutput finds a literal and a regex marker reassembled across two cursor-paged read chunks and across a renderer-wrapped trailer line on a running terminal while a single unpaged tail read finds neither", async () => {
     const { fake, driver } = rig();
     const slot = await bound(driver, fake, pagedMarkerLines());
@@ -372,9 +410,24 @@ describe("OrcaDriver", () => {
     expect(showMismatch).toBeInstanceOf(OrcaUnavailableError);
     expect((showMismatch as OrcaUnavailableError).message).toContain(foreignHandle);
 
-    // The recorded 1.4.186 wait family: an elapsed wait is rc 1 with an otherwise-successful,
+    // The default 1.4.195 wait family: an elapsed wait is rc 1 with ok:false/code:timeout.
+    const elapsed195 = rig();
+    const elapsed195Slot = await bound(elapsed195.driver, elapsed195.fake, ["x"]);
+    const elapsed195Fixture = await elapsed195.fake.exec([
+      "terminal", "wait", "--terminal", elapsed195.fake.last()!.handle,
+      "--for", "exit", "--timeout-ms", "400", "--json",
+    ], WT);
+    expect(elapsed195Fixture.code).toBe(1);
+    expect(JSON.parse(elapsed195Fixture.stdout)).toMatchObject({
+      ok: false,
+      error: { code: "timeout" },
+      _meta: { runtimeId: "rt-1" },
+    });
+    expect(await elapsed195.driver.waitAgentStatus(elapsed195Slot, "done", 400)).toBe(false);
+
+    // The selectable 1.4.186 wait family: an elapsed wait is rc 1 with an otherwise-successful,
     // handle/condition/status-bearing `satisfied:false` receipt — "not yet", not a failure.
-    const elapsed = rig();
+    const elapsed = rig({ elapsedWaitTransport: "1.4.186-satisfied-false" });
     const elapsedSlot = await bound(elapsed.driver, elapsed.fake, ["x"]);
     const elapsedFixture = await elapsed.fake.exec([
       "terminal", "wait", "--terminal", elapsed.fake.last()!.handle,
@@ -669,6 +722,42 @@ describe("OrcaDriver", () => {
       // and the slot STAYS unavailable — no later call quietly resolves onto anything
       await expect(r.driver.status(s)).rejects.toBeInstanceOf(OrcaUnavailableError);
       await expect(r.driver.run(s, "anything")).rejects.toBeInstanceOf(OrcaUnavailableError);
+    }
+  });
+
+  test("test: a terminal_gone refusal on a terminal operation triggers exactly one relist of the slot worktree exactly as terminal_handle_stale does whereas a driver that treats terminal_gone as a plain refusal leaves the slot failed so it fails", async () => {
+    expect([...STALE_HANDLE_CODES]).toEqual([STALE_HANDLE_CODE, TERMINAL_GONE_CODE]);
+
+    for (const code of [STALE_HANDLE_CODE, TERMINAL_GONE_CODE]) {
+      const fake = new FakeOrca({ runtimeId: "rt-1", nextHandle: "term_A" });
+      let refused = false;
+      const driver = new OrcaDriver({
+        exec: async (args, cwd, timeoutMs) => {
+          if (!refused && args[0] === "terminal" && args[1] === "read" && args.includes("term_A")) {
+            refused = true;
+            return {
+              code: 1,
+              stdout: JSON.stringify({
+                ok: false,
+                error: { code, message: code },
+                _meta: { runtimeId: fake.runtimeId },
+              }),
+              stderr: "",
+            };
+          }
+          return fake.exec(args, cwd, timeoutMs);
+        },
+        time: steppedTime(),
+      });
+      const slot = await bound(driver, fake, ["before"]);
+      fake.terminals = [{ handle: "term_B", title: TITLE, worktree: WT, lines: [`after ${code}`] }];
+
+      await expect(driver.read(slot, 5)).resolves.toBe(`after ${code}`);
+      expect(fake.calls.filter((a) => a[1] === "list")).toEqual([
+        ["terminal", "list", "--worktree", `path:${WT}`, "--include-visual-layouts", "--limit", "10000", "--json"],
+      ]);
+      expect(refused).toBe(true);
+      expect(fake.calls.filter((a) => a[1] === "read" && a.includes("term_B"))).toHaveLength(1);
     }
   });
 

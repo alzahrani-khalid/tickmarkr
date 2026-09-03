@@ -78,6 +78,30 @@ class DelegatingOrcaDriver extends OrcaDriver {
 }
 
 describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
+  test("test: a create receipt whose surface is not visible raises one attention notify naming the surface whereas a receipt whose surface is visible or absent raises none so a driver that accepts a background surface silently fails", async () => {
+    const notifications: { message: string; tier?: string }[] = [];
+    const withNotify = (driver: OrcaDriver) => {
+      driver.notify = async (message, opts) => {
+        notifications.push({ message, tier: opts?.tier });
+      };
+      return driver;
+    };
+
+    const visible = rig({ createSurface: "visible" });
+    await withNotify(visible.driver).run(await visible.driver.slot(WT_A, TITLE_A), "run-visible");
+    expect(notifications).toEqual([]);
+
+    const absent = rig({ createSurface: null });
+    await withNotify(absent.driver).run(await absent.driver.slot(WT_A, TITLE_A), "run-absent");
+    expect(notifications).toEqual([]);
+
+    const background = rig({ createSurface: "background" });
+    await withNotify(background.driver).run(await background.driver.slot(WT_A, TITLE_A), "run-background");
+    expect(notifications).toEqual([
+      { message: "tickmarkr orca terminal created on background surface", tier: "attention" },
+    ]);
+  });
+
   test("test: two logical slots with different worktree paths produce create commands whose path selectors and create receipts each bind to their own slot's cwd while a driver that resolves the UI-active worktree or the daemon's cwd for either slot fails the pair", async () => {
     const { fake, driver } = rig();
     const a = await driver.slot(WT_A, TITLE_A);

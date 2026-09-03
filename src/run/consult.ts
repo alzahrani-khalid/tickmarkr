@@ -23,6 +23,9 @@ export interface ConsultVerdict {
   // ("the CLI is blocked"), not model-quality misses. Daemon expands the task tried-list
   // with every channel of this adapter before nextChannel — never a router change (D-03).
   excludeAdapter?: string;
+  adapter?: string;
+  model?: string;
+  vendor?: string;
 }
 
 const MAX_RETRY_GUIDANCE_LINES = 10;
@@ -173,7 +176,7 @@ export async function consult(
   // via SlotOpts.owned; without it the legacy gatePaneName shape survives (non-daemon callers/tests).
   // v1.54 T1: channels — the daemon's doctor-filtered live channel list; prefer-seat liveness is
   // judged against it only (never rebuilt from config, which would select installed-but-unauthed seats).
-  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; runId?: string; channels?: Array<{ adapter: string }> } = {},
+  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; runId?: string; channels?: Array<{ adapter: string; model?: string; vendor?: string; channel?: "sub" | "api"; tier?: string }> } = {},
 ): Promise<ConsultVerdict> {
   const n = ++consultSeq;
   const nonce = generateVerdictNonce();
@@ -250,6 +253,17 @@ export async function consult(
   // the same rule as every prefer entry — and disallowedBy carries the full deny grammar (adapter,
   // model, or adapter:model), so a model-scoped deny cannot slip past an adapter-id-only read.
   const allowedSeats = seats.filter((s) => disallowedBy(s, cfg.routing, "consult") === null);
+  const seatIdentity = (seat: { adapter: string; model: string }) => {
+    let vendor = opts.channels?.find((candidate) =>
+      candidate.adapter === seat.adapter && candidate.model === seat.model)?.vendor;
+    if (!vendor) {
+      try {
+        const adapter = getAdapter(seat.adapter, adapters);
+        vendor = adapter.channels(cfg).find((channel) => channel.model === seat.model)?.vendor ?? adapter.vendor;
+      } catch { /* an unknown adapter still gets explicit unknown provenance */ }
+    }
+    return { adapter: seat.adapter, model: seat.model, vendor: vendor ?? "unknown" };
+  };
   if (!allowedSeats.length) {
     const d = disallowedBy(seats[seats.length - 1]!, cfg.routing, "consult")!;
     return {
@@ -261,10 +275,13 @@ export async function consult(
   for (const [i, seat] of allowedSeats.entries()) {
     try {
       const parsed = await invokeSeat(seat.adapter, seat.model, i);
-      if (parsed.verdict) return parsed.verdict;
+      if (parsed.verdict) return { ...parsed.verdict, ...seatIdentity(seat) };
     } catch {
       // failed seat (unknown adapter, dead driver/pane, shell error) — fall to the next entry
     }
   }
-  return { action: "human", notes: "consult verdict unparseable — failing safe to human" };
+  return {
+    action: "human",
+    notes: "consult verdict unparseable — failing safe to human",
+  };
 }

@@ -1,5 +1,6 @@
 tickmarkr plan — dry run (2 channels available)
 mode: risk-based (default) · explore on
+driver: auto → subprocess (HERDR_ENV unset)
 harness: /opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js (unresolved location)
 
 model auth: 2 channel(s) unauthed — claude-code:fable (HTTP 403: forbidden — probed 2026-07-13), claude-code:opus (insufficient credit — probed 2026-07-13)

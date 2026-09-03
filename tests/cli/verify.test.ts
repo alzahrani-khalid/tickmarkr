@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { BillingChannel } from "../../src/adapters/types.js";
 import { pickReviewer } from "../../src/gates/review.js";
 import { HUMAN_AUTHOR, HUMAN_CHANNEL, parseCriteria, verify, verifyStateDir } from "../../src/cli/commands/verify.js";
@@ -36,7 +36,7 @@ const FAKE_ONLY_DOCTOR = {
 const captured = (repo: string) => existsSync(verifyStateDir(repo));
 
 describe("tickmarkr verify — standalone gate battery", () => {
-  afterEach(() => { delete process.env.TICKMARKR_FAKE_SCRIPT; });
+  afterEach(() => { delete process.env.TICKMARKR_FAKE_SCRIPT; vi.restoreAllMocks(); });
 
   test("green diff verifies end-to-end without a daemon: battery + evidence pass, exit 0", async () => {
     const repo = repoWithBranch();
@@ -142,6 +142,42 @@ describe("tickmarkr verify — standalone gate battery", () => {
       const at = src.indexOf(check);
       expect(at, `${check} is missing`).toBeGreaterThan(-1);
       expect(at, `${check} sits below the baseline capture`).toBeLessThan(capture);
+    }
+  });
+
+  test("test: the standalone verify command prints one stderr line naming the gate the event name and the payload for every note event its gate run emits whereas a verify that drops the note phase prints nothing for it and fails", async () => {
+    const repo = makeTestTempDir("tickmarkr-verify-note-");
+    const baseline = join(repo, "baseline.json");
+    writeFileSync(baseline, "{}");
+    vi.resetModules();
+    vi.doMock("../../src/run/git.js", () => ({
+      shGitOk: vi.fn(async (cmd: string) => cmd.includes("merge-base") ? "aaaaaaaaaaaa\n" : cmd.includes("main") ? "bbbbbbbbbbbb\n" : "cccccccccccc\n"),
+      shGit: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })),
+      linkNodeModules: vi.fn(),
+      removeWorktree: vi.fn(),
+    }));
+    vi.doMock("../../src/gates/baseline.js", () => ({
+      detectGateCommands: vi.fn(() => ({})),
+      captureBaseline: vi.fn(async () => ({})),
+    }));
+    vi.doMock("../../src/gates/run-gates.js", () => ({
+      runGates: vi.fn(async (_task: unknown, ctx: { onGate?: (e: unknown) => void | Promise<void> }) => {
+        await ctx.onGate?.({ phase: "note", gate: "review", name: "reviewer-empty-output", payload: { reviewer: "fake:m", bytes: 1 }, result: { gate: "review", pass: false, details: "note" } });
+        return { results: [{ gate: "review", pass: true, details: "ok" }], commits: [] };
+      }),
+    }));
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const mod = await import("../../src/cli/commands/verify.js");
+      await mod.verify(["--no-review", "--baseline", baseline], repo);
+      expect(err.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("reviewer-empty-output"))).toEqual([
+        'verify: note review reviewer-empty-output {"reviewer":"fake:m","bytes":1}',
+      ]);
+    } finally {
+      vi.doUnmock("../../src/run/git.js");
+      vi.doUnmock("../../src/gates/baseline.js");
+      vi.doUnmock("../../src/gates/run-gates.js");
+      vi.resetModules();
     }
   });
 });

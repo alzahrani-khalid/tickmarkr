@@ -1,8 +1,12 @@
 import { stringify } from "yaml";
 import { describe, expect, test } from "vitest";
+import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { compareToBaseline } from "../../src/gates/baseline.js";
+import { runGates } from "../../src/gates/run-gates.js";
+import type { Task } from "../../src/graph/schema.js";
 import { gateSatisfied, runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
+import { normalizeGateOutcome } from "../../src/run/outcome.js";
 import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 // T9: the merge predicate. `gateSatisfied` decides whether a task's gate battery authorizes a merge
@@ -34,6 +38,59 @@ test("test: replaySatisfiedGates keeps a gate-satisfied entry only while it is t
 
   journal.append("task-approved", "T2", { by: "operator", release: "recheck" });
   expect(journal.replaySatisfiedGates()).toEqual(new Map());
+});
+
+test("test: a gate without a detected command produces a row whose meta outcome kind is skipped carrying a reason that the shared outcome reader reports as skipped so the battery continues past it whereas a row whose only skip evidence is meta skipped beside pass true or a row that reads red halting the battery fails", async () => {
+  const task = { ...T("T1"), gates: ["build", "lint"], files: [] } as Task;
+  const author = { adapter: "fake", model: "fake-1", channel: "sub", tier: "cheap" } as const;
+  const result = { ok: true, summary: "done", deviations: [], raw: "" };
+  const repo = makeRepo({
+    "lint.sh": "printf '%s\\n' lint-ok\n",
+    "red.sh": "printf '%s\\n' 'FAIL tests/red.test.ts > red control'\nexit 1\n",
+  });
+  const ctx = (commands: Record<string, string>, baseline: Parameters<typeof runGates>[1]["baseline"], events: string[]) => ({
+    worktree: repo,
+    baseRef: "HEAD",
+    result,
+    author,
+    commands,
+    baseline,
+    channels: [],
+    adapters: [],
+    cfg: DEFAULT_CONFIG,
+    pipeline: "v185" as const,
+    onGate: (e: { phase: string; gate: string }) => {
+      if (e.phase === "end") events.push(e.gate);
+    },
+  });
+
+  const afterSkip: string[] = [];
+  const skipRun = await runGates(task, ctx(
+    { lint: "bash lint.sh" },
+    { commands: { lint: { exitCode: 0, fingerprints: [] } } },
+    afterSkip,
+  ));
+  const skipped = skipRun.results[0]!;
+
+  expect(skipped).toMatchObject({ gate: "build", pass: true, meta: { skipped: true, outcome: { kind: "skipped" } } });
+  expect(skipped.meta?.outcome).toHaveProperty("reason", "no build command detected");
+  expect(normalizeGateOutcome(skipped.meta?.outcome)).toEqual({ kind: "skipped", reason: "no build command detected" });
+  expect(gateSatisfied(skipped)).toBe(true);
+  expect(skipRun.results.some((r) => !r.pass)).toBe(false);
+  expect(skipRun.results.find((r) => r.gate === "lint")?.details).toBe("exit 0");
+  expect(afterSkip).toEqual(["build", "lint"]);
+  expect(skipped.meta).not.toEqual({ skipped: true });
+
+  const afterRed: string[] = [];
+  const redRun = await runGates(task, ctx(
+    { build: "bash red.sh", lint: "bash lint.sh" },
+    { commands: { build: { exitCode: 0, fingerprints: [] }, lint: { exitCode: 0, fingerprints: [] } } },
+    afterRed,
+  ));
+
+  expect(redRun.results).toHaveLength(1);
+  expect(redRun.results[0]).toMatchObject({ gate: "build", pass: false });
+  expect(afterRed).toEqual(["build"]);
 });
 
 describe("merge satisfaction of an infra-only gate result (fake adapter, zero tokens)", () => {

@@ -237,6 +237,94 @@ describe("a resource-starved baseline capture is invalid even when the child exi
   const CAPTURED_FAILURE = "FAIL tests/shared.test.ts > pre-existing or exhaustion-induced";
   const ASSERTION = "AssertionError: expected the worker to spawn";
 
+  test("test: a capture whose only exhaustion token sits inside a vitest echoed stdout or stderr block headed by the file and test name records an ordinary entry carrying its exit code and fingerprints whereas the same token on a runner-level line outside any echoed block still records the infra state without exit code or fingerprints so a scan blind to the block structure fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const repo = makeRepo({ "base.txt": "base\n" });
+    shSpy.stub = (cmd) => {
+      if (cmd === "echoed exhaustion") return {
+        code: 1,
+        stdout: [
+          "stdout | tests/run/gate-satisfaction.test.ts > merge satisfaction > prints expected failure",
+          "Error: spawn EAGAIN",
+          "",
+          "stdout | tests/run/gate-satisfaction.test.mts > merge satisfaction > prints expected failure",
+          "Error: spawn EAGAIN",
+          "",
+          "stdout | tests/run/gate-satisfaction.test.cts > merge satisfaction > prints expected failure",
+          "Resource temporarily unavailable",
+          "",
+          CAPTURED_FAILURE,
+        ].join("\n"),
+        stderr: [
+          "stderr | tests/run/gate-satisfaction.test.mjs > merge satisfaction > prints expected failure",
+          "Resource temporarily unavailable",
+          "",
+          "stderr | tests/run/gate-satisfaction.test.cjs > merge satisfaction > prints expected failure",
+          "Resource temporarily unavailable",
+          "",
+        ].join("\n"),
+        durationMs: 123,
+      };
+      if (cmd === "runner exhaustion") return {
+        code: 1,
+        stdout: [
+          "stdout | tests/run/gate-satisfaction.test.ts > merge satisfaction > prints expected failure",
+          "not an exhaustion line",
+          "",
+          "Error: spawn EAGAIN",
+          CAPTURED_FAILURE,
+        ].join("\n"),
+        stderr: "",
+        durationMs: 456,
+      };
+      if (cmd === "tip runner exhaustion") return {
+        code: 1,
+        stdout: ["Error: spawn EAGAIN", CAPTURED_FAILURE].join("\n"),
+        stderr: "",
+        durationMs: 789,
+      };
+      return undefined;
+    };
+
+    const baseline = await captureBaseline(repo, { test: "echoed exhaustion", lint: "runner exhaustion" });
+
+    expect(baseline.commands.test.exitCode).toBe(1);
+    expect(baseline.commands.test.infra).toBeUndefined();
+    expect(baseline.commands.test.fingerprints).toEqual([CAPTURED_FAILURE]);
+    expect(baseline.commands.lint).toMatchObject({ infra: true, fingerprints: [], invalidatingLines: ["Error: spawn EAGAIN"] });
+    expect(baseline.commands.lint.exitCode).toBeUndefined();
+
+    const [tip] = await compareToBaseline(
+      repo,
+      { test: "tip runner exhaustion" },
+      { commands: { test: baseline.commands.test } },
+      ["test"],
+    );
+    expect(tip).toMatchObject({ pass: false, meta: { classification: "infra", infra: true } });
+  });
+
+  test("test: an invalidated capture entry persists the invalidating lines verbatim under invalidatingLines so the capture stderr sentence names the first of them whereas an entry recording infra true without a line to show fails", async () => {
+    const operatorLine = vi.spyOn(console, "error").mockImplementation(() => {});
+    const repo = makeRepo({ "base.txt": "base\n" });
+    const firstInvalidatingLine = `Error: spawn ${repo}/node EAGAIN`;
+    shSpy.stub = (cmd) => cmd === "run capture"
+      ? {
+        code: 1,
+        stdout: `${firstInvalidatingLine}\nResource temporarily unavailable\n`,
+        stderr: "",
+        durationMs: 2_137,
+      }
+      : undefined;
+    const baseline = await captureBaseline(repo, { test: "run capture" });
+
+    expect(baseline.commands.test).toMatchObject({
+      infra: true,
+      invalidatingLines: [firstInvalidatingLine, "Resource temporarily unavailable"],
+    });
+    expect(baseline.commands.test.invalidatingLines?.length).toBeGreaterThan(0);
+    expect(operatorLine.mock.calls[0]?.join(" ")).toContain(`First invalidating line: ${firstInvalidatingLine}`);
+  });
+
   const captureCompleted = async (lines: string[], code = 1) => {
     const repo = makeRepo({ "base.txt": "base\n" });
     shSpy.stub = (cmd) => cmd === "run capture"

@@ -1,8 +1,9 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
-import { version } from "../../src/cli/commands/version.js";
+import { distFingerprint, version } from "../../src/cli/commands/version.js";
 import { dispatch, USAGE } from "../../src/cli/index.js";
 import { spawnCli, assertCliSuccess, prepareBuiltCli, ENTRY } from "../helpers/built-cli.js";
 
@@ -42,6 +43,21 @@ describe("tickmarkr version", () => {
     const r = await dispatch("version", []);
     expect(r.out).not.toContain("usage:");
     expect(r.out).not.toContain("\n");
+  });
+
+  test("test: tickmarkr version prints the package version alone on one line whereas version --dist appends a dist fingerprint on that same line which changes when one byte of one dist file changes so a fingerprint over file names alone or a second output line fails", async () => {
+    const dist = mkdtempSync(join(tmpdir(), "tickmarkr-dist-fingerprint-"));
+    const file = join(dist, "cli.js");
+    writeFileSync(file, "a");
+    const first = distFingerprint(dist);
+    expect(await version([], dist)).toBe(PKG_VERSION);
+    expect(await version(["--dist"], dist)).toBe(`${PKG_VERSION} dist:${first}`);
+    expect((await version(["--dist"], dist)).includes("\n")).toBe(false);
+    const dispatched = await dispatch("version", ["--dist"]);
+    expect(dispatched.out).toMatch(new RegExp(`^${PKG_VERSION.replaceAll(".", "\\.")} dist:[0-9a-f]{64}$`));
+    expect(dispatched.code).toBe(0);
+    writeFileSync(file, "b");
+    expect(distFingerprint(dist)).not.toBe(first);
   });
 
   test("non-TTY help output is byte-identical to USAGE (unchanged by version wiring)", async () => {

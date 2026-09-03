@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { WorkerAdapter } from "../adapters/types.js";
+import { matchesTrustDialog, type WorkerAdapter } from "../adapters/types.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { sh } from "../run/git.js";
@@ -227,6 +227,15 @@ export async function runViaDriver(
     slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
     via.onSlot?.(slot);
     await via.driver.run(slot, paneDispatchCommand(scriptPath));
+    if (via.driver.sendKey) {
+      try {
+        if (matchesTrustDialog(await via.driver.read(slot, 400), adapter.trustDialog)) {
+          await via.driver.sendKey(slot, adapter.trustDialog.key);
+        }
+      } catch {
+        /* a failed pre-wait read must not replace the verdict wait */
+      }
+    }
     // nonce-suffixed exit only: a displayed bare "TICKMARKR_EXIT:" or another call's marker must not
     // false-complete — same guard the worker path uses (daemon.ts:330-331).
     const exitPattern = `TICKMARKR_EXIT_${nonce}:\\d`;
@@ -429,33 +438,35 @@ export function extractVerdictJson<T>(raw: string, nonce: string): T | null {
       /* fall through */
     }
   }
-  let pos = raw.length - 1;
-  while (pos >= 0) {
-    const end = raw.lastIndexOf("}", pos);
-    if (end === -1) return null;
-    let depth = 1;
-    let stepped = false;
-    for (let i = end - 1; i >= 0; i--) {
-      if (raw[i] === "}") depth++;
-      else if (raw[i] === "{") {
-        depth--;
-        if (depth === 0) {
-          stepped = true;
-          try {
-            const v = JSON.parse(raw.slice(i, end + 1));
-            if (v && typeof v === "object" && v.nonce === nonce) {
-              const { nonce: _n, ...rest } = v as { nonce?: string };
-              return rest as T;
-            }
-          } catch {
-            /* keep scanning */
+  for (let start = raw.lastIndexOf("{"); start >= 0;) {
+    const nextStart = start === 0 ? -1 : raw.lastIndexOf("{", start - 1);
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let i = start; i < raw.length; i++) {
+      const char = raw[i]!;
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') quoted = false;
+        continue;
+      }
+      if (char === '"') quoted = true;
+      else if (char === "{") depth++;
+      else if (char === "}" && --depth === 0) {
+        try {
+          const v = JSON.parse(raw.slice(start, i + 1));
+          if (v && typeof v === "object" && v.nonce === nonce) {
+            const { nonce: _n, ...rest } = v as { nonce?: string };
+            return rest as T;
           }
-          pos = i - 1;
-          break;
+        } catch {
+          /* keep scanning */
         }
+        break;
       }
     }
-    if (!stepped) return null;
+    start = nextStart;
   }
   return null;
 }

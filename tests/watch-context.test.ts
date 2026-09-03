@@ -339,6 +339,28 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     }
   }, 90_000);
 
+  test("test: watch-context.sh armed as role consult at or above act holding a fresh handoff under TKR_AUTO_CLEAR prints a wake line yet sends no prompt to the seat whereas the same arming as role overseer sends the clear prompt so a script that clears any role fails", async () => {
+    const runAtAct = async (role: "consult" | "overseer") => {
+      const repo = seedRepo();
+      const handoff = join(repo, "HANDOFF.md");
+      writeFileSync(handoff, "everything this seat holds, on disk\n");
+      const stub = makeStub(repo, MARKED(80));
+      const watcher = watch(stub, repo, [role, `${role}-seat`, "60", "75", handoff, "1", "600"],
+        { TKR_AUTO_CLEAR: "1", TKR_CLEAR_SETTLE_S: "0" });
+      expect(await watcher.exited).toBe(0);
+      return { output: watcher.out(), prompts: calls(stub).filter((line) => line.includes("agent prompt")) };
+    };
+
+    const consult = await runAtAct("consult");
+    expect(consult.output).toContain("CONTEXT_ACT consult-seat");
+    expect(consult.output).not.toContain("CONTEXT_CLEARED");
+    expect(consult.prompts).toEqual([]);
+
+    const overseer = await runAtAct("overseer");
+    expect(overseer.output).toContain("CONTEXT_CLEARED overseer-seat");
+    expect(overseer.prompts.some((line) => line.includes("/clear"))).toBe(true);
+  }, 30_000);
+
   test("the diff anchors the percentage read to the model banner rather than widening a bare numeric pattern, and leaves both copies of the script byte-identical", () => {
     const shipped = readFileSync(SCRIPT);
     const source = shipped.toString("utf8");

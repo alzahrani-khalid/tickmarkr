@@ -9,12 +9,13 @@ import { allAdapters, readDoctor, writeDoctor } from "../../src/adapters/registr
 import { readCachedCatalog, type CatalogReadResult } from "../../src/adapters/catalog-remote.js";
 import { MODEL_STALE_DAYS, SEED_STAMPED, catalogModelAdvisory, catalogTierRanking, contextWindowLints, deadPoolLints, estimateTaskPayloadTokens, hasWindowsConfig, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
 import { CITED_MODEL_WINDOWS } from "../../src/adapters/model-windows.js";
+import { pi } from "../../src/adapters/pi.js";
 import { compileSource } from "../../src/compile/index.js";
 import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
 import { readyTasks, setStatus } from "../../src/graph/graph.js";
 import type { RunGraph } from "../../src/graph/schema.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import type { AuthHealth, WorkerAdapter } from "../../src/adapters/types.js";
+import type { AuthHealth, BillingChannel, WorkerAdapter } from "../../src/adapters/types.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const emptyRepo = () => ({ repo: mkdtempSync(join(tmpdir(), "tickmarkr-ml-r-")), globalDir: mkdtempSync(join(tmpdir(), "tickmarkr-ml-g-")) });
@@ -145,6 +146,25 @@ describe("modelLints — both-direction staleness lints", () => {
 // placeholder (a tier is a benchmark claim — the machine never fabricates one); removals render as
 // live `null` tombstones. Print-only: pure function, no fs/process. The codex gpt-5.6-sol seed vs the
 // installed CLI's refusal (Phase 17 LIVE-CHECK finding 5) is the worked example.
+test("test: modelLints emits one attention line for a configured pi channel whose stamped vendor disagrees with its model provider prefix naming the model both vendors and the modelOverrides remedy yet emits none when they agree whereas a lint keyed on the adapter literal instead of the configured channel fails", () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.routing.map = {};
+  config.tiers = {
+    pi: { vendor: "zhipu", channel: "sub", models: { "openai-codex/gpt-5.5": "frontier" } },
+  };
+  const health = { pi: installed(["openai-codex/gpt-5.5"]) };
+  const channel = (vendor: string): BillingChannel => ({
+    adapter: "pi", vendor, model: "openai-codex/gpt-5.5", channel: "sub", tier: "frontier",
+  });
+  const wrong = { ...pi, vendor: "openai", channels: () => [channel("zhipu")] };
+  const right = { ...pi, vendor: "zhipu", channels: () => [channel("openai")] };
+
+  expect(modelLints(config, health, [wrong])).toEqual([
+    "pi: openai-codex/gpt-5.5 channel vendor zhipu disagrees with provider vendor openai — set tiers.pi.modelOverrides.openai-codex/gpt-5.5.vendor to openai",
+  ]);
+  expect(modelLints(config, health, [right])).toEqual([]);
+});
+
 describe("suggestOverlay — paste-ready drift fragment", () => {
   const AT = "2026-07-10T09:00:00.000Z";
 

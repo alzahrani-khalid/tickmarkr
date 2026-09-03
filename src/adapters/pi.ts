@@ -132,6 +132,19 @@ export function servedModelNote(drifts: ServedModelDrift[] = readPiServedModels(
   return `served-model drift: ${drifts.map((d) => `pinned ${d.pinned} served ${d.served}`).join(", ")}`;
 }
 
+const PI_PROVIDER_VENDORS: Readonly<Record<string, string>> = {
+  anthropic: "anthropic",
+  google: "google",
+  openai: "openai",
+  "openai-codex": "openai",
+  xai: "xai",
+  zai: "zhipu",
+};
+
+export function piModelVendor(model: string): string | undefined {
+  return PI_PROVIDER_VENDORS[model.split("/", 1)[0]];
+}
+
 export const pi: WorkerAdapter = {
   id: "pi",
   // FLEET-04: cross-vendor review honesty — GLM's provider (pi's own label is "zai"; either is
@@ -153,7 +166,10 @@ export const pi: WorkerAdapter = {
     const note = `auth verified via pi --list-models (free; auth-filtered by pi)${drift ? `; ${drift}` : ""}`;
     return { ...h, servable: parsePiModels(r.stdout || ""), note };
   },
-  channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("pi", cfg),
+  channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("pi", cfg).map((channel) => ({
+    ...channel,
+    vendor: cfg.tiers.pi?.modelOverrides?.[channel.model]?.vendor ?? piModelVendor(channel.model) ?? channel.vendor,
+  })),
   // v1.65 T3: every flag the command builders below hardcode — verified in `pi --help` 2026-07-22.
   hardcodedFlags: { binary: "pi", flags: ["-p", "--approve", "--model"] },
   // --approve: pi's per-directory trust prompt would stall fresh worktrees (herdr scrapes the dialog

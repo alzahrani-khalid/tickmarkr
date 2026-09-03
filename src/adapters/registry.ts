@@ -17,7 +17,7 @@ import {
 } from "./catalog.js";
 import {
   type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, type ModelAuth,
-  modelAuthed, MODEL_ID_RE, QUOTA_RE, shq, type WorkerAdapter,
+  modelAuthed, MODEL_ID_RE, MODEL_PROBE_ERRORS, type ModelProbeError, QUOTA_RE, shq, type WorkerAdapter,
 } from "./types.js";
 
 // Compatibility projection for callers/tests that only need shipped advisory names. The literal
@@ -475,6 +475,12 @@ function probeFailure(
     : undefined;
 }
 
+const PROBE_ERROR_RE = new RegExp(`\\b(${MODEL_PROBE_ERRORS.join("|")})\\b`);
+function probeError(code: number, stdout: string, stderr: string, timedOut?: boolean): ModelProbeError | undefined {
+  if (timedOut || code === 0) return undefined;
+  return PROBE_ERROR_RE.exec(`${stderr}\n${stdout}`)?.[1] as ModelProbeError | undefined;
+}
+
 export type ProbeModelStatus = "ok" | "timeout" | "failed";
 export type ProbeModelProgress = (adapter: string, model: string, status: ProbeModelStatus, durationMs: number) => void;
 
@@ -512,8 +518,8 @@ export async function probeModels(
       const attempt = async (model: string, retry?: { firstTimedOut: boolean }): Promise<{ verdict: ProbedModelAuth | null; timedOut: boolean }> => {
         const t0 = Date.now();
         const probedAt = new Date().toISOString();
-        const v = (authed: boolean, reason?: string): ProbedModelAuth =>
-          ({ authed, ...(reason !== undefined ? { reason } : {}), probedAt, durationMs: Date.now() - t0 });
+        const v = (authed: boolean, reason?: string, error?: ModelProbeError): ProbedModelAuth =>
+          ({ authed, ...(reason !== undefined ? { reason } : {}), ...(error ? { probeError: error } : {}), probedAt, durationMs: Date.now() - t0 });
         try {
           if (typeof a.headlessCommand !== "function") return { verdict: v(false, "headless probe unavailable"), timedOut: false };
           const promptDir = mkdtempSync(join(tmpdir(), "tickmarkr-auth-"));
@@ -529,8 +535,11 @@ export async function probeModels(
             const reason = probeFailure(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
             if (!reason) return { verdict: v(true), timedOut: false };
             if (!retry) return { verdict: null, timedOut: r.timedOut === true };
+            const error = probeError(r.code, r.stdout, r.stderr, r.timedOut);
             return {
-              verdict: r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`) : v(false, reason),
+              verdict: error
+                ? v(priorModelAuth?.[model]?.authed === true, undefined, error)
+                : r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`) : v(false, reason),
               timedOut: r.timedOut === true,
             };
           } finally {
@@ -695,7 +704,7 @@ export function modelAuthExclusions(
     for (const c of a.channels(cfg)) {
       const v = h.modelAuth?.[c.model];
       if (modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels)) continue;
-      if (v?.authed === false) out.push({ key: channelKey(c), adapter: a.id, reason: v.reason ?? "probe failed", probedAt: v.probedAt });
+      if (v?.authed === false) out.push({ key: channelKey(c), adapter: a.id, reason: v.probeError ? `probe-error (${v.probeError})` : v.reason ?? "probe failed", probedAt: v.probedAt });
       else out.push({ key: channelKey(c), adapter: a.id, reason: "no model auth verdict — run tickmarkr doctor", probedAt: "not recorded" });
     }
   }

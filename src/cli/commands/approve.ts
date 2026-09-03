@@ -29,8 +29,8 @@ export function approvalDispositionForRelease(release: unknown): ApprovalDisposi
 import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
 
 // GATE-08 (v1.12): approve a parked human gate so the run dispatches it — the live daemon owning this
-// run enacts the release at its next task boundary (v2.2 T3), and only a run with no live owner waits
-// for the next `tickmarkr resume <runId>`.
+// run enacts the release at its next task boundary (v2.2 T3); with no live repository owner the next
+// `tickmarkr resume <runId>` enacts it, while a different live run must end before this run resumes.
 //
 // The approval is a JOURNAL EVENT (task-approved) carrying who and when — it touches ONLY the
 // append-only journal. Writing it into tickmarkr's compiled graph artifact would be silently erased by
@@ -57,44 +57,54 @@ import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
 // owner of this run enacts the decision itself, and the approval is no longer inert for that run.
 // Every approval still closes on a DISPOSITION drawn from the five-token vocabulary printed in a JSON
 // status line — `deferred-live` keeps its established machine token, and only its TEXT changes — but
-// the ENACTMENT half of each message is now chosen from the run lock: a live owner is told the boundary
-// sweep will act, and `tickmarkr resume <runId>` is printed ONLY when this run has no live owner. Telling the operator of a live run to resume would prescribe a second run in the same
-// repository — the invariant forbids it, and it would contend for the live daemon's graph.lock over an
-// approval that has already dispatched. What a boundary sweep still cannot enact is an approval that
-// lands after the last boundary (during tip verify): the run's completion record names that one, and
-// every other approval that never reached a dispatch, as `approvalDisposition: "outstanding"`.
+// the ENACTMENT half of each message is now chosen from the repository lock's three states. This
+// run's live daemon names its boundary sweep; no live owner names `tickmarkr resume <runId>`; and a
+// different live run names the lock holder and waits for a resume after that run ends without
+// prescribing a command that would contend for its lock. What a boundary sweep still cannot enact is
+// an approval that lands after the last boundary (during tip verify): the run's completion record
+// names that one, and every other approval that never reached a dispatch, as
+// `approvalDisposition: "outstanding"`.
 // Liveness and the enactment sentence are both stated once, below (ownedByLiveDaemon /
 // approvalEnactment), because the setup cockpit predicts the same effect before writing and a
 // prediction free to drift from the write is worth less than none.
 //
 export type ApprovalStatus = "deferred-live" | "recorded-no-owner";
 
-/** Which run, and whether a LIVE daemon owns THAT run — the two facts an enactment sentence needs. */
-export interface ApprovalRunOwner { runId: string; live: boolean }
+/** The requested run plus the different live run currently blocking its repository, when present. */
+export interface ApprovalRunOwner {
+  runId: string;
+  live: boolean;
+  blockingRunId?: string;
+}
 
 // THE liveness rule, written once. The lock is REPOSITORY-wide, so a live owner of some OTHER run is
 // not an owner of this one and sweeps none of its approvals — claiming otherwise is the same
 // falsehood in a new shape. Liveness itself comes from lock.ts's runLockOwner (the same inspect() the
 // acquire/unlock decision table uses), never a second `process.kill(pid, 0)`, and never the lock
 // FILE's presence: a stale lock whose recorded pid is dead is not a live run.
-const ownedByLiveDaemon = (owner: ReturnType<typeof runLockOwner>, runId: string): ApprovalRunOwner =>
-  ({ runId, live: owner?.live === true && owner.runId === runId });
+const ownedByLiveDaemon = (owner: { runId?: string; live: boolean } | undefined, runId: string): ApprovalRunOwner => {
+  const run: ApprovalRunOwner = { runId, live: owner?.live === true && owner.runId === runId };
+  if (owner?.live === true && owner.runId !== undefined && owner.runId !== runId) {
+    // Preserve the shipped enumerable { runId, live } shape while carrying the third state.
+    Object.defineProperty(run, "blockingRunId", { value: owner.runId });
+  }
+  return run;
+};
 
 /** The same read `approve` performs, for surfaces that must predict an enactment before writing. */
 export function approvalRunOwner(cwd: string, runId: string): ApprovalRunOwner {
   return ownedByLiveDaemon(runLockOwner(cwd), runId);
 }
 
-/**
- * The one sentence that says who enacts this release and what it buys. A live owner's approval is
- * already scheduled — it rides that daemon's next task boundary — so it must NOT be told to resume:
- * a second run in the same repository is forbidden, and it would contend for the live daemon's
- * graph.lock over an approval that has already dispatched.
- */
+/** The one sentence that says who enacts this release and what it buys. */
 export function approvalEnactment(token: ApprovalDisposition, run: ApprovalRunOwner): string {
-  return run.live
-    ? `the live daemon enacts this at its next task boundary — it will ${APPROVAL_ENACTS[token]}`
-    : `run \`tickmarkr resume ${run.runId}\` to ${APPROVAL_ENACTS[token]}`;
+  if (run.live) {
+    return `the live daemon enacts this at its next task boundary — it will ${APPROVAL_ENACTS[token]}`;
+  }
+  if (run.blockingRunId) {
+    return `release recorded; live run \`${run.blockingRunId}\` holds the repository lock, so resume \`${run.runId}\` after it ends to ${APPROVAL_ENACTS[token]}`;
+  }
+  return `run \`tickmarkr resume ${run.runId}\` to ${APPROVAL_ENACTS[token]}`;
 }
 
 /** The production command registered in COMMANDS; its returned bytes are what the CLI prints. */
@@ -205,21 +215,20 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
 //
 // The ENACTMENT half of the message is completed here because only here is liveness known: the call
 // sites carry the decision, not the answer to who will act on it. `deferred-live` keeps its v1.89
-// token — machine consumers parse it — while its TEXT now names the boundary sweep, and the `resume`
-// field it used to carry unconditionally is withheld from the live branch it would misdirect.
+// token — machine consumers parse it — while its TEXT now names the boundary sweep. A recovery
+// command is emitted only with no live repository owner; a different run's live owner instead names
+// the blocker and waits until it ends.
 function disposition(cwd: string, runId: string, token: ApprovalDisposition, message: string, contended: boolean): string {
   const owner = runLockOwner(cwd);
   const run = ownedByLiveDaemon(owner, runId);
-  const resume = `tickmarkr resume ${runId}`;
   const out = `approval disposition ${token}: ${message}; ${approvalEnactment(token, run)}`;
   if (!owner && !contended) return out;
   const status: ApprovalStatus = run.live ? "deferred-live" : "recorded-no-owner";
   const record = {
     status,
     disposition: token,
-    // The recovery command is claimed only where it IS the enactment. A live owner's approval is
-    // already scheduled, and a resume would contend for that daemon's graph.lock.
-    ...(run.live ? {} : { resume }),
+    // Resume is safe to prescribe only when no live repository owner would contend with it.
+    ...(!run.live && !run.blockingRunId ? { resume: `tickmarkr resume ${runId}` } : {}),
     ...(owner?.pid === undefined ? {} : { ownerPid: owner.pid }),
     ...(owner?.runId === undefined ? {} : { ownerRunId: owner.runId }),
   };

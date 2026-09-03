@@ -17,6 +17,7 @@ import { loadRoutingProfile } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
 import { shq, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { shGit } from "../../run/git.js";
+import { driverEvidence, pickDriver } from "../../drivers/index.js";
 
 // T4 (v1.50): TTY-only brand pass — the title helper frames the routing table, lint/unroutable
 // markers carry the attention glyph, section labels dim to chrome (the doctor/status system).
@@ -116,7 +117,7 @@ export async function plan(
   const DOCTOR_STALE_MS = 24 * 60 * 60 * 1000;
   // v1.51 T2: plan previews any mode without a config edit — same source precedence as run
   // (flag > spec front-matter > repo > global > default), same preset compiler.
-  const { values } = parseArgs({ args: argv, options: { mode: { type: "string" } }, allowPositionals: true });
+  const { values } = parseArgs({ args: argv, options: { mode: { type: "string" }, driver: { type: "string" } }, allowPositionals: true });
   if (values.mode !== undefined && !(ROUTING_MODES as readonly string[]).includes(values.mode)) {
     throw new Error(`--mode must be one of ${ROUTING_MODES.join(" | ")} (got ${values.mode})`);
   }
@@ -149,6 +150,7 @@ export async function plan(
     inputRefusals.set(finding.taskId, [...(inputRefusals.get(finding.taskId) ?? []), finding.detail]);
   }
   const { cfg, mode, source } = resolveRunMode(cwd, { flag: values.mode as RoutingMode | undefined, spec: g.mode });
+  const selectedDriver = pickDriver(cfg, values.driver);
   // readDoctor cache path: staleness line only fires here (probeAll fallback is fresh by construction).
   const cached = readDoctor(cwd);
   const health = cached ?? (await probeAll(adapters));
@@ -170,6 +172,7 @@ export async function plan(
   const lines: string[] = [
     `tickmarkr plan — dry run (${channels.length} channels available)`,
     `mode: ${mode.mode} (${source}) · explore ${cfg.routing.explore?.mode ?? "on"}`,
+    `driver: ${driverEvidence(cfg, selectedDriver, values.driver)}`,
     harnessLine(resolveHarness(harnessFrom)),
     "",
   ];

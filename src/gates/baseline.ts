@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
 import { DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShResult } from "../run/git.js";
+import type { GateOutcome } from "../run/outcome.js";
 import type { GateResult } from "./types.js";
 
 /**
@@ -49,6 +50,8 @@ export interface BaselineCommand {
    * verdict: no exit code, no fingerprints, nothing forgivable.
    */
   infra?: true;
+  /** Runner-level exhaustion lines that invalidated a completed capture. */
+  invalidatingLines?: string[];
 }
 
 export interface BaselineFileDuration {
@@ -151,7 +154,7 @@ const TURBO_FAIL_RE = /^\s*(?:[\w@./-]+:\s*)*ELIFECYCLE\s+Command failed\b|^\s*F
 // at least TWO colon-joined segments (`<pkg>:<task>:`, tasks may nest — `pkg:test:unit:`), every
 // segment after the first starting with a letter — so `Error: boom` (one segment), `src/x.ts:12:`
 // (digit segment) and `12:34 error` (eslint stylish) are never stripped.
-const TURBO_PREFIX_RE = /^\s*[\w@./-]+(?::[A-Za-z_][\w.-]*)+:\s+/;
+const TURBO_PREFIX_RE = /^\s*[\w@./-]+(?::[A-Za-z_][\w.-]*)+:(?:\s+|$)/;
 const stripTurboPrefix = (l: string): string | undefined => {
   const m = TURBO_PREFIX_RE.exec(l);
   return m ? l.slice(m[0].length) : undefined;
@@ -232,11 +235,36 @@ export function classifyFailureOutput(output: string): FailureClassification | u
  * no failure in that incomplete environment can safely become pre-existing forgiveness. Keep this
  * separate from `classifyFailureOutput` so changing capture policy cannot move gate verdicts.
  */
-const captureHasInvalidatingInfra = (output: string): boolean => output
-  .split("\n")
-  .map((l) => l.replace(ANSI_RE, ""))
-  .filter((l) => !PASS_LINE_RE.test(l))
-  .some((l) => CAPTURE_EXHAUSTION_RE.test(l));
+const VITEST_ECHO_BLOCK_RE = /^\s*std(?:out|err)\s+\|\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\s+>\s+\S/;
+
+/** Keep runner output while omitting Vitest's echoed test-owned stdout/stderr diagnostic blocks. */
+const withoutVitestEchoBlocks = (output: string): string[] => {
+  const outside: string[] = [];
+  let inVitestEchoBlock = false;
+  for (const line of output.split("\n")) {
+    const clean = line.replace(ANSI_RE, "");
+    const runnerLine = stripTurboPrefix(clean) ?? clean;
+    if (inVitestEchoBlock) {
+      if (runnerLine.trim() === "") inVitestEchoBlock = false;
+      continue;
+    }
+    if (VITEST_ECHO_BLOCK_RE.test(runnerLine)) {
+      inVitestEchoBlock = true;
+      continue;
+    }
+    outside.push(line);
+  }
+  return outside;
+};
+
+const captureInvalidatingLines = (output: string): string[] => {
+  const invalidating: string[] = [];
+  for (const line of withoutVitestEchoBlocks(output)) {
+    const clean = line.replace(ANSI_RE, "");
+    if (!PASS_LINE_RE.test(clean) && CAPTURE_EXHAUSTION_RE.test(clean)) invalidating.push(line);
+  }
+  return invalidating;
+};
 
 const normalizeLine = (l: string) => l.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 
@@ -277,8 +305,7 @@ export const UNRECOGNIZED_FAILURE = "<unrecognized failure output>";
 // renders "zone +3 · run attempt 2 · 1 failed" (what T9 is chartered to draw) contributes nothing, with
 // or without box glyphs, so it cannot manufacture a fresh-fingerprint rejection on any future attempt.
 export function fingerprint(output: string): string[] {
-  const lines = output
-    .split("\n")
+  const lines = withoutVitestEchoBlocks(output)
     .map((l) => l.replace(ANSI_RE, ""))
     .filter((l) => !PASS_LINE_RE.test(l));
   // GATE-FIX-4 DEFECT 4: every line is read twice — as printed, and with a turbo `<pkg>:<task>:`
@@ -483,7 +510,7 @@ export function ceilingKillResult(gate: string, r: ShResult, ceilingMs: number):
  */
 export const CAPTURE_CEILING_MS = 1_800_000;
 
-const invalidCaptureEntry = (durationMs: number): BaselineCommand => ({
+const invalidCaptureEntry = (durationMs: number, invalidatingLines: string[] = []): BaselineCommand => ({
   infra: true,
   fingerprints: [],
   durationMs,
@@ -491,6 +518,7 @@ const invalidCaptureEntry = (durationMs: number): BaselineCommand => ({
   impliedParallelism: null,
   longestFile: null,
   ceilingMs: effectiveCeilingMs({ durationMs }),
+  ...(invalidatingLines.length ? { invalidatingLines } : {}),
 });
 
 export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
@@ -524,19 +552,22 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
       base.commands[name] = invalidCaptureEntry(durationMs);
       continue;
     }
-    const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
+    const combinedOutput = r.stdout + "\n" + r.stderr;
+    const raw = combinedOutput.split(cwd).join("");
     // Run 2137: the child exited and printed ordinary FAIL/AssertionError lines, so the gate-side
     // discriminator correctly called the mixed output a regression. But the same output also said
     // `spawn EAGAIN`: the machine had run out of processes while the pristine-tree measurement was
     // being taken. A capture cannot know which red lines predated that shortage and which it caused,
     // so none may become a fingerprint every later task gets to forgive.
-    if (captureHasInvalidatingInfra(raw)) {
+    const invalidatingLines = captureInvalidatingLines(combinedOutput);
+    if (invalidatingLines.length) {
       console.error(
         `tickmarkr: baseline capture for "${name}" completed with process/resource-exhaustion evidence — `
         + `it recorded NO exit-code verdict and NO fingerprints, so nothing is forgiven for this command; `
-        + `the measurement cannot distinguish a pre-existing failure from one caused by exhaustion.`,
+        + `the measurement cannot distinguish a pre-existing failure from one caused by exhaustion. `
+        + `First invalidating line: ${invalidatingLines[0]}`,
       );
-      base.commands[name] = invalidCaptureEntry(durationMs);
+      base.commands[name] = invalidCaptureEntry(durationMs, invalidatingLines);
       continue;
     }
     base.commands[name] = {
@@ -630,7 +661,14 @@ export async function compareToBaseline(
     if (!cmd) {
       // nothing detected for this gate in the target repo — journal an explicit skip instead of
       // vanishing silently (a lint gate with no lint script rendered as forever-open in status)
-      results.push({ gate: name, pass: true, details: `no ${name} command detected — skipped`, meta: { skipped: true } });
+      const reason = `no ${name} command detected`;
+      const outcome = { kind: "skipped", reason } satisfies GateOutcome;
+      results.push({
+        gate: name,
+        pass: true,
+        details: `${reason} — skipped`,
+        meta: { skipped: true, outcome },
+      });
       continue;
     }
     const entry = baseline.commands[name];

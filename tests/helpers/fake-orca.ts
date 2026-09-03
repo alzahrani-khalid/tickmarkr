@@ -1,14 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { OrcaExec, OrcaFamily } from "../../src/drivers/orca.js";
+import { ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/drivers/orca.js";
 
 // A deterministic in-process stand-in for the `orca` CLI, replaying the envelope shapes RECORDED
-// against live Orca 1.4.186 (conformance spike .planning/assessments/orca-conformance-spike.mjs).
+// against live Orca 1.4.195 (.planning/assessments/2026-09-02-orca-1.4.195-capture/).
 // Envelope shapes are based on the spike and the documented CLI contract:
 //   status   → {ok, result:{runtime:{reachable, runtimeId, appVersion}}, _meta:{runtimeId}}
 //   create   → {ok, result:{terminal:{handle, tabId, paneKey, worktreeId:"<repoId>::<path>",
-//              title:<owned title>}}, _meta} — no status field on the receipt
+//              title:<owned title>, surface:"visible", hostPlatform, executionHostId}}, _meta}
+//              — no status field on the receipt
 //   list     → {ok, result:{terminals:[{handle, tabId, worktreeId, worktreePath, title:<PANE
 //              title, shell-controlled>, connected, writable, orphaned}], visualLayouts:[{root:{
 //              tabs:[{tabId, title:<owned TAB title — the durable one>, panes:{handle}}]}}],
@@ -23,8 +24,8 @@ import type { OrcaExec, OrcaFamily } from "../../src/drivers/orca.js";
 //              orphaned, worktreeId, worktreePath}}, _meta} — liveness only; NO status, NO agent
 //   send     → {ok, result:{send:{handle, accepted:true, bytesWritten}}, _meta}
 //   wait     → satisfied → {ok, result:{wait:{handle, condition, satisfied:true, status, exitCode}},
-//              _meta}; elapsed → rc 1 + {ok:true, result:{wait:{handle, condition,
-//              satisfied:false, status:"running"}}, _meta}
+//              _meta}; elapsed → rc 1 + {ok:false, error:{code:"timeout",message:"timeout"}, _meta}
+//              by default, with the recorded 1.4.186 ok:true satisfied:false receipt selectable
 //   close    → {ok, result:{close:{handle, tabId, ptyKilled:<boolean>}}, _meta}; ptyKilled:false
 //              is a successful close of an exited/no-live-PTY terminal
 //   worktree create → the checkout verb Orca really exposes (`orca worktree create --help`,
@@ -99,6 +100,7 @@ export interface FakeTerminalSpec {
 
 export interface FakeOrcaOpts {
   runtimeId?: string;
+  appVersion?: string;
   /** `status` may be ok:true while the installed app reports no reachable runtime. */
   reachable?: boolean;
   /** what the ambient `--worktree active`/`current` selectors resolve to — whatever checkout the UI
@@ -117,6 +119,10 @@ export interface FakeOrcaOpts {
   flippedStatus?: string;
   /** handle the next `terminal create` hands back */
   nextHandle?: string;
+  /** create receipt surface. Default: "visible" (1.4.195). null omits the field. */
+  createSurface?: string | null;
+  /** elapsed wait transport. Default: 1.4.195 timeout refusal; old receipt remains selectable. */
+  elapsedWaitTransport?: "1.4.195-timeout" | "1.4.186-satisfied-false";
   /** where `worktree create` puts the checkout — Orca's own root, never the caller's choice.
    *  Default: an `orca-worktrees` directory beside the repo. */
   worktreeRoot?: string;
@@ -347,7 +353,15 @@ export class FakeOrca {
   }
 
   private answer(family: string, args: string[], cwd: string): { code: number; stdout: string; stderr: string } {
-    if (family === "status") return this.ok({ runtime: { reachable: this.opts.reachable !== false } });
+    if (family === "status") {
+      return this.ok({
+        runtime: {
+          reachable: this.opts.reachable !== false,
+          runtimeId: this.runtimeId,
+          appVersion: this.opts.appVersion ?? ORCA_FIXTURE_VERSION,
+        },
+      });
+    }
     if (family === "create") {
       const worktree = this.selected(flag(args, "--worktree"), cwd) ?? cwd;
       const t: FakeTerminal = {
@@ -359,7 +373,17 @@ export class FakeOrca {
       };
       this.terminals.push(t);
       // Recorded create receipt: durable tabId + composite worktree identity; status is absent.
-      return this.ok({ terminal: { handle: t.handle, tabId: this.tabId(t), paneKey: `${this.tabId(t)}:${t.handle}-leaf`, worktreeId: `repo-fixture::${t.worktree}`, title: t.title } });
+      const terminal: Record<string, unknown> = {
+        handle: t.handle,
+        tabId: this.tabId(t),
+        paneKey: `${this.tabId(t)}:${t.handle}-leaf`,
+        worktreeId: `repo-fixture::${t.worktree}`,
+        title: t.title,
+        hostPlatform: "darwin",
+        executionHostId: "local",
+      };
+      if (this.opts.createSurface !== null) terminal.surface = this.opts.createSurface ?? "visible";
+      return this.ok({ terminal });
     }
     if (family === "worktree") {
       // Orca creates the checkout ITSELF: its own root, and a branch derived from --name — the
@@ -416,6 +440,9 @@ export class FakeOrca {
         || (condition === "exit" && this.reportedStatus(t) === "exited")
         || (condition === "tui-idle" && t.tuiIdle === true);
       if (!satisfied) {
+        if (this.opts.elapsedWaitTransport !== "1.4.186-satisfied-false") {
+          return this.refusal("timeout", "timeout");
+        }
         return {
           code: 1,
           stdout: this.envelope({

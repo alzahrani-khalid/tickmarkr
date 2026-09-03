@@ -2,6 +2,31 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.2.1 — record truth
+
+**v2.2.1** — the run record, the review row, the approval, the baseline and the vendor stamp each say what
+actually happened, and the release ritual proves the exported tree before a tag exists. Delivered by one
+gated run (7/8) resumed once after a plan amendment (8/8), with a true cross-provider verify on the one task
+whose in-run review resolved to the same provider.
+
+- **A channel's vendor is its model's.** The pi adapter no longer stamps one vendor on every channel, so the
+  review picker's diversity filter excludes the provider it means to exclude (T2).
+- **The review gate says what happened.** A reviewer that returned nothing, timed out, or was failed over to
+  another model is recorded as such in the gate row, never as a silent approve (T1).
+- **The run record keeps what it knows.** `run-start` carries the driver, dist fingerprint and channel map;
+  prompts written over a prior engagement's brief are preserved beside it; `report` reads them back (T3).
+- **`approve` tells the truth about who enacts.** The approval record names the seat and the disposition
+  the daemon will act on (T5).
+- **The baseline tells the truth.** A baseline capture that could not produce a verdict is recorded as
+  infra and the gate grades the head absolutely instead of forgiving against nothing (T6).
+- **A dead probe is not an unauthed channel.** A model probe that dies on EMFILE or a spawn error keeps the
+  channel's last known auth verdict and records the errno; a real 403 still marks it unauthed (T8).
+- **Orca on the installed version.** The Orca driver pins fixture 1.4.195 and accepts both elapsed-wait
+  transport shapes (T4).
+- **The spec template's laws and the release ritual's proofs.** The template states the surface-ownership
+  law and the semicolon rule; `npm run verify:export` runs the suite inside the export candidate before a
+  push; `watch-context.sh` clears only supervising roles (T7).
+
 ## v2.2 — what a revived worker is told
 
 **v2.2.0** — a released, revived, or re-dispatched task is told the truth about its own state, and the

@@ -755,6 +755,10 @@ once** — an overseer ran nine hours at 86% unable to read its own number. Arm
 Herdr's `agent_status`, which is unreliable for vendors whose screen detection is skipped (kimi) — for
 those, the spawn-time auto-approve flag is the control, not this watcher.
 
+For `consult`, `surgeon`, and `reviewer` seats, the CONTEXT watcher is wake-only: arm it with
+`TKR_AUTO_CLEAR=0 .claude/skills/tickmarkr-overseer/scripts/watch-context.sh <consult|surgeon|reviewer>
+<agent|pane> 50 50 <handoff-file>`. Only `orchestrator` and `overseer` seats may use auto-clear.
+
 ```bash
 .claude/skills/tickmarkr-overseer/scripts/watch-pending-input.sh <agent|pane> [poll-s] [cap-s] [confirm-polls]
 ```
@@ -952,6 +956,11 @@ orchestrator turn boundary.
    before you stand down from any release — **operator instruction, 2026-08-25: *"overseer should always
    leave clean state after a version is shipped"***. Every line below is a defect that actually happened
    on the release that produced this rule.
+
+   - **RUN BOTH RELEASE PROOFS BEFORE STANDING DOWN.** `npm run verify:export` must install, build, and
+     run the suite in the exported tree; then
+     `TICKMARKR_E2E=1 npx vitest run tests/e2e/orca-smoke.e2e.test.ts` must exercise the installed-Orca
+     smoke. A skipped smoke is not proof. Record both results before declaring the release complete.
 
    - **REWRITE THE MEMORY INDEX FIRST, and read it back.** Minutes after `2.1.1` hit npm, the index line
      a fresh session loads still read *"⛔ 2.1.1 CANNOT ship from run …2011"* — true when written, and by

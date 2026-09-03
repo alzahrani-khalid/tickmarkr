@@ -137,7 +137,8 @@ export type GateEvent =
   // review share one parent timestamp, so a surface can tell "ran in parallel" from "ran in sequence"
   // without inferring it from wall-clock. Deterministic gates carry no parent: they are the sequence.
   | { phase: "start"; gate: GateName; index: number; total: number; parentAt?: number }
-  | { phase: "end"; gate: GateName; result: GateResult };
+  | { phase: "end"; gate: GateName; result: GateResult }
+  | { phase: "note"; gate: GateName; name: string; payload: Record<string, unknown>; result: GateResult };
 
 export interface GateContext {
   worktree: string;
@@ -673,6 +674,14 @@ export async function runGates(
     // eligible seat keeps the ORIGINAL result so the recorded cause stays truthful (OBS-196).
     if (rv.meta?.unparseable === true && typeof rv.meta.reviewer === "string") {
       const flaked = rv.meta.reviewer;
+      const emptyOutput = rv.meta.cause === "empty-output";
+      if (emptyOutput) {
+        await ctx.onGate?.({
+          phase: "note", gate: "review", name: "reviewer-empty-output",
+          payload: { reviewer: flaked, bytes: typeof rv.meta.bytes === "number" ? rv.meta.bytes : 0 },
+          result: { ...rv, meta: { ...rv.meta, skipped: true } },
+        });
+      }
       const retryVia = ctx.via
         ? { ...ctx.via, nameFor: (role: "judge" | "review", adapter: string) => ctx.via!.nameFor(role, adapter) + "-r1" }
         : undefined;
@@ -686,7 +695,7 @@ export async function runGates(
           ...second,
           // `details` is lifted onto the journal's gate-result row; meta.reviewRetry is not. Keep the
           // re-route visible in the result text a reader actually opens, including on a red retry.
-          details: `review re-route: ${flaked} produced no parseable verdict; replaced by ${retried}\n${second.details}`,
+          details: `review re-route: ${flaked} produced ${emptyOutput ? "EMPTY output" : "no parseable verdict"}; replaced by ${retried}\n${second.details}`,
           meta: { ...second.meta, reviewRetry: { flaked, retried } },
         };
       } else if (task.routingHints?.floor) {

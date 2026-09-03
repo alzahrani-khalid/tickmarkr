@@ -29,6 +29,7 @@ Outside a multi-agent terminal environment, run the loop directly.
 - Do not edit the compiled graph to force an outcome; fix the source spec and compile again.
 - Gates verify commits, diffs, acceptance criteria, and reviews independently. Never trust a worker's claim that work is complete.
 - Treat missing or unparseable machine results and verdicts as failures. Do not release, resume, or merge around failed gates.
+- A task changing what the daemon DOES must own every surface that TELLS the operator what the daemon does.
 
 ## Act by default
 

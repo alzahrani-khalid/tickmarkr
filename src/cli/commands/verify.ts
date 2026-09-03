@@ -213,6 +213,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     pipeline: "v185", artifactDir,
     onGate: (e) => {
       if (e.phase === "start") console.error(`verify: → ${e.gate} (${e.index}/${e.total})`);
+      else if (e.phase === "note") console.error(`verify: note ${e.gate} ${e.name} ${JSON.stringify(e.payload)}`);
       else console.error(`verify: ${e.result.pass ? "✓" : "✗"} ${e.result.gate} — ${e.result.details.split("\n")[0] ?? ""}`);
     },
   });

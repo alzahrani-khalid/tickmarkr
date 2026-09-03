@@ -107,7 +107,7 @@ describe("consult", () => {
       notes: "audit-only prose the worker must not see",
     });
     const v = await consult(dossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
-    expect(v).toEqual({
+    expect(v).toMatchObject({
       action: "retry",
       reason: "evidence gate empty",
       guidance: "Write a real commit.",
@@ -131,14 +131,14 @@ describe("consult", () => {
       worktree: async () => "/tmp/wt",
     };
     const v = await consult(dossier, cfg, [fake], throwing, "/tmp", runDir);
-    expect(v).toEqual({ action: "retry", notes: "headless path" });
+    expect(v).toMatchObject({ action: "retry", notes: "headless path" });
   });
 
   test("returns structured verdict via driver; dossier saved as artifact", async () => {
     const { cfg, fake, runDir } = setup({ action: "reroute", notes: "cursor keeps ignoring scope" });
     cfg.visibility.llm = "pane";
     const v = await consult(dossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
-    expect(v).toEqual({ action: "reroute", notes: "cursor keeps ignoring scope" });
+    expect(v).toMatchObject({ action: "reroute", notes: "cursor keeps ignoring scope" });
     const files = readdirSync(join(runDir, "consults"));
     expect(files.some((f) => f.startsWith("T1-"))).toBe(true);
   });
@@ -148,7 +148,7 @@ describe("consult", () => {
     const { cfg, fake, runDir } = setup({ action: "retry", notes: "redaction path" });
     const leaky: Dossier = { ...dossier, transcript: 'worker ran: export DEPLOY_TOKEN="hunter2secretvalue99"' };
     const v = await consult(leaky, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
-    expect(v).toEqual({ action: "retry", notes: "redaction path" });
+    expect(v).toMatchObject({ action: "retry", notes: "redaction path" });
     const md = readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!;
     const persisted = readFileSync(join(runDir, "consults", md), "utf8");
     expect(persisted).not.toContain("hunter2secretvalue99");
@@ -163,7 +163,7 @@ describe("consult", () => {
     const churn = Array.from({ length: 60 }, (_, i) => `⠋ Starting MCP servers (${i}s • esc to interrupt)`).join("\n");
     const noisy: Dossier = { ...dossier, transcript: `${churn}\nFAIL tests/x.test.ts > boom\nprocess exited with exit code 1` };
     const v = await consult(noisy, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
-    expect(v).toEqual({ action: "retry", notes: "filter path" });
+    expect(v).toMatchObject({ action: "retry", notes: "filter path" });
     const md = readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!;
     const persisted = readFileSync(join(runDir, "consults", md), "utf8");
     expect(persisted.split("\n").filter((l) => l.includes("Starting MCP servers")).length).toBeLessThanOrEqual(1);
@@ -177,7 +177,7 @@ describe("consult", () => {
       action: "reroute", notes: "trust dialog blocks the CLI", excludeAdapter: "cursor-agent",
     });
     const v = await consult(dossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
-    expect(v).toEqual({
+    expect(v).toMatchObject({
       action: "reroute",
       notes: "trust dialog blocks the CLI",
       excludeAdapter: "cursor-agent",
@@ -215,7 +215,7 @@ describe("consult", () => {
     fake.headlessCommand = (pf: string): string =>
       `n=$(grep -oE 'VERDICT_NONCE: [a-f0-9]+' ${shq(pf)} | head -1 | awk '{print $2}'); printf '{ "nonce": "%s", "act\\nion": "retry", "notes": "dew\\nrapped" }\\n' "$n"`;
     const v = await consult(dossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
-    expect(v).toEqual({ action: "retry", notes: "dewrapped" });
+    expect(v).toMatchObject({ action: "retry", notes: "dewrapped" });
   });
 
   // Q144s / OBS-196 parity: an unparseable verdict persists its raw bytes for diagnosis —
@@ -258,7 +258,7 @@ describe("consult", () => {
     const nonce = extractPromptNonce(readFileSync(promptFile, "utf8"))!;
     expect(paneOutput).toContain(`"nonce": "${nonce}"`);
     expect(extractVerdictJson(paneOutput, nonce)).toMatchObject({ action: "retry", notes: "pane path" });
-    expect(v).toEqual({ action: "retry", notes: "pane path" });
+    expect(v).toMatchObject({ action: "retry", notes: "pane path" });
     expect(captured).toHaveLength(1);
     expect(captured[0]).toMatch(/^bash ['"]/);
     expect(captured[0]!.length).toBeLessThan(120);
@@ -285,7 +285,7 @@ describe("consult", () => {
       worktree: async () => "/tmp/wt",
     };
     const v = await consult(dossier, cfg, [fake], throwing, "/tmp", runDir);
-    expect(v).toEqual({ action: "retry", notes: "headless bytes" });
+    expect(v).toMatchObject({ action: "retry", notes: "headless bytes" });
     expect(readdirSync(join(runDir, "consults")).some((f) => f.endsWith(".sh"))).toBe(false);
     const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults"))[0]!);
     const headlessCmd = fake.headlessCommand(promptFile, cfg.consult.model);
@@ -355,7 +355,7 @@ describe("consult.prefer seat failover", () => {
     const v = await consult(dossier, cfg, [alpha.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
       channels: [{ adapter: "alpha" }, { adapter: "fake" }],
     });
-    expect(v).toEqual({ action: "retry", notes: "pinned seat" });
+    expect(v).toMatchObject({ action: "retry", notes: "pinned seat" });
     expect(alpha.calls.count).toBe(0);
   });
 
@@ -367,7 +367,7 @@ describe("consult.prefer seat failover", () => {
     const v = await consult(dossier, cfg, [alpha.adapter, beta.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
       channels: [{ adapter: "alpha" }, { adapter: "beta" }],
     });
-    expect(v).toEqual({ action: "retry", notes: "seat alpha" });
+    expect(v).toMatchObject({ action: "retry", notes: "seat alpha" });
     expect(alpha.calls).toEqual({ count: 1, models: ["a-1"] });
     expect(beta.calls.count).toBe(0);
   });
@@ -380,7 +380,7 @@ describe("consult.prefer seat failover", () => {
     const v = await consult(dossier, cfg, [ghost.adapter, alpha.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
       channels: [{ adapter: "alpha" }],
     });
-    expect(v).toEqual({ action: "retry", notes: "live seat" });
+    expect(v).toMatchObject({ action: "retry", notes: "live seat" });
     expect(ghost.calls.count).toBe(0);
     expect(alpha.calls.count).toBe(1);
   });
@@ -393,7 +393,7 @@ describe("consult.prefer seat failover", () => {
     const v = await consult(dossier, cfg, [alpha.adapter, beta.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
       channels: [{ adapter: "alpha" }, { adapter: "beta" }],
     });
-    expect(v).toEqual({ action: "retry", notes: "seat beta answered" });
+    expect(v).toMatchObject({ action: "retry", notes: "seat beta answered" });
     expect(alpha.calls.count).toBe(1);
     expect(beta.calls.count).toBe(1);
   });
@@ -430,7 +430,7 @@ describe("consult.prefer seat failover", () => {
     const v = await consult(dossier, cfg, [alpha.adapter, beta.adapter, fake], stub, "/tmp", runDir, {
       channels: [{ adapter: "alpha" }, { adapter: "beta" }],
     });
-    expect(v).toEqual({ action: "retry", notes: "seat two pane" });
+    expect(v).toMatchObject({ action: "retry", notes: "seat two pane" });
     expect(runs).toBe(2); // seat one dispatched and died; seat two dispatched and answered
     expect(closes).toBe(2); // the failed seat's pane did not leak
     expect(alpha.calls.count).toBe(1);
@@ -446,7 +446,7 @@ describe("consult.prefer seat failover", () => {
     const v = await consult(dossier, cfg, [alpha.adapter, omega.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
       channels: [{ adapter: "alpha" }],
     });
-    expect(v).toEqual({ action: "decompose", notes: "pin seat answered" });
+    expect(v).toMatchObject({ action: "decompose", notes: "pin seat answered" });
     expect(alpha.calls.count).toBe(1);
     expect(omega.calls).toEqual({ count: 1, models: ["om-1"] });
   });
@@ -458,7 +458,7 @@ describe("consult.prefer seat failover", () => {
     const v = await consult(dossier, cfg, [alpha.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
       channels: [{ adapter: "alpha" }],
     });
-    expect(v).toEqual({ action: "human", notes: "consult verdict unparseable — failing safe to human" });
+    expect(v).toMatchObject({ action: "human", notes: "consult verdict unparseable — failing safe to human" });
     expect(alpha.calls.count).toBe(1);
   });
 });

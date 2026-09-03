@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
@@ -33,8 +33,15 @@ TICKMARKR_RESULT_${nonce} {"ok":true|false,"summary":"<one sentence>","deviation
 }
 
 export function writePrompt(dir: string, task: Task, attempt: number, feedback = "", nonce = ""): string {
-  const p = join(dir, "prompts", `${task.id}-a${attempt}.md`);
-  mkdirSync(join(dir, "prompts"), { recursive: true });
+  const prompts = join(dir, "prompts");
+  const p = join(prompts, `${task.id}-a${attempt}.md`);
+  mkdirSync(prompts, { recursive: true });
+  if (existsSync(p)) {
+    let engagement = 0;
+    let archive = join(prompts, `${task.id}-a${attempt}-engagement-${engagement}.md`);
+    while (existsSync(archive)) archive = join(prompts, `${task.id}-a${attempt}-engagement-${++engagement}.md`);
+    copyFileSync(p, archive);
+  }
   writeFileSync(p, buildTaskPrompt(task, feedback, nonce));
   return p;
 }

@@ -30,7 +30,9 @@ export function addUsage(a: TokenUsage | undefined, b: TokenUsage): TokenUsage {
 
 export interface Assignment { adapter: string; model: string; channel: "sub" | "api"; tier: Tier }
 export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier }
-export interface ModelAuth { authed: boolean; reason?: string; probedAt: string }
+export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
+export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
+export interface ModelAuth { authed: boolean; reason?: string; probeError?: ModelProbeError; probedAt: string }
 export interface AuthHealth {
   installed: boolean; authed: boolean; version?: string; models: string[]; note?: string;
   // v1.5 MODEL-02: ISO timestamp — additive-optional, pre-v1.5 doctor.json lacks it, readers use ?.

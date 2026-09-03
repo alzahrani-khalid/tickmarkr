@@ -1,6 +1,6 @@
 {
   "name": "tickmarkr",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Spec in, verified work out.",
   "type": "module",
   "license": "MIT",
@@ -37,7 +37,8 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "schema": "tsx scripts/emit-schema.ts",
-    "e2e": "TICKMARKR_E2E=1 vitest run tests/e2e --testTimeout 900000"
+    "e2e": "TICKMARKR_E2E=1 vitest run tests/e2e --testTimeout 900000",
+    "verify:export": "bash scripts/verify-export.sh"
   },
   "dependencies": {
     "@types/react": "^19.2.17",
