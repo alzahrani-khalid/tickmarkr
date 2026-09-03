@@ -766,7 +766,7 @@ export type InitConfigOverlay = {
 export function configTemplate(overlay?: InitConfigOverlay): string {
   const base = `# tickmarkr config overlay — merges over built-in defaults (repo beats global beats defaults)
 # concurrency: 3
-# driver: auto            # auto | herdr | subprocess | orca
+# driver: auto            # auto: herdr when HERDR_ENV=1, then orca when TERM_PROGRAM=Orca + ORCA_TERMINAL_HANDLE, else subprocess; name orca explicitly outside an Orca terminal
 # taskTimeoutMinutes: 30
 # contextWarnTokens: 170000   # v1.23: journal+notify once per attempt when live worker context crosses this (status shows the sample)
 # setup: npm ci --prefer-offline   # run in each fresh task worktree before dispatch

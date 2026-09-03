@@ -1,17 +1,19 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, probeAll, readDoctor, rolePools } from "../../adapters/registry.js";
 import { channelKey, type Assignment, type BillingChannel } from "../../adapters/types.js";
 import { loadConfig } from "../../config/config.js";
 import { captureBaseline, detectGateCommands, type Baseline } from "../../gates/baseline.js";
+import { modelProvider } from "../../gates/review.js";
 import { runGates } from "../../gates/run-gates.js";
 import type { GateResult } from "../../gates/types.js";
 import { getTask, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../../graph/schema.js";
 import { linkNodeModules, removeWorktree, shGit, shGitOk } from "../../run/git.js";
+import { Journal } from "../../run/journal.js";
 
 /**
  * tickmarkr verify — the gate battery as a standalone command (OPERATING-MODEL-2026-08-11 item 3).
@@ -66,6 +68,74 @@ export function verifyStateDir(cwd: string): string {
   return join(realpathSync(tmpdir()), "tickmarkr-verify", createHash("sha256").update(cwd).digest("hex").slice(0, 12));
 }
 
+const STATE_FILES = ["graph.json", "doctor.json", "config.yaml"] as const;
+const LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"] as const;
+
+/** Linked worktrees share operational state with the repository that owns the common git dir. */
+export async function verifyStateRoot(cwd: string): Promise<string> {
+  const commonDir = resolve(cwd, (await shGitOk("git rev-parse --git-common-dir", cwd)).trim());
+  const commonRoot = realpathSync(dirname(commonDir));
+  if (commonRoot === realpathSync(cwd)) return cwd;
+  const localState = join(cwd, ".tickmarkr");
+  const commonState = join(commonRoot, ".tickmarkr");
+  return STATE_FILES.some((file) => !existsSync(join(localState, file)) && existsSync(join(commonState, file)))
+    ? commonRoot
+    : cwd;
+}
+
+const hashParts = (parts: Array<string | Buffer>): string => {
+  const hash = createHash("sha256");
+  for (const part of parts) hash.update(part);
+  return hash.digest("hex").slice(0, 12);
+};
+
+/** Cache identity is repository content, never a checkout path. */
+export function baselineCachePath(cwd: string, baseSha: string, commands: Record<string, string>): string {
+  const lockParts: Array<string | Buffer> = [];
+  for (const file of LOCKFILES) {
+    const path = join(cwd, file);
+    lockParts.push(file, existsSync(path) ? readFileSync(path) : "<absent>");
+  }
+  const commandParts = Object.entries(commands).sort(([a], [b]) => a.localeCompare(b)).map(([name, command]) => `${name}\0${command}\0`);
+  return join(realpathSync(tmpdir()), "tickmarkr-verify", "cache",
+    `baseline-${baseSha.slice(0, 12)}-${hashParts(lockParts)}-${hashParts(commandParts)}.json`);
+}
+
+const verdictlessCommands = (baseline: Baseline, commands: Record<string, string>): string[] =>
+  Object.keys(commands).filter((name) => baseline.commands[name]?.exitCode === undefined);
+
+export function excludeAuthorProvider(channels: BillingChannel[], author: BillingChannel): BillingChannel[] {
+  const provider = modelProvider(author.model, author.vendor);
+  return [author, ...channels.filter((candidate) => candidate !== author && modelProvider(candidate.model, candidate.vendor) !== provider)];
+}
+
+function recordedMerges(repoRoot: string): Array<{ runId: string; taskId: string; commit: string }> {
+  const runs = join(repoRoot, ".tickmarkr", "runs");
+  if (!existsSync(runs)) return [];
+  const rows: Array<{ runId: string; taskId: string; commit: string }> = [];
+  for (const runId of readdirSync(runs).filter((name) => name.startsWith("run-")).sort().reverse()) {
+    const path = join(runs, runId, "journal.jsonl");
+    if (!existsSync(path)) continue;
+    for (const line of readFileSync(path, "utf8").split("\n").filter(Boolean)) {
+      try {
+        const row = JSON.parse(line) as { event?: string; taskId?: string; data?: { commit?: string } };
+        if (row.event === "merge" && row.taskId && row.data?.commit) rows.push({ runId, taskId: row.taskId, commit: row.data.commit });
+      } catch { /* torn journal tail is not a merge record */ }
+    }
+  }
+  return rows;
+}
+
+async function warnWideTaskRange(cwd: string, stateRoot: string, taskId: string, mergeBase: string): Promise<void> {
+  const inRange = new Set((await shGitOk(`git rev-list --merges '${mergeBase}..HEAD'`, cwd)).trim().split("\n").filter(Boolean));
+  const merges = recordedMerges(stateRoot).filter((row) => inRange.has(row.commit));
+  const own = merges.find((row) => row.taskId === taskId);
+  const others = own ? merges.filter((row) => row.taskId !== taskId) : [];
+  if (own && others.length) {
+    console.error(`verify: WARNING --task ${taskId} range also carries merge commit(s) for ${others.map((row) => `${row.taskId} ${row.commit.slice(0, 12)}`).join(", ")}; ${taskId}'s own merge ${own.commit} is the intended HEAD`);
+  }
+}
+
 export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
   const { values } = parseArgs({
     args: argv,
@@ -76,6 +146,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
       files: { type: "string", multiple: true },
       author: { type: "string" },
       baseline: { type: "string" },
+      record: { type: "string" },
       json: { type: "boolean", default: false },
       "no-review": { type: "boolean", default: false },
       "no-acceptance": { type: "boolean", default: false },
@@ -83,7 +154,11 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     allowPositionals: false,
   });
 
-  const cfg = loadConfig(cwd);
+  const stateRoot = await verifyStateRoot(cwd);
+  if (resolve(stateRoot) !== resolve(cwd)) {
+    console.error(`verify: state files graph.json, doctor.json and config.yaml resolved read-only from ${join(stateRoot, ".tickmarkr")} (linked worktree)`);
+  }
+  const cfg = loadConfig(stateRoot);
   const head = (await shGitOk("git rev-parse HEAD", cwd)).trim();
   const baseTip = (await shGitOk(`git rev-parse '${values.base}'`, cwd).catch(() => {
     throw new Error(`--base ${values.base} is not a resolvable ref — pass --base <ref> naming the branch this diff targets`);
@@ -98,8 +173,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   let files = values.files ?? [];
   let goal = `independent verification of the ${values.base}..HEAD diff`;
   if (values.task) {
-    const t = getTask(loadGraph(cwd), values.task);
-    if (!t) throw new Error(`--task ${values.task}: no such task in .tickmarkr/graph.json`);
+    const t = getTask(loadGraph(stateRoot), values.task);
     acceptance = t.acceptance;
     if (!files.length) files = t.files;
     goal = t.goal;
@@ -107,6 +181,8 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     acceptance = parseCriteria(readFileSync(values.criteria, "utf8"));
     if (!acceptance.length) throw new Error(`--criteria ${values.criteria}: no criteria found (bullets or command:/test:/judge: lines)`);
   }
+
+  if (values.task) await warnWideTaskRange(cwd, stateRoot, values.task, mergeBase);
 
   const wantAcceptance = acceptance.length > 0 && !values["no-acceptance"];
   const wantReview = !values["no-review"];
@@ -155,7 +231,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   let author: Assignment = HUMAN_AUTHOR;
   const adapters = allAdapters();
   if (wantAcceptance || wantReview) {
-    const health = readDoctor(cwd) ?? (await probeAll(adapters));
+    const health = readDoctor(stateRoot) ?? (await probeAll(adapters));
     const pools = rolePools(cfg, adapters, health);
     judgeChannels = pools.judge;
     channels = pools.review;
@@ -167,6 +243,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
         throw new Error(`--author ${values.author} does not name a discoverable review channel — one of: ${channels.map(channelKey).join(", ") || "(none)"}`);
       }
       author = { adapter: c.adapter, model: c.model, channel: c.channel, tier: c.tier };
+      channels = excludeAuthorProvider(channels, c);
     } else {
       channels = [...channels, HUMAN_CHANNEL];
     }
@@ -183,26 +260,52 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   const stateDir = verifyStateDir(cwd);
   mkdirSync(stateDir, { recursive: true });
   let baseline: Baseline;
-  const cachePath = join(stateDir, `baseline-${mergeBase.slice(0, 12)}.json`);
+  const cachePath = baselineCachePath(cwd, mergeBase, commands);
+  const verdictlessMarker = `${cachePath}.verdictless`;
+  mkdirSync(dirname(cachePath), { recursive: true });
   if (values.baseline) {
     baseline = JSON.parse(readFileSync(values.baseline, "utf8")) as Baseline;
-  } else if (existsSync(cachePath)) {
-    console.error(`verify: reusing cached baseline for ${mergeBase.slice(0, 12)} (${cachePath})`);
-    baseline = JSON.parse(readFileSync(cachePath, "utf8")) as Baseline;
   } else {
-    const baseDir = join(stateDir, `base-${mergeBase.slice(0, 12)}`);
-    console.error(`verify: capturing baseline at merge-base ${mergeBase.slice(0, 12)} (one-time per base; cached at ${cachePath})`);
-    await shGit(`git worktree remove --force '${baseDir}'`, cwd); // stale leftover from an interrupted run
-    await shGitOk(`git worktree add --detach '${baseDir}' '${mergeBase}'`, cwd);
-    try {
-      linkNodeModules(cwd, baseDir, { force: true });
-      baseline = await captureBaseline(baseDir, commands);
-      writeFileSync(cachePath, JSON.stringify(baseline, null, 2));
-    } finally {
-      await removeWorktree(cwd, baseDir);
+    let cached: Baseline | undefined;
+    if (existsSync(cachePath)) {
+      cached = JSON.parse(readFileSync(cachePath, "utf8")) as Baseline;
+      const missing = verdictlessCommands(cached, commands);
+      if (missing.length) {
+        console.error(`verify: cached baseline recorded no verdict for ${missing.join(", ")}; it was not reusable and will be recaptured`);
+        rmSync(cachePath, { force: true });
+        cached = undefined;
+      }
+    }
+    if (cached) {
+      console.error(`verify: reusing cached baseline for ${mergeBase.slice(0, 12)} (${cachePath})`);
+      baseline = cached;
+    } else {
+      if (existsSync(verdictlessMarker)) {
+        console.error(`verify: prior baseline recorded no verdict and was not cached; recapturing merge-base ${mergeBase.slice(0, 12)}`);
+      } else {
+        console.error(`verify: capturing baseline at merge-base ${mergeBase.slice(0, 12)} (cached by base, lockfile and command hashes at ${cachePath})`);
+      }
+      const baseDir = join(stateDir, `base-${mergeBase.slice(0, 12)}`);
+      await shGit(`git worktree remove --force '${baseDir}'`, cwd); // stale leftover from an interrupted run
+      await shGitOk(`git worktree add --detach '${baseDir}' '${mergeBase}'`, cwd);
+      try {
+        linkNodeModules(cwd, baseDir, { force: true });
+        baseline = await captureBaseline(baseDir, commands);
+        const missing = verdictlessCommands(baseline, commands);
+        if (missing.length) {
+          writeFileSync(verdictlessMarker, JSON.stringify({ base: mergeBase, commands: missing }) + "\n");
+          rmSync(cachePath, { force: true });
+        } else {
+          writeFileSync(cachePath, JSON.stringify(baseline, null, 2));
+          rmSync(verdictlessMarker, { force: true });
+        }
+      } finally {
+        await removeWorktree(cwd, baseDir);
+      }
     }
   }
 
+  const recordJournal = values.record ? Journal.open(stateRoot, values.record) : undefined;
   const artifactDir = join(stateDir, new Date().toISOString().replace(/[:.]/g, "-"));
   mkdirSync(artifactDir, { recursive: true });
 
@@ -219,13 +322,28 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   });
 
   const green = results.length > 0 && results.every((r) => r.pass || r.meta?.skipped === true);
+  const reviewRows = results.filter((result) => result.gate === "review");
+  const reviewFindings = reviewRows.flatMap((result) => result.details.split("\n").flatMap((line) => {
+    const match = /^- \[([^\]]+)\] (.*)$/.exec(line);
+    return match ? [{ classification: match[1], note: match[2], reviewer: result.meta?.reviewer }] : [];
+  }));
+  const artifactPath = join(artifactDir, "verify-results.json");
+  writeFileSync(artifactPath, JSON.stringify({ base: baseTip, head, mergeBase, green, gateRows: results, reviewFindings }, null, 2) + "\n");
+  console.error(`verify: artifacts written to ${artifactPath}`);
+  const review = reviewRows.at(-1);
+  if (recordJournal && review) {
+    recordJournal.append("review-leg2", values.task ?? "VERIFY", {
+      base: baseTip, head, mergeBase, author: channelKey(author), artifactPath,
+      ...review,
+    });
+  }
   if (values.json) {
-    return { out: JSON.stringify({ base: baseTip, head, mergeBase, green, results }, null, 2), code: green ? 0 : 2 };
+    return { out: JSON.stringify({ base: baseTip, head, mergeBase, green, artifactPath, results }, null, 2), code: green ? 0 : 2 };
   }
   const lines = results.map((r: GateResult) =>
     `${r.pass ? "PASS" : "FAIL"} ${r.gate}\n${r.details.split("\n").map((l) => `  ${l}`).join("\n")}`);
   const verdict = green
-    ? `verify GREEN — ${results.length} gate(s) passed on ${mergeBase.slice(0, 12)}..${head.slice(0, 12)} (merge is a human decision)`
-    : `verify RED — first failure decides; artifacts in ${artifactDir}`;
+    ? `verify GREEN — ${results.length} gate(s) passed on ${mergeBase.slice(0, 12)}..${head.slice(0, 12)} (merge is a human decision; artifacts: ${artifactPath})`
+    : `verify RED — first failure decides; artifacts: ${artifactPath}`;
   return { out: [...lines, "", verdict].join("\n"), code: green ? 0 : 2 };
 }

@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, relative } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
 import {
@@ -20,6 +20,7 @@ const MAX_WALK_FILES = 400;
 const MAX_HITS_PER_TASK = 20;
 /** Skip giant fixtures / snapshots. */
 const MAX_READ_BYTES = 512 * 1024;
+const EXPORT_MANIFEST_TEST = "tests/repo/export-manifest.test.ts";
 
 const SRC_EXT = /\.(ts|tsx|js|jsx|mts|cts)$/;
 const CODE_EXT = /\.(ts|tsx|js|jsx|mts|cts)$/;
@@ -117,21 +118,29 @@ export function collateralHits(
   const read = makeReader(repoRoot);
   for (const t of tasks) {
     // OBS-22: scopeGate accepts picomatch globs; advisory collateral warnings must agree.
-    const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
-    const srcFiles = t.files.map((f) => f.replace(/^\.\//, "")).filter(isSrcPath);
-    if (!srcFiles.length) continue;
+    const files = t.files.map((f) => f.replace(/^\.\//, ""));
+    const scoped = filesGlob(files);
+    const srcFiles = files.filter(isSrcPath);
+    const hits: string[] = [];
+
+    // Exact-enumerated scripts are an export-set contract: a new path has no name or symbol for the
+    // ordinary sweep to find, but the manifest test will reject it unless the task owns that oracle.
+    if (
+      testFiles.includes(EXPORT_MANIFEST_TEST)
+      && !scoped(EXPORT_MANIFEST_TEST)
+      && files.some((path) => path.startsWith("scripts/") && !/[?*{[]/.test(path) && !existsSync(join(repoRoot, path)))
+    ) hits.push(EXPORT_MANIFEST_TEST);
 
     // needles unioned across all src files in this task
     const needles = [...new Set(srcFiles.flatMap(needlesFor))];
-    const hits: string[] = [];
     for (const tf of testFiles) {
-      if (scoped(tf)) continue;
+      if (scoped(tf) || hits.includes(tf)) continue;
       const text = read(tf);
       if (text === null) continue;
       if (mentions(text, needles)) hits.push(tf);
     }
-    // deterministic: walk already sorted; stable list
-    if (hits.length) map.set(t.id, hits);
+    // deterministic: the special hit and walk are stable; sort their union for one canonical map.
+    if (hits.length) map.set(t.id, hits.sort());
   }
   return map;
 }

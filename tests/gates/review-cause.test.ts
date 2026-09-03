@@ -7,8 +7,9 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
-import type { GateVia } from "../../src/gates/llm.js";
+import { type GateVia, runLlmDetailed } from "../../src/gates/llm.js";
 import { reviewGate } from "../../src/gates/review.js";
+import { classifyVerdictCause } from "../../src/gates/verdict-cause.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -72,6 +73,24 @@ function via(driver: ExecutorDriver): GateVia {
 }
 
 describe("review caller verdict cause", () => {
+  test("test: a reviewer killed at the ceiling carries cause timeout and a reviewer whose process exits nonzero with banner-only bytes carries cause startup-failure while a nonce-bearing but malformed verdict keeps cause malformed-verdict and an empty output keeps cause empty-output whereas a classifier that reads bytes alone fails", async () => {
+    class ProcessReviewer extends FakeAdapter {
+      constructor(scriptPath: string, private readonly command: string) { super(scriptPath); }
+      headlessCommand(): string { return this.command; }
+    }
+    const nonce = "deadbeef";
+    const script = join(mkdtempSync(join(tmpdir(), "tickmarkr-review-process-")), "script.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const timed = await runLlmDetailed(new ProcessReviewer(script, "printf banner; sleep 1"), "fake-2", "review", process.cwd(), undefined, 20);
+    const startup = await runLlmDetailed(new ProcessReviewer(script, "printf banner; exit 2"), "fake-2", "review", process.cwd(), undefined, 200);
+
+    expect(timed.timedOut).toBe(true);
+    expect(classifyVerdictCause(timed.output, nonce, "approve", timed)).toBe("timeout");
+    expect(classifyVerdictCause(startup.output, nonce, "approve", startup)).toBe("startup-failure");
+    expect(classifyVerdictCause(`{"nonce":"${nonce}","approve":true,broken`, nonce, "approve", { exitCode: 2 })).toBe("malformed-verdict");
+    expect(classifyVerdictCause("", nonce, "approve", { exitCode: 0 })).toBe("empty-output");
+  });
+
   test("the review caller branches on the cause, so a silent review is recorded as a dispatch failure rather than a rejection, while a structurally valid but malformed verdict still fails closed", async () => {
     const { repo, base } = repoWithCommit();
     const fake = reviewer();

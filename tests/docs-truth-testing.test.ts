@@ -138,6 +138,12 @@ function runScratchTests(scratch: string, files: string[], title?: string) {
         FORCE_COLOR: "0",
         NO_COLOR: "1",
         TICKMARKR_DOCS_TRUTH_MUTATION_CHILD: "1",
+        // OBS-854: every nested run is a whole vitest process whose fork pool pre-spawns min(cpus-1, maxForks)
+        // workers at startup — 17 per child on an 18-core host, ~45 children per sweep: the storm that starves a
+        // concurrent suite's birpc window. vitest 3.2.7 reads VITEST_MAX_FORKS natively, so this caps the child
+        // under the scratch's vitest.config.ts AND the isolated mutation config; the children are already
+        // awaited one at a time, so the sweep is serial by construction.
+        VITEST_MAX_FORKS: "1",
       },
     });
     let stdout = "";

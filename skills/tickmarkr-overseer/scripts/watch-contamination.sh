@@ -21,8 +21,16 @@ LOAD_CEIL="${2:-24}"
 POLL="${3:-45}"
 CAP="${4:-14400}"
 
-STATE="$(dirname "$J")/.contamination.seen"
-: > "$STATE" 2>/dev/null || STATE="/tmp/.contamination.seen.$$"
+# OBS-848: the arming seat owns this pid, even when a partner watches the same journal. Never derive
+# retirement ownership from the script or journal argv: both are deliberately shared across tiers.
+PID_DIR="${TKR_STATE_DIR:-.tickmarkr}/overseer/pids"
+PID_SEAT=$(printf '%s' "${TKR_ARMING_SEAT:-unattributed}" | sed 's/[^A-Za-z0-9_-]/_/g')
+PID_FILE="$PID_DIR/${PID_SEAT}-watch-contamination-$$.pid"
+mkdir -p "$PID_DIR" && (umask 077; printf '%s\n' "$$" > "$PID_FILE") || {
+  echo "watch-contamination: cannot record pid under $PID_DIR" >&2; exit 73;
+}
+clear_pid() { rm -f "$PID_FILE"; }
+trap clear_pid EXIT
 
 # Fingerprints of a harness collapse rather than a real regression. Deliberately narrow: a genuine
 # assertion failure must NOT match, or the watcher launders real defects into "infra".
@@ -35,11 +43,8 @@ load1() { uptime | sed 's/.*load averages*: *//' | awk '{print $1}' | tr -d ',';
 vitest_n() { ps -axo comm,command 2>/dev/null | grep -Ec 'node_modules/(\.bin/)?[v]itest|[v]itest/dist/|\([v]itest [0-9]+\)'; }
 
 # Seed the seen-set so we wake on what happens NEXT, not on history already ruled on.
-if [ -f "$J" ]; then
-  grep -c '' "$J" > "$STATE" 2>/dev/null || echo 0 > "$STATE"
-else
-  echo 0 > "$STATE"
-fi
+if [ -f "$J" ]; then seen=$(grep -c '' "$J" 2>/dev/null); else seen=0; fi
+[ -n "$seen" ] || seen=0
 
 elapsed=0
 while [ "$elapsed" -lt "$CAP" ]; do
@@ -54,18 +59,34 @@ while [ "$elapsed" -lt "$CAP" ]; do
   Li=$(printf %s "$L" | sed "s/[^0-9].*//"); [ -z "$Li" ] && Li=0
 
   if [ -f "$J" ]; then
-    seen=$(cat "$STATE" 2>/dev/null); [ -z "$seen" ] && seen=0
     now=$(grep -c '' "$J" 2>/dev/null); [ -z "$now" ] && now=0
     if [ "$now" -gt "$seen" ]; then
       newrows=$(tail -n "$((now - seen))" "$J" 2>/dev/null)
-      echo "$now" > "$STATE"
-      hit=$(printf '%s\n' "$newrows" \
-        | grep '"event":"gate-result"' \
-        | grep '"pass":false' \
-        | grep -E "$INFRA_RE" | head -1)
+      seen="$now"
+      # A fingerprint in arbitrary JSON details is prose, not an occurrence. Parse the event shape,
+      # admit only runner gates, and stop before the baseline classifier's secondary echo list. Review
+      # findings and acceptance prose are deliberately outside this instrument's claim.
+      hit=$(printf '%s\n' "$newrows" | python3 -c '
+import json, re, sys
+infra = re.compile(sys.argv[1], re.I)
+for raw in sys.stdin:
+    try: row = json.loads(raw)
+    except Exception: continue
+    data = row.get("data") or {}
+    gate = data.get("gate")
+    if row.get("event") != "gate-result" or data.get("pass") is not False or gate not in {"test", "build", "lint"}: continue
+    details = str(data.get("details") or "")
+    runner = re.split(r"(?im)^new failure fingerprints vs baseline \(secondary\):[ \t]*$", details, maxsplit=1)[0]
+    match = infra.search(runner)
+    if match:
+        end = runner.find("\n", match.end())
+        line = runner[runner.rfind("\n", 0, match.start()) + 1:end if end >= 0 else len(runner)]
+        print("%s\t%s\t%s" % (row.get("taskId", ""), gate, line))
+        break
+' "$INFRA_RE")
       if [ -n "$hit" ]; then
-        task=$(printf '%s' "$hit" | sed -n 's/.*"taskId":"\([^"]*\)".*/\1/p')
-        gate=$(printf '%s' "$hit" | sed -n 's/.*"gate":"\([^"]*\)".*/\1/p')
+        task=$(printf '%s' "$hit" | cut -f1)
+        gate=$(printf '%s' "$hit" | cut -f2)
         echo "CONTAMINATED_VERDICT task=$task gate=$gate load=$L vitest=$V"
         echo "  an infra fingerprint appeared in a FAILED gate â this red is not evidence about the diff"
         echo "  ruling owed: is the attempt chargeable? (OBS-426: infra failures are not)"

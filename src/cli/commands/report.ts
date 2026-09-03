@@ -4,6 +4,7 @@ import { ttyVisual } from "../../adapters/model-lints.js";
 import { addUsage, type TokenUsage } from "../../adapters/types.js";
 import { dim, rule, title } from "../../brand.js";
 import { loadConfig } from "../../config/config.js";
+import { modelProvider } from "../../gates/review.js";
 import { buildProofBundle, gateDeclined } from "../../report/bundle.js";
 import { compareRuns } from "../../report/compare.js";
 import { estimateCosts, type ChannelCost } from "../../report/cost.js";
@@ -35,6 +36,23 @@ const channelLabel = (data: Record<string, unknown>): string => {
   if (!a || typeof a !== "object") return EM;
   const { adapter, model } = a as { adapter?: unknown; model?: unknown };
   return typeof adapter === "string" && typeof model === "string" ? `${adapter}:${model}` : EM;
+};
+
+const modelFromChannel = (channel: string): string => channel.slice(channel.indexOf(":") + 1);
+
+const reviewerIdentity = (data: Record<string, unknown>): { reviewer: string; provider: string; vendor?: string } | undefined => {
+  const details = typeof data.details === "string" ? data.details : "";
+  const fromDetails = /reviewer\s+([^\s;()]+:[^\s;()]+)/i.exec(details)?.[1];
+  const reviewer = typeof data.reviewer === "string" ? data.reviewer : fromDetails;
+  if (!reviewer || !reviewer.includes(":")) return undefined;
+  const vendor = typeof data.vendor === "string"
+    ? data.vendor
+    : /vendor:\s*([^;()]+)/i.exec(details)?.[1]?.trim()
+      ?? /\(([^;:()]+)\):/.exec(details)?.[1]?.trim();
+  const provider = typeof data.provider === "string"
+    ? data.provider
+    : modelProvider(modelFromChannel(reviewer), vendor ?? "unknown");
+  return { reviewer, provider, ...(vendor ? { vendor } : {}) };
 };
 
 const rateBasis = (row: ChannelCost): string => {
@@ -253,6 +271,7 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     const dispatches = events.filter((e) => e.taskId === taskId && e.event === "task-dispatch");
     const channels = dispatches.map((e) => channelLabel(e.data));
     const gates = events.filter((e) => e.taskId === taskId && e.event === "gate-result");
+    const leg2 = events.filter((e) => e.taskId === taskId && e.event === "review-leg2");
     const consults = events.filter((e) => e.taskId === taskId && e.event === "consult-verdict");
     const deviations = events.filter((e) => e.taskId === taskId && e.event === "route-deviation");
     const merge = [...events].reverse().find((e) => e.taskId === taskId && e.event === "merge");
@@ -274,9 +293,27 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     if (gates.length) {
       for (const g of gates) {
         // T11: a declined gate never ran — report it as declined, never as a pass.
-        const pass = gateDeclined(g.data) ? "declined" : g.data.pass === true ? "pass" : g.data.pass === false ? "fail" : EM;
+        let pass = gateDeclined(g.data) ? "declined" : g.data.pass === true ? "pass" : g.data.pass === false ? "fail" : EM;
         const gate = typeof g.data.gate === "string" ? g.data.gate : EM;
+        if (gate === "review" && pass === "pass") {
+          const reviewer = reviewerIdentity(g.data);
+          const before = events.slice(0, events.indexOf(g) + 1).reverse()
+            .find((e) => e.taskId === taskId && e.event === "task-dispatch");
+          const author = channelLabel(before?.data ?? {});
+          const authorProvider = author === EM ? "unknown" : modelProvider(modelFromChannel(author));
+          if (reviewer && authorProvider !== "unknown" && authorProvider === reviewer.provider) {
+            pass = "pass (same-provider — independence not established)";
+          }
+        }
         lines.push(`  - ${gate}: ${pass} — ${firstLine(g.data.details)}`);
+      }
+      for (const row of leg2) {
+        const pass = row.data.pass === true ? "pass" : row.data.pass === false ? "fail" : EM;
+        const identity = reviewerIdentity(row.data);
+        const identityText = identity
+          ? `reviewer ${identity.reviewer}${identity.vendor ? ` (vendor: ${identity.vendor}; provider: ${identity.provider})` : ` (provider: ${identity.provider})`}`
+          : firstLine(row.data.details);
+        lines.push(`  - review-leg2: ${pass} (supersedes daemon review) — ${identityText}`);
       }
     } else lines.push(`  - ${EM}`);
     lines.push("- **National Office:**");

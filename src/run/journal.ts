@@ -112,8 +112,8 @@ export const REVIEW_UPHELD_RELEASE = "review-upheld" as const;
 // OBS-203: the third decision a gate-fail park needs. Plain approve WAIVES the failed gate (and every
 // gate before it — daemon.ts remainingGates), which is wrong when the gate failed against a stale task
 // DECLARATION rather than a bad diff: amend the spec's files[], recompile, and the gate now passes
-// honestly. This release re-dispatches with the whole gate suite intact and no gate marked satisfied,
-// so the corrected declaration is the thing that earns the green. Budget semantics match attempt-cap
+// honestly. This release runs the whole gate suite over the parked commit before any worker and
+// marks no gate satisfied: green merges directly, red returns to the ladder. Budget semantics match attempt-cap
 // (fresh attempts, tried survives) because the park cost the task its remaining budget.
 export const RECHECK_RELEASE = "recheck" as const;
 
@@ -653,15 +653,65 @@ export function identicalGateFailures(events: JournalEvent[], taskId: string, ga
   return n;
 }
 
-/** Repair attempts this engagement has already funded — journal-derived, so a resume inherits it. */
-export function repairsSinceApproval(events: JournalEvent[], taskId: string): number {
-  let n = 0;
+/** What each funded repair's next battery actually reached. A repair spends its budget only
+ * when that battery reaches one of the gates it was funded to fix; an earlier red is evidence that
+ * this repair never got its funded turn, not a charge against the repair ladder. */
+export interface RepairReach {
+  repair: number;
+  funded: string[];
+  reached: string[];
+  diedAt?: string;
+  charged: boolean;
+}
+
+export function repairReachSinceApproval(events: JournalEvent[], taskId: string): RepairReach[] {
+  const repairs: Array<RepairReach & { launched: boolean; closed: boolean }> = [];
   for (const e of events) {
     if (e.taskId !== taskId) continue;
-    if (e.event === "task-approved") n = 0;
-    else if (e.event === "repair-attempt") n++;
+    if (e.event === "task-approved") {
+      repairs.length = 0;
+    } else if (e.event === "repair-attempt") {
+      const funded = Array.isArray(e.data.gates)
+        ? e.data.gates.filter((gate): gate is string => typeof gate === "string")
+        : [];
+      repairs.push({
+        repair: typeof e.data.repair === "number" ? e.data.repair : repairs.length + 1,
+        funded,
+        reached: [],
+        charged: false,
+        launched: false,
+        closed: false,
+      });
+    } else {
+      const repair = repairs.at(-1);
+      if (!repair || repair.closed) continue;
+      if (e.event === "worker-launch") {
+        if (repair.launched) repair.closed = true;
+        else repair.launched = true;
+      } else if (repair.launched && e.event === "gate-result" && typeof e.data.gate === "string") {
+        if (!repair.reached.includes(e.data.gate)) repair.reached.push(e.data.gate);
+        if (e.data.pass === false && repair.diedAt === undefined) repair.diedAt = e.data.gate;
+        if (repair.funded.includes(e.data.gate)) repair.charged = true;
+      }
+    }
   }
-  return n;
+  return repairs.map(({ launched: _launched, closed: _closed, ...repair }) => repair);
+}
+
+/** Repair slots actually spent this engagement — journal-derived, so a resume inherits it. */
+export function repairsSinceApproval(events: JournalEvent[], taskId: string): number {
+  return repairReachSinceApproval(events, taskId).filter((repair) => repair.charged).length;
+}
+
+/** Recheck releases not yet enacted by a battery (or by a legacy worker launch). */
+export function pendingRechecks(events: JournalEvent[]): Set<string> {
+  const pending = new Set<string>();
+  for (const e of events) {
+    if (!e.taskId) continue;
+    if (e.event === "task-approved" && e.data.release === RECHECK_RELEASE) pending.add(e.taskId);
+    else if (e.event === "recheck-battery" || e.event === "worker-launch") pending.delete(e.taskId);
+  }
+  return pending;
 }
 
 // Both retry decisions below govern exactly ONE dispatch: the next one. So both are read back from the
@@ -788,8 +838,16 @@ export function pendingRepairFindings(events: JournalEvent[], taskId: string): s
  * a channel it is no longer using, and a later unrelated failure is not parked under a stale reason.
  */
 export function activeRetryBan(events: JournalEvent[], taskId: string, channel: string): string | undefined {
-  const e = decisionForNextDispatch(events, taskId, "gate-fingerprint-cap");
-  return e && e.data.channel === channel && typeof e.data.gate === "string" ? e.data.gate : undefined;
+  let pending: JournalEvent | undefined;
+  for (const e of events) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "gate-fingerprint-cap") pending = e;
+    else if (e.event === DECISION_SPENT
+      || (e.event === "task-approved" && e.data.release === RECHECK_RELEASE)) pending = undefined;
+  }
+  return pending && pending.data.channel === channel && typeof pending.data.gate === "string"
+    ? pending.data.gate
+    : undefined;
 }
 
 // Fail-closed shape for a dispatched assignment (journal.ts:75-90 posture): a malformed assignment in

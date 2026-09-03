@@ -51,6 +51,34 @@ async function gateOver(lines: string[], baseline: Baseline = RED_BASELINE) {
 }
 
 describe("baseline failure classification (real gate, zero tokens)", () => {
+  test("test: a baseline entry recorded as missingCommand from an exit-127 capture keeps its shape and its journaled warning and the head battery on it or on a head run that exits 127 or spawns ENOENT returns pass false with meta unreadable naming the runner so verify stops before acceptance or review while an invalidated capture with no fingerprints is narrated by its recorded cause and never as a ceiling kill unless the ceiling was hit whereas a battery that forgives head-127 against base-127 fails", async () => {
+    const repo = makeRepo({ "base.txt": "base\n" });
+    shSpy.stub = (cmd) => cmd === "missing-runner check"
+      ? { code: 127, stdout: "", stderr: "bash: missing-runner: command not found", durationMs: 1 }
+      : undefined;
+    const captured = await captureBaseline(repo, { test: "missing-runner check" });
+    expect(captured.commands.test).toMatchObject({ exitCode: 127, missingCommand: true });
+    expect(captured.warnings?.[0]).toMatchObject({ kind: "wrong-environment", commands: ["test"] });
+
+    const missing = (await compareToBaseline(repo, { test: "missing-runner check" }, captured, ["test"]))[0]!;
+    expect(missing).toMatchObject({ pass: false, meta: { unreadable: true, runner: "missing-runner" } });
+
+    shSpy.stub = (cmd) => cmd === "spawned-runner check"
+      ? { code: 127, stdout: "", stderr: "Error: spawn bash ENOENT", durationMs: 1 }
+      : cmd === "ordinary-red"
+        ? { code: 1, stdout: "runner returned no known shape", stderr: "", durationMs: 1 }
+        : undefined;
+    const spawned = (await compareToBaseline(repo, { test: "spawned-runner check" }, {
+      commands: { test: { exitCode: 127, fingerprints: ["Error: spawn bash ENOENT"] } },
+    }, ["test"]))[0]!;
+    expect(spawned).toMatchObject({ pass: false, meta: { unreadable: true, runner: "spawned-runner" } });
+
+    const invalidated = (await compareToBaseline(repo, { test: "ordinary-red" }, {
+      commands: { test: { infra: true, invalidCause: "resource-exhaustion", invalidatingLines: ["Error: spawn EAGAIN"], fingerprints: [] } },
+    }, ["test"]))[0]!;
+    expect(invalidated.details).toContain("recorded process/resource-exhaustion cause");
+    expect(invalidated.details).not.toContain("killed at its ceiling");
+  });
   test("test: a fresh-failure set whose only lines are the birpc RPC-death fingerprint classifies infra, and the same set with one AssertionError line added classifies regression", async () => {
     const known = "FAIL tests/known.test.ts > pre-existing assertion";
     const baseline: Baseline = {

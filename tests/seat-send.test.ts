@@ -1,4 +1,13 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +39,12 @@ type StubOpts = {
   paneId?: string;
   /** replay a captured screen for `agent read` instead of the synthetic one-liner */
   readFixture?: string;
+  /** adapter id Herdr reports for prompt-glyph lookup */
+  adapter?: string;
+  /** prompt glyph in the synthetic screen */
+  promptGlyph?: string;
+  /** prompt text rendered after a successful send (empty by default) */
+  promptAfterSend?: string;
 };
 
 function makeStub(opts: StubOpts = {}): { bin: string; log: string } {
@@ -38,12 +53,15 @@ function makeStub(opts: StubOpts = {}): { bin: string; log: string } {
   const status = opts.status ?? "idle";
   const paneId = opts.paneId === undefined ? "w1:p9" : opts.paneId;
   const line = opts.promptLine ?? "";
+  const adapter = opts.adapter ?? "claude-code";
+  const promptGlyph = opts.promptGlyph ?? "❯";
+  const sent = join(dir, "sent");
   const promptCase =
     opts.prompt === "not_ready"
       ? `echo '{"error":{"code":"agent_not_ready","message":"agent w1:p9 is not an active named agent"}}' >&2; exit 1`
       : opts.prompt === "ambiguous"
         ? `echo 'broker timeout' >&2; exit 1`
-        : `echo '{}'`;
+        : `touch '${sent}'; echo '{}'`;
   const paneRunCase = opts.paneRun === "fail" ? `echo 'pane closed' >&2; exit 1` : `echo '{}'`;
   const bin = join(dir, "herdr");
   writeFileSync(
@@ -51,8 +69,8 @@ function makeStub(opts: StubOpts = {}): { bin: string; log: string } {
     `#!/usr/bin/env bash
 echo "$@" >> '${log}'
 case "$1 $2" in
-  "agent get") echo '{"result":{"agent":{"agent":"prime-agent","agent_status":"${status}"${paneId ? `,"pane_id":"${paneId}"` : ""}}}}' ;;
-  "agent read") ${opts.readFixture ? `cat '${opts.readFixture}'` : `printf '%s\\n' '  ❯ ${line}'`} ;;
+  "agent get") echo '{"result":{"agent":{"agent":"${adapter}","agent_status":"${status}"${paneId ? `,"pane_id":"${paneId}"` : ""}}}}' ;;
+  "agent read") ${opts.readFixture ? `cat '${opts.readFixture}'` : `if [ -f '${sent}' ]; then printf '%s\\n' '  ${promptGlyph} ${opts.promptAfterSend ?? ""}'; else printf '%s\\n' '  ${promptGlyph} ${line}'; fi`} ;;
   "agent prompt") ${promptCase} ;;
   "agent send-keys") echo '{}' ;;
   "pane run") ${paneRunCase} ;;
@@ -61,13 +79,23 @@ esac
 `,
   );
   chmodSync(bin, 0o755);
+  // The fake pane changes state synchronously, so real receipt sleeps only add process pressure to the
+  // full suite and can starve unrelated fork-heavy tests without exercising another delivery state.
+  const sleepStub = join(dir, "sleep");
+  writeFileSync(sleepStub, "#!/usr/bin/env bash\nexit 0\n");
+  chmodSync(sleepStub, 0o755);
   return { bin: dir, log };
 }
 
-function run(stub: { bin: string }, target = "w1:p9", msg = "hold the merge"): { code: number; out: string } {
+function run(
+  stub: { bin: string },
+  target = "w1:p9",
+  msg = "hold the merge",
+  script = SCRIPT,
+): { code: number; out: string } {
   try {
-    const out = execFileSync("bash", [SCRIPT, target, msg], {
-      env: { ...process.env, PATH: `${stub.bin}:${process.env.PATH}` },
+    const out = execFileSync("bash", [script, target, msg], {
+      env: { ...process.env, TKR_DRAFT_WAIT_S: "0", PATH: `${stub.bin}:${process.env.PATH}` },
       encoding: "utf8",
       stdio: "pipe",
     });
@@ -76,6 +104,24 @@ function run(stub: { bin: string }, target = "w1:p9", msg = "hold the merge"): {
     const err = e as { status?: number; stdout?: string; stderr?: string };
     return { code: err.status ?? -1, out: (err.stdout ?? "") + (err.stderr ?? "") };
   }
+}
+
+function copiedConsumerInstall(stubBin: string): string {
+  const consumerScript = join(stubBin, "consumer/.agents/skills/tickmarkr-overseer/scripts/seat-send.sh");
+  mkdirSync(dirname(consumerScript), { recursive: true });
+  copyFileSync(SCRIPT, consumerScript);
+  chmodSync(consumerScript, 0o755);
+
+  const packageRoot = join(stubBin, "tickmarkr-package");
+  const cli = join(packageRoot, "dist/cli/index.js");
+  const declarations = join(packageRoot, "dist/adapters/types.js");
+  mkdirSync(dirname(cli), { recursive: true });
+  mkdirSync(dirname(declarations), { recursive: true });
+  writeFileSync(cli, "#!/usr/bin/env node\n");
+  writeFileSync(declarations, 'export const ADAPTER_PROMPT_GLYPHS = {\n  "codex": "›",\n};\n');
+  chmodSync(cli, 0o755);
+  symlinkSync(cli, join(stubBin, "tickmarkr"));
+  return consumerScript;
 }
 
 const calls = (log: string): string[] => readFileSync(log, "utf8").trim().split("\n");
@@ -124,14 +170,36 @@ describe("seat-send.sh delivery outcomes (OBS-552)", () => {
     expect(calls(stub.log).filter((c) => c.startsWith("pane run"))).toHaveLength(1);
   });
 
-  test("a foreign draft in the box is still refused before any send, fallback or not", () => {
+  test("a foreign draft in the box is deferred before any send, fallback or not", () => {
     // no apostrophe on purpose: the stub embeds this in a single-quoted shell string
     const stub = makeStub({ prompt: "ok", promptLine: "a foreign unsent line" });
     const r = run(stub);
     expect(r.code).toBe(2);
-    expect(r.out).toMatch(/^REFUSED_BOX_OCCUPIED /);
+    expect(r.out).toMatch(/^SEND_DEFERRED /);
     expect(calls(stub.log).some((c) => c.startsWith("agent prompt"))).toBe(false);
     expect(calls(stub.log).some((c) => c.startsWith("pane run"))).toBe(false);
+  });
+
+  test("test: every shipped adapter declares a prompt glyph beside its input-box matchers and seat-send reads it so a codex seat whose pane ends with an unsubmitted draft after › is reported SEND_UNSUBMITTED and a send into a pane whose prompt line already holds a draft is not written and answers SEND_DEFERRED until the draft submits or clears whereas the shipped script that matches ❯ only reports DELIVERED_SUBMITTED on codex and glues a message onto a human draft fails", () => {
+    const message = "hold the merge";
+    const codex = makeStub({ adapter: "codex", promptGlyph: "›", promptAfterSend: message });
+    const unsent = run(codex, "T7-worker-codex-a0-run", message);
+    expect(unsent.code).toBe(1);
+    expect(unsent.out).toMatch(/^SEND_UNSUBMITTED /);
+    expect(unsent.out).not.toContain("DELIVERED_SUBMITTED");
+
+    const human = makeStub({ adapter: "codex", promptGlyph: "›", promptLine: "can you open a tab" });
+    // A consumer install has no Tickmarkr src/ or dist/ in its ancestors. It resolves the installed
+    // executable and reads that package's compiled declaration before touching the pane.
+    const deferred = run(human, "overseer", "ORCH ACK", copiedConsumerInstall(human.bin));
+    expect(deferred.code).toBe(2);
+    expect(deferred.out).toMatch(/^SEND_DEFERRED /);
+    expect(calls(human.log).some((call) => call.startsWith("agent prompt"))).toBe(false);
+    expect(calls(human.log).some((call) => call.startsWith("pane run"))).toBe(false);
+
+    // The pre-fix matcher saw no codex prompt line, while pane-run would concatenate these bytes.
+    expect("  › hold the merge".match(/^[\s]*❯[\s]*(.*)$/u)).toBeNull();
+    expect(`${"can you open a tab"}${"ORCH ACK"}`).toBe("can you open a tabORCH ACK");
   });
 
   test("when the fallback also fails, BOTH causes are surfaced and nothing claims delivery", () => {

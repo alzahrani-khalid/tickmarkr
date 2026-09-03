@@ -491,7 +491,13 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
 
     await runDaemon(repo, { adapters: [fake], runId: "run-missing-baseline" });
 
-    const warning = Journal.open(repo, "run-missing-baseline").read().find((e) => e.event === "baseline-warning");
+    const run = Journal.open(repo, "run-missing-baseline");
+    const warning = run.read().find((e) => e.event === "baseline-warning");
+    const baseline = JSON.parse(readFileSync(join(run.dir, "baseline.json"), "utf8")) as {
+      commands: Record<string, { exitCode?: number; missingCommand?: boolean }>;
+    };
+    expect(baseline.commands.build).toMatchObject({ exitCode: 127, missingCommand: true });
+    expect(baseline.commands.test).toMatchObject({ exitCode: 127, missingCommand: true });
     expect(warning).toBeDefined();
     expect(warning!.data.kind).toBe("wrong-environment");
     expect(warning!.data.commands).toEqual(["build", "test"]);

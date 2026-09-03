@@ -99,6 +99,10 @@ function statesSpikeNonApplication(section: string): boolean {
     && /bounded by\s+the expense of a late defect, not by novelty/i.test(section);
 }
 
+function statesShippedFileTrigger(section: string): boolean {
+  return /adding or removing a shipped file/i.test(section);
+}
+
 describe("spec template — daemon surfaces and single-claim judges", () => {
   test("test: the spec template a fresh tickmarkr init writes states in its ordering law that a task changing what the daemon does must own every surface that tells the operator what the daemon does and states beside the judge oracle that a judge criterion carries one claim so a semicolon-joined criterion warns whereas a template missing either sentence fails", async () => {
     const written = await initialisedSpec();
@@ -123,6 +127,13 @@ describe("spec template — spike contract before scope", () => {
     const riskyOnly = "SPIKE-THE-CONTRACT-THEN-SCOPE: If this change feels risky, run a spike first.";
     expect(riskyOnly).not.toMatch(/test this task does not own/i);
     expect(statesSpikeTrigger(riskyOnly)).toBe(false);
+  });
+
+  test("the spec template a fresh tickmarkr init writes lists adding or removing a shipped file among the rule-37 spike-the-contract triggers whereas a template without that trigger fails", async () => {
+    const section = spikeSection(await initialisedSpec());
+
+    expect(statesShippedFileTrigger(section)).toBe(true);
+    expect(statesShippedFileTrigger(section.replace("adding or removing a shipped file", "changing a file"))).toBe(false);
   });
 
   test("test: the template states that a spike measures one implementation, so a worker taking a different route can still red on unowned collateral and that remains a plan defect rather than a retry; text presenting the spike's result as the closed blocker set fails", async () => {

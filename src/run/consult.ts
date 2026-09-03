@@ -197,6 +197,10 @@ export async function consult(
       const r = await sh(adapter.headlessCommand(promptFile, seatModel), cwd, cfg.consult.stallMinutes * 60_000);
       out = r.stdout + r.stderr;
     } else {
+      // Preserve the adapter contract for CLIs that cannot seed their TUI: supported adapters use
+      // the interactive form, while a declared null keeps the existing visible print fallback.
+      const command = adapter.interactiveCommand(promptFile, seatModel)
+        ?? adapter.headlessCommand(promptFile, seatModel);
       // T8: role-first pane name for fleet visibility (consult · T2); consultSeq stays on the dossier artifact only
       const slot = await driver.slot(cwd, gatePaneName("consult", d.taskId), {
         label: `CONSULT ${d.taskId}`,
@@ -208,7 +212,7 @@ export async function consult(
       writeFileSync(scriptPath, [
         "export BASH_SILENCE_DEPRECATION_WARNING=1",
         bannerShell(),
-        adapter.headlessCommand(promptFile, seatModel),
+        command,
         gateExitTrailer(nonce),
       ].join("\n"));
       try {

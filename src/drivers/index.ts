@@ -9,6 +9,15 @@ export type DriverChoice = (typeof DRIVER_CHOICES)[number];
 
 const overrideByDriver = new WeakMap<ExecutorDriver, DriverChoice>();
 
+/**
+ * Orca authors both markers on every terminal it creates. Requiring the pair avoids treating an
+ * unrelated TERM_PROGRAM value or a copied terminal handle as host identity. This is deliberately
+ * environment-only: selection must not execute a binary or contact the Orca runtime.
+ */
+export function orcaHostDetected(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.TERM_PROGRAM === "Orca" && env.ORCA_TERMINAL_HANDLE !== undefined;
+}
+
 /** Validate argv at the CLI boundary rather than casting an arbitrary string into a driver choice. */
 export function parseDriverOverride(override?: string): DriverChoice | undefined {
   if (override === undefined) return undefined;
@@ -22,8 +31,12 @@ export function driverEvidence(cfg: TickmarkrConfig, driver: ExecutorDriver, ove
   if (selectedOverride !== undefined) return `${driver.id} (--driver)`;
   if (want !== "auto") return `${driver.id} (config)`;
   const herdrAvailable = process.env.HERDR_ENV === "1";
-  if (driver.id === (herdrAvailable ? "herdr" : "subprocess")) {
-    return `auto → ${driver.id} (${herdrAvailable ? "HERDR_ENV=1" : "HERDR_ENV unset"})`;
+  if (herdrAvailable && driver.id === "herdr") return "auto → herdr (HERDR_ENV=1)";
+  if (!herdrAvailable && orcaHostDetected() && driver.id === "orca") {
+    return "auto → orca (TERM_PROGRAM+ORCA_TERMINAL_HANDLE)";
+  }
+  if (!herdrAvailable && !orcaHostDetected() && driver.id === "subprocess") {
+    return "auto → subprocess (HERDR_ENV unset)";
   }
   return `auto → ${driver.id} (runtime)`;
 }
@@ -37,9 +50,11 @@ export function pickDriver(cfg: TickmarkrConfig, override?: string): ExecutorDri
   const driver = want === "herdr" ? new HerdrDriver("herdr", cfg.visibility.workersPerTab)
     : want === "subprocess" ? new SubprocessDriver()
       // Orca is an operator-selected execution surface. Its runtime failure stays on Orca; selection
-      // must never substitute a hidden subprocess worker after this explicit choice.
+      // must never substitute a hidden subprocess worker after an explicit or detected choice.
       : want === "orca" ? new OrcaDriver()
-        : HerdrDriver.available() ? new HerdrDriver("herdr", cfg.visibility.workersPerTab) : new SubprocessDriver();
+        : HerdrDriver.available() ? new HerdrDriver("herdr", cfg.visibility.workersPerTab)
+          : orcaHostDetected() ? new OrcaDriver()
+            : new SubprocessDriver();
   if (selectedOverride !== undefined) overrideByDriver.set(driver, selectedOverride);
   return driver;
 }

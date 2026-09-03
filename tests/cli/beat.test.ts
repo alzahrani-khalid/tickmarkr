@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { beat } from "../../src/cli/commands/beat.js";
+import { dispatch } from "../../src/cli/index.js";
 import { status } from "../../src/cli/commands/status.js";
 import { saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -167,5 +168,27 @@ describe("SUP-04 tickmarkr beat", () => {
     const line = supervisionLine(await status([], legacyRepo));
     expect(line).toContain("orchestrator-context UNREADABLE");
     expect(line).not.toContain("orchestrator-context ARMED");
+  });
+
+  test("test: a beat issued from a subdirectory of a repository lands in that repository's root supervision file and a beat issued from a directory under no repository exits non-zero naming the missing state dir and creates no supervision tree whereas the shipped beat that writes relative to cwd and prints ARMED fails", async () => {
+    const repo = seedRepo(mkRepo());
+    const nested = join(repo, "packages", "worker", "src");
+    mkdirSync(nested, { recursive: true });
+
+    const armed = await beat(["overseer", "--seat", "OVSR-w1:p2"], nested);
+    expect(armed).toContain("overseer ARMED");
+    expect(existsSync(supervisionBeatPath(repo, "overseer"))).toBe(true);
+    expect(existsSync(join(nested, ".tickmarkr", "supervision"))).toBe(false);
+
+    const outside = mkRepo();
+    const outsideChild = join(outside, "some", "directory");
+    mkdirSync(outsideChild, { recursive: true });
+    const refused = await dispatch("beat", ["overseer", "--seat", "OVSR-w1:p2"], {
+      beat: (argv) => beat(argv, outsideChild),
+    });
+    expect(refused.code).toBe(1);
+    expect(refused.out).toMatch(/missing \.tickmarkr\/ state dir/);
+    expect(existsSync(join(outside, ".tickmarkr"))).toBe(false);
+    expect(existsSync(join(outsideChild, ".tickmarkr", "supervision"))).toBe(false);
   });
 });

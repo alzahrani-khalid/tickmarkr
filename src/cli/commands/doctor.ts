@@ -41,6 +41,10 @@ export type DoctorOpts = {
   compact?: boolean;
   /** Test seam for the same `orca status --json` transport production invokes. */
   orcaStatusProbe?: (cwd: string, binary: string) => Promise<ShResult>;
+  /** Test seam for Orca's authoritative per-agent hook coverage listing. */
+  orcaHooksStatusProbe?: (cwd: string, binary: string) => Promise<ShResult>;
+  /** Environment used only to explain whether auto-selection applies in this terminal. */
+  orcaEnv?: NodeJS.ProcessEnv | Record<string, string | undefined>;
   /** Test seam for shell-path discovery; absence remains a normal doctor row, never an exception. */
   resolveOrcaBinary?: (cwd: string) => string | undefined;
   /** Test seam for the runner-owned JSON listing used by the acceptance-oracle report row. */
@@ -48,6 +52,63 @@ export type DoctorOpts = {
 };
 
 type OrcaCapability = { verdict: "pass" | "fail" | "warn"; detail: string };
+
+const ORCA_HOOK_ADAPTERS: Readonly<Record<string, string>> = {
+  claude: "claude-code",
+  "claude-code": "claude-code",
+  codex: "codex",
+  cursor: "cursor-agent",
+  "cursor-agent": "cursor-agent",
+  grok: "grok",
+  kimi: "kimi",
+  opencode: "opencode",
+  pi: "pi",
+};
+
+function orcaSelectionDetail(env: NodeJS.ProcessEnv | Record<string, string | undefined>): string {
+  const inside = env.TERM_PROGRAM === "Orca" && !!env.ORCA_TERMINAL_HANDLE?.trim();
+  return inside
+    ? "auto picks orca in this Orca terminal"
+    : "not an Orca terminal; auto picks orca only inside one; use --driver orca";
+}
+
+async function orcaHookCoverage(
+  cwd: string,
+  binary: string,
+  opts: Pick<DoctorOpts, "orcaStatusProbe" | "orcaHooksStatusProbe">,
+): Promise<string> {
+  // A supplied status transport is a hermetic boundary: do not escape it to a real binary for the
+  // second command. Tests (and embedders) that want coverage supply the matching hook transport.
+  if (opts.orcaHooksStatusProbe === undefined && opts.orcaStatusProbe !== undefined) {
+    return "hooks status unavailable";
+  }
+  let response: ShResult;
+  try {
+    response = await (opts.orcaHooksStatusProbe ?? ((probeCwd, executable) =>
+      sh(`${shq(executable)} agent hooks status --json`, probeCwd, 10_000)))(cwd, binary);
+    if (response.code !== 0 || response.timedOut) return "hooks status unavailable";
+    // Until the driver's response-family expansion lands, this still uses its one strict envelope
+    // parser. Coverage comes only from this command's `statuses[].state`; managedHooksPresent and
+    // local agent config files are deliberately not alternative oracles.
+    const envelope = parseEnvelope("status", response.stdout);
+    const statuses = envelope.result.statuses;
+    if (!Array.isArray(statuses)) return "hooks status unavailable";
+    const coverage = new Map<string, "hooked" | "unhooked">();
+    for (const raw of statuses) {
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+      const row = raw as Record<string, unknown>;
+      const adapter = typeof row.agent === "string" ? ORCA_HOOK_ADAPTERS[row.agent] : undefined;
+      if (!adapter) continue;
+      if (row.state === "installed") coverage.set(adapter, "hooked");
+      else if (row.state === "not_installed") coverage.set(adapter, "unhooked");
+    }
+    return coverage.size
+      ? `hooks: ${[...coverage].map(([adapter, state]) => `${adapter} ${state}`).join(", ")}`
+      : "hooks: no tickmarkr adapter status reported";
+  } catch {
+    return "hooks status unavailable";
+  }
+}
 
 /**
  * Orca's status body is deliberately interpreted by T1's one shared envelope parser. Doctor owns
@@ -57,7 +118,10 @@ type OrcaCapability = { verdict: "pass" | "fail" | "warn"; detail: string };
  * Capability-row `detail` stays hermetic — never `OrcaError.message`, which embeds volatile CLI
  * stderr (Electron timestamps), so the row is byte-stable across runs.
  */
-export async function probeOrcaCapability(cwd: string, opts: Pick<DoctorOpts, "orcaStatusProbe" | "resolveOrcaBinary"> = {}): Promise<OrcaCapability> {
+export async function probeOrcaCapability(
+  cwd: string,
+  opts: Pick<DoctorOpts, "orcaStatusProbe" | "orcaHooksStatusProbe" | "resolveOrcaBinary" | "orcaEnv"> = {},
+): Promise<OrcaCapability> {
   const binary = opts.resolveOrcaBinary
     ? opts.resolveOrcaBinary(cwd)
     : resolveOrcaCliBinary(cwd, { resolve: (bin, dir) => resolveShellBinary(bin, dir) });
@@ -88,13 +152,15 @@ export async function probeOrcaCapability(cwd: string, opts: Pick<DoctorOpts, "o
       ? (runtime as Record<string, unknown>).reachable
       : undefined;
     if (reachable === true) {
+      const hooks = await orcaHookCoverage(cwd, binary, opts);
+      const selection = orcaSelectionDetail(opts.orcaEnv ?? process.env);
       const appVersion = typeof runtime === "object" && runtime !== null && !Array.isArray(runtime)
         ? (runtime as Record<string, unknown>).appVersion
         : undefined;
       if (typeof appVersion !== "string" || !appVersion) {
-        return { verdict: "warn", detail: `runtime reachable (${envelope.runtimeId}, appVersion absent; fixture pin ${ORCA_FIXTURE_VERSION})` };
+        return { verdict: "warn", detail: `runtime reachable (${envelope.runtimeId}, appVersion absent; fixture pin ${ORCA_FIXTURE_VERSION}); ${hooks} — ${selection}` };
       }
-      const detail = `runtime reachable (${envelope.runtimeId}, appVersion ${appVersion}; fixture pin ${ORCA_FIXTURE_VERSION})`;
+      const detail = `runtime reachable (${envelope.runtimeId}, appVersion ${appVersion}; fixture pin ${ORCA_FIXTURE_VERSION}); ${hooks} — ${selection}`;
       return { verdict: appVersion === ORCA_FIXTURE_VERSION ? "pass" : "warn", detail };
     }
     if (reachable === false) return { verdict: "fail", detail: "CLI installed but runtime unreachable" };
@@ -502,8 +568,8 @@ export async function doctor(
     }
   }
   if (trustNa.length) rows.push(`  ${dim("=")} ${dim(`n/a (${trustNa.length}): ${trustNa.join(", ")}`)}`);
-  // Orca is an explicit choice, so its health is capability information rather than an auto-routing
-  // input. A failed probe never changes pickDriver's auto ordering or substitutes subprocess.
+  // Capability is diagnostic only: auto-selection is decided from terminal identity markers, never
+  // from this runtime probe, and a failed probe cannot silently substitute another driver.
   const orca = await probeOrcaCapability(cwd, opts);
   rows.push(legend("execution runtime:"));
   rows.push(alignedStatusRow(orca.verdict, "orca", orca.detail));
@@ -611,7 +677,9 @@ export async function doctor(
       const probed = probedMs !== undefined ? dim(` ${(probedMs / 1000).toFixed(1)}s`) : "";
       const auth = !v
         ? dim("unknown")
-        : v.authed
+        : v.probeError
+          ? `${fail(`probe error (${v.probeError})`)}${probed}`
+          : v.authed
           ? `${ok("authed")}${probed}`
           : `${fail("unauthed:")} ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
       const d = disallowedBy({ adapter: a.id, model: m }, cfg.routing);

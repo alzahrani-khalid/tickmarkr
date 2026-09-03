@@ -244,7 +244,33 @@ export function matchesTrustDialog(paneText: string, dialog: TrustDialog): dialo
 // `match` is the box painted, `emptyMatch` the box carrying nothing, `occupiedMatch` the box still
 // holding a prompt. An adapter may pin `occupiedMatch` directly, or leave it derived from the other
 // two — but an adapter that declares neither cannot acknowledge a submission and is refused.
+// OBS-620: prompt glyphs are adapter facts, just like the input-box matchers below. Keep the shipped
+// set in one shell-readable table: the overseer receipt cannot import TypeScript, but it reads these
+// exact declarations from src/ in a checkout or dist/ in an installed package. A newly shipped
+// adapter therefore has one visible place where omission can be enumerated and refused.
+export const ADAPTER_PROMPT_GLYPHS = {
+  "claude-code": "❯",
+  "codex": "›",
+  "cursor-agent": ">",
+  "opencode": ">",
+  "pi": ">",
+  "grok": ">",
+  "kimi": ">",
+  "omp": ">",
+  "agy": ">",
+  "prime-agent": ">",
+  // Test-only, but declared so a fake interactive slot exercises the same fail-closed contract.
+  "fake": ">",
+} as const;
+
+export type PromptGlyph = (typeof ADAPTER_PROMPT_GLYPHS)[keyof typeof ADAPTER_PROMPT_GLYPHS];
+
+export function declaredPromptGlyphForAdapter(adapterId: string): PromptGlyph | undefined {
+  return (ADAPTER_PROMPT_GLYPHS as Readonly<Record<string, PromptGlyph>>)[adapterId];
+}
+
 export interface InputBox {
+  promptGlyph?: PromptGlyph;
   fingerprint: string;
   match?(paneText: string): boolean;
   emptyMatch?(paneText: string): boolean;
@@ -255,14 +281,27 @@ export interface InputBox {
 
 const inputBoxes = new Map<string, InputBox>();
 
-export function declareInputBox(adapterId: string, inputBox: InputBox): InputBox {
-  inputBoxes.set(adapterId, inputBox);
-  return inputBox;
+export function declareInputBox(
+  adapterId: string,
+  inputBox: Omit<InputBox, "promptGlyph"> & { promptGlyph?: PromptGlyph },
+): InputBox {
+  const promptGlyph = inputBox.promptGlyph ?? declaredPromptGlyphForAdapter(adapterId);
+  // The shipped-adapter registry is audited separately against ADAPTER_PROMPT_GLYPHS. Keep this
+  // declaration helper open to synthetic and extension adapters: Herdr's input-state tests register
+  // those at module load, and prompt glyphs are not part of its typed-delivery decision.
+  const declared: InputBox = promptGlyph === undefined ? inputBox : { ...inputBox, promptGlyph };
+  inputBoxes.set(adapterId, declared);
+  return declared;
 }
 
 export function declaredInputBoxForWorkerName(workerName: string): InputBox | undefined {
   const adapterId = /^.+-worker-(.+)-a\d+-.+$/.exec(workerName)?.[1];
   return adapterId === undefined ? undefined : inputBoxes.get(adapterId);
+}
+
+export function declaredPromptGlyphForWorkerName(workerName: string): PromptGlyph | undefined {
+  const adapterId = /^.+-worker-(.+)-a\d+-.+$/.exec(workerName)?.[1];
+  return adapterId === undefined ? undefined : declaredPromptGlyphForAdapter(adapterId);
 }
 
 export function matchesInputBox(paneText: string, inputBox: InputBox): boolean {

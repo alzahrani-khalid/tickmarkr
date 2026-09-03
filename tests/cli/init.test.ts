@@ -202,6 +202,24 @@ describe("tickmarkr init doctor.json reuse (T1)", () => {
 });
 
 describe("tickmarkr init", () => {
+  test("test: init in a repository whose package.json name is tickmarkr exits non-zero naming OBS-584 before writing any file even under --agent --force while a repository named anything else proceeds whereas an init that scaffolds there fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const blocked = makeRepo({ "package.json": JSON.stringify({ name: "tickmarkr" }) });
+    const blockedGlobal = join(tmpdir(), `tickmarkr-init-global-blocked-${process.pid}-${Date.now()}`);
+
+    await expect(init(["--global-dir", blockedGlobal, "--agent", "--force"], blocked)).rejects.toThrow(/OBS-584/);
+
+    expect(existsSync(blockedGlobal)).toBe(false);
+    expect(existsSync(join(blocked, ".tickmarkr"))).toBe(false);
+    expect(existsSync(join(blocked, "tickmarkr.spec.md"))).toBe(false);
+    expect(existsSync(join(blocked, ".agents"))).toBe(false);
+
+    const allowed = makeRepo({ "package.json": JSON.stringify({ name: "consumer" }) });
+    const out = await runInit(allowed);
+    expect(out).toContain(`wrote ${join(allowed, "tickmarkr.spec.md")}`);
+    expect(existsSync(join(allowed, ".tickmarkr", "config.yaml"))).toBe(true);
+  });
+
   test("writes tickmarkr.spec.md when only a legacy spec filename exists", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const legacySpec = `${["dro", "vr"].join("")}.spec.md`;
@@ -463,6 +481,39 @@ describe("tickmarkr init wizard (T4)", () => {
     expect(existsSync(join(repo, ".tickmarkr", "config.yaml"))).toBe(false);
   });
 
+  test("test: the closing environments footer says auto picks orca inside an Orca terminal and the wizard seeds the driver as orca when both Orca markers are set and HERDR_ENV is unset whereas a footer saying auto never picks it or a seed of auto under the markers fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const oldHerdr = process.env.HERDR_ENV;
+    const oldTerm = process.env.TERM_PROGRAM;
+    const oldTermVersion = process.env.TERM_PROGRAM_VERSION;
+    const oldOrca = process.env.ORCA_TERMINAL_HANDLE;
+    delete process.env.HERDR_ENV;
+    process.env.TERM_PROGRAM = "Orca";
+    process.env.TERM_PROGRAM_VERSION = "1.4.195";
+    process.env.ORCA_TERMINAL_HANDLE = "terminal-1";
+    try {
+      const footerRepo = makeRepo({ "keep.txt": "x" });
+      stampDoctor(footerRepo, 5 * 60 * 1000);
+      const out = await runInit(footerRepo);
+      expect(out).toContain("auto picks it inside an Orca terminal");
+      expect(out).not.toContain("auto never picks it");
+
+      const wizardRepo = makeRepo({ "keep.txt": "x" });
+      stampDoctor(wizardRepo, 5 * 60 * 1000);
+      await driveInit(wizardRepo, KEY.down.repeat(9) + KEY.enter);
+      expect(loadConfig(wizardRepo).driver).toBe("orca");
+    } finally {
+      if (oldHerdr !== undefined) process.env.HERDR_ENV = oldHerdr;
+      else delete process.env.HERDR_ENV;
+      if (oldTerm !== undefined) process.env.TERM_PROGRAM = oldTerm;
+      else delete process.env.TERM_PROGRAM;
+      if (oldTermVersion !== undefined) process.env.TERM_PROGRAM_VERSION = oldTermVersion;
+      else delete process.env.TERM_PROGRAM_VERSION;
+      if (oldOrca !== undefined) process.env.ORCA_TERMINAL_HANDLE = oldOrca;
+      else delete process.env.ORCA_TERMINAL_HANDLE;
+    }
+  });
+
   test("pressing Enter through every default writes uncommented defaults", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
@@ -543,6 +594,7 @@ describe("T4 init closing block", () => {
 
     expect(out).toContain("environments:");
     expect(out).toMatch(/herdr\s+—/);
+    expect(out).toMatch(/orca\s+—/);
     expect(out).toMatch(/claude code\s+—/);
     expect(out).toMatch(/anywhere\s+—/);
     expect(out).toContain(
@@ -551,7 +603,7 @@ describe("T4 init closing block", () => {
     expect(out).toContain(
       "tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
     );
-    expect(out).toContain("no herdr? same fail-closed gates, headless subprocess driver");
+    expect(out).toContain("no herdr or Orca terminal? same fail-closed gates, headless subprocess driver");
   });
 
   test("the herdr footer row contains no npm install line", async () => {

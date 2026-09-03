@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { rmSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import { shq } from "../../src/adapters/types.js";
 import { USAGE } from "../../src/cli/index.js";
@@ -6,6 +7,7 @@ import { DRIVER_CHOICES } from "../../src/drivers/index.js";
 import { canonicalWorktreePath, OrcaDriver, OrcaError, parseEnvelope, resolveOrcaCliBinary, terminalWorktree, type OrcaExec } from "../../src/drivers/orca.js";
 import type { Slot } from "../../src/drivers/types.js";
 import { removeWorktree, sh, shGit, shOk, type ShResult } from "../../src/run/git.js";
+import { Journal } from "../../src/run/journal.js";
 
 /**
  * Real-Orca smoke for the shipped OrcaDriver. Self-gated twice over: it runs only when
@@ -23,6 +25,7 @@ import { removeWorktree, sh, shGit, shOk, type ShResult } from "../../src/run/gi
  */
 
 const NONCE = `SMOKE${randomBytes(3).toString("hex").toUpperCase()}`;
+const SMOKE_RUN_ID = `run-${NONCE}`;
 // Deliberately short: it must land on one terminal row un-wrapped for the byte-exact read to mean
 // what it says. Same shape as the worker trailer (src/adapters/prompt.ts), a nonce of its own.
 const TRAILER = `TICKMARKR_RESULT_${NONCE} {"ok":true,"summary":"smoke","deviations":[]}`;
@@ -42,7 +45,6 @@ const LIVE_LEG_TIMEOUT_MS = 300_000; // the vitest timeout on the live leg below
 // orca — the bounded call fails, and probeReachable classifies that as unreachable, which is the
 // runner-visible skip criterion 2 requires. Generous for a single CLI round-trip.
 const CALL_TIMEOUT_MS = 25_000;
-const WORKTREE_TIMEOUT_MS = 60_000; // measured: orca picked a fresh worktree up in 0.1s once and 13.5s the next time
 const IDLE_SECONDS = 20;
 // The ONLY close refusal this smoke tolerates: orca removes a live terminal and then answers
 // `{"code":"runtime_error","message":"tab_not_found"}` for the tab it just took away (observed on
@@ -68,6 +70,10 @@ interface SmokeObservations {
   createReceiptWorktree?: string;
   /** the nonce trailer came back contiguous and byte-exact through OrcaDriver reads */
   trailerObserved: boolean;
+  /** OrcaDriver itself proved the fresh checkout through worktree current from that checkout */
+  adoptionWaitExercised: boolean;
+  /** driver.status() issued a rendered-frame read rather than reading repainting stream fragments */
+  screenReadExercised: boolean;
   /** driver.status() deliberately exercised an elapsed terminal wait against the installed Orca */
   elapsedWaitExercised: boolean;
   /** the runtime identity that ANSWERED the create — orca handles are runtime-scoped, so this is
@@ -99,6 +105,8 @@ export function smokeVerdict(o: SmokeObservations): { status: SmokeStatus; reaso
   if (!o.reachable) return { status: "skipped", reasons: [o.unreachable ?? "orca runtime is not reachable"] };
   const reasons: string[] = [];
   if (!o.trailerObserved) reasons.push("no byte-exact nonce trailer observed through OrcaDriver reads");
+  if (!o.adoptionWaitExercised) reasons.push("no worktree adoption wait exercised through OrcaDriver create");
+  if (!o.screenReadExercised) reasons.push("no rendered screen read exercised through OrcaDriver status");
   if (!o.elapsedWaitExercised) reasons.push("no elapsed terminal wait exercised through OrcaDriver status");
   if (o.smokeWorktree === undefined || o.createReceiptWorktree !== o.smokeWorktree) {
     reasons.push(`create receipt bound to ${o.createReceiptWorktree ?? "no worktree"}, not the smoke's ${o.smokeWorktree ?? "unknown"}`);
@@ -120,7 +128,7 @@ export function smokeVerdict(o: SmokeObservations): { status: SmokeStatus; reaso
   return { status: reasons.length > 0 ? "failed" : "passed", reasons };
 }
 
-interface OrcaCall { args: string[]; result: ShResult }
+interface OrcaCall { args: string[]; cwd: string; result: ShResult }
 
 /** The production exec, plus a tape: every envelope orca actually answered stays readable so the
  *  smoke can observe the create RECEIPT rather than trust that the driver checked it. `run` is a
@@ -131,9 +139,31 @@ export function recordingExec(tape: OrcaCall[], run: typeof sh = sh): OrcaExec {
     // sh's 600s default is twice the live leg's ceiling (CALL_TIMEOUT_MS).
     const binary = resolveOrcaCliBinary(cwd) ?? "orca";
     const result = await run([binary, ...args].map(shq).join(" "), cwd, timeoutMs ?? CALL_TIMEOUT_MS);
-    tape.push({ args, result });
+    tape.push({ args, cwd, result });
     return result;
   };
+}
+
+function adoptionWaitSeen(tape: OrcaCall[], worktree: string): boolean {
+  return tape.some(({ args, cwd }) =>
+    args[0] === "worktree"
+    && args[1] === "current"
+    && canonicalWorktreePath(cwd) === worktree);
+}
+
+function screenReadSeen(tape: OrcaCall[]): boolean {
+  return tape.some(({ args, result }) => {
+    if (args[0] !== "terminal" || args[1] !== "read" || !args.includes("--screen")) return false;
+    try {
+      const term = parseEnvelope("read", result.stdout).result.terminal;
+      const source = typeof term === "object" && term !== null
+        ? (term as Record<string, unknown>).source
+        : undefined;
+      return source === "screen" || source === "screen-unavailable";
+    } catch {
+      return false;
+    }
+  });
 }
 
 function elapsedWaitSeen(tape: OrcaCall[]): boolean {
@@ -172,27 +202,6 @@ function createReceipt(tape: OrcaCall[]): { handle?: string; worktree?: string; 
     worktree: worktree === undefined ? undefined : canonicalWorktreePath(worktree),
     runtimeId: env.runtimeId,
   };
-}
-
-/**
- * Orca resolves a `path:` selector against the worktrees it currently lists, and it picks a freshly
- * created git worktree up on its own refresh — so the selector can be unknown for a moment after
- * createWorktree returns. Bounded wait for the checkout to be resolvable at all; the create that
- * follows is what actually proves the binding.
- */
-async function awaitWorktreeListed(exec: OrcaExec, cwd: string, worktree: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const r = await exec(["worktree", "list", "--json"], cwd);
-    const rows = parseEnvelope("list", r.stdout).result.worktrees;
-    const listed = Array.isArray(rows) && rows.some((w) => {
-      const path = typeof w === "object" && w !== null ? (w as Record<string, unknown>).path : undefined;
-      return typeof path === "string" && canonicalWorktreePath(path) === worktree;
-    });
-    if (listed) return true;
-    if (Date.now() >= deadline) return false;
-    await new Promise((done) => setTimeout(done, 1000));
-  }
 }
 
 /**
@@ -257,6 +266,8 @@ export async function runOrcaSmoke(opts: {
     gate: opts.gate ?? process.env.TICKMARKR_E2E === "1",
     reachable: false,
     trailerObserved: false,
+    adoptionWaitExercised: false,
+    screenReadExercised: false,
     elapsedWaitExercised: false,
     listedBeforeClose: false,
     terminalClosed: false,
@@ -281,20 +292,16 @@ export async function runOrcaSmoke(opts: {
   const failures: string[] = [];
   const repo = (await shOk("git rev-parse --show-toplevel", cwd)).trim();
   const branch = `orca-smoke-${NONCE.toLowerCase()}`;
+  const smokeJournal = Journal.create(repo, SMOKE_RUN_ID);
+  smokeJournal.append("task-dispatch", "ORCASMOKE", { attempt: 0, smoke: true });
   // tickmarkr's own checkout authority — the same primitive a real run uses. orca never makes it.
   const worktree = await driver.worktree(repo, branch, "HEAD");
   let slot: Slot | undefined;
   try {
     slot = await driver.slot(worktree, branch, {
-      owned: { role: "watch", taskId: "ORCASMOKE", attempt: 0, runId: NONCE },
+      owned: { role: "watch", taskId: "ORCASMOKE", attempt: 0, runId: SMOKE_RUN_ID },
     });
     observations.smokeWorktree = slot.cwd;
-    if (!await awaitWorktreeListed(exec, cwd, slot.cwd, WORKTREE_TIMEOUT_MS)) {
-      // A RED, not a skip: the runtime answered the reachability probe, so a checkout it will not resolve
-      // is a failure to establish the very binding this smoke exists to prove. Reclassifying it as
-      // "unreachable" here would bypass the trailer, receipt and close checks with a green run.
-      throw new Error(`orca does not resolve the smoke's worktree ${slot.cwd} within ${WORKTREE_TIMEOUT_MS}ms — the create receipt can never be bound`);
-    }
     // The whole payload: two printfs emitting the split trailer, then an idle sleep the close will
     // kill. No agent CLI is launched, so no tokens are spent; the sleep only keeps the terminal
     // alive to be closed, since orca reaps the tab of a command that has already exited (observed:
@@ -304,12 +311,14 @@ export async function runOrcaSmoke(opts: {
       slot,
       `printf '%s' ${shq(TRAILER_HEAD)}; printf '%s\\n' ${shq(TRAILER_TAIL)}; sleep ${IDLE_SECONDS}`,
     );
+    observations.adoptionWaitExercised = adoptionWaitSeen(tape, slot.cwd);
     const receipt = createReceipt(tape);
     observations.createReceiptWorktree = receipt.worktree;
     observations.createRuntimeId = receipt.runtimeId;
     // waitOutput tolerates renderer wrapping; the unpaged read is the byte-exact leg.
     const matched = await driver.waitOutput(slot, TRAILER, TRAILER_TIMEOUT_MS);
     await driver.status(slot);
+    observations.screenReadExercised = screenReadSeen(tape);
     observations.elapsedWaitExercised = elapsedWaitSeen(tape);
     observations.trailerObserved = matched && (await driver.read(slot, 200)).includes(TRAILER);
     if (receipt.handle === undefined) throw new Error("the create receipt carries no handle — no close can be proven against it");
@@ -345,6 +354,7 @@ export async function runOrcaSmoke(opts: {
     if (slot) await driver.close(slot).catch(() => undefined);
     await removeWorktree(repo, worktree);
     await shGit(`git branch -D ${shq(branch)}`, repo);
+    rmSync(smokeJournal.dir, { recursive: true, force: true });
   }
   return settle(failures);
 }
@@ -394,6 +404,8 @@ export async function liveLeg(ctx: SkipChannel, smoke: SmokeResult): Promise<"sk
   expect(smoke.reasons, "smoke reasons must be empty to pass").toEqual([]);
   expect(smoke.status).toBe("passed");
   expect(smoke.observations.trailerObserved).toBe(true);
+  expect(smoke.observations.adoptionWaitExercised).toBe(true);
+  expect(smoke.observations.screenReadExercised).toBe(true);
   expect(smoke.observations.elapsedWaitExercised).toBe(true);
   expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.smokeWorktree);
   expect(smoke.observations.listedBeforeClose).toBe(true);
@@ -420,6 +432,8 @@ describe("e2e: orca driver smoke", () => {
       smokeWorktree: "/tmp/smoke-wt",
       createReceiptWorktree: "/tmp/smoke-wt",
       trailerObserved: true,
+      adoptionWaitExercised: true,
+      screenReadExercised: true,
       elapsedWaitExercised: true,
       createRuntimeId: "rt-1",
       listedBeforeRuntimeId: "rt-1",
@@ -429,6 +443,8 @@ describe("e2e: orca driver smoke", () => {
     };
     expect(smokeVerdict(green).status).toBe("passed");
     expect(smokeVerdict({ ...green, trailerObserved: false }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, adoptionWaitExercised: false }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, screenReadExercised: false }).status).toBe("failed");
     expect(smokeVerdict({ ...green, elapsedWaitExercised: false }).status).toBe("failed");
     expect(smokeVerdict({ ...green, createReceiptWorktree: "/tmp/some-other-wt" }).status).toBe("failed");
     expect(smokeVerdict({ ...green, createReceiptWorktree: undefined }).status).toBe("failed");
@@ -450,6 +466,8 @@ describe("e2e: orca driver smoke", () => {
     if (smoke.status !== "skipped") {
       expect(smoke.status, `live smoke: ${smoke.reasons.join(" · ")}`).toBe("passed");
       expect(smoke.observations.trailerObserved).toBe(true);
+      expect(smoke.observations.adoptionWaitExercised).toBe(true);
+      expect(smoke.observations.screenReadExercised).toBe(true);
       expect(smoke.observations.elapsedWaitExercised).toBe(true);
       expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.smokeWorktree);
       expect(smoke.observations.listedBeforeClose).toBe(true);
@@ -499,6 +517,8 @@ describe("e2e: orca driver smoke", () => {
       smokeWorktree: "/tmp/smoke-wt",
       createReceiptWorktree: "/tmp/smoke-wt",
       trailerObserved: true,
+      adoptionWaitExercised: true,
+      screenReadExercised: true,
       elapsedWaitExercised: true,
       listedBeforeClose: true,
       terminalClosed: true,

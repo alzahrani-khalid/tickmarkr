@@ -13,13 +13,13 @@ type VisibilityLlm = NonNullable<NonNullable<InitConfigOverlay["visibility"]>["l
 const DRIVERS: readonly Driver[] = ["auto", "herdr", "subprocess", "orca"];
 
 // One line per driver, shown for the value currently selected: four environments no longer fit on
-// a single description row at 80 columns (the shipped three already clipped), and orca is an
-// EXPLICIT choice — `auto` still means herdr-else-subprocess and never reaches for it.
+// a single description row at 80 columns (the shipped three already clipped). Auto identifies its
+// innermost host from environment markers only; outside an Orca terminal, Orca is named explicitly.
 const DRIVER_DESC: Record<Driver, string> = {
-  auto: "auto: herdr when HERDR_ENV=1, else subprocess — never orca",
+  auto: "auto: herdr when HERDR_ENV=1, else orca inside an Orca terminal, else subprocess",
   herdr: "herdr: every worker runs in a visible pane you can watch and unblock",
   subprocess: "subprocess: headless child processes — no cockpit, same fail-closed gates",
-  orca: "orca: visible terminals in the Orca app — an explicit choice, never auto's",
+  orca: "orca: visible terminals in the Orca app — picked by auto inside one; name it elsewhere",
 };
 const VISIBILITY: readonly VisibilityLlm[] = ["pane", "headless"];
 

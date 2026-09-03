@@ -1,7 +1,9 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, doctorAgeMs, modelAuthExclusions, probeAll, readDoctor, servableExclusions, servabilityLine } from "../../adapters/registry.js";
 import { formatModelAuthLine, contextWindowLints, modelLints, preferEntryLints, ttyVisual, type RoutedAssignment } from "../../adapters/model-lints.js";
 import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
-import { parseArgs } from "node:util";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { classifyContextPath } from "../../compile/native.js";
 import { DEFAULT_CONFIG, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK } from "../../config/config.js";
@@ -123,17 +125,24 @@ export async function plan(
   }
   const g = loadGraph(cwd);
   const oracleRefusals = new Map<string, string[]>();
+  const oracleAdvisories = new Map<string, string[]>();
   if (g.tasks.some((task) => task.acceptance.some((item) => typeof item === "object" && item.oracle === "test"))) {
     const listing = await (opts.listTests ?? listVitestTests)(cwd);
     for (const task of g.tasks) {
       const refusals: string[] = [];
+      const advisories: string[] = [];
+      const authoredTest = task.files
+        .map((path) => path.replace(/^\.\//, ""))
+        .find((path) => /^tests\/.+\.test\.ts$/.test(path) && !/[?*{[]/.test(path) && !existsSync(join(cwd, path)));
       if (listing.status === "failed") {
         if (task.acceptance.some((item) => typeof item === "object" && item.oracle === "test")) {
           refusals.push(`acceptance oracle unresolved — runner listing failed: ${listing.error.split("\n")[0]}`);
         }
       } else {
         for (const audit of auditNamedTestOracles(task.acceptance, listing.tests)) {
-          if (audit.matches.length === 0) {
+          if (audit.matches.length === 0 && authoredTest) {
+            advisories.push(`acceptance oracle ${JSON.stringify(audit.criterion)} not yet written (worker authors ${authoredTest})`);
+          } else if (audit.matches.length === 0) {
             refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches zero runner-listed test names`);
           } else if (audit.matches.length > 1) {
             refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches ${audit.matches.length} runner-listed test names`);
@@ -141,6 +150,7 @@ export async function plan(
         }
       }
       if (refusals.length) oracleRefusals.set(task.id, refusals);
+      if (advisories.length) oracleAdvisories.set(task.id, advisories);
     }
   }
   const inputFindings = await taskInputFindings(g.tasks, cwd);
@@ -287,6 +297,7 @@ export async function plan(
       if (d) lines.push(d);
       lints.push(`${t.id}: unroutable — ${msg}`);
     }
+    for (const advisory of oracleAdvisories.get(t.id) ?? []) lines.push(`    ! ${advisory}`);
   }
   const inputWarnings = inputFindings.filter((finding) => finding.severity === "warn");
   if (inputWarnings.length) {

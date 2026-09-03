@@ -79,6 +79,44 @@ test("test: plan refuses a graph whose acceptance item matches zero of the runne
   expect(many).toContain(`acceptance oracle ${JSON.stringify(criterion)} matches 2 runner-listed test names`);
 });
 
+test("plan on a spec whose test criterion names a title with no match and whose owning task lists a test file absent from the tree prints an advisory not yet written line naming that path and keeps the task's routing column while a criterion whose test file exists with a different title still prints the pre-dispatch refusal whereas a plan that refuses both or advises both fails", async () => {
+  const repo = preflightRepo(
+    [{ oracle: "test", test: "placeholder" }],
+    [],
+    { "tests/existing.test.ts": 'test("a different title", () => {});\n' },
+  );
+  saveGraph(repo, validateGraph({
+    version: 1,
+    spec: { source: "prd", paths: ["fixture"], hash: "fixture" },
+    tasks: [
+      {
+        id: "T1", title: "fresh test", goal: "fresh test", shape: "chore", complexity: 2,
+        files: ["tests/fresh.test.ts"], acceptance: [{ oracle: "test", test: "fresh criterion" }],
+      },
+      {
+        id: "T2", title: "wrong title", goal: "wrong title", shape: "chore", complexity: 2,
+        files: ["tests/existing.test.ts"], acceptance: [{ oracle: "test", test: "expected criterion" }],
+      },
+    ],
+  }));
+
+  const output = await plan([], repo, [adapter], undefined, {
+    listTests: async () => ({
+      status: "listed",
+      tests: [{ name: "test: a different title", file: join(repo, "tests/existing.test.ts"), projectName: "suite" }],
+    }),
+  });
+  const freshRow = output.split("\n").find((line) => /^\s+T1\s/.test(line));
+  const existingRow = output.split("\n").find((line) => /^\s+T2\s/.test(line));
+
+  expect(freshRow).toContain("→ fake:fake-1");
+  expect(output).toContain('acceptance oracle "fresh criterion" not yet written (worker authors tests/fresh.test.ts)');
+  expect(existingRow).toContain("pre-dispatch refusal");
+  expect(existingRow).toContain('acceptance oracle "expected criterion" matches zero runner-listed test names');
+  expect(output.match(/not yet written/g)).toHaveLength(1);
+  expect(output.match(/pre-dispatch refusal/g)).toHaveLength(1);
+});
+
 test("test: a criterion matching exactly one runner listed test name plans without refusal and reports a passing oracle row in doctor, so a resolved oracle is distinguishable from an unresolved one", async () => {
   const criterion = "one resolved oracle fixture";
   const repo = preflightRepo([{ oracle: "test", test: criterion }]);

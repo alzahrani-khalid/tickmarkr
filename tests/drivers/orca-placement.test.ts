@@ -6,6 +6,7 @@ import { describe, expect, test } from "vitest";
 import { canonicalWorktreePath, OrcaDriver, OrcaError, OrcaUnavailableError } from "../../src/drivers/orca.js";
 import { formatOwnedName, panesToClose, type ExecutorDriver } from "../../src/drivers/types.js";
 import { createWorktree, worktreePath } from "../../src/run/git.js";
+import { Journal } from "../../src/run/journal.js";
 import { FakeOrca, steppedTime, type FakeTerminalSpec } from "../helpers/fake-orca.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
@@ -78,6 +79,54 @@ class DelegatingOrcaDriver extends OrcaDriver {
 }
 
 describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
+  test("test: the first run on a slot issues terminal create only after worktree current answers the slot's canonical path so a fixture that refuses selector_not_found or answers the enclosing checkout for the first three probes still binds on the fourth with a worktree-adoption-wait journal row carrying the milliseconds when the wait exceeded 2 s and a fixture that never answers within 60 s fails the dispatch loudly whereas a driver that creates before the path is answered fails", async () => {
+    const repo = makeRepo({ "adoption.txt": "ready\n" });
+    const runId = "run-orca-adoption";
+    const branch = `tickmarkr/${runId}--TA`;
+    const target = worktreePath(repo, branch);
+    const journal = Journal.create(repo, runId);
+    journal.append("task-dispatch", "TA", { attempt: 0 });
+
+    const fake = new FakeOrca({
+      worktreeCurrentAnswers: ["selector_not_found", repo, repo, target],
+    });
+    const driver = new OrcaDriver({ exec: fake.exec, time: steppedTime() });
+    const worktree = await driver.worktree(repo, branch, "HEAD");
+    const expected = canonicalWorktreePath(worktree);
+    const slot = await driver.slot(worktree, "legacy", {
+      owned: { role: "worker", taskId: "TA", attempt: 0, runId },
+    });
+    await driver.run(slot, "run-after-adoption");
+
+    const currentIndexes = fake.calls.flatMap((call, index) =>
+      call[0] === "worktree" && call[1] === "current" ? [index] : []);
+    const createIndex = fake.calls.findIndex((call) => call[0] === "terminal" && call[1] === "create");
+    expect(currentIndexes).toHaveLength(4);
+    expect(createIndex).toBeGreaterThan(currentIndexes.at(-1)!);
+    expect(currentIndexes.map((index) => fake.callCwds[index])).toEqual([expected, expected, expected, expected]);
+    expect(fake.last()?.worktree).toBe(expected);
+    const wait = Journal.open(repo, runId).read().filter((row) => row.event === "worktree-adoption-wait");
+    expect(wait).toHaveLength(1);
+    expect(wait[0]).toMatchObject({ taskId: "TA", data: { milliseconds: 3_000 } });
+
+    const neverRunId = "run-orca-adoption-never";
+    const neverBranch = `tickmarkr/${neverRunId}--TB`;
+    const neverJournal = Journal.create(repo, neverRunId);
+    neverJournal.append("task-dispatch", "TB", { attempt: 0 });
+    const never = new FakeOrca({ worktreeCurrentAnswers: [repo] });
+    const neverDriver = new OrcaDriver({ exec: never.exec, time: steppedTime() });
+    const neverWorktree = await neverDriver.worktree(repo, neverBranch, "HEAD");
+    const neverSlot = await neverDriver.slot(neverWorktree, "legacy", {
+      owned: { role: "worker", taskId: "TB", attempt: 0, runId: neverRunId },
+    });
+    const error = await neverDriver.run(neverSlot, "must-not-run").then(() => undefined, (reason: unknown) => reason);
+    expect(error).toBeInstanceOf(OrcaUnavailableError);
+    expect((error as OrcaUnavailableError).family).toBe("worktree-current");
+    expect((error as Error).message).toContain("within 60000ms");
+    expect(never.countOf("create")).toBe(0);
+    expect(never.countOf("worktree-current")).toBeGreaterThan(1);
+  });
+
   test("test: a create receipt whose surface is not visible raises one attention notify naming the surface whereas a receipt whose surface is visible or absent raises none so a driver that accepts a background surface silently fails", async () => {
     const notifications: { message: string; tier?: string }[] = [];
     const withNotify = (driver: OrcaDriver) => {
@@ -142,8 +191,8 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     expect(retry).toBeInstanceOf(OrcaUnavailableError);
     expect(uiFake.countOf("create")).toBe(2);
 
-    // Control 2 — the daemon's cwd. With nothing focused, an ambient selector resolves against the
-    // invoking CLI child, and the daemon runs in the repo root, not in either slot's checkout.
+    // Control 2 — the daemon's cwd. Adoption itself now refuses this placement before create: a
+    // current answer from the daemon checkout is never evidence that either slot checkout exists.
     const daemonFake = new FakeOrca();
     const daemonDriver = ambientSelector(daemonFake, "current", DAEMON_CWD);
     const dA = await daemonDriver.slot(WT_A, TITLE_A);
@@ -151,11 +200,11 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     for (const [slot, wt] of [[dA, WT_A], [dB, WT_B]] as const) {
       const err = await daemonDriver.run(slot, "run").then(() => undefined, (e: unknown) => e);
       expect(err).toBeInstanceOf(OrcaError);
-      expect((err as OrcaError).message).toContain(`create receipt bound to ${DAEMON_CWD}, not the slot's ${wt}`);
+      expect((err as OrcaError).message).toContain(`Orca did not adopt ${wt}`);
     }
-    // Neither misplaced terminal is left running in the daemon's own repo: each is closed at its
-    // rejected receipt, and both slots stay latched.
-    expect(daemonFake.calls.filter((c) => c[1] === "close").map((c) => c[3])).toEqual(["term_1", "term_2"]);
+    // No command was launched in the daemon checkout at all.
+    expect(daemonFake.countOf("create")).toBe(0);
+    expect(daemonFake.countOf("close")).toBe(0);
     expect(daemonFake.terminals).toEqual([]);
   });
 

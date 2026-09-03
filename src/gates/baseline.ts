@@ -28,6 +28,8 @@ export interface BaselineCommand {
   exitCode?: number;
   fingerprints: string[];
   missingCommand?: boolean;
+  /** Why a capture returned no verdict. */
+  invalidCause?: "ceiling-kill" | "resource-exhaustion";
   /** What this command actually took at capture, on a pristine tree. Absent in pre-v1.90 baselines. */
   durationMs?: number;
   /** Sum of the per-file durations named by the runner; null when its output names none. */
@@ -510,8 +512,13 @@ export function ceilingKillResult(gate: string, r: ShResult, ceilingMs: number):
  */
 export const CAPTURE_CEILING_MS = 1_800_000;
 
-const invalidCaptureEntry = (durationMs: number, invalidatingLines: string[] = []): BaselineCommand => ({
+const invalidCaptureEntry = (
+  durationMs: number,
+  invalidCause: BaselineCommand["invalidCause"],
+  invalidatingLines: string[] = [],
+): BaselineCommand => ({
   infra: true,
+  invalidCause,
   fingerprints: [],
   durationMs,
   fileDurationSumMs: null,
@@ -549,7 +556,7 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `it recorded NO fingerprints, so nothing is forgiven and every gate will treat a pre-existing `
         + `failure as a fresh one. Raise the ceiling or shorten the command.`,
       );
-      base.commands[name] = invalidCaptureEntry(durationMs);
+      base.commands[name] = invalidCaptureEntry(durationMs, "ceiling-kill");
       continue;
     }
     const combinedOutput = r.stdout + "\n" + r.stderr;
@@ -567,7 +574,7 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `the measurement cannot distinguish a pre-existing failure from one caused by exhaustion. `
         + `First invalidating line: ${invalidatingLines[0]}`,
       );
-      base.commands[name] = invalidCaptureEntry(durationMs, invalidatingLines);
+      base.commands[name] = invalidCaptureEntry(durationMs, "resource-exhaustion", invalidatingLines);
       continue;
     }
     base.commands[name] = {
@@ -694,6 +701,19 @@ export async function compareToBaseline(
       record(killed);
       continue;
     }
+    const runner = shellToken(cmd) ?? name;
+    if (entry?.missingCommand === true || r.code === 127) {
+      const cause = entry?.missingCommand === true && r.code !== 127
+        ? "the baseline capture recorded this runner as missing"
+        : `the head command exited 127${/\bENOENT\b/i.test(`${r.stdout}\n${r.stderr}`) ? " (spawn ENOENT)" : ""}`;
+      record({
+        gate: name,
+        pass: false,
+        details: `unreadable — ${cause}; runner ${JSON.stringify(runner)} did not produce a trustworthy verdict`,
+        meta: { unreadable: true, runner },
+      });
+      continue;
+    }
     if (r.code === 0) {
       record({ gate: name, pass: true, details: "exit 0" });
       continue;
@@ -732,8 +752,11 @@ export async function compareToBaseline(
     // entries with no exitCode keep the `?? 1` red default both readers share (merge.ts:131).
     const baselineRed = entry?.infra !== true && (entry?.exitCode ?? 1) !== 0;
     if (!failing.length && !baselineRed) {
+      const recordedCause = entry?.invalidCause === "resource-exhaustion" || entry?.invalidatingLines?.length
+        ? `was invalidated by its recorded process/resource-exhaustion cause${entry.invalidatingLines?.[0] ? ` (${entry.invalidatingLines[0]})` : ""}`
+        : "was killed at its ceiling";
       const closed = entry?.infra === true
-        ? `the baseline capture for this command was killed at its ceiling and recorded no verdict, so nothing here is forgivable — it now exits ${r.code} with no recognizable failure lines — failing closed`
+        ? `the baseline capture for this command ${recordedCause} and recorded no verdict, so nothing here is forgivable — it now exits ${r.code} with no recognizable failure lines — failing closed`
         : `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`;
       const evidence = unrecognizedEvidence(raw);
       record({

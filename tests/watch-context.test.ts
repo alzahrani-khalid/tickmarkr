@@ -43,6 +43,27 @@ const REAL_CAPTURED_STATUSLINE =
   "  \u2733 Opus 5 (1M context) \u2502 \u2442 fix/obs-769-cross-run-pane-close \u2502 "
   + "\u23f8 parked 8/9 T9\u23f8 tip\u2713 \u2502 \u2211 1.2M tok \u2502 \u2b22 9/9 \u2502 \u2588\u2588\u258a\u2500\u2500\u2500\u2500\u2500 35% \u2502 \u25b8 tickmarkr";
 
+/**
+ * A real pane renders its statusline BELOW the input box's horizontal rule, so a stub screen without
+ * that rule is not a pane. Every fixture gets one by default; `raw` passes a whole screen through
+ * verbatim for the tests that must place rows ABOVE the rule, or supply no rule at all (OBS-865).
+ */
+const INPUT_RULE = "\u2500".repeat(103);
+/**
+ * OBS-865: a REAL statusline, captured verbatim from the live overseer seat (wZ:pS4) on 2026-09-03,
+ * not composed here. The shipped selector matched a vendor word ANYWHERE in the window and listed no
+ * `fable`, so on this seat it chose Claude Code's own `Tip: Ask Claude ...` row and reported
+ * UNREADABLE while a human read 27% at a glance. Keep this byte-exact, trailing widgets included.
+ */
+const FABLE_CAPTURED_STATUSLINE =
+  "  ✳ Fable 5.1 │ "
+  + "⑂ main │ "
+  + "● complete 8/8 tip✓ │ "
+  + "∑ 1.6M tok │ "
+  + "⬢ 9/9 │ "
+  + "██▏───── 27% │ "
+  + "▸ tickmarkr                                                                                                                  /rc failed";
+
 const TRUNCATED_LIVE_RUN = `  claude-opus-5  live-run=${"task-routing-and-gate-status/".repeat(8)}`;
 
 const seedRepo = (): string => {
@@ -73,12 +94,13 @@ interface Stub {
  * reads those bytes back through the product's reader — so a payload shape the reader would reject
  * fails these tests rather than passing them.
  */
-function makeStub(repo: string, screenLine: string): Stub {
+function makeStub(repo: string, screenLine: string, opts: { raw?: boolean } = {}): Stub {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-watch-context-bin-"));
   const log = join(dir, "calls.log");
   const screen = join(dir, "screen.txt");
   writeFileSync(log, "");
-  writeFileSync(screen, screenLine + "\n");
+  const compose = (text: string) => (opts.raw ? text : `${INPUT_RULE}\n${text}`) + "\n";
+  writeFileSync(screen, compose(screenLine));
   const beatDir = dirname(supervisionBeatPath(repo, "overseer-context"));
 
   const herdr = join(dir, "herdr");
@@ -117,7 +139,7 @@ if (args.includes("--stand-down")) {
 }
 `);
   chmodSync(cli, 0o755);
-  return { dir, log, screen, render: (line: string) => writeFileSync(screen, line + "\n") };
+  return { dir, log, screen, render: (line: string) => writeFileSync(screen, compose(line)) };
 }
 
 const live: ChildProcess[] = [];
@@ -323,7 +345,7 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     // EXIT 3 — the cap: nothing crossed, the watch simply ran out.
     const capRepo = fresh();
     const capStub = makeStub(capRepo, MARKED(10));
-    const cap = watch(capStub, capRepo, ["overseer", "OVSR-w1:p2", "60", "75", "", "1", "1"]);
+    const cap = watch(capStub, capRepo, ["overseer", "OVSR-w1:p2", "60", "75", "", "1", "0"]);
     expect(await cap.exited).toBe(0);
     expect(cap.out()).toContain("WATCH_CAP_REACHED");
 
@@ -359,6 +381,70 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     const overseer = await runAtAct("overseer");
     expect(overseer.output).toContain("CONTEXT_CLEARED overseer-seat");
     expect(overseer.prompts.some((line) => line.includes("/clear"))).toBe(true);
+  }, 30_000);
+
+  test("test: a Fable seat's real captured statusline reads its percentage, because the banner is chosen by its position below the input rule rather than by a vendor vocabulary that never listed fable", async () => {
+    const repo = seedRepo();
+    const handoff = join(repo, "HANDOFF.md");
+    writeFileSync(handoff, "safe state\n");
+    const stub = makeStub(repo, FABLE_CAPTURED_STATUSLINE);
+    const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "1", "1", handoff, "1", "600"]);
+
+    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_ACT"), { timeout: 20_000, interval: 100 });
+    expect(w.out()).not.toContain("CONTEXT_UNREADABLE");
+    expect(w.out()).toContain("27%");
+    w.proc.kill("SIGKILL");
+  }, 30_000);
+
+  test("test: a Tip row naming Claude ABOVE the input rule does not displace the Fable banner below it, so the row a human reads as the statusline is the row the watcher reads", async () => {
+    const repo = seedRepo();
+    const handoff = join(repo, "HANDOFF.md");
+    writeFileSync(handoff, "safe state\n");
+    const screen = [
+      "  \u23bf  Tip: Ask Claude to create a todo list when working on complex tasks",
+      INPUT_RULE,
+      FABLE_CAPTURED_STATUSLINE,
+    ].join("\n");
+    const stub = makeStub(repo, screen, { raw: true });
+    const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "1", "1", handoff, "1", "600"]);
+
+    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_ACT"), { timeout: 20_000, interval: 100 });
+    expect(w.out()).not.toContain("CONTEXT_UNREADABLE");
+    expect(w.out()).toContain("27%");
+    w.proc.kill("SIGKILL");
+  }, 30_000);
+
+  test("test: a decoy percentage quoted ABOVE the input rule is never read as this seat's fill; the banner below the rule decides, so a quoted number can neither fire a clear nor mask a crossing", async () => {
+    const repo = seedRepo();
+    const handoff = join(repo, "HANDOFF.md");
+    writeFileSync(handoff, "safe state\n");
+    const screen = [
+      "  relaying another seat's report: opus 12%",
+      INPUT_RULE,
+      MARKED(57),
+    ].join("\n");
+    const stub = makeStub(repo, screen, { raw: true });
+    const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "1", "1", handoff, "1", "600"]);
+
+    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_ACT"), { timeout: 20_000, interval: 100 });
+    expect(w.out()).toContain("57%");
+    expect(w.out()).not.toContain("12%");
+    w.proc.kill("SIGKILL");
+  }, 30_000);
+
+  test("test: a window carrying no input rule at all reports unreadable rather than guessing at a banner, which is also the control proving the other fixtures are read BECAUSE of the rule and not in spite of it", async () => {
+    const repo = seedRepo();
+    const handoff = join(repo, "HANDOFF.md");
+    writeFileSync(handoff, "safe state\n");
+    const stub = makeStub(repo, MARKED(80), { raw: true });
+    const w = watch(stub, repo, ["overseer", "OVSR-w1:p2", "1", "1", handoff, "1", "600"],
+      { TKR_AUTO_CLEAR: "1", TKR_CLEAR_SETTLE_S: "0" });
+
+    await vi.waitFor(() => expect(w.out()).toContain("CONTEXT_UNREADABLE"), { timeout: 20_000, interval: 100 });
+    expect(w.out()).not.toContain("CONTEXT_ACT");
+    expect(calls(stub).filter((line) => line.includes("agent prompt"))).toEqual([]);
+    expect(beats(stub, "overseer-context").length).toBeGreaterThan(0);
+    w.proc.kill("SIGKILL");
   }, 30_000);
 
   test("the diff anchors the percentage read to the model banner rather than widening a bare numeric pattern, and leaves both copies of the script byte-identical", () => {

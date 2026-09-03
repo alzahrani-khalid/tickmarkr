@@ -5,6 +5,7 @@
 # under load; this encodes the steps.
 #
 #   seat-send.sh <agent-name-or-pane> <message>
+#   TKR_ADAPTER=<id> supplies the adapter when a bare pane/name does not expose it in `agent get`.
 #
 #   TKR_INTERRUPT=1  end a `working` seat's turn first (Esc, at most twice, verified between) so the
 #                    directive is READ now instead of queued behind the turn. A message to a working
@@ -24,8 +25,8 @@
 # alone, or nothing — a decorative check beside a real one reads as corroboration.
 #
 # First output line is the machine-greppable verdict:
-#   DELIVERED_SUBMITTED | QUEUED_BEHIND_TURN | SEND_UNSUBMITTED | INTERRUPT_FAILED | TARGET_GONE
-#   | REFUSED_SIZE | REFUSED_BOX_OCCUPIED | SEND_UNVERIFIED | SEND_REFUSED | SEND_FAILED
+#   DELIVERED_SUBMITTED | QUEUED_BEHIND_TURN | SEND_UNSUBMITTED | SEND_DEFERRED
+#   | INTERRUPT_FAILED | TARGET_GONE | REFUSED_SIZE | SEND_UNVERIFIED | SEND_REFUSED | SEND_FAILED
 #
 # A success verdict names the surface that delivered when it was not the default one, so a fallback
 # is visible in the transcript rather than inferred (OBS-552).
@@ -36,6 +37,7 @@ set -u
 
 TARGET="${1:?usage: seat-send.sh <agent-name-or-pane> <message>}"
 MSG="${2:?message required}"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 # PTY input front-truncates around 1KB and a truncated brief silently drops policy — the drop is at
 # the FRONT, so what survives still reads as a complete message. Long content goes in a FILE; the
@@ -57,9 +59,68 @@ pane_of() {
     | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -1
 }
 
-# The rendered `❯` line — the only state that discriminates submitted from sitting. tail -1 takes
-# the LAST `❯` line, which is always the LIVE INPUT BOX: a wrapped draft's continuation lines carry
-# no `❯`, so the last one is still that draft's FIRST rendered line, i.e. a PREFIX of the draft —
+# Adapter identity comes from the worker name or Herdr's agent field; a caller targeting a bare pane
+# supplies TKR_ADAPTER. The glyph itself is never duplicated here: this parser reads the declaration
+# beside the input-box matchers in adapters/types.ts (or its built dist twin in an installed package).
+adapter_of() {
+  if [ -n "${TKR_ADAPTER:-}" ]; then printf '%s\n' "$TKR_ADAPTER"; return 0; fi
+  local record identity adapter
+  record=$(herdr agent get "$TARGET" 2>/dev/null)
+  identity=$(printf '%s\n' "$record" |
+    sed -n 's/.*"agent":"\([^"]*\)".*/\1/p; s/.*"name":"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$identity" ] || identity="$TARGET"
+  adapter=$(printf '%s\n' "$identity" |
+    sed -n 's/^.*-worker-\(.*\)-a[0-9][0-9]*-.*$/\1/p' | head -1)
+  [ -n "$adapter" ] || adapter="$identity"
+  case "$adapter" in claude) adapter="claude-code" ;; cursor) adapter="cursor-agent" ;; esac
+  printf '%s\n' "$adapter"
+}
+
+prompt_glyph_of() {
+  local adapter="$1" source glyph root tickmarkr_bin tickmarkr_entry
+  # The canonical script is <repo>/skills/.../scripts; the independently tracked installed copy is
+  # <repo>/.claude/skills/.../scripts. Search both ancestor shapes so identical bytes work from either
+  # shipped location. TKR_ADAPTER_TYPES remains the explicit consumer-install override.
+  for source in ${TKR_ADAPTER_TYPES:+"$TKR_ADAPTER_TYPES"}; do
+    [ -f "$source" ] || continue
+    glyph=$(awk -F'"' -v adapter="$adapter" '$2 == adapter && $3 ~ /^[[:space:]]*:[[:space:]]*$/ { print $4; exit }' "$source")
+    if [ -n "$glyph" ]; then printf '%s\n' "$glyph"; return 0; fi
+  done
+  for root in "$SCRIPT_DIR/../../.." "$SCRIPT_DIR/../../../.."; do
+    root=$(CDPATH= cd -- "$root" 2>/dev/null && pwd) || continue
+    for source in "$root/src/adapters/types.ts" "$root/dist/adapters/types.js"; do
+      [ -f "$source" ] || continue
+      glyph=$(awk -F'"' -v adapter="$adapter" '$2 == adapter && $3 ~ /^[[:space:]]*:[[:space:]]*$/ { print $4; exit }' "$source")
+      if [ -n "$glyph" ]; then printf '%s\n' "$glyph"; return 0; fi
+    done
+  done
+  # `tickmarkr init` copies this skill into a consumer repository, so neither ancestor above belongs
+  # to the package. The executable is shipped from <package>/dist/cli/index.js; resolve its symlink and
+  # read the adjacent compiled declaration. Node is already a runtime requirement of that executable.
+  tickmarkr_bin=$(command -v tickmarkr 2>/dev/null) || tickmarkr_bin=""
+  if [ -n "$tickmarkr_bin" ]; then
+    tickmarkr_entry=$(node -e 'try { process.stdout.write(require("fs").realpathSync(process.argv[1])) } catch {}' "$tickmarkr_bin" 2>/dev/null)
+    if [ -n "$tickmarkr_entry" ]; then
+      root=$(CDPATH= cd -- "$(dirname -- "$tickmarkr_entry")/../.." 2>/dev/null && pwd) || root=""
+      source="$root/dist/adapters/types.js"
+      if [ -n "$root" ] && [ -f "$source" ]; then
+        glyph=$(awk -F'"' -v adapter="$adapter" '$2 == adapter && $3 ~ /^[[:space:]]*:[[:space:]]*$/ { print $4; exit }' "$source")
+        if [ -n "$glyph" ]; then printf '%s\n' "$glyph"; return 0; fi
+      fi
+    fi
+  fi
+  return 1
+}
+
+ADAPTER=$(adapter_of)
+if ! PROMPT_GLYPH=$(prompt_glyph_of "$ADAPTER"); then
+  echo "SEND_UNVERIFIED $TARGET — adapter '$ADAPTER' has no prompt glyph declaration; nothing was typed"
+  exit 1
+fi
+
+# The adapter-declared prompt line is the only state that discriminates submitted from sitting.
+# tail -1 takes the LAST matching line: a wrapped draft's continuation lines carry no prompt glyph,
+# so the last one is still that draft's FIRST rendered line, i.e. a PREFIX of the draft —
 # callers compare prefixes, never whole sentences (OBS-396: a full-sentence match returns false on a
 # message that arrived intact).
 #
@@ -84,7 +145,11 @@ pane_of() {
 prompt_line() {
   herdr agent read "$TARGET" --source visible --lines 14 2>/dev/null \
     | sed '/↑ to edit/{/steer/d;}' \
-    | sed -n 's/^[[:space:]]*❯[[:space:]]*//p' | tail -1 | sed 's/[[:space:]]*$//'
+    | awk -v glyph="$PROMPT_GLYPH" '
+        { pos = index($0, glyph); if (!pos) next
+          prefix = substr($0, 1, pos - 1); gsub(/[[:space:]|]/, "", prefix); gsub(/│/, "", prefix)
+          if (prefix == "") print substr($0, pos + length(glyph)) }
+      ' | tail -1 | sed 's/^[[:space:]]*//; s/[[:space:]│|]*$//'
 }
 
 # STAGED-QUEUE DISCRIMINATOR (OBS-552 addendum, captured 2026-08-19 on a live kimi seat). After its
@@ -114,7 +179,7 @@ is_ours() {
 # wrapped in SGR dim; typed text renders default. A dim-wrapped line is rendering, not state.
 is_ghost() {
   herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
-    | grep -F -- "❯" | grep -F -- "$1" | head -1 | grep -q "$(printf '\033')\[2m"
+    | grep -F -- "$PROMPT_GLYPH" | grep -F -- "$1" | head -1 | grep -q "$(printf '\033')\[2m"
 }
 
 S=$(status_of)
@@ -123,17 +188,22 @@ if [ -z "$S" ]; then
   exit 1
 fi
 
-# A pre-existing draft in the box is a decision, not an obstacle: `agent prompt` would APPEND to it
-# and submit both. Superseding someone else's text needs an author and the arrow form — refuse and
-# surface it rather than silently stomping it (D-206: an unattributed line in a box, origin never
-# resolved because it was cleared).
-PRE=$(prompt_line)
-if [ -n "$PRE" ] && ! is_ghost "$PRE"; then
-  echo "REFUSED_BOX_OCCUPIED $TARGET — input box already holds: $PRE"
-  echo "  ANSI-verify first (dim SGR = autosuggest ghost, ignorable). A real draft is superseded by a"
-  echo "  DECISION, not by this script: send the arrow form naming what you are overriding."
-  exit 2
-fi
+# Probe BEFORE writing: `agent prompt` and `pane run` both append to a live draft and submit the
+# concatenation. Give a human a short bounded window to finish or clear; if it remains, defer without
+# touching the pane. Re-running the receipt is the retry, so SEND_DEFERRED remains safe indefinitely.
+DRAFT_WAIT="${TKR_DRAFT_WAIT_S:-10}"
+DRAFT_POLL="${TKR_DRAFT_POLL_S:-1}"
+waited=0
+while :; do
+  PRE=$(prompt_line)
+  if [ -z "$PRE" ] || is_ghost "$PRE"; then break; fi
+  if [ "$waited" -ge "$DRAFT_WAIT" ] 2>/dev/null; then
+    echo "SEND_DEFERRED $TARGET — draft present; nothing was typed: $PRE"
+    exit 2
+  fi
+  sleep "$DRAFT_POLL"
+  waited=$((waited + DRAFT_POLL))
+done
 
 QUEUED=""
 if [ "$S" = "working" ]; then

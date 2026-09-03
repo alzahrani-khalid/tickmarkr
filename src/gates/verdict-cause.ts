@@ -1,5 +1,10 @@
 export type VerdictDiscriminator = "approve" | "pass" | "ok" | "action";
-export type VerdictUnparseableCause = "empty-output" | "no-verdict" | "malformed-verdict";
+export type VerdictUnparseableCause = "empty-output" | "no-verdict" | "malformed-verdict" | "timeout" | "startup-failure";
+
+export interface VerdictProcessFacts {
+  timedOut?: boolean;
+  exitCode?: number;
+}
 
 const MAX_WITNESS_BYTES = 4096;
 const JSON_STRING_VALUE = String.raw`"(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\u0000-\u001F])*"`;
@@ -69,9 +74,11 @@ export function classifyVerdictCause(
   raw: string,
   nonce: string,
   discriminator: VerdictDiscriminator,
+  process: VerdictProcessFacts = {},
 ): VerdictUnparseableCause {
+  if (process.timedOut) return "timeout";
   if (raw.trim().length === 0) return "empty-output";
-  return hasVerdictParticipationWitness(raw, nonce, discriminator)
-    ? "malformed-verdict"
-    : "no-verdict";
+  if (hasVerdictParticipationWitness(raw, nonce, discriminator)) return "malformed-verdict";
+  if (process.exitCode !== undefined && process.exitCode !== 0) return "startup-failure";
+  return "no-verdict";
 }

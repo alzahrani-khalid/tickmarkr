@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, type TickmarkrConfig } from "../../src/config/config.js";
@@ -11,6 +11,17 @@ import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { buildDossierPrompt, consult, augmentRetryBrief, renderRetryGuidance, type Dossier } from "../../src/run/consult.js";
 import { extractPromptNonce, extractVerdictJson, gateExitTrailer, gatePaneName } from "../../src/gates/llm.js";
 import { bannerShell } from "../../src/brand.js";
+import { sh } from "../../src/run/git.js";
+
+vi.mock("../../src/run/git.js", async (importOriginal) => {
+  const actual = await importOriginal<{ sh: typeof sh }>();
+  return {
+    ...actual,
+    sh: vi.fn((cmd: string, cwd: string, timeoutMs?: number) => actual.sh(cmd, cwd, timeoutMs)),
+  };
+});
+
+const shMock = vi.mocked(sh);
 
 const dossier: Dossier = {
   taskId: "T1",
@@ -27,7 +38,9 @@ function setup(consultVerdict: unknown): { cfg: TickmarkrConfig; fake: FakeAdapt
   writeFileSync(sp, JSON.stringify({ tasks: {}, consult: consultVerdict }));
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.consult = { adapter: "fake", model: "fake-1", stallMinutes: 15 };
-  return { cfg, fake: new FakeAdapter(sp), runDir: mkdtempSync(join(tmpdir(), "tickmarkr-rundir-")) };
+  const fake = new FakeAdapter(sp);
+  fake.interactiveCommand = (promptFile: string, model: string) => fake.headlessCommand(promptFile, model);
+  return { cfg, fake, runDir: mkdtempSync(join(tmpdir(), "tickmarkr-rundir-")) };
 }
 
 describe("consult", () => {
@@ -231,13 +244,13 @@ describe("consult", () => {
     expect(readFileSync(join(runDir, "consults", raw!), "utf8")).toContain("gibberish");
   });
 
-  test("OBS-50: visible consult pane dispatches a short bash script that includes the brand banner", async () => {
+  test("test: with visibility llm pane the consult pane script invokes the adapter's interactive command with the prompt seeded and never its headless command and the verdict is still parsed from the nonce trailer whereas the shipped visible branch that writes the headless command into the pane fails", async () => {
     const captured: string[] = [];
     let paneOutput = "";
     const stubSlot: Slot = { id: "stub", name: gatePaneName("consult", "T1"), cwd: "/tmp" };
     const stub: ExecutorDriver = {
       id: "stub",
-      interactive: false,
+      interactive: true,
       slot: async () => stubSlot,
       run: async (_s, cmd) => {
         captured.push(cmd);
@@ -251,26 +264,44 @@ describe("consult", () => {
       close: async () => {},
       worktree: async () => "/tmp/wt",
     };
-    const { cfg, fake, runDir } = setup({ action: "retry", notes: "pane path" });
+    const { cfg, fake, runDir } = setup({ action: "human", notes: "headless must not answer" });
+    let headlessCalls = 0;
+    const interactiveCalls: Array<{ promptFile: string; model: string }> = [];
+    fake.headlessCommand = () => {
+      headlessCalls++;
+      return "TICKMARKR_TEST_CONSULT_MODE=HEADLESS false";
+    };
+    fake.interactiveCommand = (promptFile: string, model: string) => {
+      interactiveCalls.push({ promptFile, model });
+      const js = `const fs=require("fs");const p=process.argv[1];const n=/VERDICT_NONCE: ([0-9a-f]+)/.exec(fs.readFileSync(p,"utf8"))[1];console.log(JSON.stringify({nonce:n,action:"retry",notes:"interactive pane"}))`;
+      return `TICKMARKR_TEST_CONSULT_MODE=INTERACTIVE node -e ${shq(js)} ${shq(promptFile)}`;
+    };
     cfg.visibility.llm = "pane";
+    shMock.mockClear();
+
     const v = await consult(dossier, cfg, [fake], stub, "/tmp", runDir);
     const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!);
     const nonce = extractPromptNonce(readFileSync(promptFile, "utf8"))!;
-    expect(paneOutput).toContain(`"nonce": "${nonce}"`);
-    expect(extractVerdictJson(paneOutput, nonce)).toMatchObject({ action: "retry", notes: "pane path" });
-    expect(v).toMatchObject({ action: "retry", notes: "pane path" });
+    expect(v).toMatchObject({ action: "retry", notes: "interactive pane" });
+    expect(extractVerdictJson(paneOutput, nonce)).toMatchObject({ action: "retry", notes: "interactive pane" });
+    expect(interactiveCalls).toEqual([{ promptFile, model: cfg.consult.model }]);
+    expect(headlessCalls).toBe(0);
+    expect(shMock).not.toHaveBeenCalled();
     expect(captured).toHaveLength(1);
     expect(captured[0]).toMatch(/^bash ['"]/);
     expect(captured[0]!.length).toBeLessThan(120);
     const scriptPath = captured[0]!.slice(6, -1);
     const script = readFileSync(scriptPath, "utf8");
+    expect(script).toContain("TICKMARKR_TEST_CONSULT_MODE=INTERACTIVE");
+    expect(script).not.toContain("TICKMARKR_TEST_CONSULT_MODE=HEADLESS");
+    expect(script).toContain(shq(promptFile));
     expect(script).toContain(bannerShell());
     expect(script.trimEnd().endsWith(gateExitTrailer(nonce))).toBe(true);
     expect(script).toContain("export BASH_SILENCE_DEPRECATION_WARNING=1");
   });
 
-  test("OBS-50: headless consult path stays byte-identical — sh() only, no banner or script", async () => {
-    const { cfg, fake, runDir } = setup({ action: "retry", notes: "headless bytes" });
+  test("test: with visibility llm headless the consult invocation is byte-identical to the shipped headless command and its parse whereas a change that alters the headless argv or the trailer contract fails", async () => {
+    const { cfg, fake, runDir } = setup({ action: "human", notes: "script fixture is bypassed" });
     const throwing: ExecutorDriver = {
       id: "throw",
       interactive: false,
@@ -284,13 +315,27 @@ describe("consult", () => {
       close: async () => { throw new Error("driver.close should not be called"); },
       worktree: async () => "/tmp/wt",
     };
+    let built: { promptFile: string; model: string; command: string } | undefined;
+    fake.headlessCommand = (promptFile: string, model: string) => {
+      const js = `const fs=require("fs");const p=process.argv[1];const n=/VERDICT_NONCE: ([0-9a-f]+)/.exec(fs.readFileSync(p,"utf8"))[1];console.log(JSON.stringify({nonce:n,action:"retry",notes:"headless bytes"}))`;
+      const command = `TICKMARKR_TEST_CONSULT_MODE=HEADLESS node -e ${shq(js)} ${shq(promptFile)}`;
+      built = { promptFile, model, command };
+      return command;
+    };
+    fake.interactiveCommand = () => {
+      throw new Error("interactiveCommand should not be called");
+    };
+    shMock.mockClear();
+
     const v = await consult(dossier, cfg, [fake], throwing, "/tmp", runDir);
     expect(v).toMatchObject({ action: "retry", notes: "headless bytes" });
+    expect(built).toBeDefined();
+    expect(shMock).toHaveBeenCalledTimes(1);
+    expect(shMock).toHaveBeenCalledWith(built!.command, "/tmp", cfg.consult.stallMinutes * 60_000);
     expect(readdirSync(join(runDir, "consults")).some((f) => f.endsWith(".sh"))).toBe(false);
-    const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults"))[0]!);
-    const headlessCmd = fake.headlessCommand(promptFile, cfg.consult.model);
-    expect(headlessCmd).not.toContain("printf '%b");
-    expect(headlessCmd).not.toContain("TICKMARKR_EXIT");
+    const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!);
+    expect(built).toMatchObject({ promptFile, model: cfg.consult.model });
+    expect(readFileSync(promptFile, "utf8")).toContain("VERDICT_NONCE:");
   });
 
   test("waitOutput deadline tracks cfg.consult.stallMinutes", async () => {
@@ -331,19 +376,21 @@ describe("consult", () => {
 });
 
 // v1.54 T1: minimal seat adapter — a real shell command that echoes a nonce-bound verdict (object)
-// or junk (string). Invocation is counted at headlessCommand-build time; the model arg is recorded
-// so tests can pin WHICH seat (adapter AND model) tickmarkr actually invoked.
+// or junk (string). Invocation is counted at command-build time; the model arg is recorded so tests
+// can pin WHICH seat (adapter AND model) tickmarkr actually invoked in either visibility mode.
 function seatAdapter(id: string, verdict: unknown): { adapter: WorkerAdapter; calls: { count: number; models: string[] } } {
   const calls = { count: 0, models: [] as string[] };
+  const command = (promptFile: string, model: string): string => {
+    calls.count++;
+    calls.models.push(model);
+    if (typeof verdict !== "object" || verdict === null) return `echo ${shq(String(verdict))}`;
+    const js = `const fs=require("fs");const n=/VERDICT_NONCE: ([0-9a-f]+)/.exec(fs.readFileSync(${JSON.stringify(promptFile)},"utf8"))[1];console.log(JSON.stringify({nonce:n,...${JSON.stringify(verdict)}}))`;
+    return `node -e ${shq(js)}`;
+  };
   const adapter = {
     id,
-    headlessCommand(promptFile: string, model: string): string {
-      calls.count++;
-      calls.models.push(model);
-      if (typeof verdict !== "object" || verdict === null) return `echo ${shq(String(verdict))}`;
-      const js = `const fs=require("fs");const n=/VERDICT_NONCE: ([0-9a-f]+)/.exec(fs.readFileSync(${JSON.stringify(promptFile)},"utf8"))[1];console.log(JSON.stringify({nonce:n,...${JSON.stringify(verdict)}}))`;
-      return `node -e ${shq(js)}`;
-    },
+    headlessCommand: command,
+    interactiveCommand: command,
   } as unknown as WorkerAdapter;
   return { adapter, calls };
 }

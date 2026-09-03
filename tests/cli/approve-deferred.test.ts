@@ -70,7 +70,7 @@ const DISPOSITION_PARKS: Array<{ taskId: string; flags: string[]; token: Approva
   { taskId: "plain", flags: [], token: "dispatch", enacts: "dispatch it" },
   { taskId: "cap", flags: [], token: "fresh-budget", enacts: "dispatch it on a fresh attempt budget" },
   { taskId: "waive", flags: ["--waive"], token: "waive-gate", enacts: "continue past the approved gate" },
-  { taskId: "recheck", flags: ["--recheck"], token: "re-dispatch", enacts: "re-dispatch against the full gate suite" },
+  { taskId: "recheck", flags: ["--recheck"], token: "re-dispatch", enacts: "re-dispatch against the full gate suite only if re-running the whole declared battery on the parked commit before any worker is red" },
   { taskId: "uphold", flags: ["--uphold"], token: "fund-fixed-attempt", enacts: "dispatch a fixed attempt carrying the findings" },
 ];
 

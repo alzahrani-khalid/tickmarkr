@@ -15,6 +15,20 @@ function corpusCaseTitle(file: string): string {
 }
 
 describe("tickmarkr report --md (REC-01 execution record)", () => {
+  test("test: report renders a review row whose author and reviewer resolve to one true provider as pass same-provider independence not established and renders a review-leg2 journal row beside the daemon row it supersedes naming its reviewer and provider whereas a report that prints a bare pass for either fails", () => {
+    const events: JournalEvent[] = [
+      { ts: "2026-09-03T00:00:00.000Z", event: "run-start", data: { baseRef: "base" } },
+      { ts: "2026-09-03T00:00:01.000Z", event: "task-dispatch", taskId: "T5", data: { assignment: { adapter: "pi", model: "openai-codex/gpt-5.5", channel: "sub", tier: "frontier" } } },
+      { ts: "2026-09-03T00:00:02.000Z", event: "gate-result", taskId: "T5", data: { gate: "review", pass: true, details: "reviewer codex:gpt-5.6-sol (vendor: openai; provider: openai): approved" } },
+      { ts: "2026-09-03T00:00:03.000Z", event: "review-leg2", taskId: "T5", data: { pass: true, reviewer: "kimi:kimi-code/k3", vendor: "moonshot", provider: "moonshot", details: "approved" } },
+      { ts: "2026-09-03T00:00:04.000Z", event: "task-done", taskId: "T5", data: {} },
+      { ts: "2026-09-03T00:00:05.000Z", event: "run-end", data: { done: ["T5"], failed: [], human: [] } },
+    ];
+    const out = renderMarkdownRecord("run-provider-review", events);
+    expect(out).toContain("review: pass (same-provider — independence not established) — reviewer codex:gpt-5.6-sol");
+    expect(out).toContain("review-leg2: pass (supersedes daemon review) — reviewer kimi:kimi-code/k3 (vendor: moonshot; provider: moonshot)");
+  });
+
   test("synthetic journal renders outcome, attempts, channels, gates, consult, merge commit", async () => {
     const repo = makeRepo({ "keep.txt": "x\n" });
     const j = Journal.create(repo, "run-md-full");

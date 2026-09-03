@@ -114,7 +114,8 @@ describe("OrcaDriver", () => {
     expect(fake.calls.find((args) => args[1] === "create")).toEqual([
       "terminal", "create", "--worktree", `path:${WT}`, "--title", TITLE, "--command", "bash", "--json",
     ]);
-    expect(fake.calls.filter((args) => args[1] === "read").every((args) => args.includes("--limit") && !args.includes("--lines"))).toBe(true);
+    expect(fake.calls.filter((args) => args[1] === "read" && !args.includes("--screen"))
+      .every((args) => args.includes("--limit") && !args.includes("--lines"))).toBe(true);
     const unsupported = await fake.exec(["terminal", "read", "--terminal", fake.last()!.handle, "--lines", "3", "--json"], WT);
     const inventedCreate = await fake.exec([
       "terminal", "create", "--path", WT, "--title", TITLE, "--command", "bash", "--json",
@@ -275,7 +276,10 @@ describe("OrcaDriver", () => {
   });
 
   test("test: one shared envelope parser serves runtime status, terminal create, list, read, send, wait, show and close, and a table of malformed, truncated and ok-false fixtures per response family fails each invoking operation closed with raw bytes preserved for diagnostics, while a caller that reinterprets parser failure as empty output, unknown-but-successful status or a successful close fails", async () => {
-    expect([...ORCA_RESPONSE_FAMILIES]).toEqual(["status", "create", "list", "read", "send", "wait", "show", "close"]);
+    expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
+      "status", "create", "list", "read", "send", "wait", "show", "close",
+      "worktree-current", "hooks-status",
+    ]);
 
     // The shared parser itself refuses every degenerate fixture, for every family.
     for (const family of ORCA_RESPONSE_FAMILIES) {
@@ -302,6 +306,16 @@ describe("OrcaDriver", () => {
         const s = await bound(r.driver, r.fake, ["x"]);
         r.fake.restart("rt-2", [{ handle: "term_new", title: TITLE, worktree: WT }]);
         return r.driver.read(s, 3);
+      },
+      "worktree-current": async (o) => {
+        const r = rig(o);
+        return r.driver.run(await r.driver.slot(WT, TITLE), "bash");
+      },
+      "hooks-status": async (o) => {
+        const r = rig(o);
+        const s = await r.driver.slot(WT, TITLE, { agent: "claude-code" });
+        await r.driver.run(s, "bash");
+        return r.driver.status(s);
       },
     };
     for (const family of ORCA_RESPONSE_FAMILIES) {
@@ -803,6 +817,121 @@ describe("OrcaDriver", () => {
     expect(await asDelivered()).toBe(true);
     expect(await asEmpty()).toBe("");
     expect(refused.fake.sent.get(handle)).toBeUndefined(); // the "delivered" control delivered nothing
+  });
+
+  test("test: status reads the rendered screen so a fixture whose screen read reports source screen-unavailable answers unknown with zero wait calls and never idle while the trailer sweep still finds a marker split across two cursor-paged stream reads whereas a driver whose status leg reads the stream or treats screen-unavailable as idle fails", async () => {
+    const unavailable = rig();
+    const unavailableSlot = await bound(unavailable.driver, unavailable.fake, ["fragment", "prompt"]);
+    unavailable.fake.last()!.screenSource = "screen-unavailable";
+    unavailable.fake.last()!.tuiIdle = true; // a stream/probe-based implementation would say idle
+
+    expect(await unavailable.driver.status(unavailableSlot)).toBe("unknown");
+    expect(unavailable.fake.countOf("wait")).toBe(0);
+    const statusReads = unavailable.fake.calls.filter((call) => call[0] === "terminal" && call[1] === "read");
+    expect(statusReads).toHaveLength(1);
+    expect(statusReads[0]).toContain("--screen");
+    expect(statusReads[0]).not.toContain("--cursor");
+    expect(statusReads[0]).not.toContain("--limit");
+
+    const trailer = rig();
+    const trailerSlot = await bound(trailer.driver, trailer.fake, pagedMarkerLines());
+    expect(await trailer.driver.waitOutput(trailerSlot, ORCA_LITERAL_MARKER, 1_000)).toBe(true);
+    const streamPages = trailer.fake.calls.filter((call) =>
+      call[0] === "terminal" && call[1] === "read" && call.includes("--cursor"));
+    expect(streamPages.length).toBeGreaterThanOrEqual(2);
+    expect(streamPages.every((call) => !call.includes("--screen"))).toBe(true);
+    expect(streamPages.map((call) => call[call.indexOf("--cursor") + 1])).toContain("0");
+
+    // The two adjacent false-clean rules the production assertions above exclude.
+    const streamStatus = (source: string, tuiIdle: boolean) => source === "stream" && tuiIdle ? "idle" : "unknown";
+    const unavailableAsIdle = (source: string) => source === "screen-unavailable" ? "idle" : "unknown";
+    expect(streamStatus("stream", true)).toBe("idle");
+    expect(unavailableAsIdle("screen-unavailable")).toBe("idle");
+  });
+
+  test("test: a slot created with agent claude-code answers blocked from show agentWait with zero wait calls and a slot whose agent's Orca hook is not_installed answers unknown with zero wait calls while a slot whose agent is hooked or unlisted still probes tui-idle once whereas a driver that probes every slot or fabricates idle for an unhooked agent fails", async () => {
+    const makeAgentSlot = async (opts: FakeOrcaOpts, agent: string) => {
+      const r = rig(opts);
+      const slot = await r.driver.slot(WT, TITLE, { agent });
+      await r.driver.run(slot, "bash");
+      return { ...r, slot };
+    };
+
+    const blocked = await makeAgentSlot({
+      hookStatuses: [{ agent: "claude", state: "not_installed" }],
+    }, "claude-code");
+    blocked.fake.last()!.agentWait = true;
+    expect(await blocked.driver.status(blocked.slot)).toBe("blocked");
+    expect(blocked.fake.countOf("wait")).toBe(0);
+    expect(blocked.fake.countOf("hooks-status")).toBe(0); // show is authoritative before coverage
+
+    const unhooked = await makeAgentSlot({
+      hookStatuses: [{ agent: "claude", state: "not_installed" }],
+    }, "claude-code");
+    unhooked.fake.last()!.tuiIdle = true; // must not fabricate idle without a working hook
+    expect(await unhooked.driver.status(unhooked.slot)).toBe("unknown");
+    expect(unhooked.fake.countOf("wait")).toBe(0);
+    expect(unhooked.fake.countOf("hooks-status")).toBe(1);
+    expect(await unhooked.driver.status(unhooked.slot)).toBe("unknown");
+    expect(unhooked.fake.countOf("hooks-status")).toBe(1); // cached per driver
+    expect(unhooked.fake.countOf("wait")).toBe(0);
+
+    const hooked = await makeAgentSlot({
+      hookStatuses: [{ agent: "codex", state: "installed" }],
+    }, "codex");
+    hooked.fake.last()!.tuiIdle = true;
+    expect(await hooked.driver.status(hooked.slot)).toBe("idle");
+    expect(hooked.fake.countOf("wait")).toBe(1);
+
+    const unlisted = await makeAgentSlot({
+      hooksEnabled: false, // absence stays inconclusive even when managed hooks are globally off
+      hookStatuses: [{ agent: "codex", state: "installed" }],
+    }, "opencode");
+    expect(await unlisted.driver.status(unlisted.slot)).toBe("unknown");
+    expect(unlisted.fake.countOf("wait")).toBe(1);
+
+    for (const r of [hooked, unlisted]) {
+      const show = r.fake.families().indexOf("show");
+      const wait = r.fake.families().indexOf("wait");
+      expect(show).toBeGreaterThanOrEqual(0);
+      expect(wait).toBeGreaterThan(show);
+    }
+  });
+
+  test("test: the shared envelope parser serves worktree current and agent hooks status exactly as it serves the eight terminal families so a malformed truncated or ok-false body on either fails the invoking method explicitly whereas a driver that reads a parse failure as not-yet-adopted or as fully hooked fails", async () => {
+    expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
+      "status", "create", "list", "read", "send", "wait", "show", "close",
+      "worktree-current", "hooks-status",
+    ]);
+    for (const family of ["worktree-current", "hooks-status"] as const) {
+      for (const raw of [MALFORMED, TRUNCATED, OK_FALSE]) {
+        expect(() => parseEnvelope(family, raw)).toThrow(OrcaError);
+        const r = rig({ raw: { [family]: raw } });
+        const slot = await r.driver.slot(WT, TITLE, { agent: "claude-code" });
+        let error: unknown;
+        if (family === "worktree-current") {
+          error = await r.driver.run(slot, "bash").then(() => undefined, (reason: unknown) => reason);
+          expect(r.fake.countOf("create")).toBe(0);
+        } else {
+          await r.driver.run(slot, "bash");
+          error = await r.driver.status(slot).then(() => undefined, (reason: unknown) => reason);
+          expect(r.fake.countOf("wait")).toBe(0);
+        }
+        expect(error, `${family} survived ${JSON.stringify(raw)}`).toBeInstanceOf(OrcaError);
+        expect((error as OrcaError).family).toBe(family);
+        expect((error as OrcaError).raw).toBe(raw);
+      }
+    }
+
+    const parseFailureAsNotYet = (_raw: string): "not-yet" => {
+      try { JSON.parse(_raw); } catch { return "not-yet"; }
+      return "not-yet";
+    };
+    const parseFailureAsHooked = (_raw: string): boolean => {
+      try { return JSON.parse(_raw).result.statuses.length > 0; } catch { return true; }
+    };
+    expect(parseFailureAsNotYet(TRUNCATED)).toBe("not-yet");
+    expect(parseFailureAsHooked(TRUNCATED)).toBe(true);
   });
 
   test("test: an agent-wait state maps to blocked and tui-idle maps to idle and an absent agent field maps to unknown while a driver that fabricates a definite status from the absent field fails", async () => {

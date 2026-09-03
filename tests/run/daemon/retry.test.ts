@@ -1193,6 +1193,49 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     expect(promptOf(repo, "run-repair-budget", 3)).toContain("applyMarker");
   }, 180_000);
 
+  test("test: a funded repair whose battery died at the test gate before reaching the review gate it was funded for is not charged so a third repair is still funded and the repair-exhausted row names per repair the funded gates the gate reached and the gate it died at whereas the shipped counter that charges every repair-attempt row and names only the last round's failing gates fails", async () => {
+    const runId = "run-repair-reached";
+    const testCmd = "test ! -f broken.txt";
+    const { repo, fake } = setupRepo(
+      [T("T1", { status: "human", humanGate: true, complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
+      {
+        review: { approve: false, findings: [{ note: "`fixReview` in src/review.ts is incomplete", severity: "material" }] },
+        consult: { action: "human", notes: "repair ladder exhausted" },
+        tasks: { T1: [
+          { shell: `echo one > marker.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } },
+          { shell: `echo broken > broken.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } },
+          { shell: `git rm -q broken.txt && echo three > marker.txt && ${COMMIT} three`, result: { ok: true, summary: "three" } },
+          { shell: `echo four > marker.txt && ${COMMIT} four`, result: { ok: true, summary: "four" } },
+          { shell: `echo five > marker.txt && ${COMMIT} five`, result: { ok: true, summary: "five" } },
+          { shell: `echo six > marker.txt && ${COMMIT} six`, result: { ok: true, summary: "six" } },
+        ] },
+      },
+      `gates: { test: ${JSON.stringify(testCmd)} }\n`,
+    );
+    const journal = Journal.create(repo, runId);
+    journal.append("run-start", undefined, {
+      baseRef: await gitHead(repo), commands: { test: testCmd },
+      graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
+    });
+    journal.append("task-human", "T1", { kind: "human-gate", reason: "seed repair accounting" });
+    writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({
+      commands: { test: { exitCode: 0, fingerprints: [] } },
+    }));
+    await approve([runId, "T1", "--review-rounds", "10", "--by", "test"], repo);
+    await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    const events = evsOf(repo, runId);
+    const repairs = events.filter((e) => e.event === "repair-attempt" && e.taskId === "T1");
+    expect(repairs).toHaveLength(3);
+    expect(repairs.map((e) => e.data.repair)).toEqual([1, 2, 3]);
+    const exhausted = events.find((e) => e.event === "repair-exhausted" && e.taskId === "T1")!;
+    expect(exhausted.data.repairs).toBe(2);
+    expect(exhausted.data.reached).toEqual([
+      expect.objectContaining({ repair: 1, funded: ["review"], reached: expect.arrayContaining(["test"]), diedAt: "test", charged: false }),
+      expect.objectContaining({ repair: 2, funded: ["test"], reached: expect.arrayContaining(["test", "review"]), diedAt: "review", charged: true }),
+      expect.objectContaining({ repair: 3, funded: ["review"], reached: expect.arrayContaining(["review"]), diedAt: "review", charged: true }),
+    ]);
+  }, 180_000);
+
   test("a single failing test gate over landed commits earns a repair, though the evidence gate never ran", async () => {
     // runGates returns at the first red gate, so a failing test gate never reaches the evidence
     // stage and its commit list comes back empty. The repair decision must measure the landed work

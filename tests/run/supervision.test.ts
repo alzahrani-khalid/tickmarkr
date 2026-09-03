@@ -192,6 +192,7 @@ describe("supervision tier liveness", () => {
 
   test("test: an obligation recorded at a threshold crossing survives a stand-down written after it, so firing the alarm cannot clear the duty the alarm raised", async () => {
     const repo = mkRepo();
+    tickmarkrDir(repo); // the CLI writer now requires pre-existing repository state
     await beat([
       "overseer-context", "--seat", "OVSR-w1:p2", "--arm-id", "arm-before-clear",
       "--pct", "55", "--threshold-pct", "50",

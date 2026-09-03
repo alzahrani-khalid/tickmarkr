@@ -89,7 +89,7 @@ describe("init wizard act 1", () => {
     });
   });
 
-  test("the guided init driver cycle offers orca with orca-specific environment copy and auto still described as herdr-else-subprocess while the shipped cycle limited to auto, herdr and subprocess fails", async () => {
+  test("test: the guided init driver cycle describes auto as herdr when HERDR_ENV is 1 else orca inside an Orca terminal else subprocess and describes orca as picked by auto inside one whereas the shipped copy saying auto never picks orca fails", async () => {
     // three cycles from the seeded auto: herdr → subprocess → orca. A cycle holding only
     // auto/herdr/subprocess wraps back to auto here and never renders the orca copy.
     const { result, io } = run(fields(), [KEYS.space, KEYS.space, KEYS.space, ...TO_CONTINUE, KEYS.enter], makeFrameIO());
@@ -98,11 +98,11 @@ describe("init wizard act 1", () => {
     if (outcome.kind === "continue") expect(outcome.overlay.driver).toBe("orca");
 
     const frames = strip(io.writes.join(""));
-    // orca's own environment — its terminals, and that only an explicit choice reaches it
+    // Orca's own environment is auto-detected; elsewhere, the named option remains available.
     expect(frames).toContain("orca: visible terminals in the Orca app");
-    expect(frames).toContain("an explicit choice, never auto's");
-    // auto's meaning is untouched by the fourth driver
-    expect(frames).toContain("auto: herdr when HERDR_ENV=1, else subprocess");
+    expect(frames).toContain("picked by auto inside one; name it elsewhere");
+    expect(frames).toContain("auto: herdr when HERDR_ENV=1, else orca inside an Orca terminal, else subprocess");
+    expect(frames).not.toContain("never orca");
   });
 
   test("cycling driver twice from auto lands on subprocess", async () => {

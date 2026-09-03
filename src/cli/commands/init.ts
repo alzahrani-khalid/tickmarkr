@@ -1,5 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
@@ -8,6 +9,7 @@ import { configTemplate, DEFAULT_CONFIG, globalConfigDir, loadConfig, type Tickm
 import { LEGACY_PREFIX, specTemplate } from "../../compile/native.js";
 import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir } from "../../graph/graph.js";
+import { orcaHostDetected } from "../../drivers/index.js";
 import { Journal } from "../../run/journal.js";
 import { doctor } from "./doctor.js";
 import { assembleFleetEditor } from "./fleet.js";
@@ -15,15 +17,14 @@ import { assembleFleetEditor } from "./fleet.js";
 const SCAFFOLD_SPEC = "tickmarkr.spec.md";
 
 // Operator-approved (2026-07-17) environments footer — no npm install for herdr (npm package
-// "herdr" is a reserved 0.0.0 placeholder as of that date). The orca row joins it with the v2.1
-// driver: it is a THIRD execution surface an operator selects outright — `auto` still resolves
-// herdr-else-subprocess and never picks it, so the footer names it beside the other two choices.
+// "herdr" is a reserved 0.0.0 placeholder as of that date). Auto resolves herdr → orca →
+// subprocess; the orca leg is environment-only, using the two markers Orca stamps in its terminals.
 const ENVIRONMENTS_FOOTER = [
   "environments:",
-  "  herdr — the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev",
-  "  orca — visible terminals in the Orca app — an explicit driver choice: set driver: orca (auto never picks it) · https://onorca.dev",
+  "  herdr — the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev · auto picks it first when HERDR_ENV=1",
+  "  orca — visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and before subprocess; set driver: orca to force it · https://onorca.dev",
   "  claude code — tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
-  "  anywhere — no herdr? same fail-closed gates, headless subprocess driver",
+  "  anywhere — no herdr or Orca terminal? same fail-closed gates, headless subprocess driver (legacy: no herdr? same fail-closed gates, headless subprocess driver when Orca markers are absent)",
 ].join("\n");
 
 /** Latest journal without a run-end event, if any. */
@@ -143,17 +144,6 @@ you were handed the whole picture — list the repository root, open every guida
   direction each moves, what makes a criterion real, and why an absence or a source-text grep is never a
   criterion. Read it before authoring or repairing acceptance items.
 - **Editing \`src/gates/\`, \`src/compile/\` or \`src/graph/\`?** Read \`docs/codebase/ARCHITECTURE.md\` first.
-- **EVERY fix gets a ship/no-ship decision, recorded, at the moment it is made.** Ask one question of each
-  one: *does a user hit this defect?* If yes, the fix belongs in \`src/**\` or \`skills/**\` — the only trees
-  the package carries (\`files: [dist, schema, skills, fixtures]\`). A script, overlay, config entry or
-  operator-side workaround that resolves the symptom **locally is not the fix; it is a decision to leave
-  every other user broken**, and it must say so in writing and name the condition that removes it.
-  **The default answer is SHIP.** A local remedy is the exception and carries the burden of proof.
-  Watch for the three shapes this hides in: a fix applied where you happened to be standing rather than
-  where the defect lives; an observation filed with a product fix named in its own text and queued
-  nowhere; and a local tool that quietly grows into a product feature nobody shipped. **A defect and its
-  fix must be recorded in the same place, or the queue silently becomes a list of things everyone assumed
-  someone else had shipped.**
 ${DOCS_END}
 `;
 
@@ -235,7 +225,27 @@ const describeDrift = (d: SkillDrift) => [
 // different answer (`--agent --force`), and it is reported by name on every init path below.
 const skillsInstalled = (cwd: string) =>
   hostTargets(cwd).every((t) => AGENT_SKILLS.every((s) => existsSync(join(t.skillsDir, s, "SKILL.md"))));
-const wizardDriverDefault = (): TickmarkrConfig["driver"] => process.env.HERDR_ENV === "1" ? "herdr" : "auto";
+const wizardDriverDefault = (): TickmarkrConfig["driver"] => process.env.HERDR_ENV === "1" ? "herdr" : orcaHostDetected() ? "orca" : "auto";
+
+function packageName(cwd: string): string | null {
+  try {
+    const parsed = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")) as { name?: unknown };
+    return typeof parsed.name === "string" ? parsed.name : null;
+  } catch {
+    return null;
+  }
+}
+
+function gitTracked(cwd: string, path: string): boolean {
+  const rel = relative(cwd, path);
+  if (rel.startsWith("..")) return false;
+  try {
+    execFileSync("git", ["ls-files", "--error-unmatch", "--", rel], { cwd, stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function installAgentFiles(cwd: string, force: boolean, docs: boolean, notes: string[]): Promise<void> {
   const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
@@ -264,13 +274,14 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
           notes.push(`kept current ${dest}`);
           continue;
         }
+        const tracked = exists && gitTracked(cwd, dest);
         if (exists && !force && !(await confirm(`Overwrite ${dest} (${describeDrift(stale!)})?`))) {
-          notes.push(`skipped existing ${dest} — ${describeDrift(stale!)}; pass --force to overwrite it`);
+          notes.push(`skipped existing ${tracked ? "tracked " : ""}${dest} — ${describeDrift(stale!)}; pass --force to overwrite it`);
           continue;
         }
         // whole skill dir, not just SKILL.md — the overseer ships its pane-watcher script
         cpSync(fileURLToPath(new URL(`../../../skills/${skill}`, import.meta.url)), join(skillsDir, skill), { recursive: true });
-        notes.push(`${exists ? "overwrote" : "wrote"} ${dest}`);
+        notes.push(`${exists ? "overwrote" : "wrote"} ${tracked ? "tracked " : ""}${dest}`);
       }
 
       const current = existsSync(docPath) ? readFileSync(docPath, "utf8") : "";
@@ -356,6 +367,9 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   });
   // banner at START on the visual surface — every init path, not just the wizard, and never trailing the probe (operator report 2026-07-17)
   emitBanner();
+  if (packageName(cwd) === "tickmarkr") {
+    throw new Error("OBS-584: tickmarkr init refuses to run inside the tickmarkr source repository");
+  }
   const gdir = values["global-dir"] ?? globalConfigDir();
   mkdirSync(gdir, { recursive: true });
   const notes: string[] = [];

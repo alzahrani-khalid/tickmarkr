@@ -11,14 +11,21 @@ import type { ExecutorDriver, NotifyOpts, Slot } from "./types.js";
 // consumers only ever tail-read.
 export const MAX_BUF = 2 * 1024 * 1024;
 
-// OBS-17 / v1.22 T3: control-plane vars that let a process talk to the operator's herdr.
-// Workers, judges, reviewers, and consults must never inherit them — only the daemon process
-// (and its own herdr driver CLI calls) keep the live session. Socket path is the wire; HERDR_ENV
-// is the "I am inside herdr" gate every agent skill checks before mutating panes.
-export const HERDR_CONTROL_VARS = ["HERDR_ENV", "HERDR_SOCKET_PATH"] as const;
+// OBS-17 / v1.22 T3 and OBS-843: host control-plane vars that let a process address the operator's
+// herdr or Orca UI. Workers, judges, reviewers, and consults must never inherit them — only the
+// daemon process and its driver calls keep the live session. TERM_PROGRAM is host description, not
+// an addressing capability, and ORCA_AGENT_HOOK_* belongs to agent status transport, so both stay.
+// Keep the exported name for compatibility even though the list is now host-neutral.
+export const HERDR_CONTROL_VARS = [
+  "HERDR_ENV",
+  "HERDR_SOCKET_PATH",
+  "ORCA_TERMINAL_HANDLE",
+  "ORCA_PANE_KEY",
+  "ORCA_TAB_ID",
+] as const;
 
 /**
- * Copy of worker env with the fork cap applied and herdr control-plane vars stripped.
+ * Copy of worker env with the fork cap applied and host control-plane vars stripped.
  * The cap is the one the enclosing run resolved (resolvedForkCap) — a worker's suites divide the
  * same machine the gate shells do, so both seams have to read the same run-owned number rather
  * than a flat constant. The operator's own export still wins.
@@ -30,7 +37,7 @@ export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Proce
   return out;
 }
 
-/** Pane/login-shell form of the same worker env seal (herdr seed + daemon setup). */
+/** Pane/login-shell form of the same host-neutral worker env seal (herdr seed + daemon setup). */
 export function herdrSealShellPrefix(env: NodeJS.ProcessEnv = process.env): string {
   const forkCap = sealHerdrEnv(env)[FORK_CAP_ENV] ?? resolvedForkCap();
   return `export ${FORK_CAP_ENV}=${shq(forkCap)}; ` +
@@ -64,8 +71,8 @@ export class SubprocessDriver implements ExecutorDriver {
     // HARD-05: interactive=false — no operator, so an open stdin pipe is a promise tickmarkr can never
     // keep; codex exec appends a piped stdin as a <stdin> block (`codex exec --help`) and blocks on a
     // read that never EOFs. One spawn site covers every adapter (D-06).
-    // v1.22 T3: seal herdr control vars so worker/judge/review/consult children cannot reach the
-    // operator's herdr (OBS-17 watch-tab leak class). process.env of the daemon is untouched.
+    // v1.22 T3 / OBS-843: seal host control vars so worker/judge/review/consult children cannot
+    // address the operator's herdr or Orca UI. process.env of the daemon is untouched.
     const p = spawn("bash", ["-lc", cmd], {
       cwd: slot.cwd,
       stdio: ["ignore", "pipe", "pipe"],

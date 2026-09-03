@@ -181,6 +181,30 @@ export async function captureLlmOutput<T>(run: () => Promise<T>): Promise<{ valu
   return { value, outputs };
 }
 
+export interface LlmRunResult {
+  output: string;
+  exitCode?: number;
+  timedOut: boolean;
+}
+
+async function runHeadlessDetailed(
+  adapter: WorkerAdapter,
+  model: string,
+  prompt: string,
+  cwd: string,
+  timeoutMs = 300000,
+): Promise<LlmRunResult> {
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
+  try {
+    const pf = join(dir, "prompt.md");
+    writeFileSync(pf, prompt);
+    const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
+    return { output: r.stdout + "\n" + r.stderr, exitCode: r.code, timedOut: r.timedOut === true };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export async function runHeadless(
   adapter: WorkerAdapter,
   model: string,
@@ -188,27 +212,19 @@ export async function runHeadless(
   cwd: string,
   timeoutMs = 300000,
 ): Promise<string> {
-  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
-  try {
-    const pf = join(dir, "prompt.md");
-    writeFileSync(pf, prompt);
-    const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
-    return r.stdout + "\n" + r.stderr;
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  return (await runHeadlessDetailed(adapter, model, prompt, cwd, timeoutMs)).output;
 }
 
 // v1.1 default path: the same headless CLI call, but dispatched through the driver
 // as a visible named agent (herdr pane), with the quote-split completion wrapper.
-export async function runViaDriver(
+async function runViaDriverDetailed(
   adapter: WorkerAdapter,
   model: string,
   prompt: string,
   cwd: string,
   via: LlmVia,
   timeoutMs = 300000,
-): Promise<string> {
+): Promise<LlmRunResult> {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
   let slot: Slot | undefined;
   let accountant: GateCpuAccountant | undefined;
@@ -240,6 +256,7 @@ export async function runViaDriver(
     // false-complete — same guard the worker path uses (daemon.ts:330-331).
     const exitPattern = `TICKMARKR_EXIT_${nonce}:\\d`;
     let out: string;
+    let timedOut = false;
     const gatePrompt = prompt.startsWith("TICKMARKR-JUDGE") || prompt.startsWith("TICKMARKR-REVIEW");
     if (!gatePrompt) {
       await via.driver.waitOutput(slot, exitPattern, timeoutMs, { regex: true });
@@ -305,8 +322,14 @@ export async function runViaDriver(
           break;
         }
       }
+      timedOut = Date.now() - startedAt >= timeoutMs && !new RegExp(exitPattern).test(out);
     }
-    return dewrapPaneVerdict(out, nonce);
+    const exitCode = Number(new RegExp(`TICKMARKR_EXIT_${nonce}:(\\d+)`).exec(out)?.[1]);
+    return {
+      output: dewrapPaneVerdict(out, nonce),
+      ...(Number.isFinite(exitCode) ? { exitCode } : {}),
+      timedOut,
+    };
   } finally {
     try {
       await accountant?.stop();
@@ -316,6 +339,17 @@ export async function runViaDriver(
       rmSync(dir, { recursive: true, force: true });
     }
   }
+}
+
+export async function runViaDriver(
+  adapter: WorkerAdapter,
+  model: string,
+  prompt: string,
+  cwd: string,
+  via: LlmVia,
+  timeoutMs = 300000,
+): Promise<string> {
+  return (await runViaDriverDetailed(adapter, model, prompt, cwd, via, timeoutMs)).output;
 }
 
 // OBS-155: a TUI renders the verdict as a bullet and HARD-wraps it at pane width with a 2-space
@@ -372,6 +406,21 @@ export function dewrapPaneVerdict(out: string, nonce: string): string {
   return out;
 }
 
+export async function runLlmDetailed(
+  adapter: WorkerAdapter,
+  model: string,
+  prompt: string,
+  cwd: string,
+  via?: LlmVia,
+  timeoutMs = 300000,
+): Promise<LlmRunResult> {
+  const result = await (via
+    ? runViaDriverDetailed(adapter, model, prompt, cwd, via, timeoutMs)
+    : runHeadlessDetailed(adapter, model, prompt, cwd, timeoutMs));
+  llmOutputCapture.getStore()?.push(result.output);
+  return result;
+}
+
 export async function runLlm(
   adapter: WorkerAdapter,
   model: string,
@@ -380,11 +429,7 @@ export async function runLlm(
   via?: LlmVia,
   timeoutMs = 300000,
 ): Promise<string> {
-  const out = await (via
-    ? runViaDriver(adapter, model, prompt, cwd, via, timeoutMs)
-    : runHeadless(adapter, model, prompt, cwd, timeoutMs));
-  llmOutputCapture.getStore()?.push(out);
-  return out;
+  return (await runLlmDetailed(adapter, model, prompt, cwd, via, timeoutMs)).output;
 }
 
 export function extractJson<T>(raw: string): T | null {

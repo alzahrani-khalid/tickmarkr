@@ -7,7 +7,7 @@
 > ("state is files + git only"). What would normally be "external integrations" in a web app are,
 > here, **subprocess CLIs**: seven AI coding-agent CLIs it dispatches work to, plus the `herdr` terminal
 > multiplexer CLI it optionally uses as an execution driver and the `orca` CLI it uses as an
-> explicit-selection one. Every integration in this document is a
+> auto-detected-inside-Orca or explicitly named one. Every integration in this document is a
 > local binary invoked with `spawn`/`bash -lc`, never an HTTP call.
 
 ## APIs & External Services
@@ -87,8 +87,8 @@ The native Claude Code integration remains fully supported. Repositories with `.
   - `herdr pane close <pane>` - best-effort teardown (`:85-88`)
 - Every LLM call site (worker, acceptance judge, cross-vendor review, stall-consult) can run as a visible named herdr pane when `visibility.llm: "pane"` is set (`DEFAULT_CONFIG` defaults to `"headless"`, `src/config/config.ts:325`); headless is the default, pane is the opt-in (`src/gates/llm.ts` `runHeadless` vs `runViaDriver`)
 
-**orca (Orca app CLI) — explicit selection only:**
-- Selected only when the operator names it: `--driver orca` or `driver: orca` (`DRIVER_CHOICES`, `src/drivers/index.ts:7`; validated at the argv boundary by `parseDriverOverride`, `:11-15`). `pickDriver`'s `auto` fallback resolves to `HerdrDriver` or `SubprocessDriver` and **never** to `OrcaDriver` (`:22-28`), so orca is never inherited from an ambient env var the way `HERDR_ENV=1` selects herdr — and an unreachable orca is never silently substituted with a hidden subprocess worker after that explicit choice (`:24-26`)
+**orca (Orca app CLI) — detected inside Orca, explicitly named elsewhere:**
+- `auto` resolves `HerdrDriver` first when `HERDR_ENV=1`, then `OrcaDriver` only when both Orca-authored markers `TERM_PROGRAM=Orca` and `ORCA_TERMINAL_HANDLE` are present, then `SubprocessDriver` (`orcaHostDetected`, `src/drivers/index.ts`). Selection reads environment only: it executes no binary or runtime probe. Outside an Orca terminal, select it explicitly by name with `--driver orca` or `driver: orca` (validated at the argv boundary by `parseDriverOverride`). Once Orca is selected either way, an unreachable runtime fails loudly on Orca and is never substituted with a hidden subprocess worker
 - `OrcaDriver` (`src/drivers/orca.ts`) shells out to the `orca` binary for terminal lifecycle only — `terminal create|list|read|send|wait|show|close` plus `status` for runtime identity — all through one shared envelope parser that fails closed on an `ok:false` refusal (`ORCA_RESPONSE_FAMILIES`, `:35-36`)
 - `--worktree` takes a **selector**, so every call names `path:<abs>` and verifies the checkout that came back; letting `active`/`current` resolve whatever the UI has focused would hand orca the isolation the worktree exists for (`src/drivers/orca.ts` header, T2)
 - **tickmarkr retains worktrees, gates and merge authority; orca supplies visible terminals only:**
@@ -147,7 +147,8 @@ The native Claude Code integration remains fully supported. Repositories with `.
 - None required for basic operation (`compile`/`plan`/`doctor` work with zero env vars).
 
 **Optional env vars:**
-- `HERDR_ENV=1` - enables the herdr visible-pane driver (there is no orca equivalent: orca is selected by name, never by environment)
+- `HERDR_ENV=1` - makes auto select the herdr visible-pane driver before any other host
+- `TERM_PROGRAM=Orca` together with `ORCA_TERMINAL_HANDLE` - makes auto select Orca; outside an Orca terminal, name `--driver orca` explicitly
 - `TICKMARKR_FAKE_SCRIPT=<path>` - enables the deterministic fake adapter (tests only)
 - `TICKMARKR_E2E=1` - unskips the real-CLI e2e suite
 - `XDG_CONFIG_HOME=<dir>` - relocates the global config directory

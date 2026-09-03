@@ -48,6 +48,15 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    a watcher you know is alive. Earned 2026-08-25 (OBS-622): a handoff recorded *"artifact watcher armed"*
    over two live consult verdicts; at adopt the only `watch-artifacts.sh` on the machine belonged to a
    different repository, and nothing had been watching either file.
+   **WATCHER OWNERSHIP IS THE ARMING SEAT'S RECORDED PID, NEVER A NAME PATTERN.** Every bundled
+   `watch-*.sh` arm sets `TKR_ARMING_SEAT=<seat>` and writes its own pid under
+   `<state-dir>/overseer/pids/<arming-seat>-<script>-<pid>.pid`. A seat retires only watchers it armed,
+   by reading those files and killing the exact recorded pids; it never uses `pkill -f`, `pgrep -f`, or
+   any argv/path pattern. A journal path is shared by partner tiers and therefore cannot prove ownership.
+   Verify each executing pid in two process-table reads before acting, kill-by-pid, arm the replacement,
+   then verify its new pid in two process-table reads. A stand-down order inventories both sets: the
+   ordering seat's recorded pids to retire, and the partner's watchers armed on the ordering seat that
+   must survive it. This is the stand-down order of 222-11, not a best-effort sweep.
    **An adopted seat ANNOUNCES itself, in the same act as re-arming:** tell the adopted orchestrator the
    fresh seat is live (verified send: probe token + read-back). Through the gap its view of your tier read
    STALE, and a tier that believes it is unsupervised escalates into a file nobody is reading. Earned
@@ -289,8 +298,11 @@ on its owner being free is scheduled, not armed* — applies to itself:
 .claude/skills/tickmarkr-overseer/scripts/watch-contamination.sh <journal> <load-ceiling> <poll-s> <cap-s>
 ```
 
-It wakes on a new **failed** `gate-result` carrying an infrastructure fingerprint, or on sustained load
-above a ceiling, and prints one wake reason. **Two triggers, because one is provably not enough:** run
+It wakes on a new **failed runner `test`, `build`, or `lint`** `gate-result` carrying an infrastructure
+fingerprint in the runner-emitted failure lines, or on sustained load above a ceiling, and prints one
+wake reason. It deliberately ignores the same tokens inside review findings, acceptance prose, and the
+secondary fingerprint echo list: quoted discussion of contamination is not contamination. **Two triggers,
+because one is provably not enough:** run
 against the four reds above, the fingerprint trigger caught the `vitest-worker` timeout and correctly
 refused to launder either review rejection — and **missed** the 1-of-3074 case, whose text looks like an
 ordinary assertion failure. Only the load ceiling catches that one. A single-signal version reads as
@@ -323,7 +335,10 @@ when the run's own status text pushed the percentage off the statusline; and an 
 The protocol, in both directions:
 
 1. **Overseer sees orch at ≥50%** → nudge it: write `HANDOFF-ORCH-<ver>.md`, then `/clear`, then re-read
-   its brief **and** its handoff, then **re-arm every watcher it listed** (a cleared session has none).
+   its brief **and** its handoff. **A same-process `/clear` keeps every background task alive**; it clears
+   conversation context, not processes. Re-arm is therefore a controlled replacement: read only this
+   seat's pid files, verify each pid in two process-table reads, kill those exact pids, arm replacements,
+   and verify every new pid in two reads. Never retire by pattern.
 2. **The returning orch, now fresh, checks the OVERSEER.** If the overseer is at ≥50%, it directs the
    overseer to write its handoff and clear, and **points it at `HANDOFF-OVERSEER-<ver>.md` by path**.
 3. Whichever seat is fresh performs the check. **Never both at once** — the run keeps one supervising tier
@@ -345,8 +360,9 @@ The protocol, in both directions:
    herdr pane run <my-pane> "/clear"
    #    read the pane back — a cleared claude session shows an empty prompt and a reset context gauge
    # 4. and only THEN, as a SEPARATE send, the re-orientation:
-   herdr pane run <my-pane> "You were cleared at <N>%. Read <handoff> and <brief>, re-arm EVERY watcher
-   they name — a cleared session has none — then confirm you are back."
+   herdr pane run <my-pane> "You were cleared at <N>%. Read <handoff> and <brief>. Same-process clear kept
+   every background task alive: retire only your recorded watcher pids, verify twice, kill-by-pid, arm,
+   verify every new pid twice, preserve the partner-owned watchers the stand-down lists, then confirm."
    ```
 
    ⚠ **Steps 3 and 4 are two sends, never one.** A pointer batched with the clear lands *during* it and is
@@ -507,7 +523,11 @@ they are left implicit:
   sleep 2–3s → send-keys Enter → read back (input empty / agent `working`). Never report "briefed" without
   the read-back. Long content goes in a brief file, never pane text. `scripts/seat-send.sh` encodes
   this whole path — size guard, atomic prompt, prompt-line read-back, optional interrupt — and never
-  auto-resends.
+  auto-resends. Each adapter declares its prompt glyph beside its input-box matchers; `seat-send.sh` reads
+  that declaration rather than assuming Claude's `❯`. **Probe the prompt line before writing:** if it
+  already holds a non-ghost draft, wait only the script's bounded window and return `SEND_DEFERRED`
+  without writing a byte. An unsubmitted post-send draft returns `SEND_UNSUBMITTED`. This protects both
+  Codex's `›` prompt and a HUMAN typing in a pane; delivery is never allowed to glue onto either draft.
   **PROBE THE READ-BACK WITH THE SHORTEST DISTINCTIVE TOKEN — a commit hash, a pid, an OBS id — NEVER a
   sentence.** A long phrase crosses the pane's render wrap boundary, so grepping for it returns zero on a
   message that arrived intact, and **a badly-probed successful send is byte-identical to a truncated one.**
@@ -802,12 +822,17 @@ nowhere.
 **The artifact watcher** — bundled, and keyed on the deliverable rather than the seat:
 
 ```bash
-.claude/skills/tickmarkr-overseer/scripts/watch-artifacts.sh <MARKER> <cap-s> <poll-s> <file>...
+TKR_ARMING_SEAT=<this-seat> .claude/skills/tickmarkr-overseer/scripts/watch-artifacts.sh \
+  [--changed-from <content-sha-or-now>] <MARKER> <cap-s> <poll-s> <file>...
 ```
 
 It wakes when every named file exists AND ends with its terminal marker, and on timeout it reports each
 file as READY / PARTIAL / ABSENT so a quiet arm still proves the watcher was alive. Tell each seat, in its
 brief, the exact marker its report must end with — you cannot watch for a marker you never demanded.
+**A re-arm over an artifact that already has its marker uses `--changed-from now` (or its captured SHA).**
+The existing marked bytes are the baseline, not a fresh delivery: the watcher fires only after content
+differs from that baseline and then stabilizes, once. Without the changed-from baseline, re-arm is an
+instant replay of old completion rather than observation of new work.
 **Arm on the marker YOU demanded, verified against the FILE — never on the seat's report of its own
 marker.** Measured 2026-08-17: a seat reported its sweep "ends `SWEEP-END`"; the file on disk ended
 `ORDER4-END`. A watcher armed on the reported marker never fires while the artifact sits COMPLETE, and
@@ -941,9 +966,18 @@ orchestrator turn boundary.
    filed a *different* finding as OBS-437, then repeated it as OBS-438 and OBS-439 — and a sweep of the
    ledger's history found **twelve** more. A duplicated id makes every citation ambiguous, and this project
    cites them in rulings, handoffs, memory entries and shipped source comments. **Allocate from the current
-   maximum and then VERIFY with `grep -o '^## OBS-[0-9]*' <ledger> | sort | uniq -d`, which must print
-   nothing** — allocation alone is a guess about what the other tier is doing, and only the check catches
-   you both guessing the same. Renumber the LATER entry and say so in its heading. **Never renumber a
+   maximum and then run the duplicate-id check against the committed historical baseline below; it must
+   print nothing NEW** — the raw `uniq -d` list is intentionally non-empty history and cannot be used as a
+   zero-output gate:
+
+   ```bash
+   comm -13 \
+     <(printf '%s\n' OBS-106 OBS-12 OBS-129 OBS-148 OBS-24 OBS-26 OBS-29 OBS-35 OBS-36 OBS-40 OBS-41 OBS-415 OBS-459 OBS-463 OBS-466 OBS-470 OBS-472 OBS-542 OBS-548 OBS-552 OBS-562 OBS-563 OBS-564 OBS-592 OBS-785 OBS-791 | sort -u) \
+     <(grep -o '^## OBS-[0-9]*' <ledger> | sed 's/^## //' | sort | uniq -d)
+   ```
+
+   Allocation alone is a guess about what the other tier is doing, and only this baseline-relative check
+   catches you both guessing the same. Renumber the LATER entry and say so in its heading. **Never renumber a
    historical id**: every record already citing it would then point at the wrong finding.
 7. **Every fix is evaluated for shipping.** The tarball is `files: [dist, schema, skills, fixtures]` — so
    `src/**` and `skills/**` reach users while `.overseer/**` and `.tickmarkr/**` reach nobody. Before
@@ -1029,6 +1063,29 @@ Distilled from a v1.86 spec-repair mission that produced 31 numbered rules, ~90 
 errors authored by the supervising seat itself. **Every line below was earned by a defect, most of them
 twice.** They are mission-independent on purpose: nothing here names a task, a line number or a figure.
 
+**Five queue-and-handoff method laws — execute them; citing their OBS id is not execution:**
+
+1. **CITE-IS-NOT-READ.** A queue, handoff, finding, or brief that cites an observation does not prove its
+   author opened it. Before acting on a cited premise, open the primary record, quote the operative bytes,
+   and state the qualifier or falsifier the citation would otherwise hide.
+2. **EXECUTING-FORM PROBE.** Process ownership starts from the watcher pid file. Where legacy discovery is
+   unavoidable, match the executing form — interpreter plus exact script path and arguments — not a journal
+   path or name substring, resolve the candidate's cwd/parent, read the arm log for startup failure, then
+   require the same pid in two reads.
+3. **RESUME-AWARE CONTAMINATION.** Capture the current engagement boundary before watching a resumable
+   journal. Never terminate on a historical `run-end`: continue across `run-resume`, and stop only at the
+   cap or after current lock release proves no later engagement follows. Classify only runner-emitted lines
+   of new failed `test`, `build`, or `lint` gates; review prose and the secondary fingerprint echo list are
+   evidence about findings, not contamination occurrences.
+4. **THE QUEUE-INHERITANCE DIFF.** In the same act that opens a queue, extract observation ids from the
+   previous queue and the new queue, run `comm -23 <previous-queue-ids> <new-queue-ids>`, paste its output
+   into the new queue, and classify every row as queued, shipped, or no-ship with a falsifiable removal
+   condition. Reading the previous queue is not a diff.
+5. **RE-RUN A PREMISE.** Before inheriting any queue item or handoff conclusion, run its named positive and
+   negative controls on the current tree. For an executable premise, execute it with a negative control;
+   for a call-site premise, open the code line and read any rationale through its rejected alternatives.
+   Record the current output; if the premise dissolved, mark it superseded rather than carrying it forward.
+
 **Rot**
 
 1. **A quotation is exact bytes.** `grep` it before attributing it; if it does not hit, it is not a
@@ -1112,11 +1169,12 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     owns it** — "watchers alive" is the one claim a seat cannot verify about itself. Measured 2026-08-06:
     an orchestrator sat `idle` through three merges and two dispatches with no journal watcher in the
     process table, while its own last report read *"daemon, board, sweeper, watcher all alive"* (OBS-366).
-    **STATE THE LIFETIME, because an unstated one is read as the mission's: a session-scoped watcher DIES
-    WITH THE SEAT THAT ARMED IT.** Every watcher a seat arms — journal, artifact, dialog, beat loop — is
-    session-scoped unless it was deliberately detached (`ppid 1`, the heartbeat form below), so `/clear`,
-    a crash, an adopt or a stand-down ends it, and **a handoff is the one moment the arming seat stops
-    existing** — which is exactly when its watchers are most likely to be believed. The inverse failure is
+    **STATE THE LIFETIME, because an unstated one is read as the mission's.** Every watcher a seat arms —
+    journal, artifact, dialog, beat loop — records its own pid and arming seat. **A same-process `/clear`
+    keeps every background task alive**; it does not retire even one watcher. A crash may orphan or kill
+    tasks according to how they were launched, while adopt and stand-down are explicit kill-by-recorded-pid
+    transitions. A handoff must therefore inventory real pids, not infer process lifetime from the context
+    lifecycle. The inverse failure is
     the same root read the other way: a DETACHED loop outlives its seat and holds a tier `ARMED` with
     nobody home (OBS-583). Neither direction may be assumed; the lifetime is a property of how the watcher
     was launched, and it belongs in writing next to every claim that one is armed.
@@ -1173,9 +1231,10 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     The general rule: **an exclusion filter is exactly as
     dangerous as an over-broad inclusion filter, and it fails in the direction that reads as "not there" —
     which is the direction that gets acted on.**
-    Two corollaries: **re-arm a wake-and-exit watcher as the same turn's LAST act**, not the next turn's
-    first — the gap between them is unwatched and its width is however long the seat stays busy; and **a
-    handoff that re-arms one tier's watchers must say which tier's it did NOT re-arm.**
+    Two corollaries: **handling a fire-and-exit watcher's wake and re-arming it are the same act.** The wake
+    handling line is incomplete until it names the new recorded pid and two successful process-table reads;
+    never defer the arm to the turn's end. And **a handoff that re-arms one tier's watchers must say which
+    tier's it did NOT re-arm.**
     **That first corollary prescribes DISCIPLINE, and discipline is the wrong fix — measured 2026-08-06.**
     One orchestrator lapsed its journal tier **31 minutes**, then, after diagnosing it and fully intending
     to re-arm, lapsed it again for 3 minutes **while actively thinking about watchers**. Its own diagnosis

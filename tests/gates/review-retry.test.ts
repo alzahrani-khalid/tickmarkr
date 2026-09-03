@@ -118,6 +118,34 @@ const gateCtx = async (repo: string, base: string, adapters: FakeAdapter[], chan
 });
 
 describe("review retry — unparseable verdict re-asks a different reviewer, never the worker (OBS-193)", () => {
+  test("test: after a review flake the retry picks a channel of a different adapter when one is installed and authed and picks a same-adapter channel only when no other adapter has an eligible seat and the gate row's re-route text and reviewRetry meta say which whereas the shipped retry that excludes only the flaked channel key fails", async () => {
+    const worker = new FakeAdapter(scriptWith({}));
+    const garbage = new GarbageReviewer(scriptWith({ review: { approve: true } }));
+    const replacement = new BindingReviewer(scriptWith({ review: { approve: true, issues: [] } }));
+    const firstRepo = repoWithCommit();
+    const first = await runGates(
+      mkTask(),
+      await gateCtx(firstRepo.repo, firstRepo.base, [worker, garbage, replacement], [chAuthor, chGarbage, chSecond]),
+    );
+    const cross = first.results.find((result) => result.gate === "review")!;
+    expect(cross.meta?.reviewRetry).toMatchObject({ retried: "fake-c:fake-c-1", exclusion: "adapter" });
+    expect(cross.details).toMatch(/different-adapter retry; excluded flaked adapter fake-b/);
+
+    const sameRepo = repoWithCommit();
+    const sameChannels: BillingChannel[] = [
+      chAuthor,
+      chGarbage,
+      { ...chGarbage, model: "fake-b-2", tier: "mid" },
+    ];
+    const same = await runGates(
+      mkTask(),
+      await gateCtx(sameRepo.repo, sameRepo.base, [worker, garbage], sameChannels),
+    );
+    const fallback = same.results.find((result) => result.gate === "review")!;
+    expect(fallback.meta?.reviewRetry).toMatchObject({ retried: "fake-b:fake-b-2", exclusion: "channel" });
+    expect(fallback.details).toMatch(/same-adapter fallback; excluded flaked channel fake-b:fake-b-1/);
+  });
+
   test("test: a reviewer that answers with a genuine request for changes carries no infrastructure marking however its verdict is shaped, so a real rejection still charges the worker; a repair marking every failing review as infrastructure launders a red into a park and: it fails", async () => {
     const { repo, base } = repoWithCommit();
     const legacy = new BindingReviewer(scriptWith({ review: { approve: false, issues: ["real defect"] } }));
@@ -193,6 +221,7 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     expect(review.meta?.reviewRetry).toEqual({
       flaked: "fake-b:fake-b-1",
       retried: "fake-c:fake-c-1",
+      exclusion: "adapter",
     });
     expect(midReplacement.calls).toBe(1);
   });
@@ -207,7 +236,7 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     const reviews = results.filter((r) => r.gate === "review");
     expect(reviews).toHaveLength(1); // exactly-once: flaked verdict replaced, not appended
     expect(reviews[0]!.pass).toBe(true);
-    expect(reviews[0]!.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1" });
+    expect(reviews[0]!.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1", exclusion: "adapter" });
     expect(events.filter((e) => e.phase === "end" && e.gate === "review")).toHaveLength(1); // no false gate event
   });
 
@@ -225,7 +254,7 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     const reviews = results.filter((r) => r.gate === "review");
     expect(reviews).toHaveLength(1);
     expect(reviews[0]!.pass).toBe(true);
-    expect(reviews[0]!.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1" });
+    expect(reviews[0]!.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1", exclusion: "adapter" });
     expect(events.filter((e) => e.phase === "end" && e.gate === "review")).toHaveLength(1);
     // and the two verdict gates really were one round: same parent, both started before either ended
     const starts = events.filter((e) => e.phase === "start" && (e.gate === "acceptance" || e.gate === "review"));
@@ -242,7 +271,7 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     const review = results.find((r) => r.gate === "review");
     expect(review?.pass).toBe(false);
     expect(review?.meta?.unparseable).toBe(true);
-    expect(review?.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1" });
+    expect(review?.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1", exclusion: "adapter" });
   });
 
   test("no second eligible seat keeps the ORIGINAL unparseable result — the recorded cause stays truthful", async () => {

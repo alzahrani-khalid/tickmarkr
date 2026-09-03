@@ -2,6 +2,44 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.3 — orca, detected and complete
+
+**v2.3.0** — tickmarkr detects the Orca terminal and drives it end to end, the daemon's escalation ladder
+charges only what ran, and every instrument that speaks for a run — doctor, init, plan, compile, verify, the
+visible consult and the supervision scripts — says what actually happened. Delivered by one gated run
+(10/10 green; halted and resumed once at width 1, no spec amendment) with a cross-provider review on every task.
+
+- **`auto` resolves herdr, then orca, then subprocess.** Inside an Orca-spawned PTY (`TERM_PROGRAM=Orca` with
+  `ORCA_TERMINAL_HANDLE`) the driver is orca; the sealed worker env carries neither the herdr nor the Orca handle,
+  so a worker can never inherit host identity. (T1)
+- **The orca driver's lifecycle matches the installed Orca.** A fresh checkout is adopted before a terminal is
+  bound, the read leg uses the screen rather than the fragmenting stream, and a `screen-unavailable` read answers
+  `unknown` instead of guessing; the fake-orca fixture replays the refused-then-adopted and screen-unavailable
+  sequences. (T2)
+- **The ladder charges what ran.** A recheck of any park kind runs the whole declared battery on the parked
+  commit before a worker is bought, and the daemon's five riders are journaled. (T3)
+- **Doctor names hook coverage and the lever, renders a probe error, and beat resolves the root.** The orca row
+  says which adapters Orca has status hooks for and names the install lever, a probe-error row renders its
+  errno, and `beat` resolves the repository root from any worktree. (T4)
+- **The reviewer is shown the task, and a killed or flaked reviewer says so.** A ceiling-killed or startup-dead
+  reviewer is classified as such rather than as a malformed verdict, the review gate grades the task's own range,
+  and the retry pool excludes what actually failed. (T5)
+- **`init` tells the truth and never reverts source.** `init --force` refuses to overwrite tracked source inside
+  the tickmarkr repository, the environments footer matches `auto`, and the shipped agent-docs block no longer
+  carries this repository's development law into consumers. (T6)
+- **The supervision skill's instruments read what they claim.** `seat-send.sh` probes the prompt line before it
+  sends and defers on a human draft, the context watcher reads the banner below the input rule for every seat
+  kind, and both skill trees are byte-identical by test. (T7)
+- **The visible consult is visible.** With `visibility.llm: pane` the consult runs the adapter's interactive form
+  in its labelled pane and the verdict is still harvested through the nonce trailer; headless output is
+  byte-identical. (T8)
+- **`plan` and `compile` tell the truth about a fresh spec.** A fresh `test:` criterion no longer renders as a
+  pre-dispatch refusal that hides routing, and the collateral sweep no longer flags a path a task legitimately
+  adds. (T9)
+- **`verify` tells the truth from any worktree.** State is read from the git common dir, `--task` warns when the
+  range carries another task's merge, an exit-127 head fails closed, a verdictless baseline is never cached,
+  artifacts are persisted, and `--author` fails over across providers. (T10)
+
 ## v2.2.1 — record truth
 
 **v2.2.1** — the run record, the review row, the approval, the baseline and the vendor stamp each say what

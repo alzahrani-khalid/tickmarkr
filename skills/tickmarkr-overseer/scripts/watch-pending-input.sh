@@ -21,6 +21,17 @@ POLL="${2:-30}"
 CAP="${3:-14400}"
 CONFIRM="${4:-2}"        # consecutive polls before waking — a draft mid-typing is not a stall
 
+# The path/target is shared evidence, not ownership. Record the arming seat and this exact process so
+# stand-down can retire only what that seat armed, without a pgrep pattern that catches its partner.
+PID_DIR="${TKR_STATE_DIR:-.tickmarkr}/overseer/pids"
+PID_SEAT=$(printf '%s' "${TKR_ARMING_SEAT:-unattributed}" | sed 's/[^A-Za-z0-9_-]/_/g')
+PID_FILE="$PID_DIR/${PID_SEAT}-watch-pending-input-$$.pid"
+mkdir -p "$PID_DIR" && (umask 077; printf '%s\n' "$$" > "$PID_FILE") || {
+  echo "watch-pending-input: cannot record pid under $PID_DIR" >&2; exit 73;
+}
+clear_pid() { rm -f "$PID_FILE"; }
+trap clear_pid EXIT
+
 status_of() {
   herdr agent get "$TARGET" 2>/dev/null \
     | sed -n 's/.*"agent_status":"\([a-z_]*\)".*/\1/p' | head -1
@@ -35,8 +46,11 @@ status_of() {
 # no wake, no streak. Negative scope: sampled on one theme/version; a theme rendering typed input dim
 # would blind this check TOWARD silence, so a wake is still authoritative but its absence is not proof.
 is_ghost() {
-  herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
-    | grep -F -- "❯" | grep -F -- "$1" | head -1 | grep -q "$(printf '\033')\[2m"
+  (
+    export LC_ALL=C
+    herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
+      | grep -F -- "❯" | grep -F -- "$1" | head -1 | grep -q "$(printf '\033')\[2m"
+  )
 }
 
 pending_text() {
@@ -175,8 +189,11 @@ while [ "$elapsed" -lt "$CAP" ]; do
           # typed draft. Ghost text renders dim/grey; typed text renders default. Emit the styled
           # bytes so the reader can discriminate before treating this as a draft.
           echo "  styling evidence (dim/grey SGR around the text = autosuggest ghost, NOT a draft):"
-          herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
-            | grep -F -- "$T" | head -2 | cat -v | sed 's/^/    /'
+          (
+            export LC_ALL=C
+            herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
+              | grep -F -- "$T" | head -2 | cat -v | sed 's/^/    /'
+          )
           echo "  the seat is idle and holding live work in its prompt — supersede it, do not re-send:"
           echo "  herdr agent prompt $TARGET \" <-- disregard everything before this arrow (stale draft). ACTUAL: …\""
           # Name the ACTUAL reason we fell through. Saying "budget exhausted" when the cause was the
@@ -208,10 +225,17 @@ done
 echo "WATCH_CAP_REACHED $TARGET status=$(status_of) — no sustained pending input in ${CAP}s"
 FINAL=$(pending_text)
 if [ -n "$FINAL" ]; then
-  echo "  final read (UNSUSTAINED — present at cap, not confirmed across polls): $FINAL"
-  echo "  styling evidence (dim/grey SGR = autosuggest ghost, NOT a draft):"
-  herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
-    | grep -F -- "$FINAL" | head -2 | cat -v | sed 's/^/    /'
+  if is_ghost "$FINAL"; then
+    echo "  final read: autosuggest ghost ignored (dim SGR), input box has no typed draft"
+  else
+    echo "  final read (UNSUSTAINED — present at cap, not confirmed across polls): $FINAL"
+    echo "  styling evidence (dim/grey SGR = autosuggest ghost, NOT a draft):"
+    (
+      export LC_ALL=C
+      herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null \
+        | grep -F -- "$FINAL" | head -2 | cat -v | sed 's/^/    /'
+    )
+  fi
 else
   echo "  final read: input box empty"
 fi

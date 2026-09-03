@@ -195,6 +195,32 @@ describe("model status table (T4)", () => {
     expect(saved.fake.modelAuth["fake-denied"]).toMatchObject({ authed: false, reason: "credit exhausted" });
   });
 
+  test("test: a channel whose doctor record carries the probe-error errno EMFILE renders probe error (EMFILE) on its doctor row and never the unauthed wording while a channel recording authed false without an errno still renders unauthed whereas a renderer that folds both into one wording fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    withOverlay(repo, fakeTiers);
+    const fake = mkFake(script);
+    vi.spyOn(fake, "headlessCommand").mockImplementation((_prompt, model) =>
+      model === "fake-1"
+        ? "printf 'spawn EMFILE' >&2; exit 1"
+        : "printf 'credit exhausted'; exit 1",
+    );
+
+    const out = await doctor(["--"], repo, [fake]);
+    const saved = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
+    const probeErrorRow = out.split("\n").find((line) => line.includes("fake-1"))!;
+    const unauthedRow = out.split("\n").find((line) => line.includes("fake-denied"))!;
+
+    expect(saved.fake.modelAuth["fake-1"]).toMatchObject({ probeError: "EMFILE" });
+    expect(probeErrorRow).toContain("probe error (EMFILE)");
+    expect(probeErrorRow).not.toContain("unauthed");
+    expect(saved.fake.modelAuth["fake-denied"]).toMatchObject({ authed: false });
+    expect(saved.fake.modelAuth["fake-denied"]).not.toHaveProperty("probeError");
+    expect(unauthedRow).toContain("unauthed:");
+    expect(unauthedRow).not.toContain("probe error");
+  });
+
   test("denied model shows the deny entry as a flag", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const script = join(repo, "fake.json");

@@ -45,6 +45,22 @@ describe("tickmarkr init --agent skills location (T3)", () => {
 });
 
 describe("tickmarkr init --agent multi-host install (T10)", () => {
+  test("test: init --agent --force in a consumer repository whose committed scaffold skill copy differs from the package copy overwrites it and prints a note naming the file as tracked so the refresh is reviewable while the same repository without --force keeps the copy and prints the skipped note whereas an install that refuses the committed copy or overwrites it silently fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const stalePath = ".agents/skills/tickmarkr-loop/SKILL.md";
+    const fixture = { [stalePath]: "committed stale copy\n" };
+
+    const kept = makeRepo(fixture);
+    const keptOut = await runInit(kept, "--agent");
+    expect(readFileSync(join(kept, stalePath), "utf8")).toBe("committed stale copy\n");
+    expect(keptOut).toContain(`skipped existing tracked ${join(kept, stalePath)}`);
+
+    const forced = makeRepo(fixture);
+    const forcedOut = await runInit(forced, "--agent", "--force");
+    expect(readFileSync(join(forced, stalePath))).toEqual(skill("tickmarkr-loop"));
+    expect(forcedOut).toContain(`overwrote tracked ${join(forced, stalePath)}`);
+  });
+
   test("test: every install writes the driving skills into the codex discoverable project skill directory regardless of what else exists in the repository", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const fresh = makeRepo({ "keep.txt": "x" });
@@ -153,6 +169,7 @@ describe("tickmarkr init --agent portable docs (T3)", () => {
     expect(section).toMatch(/Verified handoffs/);
     expect(section).toMatch(/never use bare send-text/);
     expect(section).toMatch(/herdr pane run/);
+    expect(section).not.toMatch(/EVERY fix gets a ship\/no-ship decision/);
     expect(section).not.toMatch(/\/tickmarkr-loop/);
     expect(section).not.toMatch(/\.claude/);
   });

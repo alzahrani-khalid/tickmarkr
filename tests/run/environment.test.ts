@@ -7,10 +7,13 @@ import type { AuthHealth, BillingChannel, WorkerAdapter } from "../../src/adapte
 import type { TickmarkrConfig } from "../../src/config/config.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { driverEvidence, pickDriver } from "../../src/drivers/index.js";
+import { OrcaDriver } from "../../src/drivers/orca.js";
 import { environmentComparable, recordedEnvironment } from "../../src/report/compare.js";
 import { type RunEnvironment, UNKNOWN_ADAPTER_VERSION, runEnvironment } from "../../src/run/environment.js";
 import { DEFAULT_FORK_CAP, deriveForkCap, FORK_CAP_ENV, runWithForkBudget } from "../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
+import { FakeOrca } from "../helpers/fake-orca.js";
 import { COMMIT, makeTestTempDir, reapTestTempDirs, setupRepo, T } from "../helpers/tmprepo.js";
 
 // v1.70 T2: the run-start journal event stamps the run's environment identity — the running tickmarkr
@@ -100,6 +103,43 @@ describe("run-start environment identity (fake adapter, zero tokens)", () => {
       expect((start.data.channelsByRole as Record<string, string[]>)[role]).toEqual(expect.arrayContaining(["fake:fake-1"]));
     }
     expect(readFileSync(join(journal.dir, "graph.json"))).toEqual(graphBytes);
+  });
+
+  test("test: driverEvidence for an auto pick under the Orca marker pair returns auto → orca (TERM_PROGRAM+ORCA_TERMINAL_HANDLE) naming the variables and never their values and the run-start journal row carries that string whereas an evidence string that prints a handle value or reads auto → subprocess (HERDR_ENV unset) under the pair fails", async () => {
+    const keys = ["HERDR_ENV", "TERM_PROGRAM", "ORCA_TERMINAL_HANDLE"] as const;
+    const previous = keys.map((key) => [key, process.env[key]] as const);
+    delete process.env.HERDR_ENV;
+    process.env.TERM_PROGRAM = "Orca";
+    process.env.ORCA_TERMINAL_HANDLE = "term-handle-must-stay-secret";
+    try {
+      const selected = pickDriver(DEFAULT_CONFIG);
+      expect(selected).toBeInstanceOf(OrcaDriver);
+      const evidence = driverEvidence(DEFAULT_CONFIG, selected);
+      expect(evidence).toBe("auto → orca (TERM_PROGRAM+ORCA_TERMINAL_HANDLE)");
+      expect(evidence).not.toContain("term-handle-must-stay-secret");
+      expect(evidence).not.toBe("auto → subprocess (HERDR_ENV unset)");
+
+      // A missing runtime proves the selected surface remains Orca: the run journals its choice,
+      // then fails loudly instead of completing through a substituted subprocess driver.
+      Object.defineProperty(selected, "exec", {
+        value: new FakeOrca({ cliMissing: "orca: command not found" }).exec,
+        configurable: true,
+      });
+      const { repo, fake } = setupRepo([T("T1")], oneTask("T1"));
+      const runId = "run-auto-orca-evidence";
+      const summary = await runDaemon(repo, { adapters: [fake], runId, driver: selected });
+      const start = Journal.open(repo, runId).read().find((event) => event.event === "run-start")!;
+      expect(start.data.driver).toBe("orca");
+      expect(start.data.driverEvidence).toBe(evidence);
+      expect(String(start.data.driverEvidence)).not.toContain("term-handle-must-stay-secret");
+      expect(summary.done).toEqual([]);
+      expect(summary.failed).toContain("T1");
+    } finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 }, 120000);
 

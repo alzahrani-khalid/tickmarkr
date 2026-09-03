@@ -338,6 +338,7 @@ describe("v2.0 calibrated gate inactivity policy", () => {
       commands: {},
       baseline: await captureBaseline(repo, {}),
       channels,
+      judgeChannels: channels,
       adapters: [worker, primary, retry],
       cfg,
       via: gateVia(driver),
@@ -351,6 +352,7 @@ describe("v2.0 calibrated gate inactivity policy", () => {
     expect(review!.meta?.reviewRetry).toEqual({
       flaked: "fake-b:fake-b-1",
       retried: "fake-c:fake-c-1",
+      exclusion: "adapter",
     });
     expect(events.filter((event) => event.phase === "end" && event.gate === "review")).toHaveLength(1);
   });
@@ -393,6 +395,7 @@ describe("v2.0 calibrated gate inactivity policy", () => {
       commands: {},
       baseline: await captureBaseline(repo, {}),
       channels,
+      judgeChannels: channels,
       adapters: [primary, retry],
       cfg,
       via: gateVia(driver),

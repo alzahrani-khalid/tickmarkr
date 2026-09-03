@@ -13,8 +13,9 @@ tickmarkr is a spec-driven orchestration harness for AI coding agent CLIs. You w
 acceptance criteria; the engine routes tasks to the best installed agent CLI (claude-code, codex,
 cursor-agent, opencode, grok, pi, kimi) by cost and capability, dispatches work in git worktrees for
 change isolation — as interactive TUIs when running under [herdr](https://herdr.dev), headless
-subprocesses otherwise, or in [Orca](https://onorca.dev) terminals when you name that driver
-yourself — and independently verifies each committed result by checking for no new
+subprocesses otherwise, or in [Orca](https://onorca.dev) terminals when auto detects both Orca
+markers (name that driver explicitly outside one) — and independently verifies each committed
+result by checking for no new
 baseline failures per task, then strictly verifying the integration tip. Green tasks consolidate onto a
 `tickmarkr/<runId>` branch; merging to your mainline is always your call, never automated. Engage
 with full visibility into routing decisions, worker progress, and gate verdicts — or run headless
@@ -251,14 +252,14 @@ and first-attempt success rate. Cost reporting follows strict honesty rules and 
 When running under [herdr](https://herdr.dev), tickmarkr creates a labeled pane-and-tab workspace
 for real-time visibility (optional — omit `--driver herdr` or run headless if preferred).
 
-### Orca: an explicit-selection execution surface
+### Orca: a detected-or-named execution surface
 
-[Orca](https://onorca.dev) is the third execution surface, and the only one you must ask for by
-name: `--driver orca` or `driver: orca` in config. `--driver auto` never selects it — auto picks
-herdr when a herdr session is live and subprocess otherwise — so Orca is never inherited from an
-ambient environment variable, and an Orca that is installed but unreachable is not silently
-downgraded to a hidden subprocess worker either. Naming it is the whole gate; its runtime failures
-stay Orca's, reported as failures.
+[Orca](https://onorca.dev) is the third execution surface. `auto` resolves herdr first when
+`HERDR_ENV=1`, then Orca only when both Orca-authored markers `TERM_PROGRAM=Orca` and
+`ORCA_TERMINAL_HANDLE` are present, then subprocess. This environment-only choice executes no
+binary or runtime probe. Outside an Orca terminal, name it explicitly with `--driver orca` or
+`driver: orca` in config. Once selected either way, an unreachable Orca stays a loud Orca driver
+failure and is never silently replaced by a hidden subprocess worker.
 
 What Orca supplies is terminals. What tickmarkr keeps is everything that decides whether work
 ships: **it creates and owns the git worktree** for every task (Orca is told which checkout to bind

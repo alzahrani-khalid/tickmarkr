@@ -869,9 +869,9 @@ acceptance is required on every task (a nested list of observable outcomes).
       set closed — this milestone paid a halted run to learn that the two populations are not identical.
     - SPIKE-THE-CONTRACT-THEN-SCOPE trigger question: COULD A TEST THIS TASK DOES NOT OWN BE ASSERTING THE
       THING I AM CHANGING? "I'D HAVE TO GREP TO KNOW" IS YES. This applies to observable contracts:
-      execution order, event-stream order, diagnostics/output sets, CLI surface, serialised formats, or
-      timing measurements. If yes, implement the change as a throwaway spike, run the full suite, read the
-      reds, THEN scope files[].
+      execution order, event-stream order, diagnostics/output sets, CLI surface, serialised formats,
+      timing measurements, or adding or removing a shipped file. If yes, implement the change as a
+      throwaway spike, run the full suite, read the reds, THEN scope files[].
     - Caveat: a spike measures ONE implementation. It converts unknown collateral into
       measured-for-one-specimen collateral; it does NOT make its reds the closed blocker set for every
       route. A worker taking a different route can still red on unowned collateral; that remains a PLAN

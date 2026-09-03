@@ -63,6 +63,15 @@ case "$ROLE" in
 esac
 TIER="${ROLE}-context"
 
+# A shared target does not identify its watcher owner. The arming seat records this exact pid under
+# the repository state dir; retirement reads that file and never matches a script/target name pattern.
+PID_DIR="${TKR_STATE_DIR:-.tickmarkr}/overseer/pids"
+PID_SEAT=$(printf '%s' "${TKR_ARMING_SEAT:-unattributed}" | sed 's/[^A-Za-z0-9_-]/_/g')
+PID_FILE="$PID_DIR/${PID_SEAT}-watch-context-$$.pid"
+mkdir -p "$PID_DIR" && (umask 077; printf '%s\n' "$$" > "$PID_FILE") || {
+  echo "watch-context: cannot record pid under $PID_DIR" >&2; exit 73;
+}
+clear_pid() { rm -f "$PID_FILE"; }
 
 # The supervision beat interval (SUPERVISION_BEAT_MS = 10s). The loop ticks at the beat cadence or the
 # caller's poll, whichever is SHORTER. Every successful screen read beats; its result is either a
@@ -100,7 +109,8 @@ beat() {
 stand_down() { tickmarkr beat "$TIER" --stand-down --seat "$SEAT" >/dev/null 2>&1; return 0; }
 # EVERY terminal exit — act, unsafe-act, cap — leaves through here, so none of them can forget to
 # record the hand-off. A killed watcher never runs it, which is the one case that must read STALE.
-trap stand_down EXIT
+cleanup() { stand_down; clear_pid; }
+trap cleanup EXIT
 
 # ── WHERE THE NUMBER COMES FROM, and this is the whole 2.1.7-series lesson ────────────────────────────
 # The shipped version read a TERMINAL RENDERING and nothing else. Every context-measurement failure of
@@ -189,15 +199,31 @@ print(int(round(fill * 100.0 / window)))
 ' "$CTX_JSONL" "$CTX_WINDOW" 2>/dev/null
 }
 
-# The banner path stays as the FALLBACK, unchanged: select the model line first, then read a percentage
-# only from it, so a bare numeric search cannot borrow an old N% from scrollback (OBS-780).
+# The banner path stays as the FALLBACK, and it now selects by POSITION (OBS-865). A seat's statusline
+# renders BELOW the input box's horizontal rule, so the only rows that can carry THIS seat's fill are the
+# rows after the LAST rule line in the window. A tip, a transcript row, or a decoy quoting another seat's
+# percentage sits ABOVE that rule and can no longer be chosen. The previous selector took the last
+# vendor-word line ANYWHERE in the window: on a Fable seat that was `Tip: Ask Claude ...` (UNREADABLE,
+# duty silently dead), and a quoted `opus 12%` would have been read as this seat's fill. The model
+# vocabulary survives only as a SANITY CHECK on the already-chosen row, never as the selector (OBS-780).
 banner_pct() {
   local screen banner pct
   screen=$(herdr agent read "$TARGET" --source visible --lines 8 2>/dev/null) || return 1
-  banner=$(printf '%s\n' "$screen" |
-    grep -Ei '(^|[^[:alnum:]])(claude|opus|sonnet|haiku|gpt|gemini|glm|kimi|grok|composer|openai|zai)[[:alnum:]_./-]*([[:space:]]|$)' |
-    tail -1)
+  # The rule glyph is passed IN, never written as an escape: this host's awk (BWK 20200816) does not
+  # honour \xNN, and an unsupported escape matches nothing — the selector would find no rule line and
+  # report UNREADABLE on every real pane while staying green against any fixture that skipped awk.
+  banner=$(printf '%s\n' "$screen" | awk -v rule='─' '
+    { line[NR] = $0
+      bare = $0; gsub(/[[:space:]]/, "", bare)
+      stripped = bare; gsub(rule, "", stripped)
+      if (bare != "" && stripped == "") last = NR }
+    END { if (last) for (i = last + 1; i <= NR; i++) if (line[i] ~ /[0-9]+%/) print line[i] }
+  ' | tail -1)
+  # No rule line in the window, or no percentage below it: say so out loud rather than guess.
   [ -n "$banner" ] || { printf 'UNREADABLE\n'; return 0; }
+  printf '%s\n' "$banner" |
+    grep -Eqi '(^|[^[:alnum:]])(claude|opus|sonnet|haiku|fable|gpt|gemini|glm|kimi|grok|composer|openai|zai)[[:alnum:]_./-]*([[:space:]]|$)' ||
+    { printf 'UNREADABLE\n'; return 0; }
   pct=$(printf '%s\n' "$banner" | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
   [ -n "$pct" ] && printf '%s\n' "$pct" || printf 'UNREADABLE\n'
 }
@@ -224,7 +250,7 @@ act_on() {
     if [ "${TKR_AUTO_CLEAR:-0}" = "1" ] && { [ "$ROLE" = "orchestrator" ] || [ "$ROLE" = "overseer" ]; }; then
       herdr agent prompt "$TARGET" "/clear" >/dev/null 2>&1
       sleep "$SETTLE"
-      herdr agent prompt "$TARGET" "Read ${REBRIEF} and continue exactly where it says. Your context was cleared at ${P}% against that handoff; it is current as of $(date '+%H:%M'). Do not reconstruct from memory — everything you need is on disk." >/dev/null 2>&1
+      herdr agent prompt "$TARGET" "Read ${REBRIEF} and continue exactly where it says. Your context was cleared at ${P}% against that handoff; it is current as of $(date '+%H:%M'). The same-process clear kept every background task alive: kill only this seat's recorded watcher pids first, verify the process table twice, then re-arm. Do not reconstruct from memory — everything you need is on disk." >/dev/null 2>&1
       echo "CONTEXT_CLEARED $TARGET at ${P}% — handoff fresh, re-briefed from ${REBRIEF}"
       exit 0
     fi

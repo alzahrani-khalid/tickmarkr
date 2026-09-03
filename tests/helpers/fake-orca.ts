@@ -18,7 +18,8 @@ import { ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/
 //              across every checkout — which is the only listing an older run's leftover appears in.
 //              Supplied, it scopes the rows AND their visual layouts to that one checkout.
 //   read     → {ok, result:{terminal:{handle, status, tail[], truncated, limited, oldestCursor,
-//              nextCursor, latestCursor, returnedLineCount}}, _meta} — a read of a CLOSED terminal
+//              nextCursor, latestCursor, returnedLineCount, source:"stream"|"screen"|
+//              "screen-unavailable"}}, _meta} — a read of a CLOSED terminal
 //              answers ok:true with that terminal's OWN dead record and retained scrollback (C4)
 //   show     → {ok, result:{terminal:{handle, tabId, title:<PANE title>, connected, writable,
 //              orphaned, worktreeId, worktreePath}}, _meta} — liveness only; NO status, NO agent
@@ -28,6 +29,9 @@ import { ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/
 //              by default, with the recorded 1.4.186 ok:true satisfied:false receipt selectable
 //   close    → {ok, result:{close:{handle, tabId, ptyKilled:<boolean>}}, _meta}; ptyKilled:false
 //              is a successful close of an exited/no-live-PTY terminal
+//   worktree current → {ok, result:{worktree:{path,...}}, _meta}; a fresh checkout may answer
+//              selector_not_found or an enclosing checkout until Orca indexes the exact cwd
+//   agent hooks status → {ok, result:{enabled,statuses:[{agent,state,...}]}, _meta}
 //   worktree create → the checkout verb Orca really exposes (`orca worktree create --help`,
 //              1.4.186): `--name <name>` REQUIRED, `--repo <selector>` inferred when omitted,
 //              `--base-branch <ref>` defaulting to the repo base. It MAKES a checkout — in Orca's
@@ -96,6 +100,13 @@ export interface FakeTerminalSpec {
   /** conditions the runtime answers satisfied regardless of liveness (the show/wait race: a
    *  terminal can exit between a show poll and the wait that observes it). */
   waitConditions?: string[];
+  /** Result source for `read --screen`. Default "screen"; stream reads always report "stream". */
+  screenSource?: "screen" | "screen-unavailable";
+}
+
+export interface FakeHookStatus {
+  agent: string;
+  state: "installed" | "not_installed" | "partial" | "error";
 }
 
 export interface FakeOrcaOpts {
@@ -123,6 +134,10 @@ export interface FakeOrcaOpts {
   createSurface?: string | null;
   /** elapsed wait transport. Default: 1.4.195 timeout refusal; old receipt remains selectable. */
   elapsedWaitTransport?: "1.4.195-timeout" | "1.4.186-satisfied-false";
+  /** Sequential `worktree current` answers; the final answer repeats after the array is exhausted. */
+  worktreeCurrentAnswers?: Array<string | "selector_not_found">;
+  hooksEnabled?: boolean;
+  hookStatuses?: FakeHookStatus[];
   /** where `worktree create` puts the checkout — Orca's own root, never the caller's choice.
    *  Default: an `orca-worktrees` directory beside the repo. */
   worktreeRoot?: string;
@@ -130,18 +145,23 @@ export interface FakeOrcaOpts {
 
 interface FakeTerminal extends FakeTerminalSpec { lines: string[] }
 
-const KNOWN_FAMILIES = new Set<string>(["status", "create", "list", "read", "send", "wait", "show", "close", "worktree"]);
+const KNOWN_FAMILIES = new Set<string>([
+  "status", "create", "list", "read", "send", "wait", "show", "close", "worktree",
+  "worktree-current", "hooks-status",
+]);
 
 const ALLOWED_FLAGS: Record<string, Set<string>> = {
   status: new Set(["--json"]),
   create: new Set(["--worktree", "--title", "--command", "--json"]),
   list: new Set(["--worktree", "--include-visual-layouts", "--limit", "--json"]),
-  read: new Set(["--terminal", "--cursor", "--limit", "--json"]),
+  read: new Set(["--terminal", "--cursor", "--screen", "--limit", "--json"]),
   send: new Set(["--terminal", "--text", "--enter", "--json"]),
   wait: new Set(["--terminal", "--for", "--timeout-ms", "--json"]),
   show: new Set(["--terminal", "--json"]),
   close: new Set(["--terminal", "--json"]),
   worktree: new Set(["--name", "--repo", "--base-branch", "--json"]),
+  "worktree-current": new Set(["--json"]),
+  "hooks-status": new Set(["--json"]),
 };
 
 function flag(args: string[], name: string): string | undefined {
@@ -167,6 +187,8 @@ function sameCheckout(a: string, b: string): boolean {
 export class FakeOrca {
   /** every argv the driver issued, in order */
   readonly calls: string[][] = [];
+  /** invoking cwd beside every argv; adoption must use the slot checkout, never the daemon cwd. */
+  readonly callCwds: string[] = [];
   /** text submitted by a successful `terminal send --enter`, per handle */
   readonly sent = new Map<string, string[]>();
   /** text typed without `--enter`; real Orca writes the bytes but nothing is submitted. */
@@ -177,6 +199,7 @@ export class FakeOrca {
   private pageSize: number;
   private reads = new Map<string, number>();
   private seq = 0;
+  private currentSeq = 0;
   private closed = new Set<string>(); // closed handles keep answering close ok:true (recorded)
 
   constructor(private opts: FakeOrcaOpts = {}) {
@@ -205,7 +228,7 @@ export class FakeOrca {
 
   /** argv families the driver issued (`terminal read` → "read"), in order */
   families(): string[] {
-    return this.calls.map((a) => (a[0] === "terminal" ? a[1] : a[0]));
+    return this.calls.map((a) => this.family(a));
   }
 
   countOf(family: string): number {
@@ -303,8 +326,9 @@ export class FakeOrca {
 
   readonly exec: OrcaExec = async (args, cwd) => {
     this.calls.push([...args]);
+    this.callCwds.push(cwd);
     if (this.opts.cliMissing !== undefined) return { code: 127, stdout: "", stderr: this.opts.cliMissing };
-    const family = args[0] === "terminal" ? args[1] : args[0];
+    const family = this.family(args);
     if (!KNOWN_FAMILIES.has(family)) return { code: 2, stdout: "", stderr: `orca: unknown verb ${args.join(" ")}` };
     const contractError = this.contractError(family, args);
     if (contractError) return { code: 2, stdout: "", stderr: `orca: ${contractError}` };
@@ -321,6 +345,16 @@ export class FakeOrca {
     const unsupported = args.find((a) => a.startsWith("--") && !ALLOWED_FLAGS[family].has(a));
     if (unsupported) return `unknown option ${unsupported}`;
     if (family === "status") return args.length === 2 ? undefined : "status accepts no positional arguments";
+    if (family === "worktree-current") {
+      return args.length === 3 && args[0] === "worktree" && args[1] === "current"
+        ? undefined
+        : "worktree current accepts no positional arguments";
+    }
+    if (family === "hooks-status") {
+      return args.length === 4 && args[0] === "agent" && args[1] === "hooks" && args[2] === "status"
+        ? undefined
+        : "agent hooks status accepts no positional arguments";
+    }
     if (family === "worktree") {
       if (args[1] !== "create") return "worktree supports only `create` in this fixture";
       return flag(args, "--name") === undefined ? "worktree create requires --name" : undefined;
@@ -329,7 +363,7 @@ export class FakeOrca {
     const required: Record<string, string[]> = {
       create: ["--worktree", "--title", "--command"],
       list: [],
-      read: ["--terminal", "--limit"],
+      read: ["--terminal"],
       send: ["--terminal", "--text"],
       wait: ["--terminal", "--for", "--timeout-ms"],
       show: ["--terminal"],
@@ -337,10 +371,22 @@ export class FakeOrca {
     };
     const missing = required[family].find((name) => flag(args, name) === undefined);
     if (missing) return `${family} requires ${missing}`;
+    if (family === "read") {
+      const screen = args.includes("--screen");
+      if (screen && args.includes("--cursor")) return "read --screen does not accept --cursor";
+      if (!screen && flag(args, "--limit") === undefined) return "read requires --limit unless --screen is set";
+    }
     if (family === "wait" && !["exit", "tui-idle"].includes(flag(args, "--for") ?? "")) {
       return "wait supports --for exit|tui-idle in this fixture";
     }
     return undefined;
+  }
+
+  private family(args: string[]): string {
+    if (args[0] === "terminal") return args[1];
+    if (args[0] === "worktree" && args[1] === "current") return "worktree-current";
+    if (args[0] === "agent" && args[1] === "hooks" && args[2] === "status") return "hooks-status";
+    return args[0];
   }
 
   /** `--worktree` takes a SELECTOR: `path:<abs>` names a checkout outright, while `active`/`current`
@@ -385,6 +431,36 @@ export class FakeOrca {
       if (this.opts.createSurface !== null) terminal.surface = this.opts.createSurface ?? "visible";
       return this.ok({ terminal });
     }
+    if (family === "worktree-current") {
+      const answers = this.opts.worktreeCurrentAnswers;
+      const answer = answers && answers.length > 0
+        ? answers[Math.min(this.currentSeq++, answers.length - 1)]
+        : cwd;
+      if (answer === "selector_not_found") {
+        return this.refusal("selector_not_found", `no worktree selector resolves from ${cwd}`);
+      }
+      return this.ok({
+        worktree: {
+          id: `repo-fixture::${answer}`,
+          repoId: "repo-fixture",
+          path: answer,
+          git: { path: answer },
+        },
+      });
+    }
+    if (family === "hooks-status") {
+      return this.ok({
+        enabled: this.opts.hooksEnabled !== false,
+        settingsPath: "/tmp/orca-data.json",
+        appliedBy: "offline",
+        statuses: (this.opts.hookStatuses ?? []).map((status) => ({
+          ...status,
+          configPath: `/tmp/${status.agent}.json`,
+          managedHooksPresent: status.state === "installed",
+          detail: null,
+        })),
+      });
+    }
     if (family === "worktree") {
       // Orca creates the checkout ITSELF: its own root, and a branch derived from --name — the
       // caller names neither. Real `git worktree add` so the receipt's path/head/branch are facts.
@@ -418,7 +494,12 @@ export class FakeOrca {
       this.reads.set(handle, (this.reads.get(handle) ?? 0) + 1);
       const status = this.reportedStatus(t);
       // Recorded read record: handle, status, tail, cursors — no titles, no liveness fields.
-      const rec: Record<string, unknown> = { handle, ...this.page(t, flag(args, "--cursor"), Number(flag(args, "--limit"))) };
+      const screen = args.includes("--screen");
+      const source = screen ? (t.screenSource ?? "screen") : "stream";
+      const page = source === "screen-unavailable"
+        ? { tail: [], truncated: false, limited: false, returnedLineCount: 0 }
+        : this.page(t, flag(args, "--cursor"), Number(flag(args, "--limit")));
+      const rec: Record<string, unknown> = { handle, ...page, source };
       if (status !== "") rec.status = status;
       return this.ok({ terminal: rec });
     }

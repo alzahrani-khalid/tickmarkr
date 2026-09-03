@@ -123,6 +123,23 @@ describe("collateralLints (plan-time OBS-12/21 scan)", () => {
   });
 });
 
+test("compile on a task whose files patterns add a new path under the top-level scripts directory names tests repo export-manifest as likely collateral while a task adding a path under tests or src does not whereas a sweep that matches names and symbols alone fails", () => {
+  const manifest = 'test("the export set is exact", () => expect(true).toBe(true));\n';
+  const repo = makeRepo({ "tests/repo/export-manifest.test.ts": manifest });
+
+  const scripts = collateralLints([task("T1", ["scripts/new-tool.ts"])], repo);
+  const controls = collateralLints([
+    task("T2", ["tests/new-test.test.ts"]),
+    task("T3", ["src/new-module.ts"]),
+  ], repo);
+
+  expect(manifest).not.toMatch(/new-tool|scripts\//);
+  expect(scripts).toEqual([
+    "T1: likely collateral tests not in files[]: tests/repo/export-manifest.test.ts",
+  ]);
+  expect(controls).toEqual([]);
+});
+
 describe("OBS-547 — the map the scope gate classifies on", () => {
   // 25 collateral hits: the display shows 20, so hits 21-25 are exactly the case that went unread.
   const capBitingRepo = () => makeRepo({

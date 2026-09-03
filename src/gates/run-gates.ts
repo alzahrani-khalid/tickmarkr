@@ -11,7 +11,7 @@ import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
 import { disallowedBy } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
-import { reviewGate } from "./review.js";
+import { pickReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
 import type { GateResult } from "./types.js";
 import { shGit } from "../run/git.js";
@@ -148,8 +148,8 @@ export interface GateContext {
   commands: Record<string, string>;
   baseline: Baseline;
   channels: BillingChannel[];
-  // v1.87 T2: the judge-role pool for the GATE-09 failover pick. Absent ⇒ `channels`, so every
-  // pre-existing caller keeps its present behaviour; the daemon passes its judge-scoped pool.
+  // v1.87 T2: the judge-role pool for the GATE-09 failover pick. Absent means no alternate seat;
+  // the configured judge remains the only truthful fallback and review channels are never judges.
   judgeChannels?: BillingChannel[];
   adapters: WorkerAdapter[];
   cfg: TickmarkrConfig;
@@ -630,7 +630,7 @@ export async function runGates(
         .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y))[0];
       // v1.87 T2: the failover seat obeys the same policy the primary judge just passed — a denied
       // channel is refused here too, never reached by falling through the exclusion arms below.
-      const judgePool = (ctx.judgeChannels ?? ctx.channels).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
+      const judgePool = (ctx.judgeChannels ?? []).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
       const crossAdapter = pick(judgePool.filter((c) => c.adapter !== flakedAdapter));
       const sameAdapter = pick(judgePool.filter((c) => c.adapter === flakedAdapter && channelKey(c) !== flakedKey));
       // Prefer a different adapter; if the fleet only has one adapter, retry on a different channel of
@@ -667,11 +667,9 @@ export async function runGates(
       return captured.value;
     };
     let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir));
-    // OBS-193: an unparseable review verdict retries the REVIEW exactly once on a different reviewer —
-    // never the worker (GATE-09's judge-retry shape: straight-line single `if`, meta-only detection,
-    // the flaked verdict never enters results). The exclusion rides reviewGate's own excludeReviewers
-    // parameter, so pickReviewer's diversity rules still govern the retry seat; a fleet with no second
-    // eligible seat keeps the ORIGINAL result so the recorded cause stays truthful (OBS-196).
+    // OBS-193/574: an unparseable review verdict retries the REVIEW exactly once, preferring a
+    // different adapter. Only a single-adapter eligible pool may fall back to another channel on the
+    // flaked adapter. The flaked verdict never enters results; an exhausted pool preserves its cause.
     if (rv.meta?.unparseable === true && typeof rv.meta.reviewer === "string") {
       const flaked = rv.meta.reviewer;
       const emptyOutput = rv.meta.cause === "empty-output";
@@ -685,18 +683,30 @@ export async function runGates(
       const retryVia = ctx.via
         ? { ...ctx.via, nameFor: (role: "judge" | "review", adapter: string) => ctx.via!.nameFor(role, adapter) + "-r1" }
         : undefined;
+      const priorExclusions = ctx.excludeReviewers ?? [];
+      const flakedAdapter = flaked.slice(0, flaked.indexOf(":"));
+      const adapterExclusions = ctx.channels.filter((c) => c.adapter === flakedAdapter).map(channelKey);
+      const crossAdapter = pickReviewer(
+        ctx.author, ctx.channels, [...priorExclusions, ...adapterExclusions],
+        ctx.cfg.review.prefer ?? [], task.routingHints?.floor,
+      );
+      const exclusion = crossAdapter ? "adapter" : "channel";
+      const retryExclusions = [...priorExclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, [...(ctx.excludeReviewers ?? []), flaked], ctx.artifactDir,
+        retryVia, retryExclusions, ctx.artifactDir,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
+        const route = exclusion === "adapter"
+          ? `different-adapter retry; excluded flaked adapter ${flakedAdapter}`
+          : `same-adapter fallback; excluded flaked channel ${flaked}`;
         rv = {
           ...second,
           // `details` is lifted onto the journal's gate-result row; meta.reviewRetry is not. Keep the
           // re-route visible in the result text a reader actually opens, including on a red retry.
-          details: `review re-route: ${flaked} produced ${emptyOutput ? "EMPTY output" : "no parseable verdict"}; replaced by ${retried}\n${second.details}`,
-          meta: { ...second.meta, reviewRetry: { flaked, retried } },
+          details: `review re-route (${route}): ${flaked} produced ${emptyOutput ? "EMPTY output" : "no parseable verdict"}; replaced by ${retried}\n${second.details}`,
+          meta: { ...second.meta, reviewRetry: { flaked, retried, exclusion } },
         };
       } else if (task.routingHints?.floor) {
         // Preserve the original no-answer cause when no replacement exists, but name the declared

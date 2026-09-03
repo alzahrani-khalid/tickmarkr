@@ -93,6 +93,33 @@ test("test: a gate without a detected command produces a row whose meta outcome 
   expect(afterRed).toEqual(["build"]);
 });
 
+test("test: a head test red whose output carries a signal exit and no failure identity parks with kind infra and charges no repair attempt while a red carrying an assertion line still funds the repair whereas a classifier that reads every nonzero head exit as a regression fails", async () => {
+  const signal = setupRepo(
+    [T("T1")],
+    { tasks: { T1: [{ shell: `touch signal.txt && ${COMMIT} signal`, result: { ok: true, summary: "signal" } }] } },
+    stringify({ gates: { test: "test ! -f signal.txt || exit 143" } }),
+  );
+  const signalSummary = await runDaemon(signal.repo, { adapters: [signal.fake], runId: "run-head-signal" });
+  expect(signalSummary.human).toEqual(["T1"]);
+  const signalEvents = Journal.open(signal.repo, "run-head-signal").read();
+  expect(signalEvents.find((e) => e.event === "task-human" && e.taskId === "T1")?.data.kind).toBe("infra");
+  expect(signalEvents.find((e) => e.event === "gate-result" && e.data.gate === "test")?.data.infra).toBe(true);
+  expect(signalEvents.filter((e) => e.event === "repair-attempt" && e.taskId === "T1")).toHaveLength(0);
+
+  const assertion = setupRepo(
+    [T("T1")],
+    { tasks: { T1: [
+      { shell: `touch assertion.txt && ${COMMIT} assertion`, result: { ok: true, summary: "assertion" } },
+      { shell: `git rm -q assertion.txt && ${COMMIT} fixed`, result: { ok: true, summary: "fixed" } },
+    ] } },
+    stringify({ gates: { test: "test ! -f assertion.txt || { echo 'AssertionError: expected 1 to be 2'; exit 1; }" } }),
+  );
+  await runDaemon(assertion.repo, { adapters: [assertion.fake], runId: "run-head-assertion" });
+  const assertionEvents = Journal.open(assertion.repo, "run-head-assertion").read();
+  expect(assertionEvents.filter((e) => e.event === "repair-attempt" && e.taskId === "T1")).toHaveLength(1);
+  expect(assertionEvents.some((e) => e.event === "task-human" && e.data.kind === "infra")).toBe(false);
+}, 240_000);
+
 describe("merge satisfaction of an infra-only gate result (fake adapter, zero tokens)", () => {
   test("test: a test gate whose runner exited nonzero on infrastructure alone with no completed suite does not read as merge-satisfied, exercised against that run and against a genuinely completed zero-failure run, because classifying the failure into infra metadata while still reporting a pass authorizes the merge anyway", async () => {
     // The gate results below are produced by the real gate over the real runners — not written here.

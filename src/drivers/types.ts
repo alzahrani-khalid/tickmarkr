@@ -38,7 +38,13 @@ export type DecisionWebhookPost = (url: string, event: DecisionEvent) => void | 
 // owned → explicit ownership-contract identity (T1). When omitted, the driver derives one from `name`
 // via canonicalizeLegacyName so every pane it actually creates still gets a contract-compliant name —
 // T2 threads `owned` through daemon/gates/consult call sites directly and retires the legacy parsing.
-export interface SlotOpts { group?: string; label?: string; owned?: OwnedName }
+export interface SlotOpts {
+  group?: string;
+  label?: string;
+  owned?: OwnedName;
+  /** Adapter id for execution surfaces whose liveness support is agent-specific. */
+  agent?: string;
+}
 
 // ---- Ownership contract (T1: OBS-17 pane-hygiene) --------------------------------------------
 // Every pane/tab tickmarkr creates is identified by exactly one parseable token:

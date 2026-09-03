@@ -13,7 +13,7 @@ import { compileSource } from "../../src/compile/index.js";
 import { compileNative } from "../../src/compile/native.js";
 import { criticalPathHits, declaredReviewPolicy, DEFAULT_CONFIG, effectiveReviewPolicy, isReviewLeafPath, repoOverlayPath } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
-import { pickReviewer, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
+import { fetchTaskDiff, modelProvider, pickReviewer, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
 import { extractJson } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
@@ -539,6 +539,34 @@ describe("R3 review participation is path-keyed", () => {
 
 describe("reviewGate", () => {
 
+  test("test: the reviewer's measured diff on a range that also carries another task's merged files contains only the paths matching the task's files patterns and the strict cap is measured on that diff whereas a reviewer diff that carries the foreign paths fails", async () => {
+    const repo = makeRepo({ "src/own.ts": "export const own = 1;\n", "src/foreign.ts": "export const foreign = 1;\n" });
+    const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    writeFileSync(join(repo, "src/own.ts"), "export const own = 2;\n");
+    writeFileSync(join(repo, "src/foreign.ts"), `export const foreign = ${JSON.stringify("x".repeat(2_000))};\n`);
+    execSync("git add -A && git commit -m integration-tip --no-gpg-sign", { cwd: repo });
+    const task = mkTask({ files: ["src/own.ts"] });
+    const scoped = await fetchTaskDiff(repo, base, task.files);
+    const whole = await fetchTaskDiff(repo, base);
+    expect(scoped.full).toContain("src/own.ts");
+    expect(scoped.full).not.toContain("src/foreign.ts");
+    expect(whole.logicBytes).toBeGreaterThan(scoped.logicBytes);
+
+    const fake = fakeWith({ review: { approve: true, issues: [] } });
+    const command = fake.headlessCommand.bind(fake);
+    let prompt = "";
+    fake.headlessCommand = (promptFile, model) => {
+      prompt = readFileSync(promptFile, "utf8");
+      return command(promptFile, model);
+    };
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.gates.diffCap = scoped.logicBytes;
+    const result = await reviewGate(task, repo, base, author, CH, [fake], cfg);
+    expect(result.pass).toBe(true);
+    expect(prompt).toContain("src/own.ts");
+    expect(prompt).not.toContain("src/foreign.ts");
+  });
+
   test("test: a reviewer that authors its verdict from the review prompt alone names a path the task declared and the diff never touched, so the verdict text is producible only by a reviewer that was shown the declaration; the same reviewer against a prompt carrying diff and criteria only cannot name it and returns a verdict that does not: it fails", async () => {
     const declaredButUntouched = "src/declared-but-untouched.ts";
     const prompt = await captureReviewPrompt(mkTask({
@@ -622,6 +650,37 @@ describe("reviewGate", () => {
     expect(capturedPrompt).toMatch(/criterion fails.*name which shortcut/i);
   });
 
+  test("test: every review gate row carries provider derived from the model string beside vendor so a pi openai-codex model stamped zhipu carries provider openai and the reviewer failover refuses every channel of the author's provider and answers unreadable when the non-excluded pool is exhausted whereas a failover that admits a same-provider seat after two no-verdicts fails", async () => {
+    expect(modelProvider("openai-codex/gpt-5.5", "zhipu")).toBe("openai");
+    const { repo, base } = repoWithCommit();
+    const stampedWrong: BillingChannel[] = [
+      { adapter: "fake", vendor: "anthropic", model: "claude-opus-5", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "zhipu", model: "openai-codex/gpt-5.5", channel: "sub", tier: "frontier" },
+    ];
+    const row = await reviewGate(
+      mkTask(), repo, base,
+      { adapter: "fake", model: "claude-opus-5", channel: "sub", tier: "frontier" },
+      stampedWrong, [fakeWith({ review: { approve: true, issues: [] } })], DEFAULT_CONFIG,
+    );
+    expect(row.meta).toMatchObject({ vendor: "zhipu", provider: "openai" });
+    expect(row.details).toMatch(/vendor: zhipu; provider: openai/);
+
+    const openaiAuthor: Assignment = { adapter: "pi", model: "openai-codex/gpt-5.5", channel: "sub", tier: "frontier" };
+    const exhausted: BillingChannel[] = [
+      { ...openaiAuthor, vendor: "zhipu" },
+      { adapter: "kimi", vendor: "moonshot", model: "kimi-code/k3", channel: "sub", tier: "frontier" },
+      { adapter: "claude-code", vendor: "anthropic", model: "claude-opus-5", channel: "sub", tier: "frontier" },
+      { adapter: "codex", vendor: "openai", model: "gpt-5.6-sol", channel: "sub", tier: "frontier" },
+    ];
+    expect(pickReviewer(openaiAuthor, exhausted, ["kimi:kimi-code/k3", "claude-code:claude-opus-5"])).toBeNull();
+    const unreadable = await reviewGate(
+      mkTask(), repo, base, openaiAuthor, exhausted, [], DEFAULT_CONFIG, undefined,
+      ["kimi:kimi-code/k3", "claude-code:claude-opus-5"],
+    );
+    expect(unreadable).toMatchObject({ pass: false, meta: { unreadable: true, noEligibleReviewer: true } });
+    expect(unreadable.details).toMatch(/unreadable/);
+  });
+
   test("approve → pass; request-changes → fail with issues", async () => {
     const { repo, base } = repoWithCommit();
     const ok = fakeWith({ review: { approve: true, issues: [] } });
@@ -697,7 +756,7 @@ describe("reviewGate", () => {
     cfg.review.prefer = ["fake:fake-3"];
     const r = await reviewGate(mkTask(), repo, base, author, pool, [fake], cfg);
     expect(r.pass).toBe(true);
-    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-3" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-3", vendor: "fake-c", provider: "fake-c" });
   });
 
   test("no cross-vendor channel: required → fail; not required → pass-with-warning", async () => {
@@ -791,7 +850,7 @@ describe("reviewGate material/minor classification (v1.70 T5)", () => {
     expect(r.pass).toBe(false);
     expect(r.details).toContain("off-by-one drops the last row");
     // fails closed the same way a legacy request-changes verdict does: pass:false + the reviewer channel
-    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", vendor: "fake-b", provider: "fake-b" });
   });
 
   test("a deferred finding is carried into the gate's recorded details with its rationale rather than silently dropped", async () => {
@@ -864,7 +923,7 @@ describe("v1.1 reviewer failover", () => {
     const r = await reviewGate(mkTask(), repo, base, author, CH, [bad], DEFAULT_CONFIG);
     expect(r.pass).toBe(false);
     // OBS-193/196: meta additionally marks unparseable (typed retry detection) and names the cause
-    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", unparseable: true, cause: "no-verdict" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", vendor: "fake-b", provider: "fake-b", unparseable: true, cause: "no-verdict" });
   });
 
   test("excludeReviewers reaches reviewGate: excluded vendor → no-reviewer path", async () => {

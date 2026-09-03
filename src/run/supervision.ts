@@ -2,7 +2,7 @@ import {
   mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, type Stats,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 
 // SUP-01: supervision liveness as FILE STATE, not as a report — lock.ts's proven shape, one file per
@@ -48,6 +48,31 @@ export const SUPERVISION_TIERS = [
 ] as const;
 
 export type SupervisionTier = (typeof SUPERVISION_TIERS)[number];
+
+const pathKind = (path: string): "directory" | "present" | "absent" => {
+  try { return statSync(path).isDirectory() ? "directory" : "present"; }
+  catch { return "absent"; }
+};
+
+/**
+ * Resolve a one-shot supervision writer to the repository state it is claiming to supervise.
+ * The nearest state directory wins; reaching a git root without one is a refusal, not permission
+ * to create fresh state there or to wander into an enclosing repository. This function is read-only.
+ */
+export function resolveSupervisionRoot(cwd: string): string {
+  let current = resolve(cwd);
+  for (;;) {
+    if (pathKind(join(current, stateDirName(current))) === "directory") return current;
+    if (pathKind(join(current, ".git")) !== "absent") {
+      throw new Error(`missing ${stateDirName(current)}/ state dir at repository root ${current}`);
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      throw new Error(`missing ${stateDirName(current)}/ state dir — no tickmarkr repository found from ${resolve(cwd)}`);
+    }
+    current = parent;
+  }
+}
 
 // The tiers whose records must NAME the seat behind them. A one-shot `tickmarkr beat` records a pid
 // that has already exited by the time anyone reads it, and an instant — nothing a reader can attribute

@@ -7,6 +7,7 @@ import {
   SUPERVISION_STALE_MS,
   SUPERVISION_TIERS,
   beatSupervision,
+  resolveSupervisionRoot,
   supervisionStandDownPath,
   type SupervisionTier,
 } from "../../run/supervision.js";
@@ -57,13 +58,16 @@ export async function beat(argv: string[], cwd = process.cwd()): Promise<string>
         " (pass the seat's own pane id or agent name)",
     );
   }
-  if (standDown) return standDownTier(cwd, named, seat);
+  // A beat names repository state, never the caller's incidental directory. Resolution is read-only
+  // and happens before every write, so a non-repository invocation cannot create the state it claims.
+  const repoRoot = resolveSupervisionRoot(cwd);
+  if (standDown) return standDownTier(repoRoot, named, seat);
   // Clear a stand-down marker left by an earlier session BEFORE beating: a valid marker outranks every
   // beat that does not strictly follow it, and two writes landing in the same millisecond do not. An
   // uncleared marker would render DISARMED while this verb claimed ARMED, so the removal is unguarded
   // too — `force` makes the ordinary "no marker" case a no-op, and anything else is a real failure.
-  rmSync(supervisionStandDownPath(cwd, named), { force: true, recursive: true });
-  beatSupervision(cwd, named, seat, pct === undefined ? undefined : { armId: armId ?? seat, pct, thresholdPct });
+  rmSync(supervisionStandDownPath(repoRoot, named), { force: true, recursive: true });
+  beatSupervision(repoRoot, named, seat, pct === undefined ? undefined : { armId: armId ?? seat, pct, thresholdPct });
   return `${named} ARMED as ${seat} — beat again every ${SUPERVISION_BEAT_MS / 1_000}s; the tier reads STALE ${SUPERVISION_STALE_MS / 1_000}s after the last beat`;
 }
 

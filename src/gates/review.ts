@@ -6,12 +6,13 @@ import {
   isReviewLeafPath, raiseReviewPolicy, type ReviewPolicy, REVIEW_VERSION_MIRRORS,
   type TickmarkrConfig, TIER_RANK, type Tier,
 } from "../config/config.js";
+import { filesGlob } from "../graph/files-glob.js";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
 import { redactSecrets } from "../run/redact.js";
 import { marginalCostRank } from "../route/router.js";
-import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlm, verdictNonceLine } from "./llm.js";
+import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlmDetailed, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
 import {
@@ -152,12 +153,14 @@ export type TaskDiffMeasurement = {
   readonly capMeasurement: ArtifactDiffMeasurement;
 };
 
-export async function fetchTaskDiff(worktree: string, baseRef: string): Promise<TaskDiffMeasurement> {
+export async function fetchTaskDiff(worktree: string, baseRef: string, files: readonly string[] = []): Promise<TaskDiffMeasurement> {
   // --full-index: abbreviated index lines vary with object-store density, so two measurements of
   // the same diff could disagree by a few bytes between invocations (CI-only red, release 1.89.0).
-  const [rawFull, rawForCap] = await Promise.all([
-    shOk(`git diff --full-index '${baseRef}..HEAD'`, worktree),
-    shOk(`git diff --full-index -U0 '${baseRef}..HEAD'`, worktree),
+  const matched = files.length ? (await changedPaths(worktree, baseRef)).filter(filesGlob([...files])) : [];
+  const pathspec = matched.length ? ` -- ${matched.map(shq).join(" ")}` : "";
+  const [rawFull, rawForCap] = files.length && matched.length === 0 ? ["", ""] : await Promise.all([
+    shOk(`git diff --full-index '${baseRef}..HEAD'${pathspec}`, worktree),
+    shOk(`git diff --full-index -U0 '${baseRef}..HEAD'${pathspec}`, worktree),
   ]);
   const fullMeasurement = measureArtifactDiff(rawFull);
   const capMeasurement = measureArtifactDiff(rawForCap);
@@ -223,6 +226,19 @@ export function modelId(model: string): string {
   return model.slice(model.lastIndexOf("/") + 1);
 }
 
+/** Provider identity comes from the served model, not a gateway adapter's stamped vendor. */
+export function modelProvider(model: string, fallback = "unknown"): string {
+  const id = model.toLowerCase();
+  const prefix = id.includes("/") ? id.slice(0, id.indexOf("/")) : "";
+  if (prefix === "openai" || prefix === "openai-codex" || /^(?:gpt|o\d)/.test(id)) return "openai";
+  if (prefix === "anthropic" || /^(?:claude|opus|sonnet|haiku|fable)(?:-|$)/.test(id)) return "anthropic";
+  if (prefix === "google" || /^gemini(?:-|$)/.test(id)) return "google";
+  if (prefix === "xai" || /^grok(?:-|$)/.test(id)) return "xai";
+  if (["zai", "zhipu", "zai-coding-plan"].includes(prefix) || /^glm(?:-|$)/.test(id)) return "zhipu";
+  if (["kimi-code", "moonshot"].includes(prefix) || /^kimi(?:-|$)/.test(id)) return "moonshot";
+  return fallback;
+}
+
 // v1.53 T2: same entry grammar as routing.map.prefer (router.ts preferIndex — router is out of this
 // module's dependency direction for a private fn, so the 3 lines live here too): `adapter` matches
 // every channel of that adapter, `adapter:model` exactly one; unmatched channels sort after all entries.
@@ -244,12 +260,15 @@ export function pickReviewer(
   // fail-closed branch under review.required.
   const authorChannel = channels.find((c) => c.adapter === author.adapter && c.model === author.model);
   if (!authorChannel) return null;
+  // Failover also guards true provider; the initial pick keeps the established stamped-vendor contract.
+  const authorProvider = modelProvider(author.model, authorChannel.vendor);
   return (
     channels
       // two independent axes: different vendor AND different base-model identity (ADDED TO the vendor
       // rule, never replacing it — a future edit can't silently drop either). The diversity filter runs
       // BEFORE preference ranking: prefer sorts survivors only, so no entry can resurrect an excluded channel.
       .filter((c) => c.vendor !== authorChannel.vendor
+        && (exclude.length === 0 || modelProvider(c.model, c.vendor) !== authorProvider)
         && modelId(c.model) !== modelId(author.model)
         && !exclude.includes(channelKey(c))
         && (floor === undefined || TIER_RANK[c.tier] >= TIER_RANK[floor]))
@@ -374,10 +393,10 @@ export async function reviewGate(
       ? `no cross-vendor reviewer available at or above task-declared ${reviewerFloor} floor (diversity rule)`
       : "no cross-vendor reviewer available (diversity rule)";
     return cfg.review.required
-      ? { gate: "review", pass: false, details: `${reason}; set review.required:false to waive`, meta: { noEligibleReviewer: true, ...(reviewerFloor ? { reviewerFloor } : {}) } }
+      ? { gate: "review", pass: false, details: `unreadable — ${reason}; set review.required:false to waive`, meta: { noEligibleReviewer: true, unreadable: true, ...(reviewerFloor ? { reviewerFloor } : {}) } }
       : { gate: "review", pass: true, details: `WARNING: ${reason} — review waived by config`, meta: { noEligibleReviewer: true, ...(reviewerFloor ? { reviewerFloor } : {}) } };
   }
-  const measuredDiff = await fetchTaskDiff(worktree, baseRef);
+  const measuredDiff = await fetchTaskDiff(worktree, baseRef, task.files);
   // Keep the reader payload identical to the text charged to the strict cap:
   // whole-file source deletions are represented by their citable operation fact.
   const diff = reviewableLogicDiff(measuredDiff.full);
@@ -415,7 +434,7 @@ Approve iff no material finding remains; an empty findings list is a clean appro
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
   let concludedOnInactivity = false;
-  const raw = await runLlm(
+  const llm = await runLlmDetailed(
     getAdapter(reviewer.adapter, adapters),
     reviewer.model,
     prompt,
@@ -435,13 +454,15 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     // second knob-turner appears.
     900_000,
   );
+  const raw = llm.output;
+  const provider = modelProvider(reviewer.model, reviewer.vendor);
   const v = extractVerdictJson<ReviewVerdict>(raw, nonce);
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
   // findings decides the verdict on its own; the legacy path still needs approve + issues to parse.
   if (!v || (findings === null && (typeof v.approve !== "boolean" || !Array.isArray(v.issues)))) {
     // OBS-196: name the cause and persist the raw bytes — a ruled-on "unparseable" without its
     // evidence cannot be audited, and a cutoff must never be indistinguishable from a parse defect.
-    const cause: ReviewUnparseableCause = classifyVerdictCause(raw, nonce, "approve");
+    const cause: ReviewUnparseableCause = classifyVerdictCause(raw, nonce, "approve", llm);
     const bytes = Buffer.byteLength(raw, "utf8");
     let saved: string | undefined;
     if (artifactDir) {
@@ -460,10 +481,12 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     return {
       gate: "review",
       pass: false,
-      details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; cause: ${cause}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
+      details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: ${cause}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
       meta: {
         ...policyMeta,
         reviewer: channelKey(reviewer),
+        vendor: reviewer.vendor,
+        provider,
         unparseable: true,
         cause,
         ...(cause === "empty-output" ? { bytes } : {}),
@@ -474,11 +497,11 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const decided = findings !== null
     ? classifyReviewFindings(findings)
     : classifyReviewIssues(v.approve as boolean, v.issues as unknown[]);
-  const prose = `reviewer ${reviewer.adapter}:${reviewer.model} (${reviewer.vendor}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`;
+  const prose = `reviewer ${reviewer.adapter}:${reviewer.model} (vendor: ${reviewer.vendor}; provider: ${provider}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`;
   return {
     gate: "review",
     pass: decided.pass,
     details: appendAnchoredReview(prose, v),
-    meta: { ...policyMeta, reviewer: channelKey(reviewer) },
+    meta: { ...policyMeta, reviewer: channelKey(reviewer), vendor: reviewer.vendor, provider },
   };
 }

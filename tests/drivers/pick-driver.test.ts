@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate } from "../../src/config/config.js";
 import { driverEvidence, pickDriver } from "../../src/drivers/index.js";
@@ -9,15 +11,22 @@ import { FakeOrca } from "../helpers/fake-orca.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 
-const withHerdrEnv = async (value: string | undefined, fn: () => Promise<void> | void) => {
-  const previous = process.env.HERDR_ENV;
-  if (value === undefined) delete process.env.HERDR_ENV;
-  else process.env.HERDR_ENV = value;
+const DRIVER_HOST_KEYS = ["HERDR_ENV", "TERM_PROGRAM", "ORCA_TERMINAL_HANDLE"] as const;
+
+const withDriverHostEnv = async (
+  values: Partial<Record<(typeof DRIVER_HOST_KEYS)[number], string>>,
+  fn: () => Promise<void> | void,
+) => {
+  const previous = DRIVER_HOST_KEYS.map((key) => [key, process.env[key]] as const);
+  for (const key of DRIVER_HOST_KEYS) delete process.env[key];
+  for (const [key, value] of Object.entries(values)) process.env[key] = value;
   try {
     await fn();
   } finally {
-    if (previous === undefined) delete process.env.HERDR_ENV;
-    else process.env.HERDR_ENV = previous;
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 };
 
@@ -28,7 +37,7 @@ const wireOrcaExec = (driver: OrcaDriver, exec: OrcaExec): void => {
 };
 
 describe("pickDriver", () => {
-  test("test: pickDriver returns the orca driver for an explicit orca override and for config driver orca while auto under HERDR_ENV=1 still returns herdr and auto without it returns subprocess even when the orca probe reports reachable", async () => {
+  test("test: pickDriver auto returns the orca driver when TERM_PROGRAM is Orca and ORCA_TERMINAL_HANDLE is set with HERDR_ENV unset yet returns subprocess when either marker is present alone and returns herdr when HERDR_ENV is 1 beside the Orca pair while no exec seam is invoked by the selection whereas the shipped chain that resolves auto to subprocess under the Orca pair fails", async () => {
     const overrideDriver = pickDriver(DEFAULT_CONFIG, "orca");
     expect(overrideDriver).toBeInstanceOf(OrcaDriver);
     expect(driverEvidence(DEFAULT_CONFIG, overrideDriver, "orca")).toBe("orca (--driver)");
@@ -37,9 +46,23 @@ describe("pickDriver", () => {
     expect(configDriver).toBeInstanceOf(OrcaDriver);
     expect(driverEvidence({ ...DEFAULT_CONFIG, driver: "orca" }, configDriver)).toBe("orca (config)");
 
-    wireOrcaExec(configDriver as OrcaDriver, new FakeOrca().exec);
-
-    await withHerdrEnv("1", () => {
+    const runtimeProbe = vi.spyOn(OrcaDriver.prototype, "probeRuntime");
+    await withDriverHostEnv({ TERM_PROGRAM: "Orca", ORCA_TERMINAL_HANDLE: "term-secret-pair" }, () => {
+      // Control for the shipped herdr-else-subprocess chain this criterion replaces.
+      const shippedAutoId = process.env.HERDR_ENV === "1" ? "herdr" : "subprocess";
+      expect(shippedAutoId).toBe("subprocess");
+      expect(pickDriver(DEFAULT_CONFIG)).toBeInstanceOf(OrcaDriver);
+    });
+    await withDriverHostEnv({ TERM_PROGRAM: "Orca" }, () => {
+      expect(pickDriver(DEFAULT_CONFIG)).toBeInstanceOf(SubprocessDriver);
+    });
+    await withDriverHostEnv({ ORCA_TERMINAL_HANDLE: "term-handle-alone" }, () => {
+      expect(pickDriver(DEFAULT_CONFIG)).toBeInstanceOf(SubprocessDriver);
+    });
+    await withDriverHostEnv({ TERM_PROGRAM: "NotOrca", ORCA_TERMINAL_HANDLE: "term-wrong-host" }, () => {
+      expect(pickDriver(DEFAULT_CONFIG)).toBeInstanceOf(SubprocessDriver);
+    });
+    await withDriverHostEnv({ HERDR_ENV: "1", TERM_PROGRAM: "Orca", ORCA_TERMINAL_HANDLE: "term-nested" }, () => {
       const driver = pickDriver(DEFAULT_CONFIG);
       expect(driver.id).toBe("herdr");
       expect(driverEvidence(DEFAULT_CONFIG, driver)).toBe("auto → herdr (HERDR_ENV=1)");
@@ -47,17 +70,15 @@ describe("pickDriver", () => {
       expect(driverEvidence(DEFAULT_CONFIG, overridden)).toBe("subprocess (--driver)");
       expect(driverEvidence(DEFAULT_CONFIG, new SubprocessDriver())).toBe("auto → subprocess (runtime)");
     });
-    await withHerdrEnv(undefined, async () => {
-      // Reachability is asserted HERE, so the auto verdict below is taken while a reachable orca
-      // runtime demonstrably answers: auto ordering is herdr-or-subprocess and orca health is not
-      // an input to it.
-      await expect((configDriver as OrcaDriver).probeRuntime("/tmp")).resolves.toBe("rt-1");
+    await withDriverHostEnv({}, () => {
       const driver = pickDriver(DEFAULT_CONFIG);
       expect(driver.id).toBe("subprocess");
       expect(driverEvidence(DEFAULT_CONFIG, driver)).toBe("auto → subprocess (HERDR_ENV unset)");
       const overridden = pickDriver(DEFAULT_CONFIG, "herdr");
       expect(driverEvidence(DEFAULT_CONFIG, overridden)).toBe("herdr (--driver)");
     });
+    expect(runtimeProbe).not.toHaveBeenCalled();
+    runtimeProbe.mockRestore();
   });
 
   test("test: an unknown driver override fails run and resume with an explicit usage error before any dispatch while the previous unvalidated cast control lets it through", async () => {
@@ -178,9 +199,20 @@ describe("pickDriver", () => {
     expect(fallbackSummary.failed).toEqual([]);
   }, 60_000);
 
-  test("the config template comment and driver enum documentation now offer orca beside auto, herdr and subprocess, citing the changed lines in src/config/config.ts", () => {
-    // src/config/config.ts:769 — the template comment operators read when authoring an overlay.
-    expect(configTemplate()).toContain("# driver: auto            # auto | herdr | subprocess | orca");
+  test("the config template driver comment README and INTEGRATIONS state that auto resolves herdr then orca on both Orca markers then subprocess and that orca is named explicitly outside an Orca terminal as the diff shows in the changed lines of those three files", () => {
+    const expectedRule = "auto: herdr when HERDR_ENV=1, then orca when TERM_PROGRAM=Orca + ORCA_TERMINAL_HANDLE, else subprocess; name orca explicitly outside an Orca terminal";
+    const readme = readFileSync(join(import.meta.dirname, "../../README.md"), "utf8");
+    const integrations = readFileSync(join(import.meta.dirname, "../../docs/codebase/INTEGRATIONS.md"), "utf8");
+
+    expect(configTemplate()).toContain(`# driver: auto            # ${expectedRule}`);
+    for (const document of [readme, integrations]) {
+      const normalized = document.replace(/\s+/g, " ");
+      expect(document).toContain("HERDR_ENV=1");
+      expect(document).toContain("TERM_PROGRAM=Orca");
+      expect(document).toContain("ORCA_TERMINAL_HANDLE");
+      expect(normalized).toMatch(/then (?:Orca|`OrcaDriver`).*then (?:subprocess|`SubprocessDriver`)/);
+      expect(normalized).toMatch(/Outside an Orca terminal, (?:name|select) it explicitly/);
+    }
     // src/config/config.ts:304 — the enum the loader validates against, so the offered value loads.
     expect(TickmarkrConfigSchema.shape.driver.options).toEqual(["auto", "herdr", "subprocess", "orca"]);
     expect(TickmarkrConfigSchema.shape.driver.safeParse("orca").success).toBe(true);

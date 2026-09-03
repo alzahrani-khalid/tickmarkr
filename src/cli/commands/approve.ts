@@ -14,7 +14,7 @@ export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
 export const APPROVAL_ENACTS: Record<ApprovalDisposition, string> = {
   dispatch: "dispatch it",
   "waive-gate": "continue past the approved gate",
-  "re-dispatch": "re-dispatch against the full gate suite",
+  "re-dispatch": "re-dispatch against the full gate suite only if re-running the whole declared battery on the parked commit before any worker is red",
   "fund-fixed-attempt": "dispatch a fixed attempt carrying the findings",
   "fresh-budget": "dispatch it on a fresh attempt budget",
 };
@@ -140,6 +140,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   const lastHuman = events[lastHumanIndex];
   const capPark = lastHuman?.data.kind === ATTEMPT_CAP_RELEASE;
   const gateFailPark = lastHuman?.data.kind === "gate-fail";
+  const infraPark = lastHuman?.data.kind === "infra";
   const failedGate = gateFailPark ? failedGateForNewestPark(events, taskId, lastHumanIndex) : undefined;
   if (gateFailPark && !failedGate) {
     throw new Error(`task ${taskId} is parked on gate-fail but has no failed gate result on the newest park — refusing to infer one`);
@@ -160,8 +161,8 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     return disposition(cwd, runId, "fund-fixed-attempt", `upheld the reviewer for ${taskId} in ${runId} — by ${by}`, serialization.contended);
   }
   if (recheck) {
-    if (!gateFailPark || !failedGate) {
-      throw new Error(`--recheck applies to a gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
+    if ((!gateFailPark || !failedGate) && !infraPark) {
+      throw new Error(`--recheck applies to a gate-fail or infra park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
       by,
@@ -170,7 +171,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       release: RECHECK_RELEASE,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; failed gate ${failedGate}; no gate marked satisfied`, serialization.contended);
+    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : "infra park"}; no gate marked satisfied`, serialization.contended);
   }
   if (waive) {
     if (!gateFailPark || !failedGate) {

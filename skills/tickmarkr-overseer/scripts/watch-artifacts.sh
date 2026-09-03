@@ -1,7 +1,7 @@
 #!/bin/bash
 # Wake the overseer when spawned seats have actually DELIVERED.
 #
-#   watch-artifacts.sh <marker> <cap-seconds> <poll-seconds> <file>...
+#   watch-artifacts.sh [--changed-from <sha|mtime|now>] <marker> <cap-seconds> <poll-seconds> <file>...
 #
 # Completion is the ARTIFACT plus its TERMINAL MARKER — never an agent's `done`, which is turn end and
 # fires the moment a seat finishes acknowledging you. Never file existence alone either: a seat killed
@@ -26,11 +26,28 @@ set -u
 # arm crashed before printing its reason — a watcher that dies without a wake reason is the exact failure
 # this script exists to prevent.
 
-MARKER="${1:?usage: watch-artifacts.sh <marker> <cap-seconds> <poll-seconds> <file>...}"
+CHANGED_FROM=""
+if [ "${1:-}" = "--changed-from" ]; then
+  CHANGED_FROM="${2:?--changed-from requires a sha, prior mtime, or 'now'}"
+  shift 2
+fi
+
+MARKER="${1:?usage: watch-artifacts.sh [--changed-from <sha|mtime|now>] <marker> <cap-seconds> <poll-seconds> <file>...}"
 CAP="${2:?}"
 POLL="${3:?}"
 shift 3
 [ "$#" -gt 0 ] || { echo "watch-artifacts: no files given" >&2; exit 2; }
+
+# OBS-848: ownership is a pid-file fact, never an argv/path pattern. Two tiers intentionally watch
+# the same artifacts, so the journal/file argument cannot identify which watcher a seat may retire.
+PID_DIR="${TKR_STATE_DIR:-.tickmarkr}/overseer/pids"
+PID_SEAT=$(printf '%s' "${TKR_ARMING_SEAT:-unattributed}" | sed 's/[^A-Za-z0-9_-]/_/g')
+PID_FILE="$PID_DIR/${PID_SEAT}-watch-artifacts-$$.pid"
+mkdir -p "$PID_DIR" && (umask 077; printf '%s\n' "$$" > "$PID_FILE") || {
+  echo "watch-artifacts: cannot record pid under $PID_DIR" >&2; exit 73;
+}
+clear_pid() { rm -f "$PID_FILE"; }
+trap clear_pid EXIT
 
 # Cap BELOW the host's background-job kill so every arm ends by PRINTING something. A job killed at the
 # limit carries no wake reason and is indistinguishable from a real wake until you read the output —
@@ -74,6 +91,22 @@ END=$((SECONDS + CAP))
 # RUNTIME, where the arithmetic then errors, `done_file` returns 1 forever, and the watcher never wakes.
 # Caught by the drill below, not by the syntax check. A syntax check is not a positive control.
 PREV=()
+BASELINE=()
+i=0
+for f in "$@"; do
+  if [ -n "$CHANGED_FROM" ]; then
+    # A SHA is an explicit single-artifact baseline. Historical callers recorded mtimes; retain that
+    # spelling as the arming signal but capture content now, because equal-length rewrites and touches
+    # prove that mtime is not the property this watcher claims to read.
+    if printf '%s' "$CHANGED_FROM" | grep -qE '^[0-9a-fA-F]{40}$' && [ "$#" -eq 1 ]; then
+      BASELINE[$i]=$(printf '%s' "$CHANGED_FROM" | tr 'A-F' 'a-f')
+    else
+      BASELINE[$i]=$(shasum -a 1 "$f" 2>/dev/null | cut -d' ' -f1)
+    fi
+  fi
+  i=$((i + 1))
+done
+
 done_file() {                  # $1 = index into "$@", $2 = path
   local i="$1" f="$2" sig
   [ -s "$f" ] || return 1
@@ -85,6 +118,7 @@ done_file() {                  # $1 = index into "$@", $2 = path
   # catch. Hashing 48KB per poll costs nothing.
   sig=$(shasum -a 1 "$f" 2>/dev/null | cut -d' ' -f1)
   [ -n "$sig" ] || return 1
+  if [ -n "$CHANGED_FROM" ] && [ "${BASELINE[$i]:-}" = "$sig" ]; then return 1; fi
   if [ "${PREV[$i]:-}" = "$sig" ]; then return 0; fi
   PREV[$i]="$sig"              # marked but still moving — hold it one more poll
   return 1

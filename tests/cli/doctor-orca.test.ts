@@ -19,6 +19,19 @@ const malformedSameMetadata = JSON.stringify({ ok: true, result: { runtime: {} }
 // shared parser's verdict is a failed probe.
 const malformedUnreachableNoRuntimeId = JSON.stringify({ ok: true, result: { runtime: { reachable: false } }, _meta: {} });
 const malformedUnreachableRuntimeIdNone = JSON.stringify({ ok: true, result: { runtime: { reachable: false } }, _meta: { runtimeId: "none" } });
+const hookCoverage = JSON.stringify({
+  ok: true,
+  result: {
+    statuses: [
+      // The contradictory convenience boolean proves doctor reads the state returned by this
+      // command, not a second inferred coverage source.
+      { agent: "claude", state: "installed", managedHooksPresent: false },
+      { agent: "cursor", state: "not_installed", managedHooksPresent: true },
+      { agent: "gemini", state: "installed", managedHooksPresent: true },
+    ],
+  },
+  _meta: { runtimeId: "rt-hooks" },
+});
 
 describe("doctor Orca capability", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -153,5 +166,44 @@ describe("doctor Orca capability", () => {
       else process.env.ORCA_CLI_COMMAND = previous;
     }
     expect(seen).toEqual(["/env/orca"]);
+  });
+
+  test("test: the doctor orca row lists the hooked and the unhooked adapters from a live hooks status answer naming claude-code hooked and cursor-agent unhooked when the fixture says so whereas a row that reports reachable without naming coverage or reads coverage from anything but hooks status fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const calls: Array<{ cwd: string; binary: string }> = [];
+    const out = await doctor(["--"], repo, [], {
+      resolveOrcaBinary: () => "/fixture/orca",
+      orcaStatusProbe: async () => status(reachable),
+      orcaHooksStatusProbe: async (cwd, binary) => {
+        calls.push({ cwd, binary });
+        return status(hookCoverage);
+      },
+      orcaEnv: {},
+    });
+
+    const row = out.split("\n").find((line) => line.includes("orca"))!;
+    expect(calls).toEqual([{ cwd: repo, binary: "/fixture/orca" }]);
+    expect(row).toContain("claude-code hooked");
+    expect(row).toContain("cursor-agent unhooked");
+    expect(row).not.toContain("gemini");
+  });
+
+  test("test: outside an Orca terminal with a reachable runtime the doctor orca row says not an Orca terminal and that auto picks orca only inside one and names --driver orca while inside one it says auto picks it whereas a row that prints the lever sentence in both environments or in neither fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const rendered = (orcaEnv: Record<string, string>) => doctor(["--"], repo, [], {
+      resolveOrcaBinary: () => "/fixture/orca",
+      orcaStatusProbe: async () => status(reachable),
+      orcaHooksStatusProbe: async () => status(hookCoverage),
+      orcaEnv,
+    });
+
+    const outside = await rendered({ TERM_PROGRAM: "WarpTerminal" });
+    expect(outside).toContain("not an Orca terminal; auto picks orca only inside one; use --driver orca");
+
+    const inside = await rendered({ TERM_PROGRAM: "Orca", ORCA_TERMINAL_HANDLE: "terminal-secret" });
+    expect(inside).toContain("auto picks orca in this Orca terminal");
+    expect(inside).not.toContain("not an Orca terminal");
+    expect(inside).not.toContain("--driver orca");
+    expect(inside).not.toContain("terminal-secret");
   });
 });

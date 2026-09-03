@@ -101,7 +101,7 @@ function repoWithCommit() {
 
 async function ctxFor(
   repo: string, base: string, adapters: WorkerAdapter[],
-  opts: { channels?: BillingChannel[]; judgeModel?: string } = {},
+  opts: { channels?: BillingChannel[]; judgeChannels?: BillingChannel[]; judgeModel?: string; omitJudgePool?: boolean } = {},
 ) {
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.judge.adapter = "fake";
@@ -111,7 +111,9 @@ async function ctxFor(
     result: noResult,
     commands: {} as Record<string, string>,
     baseline: await captureBaseline(repo, {}),
-    channels: opts.channels ?? CH_TWO_ADAPTERS, adapters, cfg,
+    channels: opts.channels ?? CH_TWO_ADAPTERS,
+    ...(opts.omitJudgePool ? {} : { judgeChannels: opts.judgeChannels ?? opts.channels ?? CH_TWO_ADAPTERS }),
+    adapters, cfg,
   };
 }
 
@@ -125,6 +127,32 @@ const PASS = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r",
 const FAIL = { pass: false, criteria: [{ criterion: "c1", met: false, reason: "nope", evidence: "+y" }] };
 
 describe("GATE-09 judge-flake retry (run-gates level)", () => {
+  test("test: the judge retry pool is the judge channels alone so a context whose review channels hold a denied judge seat never retries the judge on it and a context without judge channels retries on the configured judge channel whereas the shipped fallback that reads review channels as judges fails", async () => {
+    const run = async (omitJudgePool: boolean) => {
+      const { repo, base } = repoWithCommit();
+      const primary = fakeWith({ judge: ["garbage", PASS] });
+      const denied = fakeBWith({ judge: [PASS] });
+      let deniedCalls = 0;
+      const command = denied.headlessCommand.bind(denied);
+      denied.headlessCommand = (...args) => { deniedCalls++; return command(...args); };
+      const ctx = await ctxFor(repo, base, [primary, denied], {
+        channels: CH_TWO_ADAPTERS,
+        judgeChannels: [CH_TWO_ADAPTERS[1]!],
+        omitJudgePool,
+      });
+      ctx.cfg.routing.deny = { adapters: ["fake-b"] };
+      const { results } = await runGates(mkTask({ gates: JUDGE_GATES, files: [] }), ctx);
+      return { acceptance: results.find((result) => result.gate === "acceptance")!, deniedCalls };
+    };
+
+    const deniedPool = await run(false);
+    expect(deniedPool.acceptance.meta?.judgeRetry).toMatchObject({ retried: "fake:fake-1" });
+    expect(deniedPool.deniedCalls).toBe(0);
+    const absentPool = await run(true);
+    expect(absentPool.acceptance.meta?.judgeRetry).toMatchObject({ retried: "fake:fake-1" });
+    expect(absentPool.deniedCalls).toBe(0);
+  });
+
   test("test: a verdict carrying well-formed anchored comments renders them as an anchored review block in the retry prompt", async () => {
     const { repo, base } = repoWithCommit();
     const commentedFailure = {

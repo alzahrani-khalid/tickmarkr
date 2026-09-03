@@ -27,9 +27,9 @@ import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { distFingerprint } from "../cli/commands/version.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
-import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, type RunCapacity, sameCapacity, sh, shGit, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, type RunCapacity, sameCapacity, sh, shGit, SUITE_PARENT_ENV, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, renderStructuredReviewFinding, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingRechecks, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { isDiffCapPark } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
@@ -150,12 +150,13 @@ export interface RunSummary {
 }
 
 // T14: the events that prove an approval was ENACTED — narrowly causal, never merely subsequent.
-// An ordinary approval (no release, attempt-cap, recheck, review-upheld) all buy a WORKER, so the
-// proof is a dispatch. Generic terminal events are deliberately NOT proof: an approved human-gate
+// Ordinary, attempt-cap and review-upheld approvals buy a WORKER, so their proof is a dispatch;
+// recheck has its own battery enactment below. Generic terminal events are deliberately NOT proof: an approved human-gate
 // task can fail in routing before task-dispatch, and the catch appends task-failed — treating that
 // as enactment reports "complete" over an approval that never ran (the exact silent-completion this
 // task exists to kill).
 const DISPATCH_ENACTMENT = new Set(["task-dispatch", "repair-dispatch"]);
+const RECHECK_ENACTMENT = "recheck-battery";
 // The ONE approval that enacts without buying a worker: GATE_SATISFIED_RELEASE resumes from the
 // persisted task branch after the approved gate (execTask's satisfiedGate branch), whose first act
 // for the task is worktree-recreation. That event is causal for this path, not incidental.
@@ -178,9 +179,13 @@ export function outstandingApprovals(events: JournalEvent[]): string[] {
   events.forEach((e, i) => { if (e.event === "task-approved" && e.taskId) newest.set(e.taskId, i); });
   return [...newest]
     .filter(([taskId, i]) => {
-      const noWorker = events[i]!.data.release === GATE_SATISFIED_RELEASE;
+      const release = events[i]!.data.release;
+      const noWorker = release === GATE_SATISFIED_RELEASE;
+      const recheck = release === RECHECK_RELEASE;
       return !events.slice(i + 1).some((e) => e.taskId === taskId
-        && (DISPATCH_ENACTMENT.has(e.event) || (noWorker && e.event === GATE_SATISFIED_ENACTMENT)));
+        && (DISPATCH_ENACTMENT.has(e.event)
+          || (noWorker && e.event === GATE_SATISFIED_ENACTMENT)
+          || (recheck && e.event === RECHECK_ENACTMENT)));
     })
     .map(([taskId]) => taskId)
     .sort();
@@ -252,6 +257,19 @@ const isOracleFailure = (g: GateResult) => g.details.startsWith("oracle failed:"
  */
 export const gateSatisfied = (g: GateResult) => (g.pass || g.meta?.skipped === true) && g.meta?.infra !== true;
 const gateFailed = (g: GateResult) => !gateSatisfied(g);
+
+const SIGNAL_EXIT_RE = /\b(?:SIGTERM|SIGKILL|signal\s+(?:9|15)|exit(?:s|ed|\s+code)?\s+(?:137|143))\b/i;
+const FAILURE_IDENTITY_RE = /\b(?:AssertionError|FAIL\s+\S|Tests?\s+\d+\s+failed|expected\s+.+\s+to\s+)\b/i;
+
+/** A signalled test runner with no failure identity produced no verdict about HEAD. Baseline owns the
+ * ordinary infra vocabulary; this daemon-only rider handles the signal-shaped non-verdict before its
+ * journal row and repair accounting are written. */
+function classifySignalOnlyTest(g: GateResult): void {
+  if (g.gate !== "test" || g.pass || g.meta?.infra === true || !SIGNAL_EXIT_RE.test(g.details)) return;
+  const named = Array.isArray(g.meta?.failingTests) && g.meta.failingTests.length > 0;
+  if (named || FAILURE_IDENTITY_RE.test(g.details)) return;
+  g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false, kind: "signal-exit" };
+}
 
 // v1.85 T3: the gates whose failure IS a deterministic measurement — a machine re-ran a command over a
 // tree and printed the same bytes. Those are the failures the fingerprint cap governs (the ruling names
@@ -356,6 +374,8 @@ function approvedReviewRoundCeiling(events: JournalEvent[], taskId: string): num
   return undefined;
 }
 const BLOCKED_POLL_MS = 30_000; // between trailer-wait slices, check whether the pane is blocked on a prompt
+export const SUITE_POLL_MS = 250;
+export const APPROVAL_POLL_MS = 250;
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
 const NO_TRAILER_DEMOTION_STREAK = 2; // OBS-57: consecutive no-trailer windows demote a channel for the rest of the run
@@ -679,6 +699,109 @@ async function observeWorkerProcessTree(marker: string, cwd: string): Promise<Wo
     }
   }
   return tree.size === 0 ? "empty" : "running";
+}
+
+interface ProcessRow { pid: number; ppid: number; command: string }
+const SUITE_COMMAND_RE = /(?:^|[\s/])(vitest(?:\.mjs)?|jest|mocha)(?:[\s/]|$)|\bnpm(?:\s+run)?\s+test\b/i;
+
+type SuitePidProbe = (pid: number) => number | undefined;
+
+function processCwd(pid: number): string | undefined {
+  try { return realpathSync(readlinkSync(`/proc/${pid}/cwd`)); } catch { /* Darwin has no /proc */ }
+  try {
+    const out = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000,
+    });
+    const path = out.split("\n").find((line) => line.startsWith("n"))?.slice(1);
+    return path ? realpathSync(path) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function processSuiteParent(pid: number): number | undefined {
+  try {
+    const env = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+    const value = env.find((entry) => entry.startsWith(`${SUITE_PARENT_ENV}=`))?.slice(SUITE_PARENT_ENV.length + 1);
+    return value && /^\d+$/.test(value) ? Number(value) : undefined;
+  } catch { /* Darwin has no /proc process environments */ }
+  try {
+    const out = execFileSync("ps", ["eww", "-p", String(pid), "-o", "command="], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000,
+    });
+    const value = new RegExp(`(?:^|\\s)${SUITE_PARENT_ENV}=(\\d+)(?:\\s|$)`).exec(out)?.[1];
+    return value ? Number(value) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const pathAtOrBelow = (root: string, candidate: string): boolean => {
+  const rel = relative(root, candidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
+
+/** Count full-suite roots in one process-table snapshot. The probes are arguments so the ownership
+ * rules remain testable on hosts that forbid process inspection; production supplies cwd and the
+ * inherited TICKMARKR_SUITE_PARENT marker from the process itself. */
+export function countLiveSuites(
+  snapshot: string,
+  repoRoot: string,
+  daemonPid = process.pid,
+  cwdForPid: (pid: number) => string | undefined = processCwd,
+  suiteParentForPid: SuitePidProbe = processSuiteParent,
+): number {
+  const rows: ProcessRow[] = [];
+  for (const line of snapshot.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (match && !match[3]!.startsWith("Z")) {
+      rows.push({ pid: Number(match[1]), ppid: Number(match[2]), command: match[4]! });
+    }
+  }
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const ancestors = new Set<number>();
+  for (let pid = daemonPid; pid && !ancestors.has(pid); pid = byPid.get(pid)?.ppid ?? 0) ancestors.add(pid);
+  const descendants = new Set<number>([daemonPid]);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const row of rows) if (!descendants.has(row.pid) && descendants.has(row.ppid)) {
+      descendants.add(row.pid);
+      grew = true;
+    }
+  }
+  const root = realpathSync(repoRoot);
+  const candidates = rows.filter((row) => !ancestors.has(row.pid) && SUITE_COMMAND_RE.test(row.command));
+  const attributable = new Set(candidates.filter((row) => {
+    if (descendants.has(row.pid)) return true;
+    const cwd = cwdForPid(row.pid);
+    if (cwd !== undefined && pathAtOrBelow(root, cwd)) return true;
+    const suiteParent = suiteParentForPid(row.pid);
+    if (suiteParent === daemonPid) return true;
+    const parentCwd = suiteParent === undefined ? undefined : cwdForPid(suiteParent);
+    return parentCwd !== undefined && pathAtOrBelow(root, parentCwd);
+  }).map((row) => row.pid));
+  // npm/npx + vitest + pool workers are one suite. Count only attributable suite processes with no
+  // attributable suite ancestor, while still following ordinary non-suite parents between them.
+  return [...attributable].filter((pid) => {
+    for (let parent = byPid.get(pid)?.ppid; parent; parent = byPid.get(parent)?.ppid) {
+      if (attributable.has(parent)) return false;
+    }
+    return true;
+  }).length;
+}
+
+let liveSuiteCountForTests: ((repoRoot: string) => Promise<number>) | undefined;
+export const setLiveSuiteCountForTests = (probe: (repoRoot: string) => Promise<number>): void => {
+  liveSuiteCountForTests = probe;
+};
+export const resetLiveSuiteCountForTests = (): void => { liveSuiteCountForTests = undefined; };
+
+/** Live full-suite roots attributable to this repository or this daemon. Ancestors are excluded so
+ * a daemon invoked by vitest does not wait on its own test harness forever. */
+export async function liveSuiteCount(repoRoot: string): Promise<number> {
+  if (liveSuiteCountForTests) return liveSuiteCountForTests(repoRoot);
+  const snapshot = await shGit("ps -Aww -o pid=,ppid=,state=,command=", repoRoot, 15_000);
+  return snapshot.code === 0 ? countLiveSuites(snapshot.stdout, repoRoot) : 0;
 }
 
 const OBSERVE_CHUNK_BYTES = 64 * 1024;
@@ -1500,6 +1623,38 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     return next;
   };
 
+  // OBS-829/OBS-854: one full-suite verdict round at a time in this run, and do not begin beside an
+  // externally live suite attributable to this repository. The process scan catches nested scratch
+  // suites through daemon parentage even after cwd stops naming a worktree.
+  let suiteChain: Promise<void> = Promise.resolve();
+  let suitePending = 0;
+  const withSuiteWindow = async <T>(taskId: string | undefined, enabled: boolean, run: () => Promise<T>): Promise<T> => {
+    if (!enabled) return run();
+    const previous = suiteChain;
+    let release!: () => void;
+    suiteChain = new Promise<void>((resolve) => { release = resolve; });
+    const queued = suitePending++ > 0;
+    if (queued) {
+      const count = Math.max(1, await liveSuiteCount(repoRoot));
+      journal.append("suite-wait", taskId, { count });
+    }
+    await previous;
+    try {
+      let lastCount = -1;
+      for (;;) {
+        const count = await liveSuiteCount(repoRoot);
+        if (count === 0) break;
+        if (count !== lastCount) journal.append("suite-wait", taskId, { count });
+        lastCount = count;
+        await new Promise((wake) => setTimeout(wake, SUITE_POLL_MS));
+      }
+      return await run();
+    } finally {
+      suitePending--;
+      release();
+    }
+  };
+
   // gateFails/consults are execTask-scoped counters passed in so a park row is a rich verified-failure
   // observation (e.g. ladder-exhausted + gateFails:4); every task-human row has a closed kind, never prose alone.
   const gateFailApprovalReason = (taskId: string, identity: string, includeUphold = false): string => {
@@ -1969,20 +2124,23 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // contiguous green prefix whose recorded commit is still the task branch tip.
     const satisfiedGate = satisfiedGates.get(t.id);
     const replayedGates = replayedGateResults.get(t.id);
-    resumeGateReplay: if (satisfiedGate || replayedGates) {
+    const recheck = pendingRechecks(journal.read()).has(t.id);
+    resumeGateReplay: if (satisfiedGate || replayedGates || recheck) {
       const taskBase = await integrationHead(intWt);
       const taskBranch = `${branch}--${t.id}`;
       const priorWt = worktreePath(repoRoot, taskBranch);
       if (!existsSync(priorWt)) {
-        if (satisfiedGate) throw new Error(`approved gate ${satisfiedGate} cannot resume: task worktree is missing`);
+        if (satisfiedGate || recheck) throw new Error(`${recheck ? "recheck" : `approved gate ${satisfiedGate}`} cannot resume: task worktree is missing`);
         // Observed passes are an optimization, never authority: without the task worktree there is no
         // commit to compare and no landed work to gate, so fall through to the ordinary worker path.
         replayedGateResults.delete(t.id);
         break resumeGateReplay;
       }
-      const resumeReason = satisfiedGate
-        ? `approved gate ${satisfiedGate}`
-        : `recorded gates on ${replayedGates!.commit.slice(0, 10)}`;
+      const resumeReason = recheck
+        ? "operator recheck"
+        : satisfiedGate
+          ? `approved gate ${satisfiedGate}`
+          : `recorded gates on ${replayedGates!.commit.slice(0, 10)}`;
       const priorTaskTip = await gitHead(priorWt);
       const priorTaskSubject = await gateCommitSubject(taskBase, priorTaskTip, priorWt);
       const commitsToCarry = await commitsAheadOf(taskBase, priorWt);
@@ -2037,7 +2195,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           : [],
         raw: "",
       };
-      const gateAuthor = rs?.lastAssignment ?? assignment;
+      const parkedAuthor = recheck
+        ? [...journal.read()].reverse().find((e) => e.event === "task-dispatch" && e.taskId === t.id)?.data.assignment as Assignment | undefined
+        : undefined;
+      const gateAuthor = parkedAuthor ?? rs?.lastAssignment ?? assignment;
       const satisfiedIndex = satisfiedGate ? GATE_NAMES.indexOf(satisfiedGate) : -1;
       // The serial pipeline could have at most one blocking result, so "everything after the
       // approved gate" was enough. v1.85 can record both verdict siblings red in one round, and a
@@ -2060,7 +2221,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         priorResults.set(e.data.gate as GateName, e);
       }
       let remainingGates: GateName[];
-      if (satisfiedGate) {
+      if (recheck) {
+        remainingGates = GATE_NAMES.filter((gate) => t.gates.includes(gate));
+      } else if (satisfiedGate) {
         remainingGates = t.gates.filter((gate) => {
           if (gate === satisfiedGate) return false;
           const prior = priorResults.get(gate)?.data;
@@ -2115,10 +2278,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // This suffix is re-measured to decide whether resume may advance, but the interrupted
           // attempt already paid for its red result. The next worker-backed round remains the next
           // deterministic-fingerprint occurrence/review round for budget accounting.
-          ...(!satisfiedGate ? { replayMeasurement: true as const } : {}),
+          ...(!satisfiedGate && !recheck ? { replayMeasurement: true as const } : {}),
         };
         journal.phaseStart(t.id, "gates");
-        const { results } = await runGates(resumedTask, {
+        const { results } = await withSuiteWindow(t.id,
+          resumedTask.gates.includes("test") && commands.test !== undefined,
+          () => runGates(resumedTask, {
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
           commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
           collateral: collateral.get(t.id) ?? [],
@@ -2145,6 +2310,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               return;
             }
             const g = e.result;
+            classifySignalOnlyTest(g);
             inParallelOrder(g.gate as GateName, () => {
               journalGateResult(g);
               noteReviewRetry(g);
@@ -2154,7 +2320,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               }
             });
           },
-        });
+        }));
+        results.forEach(classifySignalOnlyTest);
+        if (pendingRechecks(journal.read()).has(t.id)) {
+          journal.append("recheck-battery", t.id, {
+            commit: gateSubject.commit,
+            gates: resumedTask.gates,
+            pass: results.every(gateSatisfied),
+          });
+        }
         const approvedCommits = await commitsAheadOf(taskBase, wt);
         graph = addEvidence(graph, t.id, { commits: approvedCommits, gateResults: results });
         saveGraph(repoRoot, graph);
@@ -2497,7 +2671,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
       // VIS-04: workers share one role tab. T2: `owned` names the pane canonically (ownership contract);
       // the legacy name stays the fallback for drivers without owned handling (subprocess spies).
-      const slot = await trackedDriver.slot(wt, `${t.id}-worker-${assignment.adapter}-a${attempt}-${runTag}`, { group: "workers", owned: { role: "worker", taskId: t.id, attempt, runId } });
+      const workerSlotOpts = {
+        group: "workers",
+        owned: { role: "worker" as const, taskId: t.id, attempt, runId },
+      };
+      // Keep the established enumerable slot-options shape consumed by legacy drivers while making
+      // the adapter hook available as an own request field to execution surfaces such as Orca.
+      Object.defineProperty(workerSlotOpts, "agent", { value: assignment.adapter });
+      const slot = await trackedDriver.slot(
+        wt,
+        `${t.id}-worker-${assignment.adapter}-a${attempt}-${runTag}`,
+        workerSlotOpts,
+      );
       const sessionId = retryMode === "resume" ? priorSession!.id : slot.name;
       const icmd = retryMode === "resume"
         ? adapter.resumeCommand!(sessionId, promptFile, assignment.model)
@@ -3561,6 +3746,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           return;
         }
         const g = e.result;
+        classifySignalOnlyTest(g);
         inParallelOrder(g.gate as GateName, () => {
           // GATE-09 (ROADMAP SC-4): journal every judge retry as an attributable event — which gate flaked,
           // which channel flaked, which channel retried — so `tickmarkr journal`/report can distinguish "judge
@@ -3593,7 +3779,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const gated = await gitHead(wt);
         gateSubject = { commit: await gateCommitSubject(taskBase, gated, wt), attempt };
         journal.phaseStart(t.id, "gates");
-        ({ results, commits } = await runGates(t, {
+        ({ results, commits } = await withSuiteWindow(t.id,
+          t.gates.includes("test") && commands.test !== undefined,
+          () => runGates(t, {
           worktree: wt, baseRef: taskBase, result, author: assignment,
           commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
           collateral: collateral.get(t.id) ?? [],
@@ -3616,7 +3804,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             : undefined,
           excludeReviewers: badReviewers,
           onGate,
-        }));
+        })));
+        results.forEach(classifySignalOnlyTest);
         graph = addEvidence(graph, t.id, { commits, gateResults: results, artifacts: [promptFile] });
         saveGraph(repoRoot, graph);
         if (results.some((g) => g.gate === "test" && !g.pass)) testGateFailed = true;
@@ -3725,6 +3914,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // failing gate, and `feedback` still carries every one of them to the next attempt.
       const repairBattery = failing.some((g) => g.gate !== "review") ? failing.filter((g) => g.gate !== "review") : failing;
       const repairable = narrowRepairBattery(repairBattery) && lostCommits.length === 0 && landed.length > 0;
+      const repairHistory = repairReachSinceApproval(journal.read(), t.id);
       const repairsDrawn = repairsSinceApproval(journal.read(), t.id);
       const repair = repairable && repairsDrawn < MAX_REPAIRS;
 
@@ -3796,12 +3986,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
       if (repair && !capStep) {
         journal.append("repair-attempt", t.id, {
-          repair: repairsDrawn + 1, of: MAX_REPAIRS, gates: failing.map((g) => g.gate),
+          repair: repairHistory.length + 1, charge: repairsDrawn + 1, of: MAX_REPAIRS,
+          gates: failing.map((g) => g.gate),
           commits: landed.length,
           findings: feedback, // the failure bytes this repair must carry, replayable across a resume
         });
       } else if (repairExhausted && !capStep) {
-        journal.append("repair-exhausted", t.id, { repairs: repairsDrawn, of: MAX_REPAIRS, gates: failing.map((g) => g.gate) });
+        journal.append("repair-exhausted", t.id, {
+          repairs: repairsDrawn, of: MAX_REPAIRS, gates: failing.map((g) => g.gate),
+          reached: repairHistory,
+        });
       }
 
       const step = capStep ?? (repair || (reviewFixRetry && !repairExhausted)
@@ -3811,7 +4005,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         journal.append("escalation", t.id, {
           step, attempt: attempt + 1,
           ...(reviewFixRetry && !repairExhausted ? { reviewFix: true } : {}),
-          ...(repair ? { repair: repairsDrawn + 1 } : {}),
+          ...(repair ? { repair: repairHistory.length + 1, repairCharge: repairsDrawn + 1 } : {}),
         });
         await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${step}`, { tier: "attention" });
       }
@@ -3864,7 +4058,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       inflight.set(t.id, p);
     }
     if (inflight.size === 0) break;
-    await Promise.race([...inflight.values(), aborted]); // aborted rejects on termination — unwinds the run
+    const waiters: Promise<unknown>[] = [...inflight.values(), aborted];
+    // A free slot is itself a scheduling boundary: poll the append-only approval stream instead of
+    // sleeping until an unrelated long-running task settles.
+    if (inflight.size < concurrency) {
+      waiters.push(new Promise((wake) => setTimeout(wake, APPROVAL_POLL_MS)));
+    }
+    await Promise.race(waiters); // aborted rejects on termination — unwinds the run
   }
 
   // D-07: the sweep now closes only what's LEFT in keptSlots — done-closed worker slots were removed
@@ -3891,7 +4091,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
   const lastMergedTask = [...journal.read()].reverse().find((e) => e.event === "merge" && e.taskId)?.taskId;
   if (summary.done.length > 0 && Object.keys(commands).length > 0) {
-    const tipFailed = await verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline });
+    const tipFailed = await withSuiteWindow(undefined, commands.test !== undefined,
+      () => verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline }));
     summary.tipVerify = tipFailed ? "failed" : "passed";
     if (tipFailed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
   }

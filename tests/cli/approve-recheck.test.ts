@@ -56,8 +56,20 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     j.append("task-human", "T1", { kind: "reroute-exhausted", reason: "every channel demoted" });
 
     await expect(approve(["run-recheck-refuse", "T1", "--recheck"], repo))
-      .rejects.toThrow(/--recheck applies to a gate-fail park/);
+      .rejects.toThrow(/--recheck applies to a gate-fail or infra park/);
     expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
+  });
+
+  test("recheck accepts an infra park without inventing a failed gate", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-recheck-infra");
+    j.append("task-dispatch", "T1", { assignment, attempt: 0 });
+    j.append("gate-result", "T1", { gate: "test", pass: false, infra: true, details: "signal exit" });
+    j.append("task-human", "T1", { kind: "infra", reason: "signal exit" });
+
+    const message = await approve(["run-recheck-infra", "T1", "--recheck"], repo);
+    expect(message).toContain("infra park");
+    expect(j.read().find((e) => e.event === "task-approved")?.data.release).toBe("recheck");
   });
 
   test("uphold and recheck are different decisions and cannot be passed together", async () => {

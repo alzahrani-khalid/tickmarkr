@@ -15,6 +15,7 @@ export { ROUTING_ENV_SEAMS };
 // Default to a modest cap through the environment so vitest honors it natively; never pass it
 // as argv (OBS-55) so child test oracles stay intact. The operator's own export wins.
 export const FORK_CAP_ENV = "VITEST_MAX_FORKS";
+export const SUITE_PARENT_ENV = "TICKMARKR_SUITE_PARENT";
 export const DEFAULT_FORK_CAP = "6";
 
 /**
@@ -199,6 +200,9 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // OBS-110: apply the run's own fork cap only when the operator has not already set one.
   if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = resolvedForkCap();
+  // OBS-854: descendants can leave the checkout (nested fixture suites do), so cwd alone cannot
+  // attribute them. Every daemon shell exports the daemon pid as their durable parentage marker.
+  env[SUITE_PARENT_ENV] = String(process.pid);
   // T7: the capacity every result of this shell carries, read HERE — off the environment the child
   // is about to receive, after the precedence above has settled. An operator export is already in
   // `env`, so what gets recorded is the operator's number, which is the case a release was re-taken

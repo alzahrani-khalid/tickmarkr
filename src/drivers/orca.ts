@@ -2,8 +2,9 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { shq } from "../adapters/types.js";
 import { createWorktree, sh, type ShResult } from "../run/git.js";
+import { Journal, type JournalEvent } from "../run/journal.js";
 import { MAX_BUF } from "./subprocess.js";
-import { formatOwnedName, panesToClose, type ExecutorDriver, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
+import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
 // Orca (onorca.dev) as a third execution surface beside herdr and subprocess. tickmarkr keeps
 // worktrees, routing, gates, journal and merges; orca supplies visible terminals only. Everything
@@ -33,7 +34,10 @@ import { formatOwnedName, panesToClose, type ExecutorDriver, type NotifyOpts, ty
 //    an older run's leftover sits in a checkout this run never knew (T2).
 
 /** The response families the ONE shared envelope parser serves. There is no second JSON seam. */
-export const ORCA_RESPONSE_FAMILIES = ["status", "create", "list", "read", "send", "wait", "show", "close"] as const;
+export const ORCA_RESPONSE_FAMILIES = [
+  "status", "create", "list", "read", "send", "wait", "show", "close",
+  "worktree-current", "hooks-status",
+] as const;
 export type OrcaFamily = (typeof ORCA_RESPONSE_FAMILIES)[number];
 
 export const ORCA_FIXTURE_VERSION = "1.4.195";
@@ -56,6 +60,9 @@ const PAGE_LINES = 500; // per-page ask; orca caps server-side and reports `limi
 const LIST_LIMIT = 10000; // well past orca's own row default; `truncated` still decides (listAll)
 const MAX_PAGES = 400; // runaway guard: a cursor that stops advancing ends the sweep, never loops
 const POLL_MS = 200;
+export const WORKTREE_ADOPTION_TIMEOUT_MS = 60_000;
+const WORKTREE_ADOPTION_POLL_MS = 1_000;
+const WORKTREE_ADOPTION_JOURNAL_MS = 2_000;
 
 export interface OrcaExec { (args: string[], cwd: string, timeoutMs?: number): Promise<ShResult> }
 export interface OrcaTimeSource { now: () => number; sleep: (ms: number) => Promise<void> }
@@ -271,6 +278,7 @@ interface OrcaSlotState {
   // selector or a handle, so the CLI's own cwd selects nothing — but it must still EXIST, and
   // reconcile sweeps checkouts an older run already removed. Defaults to the worktree itself.
   dir?: string;
+  agent?: string; // tickmarkr adapter id; Orca's hook table uses a few different names
   handle?: string;
 
   runtimeId?: string; // the runtime identity that ANSWERED this handle's create
@@ -304,6 +312,9 @@ export class OrcaDriver implements ExecutorDriver {
   private pageLines: number;
   private pollMs: number;
   private probeStalenessMs: number;
+  private journalRoots = new Map<string, string>();
+  private narrate?: (event: JournalEvent) => void;
+  private hookCoverage?: Promise<{ enabled: boolean; states: Map<string, string> }>;
 
   constructor(opts: OrcaDriverOpts = {}) {
     this.bin = opts.bin ?? resolveOrcaCliBinary(process.cwd(), { env: opts.env, platform: opts.platform }) ?? "orca";
@@ -411,7 +422,7 @@ export class OrcaDriver implements ExecutorDriver {
     // Canonical: git and Orca can spell one checkout two ways, and every later comparison — create
     // receipt, relist, reconcile — is against THIS value.
     const worktree = canonicalWorktreePath(cwd);
-    this.slots.set(id, { title, cwd: worktree, buf: "", recoveries: 0, recovering: false });
+    this.slots.set(id, { title, cwd: worktree, agent: opts?.agent, buf: "", recoveries: 0, recovering: false });
     return { id, name: title, cwd: worktree, group: opts?.group };
   }
 
@@ -464,6 +475,7 @@ export class OrcaDriver implements ExecutorDriver {
 
   private async create(st: OrcaSlotState, cmd: string): Promise<void> {
     await this.probeRuntime(this.cliCwd(st));
+    await this.awaitWorktreeAdoption(st);
     // The selector names THIS slot's checkout outright, and the CLI child is bound to it too, so
     // neither the UI's active worktree (`active`/`current`) nor the daemon's cwd can place it.
     const env = await this.call("create", [
@@ -494,6 +506,69 @@ export class OrcaDriver implements ExecutorDriver {
     if (surface !== undefined && surface !== "visible") {
       await this.notify(`tickmarkr orca terminal created on ${surface} surface`, { tier: "attention" });
     }
+  }
+
+  /**
+   * A freshly-created git checkout does not become a valid Orca selector atomically. Ask
+   * `worktree current` FROM that checkout until Orca itself resolves the exact filesystem identity;
+   * an enclosing checkout is still not adoption. Only selector_not_found is a retryable refusal —
+   * malformed envelopes and every other refusal remain explicit driver failures.
+   */
+  private async awaitWorktreeAdoption(st: OrcaSlotState): Promise<void> {
+    const started = this.time.now();
+    const deadline = started + WORKTREE_ADOPTION_TIMEOUT_MS;
+    let lastReported: string | undefined;
+    for (;;) {
+      const left = deadline - this.time.now();
+      if (left < 0) break;
+      try {
+        const env = await this.call(
+          "worktree-current",
+          ["worktree", "current"],
+          st.cwd,
+          Math.max(1, left),
+        );
+        const worktree = env.result.worktree;
+        if (typeof worktree !== "object" || worktree === null || Array.isArray(worktree)) {
+          throw new OrcaError("worktree-current", "response carries no worktree record", env.raw, { runtimeId: env.runtimeId });
+        }
+        const reported = terminalWorktree(worktree as Record<string, unknown>);
+        if (!reported) {
+          throw new OrcaError("worktree-current", "worktree record carries no path", env.raw, { runtimeId: env.runtimeId });
+        }
+        lastReported = canonicalWorktreePath(reported);
+        if (lastReported === st.cwd) {
+          const waitedMs = this.time.now() - started;
+          if (waitedMs > WORKTREE_ADOPTION_JOURNAL_MS) this.appendAdoptionWait(st, waitedMs);
+          return;
+        }
+      } catch (error) {
+        if (!(error instanceof OrcaError) || error.code !== "selector_not_found") throw error;
+        lastReported = undefined;
+      }
+      const remaining = deadline - this.time.now();
+      if (remaining <= 0) break;
+      await this.time.sleep(Math.min(WORKTREE_ADOPTION_POLL_MS, remaining));
+    }
+    const waitedMs = this.time.now() - started;
+    throw new OrcaUnavailableError(
+      "worktree-current",
+      `Orca did not adopt ${st.cwd} within ${WORKTREE_ADOPTION_TIMEOUT_MS}ms${lastReported ? ` (last answered ${lastReported})` : ""}`,
+      `waitedMs=${waitedMs}`,
+    );
+  }
+
+  /** Same repo/run/narration path Herdr uses for its driver-owned dispatch-retry row. */
+  private appendAdoptionWait(st: OrcaSlotState, waitedMs: number): void {
+    const owned = parseOwnedName(st.title);
+    if (!owned) throw new Error(`cannot journal worktree-adoption-wait: slot ${st.title} carries no run identity`);
+    const repoRoot = this.journalRoots.get(st.cwd);
+    if (!repoRoot) {
+      throw new Error(`cannot journal worktree-adoption-wait: slot ${st.title} has no daemon repo binding for ${st.cwd}`);
+    }
+    Journal.open(repoRoot, owned.runId, this.narrate).append("worktree-adoption-wait", owned.taskId, {
+      milliseconds: waitedMs,
+    });
   }
 
   // ---- handle identity and restart recovery ----------------------------------------------------
@@ -711,6 +786,19 @@ export class OrcaDriver implements ExecutorDriver {
     return { term: this.validated(family, st, env), raw: env.raw, recovered };
   }
 
+  /** A rendered-frame liveness read. `--screen` and `--cursor` are mutually exclusive in Orca. */
+  private async readScreen(st: OrcaSlotState): Promise<{ term: Record<string, unknown>; source: string }> {
+    const env = await this.terminalOp("status", st, (h) => this.call("read", [
+      "terminal", "read", "--terminal", h, "--screen",
+    ], this.cliCwd(st)));
+    const term = this.validated("status", st, env);
+    const source = str(term.source);
+    if (source !== "screen" && source !== "screen-unavailable") {
+      throw new OrcaError("read", `screen read reports source ${source ?? "absent"}, not screen or screen-unavailable`, env.raw);
+    }
+    return { term, source };
+  }
+
   /** A single UNPAGED tail read — exactly what the caller asked for and nothing more. Markers split
    *  across cursor pages are not reassembled here; that is waitOutput's job. */
   async read(slot: Slot, lines: number): Promise<string> {
@@ -787,10 +875,13 @@ export class OrcaDriver implements ExecutorDriver {
       // reporting even when the show record alone would still look connected (show carries no
       // status field of its own, so a terminal can report "unknown"/"exited" on read while its
       // show row still says connected — the read leg is the only place that catches that).
-      await this.readPage("status", st, undefined, 1);
+      const screen = await this.readScreen(st);
       if (`${st.runtimeId}:${st.handle}:${st.recoveries}` !== gen) {
         continue;
       }
+      // No rendered frame means no trustworthy TUI state. In particular, the stream fragments this
+      // call replaced cannot license an idle verdict or a wait probe.
+      if (screen.source === "screen-unavailable") return "unknown";
 
       const env = await this.terminalOp("show", st, (h) => this.call("show", ["terminal", "show", "--terminal", h], this.cliCwd(st)));
       if (`${st.runtimeId}:${st.handle}:${st.recoveries}` !== gen) {
@@ -798,6 +889,11 @@ export class OrcaDriver implements ExecutorDriver {
       }
       const term = this.liveShowTerm("status", st, env);
       if (term.agentWait === true) return "blocked";
+
+      // Orca can only report tui-idle/agentWait for agents whose managed hook is installed. A
+      // definitively unhooked adapter is unknown; an agent absent from Orca's table keeps the
+      // legacy probe because absence is not proof that the CLI has no compatible status surface.
+      if (await this.agentHookAvailable(st) === false) return "unknown";
 
       // `idle` is proven only by orca's own tui-idle condition: a 1ms wait is a point-in-time probe —
       // satisfied now → idle; elapsed (the recorded `timeout` refusal) → not idle.
@@ -808,6 +904,49 @@ export class OrcaDriver implements ExecutorDriver {
 
       return mapAgentState(term, isIdle);
     }
+  }
+
+  private hookAgent(adapter: string): string {
+    if (adapter === "claude-code") return "claude";
+    if (adapter === "cursor-agent") return "cursor";
+    return adapter;
+  }
+
+  /** true = hooked, false = definitively unhooked, undefined = agent absent from Orca's table. */
+  private async agentHookAvailable(st: OrcaSlotState): Promise<boolean | undefined> {
+    if (!st.agent) return undefined;
+    this.hookCoverage ??= this.loadHookCoverage(st.cwd);
+    const coverage = await this.hookCoverage;
+    const state = coverage.states.get(this.hookAgent(st.agent));
+    // The table's omission is deliberately inconclusive even when managed hooks are disabled:
+    // Orca may not know this agent, so preserve the legacy probe exactly as an unlisted row does.
+    if (state === undefined) return undefined;
+    return coverage.enabled && state === "installed";
+  }
+
+  private async loadHookCoverage(cwd: string): Promise<{ enabled: boolean; states: Map<string, string> }> {
+    const env = await this.call("hooks-status", ["agent", "hooks", "status"], cwd);
+    if (typeof env.result.enabled !== "boolean") {
+      throw new OrcaError("hooks-status", "response carries no boolean enabled", env.raw, { runtimeId: env.runtimeId });
+    }
+    const statuses = env.result.statuses;
+    if (!Array.isArray(statuses)) {
+      throw new OrcaError("hooks-status", "response carries no statuses array", env.raw, { runtimeId: env.runtimeId });
+    }
+    const states = new Map<string, string>();
+    const allowed = new Set(["installed", "not_installed", "partial", "error"]);
+    for (const row of statuses) {
+      if (typeof row !== "object" || row === null || Array.isArray(row)) {
+        throw new OrcaError("hooks-status", "statuses carries a non-object row", env.raw, { runtimeId: env.runtimeId });
+      }
+      const agent = str((row as Record<string, unknown>).agent);
+      const state = str((row as Record<string, unknown>).state);
+      if (!agent || !state || !allowed.has(state)) {
+        throw new OrcaError("hooks-status", "status row carries no valid agent/state pair", env.raw, { runtimeId: env.runtimeId });
+      }
+      states.set(agent, state);
+    }
+    return { enabled: env.result.enabled, states };
   }
 
   /** One `terminal wait` through the full identity machinery. The recorded 1.4.186 elapsed answer
@@ -886,6 +1025,10 @@ export class OrcaDriver implements ExecutorDriver {
   async notify(msg: string, opts?: NotifyOpts): Promise<void> {
     if (opts?.tier === "routine") return;
     console.log(`[tickmarkr] ${msg}`); // console fallback only — notification injection is out of scope
+  }
+
+  narrateWith(narrate: (event: JournalEvent) => void): void {
+    this.narrate = narrate;
   }
 
   async close(slot: Slot): Promise<void> {
@@ -1003,7 +1146,11 @@ export class OrcaDriver implements ExecutorDriver {
   }
 
   // tickmarkr's own createWorktree stays the sole checkout authority — orca never makes worktrees.
-  worktree(repo: string, branch: string, baseRef: string): Promise<string> {
-    return createWorktree(repo, branch, baseRef);
+  async worktree(repo: string, branch: string, baseRef: string): Promise<string> {
+    const worktree = await createWorktree(repo, branch, baseRef);
+    const repoRoot = canonicalWorktreePath(repo);
+    this.journalRoots.set(repoRoot, repoRoot);
+    this.journalRoots.set(canonicalWorktreePath(worktree), repoRoot);
+    return worktree;
   }
 }
