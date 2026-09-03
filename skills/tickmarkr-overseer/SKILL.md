@@ -957,8 +957,10 @@ orchestrator turn boundary.
    leave clean state after a version is shipped"***. Every line below is a defect that actually happened
    on the release that produced this rule.
 
-   - **RUN BOTH RELEASE PROOFS BEFORE STANDING DOWN.** `npm run verify:export` must install, build, and
-     run the suite in the exported tree; then
+   - **RUN BOTH RELEASE PROOFS BEFORE STANDING DOWN.** The first is the exported-tree suite, which
+     maintainers run from the private repo with its `verify:export` script — that tooling is deliberately
+     not part of this package, so the command does not exist in a public checkout; it must install,
+     build, and run the suite in the exported tree; then
      `TICKMARKR_E2E=1 npx vitest run tests/e2e/orca-smoke.e2e.test.ts` must exercise the installed-Orca
      smoke. A skipped smoke is not proof. Record both results before declaring the release complete.
 

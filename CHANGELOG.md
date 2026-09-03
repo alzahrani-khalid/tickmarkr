@@ -24,8 +24,9 @@ whose in-run review resolved to the same provider.
 - **Orca on the installed version.** The Orca driver pins fixture 1.4.195 and accepts both elapsed-wait
   transport shapes (T4).
 - **The spec template's laws and the release ritual's proofs.** The template states the surface-ownership
-  law and the semicolon rule; `npm run verify:export` runs the suite inside the export candidate before a
-  push; `watch-context.sh` clears only supervising roles (T7).
+  law and the semicolon rule; maintainers run the suite inside the export candidate before a push, from the
+  private repo (that tooling is not part of this package); `watch-context.sh` clears only supervising
+  roles (T7).
 
 ## v2.2 — what a revived worker is told
 

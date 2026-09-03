@@ -37,8 +37,7 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "schema": "tsx scripts/emit-schema.ts",
-    "e2e": "TICKMARKR_E2E=1 vitest run tests/e2e --testTimeout 900000",
-    "verify:export": "bash scripts/verify-export.sh"
+    "e2e": "TICKMARKR_E2E=1 vitest run tests/e2e --testTimeout 900000"
   },
   "dependencies": {
     "@types/react": "^19.2.17",

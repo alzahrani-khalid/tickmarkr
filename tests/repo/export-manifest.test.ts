@@ -10,7 +10,7 @@
 // reject at any depth. Secret findings disclose pattern id, path, and occurrence count only —
 // never the matched text.
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
@@ -78,6 +78,9 @@ function privateClass(path: string): string | undefined {
     if (/\.local\./.test(seg)) return "local-machine file";
   }
   if (path.startsWith("specs/") && !PUBLIC_EXACT.has(path)) return "private spec corpus";
+  // a dev-only exclusion takes its tests with it: this file's whole subject is
+  // scripts/verify-export.sh, which the export excludes, so shipping it is an ENOENT (OBS-862).
+  if (path === "tests/scripts/verify-export.test.ts") return "test for an excluded dev-only script";
   if (path === "docs/codebase/CONCERNS.md") return "private concerns page";
   if (path.startsWith("docs/analysis/") || path.startsWith("docs/superpowers/")) return "operational diary docs";
   return undefined;
@@ -86,6 +89,9 @@ function privateClass(path: string): string | undefined {
 // fail closed: unclassified is rejected exactly like private — only the enumerated set ships
 const accepts = (path: string): boolean =>
   privateClass(path) === undefined && (PUBLIC_EXACT.has(path) || PUBLIC_PREFIXES.some((pre) => path.startsWith(pre)));
+
+// a referenced path must resolve to a FILE — existsSync alone lets a directory stand in for one
+const isFile = (p: string): boolean => existsSync(p) && statSync(p).isFile();
 
 // ---- secret sweep: findings carry pattern id, path, count — never the matched text -----------
 // Pattern set mirrors scripts/export-public.sh secret_sweep (case-insensitive there too).
@@ -180,9 +186,62 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       const candidate = getCandidate();
       expect(candidate.paths.length).toBeGreaterThan(100);
       expect(candidate.paths).not.toContain("scripts/verify-export.sh");
+      expect(candidate.paths).not.toContain("tests/scripts/verify-export.test.ts");
       const rejected = candidate.paths.filter((p) => !accepts(p)).map((p) => `${p} (${privateClass(p) ?? "not allowlisted"})`);
       expect(rejected).toEqual([]);
       expect(secretFindings(candidate.root, candidate.paths)).toEqual([]);
+    },
+  );
+
+  test(
+    "the shipped package.json advertises no npm script whose scripts/ target the export omits — the dangling verify:export entry specifically, and the class generally",
+    { timeout: 120_000 },
+    () => {
+      const c = getCandidate();
+      const scripts = (JSON.parse(readFileSync(join(c.root, "package.json"), "utf8")) as { scripts: Record<string, string> }).scripts;
+
+      // the specific hole that halted v2.2.1 (OBS-862): the entry survived an exclusion of its target
+      expect(scripts["verify:export"]).toBeUndefined();
+
+      // the class: every scripts/<file> a shipped npm script names must exist in the candidate.
+      // Fail-closed — this catches the NEXT dev-only exclusion that forgets its npm entry, not just this one.
+      const dangling = Object.entries(scripts).flatMap(([name, value]) =>
+        // `[^\s"']+` so a NESTED target (scripts/release/check.ts) is matched whole: the earlier
+        // `[A-Za-z0-9._-]+` stopped at the first slash and matched only `scripts/release`, whereupon an
+        // existing DIRECTORY satisfied the check and hid a missing file. isFile() closes that for flat
+        // targets too, not only nested ones.
+        (value.match(/scripts\/[^\s"']+/g) ?? [])
+          .filter((target) => !isFile(join(c.root, target)))
+          .map((target) => `${name} -> ${target}`),
+      );
+      expect(dangling).toEqual([]);
+
+      // positive control: the assertion above is only meaningful if a resolvable reference exists to find
+      expect(scripts.schema).toContain("scripts/emit-schema.ts");
+      expect(existsSync(join(c.root, "scripts/emit-schema.ts"))).toBe(true);
+    },
+  );
+
+  test(
+    "no shipped markdown mandates an `npm run` script the candidate's package.json does not define",
+    { timeout: 120_000 },
+    () => {
+      const c = getCandidate();
+      const defined = new Set(
+        Object.keys((JSON.parse(readFileSync(join(c.root, "package.json"), "utf8")) as { scripts: Record<string, string> }).scripts),
+      );
+      const docs = c.paths.filter((p) => p.endsWith(".md"));
+      const referenced = docs.flatMap((rel) =>
+        [...readFileSync(join(c.root, rel), "utf8").matchAll(/npm run ([A-Za-z0-9:_-]+)/g)].map((m) => ({ rel, name: m[1] })),
+      );
+
+      // twice in this release the fault was the same shape: the export removed something and an artifact
+      // one step further out still advertised it (CHANGELOG.md, then skills/tickmarkr-overseer/SKILL.md).
+      // This asserts the class instead of chasing the next instance.
+      expect(referenced.filter((r) => !defined.has(r.name)).map((r) => `${r.rel} -> npm run ${r.name}`)).toEqual([]);
+
+      // positive control: an empty or non-matching sweep would satisfy the assertion vacuously
+      expect(referenced.map((r) => r.name)).toContain("build");
     },
   );
 
@@ -266,6 +325,7 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       "docs/finisher-enforcement.md",
       "scripts/export-public.sh",
       "scripts/verify-export.sh",
+      "tests/scripts/verify-export.test.ts",
       "scripts/measure-trailer-width.mjs",
       "unclassified-new-top-level.md",
     ];
