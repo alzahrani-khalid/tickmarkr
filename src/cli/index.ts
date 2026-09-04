@@ -47,9 +47,9 @@ usage: tickmarkr <command>
   plan          dry-run routing table + cost estimate + floor lints
   eval          run checked-in fixtures against every channel in isolated temp repos
   run           execute the graph (--concurrency N --driver auto|herdr|subprocess|orca --route-strict; orca runs only when named)
-  status        live run state
+  status        live run state (--watch --events: JSON documents on stdout, keepalives on stderr; 2>&1 corrupts the stream)
   stats         all-run channel delivery, red, rescue, author and reviewer statistics
-  verify        run the gate battery standalone against merge-base(--base, HEAD)..HEAD — no daemon, one verdict (--base main --criteria <file> | --task <id> [--files <glob>] [--author adapter:model] [--no-review] [--json])
+  verify        run the gate battery standalone against merge-base(--base, HEAD)..HEAD — verdict/JSON on stdout, progress on stderr; 2>&1 corrupts the verdict stream (--base main --criteria <file> | --task <id> [--files <glob>] [--author adapter:model] [--no-review] [--json])
   resume <id>   continue a run from its journal
   report <id>   cost/quality report (--md for committable execution record)
   profile       show learned routing profile (profile reset = forget history via cursor, keeps telemetry)

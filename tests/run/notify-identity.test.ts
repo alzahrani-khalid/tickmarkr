@@ -41,7 +41,7 @@ function swapExact<T>(obj: T, from: string, to: string): T {
 // notifications could in principle make a gate slower or land it on a busier host; they cannot
 // change what it does. That the measurement is PRESENT on all seven gates is pinned by
 // tests/run/gate-telemetry.test.ts — this oracle only asks whether notifying changed the run.
-const MEASURED = new Set(["durationMs", "selectedDurationMs", "fullDurationMs", "load1Start", "load1End"]);
+const MEASURED = new Set(["durationMs", "selectedDurationMs", "fullDurationMs", "load1Start", "load1End", "load1Max", "load1Mean"]);
 function maskMeasured<T>(obj: T): T {
   if (Array.isArray(obj)) return obj.map(maskMeasured) as T;
   if (obj && typeof obj === "object") {

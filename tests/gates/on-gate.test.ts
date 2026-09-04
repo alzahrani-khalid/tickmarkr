@@ -61,7 +61,7 @@ async function ctxFor(repo: string, base: string, task: ReturnType<typeof mkTask
 }
 
 // v2.0 T2: the run-specific measurement keys, dropped for equality between two separate runs.
-const MEASURED = new Set(["durationMs", "load1Start", "load1End", "selectedDurationMs", "fullDurationMs", "invocations"]);
+const MEASURED = new Set(["durationMs", "load1Start", "load1End", "load1Max", "load1Mean", "selectedDurationMs", "fullDurationMs", "invocations"]);
 const withoutMeasurement = (r: { results: { meta?: Record<string, unknown> }[] } & Record<string, unknown>) => ({
   ...r,
   results: r.results.map((g) => ({

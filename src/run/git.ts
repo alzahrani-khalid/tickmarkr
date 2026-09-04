@@ -154,6 +154,8 @@ export interface ShResult {
   stdout: string;
   stderr: string;
   timedOut?: boolean;
+  /** The shell exited, but descendants still held its process group and pipes past the grace. */
+  reapedGroup?: boolean;
   durationMs?: number;
   /** T7: the capacity THIS child ran under, stamped where its environment was built (see `shell`). */
   capacity?: RunCapacity;
@@ -189,6 +191,10 @@ export const SPAWN_RETRY_BACKOFF_MS = 50;
 /** A spawn the machine refused before the command started; carries the error for the caller. */
 interface SpawnRefusal { refused: NodeJS.ErrnoException }
 
+// RULING-P99-28: SHIP — every gate user can hit the inherited-pipe hang at this product seam.
+/** Give a normally-exited shell's descendants this long to close their inherited pipes themselves. */
+const SHELL_REAP_GRACE_MS = 2000;
+
 // stdin "ignore": same class as HARD-05 / SubprocessDriver — never leave an open pipe a child can block on
 // (pi -p / codex exec wait for stdin EOF). timedOut distinguishes SIGKILL-timeout from a real nonzero exit.
 function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Promise<ShResult> {
@@ -219,14 +225,24 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
     let stdout = "", stderr = "";
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
-    let timedOut = false, done = false, started = false, outputSeen = false;
+    let timedOut = false, reapedGroup = false, done = false, started = false, outputSeen = false;
+    let reapTimer: NodeJS.Timeout | undefined;
     const finish = (code: number, err?: string) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      clearTimeout(reapTimer);
       stdout += stdoutDecoder.end();
       stderr += stderrDecoder.end();
-      resolve({ code, stdout, stderr: err ?? stderr, timedOut, durationMs: Date.now() - startedAt, capacity });
+      resolve({
+        code,
+        stdout,
+        stderr: err ?? stderr,
+        timedOut,
+        durationMs: Date.now() - startedAt,
+        capacity,
+        ...(reapedGroup ? { reapedGroup: true } : {}),
+      });
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -256,8 +272,25 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
       finish(127, String(e));
     });
     p.on("close", (code) => finish(code ?? 1));
-    // "close" waits for stdio to drain; a surviving pipe-holder must not outlive the timeout
-    p.on("exit", (code) => { if (timedOut) finish(code ?? 1); });
+    // "close" waits for stdio to drain. Once bash exits normally, give descendants a bounded grace
+    // to exit with it; a survivor still in bash's detached group is then reaped so its inherited pipe
+    // cannot hold this promise until the command ceiling. A real timeout wins first and is never
+    // reclassified as a grace reap.
+    p.on("exit", (code) => {
+      if (timedOut) {
+        finish(code ?? 1);
+        return;
+      }
+      reapTimer = setTimeout(() => {
+        if (done) return;
+        try {
+          process.kill(-p.pid!, "SIGKILL");
+          reapedGroup = true;
+        } catch {
+          // The group closed between the shell's exit and the grace boundary; "close" owns finish.
+        }
+      }, SHELL_REAP_GRACE_MS);
+    });
   });
   return (async () => {
     const startedAt = Date.now();

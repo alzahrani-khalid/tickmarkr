@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { parse } from "yaml";
 import { type RunGraph, type SpecSource, validateGraph } from "../graph/schema.js";
 import { taskUnitContractErrors } from "./collateral.js";
 import { blocksCompile, ownershipFindings, renderOwnershipFinding } from "./ownership.js";
@@ -25,6 +26,8 @@ export type PlanIR = {
 
 export type PlanFinalizationHook = (plan: PlanIR) => PlanIR;
 
+export type CompileOptions = { strict?: boolean };
+
 function detect(src: string): SourceType | null {
   if (existsSync(src) && statSync(src).isDirectory()) {
     if (existsSync(join(src, "tasks.md"))) return "speckit";
@@ -46,8 +49,38 @@ function detect(src: string): SourceType | null {
 // tasks are too large to converge. A violation is a compile error, never a warning — the failures it
 // prevents (silently dropped commits, a 28-dispatch task) are invisible until they have already cost
 // hours, which is exactly the class of thing that has to fail at authoring time.
-function enforceTaskUnitContract(g: RunGraph, src: string): RunGraph {
-  const errors = taskUnitContractErrors(g.tasks);
+function repoOverlayMode(repoRoot?: string): string | undefined {
+  if (!repoRoot) return undefined;
+  try {
+    const cfg = parse(readFileSync(join(repoRoot, ".tickmarkr", "config.yaml"), "utf8")) as { routing?: { mode?: unknown } } | null;
+    return typeof cfg?.routing?.mode === "string" ? cfg.routing.mode : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasModeOverride(src: string): boolean {
+  try {
+    for (const line of readFileSync(src, "utf8").split("\n")) {
+      if (/^##\s+T\d+:/i.test(line)) return false;
+      if (/^mode-override:\s*true\s*(?:#.*)?$/.test(line)) return true;
+    }
+  } catch { /* unreadable specs fail elsewhere */ }
+  return false;
+}
+
+function enforceModeOverlay(graph: RunGraph, src: string, repoRoot?: string): void {
+  if (graph.spec.source !== "native" || graph.mode === undefined) return;
+  const overlayMode = repoOverlayMode(repoRoot);
+  if (overlayMode === undefined || overlayMode === graph.mode || hasModeOverride(src)) return;
+  throw new CompileError(
+    `${src} front-matter mode ${graph.mode} disagrees with repository routing.mode ${overlayMode}; `
+    + `write mode-override: true beside the mode line to make the override explicit.`,
+  );
+}
+
+function enforceTaskUnitContract(g: RunGraph, src: string, repoRoot?: string): RunGraph {
+  const errors = taskUnitContractErrors(g.tasks, repoRoot);
   if (errors.length > 0) {
     throw new CompileError(
       `${src} violates the task unit contract (${errors.length} error${errors.length > 1 ? "s" : ""}):\n`
@@ -68,7 +101,8 @@ export function finalizePlan(plan: PlanIR, src: string, repoRoot?: string): RunG
       ...(plan.base !== undefined ? { base: plan.base } : {}),
     },
     tasks: plan.tasks,
-  }), src);
+  }), src, repoRoot);
+  enforceModeOverlay(graph, src, repoRoot);
   // overseer-217 removal condition, now paid: on this milestone's authored graph the conventional
   // name map emitted 21 raw unowned-test findings; review found 1 real and 20 false, while intersecting
   // with a direct import or command-entry spawn retained the real one and left 0 false positives. That
@@ -92,11 +126,11 @@ export function finalizePlan(plan: PlanIR, src: string, repoRoot?: string): RunG
   return graph;
 }
 
-function compilePlan(src: string, type?: SourceType, root?: string): PlanIR {
+function compilePlan(src: string, type?: SourceType, root?: string, options: CompileOptions = {}): PlanIR {
   const kind = type ?? detect(src);
   const graph = kind === "speckit" ? compileSpecKit(src)
     : kind === "gsd" ? compileGsd(src, root)
-    : kind === "native" ? compileNative(src)
+    : kind === "native" ? compileNative(src, { strict: options.strict })
     : kind === "prd" ? compilePrd(src)
     : null;
   if (!graph) {
@@ -120,6 +154,7 @@ export function compileSource(
   type?: SourceType,
   root?: string,
   beforeFinalize: PlanFinalizationHook = (plan) => plan,
+  options: CompileOptions = {},
 ): RunGraph {
-  return finalizePlan(beforeFinalize(compilePlan(src, type, root)), src, root);
+  return finalizePlan(beforeFinalize(compilePlan(src, type, root, options)), src, root);
 }

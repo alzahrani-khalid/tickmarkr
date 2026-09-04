@@ -248,7 +248,7 @@ describe("cache-only model capability catalog", () => {
     const task = { id: "T17", title: "catalog", goal: "catalog", shape: "implement", complexity: 4, acceptance: ["catalog"] } as const;
     const routeBefore = route(task, cfgBefore, adapter.channels!(cfgBefore));
 
-    const ordinary = await doctor(["--"], repo, [adapter], { banner: false });
+    const ordinary = await doctor(["--"], repo, [adapter], { banner: false, catalogNow: () => new Date("2026-08-05T00:00:00.000Z") });
     expect(network).not.toHaveBeenCalled();
     expect(probe).toHaveBeenCalledOnce();
     expect(listModels).toHaveBeenCalledOnce();
@@ -317,7 +317,7 @@ describe("cache-only model capability catalog", () => {
       expect(result.updated, failure.name).toBe(false);
       expect(result.warning, failure.name).toContain(failure.name === "malformed-JSON" ? "bad JSON" : failure.name === "timeout" ? "timed out" : failure.name);
       expect(readFileSync(catalogCachePath(repo), "utf8"), failure.name).toBe(cacheBefore);
-      await expect(doctor(["--"], repo, [adapter], { banner: false })).resolves.toContain("models.dev id=fake-2");
+      await expect(doctor(["--"], repo, [adapter], { banner: false, catalog: readCachedCatalog(repo) })).resolves.toContain("models.dev id=fake-2");
     }
 
     const cacheBeforeAaFailure = readFileSync(catalogCachePath(repo), "utf8");
@@ -325,14 +325,14 @@ describe("cache-only model capability catalog", () => {
       .mockResolvedValueOnce(response(refreshed.modelsDev))
       .mockResolvedValueOnce(response({}, 401));
     const partial = await refreshCatalogCommand({ repoRoot: repo, fetcher: aa401, artificialAnalysisKey: "configured-key" });
-    expect(partial.updated).toBe(false);
+    expect(partial.updated).toBe(true);
     expect(partial.warning).toContain("Artificial Analysis HTTP 401");
     expect(readFileSync(catalogCachePath(repo), "utf8")).toBe(cacheBeforeAaFailure);
 
     writeCache(repo, fakeCatalog("2020-01-01T00:00:00.000Z"));
     const stale = readCachedCatalog(repo, { now: () => new Date("2026-08-05T00:00:00.000Z") });
     expect(stale.stale).toBe(true);
-    await expect(doctor(["--"], repo, [adapter], { banner: false, catalogNow: () => new Date("2026-08-05T00:00:00.000Z") })).resolves.toContain("stale cache");
+    await expect(doctor(["--"], repo, [adapter], { banner: false, catalog: stale })).resolves.toContain("stale cache");
 
     writeCache(repo, { schemaVersion: 1, fetchedAt: "2026-08-05T00:00:00.000Z", modelsDev: {} });
     const emptyCache = readCachedCatalog(repo, { now: () => new Date("2026-08-05T00:00:00.000Z") });
@@ -405,7 +405,7 @@ describe("cache-only model capability catalog", () => {
     delete process.env.NO_COLOR;
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
     try {
-      await doctor(["--"], repo, [adapter], { banner: false });
+      await doctor(["--"], repo, [adapter], { banner: false, catalog: readCachedCatalog(repo) });
     } finally {
       if (noColor === undefined) delete process.env.NO_COLOR;
       else process.env.NO_COLOR = noColor;
@@ -540,6 +540,49 @@ test("a fleet id resolves the highest-effort LiveBench row among its suffix vari
   expect(unbenchmarked?.agenticCodingScore).toBeUndefined();
   expect(unbenchmarked?.codingScore).toBeUndefined();
   expect(unbenchmarked?.evidenceDate).toBeUndefined();
+});
+
+test("test: resolveCatalogModel for zai/glm-5.3 against a cache whose gateway record is named GLM-5.3 (Z AI) resolves the glm-5.3 LiveBench row and anthropic/claude-fable-5-1 resolves the claude-fable-5-1 models.dev record and the claude-fable-5-1-max-effort LiveBench row while zai/glm-5 resolves none whereas a resolver that offers only the full id and the display name fails", () => {
+  const cache: CatalogCache = {
+    schemaVersion: 1,
+    fetchedAt: "2026-09-03T00:00:00.000Z",
+    modelsDev: {
+      anthropic: {
+        id: "anthropic",
+        models: {
+          "claude-fable-5-1": { id: "claude-fable-5-1", name: "Claude Fable 5.1", cost: { input: 2, output: 10 }, limit: { context: 200_000 } },
+        },
+      },
+      zhipuai: {
+        id: "zhipuai",
+        models: {
+          "glm-5.3": { id: "glm-5.3", name: "GLM-5.3 (Z AI)", cost: { input: 1, output: 4 }, limit: { context: 200_000 } },
+          "glm-5": { id: "glm-5", name: "GLM 5", cost: { input: 1, output: 4 }, limit: { context: 200_000 } },
+        },
+      },
+    },
+    liveBench: {
+      tableDate: LIVEBENCH_TABLE_DATE,
+      categories: LIVEBENCH_CATEGORIES,
+      rows: [
+        { model: "glm-5-3", javascript: 61, typescript: 62, python: 63, code_generation: 70, code_completion: 72 },
+        { model: "claude-fable-5-1-max-effort", javascript: 81, typescript: 82, python: 83, code_generation: 90, code_completion: 92 },
+      ],
+    },
+  };
+
+  expect(resolveCatalogModel(cache, { provider: "zai", model: "zai/glm-5.3" })).toMatchObject({
+    catalogId: "zhipuai/glm-5.3",
+    agenticCodingScore: 62,
+  });
+  expect(resolveCatalogModel(cache, { provider: "anthropic", model: "anthropic/claude-fable-5-1" })).toMatchObject({
+    catalogId: "anthropic/claude-fable-5-1",
+    agenticCodingScore: 82,
+  });
+  expect(resolveCatalogModel(cache, { provider: "zai", model: "zai/glm-5" })?.agenticCodingScore).toBeUndefined();
+
+  const legacyOffers = ["zai/glm-5.3", "GLM-5.3 (Z AI)"].map((id) => id.toLowerCase().replace(/\s+/g, "-"));
+  expect(legacyOffers.some((id) => "glm-5-3".startsWith(id))).toBe(false);
 });
 
 test("a LiveBench fetch that fails and one that parses to zero rows each preserve the previous liveBench section while modelsDev still updates and the warning names LiveBench, so reading an empty probe as an empty fleet or losing the models.dev refresh fails", async () => {

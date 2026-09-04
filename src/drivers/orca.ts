@@ -36,7 +36,7 @@ import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, typ
 /** The response families the ONE shared envelope parser serves. There is no second JSON seam. */
 export const ORCA_RESPONSE_FAMILIES = [
   "status", "create", "list", "read", "send", "wait", "show", "close",
-  "worktree-current", "hooks-status",
+  "worktree-current", "worktree-set", "hooks-status",
 ] as const;
 export type OrcaFamily = (typeof ORCA_RESPONSE_FAMILIES)[number];
 
@@ -63,6 +63,7 @@ const POLL_MS = 200;
 export const WORKTREE_ADOPTION_TIMEOUT_MS = 60_000;
 const WORKTREE_ADOPTION_POLL_MS = 1_000;
 const WORKTREE_ADOPTION_JOURNAL_MS = 2_000;
+const NUDGE_ECHO_TIMEOUT_MS = 2_000;
 
 export interface OrcaExec { (args: string[], cwd: string, timeoutMs?: number): Promise<ShResult> }
 export interface OrcaTimeSource { now: () => number; sleep: (ms: number) => Promise<void> }
@@ -280,6 +281,8 @@ interface OrcaSlotState {
   dir?: string;
   agent?: string; // tickmarkr adapter id; Orca's hook table uses a few different names
   handle?: string;
+  surface?: string; // copied only from the terminal create receipt; never inferred
+  hostPlatform?: string; // copied only from the terminal create receipt; never inferred
 
   runtimeId?: string; // the runtime identity that ANSWERED this handle's create
   cursor?: string; // waitOutput's resume point; undefined until the first sweep anchors it
@@ -315,6 +318,8 @@ export class OrcaDriver implements ExecutorDriver {
   private journalRoots = new Map<string, string>();
   private narrate?: (event: JournalEvent) => void;
   private hookCoverage?: Promise<{ enabled: boolean; states: Map<string, string> }>;
+  private taskWorktrees = new Map<string, string>();
+  private pendingProjects = new Map<string, "in-progress" | "in-review" | "completed">();
 
   constructor(opts: OrcaDriverOpts = {}) {
     this.bin = opts.bin ?? resolveOrcaCliBinary(process.cwd(), { env: opts.env, platform: opts.platform }) ?? "orca";
@@ -423,6 +428,15 @@ export class OrcaDriver implements ExecutorDriver {
     // receipt, relist, reconcile — is against THIS value.
     const worktree = canonicalWorktreePath(cwd);
     this.slots.set(id, { title, cwd: worktree, agent: opts?.agent, buf: "", recoveries: 0, recovering: false });
+    const owned = parseOwnedName(title);
+    if (owned?.role === "worker") {
+      this.taskWorktrees.set(owned.taskId, worktree);
+      const pending = this.pendingProjects.get(owned.taskId);
+      if (pending) {
+        await this.setWorkspaceStatus(worktree, pending);
+        this.pendingProjects.delete(owned.taskId);
+      }
+    }
     return { id, name: title, cwd: worktree, group: opts?.group };
   }
 
@@ -445,6 +459,16 @@ export class OrcaDriver implements ExecutorDriver {
   private assertAvailable(family: string, st: OrcaSlotState): void {
     if (st.unavailable) throw new OrcaUnavailableError(family, st.unavailable, "");
   }
+  describe(slot: Slot): { surface?: string; hostPlatform?: string } {
+    const st = this.state(slot);
+    // The daemon asks only after run(), but callers probing a lazy slot must see absence rather
+    // than an invented placement. The interface's object spread accepts this runtime absence.
+    if (!st.handle) return undefined as never;
+    return {
+      ...(st.surface === undefined ? {} : { surface: st.surface }),
+      ...(st.hostPlatform === undefined ? {} : { hostPlatform: st.hostPlatform }),
+    };
+  }
 
   async run(slot: Slot, cmd: string): Promise<void> {
     const st = this.state(slot);
@@ -455,22 +479,34 @@ export class OrcaDriver implements ExecutorDriver {
     this.assertAvailable("send", st);
     // Later deliveries go into the terminal this slot already owns — never a second create.
     // terminalOp proves the runtime binding before the handle goes on the wire.
-    const env = await this.terminalOp("send", st, (h) => this.call("send", ["terminal", "send", "--terminal", h, "--text", cmd, "--enter"], this.cliCwd(st)), { mutating: true });
-    // Recorded 1.4.186 send receipt: result.send = {handle, accepted, bytesWritten} — there is no
-    // `delivered`. `ok:true` alone is not a receipt: only an accepted receipt naming THIS handle
-    // proves the text was submitted, so anything else is a failed send, never a silent no-op.
+    await this.sendText(st, cmd);
+  }
+
+  private async sendText(st: OrcaSlotState, text: string): Promise<void> {
+    const env = await this.terminalOp("send", st, (h) => this.call(
+      "send",
+      ["terminal", "send", "--terminal", h, "--text", text, "--enter"],
+      this.cliCwd(st),
+    ), { mutating: true });
+    // Recorded 1.4.195 send receipt: result.send = {handle, accepted, bytesWritten}. `ok:true`
+    // alone is not delivery: the accepted receipt must name this handle and account for the bytes.
+    const receipt = this.sendReceipt(env, st);
+    const expectedBytes = Buffer.byteLength(text, "utf8") + 1;
+    if (receipt.accepted !== true || typeof receipt.bytesWritten !== "number" || receipt.bytesWritten !== expectedBytes) {
+      throw new OrcaError("send", `send receipt does not report expected byte delivery (accepted: ${JSON.stringify(receipt.accepted)}, bytesWritten: ${receipt.bytesWritten}, expected: ${expectedBytes})`, env.raw);
+    }
+  }
+
+  private sendReceipt(env: OrcaEnvelope, st: OrcaSlotState): Record<string, unknown> {
     const receipt = env.result.send;
     if (typeof receipt !== "object" || receipt === null || Array.isArray(receipt)) {
       throw new OrcaError("send", "send response carries no send receipt", env.raw);
     }
-    const s = receipt as Record<string, unknown>;
-    if (str(s.handle) !== st.handle) {
-      throw new OrcaError("send", `send receipt names terminal ${str(s.handle) ?? "none"}, not the addressed ${st.handle}`, env.raw);
+    const parsed = receipt as Record<string, unknown>;
+    if (str(parsed.handle) !== st.handle) {
+      throw new OrcaError("send", `send receipt names terminal ${str(parsed.handle) ?? "none"}, not the addressed ${st.handle}`, env.raw);
     }
-    const expectedBytes = Buffer.byteLength(cmd, "utf8") + 1; // 1 for the --enter newline
-    if (s.accepted !== true || typeof s.bytesWritten !== "number" || s.bytesWritten !== expectedBytes) {
-      throw new OrcaError("send", `send receipt does not report expected byte delivery (accepted: ${JSON.stringify(s.accepted)}, bytesWritten: ${s.bytesWritten}, expected: ${expectedBytes})`, env.raw);
-    }
+    return parsed;
   }
 
   private async create(st: OrcaSlotState, cmd: string): Promise<void> {
@@ -502,9 +538,10 @@ export class OrcaDriver implements ExecutorDriver {
     st.handle = handle;
     // The handle is bound to the runtime identity that ANSWERED its create.
     st.runtimeId = env.runtimeId;
-    const surface = str(term.surface);
-    if (surface !== undefined && surface !== "visible") {
-      await this.notify(`tickmarkr orca terminal created on ${surface} surface`, { tier: "attention" });
+    st.surface = str(term.surface);
+    st.hostPlatform = str(term.hostPlatform);
+    if (st.surface !== undefined && st.surface !== "visible") {
+      await this.notify(`tickmarkr orca terminal created on ${st.surface} surface`, { tier: "attention" });
     }
   }
 
@@ -1020,6 +1057,86 @@ export class OrcaDriver implements ExecutorDriver {
       if (left2 <= 0) return false;
       await this.time.sleep(Math.min(this.pollMs, left2));
     }
+  }
+
+  async sendKey(slot: Slot, key: string): Promise<void> {
+    const st = this.state(slot);
+    this.assertAvailable("send", st);
+    if (key === "enter") {
+      await this.sendText(st, "");
+      return;
+    }
+    if (key === "ctrl+c") {
+      const env = await this.terminalOp("send", st, (h) => this.call(
+        "send",
+        ["terminal", "send", "--terminal", h, "--interrupt"],
+        this.cliCwd(st),
+      ), { mutating: true });
+      // UNRECORDED SHAPE: Orca 1.4.195 was not captured for `send --interrupt`. Until a live
+      // receipt exists, validate only the shared envelope and its handle binding; do not invent
+      // accepted/bytesWritten semantics for an interrupt.
+      this.sendReceipt(env, st);
+      return;
+    }
+    throw new OrcaError("send", `Orca has no terminal key verb for ${JSON.stringify(key)}`, "");
+  }
+
+  async nudge(slot: Slot, message: string): Promise<boolean> {
+    if (!message) return false;
+    try {
+      const st = this.state(slot);
+      if (!await this.waitCondition(st, "tui-idle", 1)) return false;
+
+      // Drain to the current stream cursor before sending. A message already present makes the
+      // proof ambiguous, so decline rather than reporting delivery from old scrollback.
+      const before = await this.sweep(st);
+      if (before.includes(message) || joinWrapped(before).includes(message)) return false;
+      await this.sendText(st, message);
+
+      const deadline = this.time.now() + NUDGE_ECHO_TIMEOUT_MS;
+      for (;;) {
+        const after = await this.sweep(st);
+        if (after.includes(message) || joinWrapped(after).includes(message)) return true;
+        const left = deadline - this.time.now();
+        if (left <= 0) return false;
+        await this.time.sleep(Math.min(this.pollMs, left));
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  async narrator(cwd: string, command: string, runId?: string): Promise<Slot> {
+    if (!runId) throw new OrcaError("create", "Orca narrator requires a run identity", "");
+    const slot = await this.slot(
+      cwd,
+      formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }),
+      { owned: { role: "watch", taskId: "run", attempt: 0, runId } },
+    );
+    await this.run(slot, command);
+    return slot;
+  }
+
+  async project(taskId: string, state: "in-progress" | "in-review" | "completed"): Promise<void> {
+    const worktree = this.taskWorktrees.get(taskId);
+    if (!worktree) {
+      // The daemon projects in-progress immediately before it creates the task checkout/slot.
+      // Hold only that latest state; slot() applies it once the task's own path is known.
+      this.pendingProjects.set(taskId, state);
+      return;
+    }
+    await this.setWorkspaceStatus(worktree, state);
+  }
+
+  private async setWorkspaceStatus(
+    worktree: string,
+    state: "in-progress" | "in-review" | "completed",
+  ): Promise<void> {
+    // UNRECORDED SHAPE: no Orca 1.4.195 `worktree set` receipt was captured. The shared envelope
+    // parser is the complete success proof here; no result payload is assumed or fabricated.
+    await this.call("worktree-set", [
+      "worktree", "set", "--worktree", `path:${worktree}`, "--workspace-status", state,
+    ], worktree);
   }
 
   async notify(msg: string, opts?: NotifyOpts): Promise<void> {

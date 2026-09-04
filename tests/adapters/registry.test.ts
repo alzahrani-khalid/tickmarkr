@@ -56,10 +56,14 @@ model status:
   cursor-agent
     composer-2.5      mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#0
     composer-2.5-fast cheap    unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#0
+    claude-fable-5-1  frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#0
+    gemini-3.8-flash  mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#0
   opencode
     zai-coding-plan/glm-5.2 mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=tests#0
   pi
-    zai/glm-5.2 mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
+    zai/glm-5.2       mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
+    zai/glm-5.3       frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
+    zai/glm-5.3-flash mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
 wrote .tickmarkr/doctor.json`;
 
 // Intercept only the hang sentinel so probeModels timeout path is zero-token and fast; real sh for everything else.
@@ -861,12 +865,14 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
 
     const used = usedFlags(builders(claudeCode));
     const declared = claudeCode.hardcodedFlags!.flags;
-    expect(used.has("--prompt-suggestions")).toBe(true); // the newly added one is actually in use
+    expect(used.has("--prompt-suggestions")).toBe(true);
+    expect(used.has("--settings")).toBe(true); // both launch-hygiene flags are actually in use
     for (const f of used) expect(declared, `claude uses ${f}`).toContain(f);
 
     // the declaration list left unchanged: exactly what shipped before the setting was added.
     const UNCHANGED = ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r"];
     expect(UNCHANGED).not.toContain("--prompt-suggestions");
+    expect(UNCHANGED).not.toContain("--settings");
     // the one-way check reads ONLY declared flags — so the stale list is green on every one of them
     // and reports nothing at all about the flag it is missing.
     const oneWayHonest = (list: string[]) => list.every((f) => used.has(f));
@@ -882,7 +888,7 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
     expect(asked).toEqual(["help"]);
     // this direction is the one that catches it: a used-but-undeclared flag
     const undeclared = [...used].filter((f) => !UNCHANGED.includes(f));
-    expect(undeclared).toEqual(["--prompt-suggestions"]);
+    expect(undeclared).toEqual(["--settings", "--prompt-suggestions"]);
   });
 
   test("every adapter whose command strings hardcode flags declares those flags for the probe", () => {

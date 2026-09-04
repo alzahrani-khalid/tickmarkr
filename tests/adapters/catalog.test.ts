@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
 import {
   SHIPPED_CLI_CATALOG,
   catalogEntries,
@@ -318,7 +319,7 @@ test("construct omp through the shipped catalog and compare its vendor, trust de
   }
 });
 
-test("enumerate production registry construction before and after the change: omp moves from unroutable to routable, while every other CLI yields an identical vendor, command, trust and identity tuple. Record both maps so a blanket routability or policy change cannot pass", () => {
+test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the roster-digest pins for claude-code and qwen are repinned to the new tuples as the diff shows in the changed hunks", () => {
   // The codex tuple embeds codexMcpSuppressionFlags(), which by design reads the operator's
   // $CODEX_HOME/config.toml at render time. Pin CODEX_HOME to an empty location so the recorded
   // digests are the zero-config rendering on every machine — the original pin hashed the author's
@@ -347,8 +348,8 @@ test("enumerate production registry construction before and after the change: om
       }];
     }));
   };
-  const beforeEntries: CliEntry[] = SHIPPED_CLI_CATALOG.map((entry) => entry.id === "omp"
-    ? { id: "omp", binary: "omp", identity: ".+", vendor: null }
+  const beforeEntries: CliEntry[] = SHIPPED_CLI_CATALOG.map((entry) => entry.id === "qwen"
+    ? { id: "qwen", binary: "qwen", identity: ".+", vendor: null }
     : entry);
   const before = recordRegistry(beforeEntries);
   const after = recordRegistry(SHIPPED_CLI_CATALOG);
@@ -361,9 +362,9 @@ test("enumerate production registry construction before and after the change: om
     ]),
   );
   const expectedBeforeDigests = {
-    // v2.1.3 T7: repinned when the interactive/resume builders gained `--prompt-suggestions false`
-    // (ghost-text suppression at the source). The tuple bytes really did change; the pin is doing its job.
-    "claude-code": "1344964a87c7d3be6edef139a0ceafe73d54b9b951aa41fdbcf806a4944cf9a8",
+    // 2026-09-03: repinned when claude moved its print prompt to stdin, pane forms gained the
+    // promptSuggestionEnabled settings pair, and Fable's stamp advanced to 5.1.
+    "claude-code": "c00cb8c0fc0e03ca99857237b98d73d59e223f4d2ec5156bc7500fc778c707d0",
     codex: "22b0e5652c1674629ea5d32db5fe14d4d6a10569702770acbd86e1e9cb8c2078",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
@@ -379,16 +380,19 @@ test("enumerate production registry construction before and after the change: om
     auggie: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
     crush: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
     "prime-agent": "459d0095ae0262ff6fce15db214b6f133d23ee11f922f09558d46dea5faa6f82",
-    omp: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
+    omp: "560517184e55bcd06d48db486e8b31ac5606fb38c75d5a58db8dc82820326a71",
     agy: "b1f724e78c4e7cb04ee8ce27bf7285dbd15dde4c3dffada16dad7cc3bc75f040",
   };
 
-  expect(before.omp).toEqual({ routable: false, vendor: null, command: null, trust: null, identity: ".+" });
-  expect(after.omp).toMatchObject({ routable: true, vendor: "mixed", identity: "^omp/" });
+  expect(CLAUDE_ALIAS_IDENTITY_STAMPS.fable).toBe("claude-fable-5-1");
+  expect(before.qwen).toEqual({ routable: false, vendor: null, command: null, trust: null, identity: ".+" });
+  expect(after.qwen).toMatchObject({ routable: true, vendor: "alibaba", identity: "^\\d+\\.\\d+\\.\\d+" });
   expect(Object.keys(after)).toEqual(Object.keys(before));
   expect(digestMap(before)).toEqual(expectedBeforeDigests);
-  expect(digestMap(after)).toEqual({ ...expectedBeforeDigests, omp: "560517184e55bcd06d48db486e8b31ac5606fb38c75d5a58db8dc82820326a71" });
-  for (const id of Object.keys(before).filter((candidate) => candidate !== "omp")) {
+  // 2026-09-04 (RULING-222-43, OBS-905): repinned when qwen lost its `-i` interactive form — the
+  // pane runs the headless command and `-i` left hardcodedFlags. Only qwen's tuple moved.
+  expect(digestMap(after)).toEqual({ ...expectedBeforeDigests, qwen: "4613b18718acb920366d8ef50d9cd2e2e0d8fb564b6c5710d371b4cde3bb58ab" });
+  for (const id of Object.keys(before).filter((candidate) => candidate !== "qwen")) {
     expect(after[id], id).toEqual(before[id]);
   }
   vi.unstubAllEnvs();

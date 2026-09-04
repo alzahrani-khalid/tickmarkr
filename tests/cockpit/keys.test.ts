@@ -578,6 +578,11 @@ function runNamedLedgerTest(
       cwd: sandbox,
       env: {
         ...process.env,
+        // OBS-886 (the OBS-854 precedent): every nested run is a whole vitest process whose fork pool pre-spawns
+        // min(cpus-1, maxForks) workers; one ledger entry at a time inside a PARALLEL fork ran ≈60 s and starved
+        // the worker↔host birpc window (post-summary "Timeout calling onTaskUpdate" with every test green).
+        // The entries are awaited serially, so one fork per child costs nothing and ends the storm.
+        VITEST_MAX_FORKS: "1",
         FORCE_COLOR: "0",
         NO_COLOR: "1",
       },

@@ -23,7 +23,9 @@ import { ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/
 //              answers ok:true with that terminal's OWN dead record and retained scrollback (C4)
 //   show     → {ok, result:{terminal:{handle, tabId, title:<PANE title>, connected, writable,
 //              orphaned, worktreeId, worktreePath}}, _meta} — liveness only; NO status, NO agent
-//   send     → {ok, result:{send:{handle, accepted:true, bytesWritten}}, _meta}
+//   send     → recorded text-send: {ok, result:{send:{handle, accepted:true, bytesWritten}}, _meta}.
+//              `send --interrupt` has NO 1.4.195 capture; its fixture returns only the addressed
+//              handle so the driver cannot accidentally depend on invented receipt fields.
 //   wait     → satisfied → {ok, result:{wait:{handle, condition, satisfied:true, status, exitCode}},
 //              _meta}; elapsed → rc 1 + {ok:false, error:{code:"timeout",message:"timeout"}, _meta}
 //              by default, with the recorded 1.4.186 ok:true satisfied:false receipt selectable
@@ -31,6 +33,8 @@ import { ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/
 //              is a successful close of an exited/no-live-PTY terminal
 //   worktree current → {ok, result:{worktree:{path,...}}, _meta}; a fresh checkout may answer
 //              selector_not_found or an enclosing checkout until Orca indexes the exact cwd
+//   worktree set → NO 1.4.195 capture; the fixture deliberately returns an empty successful result
+//              so the driver validates the shared envelope without inventing payload semantics.
 //   agent hooks status → {ok, result:{enabled,statuses:[{agent,state,...}]}, _meta}
 //   worktree create → the checkout verb Orca really exposes (`orca worktree create --help`,
 //              1.4.186): `--name <name>` REQUIRED, `--repo <selector>` inferred when omitted,
@@ -138,6 +142,8 @@ export interface FakeOrcaOpts {
   worktreeCurrentAnswers?: Array<string | "selector_not_found">;
   hooksEnabled?: boolean;
   hookStatuses?: FakeHookStatus[];
+  /** Whether accepted text sends are echoed into the cursor stream. Real interactive shells do. */
+  echoSends?: boolean;
   /** where `worktree create` puts the checkout — Orca's own root, never the caller's choice.
    *  Default: an `orca-worktrees` directory beside the repo. */
   worktreeRoot?: string;
@@ -147,7 +153,7 @@ interface FakeTerminal extends FakeTerminalSpec { lines: string[] }
 
 const KNOWN_FAMILIES = new Set<string>([
   "status", "create", "list", "read", "send", "wait", "show", "close", "worktree",
-  "worktree-current", "hooks-status",
+  "worktree-current", "worktree-set", "hooks-status",
 ]);
 
 const ALLOWED_FLAGS: Record<string, Set<string>> = {
@@ -155,12 +161,13 @@ const ALLOWED_FLAGS: Record<string, Set<string>> = {
   create: new Set(["--worktree", "--title", "--command", "--json"]),
   list: new Set(["--worktree", "--include-visual-layouts", "--limit", "--json"]),
   read: new Set(["--terminal", "--cursor", "--screen", "--limit", "--json"]),
-  send: new Set(["--terminal", "--text", "--enter", "--json"]),
+  send: new Set(["--terminal", "--text", "--enter", "--interrupt", "--json"]),
   wait: new Set(["--terminal", "--for", "--timeout-ms", "--json"]),
   show: new Set(["--terminal", "--json"]),
   close: new Set(["--terminal", "--json"]),
   worktree: new Set(["--name", "--repo", "--base-branch", "--json"]),
   "worktree-current": new Set(["--json"]),
+  "worktree-set": new Set(["--worktree", "--workspace-status", "--json"]),
   "hooks-status": new Set(["--json"]),
 };
 
@@ -194,6 +201,10 @@ export class FakeOrca {
   /** text typed without `--enter`; real Orca writes the bytes but nothing is submitted. */
   readonly typed = new Map<string, string[]>();
   runtimeId: string;
+  /** handles interrupted through the unrecorded `terminal send --interrupt` shape */
+  readonly interrupted: string[] = [];
+  /** board projection by canonical checkout path */
+  readonly workspaceStatuses = new Map<string, string>();
   /** the live terminal table — tests seed scrollback and flip status directly on these records */
   terminals: FakeTerminal[];
   private pageSize: number;
@@ -355,6 +366,14 @@ export class FakeOrca {
         ? undefined
         : "agent hooks status accepts no positional arguments";
     }
+    if (family === "worktree-set") {
+      if (args.length !== 7 || args[0] !== "worktree" || args[1] !== "set") {
+        return "invalid worktree set invocation";
+      }
+      if (flag(args, "--worktree") === undefined) return "worktree set requires --worktree";
+      if (flag(args, "--workspace-status") === undefined) return "worktree set requires --workspace-status";
+      return undefined;
+    }
     if (family === "worktree") {
       if (args[1] !== "create") return "worktree supports only `create` in this fixture";
       return flag(args, "--name") === undefined ? "worktree create requires --name" : undefined;
@@ -364,7 +383,7 @@ export class FakeOrca {
       create: ["--worktree", "--title", "--command"],
       list: [],
       read: ["--terminal"],
-      send: ["--terminal", "--text"],
+      send: ["--terminal"],
       wait: ["--terminal", "--for", "--timeout-ms"],
       show: ["--terminal"],
       close: ["--terminal"],
@@ -376,6 +395,13 @@ export class FakeOrca {
       if (screen && args.includes("--cursor")) return "read --screen does not accept --cursor";
       if (!screen && flag(args, "--limit") === undefined) return "read requires --limit unless --screen is set";
     }
+    if (family === "send") {
+      const interrupt = args.includes("--interrupt");
+      if (interrupt && (args.includes("--text") || args.includes("--enter"))) {
+        return "send --interrupt does not accept text or enter";
+      }
+      if (!interrupt && flag(args, "--text") === undefined) return "send requires --text";
+    }
     if (family === "wait" && !["exit", "tui-idle"].includes(flag(args, "--for") ?? "")) {
       return "wait supports --for exit|tui-idle in this fixture";
     }
@@ -386,6 +412,7 @@ export class FakeOrca {
     if (args[0] === "terminal") return args[1];
     if (args[0] === "worktree" && args[1] === "current") return "worktree-current";
     if (args[0] === "agent" && args[1] === "hooks" && args[2] === "status") return "hooks-status";
+    if (args[0] === "worktree" && args[1] === "set") return "worktree-set";
     return args[0];
   }
 
@@ -448,6 +475,13 @@ export class FakeOrca {
         },
       });
     }
+    if (family === "worktree-set") {
+      const worktree = this.selected(flag(args, "--worktree"), cwd);
+      const status = flag(args, "--workspace-status");
+      if (worktree && status) this.workspaceStatuses.set(worktree, status);
+      // UNRECORDED SHAPE: intentionally no invented receipt beyond the shared success envelope.
+      return this.ok({});
+    }
     if (family === "hooks-status") {
       return this.ok({
         enabled: this.opts.hooksEnabled !== false,
@@ -508,10 +542,19 @@ export class FakeOrca {
       if (t.writable === false || this.reportedStatus(t) !== "running") {
         return this.refusal("terminal_not_writable", `terminal ${handle} is not writable`);
       }
+      if (args.includes("--interrupt")) {
+        this.interrupted.push(handle);
+        // UNRECORDED SHAPE: only the handle binding is available to validate.
+        return this.ok({ send: { handle } });
+      }
       const text = flag(args, "--text") ?? "";
       const enter = args.includes("--enter");
-      if (enter) this.sent.set(handle, [...(this.sent.get(handle) ?? []), text]);
-      else this.typed.set(handle, [...(this.typed.get(handle) ?? []), text]);
+      if (enter) {
+        this.sent.set(handle, [...(this.sent.get(handle) ?? []), text]);
+        if (this.opts.echoSends !== false) t.lines.push(text);
+      } else {
+        this.typed.set(handle, [...(this.typed.get(handle) ?? []), text]);
+      }
       // Recorded send receipt: accepted + bytesWritten (the trailing newline of --enter included).
       return this.ok({ send: { handle, accepted: true, bytesWritten: Buffer.byteLength(text, "utf8") + (enter ? 1 : 0) } });
     }

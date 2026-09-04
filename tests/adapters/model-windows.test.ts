@@ -62,6 +62,19 @@ describe("cited model-window claims", () => {
     expect(unknown).not.toHaveProperty("window");
   });
 
+  test("OBS-871 rows have dated cited windows and remain seed-pinned", () => {
+    const ids = [
+      "zai/glm-5.3", "zai/glm-5.3-flash", "google/gemini-3.8-flash", "alibaba/qwen3.8-max",
+      "claude-fable-5-1", "gemini-3.8-flash", "qwen3.8-max", "prime-inference/z-ai/glm-5.2",
+    ];
+    for (const id of ids) {
+      const claim = CITED_MODEL_WINDOWS.find((entry) => entry.modelId === id);
+      expect(claim, id).toMatchObject({ modelId: id, readDate: "2026-09-03" });
+      expect(claim?.source, id).toMatch(/^https:\/\//);
+      expect(Object.values(DEFAULT_CONFIG.tiers).some((entry) => id in entry.models), id).toBe(true);
+    }
+  });
+
   test("test: the table's model ids equal the seeded-model set exactly, proven member by member over the closed set of divergence shapes — a table-only fixture, a seed-only fixture and an exact-match fixture — so the set of source claims the judge must weigh is finite and enumerable", () => {
     const seededModelIds = Object.values(DEFAULT_CONFIG.tiers).flatMap((tier) => Object.keys(tier.models));
     const claimedModelIds = CITED_MODEL_WINDOWS.map((claim) => claim.modelId);

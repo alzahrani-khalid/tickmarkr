@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import * as os from "node:os";
 import { join } from "node:path";
 import { GLYPHS, LIVE } from "../../brand.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../config/config.js";
@@ -157,6 +158,12 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const ASCII_SPINNER = ["|", "/", "-", "\\"] as const;
 const SAVE_TERMINAL_TITLE = "\x1b[22;0t";
 const RESTORE_TERMINAL_TITLE = "\x1b[23;0t";
+const ENTER_ALTERNATE_SCREEN = "\x1b[?1049h";
+const LEAVE_ALTERNATE_SCREEN = "\x1b[?1049l";
+
+export const STATUS_HELP = `usage: tickmarkr status [<runId>] [--watch [--events]] [--oneline]
+With --watch --events, stdout is one JSON document per decision event and stderr carries keepalive lines.
+Do not merge stdout and stderr (for example with 2>&1): doing so corrupts the JSON document stream.`;
 
 const decisionEvidence = (stateDir: string, runId: string, sequence: number): string =>
   `${stateDir}/runs/${runId}/journal.jsonl#L${sequence}`;
@@ -1302,7 +1309,7 @@ const renderFrame = (
   const tally = tipPhase
     ? `${progressTone(`${progressGlyph} ${done}/${total} tasks done`)}${dot}${progressTone("run not verified")}`
     : done === total && total > 0 ? ok(`${done}/${total} done`) : information(`${done}/${total} done`);
-  const live = liveness(events, daemon, now)
+  const live = `${liveness(events, daemon, now)} · load1 ${os.loadavg()[0]!.toFixed(2)}`
     .replace(/\bdead\b/u, fail("dead"))
     .replace(/\bfinished\b/u, dim("finished"))
     .replace(/\balive\b/u, running("alive"))
@@ -1532,6 +1539,7 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
 };
 
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {
+  if (argv.some((arg) => arg === "--help" || arg === "-h")) return STATUS_HELP;
   const namedRunId = positionalRunId(argv);
   if (argv.includes("--oneline")) return oneLine(cwd, namedRunId);
   // ONE manifest read per invocation, here — every frame below names this same version.
@@ -1655,6 +1663,12 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   // a dead board keeps writing and reads ARMED. That is the over-claiming direction, the one an operator
   // acts on, and the one this instrument exists to close.
   const armed = bounded ? undefined : armWatchSupervision(cwd, opts.supervisionBeatMs);
+  let alternateScreen = false;
+  const leaveAlternateScreen = () => {
+    if (!alternateScreen) return;
+    alternateScreen = false;
+    process.stdout.write(LEAVE_ALTERNATE_SCREEN);
+  };
   let titleSaved = false;
   const restoreTitle = () => {
     if (!titleSaved) return;
@@ -1676,6 +1690,28 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     }
     process.stdout.write(`\x1b]0;⏳ ${hotPhase.taskId} ${phaseLabel(hotPhase)} ${fmtElapsed(nowMs - hotPhase.startedAt)}\x07`);
   };
+  const signalHandlers: Array<["SIGINT" | "SIGTERM", () => void]> = [];
+  const exitFromSignal = (code: number) => () => {
+    if (titleSaved) {
+      process.removeListener("exit", restoreTitle);
+      restoreTitle();
+    }
+    if (alternateScreen) {
+      process.removeListener("exit", leaveAlternateScreen);
+      leaveAlternateScreen();
+    }
+    process.exit(code);
+  };
+  if (!bounded && !eventStream && tty) {
+    process.stdout.write(ENTER_ALTERNATE_SCREEN);
+    alternateScreen = true;
+    process.once("exit", leaveAlternateScreen);
+    for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
+      const handler = exitFromSignal(code);
+      signalHandlers.push([signal, handler]);
+      process.once(signal, handler);
+    }
+  }
 
   try {
     for (let i = 0; i < iterations; i++) {
@@ -1688,6 +1724,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
           process.stdout.write(line + "\n");
           if (bounded) eventLines.push(line);
         }
+        process.stderr.write("status: keepalive\n");
       } else {
         frame = renderFrame(cwd, binaryVersion, nowMs, i, workerLiveness, true, namedRunId);
         if (tty) {
@@ -1718,6 +1755,11 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     if (titleSaved) {
       process.removeListener("exit", restoreTitle);
       restoreTitle();
+    }
+    for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
+    if (alternateScreen) {
+      process.removeListener("exit", leaveAlternateScreen);
+      leaveAlternateScreen();
     }
   }
   return bounded ? eventStream ? eventLines.join("\n") : frames.join(sep) : "";

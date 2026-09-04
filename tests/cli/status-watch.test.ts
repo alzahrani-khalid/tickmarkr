@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { GLYPHS, LIVE } from "../../src/brand.js";
-import { status } from "../../src/cli/commands/status.js";
+import { STATUS_HELP, status } from "../../src/cli/commands/status.js";
+import { VERIFY_HELP, verify } from "../../src/cli/commands/verify.js";
 import { narrationRow } from "../../src/cli/commands/run.js";
+import { USAGE } from "../../src/cli/index.js";
 import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
@@ -15,6 +17,10 @@ import type { JournalEvent } from "../../src/run/journal.js";
 // test in this file sees the real filesystem — only the tally is added.
 const journalReads = vi.hoisted(() => ({ count: 0 }));
 const foldFailure = vi.hoisted(() => ({ enabled: false }));
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, default: { ...actual, loadavg: () => [1.23, 0, 0] }, loadavg: () => [1.23, 0, 0] };
+});
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const counted = ((path: unknown, ...rest: unknown[]) => {
@@ -1466,6 +1472,119 @@ describe("status checklist rendering", () => {
       "human-decision-required",
       "run-end",
     ]);
+  });
+
+  test("test: a bounded status --watch --events run writes one JSON document per decision event and nothing else to stdout and its keepalive lines to stderr and the help text names stdout as the document stream and stderr as the keepalive stream for status and the verdict stream for verify whereas a watch that interleaves a keepalive on stdout or help that names no stream fails", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), phaseStart("T1", "worker", ts)]);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+    const errSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    let out = "";
+    try {
+      out = await status(["--watch", "--events"], repo, { iterations: 2, sleep: async () => {} });
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+
+    expect(stdout.join("")).toBe(`${out}\n`);
+    expect(stdout.join("").trim().split("\n").map((line) => JSON.parse(line).type)).toEqual(["phase-change"]);
+    expect(stderr).toEqual(["status: keepalive\n", "status: keepalive\n"]);
+    expect(await status(["--help"], repo)).toBe(STATUS_HELP);
+    expect((await verify(["--help"], repo)).out).toBe(VERIFY_HELP);
+    for (const help of [STATUS_HELP, USAGE]) {
+      expect(help).toMatch(/stdout.*JSON|JSON documents.*stdout/u);
+      expect(help).toMatch(/keepalive.*stderr|stderr.*keepalive/u);
+      expect(help).toMatch(/(?:never|not) merge|Do not merge|2>&1.*corrupt/iu);
+    }
+    for (const help of [VERIFY_HELP, USAGE]) {
+      expect(help).toMatch(/verdict(?:\/JSON)? (?:and JSON result )?(?:are |on )?stdout|verdict.*stdout/iu);
+      expect(help).toMatch(/stderr/u);
+      expect(help).toMatch(/(?:never|not) merge|Do not merge|2>&1.*corrupt/iu);
+    }
+  });
+
+  test("test: an unbounded tty watch writes the alternate-screen enter sequence before its first frame and the leave sequence when it ends while a bounded render and an event stream write neither whereas a watch that repaints with clear-and-home on the main screen fails", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), phaseStart("T1", "worker", ts)]);
+    const capture = async (args: string[], opts: Parameters<typeof status>[2]) => {
+      const writes: string[] = [];
+      const outSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        writes.push(String(chunk));
+        return true;
+      });
+      const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        await status(args, repo, opts).catch(() => "");
+      } finally {
+        outSpy.mockRestore();
+        errSpy.mockRestore();
+      }
+      return writes.join("");
+    };
+    const captureSignalExit = async (signal: "SIGINT" | "SIGTERM", code: number) => {
+      const writes: string[] = [];
+      const before = new Set(process.rawListeners(signal));
+      const outSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        writes.push(String(chunk));
+        return true;
+      });
+      const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((actualCode?: string | number | null) => {
+        throw new Error(`exit ${actualCode}`);
+      }) as never);
+      let caught: unknown;
+      let exitCalls: unknown[] = [];
+      try {
+        await status(["--watch"], repo, {
+          sleep: async () => {
+            const handler = process.rawListeners(signal).find((candidate) => !before.has(candidate));
+            expect(handler).toBeDefined();
+            (handler as () => void)();
+          },
+        });
+      } catch (error) {
+        caught = error;
+      } finally {
+        exitCalls = exitSpy.mock.calls.map(([actualCode]) => actualCode);
+        outSpy.mockRestore();
+        errSpy.mockRestore();
+        exitSpy.mockRestore();
+      }
+      expect(caught).toMatchObject({ message: `exit ${code}` });
+      expect(exitCalls).toEqual([code]);
+      return writes.join("");
+    };
+
+    await withTty(async () => {
+      const live = await capture(["--watch"], { sleep: async () => { throw new Error("board closed"); } });
+      expect(live.startsWith("\x1b[?1049h")).toBe(true);
+      expect(live.indexOf("\x1b[2J\x1b[H")).toBeGreaterThan(live.indexOf("\x1b[?1049h"));
+      expect(live.endsWith("\x1b[?1049l")).toBe(true);
+      for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
+        const signaled = await captureSignalExit(signal, code);
+        expect(signaled.startsWith("\x1b[?1049h")).toBe(true);
+        expect(signaled.endsWith("\x1b[?1049l")).toBe(true);
+      }
+
+      const bounded = await capture(["--watch"], { iterations: 1, sleep: async () => {} });
+      const boundedEvents = await capture(["--watch", "--events"], { iterations: 1, sleep: async () => {} });
+      const unboundedEvents = await capture(["--watch", "--events"], {
+        sleep: async () => { throw new Error("event stream closed"); },
+      });
+      for (const output of [bounded, boundedEvents, unboundedEvents]) {
+        expect(output).not.toContain("\x1b[?1049h");
+        expect(output).not.toContain("\x1b[?1049l");
+      }
+    });
   });
 
   test("test: a configured webhook sink receives decision-tier events and its failure never affects the run or the stream", async () => {

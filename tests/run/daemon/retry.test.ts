@@ -293,7 +293,8 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
     expect(dispatches).toHaveLength(2);
     for (const d of dispatches) {
-      expect(Object.keys(d.data).sort()).toEqual(["assignment", "attempt", "provenance", "retryMode"]);
+      expect(Object.keys(d.data).sort()).toEqual(["assignment", "attempt", "excludedChannels", "provenance", "retryMode"]);
+      expect(d.data.excludedChannels).toEqual([]);
       expect(d.data.retryMode).toBe("fresh");
     }
   });

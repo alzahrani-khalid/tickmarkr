@@ -37,16 +37,33 @@ function testSources(repoRoot: string): TestSource[] {
 
 // Conventional, not universal: a name match supplies candidates only. Compile may refuse one when the
 // test itself also supplies one of the two corroborating edges below; the raw name mapping stays data.
-type NamedSource = { taskId: string; source: string };
+type NamedSource = { taskId: string; source: string; fromGlob: boolean };
 
-function namedSources(test: string, tasks: readonly Task[]): NamedSource[] {
+function sourceFiles(repoRoot: string): string[] {
+  const root = join(repoRoot, "src");
+  try {
+    return readdirSync(root, { recursive: true, encoding: "utf8" })
+      .filter((path) => /\.(?:[cm]?[jt]sx?)$/.test(path))
+      .map((path) => `src/${normalize(path)}`)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+// OBS-898: `allSources` is indexed once per ownership pass by the caller, never per test source.
+function namedSources(test: string, tasks: readonly Task[], allSources: readonly string[]): NamedSource[] {
   const stem = basename(test).replace(/\.test\.ts$/, "");
   const matches = new Map<string, NamedSource>();
   for (const task of tasks) {
-    for (const entry of task.files.map(normalize).filter((path) => path.startsWith("src/") && !/[*?{[]/.test(path))) {
-      const source = basename(entry, extname(entry));
-      if (stem === source || stem.startsWith(`${source}-`)) {
-        matches.set(`${task.id}:${entry}`, { taskId: task.id, source: entry });
+    for (const entry of task.files.map(normalize).filter((path) => path.startsWith("src/"))) {
+      const fromGlob = /[*?{[]/.test(entry);
+      const entries = fromGlob ? allSources.filter(filesGlob(entry)) : [entry];
+      for (const sourcePath of entries) {
+        const source = basename(sourcePath, extname(sourcePath));
+        if (stem === source || stem.startsWith(`${source}-`)) {
+          matches.set(`${task.id}:${sourcePath}`, { taskId: task.id, source: sourcePath, fromGlob });
+        }
       }
     }
   }
@@ -167,18 +184,27 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
       predictedBy.set(hit, ids);
     }
   }
+  const globOwnedTests = new Map<string, Set<string>>();
+  const allSources = sourceFiles(repoRoot);
   for (const source of sources) {
     const ids = predictedBy.get(source.path) ?? new Set<string>();
-    for (const { taskId } of namedSources(source.path, tasks)) ids.add(taskId);
+    for (const named of namedSources(source.path, tasks, allSources)) {
+      ids.add(named.taskId);
+      if (named.fromGlob) {
+        const owners = globOwnedTests.get(source.path) ?? new Set<string>();
+        owners.add(named.taskId);
+        globOwnedTests.set(source.path, owners);
+      }
+    }
     if (ids.size > 0) predictedBy.set(source.path, ids);
   }
 
   const findings: OwnershipFinding[] = [];
   for (const [test, taskIds] of predictedBy) {
-    if (owners(test).length === 0) {
+    if (owners(test).length === 0 && !(globOwnedTests.get(test)?.size)) {
       const ids = [...taskIds].sort();
       const source = sourceByPath.get(test)!;
-      const evidence = corroboration(source, namedSources(test, tasks));
+      const evidence = corroboration(source, namedSources(test, tasks, allSources));
       findings.push({
         code: "unowned-test",
         test,

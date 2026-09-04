@@ -19,7 +19,8 @@ import {
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
-import { setupRepo, T } from "../helpers/tmprepo.js";
+import { Journal } from "../../src/run/journal.js";
+import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 // v1.22 T5 / OBS-19: fingerprint-matched trust dialog gets one Enter; anything else pages.
 
@@ -148,6 +149,55 @@ async function runTrustPane(
   const summary = await runDaemon(repo, { adapters: [fake], runId: "run-trust-pane", driver });
   return { keys, keyedSlots, notified, human: summary.human };
 }
+
+test("test: under the subprocess driver the journal carries driver-capability-absent once per run for narrator and once for sendKey when a trust-dialog adapter is dispatched and never under a driver that implements them while the worker-launch row carries surface and hostPlatform when the driver describes the slot and every worker-dead and worker-dead-held row names the read source it judged from whereas a daemon that journals the absence per slice or omits the source fails", async () => {
+  const run = async (runId: string, complete: boolean) => {
+    const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [{
+      shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" },
+    }] } });
+    (fake as { trustDialog?: TrustDialog }).trustDialog = CURSOR_TRUST_DIALOG;
+    const inner = new SubprocessDriver();
+    const driver: ExecutorDriver = {
+      id: "placement-spy", interactive: false, readSource: "captured-screen",
+      slot: inner.slot.bind(inner), run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner), status: inner.status.bind(inner),
+      read: inner.read.bind(inner), notify: inner.notify.bind(inner), close: inner.close.bind(inner),
+      worktree: inner.worktree.bind(inner),
+      describe: () => ({ surface: "visible", hostPlatform: "darwin" }),
+      ...(complete ? {
+        sendKey: async () => {},
+        narrator: async (cwd: string) => inner.slot(cwd, `watch-${runId}`),
+      } : {}),
+    };
+    await runDaemon(repo, { adapters: [fake], runId, driver });
+    return Journal.open(repo, runId).read();
+  };
+
+  const absent = await run("run-capability-absent", false);
+  expect(absent.filter((e) => e.event === "driver-capability-absent").map((e) => e.data.capability).sort())
+    .toEqual(["narrator", "sendKey"]);
+  expect(absent.find((e) => e.event === "worker-launch")?.data)
+    .toMatchObject({ surface: "visible", hostPlatform: "darwin" });
+  const complete = await run("run-capability-complete", true);
+  expect(complete.filter((e) => e.event === "driver-capability-absent")).toEqual([]);
+
+  const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.01 })], {
+    tasks: { T1: [{ shell: "sleep 30", result: { ok: true } }] },
+  });
+  const inner = new SubprocessDriver();
+  const driver: ExecutorDriver = {
+    id: "source-spy", interactive: true, readSource: "captured-screen",
+    slot: inner.slot.bind(inner), run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner),
+    waitAgentStatus: inner.waitAgentStatus.bind(inner), status: async () => { throw new Error("status unavailable"); },
+    read: inner.read.bind(inner), notify: inner.notify.bind(inner), close: inner.close.bind(inner),
+    worktree: inner.worktree.bind(inner),
+  };
+  await runDaemon(repo, { adapters: [fake], runId: "run-read-source", driver });
+  const liveness = Journal.open(repo, "run-read-source").read()
+    .filter((e) => e.event === "worker-dead" || e.event === "worker-dead-held");
+  expect(liveness.length).toBeGreaterThan(0);
+  expect(liveness.every((row) => row.data.source === "captured-screen")).toBe(true);
+}, 60_000);
 
 describe("trust-dialog declarations", () => {
   test("a pane showing the claude workspace-trust dialog matches its adapter's declared fingerprint and is answered with its declared key", async () => {

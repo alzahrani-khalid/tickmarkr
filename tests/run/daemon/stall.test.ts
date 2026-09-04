@@ -510,10 +510,10 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
   // tracker means "unmeasurable", not "dead". For UNMETERED adapters (no contextUsage: codex,
   // cursor-agent, grok, opencode — the exact non-nudgeable set this kill governs) rows are the
   // only liveness signal, so a live worker past the ceiling would be concluded dead mid-work.
-  // The kill must stand down on a saturated row signal (journaled once) and let the rolling
-  // window own the pane, as pre-T1.
-  test("a saturated row signal stands the fast-kill down — a live pane past the read ceiling is never concluded dead", async () => {
-    setDeadChannelFastKillMsForTests(1_500); // kill seam far below the 6s window: without the stand-down, worker-dead fires
+  // Saturation makes the row signal unreadable. It cannot condemn a worker, but independent flat
+  // CPU plus an unchanged tree still may; accruing CPU remains the live-worker control.
+  test("test: a saturated row signal beside accruing CPU never holds a worker dead and journals the row as unreadable while a saturated row beside flat CPU and an unchanged worktree may and a tab that vanished before the sweep's close journals tab-reconcile-close-skipped with exit code zero whereas a driver that holds dead on the saturated row alone or logs tab_not_found as a failed close fails", async () => {
+    setDeadChannelFastKillMsForTests(1_500); // kill seam far below the 6s window so the independent flat legs can conclude
     try {
       const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED);
       // a constant FULL read window in the shape a production `read(slot, PANE_READ_ROWS)`
@@ -527,10 +527,11 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
       const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-saturated", driver });
       expect(s.human).toEqual(["T1"]); // the rolling window concluded it — the stall consult parks human
       const evs = Journal.open(repo, "run-t1-saturated").read();
-      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0); // never killed on a blind signal
-      const held = evs.filter((e) => e.event === "worker-dead-held" && e.taskId === "T1");
-      expect(held).toHaveLength(1); // the stand-down is journaled exactly once per attempt
-      expect(held[0]!.data.reason).toBe("row-signal-saturated");
+      expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(1); // flat CPU + unchanged tree may conclude
+      const unreadable = evs.filter((e) => e.event === "contact-unreadable" && e.taskId === "T1");
+      expect(unreadable).toHaveLength(1);
+      expect(unreadable[0]!.data).toMatchObject({ source: "pane-rows", reason: "row-signal-saturated", concludes: false });
+      expect(evs.some((e) => e.event === "worker-dead-held" && e.data.reason === "row-signal-saturated")).toBe(false);
     } finally {
       resetDeadChannelFastKillMsForTests();
     }

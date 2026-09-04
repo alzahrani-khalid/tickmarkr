@@ -12,12 +12,57 @@ export const SEED_STAMPED = "2026-07-09";
 // knowledge past this age gets a "rerun tickmarkr doctor" nudge (BLOCKED_POLL_MS-style named constant).
 export const MODEL_STALE_DAYS = 30;
 const DAY_MS = 86400000;
-// cursor-agent 2026.07.08 reports 193 mostly-parameterized ids (e.g. gpt-5.3-codex-high-fast); filter the `auto`
-// pseudo-model + effort/speed variant suffixes from the unconfigured-lint aggregation ONLY — doctor.json keeps the
-// raw list (verified 2026-07-10). Data stays raw; lints stay signal. -max/-none/-thinking joined the suffix set
-// 2026-08-12 (D-OBS-11: cursor's residual lint list was still mostly effort variants of configured bases).
-const LINT_VARIANT_RE = /^auto$|-(fast|minimal|none|low|medium|high|xhigh|max|thinking)$/;
+// cursor-agent reports mostly effort/speed variants. Keep doctor.json raw, but collapse those ids
+// into one base row; a base-less classify writes the highest-effort real id.
+const VARIANT_SUFFIX_RE = /-(fast|minimal|none|low|medium|high|xhigh|max|thinking)$/;
+const VARIANT_RANK: Record<string, number> = { max: 6, xhigh: 5, high: 4, medium: 3, low: 2, minimal: 1, none: 0, thinking: 0, fast: 0 };
 const LINT_CAP = 5;
+
+export type FleetUnclassifiedModel = {
+  adapter: string;
+  model: string;
+  detectedAt?: string;
+  variants?: string[];
+  /** The real CLI id written by classify when the display row is a collapsed base. */
+  classifyModel?: string;
+};
+
+const variantBase = (model: string): string => {
+  let base = model;
+  while (VARIANT_SUFFIX_RE.test(base)) base = base.replace(VARIANT_SUFFIX_RE, "");
+  return base;
+};
+
+const variantRank = (model: string): number => {
+  let rank = 0;
+  for (const token of model.split("-")) rank = Math.max(rank, VARIANT_RANK[token] ?? 0);
+  return rank;
+};
+
+function collapseUnclassified(detected: readonly string[], configured: ReadonlySet<string>): FleetUnclassifiedModel[] {
+  const groups = new Map<string, { bare: boolean; variants: string[] }>();
+  for (const model of detected) {
+    if (model === "auto" || configured.has(model)) continue;
+    const base = variantBase(model);
+    if (configured.has(base)) continue;
+    const group = groups.get(base) ?? { bare: false, variants: [] };
+    if (model === base) group.bare = true;
+    else group.variants.push(model);
+    groups.set(base, group);
+  }
+  return [...groups].map(([model, group]) => {
+    if (!group.variants.length) return { adapter: "", model };
+    const classifyModel = group.bare
+      ? model
+      : group.variants.reduce((best, candidate) => variantRank(candidate) > variantRank(best) ? candidate : best);
+    return {
+      adapter: "",
+      model,
+      variants: group.variants,
+      ...(classifyModel !== model ? { classifyModel } : {}),
+    };
+  });
+}
 
 /**
  * Operator directive 2026-08-13 ("we should exclude all retired models"): the fleet models
@@ -575,9 +620,9 @@ export function modelLints(
         lints.push(`${id}: tiers lists ${model} — CLI no longer reports it; tombstone it (${model}: null overlay) or verify the id`);
       }
     }
-    const extra = detected.filter((m) => !configured.includes(m) && !LINT_VARIANT_RE.test(m));
+    const extra = collapseUnclassified(detected, new Set(configured));
     if (extra.length) {
-      const shown = extra.slice(0, cap).join(", ");
+      const shown = extra.slice(0, cap).map((row) => row.model).join(", ");
       const tail = extra.length > cap ? `, +${extra.length - cap} more${doctorRef}` : "";
       lints.push(`${id}: reports ${extra.length} model(s) not in tiers (${shown}${tail}) — classify before routing (benchmark policy)`);
     }
@@ -643,7 +688,7 @@ export function suggestOverlay(
     // Tombstones: configured ids the CLI no longer reports. Ids are operator-authored (from cfg) → MODEL_ID_RE only.
     const tombstones = configured.filter((model) => !detected.includes(model) && MODEL_ID_RE.test(model));
     // Additions: detected ids not in cfg. WHOLE line commented, no tier (MODEL-06). Ids come from an external
-    // CLI → MODEL_ID_RE (defense-in-depth, T-21-01) + the variant filter (cursor's ~193 parameterized ids).
+    // CLI → MODEL_ID_RE (defense-in-depth, T-21-01); effort variants collapse before this loop.
     // RELATIONAL gate (no capability judgment — "looks like an embedding model" is auto-tiering's cousin, the
     // NaN-routing class the v1.5 decision forbids): a detected id is suggested iff it shares a provider prefix
     // (clause a) OR a canonical segment (clause b, the RENAME case: opencode/glm-5.2 ⇒ zai-coding-plan/glm-5.2)
@@ -657,8 +702,9 @@ export function suggestOverlay(
     const cfgCanon = new Set(configured.map(canonical));
     const additions: string[] = [];
     let omitted = 0;
-    for (const model of detected) {
-      if (configured.includes(model) || !MODEL_ID_RE.test(model) || LINT_VARIANT_RE.test(model)) continue;
+    for (const row of collapseUnclassified(detected, new Set(configured))) {
+      const model = row.classifyModel ?? row.model;
+      if (!MODEL_ID_RE.test(model)) continue;
       if (configured.length > 0 && !cfgPrefixes.has(providerPrefix(model)) && !cfgCanon.has(canonical(model))) {
         omitted++;
         continue;
@@ -719,8 +765,8 @@ export function fleetUnclassifiedModels(
   cfg: TickmarkrConfig,
   health: Record<string, AuthHealth>,
   adapters: WorkerAdapter[],
-): { adapter: string; model: string; detectedAt?: string }[] {
-  const out: { adapter: string; model: string; detectedAt?: string }[] = [];
+): FleetUnclassifiedModel[] {
+  const out: FleetUnclassifiedModel[] = [];
   for (const adapter of adapters) {
     const id = adapter.id;
     const h = health[id];
@@ -729,10 +775,11 @@ export function fleetUnclassifiedModels(
     if (!detected.length) continue;
     const configured = new Set(Object.keys(cfg.tiers[id]?.models ?? {}));
     const date = h?.modelsDetectedAt?.split("T")[0];
-    for (const model of detected) {
-      if (configured.has(model) || LINT_VARIANT_RE.test(model)) continue;
-      out.push({ adapter: id, model, detectedAt: date });
-    }
+    out.push(...collapseUnclassified(detected, configured).map((row) => ({
+      ...row,
+      adapter: id,
+      ...(date ? { detectedAt: date } : {}),
+    })));
   }
   return out;
 }

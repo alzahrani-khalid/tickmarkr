@@ -1,6 +1,6 @@
 {
   "name": "tickmarkr",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Spec in, verified work out.",
   "type": "module",
   "license": "MIT",
@@ -57,5 +57,63 @@
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
+  },
+  "tickmarkrExport": {
+    "publicPaths": {
+      "exact": [
+        ".gitignore",
+        ".oxlintrc.json",
+        "CHANGELOG.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "FLEET.md",
+        "LICENSE",
+        "README.md",
+        "RELEASING.md",
+        "SECURITY.md",
+        "package-lock.json",
+        "package.json",
+        "tickmarkr.spec.md",
+        "tsconfig.json",
+        "vitest.config.ts",
+        ".github/pull_request_template.md",
+        "scripts/assert-test-file-count.sh",
+        "scripts/emit-schema.ts",
+        "scripts/probe-rig.mjs",
+        "specs/export-selftest.spec.md"
+      ],
+      "prefixes": [
+        ".github/ISSUE_TEMPLATE/",
+        ".github/workflows/",
+        "assets/",
+        "docs/codebase/",
+        "fixtures/",
+        "schema/",
+        "skills/tickmarkr-auto/",
+        "skills/tickmarkr-loop/",
+        "skills/tickmarkr-overseer/",
+        "src/",
+        "tests/"
+      ]
+    },
+    "excludedPaths": [
+      ".planning",
+      "specs",
+      ".tickmarkr",
+      ".overseer",
+      ".claude",
+      "docs",
+      "ASSESSMENT-*.md",
+      ".gitignore",
+      "scripts/measure-trailer-width.mjs",
+      "scripts/scan-scope-corpus.mjs",
+      "scripts/repro-obs96.mjs",
+      "CLAUDE.md",
+      "scripts/export-public.sh",
+      "scripts/verify-export.sh",
+      "tests/scripts/verify-export.test.ts",
+      ".github/workflows/ci.yml",
+      "**/*.local.*"
+    ]
   }
 }

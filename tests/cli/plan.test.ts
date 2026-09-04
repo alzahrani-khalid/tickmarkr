@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, realpathSync, utimesSync, writeFileSync } from
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import { writeDoctor } from "../../src/adapters/registry.js";
+import { allAdapters, writeDoctor } from "../../src/adapters/registry.js";
 import type { WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
@@ -130,7 +130,7 @@ describe("V-10 fleet preference visibility", () => {
     withOverlay(repo, "routing:\n  deny:\n    adapters: [pi]\n");
     const out = await plan([], repo);
     expect(out).toContain("pi:zai/glm-5.2");
-    expect(out).toMatch(/routing preference active: 1 channel\(s\) excluded/);
+    expect(out).toMatch(/routing preference active: 3 channel\(s\) excluded/);
     expect(out).toMatch(/deny: pi/);
     expect(out).toMatch(/dry run \(\d+ channels available\)/);
     expect(out).not.toMatch(/dry run \(0 channels available\)/);
@@ -149,6 +149,78 @@ describe("V-10 fleet preference visibility", () => {
     expect(out).toMatch(/routing preference active:/);
     expect(out).toContain("(empty allowlist)");
     expect(out).toMatch(/dry run \(0 channels available\)/);
+  });
+
+  test("test: plan prints for every routing deny and allow entry the seats it reaches naming all four for a flat entry and worker alone for a deny.workers entry prints one line per prefer entry that resolves to no live channel of its role pool naming the pool and prints a review-pool concentration line naming channel and provider counts when the pool spans fewer than two providers while a config with no deny or allow entries every prefer live and a pool of two providers prints none of these lines whereas a plan that prints the exclusion line alone or prints the pool line unconditionally fails", async () => {
+    const scoped = mkRepo();
+    withOverlay(scoped, `routing:
+  allow:
+    adapters: [claude-code]
+    models: [codex:gpt-5.5]
+  deny:
+    adapters: [pi]
+    models: [cursor-agent:composer-2.5]
+    workers:
+      adapters: [opencode]
+      models: [codex:gpt-5.5]
+`);
+    const scopedOut = await plan([], scoped);
+    expect(scopedOut).toContain("routing.allow.adapters 'claude-code' reaches seats: worker, judge, review, consult");
+    expect(scopedOut).toContain("routing.allow.models 'codex:gpt-5.5' reaches seats: worker, judge, review, consult");
+    expect(scopedOut).toContain("routing.deny.adapters 'pi' reaches seats: worker, judge, review, consult");
+    expect(scopedOut).toContain("routing.deny.models 'cursor-agent:composer-2.5' reaches seats: worker, judge, review, consult");
+    expect(scopedOut).toContain("routing.deny.workers.adapters 'opencode' reaches seats: worker");
+    expect(scopedOut).toContain("routing.deny.workers.models 'codex:gpt-5.5' reaches seats: worker");
+    expect(scopedOut).toContain("routing preference active:");
+
+    const inert = mkRepo();
+    withOverlay(inert, `routing:
+  map:
+    chore: { prefer: [grok] }
+review: { prefer: [grok:grok-4.5] }
+consult: { prefer: [grok:grok-4.5] }
+`);
+    const inertOut = await plan([], inert);
+    expect(inertOut).toContain("routing.map.chore.prefer 'grok' resolves to no live channel of worker pool");
+    expect(inertOut).toContain("review.prefer 'grok:grok-4.5' resolves to no live channel of review pool");
+    expect(inertOut).toContain("consult.prefer 'grok:grok-4.5' resolves to no live channel of consult pool");
+
+    const concentrated = mkRepo();
+    withOverlay(concentrated, "routing:\n  allow:\n    adapters: [codex]\n");
+    const concentratedOut = await plan([], concentrated);
+    expect(concentratedOut).toMatch(/review pool concentration: \d+ channel\(s\), 1 provider\(s\)/);
+
+    const clean = mkRepo();
+    withOverlay(clean, `routing:
+  map:
+    implement: { prefer: [codex] }
+    tests: { prefer: [claude-code] }
+`);
+    const twoProviderFleet = allAdapters().filter((adapter) => ["claude-code", "codex"].includes(adapter.id));
+    const cleanOut = await plan([], clean, twoProviderFleet);
+    expect(cleanOut).not.toContain("reaches seats:");
+    expect(cleanOut).not.toContain("resolves to no live channel of");
+    expect(cleanOut).not.toContain("review pool concentration:");
+  });
+
+  test("test: plan on a config whose flat routing.deny names the judge's adapter model or channel prints a refusal line naming OBS-576 the judge seat and the deny.workers remedy before any routing row while the same entry under deny.workers prints no refusal and benches workers only whereas a plan that routes over a judge-less config silently fails", async () => {
+    for (const deny of ["adapters: [claude-code]", "models: [fable]", "models: [claude-code:fable]"]) {
+      const denied = mkRepo();
+      withOverlay(denied, `routing:\n  deny:\n    ${deny}\n`);
+      const deniedOut = await plan([], denied);
+      const refusal = deniedOut.indexOf("REFUSAL OBS-576: judge seat claude-code:fable");
+      const routingRow = deniedOut.search(/^  T1\s/m);
+      expect(refusal, deny).toBeGreaterThanOrEqual(0);
+      expect(refusal, deny).toBeLessThan(routingRow);
+      expect(deniedOut, deny).toContain("routing.deny.workers");
+    }
+
+    const workerOnly = mkRepo();
+    withOverlay(workerOnly, "routing:\n  deny:\n    workers:\n      models: [claude-code:fable]\n");
+    const workerOut = await plan([], workerOnly);
+    expect(workerOut).not.toContain("REFUSAL OBS-576");
+    expect(workerOut).toContain("claude-code:fable (deny: claude-code:fable)");
+    expect(workerOut).toContain("routing.deny.workers.models 'claude-code:fable' reaches seats: worker");
   });
 });
 
@@ -186,7 +258,7 @@ describe("HYG-07(a) servable attribution in plan", () => {
   test("servable-dropped channel is a named truth in plan output", async () => {
     const repo = mkServableRepo();
     const out = await plan([], repo);
-    expect(out).toMatch(/servability: 1 channel\(s\) unservable/);
+    expect(out).toMatch(/servability: 3 channel\(s\) unservable/);
     expect(out).toContain("pi:anthropic/claude-opus-4-5");
     expect(out).toContain("not in pi's served model list");
   });

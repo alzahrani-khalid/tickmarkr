@@ -6,6 +6,45 @@ import { route, RoutingError } from "./router.js";
 export interface Disallowed { by: "deny" | "allow"; entry: string }
 export type PreferenceRole = "worker" | "judge" | "review" | "consult";
 
+const PREFERENCE_ROLES: PreferenceRole[] = ["worker", "judge", "review", "consult"];
+
+// Keep routing retries on the same identity review diversity uses: the served provider plus the
+// unprefixed model id. Gate review owns the original modelProvider policy; this dependency-leaf copy
+// avoids importing gates back into route/run and must move with that helper when the scope permits.
+export function routingModelProvider(model: string, fallback = "unknown"): string {
+  const id = model.toLowerCase();
+  const prefix = id.includes("/") ? id.slice(0, id.indexOf("/")) : "";
+  if (prefix === "openai" || prefix === "openai-codex" || /^(?:gpt|o\d)/.test(id)) return "openai";
+  if (prefix === "anthropic" || /^(?:claude|opus|sonnet|haiku|fable)(?:-|$)/.test(id)) return "anthropic";
+  if (prefix === "google" || /^gemini(?:-|$)/.test(id)) return "google";
+  if (prefix === "xai" || /^grok(?:-|$)/.test(id)) return "xai";
+  if (["zai", "zhipu", "zai-coding-plan"].includes(prefix) || /^glm(?:-|$)/.test(id)) return "zhipu";
+  if (["kimi-code", "moonshot"].includes(prefix) || /^kimi(?:-|$)/.test(id)) return "moonshot";
+  return fallback;
+}
+
+export const modelRouteIdentity = (model: string, fallback = "unknown") =>
+  `${routingModelProvider(model, fallback)}/${model.slice(model.lastIndexOf("/") + 1).toLowerCase()}`;
+
+export const channelRouteIdentity = (key: string, fallback = "unknown") => {
+  const i = key.indexOf(":");
+  return i < 0 ? key : modelRouteIdentity(key.slice(i + 1), fallback);
+};
+
+export function routingEntrySeatLines(cfg: TickmarkrConfig): string[] {
+  const lines: string[] = [];
+  const add = (path: string, entries: readonly string[] | undefined, roles: PreferenceRole[]) => {
+    for (const entry of entries ?? []) lines.push(`${path} '${entry}' reaches seats: ${roles.join(", ")}`);
+  };
+  add("routing.allow.adapters", cfg.routing.allow?.adapters, PREFERENCE_ROLES);
+  add("routing.allow.models", cfg.routing.allow?.models, PREFERENCE_ROLES);
+  add("routing.deny.adapters", cfg.routing.deny?.adapters, PREFERENCE_ROLES);
+  add("routing.deny.models", cfg.routing.deny?.models, PREFERENCE_ROLES);
+  add("routing.deny.workers.adapters", cfg.routing.deny?.workers?.adapters, ["worker"]);
+  add("routing.deny.workers.models", cfg.routing.deny?.workers?.models, ["worker"]);
+  return lines;
+}
+
 const adapterIds = (adapters: { id: string }[] | string[]): string[] =>
   typeof adapters[0] === "string" ? (adapters as string[]) : (adapters as { id: string }[]).map((a) => a.id);
 

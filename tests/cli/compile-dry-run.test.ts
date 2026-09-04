@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { compile } from "../../src/cli/commands/compile.js";
 import { graphPath, loadGraph } from "../../src/graph/graph.js";
 import { acquireRunLock, isRunLockLive, releaseRunLock } from "../../src/run/lock.js";
@@ -64,6 +64,10 @@ async function failure(argv: string[], repo: string): Promise<string> {
   }
 }
 
+function nativeSpec(mode = "", goal = "Compile one native task."): string {
+  return `<!-- tickmarkr:spec -->\n${mode}## T1: Native task\n- goal: ${goal}\n- shape: implement\n- complexity: 2\n- files: src/owned.ts\n- acceptance:\n  - judge: Native task holds\n`;
+}
+
 describe("compile --dry-run", () => {
   test("a dry compile of a valid spec reports the same task count and the same diagnostics as a real compile of that spec, with the graph file byte-identical before and after", async () => {
     const repo = compileRepo();
@@ -112,6 +116,63 @@ describe("compile --dry-run", () => {
     } finally {
       releaseRunLock(repo);
     }
+  });
+
+  test("test: a spec front-matter mode that differs from the routing.mode written in the repository's config overlay fails compile naming both modes and the mode-override line while the same spec with mode-override true or a repository whose overlay writes no mode compiles whereas a compiler that accepts the disagreement silently fails", async () => {
+    const repo = makeRepo({ "src/owned.ts": "export const owned = true;\n", "feature.spec.md": nativeSpec("mode: staff-led\n") });
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), "routing:\n  mode: partner-led\n");
+
+    await expect(compile(["feature.spec.md"], repo)).rejects.toThrow(/staff-led[\s\S]*partner-led[\s\S]*mode-override: true/);
+
+    writeFileSync(join(repo, "feature.spec.md"), nativeSpec("mode: staff-led\nmode-override: true\n"));
+    await expect(compile(["feature.spec.md", "--dry-run"], repo)).resolves.toContain("validated feature.spec.md");
+
+    const noMode = makeRepo({ "src/owned.ts": "export const owned = true;\n", "feature.spec.md": nativeSpec("mode: staff-led\n") });
+    mkdirSync(join(noMode, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(noMode, ".tickmarkr", "config.yaml"), "routing:\n  learned: off\n");
+    await expect(compile(["feature.spec.md", "--dry-run"], noMode)).resolves.toContain("validated feature.spec.md");
+  });
+
+  test("test: a native task whose criteria implicate a source file outside its files patterns fails compile naming the path unless the task's goal carries scope-waiver naming that path in which case the advisory line still prints and the compile succeeds while a PRD source keeps the advisory line and compiles whereas a compiler that prints the implication for a native task and writes the graph fails", async () => {
+    const repo = makeRepo({
+      "src/owned.ts": "export const owned = true;\n",
+      "src/other.ts": "export const other = 'RiskySymbol mention only';\n",
+      "feature.spec.md": nativeSpec("", "Compile one native task."),
+      "feature.prd.md": nativeSpec("", "Compile one PRD task.").replace("<!-- tickmarkr:spec -->\n", ""),
+    });
+    const criterion = "  - judge: RiskySymbol remains observable\n";
+    const spec = (goal: string) => `<!-- tickmarkr:spec -->\n## T1: Native task\n- goal: ${goal}\n- shape: implement\n- complexity: 2\n- files: src/owned.ts\n- acceptance:\n${criterion}`;
+    writeFileSync(join(repo, "feature.spec.md"), spec("Compile one native task."));
+    writeFileSync(join(repo, "feature.prd.md"), spec("Compile one PRD task.").replace("<!-- tickmarkr:spec -->\n", ""));
+
+    await expect(compile(["feature.spec.md", "--dry-run"], repo)).rejects.toThrow(/src\/other\.ts[\s\S]*scope-waiver: src\/other\.ts/);
+    expect(existsSync(graphPath(repo))).toBe(false);
+
+    writeFileSync(join(repo, "feature.spec.md"), spec("Compile one native task. scope-waiver: src/other.ts"));
+    const native = await compile(["feature.spec.md", "--dry-run"], repo);
+    expect(native).toContain("criteria implicate out-of-scope source not in files[]: src/other.ts");
+
+    const prd = await compile(["feature.prd.md", "--dry-run"], repo);
+    expect(prd).toContain("criteria implicate out-of-scope source not in files[]: src/other.ts");
+  });
+
+  test("test: compile --strict turns every authoring-lint finding into a compile error naming its code while the same spec without the flag warns and writes the graph whereas a strict compile that still writes the graph over a finding fails", async () => {
+    const repo = makeRepo({
+      "src/owned.ts": "export const owned = true;\n",
+      "strict.spec.md": "<!-- tickmarkr:spec -->\n## T1: Strict lint\n- goal: Compile one linted native task.\n- shape: implement\n- complexity: 2\n- files: src/owned.ts\n- acceptance:\n  - judge: behavior holds per the audit\n",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(compile(["strict.spec.md"], repo)).resolves.toContain("compiled strict.spec.md");
+      expect(warn.mock.calls.flat().join("\n")).toContain("authoring-lint[external-referent]");
+    } finally {
+      warn.mockRestore();
+    }
+    const before = readFileSync(graphPath(repo));
+
+    await expect(compile(["strict.spec.md", "--strict"], repo)).rejects.toThrow(/authoring-lint\[external-referent]/);
+    expect(readFileSync(graphPath(repo)).equals(before)).toBe(true);
   });
 
   test("a compile without the flag still writes the graph and still takes the lock, so the default path is unweakened", async () => {

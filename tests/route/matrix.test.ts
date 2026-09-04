@@ -43,14 +43,12 @@ describe("TEST-01 oracle roster — matrix derives all real adapters", () => {
     // v1.89 T2: the registry-order pin is the registry-INDEPENDENT constant — a literal list, so a
     // dropped or renamed adapter bites here rather than shrinking both sides of a derived compare.
     expect(expectedRoster).toEqual([
-      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp", "agy", "prime-agent",
+      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "qwen", "omp", "agy", "prime-agent",
     ]);
-    // omp and agy are gateways: their models come from the CLI's own list (or, for agy, an
-    // operator-classified tier table), not from a seed tier table, so they enroll in the registry
-    // without contributing a default channel. Still deep-equal, never a subset check — the channel
-    // set keeps its exact membership.
+    // OBS-871 seeds qwen, omp and prime-agent; agy remains discovery-only. Still deep-equal,
+    // never a subset check — the channel set keeps its exact membership.
     const channelled = expectedRoster.filter((id) => channelsFromConfig(id, cfg).length > 0);
-    expect(channelled).toEqual(expectedRoster.filter((id) => id !== "omp" && id !== "agy" && id !== "prime-agent"));
+    expect(channelled).toEqual(expectedRoster.filter((id) => id !== "agy"));
     expect(seen).toEqual([...channelled].sort());
   });
 
@@ -81,9 +79,8 @@ describe("ROUTE-05 defaults shape→channel matrix", () => {
     ["chore", { adapter: "claude-code", model: "haiku" }],
     ["ui", { adapter: "claude-code", model: "sonnet" }],
     ["refactor", { adapter: "claude-code", model: "sonnet" }],
-    // v1.58 frontier spread: the 5-way frontier sub tie no longer falls to discovery order (fable);
-    // the task-keyed rotation lands this fixture task on opus — a different task lands elsewhere
-    ["migration", { adapter: "claude-code", model: "opus" }],
+    // Frontier spread rotates across the current seeded frontier pool.
+    ["migration", { adapter: "kimi", model: "kimi-code/k3" }],
   ];
 
   test.each(cases)("%s → %o", (shape, expected) => {
@@ -211,8 +208,8 @@ describe("FLEET-06 parity baseline (V-1/V-2) — pinned pre-implementation", () 
     ["chore", { adapter: "claude-code", model: "haiku", channel: "sub", tier: "cheap" }, "floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)"],
     ["ui", { adapter: "claude-code", model: "sonnet", channel: "sub", tier: "mid" }, "floor mid (config floors), marginal-cost auto (cheapest sufficient tier)"],
     ["refactor", { adapter: "claude-code", model: "sonnet", channel: "sub", tier: "mid" }, "floor mid (config floors), marginal-cost auto (cheapest sufficient tier)"],
-    // v1.58: the frontier spread breaks the 5-way frontier sub tie (was fable by discovery order)
-    ["migration", { adapter: "claude-code", model: "opus", channel: "sub", tier: "frontier" }, "floor frontier (config floors), marginal-cost auto (via frontier spread)"],
+    // Frontier spread rotates across the current seeded frontier pool.
+    ["migration", { adapter: "kimi", model: "kimi-code/k3", channel: "sub", tier: "frontier" }, "floor frontier (config floors), marginal-cost auto (via frontier spread)"],
   ];
 
   test.each(matrixCases)("V-2 route-matrix parity: %s", (shape, assignment, provenance) => {

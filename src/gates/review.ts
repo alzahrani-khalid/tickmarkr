@@ -253,6 +253,8 @@ export function pickReviewer(
   exclude: string[] = [], // v1.1 failover: reviewer channels that already produced garbage for this task
   prefer: string[] = [], // v1.53 T2: review.prefer — reorders eligible channels, never changes eligibility
   floor?: Tier, // task-declared only; config floors govern workers and must not silently move review seats
+  history: string[] = [], // run-scoped picks, oldest to newest; empty preserves the established ranking
+  onSeat?: (seat: number) => void,
 ): BillingChannel | null {
   // FLEET-05 success criterion 2: an author not resolvable in the channel list yields NO reviewer.
   // The old `?? author.adapter` fallback compared an adapter id to vendor names, matched nothing, and
@@ -260,20 +262,23 @@ export function pickReviewer(
   // fail-closed branch under review.required.
   const authorChannel = channels.find((c) => c.adapter === author.adapter && c.model === author.model);
   if (!authorChannel) return null;
-  // Failover also guards true provider; the initial pick keeps the established stamped-vendor contract.
   const authorProvider = modelProvider(author.model, authorChannel.vendor);
-  return (
-    channels
-      // two independent axes: different vendor AND different base-model identity (ADDED TO the vendor
-      // rule, never replacing it — a future edit can't silently drop either). The diversity filter runs
-      // BEFORE preference ranking: prefer sorts survivors only, so no entry can resurrect an excluded channel.
-      .filter((c) => c.vendor !== authorChannel.vendor
-        && (exclude.length === 0 || modelProvider(c.model, c.vendor) !== authorProvider)
-        && modelId(c.model) !== modelId(author.model)
-        && !exclude.includes(channelKey(c))
-        && (floor === undefined || TIER_RANK[c.tier] >= TIER_RANK[floor]))
-      .sort((a, b) => reviewPreferIndex(a, prefer) - reviewPreferIndex(b, prefer) || TIER_RANK[b.tier] - TIER_RANK[a.tier] || marginalCostRank(a) - marginalCostRank(b))[0] ?? null
-  );
+  const ranked = channels
+    // two independent axes: different vendor AND different base-model identity (ADDED TO the vendor
+    // rule, never replacing it — a future edit can't silently drop either). Failover additionally guards
+    // true provider identity; the initial pick keeps the established stamped-vendor contract. The diversity
+    // filter runs BEFORE preference ranking, so prefer cannot resurrect an excluded channel.
+    .filter((c) => c.vendor !== authorChannel.vendor
+      && (exclude.length === 0 || modelProvider(c.model, c.vendor) !== authorProvider)
+      && modelId(c.model) !== modelId(author.model)
+      && !exclude.includes(channelKey(c))
+      && (floor === undefined || TIER_RANK[c.tier] >= TIER_RANK[floor]))
+    .sort((a, b) => reviewPreferIndex(a, prefer) - reviewPreferIndex(b, prefer) || TIER_RANK[b.tier] - TIER_RANK[a.tier] || marginalCostRank(a) - marginalCostRank(b));
+  const reviewer = [...ranked].sort((a, b) =>
+    history.lastIndexOf(channelKey(a)) - history.lastIndexOf(channelKey(b))
+    || ranked.indexOf(a) - ranked.indexOf(b))[0] ?? null;
+  if (reviewer) onSeat?.(ranked.indexOf(reviewer) + 1);
+  return reviewer;
 }
 
 // OBS-196: the two observed unparseable causes are different defects — a cutoff/empty output is
@@ -308,6 +313,7 @@ export async function reviewGate(
   // OBS-196: run dir for raw-output persistence on an unparseable verdict; absent (older callers,
   // direct tests) skips persistence and changes nothing else.
   artifactDir?: string,
+  reviewHistory?: string[],
 ): Promise<GateResult> {
   // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
   // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
@@ -385,7 +391,11 @@ export async function reviewGate(
   // A reviewer floor is opt-in at the task. Applying cfg.routing.floors here would change the
   // historical seat for every task that never asked for review-tier coupling.
   const reviewerFloor = task.routingHints?.floor;
-  const reviewer = pickReviewer(author, channels, excludeReviewers ?? [], cfg.review.prefer ?? [], reviewerFloor);
+  let rotationSeat: number | undefined;
+  const reviewer = pickReviewer(
+    author, channels, excludeReviewers ?? [], cfg.review.prefer ?? [], reviewerFloor,
+    reviewHistory, reviewHistory ? (seat) => { rotationSeat = seat; } : undefined,
+  );
   if (!reviewer) {
     // meta.noEligibleReviewer lets run-gates' review-retry keep the ORIGINAL unparseable result when
     // the retry finds no second seat — a truthful cause beats a synthetic no-reviewer failure.
@@ -396,6 +406,8 @@ export async function reviewGate(
       ? { gate: "review", pass: false, details: `unreadable — ${reason}; set review.required:false to waive`, meta: { noEligibleReviewer: true, unreadable: true, ...(reviewerFloor ? { reviewerFloor } : {}) } }
       : { gate: "review", pass: true, details: `WARNING: ${reason} — review waived by config`, meta: { noEligibleReviewer: true, ...(reviewerFloor ? { reviewerFloor } : {}) } };
   }
+  reviewHistory?.push(channelKey(reviewer));
+  const rotationMeta = rotationSeat === undefined ? {} : { rotationSeat };
   const measuredDiff = await fetchTaskDiff(worktree, baseRef, task.files);
   // Keep the reader payload identical to the text charged to the strict cap:
   // whole-file source deletions are represented by their citable operation fact.
@@ -450,9 +462,8 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     // frontier reviewers routinely need >5min on a configured-cap-sized diff, and `claude -p` buffers all
     // output until completion — runLlm's 300s default killed reviews mid-flight, returning empty
     // stdout that read as "unparseable" and escalated to re-implementation of green code
-    // (run-20260709-104447 P87-09). ponytail: literal 15min; make it cfg.review.timeoutMs if a
-    // second knob-turner appears.
-    900_000,
+    // (run-20260709-104447 P87-09). The configured ceiling defaults to that measured 15 minutes.
+    cfg.review.timeoutMs,
   );
   const raw = llm.output;
   const provider = modelProvider(reviewer.model, reviewer.vendor);
@@ -481,15 +492,17 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     return {
       gate: "review",
       pass: false,
-      details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: ${cause}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
+      details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: ${cause}${cause === "timeout" ? `; killed at configured review timeout ${cfg.review.timeoutMs}ms` : ""}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
       meta: {
         ...policyMeta,
+        ...rotationMeta,
         reviewer: channelKey(reviewer),
         vendor: reviewer.vendor,
         provider,
         unparseable: true,
         cause,
         ...(cause === "empty-output" ? { bytes } : {}),
+        ...(cause === "timeout" ? { timeoutMs: cfg.review.timeoutMs } : {}),
         ...(concludedOnInactivity ? { classification: "infra", infra: true } : {}),
       },
     };
@@ -502,6 +515,6 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     gate: "review",
     pass: decided.pass,
     details: appendAnchoredReview(prose, v),
-    meta: { ...policyMeta, reviewer: channelKey(reviewer), vendor: reviewer.vendor, provider },
+    meta: { ...policyMeta, ...rotationMeta, reviewer: channelKey(reviewer), vendor: reviewer.vendor, provider },
   };
 }

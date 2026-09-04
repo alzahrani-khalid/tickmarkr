@@ -256,6 +256,7 @@ export const ADAPTER_PROMPT_GLYPHS = {
   "pi": ">",
   "grok": ">",
   "kimi": ">",
+  "qwen": ">",
   "omp": ">",
   "agy": ">",
   "prime-agent": ">",

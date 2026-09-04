@@ -3,12 +3,22 @@ import { EventEmitter } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { fingerprint } from "../../src/gates/baseline.js";
 import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, createWorktree, gitHead, linkNodeModules, preserveWorktree, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
+
+const processGroupExists = (groupId: number): boolean => {
+  try {
+    process.kill(-groupId, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+};
 
 describe("sh", () => {
   test("captures stdout/stderr/code", async () => {
@@ -22,6 +32,51 @@ describe("sh", () => {
     const r = await sh("sleep 5", "/tmp", 300);
     expect(r.code).not.toBe(0);
     expect(r.timedOut).toBe(true);
+  }, 10000);
+
+  test("test: a shell command that exits zero while leaving a background child holding its stdio settles within the reap grace after the shell's exit with code zero reapedGroup true and the child's process group gone while a command whose group exits with it settles on close without the flag whereas a shell that waits for the timeout to kill the survivors fails", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reap-"));
+    const groupFile = join(dir, "group");
+    try {
+      const timeoutMs = 8000;
+      const startedAt = Date.now();
+      const reaped = await sh(`printf '%s' "$$" > ${JSON.stringify(groupFile)}; sleep 30 &`, dir, timeoutMs);
+      const groupId = Number(readFileSync(groupFile, "utf8"));
+
+      expect(reaped).toMatchObject({ code: 0, reapedGroup: true });
+      expect(reaped.timedOut).not.toBe(true);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1800);
+      expect(Date.now() - startedAt).toBeLessThan(5000);
+      await vi.waitFor(() => expect(processGroupExists(groupId)).toBe(false), { timeout: 2000, interval: 20 });
+
+      const closedAt = Date.now();
+      const closed = await sh(":", dir, 5000);
+      expect(closed).toMatchObject({ code: 0 });
+      expect(closed.reapedGroup).toBeUndefined();
+      expect(Date.now() - closedAt).toBeLessThan(2000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("test: a command that reaches its timeout is still killed as a whole group and reports timedOut without reapedGroup whereas a reap path that reclassifies a timeout kill as a grace reap fails", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-timeout-group-"));
+    const groupFile = join(dir, "group");
+    try {
+      const timedOut = await sh(
+        `printf '%s' "$$" > ${JSON.stringify(groupFile)}; sleep 30 & wait`,
+        dir,
+        300,
+      );
+      const groupId = Number(readFileSync(groupFile, "utf8"));
+
+      expect(timedOut.code).not.toBe(0);
+      expect(timedOut.timedOut).toBe(true);
+      expect(timedOut.reapedGroup).toBeUndefined();
+      await vi.waitFor(() => expect(processGroupExists(groupId)).toBe(false), { timeout: 2000, interval: 20 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 10000);
 
   // Q24: the ceiling scales with what a suite actually costs, so the shell has to report that cost.

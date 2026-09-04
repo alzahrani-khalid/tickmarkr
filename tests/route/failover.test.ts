@@ -4,6 +4,7 @@ import { DEFAULT_CONFIG, type TickmarkrConfig, type Tier } from "../../src/confi
 import { validateGraph } from "../../src/graph/schema.js";
 import type { ProfileCell, RoutingProfile } from "../../src/route/profile.js";
 import { marginalCostRank, nextChannel } from "../../src/route/router.js";
+import { activeRetryBan, type JournalEvent } from "../../src/run/journal.js";
 
 // ROUTE-13 behavioral oracles for the FAILURE path. These are the successors of the retired ROUTE-10
 // learning-blind grep-pin (learned.test.ts): learnedScore is the STRICTLY-LAST nextChannel sort key —
@@ -145,6 +146,28 @@ describe("ROUTE-13 oracle 3 — cold-parity of the FULL candidate order (absent 
       const sixArgUndef = seq((tried) => nextChannel(cur(s.tier), task, cfg, CP, tried, undefined), s.tried0);
       expect(fiveArg).toEqual(s.expected);
       expect(sixArgUndef).toEqual(s.expected);
+    });
+  }
+});
+
+test("test: a gate-fingerprint-cap recorded on pi:openai-codex/gpt-5.5 bans codex:gpt-5.5 as the same provider and model identity and nextChannel skips both when either is in tried while a different model on the same adapter stays eligible whereas a ban or tried-list keyed on the channel string that admits the alias fails", () => {
+  const events: JournalEvent[] = [{
+    ts: "2026-09-03T00:00:00.000Z", event: "gate-fingerprint-cap", taskId: "T1",
+    data: { channel: "pi:openai-codex/gpt-5.5", gate: "test" },
+  }];
+  expect(activeRetryBan(events, "T1", "codex:gpt-5.5")).toBe("test");
+
+  const aliasFleet: BillingChannel[] = [
+    { adapter: "pi", vendor: "mixed", model: "openai-codex/gpt-5.5", channel: "sub", tier: "mid" },
+    { adapter: "pi", vendor: "zhipu", model: "zai/glm-5.3", channel: "sub", tier: "mid" },
+    { adapter: "codex", vendor: "openai", model: "gpt-5.5", channel: "sub", tier: "mid" },
+    { adapter: "omp", vendor: "mixed", model: "openai-codex/gpt-5.5", channel: "sub", tier: "mid" },
+    { adapter: "codex", vendor: "openai", model: "gpt-5.6-terra", channel: "sub", tier: "mid" },
+  ];
+  const current = { adapter: "pi", model: "openai-codex/gpt-5.5", channel: "sub" as const, tier: "mid" as const };
+  for (const tried of ["pi:openai-codex/gpt-5.5", "codex:gpt-5.5"]) {
+    expect(nextChannel(current, mkTask("implement"), cfg, aliasFleet, [tried])).toMatchObject({
+      adapter: "pi", model: "zai/glm-5.3",
     });
   }
 });

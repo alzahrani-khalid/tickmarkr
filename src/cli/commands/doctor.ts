@@ -16,7 +16,7 @@ import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../..
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
-import { LIVEBENCH_TABLE_DATE, readCachedCatalog, refreshCatalogCommand, type CatalogReadResult } from "../../adapters/catalog-remote.js";
+import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, readCachedCatalog, refreshCatalogCommand, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 import { sh, type ShResult } from "../../run/git.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 
@@ -36,6 +36,7 @@ export type DoctorOpts = {
   resolveClaudeAliasIdentity?: (cwd: string, alias: ClaudeAlias) => string | undefined;
   catalog?: CatalogReadResult;
   catalogNow?: () => Date;
+  catalogFetcher?: CatalogFetcher;
   /** init's between-acts surface: status rows only — the model matrix and inline drift stay
    *  behind `tickmarkr doctor` (files are still written; only the RETURNED string shrinks). */
   compact?: boolean;
@@ -394,8 +395,8 @@ export function selfShadowFinding(
  * §4.4: `LIVEBENCH_TABLE_DATE` is a hand-bumped constant, and a constant nobody lints is a stale
  * constant — the pinned table ages silently while every tier suggestion keeps citing it. Warns past
  * 90 days, naming the pinned date and the listing where a newer table is discovered.
- * ponytail: a LINT, never a fetch — doctor stays cache-only (T17); the operator (or RELEASING.md's
- * release-time check) reads the listing and bumps the constant.
+ * ponytail: the listing itself is never fetched; the operator (or RELEASING.md's release-time
+ * check) reads it and bumps the constant.
  */
 export function liveBenchStalenessFinding(now: Date): string | undefined {
   const pinnedMs = Date.parse(`${LIVEBENCH_TABLE_DATE.replace(/_/g, "-")}T00:00:00Z`);
@@ -419,9 +420,20 @@ export async function doctor(
   // Operator directive 2026-08-12 (declutter): long per-model lists render only when asked for.
   const listAllModels = _argv.includes("--models");
   const cfg = loadConfig(cwd);
-  // T17: synchronous/cache-only by operator ruling. The only network-bearing catalog function is the
-  // separately invoked refreshCatalogCommand; ordinary doctor never calls it.
-  const catalog = opts.catalog ?? readCachedCatalog(cwd, { now: opts.catalogNow });
+  let catalog = opts.catalog ?? readCachedCatalog(cwd, { now: opts.catalogNow });
+  let catalogRefreshWarning: string | undefined;
+  // RULING-222-17 reverses cache-only for these two operator-facing commands only. The refresh
+  // remains age-guarded; compile, plan, and run never import this path.
+  if (!opts.catalog && catalog.source === "cache" && catalog.stale) {
+    const refreshed = await refreshCatalogCommand({
+      repoRoot: cwd,
+      fetcher: opts.catalogFetcher,
+      timeoutMs: CATALOG_REFRESH_TIMEOUT_MS,
+      now: opts.catalogNow,
+    });
+    catalog = refreshed.catalog;
+    catalogRefreshWarning = refreshed.warning;
+  }
   // banner at START — the logo greets the operator before the ~60s probe wait, never trailing it (operator report 2026-07-17)
   if (opts.banner !== false && visual()) process.stdout.write(BANNER);
   // stderr, live: auth probes are real LLM calls (up to 30s per configured model) and the CLI
@@ -512,6 +524,9 @@ export async function doctor(
   }
   if (catalog.warning) {
     rows.push(attentionRow(`model catalog cache unreadable — ${catalog.warning}; using vendored fallback (advisory — routing unchanged)`));
+  }
+  if (catalogRefreshWarning) {
+    rows.push(attentionRow(`model catalog auto-refresh failed open — ${catalogRefreshWarning}; retained ${catalog.source} catalog`));
   }
   // v1.48 T1 / v1.86 T12: advisory sweep for known agent CLIs with no drive contract. Presence is
   // resolved through the worker's login shell; advisory targets are never executed or written to health.

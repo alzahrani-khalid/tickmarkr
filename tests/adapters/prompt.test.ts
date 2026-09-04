@@ -72,6 +72,12 @@ describe("buildTaskPrompt", () => {
     expect(p).not.toContain("unless the operator's config allowlists that path");
   });
 
+  test("test: the worker prompt names the rule that no background process may outlive the worker and no suite may run beside another whereas a prompt without that rule fails", () => {
+    const prompt = buildTaskPrompt(task, "", N);
+    expect(prompt).toContain("No background process may outlive the worker");
+    expect(prompt).toContain("no suite may run beside another");
+  });
+
   test("test: writePrompt over a path already holding a brief copies the existing bytes to an engagement-suffixed sibling before writing the fixed path so after approve --uphold plus resume both engagements attempt-0 briefs exist under prompts with the fixed path holding the newest whereas the shipped overwrite that loses the first brief or a rename that leaves the fixed path stale fails", () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-prompt-archive-"));
     const fixed = writePrompt(dir, task, 0, "first engagement", "first");

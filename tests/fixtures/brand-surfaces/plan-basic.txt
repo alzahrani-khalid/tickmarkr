@@ -1,4 +1,4 @@
-tickmarkr plan — dry run (12 channels available)
+tickmarkr plan — dry run (16 channels available)
 mode: risk-based (default) · explore on
 driver: auto → subprocess (HERDR_ENV unset)
 harness: /opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js (unresolved location)
@@ -14,4 +14,5 @@ routing lints:
   ! cursor-agent: no detection data — run tickmarkr doctor
   ! opencode: no detection data — run tickmarkr doctor
   ! pi: no detection data — run tickmarkr doctor
+  ! qwen: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! agy: no model-list surface and no configured models — classify per benchmark policy to open channels

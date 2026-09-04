@@ -75,7 +75,7 @@ describe("narration side-channel (fake adapter, zero tokens)", () => {
       // not add, drop, reorder, or alter events, and a number the host clock chose cannot answer that.
       const maskTs = (s: string) => s
         .replace(/"ts":"[^"]*"/g, '"ts":"X"')
-        .replace(/"(durationMs|selectedDurationMs|fullDurationMs|load1Start|load1End)":-?[\d.e+-]+/g, '"$1":"X"');
+        .replace(/"(durationMs|selectedDurationMs|fullDurationMs|load1Start|load1End|load1Max|load1Mean)":-?[\d.e+-]+/g, '"$1":"X"');
       const onFile = maskTs(readFileSync(join(tickmarkrDir(on.repo), "runs", "run-byte", "journal.jsonl"), "utf8"));
       const offFile = maskTs(readFileSync(join(tickmarkrDir(off.repo), "runs", "run-byte", "journal.jsonl"), "utf8"));
       expect(onFile).toBe(offFile); // byte-identical except the unavoidable clock

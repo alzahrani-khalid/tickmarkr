@@ -31,8 +31,8 @@ describe("real adapters", () => {
 
   test("headless commands embed prompt file and model; invoke delegates", () => {
     const a = { model: "x", channel: "sub" as const, tier: "mid" as const };
-    expect(claudeCode.headlessCommand("/tmp/p.md", "fable")).toContain(`"$(cat '/tmp/p.md')"`);
-    expect(claudeCode.headlessCommand("/tmp/p.md", "fable")).toContain("--model 'fable'");
+    expect(claudeCode.headlessCommand("/tmp/p.md", "fable")).toMatch(/claude -p ''/);
+    expect(claudeCode.headlessCommand("/tmp/p.md", "fable")).toMatch(/--output-format text < '\/tmp\/p\.md'$/);
     // HYG-01: fresh-worktree headless workers/gates must never park on the MCP-enable dialog.
     // Value must be '{"mcpServers":{}}' — bare '{}' is rejected by claude 2.1.205
     // ("mcpServers: Invalid input: expected record") — live check 2026-07-10.
@@ -195,9 +195,9 @@ describe("codex mcp suppression — live surface (OBS-82)", () => {
 
 describe("registry + doctor", () => {
   test("getAdapter throws on unknown; fake only present when scripted", () => {
-    // deliberate order assertion — pi+grok registered LAST among the natives so the Phase 6 matrix
-    // stays byte-identical; v1.89 T2: catalog-driven adapters append after them, omp first of those
-    expect(allAdapters().map((a) => a.id)).toEqual(["claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp", "agy", "prime-agent"]);
+    // Deliberate order assertion: the historical native sequence stays intact, qwen appends to it,
+    // and the catalog-driven omp/agy/prime-agent sequence remains last.
+    expect(allAdapters().map((a) => a.id)).toEqual(["claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "qwen", "omp", "agy", "prime-agent"]);
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reg-"));
     const sp = join(dir, "s.json");
     writeFileSync(sp, JSON.stringify({ tasks: {} }));

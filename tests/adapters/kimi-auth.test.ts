@@ -216,7 +216,7 @@ describe("registry + tiers", () => {
   // kimi — kimi stays last among the natives, which is what the historical tie-break order pins.
   test("prime-agent is the last adapter in the registry order", () => {
     expect(allAdapters().map((a) => a.id)).toEqual([
-      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp", "agy", "prime-agent",
+      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "qwen", "omp", "agy", "prime-agent",
     ]);
   });
 

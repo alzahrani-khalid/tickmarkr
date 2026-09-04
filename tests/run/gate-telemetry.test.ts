@@ -6,7 +6,7 @@
 // the composite test row splits its two suites, and the verdict gates keep one span per dispatch.
 // Measurement only — no scheduler is exercised here, because none was built.
 import { execFileSync } from "node:child_process";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -20,14 +20,17 @@ import { authedModels, COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/
 // The three fields every gate-result row must carry, and the predicate the criterion calls "closed":
 // a row is telemetered only when ALL of them are present as numbers. Absence is the falsifier — a row
 // that dropped one is not "mostly measured", it is unusable for a stratified recalibration.
-const TELEMETRY_FIELDS = ["durationMs", "load1Start", "load1End"] as const;
+const TELEMETRY_FIELDS = ["durationMs", "load1Start", "load1End", "load1Max", "load1Mean"] as const;
 const carriesTelemetry = (data: Record<string, unknown>): boolean =>
   TELEMETRY_FIELDS.every((f) => typeof data[f] === "number");
 
 // THE rows under test: the daemon's own `gate-result` journal events, written through the one
 // journalGateResult helper that serves both onGate sites. Read straight off the ledger — a
 // measurement kept anywhere else is not the row the spec requires.
-type GateRow = Record<string, unknown> & { gate: string; pass?: boolean; durationMs: number; load1Start: number; load1End: number };
+type GateRow = Record<string, unknown> & {
+  gate: string; pass?: boolean; durationMs: number;
+  load1Start: number; load1End: number; load1Max: number; load1Mean: number;
+};
 const gateRows = (repo: string, runId: string): GateRow[] =>
   Journal.open(repo, runId).read().filter((e) => e.event === "gate-result").map((e) => e.data as GateRow);
 
@@ -87,6 +90,42 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
       expect(end).toBeGreaterThan(start); // the provider only ever moves forward, so end is the later read
     }
     expect(reads).toBeGreaterThanOrEqual(2 * rows.length);
+  }, 120000);
+
+  test("test: a gate whose injected load provider reports an interior peak higher than both endpoints records load1Max at that peak and load1Mean over every sample beside load1Start and load1End whereas telemetry that reports the endpoints alone fails", async () => {
+    const marker = join(makeTestTempDir("tickmarkr-load-sample-"), "finished");
+    let reads = 0;
+    setLoadProviderForTests(() => {
+      reads += 1;
+      if (reads <= 6) return 0; // round-entry + evidence/scope screens precede the build
+      if (reads === 7) return 1;
+      return existsSync(marker) ? 2 : 9;
+    });
+    const fixture = setupRepo(
+      [T("T1")], oneTask("T1"),
+      `gates:\n  build: "if [ ! -f t1.txt ]; then true; else sleep 1.1; touch '${marker}'; fi"\n`,
+    );
+    await runDaemon(fixture, "run-telemetry-interior-peak");
+    const row = gateRows(fixture.repo, "run-telemetry-interior-peak").find((gate) => gate.gate === "build")!;
+
+    expect(row.load1Start).toBe(1);
+    expect(row.load1End).toBe(2);
+    expect(row.load1Max).toBe(9);
+    expect(row.load1Mean).toBeGreaterThan((row.load1Start + row.load1End) / 2);
+    expect(row.load1Mean).toBeLessThan(row.load1Max);
+    const endpointsOnly = { load1Start: row.load1Start, load1End: row.load1End };
+    expect(carriesTelemetry(endpointsOnly)).toBe(false);
+  }, 120000);
+
+  test("test: a gate whose shell result carries reapedGroup true journals reapedGroup on its row and a result without it journals no such field whereas a row that drops the flag fails", async () => {
+    const fixture = setupRepo(
+      [T("T1")], oneTask("T1"),
+      'gates:\n  build: "if [ ! -f t1.txt ]; then true; else sleep 30 & fi"\n  lint: "true"\n',
+    );
+    await runDaemon(fixture, "run-telemetry-reaped-group");
+    const rows = gateRows(fixture.repo, "run-telemetry-reaped-group");
+    expect(rows.find((row) => row.gate === "build")?.reapedGroup).toBe(true);
+    expect(Object.hasOwn(rows.find((row) => row.gate === "lint")!, "reapedGroup")).toBe(false);
   }, 120000);
 
   // The composite path, staged so the three intervals are separable by construction: the SELECTED

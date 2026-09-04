@@ -52,7 +52,7 @@
 #   test: npm test
 #   byShape:
 #     docs: { acceptance: false, review: false }  # baseline, evidence, and scope are mandatory
-# review: { complexityThreshold: 7, required: true, prefer: [codex:gpt-5.6-sol, kimi] }
+# review: { complexityThreshold: 7, timeoutMs: 900000, required: true, prefer: [codex:gpt-5.6-sol, kimi] }
 #                         # prefer: ordered reviewer seat preference (adapter | adapter:model); ranks
 #                         # diversity-eligible channels only — never admits a same-vendor/same-model reviewer
 # consult: { adapter: claude-code, model: fable, stallMinutes: 15, prefer: [codex:gpt-5.6-sol, kimi:kimi-code/k3] }

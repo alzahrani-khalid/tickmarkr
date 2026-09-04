@@ -10,7 +10,7 @@ export const ARTIFICIAL_ANALYSIS_CATALOG_URL = "https://artificialanalysis.ai/ap
 export const LIVEBENCH_TABLE_DATE = "2026_06_25";
 export const LIVEBENCH_TABLE_URL = `https://livebench.ai/table_${LIVEBENCH_TABLE_DATE}.csv`;
 export const LIVEBENCH_CATEGORIES_URL = `https://livebench.ai/categories_${LIVEBENCH_TABLE_DATE}.json`;
-export const CATALOG_CACHE_MAX_AGE_MS = 30 * 86_400_000;
+export const CATALOG_CACHE_MAX_AGE_MS = 7 * 86_400_000;
 export const CATALOG_REFRESH_TIMEOUT_MS = 10_000;
 const ARTIFICIAL_ANALYSIS_PAGE_SIZE = 100;
 const ARTIFICIAL_ANALYSIS_MAX_PAGES = 100;
@@ -70,13 +70,14 @@ export interface RefreshCatalogResult {
 const VENDORED_CATALOG: CatalogCache = {
   schemaVersion: 1,
   // Package fallback copied from https://models.dev/api.json on 2026-08-05. It is deliberately
-  // small: an explicit refresh owns broad/current coverage, while doctor remains cache-only.
+  // small: the explicit or seven-day operator-surface refresh owns broad/current coverage.
   fetchedAt: "2026-08-05T20:00:05.000Z",
   modelsDev: {
     anthropic: {
       id: "anthropic",
       models: {
-        "claude-fable-5": { id: "claude-fable-5", cost: { input: 10, output: 50 }, limit: { context: 1_000_000, output: 128_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
+        // SHIP (OBS-871, 2026-09-03): users resolving the current Fable alias need the 5.1 identity even when refresh is unavailable.
+        "claude-fable-5-1": { id: "claude-fable-5-1", cost: { input: 10, output: 50 }, limit: { context: 1_000_000, output: 128_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
         "claude-opus-4-8": { id: "claude-opus-4-8", cost: { input: 5, output: 25 }, limit: { context: 1_000_000, output: 128_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
         "claude-sonnet-5": { id: "claude-sonnet-5", cost: { input: 2, output: 10 }, limit: { context: 1_000_000, output: 128_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
         "claude-haiku-4-5-20251001": { id: "claude-haiku-4-5-20251001", cost: { input: 1, output: 5 }, limit: { context: 200_000, output: 64_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
@@ -292,6 +293,7 @@ function assertUsableLiveBench(rows: Record<string, unknown>[], categories: Reco
 // `-thinking-auto-medium-effort`); the highest effort is the model at its best. Rank by
 // hyphen-delimited token so `xhigh` never reads as `high`.
 const LIVEBENCH_EFFORT_RANK: Record<string, number> = { max: 5, xhigh: 4, high: 3, medium: 2, low: 1 };
+const LIVEBENCH_VARIANT_RE = /^-(?:max|xhigh|high|medium|low|thinking|auto|effort|fast)(?:-(?:max|xhigh|high|medium|low|thinking|auto|effort|fast))*$/;
 
 const liveBenchEffortRank = (residue: string): number =>
   residue.split("-").reduce((rank, token) => Math.max(rank, LIVEBENCH_EFFORT_RANK[token] ?? 0), 0);
@@ -303,8 +305,9 @@ const liveBenchCategoryMean = (row: Record<string, unknown>, tasks: unknown): nu
   return scores.length > 0 ? scores.reduce((sum, score) => sum + score, 0) / scores.length : undefined;
 };
 
-/** LiveBench hyphenates where models.dev spaces: `Kimi K3` is `kimi-k3` in the table. */
-const liveBenchIdentity = (value: string): string => value.trim().toLowerCase().replace(/\s+/g, "-");
+/** LiveBench treats spaces, dots, and punctuation as the same word boundary. */
+const liveBenchIdentity = (value: string): string =>
+  value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
 function liveBenchIndex(
   value: unknown,
@@ -321,7 +324,7 @@ function liveBenchIndex(
     // Bare startsWith is a false-positive machine: `glm-5` would claim `glm-5.2`. The residue after
     // the fleet id must be empty or an effort suffix.
     const residue = wanted.map((identity) => model.startsWith(identity) ? model.slice(identity.length) : undefined)
-      .find((rest) => rest === "" || rest?.startsWith("-"));
+      .find((rest) => rest === "" || LIVEBENCH_VARIANT_RE.test(rest ?? ""));
     if (residue === undefined) continue;
     const rank = liveBenchEffortRank(residue);
     if (!best || rank > best.rank) best = { row, rank };
@@ -357,6 +360,7 @@ export function resolveCatalogModel(
   const identities = [
     modelId,
     query.model,
+    ...[modelId, query.model].flatMap((identity) => identity.includes("/") ? [identity.slice(identity.lastIndexOf("/") + 1)] : []),
     ...(typeof model.name === "string" ? [model.name] : []),
   ];
   const intelligence = artificialAnalysisIndex(catalog.artificialAnalysis, [
@@ -482,53 +486,60 @@ async function fetchLiveBench(fetcher: CatalogFetcher, timeoutMs: number): Promi
   return { tableDate: LIVEBENCH_TABLE_DATE, categories, rows };
 }
 
-/**
- * The named, explicit refresh path. No other function in this module can reach fetch.
- * A failed refresh preserves the previous cache byte-for-byte and returns it fail-open.
- */
+/** Shared refresh path for the explicit command and the seven-day doctor/fleet guard. */
 export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promise<RefreshCatalogResult> {
   const now = opts.now ?? (() => new Date());
   const current = readCachedCatalog(opts.repoRoot, { now });
+  const fetcher = opts.fetcher ?? globalThis.fetch.bind(globalThis) as CatalogFetcher;
+  const timeoutMs = opts.timeoutMs ?? CATALOG_REFRESH_TIMEOUT_MS;
+  const warnings: string[] = [];
+
+  let modelsDev: unknown = current.catalog.modelsDev;
+  let modelsDevUpdated = false;
   try {
-    const fetcher = opts.fetcher ?? globalThis.fetch.bind(globalThis) as CatalogFetcher;
-    const timeoutMs = opts.timeoutMs ?? CATALOG_REFRESH_TIMEOUT_MS;
-    const modelsDev = await fetchCatalog(fetcher, MODELS_DEV_CATALOG_URL, {}, timeoutMs, (r) => r.json());
+    modelsDev = await fetchCatalog(fetcher, MODELS_DEV_CATALOG_URL, {}, timeoutMs, (r) => r.json());
     if (!validModelsDevCatalog(modelsDev)) throw new Error("models.dev catalog schema is invalid");
-
-    const apiKey = opts.artificialAnalysisKey ?? process.env.ARTIFICIAL_ANALYSIS_API_KEY?.trim();
-    const artificialAnalysis = apiKey
-      ? await fetchArtificialAnalysis(fetcher, apiKey, timeoutMs)
-      : undefined;
-
-    // The LiveBench leg is keyless and never costs the models.dev refresh: a failure keeps the
-    // previous section verbatim and names the leg in the warning.
-    let liveBench = current.catalog.liveBench;
-    let warning: string | undefined;
-    try {
-      liveBench = await fetchLiveBench(fetcher, timeoutMs);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      warning = message.startsWith("LiveBench") ? message : `LiveBench refresh failed: ${message}`;
-    }
-
-    const catalog: CatalogCache = {
-      schemaVersion: 1,
-      fetchedAt: now().toISOString(),
-      modelsDev,
-      ...(artificialAnalysis !== undefined ? { artificialAnalysis } : {}),
-      ...(liveBench !== undefined ? { liveBench } : {}),
-    };
-    writeCatalogCache(opts.repoRoot, catalog);
-    return {
-      updated: true,
-      catalog: readCachedCatalog(opts.repoRoot, { now }),
-      ...(warning !== undefined ? { warning } : {}),
-    };
+    modelsDevUpdated = true;
   } catch (error) {
-    return {
-      updated: false,
-      catalog: current,
-      warning: error instanceof Error ? error.message : String(error),
-    };
+    warnings.push(`models.dev refresh failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+
+  let artificialAnalysis = current.catalog.artificialAnalysis;
+  const apiKey = opts.artificialAnalysisKey ?? process.env.ARTIFICIAL_ANALYSIS_API_KEY?.trim();
+  if (apiKey) {
+    try {
+      artificialAnalysis = await fetchArtificialAnalysis(fetcher, apiKey, timeoutMs);
+    } catch (error) {
+      warnings.push(`Artificial Analysis refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  let liveBench = current.catalog.liveBench;
+  let liveBenchUpdated = false;
+  try {
+    liveBench = await fetchLiveBench(fetcher, timeoutMs);
+    liveBenchUpdated = true;
+  } catch (error) {
+    warnings.push(`LiveBench refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // models.dev is the required cache spine. Still run every independent leg after it fails, but do
+  // not write a cache that would make the vendored fallback look fetched.
+  if (!modelsDevUpdated) {
+    return { updated: false, catalog: current, warning: warnings.join("; ") };
+  }
+  const catalog: CatalogCache = {
+    schemaVersion: 1,
+    // A failed keyless leg keeps the old age so doctor/fleet retry it rather than masking it for 7d.
+    fetchedAt: liveBenchUpdated ? now().toISOString() : current.catalog.fetchedAt,
+    modelsDev,
+    ...(artificialAnalysis !== undefined ? { artificialAnalysis } : {}),
+    ...(liveBench !== undefined ? { liveBench } : {}),
+  };
+  writeCatalogCache(opts.repoRoot, catalog);
+  return {
+    updated: true,
+    catalog: readCachedCatalog(opts.repoRoot, { now }),
+    ...(warnings.length ? { warning: warnings.join("; ") } : {}),
+  };
 }

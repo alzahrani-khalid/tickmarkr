@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions } from "../../adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
-import { type CatalogModelEvidence, readCachedCatalog } from "../../adapters/catalog-remote.js";
+import { CATALOG_REFRESH_TIMEOUT_MS, type CatalogFetcher, type CatalogModelEvidence, type CatalogReadResult, readCachedCatalog, refreshCatalogCommand } from "../../adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import {
@@ -56,6 +56,8 @@ export type FleetIO = {
   output?: FleetOutput;
   debug?: boolean;
   reloadGuard?: (bytes: string) => string | null;
+  catalogFetcher?: CatalogFetcher;
+  catalogNow?: () => Date;
 };
 
 // v1.60 T3: every preview surface ranks with the SAME exploration setting as the candidate picker
@@ -153,6 +155,18 @@ export async function fleet(
   const input = io.input ?? (process.stdin as FleetInput);
   const output = io.output ?? (process.stdout as FleetOutput);
   const interactive = input.isTTY === true && output.isTTY === true;
+  let catalog = readCachedCatalog(cwd, { now: io.catalogNow });
+  let refreshReason = "";
+  if (catalog.source === "cache" && catalog.stale) {
+    const refreshed = await refreshCatalogCommand({
+      repoRoot: cwd,
+      fetcher: io.catalogFetcher,
+      timeoutMs: CATALOG_REFRESH_TIMEOUT_MS,
+      now: io.catalogNow,
+    });
+    catalog = refreshed.catalog;
+    if (refreshed.warning) refreshReason = `fleet: catalog auto-refresh failed open — ${refreshed.warning}; retained ${catalog.source} catalog`;
+  }
 
   if (print) {
     // v1.51 T4: the print surface names the mode and its source layer right under the header —
@@ -162,10 +176,10 @@ export async function fleet(
     const nl = body.indexOf("\n");
     // Steering comes from the same resolved config snapshot the editor consumes below,
     // not from another parse of either raw overlay.
-    return `${body.slice(0, nl)}\n# mode: ${rm.mode.mode} (${rm.source})${body.slice(nl)}${formatFleetSteering(rm.cfg)}`;
+    return `${body.slice(0, nl)}\n# mode: ${rm.mode.mode} (${rm.source})${refreshReason ? `\n# ${refreshReason}` : ""}${body.slice(nl)}${formatFleetSteering(rm.cfg)}`;
   }
 
-  if (!why && !interactive) return { out: NON_TTY_MSG, code: 1 };
+  if (!why && !interactive) return { out: `${refreshReason ? `${refreshReason}\n` : ""}${NON_TTY_MSG}`, code: 1 };
 
   // OBS-528: `--fresh` parsed since v1.92 but nothing ever RAN the probe — it forced the reuse
   // gate false and guaranteed the "probe data missing or stale" refusal. The law stands — the
@@ -179,9 +193,9 @@ export async function fleet(
     }
   }
 
-  const assembled = await assembleFleetEditor(cwd, adapters, io, { globalDir });
-  if ("unavailable" in assembled) return { out: assembled.unavailable, code: 1 };
-  if (why) return assembled.renderWhy();
+  const assembled = await assembleFleetEditor(cwd, adapters, io, { globalDir, catalog });
+  if ("unavailable" in assembled) return { out: `${refreshReason ? `${refreshReason}\n` : ""}${assembled.unavailable}`, code: 1 };
+  if (why) return `${refreshReason ? `${refreshReason}\n` : ""}${assembled.renderWhy()}`;
 
   // Keep Ink out of print, non-TTY, and missing-probe paths: the component runtime belongs
   // exclusively to the interactive editor. The capture window brackets only the dynamic Ink
@@ -213,7 +227,7 @@ export async function fleet(
   }
   assembled.props.initialInput = initialInput;
   const result = await runFleetInkEditor(assembled.props);
-  return assembled.commit(result);
+  return `${refreshReason ? `${refreshReason}\n` : ""}${assembled.commit(result)}`;
 }
 
 /** Everything between the doctor-reuse gate and the Ink render, packaged for reuse: `tickmarkr init`
@@ -225,7 +239,7 @@ export async function assembleFleetEditor(
   cwd: string,
   adapters: WorkerAdapter[],
   io: FleetIO,
-  opts: { globalDir: string; entry?: "presets" | "probe" },
+  opts: { globalDir: string; entry?: "presets" | "probe"; catalog?: CatalogReadResult },
 ): Promise<
   | {
     props: FleetEditorProps;
@@ -264,7 +278,7 @@ export async function assembleFleetEditor(
   // OBS-508: the same catalog evidence doctor's drift overlay prints now rides each unclassified
   // row — it prefills the classify flow and feeds the bulk `s` stage. Suggestions stay advisory:
   // only the review-diff confirm writes, so "tickmarkr never applies" holds with less typing.
-  const catalog = readCachedCatalog(cwd);
+  const catalog = opts.catalog ?? readCachedCatalog(cwd);
   // The same alias→identity resolution doctor hands its advisory rows: models.dev has never heard of
   // `opus`, so without it the fleet's own frontier models drop out of the universe they are supposed
   // to anchor and fleet bands a different set than doctor for one fleet. The stored identity wins;
@@ -276,9 +290,35 @@ export async function assembleFleetEditor(
       : readClaudeAliasIdentity(cwd, model as ClaudeAlias) ?? CLAUDE_ALIAS_IDENTITY_STAMPS[model as ClaudeAlias];
   // One ranking universe for the whole screen: every unclassified row bands fleet-relatively
   // against the same set, so a suggestion never depends on which adapter group renders first.
-  const unclassifiedRows = fleetUnclassifiedModels(cfg, health, adapters)
+  const detectedRows = fleetUnclassifiedModels(cfg, health, adapters)
     .map((row) => ({ ...row, resolvedModel: resolvedCatalogModel(row.adapter, row.model) }));
-  const catalogRanking = catalogTierRanking(cfg, catalog, unclassifiedRows, resolvedCatalogModel);
+  const catalogRanking = catalogTierRanking(cfg, catalog, detectedRows, resolvedCatalogModel);
+  const foldedRows: Array<(typeof detectedRows)[number] & {
+    advisory: ReturnType<typeof catalogModelAdvisory>;
+    score?: number;
+    foldedModels?: string[];
+  }> = [];
+  const folds = new Map<string, (typeof foldedRows)[number]>();
+  for (const row of detectedRows) {
+    const advisory = catalogModelAdvisory(cfg, catalog, row.adapter, row.model, row.resolvedModel, catalogRanking);
+    const evidence = advisory.coverage === "covered" ? advisory.evidence : undefined;
+    const score = evidence?.agenticCodingScore ?? evidence?.intelligenceIndex ?? evidence?.codingScore;
+    const next = { ...row, advisory, ...(score !== undefined ? { score } : {}) };
+    const foldKey = evidence ? `${row.adapter}:${evidence.catalogId}` : undefined;
+    const first = foldKey ? folds.get(foldKey) : undefined;
+    if (first) {
+      first.foldedModels ??= [first.model];
+      first.foldedModels.push(row.model);
+    } else {
+      foldedRows.push(next);
+      if (foldKey) folds.set(foldKey, next);
+    }
+  }
+  const unclassifiedRows = foldedRows.sort((a, b) =>
+    Number(!!b.advisory.suggestion) - Number(!!a.advisory.suggestion)
+      || (b.detectedAt ?? "").localeCompare(a.detectedAt ?? "")
+      || (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY)
+      || a.model.localeCompare(b.model));
   // OBS-508 follow-through: the browser renders the metadata the assembler always had — catalog
   // ctx/price evidence and doctor's model-probe wall clock — as columns instead of dropping them.
   const rowEvidence = (adapter: string, model: string, evidence?: CatalogModelEvidence): FleetModelEvidence | undefined => {
@@ -312,14 +352,18 @@ export async function assembleFleetEditor(
           ...unclassified
             .filter((row) => !editable.tiers[adapter.id]?.[row.model])
             .map((row) => {
-              const advisory = catalogModelAdvisory(cfg, catalog, adapter.id, row.model, row.resolvedModel, catalogRanking);
-              const evidence = rowEvidence(adapter.id, row.model, advisory.coverage === "covered" ? advisory.evidence : undefined);
+              const evidence = rowEvidence(adapter.id, row.classifyModel ?? row.model,
+                row.advisory.coverage === "covered" ? row.advisory.evidence : undefined);
               return {
                 model: row.model,
                 detectedAt: row.detectedAt,
+                ...(row.classifyModel ? { classifyModel: row.classifyModel } : {}),
+                ...(row.variants ? { variants: row.variants } : {}),
+                ...(row.foldedModels ? { foldedModels: row.foldedModels } : {}),
+                ...(row.score !== undefined ? { score: row.score } : {}),
                 ...(evidence ? { evidence } : {}),
-                ...(advisory.suggestion
-                  ? { suggestion: { tier: advisory.suggestion.tier, note: advisory.suggestion.provenanceNote } }
+                ...(row.advisory.suggestion
+                  ? { suggestion: { tier: row.advisory.suggestion.tier, note: row.advisory.suggestion.provenanceNote } }
                   : {}),
               };
             }),

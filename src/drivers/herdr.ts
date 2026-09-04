@@ -193,6 +193,7 @@ interface LifecycleInputBox extends InputBox { firstDeliveryIsLaunch?: true }
 export class HerdrDriver implements ExecutorDriver {
   id = "herdr";
   interactive = true;
+  readSource = "recent-unwrapped";
 
   private groups = new Map<string, GroupState>();
   // grouped slot()/close() mutate shared group state across awaits — serialize them so two
@@ -1442,7 +1443,15 @@ export class HerdrDriver implements ExecutorDriver {
       for (const tab of touched) {
         if (alive.has(tab)) continue;
         const closed = await this.herdr(`tab close ${shq(tab)}`);
-        if (closed.code !== 0) {
+        if (closed.code !== 0 && /tab_not_found/i.test(`${closed.stderr}\n${closed.stdout}`)) {
+          this.journalReconcile(journalHandle, "tab-reconcile-close-skipped", undefined, {
+            tabId: tab,
+            runId,
+            sweeperRunId: runId,
+            exitCode: 0,
+            reason: "tab_not_found",
+          });
+        } else if (closed.code !== 0) {
           this.journalReconcile(journalHandle, "tab-reconcile-close-failed", undefined, {
             tabId: tab,
             runId,

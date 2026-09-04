@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, discoverChannels, doctorAgeMs, modelAuthExclusions, probeAll, readDoctor, servableExclusions, servabilityLine } from "../../adapters/registry.js";
+import { allAdapters, doctorAgeMs, modelAuthExclusions, probeAll, readDoctor, rolePools, servableExclusions, servabilityLine } from "../../adapters/registry.js";
 import { formatModelAuthLine, contextWindowLints, modelLints, preferEntryLints, ttyVisual, type RoutedAssignment } from "../../adapters/model-lints.js";
 import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
@@ -10,11 +10,11 @@ import { DEFAULT_CONFIG, overlayPreferShapes, ROUTING_MODES, type RoutingMode, T
 import { loadGraph } from "../../graph/graph.js";
 import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
 import { resolveRunMode } from "../../run/daemon.js";
-import { excludedChannels, exclusionLine } from "../../route/preference.js";
+import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } from "../../route/preference.js";
 import { staffLedEvidence } from "../../route/profile.js";
 import { route, RoutingError } from "../../route/router.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
-import { modelId } from "../../gates/review.js";
+import { modelId, modelProvider } from "../../gates/review.js";
 import { loadRoutingProfile } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
 import { shq, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
@@ -164,7 +164,8 @@ export async function plan(
   // readDoctor cache path: staleness line only fires here (probeAll fallback is fresh by construction).
   const cached = readDoctor(cwd);
   const health = cached ?? (await probeAll(adapters));
-  const channels = discoverChannels(cfg, adapters, health);
+  const pools = rolePools(cfg, adapters, health);
+  const channels = pools.worker;
   // VIS-04 trust ramp (VALIDATION 13-01-11): preview:true bypasses the routing.learned:off short-circuit so
   // the static-vs-learned comparison renders even when the daemon's learned routing is off. Cold ⇒ undefined ⇒
   // output byte-identical to today.
@@ -186,6 +187,15 @@ export async function plan(
     harnessLine(resolveHarness(harnessFrom)),
     "",
   ];
+  const judgeDeny = disallowedBy(cfg.judge, cfg.routing, "judge");
+  if (judgeDeny?.by === "deny") {
+    lines.push(
+      `REFUSAL OBS-576: judge seat ${cfg.judge.adapter}:${cfg.judge.model} is removed by flat routing.deny (${judgeDeny.entry}) — move worker-only policy to routing.deny.workers`,
+      "",
+    );
+  }
+  const entrySeats = routingEntrySeatLines(cfg);
+  if (entrySeats.length) lines.push(...entrySeats, "");
   const derivation = (shape: string): string | null => {
     const floor = cfg.routing.floors[shape];
     return floor ? `    floor ${floor} ← ${mode.provenance[shape] ?? "config floors"}` : null;
@@ -240,6 +250,22 @@ export async function plan(
   lints.push(...modelLints(cfg, health, adapters, { tty: ttyVisual() })); // health may be pre-v1.5/probeAll-fallback — no-detection branch covers both
   // v1.54 T3: dead-steering sweep — advisory only, renders with the routing lints, never alters routing.
   lints.push(...preferEntryLints(cfg, health, overlayPreferShapes(cwd)));
+  const preferMatches = (entry: string, pool: BillingChannel[]) => pool.some((c) =>
+    entry === c.adapter || entry === `${c.adapter}:${c.model}`);
+  const lintInertPrefer = (surface: string, entries: readonly string[] | undefined, poolName: string, pool: BillingChannel[]) => {
+    for (const entry of entries ?? []) {
+      if (!preferMatches(entry, pool)) lints.push(`${surface} '${entry}' resolves to no live channel of ${poolName} pool`);
+    }
+  };
+  for (const [shape, entry] of Object.entries(cfg.routing.map)) {
+    lintInertPrefer(`routing.map.${shape}.prefer`, entry.prefer, "worker", pools.worker);
+  }
+  lintInertPrefer("review.prefer", cfg.review.prefer, "review", pools.review);
+  lintInertPrefer("consult.prefer", cfg.consult.prefer, "consult", pools.consult);
+  const reviewProviders = new Set(pools.review.map((c) => modelProvider(c.model, c.vendor)));
+  if (pools.review.length > 0 && reviewProviders.size < 2) {
+    lints.push(`review pool concentration: ${pools.review.length} channel(s), ${reviewProviders.size} provider(s)`);
+  }
   // The guard here was `channels.length && !fleetCanCrossVendorReview(channels)`, so the review lint went
   // SILENT at zero channels — the first-run state, where review.required is set and nothing can route at all.
   // Deleting that clause outright is worse than the silence: it fires "no cross-vendor reviewer pair in fleet"
@@ -249,7 +275,7 @@ export async function plan(
   // does not own that fixture, so the pair lint keeps naming the waiver as the repair it can offer inline.
   if (cfg.review.required && channels.length === 0) {
     lints.push("review: review.required is set but no channel can route — the fleet is empty; install or authenticate an adapter");
-  } else if (cfg.review.required && !fleetCanCrossVendorReview(channels)) {
+  } else if (cfg.review.required && !fleetCanCrossVendorReview(pools.review)) {
     lints.push("review: no cross-vendor reviewer pair in fleet — set review.required: false to waive");
   }
 

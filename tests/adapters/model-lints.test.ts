@@ -91,11 +91,10 @@ describe("modelLints — both-direction staleness lints", () => {
     expect(unconfigured[0]).not.toContain("cmodel-3");
   });
 
-  test("cursor noise filter: auto + effort/speed variants excluded from aggregation", () => {
+  test("cursor noise filter: auto is excluded and effort/speed variants collapse to their base", () => {
     const health = { "cursor-agent": installed(["auto", "gpt-x-high", "gpt-x-fast", "gpt-x-minimal", "gpt-x-low", "gpt-x-medium", "gpt-x-xhigh", "newmodel-1"]) };
     const lints = modelLints(cfg(), health, adapters);
-    // composer-2.5 configured, missing from detection → tombstone; only newmodel-1 survives the variant filter
-    expect(lints).toContain("cursor-agent: reports 1 model(s) not in tiers (newmodel-1) — classify before routing (benchmark policy)");
+    expect(lints).toContain("cursor-agent: reports 2 model(s) not in tiers (gpt-x, newmodel-1) — classify before routing (benchmark policy)");
   });
 
   test("age: >30d stale → lint; <30d → none", () => {
@@ -115,6 +114,8 @@ describe("modelLints — both-direction staleness lints", () => {
   test("no list surface: claude-code has no listModels → seed-stamp note, never tombstone/unconfigured", () => {
     const lints = modelLints(cfg(), { "claude-code": installed([]) }, adapters);
     expect(lints).toContain(`claude-code: no model-list surface — seeds stamped ${SEED_STAMPED}; verify manually`);
+    expect(modelLints(cfg(), { "claude-code": installed([]) }, adapters, { tty: false }))
+      .toContain(`claude-code: no model-list surface — seeds stamped ${SEED_STAMPED}; verify manually`);
     expect(SEED_STAMPED).toBe("2026-07-09");
     expect(lints.some((l) => l.startsWith("claude-code: tiers lists") || l.startsWith("claude-code: reports"))).toBe(false);
   });
@@ -205,7 +206,7 @@ describe("suggestOverlay — paste-ready drift fragment", () => {
     expect(plainTomb).not.toContain("WARNING");
   });
 
-  test("filters: MODEL_ID_RE-failing ids (ANSI) and lint variants never become additions", () => {
+  test("MODEL_ID_RE-failing ids are filtered while effort variants surface through their classified real id", () => {
     const health = {
       codex: installed(
         ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna", "\x1b[31mgpt-evil", "gpt-5.3-codex-high"],
@@ -214,9 +215,7 @@ describe("suggestOverlay — paste-ready drift fragment", () => {
     };
     const frag = suggestOverlay(cfg(), health, adapters);
     expect(frag).not.toContain("gpt-evil");
-    expect(frag).not.toContain("gpt-5.3-codex-high");
-    // all configured present + both extras filtered ⇒ zero delta ⇒ empty fragment
-    expect(frag).toBe("");
+    expect(frag).toContain("# gpt-5.3-codex-high: ???");
   });
 
   // Follow-up correction (2026-07-10): additions are gated by a purely RELATIONAL rule (no capability
@@ -484,7 +483,10 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
     const { catalog } = fetched(fleet);
     const base = apiCfg();                                  // DEFAULT_CONFIG tiers, so both glm seeds are configured
     const configuredGlm = [base.tiers.opencode?.models, base.tiers.pi?.models].map((m) => Object.keys(m ?? {}));
-    expect(configuredGlm).toEqual([["zai-coding-plan/glm-5.2"], ["zai/glm-5.2"]]);   // the shipped duplicate
+    expect(configuredGlm).toEqual([
+      ["zai-coding-plan/glm-5.2"],
+      ["zai/glm-5.2", "zai/glm-5.3", "zai/glm-5.3-flash"],
+    ]);   // the shipped duplicate remains among the current GLM seeds
     expect(Object.keys(base.tiers["claude-code"]?.models ?? {})).toContain("opus");  // the shipped alias
 
     const rows = [{ adapter: "fake", model: "aurora" }];
@@ -779,9 +781,12 @@ describe("contextWindowLints — v1.47 T3", () => {
     const installedFleet = {
       "claude-code": ["fable", "opus", "sonnet", "haiku"],
       codex: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"],
-      "cursor-agent": ["composer-2.5", "composer-2.5-fast"],
+      "cursor-agent": ["composer-2.5", "composer-2.5-fast", "claude-fable-5-1", "gemini-3.8-flash"],
       opencode: ["zai-coding-plan/glm-5.2"],
-      pi: ["zai/glm-5.2"],
+      pi: ["zai/glm-5.2", "zai/glm-5.3", "zai/glm-5.3-flash"],
+      omp: ["google/gemini-3.8-flash", "zai/glm-5.3", "alibaba/qwen3.8-max"],
+      qwen: ["qwen3.8-max"],
+      "prime-agent": ["prime-inference/z-ai/glm-5.2"],
       grok: ["grok-4.5", "grok-composer-2.5-fast"],
       kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
     } as const;

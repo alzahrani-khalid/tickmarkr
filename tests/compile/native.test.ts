@@ -259,6 +259,7 @@ describe("native spec compiler", () => {
       // UNKNOWN reason"; it has never asserted that every archive compiles (65 already do not).
       // Frame-v2 criterion-scope is the same class: the checked-in corpus guards current authoring,
       // while immutable pre-lint specs remain useful historical inputs rather than migration work.
+      // OBS-604 fence-symbol-absent is likewise a current authoring bar, not an archive sweep.
       // OBS-488: the unconsumed-line invariant is the fourth bar. Measured over the corpus:
       // 3 column-zero prose lines across v1.86 (2) and v1.90 (1) were silently DROPPED by every
       // prior compiler — the error now names them instead.
@@ -266,7 +267,7 @@ describe("native spec compiler", () => {
         expect(compileSource(join("specs", file)).spec.source).toBe("native");
       } catch (error) {
         expect(error).toBeInstanceOf(CompileError);
-        expect((error as Error).message).toMatch(/OBS-97|task unit contract|context: paths that do not exist|criterion-scope authoring lint|no parse rule consumes/);
+        expect((error as Error).message).toMatch(/OBS-97|OBS-604|task unit contract|context: paths that do not exist|criterion-scope authoring lint|no parse rule consumes/);
       }
     }
   });

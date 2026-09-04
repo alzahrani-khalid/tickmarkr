@@ -9,6 +9,7 @@ import { cursorAgent } from "./cursor-agent.js";
 import { grok } from "./grok.js";
 import { kimi } from "./kimi.js";
 import { opencode } from "./opencode.js";
+import { qwen, QWEN_VERSION_IDENTITY } from "./qwen.js";
 import { pi } from "./pi.js";
 import { TRUST_DIALOG_VARIANTS, TrustDialogSchema, type WorkerAdapter } from "./types.js";
 
@@ -119,10 +120,10 @@ function validateCliEntry(entry: CliEntry): CliEntry {
 
 // Package-owned, deterministic order. This is the sole shipped definition array: candidate-name
 // compatibility and advisory/routable projections below are all derived from it.
-const native = (adapter: WorkerAdapter, binary: string): CliEntry => ({
+const native = (adapter: WorkerAdapter, binary: string, identity = ".+"): CliEntry => ({
   id: adapter.id,
   binary,
-  identity: ".+",
+  identity,
   vendor: adapter.vendor,
   drive: { adapter },
 });
@@ -137,7 +138,8 @@ export const CLI_CATALOG: readonly CliEntry[] = [
   native(pi, "pi"),
   native(grok, "grok"),
   native(kimi, "kimi"),
-  "gemini", "qwen", "aider", "goose", "amp", "droid", "auggie", "crush",
+  native(qwen, "qwen", QWEN_VERSION_IDENTITY.source),
+  "gemini", "aider", "goose", "amp", "droid", "auggie", "crush",
   {
     id: "omp",
     binary: "omp",

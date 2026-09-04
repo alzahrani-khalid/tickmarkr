@@ -2,6 +2,70 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.4 — seen, scored and truthful
+
+**v2.4.0** — the fleet is seen and scored from live catalogs instead of a stamped seed table, the qwen CLI
+joins it as a native drive, routing names the blast radius of every deny and prefer entry and scopes bans and
+reroutes by the provider that actually served a model, the gate's children are reaped and every gate row says
+what it measured, and the release instruments run under the daemon's own rules. Delivered by one gated run
+(10/10 green at width 1; halted and resumed five times — once for a classifier fix, four times for `files[]` amendments, each a recorded ruling)
+with a cross-provider review on every task.
+
+- **The board and the journal say what the daemon did.** A `task-dispatch` row carries the exclusion set the
+  router honoured, a `resume-restore` counts as an enactment, and the status board renders a `prior graph`
+  marker on tasks whose gates ran before an audited `--graph-changed` rehash. (T1)
+- **The orca driver's capabilities are real and the board projects onto Orca.** `sendKey` maps enter and
+  ctrl+c onto the CLI's own verbs and refuses anything else loudly; `nudge` proves idle, submits and reads its
+  echo back; the narrator opens a watch terminal and `project` sets the workspace status on the task's own
+  checkout; a receipt with no capture is validated by envelope and says so. (T2)
+- **Routing truth: blast radius, identity scoping, a ceiling key, seeds.** `plan` prints the seats every
+  deny or allow entry reaches, an inert prefer entry per role pool, the review pool's provider breadth, and a
+  refusal when a flat deny leaves the judge seat channel-less; fingerprint bans and tried-lists key on the
+  provider/model identity so an alias or gateway cannot evade them; `review.timeoutMs` (default 900000) is the
+  review ceiling; worker reroute and the stall-consult exclusion are provider-scoped; the seed table gains
+  GLM 5.3, Gemini 3.8 Flash, Qwen 3.8 Max and Fable 5.1 with dated sources and window entries. (T3)
+- **Authoring lints catch the criteria that cannot be graded.** A preservation-worded criterion citing a
+  symbol absent from the task's files, a `mode:` disagreeing with the repo overlay, and an out-of-scope
+  implication without a `scope-waiver:` fail compile; `--strict` promotes every lint to an error. (T4)
+- **The status surface is stream-clean.** The event stream writes one JSON document per event to stdout and
+  its keepalive to stderr, the board's liveness line carries `load1`, and an unbounded watch uses the
+  alternate screen while a bounded render never does. (T5)
+- **The gate's children are reaped.** A process group still alive two seconds after its shell exited is
+  reaped and the shell result carries `reapedGroup: true`. (T6)
+- **Every gate row says what it measured.** Gate rows carry `load1Max` and `load1Mean` sampled through the
+  gate's duration and `reapedGroup` when the shell result does; the review ceiling reads `review.timeoutMs`
+  and its kill row names the configured value; the reviewer picker rotates least-recently-used among eligible
+  cross-provider channels and the row names the seat it took; the placement audit asserts the sealed-launch
+  property structurally. (T8)
+- **Fleet truth: seen, scored, seeded, refreshed.** The evidence join keys on the fleet id's own bare
+  suffix, variants collapse to one row per base model, unclassified rows sort by suggestion and fold gateway
+  duplicates with a count, and `doctor` and `fleet` refresh the keyless models.dev and LiveBench legs when the
+  cache is older than seven days — ten-second timeout, fail-open with one reason line — while `plan`,
+  `compile` and `run` never fetch. (T9)
+- **The qwen CLI joins the fleet, and every worker launches clean.** A native `qwen` drive delivers the
+  prompt file on stdin, passes the approval mode and JSON output, and parses the decoded envelope fail-closed
+  (an API error inside an exit-0 stream is a startup failure, never a success); `claude-code` headless
+  delivers its prompt on stdin and declares every hardcoded flag; the worker prompt states that no background
+  process may outlive the worker and no suite may run beside another; the fable stamp reads
+  `claude-fable-5-1`. (T10)
+- **The release instruments run where the daemon's rules run.** `verify-export.sh` caps the candidate's
+  suite at the daemon's fork cap, the exporter declares its allowlist as data the manifest test reads, and a
+  repo test scans every test file for reads of export-excluded roots and demands a named skip guard or an
+  allowlisted reason. (T11)
+- **Compile lists its lint corpus once.** The fence lint resolves each task's `files[]` from one `git ls-files` per
+  compile instead of walking the whole checkout per task (dot-directories included), and the ownership pass indexes
+  `src/` once per pass — the committed-spec corpus compiles in under 4 s where the merged run took 35 s. Found by the
+  release's own merged-main suite; the run's worktree-hosted gates could not see it. (OBS-898, post-run fix)
+- **The qwen drive reads the stream the daemon actually hands it.** The parser locates the JSON event array inside
+  the captured worker stream (the launch banner before it, the driver's interleaved stderr, the exit marker after it)
+  instead of assuming the bare array, and a no-auth `error_during_execution` result names its `error.message` as the
+  startup-failure cause. Found by the release's live qwen probe: a real completion had read as unparseable and merged
+  only through the harvest path. (OBS-903, post-run fix)
+- **A qwen worker never carries its prompt in argv.** The drive has no interactive form: under every driver the
+  headless command runs (prompt on stdin, JSON events out) in the worker's pane, like omp's, so the same parser reads
+  every transcript. The pane shows the launch and the final event stream rather than a live TUI. Found by the live
+  probe under the herdr driver. (OBS-905, post-run fix)
+
 ## v2.3 — orca, detected and complete
 
 **v2.3.0** — tickmarkr detects the Orca terminal and drives it end to end, the daemon's escalation ladder

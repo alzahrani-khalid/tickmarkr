@@ -4,6 +4,7 @@ import { shq } from "../adapters/types.js";
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { stringify } from "yaml";
 import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
@@ -155,7 +156,7 @@ export interface RunSummary {
 // task can fail in routing before task-dispatch, and the catch appends task-failed — treating that
 // as enactment reports "complete" over an approval that never ran (the exact silent-completion this
 // task exists to kill).
-const DISPATCH_ENACTMENT = new Set(["task-dispatch", "repair-dispatch"]);
+const DISPATCH_ENACTMENT = new Set(["task-dispatch", "repair-dispatch", "resume-restore"]);
 const RECHECK_ENACTMENT = "recheck-battery";
 // The ONE approval that enacts without buying a worker: GATE_SATISFIED_RELEASE resumes from the
 // persisted task branch after the approved gate (execTask's satisfiedGate branch), whose first act
@@ -220,7 +221,9 @@ export function formatSummary(s: RunSummary): string {
  *  run id (cli/commands/status.ts positionalRunId), so naming it here is what stops the board from
  *  following the newest journal in a repo that already carries a second, newer run — a board showing
  *  the wrong run is a recorded incident (skills/tickmarkr-overseer/SKILL.md). */
-export const watchCommand = (runId: string): string => `tickmarkr status --watch ${runId}`;
+export const daemonEntrypoint = fileURLToPath(new URL("../cli/index.js", import.meta.url));
+export const watchCommand = (runId: string): string =>
+  `${shq(process.execPath)} ${shq(daemonEntrypoint)} status --watch ${shq(runId)}`;
 
 const MAX_ATTEMPTS = 10; // ponytail: hard cap so a pathological ladder can never loop forever
 
@@ -300,7 +303,7 @@ function narrowRepairBattery(failing: GateResult[]): boolean {
 
 // v2.0 T2 (OBS-554): the measurement keys run-gates stamps on a GateResult, lifted verbatim onto the
 // gate row. One list, one lift — both onGate sites record through the same helper.
-const GATE_TELEMETRY_KEYS = ["durationMs", "load1Start", "load1End", "selectedDurationMs", "fullDurationMs", "invocations"] as const;
+const GATE_TELEMETRY_KEYS = ["durationMs", "load1Start", "load1End", "load1Max", "load1Mean", "selectedDurationMs", "fullDurationMs", "invocations"] as const;
 
 const gateMeasurement = (meta: Record<string, unknown> = {}): Record<string, unknown> =>
   Object.fromEntries(GATE_TELEMETRY_KEYS.filter((k) => meta[k] !== undefined).map((k) => [k, meta[k]]));
@@ -375,6 +378,11 @@ function approvedReviewRoundCeiling(events: JournalEvent[], taskId: string): num
 }
 const BLOCKED_POLL_MS = 30_000; // between trailer-wait slices, check whether the pane is blocked on a prompt
 export const SUITE_POLL_MS = 250;
+// ponytail: one fixed ceiling on the live-suite wait; the baseline's test ceilingMs is the upgrade path
+export const SUITE_WAIT_CEILING_MS = 600_000;
+let suiteWaitCeilingMs = SUITE_WAIT_CEILING_MS;
+export const setSuiteWaitCeilingForTests = (ms: number): void => { suiteWaitCeilingMs = ms; };
+export const resetSuiteWaitCeilingForTests = (): void => { suiteWaitCeilingMs = SUITE_WAIT_CEILING_MS; };
 export const APPROVAL_POLL_MS = 250;
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
@@ -428,6 +436,7 @@ export function resetNudgeTimingForTests(): void {
 // diff merely quotes "rate limit" keeps working undisturbed).
 const QUOTA_BANNER_SILENT_MS = 3 * 60_000;
 let quotaBannerSilentMs = QUOTA_BANNER_SILENT_MS;
+const WORKER_STARTUP_FAILURE_RE = /(?:not logged in|authentication(?:[ _-](?:required|failed|error))|401 unauthorized|model[_ -]?not[_ -]?found|(?:model|deployment)[^\n]{0,80}(?:not found|does not exist|is unavailable)|(?:404|not[_ -]?found)[^\n]{0,80}(?:model|deployment))/i;
 /** Test seam — shrink the quota-banner silence gate without minute-long sleeps. */
 export function setQuotaBannerSilentMsForTests(ms: number): void {
   quotaBannerSilentMs = ms;
@@ -770,7 +779,11 @@ export function countLiveSuites(
     }
   }
   const root = realpathSync(repoRoot);
-  const candidates = rows.filter((row) => !ancestors.has(row.pid) && SUITE_COMMAND_RE.test(row.command));
+  // OBS-889 (run 3372): a bare-codex worker carries its whole prompt in argv and the prompt names the
+  // runner ("…as a vitest test whose…"), so a finished interactive worker counted as a live suite and
+  // held a task's gates for 9 min 46 s. A runner is named in a command's HEAD — `node <bin>`,
+  // `npm test`, `npx vitest`, `sh -c npm test` — never 140 KB into it: read the first four tokens only.
+  const candidates = rows.filter((row) => !ancestors.has(row.pid) && SUITE_COMMAND_RE.test(row.command.split(/\s+/, 4).join(" ")));
   const attributable = new Set(candidates.filter((row) => {
     if (descendants.has(row.pid)) return true;
     const cwd = cwdForPid(row.pid);
@@ -1345,6 +1358,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const trackedDriver: ExecutorDriver = {
     id: driver.id,
     interactive: driver.interactive,
+    ...(driver.readSource ? { readSource: driver.readSource } : {}),
+    ...(driver.describe ? { describe: driver.describe.bind(driver) } : {}),
     slot: async (cwd, name, o) => { const s = await driver.slot(cwd, name, o); liveSlots.add(s); return s; },
     run: (s, cmd) => driver.run(s, cmd),
     waitOutput: (s, p, ms, o) => driver.waitOutput(s, p, ms, o),
@@ -1353,9 +1368,23 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     read: (s, n) => driver.read(s, n),
     ...(driver.sendKey ? { sendKey: driver.sendKey.bind(driver) } : {}),
     ...(driver.nudge ? { nudge: driver.nudge.bind(driver) } : {}),
+    ...(driver.narrator ? { narrator: async (cwd: string, command: string, id?: string) => {
+      const s = await driver.narrator!(cwd, command, id);
+      liveSlots.add(s);
+      return s;
+    } } : {}),
+    ...(driver.project ? { project: driver.project.bind(driver) } : {}),
+    ...(driver.reconcile ? { reconcile: driver.reconcile.bind(driver) } : {}),
     notify: (m, o) => driver.notify(m, o),
     close: closeSlot,
     worktree: (r, b, base) => driver.worktree(r, b, base),
+  };
+  const absentCapabilities = new Set<string>();
+  const noteCapabilityAbsent = (capability: string) => {
+    if (absentCapabilities.has(capability)
+        || journal.read().some((event) => event.event === "driver-capability-absent" && event.data.capability === capability)) return;
+    absentCapabilities.add(capability);
+    journal.append("driver-capability-absent", undefined, { driver: driver.id, capability });
   };
   // Termination (SIGINT/SIGTERM): record the daemon-controlled exit before closing every live slot,
   // reconcile owned panes against an EMPTY
@@ -1379,6 +1408,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         catch (error) {
           console.error(`tickmarkr ${runId}: deliberate exit cause could not be journalled (${error instanceof Error ? error.message : String(error)})`);
         }
+        // Stop the scheduler before the first awaited retirement. Otherwise a freed slot can fund a
+        // new attempt while this reaper is still closing the old ones.
+        abortRun(new Error(`terminated by ${sig}`));
         if (cfg.visibility.keepPanes !== "forever") {
           for (const s of liveSlots) { // closeSlot only deletes the element being visited — safe during Set iteration
             try { await closeSlot(s); } catch { /* cosmetic — reconcile is the backstop */ }
@@ -1387,7 +1419,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
         releaseRunLock(repoRoot); // the process dies at exit() below — the finally never runs on this path
       }
-      abortRun(new Error(`terminated by ${sig}`));
       exit(sig === "SIGINT" ? 130 : 143);
     })();
   };
@@ -1395,6 +1426,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   process.on("SIGTERM", onTermination);
 
   journal = opts.resume ? Journal.open(repoRoot, runId, opts.narrate) : Journal.create(repoRoot, runId, opts.narrate);
+  const reviewHistory = journal.read()
+    .filter((event) => event.event === "gate-result" && event.data.gate === "review" && typeof event.data.reviewer === "string")
+    .map((event) => event.data.reviewer as string);
   // Capture this before this observer appends run-resume. A prior run-end belongs to a completed
   // lifecycle and must use the ordinary resume/redispatch rules; only an interrupted live attempt
   // owns reusable measurements or unclean-death residue.
@@ -1424,6 +1458,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const approved = new Set(approvalStartupEvents.filter((e) => e.event === "task-approved" && e.taskId).map((e) => e.taskId as string));
   let approvalSweepCursor = approvalStartupEvents.length;
   const commands = detectGateCommands(repoRoot, cfg);
+  const watchName = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
+  let watchSlot: Slot | undefined;
+  const openBoard = async () => {
+    if (!trackedDriver.narrator) {
+      noteCapabilityAbsent("narrator");
+      return;
+    }
+    try {
+      watchSlot = await trackedDriver.narrator(repoRoot, watchCommand(runId), runId);
+    } catch (error) {
+      journal.append("watch-placement-failed", undefined, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
 
   let baseRef: string;
   let baseline: Baseline;
@@ -1489,8 +1536,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       ...(replayedExclusions.size > 0 ? { excludedChannels: [...replayedExclusions].sort() } : {}),
       ...(opts.retryFailed ? { retryFailed: true } : {}),
     });
+    await openBoard();
   } else {
     baseRef = await gitHead(repoRoot);
+    journal.append("baseline-start", undefined, { baseRef, commands });
+    await openBoard();
     baseline = await captureBaseline(repoRoot, commands);
     writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline, null, 2));
     writeFileSync(join(journal.dir, "graph.json"), readFileSync(join(tickmarkrDir(repoRoot), "graph.json")));
@@ -1535,21 +1585,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const collateral = pinnedCollateral ?? collateralHits(graph.tasks, repoRoot);
   if (!pinnedCollateral) writeFileSync(collateralPath, JSON.stringify(Object.fromEntries(collateral), null, 2));
 
-  // T6: open the narrator AFTER run-start/run-resume is journaled so the watch surface has a run to
-  // show. driver.narrator is undefined on subprocess → no-op (subprocess spawns nothing). Swallowed:
-  // a failed-to-open or later-dead watch pane never affects the run.
-  // OBS-103: hold the returned slot — narrator() returns the run's board under its canonical owned
-  // name whichever way it got there (the herdr driver retires a survivor it finds and re-splits, so
-  // the live command is run-bound), and the run-end sweep below retires it by that name regardless
-  // of which daemon instance split the pane.
-  const watchName = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
-  let watchSlot: Slot | undefined;
-  try {
-    watchSlot = await driver.narrator?.(repoRoot, watchCommand(runId), runId);
-  } catch (error) {
-    journal.append("watch-placement-failed", undefined, { error: error instanceof Error ? error.message : String(error) });
-  }
-
   const intWt = await ensureIntegration(repoRoot, branch, baseRef);
 
   // v1.1 visibility: role-named slots; panes persist per keepPanes (attempt = v1 close-after-harvest)
@@ -1589,7 +1624,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (watchSlot && watchSlot.name === watchName && !desired.has(watchName)) {
         const w = watchSlot;
         watchSlot = undefined;
-        await driver.close(w);
+        await trackedDriver.close(w);
       }
     } catch {
       /* cosmetic — visibility is never a gate */
@@ -1641,9 +1676,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     await previous;
     try {
       let lastCount = -1;
+      const startedAt = Date.now();
       for (;;) {
         const count = await liveSuiteCount(repoRoot);
         if (count === 0) break;
+        // OBS-889: a census that never reaches zero held T5's gates with no row and no end. Proceed at
+        // the ceiling, flagged: the verdict that follows was produced beside whatever is still counted.
+        if (Date.now() - startedAt >= suiteWaitCeilingMs) {
+          journal.append("suite-wait-ceiling", taskId, { count, waitedMs: Date.now() - startedAt });
+          break;
+        }
         if (count !== lastCount) journal.append("suite-wait", taskId, { count });
         lastCount = count;
         await new Promise((wake) => setTimeout(wake, SUITE_POLL_MS));
@@ -1913,6 +1955,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // `test` row whose scope no consumer could recover.
         ...(Array.isArray(g.meta?.selectedTests) ? { selectedTests: g.meta.selectedTests } : {}),
         ...(g.meta?.fullSuite === true ? { fullSuite: true } : {}),
+        ...(g.meta?.reapedGroup === true ? { reapedGroup: true } : {}),
+        ...(g.gate === "review" && typeof g.meta?.reviewer === "string" ? {
+          reviewer: g.meta.reviewer,
+          ...(typeof g.meta.vendor === "string" ? { vendor: g.meta.vendor } : {}),
+          ...(typeof g.meta.provider === "string" ? { provider: g.meta.provider } : {}),
+          ...(typeof g.meta.rotationSeat === "number" ? { rotationSeat: g.meta.rotationSeat } : {}),
+          ...(typeof g.meta.timeoutMs === "number" ? { timeoutMs: g.meta.timeoutMs } : {}),
+        } : {}),
         // A finding's path is its own evidence path. Do not pass task scope here: a declaration says
         // where work is allowed, not where this verdict found the defect.
         ...(blocking ? {
@@ -1934,9 +1984,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // T7: the capacity the gate's own command child ran under, lifted verbatim from the result
         // the battery produced — read where the shell built that child's environment, never
         // re-derived from the run's own budget, which would answer a different number than the
-        // operator's export did. It is this row's only COMPARABLE identity: the two load samples
-        // beside it are endpoint reads of a gate whose interior neither of them saw, so no reader
-        // compares them, and matching capacity never claims the machine was calm. A gate that ran
+        // operator's export did. It is this row's only COMPARABLE identity: the load samples describe
+        // contention while capacity describes how the command divided the machine, and matching
+        // capacity never claims the machine was calm. A gate that ran
         // no command carries nothing — it divided nothing.
         //
         // `dirtiedBy` is the one hole in that lift: run-gates REPLACES a green battery verdict with
@@ -2280,6 +2330,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // deterministic-fingerprint occurrence/review round for budget accounting.
           ...(!satisfiedGate && !recheck ? { replayMeasurement: true as const } : {}),
         };
+        await trackedDriver.project?.(t.id, "in-review");
         journal.phaseStart(t.id, "gates");
         const { results } = await withSuiteWindow(t.id,
           resumedTask.gates.includes("test") && commands.test !== undefined,
@@ -2299,6 +2350,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               }
             : undefined,
           excludeReviewers: badReviewers,
+          reviewHistory,
           onGate: async (e) => {
             if (e.phase === "start") {
               notePhaseStart(e);
@@ -2379,6 +2431,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           attempts: rs?.attempts ?? 0, assignment: gateAuthor, taskContentDigest: contentDigest,
         });
         journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
+        await trackedDriver.project?.(t.id, "completed");
         journal.telemetry({
           taskId: t.id, shape: t.shape, adapter: gateAuthor.adapter, model: gateAuthor.model,
           channel: gateAuthor.channel, attempts: rs?.attempts ?? 0, outcome: "done",
@@ -2550,11 +2603,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       lastContextTokens = undefined;
       graph = setStatus(graph, t.id, "running");
       saveGraph(repoRoot, graph);
+      await trackedDriver.project?.(t.id, "in-progress");
       // T6: a dispatch that carries an outstanding finding says so, and names it. Without this the
       // ledger cannot tell a carried dispatch from an amnesiac one — the exact question a run that
       // spends two frontier attempts re-deriving a known defect has to be able to answer afterwards.
       journal.append("task-dispatch", t.id, {
         assignment, attempt, provenance: dispatchProvenance(r.provenance), retryMode,
+        excludedChannels: [...demotedChannels].sort(),
         ...(outstandingFindings.length > 0 ? { carriedFindings: outstandingFindings } : {}),
         ...(carriedConsultGuidance ? { carriedConsultGuidance } : {}),
       });
@@ -2668,6 +2723,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // itself before gates regardless of what the worker does with it.
       writeFileSync(promptFile, `${WORKTREE_LAYOUT_CONTRACT}\n\n${workerContract}\n\n${readFileSync(promptFile, "utf8")}`);
       const adapter = getAdapter(assignment.adapter, adapters);
+      if (adapter.trustDialog && !trackedDriver.sendKey) noteCapabilityAbsent("sendKey");
 
       // VIS-04: workers share one role tab. T2: `owned` names the pane canonically (ownership contract);
       // the legacy name stays the fallback for drivers without owned handling (subprocess spies).
@@ -2727,7 +2783,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // between task-dispatch and this line — worktree recreation, setup, prompt write, slot allocation,
       // the launch itself — can still die with no worker having seen the brief, and `--retry-failed`
       // must then re-send that same brief rather than a fresh prompt on a possibly banned channel.
-      const noteLaunched = () => journal.append("worker-launch", t.id, { attempt, retryMode });
+      const noteLaunched = async () => journal.append("worker-launch", t.id, {
+        attempt,
+        retryMode,
+        ...(trackedDriver.describe ? await trackedDriver.describe(slot) : {}),
+      });
+      const noteWorkerLiveness = (event: "worker-dead" | "worker-dead-held", data: Record<string, unknown>) =>
+        journal.append(event, t.id, { ...data, source: trackedDriver.readSource ?? "driver.read" });
       let cpuFlat: { ms: number; since: number } | undefined;
       let cpuAccountant: WorkerTreeCpuAccountant | undefined;
       let cpuGapCount = 0;
@@ -2864,6 +2926,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // subprocess tree that REACHED its exit marker, not about what the worker claimed.
       let processExited = false;
       let earlyLaunchDead = false;
+      let startupFailure = false;
       let deadWorkerPark: { ref: string; reason: string } | undefined;
       let settleParsed: WorkerResult | undefined;
       let seedResult: InteractiveSeedResult | undefined;
@@ -2940,7 +3003,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             if (await handleDeliveryReadiness(error)) continue attempts;
             return;
           }
-          noteLaunched();
+          await noteLaunched();
           output = seedResult.output;
         } else {
           try {
@@ -2950,13 +3013,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             if (await handleDeliveryReadiness(error)) continue attempts;
             return;
           }
-          noteLaunched();
+          await noteLaunched();
           output = await driver.read(slot, PANE_READ_ROWS);
         }
         // The returning paths report the same fact on the result; both callbacks land on the one
         // latch, and the second is a no-op. A seed that answered is never re-answered by the loop.
         if (seedResult?.trustAnswered) noteSeedTrustAnswered();
-        if (seedResult?.seedFailed) {
+        startupFailure = WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(output));
+        if (seedResult?.seedFailed || startupFailure) {
           finished = false;
         } else {
           // OBS-201: one liveness nudge per attempt; the grace deadline is its OWN timer, never the
@@ -3039,7 +3103,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               if (!paneUndetectable) throw error;
               if (!paneReadHeld) {
                 paneReadHeld = true;
-                journal.append("worker-dead-held", t.id, {
+                noteWorkerLiveness("worker-dead-held", {
                   slot: slot.name, attempt, reason: "pane-read-unreadable",
                   error: error instanceof Error ? error.message : String(error),
                 });
@@ -3050,6 +3114,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               continue;
             }
             if (paneText.length > 0) everHadOutput = true;
+            if (WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(paneText))) {
+              startupFailure = true;
+              output = paneText;
+              break;
+            }
             // OBS-117 (v1.71 T6): zero raw output by the early-launch deadline is a dead channel now.
             if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
               earlyLaunchDead = true;
@@ -3118,7 +3187,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             } catch (error) {
               if (!paneStatusHeld) {
                 paneStatusHeld = true;
-                journal.append("worker-dead-held", t.id, {
+                noteWorkerLiveness("worker-dead-held", {
                   slot: slot.name, attempt, reason: "pane-status-unreadable",
                   error: error instanceof Error ? error.message : String(error),
                 });
@@ -3191,7 +3260,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 paneAbsent = false;
                 if (!paneReadHeld) {
                   paneReadHeld = true;
-                  journal.append("worker-dead-held", t.id, {
+                  noteWorkerLiveness("worker-dead-held", {
                     slot: slot.name, attempt, reason: "pane-read-unreadable",
                     error: error instanceof Error ? error.message : String(error),
                   });
@@ -3213,7 +3282,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 paneAbsent = false;
                 if (!paneReadHeld) {
                   paneReadHeld = true;
-                  journal.append("worker-dead-held", t.id, {
+                  noteWorkerLiveness("worker-dead-held", {
                     slot: slot.name, attempt, reason: "pane-read-unreadable",
                     error: error instanceof Error ? error.message : String(error),
                   });
@@ -3237,7 +3306,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             if (deathCertain) {
               const preservation = await preserveDeadWorker(wt, taskBase);
               if (!preservation.ref) {
-                journal.append("worker-dead-held", t.id, {
+                noteWorkerLiveness("worker-dead-held", {
                   slot: slot.name, attempt, reason: `worktree-${preservation.state}`,
                 });
                 continue;
@@ -3246,7 +3315,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               const reason = `worker is unambiguously dead: pane absent, process tree empty, and worktree unchanged; preserved at ${ref}`;
               deadWorkerPark = { ref, reason };
               journal.append("worktree-preserved", t.id, { ref });
-              journal.append("worker-dead-held", t.id, {
+              noteWorkerLiveness("worker-dead-held", {
                 slot: slot.name, attempt, reason: "unambiguous-worker-death", ref,
               });
               break;
@@ -3262,8 +3331,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // Everything the fast-kill can decide from the CHANNEL, evaluated before the CPU leg is
             // asked for anything: the kill's own probe costs a `ps` every 100ms, so an ineligible
             // slice must not pay for it. The CPU reading is consulted at the kill itself, below.
-            const fastKillEligible = !stallProgress.rowSignalSaturated
-              && !nudgePending && !nudgeFailed
+            const fastKillEligible = !nudgePending && !nudgeFailed
               && sliceNow - lastOutputGrowthAt >= deadChannelFastKillMs
               && worktreeSinceLaunch === "unchanged";
             const harvestCpuEligible = !nudgePending && !nudgeFailed
@@ -3303,14 +3371,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // (an elapsed "9s"→"10s" lengthens the read and would hide a frozen pane). But the
             // tracker SHARES the read window's ceiling: its row signal saturates once a sample
             // FILLS a PANE_READ_ROWS read on raw lines (blanks/chrome included — see stall.ts),
-            // and past that point a flat tracker means "unmeasurable", not "dead". For unmetered
-            // adapters (codex, cursor-agent, grok, opencode — no contextUsage, so the token signal
-            // never fires) rows are the ONLY
-            // signal, and those are exactly the non-nudgeable adapters this kill governs — a live
-            // worker past the ceiling would be concluded dead mid-work. So the kill STANDS DOWN on
-            // a saturated row signal (journaled once per attempt); the rolling window still owns
-            // that pane, exactly as pre-T1. Token growth counts as life either way, so a metered
-            // worker thinking through a long tool run survives.
+            // and past that point a flat tracker means "unmeasurable", not "dead". Journal that
+            // unreadability once, then let the independent CPU and worktree legs decide: accruing or
+            // unreadable CPU preserves the worker; flat CPU beside an unchanged tree may conclude.
+            // A saturated row alone is never a death verdict.
             // The triad has NO status exemption: a pane that herdr reports as blocked, idle, working
             // or unknown dies alike once it holds no trailer, an unchanged tree and no growth — waiting the
             // rolling window out on a status reading is exactly the blindness T1 removes. A matched
@@ -3324,7 +3388,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // filesystem/git observation answer that clause.
             if (stallProgress.rowSignalSaturated && !rowSaturationHeld) {
               rowSaturationHeld = true;
-              journal.append("worker-dead-held", t.id, { slot: slot.name, attempt, reason: "row-signal-saturated" });
+              journal.append("contact-unreadable", t.id, {
+                slot: slot.name, attempt, source: "pane-rows", reason: "row-signal-saturated", concludes: false,
+              });
             }
             // OBS-548: the FOURTH leg, and the one the daemon already measured. The three legs above
             // are all channel-side: they say a pane stopped talking. The tree's CPU says whether
@@ -3341,12 +3407,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 journal.append("worker-dead", t.id, {
                   slot: slot.name, attempt, silentMs: sliceNow - lastOutputGrowthAt,
                   cpuMs: leg.cpu.ms, cpuResolutionMs: leg.cpu.resolutionMs,
+                  source: trackedDriver.readSource ?? "driver.read",
                 });
                 break;
               }
               if (!cpuHeld) {
                 cpuHeld = true;
-                journal.append("worker-dead-held", t.id, {
+                noteWorkerLiveness("worker-dead-held", {
                   slot: slot.name, attempt, reason: leg.state === "accruing" ? "cpu-accruing" : "cpu-unmeasurable",
                 });
               }
@@ -3466,11 +3533,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (await handleDeliveryReadiness(error)) continue attempts;
           return;
         }
-        noteLaunched();
+        await noteLaunched();
         // OBS-54: headless workers have the same output-inactivity budget as visible panes.
         // v1.76: same monotonic-progress measure as the interactive site; harvest stays raw.
         const stallWindowMs = taskTimeoutMinutes * 60_000;
         const initialPane = await driver.read(slot, 500);
+        startupFailure = WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(initialPane));
         let everHadOutput = initialPane.length > 0;
         const stallProgress = new StallProgressTracker();
         stallProgress.observe({ paneText: initialPane, seedSubmitted: true, contextTokens });
@@ -3483,7 +3551,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // worker-result-harvested row. The interactive site has always kept them apart (`finished`
         // there is the trailer regex; the exit marker only sets exitCode), and the cause taxonomy
         // already names this shape "clean-exit-no-trailer" — unreachable in print mode until now.
-        while (Date.now() - lastProgressAt < stallWindowMs) {
+        while (!startupFailure && Date.now() - lastProgressAt < stallWindowMs) {
           const remaining = stallWindowMs - (Date.now() - lastProgressAt);
           let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
           if (!everHadOutput) {
@@ -3498,6 +3566,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           const paneText = await driver.read(slot, 500);
           if (paneText.length > 0) everHadOutput = true;
+          if (WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(paneText))) {
+            startupFailure = true;
+            break;
+          }
           if (!everHadOutput && Date.now() - attemptStart >= earlyLaunchLivenessMs) {
             earlyLaunchDead = true;
             break;
@@ -3554,7 +3626,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
       let result = settleParsed ?? adapter.parse(output, nonce);
       const workerFinished = finished;
-      const workerCause = classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut, deadChannel: deadChannelKilled });
+      const workerCause = startupFailure
+        ? "startup-failure"
+        : classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut, deadChannel: deadChannelKilled });
       journal.append("worker-result", t.id, {
         ok: result.ok, summary: result.summary, deviations: result.deviations, finished: workerFinished, exitCode,
         mode: interactive ? "interactive" : "print", ...(workerCause ? { cause: workerCause } : {}),
@@ -3669,7 +3743,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // T2 review: classify the PRE-HARVEST parse — classifyDeadChannel bails on any ok:true
       // result, so reading the synthesized harvest result would swallow auth-required /
       // setup-required / provider-outage for every committed-but-walled attempt (in both modes).
-      const dead = classifyDeadChannel(preHarvestResult) ?? (earlyLaunchDead ? "setup-required" : undefined);
+      const dead = classifyDeadChannel(preHarvestResult) ?? (earlyLaunchDead || startupFailure ? "setup-required" : undefined);
       if (dead) {
         const from = channelKey(assignment);
         demotedChannels.add(from); // excluded for later attempts AND later tasks in this run
@@ -3778,6 +3852,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       gateLoop: while (true) {
         const gated = await gitHead(wt);
         gateSubject = { commit: await gateCommitSubject(taskBase, gated, wt), attempt };
+        await trackedDriver.project?.(t.id, "in-review");
         journal.phaseStart(t.id, "gates");
         ({ results, commits } = await withSuiteWindow(t.id,
           t.gates.includes("test") && commands.test !== undefined,
@@ -3803,6 +3878,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               }
             : undefined,
           excludeReviewers: badReviewers,
+          reviewHistory,
           onGate,
         })));
         results.forEach(classifySignalOnlyTest);
@@ -3839,6 +3915,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             attempts: attempt + 1, assignment, taskContentDigest: contentDigest,
           });
           journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
+          await trackedDriver.project?.(t.id, "completed");
           // firstAttemptOk/gateFails/consults are recorded FACTS, not policy — a parkKind:"stall" row is
           // recorded but NOT quality-negative in v1.6; Phase 12 owns reward policy, so flipping it later needs zero data migration.
           journal.telemetry({ taskId: t.id, shape: t.shape, adapter: assignment.adapter, model: assignment.model, channel: assignment.channel, attempts: attempt + 1, outcome: "done", durationMs: Date.now() - startMs, firstAttemptOk: attempt === 0, gateFails, consults, tokens, meteredAttempts: tokens ? metered : undefined, retryMode });

@@ -60,7 +60,7 @@ describe("HYG-05 pi auth — unknown vs unauthed", () => {
     );
     const channels = discoverChannels(cfg, adapters, health);
     const piChannels = channels.filter((c) => c.adapter === "pi");
-    expect(piChannels).toHaveLength(2);
+    expect(piChannels).toHaveLength(4);
     expect(() => route(mkTask("chore"), cfg, channels)).not.toThrow();
   });
 

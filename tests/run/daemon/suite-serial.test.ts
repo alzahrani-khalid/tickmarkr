@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { realpathSync } from "node:fs";
 import { expect, test } from "vitest";
-import { countLiveSuites, resetLiveSuiteCountForTests, runDaemon, setLiveSuiteCountForTests, SUITE_POLL_MS } from "../../../src/run/daemon.js";
+import { countLiveSuites, resetLiveSuiteCountForTests, resetSuiteWaitCeilingForTests, runDaemon, setLiveSuiteCountForTests, setSuiteWaitCeilingForTests, SUITE_POLL_MS } from "../../../src/run/daemon.js";
 import { SUITE_PARENT_ENV } from "../../../src/run/git.js";
 import { Journal } from "../../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
@@ -46,4 +46,44 @@ test("test: a full-suite verdict round waits while another suite is live under t
   const waits = Journal.open(repo, "run-suite-serial").read().filter((e) => e.event === "suite-wait");
   expect(waits.length).toBeGreaterThan(0);
   expect(waits.some((e) => typeof e.data.count === "number" && e.data.count >= 1)).toBe(true);
+}, 30_000);
+
+// OBS-889 (run 3372): a bare-codex worker's argv carries its whole prompt, and the prompt names the
+// runner, so a FINISHED interactive worker in a task's worktree counted as a live suite and the census
+// never reached zero — T5's gates waited 9 min 46 s with no row. A runner is named in a command's head.
+test("test: a process whose command names the runner only deep inside a prompt-sized argv counts zero while sh -c npm test and node <bin>/vitest.mjs count one whereas a census that reads the whole command line counts the worker", () => {
+  const repo = realpathSync(tmpdir());
+  const prose = `codex -a never -s workspace-write --prompt ${"lorem ipsum ".repeat(4000)}Each test: acceptance criterion must exist as a vitest test whose OWN title names it`;
+  const rows = [
+    `8001 1 S ${prose}`,
+    `8002 1 S sh -c npm test`,
+    `8003 1 S node /repo/node_modules/vitest/vitest.mjs run --reporter=default`,
+  ];
+  const count = (row: string) => countLiveSuites(row, repo, 7000, () => repo, () => undefined);
+  expect(count(rows[0]!)).toBe(0);
+  expect(count(rows[1]!)).toBe(1);
+  expect(count(rows[2]!)).toBe(1);
+});
+
+test("test: a live-suite census that never reaches zero releases the verdict round at the ceiling and journals suite-wait-ceiling with the count and the wait whereas a window with no ceiling holds the run forever", async () => {
+  const { repo, fake } = setupRepo(
+    [T("T1")],
+    { tasks: { T1: [{ shell: `echo suite > suite.txt && ${COMMIT} suite`, result: { ok: true, summary: "suite" } }] } },
+    "gates: { test: 'true' }\n",
+  );
+  setLiveSuiteCountForTests(async () => 1);
+  setSuiteWaitCeilingForTests(SUITE_POLL_MS * 2);
+  let summary: Awaited<ReturnType<typeof runDaemon>>;
+  try {
+    summary = await runDaemon(repo, { adapters: [fake], runId: "run-suite-ceiling" });
+  } finally {
+    resetLiveSuiteCountForTests();
+    resetSuiteWaitCeilingForTests();
+  }
+  expect(summary.done).toEqual(["T1"]);
+  const rows = Journal.open(repo, "run-suite-ceiling").read();
+  const ceiling = rows.filter((e) => e.event === "suite-wait-ceiling");
+  expect(ceiling.length).toBeGreaterThan(0);
+  expect(ceiling[0]!.data.count).toBe(1);
+  expect(typeof ceiling[0]!.data.waitedMs).toBe("number");
 }, 30_000);

@@ -136,7 +136,12 @@ async function warnWideTaskRange(cwd: string, stateRoot: string, taskId: string,
   }
 }
 
+export const VERIFY_HELP = `usage: tickmarkr verify [--base <ref>] [--criteria <file> | --task <id>] [--json]
+The final verdict and JSON result are written to stdout; progress and diagnostics are written to stderr.
+Do not merge stdout and stderr (for example with 2>&1): doing so corrupts the verdict stream.`;
+
 export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
+  if (argv.some((arg) => arg === "--help" || arg === "-h")) return { out: VERIFY_HELP, code: 0 };
   const { values } = parseArgs({
     args: argv,
     options: {

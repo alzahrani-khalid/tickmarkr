@@ -552,6 +552,33 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
   }, 30_000);
 });
 
+test("test: a worker pane whose first screen carries a model auth or not-found banner is concluded startup-failure inside one poll with no attempt idling to the ceiling and every task-dispatch row carries the exclusion set in force so a reroute's honouring is readable from that row alone whereas a daemon that reads the banner as idle for five minutes or journals the exclusion only on consult-verdict fails", async () => {
+  const { repo, fake } = setupRepo(
+    [T("T1", { timeoutMinutes: 5 })],
+    { tasks: { T1: [
+      { shell: "true" },
+      { shell: `echo recovered > recovered.txt && ${COMMIT} recovered`, result: { ok: true, summary: "recovered" } },
+    ] } },
+    "visibility:\n  worker: interactive\n",
+  );
+  const inner = new SubprocessDriver();
+  const driver = idriver({
+    run: (slot: Slot, cmd: string) => slot.name.includes("-a0-") ? Promise.resolve() : inner.run(slot, cmd),
+    waitOutput: (slot: Slot, pattern: string, ms: number, opts?: { regex?: boolean }) =>
+      slot.name.includes("-a0-") ? Promise.resolve(false) : inner.waitOutput(slot, pattern, ms, opts),
+    read: (slot: Slot, lines?: number) => slot.name.includes("-a0-")
+      ? Promise.resolve("Error: requested model deployment was not found (404)\n")
+      : inner.read(slot, lines),
+  });
+  await runDaemon(repo, { adapters: [fake], runId: "run-startup-failure", driver }); // a five-minute idle path cannot finish inside this test budget
+  const events = Journal.open(repo, "run-startup-failure").read();
+  expect(events.find((e) => e.event === "worker-result")?.data.cause).toBe("startup-failure");
+  const dispatches = events.filter((e) => e.event === "task-dispatch");
+  expect(dispatches).toHaveLength(2);
+  expect(dispatches[0]!.data.excludedChannels).toEqual([]);
+  expect(dispatches[1]!.data.excludedChannels).toEqual(["fake:fake-1"]);
+}, 30_000);
+
 describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
   // Shared scenario: channel 1's pane never prints a byte, channel 2 recovers the task.
   async function runEarlyDeadScenario(runId: string, slow?: (d: ExecutorDriver) => ExecutorDriver) {

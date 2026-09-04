@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { describe, expect, test, vi } from "vitest";
@@ -11,7 +11,7 @@ import { captureBaseline } from "../../../src/gates/baseline.js";
 import { gatePaneName } from "../../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../../src/graph/graph.js";
 import { validateGraph } from "../../../src/graph/schema.js";
-import { runDaemon, watchCommand } from "../../../src/run/daemon.js";
+import { daemonEntrypoint, runDaemon, watchCommand } from "../../../src/run/daemon.js";
 import { gitHead, shOk } from "../../../src/run/git.js";
 import { journaledFailureBrief, Journal, reviewRoundsSinceApproval, runHasEnded } from "../../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
@@ -533,13 +533,13 @@ describe("HYG-09 fleet hygiene (fake adapter, zero tokens)", () => {
 // — the run is unaffected. Drivers without the narrator method (subprocess, every stub above) spawn
 // nothing: driver.narrator?.() is a no-op there (criterion 3 = the whole suite above).
 describe("narrator pane (fake adapter, zero tokens)", () => {
-  test("herdr-style driver: opens exactly one watch pane only after run-start is journaled and before any worker", async () => {
+  test("test: a fresh run journals baseline-start naming baseRef and the gate commands before the capture runs and places the board after that row and before the capture on a resume after run-resume through a watch command built from the running daemon's own entrypoint so the board's header version equals the daemon's whereas a daemon that places the board at run-start or spawns it through the bare tickmarkr name fails", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
     );
     const inner = new SubprocessDriver();
-    const ops: { kind: string; name?: string; cmd?: string; msg?: string; journalEvent?: string }[] = [];
+    const ops: { kind: string; name?: string; cmd?: string; msg?: string; journalEvent?: string; baselineExists?: boolean }[] = [];
     const driver = {
       id: "herdr",
       interactive: true,
@@ -561,6 +561,7 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
           kind: "narrator-open",
           cmd: command,
           journalEvent: Journal.open(cwd, "run-narr").read().at(-1)?.event,
+          baselineExists: existsSync(join(Journal.open(cwd, "run-narr").dir, "baseline.json")),
         });
         return inner.slot(cwd, "narrator-watch");
       },
@@ -571,13 +572,21 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
     const opens = ops.filter((o) => o.kind === "narrator-open");
     expect(opens).toHaveLength(1);
     expect(opens[0]!.cmd).toBe(watchCommand("run-narr"));
-    expect(opens[0]!.journalEvent).toBe("run-start");
-    // opened at run START — before the first worker slot is created
+    expect(opens[0]!.journalEvent).toBe("baseline-start");
+    expect(opens[0]!.baselineExists).toBe(false);
+    const baselineStart = Journal.open(repo, "run-narr").read().find((e) => e.event === "baseline-start");
+    expect(baselineStart?.data).toMatchObject({ baseRef: expect.any(String), commands: expect.any(Object) });
+    expect(opens[0]!.cmd).toContain(daemonEntrypoint);
+    expect(opens[0]!.cmd).not.toMatch(/^tickmarkr\b/);
+    // opened before the first worker slot is created
     const openIdx = ops.findIndex((o) => o.kind === "narrator-open");
     const firstWorker = ops.findIndex((o) => o.kind === "slot" && /-worker-/.test(o.name ?? ""));
     expect(openIdx).toBeGreaterThanOrEqual(0);
     expect(firstWorker).toBeGreaterThan(openIdx);
     expect(ops.filter((o) => o.kind === "close" && o.name === "narrator-watch")).toHaveLength(0);
+
+    await runDaemon(repo, { adapters: [fake], runId: "run-narr", driver, resume: true });
+    expect(ops.filter((o) => o.kind === "narrator-open").at(-1)?.journalEvent).toBe("run-resume");
   });
 
   // QUEUE-v194: the board is bound to the run that spawned it. `status` resolves the newest journal
@@ -586,10 +595,11 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
   test("the exported watchCommand builder names its run id as the explicit status positional and the daemon spawns the narrator through it, so a bare watch command following the newest journal in a repo carrying a second newer run fails", async () => {
     // status takes exactly one positional and it is the run id (cli/commands/status.ts
     // positionalRunId reads the first bare token) — so the run id must BE that bare token.
-    const argv = watchCommand("run-board-42").split(" ");
-    expect(argv.slice(0, 2)).toEqual(["tickmarkr", "status"]);
-    expect(argv).toContain("--watch");
-    expect(argv.slice(2).filter((a) => !a.startsWith("-"))).toEqual(["run-board-42"]);
+    const command = watchCommand("run-board-42");
+    expect(command).toContain(process.execPath);
+    expect(command).toContain(daemonEntrypoint);
+    expect(command).toContain("status --watch 'run-board-42'");
+    expect(command).not.toMatch(/^tickmarkr\b/);
 
     const { repo, fake } = setupRepo(
       [T("T1")],

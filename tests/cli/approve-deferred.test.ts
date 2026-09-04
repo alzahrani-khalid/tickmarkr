@@ -428,6 +428,20 @@ test("approval append and run-end sampling are serialized across the terminaliza
   expect(dispatchesOf(events, "B")).toBe(0);
 }, 240_000);
 
+test("test: a journal with task-approved then resume-restore then green gates then merge reports outstandingApprovals empty at run-end while the run-230 fixture with two upheld approvals and no later enactment still reports both outstanding whereas a fold that ignores resume-restore or counts any later event fails", () => {
+  const at = (event: string, taskId: string, data: Record<string, unknown> = {}): JournalEvent =>
+    ({ ts: "2026-09-03T00:00:00.000Z", event, taskId, data }) as JournalEvent;
+  expect(outstandingApprovals([
+    at("task-approved", "T1"), at("resume-restore", "T1"),
+    at("gate-result", "T1", { pass: true }), at("merge", "T1"),
+  ])).toEqual([]);
+  expect(outstandingApprovals([
+    at("task-approved", "T1", { release: "review-upheld" }),
+    at("task-approved", "T2", { release: "review-upheld" }),
+    at("gate-result", "T1", { pass: true }), at("merge", "T1"),
+  ])).toEqual(["T1", "T2"]);
+});
+
 // Finding 3: task-failed is not proof of dispatch. An approved human gate can fail in routing BEFORE
 // task-dispatch; treating the catch's task-failed as enactment reports "complete" over an approval
 // that never ran — the exact silent completion this task exists to kill. And because that failure

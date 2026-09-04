@@ -975,15 +975,8 @@ function activeReviewParticipation(repoRoot: string): ReviewParticipation {
  * whose task objects carry no `context` gets byte-identical verdicts to the ones it got before the
  * field existed, because an absent declaration grants no authority at all.
  *
- * KNOWN GAP (R2 review, T6/T7 scope): the compile seam in src/compile/index.ts
- * (`enforceTaskUnitContract`) does not thread `compileSource`'s `root` argument into this call, so a
- * PROGRAMMATIC compile whose target repo differs from process.cwd() resolves the wrong root and can
- * miss that repo's own `review.criticalPaths`. Threading it is one line in src/compile/index.ts,
- * outside this task's file scope. Two things bound the exposure meanwhile, both live: the critical
- * set here is the UNION with the shipped defaults, so a wrong root can never lower enforcement below
- * the shipped floor; and the review GATE — which is handed the run's real config — refuses to skip a
- * critical path itself (src/gates/review.ts), so a lint this seam misses costs a late verdict rather
- * than an unreviewed one. The compile lint is the early warning; the gate is the fail-closed backstop.
+ * The compile seam in src/compile/index.ts threads `compileSource`'s repo root here, so CLI tests
+ * and programmatic compiles check the same repository overlay the later run will use.
  */
 export function taskUnitContractErrors(
   tasks: ReadonlyArray<

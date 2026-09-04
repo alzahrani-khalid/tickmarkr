@@ -33,7 +33,8 @@ const MAX_SESSION_BYTES = 8_000_000; // per-file cap; a runaway JSONL cannot mak
 // claude-opus-5 channel to the repo overlay — it did not re-date this alias's stamps, so the
 // alias channel still carries 4-8-dated tier/pricing while serving 5. That warning is true.
 export const CLAUDE_ALIAS_IDENTITY_STAMPS = {
-  fable: "claude-fable-5",
+  // OBS-871, 2026-09-03: Fable's floating alias now resolves to the 5.1 benchmark identity.
+  fable: "claude-fable-5-1",
   opus: "claude-opus-4-8",
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5-20251001",
@@ -217,7 +218,7 @@ export const claudeCode: WorkerAdapter = {
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("claude-code", cfg),
   // v1.65 T3: every flag the command builders below hardcode — doctor checks `claude --help` still
   // lists each (all present on claude 2.x, verified 2026-07-22). Advisory only, never routing.
-  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r", "--prompt-suggestions"] },
+  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r", "--prompt-suggestions", "--settings"] },
   // --strict-mcp-config --mcp-config '{"mcpServers":{}}': pin the MCP surface to empty so fresh-worktree
   // workers/gates don't load project .mcp.json servers (herdr scrapes dialogs as idle — v1.4 incident,
   // memory tickmarkr-worker-mcp-dialog-stall). Live-verified 2026-07-10 on claude 2.1.205 (operator check):
@@ -227,8 +228,10 @@ export const claudeCode: WorkerAdapter = {
   // Gotchas (both bit the 2026-07-10 live check): bare '{}' is REJECTED ("mcpServers: expected record"),
   // and --mcp-config is VARIADIC — a positional after it is eaten as a config-file path, so another
   // flag must always follow the value, never the prompt.
+  // The empty -p argument selects print mode while stdin carries the prompt, keeping its nonce out
+  // of process argv. The redirect path is shell-quoted independently from the model.
   headlessCommand: (promptFile: string, model: string) =>
-    `claude -p "$(cat ${shq(promptFile)})" --model ${shq(model)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format text`,
+    `claude -p '' --model ${shq(model)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format text < ${shq(promptFile)}`,
   // HYG-03 / OBS-137: the residual first-entry dialog is workspace trust, not MCP config loading.
   // Claude's only store is global last-writer-wins ~/.claude.json, so tickmarkr still does not seed it;
   // the daemon safely answers only the exact adapter-declared dialog once per slot.
@@ -246,13 +249,13 @@ export const claudeCode: WorkerAdapter = {
   // before the prompt it would swallow it the same way. So the setting's value is always followed by
   // another flag, never by the prompt positional.
   interactiveCommand: (promptFile: string, model: string) =>
-    `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+    `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   trustDialog: CLAUDE_TRUST_DIALOG,
   inputBox: CLAUDE_INPUT_BOX,
   // A resumed attempt lands in the same painted editor, so it carries the same ghost-text suppression
   // and the same value-then-flag placement.
   resumeCommand: (sessionId: string, promptFile: string, model: string) =>
-    `claude -r ${shq(sessionId)} --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+    `claude -r ${shq(sessionId)} --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },

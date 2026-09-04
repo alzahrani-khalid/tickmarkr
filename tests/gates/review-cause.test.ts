@@ -73,6 +73,25 @@ function via(driver: ExecutorDriver): GateVia {
 }
 
 describe("review caller verdict cause", () => {
+  test("test: a reviewer that runs past cfg.review.timeoutMs is killed at that value and its row names the configured milliseconds while the default is 900000 whereas a ceiling that ignores the key fails", async () => {
+    class SlowReviewer extends FakeAdapter {
+      override headlessCommand(): string { return "sleep 1"; }
+    }
+    const { repo, base } = repoWithCommit();
+    const script = join(mkdtempSync(join(tmpdir(), "tickmarkr-review-timeout-")), "script.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const slow = new SlowReviewer(script);
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.review.timeoutMs = 25;
+    const startedAt = Date.now();
+    const row = await reviewGate(task, repo, base, author, channels, [slow], cfg);
+
+    expect(DEFAULT_CONFIG.review.timeoutMs).toBe(900_000);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(row).toMatchObject({ pass: false, meta: { cause: "timeout", timeoutMs: 25 } });
+    expect(row.details).toContain("configured review timeout 25ms");
+  });
+
   test("test: a reviewer killed at the ceiling carries cause timeout and a reviewer whose process exits nonzero with banner-only bytes carries cause startup-failure while a nonce-bearing but malformed verdict keeps cause malformed-verdict and an empty output keeps cause empty-output whereas a classifier that reads bytes alone fails", async () => {
     class ProcessReviewer extends FakeAdapter {
       constructor(scriptPath: string, private readonly command: string) { super(scriptPath); }

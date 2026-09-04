@@ -18,47 +18,43 @@ import { afterAll, describe, expect, test } from "vitest";
 const ROOT = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim();
 const EXPORT_SCRIPT = join(ROOT, "scripts/export-public.sh");
 
-// ---- the allowlist: the enumerated public path set -------------------------------------------
-// Entries for paths later v1.59 tasks generate (public .gitignore, ci.public.yml, issue/PR
-// templates, docs/codebase pages, the canonical overseer skill) are enumerated now — an allowlist
-// entry for a not-yet-present path admits nothing until the path exists.
-const PUBLIC_EXACT = new Set([
-  ".gitignore",
-  ".oxlintrc.json",
-  "CHANGELOG.md",
-  "CODE_OF_CONDUCT.md",
-  "CONTRIBUTING.md",
-  "FLEET.md",
-  "LICENSE",
-  "README.md",
-  "RELEASING.md",
-  "SECURITY.md",
-  "package-lock.json",
-  "package.json",
-  "tickmarkr.spec.md",
-  "tsconfig.json",
-  "vitest.config.ts",
-  ".github/pull_request_template.md",
-  "scripts/assert-test-file-count.sh",
-  "scripts/emit-schema.ts",
-  "scripts/probe-rig.mjs",
-  "specs/export-selftest.spec.md", // the generated stub — the ONLY specs/ path that ships
-]);
-const PUBLIC_PREFIXES = [
-  ".github/ISSUE_TEMPLATE/",
-  ".github/workflows/",
-  "assets/",
-  "docs/codebase/", // docs allowlist lands in T3; CONCERNS.md stays denied below
-  // fixtures/ is enumerated here (compiler samples + eval-lab trees under fixtures/eval/) —
-  // fail-closed: a new top-level fixtures path only ships because this prefix admits it.
-  "fixtures/",
-  "schema/",
-  "skills/tickmarkr-auto/",
-  "skills/tickmarkr-loop/",
-  "skills/tickmarkr-overseer/",
-  "src/",
-  "tests/",
-];
+// ---- the allowlist: data owned by the exporter ------------------------------------------------
+// The private tree reads the declaration directly. The exporter stamps the same parsed object into
+// the candidate package before it excludes itself, so the public-tree run never needs a fallback
+// list in this file. An entry for a not-yet-present path admits nothing until the path exists.
+interface PublicPathPolicy {
+  exact: string[];
+  prefixes: string[];
+}
+
+function validatePublicPathPolicy(value: unknown, source: string): PublicPathPolicy {
+  const policy = value as Partial<PublicPathPolicy> | undefined;
+  if (!policy || !Array.isArray(policy.exact) || !Array.isArray(policy.prefixes)) {
+    throw new Error(`public export allowlist is missing or malformed in ${source}`);
+  }
+  if (![...policy.exact, ...policy.prefixes].every((entry) => typeof entry === "string" && entry.length > 0)) {
+    throw new Error(`public export allowlist has a non-string or empty entry in ${source}`);
+  }
+  return { exact: policy.exact, prefixes: policy.prefixes };
+}
+
+function policyFromExporter(source: string): PublicPathPolicy {
+  const encoded = /^PUBLIC_EXPORT_ALLOWLIST_JSON='([^']+)'$/m.exec(source)?.[1];
+  if (!encoded) throw new Error("PUBLIC_EXPORT_ALLOWLIST_JSON declaration not found in scripts/export-public.sh");
+  return validatePublicPathPolicy(JSON.parse(encoded), "scripts/export-public.sh");
+}
+
+function loadPublicPathPolicy(): PublicPathPolicy {
+  if (existsSync(EXPORT_SCRIPT)) return policyFromExporter(readFileSync(EXPORT_SCRIPT, "utf8"));
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
+    tickmarkrExport?: { publicPaths?: unknown };
+  };
+  return validatePublicPathPolicy(pkg.tickmarkrExport?.publicPaths, "the exported package.json");
+}
+
+const PUBLIC_PATH_POLICY = loadPublicPathPolicy();
+const PUBLIC_EXACT = new Set(PUBLIC_PATH_POLICY.exact);
+const PUBLIC_PREFIXES = PUBLIC_PATH_POLICY.prefixes;
 
 // ---- the private path classes: rejected at ANY depth -----------------------------------------
 const PRIVATE_SEGMENTS: Record<string, string> = {
@@ -70,14 +66,14 @@ const PRIVATE_SEGMENTS: Record<string, string> = {
   "node_modules": "dependencies",
 };
 
-function privateClass(path: string): string | undefined {
+function privateClass(path: string, publicExact: ReadonlySet<string> = PUBLIC_EXACT): string | undefined {
   for (const seg of path.split("/")) {
     if (PRIVATE_SEGMENTS[seg]) return PRIVATE_SEGMENTS[seg];
     if (seg === "CLAUDE.md") return "operator instructions";
     if (/^ASSESSMENT-.+\.md$/.test(seg)) return "internal assessment";
     if (/\.local\./.test(seg)) return "local-machine file";
   }
-  if (path.startsWith("specs/") && !PUBLIC_EXACT.has(path)) return "private spec corpus";
+  if (path.startsWith("specs/") && !publicExact.has(path)) return "private spec corpus";
   // a dev-only exclusion takes its tests with it: this file's whole subject is
   // scripts/verify-export.sh, which the export excludes, so shipping it is an ENOENT (OBS-862).
   if (path === "tests/scripts/verify-export.test.ts") return "test for an excluded dev-only script";
@@ -87,8 +83,11 @@ function privateClass(path: string): string | undefined {
 }
 
 // fail closed: unclassified is rejected exactly like private — only the enumerated set ships
-const accepts = (path: string): boolean =>
-  privateClass(path) === undefined && (PUBLIC_EXACT.has(path) || PUBLIC_PREFIXES.some((pre) => path.startsWith(pre)));
+const acceptsWithPolicy = (path: string, policy: PublicPathPolicy): boolean => {
+  const exact = new Set(policy.exact);
+  return privateClass(path, exact) === undefined && (exact.has(path) || policy.prefixes.some((pre) => path.startsWith(pre)));
+};
+const accepts = (path: string): boolean => acceptsWithPolicy(path, PUBLIC_PATH_POLICY);
 
 // a referenced path must resolve to a FILE — existsSync alone lets a directory stand in for one
 const isFile = (p: string): boolean => existsSync(p) && statSync(p).isFile();
@@ -168,6 +167,33 @@ const getCandidate = (): Candidate => (sharedCandidate ??= loadCandidate());
 afterAll(() => sharedCandidate?.cleanup());
 
 describe("export boundary — fail-closed dual-context allowlist manifest", () => {
+  test("test: the manifest test reads the allowlist export-public.sh declares as data so a script added to that one list is admitted without a second edit whereas a manifest that keeps its own list fails", () => {
+    const exporter = existsSync(EXPORT_SCRIPT)
+      ? readFileSync(EXPORT_SCRIPT, "utf8")
+      : `PUBLIC_EXPORT_ALLOWLIST_JSON='${JSON.stringify(PUBLIC_PATH_POLICY)}'`;
+    const addedScript = "scripts/new-release-instrument.sh";
+    const changedPolicy = {
+      ...PUBLIC_PATH_POLICY,
+      exact: [...PUBLIC_PATH_POLICY.exact, addedScript],
+    };
+    const changedExporter = exporter.replace(
+      /^PUBLIC_EXPORT_ALLOWLIST_JSON='[^']+'$/m,
+      `PUBLIC_EXPORT_ALLOWLIST_JSON='${JSON.stringify(changedPolicy)}'`,
+    );
+    expect(changedExporter).not.toBe(exporter);
+
+    const policyReadFromChangedExporter = policyFromExporter(changedExporter);
+    expect(acceptsWithPolicy(addedScript, policyReadFromChangedExporter)).toBe(true);
+
+    // The old design copied the policy into this test. That copy is stale after the one exporter
+    // edit above, and the same admission assertion must therefore turn red.
+    const manifestOwnedCopy = {
+      exact: [...PUBLIC_PATH_POLICY.exact],
+      prefixes: [...PUBLIC_PATH_POLICY.prefixes],
+    };
+    expect(() => expect(acceptsWithPolicy(addedScript, manifestOwnedCopy)).toBe(true)).toThrow();
+  });
+
   test("the checked-in fixture directory is included in the package manifest's published file set, not only present in the source tree", { timeout: 120_000 }, () => {
     const candidate = getCandidate();
     // package.json `files` is the published npm set; fixtures must be enumerated there, not merely present in the source tree.

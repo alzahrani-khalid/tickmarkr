@@ -181,10 +181,19 @@ export function canonicalizeLegacyName(name: string, runId: string): OwnedName {
   return { role: "other", taskId: name, attempt: 0, runId };
 }
 
+export interface SlotPlacement {
+  surface?: string;
+  hostPlatform?: string;
+}
+
 export interface ExecutorDriver {
   id: string;
   // v1.2: can this driver host a live TUI the operator can watch and answer? (herdr yes, subprocess no)
   interactive: boolean;
+  /** The exact terminal read surface used for liveness evidence. */
+  readSource?: string;
+  /** Placement facts returned by drivers whose terminal host exposes them. */
+  describe?(slot: Slot): SlotPlacement | Promise<SlotPlacement>;
   slot(cwd: string, name: string, opts?: SlotOpts): Promise<Slot>;
   run(slot: Slot, cmd: string): Promise<void>;
   waitOutput(slot: Slot, pattern: string, timeoutMs: number, opts?: { regex?: boolean }): Promise<boolean>;
@@ -221,6 +230,8 @@ export interface ExecutorDriver {
   // contract: the daemon swallows any failure so a dead/failed watch pane never affects the run.
   // T2: runId names the pane canonically (tickmarkr:watch:run:0:<runId>) so reconcile can own or reuse it.
   narrator?: (cwd: string, command: string, runId?: string) => Promise<Slot>;
+  /** Best-effort projection of a task's lifecycle onto the execution host. */
+  project?: (taskId: string, state: "in-progress" | "in-review" | "completed") => Promise<void>;
   // OBS-17 T2: sweep tickmarkr-owned panes down to `desired` (the reconcile.ts journal fold) — close
   // owned-but-undesired panes and any tab a close emptied, including leftovers from OLDER runs of
   // the same repo. Ownership is decided ONLY by parseOwnedName; foreign names and operator tabs are

@@ -1,12 +1,33 @@
 import { isAbsolute, join } from "node:path";
 import { parseArgs } from "node:util";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
+import { CompileError } from "../../compile/common.js";
 import { compileSource } from "../../compile/index.js";
 import { saveGraph, stateDirName } from "../../graph/graph.js";
 import { formatPriorFindingEvidence, readPriorRunEvidence, type PriorMergeEvidence } from "../../run/journal.js";
 import { shGit } from "../../run/git.js";
 import { acquireRunLock, releaseRunLock } from "../../run/lock.js";
 import { harnessLine, resolveHarness } from "../harness.js";
+
+function nativeSourceScopeErrors(
+  graph: ReturnType<typeof compileSource>,
+  lints: readonly string[],
+): string[] {
+  const byId = new Map(graph.tasks.map((task) => [task.id, task]));
+  const errors: string[] = [];
+  for (const lint of lints) {
+    const match = lint.match(/^(\S+): criteria implicate out-of-scope source not in files\[\]: (.*)$/);
+    if (!match) continue;
+    const task = byId.get(match[1]);
+    if (!task) continue;
+    const paths = match[2].replace(/ \(capped\)$/, "").split(", ").filter(Boolean);
+    for (const path of paths) {
+      if (task.goal.includes(`scope-waiver: ${path}`)) continue;
+      errors.push(`${task.id}: ${path} requires scope-waiver: ${path} in the task goal`);
+    }
+  }
+  return errors;
+}
 
 async function mergedPendingDiagnostics(
   cwd: string,
@@ -37,18 +58,29 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
     options: {
       type: { type: "string" },
       "dry-run": { type: "boolean" },
+      strict: { type: "boolean" },
     },
     allowPositionals: true,
   });
   const src = positionals[0];
-  if (!src) throw new Error("usage: tickmarkr compile <spec-dir-or-md> [--type speckit|prd|gsd|native] [--dry-run]");
+  if (!src) throw new Error("usage: tickmarkr compile <spec-dir-or-md> [--type speckit|prd|gsd|native] [--dry-run] [--strict]");
   // resolve against the target repo, not the process cwd (the CLI test passes a tmp repo)
   // Both modes reach the same pure compiler; --dry-run only removes the lock/write side effect below.
   const g = compileSource(
     isAbsolute(src) ? src : join(cwd, src),
     values.type as "speckit" | "prd" | "gsd" | "native" | undefined,
     cwd, // repo root: gsd stores context[0] repo-relative so workers resolve it inside their worktree
+    (plan) => plan,
+    { strict: values.strict },
   );
+  const scopeLints = [...collateralLints(g.tasks, cwd), ...sourceScopeLints(g.tasks, cwd)];
+  const diagnostics = scopeLints.length
+    ? `\nscope lints:\n${scopeLints.map((lint) => `  ! ${lint}`).join("\n")}`
+    : "";
+  const unwaived = g.spec.source === "native" ? nativeSourceScopeErrors(g, scopeLints) : [];
+  if (unwaived.length > 0) {
+    throw new CompileError(`${src} has unwaived native source-scope authoring errors:\n${unwaived.map((line) => `  - ${line}`).join("\n")}${diagnostics}`);
+  }
   // One bounded read supplies both cross-run surfaces: unresolved findings below and merge facts for
   // the ancestry check. Neither fact mutates the compiled graph; status and every readiness predicate
   // remain the source compiler's answer.
@@ -72,10 +104,6 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
   const summary = values["dry-run"]
     ? `validated ${src} (${g.tasks.length} tasks, source ${g.spec.source}, hash ${g.spec.hash.slice(0, 12)}) — dry run; no graph written`
     : `compiled ${src} → ${stateDir}/graph.json (${g.tasks.length} tasks, source ${g.spec.source}, hash ${g.spec.hash.slice(0, 12)})`;
-  const scopeLints = [...collateralLints(g.tasks, cwd), ...sourceScopeLints(g.tasks, cwd)];
-  const diagnostics = scopeLints.length
-    ? `\nscope lints:\n${scopeLints.map((lint) => `  ! ${lint}`).join("\n")}`
-    : "";
   const priorFindings = prior.findings.length
     ? `\nprior-run evidence:\n${prior.findings.map((finding) => `  ${formatPriorFindingEvidence(finding)}`).join("\n")}`
     : "";

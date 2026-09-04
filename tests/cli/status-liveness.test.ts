@@ -15,6 +15,13 @@ import {
   supervisionBeatPath,
 } from "../../src/run/supervision.js";
 
+const hostLoad = vi.hoisted(() => ({ value: undefined as number[] | undefined }));
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const loadavg = () => hostLoad.value ?? actual.loadavg();
+  return { ...actual, default: { ...actual, loadavg }, loadavg };
+});
+
 // Phase 48-03 (VIS-11 / SC4): `tickmarkr status` shows the age of the last journal event and whether the
 // recorded daemon pid is alive — honest about unknowns, a pure reader (kill(pid,0) signal probe only).
 // Synthetic tmpdir journals; assertions on distinct fixture-driven outcomes (dead vs alive vs unknown),
@@ -85,6 +92,34 @@ describe("VIS-11 status liveness (SC4)", () => {
     const out = await status([], repo);
     expect(out).toContain("alive");
     expect(out).not.toContain("dead");
+  });
+
+  test("test: the board's liveness line carries load1 read from os.loadavg formatted to two decimals beside the daemon pid state whereas a board that renders the line without the host load fails", async () => {
+    const repo = mkRepo();
+    seedGraph(repo);
+    seedJournal(repo, [ev("run-start", { pid: process.pid })]);
+    hostLoad.value = [3.456, 0, 0];
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const noColor = process.env.NO_COLOR;
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    Object.defineProperty(process.stdout, "columns", { configurable: true, value: 220 });
+    delete process.env.NO_COLOR;
+    try {
+      const out = await status([], repo);
+      const line = out.split("\n").find((row) => row.includes("daemon pid"))!.replace(/\x1b\[[0-9;]*m/gu, "");
+      expect(line).toContain(`daemon pid ${process.pid} alive`);
+      expect(line).toContain("load1 3.46");
+      expect(line).not.toContain("3.456");
+    } finally {
+      if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+      if (columns) Object.defineProperty(process.stdout, "columns", columns);
+      else delete (process.stdout as { columns?: number }).columns;
+      if (noColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = noColor;
+      hostLoad.value = undefined;
+    }
   });
 
   test("pid-less journal renders unknown (never fabricated)", async () => {

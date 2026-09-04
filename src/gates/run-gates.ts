@@ -123,13 +123,15 @@ async function captureLlmDispatches<T>(
  * intervals and nothing between them, so the composite `test` gate (a selected screen, then other
  * gates, then the full suite) reports the two suites' cost rather than the span containing them —
  * and no consumer has to re-derive a duration by subtracting journal timestamps, which measures the
- * queue as well as the work. The load samples bracket the FIRST interval's start and the LAST
- * interval's end: start is what a scheduler would have decided on, end is the state it left behind.
+ * queue as well as the work. Load is sampled at each interval's endpoints and every second within it;
+ * start preserves the scheduling input while max and mean retain sustained interior saturation.
  */
 export interface GateTelemetry {
   durationMs: number;
   load1Start: number;
   load1End: number;
+  load1Max: number;
+  load1Mean: number;
 }
 
 export type GateEvent =
@@ -155,6 +157,7 @@ export interface GateContext {
   cfg: TickmarkrConfig;
   via?: GateVia; // v1.1: present → judge/review run as visible named agents through the driver
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
+  reviewHistory?: string[]; // run-scoped LRU reviewer rotation; mutated synchronously when a seat is reserved
   artifactDir?: string; // OBS-196: run dir for raw reviewer-output persistence on unparseable verdicts
   // T4 (OBS-265): "v185" runs the pipeline mechanics this milestone buys — the cheap git checks as a
   // pre-battery screen, a battery that stops at its first red, and judge ‖ review. The daemon always
@@ -281,23 +284,41 @@ export async function runGates(
   // executing is added HERE, at the call site that runs it, so a gate that runs twice (the test
   // gate's screen and its full suite) sums to its own cost and never to the span between them.
   const spans = new Map<string, GateTelemetry>();
+  const loadSamples = new Map<string, number[]>();
   // The test gate's two halves, kept apart as well as summed: `durationMs` alone cannot say whether
   // a slow round was a slow subset or a slow full suite, and the parked scheduler's threshold is
   // defined over the full-suite cost.
   let selectedDurationMs: number | undefined;
   let fullDurationMs: number | undefined;
-  const measure = async <T>(gate: string, run: () => Promise<T>): Promise<T> => {
+  const startMeasurement = () => {
     const at = Date.now();
-    const load1Start = loadProvider();
+    const samples = [loadProvider()];
+    const timer = setInterval(() => samples.push(loadProvider()), 1_000);
+    timer.unref();
+    return () => {
+      clearInterval(timer);
+      samples.push(loadProvider());
+      return { durationMs: Date.now() - at, samples };
+    };
+  };
+  const addMeasurement = (gate: string, measured: { durationMs: number; samples: number[] }) => {
+    const prior = spans.get(gate);
+    const samples = [...(loadSamples.get(gate) ?? []), ...measured.samples];
+    loadSamples.set(gate, samples);
+    spans.set(gate, {
+      durationMs: (prior?.durationMs ?? 0) + measured.durationMs,
+      load1Start: samples[0]!,
+      load1End: samples[samples.length - 1]!,
+      load1Max: Math.max(...samples),
+      load1Mean: samples.reduce((sum, value) => sum + value, 0) / samples.length,
+    });
+  };
+  const measure = async <T>(gate: string, run: () => Promise<T>): Promise<T> => {
+    const finish = startMeasurement();
     try {
       return await run();
     } finally {
-      const prior = spans.get(gate);
-      spans.set(gate, {
-        durationMs: (prior?.durationMs ?? 0) + (Date.now() - at),
-        load1Start: prior?.load1Start ?? load1Start,
-        load1End: loadProvider(),
-      });
+      addMeasurement(gate, finish());
     }
   };
   // The measurement is attached at the ONE seam every result leaves this function through, so a
@@ -426,11 +447,10 @@ export async function runGates(
       // suppresses them anyway; split compareToBaseline only if a tool gate ever gets slow.
       // ponytail: legacy runs adjacent tools in ONE compareToBaseline call, so there is one interval
       // to measure and each of its gates carries it. Split it only if this branch ever stops batching.
-      const batchAt = Date.now();
-      const batchLoadStart = loadProvider();
+      const finish = startMeasurement();
       const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, [...gates]);
-      const batch: GateTelemetry = { durationMs: Date.now() - batchAt, load1Start: batchLoadStart, load1End: loadProvider() };
-      for (const g of gates) spans.set(g, batch);
+      const batch = finish();
+      for (const g of gates) addMeasurement(g, batch);
       // The same refusal AFTER the commands, because a green command can dirty the tree the check
       // above just proved clean. Batched, legacy cannot say WHICH command did it, so the refusal
       // lands on the last gate that had one — the round dies there either way. A red battery is
@@ -666,7 +686,7 @@ export async function runGates(
       invocations.push(...captured.invocations);
       return captured.value;
     };
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir));
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir, ctx.reviewHistory));
     // OBS-193/574: an unparseable review verdict retries the REVIEW exactly once, preferring a
     // different adapter. Only a single-adapter eligible pool may fall back to another channel on the
     // flaked adapter. The flaked verdict never enters results; an exhausted pool preserves its cause.
@@ -694,7 +714,7 @@ export async function runGates(
       const retryExclusions = [...priorExclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, retryExclusions, ctx.artifactDir,
+        retryVia, retryExclusions, ctx.artifactDir, ctx.reviewHistory,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
@@ -727,11 +747,11 @@ export async function runGates(
   // The check runs BEFORE any gate, so on a clean tree it belongs to no gate: charging every round's
   // first gate for it would inflate the one measurement the parked recalibrations key on. It becomes
   // that gate's interval only on the path where it IS what the gate did — the refusal below.
-  const entryAt = Date.now();
-  const entryLoad = loadProvider();
+  const finishEntry = startMeasurement();
   const entryDirt = sequence.length ? await dirtyWorktree() : undefined;
+  const entryMeasurement = finishEntry();
   if (entryDirt) {
-    spans.set(sequence[0]!, { durationMs: Date.now() - entryAt, load1Start: entryLoad, load1End: loadProvider() });
+    addMeasurement(sequence[0]!, entryMeasurement);
     await emitStart(sequence[0]!);
     await record(dirtyRefusal(sequence[0]!, entryDirt));
     return done();

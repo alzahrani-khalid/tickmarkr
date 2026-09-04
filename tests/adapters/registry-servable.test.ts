@@ -92,7 +92,7 @@ tiers:
   test("HYG-05: pickReviewer still resolves pi under realistic servable", () => {
     const { repo, globalDir } = repoWithOverlay(`routing:
   deny:
-    adapters: [codex, cursor-agent, opencode, grok, kimi]
+    adapters: [codex, cursor-agent, opencode, grok, kimi, qwen, omp, prime-agent]
 tiers:
   pi:
     vendor: zhipu
@@ -148,7 +148,7 @@ describe("HYG-07(a) servable exclusion attribution", () => {
     const { cfg } = piOverlayCfg();
     const health = piHealthServable(cfg);
     const line = servabilityLine(servableExclusions(cfg, adapters, health));
-    expect(line).toMatch(/^servability: 1 channel\(s\) unservable — /);
+    expect(line).toMatch(/^servability: 3 channel\(s\) unservable — /);
     expect(line).toContain("pi:anthropic/claude-opus-4-5");
     expect(line).toContain("not in pi's served model list");
   });

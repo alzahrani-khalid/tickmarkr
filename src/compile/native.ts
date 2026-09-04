@@ -105,6 +105,7 @@ export const AUTHORING_LINT_CODES = [
   "one-behavior",
   "concern-bundle",
   "seam-exists",
+  "fence-symbol-absent",
 ] as const;
 
 export type AuthoringLintCode = (typeof AUTHORING_LINT_CODES)[number];
@@ -264,6 +265,36 @@ function criterionScopeFinding(
   };
 }
 
+// OBS-898: the fence lint's corpus is listed ONCE per compile by git (tracked plus untracked-not-ignored,
+// the same set a checkout walk sees minus the ignored trees) and filtered per task. The walk it replaces
+// descended every dot-directory (.tickmarkr/runs alone held 3 799 files here) once PER TASK, so a
+// 20-task spec compiled in seconds and the committed-spec corpus test timed out. Fail-open like
+// testsAtHead: no git answer means no corpus, and the lint stays quiet rather than wrong.
+function repoFileList(root: string): string[] {
+  const ls = spawnSync(
+    "git",
+    ["-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    { encoding: "utf8", maxBuffer: 1 << 25 },
+  );
+  if (ls.status !== 0 || typeof ls.stdout !== "string") return [];
+  return ls.stdout.split("\0").filter(Boolean).sort();
+}
+
+function repoFiles(files: readonly string[], entries: readonly string[]): string[] {
+  const scoped = filesGlob(entries.map((entry) => entry.replace(/^\.\//, "")));
+  return files.filter(scoped);
+}
+
+const PRESERVATION_RE = /\b(?:keeps?|preserves?|retains?|does\s+not\s+weaken|do\s+not\s+weaken|not\s+weaken)\b/i;
+const IDENTIFIER_SHAPED_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+function fencedIdentifiers(text: string): string[] {
+  if (!PRESERVATION_RE.test(text)) return [];
+  return [...new Set([...text.matchAll(/`([^`\n]{1,120})`/g)]
+    .map((match) => match[1].trim())
+    .filter((token) => IDENTIFIER_SHAPED_RE.test(token) && /[A-Z0-9_$]/.test(token)))]
+    .sort();
+}
+
 function exportedIdentifier(root: string, files: readonly string[], identifier: string): boolean {
   const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const declaration = new RegExp(`\\bexport\\s+(?:(?:declare|default|async)\\s+)*(?:function|class|const|let|var|interface|type)\\s+${escaped}\\b|\\bexport\\s*\\{[^}]*\\b${escaped}\\b`);
@@ -286,14 +317,29 @@ export function authoringLintFindings(tasks: readonly Task[], file: string): Aut
   const root = repositoryRoot(file);
   let indexedTests: HeadTest[] | undefined;
   const testIndex = () => indexedTests ??= root ? testsAtHead(root) : [];
+  let indexedFiles: string[] | undefined;
+  const fileIndex = () => indexedFiles ??= root ? repoFileList(root) : [];
   const findings: AuthoringLintFinding[] = [];
 
   for (const task of tasks) {
     const criteria = criterionTexts(task);
+    const taskFiles = root && task.files.length ? repoFiles(fileIndex(), task.files) : [];
+    const taskTexts = new Map(taskFiles.map((path) => {
+      try { return [path, readFileSync(join(root!, path), "utf8")] as const; }
+      catch { return [path, ""] as const; }
+    }));
     for (const [index, text] of criteria.entries()) {
       const needsTestIndex = /`[^`\n]{2,120}`|\b\d+\s*(?:\/|of)\s*\d+\b|\b[A-Za-z0-9_.-]+\.test\.ts\b/.test(text);
       const scope = criterionScopeFinding(task, text, index + 1, id, needsTestIndex ? testIndex() : []);
       if (scope) findings.push(scope);
+
+      for (const symbol of fencedIdentifiers(text)) {
+        if (!taskTexts.size || [...taskTexts.values()].some((body) => body.includes(symbol))) continue;
+        findings.push({
+          code: "fence-symbol-absent", fixtureId: id, taskId: task.id, criterion: index + 1,
+          detail: `preservation fence cites \`${symbol}\` but that symbol has zero hits in this task's files[] (${taskFiles.join(", ")}) — OBS-604`,
+        });
+      }
 
       if (/line[- ]count|physical line|not greater than (?:the|\d)|no larger than|at most \d+ (?:lines|bytes)/i.test(text)) {
         findings.push({ code: "proxy-metric", fixtureId: id, taskId: task.id, criterion: index + 1, detail: "criterion uses a proxy size metric; state the structural intent instead" });
@@ -359,7 +405,7 @@ function renderAuthoringFinding(finding: AuthoringLintFinding): string {
   return `tickmarkr: authoring-lint[${finding.code}] fixture ${finding.fixtureId} task ${finding.taskId}${criterion}: ${finding.detail}`;
 }
 
-export function compileNative(file: string): RunGraph {
+export function compileNative(file: string, options: { strict?: boolean } = {}): RunGraph {
   if (!existsSync(file)) throw new CompileError(`no such native spec file: ${file}`);
   const content = readFileSync(file, "utf8");
   // Exact shared-template check: init writes specTemplate(), and any edit changes the body.
@@ -690,14 +736,18 @@ export function compileNative(file: string): RunGraph {
     tasks,
   });
   const authoringFindings = authoringLintFindings(result.tasks, file);
-  for (const finding of authoringFindings.filter(({ code }) => code !== "criterion-scope")) {
+  const blockingCodes = new Set<AuthoringLintCode>(["criterion-scope", "fence-symbol-absent"]);
+  const blockingFindings = authoringFindings.filter((finding) => options.strict || blockingCodes.has(finding.code));
+  for (const finding of authoringFindings.filter((finding) => !blockingFindings.includes(finding))) {
     console.warn(renderAuthoringFinding(finding));
   }
-  const scopeErrors = authoringFindings.filter(({ code }) => code === "criterion-scope");
-  if (scopeErrors.length > 0) {
+  if (blockingFindings.length > 0) {
+    const strict = options.strict ? " under --strict" : "";
+    const onlyCriterionScope = blockingFindings.every(({ code }) => code === "criterion-scope");
+    const label = onlyCriterionScope && !options.strict ? "the criterion-scope authoring lint" : `authoring lints${strict}`;
     throw new CompileError(
-      `${file} violates the criterion-scope authoring lint (${scopeErrors.length} error${scopeErrors.length === 1 ? "" : "s"}):\n`
-        + scopeErrors.map((finding) => `  - ${renderAuthoringFinding(finding)}`).join("\n"),
+      `${file} violates ${label} (${blockingFindings.length} error${blockingFindings.length === 1 ? "" : "s"}):\n`
+        + blockingFindings.map((finding) => `  - ${renderAuthoringFinding(finding)}`).join("\n"),
     );
   }
   // v1.19 read-old/write-new: a plain-string acceptance item compiles as a judge oracle. This is the

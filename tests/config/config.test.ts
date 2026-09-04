@@ -19,6 +19,7 @@ describe("config", () => {
     expect(DEFAULT_CONFIG.routing.map.plan?.pin).toEqual({ via: "claude-code", model: "fable" });
     expect(DEFAULT_CONFIG.tiers["claude-code"].models.fable).toBe("frontier");
     expect(DEFAULT_CONFIG.review.complexityThreshold).toBe(7);
+    expect(DEFAULT_CONFIG.review.timeoutMs).toBe(900_000);
     expect(TIER_RANK.frontier).toBeGreaterThan(TIER_RANK.mid);
   });
 
@@ -31,6 +32,30 @@ describe("config", () => {
     // sibling keys survive the overlay merge
     expect(cfg.review.complexityThreshold).toBe(7);
     expect(cfg.review.required).toBe(true);
+  });
+
+  test("test: review.timeoutMs loads with default 900000 is rejected when not a positive integer and is absent from the config template's active lines whereas a loader without the key or one that accepts zero fails", () => {
+    expect(DEFAULT_CONFIG.review.timeoutMs).toBe(900_000);
+    const valid = repoWithOverlay("review:\n  timeoutMs: 120000\n");
+    expect(loadConfig(valid.repo, { globalDir: valid.globalDir }).review.timeoutMs).toBe(120_000);
+    for (const value of [0, -1, 1.5]) {
+      const bad = repoWithOverlay(`review:\n  timeoutMs: ${value}\n`);
+      expect(() => loadConfig(bad.repo, { globalDir: bad.globalDir }), String(value)).toThrow(/timeoutMs|positive|integer/);
+    }
+    const activeLines = configTemplate().split("\n").filter((line) => line.trim() && !line.trimStart().startsWith("#"));
+    expect(activeLines.join("\n")).not.toContain("timeoutMs");
+  });
+
+  test("OBS-871 seed pins carry every dated fleet row", () => {
+    expect(DEFAULT_CONFIG.tiers.pi.models).toMatchObject({ "zai/glm-5.3": "frontier", "zai/glm-5.3-flash": "mid" });
+    expect(DEFAULT_CONFIG.tiers.omp.models).toMatchObject({
+      "google/gemini-3.8-flash": "mid", "zai/glm-5.3": "frontier", "alibaba/qwen3.8-max": "frontier",
+    });
+    expect(DEFAULT_CONFIG.tiers["cursor-agent"].models).toMatchObject({
+      "claude-fable-5-1": "frontier", "gemini-3.8-flash": "mid",
+    });
+    expect(DEFAULT_CONFIG.tiers.qwen.models["qwen3.8-max"]).toBe("frontier");
+    expect(DEFAULT_CONFIG.tiers["prime-agent"].models["prime-inference/z-ai/glm-5.2"]).toBe("mid");
   });
 
   // v1.54 T1: consult.prefer — ranked seat failover; entries MUST be adapter:model (a consult seat

@@ -75,6 +75,27 @@ describe("pickReviewer", () => {
     expect(pickReviewer(author, CH)?.vendor).toBe("fake-b");
     expect(pickReviewer(author, [CH[0]])).toBeNull();
   });
+
+  test("test: across four reviews with three eligible cross-provider channels the picker takes each channel before repeating any and each row names the seat it took whereas a picker that answers every review from the cheapest channel fails", async () => {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: true, issues: [] } });
+    const channels: BillingChannel[] = [
+      CH[0]!,
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-c", model: "fake-3", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-d", model: "fake-4", channel: "sub", tier: "frontier" },
+    ];
+    const history: string[] = [];
+    const rows = [];
+    for (let i = 0; i < 4; i++) {
+      rows.push(await reviewGate(mkTask(), repo, base, author, channels, [fake], DEFAULT_CONFIG, undefined, [], undefined, history));
+    }
+
+    const reviewers = rows.map((row) => row.meta?.reviewer);
+    expect(new Set(reviewers.slice(0, 3)).size).toBe(3);
+    expect(reviewers[3]).toBe(reviewers[0]);
+    expect(rows.map((row) => row.meta?.rotationSeat)).toEqual([1, 2, 3, 1]);
+  });
 });
 
 // FLEET-05: same base model behind two harnesses (opencode zen vs ZAI Coding Plan) must not

@@ -1,7 +1,7 @@
 import { type Assignment, type BillingChannel, channelKey, channelsFromConfig } from "../adapters/types.js";
 import { type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
-import { disallowedBy } from "./preference.js";
+import { channelRouteIdentity, disallowedBy, modelRouteIdentity, routingModelProvider } from "./preference.js";
 import { cellOf, EXPLORE_CAP, explorationBonus, learnedScore, MIN_SAMPLES, type RoutingProfile } from "./profile.js";
 
 export type LadderStep = "retry" | "escalate" | "consult" | "human";
@@ -383,7 +383,20 @@ export function nextChannel(
   // profile-dependent filter. NO exploration bonus here (route():110 has one; a probe on the
   // failure path would spend a real retry). Absent profile ⇒ every score is 0 ⇒ third key
   // all-ties ⇒ the stable sort preserves the exact v1.7 candidate ORDER.
-  const pool = channels.filter((c) => !tried.includes(channelKey(c)) && TIER_RANK[c.tier] >= TIER_RANK[current.tier]);
+  const triedKeys = new Set(tried);
+  const triedIdentities = new Set(tried.map((key) => {
+    const channel = channels.find((c) => channelKey(c) === key);
+    return channel ? modelRouteIdentity(channel.model, channel.vendor) : channelRouteIdentity(key);
+  }));
+  // excludeAdapter is expanded by the daemon into every channel key of the failed adapter. Once that
+  // complete set is present, the outage follows the current served provider across gateway aliases.
+  const currentAdapterExcluded = channels.some((c) => c.adapter === current.adapter)
+    && channels.filter((c) => c.adapter === current.adapter).every((c) => triedKeys.has(channelKey(c)));
+  const currentChannel = channels.find((c) => c.adapter === current.adapter && c.model === current.model);
+  const excludedProvider = currentAdapterExcluded ? routingModelProvider(current.model, currentChannel?.vendor) : undefined;
+  const pool = channels.filter((c) => !triedIdentities.has(modelRouteIdentity(c.model, c.vendor))
+    && (!excludedProvider || routingModelProvider(c.model, c.vendor) !== excludedProvider)
+    && TIER_RANK[c.tier] >= TIER_RANK[current.tier]);
   const scores = new Map(pool.map((c) => [channelKey(c), profile ? learnedScore(profile, task.shape, channelKey(c), c.channel, { availWeight: cfg.routing.learnedTuning?.availWeight }) : 0]));
   const scoreOf = (c: BillingChannel) => scores.get(channelKey(c))!;
   const candidates = pool.sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier] || marginalCostRank(a) - marginalCostRank(b) || scoreOf(b) - scoreOf(a));

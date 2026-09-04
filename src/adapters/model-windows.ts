@@ -36,6 +36,9 @@ const CURSOR_SOURCE = "https://cursor.com/help/ai-features/max-mode";
 const ZAI_SOURCE = "https://z.ai/blog/glm-5.2";
 const XAI_SOURCE = "https://docs.x.ai/developers/models/grok-4.5";
 const KIMI_SOURCE = "https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files.html";
+const GOOGLE_SOURCE = "https://ai.google.dev/gemini-api/docs/models";
+const QWEN_SOURCE = "https://qwenlm.github.io/";
+const OBS_871_READ_DATE = "2026-09-03";
 const READ_DATE = "2026-08-05";
 
 const VENDORED_MODEL_WINDOW_CLAIMS = [
@@ -49,8 +52,16 @@ const VENDORED_MODEL_WINDOW_CLAIMS = [
   { modelId: "gpt-5.6-luna", window: 1_050_000, source: OPENAI_SOURCE, readDate: READ_DATE },
   { modelId: "composer-2.5", window: 200_000, source: CURSOR_SOURCE, readDate: READ_DATE },
   { modelId: "composer-2.5-fast", window: 200_000, source: CURSOR_SOURCE, readDate: READ_DATE },
+  { modelId: "claude-fable-5-1", window: 1_000_000, source: ANTHROPIC_SOURCE, readDate: OBS_871_READ_DATE },
+  { modelId: "gemini-3.8-flash", window: 1_000_000, source: GOOGLE_SOURCE, readDate: OBS_871_READ_DATE },
+  { modelId: "google/gemini-3.8-flash", window: 1_000_000, source: GOOGLE_SOURCE, readDate: OBS_871_READ_DATE },
   { modelId: "zai-coding-plan/glm-5.2", window: 1_000_000, source: ZAI_SOURCE, readDate: READ_DATE },
   { modelId: "zai/glm-5.2", window: 1_000_000, source: ZAI_SOURCE, readDate: READ_DATE },
+  { modelId: "zai/glm-5.3", window: 1_000_000, source: ZAI_SOURCE, readDate: OBS_871_READ_DATE },
+  { modelId: "zai/glm-5.3-flash", window: 200_000, source: ZAI_SOURCE, readDate: OBS_871_READ_DATE },
+  { modelId: "alibaba/qwen3.8-max", window: 1_000_000, source: QWEN_SOURCE, readDate: OBS_871_READ_DATE },
+  { modelId: "qwen3.8-max", window: 1_000_000, source: QWEN_SOURCE, readDate: OBS_871_READ_DATE },
+  { modelId: "prime-inference/z-ai/glm-5.2", window: 1_000_000, source: ZAI_SOURCE, readDate: OBS_871_READ_DATE },
   { modelId: "grok-4.5", window: 500_000, source: XAI_SOURCE, readDate: READ_DATE },
   { modelId: "grok-composer-2.5-fast", window: 200_000, source: CURSOR_SOURCE, readDate: READ_DATE },
   { modelId: "kimi-code/k3", window: 1_048_576, source: KIMI_SOURCE, readDate: READ_DATE },

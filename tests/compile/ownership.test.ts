@@ -191,6 +191,22 @@ describe("cross-task ownership", () => {
     }
   });
 
+  test("test: a task whose files list a glob over src owns the dedicated test named after each source the glob expands to so no unowned-test finding is raised for it whereas an ownership pass that skips the glob entry fails", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-ownership-glob-"));
+    put(repo, "src/gates/acceptance.ts", "export const acceptanceGate = true;\n");
+    put(repo, "tests/gates/acceptance.test.ts", [
+      'import { test } from "vitest";',
+      'import { acceptanceGate } from "../../src/gates/acceptance.js";',
+      'test("acceptance", () => void acceptanceGate);',
+    ].join("\n"));
+
+    const graph = compileRepo(repo, `## T1: Gate family\n- files: src/gates/*.ts\n- acceptance:\n  - judge: gate family holds\n`);
+
+    expect(ownershipFindings(graph.tasks, repo).filter((finding) => finding.code === "unowned-test")).toEqual([]);
+    expect(() => compileRepo(repo, `## T1: Gate leaf\n- files: src/gates/acceptance.ts\n- acceptance:\n  - judge: gate leaf holds\n`))
+      .toThrow(/ownership-lint\[unowned-test]/);
+  });
+
   test("the allowlist and unordered-context findings remain warnings even when a corroborated unowned test aborts", () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-ownership-advisory-"));
     put(repo, "tests/feature.test.ts", [

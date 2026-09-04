@@ -106,12 +106,12 @@ const leaveCandidateEnv = () => {
   else delete process.env.HOME;
 };
 
-test("the production adapter enumeration over the shipped catalog yields omp as a routable adapter alongside the seven natives, and the doctor matrix names omp exactly once as an adapter row and in no detected-not-routable row, while another bare-string entry still renders the detected-not-routable advisory, so the guard class keeps a live instance", async () => {
+test("the production adapter enumeration over the shipped catalog yields qwen and omp as routable adapters, names omp exactly once in the doctor matrix, and keeps gemini as the detected-not-routable advisory fixture", async () => {
   enterCandidateEnv();
   try {
     // Enumeration first: allAdapters() over the SHIPPED catalog, not a fixture array.
     expect(allAdapters({ cliEntries: SHIPPED_CLI_CATALOG }).map((adapter) => adapter.id)).toEqual([
-      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "omp", "agy", "prime-agent",
+      "claude-code", "codex", "cursor-agent", "opencode", "pi", "grok", "kimi", "qwen", "omp", "agy", "prime-agent",
     ]);
     expect(CANDIDATE_CLI_CATALOG).toContain(ADVISORY_FIXTURE);
     expect(CANDIDATE_CLI_CATALOG).not.toContain("omp");
@@ -156,14 +156,15 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
     expect(() => assertNoCatalogCollision([...adapters, conflictingAdapter])).toThrow(new RegExp(`\\b${ADVISORY_FIXTURE}\\b`));
   });
 
-  test("test: doctor's matrix names each installed binary exactly once with no id appearing as both an adapter row and a detected-not-routable row, proven member by member over the full registry — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture, a kimi fixture, an omp fixture, an agy fixture and a prime-agent fixture", async () => {
+  test("test: doctor's matrix names each installed binary exactly once with no id appearing as both an adapter row and a detected-not-routable row, proven member by member over the full registry — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture, a kimi fixture, a qwen fixture, an omp fixture, an agy fixture and a prime-agent fixture", async () => {
     for (const adapter of adapters) {
       const binary = registryBinaries().get(adapter.id);
       expect(binary, `${adapter.id} must declare its registry binary`).toBeTruthy();
-      // Recorded banners for the identity-gated declarative probes: `^omp/` and the bare-semver
-      // `^\d+\.\d+\.\d+` gates (agy, prime-agent) — an "<id> fixture 1.0.0" line would land those
-      // rows as identity mismatches instead of installed.
+      // Recorded banners for the identity-gated probes: `^omp/` and the bare-semver
+      // `^\d+\.\d+\.\d+` gates (qwen, agy, prime-agent). An "<id> fixture 1.0.0" line would land
+      // those rows as identity mismatches instead of installed.
       const banner = adapter.id === "omp" ? "omp/17.2.10"
+        : adapter.id === "qwen" ? "0.21.15"
         : adapter.id === "agy" ? "1.1.12"
         : adapter.id === "prime-agent" ? "0.7.1"
         : `${adapter.id} fixture 1.0.0`;
@@ -195,6 +196,7 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
       "pi",
       "grok",
       "kimi",
+      "qwen",
       "omp",
       "agy",
       "prime-agent",

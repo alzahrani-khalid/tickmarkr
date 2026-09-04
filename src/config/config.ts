@@ -389,6 +389,7 @@ export const TickmarkrConfigSchema = z.object({
     // because routing hints and the setup cockpit still read it as a complexity landmark; NOTHING in
     // src/gates/review.ts reads it any more, and a value here can no longer disable a review.
     complexityThreshold: z.number(),
+    timeoutMs: z.number().int().positive(),
     required: z.boolean(),
     prefer: z.array(z.string()).optional(),
     // R3: the operator's participation floor. "full" forces a cross-vendor review on every task;
@@ -522,8 +523,15 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
         // 2026-07-16 (cursor-agent 2026.07.09); gives cursor a cheap-tier channel so low-complexity shapes
         // stop burning its mid. Operator-approved 2026-07-16.
         "composer-2.5-fast": "cheap",
+        // OBS-871: LiveBench 2026_06_25, fetched 2026-09-03; released 2026-09-01.
+        "claude-fable-5-1": "frontier",
+        // OBS-871: LiveBench 2026_06_25, fetched 2026-09-03; released 2026-09-02.
+        "gemini-3.8-flash": "mid",
       },
-      windows: { "composer-2.5": 200_000, "composer-2.5-fast": 200_000 },
+      windows: {
+        "composer-2.5": 200_000, "composer-2.5-fast": 200_000,
+        "claude-fable-5-1": 1_000_000, "gemini-3.8-flash": 1_000_000,
+      },
     },
     // GLM-5.2 → mid per benchmark policy (2026-07): SWE-bench Pro 62.1 (> GPT-5.5 58.6), FrontierSWE 74.4 ≈ Opus 4.8;
     // no independent Terminal-Bench score → conservative mid, overlays may raise.
@@ -545,8 +553,46 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     // cross-harness) is pre-existing, FLEET-05 owns it.
     pi: {
       vendor: "zhipu", channel: "sub",
-      models: { "zai/glm-5.2": "mid" },
-      windows: { "zai/glm-5.2": 1_000_000 },
+      models: {
+        "zai/glm-5.2": "mid",
+        // OBS-871: LiveBench 2026_06_25, fetched 2026-09-03; GLM-5.3 released 2026-08-18.
+        "zai/glm-5.3": "frontier",
+        // OBS-871: same LiveBench source and 2026-09-03 fetch; speed variant remains mid.
+        "zai/glm-5.3-flash": "mid",
+      },
+      windows: { "zai/glm-5.2": 1_000_000, "zai/glm-5.3": 1_000_000, "zai/glm-5.3-flash": 200_000 },
+    },
+    // OBS-871: gateway ids and bands from LiveBench 2026_06_25, fetched 2026-09-03.
+    omp: {
+      vendor: "mixed", channel: "sub",
+      models: {
+        "google/gemini-3.8-flash": "mid",
+        "zai/glm-5.3": "frontier",
+        "alibaba/qwen3.8-max": "frontier",
+      },
+      modelOverrides: {
+        "google/gemini-3.8-flash": { vendor: "google" },
+        "zai/glm-5.3": { vendor: "zhipu" },
+        "alibaba/qwen3.8-max": { vendor: "alibaba" },
+      },
+      windows: {
+        "google/gemini-3.8-flash": 1_000_000,
+        "zai/glm-5.3": 1_000_000,
+        "alibaba/qwen3.8-max": 1_000_000,
+      },
+    },
+    // OBS-871: Qwen 3.8 Max scored 64.6 in LiveBench 2026_06_25, fetched 2026-09-03.
+    qwen: {
+      vendor: "alibaba", channel: "sub",
+      models: { "qwen3.8-max": "frontier" },
+      windows: { "qwen3.8-max": 1_000_000 },
+    },
+    // OBS-871: prime-agent listed this prime-inference route on 2026-09-03; GLM-5.2 remains mid.
+    "prime-agent": {
+      vendor: "mixed", channel: "sub",
+      models: { "prime-inference/z-ai/glm-5.2": "mid" },
+      modelOverrides: { "prime-inference/z-ai/glm-5.2": { vendor: "zhipu" } },
+      windows: { "prime-inference/z-ai/glm-5.2": 1_000_000 },
     },
     // Native grok CLI (Phase 40). grok-4.5 → mid: same benchmark provenance as the retired cursor-agent
     // grok-4.5-xhigh seed above (AA 54, TB2.1 83.3%, SWE-b Pro 64.7% — researched 2026-07-10).
@@ -581,7 +627,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
   judge: { adapter: "claude-code", model: "fable" },
   // R3: no `policy` floor — the neutral floor leaves the compiler's per-task assignment standing, so
   // the path-keyed rule is reachable out of the box rather than raised to full by construction.
-  review: { complexityThreshold: 7, required: true, criticalPaths: [...DEFAULT_REVIEW_CRITICAL_PATHS] },
+  review: { complexityThreshold: 7, timeoutMs: 900_000, required: true, criticalPaths: [...DEFAULT_REVIEW_CRITICAL_PATHS] },
   consult: { adapter: "claude-code", model: "fable", stallMinutes: 15 },
   // v1.4: gate LLM calls (judge/review/consult) run headless by default; pane opts back into visible agents.
   // v1.2: workers are the real agent TUI in the pane; "print" restores the -p-rendered-in-pane path.
@@ -818,7 +864,7 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #   test: npm test
 #   byShape:
 #     docs: { acceptance: false, review: false }  # baseline, evidence, and scope are mandatory
-# review: { complexityThreshold: 7, required: true, prefer: [codex:gpt-5.6-sol, kimi] }
+# review: { complexityThreshold: 7, timeoutMs: 900000, required: true, prefer: [codex:gpt-5.6-sol, kimi] }
 #                         # prefer: ordered reviewer seat preference (adapter | adapter:model); ranks
 #                         # diversity-eligible channels only — never admits a same-vendor/same-model reviewer
 # consult: { adapter: claude-code, model: fable, stallMinutes: 15, prefer: [codex:gpt-5.6-sol, kimi:kimi-code/k3] }

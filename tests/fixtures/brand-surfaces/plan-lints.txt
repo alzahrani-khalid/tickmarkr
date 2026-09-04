@@ -12,9 +12,14 @@ est. cost (API channels only, rough): ~$0.00 + judge/review/consult calls
 
 routing lints:
   ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
+  ! qwen: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! agy: no model-list surface and no configured models — classify per benchmark policy to open channels
   ! routing seed names dead adapter 'cursor-agent' for shape 'implement' — no declared preference overrides it
   ! routing seed names dead adapter 'codex' for shape 'implement' — no declared preference overrides it
   ! routing seed names dead adapter 'opencode' for shape 'tests' — no declared preference overrides it
+  ! routing.map.implement.prefer 'cursor-agent' resolves to no live channel of worker pool
+  ! routing.map.implement.prefer 'codex' resolves to no live channel of worker pool
+  ! routing.map.tests.prefer 'opencode' resolves to no live channel of worker pool
+  ! review pool concentration: 2 channel(s), 1 provider(s)
   ! review: no cross-vendor reviewer pair in fleet — set review.required: false to waive
   ! T1: unroutable — T1: no channel at tier>=frontier; available: claude-code:sonnet, claude-code:haiku

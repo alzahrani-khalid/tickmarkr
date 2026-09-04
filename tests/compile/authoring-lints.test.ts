@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import { expect, test, vi } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
 import { compileSource } from "../../src/compile/index.js";
+import { makeRepo } from "../helpers/tmprepo.js";
 
 const CORPUS = "fixtures/authoring-lints";
 
@@ -100,4 +101,22 @@ test("a criterion naming a .json, .tsx or .jsx file inside its own files[] compi
   }
   expect(error).toBeInstanceOf(CompileError);
   expect(String(error)).toContain("src/other/Untouched.tsx"); // the real path, not `Untouched.ts`
+});
+
+test("test: a criterion that keeps or does not weaken a backticked identifier-shaped symbol with zero hits in the task's files fails compile naming the symbol the task and OBS-604 while the same criterion with the symbol present in an owned file compiles and a criterion that backticks an ordinary word such as flat compiles whereas a compiler that warns on the absent fence or reds the ordinary word fails", () => {
+  const repo = makeRepo({
+    "src/owned.ts": "export const PresentSymbol = 1;\n",
+    "absent.spec.md": "<!-- tickmarkr:spec -->\n## T1: Preserve absent\n- files: src/owned.ts\n- acceptance:\n  - judge: keeps `MissingSymbol` behavior from weakening\n",
+    "present.spec.md": "<!-- tickmarkr:spec -->\n## T1: Preserve present\n- files: src/owned.ts\n- acceptance:\n  - judge: keeps `PresentSymbol` behavior from weakening\n",
+    "flat.spec.md": "<!-- tickmarkr:spec -->\n## T1: Preserve word\n- files: src/owned.ts\n- acceptance:\n  - judge: keeps `flat` output readable\n",
+  });
+
+  expect(() => compileSource(join(repo, "absent.spec.md"), "native", repo)).toThrow(CompileError);
+  const message = (() => { try { compileSource(join(repo, "absent.spec.md"), "native", repo); } catch (error) { return String(error); } return ""; })();
+  expect(message).toContain("fence-symbol-absent");
+  expect(message).toContain("MissingSymbol");
+  expect(message).toContain("task T1");
+  expect(message).toContain("OBS-604");
+  expect(compileSource(join(repo, "present.spec.md"), "native", repo).tasks).toHaveLength(1);
+  expect(compileSource(join(repo, "flat.spec.md"), "native", repo).tasks).toHaveLength(1);
 });

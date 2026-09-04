@@ -278,7 +278,7 @@ describe("OrcaDriver", () => {
   test("test: one shared envelope parser serves runtime status, terminal create, list, read, send, wait, show and close, and a table of malformed, truncated and ok-false fixtures per response family fails each invoking operation closed with raw bytes preserved for diagnostics, while a caller that reinterprets parser failure as empty output, unknown-but-successful status or a successful close fails", async () => {
     expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
       "status", "create", "list", "read", "send", "wait", "show", "close",
-      "worktree-current", "hooks-status",
+      "worktree-current", "worktree-set", "hooks-status",
     ]);
 
     // The shared parser itself refuses every degenerate fixture, for every family.
@@ -310,6 +310,11 @@ describe("OrcaDriver", () => {
       "worktree-current": async (o) => {
         const r = rig(o);
         return r.driver.run(await r.driver.slot(WT, TITLE), "bash");
+      },
+      "worktree-set": async (o) => {
+        const r = rig(o);
+        await r.driver.slot(WT, TITLE);
+        return r.driver.project("T1", "in-review");
       },
       "hooks-status": async (o) => {
         const r = rig(o);
@@ -901,7 +906,7 @@ describe("OrcaDriver", () => {
   test("test: the shared envelope parser serves worktree current and agent hooks status exactly as it serves the eight terminal families so a malformed truncated or ok-false body on either fails the invoking method explicitly whereas a driver that reads a parse failure as not-yet-adopted or as fully hooked fails", async () => {
     expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
       "status", "create", "list", "read", "send", "wait", "show", "close",
-      "worktree-current", "hooks-status",
+      "worktree-current", "worktree-set", "hooks-status",
     ]);
     for (const family of ["worktree-current", "hooks-status"] as const) {
       for (const raw of [MALFORMED, TRUNCATED, OK_FALSE]) {
@@ -962,4 +967,134 @@ describe("OrcaDriver", () => {
     expect(fabricating({ connected: true })).toBe("idle");
     expect(mapAgentState({ connected: true }, false)).not.toBe(fabricating({ connected: true }));
   });
+  test("test: sendKey enter issues terminal send with an empty text and --enter and sendKey ctrl+c issues terminal send --interrupt each accepted only by a receipt naming the slot's handle while any other key throws naming the key and Orca's missing verb whereas a driver that silently returns for an unknown key or accepts a receipt naming another handle fails", async () => {
+    const enter = rig();
+    const enterSlot = await bound(enter.driver, enter.fake);
+    const enterHandle = enter.fake.last()!.handle;
+    await enter.driver.sendKey(enterSlot, "enter");
+    expect(enter.fake.calls.at(-1)).toEqual([
+      "terminal", "send", "--terminal", enterHandle, "--text", "", "--enter", "--json",
+    ]);
+    expect(enter.fake.sent.get(enterHandle)).toEqual([""]);
+
+    const interrupt = rig();
+    const interruptSlot = await bound(interrupt.driver, interrupt.fake);
+    const interruptHandle = interrupt.fake.last()!.handle;
+    await interrupt.driver.sendKey(interruptSlot, "ctrl+c");
+    expect(interrupt.fake.calls.at(-1)).toEqual([
+      "terminal", "send", "--terminal", interruptHandle, "--interrupt", "--json",
+    ]);
+    expect(interrupt.fake.interrupted).toEqual([interruptHandle]);
+
+    const unsupported = await enter.driver.sendKey(enterSlot, "f2").then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(unsupported).toBeInstanceOf(OrcaError);
+    expect((unsupported as Error).message).toContain('"f2"');
+    expect((unsupported as Error).message).toContain("no terminal key verb");
+
+    const wrongHandle = rig({
+      raw: {
+        send: JSON.stringify({
+          ok: true,
+          result: { send: { handle: "term_other", accepted: true, bytesWritten: 1 } },
+          _meta: { runtimeId: "rt-1" },
+        }),
+      },
+    });
+    const wrongSlot = await bound(wrongHandle.driver, wrongHandle.fake);
+    await expect(wrongHandle.driver.sendKey(wrongSlot, "enter"))
+      .rejects.toThrow(/term_other.*addressed/);
+  });
+
+  test("test: nudge answers true only after a satisfied tui-idle probe a handle-bound send receipt and a cursor-paged read that carries the submitted text back and answers false when the probe elapses or the echo is absent and never throws whereas a nudge that reports delivery without the read-back fails", async () => {
+    const delivered = rig();
+    const deliveredSlot = await bound(delivered.driver, delivered.fake, ["ready"]);
+    delivered.fake.last()!.tuiIdle = true;
+    expect(await delivered.driver.nudge(deliveredSlot, "continue now")).toBe(true);
+    const families = delivered.fake.families();
+    const waitAt = families.indexOf("wait");
+    const sendAt = families.indexOf("send");
+    expect(waitAt).toBeGreaterThanOrEqual(0);
+    expect(sendAt).toBeGreaterThan(waitAt);
+    expect(delivered.fake.calls.slice(sendAt + 1).some((call) =>
+      call[0] === "terminal" && call[1] === "read" && call.includes("--cursor"))).toBe(true);
+    expect(delivered.fake.sent.get(delivered.fake.last()!.handle)).toEqual(["continue now"]);
+
+    const busy = rig();
+    const busySlot = await bound(busy.driver, busy.fake, ["working"]);
+    expect(await busy.driver.nudge(busySlot, "continue now")).toBe(false);
+    expect(busy.fake.countOf("send")).toBe(0);
+
+    const silent = rig({ echoSends: false });
+    const silentSlot = await bound(silent.driver, silent.fake, ["ready"]);
+    silent.fake.last()!.tuiIdle = true;
+    expect(await silent.driver.nudge(silentSlot, "continue now")).toBe(false);
+    expect(silent.fake.countOf("send")).toBe(1);
+    expect(silent.fake.calls.filter((call) => call[1] === "read" && call.includes("--cursor")).length)
+      .toBeGreaterThan(1);
+
+    const malformed = rig({ raw: { send: MALFORMED } });
+    const malformedSlot = await bound(malformed.driver, malformed.fake, ["ready"]);
+    malformed.fake.last()!.tuiIdle = true;
+    await expect(malformed.driver.nudge(malformedSlot, "continue now")).resolves.toBe(false);
+  });
+
+  test("test: narrator creates one terminal in the repository checkout titled with the canonical watch name for the run running the supplied command and the reconcile sweep recognises that terminal as the run's board whereas a narrator that titles the terminal without the run identity fails", async () => {
+    const { fake, driver } = rig();
+    const runId = "run-board-identity";
+    const command = "tickmarkr status --watch run-board-identity";
+    const title = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
+    const slot = await driver.narrator(WT, command, runId);
+
+    expect(slot.name).toBe(title);
+    expect(fake.calls.filter((call) => call[0] === "terminal" && call[1] === "create")).toEqual([[
+      "terminal", "create", "--worktree", `path:${WT}`, "--title", title,
+      "--command", command, "--json",
+    ]]);
+    await driver.reconcile(new Set([title]), runId);
+    expect(fake.terminals).toHaveLength(1);
+    expect(fake.countOf("close")).toBe(0);
+    await expect(driver.narrator(WT, command)).rejects.toThrow(/requires a run identity/);
+  });
+
+  test("test: project sets --workspace-status in-progress in-review and completed on the path selector of the task's own checkout never the active selector or the daemon's cwd and describe returns the create receipt's surface and hostPlatform for a created slot and undefined before creation whereas a projection that names the wrong selector or a describe that invents a surface fails", async () => {
+    const { fake, driver } = rig({ activeWorktree: OTHER_WT });
+    await driver.project("T1", "in-progress");
+    expect(fake.countOf("worktree-set")).toBe(0);
+
+    const slot = await driver.slot(WT, TITLE);
+    expect(driver.describe(slot)).toBeUndefined();
+    await driver.run(slot, "bash");
+    expect(driver.describe(slot)).toEqual({ surface: "visible", hostPlatform: "darwin" });
+    await driver.project("T1", "in-review");
+    await driver.project("T1", "completed");
+
+    const projections = fake.calls.filter((call) => call[0] === "worktree" && call[1] === "set");
+    expect(projections).toEqual([
+      ["worktree", "set", "--worktree", `path:${WT}`, "--workspace-status", "in-progress", "--json"],
+      ["worktree", "set", "--worktree", `path:${WT}`, "--workspace-status", "in-review", "--json"],
+      ["worktree", "set", "--worktree", `path:${WT}`, "--workspace-status", "completed", "--json"],
+    ]);
+    expect(projections.every((call) => !call.includes("active") && !call.includes("current"))).toBe(true);
+    expect(fake.workspaceStatuses.get(WT)).toBe("completed");
+    const projectionCwds = fake.callCwds.filter((_, index) =>
+      fake.calls[index]?.[0] === "worktree" && fake.calls[index]?.[1] === "set");
+    expect(projectionCwds).toEqual([WT, WT, WT]);
+  });
+
+  test("the fake Orca's send --interrupt and worktree set receipts are either recorded from Orca 1.4.195 with the capture file named in the fixture or marked as unrecorded shapes beside a driver that validates only the envelope and the handle for those two families as the diff shows in the fixture and driver hunks", async () => {
+    expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
+      "status", "create", "list", "read", "send", "wait", "show", "close",
+      "worktree-current", "worktree-set", "hooks-status",
+    ]);
+    const { fake, driver } = rig();
+    const slot = await bound(driver, fake);
+    await driver.sendKey(slot, "ctrl+c");
+    await driver.project("T1", "in-review");
+    expect(fake.interrupted).toEqual([fake.last()!.handle]);
+    expect(fake.workspaceStatuses.get(WT)).toBe("in-review");
+  });
+
 });

@@ -5,19 +5,23 @@ import { join } from "node:path";
 import { beforeEach, afterEach, describe, expect, test, vi } from "vitest";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
 import { hasCodexTrustedProject, seedCodexTrust } from "../../src/adapters/codex.js";
-import { LIVEBENCH_TABLE_DATE } from "../../src/adapters/catalog-remote.js";
+import { ARTIFICIAL_ANALYSIS_CATALOG_URL, CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_CATEGORIES_URL, LIVEBENCH_TABLE_DATE, LIVEBENCH_TABLE_URL, MODELS_DEV_CATALOG_URL, readCachedCatalog } from "../../src/adapters/catalog-remote.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import * as registry from "../../src/adapters/registry.js";
 import { channelsFromConfig, type TrustVerdict, type WorkerAdapter } from "../../src/adapters/types.js";
 import { BANNER, TOKENS } from "../../src/brand.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
+import { fleet } from "../../src/cli/commands/fleet.js";
+import { compile as compileCommand } from "../../src/cli/commands/compile.js";
+import { plan as planCommand } from "../../src/cli/commands/plan.js";
+import { run as runCommand } from "../../src/cli/commands/run.js";
 import { resume } from "../../src/cli/commands/resume.js";
 import { loadConfig } from "../../src/config/config.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import { route } from "../../src/route/router.js";
 import { gitHead } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
-import { makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
+import { authedModels, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 
 const {
   discoverChannels,
@@ -123,7 +127,7 @@ describe("V-10 fleet preference visibility (doctor)", () => {
     expect(out).toMatch(/^tickmarkr doctor — capability matrix:/);
     expect(out).not.toContain(retiredBanner);
     expect(out).toContain("pi:zai/glm-5.2");
-    expect(out).toMatch(/! routing preference active: 1 channel\(s\) excluded/);
+    expect(out).toMatch(/! routing preference active: 3 channel\(s\) excluded/);
     expect(out).toMatch(/deny: pi/);
   });
 
@@ -150,7 +154,7 @@ describe("HYG-07(a) servable attribution in doctor", () => {
     const adapters = ["claude-code", "codex", "cursor-agent", "opencode"].map(stub)
       .concat([stubServable("pi", ["zai/glm-5.2"])]);
     const out = await doctor(["--"], repo, adapters);
-    expect(out).toMatch(/servability: 1 channel\(s\) unservable/);
+    expect(out).toMatch(/servability: 3 channel\(s\) unservable/);
     expect(out).toContain("pi:anthropic/claude-opus-4-5");
     expect(out).toContain("not in pi's served model list");
   });
@@ -266,11 +270,11 @@ describe("model status table (T4)", () => {
     withOverlay(repo, fakeTiers);
 
     // fake-2 is unclassified and uncovered (no catalog cache) — a no-decision row, collapsed by default
-    const collapsed = await doctor(["--"], repo, [mkFake(script)]);
+    const collapsed = await doctor(["--"], repo, [mkFake(script)], { catalog: readCachedCatalog(repo) });
     expect(collapsed).toMatch(/catalog · 1 uncovered by vendored catalog — tickmarkr doctor --models lists each/);
     expect(collapsed).not.toMatch(/catalog · fake-2/);
 
-    const listed = await doctor(["--models"], repo, [mkFake(script)]);
+    const listed = await doctor(["--models"], repo, [mkFake(script)], { catalog: readCachedCatalog(repo) });
     expect(listed).toMatch(/catalog · fake-2 — uncovered by vendored catalog; no tier suggestion/);
     expect(listed).not.toMatch(/lists each/);
   });
@@ -831,6 +835,104 @@ describe("T7 deny∩prefer static preflight (doctor + resume)", () => {
     expect(events.some((e) => e.event === "run-resume")).toBe(false);
     expect(events.filter((e) => e.event === "task-dispatch")).toHaveLength(1);
   });
+});
+
+test("test: doctor and fleet against a catalog cache older than seven days invoke the keyless models.dev and LiveBench legs with a ten-second timeout and print one reason line when a leg fails while the same commands against a fresh cache and plan compile and run against the stale one invoke no fetch and the AA leg is invoked only with a key whereas a doctor that refreshes with a key alone or a plan that fetches fails", async () => {
+  const cache = (repo: string, fetchedAt: string) => {
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+      schemaVersion: 1,
+      fetchedAt,
+      modelsDev: { anthropic: { id: "anthropic", models: { seed: { id: "seed", cost: { input: 1, output: 2 } } } } },
+    }));
+  };
+  const response = (body: unknown, status = 200) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+    text: async () => String(body),
+  });
+  const routes = (failLiveBench = false) => vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith(MODELS_DEV_CATALOG_URL)) return response({ anthropic: { id: "anthropic", models: { fresh: { id: "fresh", cost: { input: 1, output: 2 } } } } });
+    if (url.startsWith(LIVEBENCH_TABLE_URL)) return failLiveBench
+      ? response("", 500)
+      : response("model,javascript,typescript,python,code_generation,code_completion\nfresh,1,2,3,4,5\n");
+    if (url.startsWith(LIVEBENCH_CATEGORIES_URL)) return response({ "Agentic Coding": ["javascript", "typescript", "python"], Coding: ["code_generation", "code_completion"] });
+    if (url.startsWith(ARTIFICIAL_ANALYSIS_CATALOG_URL)) return response({ pagination: { has_more: false }, data: [] });
+    throw new Error(`unexpected ${url}`);
+  });
+  const now = () => new Date("2026-09-20T00:00:00.000Z");
+  const staleAt = "2026-09-01T00:00:00.000Z";
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+
+  const doctorRepo = makeRepo({ "keep.txt": "x" });
+  cache(doctorRepo, staleAt);
+  const doctorFetch = routes(true);
+  const doctorOut = await doctor(["--"], doctorRepo, [stub("probe")], { banner: false, catalogNow: now, catalogFetcher: doctorFetch });
+  const doctorUrls = doctorFetch.mock.calls.map(([url]) => String(url));
+  expect(doctorUrls).toEqual([MODELS_DEV_CATALOG_URL, LIVEBENCH_TABLE_URL]);
+  expect(doctorOut.split("\n").filter((line) => line.includes("catalog auto-refresh failed open"))).toHaveLength(1);
+  expect(doctorOut).toContain("LiveBench HTTP 500");
+  expect(CATALOG_REFRESH_TIMEOUT_MS).toBe(10_000);
+  expect(doctorFetch.mock.calls.every(([, init]) => (init as RequestInit).signal instanceof AbortSignal)).toBe(true);
+
+  const fleetRepo = makeRepo({ "keep.txt": "x" });
+  cache(fleetRepo, staleAt);
+  const fleetFetch = routes(true);
+  const fleetOut = await fleet(["--print"], fleetRepo, [], { catalogFetcher: fleetFetch, catalogNow: now });
+  expect(fleetFetch.mock.calls.map(([url]) => String(url))).toEqual([
+    MODELS_DEV_CATALOG_URL,
+    LIVEBENCH_TABLE_URL,
+  ]);
+  expect(fleetOut.split("\n").filter((line) => line.includes("fleet: catalog auto-refresh failed open"))).toEqual([
+    "# fleet: catalog auto-refresh failed open — LiveBench refresh failed: LiveBench HTTP 500; retained cache catalog",
+  ]);
+  expect(fleetFetch.mock.calls.some(([url]) => String(url).startsWith(ARTIFICIAL_ANALYSIS_CATALOG_URL))).toBe(false);
+
+  const keyedRepo = makeRepo({ "keep.txt": "x" });
+  cache(keyedRepo, staleAt);
+  const keyedFetch = routes();
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "key");
+  await doctor(["--"], keyedRepo, [stub("probe")], { banner: false, catalogNow: now, catalogFetcher: keyedFetch });
+  expect(keyedFetch.mock.calls.some(([url]) => String(url).startsWith(ARTIFICIAL_ANALYSIS_CATALOG_URL))).toBe(true);
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+
+  const freshRepo = makeRepo({
+    "tickmarkr.spec.md": "<!-- tickmarkr:spec -->\n## T1: no fetch\n- acceptance:\n  - command: true\n",
+  });
+  cache(freshRepo, "2026-09-19T00:00:00.000Z");
+  const noFetch = routes();
+  await doctor(["--"], freshRepo, [stub("probe")], { banner: false, catalogNow: now, catalogFetcher: noFetch });
+  expect(noFetch).not.toHaveBeenCalled();
+  await fleet(["--print"], freshRepo, [], { catalogFetcher: noFetch, catalogNow: now });
+  expect(noFetch).not.toHaveBeenCalled();
+
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+  cache(freshRepo, staleAt);
+  const globalFetch = vi.fn(async () => { throw new Error("catalog fetch forbidden"); });
+  vi.stubGlobal("fetch", globalFetch);
+  await compileCommand(["tickmarkr.spec.md"], freshRepo, undefined);
+  await expect(planCommand([], freshRepo, [], undefined)).resolves.toBeTypeOf("string");
+  const { repo: runRepo, scriptPath } = setupRepo([T("T1")], {
+    tasks: {
+      T1: [{
+        shell: "printf run > run.txt && git add run.txt && git commit --no-gpg-sign -m run",
+        result: { ok: true, summary: "run" },
+      }],
+    },
+  });
+  cache(runRepo, staleAt);
+  registry.writeDoctor(runRepo, {
+    fake: { installed: true, authed: true, models: [], modelAuth: authedModels(["fake-1", "fake-2"]) },
+  });
+  process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+  try {
+    await expect(runCommand(["--driver", "subprocess"], runRepo)).resolves.toMatchObject({ code: 0 });
+  } finally {
+    delete process.env.TICKMARKR_FAKE_SCRIPT;
+  }
+  expect(globalFetch).not.toHaveBeenCalled();
 });
 
 describe("§4.4 LiveBench table staleness lint", () => {

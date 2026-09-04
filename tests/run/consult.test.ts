@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import { shq, type WorkerAdapter } from "../../src/adapters/types.js";
+import { channelKey, shq, type BillingChannel, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, type TickmarkrConfig } from "../../src/config/config.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
@@ -12,6 +12,8 @@ import { buildDossierPrompt, consult, augmentRetryBrief, renderRetryGuidance, ty
 import { extractPromptNonce, extractVerdictJson, gateExitTrailer, gatePaneName } from "../../src/gates/llm.js";
 import { bannerShell } from "../../src/brand.js";
 import { sh } from "../../src/run/git.js";
+import { validateGraph } from "../../src/graph/schema.js";
+import { nextChannel } from "../../src/route/router.js";
 
 vi.mock("../../src/run/git.js", async (importOriginal) => {
   const actual = await importOriginal<{ sh: typeof sh }>();
@@ -195,6 +197,38 @@ describe("consult", () => {
       notes: "trust dialog blocks the CLI",
       excludeAdapter: "cursor-agent",
     });
+  });
+
+  test("test: a stall-consult exclusion of adapter pi whose model resolves to provider openai reroutes to a channel of a different provider skipping codex and omp channels fronting openai and the reroute row names the excluded provider whereas a reroute that lands on omp openai-codex after excluding pi fails", async () => {
+    const { cfg, fake, runDir } = setup({
+      action: "reroute", notes: "all frontends returned 404", excludeAdapter: "pi",
+    });
+    const current = { adapter: "pi", model: "openai-codex/gpt-5.5", channel: "sub" as const, tier: "mid" as const };
+    const stallDossier: Dossier = {
+      ...dossier,
+      trigger: "stall",
+      journalTail: JSON.stringify([{ event: "task-dispatch", data: { assignment: current } }]),
+    };
+    const verdict = await consult(stallDossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
+    expect(verdict).toMatchObject({ excludeAdapter: "pi", excludeProvider: "openai" });
+    expect(verdict.notes).toContain("excluded provider openai");
+
+    const channels: BillingChannel[] = [
+      { ...current, vendor: "mixed" },
+      { adapter: "pi", vendor: "zhipu", model: "zai/glm-5.3", channel: "sub", tier: "mid" },
+      { adapter: "codex", vendor: "openai", model: "gpt-5.5", channel: "sub", tier: "mid" },
+      { adapter: "omp", vendor: "mixed", model: "openai-codex/gpt-5.6-sol", channel: "sub", tier: "mid" },
+      { adapter: "qwen", vendor: "alibaba", model: "qwen3.8-max", channel: "sub", tier: "mid" },
+    ];
+    const task = validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 5, acceptance: ["a"] }],
+    }).tasks[0];
+    const tried = channels.filter((channel) => channel.adapter === verdict.excludeAdapter).map(channelKey);
+    const next = nextChannel(current, task, cfg, channels, tried);
+    expect(next).toMatchObject({ adapter: "qwen", model: "qwen3.8-max" });
+    expect(next?.adapter).not.toBe("codex");
+    expect(next?.adapter).not.toBe("omp");
   });
 
   test("v1.24: malformed excludeAdapter degrades to channel-level reroute (never crash, never human)", async () => {

@@ -76,10 +76,19 @@ export interface BaselineWarning {
 // codes that varied between baseline and worktree runs, was reported as a "new failure". Strip ANSI first;
 // a pass-marker line is never a failure. [\d;#] covers raw ANSI and digit-normalized ANSI ("\x1b[#m") from
 // baselines stored by pre-hardening code.
-const ANSI_RE = /\x1b\[[\d;#]*[A-Za-z]/g;
+// OBS-891 (run 3372): vitest toggles the cursor (`\x1b[?25l` / `\x1b[?25h`) around its progress
+// output, and the private-mode parameter byte `?` never matched [\d;#], so an echo-block HEADER glued
+// to a cursor-show sequence stayed invisible to withoutVitestEchoBlocks and its whole block leaked as
+// runner evidence — seven prose-only "infra" parks in one night. Full CSI grammar: parameter bytes
+// 0x30–0x3F (plus `#` for digit-normalized stored baselines), intermediates 0x20–0x2F, final 0x40–0x7E.
+const ANSI_RE = /\x1b\[[0-?#]*[ -\/]*[@-~]/g;
 // ponytail: only leading ✓/✔ after optional "label:" prefixes (turbo/vitest), or tickmarkr's own run
 // summary, counts as a pass line — other runners' pass markers (PASS, ok) stay fingerprintable
 const PASS_LINE_RE = /^\s*(?:(?:[\w@./-]+:\s*)*[✓✔]|(?:\[tickmarkr\]\s+)?(?:tickmarkr\s+[\w.-]+:\s+)?(?:\d+|#)\s+done,\s+(?:\d+|#)\s+failed(?:,\s+(?:\d+|#)\s+awaiting human)?\b)/;
+// OBS-888: tickmarkr's own operator lines (`tickmarkr: baseline capture for "test" … spawn EAGAIN`)
+// are printed by this product, never by a runner about the work. When this repository's tests exercise
+// the capture path they print them too, carrying errno tokens INFRA_RE would read as host evidence.
+const OPERATOR_LINE_RE = /^\s*tickmarkr: /;
 // HYG-08 (D-01, incident run-20260711-154920): a failing test went unnamed for 3 attempts because details
 // headlined benign fingerprint-diff noise. These anchors harvest the runner's OWN failure naming from fresh
 // output to headline it. \s is fine in a TS regex — the BSD [[:space:]] rule binds shell grep only.
@@ -225,7 +234,10 @@ export type FailureClassification = "regression" | "infra";
  * unreadable-runner case the existing fail-closed path already owns.
  */
 export function classifyFailureOutput(output: string): FailureClassification | undefined {
-  const lines = output.split("\n").map((l) => l.replace(ANSI_RE, "")).filter((l) => !PASS_LINE_RE.test(l));
+  // OBS-891: the gate reads the WHOLE output here when the fresh-fingerprint diff is empty, so an errno
+  // token inside a test's echoed stdout/stderr block must be as invisible to this classifier as it is
+  // to fingerprint(): test-owned output is never runner evidence about the work.
+  const lines = withoutVitestEchoBlocks(output).map((l) => l.replace(ANSI_RE, "")).filter((l) => !PASS_LINE_RE.test(l) && !OPERATOR_LINE_RE.test(l));
   if (lines.some(namesRegression)) return "regression";
   return lines.some(isInfraLine) ? "infra" : undefined;
 }
@@ -237,7 +249,11 @@ export function classifyFailureOutput(output: string): FailureClassification | u
  * no failure in that incomplete environment can safely become pre-existing forgiveness. Keep this
  * separate from `classifyFailureOutput` so changing capture policy cannot move gate verdicts.
  */
-const VITEST_ECHO_BLOCK_RE = /^\s*std(?:out|err)\s+\|\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\s+>\s+\S/;
+// OBS-888 row 1: vitest 3.2.7 heads an echo block `std{out,err} | <file> > <test>` when the log is
+// attributed to a test, `stderr | unknown test` when it is not, `stderr | <file>` for file-level output
+// and `stderr | <task id>` (digits and underscores) when the reporter no longer knows the task
+// (dist/chunks/index.*.js, `headerText`). The stripper knew only the first form.
+const VITEST_ECHO_BLOCK_RE = /^\s*std(?:out|err)\s+\|\s+(?:unknown test\s*$|\d+_[\d_]+\s*$|\S+\.(?:test|spec)\.[cm]?[jt]sx?(?:\s*$|\s+>\s+\S))/;
 
 /** Keep runner output while omitting Vitest's echoed test-owned stdout/stderr diagnostic blocks. */
 const withoutVitestEchoBlocks = (output: string): string[] => {
@@ -263,7 +279,7 @@ const captureInvalidatingLines = (output: string): string[] => {
   const invalidating: string[] = [];
   for (const line of withoutVitestEchoBlocks(output)) {
     const clean = line.replace(ANSI_RE, "");
-    if (!PASS_LINE_RE.test(clean) && CAPTURE_EXHAUSTION_RE.test(clean)) invalidating.push(line);
+    if (!PASS_LINE_RE.test(clean) && !OPERATOR_LINE_RE.test(clean) && CAPTURE_EXHAUSTION_RE.test(clean)) invalidating.push(line);
   }
   return invalidating;
 };
@@ -309,15 +325,16 @@ export const UNRECOGNIZED_FAILURE = "<unrecognized failure output>";
 export function fingerprint(output: string): string[] {
   const lines = withoutVitestEchoBlocks(output)
     .map((l) => l.replace(ANSI_RE, ""))
-    .filter((l) => !PASS_LINE_RE.test(l));
+    .filter((l) => !PASS_LINE_RE.test(l) && !OPERATOR_LINE_RE.test(l));
   // GATE-FIX-4 DEFECT 4: every line is read twice — as printed, and with a turbo `<pkg>:<task>:`
   // prefix removed. A recognized stripped line fingerprints as its STRIPPED text, so the same
   // failure fingerprints identically whether turbo prefixed it or a bare runner printed it; the
   // prefixed form keeps fingerprinting too (baseline-recorded package-level reds stay forgivable).
   const shaped: string[] = [];
   for (const l of lines) {
-    if (isFingerprintShaped(l)) shaped.push(l);
     const stripped = stripTurboPrefix(l);
+    if (stripped !== undefined && OPERATOR_LINE_RE.test(stripped)) continue; // OBS-888: operator prose under a turbo prefix
+    if (isFingerprintShaped(l)) shaped.push(l);
     if (stripped !== undefined && !PASS_LINE_RE.test(stripped) && isFingerprintShaped(stripped)) shaped.push(stripped);
   }
   if (!shaped.length) return lines.some((l) => l.trim()) ? [UNRECOGNIZED_FAILURE] : [];
@@ -685,7 +702,8 @@ export async function compareToBaseline(
     // result rather than re-derived after the fact. The skip row above ran no command and therefore
     // states no capacity — a row that never divided the machine must not claim that it did.
     const record = (g: GateResult): void => {
-      results.push(r.capacity ? { ...g, capacity: r.capacity } : g);
+      const withReap = r.reapedGroup ? { ...g, meta: { ...g.meta, reapedGroup: true } } : g;
+      results.push(r.capacity ? { ...withReap, capacity: r.capacity } : withReap);
     };
     // …and whether the entry that would forgive this command was measured in the same world. A
     // baseline captured under a different fork cap forgives nothing: its fingerprints describe a

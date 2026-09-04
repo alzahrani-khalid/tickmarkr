@@ -31,7 +31,7 @@ const owned = (role: OwnedName["role"], taskId: string, attempt: number, runId: 
 // ---- herdr stub: agent list / pane list backed by files so pane close is observable ------------
 interface StubAgent { name?: string; pane_id: string; tab_id: string; workspace_id: string }
 
-function makeReconcileStub(agents: StubAgent[], opts: { listFails?: boolean; listGarbage?: boolean } = {}) {
+function makeReconcileStub(agents: StubAgent[], opts: { listFails?: boolean; listGarbage?: boolean; tabGone?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reconcile-"));
   const log = join(dir, "log.txt");
   // herdr 0.7.5: reconcile reads ownership off `pane list` labels (not `agent list`). The registry
@@ -60,6 +60,7 @@ case "$1 $2" in
   "pane wait-output") exit 0 ;;
   "agent wait") exit 0 ;;
   "pane read") printf 'line1\\nTICKMARKR_EXIT:0\\n' ;;
+  "tab close") ${opts.tabGone ? "echo 'tab_not_found' >&2; exit 1" : "echo '{}'"} ;;
   *) echo '{}' ;;
 esac
 `,
@@ -132,6 +133,22 @@ describe("HerdrDriver.reconcile (stubbed binary)", () => {
     await d.reconcile(new Set([owned("worker", "T2", 1, RUN)]), RUN);
     expect(log()).toContain("pane close w1:p5");
     expect(log()).toContain("tab close w1:t4");
+  });
+
+  test("a tab already gone at reconcile close is journaled as a successful skip", async () => {
+    const runId = "run-tab-gone";
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const { bin } = makeReconcileStub([
+      { name: owned("worker", "T1", 0, runId), pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "wT" },
+    ], { tabGone: true });
+    const d = new HerdrDriver(bin);
+    await d.worktree(repo, `test/${runId}`, await gitHead(repo)); // binds the driver's journal root
+    Journal.create(repo, runId).append("run-start", undefined, {});
+    await d.reconcile(new Set(), runId);
+    const skipped = Journal.open(repo, runId).read().filter((e) => e.event === "tab-reconcile-close-skipped");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.data).toMatchObject({ tabId: "w1:t1", exitCode: 0, reason: "tab_not_found" });
+    expect(Journal.open(repo, runId).read().some((e) => e.event === "tab-reconcile-close-failed")).toBe(false);
   });
 
   test("never throws: herdr gone (agent list fails) and garbage listings both resolve quietly", async () => {
@@ -357,6 +374,12 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
     const { repo, fake } = setupRepo(cfg.tasks, cfg.script, cfg.extraCfg);
     cfg.patchFake?.(fake);
     const world = paneWorld(cfg.seed ?? [], { capWaitMs: 3_000 });
+    world.driver.narrator = async (cwd, _command, id) => {
+      const name = owned("watch", "run", 0, id!);
+      world.live.add(name);
+      world.ops.push({ kind: "slot", name });
+      return { id: name, name, cwd };
+    };
     const lockPath = join(tickmarkrDir(repo), "graph.lock");
     const before = process.listeners("SIGTERM");
     let fired: FiredState | undefined;
@@ -376,6 +399,7 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
     expect(handler, "daemon registered its SIGTERM handler").toBeDefined();
     handler!("SIGTERM");
     await expect(run).rejects.toThrow(/terminated by SIGTERM/);
+    while (!fired && timing.now() <= deadline) await timing.yield();
     expect(fired, "the reaper called exit").toBeDefined();
     return { repo, ...world, fired: fired!, lockHeldBeforeSignal };
   }
@@ -429,11 +453,11 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
     expect(fired.code).toBe(143); // 128 + SIGTERM
   });
 
-  test("a termination signal closes kept gate slots", async () => {
+  test("test: a termination signal closes every open worker slot every kept gate slot and the run's own board before the injected exit fires with code 143 and no task-dispatch row follows the exit-cause row while under keepPanes forever the board survives whereas the shipped reaper that leaves the board open or dispatches an attempt after exit-cause fails", async () => {
     const runId = "run-sig-gates";
     const workerPane = owned("worker", "T1", 0, runId);
     const judgePane = owned("judge", "T1", 0, runId);
-    const { fired, ops } = await terminate({
+    const { fired, ops, repo } = await terminate({
       runId,
       tasks: [T("T1")],
       script: { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
@@ -446,9 +470,26 @@ describe("daemon signal reaper (fake adapter, zero tokens)", () => {
       },
       fireWhen: ({ live }) => live.has(judgePane),
     });
+    const board = owned("watch", "run", 0, runId);
     expect(fired.liveAtExit).not.toContain(judgePane); // the live gate slot closed
     expect(fired.liveAtExit).not.toContain(workerPane); // the kept worker slot closed too
+    expect(fired.liveAtExit).not.toContain(board); // the board is a tracked daemon slot too
+    expect(fired.code).toBe(143);
     expect(ops.some((o) => o.kind === "close" && o.name === judgePane)).toBe(true);
+    const events = Journal.open(repo, runId).read();
+    const exitCause = events.findIndex((e) => e.event === "exit-cause");
+    expect(exitCause).toBeGreaterThanOrEqual(0);
+    expect(events.slice(exitCause + 1).some((e) => e.event === "task-dispatch")).toBe(false);
+
+    const foreverId = "run-sig-board-forever";
+    const forever = await terminate({
+      runId: foreverId,
+      tasks: [T("T1")],
+      script: { tasks: { T1: [HANG] } },
+      extraCfg: "visibility:\n  keepPanes: forever\n",
+      fireWhen: ({ live }) => live.has(owned("worker", "T1", 0, foreverId)),
+    });
+    expect(forever.fired.liveAtExit).toContain(owned("watch", "run", 0, foreverId));
   });
 
   test("the signal handler reconciles panes against an empty desired set", async () => {

@@ -8,7 +8,7 @@ import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { dewrapPaneVerdict, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
-import { disallowedBy } from "../route/preference.js";
+import { disallowedBy, routingModelProvider } from "../route/preference.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
 import { filterLlmTranscript } from "./stall.js";
@@ -19,10 +19,10 @@ export interface ConsultVerdict {
   // OBS-37a: structured retry guidance — rendered as bullets in worker prompts, never quoted prose.
   reason?: string;
   guidance?: string;
-  // OBS-20: optional adapter-scoped ban on reroute for environmental CLI failures
-  // ("the CLI is blocked"), not model-quality misses. Daemon expands the task tried-list
-  // with every channel of this adapter before nextChannel — never a router change (D-03).
+  // OBS-20/873: the consult names the failed adapter; routing resolves its current model to the
+  // provider and excludes that backend across adapter aliases, not model-quality misses.
   excludeAdapter?: string;
+  excludeProvider?: string;
   adapter?: string;
   model?: string;
   vendor?: string;
@@ -96,6 +96,22 @@ export interface Dossier {
 
 const ACTIONS = ["retry", "reroute", "decompose", "human"] as const;
 
+function excludedProviderFromDossier(d: Dossier, adapter: string): string | undefined {
+  try {
+    const events = JSON.parse(d.journalTail) as Array<{ event?: unknown; data?: { assignment?: { adapter?: unknown; model?: unknown } } }>;
+    const assignment = [...events].reverse().find((event) =>
+      event.event === "task-dispatch"
+      && event.data?.assignment?.adapter === adapter
+      && typeof event.data.assignment.model === "string")?.data?.assignment;
+    if (typeof assignment?.model !== "string") return undefined;
+    const provider = routingModelProvider(assignment.model);
+    return provider === "unknown" ? undefined : provider;
+  } catch {
+    // Legacy/non-JSON dossier tails retain the adapter exclusion without inventing a provider.
+    return undefined;
+  }
+}
+
 export interface ConsultParseResult {
   verdict: ConsultVerdict | null;
   cause?: VerdictUnparseableCause;
@@ -151,10 +167,10 @@ ${d.journalTail}
 Verdict meanings: retry = same assignment with your notes as feedback; reroute = different CLI/model;
 decompose = task too big, needs human re-planning; human = a person must look at this.
 
-On reroute only, optional excludeAdapter is an adapter id (e.g. "cursor-agent") that bans EVERY
-channel of that adapter for this task. Use it for environmental failures ("the CLI is blocked",
-trust dialog, broken install) — not when a single model produced bad code. Omit for model-level
-reroutes so other models of the same adapter remain eligible.
+On reroute only, optional excludeAdapter is the failed adapter id (e.g. "cursor-agent"). Tickmarkr
+resolves the adapter's current model to its provider and bans that provider for this task. Use it for
+environmental/provider failures ("the CLI is blocked", trust dialog, broken install) — not when a
+single model produced bad code. Omit for model-level reroutes so other models remain eligible.
 
 ${verdictNonceLine(nonce)}
 
@@ -279,7 +295,19 @@ export async function consult(
   for (const [i, seat] of allowedSeats.entries()) {
     try {
       const parsed = await invokeSeat(seat.adapter, seat.model, i);
-      if (parsed.verdict) return { ...parsed.verdict, ...seatIdentity(seat) };
+      if (parsed.verdict) {
+        const excludeProvider = parsed.verdict.excludeAdapter
+          ? excludedProviderFromDossier(d, parsed.verdict.excludeAdapter)
+          : undefined;
+        return {
+          ...parsed.verdict,
+          ...(excludeProvider ? {
+            excludeProvider,
+            notes: `${parsed.verdict.notes} — excluded provider ${excludeProvider}`,
+          } : {}),
+          ...seatIdentity(seat),
+        };
+      }
     } catch {
       // failed seat (unknown adapter, dead driver/pane, shell error) — fall to the next entry
     }

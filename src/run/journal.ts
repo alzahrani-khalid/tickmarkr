@@ -6,6 +6,7 @@ import { channelKey, shq, TokenUsageSchema, type Assignment } from "../adapters/
 import type { TickmarkrConfig } from "../config/config.js";
 import { stateDirName, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, TIERS, type GateName, type Task, type TaskStatus } from "../graph/schema.js";
+import { channelRouteIdentity } from "../route/preference.js";
 import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
 import {
   DecisionEventSchema,
@@ -845,7 +846,9 @@ export function activeRetryBan(events: JournalEvent[], taskId: string, channel: 
     else if (e.event === DECISION_SPENT
       || (e.event === "task-approved" && e.data.release === RECHECK_RELEASE)) pending = undefined;
   }
-  return pending && pending.data.channel === channel && typeof pending.data.gate === "string"
+  return pending && typeof pending.data.channel === "string"
+    && channelRouteIdentity(pending.data.channel) === channelRouteIdentity(channel)
+    && typeof pending.data.gate === "string"
     ? pending.data.gate
     : undefined;
 }

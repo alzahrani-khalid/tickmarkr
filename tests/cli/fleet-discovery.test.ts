@@ -8,7 +8,8 @@ import { parse } from "yaml";
 import { fleetUnclassifiedModels, modelLints, suggestOverlay } from "../../src/adapters/model-lints.js";
 import * as registry from "../../src/adapters/registry.js";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../src/adapters/types.js";
-import { fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { readCachedCatalog } from "../../src/adapters/catalog-remote.js";
 import {
   DEFAULT_CONFIG,
   TierEntrySchema,
@@ -49,6 +50,13 @@ const editable = (over: Partial<FleetEditable> = {}): FleetEditable => ({
   map: {},
   floors: {},
   ...over,
+});
+
+const installed = (models: string[], modelsDetectedAt?: string): AuthHealth => ({
+  installed: true,
+  authed: true,
+  models,
+  ...(modelsDetectedAt ? { modelsDetectedAt } : {}),
 });
 
 const declaredAdapter = (id = "nova"): WorkerAdapter => ({
@@ -234,6 +242,114 @@ test("test: an installed adapter with detected models and no tiers block contrib
     "nova: reports 2 model(s) not in tiers (nova-1, nova-2) — classify before routing (benchmark policy)",
   );
   expect(suggestOverlay(cfg, health, [adapter])).toContain("# nova-1: ???");
+});
+
+test("test: a cursor-agent list carrying claude-fable-5-1 only as low medium high xhigh and max variants yields one unclassified row naming the base with its variants and a classify of it writes claude-fable-5-1-max and says so while a base the CLI lists bare is written bare and two configured ids are never collapsed whereas a filter that drops every variant fails", async () => {
+  const variants = ["low", "medium", "high", "xhigh", "max"].map((effort) => `claude-fable-5-1-${effort}`);
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.tiers["cursor-agent"] = { vendor: "anthropic", channel: "sub", models: {} };
+  const adapter = declaredAdapter("cursor-agent");
+  const variantHealth = { "cursor-agent": installed(variants, "2026-09-03T12:00:00.000Z") };
+  const collapsed = fleetUnclassifiedModels(config, variantHealth, [adapter]);
+
+  expect(collapsed).toEqual([{
+    adapter: "cursor-agent",
+    model: "claude-fable-5-1",
+    detectedAt: "2026-09-03",
+    variants,
+    classifyModel: "claude-fable-5-1-max",
+  }]);
+  expect(variants.filter((model) => !/-(low|medium|high|xhigh|max)$/.test(model))).toEqual([]);
+
+  const classifiedVariant = await driveInk(
+    [{ adapter: "cursor-agent", vendor: "declared-vendor", channel: "sub", rows: collapsed }],
+    KEYS.t + KEYS.enter + KEYS.enter + "LiveBench max effort" + KEYS.enter + KEYS.w,
+  );
+  expect(stripAnsi(classifiedVariant.writes.join(""))).toContain("writes claude-fable-5-1-max");
+  expect(stripAnsi(classifiedVariant.writes.join(""))).not.toContain("cursor-agent/claude-fable-5-1-max");
+  expect(classifiedVariant.reviewed?.classifications[0].model).toBe("claude-fable-5-1-max");
+
+  const withBare = fleetUnclassifiedModels(config, {
+    "cursor-agent": installed([variants[0], "claude-fable-5-1", variants[4]], "2026-09-03T12:00:00.000Z"),
+  }, [adapter]);
+  expect(withBare).toEqual([{
+    adapter: "cursor-agent",
+    model: "claude-fable-5-1",
+    detectedAt: "2026-09-03",
+    variants: [variants[0], variants[4]],
+  }]);
+  const classifiedBare = await driveInk(
+    [{ adapter: "cursor-agent", vendor: "declared-vendor", channel: "sub", rows: withBare }],
+    KEYS.t + KEYS.enter + KEYS.enter + "LiveBench bare" + KEYS.enter + KEYS.w,
+  );
+  expect(classifiedBare.reviewed?.classifications[0].model).toBe("claude-fable-5-1");
+
+  const configured = await driveInk([{
+    adapter: "cursor-agent",
+    rows: [
+      { model: variants[0], tier: "cheap" },
+      { model: variants[4], tier: "frontier" },
+    ],
+  }], KEYS.q);
+  const configuredFrame = stripAnsi(configured.writes[0] ?? "");
+  expect(configuredFrame).toContain(variants[0]);
+  expect(configuredFrame).toContain(variants[4]);
+});
+
+test("test: three omp ids resolving to one models.dev model fold under the first-listed id with a times-three count and the hidden-count line names folds apart from retired hides while unclassified rows order by suggestion present then detectedAt then score then id whereas a screen that renders the sensor's raw order fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), `tiers:
+  omp:
+    vendor: anthropic
+    channel: api
+    models:
+      google/gemini-3.8-flash: null
+      zai/glm-5.3: null
+      alibaba/qwen3.8-max: null
+`);
+  const gatewayIds = ["gateway-z/same-model", "gateway-a/same-model", "gateway-m/same-model"];
+  registry.writeDoctor(repo, {
+    omp: installed(gatewayIds, "2026-09-03T12:00:00.000Z"),
+  });
+  writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+    schemaVersion: 1,
+    fetchedAt: "2026-09-03T00:00:00.000Z",
+    modelsDev: {
+      anthropic: {
+        id: "anthropic",
+        models: {
+          "same-model": { id: "same-model", cost: { input: 1, output: 4 }, limit: { context: 200_000 } },
+        },
+      },
+    },
+  }));
+  const assembled = await assembleFleetEditor(repo, [declaredAdapter("omp")], {}, {
+    globalDir: mkdtempSync(join(tmpdir(), "tickmarkr-fold-global-")),
+    catalog: readCachedCatalog(repo, { now: () => new Date("2026-09-03T12:00:00.000Z") }),
+  });
+  if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+  const folded = assembled.props.modelGroups[0].rows;
+  expect(folded).toHaveLength(1);
+  expect(folded[0]).toMatchObject({ model: gatewayIds[0], foldedModels: gatewayIds });
+
+  const screen = await driveInk([{
+    adapter: "omp",
+    rows: [
+      { model: "raw-first-no-suggestion", detectedAt: "2026-09-04", score: 999 },
+      { model: "z-score-low-newer", detectedAt: "2026-09-03", score: 10, suggestion: { tier: "mid", note: "new" }, foldedModels: gatewayIds },
+      { model: "a-score-high-older", detectedAt: "2026-09-02", score: 90, suggestion: { tier: "frontier", note: "high" } },
+      { model: "b-score-low-older", detectedAt: "2026-09-02", score: 20, suggestion: { tier: "cheap", note: "low" } },
+      { model: "retired-embedding", detectedAt: "2026-09-05" },
+    ],
+  }], KEYS.q);
+  const frame = stripAnsi(screen.writes[0] ?? "");
+  expect(frame.indexOf("z-score-low-newer")).toBeLessThan(frame.indexOf("a-score-high-older"));
+  expect(frame.indexOf("a-score-high-older")).toBeLessThan(frame.indexOf("b-score-low-older"));
+  expect(frame.indexOf("b-score-low-older")).toBeLessThan(frame.indexOf("raw-first-no-suggestion"));
+  expect(frame).toContain("×3");
+  expect(frame).toContain("2 same-model gateway ids folded");
+  expect(frame).toContain("1 retired/preview/non-worker hidden");
 });
 
 test("test: the channel a first classification needs is asked rather than inferred, and no cost preview is computed from a channel the operator did not answer", async () => {

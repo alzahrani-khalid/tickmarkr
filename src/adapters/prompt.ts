@@ -25,6 +25,7 @@ ${task.files.length ? `\n## File scope — touch ONLY paths matching:\n${list(ta
 - Work only inside the current directory (your isolated worktree). Never push. Never switch branches.
 - Make small atomic git commits as you go (git add + git commit, conventional messages).
 - Touch ONLY paths matching the file scope. Out-of-scope edits FAIL the scope gate. The operator's allowlist is fixed when the run starts and nothing you do can change it while your work is judged; declaring a deviation never passes the gate either. If you cannot complete the task without an out-of-scope edit, stop and report ok:false explaining why in "summary". List any out-of-scope paths you did touch, each with a reason, in "deviations" (journaled for the operator's audit).
+- No background process may outlive the worker, and no suite may run beside another.
 - Do not ask questions; you are unattended. Make the smallest correct change.
 ${feedback ? `\n## Previous attempt failed gates — fix these specifically\n${feedback}\n` : ""}
 When finished, end your final message with exactly one line (no code fence):

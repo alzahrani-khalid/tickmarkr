@@ -86,7 +86,17 @@ export type FleetModelGroup = {
   channel?: "sub" | "api";
   // OBS-508: `suggestion` is catalog evidence (catalogModelAdvisory) — prefills the classify flow
   // and feeds the bulk `s` stage; tickmarkr still never WRITES a tier without the review diff.
-  rows: Array<{ model: string; tier?: Tier; detectedAt?: string; suggestion?: FleetModelSuggestion; evidence?: FleetModelEvidence }>;
+  rows: Array<{
+    model: string;
+    tier?: Tier;
+    detectedAt?: string;
+    suggestion?: FleetModelSuggestion;
+    evidence?: FleetModelEvidence;
+    classifyModel?: string;
+    variants?: string[];
+    foldedModels?: string[];
+    score?: number;
+  }>;
 };
 
 export type FleetClassification = {
@@ -145,6 +155,7 @@ type Overlay =
     kind: "classify";
     adapter: string;
     model: string;
+    displayModel?: string;
     vendor?: string;
     stage: "channel" | "tier" | "note";
     channelAt: number;
@@ -176,6 +187,10 @@ type ModelRow = {
   suggestion?: FleetModelSuggestion;
   evidence?: FleetModelEvidence;
   channel?: "sub" | "api";
+  classifyModel?: string;
+  variants?: string[];
+  foldedModels?: string[];
+  score?: number;
   denied: boolean;
 };
 
@@ -335,7 +350,8 @@ export function FleetApp({
   const groupRows = (group: FleetModelGroup): ModelRow[] => {
     const rows: ModelRow[] = group.rows.map((row) => {
       const staged = ui.classifications.find(
-        (classification) => classification.adapter === group.adapter && classification.model === row.model,
+        (classification) => classification.adapter === group.adapter
+          && (classification.model === row.model || classification.model === row.classifyModel),
       );
       return {
         adapter: group.adapter,
@@ -345,10 +361,14 @@ export function FleetApp({
         suggestion: row.suggestion,
         evidence: row.evidence,
         channel: group.channel,
+        classifyModel: row.classifyModel,
+        variants: row.variants,
+        foldedModels: row.foldedModels,
+        score: row.score,
         denied: ui.denyModels.has(`${group.adapter}:${row.model}`),
       };
     });
-    const known = new Set(rows.map((row) => row.model));
+    const known = new Set(rows.flatMap((row) => row.classifyModel ? [row.model, row.classifyModel] : [row.model]));
     for (const staged of ui.classifications) {
       if (staged.adapter === group.adapter && !known.has(staged.model)) {
         rows.push({
@@ -367,13 +387,24 @@ export function FleetApp({
 
   // Operator directive 2026-08-13: retired shapes (dated snapshots, previews, non-worker SKUs,
   // legacy families) hide by DEFAULT. `a` reveals them; a CLASSIFIED row is never hidden.
-  const modelRows = (f = ui.filter): ModelRow[] =>
-    scopedGroups().flatMap(groupRows).filter((row) =>
-      matches(`${row.adapter}/${row.model}`, f)
+  const modelRows = (f = ui.filter): ModelRow[] => {
+    const rows = scopedGroups().flatMap(groupRows).filter((row) =>
+      matches(`${row.adapter}/${row.model} ${(row.foldedModels ?? []).join(" ")}`, f)
       && (ui.showAll || row.tier !== undefined || retiredModelReason(row.model) === null));
+    const classified = rows.filter((row) => row.tier !== undefined);
+    const unclassified = rows.filter((row) => row.tier === undefined).sort((a, b) =>
+      Number(!!b.suggestion) - Number(!!a.suggestion)
+        || (b.detectedAt ?? "").localeCompare(a.detectedAt ?? "")
+        || (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY)
+        || `${a.adapter}/${a.model}`.localeCompare(`${b.adapter}/${b.model}`));
+    return [...classified, ...unclassified];
+  };
   const hiddenModelCount = (f = ui.filter) =>
-    scopedGroups().flatMap(groupRows).filter((row) => matches(`${row.adapter}/${row.model}`, f)).length
+    scopedGroups().flatMap(groupRows)
+      .filter((row) => matches(`${row.adapter}/${row.model} ${(row.foldedModels ?? []).join(" ")}`, f)).length
     - modelRows(f).length;
+  const foldedModelCount = (f = ui.filter) => modelRows(f)
+    .reduce((count, row) => count + Math.max((row.foldedModels?.length ?? 1) - 1, 0), 0);
 
   /** rail counts mirror the list's retired-hide (never the text filter) so numbers agree on screen */
   const visibleCount = (scope: number) => {
@@ -489,14 +520,17 @@ export function FleetApp({
     if (!group) return;
     // OBS-508: catalog evidence prefills the flow — the tier cursor lands on the suggested band and
     // (when the operator keeps that band) the provenance note arrives pre-typed. Free to override.
-    const suggestion = group.rows.find((row) => row.model === model)?.suggestion ?? null;
+    const source = group.rows.find((row) => row.model === model);
+    const suggestion = source?.suggestion ?? null;
+    const classifyModel = source?.classifyModel ?? model;
     const tierAt = suggestion ? Math.max(TIERS.indexOf(suggestion.tier), 0) : 0;
     const firstTouch = !group.rows.some((row) => row.tier !== undefined)
       && !ui.classifications.some((c) => c.adapter === adapter);
     const base = {
       kind: "classify" as const,
       adapter,
-      model,
+      model: classifyModel,
+      ...(classifyModel !== model ? { displayModel: model } : {}),
       channelAt: 0,
       tierAt,
       note: "",
@@ -1237,7 +1271,7 @@ export function FleetApp({
         const suggested = rows
           .filter((candidate): candidate is ModelRow & { suggestion: FleetModelSuggestion } =>
             candidate.adapter === group.adapter && !candidate.tier && candidate.suggestion !== undefined)
-          .map((candidate) => ({ model: candidate.model, suggestion: candidate.suggestion }));
+          .map((candidate) => ({ model: candidate.classifyModel ?? candidate.model, suggestion: candidate.suggestion }));
         if (!suggested.length) {
           ui.notice = "no catalog tier suggestions among the visible unclassified models — evidence comes from the cached catalogs (AA index / API pricing)";
           bump();
@@ -1372,6 +1406,9 @@ export function FleetApp({
     const parts = [
       `${row.adapter}:${row.model}`,
       row.tier ?? "unclassified",
+      row.variants?.length ? `variants ${row.variants.join(", ")}` : "",
+      row.classifyModel ? `classify writes ${row.classifyModel}` : "",
+      row.foldedModels?.length ? `${row.foldedModels.length} gateway ids folded: ${row.foldedModels.join(", ")}` : "",
       row.evidence?.unauthed !== undefined ? `UNAUTHED — ${row.evidence.unauthed}` : "",
       row.evidence?.contextWindow !== undefined ? `${fmtCtx(row.evidence.contextWindow)} ctx` : "",
       row.evidence?.outputWindow !== undefined ? `${fmtCtx(row.evidence.outputWindow)} out` : "",
@@ -1392,7 +1429,8 @@ export function FleetApp({
     const nameW = bodyW - 4 - 11 - 6 - (showPrice ? 12 : 0) - (showProbe ? 7 : 0);
     // OBS-531: deep router ids (omp/prime-agent) clip tail-preserving — the LAST segment is the
     // distinguishing half; end-clipping rendered ten identical "prime-agent/anthropic/claude-…" rows.
-    const name = clipPathTail(`${row.adapter}/${row.model}`, nameW);
+    const folded = row.foldedModels?.length ?? 1;
+    const name = clipPathTail(`${row.adapter}/${row.model}${folded > 1 ? ` ×${folded}` : ""}`, nameW);
     const prefixLen = Math.min(name.length, row.adapter.length + 1);
     return (
       <Text key={`${row.adapter}:${row.model}`} wrap="truncate">
@@ -1532,7 +1570,9 @@ export function FleetApp({
     if (overlay.kind === "classify") {
       const subject = overlay.bulk
         ? `${overlay.adapter} · ${overlay.bulk.rows.length} suggested models`
-        : `${overlay.adapter}:${overlay.model}`;
+        : overlay.displayModel
+          ? `${overlay.adapter}:${overlay.displayModel} · writes ${overlay.model}`
+          : `${overlay.adapter}:${overlay.model}`;
       return (
         <OverlayPanel title={`classify · ${subject}`} width={bodyW}>
           {overlay.stage === "channel" && (
@@ -1701,6 +1741,16 @@ export function FleetApp({
     );
   })();
 
+  const modelVisibilityLine = (): string => {
+    const hidden = hiddenModelCount();
+    const folded = foldedModelCount();
+    return [
+      ...(folded ? [`${folded} same-model gateway id${folded === 1 ? "" : "s"} folded`] : []),
+      ...(hidden ? [`${hidden} retired/preview/non-worker hidden — a shows all`] : []),
+      ...(ui.showAll ? ["showing retired models — a hides them again"] : []),
+    ].join(" · ");
+  };
+
   const listNode = (() => {
     if (overlayNode) return overlayNode;
     if (ui.view === "models") {
@@ -1717,6 +1767,7 @@ export function FleetApp({
             <Text dimColor>{`  ${rows.length}`}</Text>
           </Text>
           <SearchRow filter={ui.filter} active={ui.searching} hint="/ to search" />
+          {modelVisibilityLine() && <Text dimColor>{`  ${modelVisibilityLine()}`}</Text>}
           {scopeDenied && <Text color={INK.warn}>{`${modelGroups[ui.adapterAt]?.adapter} is out of the fleet — Space on its rail row adds it back`}</Text>}
           {above > 0 && <ElisionMark count={above} side="above" />}
           {visible.map((row, index) => renderModelRow(row, ui.focus === "list" && start + index === ui.listAt))}
@@ -1778,9 +1829,6 @@ export function FleetApp({
             : "unclassified — Space/Enter classifies; unclassified models are never routed");
         }
       }
-      const hidden = hiddenModelCount();
-      if (hidden > 0 && lines.length < 2) lines.push(`${hidden} retired/preview/non-worker hidden — a shows all`);
-      if (ui.showAll && lines.length < 2) lines.push("showing retired models — a hides them again");
       return lines;
     }
     if (ui.view === "shapes") {
