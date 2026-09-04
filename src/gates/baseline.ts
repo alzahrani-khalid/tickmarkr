@@ -81,7 +81,7 @@ export interface BaselineWarning {
 // to a cursor-show sequence stayed invisible to withoutVitestEchoBlocks and its whole block leaked as
 // runner evidence — seven prose-only "infra" parks in one night. Full CSI grammar: parameter bytes
 // 0x30–0x3F (plus `#` for digit-normalized stored baselines), intermediates 0x20–0x2F, final 0x40–0x7E.
-const ANSI_RE = /\x1b\[[0-?#]*[ -\/]*[@-~]/g;
+const ANSI_RE = /\x1b\[[0-?#]*[ -/]*[@-~]/g;
 // ponytail: only leading ✓/✔ after optional "label:" prefixes (turbo/vitest), or tickmarkr's own run
 // summary, counts as a pass line — other runners' pass markers (PASS, ok) stay fingerprintable
 const PASS_LINE_RE = /^\s*(?:(?:[\w@./-]+:\s*)*[✓✔]|(?:\[tickmarkr\]\s+)?(?:tickmarkr\s+[\w.-]+:\s+)?(?:\d+|#)\s+done,\s+(?:\d+|#)\s+failed(?:,\s+(?:\d+|#)\s+awaiting human)?\b)/;
