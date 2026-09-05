@@ -55,11 +55,18 @@ describe("real adapters", () => {
     // codex v0.144.1: --sandbox workspace-write replaces deprecated --full-auto
     const cxHeadless = codex.headlessCommand("/p", "gpt-5.2");
     expect(cxHeadless).toContain("--sandbox workspace-write");
-    // OBS-24/OBS-82: MCP suppressed in the argv-safe headless form — a down operator-global MCP
-    // server wedges codex startup. The unsupported TUI form falls back to this command in the daemon.
+    // OBS-24/OBS-82: MCP suppressed in BOTH forms — a down operator-global MCP server wedges codex
+    // startup. OBS-930: the interactive form is the real TUI again (the prompt as the last positional),
+    // carrying the same suppression, sandbox and hook trust as the headless form.
     expect(cxHeadless).toContain(`-c 'mcp_servers={}'`);
     expect(cxHeadless).toContain("--disable plugins");
-    expect(codex.interactiveCommand("/p", "gpt-5.2")).toBeNull();
+    const cxInteractive = codex.interactiveCommand("/p", "gpt-5.2") as string;
+    expect(cxInteractive).toMatch(/^codex -a never -s workspace-write --dangerously-bypass-hook-trust /);
+    expect(cxInteractive).toContain(`-c 'mcp_servers={}'`);
+    expect(cxInteractive).toContain("--disable plugins");
+    expect(cxInteractive).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
+    expect(cxInteractive).toMatch(/--model 'gpt-5.2' "\$\(cat '\/p'\)"$/);
+    expect(cxInteractive).not.toContain(" exec ");
     expect(cxHeadless).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     expect(cxHeadless).not.toContain("--full-auto");
     // OBS-125: codex 0.144.x per-worktree "Hooks need review" gate — bypass hook trust so the operator's
@@ -82,7 +89,7 @@ describe("real adapters", () => {
     }
   });
 
-  test("v1.2 interactive commands: supported real TUIs carry verified flags and codex declares fallback", () => {
+  test("v1.2 interactive commands: supported real TUIs carry verified flags and only the seed-launched adapter still declares fallback", () => {
     const c = claudeCode.interactiveCommand("/tmp/p.md", "fable") as string;
     expect(c).toContain(`"$(cat '/tmp/p.md')"`);
     expect(c).toContain("--model 'fable'");
@@ -98,10 +105,22 @@ describe("real adapters", () => {
     expect(cu).toContain("--force");
     expect(cu).not.toContain("--trust"); // print-only flag: interactive cursor exits 1 with it (v1.4 incident)
     expect(cu).not.toMatch(/\s-p\s|--print/);
-    // OBS-889: codex's TUI cannot read a prompt file or stdin. Null makes the daemon journal the
-    // visible worker's fallback before running the same argv-safe headless form in its pane.
-    expect(codex.interactiveCommand("/p", "gpt-5.2")).toBeNull();
+    // OBS-930: codex's TUI takes the prompt only as the [PROMPT] positional (`codex --help` 0.153.4 —
+    // no file/stdin form), so the launch inlines the file LAST, every flag value followed by a flag;
+    // `-a never` (--ask-for-approval) and `-s workspace-write` (--sandbox) verified on that help. The
+    // OBS-889 argv hazard is closed on the counter side (countLiveSuites reads four tokens), so the
+    // fallback-to-headless that 8428bd18 journaled is gone for codex.
+    const cx = codex.interactiveCommand("/p", "gpt-5.2") as string;
+    expect(cx).toMatch(/^codex -a never -s workspace-write /);
+    expect(cx).toContain("--dangerously-bypass-hook-trust");
+    expect(cx).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(cx).toContain("sandbox_workspace_write.writable_roots");
+    expect(cx).toMatch(/--model 'gpt-5.2' "\$\(cat '\/p'\)"$/);
+    expect(cx).not.toMatch(/\s-p\s|--print|\bexec\b/);
+    expect(cx.split(/\s+/, 4).join(" ")).toBe("codex -a never -s");
     expect(codex.headlessCommand("/p", "gpt-5.2")).toContain("sandbox_workspace_write.writable_roots");
+    // which real adapters still return null: exactly the one that launches then seeds (kimi, v1.69 T6)
+    expect(REAL.filter((ad) => ad.interactiveCommand("/p", "m") === null).map((ad) => ad.id)).toEqual(["kimi"]);
     const oc = opencode.interactiveCommand("/p", "m/k") as string;
     expect(oc).toMatch(/^opencode (?!run)/);
     expect(oc).toContain("--prompt");

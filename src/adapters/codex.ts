@@ -5,7 +5,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
 
 // SPEND-07: codex writes per-session JSONL to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — date-partitioned,
 // NOT cwd-keyed. session_meta.payload.cwd is FILE-SCOPED (one codex exec per cwd). token_count events carry
@@ -87,6 +87,56 @@ export const CODEX_TRUST_DIALOG: TrustDialog = {
   fingerprint: "Do you trust the contents of this directory?",
   key: "Enter",
 };
+
+// OBS-930 / OBS-136: the codex TUI's composer, CAPTURED (codex 0.153.4, herdr pane read, 2026-09-05
+// 15:48Z — tests/fixtures/codex-input-box, provenance in its README), never guessed:
+//     (background row)
+//     › Ask Codex to do anything        ← U+203A, ASCII space, then the DIM placeholder (empty) or the draft
+//     (background row)
+//     gpt-5.6-luna medium · /private/tmp/tkr-obs930-smoke   ← footer: <model> <effort> · <cwd>
+// Two facts a fingerprint alone would get wrong: (1) a submitted turn is echoed into the transcript
+// with the SAME caret (`› You are a smoke test.`), and so is the trust dialog's cursor (`› 1. Yes,
+// continue`) — only the composer is followed by the footer row, so the footer is the anchor, exactly
+// as claude's editor is anchored by its rules; (2) an EMPTY composer paints its placeholder as text,
+// so "empty" is a closed allowlist of captured placeholders (0.153.4 above; 0.144.5's
+// `Run /review on my current changes` from tests/fixtures/codex-mcp-spinner). An unknown placeholder
+// reads as occupied and a submit onto it fails closed by name (OBS-140) — a fixture-capture chore,
+// never a drive-by widening. `match` is THE COMPOSER IS PAINTED (true while empty, true mid-turn);
+// `emptyMatch` is painted AND carrying nothing — the only positive evidence a submit registered.
+const CODEX_ANSI_SGR_RE = /\u001B\[[0-9;]*m/g;
+const CODEX_CARET_RE = /^› /;
+const CODEX_PLACEHOLDER_RE = /^› (?:Ask Codex to do anything|Run \/review on my current changes)$/;
+const CODEX_FOOTER_RE = /^\S+(?: \S+)? · \S/;
+// A wrapped or multi-line draft grows the composer downward before the footer.
+// ponytail: a fixed window, not a parser — raise it if a real capture ever shows a taller composer.
+const CODEX_MAX_COMPOSER_ROWS = 8;
+
+function matchesCodexComposer(paneText: string, empty: boolean): boolean {
+  const lines = paneText.replace(CODEX_ANSI_SGR_RE, "").split("\n").map((l) => l.trim());
+  const caret = empty ? CODEX_PLACEHOLDER_RE : CODEX_CARET_RE;
+  return lines.some((line, i) => {
+    if (!caret.test(line)) return false;
+    for (let below = i + 1; below < lines.length && below <= i + CODEX_MAX_COMPOSER_ROWS; below++) {
+      if (CODEX_FOOTER_RE.test(lines[below]!)) return true;
+      // only the composer's own rows may sit between the caret row and the footer: the background
+      // rows (blank in a text read) and a draft's continuation rows — never another caret row
+      if (lines[below] !== "" && CODEX_CARET_RE.test(lines[below]!)) return false;
+    }
+    return false;
+  });
+}
+
+export const CODEX_INPUT_BOX = declareInputBox("codex", {
+  fingerprint: "› ",
+  match: (paneText: string) => matchesCodexComposer(paneText, false),
+  emptyMatch: (paneText: string) => matchesCodexComposer(paneText, true),
+  // As for claude (OBS-342): a fresh codex worker slot is a shell awaiting its launch line; every
+  // later delivery is a TUI turn awaiting this composer.
+  firstDeliveryIsLaunch: true,
+  // The 2026-09-05 capture painted the composer ~10 s after the trust answer with MCP suppressed;
+  // claude's bound, kept for the same cold-start reasons.
+  readinessTimeoutMs: 30_000,
+} as Parameters<typeof declareInputBox>[1] & { firstDeliveryIsLaunch: true });
 
 // v1.22 T5 / OBS-16: codex keys trust on absolute path under [projects."<root>"] trust_level="trusted"
 // in ~/.codex/config.toml (CODEX_HOME relocates the dir). Worktrees inherit parent-project trust when
@@ -181,15 +231,22 @@ export const codex: WorkerAdapter = {
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("codex", cfg),
   // v1.65 T3: every flag the command builder below hardcodes (incl. codexMcpSuppressionFlags' -c/
   // --disable and GITDIR_WRITABLE's -c) — all listed by top-level `codex --help`, verified 2026-07-22.
-  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "--model", "-c", "--disable", "--dangerously-bypass-hook-trust"] },
+  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "-a", "-s", "--model", "-c", "--disable", "--dangerously-bypass-hook-trust"] },
   // --sandbox workspace-write is the autonomous sandbox mode (codex v0.144.1+)
   // MCP suppression built per dispatch (config can change between runs) — see codexMcpSuppressionFlags.
   // CODEX_HOOK_TRUST (OBS-125) clears the per-worktree "Hooks need review" gate while keeping the sandbox.
   headlessCommand: (promptFile: string, model: string) =>
     `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} - < ${shq(promptFile)}`,
-  // OBS-889: Codex's TUI has no file/stdin prompt form. Returning null makes the daemon journal
-  // worker-mode-fallback before it runs the argv-safe headless command in the visible pane.
-  interactiveCommand: () => null,
+  // OBS-930: the visible pane runs the REAL TUI. Codex's TUI takes its prompt only as the [PROMPT]
+  // positional (`codex --help`, 0.153.4 — no file/stdin form), so the launch inlines the file exactly
+  // as the claude adapter does: the prompt is the LAST positional and every flag value is followed by
+  // a flag, never by the prompt. The argv hazard that once forbade this (OBS-889: `countLiveSuites`
+  // matched a suite word 140 KB into a finished worker's argv) is closed on the counter side — the
+  // census reads a command's first four tokens only — and those four never carry a suite word here.
+  // Same sandbox, hook trust and MCP suppression as the headless form; `-a never` is the TUI's
+  // autonomous approval policy (exec has no approvals to configure).
+  interactiveCommand: (promptFile: string, model: string) =>
+    `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },
@@ -198,6 +255,7 @@ export const codex: WorkerAdapter = {
   // "Do you trust this directory?" (OBS-16). doctor-only side effect.
   trust: (repoRoot: string) => seedCodexTrust(repoRoot),
   trustDialog: CODEX_TRUST_DIALOG,
+  inputBox: CODEX_INPUT_BOX,
   // v1.5 MODEL-01: file read only (no `codex models` subcommand exists, verified 2026-07-10).
   // Already fails OPEN to [] internally — advisory detection, unlike gates' fail-closed.
   listModels: async () => readCodexModelsCache().models,

@@ -21,8 +21,8 @@ Tickmarkr never calls a vendor HTTP API directly. It shells out to a locally ins
   - Interactive: `claude --model <model> --permission-mode acceptEdits "$(cat <prompt>)"`
   - Also the default adapter for `plan`/`spec` shape tasks, the acceptance judge, and the stall-consult role (`src/config/config.ts:218-219,320-322`)
 - **codex** (`codex` binary) - vendor `openai` - `src/adapters/codex.ts`
-  - Headless: `codex exec --sandbox workspace-write --model <model> "$(cat <prompt>)"`
-  - Interactive: `codex -a never -s workspace-write --model <model> "$(cat <prompt>)"`
+  - Headless: `codex exec --sandbox workspace-write --dangerously-bypass-hook-trust --disable plugins -c 'mcp_servers={}' -c "sandbox_workspace_write.writable_roots=[\"$(git rev-parse --path-format=absolute --git-common-dir)\"]" --model '<model>' - < '<prompt>'` — prompt on stdin (OBS-889). Zero-config rendering: per dispatch, `codexMcpSuppressionFlags()` also appends `-c 'mcp_servers.<name>.enabled=false'` for every server named in the operator's `$CODEX_HOME/config.toml`.
+  - Interactive: `codex -a never -s workspace-write --dangerously-bypass-hook-trust --disable plugins -c 'mcp_servers={}' -c "sandbox_workspace_write.writable_roots=[\"$(git rev-parse --path-format=absolute --git-common-dir)\"]" --model '<model>' "$(cat '<prompt>')"` — the real TUI (OBS-930): the prompt is the `[PROMPT]` positional because codex's TUI has no file/stdin form, and it is the LAST argument. Argv-safe since `countLiveSuites` reads a command's first four tokens only (OBS-889). `CODEX_INPUT_BOX` (captured composer, `tests/fixtures/codex-input-box`) declares the editor for the herdr driver. Same per-dispatch MCP suppression as the headless row.
   - Model ids in `DEFAULT_CONFIG.tiers.codex` are live-verified against the installed CLI's `models_cache.json` (see comment block at `src/config/config.ts:244-249`)
 - **cursor-agent** (`cursor-agent` binary) - vendor `cursor` - `src/adapters/cursor-agent.ts`
   - Headless: `cursor-agent -p "$(cat <prompt>)" --model <model> --force --output-format text`

@@ -4,6 +4,7 @@ import {
   declaredPromptGlyphForWorkerName,
 } from "../../src/adapters/types.js";
 import { CLAUDE_INPUT_BOX } from "../../src/adapters/claude-code.js";
+import { CODEX_INPUT_BOX } from "../../src/adapters/codex.js";
 import { KIMI_INPUT_BOX } from "../../src/adapters/kimi.js";
 
 describe("worker prompt glyph lookup", () => {
@@ -15,6 +16,7 @@ describe("worker prompt glyph lookup", () => {
 
   test("input-box declarations carry the prompt glyph beside their state matchers", () => {
     expect(CLAUDE_INPUT_BOX.promptGlyph).toBe("❯");
+    expect(CODEX_INPUT_BOX.promptGlyph).toBe("›");
     expect(KIMI_INPUT_BOX.promptGlyph).toBe(">");
     expect(declaredInputBoxForWorkerName("T7-worker-kimi-a0-run")?.promptGlyph).toBe(">");
   });

@@ -81,15 +81,24 @@ describe("codex mcp suppression (OBS-82)", () => {
     expect(codex.headlessCommand("/p", "gpt-5.2")).toContain(flags);
   });
 
-  test("codex declares no interactive command when its TUI cannot read a prompt file", () => {
+  // OBS-930: the visible pane runs the real TUI. Codex's TUI takes the prompt only as the [PROMPT]
+  // positional, so the launch inlines the file like the claude adapter — LAST, after every flag.
+  test("test: the codex interactive command launches the TUI with the same sandbox hook-trust and mcp suppression as the headless form and the prompt file's content as the last positional whereas its first four argv tokens carry no suite word", () => {
     codexHome(FIXTURE);
     const flags = codexMcpSuppressionFlags();
     expect(flags).toContain("--disable plugins");
     expect(codex.headlessCommand("/p", "gpt-5.2")).toContain(flags);
-    expect(codex.interactiveCommand("/p", "gpt-5.2")).toBeNull();
+    const cmd = codex.interactiveCommand("/p", "gpt-5.2");
+    expect(cmd).not.toBeNull();
+    expect(cmd!.startsWith("codex -a never -s workspace-write --dangerously-bypass-hook-trust ")).toBe(true);
+    expect(cmd).toContain(flags);
+    expect(cmd).not.toContain(" exec ");
+    expect(cmd!.endsWith(` --model 'gpt-5.2' "$(cat '/p')"`)).toBe(true);
+    // OBS-889: the census reads the first four tokens only — and those must never name a runner
+    expect(cmd!.split(/\s+/, 4).join(" ")).toBe("codex -a never -s");
   });
 
-  test("test: the codex headless command run against a stub codex on PATH carries no prompt bytes in argv so the result nonce appears in no argument while the prompt reaches the process and the interactive form likewise carries no prompt bytes whereas a form that inlines the prompt file's content fails", () => {
+  test("test: the codex headless command run against a stub codex on PATH carries no prompt bytes in argv so the result nonce appears in no argument while the prompt reaches the process and the interactive form passes the prompt as the last argument with the model value followed by it and a 140 KB prompt fits whereas a form that inlines the prompt file's content into the headless check fails", () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-codex-argv-"));
     const promptFile = join(dir, "prompt.md");
     const argvLog = join(dir, "argv.log");
@@ -115,8 +124,25 @@ cat > "$CODEX_STDIN_LOG"
     };
 
     assertPromptOffArgv(codex.headlessCommand(promptFile, "gpt-5.2"));
-    expect(codex.interactiveCommand(promptFile, "gpt-5.2")).toBeNull();
     expect(() => assertPromptOffArgv(`codex ${shq(prompt)}`)).toThrow();
+
+    // OBS-930: the TUI form carries the prompt BY DESIGN — as the last positional, never as a flag
+    // value ("$(cat …)" strips the trailing newline; codex sees the same text a paste would give it).
+    const argvOf = (command: string) => {
+      execSync(command, { env });
+      return readFileSync(argvLog, "utf8").split("\n");
+    };
+    const argv = argvOf(codex.interactiveCommand(promptFile, "gpt-5.2")!);
+    const promptLines = prompt.replace(/\n$/, "").split("\n");
+    expect(argv.slice(-(promptLines.length + 3))).toEqual(["--model", "gpt-5.2", ...promptLines, ""]);
+    expect(argv.slice(0, 4)).toEqual(["-a", "never", "-s", "workspace-write"]);
+    expect(argv.indexOf("exec")).toBe(-1);
+    // a real worker prompt is ~140 KB (OBS-889 measured 149,417 bytes of argv); ARG_MAX here is 1 MB
+    const big = `${"lorem ipsum vitest npm test ".repeat(5000)}${nonce}\n`;
+    writeFileSync(promptFile, big);
+    expect(big.length).toBeGreaterThan(140_000);
+    const bigArgv = argvOf(codex.interactiveCommand(promptFile, "gpt-5.2")!);
+    expect(bigArgv[bigArgv.length - 2]).toBe(big.replace(/\n$/, ""));
   });
 
   test("config-scanned server names reach the shell line only through shq", () => {

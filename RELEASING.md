@@ -105,8 +105,8 @@ Per release:
    push the tag:
 
    ```bash
-   git tag -a v2.4.1 -m "v2.4.1"
-   git push origin v2.4.1
+   git tag -a v2.4.2 -m "v2.4.2"
+   git push origin v2.4.2
    ```
 
 5. The tag push runs `release.yml` in the public repository:

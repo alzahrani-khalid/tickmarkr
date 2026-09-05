@@ -2,6 +2,29 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.4.2 — codex workers get their screen back
+
+**v2.4.2** — a one-fix patch shipped on the operator's word during the 2.5.0 run. Every codex worker had been launched
+headless (`codex exec` reading its prompt from stdin) inside its visible Herdr pane, so the operator watching a task
+saw a raw stream of tool output and whole diffs instead of an agent; commit 8428bd18 had only made that fallback
+explicit and journaled it as `worker-mode-fallback`. Codex's TUI takes its prompt as a positional and nothing else,
+and the argv hazard that once forbade that (OBS-889: the suite counter matched runner words deep inside a worker's
+prompt) is closed on the counter side, which reads only the first four argv tokens — the launch shape the claude
+adapter has used all along.
+
+- **A real codex TUI launch.** `interactiveCommand` now opens the Codex TUI with the same sandbox and MCP suppression
+  as the headless form, the prompt as the last positional and every flag value followed by a flag. The headless form
+  stays for non-interactive drivers, and adapters that still return no interactive command keep journaling the
+  fallback. (OBS-930)
+- **An input box the driver can read.** The codex adapter declares its composer (`› Ask Codex to do anything`,
+  anchored by the `<model> <effort> · <cwd>` footer) from verbatim pane captures of codex 0.153.4 — never a
+  fingerprint typed from memory; an unknown placeholder reads as occupied and a submit onto it fails closed by name.
+  (OBS-136, OBS-140)
+- **The suite counter's OBS-889 test now includes a codex TUI argv** carrying a prompt that names the runner, and
+  counts it as zero live suites.
+- Proven by targeted tests, `npm run build`, `npm run lint`, one live smoke of the exact rendered command in a scratch
+  repository, and the release proof on the exported tree.
+
 ## v2.4.1 — the records tell the truth
 
 **v2.4.1** — a patch release with no new adapter, driver or design row: the rows the daemon writes say what the

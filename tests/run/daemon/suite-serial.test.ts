@@ -1,6 +1,7 @@
 import { tmpdir } from "node:os";
 import { realpathSync } from "node:fs";
 import { expect, test } from "vitest";
+import { codex } from "../../../src/adapters/codex.js";
 import { countLiveSuites, resetLiveSuiteCountForTests, resetSuiteWaitCeilingForTests, runDaemon, setLiveSuiteCountForTests, setSuiteWaitCeilingForTests, SUITE_POLL_MS } from "../../../src/run/daemon.js";
 import { SUITE_PARENT_ENV } from "../../../src/run/git.js";
 import { Journal } from "../../../src/run/journal.js";
@@ -63,6 +64,16 @@ test("test: a process whose command names the runner only deep inside a prompt-s
   expect(count(rows[0]!)).toBe(0);
   expect(count(rows[1]!)).toBe(1);
   expect(count(rows[2]!)).toBe(1);
+  // OBS-930: the SHIPPED codex TUI launch, as `ps` would show it once the pane shell has expanded
+  // "$(cat promptFile)" — the whole prompt inline, naming vitest and npm test — counts zero too.
+  const promptBytes = `${"lorem ipsum ".repeat(4000)}Run npm test; each criterion must exist as a vitest test whose OWN title names it`;
+  const shipped = codex.interactiveCommand("/tmp/T5-a0.md", "gpt-5.6-sol")!
+    .replace(/"\$\(cat '\/tmp\/T5-a0\.md'\)"$/, promptBytes)
+    .replace(/'/g, "");
+  expect(shipped.startsWith("codex -a never -s workspace-write ")).toBe(true);
+  expect(shipped).toContain("vitest");
+  expect(count(`8004 1 S ${shipped}`)).toBe(0);
+  expect(count(`8004 1 S ${shipped}\n8005 8004 S sh -c npm test`)).toBe(1);
 });
 
 test("test: a live-suite census that never reaches zero releases the verdict round at the ceiling and journals suite-wait-ceiling with the count and the wait whereas a window with no ceiling holds the run forever", async () => {

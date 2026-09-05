@@ -366,7 +366,9 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
     // promptSuggestionEnabled settings pair, and Fable's stamp advanced to 5.1.
     "claude-code": "c00cb8c0fc0e03ca99857237b98d73d59e223f4d2ec5156bc7500fc778c707d0",
     // 2026-09-05 (OBS-889): repinned when headless prompts moved to stdin and TUI fallback became explicit.
-    codex: "c6072b1c914d84f2c3927f8093a2398949bb5d52e3fe858636c5e77848ba9f35",
+    // 2026-09-05 (OBS-930): repinned when the interactive form became the real TUI launch with the
+    // prompt as the last positional (the argv-safe shape the claude adapter uses).
+    codex: "ac955b630139704f37697deefdb8c10424a4842ce747d168b03bc81be02d24ed",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
     pi: "d8c6ab42a4052ee982ead3e119d02d4df8734429b36a129a9e926cf1c2f8c3b7",

@@ -1,9 +1,21 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { codex } from "../src/adapters/codex.js";
 
 const repoRoot = join(import.meta.dirname, "..");
 const codebaseDocs = join(repoRoot, "docs", "codebase");
+
+// The codex bullet block of INTEGRATIONS.md — from `**codex**` to the next adapter's `- **` — so a row
+// lookup can never drift into a neighbouring adapter's row (OBS-930 collateral: a relabelled codex row
+// made the lazy cross-row regex return cursor-agent's command as "codex's").
+function codexDocBlock(integrations: string): string {
+  const start = integrations.indexOf("**codex**");
+  expect(start).toBeGreaterThan(-1);
+  const rest = integrations.slice(start);
+  const next = rest.search(/\n- \*\*/);
+  return next === -1 ? rest : rest.slice(0, next);
+}
 
 // All files cited in STACK, INTEGRATIONS, CONVENTIONS docs. These must exist in the tree.
 const CITED_FILES = [
@@ -158,16 +170,20 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     const integrations = readFileSync(intPath, "utf8");
     const adapter = readFileSync(adapterPath, "utf8");
 
-    // Extract documented codex headless command specifically
-    const docMatch = integrations.match(/\*\*codex\*\*.*?\n\s+-\s+Headless:\s+`([^`]+)`/s);
-    expect(docMatch).toBeDefined();
-    const docCommand = docMatch![1];
+    // Extract documented codex headless command specifically — from the codex block only
+    const docMatch = codexDocBlock(integrations).match(/\n\s+-\s+Headless:\s+`([^`]+)`/);
+    expect(docMatch).not.toBeNull();
+    const docCommand = docMatch![1]!;
 
     // Verify key elements match adapter's headlessCommand
     expect(adapter).toContain("headlessCommand");
     expect(docCommand).toContain("codex exec");
     expect(docCommand).toContain("--sandbox workspace-write");
     expect(docCommand).not.toContain("--full-auto"); // Verify old stale command is gone
+    // Byte-equal to the adapter's zero-config rendering (CODEX_HOME pinned empty: the per-dispatch
+    // `-c mcp_servers.<name>.enabled=false` flags are the operator's config, documented in prose).
+    vi.stubEnv("CODEX_HOME", "/var/empty/tickmarkr-hermetic-codex-home");
+    expect(docCommand).toBe(codex.headlessCommand("<prompt>", "<model>"));
   });
 
   test("test: the integrations page's documented codex interactive command matches the codex adapter's actual interactive command", () => {
@@ -176,10 +192,10 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     const integrations = readFileSync(intPath, "utf8");
     const adapter = readFileSync(adapterPath, "utf8");
 
-    // Extract documented codex interactive command specifically
-    const docMatch = integrations.match(/\*\*codex\*\*.*?\n\s+-\s+Interactive:\s+`([^`]+)`/s);
-    expect(docMatch).toBeDefined();
-    const docCommand = docMatch![1];
+    // Extract documented codex interactive command specifically — from the codex block only
+    const docMatch = codexDocBlock(integrations).match(/\n\s+-\s+Interactive:\s+`([^`]+)`/);
+    expect(docMatch).not.toBeNull();
+    const docCommand = docMatch![1]!;
 
     // Verify key elements match adapter's interactiveCommand
     expect(adapter).toContain("interactiveCommand");
@@ -187,6 +203,11 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     expect(docCommand).toContain("-a never");
     expect(docCommand).toContain("-s workspace-write");
     expect(docCommand).not.toContain("-a on-failure"); // Verify old stale command is gone
+    // OBS-930: the real TUI launch, prompt as the LAST positional — byte-equal to the adapter's
+    // zero-config rendering (same CODEX_HOME pin as the headless row).
+    vi.stubEnv("CODEX_HOME", "/var/empty/tickmarkr-hermetic-codex-home");
+    expect(docCommand).toBe(codex.interactiveCommand("<prompt>", "<model>"));
+    expect(docCommand.endsWith(`--model '<model>' "$(cat '<prompt>')"`)).toBe(true);
   });
 
   test("test: the integrations page describes the portable driving skill install command", () => {
