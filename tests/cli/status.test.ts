@@ -642,17 +642,21 @@ describe("status <runId> reports the run you named", () => {
     await expect(status(["run-DOESNOTEXIST"], repo, { now: fixedNow })).rejects.toThrow(/run-DOESNOTEXIST/);
   });
 
-  test("omitting the argument renders the latest run byte-identically to the pre-change output", async () => {
+  test("omitting the argument still renders the latest run while naming it prints the lock-derived run line", async () => {
     const { repo, g } = oneTaskRepo();
     seedJournal(repo, "run-20260101-000000", [startFor(g)]);
     seedJournal(repo, "run-20260102-000000", [startFor(g)]);
-    // the pre-change output IS the latest-run resolution: naming that same run explicitly must
-    // reproduce the no-argument frame byte-for-byte, on the plain surface and under --watch.
+
     const implicit = await status([], repo, { now: fixedNow });
     const explicit = await status(["run-20260102-000000"], repo, { now: fixedNow });
+    expect(implicit).toContain("run run-20260102-000000");
+    expect(explicit).toContain("run run-20260102-000000 abandoned since");
+    // Naming the same latest run explicitly must reproduce the no-argument frame byte-for-byte.
     expect(implicit).toBe(explicit);
     const implicitWatch = await status(["--watch"], repo, { iterations: 1, now: fixedNow, sleep: async () => {} });
     const explicitWatch = await status(["--watch", "run-20260102-000000"], repo, { iterations: 1, now: fixedNow, sleep: async () => {} });
+    expect(implicitWatch).toContain("run run-20260102-000000");
+    expect(explicitWatch).toContain("run run-20260102-000000 abandoned since");
     expect(implicitWatch).toBe(explicitWatch);
   });
 
@@ -691,7 +695,7 @@ describe("status <runId> reports the run you named", () => {
     expect(out).not.toContain("run-20260103-000000");
   });
 
-  test("test: a lock whose recorded holder is dead selects the newest journalled run rather than the run that dead holder names", async () => {
+  test("test: a lock whose recorded holder is dead reports the locked run as stale instead of falling back to a newer journal", async () => {
     const { repo, g } = oneTaskRepo();
     const journalledRun = "run-20260102-000000";
     const deadLockedRun = "run-20260103-000000";
@@ -705,8 +709,8 @@ describe("status <runId> reports the run you named", () => {
 
     const out = await status([], repo, { now: fixedNow });
 
-    expect(out).toContain(`run ${journalledRun}`);
-    expect(out).not.toContain(`run ${deadLockedRun}`);
+    expect(out).toContain(`run ${deadLockedRun} stale lock naming dead holder pid ${holder.pid}`);
+    expect(out).not.toContain(`run ${journalledRun}`);
   });
 
   test("test: an explicitly named run id remains the run the board reports even while a different run holds the live lock", async () => {

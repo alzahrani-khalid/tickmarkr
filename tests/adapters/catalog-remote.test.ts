@@ -5,6 +5,7 @@ import { parse } from "yaml";
 import {
   ARTIFICIAL_ANALYSIS_CATALOG_URL,
   catalogCachePath,
+  formatCatalogRefreshLegs,
   LIVEBENCH_CATEGORIES_URL,
   LIVEBENCH_TABLE_DATE,
   LIVEBENCH_TABLE_URL,
@@ -15,7 +16,7 @@ import {
   type CatalogCache,
 } from "../../src/adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
-import { catalogModelAdvisory, suggestOverlay } from "../../src/adapters/model-lints.js";
+import { catalogModelAdvisory, catalogTierRanking, suggestOverlay } from "../../src/adapters/model-lints.js";
 import type { AuthHealth, WorkerAdapter } from "../../src/adapters/types.js";
 import { channelsFromConfig } from "../../src/adapters/types.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
@@ -320,14 +321,18 @@ describe("cache-only model capability catalog", () => {
       await expect(doctor(["--"], repo, [adapter], { banner: false, catalog: readCachedCatalog(repo) })).resolves.toContain("models.dev id=fake-2");
     }
 
-    const cacheBeforeAaFailure = readFileSync(catalogCachePath(repo), "utf8");
-    const aa401 = vi.fn()
-      .mockResolvedValueOnce(response(refreshed.modelsDev))
-      .mockResolvedValueOnce(response({}, 401));
+    const aa401 = routedFetcher({
+      modelsDev: () => response(refreshed.modelsDev),
+      aa: () => response({}, 401),
+    });
     const partial = await refreshCatalogCommand({ repoRoot: repo, fetcher: aa401, artificialAnalysisKey: "configured-key" });
     expect(partial.updated).toBe(true);
     expect(partial.warning).toContain("Artificial Analysis HTTP 401");
-    expect(readFileSync(catalogCachePath(repo), "utf8")).toBe(cacheBeforeAaFailure);
+    expect(partial.legs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ leg: "models.dev", status: "updated" }),
+      expect.objectContaining({ leg: "Artificial Analysis", status: "failed" }),
+      expect.objectContaining({ leg: "LiveBench", status: "updated" }),
+    ]));
 
     writeCache(repo, fakeCatalog("2020-01-01T00:00:00.000Z"));
     const stale = readCachedCatalog(repo, { now: () => new Date("2026-08-05T00:00:00.000Z") });
@@ -583,6 +588,146 @@ test("test: resolveCatalogModel for zai/glm-5.3 against a cache whose gateway re
 
   const legacyOffers = ["zai/glm-5.3", "GLM-5.3 (Z AI)"].map((id) => id.toLowerCase().replace(/\s+/g, "-"));
   expect(legacyOffers.some((id) => "glm-5-3".startsWith(id))).toBe(false);
+});
+
+test("test: a refresh whose models.dev leg fails and whose LiveBench leg succeeds persists the LiveBench result and reports that leg updated and the models.dev leg failed while a refresh whose keyless leg fails keeps that leg's prior age so the next run retries it and the AA leg follows the same per-leg policy whereas a refresh that discards the successful leg or masks a failed one for seven days fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const oldAt = "2026-09-01T00:00:00.000Z";
+  const now = () => new Date("2026-09-20T00:00:00.000Z");
+  writeCache(repo, {
+    ...fakeCatalog(oldAt),
+    artificialAnalysis: { data: [{ id: "old-aa", evaluations: { artificial_analysis_intelligence_index: 1 } }] },
+    liveBench: { tableDate: "old", categories: LIVEBENCH_CATEGORIES, rows: [{ model: "old", javascript: 1 }] },
+    legFetchedAt: { modelsDev: oldAt, artificialAnalysis: oldAt, liveBench: oldAt },
+  });
+
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+  const liveBenchWins = await refreshCatalogCommand({
+    repoRoot: repo,
+    now,
+    fetcher: routedFetcher({ modelsDev: () => response("nope", 500) }),
+  });
+  expect(liveBenchWins.updated).toBe(true);
+  expect(liveBenchWins.legs).toEqual(expect.arrayContaining([
+    expect.objectContaining({ leg: "models.dev", status: "failed" }),
+    expect.objectContaining({ leg: "LiveBench", status: "updated" }),
+  ]));
+  let stored = readCachedCatalog(repo, { now }).catalog;
+  expect(stored.liveBench).toMatchObject({ tableDate: LIVEBENCH_TABLE_DATE });
+  expect(stored.legFetchedAt?.modelsDev).toBe(oldAt);
+  expect(stored.legFetchedAt?.liveBench).toBe(now().toISOString());
+
+  writeCache(repo, {
+    ...fakeCatalog(oldAt),
+    artificialAnalysis: { data: [{ id: "old-aa", evaluations: { artificial_analysis_intelligence_index: 1 } }] },
+    liveBench: { tableDate: "old", categories: LIVEBENCH_CATEGORIES, rows: [{ model: "old", javascript: 1 }] },
+    legFetchedAt: { modelsDev: oldAt, artificialAnalysis: oldAt, liveBench: oldAt },
+  });
+  const masked = await refreshCatalogCommand({
+    repoRoot: repo,
+    now,
+    artificialAnalysisKey: "key",
+    fetcher: routedFetcher({
+      table: () => response("", 500),
+      aa: () => response("denied", 500),
+    }),
+  });
+  expect(masked.updated).toBe(true);
+  stored = readCachedCatalog(repo, { now }).catalog;
+  expect(stored.legFetchedAt?.liveBench).toBe(oldAt);
+  expect(stored.legFetchedAt?.artificialAnalysis).toBe(oldAt);
+  expect(readCachedCatalog(repo, { now }).stale).toBe(true);
+
+  const retry = routedFetcher();
+  await refreshCatalogCommand({ repoRoot: repo, now, artificialAnalysisKey: "key", fetcher: retry });
+  expect(requestedUrls(retry)).toEqual(expect.arrayContaining([
+    LIVEBENCH_TABLE_URL,
+    expect.stringContaining(ARTIFICIAL_ANALYSIS_CATALOG_URL),
+  ]));
+});
+
+test("a partial refresh cannot launder the vendored models.dev snapshot into cached evidence or tier suggestions", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), `tiers:
+  fake:
+    vendor: anthropic
+    channel: sub
+    models:
+      claude-fable-5-1: frontier
+      claude-opus-4-8: frontier
+      claude-sonnet-5: mid
+      claude-haiku-4-5-20251001: cheap
+`);
+  const cfg = loadConfig(repo);
+  const before = readCachedCatalog(repo);
+  expect(catalogTierRanking(cfg, before)).toEqual([]);
+  expect(catalogModelAdvisory(cfg, before, "fake", "claude-opus-4-8").display).toContain(
+    "the vendored catalog is a shipped default, not fetched evidence — no tier suggestion",
+  );
+
+  const refreshed = await refreshCatalogCommand({
+    repoRoot: repo,
+    now: () => new Date("2026-09-20T00:00:00.000Z"),
+    artificialAnalysisKey: "",
+    fetcher: routedFetcher({
+      modelsDev: () => response("blocked", 500),
+      table: () => response(liveBenchCsv([
+        { model: "claude-fable-5-1", scores: { ...FAKE_2_SCORES, javascript: 91, typescript: 91, python: 91 } },
+        { model: "claude-opus-4-8", scores: { ...FAKE_2_SCORES, javascript: 81, typescript: 81, python: 81 } },
+        { model: "claude-sonnet-5", scores: { ...FAKE_2_SCORES, javascript: 71, typescript: 71, python: 71 } },
+        { model: "claude-haiku-4-5-20251001", scores: { ...FAKE_2_SCORES, javascript: 51, typescript: 51, python: 51 } },
+      ])),
+    }),
+  });
+
+  expect(refreshed.legs).toEqual(expect.arrayContaining([
+    expect.objectContaining({ leg: "models.dev", status: "failed" }),
+    expect.objectContaining({
+      leg: "LiveBench",
+      status: "failed",
+      detail: "fetched but discarded — models.dev spine unavailable",
+      retry: "retry next refresh",
+    }),
+  ]));
+  const operatorLine = formatCatalogRefreshLegs(refreshed.legs);
+  expect(operatorLine).toContain(
+    "LiveBench failed (fetched but discarded — models.dev spine unavailable; retry next refresh)",
+  );
+  expect(operatorLine).not.toContain("LiveBench updated");
+  const after = readCachedCatalog(repo);
+  expect(after.source).toBe("vendored");
+  expect(catalogTierRanking(cfg, after)).toEqual([]);
+  expect(catalogModelAdvisory(cfg, after, "fake", "claude-opus-4-8").display).toContain(
+    "the vendored catalog is a shipped default, not fetched evidence — no tier suggestion",
+  );
+});
+
+test("a skipped Artificial Analysis leg does not keep an otherwise refreshed catalog stale forever", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const oldAt = "2026-09-01T00:00:00.000Z";
+  const now = () => new Date("2026-09-20T00:00:00.000Z");
+  writeCache(repo, {
+    ...fakeCatalog(oldAt),
+    artificialAnalysis: { data: [{ id: "previous-aa", evaluations: { artificial_analysis_intelligence_index: 1 } }] },
+    liveBench: { tableDate: "old", categories: LIVEBENCH_CATEGORIES, rows: [{ model: "old", javascript: 1 }] },
+    legFetchedAt: { modelsDev: oldAt, artificialAnalysis: oldAt, liveBench: oldAt },
+  });
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+
+  const staleAfterRefresh: boolean[] = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const refreshed = await refreshCatalogCommand({ repoRoot: repo, now, fetcher: routedFetcher() });
+    expect(refreshed.updated).toBe(true);
+    expect(refreshed.legs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ leg: "models.dev", status: "updated" }),
+      expect.objectContaining({ leg: "Artificial Analysis", status: "skipped" }),
+      expect.objectContaining({ leg: "LiveBench", status: "updated" }),
+    ]));
+    staleAfterRefresh.push(readCachedCatalog(repo, { now }).stale);
+  }
+
+  expect(staleAfterRefresh).toEqual([false, false, false]);
 });
 
 test("a LiveBench fetch that fails and one that parses to zero rows each preserve the previous liveBench section while modelsDev still updates and the warning names LiveBench, so reading an empty probe as an empty fleet or losing the models.dev refresh fails", async () => {

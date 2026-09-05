@@ -156,6 +156,8 @@ export interface ShResult {
   timedOut?: boolean;
   /** The shell exited, but descendants still held its process group and pipes past the grace. */
   reapedGroup?: boolean;
+  /** The grace reap's group kill failed with something other than ESRCH (for example EPERM). */
+  reapError?: string;
   durationMs?: number;
   /** T7: the capacity THIS child ran under, stamped where its environment was built (see `shell`). */
   capacity?: RunCapacity;
@@ -226,6 +228,7 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
     let timedOut = false, reapedGroup = false, done = false, started = false, outputSeen = false;
+    let reapError: string | undefined, exitedCode: number | undefined;
     let reapTimer: NodeJS.Timeout | undefined;
     const finish = (code: number, err?: string) => {
       if (done) return;
@@ -242,11 +245,22 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
         durationMs: Date.now() - startedAt,
         capacity,
         ...(reapedGroup ? { reapedGroup: true } : {}),
+        ...(reapError ? { reapError } : {}),
       });
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      try { process.kill(-p.pid!, "SIGKILL"); } catch { p.kill("SIGKILL"); }
+      try {
+        process.kill(-p.pid!, "SIGKILL");
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== "ESRCH") {
+          reapError ??= `${code ?? "kill"}: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        p.kill("SIGKILL");
+        // A failed group kill can leave inherited pipes open forever; the command ceiling still wins.
+        if (code !== "ESRCH") finish(exitedCode ?? 1);
+      }
     }, timeoutMs);
     p.on("spawn", () => { started = true; }); // the command exists from here on — never retryable past it
     // OBS-716: one stateful decoder per stream carries an incomplete UTF-8 sequence into that
@@ -277,8 +291,9 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
     // cannot hold this promise until the command ceiling. A real timeout wins first and is never
     // reclassified as a grace reap.
     p.on("exit", (code) => {
+      exitedCode = code ?? 1;
       if (timedOut) {
-        finish(code ?? 1);
+        finish(exitedCode);
         return;
       }
       reapTimer = setTimeout(() => {
@@ -286,8 +301,11 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
         try {
           process.kill(-p.pid!, "SIGKILL");
           reapedGroup = true;
-        } catch {
-          // The group closed between the shell's exit and the grace boundary; "close" owns finish.
+        } catch (error) {
+          // ESRCH means the group closed in the grace race; every other error must survive to the
+          // result while the command timeout remains the explicit backstop.
+          const code = (error as NodeJS.ErrnoException | undefined)?.code;
+          if (code !== "ESRCH") reapError = `${code ?? "kill"}: ${error instanceof Error ? error.message : String(error)}`;
         }
       }, SHELL_REAP_GRACE_MS);
     });

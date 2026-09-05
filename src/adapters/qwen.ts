@@ -70,7 +70,7 @@ function decodeQwenEvents(events: readonly unknown[]): DecodedQwenEvents {
   }
 
   const assistantText = text.join("\n");
-  const apiError = text.find((line) => line.startsWith("[API Error:"));
+  const apiError = assistantText.match(/\[API Error:[^\n]*/)?.[0];
   if (apiError) failed = true;
   if (!failed) return { assistantText };
   return {
@@ -144,9 +144,9 @@ export const qwen: WorkerAdapter = {
   probeCwd: "neutral",
   probe: async () => probeQwen(),
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("qwen", cfg),
-  hardcodedFlags: { binary: "qwen", flags: ["--approval-mode", "-m", "-o", "-p"] },
+  hardcodedFlags: { binary: "qwen", flags: ["--safe-mode", "--approval-mode", "-m", "-o", "-p"] },
   headlessCommand: (promptFile: string, model: string) =>
-    `${QWEN_SKIP_UPDATE} qwen --approval-mode yolo -m ${shq(model)} -o json -p '' < ${shq(promptFile)}`,
+    `${QWEN_SKIP_UPDATE} qwen --safe-mode --approval-mode yolo -m ${shq(model)} -o json -p '' < ${shq(promptFile)}`,
   // OBS-905: qwen has NO interactive form. The `-i "$(cat prompt)"` TUI launch put the whole prompt in
   // argv (the OBS-889 leak-and-census shape) and produced a rendered transcript the JSON decoder above
   // can never read — under the herdr driver every qwen task read "unparseable" and merged only by harvest.

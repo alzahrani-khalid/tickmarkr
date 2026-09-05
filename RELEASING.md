@@ -62,29 +62,51 @@ Per release:
    doctor` lints the age past 90 days but never fetches, and a stale pin means every tier suggestion
    cites a dead table. Fetch tables from `livebench.ai`, never `raw.githubusercontent.com` — same
    filename, 15 fewer models on raw.
-2. In the private repository: bump `version` in `package.json`, commit, and run the export in
-   mirror publish mode (below). Review the mirror commit, then push the mirror's `main`:
+2. In the private repository, bump `version` in `package.json` and commit it. The proof and mirror push
+   are step 3; do not tag or publish from the private repository.
+3. Produce and retain the release proof, including lint, before grading CI. From the private tree run:
 
    ```bash
+   VITEST_MAX_FORKS=6 npm run-script verify:export
+   ```
+
+   The captured proof must show the exported candidate complete `npm ci`, `npm run build`,
+   **`npm run lint`**, and only then `npm test`, with a zero exit. A suite summary without the preceding
+   lint block is not a release proof. Then export into the persistent mirror, review the commit, and
+   derive the count oracle `N` from its tracked tree using real glob semantics:
+
+   ```bash
+   bash scripts/export-public.sh --onto /path/to/tickmarkr-public-mirror
    git -C /path/to/tickmarkr-public-mirror show --stat
+   git -C /path/to/tickmarkr-public-mirror ls-files \
+     ':(glob)tests/**/*.test.ts' ':(glob)tests/**/*.test.tsx' | wc -l
    git -C /path/to/tickmarkr-public-mirror push origin HEAD:main
    ```
 
-3. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run — the **full-suite
-   proof** triggered by that exact mirror `main` push — to report green for the exported commit. In each of the `test`
-   and `test-macos` jobs, that proof runs the parallel `suite` project under coverage and the three
-   single-fork projects in a second, independent invocation (OBS-829: a worker rpc timeout in the
-   first must not silently drop the second), and count-asserts the SUM of both reported collected
-   test-file totals against the tracked test-file tree. Both jobs must be green. Match the run's head SHA to the mirror's
-   `HEAD`; a red or missing run is a hard stop, and the tag does not exist yet. This proves the
-   exported tree was fully collected on those two CI jobs; it does not make the post-tag workflow
-   rerun the full suite or automatically bind publication to the recorded pre-tag proof.
-4. Only after that count-asserted full-suite proof is green, in the **public** repository (the
-   mirror), tag the export commit and push the tag:
+   A bare git pathspec such as `tests/**/*.test.ts` does not give `**` glob semantics; use `:(glob)` as
+   above (or `git ls-files | grep`) or the expected count is false. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that exact mirror `main`
+   push to reach **run-end**. Its `test` and `test-macos` jobs run the parallel `suite` project under
+   coverage and the three single-fork projects independently, then count-assert the sum of both
+   collected test-file totals against `N`.
+4. At run-end, match the run's head SHA to the mirror's `HEAD`, then grade the two JOB LOGS — never the
+   badge and never an in-progress run — with the shipped tri-state grader:
 
    ```bash
-   git tag -a v2.4.0 -m "v2.4.0"
-   git push origin v2.4.0
+   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> <N> v2.4.0
+   ```
+
+   `gh run view --job --log` can be empty while a run is in progress, so `UNREADABLE` (exit 2) is a hard
+   stop, not green. `GREEN` requires the expected `COUNT_ORACLE`, zero failed/timed-out tests, and the
+   matching collected total in both job logs; `RED` exits 1. This is the count-asserted full-suite proof
+   for the exported tree. It does not make the post-tag workflow rerun that suite or automatically bind
+   publication to the recorded pre-tag proof.
+
+   Only after the grader returns GREEN for both jobs, tag the export commit in the **public** mirror and
+   push the tag:
+
+   ```bash
+   git tag -a v2.4.1 -m "v2.4.1"
+   git push origin v2.4.1
    ```
 
 5. The tag push runs `release.yml` in the public repository:
@@ -99,6 +121,11 @@ Per release:
      precondition. The teardown RPC timeout is real, but release trees have also carried genuine
      assertion failures this subset does not run)
    - `npm publish --provenance --access public` (only if all checks pass)
+
+   After the Release run reaches success, query `npm view tickmarkr version` and the published
+   `dist.attestations`. Registry propagation can lag the completed run by seconds: if the first read
+   returns the prior version, wait and **re-read the registry before ruling**. Record publication only
+   after a fresh read shows the intended version and provenance.
 
 Publish is fail-closed: a failing build, lint, or test blocks publication.
 

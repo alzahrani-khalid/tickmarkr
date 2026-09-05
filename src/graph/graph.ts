@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { type RunGraph, type Task, type TaskStatus, validateGraph } from "./schema.js";
 
 export function stateDirName(_repoRoot: string): string {
@@ -9,6 +9,87 @@ export function stateDirName(_repoRoot: string): string {
 
 export function graphPath(repoRoot: string): string {
   return join(repoRoot, stateDirName(repoRoot), "graph.json");
+}
+
+// OBS-904: a refused compile must leave durable negative evidence without changing graph.json.
+// RunGraphSchema intentionally strips/rejects non-graph state, so this record is a sibling rather
+// than a graph field. Its presence wins over an otherwise valid prior graph until a successful
+// non-dry compile replaces that graph and clears the record.
+export interface CompileRefusalRecord {
+  refusedAt: string;
+  source: string;
+  error: string;
+}
+
+export function compileRefusalPath(repoRoot: string): string {
+  return join(repoRoot, stateDirName(repoRoot), "compile-refusal.json");
+}
+
+export function readCompileRefusal(repoRoot: string): CompileRefusalRecord | undefined {
+  const path = compileRefusalPath(repoRoot);
+  if (!existsSync(path)) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `compile refusal record at ${path} is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (
+    typeof value !== "object" || value === null
+    || typeof (value as Record<string, unknown>).refusedAt !== "string"
+    || typeof (value as Record<string, unknown>).source !== "string"
+    || typeof (value as Record<string, unknown>).error !== "string"
+  ) {
+    throw new Error(`compile refusal record at ${path} is malformed`);
+  }
+  return value as CompileRefusalRecord;
+}
+
+export function saveCompileRefusal(repoRoot: string, record: CompileRefusalRecord): void {
+  tickmarkrDir(repoRoot);
+  const path = compileRefusalPath(repoRoot);
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(record, null, 2) + "\n");
+    renameSync(tmp, path);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
+export function clearCompileRefusal(repoRoot: string): void {
+  rmSync(compileRefusalPath(repoRoot), { force: true });
+}
+
+export interface OnDiskSpecHash {
+  path: string;
+  hash: string;
+}
+
+/**
+ * Re-hash the exact single source file recorded by CLI compiles. Native and PRD record the source
+ * markdown; Spec Kit records its tasks.md. GSD combines several plan bodies and is deliberately not
+ * reconstructed here. A missing file is the one fail-open case: the refusal record is the fail-closed
+ * evidence for failed recompiles, while moved/deleted source files need not strand a compiled graph.
+ */
+export function onDiskSpecHash(_repoRoot: string, graph: RunGraph): OnDiskSpecHash | undefined {
+  if (graph.spec.source === "gsd") return undefined;
+  if (graph.spec.paths.length !== 1) return undefined;
+  const recorded = graph.spec.paths[0]!;
+  // CLI compilation records an absolute source. Relative paths belong to legacy/programmatic
+  // graphs whose resolution context is unknowable here, so preserve their prior fail-open behavior.
+  if (!isAbsolute(recorded)) return undefined;
+  const path = recorded;
+  try {
+    const content = readFileSync(path);
+    return { path, hash: createHash("sha256").update(content).digest("hex") };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`cannot verify compiled spec hash from ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 // T3 (Sol #2 / Fable F2): ONE canonical engagement identity over COMPILED TASK DEFINITIONS only.

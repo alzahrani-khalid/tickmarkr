@@ -25,7 +25,7 @@ import {
   type TaskPhase,
   upheldFeedbackByTask,
 } from "../../run/journal.js";
-import { isPidLive, runLockOwner } from "../../run/lock.js";
+import { isPidLive, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
@@ -1032,16 +1032,6 @@ type RunRecord = {
 const canReadRunLockOwner = (cwd: string): boolean =>
   existsSync(join(cwd, stateDirName(cwd), ".gitignore"));
 
-const reportableLockRunId = (owner: ReturnType<typeof runLockOwner>): string | undefined => {
-  if (!owner?.live || owner.runId === undefined) return undefined;
-  try {
-    return parseRunId(owner.runId);
-  } catch {
-    // Repository-wide locks can be held for non-run work such as compile; those are not a status run.
-    return undefined;
-  }
-};
-
 const readRunJournalRaw = (cwd: string, runId: string, allowMissingJournal: boolean): string => {
   const dir = join(cwd, stateDirName(cwd), "runs", runId);
   try {
@@ -1070,7 +1060,7 @@ const readRunJournalRaw = (cwd: string, runId: string, allowMissingJournal: bool
 const readRunRecord = (cwd: string, graph: RunGraph, namedRunId?: string): RunRecord | undefined => {
   const explicitRunId = namedRunId === undefined ? undefined : parseRunId(namedRunId);
   const lockedRunId = explicitRunId === undefined && canReadRunLockOwner(cwd)
-    ? reportableLockRunId(runLockOwner(cwd))
+    ? runLockRunId(cwd)
     : undefined;
   const runId = explicitRunId ?? lockedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
   if (!runId) return undefined;
@@ -1136,6 +1126,7 @@ const renderFrame = (
   const record = readRunRecord(cwd, g, namedRunId);
   const runId = record?.runId;
   const events = record?.events ?? [];
+  const runLine = runId && record ? runStatusLine(cwd, runId, events) : null;
   // The header and every live-phase consumer share this exact process reading. Proved death retires
   // stale phase markers; unknown identity deliberately does not, preserving pre-identity journals.
   const daemon = daemonLiveness(events);
@@ -1284,7 +1275,7 @@ const renderFrame = (
     });
     const zone = journalRowsOnly ? `${divider}zone ${localZoneLabel(zoneReference)}` : "";
     const header = runId
-      ? `tickmarkr status${divider}run ${runId}${zone}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, daemon, now).replaceAll(" · ", divider)}${verify ? `${divider}${verify}` : ""}${divider}${tipPhase ? `${done}/${total} tasks done${divider}run not verified` : `${done}/${total} done`}`
+      ? `tickmarkr status${divider}${runLine ?? `run ${runId}`}${zone}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, daemon, now).replaceAll(" · ", divider)}${verify ? `${divider}${verify}` : ""}${divider}${tipPhase ? `${done}/${total} tasks done${divider}run not verified` : `${done}/${total} done`}`
       : `tickmarkr status${zone}${divider}no runs yet${divider}${done}/${total} done`;
     const legendLine = `  gates: ${GATE_NAMES.map((gate) => `${GATE_KEYS[gate]} ${gate}`).join(divider)}`;
     return {
@@ -1309,7 +1300,8 @@ const renderFrame = (
   const tally = tipPhase
     ? `${progressTone(`${progressGlyph} ${done}/${total} tasks done`)}${dot}${progressTone("run not verified")}`
     : done === total && total > 0 ? ok(`${done}/${total} done`) : information(`${done}/${total} done`);
-  const live = `${liveness(events, daemon, now)} · load1 ${os.loadavg()[0]!.toFixed(2)}`
+  const load1 = os.loadavg()[0] ?? 0;
+  const live = `${liveness(events, daemon, now)} · load1 ${load1.toFixed(2)}`
     .replace(/\bdead\b/u, fail("dead"))
     .replace(/\bfinished\b/u, dim("finished"))
     .replace(/\balive\b/u, running("alive"))
@@ -1327,6 +1319,7 @@ const renderFrame = (
         ? ok(verify)
         : tipFailed ? fail(`${GLYPHS.fail} ${verify}`) : warn(`${GLYPHS.attention} ${verify}`)]),
     ...(runId ? [live] : []),
+    ...(runLine && runLine !== `run ${runId}` ? [runLine] : []),
     ...(journalRowsOnly ? [`zone ${localZoneLabel(zoneReference)}`] : []),
   ].join(separator);
   // The brand lockup is two rows and stays two rows at every width: the muted chip, and the running
@@ -1629,7 +1622,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     // newer runs start. The no-argument form tracks the live lock first, then latest journal.
     const explicitRunId = namedRunId === undefined ? undefined : parseRunId(namedRunId);
     const lockedRunId = explicitRunId === undefined && canReadRunLockOwner(cwd)
-      ? reportableLockRunId(runLockOwner(cwd))
+      ? runLockRunId(cwd)
       : undefined;
     const runId = explicitRunId ?? lockedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
     if (!runId) return [];
@@ -1691,16 +1684,21 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     process.stdout.write(`\x1b]0;⏳ ${hotPhase.taskId} ${phaseLabel(hotPhase)} ${fmtElapsed(nowMs - hotPhase.startedAt)}\x07`);
   };
   const signalHandlers: Array<["SIGINT" | "SIGTERM", () => void]> = [];
+  let exitingFromSignal = false;
   const exitFromSignal = (code: number) => () => {
+    if (exitingFromSignal) return;
+    exitingFromSignal = true;
     if (titleSaved) {
       process.removeListener("exit", restoreTitle);
       restoreTitle();
     }
-    if (alternateScreen) {
-      process.removeListener("exit", leaveAlternateScreen);
-      leaveAlternateScreen();
+    if (!alternateScreen) {
+      process.exit(code);
+      return;
     }
-    process.exit(code);
+    process.removeListener("exit", leaveAlternateScreen);
+    alternateScreen = false;
+    process.stdout.write(LEAVE_ALTERNATE_SCREEN, () => process.exit(code));
   };
   if (!bounded && !eventStream && tty) {
     process.stdout.write(ENTER_ALTERNATE_SCREEN);
@@ -1724,7 +1722,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
           process.stdout.write(line + "\n");
           if (bounded) eventLines.push(line);
         }
-        process.stderr.write("status: keepalive\n");
+        if (decisionEvents.length === 0) process.stderr.write("status: keepalive\n");
       } else {
         frame = renderFrame(cwd, binaryVersion, nowMs, i, workerLiveness, true, namedRunId);
         if (tty) {

@@ -55,13 +55,11 @@ describe("real adapters", () => {
     // codex v0.144.1: --sandbox workspace-write replaces deprecated --full-auto
     const cxHeadless = codex.headlessCommand("/p", "gpt-5.2");
     expect(cxHeadless).toContain("--sandbox workspace-write");
-    // OBS-24/OBS-82: MCP suppressed in BOTH modes — a down operator-global MCP server wedges codex
-    // startup. codex ≥0.144 merges the empty table (no-op), so plugin loading is disabled and every
-    // config-named server gets a per-name override too (see codex-mcp-suppress.test.ts).
+    // OBS-24/OBS-82: MCP suppressed in the argv-safe headless form — a down operator-global MCP
+    // server wedges codex startup. The unsupported TUI form falls back to this command in the daemon.
     expect(cxHeadless).toContain(`-c 'mcp_servers={}'`);
     expect(cxHeadless).toContain("--disable plugins");
-    expect(codex.interactiveCommand("/p", "gpt-5.2")).toContain(`-c 'mcp_servers={}'`);
-    expect(codex.interactiveCommand("/p", "gpt-5.2")).toContain("--disable plugins");
+    expect(codex.interactiveCommand("/p", "gpt-5.2")).toBeNull();
     expect(cxHeadless).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     expect(cxHeadless).not.toContain("--full-auto");
     // OBS-125: codex 0.144.x per-worktree "Hooks need review" gate — bypass hook trust so the operator's
@@ -84,7 +82,7 @@ describe("real adapters", () => {
     }
   });
 
-  test("v1.2 interactive commands: real TUI with initial prompt, verified flags, never print mode", () => {
+  test("v1.2 interactive commands: supported real TUIs carry verified flags and codex declares fallback", () => {
     const c = claudeCode.interactiveCommand("/tmp/p.md", "fable") as string;
     expect(c).toContain(`"$(cat '/tmp/p.md')"`);
     expect(c).toContain("--model 'fable'");
@@ -100,23 +98,10 @@ describe("real adapters", () => {
     expect(cu).toContain("--force");
     expect(cu).not.toContain("--trust"); // print-only flag: interactive cursor exits 1 with it (v1.4 incident)
     expect(cu).not.toMatch(/\s-p\s|--print/);
-    // codex TUI has no --full-auto (exec-only); its interactive equivalent is the expanded pair
-    const cx = codex.interactiveCommand("/p", "gpt-5.2") as string;
-    expect(cx).toMatch(/^codex (?!exec)/);
-    // `on-failure` is not a valid codex approval policy (untrusted|on-request|never) —
-    // it made every interactive codex dispatch exit 2 pre-inference (2026-07-09 incident)
-    expect(cx).toContain("-a never");
-    expect(cx).not.toContain("on-failure");
-    expect(cx).toContain("-s workspace-write");
-    // OBS-125: the interactive worker (the mode that stalled at the hooks gate) carries the hook-trust
-    // bypass so it reasons past "Hooks need review"; sandbox kept (NOT --dangerously-bypass-approvals-and-sandbox).
-    expect(cx).toContain("--dangerously-bypass-hook-trust");
-    expect(cx).not.toContain("--dangerously-bypass-approvals-and-sandbox");
-    // worktree gitdirs live under the main repo's .git/worktrees — outside the sandbox root —
-    // so both codex commands must whitelist the git common dir or every commit dies on index.lock
-    expect(cx).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
-    const cxh = codex.headlessCommand("/p", "gpt-5.2") as string;
-    expect(cxh).toContain("sandbox_workspace_write.writable_roots");
+    // OBS-889: codex's TUI cannot read a prompt file or stdin. Null makes the daemon journal the
+    // visible worker's fallback before running the same argv-safe headless form in its pane.
+    expect(codex.interactiveCommand("/p", "gpt-5.2")).toBeNull();
+    expect(codex.headlessCommand("/p", "gpt-5.2")).toContain("sandbox_workspace_write.writable_roots");
     const oc = opencode.interactiveCommand("/p", "m/k") as string;
     expect(oc).toMatch(/^opencode (?!run)/);
     expect(oc).toContain("--prompt");

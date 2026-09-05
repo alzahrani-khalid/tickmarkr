@@ -8,10 +8,8 @@ export type PreferenceRole = "worker" | "judge" | "review" | "consult";
 
 const PREFERENCE_ROLES: PreferenceRole[] = ["worker", "judge", "review", "consult"];
 
-// Keep routing retries on the same identity review diversity uses: the served provider plus the
-// unprefixed model id. Gate review owns the original modelProvider policy; this dependency-leaf copy
-// avoids importing gates back into route/run and must move with that helper when the scope permits.
-export function routingModelProvider(model: string, fallback = "unknown"): string {
+/** Provider identity comes from the served model, not a gateway adapter's stamped vendor. */
+export function modelProvider(model: string, fallback = "unknown"): string {
   const id = model.toLowerCase();
   const prefix = id.includes("/") ? id.slice(0, id.indexOf("/")) : "";
   if (prefix === "openai" || prefix === "openai-codex" || /^(?:gpt|o\d)/.test(id)) return "openai";
@@ -22,6 +20,9 @@ export function routingModelProvider(model: string, fallback = "unknown"): strin
   if (["kimi-code", "moonshot"].includes(prefix) || /^kimi(?:-|$)/.test(id)) return "moonshot";
   return fallback;
 }
+
+// Router naming remains explicit while sharing the review gate's exact function object.
+export const routingModelProvider = modelProvider;
 
 export const modelRouteIdentity = (model: string, fallback = "unknown") =>
   `${routingModelProvider(model, fallback)}/${model.slice(model.lastIndexOf("/") + 1).toLowerCase()}`;

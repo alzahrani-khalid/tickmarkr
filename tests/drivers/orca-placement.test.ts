@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, test } from "vitest";
-import { canonicalWorktreePath, OrcaDriver, OrcaError, OrcaUnavailableError } from "../../src/drivers/orca.js";
+import { canonicalWorktreePath, OrcaDriver, OrcaError, OrcaUnavailableError, PENDING_PROJECT_GRACE_MS } from "../../src/drivers/orca.js";
 import { formatOwnedName, panesToClose, type ExecutorDriver } from "../../src/drivers/types.js";
 import { createWorktree, worktreePath } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
@@ -79,6 +79,58 @@ class DelegatingOrcaDriver extends OrcaDriver {
 }
 
 describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
+  test("test: a project call for a task whose slot never appears is dropped after the pending grace and journaled project-unplaced at the next reconcile so a later slot for that task applies no stale status whereas a driver that parks the projection forever fails", async () => {
+    const repo = makeRepo({ "pending.txt": "pending\n" });
+    const runId = "run-project-unplaced";
+    const midDispatchTaskId = "T-mid-dispatch";
+    const neverTaskId = "T-never";
+    const journal = Journal.create(repo, runId);
+    journal.append("run-start", undefined, {});
+    const fake = new FakeOrca();
+    const time = steppedTime();
+    const driver = new OrcaDriver({ exec: fake.exec, time });
+
+    await driver.project(midDispatchTaskId, "in-progress");
+    await driver.project(neverTaskId, "in-progress");
+    const midDispatchWorktree = await driver.worktree(
+      repo, `tickmarkr/${runId}--${midDispatchTaskId}`, "HEAD",
+    );
+    const neverWorktree = await driver.worktree(repo, `tickmarkr/${runId}--${neverTaskId}`, "HEAD");
+    const desired = new Set([
+      formatOwnedName({ role: "worker", taskId: midDispatchTaskId, attempt: 0, runId }),
+    ]);
+    await driver.reconcile(desired, runId);
+    expect(Journal.open(repo, runId).read().filter((row) => row.event === "project-unplaced"))
+      .toHaveLength(0);
+
+    time.advance(PENDING_PROJECT_GRACE_MS + 1);
+    await driver.reconcile(desired, runId);
+    const dropped = Journal.open(repo, runId).read().filter((row) => row.event === "project-unplaced");
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      taskId: neverTaskId,
+      data: {
+        state: "in-progress",
+        pendingMs: PENDING_PROJECT_GRACE_MS + 1,
+        graceMs: PENDING_PROJECT_GRACE_MS,
+      },
+    });
+
+    await driver.slot(midDispatchWorktree, "legacy-mid-dispatch", {
+      owned: { role: "worker", taskId: midDispatchTaskId, attempt: 0, runId },
+    });
+    expect(fake.workspaceStatuses.get(canonicalWorktreePath(midDispatchWorktree))).toBe("in-progress");
+
+    await driver.slot(neverWorktree, "legacy-never", {
+      owned: { role: "worker", taskId: neverTaskId, attempt: 0, runId },
+    });
+    expect(fake.countOf("worktree-set")).toBe(1);
+    expect(fake.workspaceStatuses.has(canonicalWorktreePath(neverWorktree))).toBe(false);
+    await driver.reconcile(new Set(), runId);
+    expect(Journal.open(repo, runId).read().filter((row) => row.event === "project-unplaced"))
+      .toHaveLength(1);
+  });
+
   test("test: the first run on a slot issues terminal create only after worktree current answers the slot's canonical path so a fixture that refuses selector_not_found or answers the enclosing checkout for the first three probes still binds on the fourth with a worktree-adoption-wait journal row carrying the milliseconds when the wait exceeded 2 s and a fixture that never answers within 60 s fails the dispatch loudly whereas a driver that creates before the path is answered fails", async () => {
     const repo = makeRepo({ "adoption.txt": "ready\n" });
     const runId = "run-orca-adoption";

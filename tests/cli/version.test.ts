@@ -45,16 +45,17 @@ describe("tickmarkr version", () => {
     expect(r.out).not.toContain("\n");
   });
 
-  test("test: tickmarkr version prints the package version alone on one line whereas version --dist appends a dist fingerprint on that same line which changes when one byte of one dist file changes so a fingerprint over file names alone or a second output line fails", async () => {
+  test("test: version --dist prints the resolved dist directory path beside the fingerprint on the one line while bare version prints the semver alone whereas a stamp that omits the path fails", async () => {
     const dist = mkdtempSync(join(tmpdir(), "tickmarkr-dist-fingerprint-"));
     const file = join(dist, "cli.js");
     writeFileSync(file, "a");
     const first = distFingerprint(dist);
     expect(await version([], dist)).toBe(PKG_VERSION);
-    expect(await version(["--dist"], dist)).toBe(`${PKG_VERSION} dist:${first}`);
+    expect(await version(["--dist"], dist)).toBe(`${PKG_VERSION} dist:${resolve(dist)} fingerprint:${first}`);
     expect((await version(["--dist"], dist)).includes("\n")).toBe(false);
     const dispatched = await dispatch("version", ["--dist"]);
-    expect(dispatched.out).toMatch(new RegExp(`^${PKG_VERSION.replaceAll(".", "\\.")} dist:[0-9a-f]{64}$`));
+    const builtDist = resolve(ROOT, "dist");
+    expect(dispatched.out).toBe(`${PKG_VERSION} dist:${builtDist} fingerprint:${distFingerprint(builtDist)}`);
     expect(dispatched.code).toBe(0);
     writeFileSync(file, "b");
     expect(distFingerprint(dist)).not.toBe(first);

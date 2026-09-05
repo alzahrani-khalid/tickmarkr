@@ -8,7 +8,7 @@ model auth: 2 channel(s) unauthed — claude-code:fable (HTTP 403: forbidden —
   T1     migration  !! T1: no channel at tier>=frontier; available: claude-code:sonnet, claude-code:haiku
     floor frontier ← mode risk-based
 
-est. cost (API channels only, rough): ~$0.00 + judge/review/consult calls
+est. cost (API LLM seats, rough): ~$0.00 + consult calls
 
 routing lints:
   ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually

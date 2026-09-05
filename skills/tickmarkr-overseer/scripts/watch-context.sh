@@ -36,7 +36,7 @@
 #   TKR_AUTO_CLEAR=1   at act-pct WITH a fresh handoff, auto-clear orchestrator/overseer; other roles wake only.
 #   TKR_REBRIEF=<path> the file the re-briefed seat is told to read (defaults to the handoff).
 #   TKR_HANDOFF_MAX_AGE_S  how fresh "fresh" is (default 900).
-#   TKR_CLEAR_SETTLE_S     seconds to let a cleared seat settle before the re-brief (default 6).
+#   TKR_CLEAR_SETTLE_S     seconds allowed for the cleared banner percentage to drop (default 6).
 #   TKR_BLIND_ALARM_S      seconds unreadable before CONTEXT_BLIND alarms (default 120).
 #   TKR_CONTEXT_WINDOW     context window in tokens. Set it when the banner does not name one;
 #                          NEVER guessed — a wrong denominator makes every warn and act line wrong.
@@ -234,6 +234,82 @@ context_pct() {
   banner_pct
 }
 
+status_of() {
+  herdr agent get "$TARGET" 2>/dev/null \
+    | sed -n 's/.*"agent_status":"\([a-z_]*\)".*/\1/p' | head -1
+}
+
+# A clear is a SEND, so it inherits the verified-send precondition: the target must be between turns
+# and its live prompt line must contain no typed draft. Claude Code's autosuggest is text in the plain
+# rendering but is wrapped in SGR dim in the ANSI rendering; it is decoration, not a draft. Parse the
+# Esc-prefixed SGR bytes instead of treating every visible character after the prompt glyph as state.
+prompt_is_empty_or_dim() {
+  herdr agent read "$TARGET" --source visible --lines 14 --format ansi 2>/dev/null | python3 -c '
+import re, sys
+screen = sys.stdin.read().splitlines()
+ansi = re.compile(r"\x1b\[([0-9;]*)m")
+prompt = None
+for line in screen:
+    plain = ansi.sub("", line).lstrip()
+    if plain.startswith(("❯", "›")):
+        prompt = line
+if prompt is None:
+    sys.exit(1)
+glyph = min((i for i in (prompt.find("❯"), prompt.find("›")) if i >= 0), default=-1)
+if glyph < 0:
+    sys.exit(1)
+payload = prompt[glyph + 1:]
+dim = False
+pos = 0
+for match in ansi.finditer(payload):
+    if payload[pos:match.start()].strip() and not dim:
+        sys.exit(1)
+    codes = [int(c) if c else 0 for c in match.group(1).split(";")]
+    if 0 in codes:
+        dim = False
+    if 2 in codes:
+        dim = True
+    if 22 in codes:
+        dim = False
+    pos = match.end()
+if payload[pos:].strip() and not dim:
+    sys.exit(1)
+' 2>/dev/null
+}
+
+clear_target_ready() {
+  CLEAR_STATUS=$(status_of)
+  case "$CLEAR_STATUS" in
+    idle|done) ;;
+    *) CLEAR_REASON="status=${CLEAR_STATUS:-unreadable}"; return 1 ;;
+  esac
+  if ! prompt_is_empty_or_dim; then
+    CLEAR_REASON="status=$CLEAR_STATUS prompt=typed-or-unreadable"
+    return 1
+  fi
+  return 0
+}
+
+# `/clear` has landed only when a fresh banner read says its context percentage is lower. The JSONL
+# source deliberately does not participate in this receipt: it names the pre-clear session and can
+# remain at the old fill while the new prompt is already visible. No drop means no re-brief and no
+# CONTEXT_CLEARED claim.
+wait_for_clear_receipt() {
+  local before="$1" waited=0 after
+  case "$SETTLE" in *[!0-9]*|'') return 1 ;; esac
+  while :; do
+    after=$(banner_pct 2>/dev/null) || after=""
+    if printf '%s\n' "$after" | grep -qE '^[0-9]+$' \
+       && [ "$after" -lt "$before" ] 2>/dev/null; then
+      printf '%s\n' "$after"
+      return 0
+    fi
+    [ "$waited" -lt "$SETTLE" ] || return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
 handoff_fresh() {
   [ -n "$HANDOFF" ] || return 1
   [ -f "$HANDOFF" ] || return 1
@@ -245,13 +321,23 @@ handoff_fresh() {
 }
 
 act_on() {
-  local P="$1"
+  local P="$1" BEFORE AFTER
   if handoff_fresh; then
     if [ "${TKR_AUTO_CLEAR:-0}" = "1" ] && { [ "$ROLE" = "orchestrator" ] || [ "$ROLE" = "overseer" ]; }; then
+      if ! clear_target_ready; then
+        echo "CONTEXT_ACT_DEFERRED $TARGET at ${P}% — ${CLEAR_REASON}; waiting for idle and an empty/dim-only prompt line"
+        return 0
+      fi
+      BEFORE=$(banner_pct 2>/dev/null) || BEFORE=""
+      case "$BEFORE" in ''|*[!0-9]*) echo "CONTEXT_CLEAR_UNVERIFIED $TARGET — no numeric banner baseline; not clearing"; return 0 ;; esac
       herdr agent prompt "$TARGET" "/clear" >/dev/null 2>&1
-      sleep "$SETTLE"
+      if ! AFTER=$(wait_for_clear_receipt "$BEFORE"); then
+        echo "CONTEXT_CLEAR_UNVERIFIED $TARGET at ${P}% — banner did not re-read below ${BEFORE}% within ${SETTLE}s"
+        echo "  no re-brief sent and CONTEXT_CLEARED withheld; inspect the seat before acting again"
+        exit 0
+      fi
       herdr agent prompt "$TARGET" "Read ${REBRIEF} and continue exactly where it says. Your context was cleared at ${P}% against that handoff; it is current as of $(date '+%H:%M'). The same-process clear kept every background task alive: kill only this seat's recorded watcher pids first, verify the process table twice, then re-arm. Do not reconstruct from memory — everything you need is on disk." >/dev/null 2>&1
-      echo "CONTEXT_CLEARED $TARGET at ${P}% — handoff fresh, re-briefed from ${REBRIEF}"
+      echo "CONTEXT_CLEARED $TARGET ${P}% -> ${AFTER}% — banner re-read lower, handoff fresh, re-briefed from ${REBRIEF}"
       exit 0
     fi
     echo "CONTEXT_ACT $TARGET ${P}% (>= ${ACT}) — handoff is FRESH, a clear is SAFE now"

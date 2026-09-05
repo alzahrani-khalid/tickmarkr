@@ -10,7 +10,8 @@ import { LEGACY_PREFIX, specTemplate } from "../../compile/native.js";
 import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
 import { tickmarkrDir } from "../../graph/graph.js";
 import { orcaHostDetected } from "../../drivers/index.js";
-import { Journal } from "../../run/journal.js";
+import { Journal, type JournalEvent } from "../../run/journal.js";
+import { runLockRunId, runStatusLine } from "../../run/lock.js";
 import { doctor } from "./doctor.js";
 import { assembleFleetEditor } from "./fleet.js";
 
@@ -27,17 +28,14 @@ const ENVIRONMENTS_FOOTER = [
   "  anywhere — no herdr or Orca terminal? same fail-closed gates, headless subprocess driver (legacy: no herdr? same fail-closed gates, headless subprocess driver when Orca markers are absent)",
 ].join("\n");
 
-/** Latest journal without a run-end event, if any. */
-function activeRunId(cwd: string): string | null {
-  const runId = Journal.latestRunId(cwd, { withJournal: true });
+/** Current run truth, lock first; falls back to an abandoned journal. */
+function activeRunLine(cwd: string): string | null {
+  const locked = runLockRunId(cwd);
+  const runId = locked ?? Journal.latestRunId(cwd, { withJournal: true });
   if (!runId) return null;
-  try {
-    const events = Journal.open(cwd, runId).read();
-    if (events.some((e) => e.event === "run-end")) return null;
-    return runId;
-  } catch {
-    return null;
-  }
+  let events: JournalEvent[] = [];
+  try { events = Journal.open(cwd, runId).read(); } catch { /* lock may exist before first journal row */ }
+  return runStatusLine(cwd, runId, events);
 }
 
 /** Relative paths of specs/*.spec.md already in the repo. */
@@ -56,8 +54,8 @@ function existingSpecs(cwd: string): string[] {
 
 /** Context-aware next-steps line (operator-approved 2026-07-17). */
 function nextSteps(cwd: string, scaffoldedSpec: string): string {
-  const runId = activeRunId(cwd);
-  if (runId) return `run ${runId} active — tickmarkr status`;
+  const runLine = activeRunLine(cwd);
+  if (runLine) return `${runLine} — tickmarkr status`;
 
   const specs = existingSpecs(cwd);
   if (specs.length > 0) {

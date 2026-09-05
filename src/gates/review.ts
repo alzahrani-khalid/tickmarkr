@@ -12,6 +12,7 @@ import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
 import { redactSecrets } from "../run/redact.js";
 import { marginalCostRank } from "../route/router.js";
+import { modelProvider } from "../route/preference.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlmDetailed, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
@@ -226,18 +227,7 @@ export function modelId(model: string): string {
   return model.slice(model.lastIndexOf("/") + 1);
 }
 
-/** Provider identity comes from the served model, not a gateway adapter's stamped vendor. */
-export function modelProvider(model: string, fallback = "unknown"): string {
-  const id = model.toLowerCase();
-  const prefix = id.includes("/") ? id.slice(0, id.indexOf("/")) : "";
-  if (prefix === "openai" || prefix === "openai-codex" || /^(?:gpt|o\d)/.test(id)) return "openai";
-  if (prefix === "anthropic" || /^(?:claude|opus|sonnet|haiku|fable)(?:-|$)/.test(id)) return "anthropic";
-  if (prefix === "google" || /^gemini(?:-|$)/.test(id)) return "google";
-  if (prefix === "xai" || /^grok(?:-|$)/.test(id)) return "xai";
-  if (["zai", "zhipu", "zai-coding-plan"].includes(prefix) || /^glm(?:-|$)/.test(id)) return "zhipu";
-  if (["kimi-code", "moonshot"].includes(prefix) || /^kimi(?:-|$)/.test(id)) return "moonshot";
-  return fallback;
-}
+export { modelProvider };
 
 // v1.53 T2: same entry grammar as routing.map.prefer (router.ts preferIndex — router is out of this
 // module's dependency direction for a private fn, so the 3 lines live here too): `adapter` matches

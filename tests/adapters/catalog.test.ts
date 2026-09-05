@@ -365,7 +365,8 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
     // 2026-09-03: repinned when claude moved its print prompt to stdin, pane forms gained the
     // promptSuggestionEnabled settings pair, and Fable's stamp advanced to 5.1.
     "claude-code": "c00cb8c0fc0e03ca99857237b98d73d59e223f4d2ec5156bc7500fc778c707d0",
-    codex: "22b0e5652c1674629ea5d32db5fe14d4d6a10569702770acbd86e1e9cb8c2078",
+    // 2026-09-05 (OBS-889): repinned when headless prompts moved to stdin and TUI fallback became explicit.
+    codex: "c6072b1c914d84f2c3927f8093a2398949bb5d52e3fe858636c5e77848ba9f35",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
     pi: "d8c6ab42a4052ee982ead3e119d02d4df8734429b36a129a9e926cf1c2f8c3b7",
@@ -389,9 +390,8 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
   expect(after.qwen).toMatchObject({ routable: true, vendor: "alibaba", identity: "^\\d+\\.\\d+\\.\\d+" });
   expect(Object.keys(after)).toEqual(Object.keys(before));
   expect(digestMap(before)).toEqual(expectedBeforeDigests);
-  // 2026-09-04 (RULING-222-43, OBS-905): repinned when qwen lost its `-i` interactive form — the
-  // pane runs the headless command and `-i` left hardcodedFlags. Only qwen's tuple moved.
-  expect(digestMap(after)).toEqual({ ...expectedBeforeDigests, qwen: "4613b18718acb920366d8ef50d9cd2e2e0d8fb564b6c5710d371b4cde3bb58ab" });
+  // 2026-09-04 (OBS-902): repinned when qwen headless gained --safe-mode. Only qwen's tuple moved.
+  expect(digestMap(after)).toEqual({ ...expectedBeforeDigests, qwen: "c92184732fd47b178be17282c5ea4784911d85a7f7f82a8ec39df1bb65c5af78" });
   for (const id of Object.keys(before).filter((candidate) => candidate !== "qwen")) {
     expect(after[id], id).toEqual(before[id]);
   }

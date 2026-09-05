@@ -235,7 +235,7 @@ describe.skipIf(skipReason !== undefined)(suiteName, () => {
     }
   });
 
-  test("live tree: shared files match and every .claude-only orphan has an explicit decision", () => {
+  test("test: live tree: shared files match and every .claude-only orphan has an explicit decision", () => {
     const explicitInstalledOnly: Violation[] = [
       {
         name: "tickmarkr-overseer",

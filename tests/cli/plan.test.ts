@@ -77,6 +77,44 @@ describe("VIS-04 plan-diff preview", () => {
 });
 
 describe("T10 plan headline names the dispatched channel", () => {
+  test("test: plan prints for every task the judge seat it will spend on or none when the task has no judge criterion and the review seat with the participation reason that admits it and the footer counts those LLM seats whereas a plan that prints the worker channel alone fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const fake = new FakeAdapter(script);
+    saveGraph(repo, validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [
+        { id: "T1", title: "judged", goal: "g", shape: "implement", complexity: 3, files: ["src/a.ts"], acceptance: ["judge me"] },
+        { id: "T2", title: "commanded", goal: "g", shape: "implement", complexity: 3, files: ["src/b.ts"], acceptance: [{ oracle: "command", command: "true" }] },
+      ],
+    }));
+    writeDoctor(repo, { fake: await fake.probe() });
+    withOverlay(repo, "judge: { adapter: fake, model: fake-1 }\nreview: { required: true }\n");
+
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const noColor = process.env.NO_COLOR;
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: false });
+    process.env.NO_COLOR = "1";
+    let out = "";
+    try {
+      out = await plan([], repo, [fake]);
+    } finally {
+      if (noColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = noColor;
+      if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    }
+
+    expect(out).toContain("T1     implement");
+    expect(out).toContain("    judge: fake:fake-1");
+    expect(out).toContain("T2     implement");
+    expect(out).toContain("    judge: none — no judge oracle");
+    expect(out).toContain("    review: fake:fake-2 — reviewPolicy full ~$2.50");
+    expect(out).toContain("est. cost (API LLM seats, rough): ~$5.00 + consult calls");
+  });
+
   const taskRow = (out: string) => out.split("\n").find((l) => /^\s+T1\s+chore/.test(l) && l.includes("→"))!;
 
   test("with learned routing off the headline names the statically routed channel and credits the reason the static router gave", async () => {

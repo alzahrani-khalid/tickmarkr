@@ -22,6 +22,7 @@ export interface CatalogCache {
   artificialAnalysis?: unknown;
   // Optional, so schemaVersion stays 1 and validCache still requires only modelsDev.
   liveBench?: unknown;
+  legFetchedAt?: Partial<Record<"modelsDev" | "artificialAnalysis" | "liveBench", string>>;
 }
 
 export interface CatalogReadResult {
@@ -61,10 +62,20 @@ export interface RefreshCatalogOptions {
   now?: () => Date;
 }
 
+export type CatalogLegName = "models.dev" | "Artificial Analysis" | "LiveBench";
+export type CatalogLegStatus = "updated" | "failed" | "skipped";
+export interface CatalogLegResult {
+  leg: CatalogLegName;
+  status: CatalogLegStatus;
+  detail: string;
+  retry: string;
+}
+
 export interface RefreshCatalogResult {
   updated: boolean;
   catalog: CatalogReadResult;
   warning?: string;
+  legs: CatalogLegResult[];
 }
 
 const VENDORED_CATALOG: CatalogCache = {
@@ -121,10 +132,21 @@ const validModelsDevCatalog = (value: unknown): boolean => {
   });
 };
 
-const staleAt = (fetchedAt: string, now: Date): boolean => {
-  const age = now.getTime() - Date.parse(fetchedAt);
+const staleAt = (fetchedAt: string | undefined, now: Date): boolean => {
+  const age = now.getTime() - Date.parse(fetchedAt ?? "");
   return !Number.isFinite(age) || age > CATALOG_CACHE_MAX_AGE_MS;
 };
+
+const legFetchedAt = (catalog: CatalogCache, leg: keyof NonNullable<CatalogCache["legFetchedAt"]>): string =>
+  catalog.legFetchedAt?.[leg] ?? catalog.fetchedAt;
+
+const catalogStale = (catalog: CatalogCache, now: Date, source: CatalogReadResult["source"]): boolean =>
+  source === "vendored" || staleAt(legFetchedAt(catalog, "modelsDev"), now) || staleAt(legFetchedAt(catalog, "liveBench"), now)
+  || (catalog.artificialAnalysis !== undefined && catalog.legFetchedAt?.artificialAnalysis !== undefined
+    && staleAt(catalog.legFetchedAt.artificialAnalysis, now));
+
+export const formatCatalogRefreshLegs = (legs: readonly CatalogLegResult[]): string =>
+  `catalog refresh: ${legs.map((leg) => `${leg.leg} ${leg.status} (${leg.detail}; ${leg.retry})`).join("; ")}`;
 
 export const catalogCachePath = (repoRoot: string): string => join(repoRoot, ".tickmarkr", "catalog-cache.json");
 
@@ -137,13 +159,13 @@ export function readCachedCatalog(repoRoot: string, opts: { now?: () => Date } =
   try {
     const parsed: unknown = JSON.parse(readFileSync(catalogCachePath(repoRoot), "utf8"));
     if (!validCache(parsed)) throw new Error("catalog cache schema is invalid");
-    return { catalog: parsed, source: "cache", stale: staleAt(parsed.fetchedAt, now) };
+    return { catalog: parsed, source: "cache", stale: catalogStale(parsed, now, "cache") };
   } catch (error) {
     const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
     return {
       catalog: VENDORED_CATALOG,
       source: "vendored",
-      stale: staleAt(VENDORED_CATALOG.fetchedAt, now),
+      stale: true,
       ...(!missing ? { warning: error instanceof Error ? error.message : String(error) } : {}),
     };
   }
@@ -493,6 +515,13 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
   const fetcher = opts.fetcher ?? globalThis.fetch.bind(globalThis) as CatalogFetcher;
   const timeoutMs = opts.timeoutMs ?? CATALOG_REFRESH_TIMEOUT_MS;
   const warnings: string[] = [];
+  const legs: CatalogLegResult[] = [];
+  const stamp = now().toISOString();
+  const legAt: CatalogCache["legFetchedAt"] = {
+    modelsDev: legFetchedAt(current.catalog, "modelsDev"),
+    liveBench: legFetchedAt(current.catalog, "liveBench"),
+    ...(current.catalog.artificialAnalysis !== undefined ? { artificialAnalysis: legFetchedAt(current.catalog, "artificialAnalysis") } : {}),
+  };
 
   let modelsDev: unknown = current.catalog.modelsDev;
   let modelsDevUpdated = false;
@@ -500,18 +529,31 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
     modelsDev = await fetchCatalog(fetcher, MODELS_DEV_CATALOG_URL, {}, timeoutMs, (r) => r.json());
     if (!validModelsDevCatalog(modelsDev)) throw new Error("models.dev catalog schema is invalid");
     modelsDevUpdated = true;
+    legAt.modelsDev = stamp;
+    legs.push({ leg: "models.dev", status: "updated", detail: "fetched", retry: "next retry after this leg is stale" });
   } catch (error) {
-    warnings.push(`models.dev refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    const detail = error instanceof Error ? error.message : String(error);
+    warnings.push(`models.dev refresh failed: ${detail}`);
+    legs.push({ leg: "models.dev", status: "failed", detail, retry: "retry next refresh because this leg kept its prior age" });
   }
 
   let artificialAnalysis = current.catalog.artificialAnalysis;
+  let artificialAnalysisUpdated = false;
   const apiKey = opts.artificialAnalysisKey ?? process.env.ARTIFICIAL_ANALYSIS_API_KEY?.trim();
   if (apiKey) {
     try {
       artificialAnalysis = await fetchArtificialAnalysis(fetcher, apiKey, timeoutMs);
+      artificialAnalysisUpdated = true;
+      legAt.artificialAnalysis = stamp;
+      legs.push({ leg: "Artificial Analysis", status: "updated", detail: "fetched", retry: "next retry after this leg is stale" });
     } catch (error) {
-      warnings.push(`Artificial Analysis refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      warnings.push(`Artificial Analysis refresh failed: ${detail}`);
+      legs.push({ leg: "Artificial Analysis", status: "failed", detail, retry: "retry next refresh because this leg kept its prior age" });
     }
+  } else {
+    delete legAt.artificialAnalysis;
+    legs.push({ leg: "Artificial Analysis", status: "skipped", detail: "no API key", retry: "retry when ARTIFICIAL_ANALYSIS_API_KEY is set" });
   }
 
   let liveBench = current.catalog.liveBench;
@@ -519,27 +561,43 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
   try {
     liveBench = await fetchLiveBench(fetcher, timeoutMs);
     liveBenchUpdated = true;
+    legAt.liveBench = stamp;
+    legs.push({ leg: "LiveBench", status: "updated", detail: `table ${LIVEBENCH_TABLE_DATE}`, retry: "next retry after this leg is stale" });
   } catch (error) {
-    warnings.push(`LiveBench refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    const detail = error instanceof Error ? error.message : String(error);
+    warnings.push(`LiveBench refresh failed: ${detail}`);
+    legs.push({ leg: "LiveBench", status: "failed", detail, retry: "retry next refresh because this leg kept its prior age" });
   }
 
-  // models.dev is the required cache spine. Still run every independent leg after it fails, but do
-  // not write a cache that would make the vendored fallback look fetched.
-  if (!modelsDevUpdated) {
-    return { updated: false, catalog: current, warning: warnings.join("; ") };
+  const updated = modelsDevUpdated || artificialAnalysisUpdated || liveBenchUpdated;
+  // models.dev is the cache spine: do not write a cache that would make the vendored fallback look
+  // fetched. Independent legs may only merge onto models.dev fetched now or already held in cache.
+  if (!updated || (!modelsDevUpdated && current.source !== "cache")) {
+    const reportedLegs = !modelsDevUpdated && current.source !== "cache"
+      ? legs.map((leg) => leg.status === "updated"
+        ? {
+            ...leg,
+            status: "failed" as const,
+            detail: "fetched but discarded — models.dev spine unavailable",
+            retry: "retry next refresh",
+          }
+        : leg)
+      : legs;
+    return { updated: false, catalog: current, legs: reportedLegs, ...(warnings.length ? { warning: warnings.join("; ") } : {}) };
   }
   const catalog: CatalogCache = {
     schemaVersion: 1,
-    // A failed keyless leg keeps the old age so doctor/fleet retry it rather than masking it for 7d.
-    fetchedAt: liveBenchUpdated ? now().toISOString() : current.catalog.fetchedAt,
+    fetchedAt: legAt.modelsDev ?? current.catalog.fetchedAt,
     modelsDev,
     ...(artificialAnalysis !== undefined ? { artificialAnalysis } : {}),
     ...(liveBench !== undefined ? { liveBench } : {}),
+    legFetchedAt: legAt,
   };
   writeCatalogCache(opts.repoRoot, catalog);
   return {
-    updated: true,
+    updated,
     catalog: readCachedCatalog(opts.repoRoot, { now }),
+    legs,
     ...(warnings.length ? { warning: warnings.join("; ") } : {}),
   };
 }

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { compile } from "../../src/cli/commands/compile.js";
+import { init } from "../../src/cli/commands/init.js";
+import { plan } from "../../src/cli/commands/plan.js";
 import { status } from "../../src/cli/commands/status.js";
 import { saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -11,6 +13,7 @@ import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { acquireRunLock, isPidLive, isRunLockLive, releaseRunLock, shouldRefuse } from "../../src/run/lock.js";
 import { deriveRunCockpitData } from "../../src/tui/cockpit/derive.js";
+import { writeDoctor } from "../../src/adapters/registry.js";
 import { COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 
 // LOCK-04 pid seam: the table itself is exercised unmocked everywhere else in this file. This wrapper
@@ -42,7 +45,80 @@ function plantLock(dir: string, payload: unknown, ageMs = 0): string {
   return p;
 }
 
+const seedStatusRepo = (runId: string, events: unknown[]): string => {
+  const repo = makeRepo({ "keep.txt": "x\n" });
+  saveGraph(repo, validateGraph({
+    version: 1,
+    spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 3, acceptance: ["a"] }],
+  }));
+  writeDoctor(repo, {});
+  const dir = join(tickmarkrDir(repo), "runs", runId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "journal.jsonl"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+  return repo;
+};
+
+const surfaces = async (repo: string, runId: string) => {
+  const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const noColor = process.env.NO_COLOR;
+  let ttyStatus = "";
+  delete process.env.NO_COLOR;
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+  try {
+    ttyStatus = await status([runId], repo);
+  } finally {
+    if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
+    else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    if (noColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = noColor;
+  }
+  return {
+    init: await init(["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-"))], repo),
+    implicitStatus: await status([], repo),
+    explicitStatus: await status([runId], repo),
+    ttyStatus,
+    plan: await plan([], repo, []),
+  };
+};
+
+const expectEverySurfaceToName = (outputs: Awaited<ReturnType<typeof surfaces>>, line: string) => {
+  for (const [surface, output] of Object.entries(outputs)) expect(output, surface).toContain(line);
+};
+
 describe("run lock decision table (HARD-01, HARD-02)", () => {
+  test("test: the run line printed by init status and plan reads active for a lock whose holder is alive stale lock naming the dead holder pid for a lock whose holder is dead and abandoned since the last row time for a run dir with no run-end row and no lock whereas a line that reads active from the missing run-end row alone fails", async () => {
+    const active = seedStatusRepo("run-active", [{ ts: "2026-09-04T10:00:00.000Z", event: "run-start", data: {} }]);
+    plantLock(active, { pid: process.pid, runId: "run-active", startedAt: Date.now() });
+    expectEverySurfaceToName(await surfaces(active, "run-active"), "run run-active active");
+
+    const dead = spawnSync("true").pid!;
+    const stale = seedStatusRepo("run-stale", [{ ts: "2026-09-04T11:00:00.000Z", event: "run-start", data: {} }]);
+    plantLock(stale, { pid: dead, runId: "run-stale", startedAt: Date.now() });
+    expectEverySurfaceToName(await surfaces(stale, "run-stale"), `run run-stale stale lock naming dead holder pid ${dead}`);
+
+    const abandoned = seedStatusRepo("run-abandoned", [
+      { ts: "2026-09-04T12:00:00.000Z", event: "run-start", data: {} },
+      { ts: "2026-09-04T12:34:56.000Z", event: "task-dispatch", taskId: "T1", data: {} },
+    ]);
+    const outputs = await surfaces(abandoned, "run-abandoned");
+    expectEverySurfaceToName(outputs, "run run-abandoned abandoned since 2026-09-04T12:34:56.000Z");
+    for (const [surface, output] of Object.entries(outputs)) expect(output, surface).not.toContain("run run-abandoned active");
+  });
+
+  test("repository-wide non-run locks do not invent a run on init status or plan", async () => {
+    const repo = seedStatusRepo("run-abandoned", [
+      { ts: "2026-09-04T12:00:00.000Z", event: "run-start", data: {} },
+      { ts: "2026-09-04T12:34:56.000Z", event: "task-dispatch", taskId: "T1", data: {} },
+    ]);
+    plantLock(repo, { pid: process.pid, runId: "compile", startedAt: Date.now() });
+
+    const outputs = await surfaces(repo, "run-abandoned");
+
+    expectEverySurfaceToName(outputs, "run run-abandoned abandoned since 2026-09-04T12:34:56.000Z");
+    for (const [surface, output] of Object.entries(outputs)) expect(output, surface).not.toContain("run compile");
+  });
+
   const dirs: string[] = [];
   const mk = () => { const d = tmp(); dirs.push(d); return d; };
   afterEach(() => { for (const d of dirs) releaseRunLock(d); dirs.length = 0; });

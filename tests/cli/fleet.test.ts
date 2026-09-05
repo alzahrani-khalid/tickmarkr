@@ -9,6 +9,7 @@ import { parse } from "yaml";
 
 import * as registry from "../../src/adapters/registry.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { LIVEBENCH_TABLE_URL, MODELS_DEV_CATALOG_URL } from "../../src/adapters/catalog-remote.js";
 import { retiredModelReason } from "../../src/adapters/model-lints.js";
 import { GLYPHS } from "../../src/brand.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
@@ -216,6 +217,7 @@ beforeEach(() => {
   Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
 });
 afterEach(() => {
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   if (stdoutTTYDescriptor) Object.defineProperty(process.stdout, "isTTY", stdoutTTYDescriptor);
   else delete (process.stdout as { isTTY?: boolean }).isTTY;
@@ -255,6 +257,26 @@ describe("tickmarkr fleet", () => {
     const lines = (out as string).split("\n");
     expect(lines[1]).toBe("# mode: risk-based (default)");
     expect([lines[0], ...lines.slice(2)].join("\n")).toBe(formatFleetPrint(repo, { globalDir: gdir }));
+  });
+
+  test("print mode reports every catalog leg when an automatic refresh fully fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const fetcher = vi.fn(async () => { throw new Error("offline"); });
+
+    const out = await fleet(["--print", "--global-dir", isolatedGlobal()], repo, [], {
+      catalogFetcher: fetcher,
+      catalogNow: () => new Date("2026-09-20T00:00:00.000Z"),
+    });
+
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      MODELS_DEV_CATALOG_URL,
+      LIVEBENCH_TABLE_URL,
+    ]);
+    const refreshLines = (out as string).split("\n").filter((line) => line.includes("fleet: catalog auto-refresh"));
+    expect(refreshLines).toHaveLength(1);
+    expect(refreshLines[0]).toContain("models.dev failed");
+    expect(refreshLines[0]).toContain("Artificial Analysis skipped");
+    expect(refreshLines[0]).toContain("LiveBench failed");
   });
 
   test("fleet print output names the mode and its source layer", async () => {
@@ -339,6 +361,37 @@ describe("tickmarkr fleet", () => {
   });
 
   // ── OBS-528: a stale cache (or --fresh) runs the sensor up front, then the editor opens ──
+  test("test: the interactive fleet path's internal doctor receives the same catalog fetcher and clock the fleet command was given so a failed refresh is attempted once whereas a path that lets doctor refresh again on its own fetcher fails", async () => {
+    const { repo, adapter } = setup();
+    const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), stale, stale);
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith(MODELS_DEV_CATALOG_URL)) throw new Error("offline-once");
+      if (url.startsWith(LIVEBENCH_TABLE_URL)) throw new Error("offline-once");
+      throw new Error(`unexpected ${url}`);
+    });
+    const { io } = makeIO();
+
+    const out = await drive(repo, adapter, io, KEYS.q, ["--global-dir", isolatedGlobal()],);
+
+    expect(out).toBe("fleet: quit without writing");
+    expect(fetcher).not.toHaveBeenCalled();
+
+    const withCatalog = setup();
+    const stale2 = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(join(tickmarkrDir(withCatalog.repo), "doctor.json"), stale2, stale2);
+    const catalogIo = makeIO();
+    const done = fleet(["--global-dir", isolatedGlobal()], withCatalog.repo, [withCatalog.adapter], {
+      ...catalogIo.io,
+      catalogFetcher: fetcher,
+      catalogNow: () => new Date("2026-09-20T00:00:00.000Z"),
+    });
+    catalogIo.input.write(KEYS.q);
+    expect(await done).toContain("fleet: quit without writing");
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([MODELS_DEV_CATALOG_URL, LIVEBENCH_TABLE_URL]);
+  });
+
   test("a stale probe cache no longer refuses the interactive editor — fleet runs doctor first and opens on what it recorded", async () => {
     const { repo, adapter } = setup();
     const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);

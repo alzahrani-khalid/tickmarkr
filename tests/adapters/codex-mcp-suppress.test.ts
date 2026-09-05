@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -70,7 +71,6 @@ describe("codex mcp suppression (OBS-82)", () => {
     // ~/.codex/plugins/cache, never under [mcp_servers.*]; only --disable plugins reaches them
     codexHome(FIXTURE);
     expect(codex.headlessCommand("/p", "gpt-5.2")).toContain("--disable plugins");
-    expect(codex.interactiveCommand("/p", "gpt-5.2")).toContain("--disable plugins");
   });
 
   test("a missing codex config yields the base suppression flags without error", () => {
@@ -81,13 +81,42 @@ describe("codex mcp suppression (OBS-82)", () => {
     expect(codex.headlessCommand("/p", "gpt-5.2")).toContain(flags);
   });
 
-  test("headless and interactive codex commands carry identical mcp suppression flags", () => {
+  test("codex declares no interactive command when its TUI cannot read a prompt file", () => {
     codexHome(FIXTURE);
     const flags = codexMcpSuppressionFlags();
-    // the whole flag run appears contiguously in BOTH production worker modes
     expect(flags).toContain("--disable plugins");
     expect(codex.headlessCommand("/p", "gpt-5.2")).toContain(flags);
-    expect(codex.interactiveCommand("/p", "gpt-5.2") as string).toContain(flags);
+    expect(codex.interactiveCommand("/p", "gpt-5.2")).toBeNull();
+  });
+
+  test("test: the codex headless command run against a stub codex on PATH carries no prompt bytes in argv so the result nonce appears in no argument while the prompt reaches the process and the interactive form likewise carries no prompt bytes whereas a form that inlines the prompt file's content fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-codex-argv-"));
+    const promptFile = join(dir, "prompt.md");
+    const argvLog = join(dir, "argv.log");
+    const stdinLog = join(dir, "stdin.log");
+    const nonce = "RESULT_NONCE_codex_argv_secret";
+    const prompt = `worker prompt\n${nonce}\n`;
+    writeFileSync(promptFile, prompt);
+    writeFileSync(join(dir, "codex"), `#!/bin/sh
+printf '%s\\n' "$@" > "$CODEX_ARGV_LOG"
+cat > "$CODEX_STDIN_LOG"
+`);
+    chmodSync(join(dir, "codex"), 0o755);
+    const env = {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH}`,
+      CODEX_ARGV_LOG: argvLog,
+      CODEX_STDIN_LOG: stdinLog,
+    };
+    const assertPromptOffArgv = (command: string) => {
+      execSync(command, { env });
+      expect(readFileSync(argvLog, "utf8")).not.toContain(nonce);
+      expect(readFileSync(stdinLog, "utf8")).toBe(prompt);
+    };
+
+    assertPromptOffArgv(codex.headlessCommand(promptFile, "gpt-5.2"));
+    expect(codex.interactiveCommand(promptFile, "gpt-5.2")).toBeNull();
+    expect(() => assertPromptOffArgv(`codex ${shq(prompt)}`)).toThrow();
   });
 
   test("config-scanned server names reach the shell line only through shq", () => {

@@ -334,10 +334,17 @@ export function authoringLintFindings(tasks: readonly Task[], file: string): Aut
       if (scope) findings.push(scope);
 
       for (const symbol of fencedIdentifiers(text)) {
-        if (!taskTexts.size || [...taskTexts.values()].some((body) => body.includes(symbol))) continue;
+        // Empty files[] is the deliberately unrestricted scope and a non-repository programmatic
+        // compile has no disk corpus to prove against. But a declared files[] that expands to zero
+        // repository files is evidence, not absence: its preservation fence cannot be satisfied.
+        if (!root || task.files.length === 0) continue;
+        if ([...taskTexts.values()].some((body) => body.includes(symbol))) continue;
+        const matchDetail = taskFiles.length === 0
+          ? `this task's files[] matched zero files on disk (${task.files.join(", ")})`
+          : `that symbol has zero hits in this task's files[] (${taskFiles.join(", ")})`;
         findings.push({
           code: "fence-symbol-absent", fixtureId: id, taskId: task.id, criterion: index + 1,
-          detail: `preservation fence cites \`${symbol}\` but that symbol has zero hits in this task's files[] (${taskFiles.join(", ")}) — OBS-604`,
+          detail: `preservation fence cites \`${symbol}\` but ${matchDetail} — OBS-604`,
         });
       }
 

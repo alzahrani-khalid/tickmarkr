@@ -482,25 +482,26 @@ export function newDirectoryLints(
   return lines;
 }
 
-/**
- * OBS-76 class: sweep src/ for out-of-scope source files that reference a symbol the acceptance
- * criteria name — the v1.52 router.ts omission, named at plan time instead of one judge round in.
- * Advisory plan output only, same contract as collateralLints.
- */
-export function sourceScopeLints(
+export interface SourceScopeFinding {
+  taskId: string;
+  /** Complete sorted hit set. Rendering may cap it; compile-time enforcement never does. */
+  paths: string[];
+}
+
+/** Structured OBS-76 findings shared by human rendering and native compile enforcement. */
+export function sourceScopeFindings(
   tasks: ReadonlyArray<Pick<Task, "id" | "files" | "acceptance">>,
   repoRoot: string,
-): string[] {
-  const newDirLints = newDirectoryLints(tasks, repoRoot);
+): SourceScopeFinding[] {
   const perTask = tasks
     .map((t) => ({ t, needles: criteriaSymbols(t.acceptance) }))
     .filter((x) => x.needles.length);
-  if (!perTask.length) return newDirLints;
+  if (!perTask.length) return [];
   const srcFiles = walkCode(repoRoot, "src");
-  if (!srcFiles.length) return newDirLints;
+  if (!srcFiles.length) return [];
 
   const read = makeReader(repoRoot);
-  const lines: string[] = [];
+  const findings: SourceScopeFinding[] = [];
   for (const { t, needles } of perTask) {
     // OBS-22: scopeGate accepts picomatch globs; advisory warnings must agree.
     const scoped = filesGlob(t.files.map((f) => f.replace(/^\.\//, "")));
@@ -515,11 +516,29 @@ export function sourceScopeLints(
     }
     if (!hits.length) continue;
     hits.sort();
-    const listed = hits.slice(0, MAX_HITS_PER_TASK).join(", ");
-    const tail = hits.length > MAX_HITS_PER_TASK ? " (capped)" : "";
-    lines.push(`${t.id}: criteria implicate out-of-scope source not in files[]: ${listed}${tail}`);
+    findings.push({ taskId: t.id, paths: hits });
   }
-  return [...newDirLints, ...lines];
+  return findings;
+}
+
+/** Human display is derived from the structured finding; no enforcement path parses this text. */
+export function renderSourceScopeFinding(finding: SourceScopeFinding): string {
+  const listed = finding.paths.slice(0, MAX_HITS_PER_TASK).join(", ");
+  const tail = finding.paths.length > MAX_HITS_PER_TASK ? " (capped)" : "";
+  return `${finding.taskId}: criteria implicate out-of-scope source not in files[]: ${listed}${tail}`;
+}
+
+/**
+ * OBS-76 class: sweep src/ for out-of-scope source files that reference a symbol the acceptance
+ * criteria name — the v1.52 router.ts omission, named at plan time instead of one judge round in.
+ * Advisory plan output only, same contract as collateralLints.
+ */
+export function sourceScopeLints(
+  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "acceptance">>,
+  repoRoot: string,
+  findings: readonly SourceScopeFinding[] = sourceScopeFindings(tasks, repoRoot),
+): string[] {
+  return [...newDirectoryLints(tasks, repoRoot), ...findings.map(renderSourceScopeFinding)];
 }
 
 // ── Task Unit Contract (OBS-212 / OBS-214) ────────────────────────────────────────────────────
@@ -911,9 +930,9 @@ export function reviewParticipationErrors(
   tasks: ReadonlyArray<Pick<Task, "id" | "files" | "shape">>,
   review: ReviewParticipation,
 ): string[] {
-  // The shipped critical paths are a FLOOR, not a default that a config replaces: this lint resolves
-  // its config from a repo root the compile seam cannot always name (see taskUnitContractErrors), and
-  // the one direction that must never happen is a wrong root lowering enforcement below what tickmarkr
+  // The shipped critical paths are a FLOOR, not a default that a config replaces: a programmatic
+  // compile may rely on taskUnitContractErrors' process.cwd() default, and the one direction that
+  // must never happen is a mismatched invocation root lowering enforcement below what tickmarkr
   // ships. Union is monotone — a repo-local list can only add.
   const critical = [...new Set([...DEFAULT_REVIEW_CRITICAL_PATHS, ...(review.criticalPaths ?? [])])];
   const errors: string[] = [];
@@ -950,11 +969,10 @@ export function reviewParticipationErrors(
 }
 
 /**
- * The ACTIVE participation config for a compile rooted at `repoRoot`. Same default-argument contract
- * as `repoRoot` itself: the CLI and daemon compile from inside the target repo, so the repo's own
- * config (plus the global overlay) is the config the run will gate under. A config the loader cannot
- * read degrades to the shipped defaults rather than crashing the compile — every command that reaches
- * this seam loads the same config itself and reports a malformed one loudly.
+ * The ACTIVE participation config for a compile rooted at `repoRoot`. CLI compilation supplies its
+ * target root; a programmatic caller that omits it uses taskUnitContractErrors' process.cwd() default,
+ * so its active overlay is the invocation repository. Native CLI compiles independently read the
+ * overlay fail-closed at the finalization seam, so malformed YAML is loud.
  */
 function activeReviewParticipation(repoRoot: string): ReviewParticipation {
   try {
@@ -967,16 +985,16 @@ function activeReviewParticipation(repoRoot: string): ReviewParticipation {
 
 /**
  * Every Task Unit Contract violation in one pass, ready to throw. `repoRoot` backs the
- * symbol-ownership lint and the participation config, and defaults to the invocation directory —
- * correct for the CLI/daemon, which compile from inside the target repo.
+ * symbol-ownership lint and participation overlay, and defaults to the invocation directory for
+ * programmatic compiles. The CLI passes its target repository explicitly.
  *
  * The read declaration (`context:`) rides on this parameter, on the task objects themselves — the
  * aggregator never infers it from the repo, the config, or a sibling task. It is OPTIONAL: a caller
  * whose task objects carry no `context` gets byte-identical verdicts to the ones it got before the
  * field existed, because an absent declaration grants no authority at all.
  *
- * The compile seam in src/compile/index.ts threads `compileSource`'s repo root here, so CLI tests
- * and programmatic compiles check the same repository overlay the later run will use.
+ * The compile seam in src/compile/index.ts threads `compileSource`'s repo root here when supplied;
+ * otherwise this function deliberately checks process.cwd().
  */
 export function taskUnitContractErrors(
   tasks: ReadonlyArray<

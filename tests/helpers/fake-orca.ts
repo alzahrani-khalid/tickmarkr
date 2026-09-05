@@ -603,8 +603,12 @@ export class FakeOrca {
   }
 }
 
-/** Stepped clock: sleeping advances it, so bounded polling loops terminate without real waiting. */
-export function steppedTime(): { now: () => number; sleep: (ms: number) => Promise<void> } {
+/** Stepped clock: sleeping or an explicit test advance moves it without real waiting. */
+export function steppedTime(): { now: () => number; sleep: (ms: number) => Promise<void>; advance: (ms: number) => void } {
   let ms = 0;
-  return { now: () => ms, sleep: async (n) => { ms += Math.max(1, n); } };
+  return {
+    now: () => ms,
+    sleep: async (n) => { ms += Math.max(1, n); },
+    advance: (n: number) => { ms += Math.max(0, n); },
+  };
 }

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
@@ -11,6 +11,7 @@ import { grok } from "../../src/adapters/grok.js";
 import { kimi } from "../../src/adapters/kimi.js";
 import { opencode } from "../../src/adapters/opencode.js";
 import { pi } from "../../src/adapters/pi.js";
+import { qwen } from "../../src/adapters/qwen.js";
 import { discoverChannels, flagDriftWarnings, missingDeclaredFlags, modelAuthExclusions, probeAll, probeModels, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { modelAuthed, type WorkerAdapter } from "../../src/adapters/types.js";
@@ -19,6 +20,8 @@ import { makeRepo } from "../helpers/tmprepo.js";
 
 const stub = (id: string) =>
   ({ id, vendor: "x", probe: async () => ({ installed: true, authed: true, models: [] }) }) as unknown as WorkerAdapter;
+
+const QWEN_PROBE_CAPTURE_DIR = join(import.meta.dirname, "../../.planning/assessments/2026-09-03-qwen-cli-probe");
 
 // Pinned at v1.34 T3 (re-pinned v1.92: trust n/a roster + counted attention section): non-TTY
 // doctor stdout must stay byte-identical when probe progress is stderr-only.
@@ -397,6 +400,59 @@ describe("model auth probes", () => {
     expect([...attempts.values()]).toEqual([2, 2, 2, 2]);
     expect(retryMaxInflight).toBe(1);
     expect(retryStartedBeforeDrain).toBe(false);
+  });
+
+  // The public export omits the private assessment record; the private suite must replay its bytes in place.
+  test.skipIf(!existsSync(QWEN_PROBE_CAPTURE_DIR))("test: a model probe whose adapter parse classifies the replayed unknown-model capture as startup-failure records the decoded API error naming 401 and Invalid API-key as its reason while an adapter whose parse yields no startup failure keeps the generic tail whereas a probe that records the event stream tail for the decoded case fails", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-qwen-probe-reason-"));
+    const parsedQwen = { ...qwen, id: "probe-qwen", channels: () => [{ adapter: "probe-qwen", vendor: "alibaba", model: "qwen-unknown", channel: "api", tier: "mid" as const }] };
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.tiers["probe-qwen"] = { vendor: "alibaba", channel: "api", models: { "qwen-unknown": "mid" } };
+    const health = { "probe-qwen": { installed: true, authed: true, models: [] } };
+    const capture = readFileSync(
+      join(QWEN_PROBE_CAPTURE_DIR, "unknown-model-live.stdout"),
+      "utf8",
+    );
+    const capturedEvents = JSON.parse(capture) as Array<Record<string, unknown>>;
+    expect(capturedEvents.map((event) => event.type)).toEqual(["system", "assistant", "result"]);
+    expect(capturedEvents.at(-1)).toMatchObject({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      stats: { models: { "tickmarkr-probe-no-such-model": { api: { totalErrors: 1 } } } },
+    });
+    const gitMock = await import("../../src/run/git.js");
+    const shMock = gitMock.sh as unknown as ReturnType<typeof vi.fn>;
+    const priorImpl = shMock.getMockImplementation();
+    shMock.mockResolvedValue({ code: 0, stdout: capture, stderr: "", timedOut: false });
+    try {
+      await probeModels(cfg, repo, [parsedQwen], health);
+    } finally {
+      if (priorImpl) shMock.mockImplementation(priorImpl);
+    }
+    const reason = health["probe-qwen"].modelAuth?.["qwen-unknown"].reason;
+    expect(reason).toContain("401");
+    expect(reason).toContain("Invalid API-key");
+    expect(reason).not.toContain("assistant");
+
+    const generic = stub("generic");
+    generic.headlessCommand = () => "generic";
+    generic.interactiveCommand = () => null;
+    generic.invoke = () => ({ command: "generic" });
+    generic.parse = () => ({ ok: false, summary: "no trailer", deviations: [], raw: capture });
+    generic.channels = () => [{ adapter: "generic", vendor: "x", model: "m", channel: "api", tier: "mid" }];
+    const genericCfg = structuredClone(DEFAULT_CONFIG);
+    genericCfg.tiers.generic = { vendor: "x", channel: "api", models: { m: "mid" } };
+    const genericHealth = { generic: { installed: true, authed: true, models: [] } };
+    shMock.mockResolvedValue({ code: 1, stdout: capture, stderr: "", timedOut: false });
+    try {
+      await probeModels(genericCfg, repo, [generic], genericHealth);
+    } finally {
+      if (priorImpl) shMock.mockImplementation(priorImpl);
+    }
+    const genericReason = genericHealth.generic.modelAuth?.m.reason;
+    expect(genericReason).toContain('"skills":{"totalCalls":0');
+    expect(genericReason).not.toContain("Invalid API-key");
   });
 
   test("a stored failure reason carries the tail of the probe output", async () => {

@@ -3,7 +3,7 @@ import { allAdapters, discoverChannels, probeAll, readDoctor } from "../../adapt
 import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
 import { parseDriverOverride, pickDriver } from "../../drivers/index.js";
 import type { ExecutorDriver } from "../../drivers/types.js";
-import { loadGraph } from "../../graph/graph.js";
+import { loadGraph, onDiskSpecHash, readCompileRefusal } from "../../graph/graph.js";
 import { type TaskStatus } from "../../graph/schema.js";
 import { type RunSummary, formatSummary, resolveRunMode, runDaemon } from "../../run/daemon.js";
 import { isRunLockLive } from "../../run/lock.js";
@@ -451,7 +451,31 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
   }
   if (values.quality) console.warn(QUALITY_ALIAS_NOTICE);
   const flagMode = (values.mode as RoutingMode | undefined) ?? (values.quality ? "partner-led" : undefined);
+  const refusal = (() => {
+    try {
+      return readCompileRefusal(cwd);
+    } catch (error) {
+      throw new Error(
+        `refusing to run: ${error instanceof Error ? error.message : String(error)}. `
+        + "Recompile successfully with `tickmarkr compile <src>` before running.",
+      );
+    }
+  })();
+  if (refusal) {
+    throw new Error(
+      `refusing to run the prior graph: the last compile of ${refusal.source} was refused at ${refusal.refusedAt}:\n`
+      + `${refusal.error}\n`
+      + "Recompile successfully with `tickmarkr compile <src>` to clear the refusal record before running.",
+    );
+  }
   const graph = loadGraph(cwd);
+  const diskSpec = onDiskSpecHash(cwd, graph);
+  if (diskSpec && diskSpec.hash !== graph.spec.hash) {
+    throw new Error(
+      `refusing to run a stale graph: ${diskSpec.path} content hash ${diskSpec.hash} differs from `
+      + `the graph's recorded spec hash ${graph.spec.hash}. Recompile with \`tickmarkr compile <src>\` before running.`,
+    );
+  }
   const { cfg, conflict } = resolveRunMode(cwd, { flag: flagMode, spec: graph.mode });
   if (conflict) {
     // Loud, never silent: live intent (the flag) may override compiled intent (the spec) — strict refuses.

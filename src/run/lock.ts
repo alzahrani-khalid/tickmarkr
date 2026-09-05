@@ -2,6 +2,7 @@ import { linkSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync
 import { join } from "node:path";
 import { z } from "zod";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
+import { parseRunId } from "./journal.js";
 
 // HARD-01/02: coarse per-run advisory lock over .tickmarkr/graph.json. LOCK-02: the lock is created by
 // the link(2) idiom — write the full payload to graph.lock.<pid>.tmp, then linkSync(tmp, lockPath),
@@ -32,6 +33,7 @@ let approvalSequence = 0;
 process.once("exit", () => { if (heldPath) unlinkIfOurs(heldPath); });
 
 export interface Inspection { pid?: number; runId?: string; garbage: boolean; dead: boolean; expired: boolean; mtimeMs: number; ino: number }
+export type RunLineEvent = { event: string; ts: string };
 
 // LOCK-04: the ONE decision table. Both acquireRunLock and isRunLockLive consume this — the two
 // hand-maintained copies of the rule cannot drift. The table changes HERE, once. unlockRun uses the
@@ -205,11 +207,34 @@ export async function acquireApprovalSerialization(repoRoot: string, runId: stri
 // undefined ⇒ no lock at all — never conflate that with a lock whose recorded owner is dead.
 export function runLockOwner(repoRoot: string): { pid?: number; runId?: string; live: boolean } | undefined {
   let insp: Inspection;
-  try { insp = inspect(lockPath(repoRoot)); }
+  try { insp = inspect(join(repoRoot, stateDirName(repoRoot), "graph.lock")); }
   catch { return undefined; } // statSync ENOENT ⇒ not held
   // `runId` is carried so a caller can name the run the live owner is actually executing — the lock is
   // REPOSITORY-wide, so a live pid here is not proof it is running the run the caller cares about.
   return { pid: insp.pid, runId: insp.runId, live: shouldRefuse(insp) };
+}
+
+export function runLockRunId(repoRoot: string): string | undefined {
+  const runId = runLockOwner(repoRoot)?.runId;
+  if (runId === undefined) return undefined;
+  try { return parseRunId(runId); } catch { return undefined; }
+}
+
+export function runStatusLine(repoRoot: string, runId: string, events: readonly RunLineEvent[]): string | null {
+  let parsedRunId: string;
+  try { parsedRunId = parseRunId(runId); } catch { return null; }
+  const owner = runLockOwner(repoRoot);
+  const ownerRunId = owner?.runId === undefined ? undefined : (() => {
+    try { return parseRunId(owner.runId); } catch { return undefined; }
+  })();
+  if (owner && ownerRunId === parsedRunId) {
+    if (owner.live) return `run ${parsedRunId} active`;
+    return owner.pid === undefined
+      ? `run ${parsedRunId} stale lock`
+      : `run ${parsedRunId} stale lock naming dead holder pid ${owner.pid}`;
+  }
+  if (events.some((event) => event.event === "run-end")) return null;
+  return `run ${parsedRunId} abandoned since ${events.at(-1)?.ts ?? "unknown"}`;
 }
 
 // Read-only predicate: true iff a lock exists that the decision table would REFUSE on (alive,

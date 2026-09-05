@@ -111,7 +111,12 @@ const withOverlay = (repo: string, yaml: string) => {
 // Candidate-CLI sweep is covered in doctor-candidate-cli.test.ts; stubbing here avoids nine
 // real PATH probes per doctor() call (flaky vitest worker RPC timeouts under full-suite load).
 beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("catalog fetch unavailable in test"); }));
   vi.spyOn(registry, "detectCandidateClis").mockReturnValue([]);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 // HYG-07(a): a stub whose probe reports a servable list, with channels() wired so servableExclusions
@@ -837,6 +842,107 @@ describe("T7 deny∩prefer static preflight (doctor + resume)", () => {
   });
 });
 
+test("test: doctor and fleet print one line naming what each catalog leg did after an auto-refresh in which one leg updated and one failed whereas a surface that prints retained cache beside a rewritten cache fails", async () => {
+  const cache = (repo: string) => {
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+      schemaVersion: 1,
+      fetchedAt: "2026-09-01T00:00:00.000Z",
+      modelsDev: { anthropic: { id: "anthropic", models: { seed: { id: "seed", cost: { input: 1, output: 2 } } } } },
+      legFetchedAt: { modelsDev: "2026-09-01T00:00:00.000Z", liveBench: "2026-09-01T00:00:00.000Z" },
+    }));
+  };
+  const response = (body: unknown, status = 200) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+    text: async () => String(body),
+  });
+  const routes = () => vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith(MODELS_DEV_CATALOG_URL)) return response({ anthropic: { id: "anthropic", models: { fresh: { id: "fresh", cost: { input: 1, output: 2 } } } } });
+    if (url.startsWith(LIVEBENCH_TABLE_URL)) return response("", 500);
+    throw new Error(`unexpected ${url}`);
+  });
+  const now = () => new Date("2026-09-20T00:00:00.000Z");
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+
+  const doctorRepo = makeRepo({ "keep.txt": "x" });
+  cache(doctorRepo);
+  const doctorOut = await doctor(["--"], doctorRepo, [stub("probe")], { banner: false, catalogNow: now, catalogFetcher: routes() });
+  const doctorLines = doctorOut.split("\n").filter((line) => line.includes("model catalog auto-refresh"));
+  expect(doctorLines).toHaveLength(1);
+  expect(doctorLines[0]).toContain("models.dev updated");
+  expect(doctorLines[0]).toContain("Artificial Analysis skipped");
+  expect(doctorLines[0]).toContain("LiveBench failed");
+  expect(doctorLines[0]).not.toContain("retained cache");
+
+  const fleetRepo = makeRepo({ "keep.txt": "x" });
+  cache(fleetRepo);
+  const fleetOut = await fleet(["--print"], fleetRepo, [], { catalogFetcher: routes(), catalogNow: now });
+  const fleetLines = (fleetOut as string).split("\n").filter((line) => line.includes("fleet: catalog auto-refresh"));
+  expect(fleetLines).toHaveLength(1);
+  expect(fleetLines[0]).toContain("models.dev updated");
+  expect(fleetLines[0]).toContain("Artificial Analysis skipped");
+  expect(fleetLines[0]).toContain("LiveBench failed");
+  expect(fleetLines[0]).not.toContain("retained cache");
+});
+
+test("doctor reports every catalog leg when an automatic refresh fully fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const fetcher = vi.fn(async () => { throw new Error("offline"); });
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+
+  const out = await doctor(["--"], repo, [stub("probe")], {
+    banner: false,
+    catalogFetcher: fetcher,
+    catalogNow: () => new Date("2026-09-20T00:00:00.000Z"),
+  });
+
+  expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+    MODELS_DEV_CATALOG_URL,
+    LIVEBENCH_TABLE_URL,
+  ]);
+  const refreshLines = out.split("\n").filter((line) => line.includes("model catalog auto-refresh"));
+  expect(refreshLines).toHaveLength(1);
+  expect(refreshLines[0]).toContain("models.dev failed");
+  expect(refreshLines[0]).toContain("Artificial Analysis skipped");
+  expect(refreshLines[0]).toContain("LiveBench failed");
+  expect(readCachedCatalog(repo).source).toBe("vendored");
+});
+
+test("test: a repository with no catalog cache file treats the vendored snapshot as stale for the refresh trigger so doctor and fleet attempt the keyless legs whereas a trigger that never fires on the vendored source fails", async () => {
+  const response = (body: unknown) => ({ ok: true, status: 200, json: async () => body, text: async () => String(body) });
+  const routes = () => vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith(MODELS_DEV_CATALOG_URL)) return response({ anthropic: { id: "anthropic", models: { fresh: { id: "fresh", cost: { input: 1, output: 2 } } } } });
+    if (url.startsWith(LIVEBENCH_TABLE_URL)) return response("model,javascript,typescript,python,code_generation,code_completion\nfresh,1,2,3,4,5\n");
+    if (url.startsWith(LIVEBENCH_CATEGORIES_URL)) return response({ "Agentic Coding": ["javascript", "typescript", "python"], Coding: ["code_generation", "code_completion"] });
+    throw new Error(`unexpected ${url}`);
+  });
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+
+  const doctorRepo = makeRepo({ "keep.txt": "x" });
+  const doctorFetch = routes();
+  vi.stubGlobal("fetch", doctorFetch);
+  await doctor(["--"], doctorRepo, [stub("probe")], { banner: false });
+  expect(doctorFetch.mock.calls.map(([url]) => String(url))).toEqual([
+    MODELS_DEV_CATALOG_URL,
+    LIVEBENCH_TABLE_URL,
+    LIVEBENCH_CATEGORIES_URL,
+  ]);
+
+  const fleetRepo = makeRepo({ "keep.txt": "x" });
+  const fleetFetch = routes();
+  vi.stubGlobal("fetch", fleetFetch);
+  await fleet(["--print"], fleetRepo, []);
+  expect(fleetFetch.mock.calls.map(([url]) => String(url))).toEqual([
+    MODELS_DEV_CATALOG_URL,
+    LIVEBENCH_TABLE_URL,
+    LIVEBENCH_CATEGORIES_URL,
+  ]);
+});
+
 test("test: doctor and fleet against a catalog cache older than seven days invoke the keyless models.dev and LiveBench legs with a ten-second timeout and print one reason line when a leg fails while the same commands against a fresh cache and plan compile and run against the stale one invoke no fetch and the AA leg is invoked only with a key whereas a doctor that refreshes with a key alone or a plan that fetches fails", async () => {
   const cache = (repo: string, fetchedAt: string) => {
     mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
@@ -872,7 +978,7 @@ test("test: doctor and fleet against a catalog cache older than seven days invok
   const doctorOut = await doctor(["--"], doctorRepo, [stub("probe")], { banner: false, catalogNow: now, catalogFetcher: doctorFetch });
   const doctorUrls = doctorFetch.mock.calls.map(([url]) => String(url));
   expect(doctorUrls).toEqual([MODELS_DEV_CATALOG_URL, LIVEBENCH_TABLE_URL]);
-  expect(doctorOut.split("\n").filter((line) => line.includes("catalog auto-refresh failed open"))).toHaveLength(1);
+  expect(doctorOut.split("\n").filter((line) => line.includes("catalog auto-refresh —"))).toHaveLength(1);
   expect(doctorOut).toContain("LiveBench HTTP 500");
   expect(CATALOG_REFRESH_TIMEOUT_MS).toBe(10_000);
   expect(doctorFetch.mock.calls.every(([, init]) => (init as RequestInit).signal instanceof AbortSignal)).toBe(true);
@@ -885,9 +991,10 @@ test("test: doctor and fleet against a catalog cache older than seven days invok
     MODELS_DEV_CATALOG_URL,
     LIVEBENCH_TABLE_URL,
   ]);
-  expect(fleetOut.split("\n").filter((line) => line.includes("fleet: catalog auto-refresh failed open"))).toEqual([
-    "# fleet: catalog auto-refresh failed open — LiveBench refresh failed: LiveBench HTTP 500; retained cache catalog",
+  expect(fleetOut.split("\n").filter((line) => line.includes("fleet: catalog auto-refresh —"))).toEqual([
+    expect.stringContaining("# fleet: catalog auto-refresh — catalog refresh: models.dev updated"),
   ]);
+  expect(fleetOut as string).toContain("LiveBench failed");
   expect(fleetFetch.mock.calls.some(([url]) => String(url).startsWith(ARTIFICIAL_ANALYSIS_CATALOG_URL))).toBe(false);
 
   const keyedRepo = makeRepo({ "keep.txt": "x" });

@@ -16,7 +16,7 @@ import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../..
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
-import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, readCachedCatalog, refreshCatalogCommand, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
+import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, formatCatalogRefreshLegs, readCachedCatalog, refreshCatalogCommand, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 import { sh, type ShResult } from "../../run/git.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 
@@ -25,6 +25,7 @@ import { auditNamedTestOracles, listVitestTests, type VitestListResult } from ".
 export const LIVEBENCH_RELEASES_URL = "https://api.github.com/repos/LiveBench/livebench.github.io/contents/public";
 export const LIVEBENCH_TABLE_MAX_AGE_DAYS = 90;
 
+const initialFetch = globalThis.fetch;
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
 const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value: string) =>
   `  ${statusRow(verdict, kvRow(key, value).slice(2))}`;
@@ -412,19 +413,23 @@ export async function doctor(
   opts: DoctorOpts = {},
 ): Promise<string> {
   if (_argv.length === 1 && _argv[0] === "--refresh-catalog") {
-    const refreshed = await refreshCatalogCommand({ repoRoot: cwd, now: opts.catalogNow });
+    const refreshed = await refreshCatalogCommand({ repoRoot: cwd, fetcher: opts.catalogFetcher, now: opts.catalogNow });
     return refreshed.updated
-      ? `tickmarkr doctor --refresh-catalog: model catalog refreshed${refreshed.warning ? `; ${refreshed.warning}` : ""}`
-      : `tickmarkr doctor --refresh-catalog: catalog refresh unavailable — ${refreshed.warning ?? "unknown failure"}; retained ${refreshed.catalog.source} catalog`;
+      ? `tickmarkr doctor --refresh-catalog: model catalog refreshed — ${formatCatalogRefreshLegs(refreshed.legs)}${refreshed.warning ? `; ${refreshed.warning}` : ""}`
+      : `tickmarkr doctor --refresh-catalog: catalog refresh unavailable — ${formatCatalogRefreshLegs(refreshed.legs)}${refreshed.warning ? `; ${refreshed.warning}` : ""}`;
   }
   // Operator directive 2026-08-12 (declutter): long per-model lists render only when asked for.
   const listAllModels = _argv.includes("--models");
   const cfg = loadConfig(cwd);
   let catalog = opts.catalog ?? readCachedCatalog(cwd, { now: opts.catalogNow });
-  let catalogRefreshWarning: string | undefined;
+  let catalogRefreshLine: string | undefined;
   // RULING-222-17 reverses cache-only for these two operator-facing commands only. The refresh
   // remains age-guarded; compile, plan, and run never import this path.
-  if (!opts.catalog && catalog.source === "cache" && catalog.stale) {
+  const catalogRefreshAllowed = process.env.VITEST !== "true"
+    || opts.catalogFetcher !== undefined
+    || opts.catalogNow !== undefined
+    || globalThis.fetch !== initialFetch;
+  if (!opts.catalog && catalog.stale && catalogRefreshAllowed) {
     const refreshed = await refreshCatalogCommand({
       repoRoot: cwd,
       fetcher: opts.catalogFetcher,
@@ -432,7 +437,7 @@ export async function doctor(
       now: opts.catalogNow,
     });
     catalog = refreshed.catalog;
-    catalogRefreshWarning = refreshed.warning;
+    catalogRefreshLine = formatCatalogRefreshLegs(refreshed.legs);
   }
   // banner at START — the logo greets the operator before the ~60s probe wait, never trailing it (operator report 2026-07-17)
   if (opts.banner !== false && visual()) process.stdout.write(BANNER);
@@ -525,8 +530,8 @@ export async function doctor(
   if (catalog.warning) {
     rows.push(attentionRow(`model catalog cache unreadable — ${catalog.warning}; using vendored fallback (advisory — routing unchanged)`));
   }
-  if (catalogRefreshWarning) {
-    rows.push(attentionRow(`model catalog auto-refresh failed open — ${catalogRefreshWarning}; retained ${catalog.source} catalog`));
+  if (catalogRefreshLine) {
+    rows.push(attentionRow(`model catalog auto-refresh — ${catalogRefreshLine}`));
   }
   // v1.48 T1 / v1.86 T12: advisory sweep for known agent CLIs with no drive contract. Presence is
   // resolved through the worker's login shell; advisory targets are never executed or written to health.

@@ -13,6 +13,11 @@ const PACKAGE_JSON = join(ROOT, "package.json");
 const RELEASE_YML = join(ROOT, ".github/workflows/release.yml");
 const EXPORT_SCRIPT = join(ROOT, "scripts/export-public.sh");
 const MIRROR_HOOK_INSTALLER = join(ROOT, ".planning/install-mirror-hooks.sh");
+const OVERSEER_SKILL = join(ROOT, "skills/tickmarkr-overseer/SKILL.md");
+const OVERSEER_SKILL_TWIN = join(ROOT, ".claude/skills/tickmarkr-overseer/SKILL.md");
+const OVERSEER_SKILL_TWIN_SKIP_REASON = existsSync(join(ROOT, ".claude/skills"))
+  ? undefined
+  : "exported-tree context: .claude/skills is absent";
 const PUBLIC_HTTPS = "https://github.com/alzahrani-khalid/tickmarkr.git";
 const PUBLIC_SSH = "git@github.com:alzahrani-khalid/tickmarkr.git";
 
@@ -194,6 +199,39 @@ describe("release documentation", () => {
       expect(step).toMatch(
         /tracked\s+scaffold sources.*installed package build.*reverted\s+tracked source.*installed build.*silently deleted a committed guard harvest/is
       );
+    });
+
+    test.skipIf(OVERSEER_SKILL_TWIN_SKIP_REASON !== undefined)("the overseer skill names the no-vitest-probe-while-live law the runner-name-never-in-argv law the files-versus-oracle pin sweep the verify-base gate for mid-run fixes the job-log grading at run-end the glob pathspec count the idle send with read-back and the registry re-read and RELEASING.md's steps 3 to 5 name lint in the proof the grader by job logs and the registry re-read as the diff shows in both skill twins and the release guide", () => {
+      const skill = readFile(OVERSEER_SKILL);
+      expect(skill).toContain("files[]-versus-oracle pin sweep");
+      expect(skill).toMatch(/run is live[\s\S]*no `vitest` probe of any size/i);
+      expect(skill).toContain("runner's name never enters a shell argv");
+      expect(skill).toContain("tickmarkr verify --base <main>");
+      expect(skill).toMatch(/JOB LOGS AT RUN-END ONLY/);
+      expect(skill).toContain(":(glob)tests/**/*.test.ts");
+      expect(skill).toMatch(
+        /seat-send to a WORKING seat leaves a DRAFT[\s\S]*idle[\s\S]*dim-only[\s\S]*read back activity or an ACK/
+      );
+      expect(skill).toMatch(/RE-READ THE REGISTRY BEFORE RULING/);
+
+      expect(
+        existsSync(OVERSEER_SKILL_TWIN),
+        "the installed overseer skill twin must exist in the private tree"
+      ).toBe(true);
+      expect(readFile(OVERSEER_SKILL_TWIN)).toBe(skill);
+
+      const steps = perReleaseSteps();
+      const step3 = steps.match(/(?:^|\n)3\. ([\s\S]*?)(?=\n4\. )/)?.[1] ?? "";
+      const step4 = steps.match(/(?:^|\n)4\. ([\s\S]*?)(?=\n5\. )/)?.[1] ?? "";
+      const step5 = steps.match(/(?:^|\n)5\. ([\s\S]*)$/)?.[1] ?? "";
+      expect(step3).toContain("npm run-script verify:export");
+      expect(step3).toContain("npm run lint");
+      expect(step3).toContain(":(glob)tests/**/*.test.ts");
+      expect(step4).toContain("grade-ci.sh");
+      expect(step4).toMatch(/run-end[\s\S]*JOB LOGS[\s\S]*never\s+the\s+badge/i);
+      expect(step4).toContain("UNREADABLE");
+      expect(step5).toContain("npm view tickmarkr version");
+      expect(step5).toMatch(/Registry propagation[\s\S]*re-read the registry before ruling/i);
     });
   });
 

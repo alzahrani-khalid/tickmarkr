@@ -6,7 +6,8 @@ import { allAdapters, discoverChannels } from "../../src/adapters/registry.js";
 import { type AuthHealth, type BillingChannel, channelKey, channelsFromConfig } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../src/config/config.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { disallowedBy, denyPreferCollisions, preferEntryDenied, preferRanks } from "../../src/route/preference.js";
+import { modelProvider } from "../../src/gates/review.js";
+import { disallowedBy, denyPreferCollisions, preferEntryDenied, preferRanks, routingModelProvider } from "../../src/route/preference.js";
 import { nextChannel, route, RoutingError } from "../../src/route/router.js";
 import { authedModels } from "../helpers/tmprepo.js";
 
@@ -31,6 +32,10 @@ const mkTask = (shape: string, extra: Record<string, unknown> = {}) =>
 
 const allHealthy = (): Record<string, AuthHealth> =>
   Object.fromEntries(allAdapters().filter((a) => a.id !== "fake").map((a) => [a.id, { installed: true, authed: true, modelAuth: authedModels(a.channels(DEFAULT_CONFIG).map((c) => c.model)) }]));
+
+test("test: the review gate's modelProvider and the router's routingModelProvider are one function object so a provider mapping added in one place is seen by both whereas two definitions that happen to agree fail", () => {
+  expect(modelProvider).toBe(routingModelProvider);
+});
 
 describe("FLEET-06/07 preference oracles (V-3..V-8)", () => {
   const adapters = allAdapters().filter((a) => a.id !== "fake");

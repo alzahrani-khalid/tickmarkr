@@ -165,6 +165,21 @@ overseer holds the mission's judgment. A tier collapse is therefore a context le
 **The tell, and you will not notice it from inside:** if you are typing `tickmarkr resume`, or reading a
 journal tail to decide what happens next, or sweeping orphans — you have taken the loop. Hand it back.
 
+### Pre-run checklist — install these laws in the brief before `compile` / `plan` / `run`
+
+1. **Run the files[]-versus-oracle pin sweep (RULING-222-36).** Read every acceptance item and enumerate
+   the PINS its satisfaction must move: implementation files, callers, fixtures, tests, snapshots and
+   documentation assertions. Put every pin in that task's `files[]` before compile. A criterion that
+   forces a file its scope forbids is a plan defect; repair the plan before dispatch, never spend a
+   worker's repair ladder on the scope/test catch-22.
+2. **Install the live-run command boundary (RULING-222-28 §5 and 222-29 §3).** While a run is live, run
+   no `vitest` probe of any size — the daemon's `suite-wait` guard counts it. During that same window the
+   runner's name never enters a shell argv: not reason text, a heredoc, `pgrep -f`, or a commit subject.
+   Write records containing the word through an editor, and wait for run-end before probing.
+3. **Gate a mid-run fix at the base, not at a summary (law 47 / OBS-909).** A fix landed on main while a
+   run is live is proved with `tickmarkr verify --base <main>`, never with a suite summary copied from a
+   different tree. A release proof runs every CI-ordered step — including lint — before its suite.
+
 ### What the ORCHESTRATOR does, and what you require of it
 
 - **The live surface arrives with the run.** `tickmarkr run` is stdout-silent until run-end by design;
@@ -358,7 +373,7 @@ The protocol, in both directions:
    herdr pane run <partner> "I am at <N>%. Clear me: send /clear to <my-pane>, then point me at <my-handoff>."
    # 3. the PARTNER sends the clear, then VERIFIES before pointing:
    herdr pane run <my-pane> "/clear"
-   #    read the pane back — a cleared claude session shows an empty prompt and a reset context gauge
+   #    read the pane back — a cleared claude session shows an empty prompt and a LOWER context percentage
    # 4. and only THEN, as a SEPARATE send, the re-orientation:
    herdr pane run <my-pane> "You were cleared at <N>%. Read <handoff> and <brief>. Same-process clear kept
    every background task alive: retire only your recorded watcher pids, verify twice, kill-by-pid, arm,
@@ -367,7 +382,9 @@ The protocol, in both directions:
 
    ⚠ **Steps 3 and 4 are two sends, never one.** A pointer batched with the clear lands *during* it and is
    lost with the context it was meant to survive. Verify the clear landed by reading the prompt line
-   before sending the pointer — the same read-back every other send in this skill requires.
+   and re-reading the banner percentage below its pre-clear value before sending the pointer — the same
+   read-back every other send in this skill requires. A working seat or a typed prompt defers the act;
+   neither authorises a queued `/clear`.
    ⚠ **The partner must not clear itself in the same window.** One supervising tier stays live at all
    times; the seat holding the endgame goes second.
    ⚠ **Step 4 must state an EXPECTED-RETURN DEADLINE**, e.g. *"confirm you are back within 10 minutes."*
@@ -451,7 +468,9 @@ The first argument chooses the closed per-seat tier (`orchestrator-context` or `
 and every beat names the second argument as that tier's seat. The watcher beats only after reading a
 rendered percentage, keeps beating on the supervision cadence even when its requested poll is slower,
 continues past WARN to ACT, and records a stand-down on each controlled exit. A killed watcher alone
-leaves its last beat to age into `STALE`.
+leaves its last beat to age into `STALE`. Auto-clear waits for `idle` plus an empty or dim-only ANSI
+prompt line, prints `CONTEXT_ACT_DEFERRED` while that gate is closed, and emits `CONTEXT_CLEARED` only
+after a banner read-back proves the percentage dropped; only then does it send the re-brief.
 **Every handoff's re-arm list ends with the announce step from Setup 0** — inform the surviving
 orchestrator the fresh seat is live — or the next seat re-arms silently beside a tier that still
 believes it is alone.
@@ -545,6 +564,11 @@ they are left implicit:
   that discriminates** — text sitting on `❯` is exactly what will not run — and a delivery report
   is prompt-line state alone, or nothing: a decorative check beside a real one reads as
   corroboration (two greens, one of which was never capable of disagreeing).
+  **Law 50 applies to every handoff, including `/clear`: a seat-send to a WORKING seat leaves a DRAFT.**
+  Send only when the seat is idle and the ANSI prompt line is empty or dim-only (the Esc/SGR discriminator
+  separates an autosuggest ghost from typed input), then read back activity or an ACK; presence is not
+  delivery. If a stale draft must be replaced, supersede it explicitly with
+  `agent prompt " <-- disregard … ACTUAL: …"` instead of stacking another instruction behind it.
 - **A MESSAGE TO A WORKING SEAT IS A QUEUED MESSAGE, AND THE QUEUE DRAINS ONLY AT TURN BOUNDARIES.**
   Delivery is not arrival: `agent prompt` to a `working` claude seat lands in its queue (`Press up to
   edit queued messages` on the seat's prompt line is the tell) and is READ only when the current turn
@@ -994,9 +1018,20 @@ orchestrator turn boundary.
    - **RUN BOTH RELEASE PROOFS BEFORE STANDING DOWN.** The first is the exported-tree suite, which
      maintainers run from the private repo with its `verify:export` script — that tooling is deliberately
      not part of this package, so the command does not exist in a public checkout; it must install,
-     build, and run the suite in the exported tree; then
+     build, lint, and only then run the suite in the exported tree; then
      `TICKMARKR_E2E=1 npx vitest run tests/e2e/orca-smoke.e2e.test.ts` must exercise the installed-Orca
      smoke. A skipped smoke is not proof. Record both results before declaring the release complete.
+
+   - **GRADE PUBLIC CI FROM JOB LOGS AT RUN-END ONLY (law 48).** A badge is not the grade, and
+     `gh run view --job --log` is empty while the run is in progress. At run-end execute
+     `scripts/grade-ci.sh <run-id> <expected-count> <tag>` and require GREEN from both jobs; its
+     UNREADABLE state is a hard stop, not a green default. Derive the expected glob pathspec count with
+     `git ls-files ':(glob)tests/**/*.test.ts'` (including the `.tsx` sibling where present), never a bare
+     `tests/**/*.test.ts`: bare `**` is not a git glob (law 49).
+
+   - **RE-READ THE REGISTRY BEFORE RULING (law 51).** A successful Release run and the first
+     `npm view` are separate observations: registry propagation can briefly return the prior version.
+     Read `npm view tickmarkr version` again and verify provenance before recording the publish verdict.
 
    - **REWRITE THE MEMORY INDEX FIRST, and read it back.** Minutes after `2.1.1` hit npm, the index line
      a fresh session loads still read *"⛔ 2.1.1 CANNOT ship from run …2011"* — true when written, and by

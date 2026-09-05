@@ -193,7 +193,7 @@ export interface ExecutorDriver {
   /** The exact terminal read surface used for liveness evidence. */
   readSource?: string;
   /** Placement facts returned by drivers whose terminal host exposes them. */
-  describe?(slot: Slot): SlotPlacement | Promise<SlotPlacement>;
+  describe?(slot: Slot): SlotPlacement | Promise<SlotPlacement> | undefined;
   slot(cwd: string, name: string, opts?: SlotOpts): Promise<Slot>;
   run(slot: Slot, cmd: string): Promise<void>;
   waitOutput(slot: Slot, pattern: string, timeoutMs: number, opts?: { regex?: boolean }): Promise<boolean>;

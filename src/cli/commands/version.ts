@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../../package.json");
@@ -24,5 +24,5 @@ export function distFingerprint(dir = distDir): string {
 
 export async function version(argv: string[] = [], dir = distDir): Promise<string> {
   const { version: v } = JSON.parse(readFileSync(pkgPath, "utf8")) as { version: string };
-  return argv.includes("--dist") ? `${v} dist:${distFingerprint(dir)}` : v;
+  return argv.includes("--dist") ? `${v} dist:${resolve(dir)} fingerprint:${distFingerprint(dir)}` : v;
 }

@@ -4,9 +4,11 @@ driver: auto → subprocess (HERDR_ENV unset)
 harness: /opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js (unresolved location)
 
   T1     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol — reviewPolicy full
     floor cheap ← mode risk-based
 
-est. cost (API channels only, rough): ~$0.00 + judge/review/consult calls
+est. cost (API LLM seats, rough): ~$0.00 + consult calls
 
 routing lints:
   ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually

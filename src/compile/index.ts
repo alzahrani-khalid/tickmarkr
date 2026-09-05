@@ -51,11 +51,16 @@ function detect(src: string): SourceType | null {
 // hours, which is exactly the class of thing that has to fail at authoring time.
 function repoOverlayMode(repoRoot?: string): string | undefined {
   if (!repoRoot) return undefined;
+  const path = join(repoRoot, ".tickmarkr", "config.yaml");
+  if (!existsSync(path)) return undefined;
   try {
-    const cfg = parse(readFileSync(join(repoRoot, ".tickmarkr", "config.yaml"), "utf8")) as { routing?: { mode?: unknown } } | null;
+    const cfg = parse(readFileSync(path, "utf8")) as { routing?: { mode?: unknown } } | null;
     return typeof cfg?.routing?.mode === "string" ? cfg.routing.mode : undefined;
-  } catch {
-    return undefined;
+  } catch (error) {
+    throw new CompileError(
+      `${path} does not parse, so compile cannot prove the repository routing overlay: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
@@ -70,8 +75,11 @@ function hasModeOverride(src: string): boolean {
 }
 
 function enforceModeOverlay(graph: RunGraph, src: string, repoRoot?: string): void {
-  if (graph.spec.source !== "native" || graph.mode === undefined) return;
+  if (graph.spec.source !== "native") return;
+  // Read every native compile's overlay before checking whether either side declares a mode. A
+  // corrupt file cannot masquerade as an absent mode and silently skip the disagreement gate.
   const overlayMode = repoOverlayMode(repoRoot);
+  if (graph.mode === undefined) return;
   if (overlayMode === undefined || overlayMode === graph.mode || hasModeOverride(src)) return;
   throw new CompileError(
     `${src} front-matter mode ${graph.mode} disagrees with repository routing.mode ${overlayMode}; `
@@ -91,7 +99,7 @@ function enforceTaskUnitContract(g: RunGraph, src: string, repoRoot?: string): R
 }
 
 export function finalizePlan(plan: PlanIR, src: string, repoRoot?: string): RunGraph {
-  const graph = enforceTaskUnitContract(validateGraph({
+  const graph = validateGraph({
     version: plan.version,
     ...(plan.mode !== undefined ? { mode: plan.mode } : {}),
     spec: {
@@ -101,8 +109,11 @@ export function finalizePlan(plan: PlanIR, src: string, repoRoot?: string): RunG
       ...(plan.base !== undefined ? { base: plan.base } : {}),
     },
     tasks: plan.tasks,
-  }), src, repoRoot);
+  });
+  // Overlay readability is compile truth, not a mode-disagreement optimization. Check it before
+  // other repo-dependent lints so malformed native config cannot be hidden by an earlier finding.
   enforceModeOverlay(graph, src, repoRoot);
+  enforceTaskUnitContract(graph, src, repoRoot);
   // overseer-217 removal condition, now paid: on this milestone's authored graph the conventional
   // name map emitted 21 raw unowned-test findings; review found 1 real and 20 false, while intersecting
   // with a direct import or command-entry spawn retained the real one and left 0 false positives. That

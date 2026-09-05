@@ -19,6 +19,7 @@ import { init } from "../../src/cli/commands/init.js";
 import { configTemplate, loadConfig, renderFleetOverlayWrite, type FleetEditable } from "../../src/config/config.js";
 import { tickmarkrDir, stateDirName } from "../../src/graph/graph.js";
 import { Journal } from "../../src/run/journal.js";
+import { acquireRunLock, releaseRunLock } from "../../src/run/lock.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const ROOT = join(import.meta.dirname, "../..");
@@ -577,8 +578,13 @@ describe("T4 init closing block", () => {
     stampDoctor(repo, 5 * 60 * 1000);
     const runId = "run-20260717-120000";
     Journal.create(repo, runId).append("run-start", undefined, { pid: process.pid });
-
-    const out = await runInit(repo);
+    acquireRunLock(repo, runId);
+    let out = "";
+    try {
+      out = await runInit(repo);
+    } finally {
+      releaseRunLock(repo);
+    }
 
     expect(out).toContain(`run ${runId} active — tickmarkr status`);
     expect(out).not.toMatch(/next:.*compile/);

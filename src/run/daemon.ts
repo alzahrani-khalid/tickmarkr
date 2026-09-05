@@ -17,7 +17,7 @@ import {
 } from "../config/config.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
 import { driverEvidence, type DriverChoice } from "../drivers/index.js";
-import { herdrSealShellPrefix, SubprocessDriver } from "../drivers/subprocess.js";
+import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subprocess.js";
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
 import { runGates, type GateEvent } from "../gates/run-gates.js";
@@ -437,6 +437,55 @@ export function resetNudgeTimingForTests(): void {
 const QUOTA_BANNER_SILENT_MS = 3 * 60_000;
 let quotaBannerSilentMs = QUOTA_BANNER_SILENT_MS;
 const WORKER_STARTUP_FAILURE_RE = /(?:not logged in|authentication(?:[ _-](?:required|failed|error))|401 unauthorized|model[_ -]?not[_ -]?found|(?:model|deployment)[^\n]{0,80}(?:not found|does not exist|is unavailable)|(?:404|not[_ -]?found)[^\n]{0,80}(?:model|deployment))/i;
+// A startup banner is evidence only while the process is starting. Applying this matcher to every
+// later poll let ordinary worker prose (including a diff that mentions model-not-found handling)
+// condemn a live attempt. Bound both dimensions: time prevents a late line from becoming startup
+// evidence, and bytes prevent a chatty launch from keeping an ever-growing classification surface.
+export const WORKER_STARTUP_WINDOW_MS = EARLY_LAUNCH_LIVENESS_MS;
+export const WORKER_STARTUP_WINDOW_BYTES = 64 * 1024;
+let workerStartupWindowMs = WORKER_STARTUP_WINDOW_MS;
+/** Test seam — exercises both sides of the startup boundary without a production-length fixture. */
+export function setWorkerStartupWindowMsForTests(ms: number): void {
+  workerStartupWindowMs = ms;
+}
+export function resetWorkerStartupWindowMsForTests(): void {
+  workerStartupWindowMs = WORKER_STARTUP_WINDOW_MS;
+}
+
+function startupFailureInWindow(output: string, launchedAt: number | undefined): boolean {
+  if (launchedAt === undefined || Date.now() - launchedAt > workerStartupWindowMs) return false;
+  const bytes = Buffer.from(output);
+  const bounded = bytes.length <= WORKER_STARTUP_WINDOW_BYTES
+    ? output
+    : bytes.subarray(0, WORKER_STARTUP_WINDOW_BYTES).toString("utf8");
+  return WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(bounded));
+}
+
+// OBS-901/906: one daemon-owned writer for every execution surface. Drivers expose one retained
+// stream through read(); the daemon persists that exact surface before any close/reconcile can make
+// it disappear. MAX_BUF is the execution layer's existing two-MiB retention contract; truncate the
+// encoded bytes from the head so the completion/error tail is always the part that survives.
+async function captureWorkerStream(
+  journalDir: string,
+  taskId: string,
+  attempt: number,
+  driver: ExecutorDriver,
+  slot: Slot,
+  fallback: string,
+): Promise<{ path: string; output: string }> {
+  let captured = fallback;
+  try {
+    captured = await driver.read(slot, PANE_READ_ROWS);
+  } catch {
+    // Earlier successful reads are still a captured stream. Persist them rather than losing the
+    // only failure evidence because the pane vanished between its terminal read and this snapshot.
+  }
+  const bytes = Buffer.from(captured);
+  const tail = bytes.length > MAX_BUF ? bytes.subarray(bytes.length - MAX_BUF) : bytes;
+  const path = posix.join("prompts", `${taskId}-a${attempt}.out`);
+  writeFileSync(join(journalDir, path), tail);
+  return { path, output: captured };
+}
 /** Test seam — shrink the quota-banner silence gate without minute-long sleeps. */
 export function setQuotaBannerSilentMsForTests(ms: number): void {
   quotaBannerSilentMs = ms;
@@ -2448,6 +2497,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // starts at 0 (fresh budget) instead of re-parking at the cap in the same tick.
     let providerDeathRequeues = 0;
     let providerDeathAttempt = -1;
+    // A completed attempt may keep its pane for gate-failure context, but once another worker is
+    // funded that context is superseded and — more importantly — must not remain a second writer on
+    // the same worktree. The next loop iteration retires it before reading/recreating the tree.
+    let supersededWorkerSlot: Slot | undefined;
     attempts: for (let attempt = rs?.attempts ?? 0; ; attempt++) {
       if (attempt !== providerDeathAttempt) {
         providerDeathRequeues = 0;
@@ -2461,6 +2514,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (attempt >= MAX_ATTEMPTS) {
         await park(t, `attempt cap (${MAX_ATTEMPTS}) reached`, "attempt-cap", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
+      }
+      if (supersededWorkerSlot && !keepForever) {
+        const prior = supersededWorkerSlot;
+        supersededWorkerSlot = undefined;
+        const idx = keptSlots.indexOf(prior);
+        if (idx >= 0) keptSlots.splice(idx, 1);
+        try {
+          await closeSlot(prior);
+        } catch (error) {
+          await park(
+            t,
+            `superseded worker could not be swept before dispatch: ${error instanceof Error ? error.message : String(error)}`,
+            "stall", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode,
+          );
+          return;
+        }
       }
       // OBS-419: read the approval-carried ceiling at the funding boundary, after every escalation
       // decision but before the sole task-dispatch below. Both interactive and headless worker-launch
@@ -2783,11 +2852,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // between task-dispatch and this line — worktree recreation, setup, prompt write, slot allocation,
       // the launch itself — can still die with no worker having seen the brief, and `--retry-failed`
       // must then re-send that same brief rather than a fresh prompt on a possibly banned channel.
-      const noteLaunched = async () => journal.append("worker-launch", t.id, {
-        attempt,
-        retryMode,
-        ...(trackedDriver.describe ? await trackedDriver.describe(slot) : {}),
-      });
+      let workerLaunchedAt: number | undefined;
+      const noteLaunched = async () => {
+        // Startup evidence begins when the worker exists, not while prompt preparation, slot
+        // allocation, or interactive readiness is still consuming the attempt wall clock.
+        workerLaunchedAt ??= Date.now();
+        journal.append("worker-launch", t.id, {
+          attempt,
+          retryMode,
+          ...(trackedDriver.describe ? await trackedDriver.describe(slot) : {}),
+        });
+      };
       const noteWorkerLiveness = (event: "worker-dead" | "worker-dead-held", data: Record<string, unknown>) =>
         journal.append(event, t.id, { ...data, source: trackedDriver.readSource ?? "driver.read" });
       let cpuFlat: { ms: number; since: number } | undefined;
@@ -3019,7 +3094,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // The returning paths report the same fact on the result; both callbacks land on the one
         // latch, and the second is a no-op. A seed that answered is never re-answered by the loop.
         if (seedResult?.trustAnswered) noteSeedTrustAnswered();
-        startupFailure = WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(output));
+        startupFailure = startupFailureInWindow(output, workerLaunchedAt);
         if (seedResult?.seedFailed || startupFailure) {
           finished = false;
         } else {
@@ -3062,6 +3137,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             const sliceStart = Date.now();
             const remaining = stallWindowMs - (sliceStart - lastProgressAt);
             let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
+            const startupLeft = workerLaunchedAt === undefined
+              ? 0
+              : workerStartupWindowMs - (sliceStart - workerLaunchedAt);
+            if (startupLeft > 0) slice = Math.min(slice, Math.max(1, startupLeft));
             if (!everHadOutput) {
               const earlyLeft = earlyLaunchLivenessMs - (sliceStart - attemptStart);
               if (earlyLeft > 0) slice = Math.min(slice, earlyLeft);
@@ -3080,6 +3159,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               const exit = exitRe.exec(output);
               if (finished || exit) {
                 exitCode = exit ? Number(exit[1]) : null; // null ⇔ the TUI is still alive
+                processExited = exit !== null;
                 await sampleContext(); // final poll-seam sample before leaving the wait
                 break;
               }
@@ -3114,7 +3194,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               continue;
             }
             if (paneText.length > 0) everHadOutput = true;
-            if (WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(paneText))) {
+            if (startupFailureInWindow(paneText, workerLaunchedAt)) {
               startupFailure = true;
               output = paneText;
               break;
@@ -3454,6 +3534,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               const exit = exitRe.exec(output);
               if (finished || exit) {
                 exitCode = exit ? Number(exit[1]) : null;
+                processExited = exit !== null;
                 await sampleContext();
                 break;
               }
@@ -3497,6 +3578,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             finished = new RegExp(trailerPattern(nonce)).test(output);
             const exit = exitRe.exec(output);
             exitCode = exit ? Number(exit[1]) : null;
+            processExited = exit !== null;
           }
           if (finished) {
             await driver.waitAgentStatus(slot, "idle", 5_000); // settle, then re-harvest the final render
@@ -3538,7 +3620,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // v1.76: same monotonic-progress measure as the interactive site; harvest stays raw.
         const stallWindowMs = taskTimeoutMinutes * 60_000;
         const initialPane = await driver.read(slot, 500);
-        startupFailure = WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(initialPane));
+        startupFailure = startupFailureInWindow(initialPane, workerLaunchedAt);
         let everHadOutput = initialPane.length > 0;
         const stallProgress = new StallProgressTracker();
         stallProgress.observe({ paneText: initialPane, seedSubmitted: true, contextTokens });
@@ -3554,6 +3636,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         while (!startupFailure && Date.now() - lastProgressAt < stallWindowMs) {
           const remaining = stallWindowMs - (Date.now() - lastProgressAt);
           let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
+          const startupLeft = workerLaunchedAt === undefined
+            ? 0
+            : workerStartupWindowMs - (Date.now() - workerLaunchedAt);
+          if (startupLeft > 0) slice = Math.min(slice, Math.max(1, startupLeft));
           if (!everHadOutput) {
             const earlyLeft = earlyLaunchLivenessMs - (Date.now() - attemptStart);
             if (earlyLeft > 0) slice = Math.min(slice, earlyLeft);
@@ -3566,7 +3652,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           const paneText = await driver.read(slot, 500);
           if (paneText.length > 0) everHadOutput = true;
-          if (WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(paneText))) {
+          if (startupFailureInWindow(paneText, workerLaunchedAt)) {
             startupFailure = true;
             break;
           }
@@ -3605,10 +3691,50 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (interactive && finished && !exitRe.test(output)) {
         await driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, 2_000, { regex: true });
       }
-      // keepPanes retains visible context, not a timed-out subprocess tree. Close before consult/retry
-      // can recreate the worktree; Herdr and subprocesses that reached their exit marker stay unchanged.
-      if (keepOpen && (finished || processExited || driver.id !== "subprocess")) keptSlots.push(slot);
-      else await closeSlot(slot);
+      // Free availability reroutes deliberately reuse the charged-attempt ordinal. Stream artifacts
+      // cannot: every dispatch owns bytes that must remain independently recoverable, so derive the
+      // append-only dispatch ordinal from the journal instead of overwriting an earlier a<n>.out.
+      const streamAttempt = journal.read().filter((event) => event.event === "task-dispatch" && event.taskId === t.id).length - 1;
+      const capturedStream = await captureWorkerStream(journal.dir, t.id, streamAttempt, driver, slot, output);
+      // An interactive settle already selected the bounded parse it is allowed to use. Every other
+      // path parses the common final stream snapshot — notably envelope adapters whose trailer is
+      // encoded and therefore invisible to the raw wait regex. Keep `output` bounded: every text
+      // classifier below retains its pre-artifact tail surface.
+      let result = settleParsed ?? adapter.parse(capturedStream.output, nonce);
+      const adapterCause = (result as WorkerResult & { cause?: string }).cause;
+      // Law 46: there is one completion fact. A classified adapter result with no parse-failure cause
+      // means its decoder found the nonce-bound trailer even when the raw JSON envelope escaped it.
+      const workerFinished = finished || adapterCause === undefined;
+      finished = workerFinished;
+      const adapterStartupFailure = adapterCause === "startup-failure";
+      const workerCause = adapterStartupFailure
+        ? "startup-failure"
+        : startupFailure
+          ? "startup-failure"
+          : classifyWorkerResultCause({ output, ok: result.ok, finished: workerFinished, exitCode, summary: result.summary, timedOut, deadChannel: deadChannelKilled });
+
+      // OBS-897/889(4): neither a timeout/quiet-harvest nor a trailer is a verdict on a tree while
+      // its writer remains alive. Reap through the same driver lifecycle every execution surface
+      // already implements, then (and only then) permit commitsAheadOf/gates below to read the tree.
+      // A failed reap is a stall disposition, never permission to gate a moving branch.
+      let reapFailure: string | undefined;
+      if (!processExited && !deadWorkerPark) {
+        try {
+          await closeSlot(slot);
+          if (!workerFinished) {
+            journal.append("worker-reaped-before-harvest", t.id, {
+              slot: slot.name, attempt, cause: workerCause ?? "stall-timeout",
+            });
+          }
+        } catch (error) {
+          reapFailure = error instanceof Error ? error.message : String(error);
+        }
+      } else if (keepOpen && (workerFinished || processExited || driver.id !== "subprocess")) {
+        keptSlots.push(slot);
+        supersededWorkerSlot = slot;
+      } else {
+        await closeSlot(slot);
+      }
       // SPEND-01: usage from the harness's own cwd-keyed structured store, read POST-HOC from disk —
       // `wt` is this task's private worktree, so the path is unique; the read is sliced to records
       // stamped at/after this attempt's dispatch instant. Never the harvested pane text, never the
@@ -3624,15 +3750,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         );
         return;
       }
-      let result = settleParsed ?? adapter.parse(output, nonce);
-      const workerFinished = finished;
-      const workerCause = startupFailure
-        ? "startup-failure"
-        : classifyWorkerResultCause({ output, ok: result.ok, finished, exitCode, summary: result.summary, timedOut, deadChannel: deadChannelKilled });
       journal.append("worker-result", t.id, {
         ok: result.ok, summary: result.summary, deviations: result.deviations, finished: workerFinished, exitCode,
-        mode: interactive ? "interactive" : "print", ...(workerCause ? { cause: workerCause } : {}),
+        mode: interactive ? "interactive" : "print", stream: capturedStream.path,
+        ...(workerCause ? { cause: workerCause } : {}),
       });
+      if (reapFailure) {
+        await park(
+          t, `worker could not be reaped before harvest: ${reapFailure}`, "stall", assignment,
+          attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode,
+          { reapFailure },
+        );
+        return;
+      }
       // T2 review (routing precedence): provider-death, quota and dead-channel classification
       // derive from ONE rule — the worker's OWN outcome, workerFinished and this PRE-HARVEST
       // parse — never from the synthesized result below. A worker that committed and then walled
@@ -3717,6 +3847,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               keptSlots.splice(idx, 1);
               try { await closeSlot(slot); } catch { /* cosmetic — reconcile is the backstop */ }
             }
+            if (supersededWorkerSlot === slot) supersededWorkerSlot = undefined;
           }
           // v1.8 TEL-05 — FROM-channel attribution for mid-task quota failover: `assignment` is still the
           // throttled-away-FROM channel here (before the reassign below). durationMs:0 marks this as a
@@ -3743,7 +3874,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // T2 review: classify the PRE-HARVEST parse — classifyDeadChannel bails on any ok:true
       // result, so reading the synthesized harvest result would swallow auth-required /
       // setup-required / provider-outage for every committed-but-walled attempt (in both modes).
-      const dead = classifyDeadChannel(preHarvestResult) ?? (earlyLaunchDead || startupFailure ? "setup-required" : undefined);
+      const dead = classifyDeadChannel({ ...preHarvestResult, raw: output })
+        ?? (earlyLaunchDead || startupFailure || adapterStartupFailure ? "setup-required" : undefined);
       if (dead) {
         const from = channelKey(assignment);
         demotedChannels.add(from); // excluded for later attempts AND later tasks in this run
@@ -3759,12 +3891,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               keptSlots.splice(idx, 1);
               try { await closeSlot(slot); } catch { /* cosmetic — reconcile is the backstop */ }
             }
+            if (supersededWorkerSlot === slot) supersededWorkerSlot = undefined;
           }
           assignment = next;
           tried.push(channelKey(next));
+          // Startup failures bought no worker turn: preserve the attempt ordinal/budget while the
+          // verified-dead channel remains excluded for every later dispatch in this run.
+          if (adapterStartupFailure || startupFailure) attempt--;
           continue;
         }
-        await park(t, `dead channel (${dead}) and no eligible channel remains`, "reroute-exhausted", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
+        const chargedAttempts = adapterStartupFailure || startupFailure ? attempt : attempt + 1;
+        await park(t, `dead channel (${dead}) and no eligible channel remains`, "reroute-exhausted", assignment, chargedAttempts, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       if (!finished) {

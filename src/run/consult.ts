@@ -98,9 +98,10 @@ const ACTIONS = ["retry", "reroute", "decompose", "human"] as const;
 
 function excludedProviderFromDossier(d: Dossier, adapter: string): string | undefined {
   try {
-    const events = JSON.parse(d.journalTail) as Array<{ event?: unknown; data?: { assignment?: { adapter?: unknown; model?: unknown } } }>;
+    const events = JSON.parse(d.journalTail) as Array<{ event?: unknown; taskId?: unknown; data?: { assignment?: { adapter?: unknown; model?: unknown } } }>;
     const assignment = [...events].reverse().find((event) =>
       event.event === "task-dispatch"
+      && event.taskId === d.taskId
       && event.data?.assignment?.adapter === adapter
       && typeof event.data.assignment.model === "string")?.data?.assignment;
     if (typeof assignment?.model !== "string") return undefined;

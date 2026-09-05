@@ -51,23 +51,29 @@ function sourceFiles(repoRoot: string): string[] {
   }
 }
 
-// OBS-898: `allSources` is indexed once per ownership pass by the caller, never per test source.
-function namedSources(test: string, tasks: readonly Task[], allSources: readonly string[]): NamedSource[] {
-  const stem = basename(test).replace(/\.test\.ts$/, "");
+// OBS-898: expand the task's source declarations against ONE source-tree listing, once per compile.
+// Tests then query this in-memory index; neither a test file nor a second corroboration pass can
+// trigger another source walk or glob expansion.
+function namedSourceIndex(tasks: readonly Task[], allSources: readonly string[]): NamedSource[] {
   const matches = new Map<string, NamedSource>();
   for (const task of tasks) {
     for (const entry of task.files.map(normalize).filter((path) => path.startsWith("src/"))) {
       const fromGlob = /[*?{[]/.test(entry);
       const entries = fromGlob ? allSources.filter(filesGlob(entry)) : [entry];
       for (const sourcePath of entries) {
-        const source = basename(sourcePath, extname(sourcePath));
-        if (stem === source || stem.startsWith(`${source}-`)) {
-          matches.set(`${task.id}:${sourcePath}`, { taskId: task.id, source: sourcePath, fromGlob });
-        }
+        matches.set(`${task.id}:${sourcePath}`, { taskId: task.id, source: sourcePath, fromGlob });
       }
     }
   }
   return [...matches.values()];
+}
+
+function namedSources(test: string, index: readonly NamedSource[]): NamedSource[] {
+  const stem = basename(test).replace(/\.test\.ts$/, "");
+  return index.filter(({ source }) => {
+    const sourceStem = basename(source, extname(source));
+    return stem === sourceStem || stem.startsWith(`${sourceStem}-`);
+  });
 }
 
 const moduleKey = (path: string): string => normalize(path).replace(/\.(?:[cm]?[jt]sx?)$/, "");
@@ -186,9 +192,10 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
   }
   const globOwnedTests = new Map<string, Set<string>>();
   const allSources = sourceFiles(repoRoot);
+  const namedIndex = namedSourceIndex(tasks, allSources);
   for (const source of sources) {
     const ids = predictedBy.get(source.path) ?? new Set<string>();
-    for (const named of namedSources(source.path, tasks, allSources)) {
+    for (const named of namedSources(source.path, namedIndex)) {
       ids.add(named.taskId);
       if (named.fromGlob) {
         const owners = globOwnedTests.get(source.path) ?? new Set<string>();
@@ -204,7 +211,7 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
     if (owners(test).length === 0 && !(globOwnedTests.get(test)?.size)) {
       const ids = [...taskIds].sort();
       const source = sourceByPath.get(test)!;
-      const evidence = corroboration(source, namedSources(test, tasks, allSources));
+      const evidence = corroboration(source, namedSources(test, namedIndex));
       findings.push({
         code: "unowned-test",
         test,

@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { fingerprint } from "../../src/gates/baseline.js";
+import { compareToBaseline, fingerprint } from "../../src/gates/baseline.js";
 import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, createWorktree, gitHead, linkNodeModules, preserveWorktree, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
@@ -632,4 +632,49 @@ describe("worktree node_modules exclude (OBS-78)", () => {
     expect(readFileSync(join(repo, ".gitignore"), "utf8")).toBe("dist/\n");
     expect(readFileSync(join(wt, ".gitignore"), "utf8")).toBe("dist/\n");
   });
+});
+
+describe("reap error visibility (§B T6)", () => {
+  test("test: a gate shell whose group kill fails with a permission error carries that error on the shell result and the gate row and still settles at the timeout while an ESRCH is silent whereas a reap that swallows the permission error fails", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-reap-eperm-"));
+    const group = join(dir, "group");
+    const realKill = process.kill.bind(process);
+    let errno = "EPERM";
+    let groupId: number | undefined;
+    const spy = vi.spyOn(process, "kill").mockImplementation(((pid: number, sig?: string | number) => {
+      if (pid < 0) {
+        const error = new Error(`kill ${errno}`) as NodeJS.ErrnoException;
+        error.code = errno;
+        throw error;
+      }
+      return realKill(pid, sig as never);
+    }) as typeof process.kill);
+    try {
+      const startedAt = Date.now();
+      const timed = await sh(`printf '%s' "$$" > ${JSON.stringify(group)}; sleep 30 & exit 0`, dir, 2_500);
+      groupId = Number(readFileSync(group, "utf8"));
+      expect(timed).toMatchObject({ timedOut: true, reapError: expect.stringMatching(/EPERM/) });
+      expect(Date.now() - startedAt).toBeLessThan(4_000); // the ceiling, not the surviving pipe, settled it
+      realKill(-groupId, "SIGKILL");
+      groupId = undefined;
+
+      const [gate] = await compareToBaseline(
+        dir,
+        { test: "sleep 2.2 & exit 0" },
+        { commands: { test: { exitCode: 0, fingerprints: [], durationMs: 100 } } },
+        ["test"],
+      );
+      expect(gate).toMatchObject({ pass: true, meta: { reapError: expect.stringMatching(/EPERM/) } });
+
+      errno = "ESRCH";
+      const silent = await sh("sleep 2.2 & exit 0", dir, 4_000);
+      expect(silent.reapError).toBeUndefined();
+      expect(silent.reapedGroup).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+      if (groupId !== undefined) {
+        try { realKill(-groupId, "SIGKILL"); } catch { /* already gone */ }
+      }
+    }
+  }, 20_000);
 });

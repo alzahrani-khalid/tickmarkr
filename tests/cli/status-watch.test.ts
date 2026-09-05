@@ -1196,7 +1196,7 @@ describe("status checklist rendering", () => {
 
   // deterministic fixture: events backdated exactly 10 minutes (age renders "10m"), a garbage
   // pid (renders "unknown", never probes), fixed 120 columns — the status-brand golden idiom
-  const seedGoldenFixture = (repo: string): void => {
+  const seedGoldenFixture = (repo: string): string => {
     const old = new Date(Date.now() - 600_000).toISOString();
     const at = (e: JournalEvent): JournalEvent => ({ ...e, ts: old });
     seed(repo, [
@@ -1204,16 +1204,17 @@ describe("status checklist rendering", () => {
       at(dispatch("T1", "fake-1")), at(gate("T1", "build", true)), at(gate("T1", "test", true)), { ts: old, event: "task-done", taskId: "T1", data: {} },
       at(dispatch("T2", "fake-2")), at(gate("T2", "build", true)), at(gate("T2", "test", false)), { ts: old, event: "task-failed", taskId: "T2", data: {} },
     ]);
+    return old;
   };
 
   // Both surfaces are pinned over the SAME fixture: the plain one to its byte golden, the watch
   // one to agreement across the tty/NO_COLOR pair. Neither pin substitutes for the other.
   const overGoldenFixture = async (
     render: (repo: string) => Promise<string>,
-    check: (out: string) => void,
+    check: (out: string, lastRowTime: string) => void,
   ): Promise<void> => {
     const repo = mkRepo();
-    seedGoldenFixture(repo);
+    const lastRowTime = seedGoldenFixture(repo);
     const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
     const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
     const noColor = process.env.NO_COLOR;
@@ -1223,7 +1224,7 @@ describe("status checklist rendering", () => {
         Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: ttyValue });
         if (noColorValue === undefined) delete process.env.NO_COLOR;
         else process.env.NO_COLOR = noColorValue;
-        check(await render(repo));
+        check(await render(repo), lastRowTime);
       }
     } finally {
       if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
@@ -1237,16 +1238,18 @@ describe("status checklist rendering", () => {
 
   test("non-TTY and NO_COLOR output is byte-pinned around the task-title column", async () => {
     // The literal pins every machine byte after the deliberate goal-to-title substitution.
-    const golden =
-      "tickmarkr status / run run-watch / last event 10m ago / daemon pid unknown / 1/3 done\n" +
-      "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
-      "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +
-      "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
-      "  [!] T2 mixed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
-      "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
     await overGoldenFixture(
       (repo) => status([], repo),
-      (out) => expect(out).toBe(golden),
+      (out, lastRowTime) => {
+        const golden =
+          `tickmarkr status / run run-watch abandoned since ${lastRowTime} / last event 10m ago / daemon pid unknown / 1/3 done\n` +
+          "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
+          "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +
+          "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
+          "  [!] T2 mixed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
+          "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
+        expect(out).toBe(golden);
+      },
     );
   });
 
@@ -1497,7 +1500,7 @@ describe("status checklist rendering", () => {
 
     expect(stdout.join("")).toBe(`${out}\n`);
     expect(stdout.join("").trim().split("\n").map((line) => JSON.parse(line).type)).toEqual(["phase-change"]);
-    expect(stderr).toEqual(["status: keepalive\n", "status: keepalive\n"]);
+    expect(stderr).toEqual(["status: keepalive\n"]);
     expect(await status(["--help"], repo)).toBe(STATUS_HELP);
     expect((await verify(["--help"], repo)).out).toBe(VERIFY_HELP);
     for (const help of [STATUS_HELP, USAGE]) {
@@ -1510,6 +1513,56 @@ describe("status checklist rendering", () => {
       expect(help).toMatch(/stderr/u);
       expect(help).toMatch(/(?:never|not) merge|Do not merge|2>&1.*corrupt/iu);
     }
+  });
+
+  test("test: a status watch that receives a termination signal writes the leave-alternate-screen sequence and exits only after the write is flushed and its event stream writes a keepalive only on an iteration that emitted no decision event whereas an exit that drops the sequence on a pipe or a keepalive on every tick fails", async () => {
+    const repo = mkRepo();
+    seed(repo, [runStart(), phaseStart("T1", "worker", ts)]);
+    const stderr: string[] = [];
+    const errSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    try {
+      await status(["--watch", "--events"], repo, { iterations: 2, sleep: async () => {} });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(stderr).toEqual(["status: keepalive\n"]);
+
+    await withTty(async () => {
+      const writes: string[] = [];
+      const before = new Set(process.rawListeners("SIGTERM"));
+      let flush: (() => void) | undefined;
+      const outSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk, cb?: (error?: Error | null) => void) => {
+        writes.push(String(chunk));
+        if (String(chunk) === "\x1b[?1049l" && typeof cb === "function") flush = () => cb();
+        return true;
+      });
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((actualCode?: string | number | null) => {
+        throw new Error(`exit ${actualCode}`);
+      }) as never);
+      let caught: unknown;
+      try {
+        await status(["--watch"], repo, {
+          sleep: async () => {
+            const handler = process.rawListeners("SIGTERM").find((candidate) => !before.has(candidate));
+            expect(handler).toBeDefined();
+            (handler as () => void)();
+            expect(writes).toContain("\x1b[?1049l");
+            expect(exitSpy).not.toHaveBeenCalled();
+            expect(flush).toBeDefined();
+            flush!();
+          },
+        });
+      } catch (error) {
+        caught = error;
+      } finally {
+        outSpy.mockRestore();
+        exitSpy.mockRestore();
+      }
+      expect(caught).toMatchObject({ message: "exit 143" });
+    });
   });
 
   test("test: an unbounded tty watch writes the alternate-screen enter sequence before its first frame and the leave sequence when it ends while a bounded render and an event stream write neither whereas a watch that repaints with clear-and-home on the main screen fails", async () => {
@@ -1533,8 +1586,9 @@ describe("status checklist rendering", () => {
     const captureSignalExit = async (signal: "SIGINT" | "SIGTERM", code: number) => {
       const writes: string[] = [];
       const before = new Set(process.rawListeners(signal));
-      const outSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      const outSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk, cb?: (error?: Error | null) => void) => {
         writes.push(String(chunk));
+        if (typeof cb === "function") cb();
         return true;
       });
       const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);

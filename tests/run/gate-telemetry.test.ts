@@ -17,9 +17,9 @@ import { runDaemon as daemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { authedModels, COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
-// The three fields every gate-result row must carry, and the predicate the criterion calls "closed":
-// a row is telemetered only when ALL of them are present as numbers. Absence is the falsifier — a row
-// that dropped one is not "mostly measured", it is unusable for a stratified recalibration.
+// The five fields every gate-result row must carry — durationMs, load1Start, load1End, load1Max and
+// load1Mean. A row is telemetered only when ALL are present as numbers. Absence is the falsifier — a
+// row that dropped one is not "mostly measured", it is unusable for a stratified recalibration.
 const TELEMETRY_FIELDS = ["durationMs", "load1Start", "load1End", "load1Max", "load1Mean"] as const;
 const carriesTelemetry = (data: Record<string, unknown>): boolean =>
   TELEMETRY_FIELDS.every((f) => typeof data[f] === "number");
@@ -103,7 +103,7 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     });
     const fixture = setupRepo(
       [T("T1")], oneTask("T1"),
-      `gates:\n  build: "if [ ! -f t1.txt ]; then true; else sleep 1.1; touch '${marker}'; fi"\n`,
+      `gates:\n  build: "if [ ! -f t1.txt ]; then true; else sleep 3.1; touch '${marker}'; fi"\n`,
     );
     await runDaemon(fixture, "run-telemetry-interior-peak");
     const row = gateRows(fixture.repo, "run-telemetry-interior-peak").find((gate) => gate.gate === "build")!;

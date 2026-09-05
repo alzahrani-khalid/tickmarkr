@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions } from "../../adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
-import { CATALOG_REFRESH_TIMEOUT_MS, type CatalogFetcher, type CatalogModelEvidence, type CatalogReadResult, readCachedCatalog, refreshCatalogCommand } from "../../adapters/catalog-remote.js";
+import { CATALOG_REFRESH_TIMEOUT_MS, formatCatalogRefreshLegs, type CatalogFetcher, type CatalogModelEvidence, type CatalogReadResult, readCachedCatalog, refreshCatalogCommand } from "../../adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import {
@@ -41,6 +41,7 @@ import type {
 
 type FleetEditorProps = Parameters<typeof import("../../tui/ink/fleet-app.js").runFleetInkEditor>[0];
 
+const initialFetch = globalThis.fetch;
 const NON_TTY_MSG = "tickmarkr fleet: interactive fleet editor requires a TTY — use `tickmarkr fleet --print` for non-interactive output";
 const QUIT = "fleet: quit without writing";
 
@@ -157,15 +158,21 @@ export async function fleet(
   const interactive = input.isTTY === true && output.isTTY === true;
   let catalog = readCachedCatalog(cwd, { now: io.catalogNow });
   let refreshReason = "";
-  if (catalog.source === "cache" && catalog.stale) {
+  let catalogRefreshAttempted = false;
+  const catalogRefreshAllowed = process.env.VITEST !== "true"
+    || io.catalogFetcher !== undefined
+    || io.catalogNow !== undefined
+    || globalThis.fetch !== initialFetch;
+  if (catalog.stale && catalogRefreshAllowed) {
     const refreshed = await refreshCatalogCommand({
       repoRoot: cwd,
       fetcher: io.catalogFetcher,
       timeoutMs: CATALOG_REFRESH_TIMEOUT_MS,
       now: io.catalogNow,
     });
+    catalogRefreshAttempted = true;
     catalog = refreshed.catalog;
-    if (refreshed.warning) refreshReason = `fleet: catalog auto-refresh failed open — ${refreshed.warning}; retained ${catalog.source} catalog`;
+    refreshReason = `fleet: catalog auto-refresh — ${formatCatalogRefreshLegs(refreshed.legs)}`;
   }
 
   if (print) {
@@ -189,7 +196,7 @@ export async function fleet(
   if (!why && interactive) {
     const { reuse } = initDoctorReuse(cwd, values.fresh ?? false);
     if (!reuse) {
-      output.write(`${await doctor([], cwd, adapters, { banner: false, compact: true })}\n`);
+      output.write(`${await doctor([], cwd, adapters, { banner: false, compact: true, ...(catalogRefreshAttempted ? { catalog } : {}), catalogFetcher: io.catalogFetcher, catalogNow: io.catalogNow })}\n`);
     }
   }
 

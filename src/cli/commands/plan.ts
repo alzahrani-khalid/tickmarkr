@@ -6,7 +6,7 @@ import { formatModelAuthLine, contextWindowLints, modelLints, preferEntryLints, 
 import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { classifyContextPath } from "../../compile/native.js";
-import { DEFAULT_CONFIG, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK } from "../../config/config.js";
+import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK } from "../../config/config.js";
 import { loadGraph } from "../../graph/graph.js";
 import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
 import { resolveRunMode } from "../../run/daemon.js";
@@ -14,11 +14,12 @@ import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } 
 import { staffLedEvidence } from "../../route/profile.js";
 import { route, RoutingError } from "../../route/router.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
-import { modelId, modelProvider } from "../../gates/review.js";
-import { loadRoutingProfile } from "../../run/journal.js";
+import { modelId, modelProvider, pickReviewer } from "../../gates/review.js";
+import { Journal, loadRoutingProfile, type JournalEvent } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
-import { shq, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
+import { channelKey, shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { shGit } from "../../run/git.js";
+import { runLockRunId, runStatusLine } from "../../run/lock.js";
 import { driverEvidence, pickDriver } from "../../drivers/index.js";
 
 // T4 (v1.50): TTY-only brand pass — the title helper frames the routing table, lint/unroutable
@@ -53,6 +54,18 @@ type TaskInputFinding = {
 };
 
 const NAMED_CRITERION_PATH = /(?:^|[\s("'`])((?:src|tests|fixtures|scripts)\/[A-Za-z0-9_@{}*?.,/+-]+\.(?:tsx|ts|jsx|json|js|mjs|cjs|md|txt))(?![A-Za-z0-9])/g;
+
+const judgeOracle = (task: Task): boolean =>
+  task.acceptance.some((item) => typeof item === "string" || (typeof item === "object" && item.oracle === "judge"));
+
+const latestRunStatusLine = (cwd: string): string | null => {
+  const locked = runLockRunId(cwd);
+  const runId = locked ?? Journal.latestRunId(cwd, { withJournal: true });
+  if (!runId) return null;
+  let events: JournalEvent[] = [];
+  try { events = Journal.open(cwd, runId).read(); } catch { /* lock may exist before first journal row */ }
+  return runStatusLine(cwd, runId, events);
+};
 
 async function taskInputFindings(tasks: readonly Task[], cwd: string): Promise<TaskInputFinding[]> {
   const pathsByTask = tasks.map((task) => {
@@ -180,11 +193,13 @@ export async function plan(
   // source, and the explore posture; each task row carries a floor-derivation line below.
   // v1.89 T4: the harness names itself ABOVE the routing table — the table is only as trustworthy as the
   // binary that produced it, and version equality cannot tell an installed package from a checkout.
+  const runLine = latestRunStatusLine(cwd);
   const lines: string[] = [
     `tickmarkr plan — dry run (${channels.length} channels available)`,
     `mode: ${mode.mode} (${source}) · explore ${cfg.routing.explore?.mode ?? "on"}`,
     `driver: ${driverEvidence(cfg, selectedDriver, values.driver)}`,
     harnessLine(resolveHarness(harnessFrom)),
+    ...(runLine ? [runLine] : []),
     "",
   ];
   const judgeDeny = disallowedBy(cfg.judge, cfg.routing, "judge");
@@ -280,6 +295,23 @@ export async function plan(
   }
 
   let cost = 0;
+  const seatCost = (seat: BillingChannel | undefined): number => seat?.channel === "api" ? cfg.pricing[seat.tier] : 0;
+  const judgeSeat = (task: Task): { line: string; cost: number } => {
+    const shapeGates = cfg.gates.byShape?.[task.shape];
+    if (!task.gates.includes("acceptance") || shapeGates?.acceptance === false) return { line: "none — acceptance gate disabled", cost: 0 };
+    if (!judgeOracle(task)) return { line: "none — no judge oracle", cost: 0 };
+    const seat = pools.judge.find((c) => c.adapter === cfg.judge.adapter && c.model === cfg.judge.model);
+    return { line: `${cfg.judge.adapter}:${cfg.judge.model}`, cost: seatCost(seat) };
+  };
+  const reviewSeat = (task: Task, author: Assignment): { line: string; cost: number } => {
+    const shapeGates = cfg.gates.byShape?.[task.shape];
+    if (!task.gates.includes("review") || shapeGates?.review === false) return { line: "none — review gate disabled", cost: 0 };
+    const policy = effectiveReviewPolicy(task.files, cfg.review);
+    if (policy === "judge-only") return { line: "none — reviewPolicy judge-only: declared leaf paths", cost: 0 };
+    const reviewer = pickReviewer(author, pools.review, [], cfg.review.prefer ?? [], task.routingHints?.floor);
+    if (!reviewer) return { line: "none — no cross-vendor reviewer available", cost: 0 };
+    return { line: `${channelKey(reviewer)} — reviewPolicy full`, cost: seatCost(reviewer) };
+  };
   const routed: RoutedAssignment[] = [];
   for (const t of g.tasks) {
     const refusals = [...(oracleRefusals.get(t.id) ?? []), ...(inputRefusals.get(t.id) ?? [])];
@@ -295,9 +327,13 @@ export async function plan(
         lints.push(suf ? `${l}${suf}` : l);
       }
       const est = r.assignment.channel === "sub" ? 0 : cfg.pricing[r.assignment.tier];
-      cost += est;
+      const judge = judgeSeat(t);
+      const review = reviewSeat(t, r.assignment);
+      cost += est + judge.cost + review.cost;
       lines.push(
         `  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} c${String(t.complexity).padEnd(3)}→ ${r.assignment.adapter}:${r.assignment.model} [${r.assignment.channel}/${r.assignment.tier}]${t.timeoutMinutes !== undefined ? ` (timeout ${t.timeoutMinutes}m)` : ""}${t.humanGate ? " (human gate)" : ""}${est ? ` ~$${est.toFixed(2)}` : ""} — ${r.provenance}`,
+        `    judge: ${judge.line}${judge.cost ? ` ~$${judge.cost.toFixed(2)}` : ""}`,
+        `    review: ${review.line}${review.cost ? ` ~$${review.cost.toFixed(2)}` : ""}`,
       );
       const d = derivation(t.shape);
       if (d) lines.push(d);
@@ -329,7 +365,7 @@ export async function plan(
   if (inputWarnings.length) {
     lines.push("", "input warnings:", ...inputWarnings.map((finding) => `  ! ${finding.taskId}: ${finding.detail}`));
   }
-  lines.push("", `est. cost (API channels only, rough): ~$${cost.toFixed(2)} + judge/review/consult calls`);
+  lines.push("", `est. cost (API LLM seats, rough): ~$${cost.toFixed(2)} + consult calls`);
   // VIS-04: summary only when a profile is active AND something deviates. Labeled by the switch — off = preview.
   if (profile && deviations) {
     lines.push(cfg.routing.learned === "off"

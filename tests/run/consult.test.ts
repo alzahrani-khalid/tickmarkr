@@ -199,7 +199,7 @@ describe("consult", () => {
     });
   });
 
-  test("test: a stall-consult exclusion of adapter pi whose model resolves to provider openai reroutes to a channel of a different provider skipping codex and omp channels fronting openai and the reroute row names the excluded provider whereas a reroute that lands on omp openai-codex after excluding pi fails", async () => {
+  test("test: a stall consult that excludes an adapter derives the excluded provider from the task's own last dispatch on that adapter and not from a sibling task's dispatch in the same dossier whereas a match by adapter alone fails", async () => {
     const { cfg, fake, runDir } = setup({
       action: "reroute", notes: "all frontends returned 404", excludeAdapter: "pi",
     });
@@ -207,7 +207,10 @@ describe("consult", () => {
     const stallDossier: Dossier = {
       ...dossier,
       trigger: "stall",
-      journalTail: JSON.stringify([{ event: "task-dispatch", data: { assignment: current } }]),
+      journalTail: JSON.stringify([
+        { event: "task-dispatch", taskId: "T1", data: { assignment: current } },
+        { event: "task-dispatch", taskId: "T2", data: { assignment: { ...current, model: "claude-opus-5" } } },
+      ]),
     };
     const verdict = await consult(stallDossier, cfg, [fake], new SubprocessDriver(), "/tmp", runDir);
     expect(verdict).toMatchObject({ excludeAdapter: "pi", excludeProvider: "openai" });

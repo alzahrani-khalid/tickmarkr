@@ -2,6 +2,56 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.4.1 — the records tell the truth
+
+**v2.4.1** — a patch release with no new adapter, driver or design row: the rows the daemon writes say what the
+adapter decoded and the stream it decoded is on disk, the drivers name what they close, the CLI's diagnostics name
+the lock and the seats, a refused compile cannot be run on hope, the gates tell a starved host from a red through one
+classifier on both sides, the fleet says what each catalog leg did, a qwen worker turn costs what the worker needs,
+and the laws the previous release paid for are installed in the overseer skill with its grader shipped beside them.
+Delivered by one gated run (9/9 green at width 1; halted and resumed seven times — two contention parks, one
+config-drift stop, three `files[]` amendments and one review-ceiling halt, each a recorded ruling) with a
+cross-provider review on every task, followed by a post-run frontier re-review of the three tasks whose only
+approval had come from a Gemini seat: it found four material defects behind two of those approvals, and they were
+corrected on a fix branch gated round by round (`verify --base <previous tip>`, non-Gemini review) before the merge.
+
+- **The worker-result row says what the adapter decoded.** The cause comes from the adapter's own parse
+  (`startup-failure` is a cause), a trailer decoded from a JSON envelope reads `finished: true`, the decoded stream is
+  persisted under the run's `prompts/` and named by the row's `stream` field, a stall-timeout harvest terminates the
+  worker's process group before it reads the tree, and a superseded attempt's pane is reconciled. (T1)
+- **Drivers name what they close and bound what they hold.** A worker close journals `pane-close` with the slot and
+  the pane or tab it held; an Orca projection older than the pending grace is dropped and journaled `project-unplaced`;
+  `describe`'s type names the absence it can return. (T2)
+- **CLI diagnostics name the lock, the seats and the reason.** `doctor` reports a qwen failure by the adapter's decoded
+  API error, not the tail of its event stream; `plan` prints the judge and review seats each task will spend on and
+  bills them in the footer; `init` and `status` derive "active run" from the lock, so an abandoned run with no run-end
+  row no longer reads live; the status stream's exit sequence is flushed before the process ends. (T3)
+- **A refused compile cannot be run on hope.** A refused compile leaves no runnable graph behind and `run`/`plan`
+  compare the graph's recorded spec-and-config hash with the tree; authoring lints are structured rather than
+  reverse-parsed from their own prose; a malformed `config.yaml` fails the overlay gate closed; the fence lint reads
+  the checkout once. (T4)
+- **The gates know a starved host from a red.** One classifier serves the daemon and `verify`; a test verdict whose
+  fresh failures are all timeout-class at twice the baseline's duration waits for a calm window and reruns once before
+  any repair is charged; a tail-birpc-only exit 1 is infrastructure on both sides; reap errors surface. (T5)
+- **Fleet truth: what each catalog leg did.** Each leg persists on its own success with one stated retry policy;
+  `doctor` and `fleet` print the leg line on every refresh; `fleet` forwards its fetcher and clock so a failed refresh
+  is not retried inside the same command; a repo with no cache file auto-refreshes. The post-run re-review corrected
+  four defects here: the vendored snapshot is never written to the cache as fetched (models.dev is the spine), a keyless
+  Artificial Analysis leg no longer pins the catalog stale forever, an all-legs-failed refresh reports itself, and a leg
+  fetched then discarded is reported as discarded, never as updated. (T6 + Leg-2)
+- **A qwen worker turn costs what the worker needs.** The headless form runs under `--safe-mode` — 17.8k input tokens
+  for a one-word prompt against 59.5k with the operator's global configuration, the same sixty-four tools — the
+  API-error marker is found inside any text block, and the replay fixtures ship with the package. (T7)
+- **Routing, consult and version hygiene.** One provider-identity function serves routing and review; consult's
+  excluded provider comes from the task's own dispatch; the codex adapter passes the prompt on stdin, not in argv;
+  `version` prints the build identity beside the semver so a patched local build cannot pass for the published one; the
+  export-boundary tests pin their pair structurally. (T8)
+- **The laws are installed, and the grader ships.** The overseer skill's checklists carry the release laws that were
+  only rulings before; `watch-context.sh` acts only on an idle target with an empty or dim-only prompt line, verifies
+  the clear before the re-brief, and (post-run fix) compares the receipt banner-to-banner so a misconfigured window
+  cannot fire it early; `grade-ci.sh` ships under the skill's scripts with its two controls as a test; the release
+  guide's proof includes lint, grades CI from job logs and re-reads the registry. (T10)
+
 ## v2.4 — seen, scored and truthful
 
 **v2.4.0** — the fleet is seen and scored from live catalogs instead of a stamped seed table, the qwen CLI

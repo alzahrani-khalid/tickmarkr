@@ -85,6 +85,7 @@ interface Stub {
   screen: string;
   /** Rewrite what every seat's statusline renders — the live seat changing under the watcher. */
   render: (line: string) => void;
+  state: (status: "working" | "idle" | "done") => void;
 }
 
 /**
@@ -94,20 +95,50 @@ interface Stub {
  * reads those bytes back through the product's reader — so a payload shape the reader would reject
  * fails these tests rather than passing them.
  */
-function makeStub(repo: string, screenLine: string, opts: { raw?: boolean } = {}): Stub {
+function makeStub(
+  repo: string,
+  screenLine: string,
+  opts: {
+    raw?: boolean;
+    prompt?: string;
+    autoDropOnClear?: boolean;
+    agentSession?: { target: string; session: string };
+  } = {},
+): Stub {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-watch-context-bin-"));
   const log = join(dir, "calls.log");
   const screen = join(dir, "screen.txt");
+  const status = join(dir, "status.txt");
   writeFileSync(log, "");
-  const compose = (text: string) => (opts.raw ? text : `${INPUT_RULE}\n${text}`) + "\n";
+  writeFileSync(status, "idle\n");
+  const compose = (text: string) => (
+    opts.raw ? text : `${INPUT_RULE}\n❯ ${opts.prompt ?? ""}\n${text}`
+  ) + "\n";
   writeFileSync(screen, compose(screenLine));
   const beatDir = dirname(supervisionBeatPath(repo, "overseer-context"));
+  const agentList = opts.agentSession
+    ? JSON.stringify({
+        result: {
+          agents: [{
+            name: opts.agentSession.target,
+            agent_session: { value: opts.agentSession.session },
+          }],
+        },
+      })
+    : "{}";
 
   const herdr = join(dir, "herdr");
   writeFileSync(herdr, `#!/usr/bin/env bash
 echo "$(date +%s) $@" >> '${log}'
 case "$1 $2" in
   "agent read") cat '${screen}' ;;
+  "agent get") echo '{"result":{"agent":{"agent_status":"'$(cat '${status}')'"}}}' ;;
+  "agent list") printf '%s\n' '${agentList}' ;;
+  "agent prompt")
+    if [ "$4" = "/clear" ] && [ "${opts.autoDropOnClear === false ? "0" : "1"}" = "1" ]; then
+      sed -E 's/[0-9]+%/0%/g' '${screen}' > '${screen}.next' && mv '${screen}.next' '${screen}'
+    fi
+    ;;
   *) echo '{}' ;;
 esac
 `);
@@ -139,7 +170,13 @@ if (args.includes("--stand-down")) {
 }
 `);
   chmodSync(cli, 0o755);
-  return { dir, log, screen, render: (line: string) => writeFileSync(screen, compose(line)) };
+  return {
+    dir,
+    log,
+    screen,
+    render: (line: string) => writeFileSync(screen, compose(line)),
+    state: (next: "working" | "idle" | "done") => writeFileSync(status, `${next}\n`),
+  };
 }
 
 const live: ChildProcess[] = [];
@@ -320,6 +357,100 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     expect(prompts.some((l) => l.includes(handoff))).toBe(true); // re-briefed, not merely cleared
   }, 60_000);
 
+  test("test: watch-context.sh against a fixture pane in the working state prints CONTEXT_ACT_DEFERRED and sends nothing and against an idle pane with a dim-only prompt line sends the clear and prints CONTEXT_CLEARED only after the banner percentage drops whereas a watcher that acts on a working pane or reports cleared without the re-read fails", async () => {
+    const workingRepo = seedRepo();
+    const workingHandoff = join(workingRepo, "HANDOFF.md");
+    writeFileSync(workingHandoff, "safe state on disk\n");
+    const workingStub = makeStub(workingRepo, MARKED(80));
+    workingStub.state("working");
+    const working = watch(
+      workingStub,
+      workingRepo,
+      ["overseer", "working-seat", "60", "75", workingHandoff, "1", "600"],
+      { TKR_AUTO_CLEAR: "1", TKR_CLEAR_SETTLE_S: "2" },
+    );
+
+    await vi.waitFor(() => expect(working.out()).toContain("CONTEXT_ACT_DEFERRED"), {
+      timeout: 20_000,
+      interval: 100,
+    });
+    expect(calls(workingStub).filter((line) => line.includes("agent prompt"))).toEqual([]);
+    working.proc.kill("SIGKILL");
+    await working.exited;
+
+    const idleRepo = seedRepo();
+    const idleHandoff = join(idleRepo, "HANDOFF.md");
+    writeFileSync(idleHandoff, "safe state on disk\n");
+    const dimSuggestion = "\u001b[0m\u001b[2mghost suggestion only\u001b[0m";
+    const idleStub = makeStub(idleRepo, MARKED(80), {
+      prompt: dimSuggestion,
+      autoDropOnClear: false,
+    });
+    const idle = watch(
+      idleStub,
+      idleRepo,
+      ["overseer", "idle-seat", "60", "75", idleHandoff, "1", "600"],
+      { TKR_AUTO_CLEAR: "1", TKR_CLEAR_SETTLE_S: "10" },
+    );
+
+    await vi.waitFor(() => {
+      expect(calls(idleStub).some((line) => line.includes("agent prompt idle-seat /clear"))).toBe(true);
+    }, { timeout: 20_000, interval: 100 });
+    expect(idle.out()).not.toContain("CONTEXT_CLEARED");
+    expect(calls(idleStub).filter((line) => line.includes(idleHandoff))).toEqual([]);
+
+    idleStub.render(MARKED(5));
+    expect(await idle.exited).toBe(0);
+    expect(idle.out()).toContain("CONTEXT_CLEARED idle-seat 80% -> 5%");
+    const idlePrompts = calls(idleStub).filter((line) => line.includes("agent prompt"));
+    expect(idlePrompts.some((line) => line.includes("/clear"))).toBe(true);
+    expect(idlePrompts.some((line) => line.includes(idleHandoff))).toBe(true);
+  }, 60_000);
+
+  test("test: a JSONL percentage above the act threshold cannot satisfy the clear receipt against a lower banner percentage; the receipt waits for the banner itself to drop", async () => {
+    const repo = seedRepo();
+    const handoff = join(repo, "HANDOFF.md");
+    writeFileSync(handoff, "safe state on disk\n");
+    const home = mkdtempSync(join(tmpdir(), "tickmarkr-watch-context-home-"));
+    const session = "jsonl-session";
+    const project = join(home, ".claude", "projects", "fixture");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, `${session}.jsonl`), JSON.stringify({
+      message: { usage: { input_tokens: 800 } },
+    }) + "\n");
+    const stub = makeStub(repo, REAL_CAPTURED_STATUSLINE, {
+      autoDropOnClear: false,
+      agentSession: { target: "jsonl-seat", session },
+    });
+    const watcher = watch(
+      stub,
+      repo,
+      ["overseer", "jsonl-seat", "60", "75", handoff, "1", "600"],
+      {
+        HOME: home,
+        TKR_AUTO_CLEAR: "1",
+        TKR_CLEAR_SETTLE_S: "10",
+        TKR_CONTEXT_WINDOW: "1000",
+      },
+    );
+
+    await vi.waitFor(() => {
+      const entries = calls(stub);
+      const clear = entries.findIndex((line) => line.includes("agent prompt jsonl-seat /clear"));
+      expect(clear).toBeGreaterThanOrEqual(0);
+      const postClearReads = entries.slice(clear + 1).filter((line) => line.includes("agent read")).length;
+      expect(watcher.out().includes("CONTEXT_CLEARED") || postClearReads >= 2).toBe(true);
+    }, { timeout: 20_000, interval: 100 });
+    expect(watcher.out()).toContain("CONTEXT_SOURCE jsonl jsonl-seat");
+    expect(watcher.out()).not.toContain("CONTEXT_CLEARED");
+    expect(calls(stub).filter((line) => line.includes(handoff))).toEqual([]);
+
+    stub.render(MARKED(5));
+    expect(await watcher.exited).toBe(0);
+    expect(watcher.out()).toContain("CONTEXT_CLEARED jsonl-seat 80% -> 5%");
+    expect(calls(stub).some((line) => line.includes(handoff))).toBe(true);
+  }, 60_000);
+
   test("test: each of the context watcher's three terminal exits records a stand-down so status reads that tier disarmed rather than dead; an exit that only stops beating ages the tier to stale and fails", async () => {
     const fresh = (): string => {
       const repo = seedRepo();
@@ -403,6 +534,7 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     const screen = [
       "  \u23bf  Tip: Ask Claude to create a todo list when working on complex tasks",
       INPUT_RULE,
+      "❯",
       FABLE_CAPTURED_STATUSLINE,
     ].join("\n");
     const stub = makeStub(repo, screen, { raw: true });
@@ -421,6 +553,7 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     const screen = [
       "  relaying another seat's report: opus 12%",
       INPUT_RULE,
+      "❯",
       MARKED(57),
     ].join("\n");
     const stub = makeStub(repo, screen, { raw: true });

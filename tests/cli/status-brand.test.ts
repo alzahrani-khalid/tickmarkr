@@ -132,7 +132,7 @@ const GRAPH = validateGraph({
 
 // Deterministic fixture: events backdated exactly 10 minutes (age renders "10m" for the next
 // ~50s of wall clock), a garbage pid (renders "unknown", never probes), fixed 120 columns.
-const seed = (repo: string) => {
+const seed = (repo: string): string => {
   saveGraph(repo, GRAPH);
   const ts = new Date(Date.now() - 600_000).toISOString();
   const events: JournalEvent[] = [
@@ -150,6 +150,7 @@ const seed = (repo: string) => {
   const dir = join(tickmarkrDir(repo), "runs", "run-brand");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  return ts;
 };
 
 const withStdout = async (tty: boolean, fn: () => Promise<void>) => {
@@ -260,11 +261,11 @@ const controlFrame = async (repo: string, columns: number): Promise<string> => {
 describe("T3 watch cockpit brand restyle", () => {
   test("status non-tty output remains byte-pinned around the task-title column", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-brand-"));
-    seed(repo);
+    const lastRowTime = seed(repo);
     await withStdout(false, async () => {
       const out = await status([], repo);
       expect(out).toBe(
-        "tickmarkr status / run run-brand / last event 10m ago / daemon pid unknown / 1/3 done\n" +
+        `tickmarkr status / run run-brand abandoned since ${lastRowTime} / last event 10m ago / daemon pid unknown / 1/3 done\n` +
         "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
         // no watcher has ever beaten in this fixture, and every tier says so rather than being omitted
         "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +

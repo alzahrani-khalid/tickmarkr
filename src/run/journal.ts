@@ -880,7 +880,7 @@ export type RetryMode = (typeof RETRY_MODES)[number];
 // concludes a worker while the rolling stall window still has most of its time left, so labelling it
 // stall-timeout points every downstream reader — the repair brief, the consult — at a mechanism that
 // cannot have fired.
-export const WORKER_RESULT_CAUSES = ["provider-death", "dead-channel", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer"] as const;
+export const WORKER_RESULT_CAUSES = ["provider-death", "dead-channel", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer", "startup-failure"] as const;
 export type WorkerResultCause = (typeof WORKER_RESULT_CAUSES)[number];
 
 // Status consumes the routing profile's existing quality split directly: verified park kinds classify

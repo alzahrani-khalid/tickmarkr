@@ -49,6 +49,12 @@ const OK_FALSE = '{"ok":false,"error":{"code":"runtime_unreachable","message":"o
 const MISSING_RUNTIME = '{"ok":true,"result":{},"_meta":{}}';
 
 describe("OrcaDriver", () => {
+  test("the driver interface's describe declares the undefined it can return and the orca driver returns that undefined without a never cast as the diff shows in the types and driver hunks", async () => {
+    const { driver } = rig();
+    const slot = await driver.slot(WT, TITLE);
+    expect(driver.describe(slot)).toBeUndefined();
+  });
+
   test("test: status answers unknown for a running terminal or idle once tui-idle is satisfied under both recorded elapsed transports the 1.4.195 default of rc 1 ok false error code timeout as well as the selectable 1.4.186 satisfied false receipt whereas a wait refusal carrying any other code still fails closed so the shipped driver that throws on every 1.4.195 non-idle poll fails", async () => {
     for (const opts of [{}, { elapsedWaitTransport: "1.4.186-satisfied-false" as const }]) {
       const { fake, driver } = rig(opts);

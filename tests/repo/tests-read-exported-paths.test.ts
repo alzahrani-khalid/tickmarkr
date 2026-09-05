@@ -48,6 +48,25 @@ function loadBoundaryData(): ExportBoundaryData {
 }
 
 const BOUNDARY = loadBoundaryData();
+const EXPECTED_EXCLUDED_PATHS = [
+  ".planning",
+  "specs",
+  ".tickmarkr",
+  ".overseer",
+  ".claude",
+  "docs",
+  "ASSESSMENT-*.md",
+  ".gitignore",
+  "scripts/measure-trailer-width.mjs",
+  "scripts/scan-scope-corpus.mjs",
+  "scripts/repro-obs96.mjs",
+  "CLAUDE.md",
+  "scripts/export-public.sh",
+  "scripts/verify-export.sh",
+  "tests/scripts/verify-export.test.ts",
+  ".github/workflows/ci.yml",
+  "**/*.local.*",
+];
 
 function publicPath(path: string): boolean {
   return BOUNDARY.publicPaths.exact.includes(path)
@@ -70,7 +89,6 @@ function excludedLiteral(literal: string): string | undefined {
     const hasPublicChild = BOUNDARY.publicPaths.exact.some((path) => path.startsWith(`${root}/`))
       || BOUNDARY.publicPaths.prefixes.some((prefix) => prefix.startsWith(`${root}/`));
     if ((normalized === root && hasPublicChild) || publicPath(normalized)) return undefined;
-    if (publicPath(normalized)) return undefined;
     return normalized;
   }
   return undefined;
@@ -197,25 +215,34 @@ test.skipIf(!existsSync(installedRoot))("tracked copies (skipped on the exported
   expect(readFileSync(installed)).toEqual(readFileSync(canonical));
 });`;
 
-function obs878Source(commit: string, fallback: string): string {
-  if (!existsSync(EXPORT_SCRIPT)) return fallback;
+const OBS_878_SHAS = ["bdf6c910", "4d9f7736"] as const;
+const hasObs878Source = (commit: string): boolean => {
   try {
-    return execFileSync("git", ["show", `${commit}:tests/skills-single-source.test.ts`], {
+    execFileSync("git", ["cat-file", "-e", `${commit}:tests/skills-single-source.test.ts`], {
       cwd: ROOT,
-      encoding: "utf8",
+      stdio: "ignore",
     });
+    return true;
   } catch {
-    return fallback;
+    return false;
   }
-}
+};
+const OBS_878_PINS_PRESENT = OBS_878_SHAS.every(hasObs878Source);
+const obs878Source = (commit: string): string => execFileSync(
+  "git", ["show", `${commit}:tests/skills-single-source.test.ts`], { cwd: ROOT, encoding: "utf8" },
+);
 
-test("test: the exported-paths scan fails on a tests file that reads an export-excluded root without a guard naming the skip and passes when the read is guarded or the file is allowlisted with a reason and the OBS-878 fixture pair reds at its pre-fix shape and greens at its fixed shape whereas a scan that never reds fails", () => {
+test.skipIf(!OBS_878_PINS_PRESENT)(
+  "OBS-878 pinned red/green pair (skipped: one or both named SHAs are absent from this checkout)",
+  () => {
+    expect(scanTestSource("tests/skills-single-source.test.ts", obs878Source(OBS_878_SHAS[0])).length).toBeGreaterThan(0);
+    expect(scanTestSource("tests/skills-single-source.test.ts", obs878Source(OBS_878_SHAS[1]))).toEqual([]);
+  },
+);
+
+test("the exported-paths test skips with a named reason when a pinned SHA is absent instead of falling back silently and asserts its boundary list against a literal expected list with the dead public-path branch removed and the verify-export test removes every temp dir it creates and the interior-peak telemetry test uses fake timers or a margin of at least twice its sampler tick with its field comment naming all five fields as the diff shows in the three test files", () => {
   expect(EXCLUDED_ROOTS).toEqual(expect.arrayContaining([".claude", ".planning", ".tickmarkr", "docs", "specs"]));
-  if (existsSync(EXPORT_SCRIPT)) {
-    expect(BOUNDARY.excludedPaths).toEqual(boundaryDataFromExporter(readFileSync(EXPORT_SCRIPT, "utf8")).excludedPaths);
-  } else {
-    expect(BOUNDARY.excludedPaths.length).toBeGreaterThan(5);
-  }
+  expect(BOUNDARY.excludedPaths).toEqual(EXPECTED_EXCLUDED_PATHS);
 
   const unguarded = OBS_878_PRE_FIX;
   const guarded = OBS_878_FIXED;
@@ -234,11 +261,6 @@ test.skipIf(!existsSync(resolve(".planning")))("skipped on the exported tree: .p
   expect(() => scanTestSource("tests/fixture.test.ts", unguarded, {
     "tests/fixture.test.ts": "",
   })).toThrow(/needs a reason/);
-
-  const preFix = obs878Source("bdf6c910", OBS_878_PRE_FIX);
-  const fixed = obs878Source("4d9f7736", OBS_878_FIXED);
-  expect(scanTestSource("tests/skills-single-source.test.ts", preFix).length).toBeGreaterThan(0);
-  expect(scanTestSource("tests/skills-single-source.test.ts", fixed)).toEqual([]);
 
   const requireRedControl = (scan: (source: string) => ExcludedRead[]) =>
     expect(scan(unguarded).length, "scanner must prove it can turn red").toBeGreaterThan(0);

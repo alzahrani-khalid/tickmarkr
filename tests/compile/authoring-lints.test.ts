@@ -120,3 +120,20 @@ test("test: a criterion that keeps or does not weaken a backticked identifier-sh
   expect(compileSource(join(repo, "present.spec.md"), "native", repo).tasks).toHaveLength(1);
   expect(compileSource(join(repo, "flat.spec.md"), "native", repo).tasks).toHaveLength(1);
 });
+
+test("test: a task whose criteria cite a preservation fence and whose files match nothing on disk refuses compile naming the task and the empty match while the same task with one matching owned file compiles whereas a compiler that skips the fence lint on zero matches fails", () => {
+  const repo = makeRepo({
+    "src/owned.ts": "export const PresentSymbol = 1;\n",
+    "no-match.spec.md": "<!-- tickmarkr:spec -->\n## T1: Preserve absent\n- files: src/missing-*.ts\n- acceptance:\n  - judge: keeps `MissingSymbol` behavior from weakening\n",
+    "present.spec.md": "<!-- tickmarkr:spec -->\n## T1: Preserve present\n- files: src/owned.ts\n- acceptance:\n  - judge: keeps `PresentSymbol` behavior from weakening\n",
+  });
+
+  expect(() => compileSource(join(repo, "no-match.spec.md"), "native", repo)).toThrow(CompileError);
+  const message = (() => { try { compileSource(join(repo, "no-match.spec.md"), "native", repo); } catch (error) { return String(error); } return ""; })();
+  expect(message).toContain("fence-symbol-absent");
+  expect(message).toContain("MissingSymbol");
+  expect(message).toContain("task T1");
+  expect(message).toContain("files[] matched zero files on disk (src/missing-*.ts)");
+  expect(message).toContain("OBS-604");
+  expect(compileSource(join(repo, "present.spec.md"), "native", repo).tasks).toHaveLength(1);
+});

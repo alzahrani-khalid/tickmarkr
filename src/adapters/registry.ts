@@ -458,6 +458,17 @@ function reasonTail(output: string): string {
   return sp === -1 ? tail : tail.slice(sp + 1);
 }
 
+function parsedStartupFailureReason(adapter: WorkerAdapter, output: string): string | undefined {
+  try {
+    const parsed = adapter.parse(output, "tickmarkr-model-probe");
+    const cause = (parsed as typeof parsed & { cause?: string }).cause;
+    if (!parsed.ok && cause === "startup-failure" && parsed.summary.trim()) {
+      return reasonTail(parsed.summary.trim().replace(/\s+/g, " "));
+    }
+  } catch { /* adapter parse is advisory for probe diagnostics */ }
+  return undefined;
+}
+
 function probeFailure(
   code: number,
   stdout: string,
@@ -532,7 +543,8 @@ export async function probeModels(
             if (r.timedOut && !retry && priorModelAuth?.[model]?.reason?.includes("timed out") === true) {
               return { verdict: v(false, `probe timed out (repeat — retry skipped) (${MODEL_PROBE_TIMEOUT_MS}ms)`), timedOut: true };
             }
-            const reason = probeFailure(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
+            const output = `${r.stderr}\n${r.stdout}`.trim();
+            const reason = parsedStartupFailureReason(a, output) ?? probeFailure(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
             if (!reason) return { verdict: v(true), timedOut: false };
             if (!retry) return { verdict: null, timedOut: r.timedOut === true };
             const error = probeError(r.code, r.stdout, r.stderr, r.timedOut);

@@ -64,6 +64,8 @@ export const WORKTREE_ADOPTION_TIMEOUT_MS = 60_000;
 const WORKTREE_ADOPTION_POLL_MS = 1_000;
 const WORKTREE_ADOPTION_JOURNAL_MS = 2_000;
 const NUDGE_ECHO_TIMEOUT_MS = 2_000;
+/** A missing slot gets the same bounded chance to appear as a reaped shell gets to settle. */
+export const PENDING_PROJECT_GRACE_MS = 2_000;
 
 export interface OrcaExec { (args: string[], cwd: string, timeoutMs?: number): Promise<ShResult> }
 export interface OrcaTimeSource { now: () => number; sleep: (ms: number) => Promise<void> }
@@ -319,7 +321,10 @@ export class OrcaDriver implements ExecutorDriver {
   private narrate?: (event: JournalEvent) => void;
   private hookCoverage?: Promise<{ enabled: boolean; states: Map<string, string> }>;
   private taskWorktrees = new Map<string, string>();
-  private pendingProjects = new Map<string, "in-progress" | "in-review" | "completed">();
+  private pendingProjects = new Map<string, {
+    state: "in-progress" | "in-review" | "completed";
+    since: number;
+  }>();
 
   constructor(opts: OrcaDriverOpts = {}) {
     this.bin = opts.bin ?? resolveOrcaCliBinary(process.cwd(), { env: opts.env, platform: opts.platform }) ?? "orca";
@@ -433,7 +438,7 @@ export class OrcaDriver implements ExecutorDriver {
       this.taskWorktrees.set(owned.taskId, worktree);
       const pending = this.pendingProjects.get(owned.taskId);
       if (pending) {
-        await this.setWorkspaceStatus(worktree, pending);
+        await this.setWorkspaceStatus(worktree, pending.state);
         this.pendingProjects.delete(owned.taskId);
       }
     }
@@ -459,11 +464,11 @@ export class OrcaDriver implements ExecutorDriver {
   private assertAvailable(family: string, st: OrcaSlotState): void {
     if (st.unavailable) throw new OrcaUnavailableError(family, st.unavailable, "");
   }
-  describe(slot: Slot): { surface?: string; hostPlatform?: string } {
+  describe(slot: Slot): { surface?: string; hostPlatform?: string } | undefined {
     const st = this.state(slot);
     // The daemon asks only after run(), but callers probing a lazy slot must see absence rather
     // than an invented placement. The interface's object spread accepts this runtime absence.
-    if (!st.handle) return undefined as never;
+    if (!st.handle) return undefined;
     return {
       ...(st.surface === undefined ? {} : { surface: st.surface }),
       ...(st.hostPlatform === undefined ? {} : { hostPlatform: st.hostPlatform }),
@@ -1122,7 +1127,7 @@ export class OrcaDriver implements ExecutorDriver {
     if (!worktree) {
       // The daemon projects in-progress immediately before it creates the task checkout/slot.
       // Hold only that latest state; slot() applies it once the task's own path is known.
-      this.pendingProjects.set(taskId, state);
+      this.pendingProjects.set(taskId, { state, since: this.time.now() });
       return;
     }
     await this.setWorkspaceStatus(worktree, state);
@@ -1196,6 +1201,51 @@ export class OrcaDriver implements ExecutorDriver {
     return whole;
   }
 
+  private openRunJournal(runId: string): Journal | undefined {
+    const roots = new Set(this.journalRoots.values());
+    roots.add(process.cwd());
+    for (const repoRoot of roots) {
+      try {
+        return Journal.open(repoRoot, runId, this.narrate);
+      } catch {
+        /* try the next daemon-bound root */
+      }
+    }
+    return undefined;
+  }
+
+  // A projection exists only to bridge project() to the worker slot that follows it. After the
+  // grace, desired remains the dispatch oracle: a declared worker is still being placed and must
+  // keep its projection. Make genuine absence durable by appending first and deleting second; with
+  // no writable run journal the entry remains eligible for a later reconcile.
+  private dropExpiredProjects(desired: Set<string>, runId: string): void {
+    const now = this.time.now();
+    const desiredTasks = new Set<string>();
+    for (const name of desired) {
+      const owned = parseOwnedName(name);
+      if (owned?.role === "worker") desiredTasks.add(owned.taskId);
+    }
+    const expired = [...this.pendingProjects].filter(([, pending]) =>
+      now - pending.since > PENDING_PROJECT_GRACE_MS
+    ).filter(([taskId]) => !desiredTasks.has(taskId));
+    if (expired.length === 0) return;
+    const journal = this.openRunJournal(runId);
+    if (!journal) return;
+    for (const [taskId, pending] of expired) {
+      try {
+        const pendingMs = Math.max(0, now - pending.since);
+        journal.append("project-unplaced", taskId, {
+          state: pending.state,
+          pendingMs,
+          graceMs: PENDING_PROJECT_GRACE_MS,
+        });
+        this.pendingProjects.delete(taskId);
+      } catch {
+        /* reconcile is cosmetic; preserve the projection until a later journalled drop */
+      }
+    }
+  }
+
   /**
    * Sweep tickmarkr-owned terminals down to `desired`. Ownership is decided ONLY by parseOwnedName
    * over the owned TAB title, through the same panesToClose fold herdr uses (drivers/types.ts): an
@@ -1211,6 +1261,7 @@ export class OrcaDriver implements ExecutorDriver {
    * Cosmetic by contract: every failure is swallowed, per candidate and overall.
    */
   async reconcile(desired: Set<string>, runId: string, opts?: { spareLiveLlm?: boolean }): Promise<void> {
+    this.dropExpiredProjects(desired, runId);
     try {
       // Every call below is handle-addressed or explicitly selectored, so the CLI's own cwd selects
       // nothing — it only has to exist, which the checkouts being swept no longer need to.

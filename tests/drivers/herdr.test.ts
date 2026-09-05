@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { declareInputBox } from "../../src/adapters/types.js";
 import { DELIVERY_ATTEMPTS, DISPATCH_START_PREFIX, DeliveryReadinessError, HerdrDriver, taskGroupOf } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
+import { formatOwnedName } from "../../src/drivers/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { classifyTaskFailure, Journal, type JournalEvent } from "../../src/run/journal.js";
 import { runDaemon } from "../../src/run/daemon.js";
@@ -1220,6 +1221,49 @@ describe("HerdrDriver pane-slot dispatch critical section (OBS-120)", () => {
 });
 
 describe("HerdrDriver grouped role-tabs (VIS-04)", () => {
+  test("test: closing a worker slot journals pane-close naming the slot and the pane it held under both the grouped and the per-slot-tab shapes whereas a close that leaves no row fails", async () => {
+    const runId = "run-close-record";
+    const { repo } = setupRepo([T("T-grouped"), T("T-tab")], {});
+    Journal.create(repo, runId).append("run-start", undefined, {});
+    const stub = makeStub(0, { tab: true });
+    const driver = new HerdrDriver(stub.bin);
+    const worktree = await driver.worktree(repo, `tickmarkr/${runId}--close`, "HEAD");
+
+    const grouped = await driver.slot(worktree, "legacy-grouped", {
+      owned: { role: "worker", taskId: "T-grouped", attempt: 0, runId },
+    });
+    await driver.run(grouped, ":");
+    await driver.close(grouped);
+
+    const perSlotTab = await driver.slot(worktree, "legacy-tab", {
+      label: "T-tab",
+      owned: { role: "worker", taskId: "T-tab", attempt: 0, runId },
+    });
+    await driver.run(perSlotTab, ":");
+    await driver.close(perSlotTab);
+
+    const rows = Journal.open(repo, runId).read().filter((row) => row.event === "pane-close");
+    expect(rows.map(({ event, taskId, data }) => ({ event, taskId, data }))).toEqual([
+      {
+        event: "pane-close",
+        taskId: "T-grouped",
+        data: {
+          slot: formatOwnedName({ role: "worker", taskId: "T-grouped", attempt: 0, runId }),
+          paneId: "w1:p9",
+          tabId: "w1:t1",
+        },
+      },
+      {
+        event: "pane-close",
+        taskId: "T-tab",
+        data: {
+          slot: formatOwnedName({ role: "worker", taskId: "T-tab", attempt: 0, runId }),
+          tabId: "w1:t1",
+        },
+      },
+    ]);
+  });
+
   test("A: concurrent same-group slots share ONE tab; second stacks via downward split + rename + cd", async () => {
     const { bin, log, cwd } = makeStub(0, { tab: true });
     const d = new HerdrDriver(bin);

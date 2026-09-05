@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -11,8 +11,7 @@ import { declaredPromptGlyphForAdapter } from "../../src/adapters/types.js";
 import { bannerShell } from "../../src/brand.js";
 
 const NONCE = "ffe5ac85";
-const CAPTURE_DIR = join(import.meta.dirname, "../../.planning/assessments/2026-09-03-qwen-cli-probe");
-const LIVE_DIR = join(import.meta.dirname, "../../.planning/assessments/2026-09-04-qwen-live-worker-form");
+const FIXTURE_DIR = join(import.meta.dirname, "../fixtures/qwen");
 
 function capturedArgv(path: string): string[] {
   const fields = readFileSync(path).toString().split("\0");
@@ -39,8 +38,20 @@ printf '%s' "$QWEN_CODE_SKIP_UPDATE_CHECK_ONCE" > "$CAPTURE_ENV"
   return { dir, argv, stdin, env, executable };
 }
 
+function fixture(name: string): string {
+  return readFileSync(join(FIXTURE_DIR, name), "utf8");
+}
+
+type QwenInit = { tools: string[]; slash_commands: string[]; agents: string[] };
+
+function initEvent(name: string): QwenInit {
+  const found = (JSON.parse(fixture(name)) as Array<Record<string, unknown>>).find((event) => event.type === "system" && event.subtype === "init");
+  if (!found) throw new Error(`${name} has no init event`);
+  return found as QwenInit;
+}
+
 describe("qwen native drive", () => {
-  test("test: the qwen headless command run against a stub qwen on PATH passes --approval-mode yolo -m the model -o json and -p with an empty argument delivers the prompt file on stdin so the result nonce appears in no argv and carries QWEN_CODE_SKIP_UPDATE_CHECK_ONCE in the child environment whereas a form that passes the prompt as an argument or omits the approval mode fails", () => {
+  test("test: the qwen headless command run against a stub qwen on PATH passes --safe-mode beside --approval-mode yolo -m the model -o json and -p with an empty argument and declares --safe-mode among its hardcoded flags whereas a form without --safe-mode or one that drops -o json fails", () => {
     const capture = makeCaptureStub("qwen");
     const prompt = join(capture.dir, "prompt.md");
     const promptText = `work\nTICKMARKR_RESULT_${NONCE} {"ok":true}`;
@@ -55,33 +66,62 @@ describe("qwen native drive", () => {
       },
     });
 
-    const assertLaunch = (argv: string[], stdin: string, env: string) => {
-      expect(argv).toEqual(["--approval-mode", "yolo", "-m", "qwen3.8-max", "-o", "json", "-p", ""]);
+    const assertLaunch = (argv: string[], stdin: string, env: string, flags: string[]) => {
+      expect(argv).toEqual(["--safe-mode", "--approval-mode", "yolo", "-m", "qwen3.8-max", "-o", "json", "-p", ""]);
       expect(argv.join(" ")).not.toContain(NONCE);
       expect(stdin).toBe(promptText);
       expect(env).toBe("true");
+      expect(flags).toContain("--safe-mode");
     };
-    assertLaunch(capturedArgv(capture.argv), readFileSync(capture.stdin, "utf8"), readFileSync(capture.env, "utf8"));
+    assertLaunch(capturedArgv(capture.argv), readFileSync(capture.stdin, "utf8"), readFileSync(capture.env, "utf8"), qwen.hardcodedFlags!.flags);
 
     expect(() => assertLaunch(
-      ["--approval-mode", "yolo", "-m", "qwen3.8-max", "-o", "json", "-p", promptText],
-      "",
+      ["--approval-mode", "yolo", "-m", "qwen3.8-max", "-o", "json", "-p", ""],
+      promptText,
       "true",
+      qwen.hardcodedFlags!.flags,
     )).toThrow();
-    expect(() => assertLaunch(["-m", "qwen3.8-max", "-o", "json", "-p", ""], promptText, "true")).toThrow();
+    expect(() => assertLaunch(["--safe-mode", "--approval-mode", "yolo", "-m", "qwen3.8-max", "-p", ""], promptText, "true", qwen.hardcodedFlags!.flags)).toThrow();
     // OBS-905 / RULING-222-43: no interactive form — the pane runs the headless command like omp's, so the
     // prompt never enters argv and the JSON decoder reads every driver's transcript.
     expect(qwen.interactiveCommand(prompt, "qwen3.8-max")).toBeNull();
     expect(qwen.hardcodedFlags!.flags).not.toContain("-i");
   });
 
-  // The public exported tree omits the private `.planning` evidence record; skip there rather than
-  // copying probe captures outside this task's scoped *.test.ts surface.
-  test.skipIf(!existsSync(CAPTURE_DIR))("test: the replayed unknown-model and closed-port captures parse as ok false with cause startup-failure naming the API error text although each ran exit 0 with subtype success while the real-model PONG control shows no failure sign and a stream whose assistant text carries the nonce trailer parses ok true from that decoded text whereas a parser that trusts subtype success or scans the raw JSON bytes for the trailer fails", () => {
-    // Replay the verbatim assessment artifacts in place.
-    const unknown = readFileSync(join(CAPTURE_DIR, "unknown-model-live.stdout"), "utf8");
-    const closedPort = readFileSync(join(CAPTURE_DIR, "closed-port.stdout"), "utf8");
-    const control = readFileSync(join(CAPTURE_DIR, "control-real-model.stdout"), "utf8");
+  test("test: the shipped safe-mode capture's init event lists the same tool set as the live capture's including write_file edit and run_shell_command while its slash commands and agents are fewer so a worker loses no tool under --safe-mode whereas a fixture pair whose tool sets differ fails", () => {
+    const assertSameTools = (left: QwenInit, right: QwenInit) => {
+      expect([...left.tools].sort()).toEqual([...right.tools].sort());
+    };
+    const safe = initEvent("safe-mode.stdout");
+    const live = initEvent("live.stdout");
+
+    assertSameTools(safe, live);
+    expect(safe.tools).toEqual(expect.arrayContaining(["write_file", "edit", "run_shell_command"]));
+    expect(safe.slash_commands.length).toBeLessThan(live.slash_commands.length);
+    expect(safe.agents.length).toBeLessThan(live.agents.length);
+    expect(() => assertSameTools({ ...safe, tools: safe.tools.filter((tool) => tool !== "write_file") }, live)).toThrow();
+  });
+
+  test("test: an assistant text block that carries the API error marker after leading prose classifies startup-failure naming the error text while a block that only mentions the words without the marker does not whereas a decoder that requires the marker at the start of the block fails", () => {
+    const leadingProse = "Leading prose before the real marker.\n[API Error: delayed boom]";
+    const stream = (text: string) => JSON.stringify([
+      { type: "assistant", message: { content: [{ type: "text", text }] } },
+      { type: "result", subtype: "success", is_error: false, permission_denials: [], stats: { models: { "qwen3.8-max": { api: { totalErrors: 0 } } } } },
+    ]);
+
+    expect(parseQwenResult(stream(leadingProse), NONCE)).toMatchObject({
+      ok: false,
+      cause: "startup-failure",
+      summary: "[API Error: delayed boom]",
+    });
+    expect(parseQwenResult(stream("The words API Error are harmless without the marker."), NONCE).cause).not.toBe("startup-failure");
+    expect(leadingProse.startsWith("[API Error:")).toBe(false);
+  });
+
+  test("test: the replayed unknown-model and closed-port captures parse as ok false with cause startup-failure naming the API error text although each ran exit 0 with subtype success while the real-model PONG control shows no failure sign and a stream whose assistant text carries the nonce trailer parses ok true from that decoded text whereas a parser that trusts subtype success or scans the raw JSON bytes for the trailer fails", () => {
+    const unknown = fixture("unknown-model-live.stdout");
+    const closedPort = fixture("closed-port.stdout");
+    const control = fixture("control-real-model.stdout");
 
     expect(parseQwenResult(unknown, NONCE)).toMatchObject({
       ok: false,
@@ -224,20 +264,35 @@ describe("qwen native drive", () => {
     expect(parseQwenResult(`${YOLO_WARNING}[not an array\nTICKMARKR_EXIT_${NONCE}:0\n`, NONCE)).toMatchObject({ ok: false, cause: "malformed-verdict" });
   });
 
-  test.skipIf(!existsSync(LIVE_DIR))("test: the verbatim 2026-09-04 worker-form captures replay through the daemon wrapper — the live PONG completions decode (never malformed, never startup-failure) and the empty-HOME capture classifies startup-failure naming the no-auth message", () => {
+  test("test: the verbatim 2026-09-04 worker-form captures replay through the daemon wrapper — the live PONG completions decode (never malformed, never startup-failure) and the empty-HOME capture classifies startup-failure naming the no-auth message", () => {
     for (const name of ["live", "dead-endpoint", "safe-mode"]) {
-      const stdout = readFileSync(join(LIVE_DIR, `${name}.stdout`), "utf8");
+      const stdout = fixture(`${name}.stdout`);
       expect(stdout).toContain('"text":"PONG"');
       const parsed = parseQwenResult(wrapAsDaemonStream(stdout, 0), NONCE);
       expect(parsed.cause, name).not.toBe("malformed-verdict");
       expect(parsed.cause, name).not.toBe("startup-failure");
       expect(parsed.summary, name).not.toContain("unparseable");
     }
-    const noAuth = readFileSync(join(LIVE_DIR, "no-auth-home.stdout"), "utf8");
-    expect(parseQwenResult(wrapAsDaemonStream(noAuth, 1), NONCE)).toMatchObject({
+    expect(parseQwenResult(wrapAsDaemonStream(fixture("no-auth-home.stdout"), 1), NONCE)).toMatchObject({
       ok: false,
       cause: "startup-failure",
       summary: expect.stringContaining("No auth type is selected"),
     });
+  });
+
+  test("every qwen replay test reads its captures from tests/fixtures/qwen with no existence guard and the fixture init events carry no operator slash command or agent names as the diff shows in the test and fixture hunks", () => {
+    const source = readFileSync(join(import.meta.dirname, "qwen.test.ts"), "utf8");
+    expect(source.includes("test." + "skipIf")).toBe(false);
+    expect(source.includes("exists" + "Sync")).toBe(false);
+    expect(source.includes(".planning/" + "assessments/2026-09-03-qwen-cli-probe")).toBe(false);
+    expect(source.includes(".planning/" + "assessments/2026-09-04-qwen-live-worker-form")).toBe(false);
+
+    for (const name of readdirSync(FIXTURE_DIR).filter((candidate) => candidate.endsWith(".stdout"))) {
+      for (const event of JSON.parse(fixture(name)) as Array<Record<string, unknown>>) {
+        if (event.type !== "system" || event.subtype !== "init") continue;
+        expect(event.slash_commands, name).toEqual(Array((event.slash_commands as string[]).length).fill("scrubbed"));
+        expect(event.agents, name).toEqual(Array((event.agents as string[]).length).fill("scrubbed"));
+      }
+    }
   });
 });

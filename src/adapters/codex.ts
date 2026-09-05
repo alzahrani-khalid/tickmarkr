@@ -179,19 +179,17 @@ export const codex: WorkerAdapter = {
   probeConcurrency: 1,
   probe: async () => probeVersion("codex"),
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("codex", cfg),
-  // v1.65 T3: every flag the command builders below hardcode (incl. codexMcpSuppressionFlags' -c/
+  // v1.65 T3: every flag the command builder below hardcodes (incl. codexMcpSuppressionFlags' -c/
   // --disable and GITDIR_WRITABLE's -c) — all listed by top-level `codex --help`, verified 2026-07-22.
-  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "--model", "-a", "-s", "-c", "--disable", "--dangerously-bypass-hook-trust"] },
+  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "--model", "-c", "--disable", "--dangerously-bypass-hook-trust"] },
   // --sandbox workspace-write is the autonomous sandbox mode (codex v0.144.1+)
   // MCP suppression built per dispatch (config can change between runs) — see codexMcpSuppressionFlags.
   // CODEX_HOOK_TRUST (OBS-125) clears the per-worktree "Hooks need review" gate while keeping the sandbox.
   headlessCommand: (promptFile: string, model: string) =>
-    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
-  // TUI uses expanded -a never -s workspace-write (exec-only flags do not apply)
-  // (--help 2026-07-09: valid approval policies are untrusted|on-request|never; the previously
-  // used `on-failure` is invalid and made codex exit 2 pre-inference)
-  interactiveCommand: (promptFile: string, model: string) =>
-    `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
+    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} - < ${shq(promptFile)}`,
+  // OBS-889: Codex's TUI has no file/stdin prompt form. Returning null makes the daemon journal
+  // worker-mode-fallback before it runs the argv-safe headless command in the visible pane.
+  interactiveCommand: () => null,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },

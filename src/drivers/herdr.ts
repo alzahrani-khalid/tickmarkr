@@ -251,6 +251,27 @@ export class HerdrDriver implements ExecutorDriver {
     Journal.open(repoRoot, owned.runId, this.narrate).append("dispatch-retry", owned.taskId, data);
   }
 
+  // OBS-906: close() is the harvest path, not a reconcile path, so the sweep's close row cannot
+  // describe it. Persist the worker slot identity beside the exact pane/tab address this path used.
+  // A driver used outside a daemon has no bound run journal; the injectable sink remains the unit
+  // seam there, while every daemon-created worktree is bound by worktree() below.
+  private appendPaneClose(slot: Slot, placement: { paneId?: string; tabId?: string }): void {
+    const owned = parseOwnedName(slot.name);
+    if (owned?.role !== "worker") return;
+    try {
+      const data = { slot: slot.name, ...placement };
+      if (this.journal) {
+        this.journal("pane-close", slot.name, data);
+        return;
+      }
+      const repoRoot = this.journalRoots.get(slot.cwd);
+      if (!repoRoot) return;
+      Journal.open(repoRoot, owned.runId, this.narrate).append("pane-close", owned.taskId, data);
+    } catch {
+      /* close is best-effort; a journal failure must not make a successful pane reap fatal */
+    }
+  }
+
   private openRunJournal(runId: string): ReconcileJournalHandle | undefined {
     const roots = new Set(this.journalRoots.values());
     roots.add(process.cwd());
@@ -1209,11 +1230,13 @@ export class HerdrDriver implements ExecutorDriver {
       return this.serial(() => this.closeGrouped(slot));
     }
     if (slot.tabId) {
-      await this.herdr(`tab close ${shq(slot.tabId)}`); // reaps the slot's whole tab, best-effort
+      const closed = await this.herdr(`tab close ${shq(slot.tabId)}`); // reaps the slot's whole tab, best-effort
+      if (closed.code === 0) this.appendPaneClose(slot, { tabId: slot.tabId });
       return;
     }
     const pane = await this.paneId(slot);
-    await this.herdr(`pane close ${shq(pane)}`); // best-effort
+    const closed = await this.herdr(`pane close ${shq(pane)}`); // best-effort
+    if (closed.code === 0) this.appendPaneClose(slot, { paneId: pane });
   }
 
   // D-08 ref-counted teardown, PER GENERATION (VIS-09 item 2): pane close per member; a generation's
@@ -1226,7 +1249,8 @@ export class HerdrDriver implements ExecutorDriver {
     const gen = state.generations.find((g) => g.tabId === slot.tabId);
     if (!gen) return; // generation already torn down — its tab is gone
     const pane = await this.paneId(slot);
-    await this.herdr(`pane close ${shq(pane)}`); // best-effort
+    const closed = await this.herdr(`pane close ${shq(pane)}`); // best-effort
+    if (closed.code === 0) this.appendPaneClose(slot, { paneId: pane, tabId: gen.tabId });
     gen.members = gen.members.filter((m) => m.name !== slot.name);
     await this.renameGroupTab(gen);
     if (gen.members.length === 0) {

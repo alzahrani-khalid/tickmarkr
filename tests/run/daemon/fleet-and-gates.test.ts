@@ -497,9 +497,9 @@ describe("HYG-09 fleet hygiene (fake adapter, zero tokens)", () => {
     expect(ops.filter((o) => o.kind === "close" && o.name === t2Name)).toHaveLength(1);
   });
 
-  test("HYG-09: failed attempts keep context — prior attempt's worker slot is NOT closed on done", async () => {
-    // D-07: only the SUCCESSFUL attempt's slot closes on the done path; a prior failed attempt's slot
-    // stays governed by keepPanes (it holds failure context the operator may need) and waits for the sweep.
+  test("HYG-09: a superseded worker closes before its replacement launches", async () => {
+    // OBS-897: failure context lives in the persisted stream artifact. Once a replacement is funded,
+    // the prior pane must close before the new slot exists so one worktree never has two live writers.
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [
@@ -515,14 +515,12 @@ describe("HYG-09 fleet hygiene (fake adapter, zero tokens)", () => {
     const a1Name = ops.find((o) => o.kind === "slot" && /T1-worker-fake-a1-/.test(o.name ?? ""))?.name;
     expect(a0Name).toBeDefined(); // the failed attempt's worker slot was created
     expect(a1Name).toBeDefined(); // the successful attempt's worker slot was created
-    // the successful attempt's slot (a1) is closed exactly once on done; the failed attempt's slot (a0)
-    // is NOT closed on the done path — it waits for the run-end sweep (both close exactly once total).
+    // Both slots close exactly once, and the superseded attempt is gone before its replacement starts.
     expect(ops.filter((o) => o.kind === "close" && o.name === a1Name)).toHaveLength(1);
     expect(ops.filter((o) => o.kind === "close" && o.name === a0Name)).toHaveLength(1);
-    // and the failed attempt's close comes AFTER the successful attempt's done-close (sweep, not done path)
-    const a1Close = ops.findIndex((o) => o.kind === "close" && o.name === a1Name);
     const a0Close = ops.findIndex((o) => o.kind === "close" && o.name === a0Name);
-    expect(a0Close).toBeGreaterThan(a1Close);
+    const a1Slot = ops.findIndex((o) => o.kind === "slot" && o.name === a1Name);
+    expect(a0Close).toBeLessThan(a1Slot);
   });
 }, 120000);
 
