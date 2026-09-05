@@ -119,8 +119,13 @@ describe("real adapters", () => {
     expect(cx).not.toMatch(/\s-p\s|--print|\bexec\b/);
     expect(cx.split(/\s+/, 4).join(" ")).toBe("codex -a never -s");
     expect(codex.headlessCommand("/p", "gpt-5.2")).toContain("sandbox_workspace_write.writable_roots");
-    // which real adapters still return null: exactly the one that launches then seeds (kimi, v1.69 T6)
-    expect(REAL.filter((ad) => ad.interactiveCommand("/p", "m") === null).map((ad) => ad.id)).toEqual(["kimi"]);
+    // which real adapters still return null: exactly the one that launches then seeds (kimi, v1.69 T6).
+    // OBS-930: enumerated on a SMALL real prompt — codex and claude return null for a prompt over the
+    // platform's single-argv-string ceiling (tests/adapters/prompt-argv-ceiling.test.ts), so the size
+    // rule must not be what puts an adapter in this list.
+    const small = join(mkdtempSync(join(tmpdir(), "tickmarkr-small-prompt-")), "p.md");
+    writeFileSync(small, "worker prompt\n");
+    expect(REAL.filter((ad) => ad.interactiveCommand(small, "m") === null).map((ad) => ad.id)).toEqual(["kimi"]);
     const oc = opencode.interactiveCommand("/p", "m/k") as string;
     expect(oc).toMatch(/^opencode (?!run)/);
     expect(oc).toContain("--prompt");

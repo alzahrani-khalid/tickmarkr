@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
+import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
 // SPEND-01/SPEND-11: claude writes a per-session JSONL to ~/.claude/projects/<slug>/ where slug is the
 // realpath'd cwd with every non-alphanumeric char replaced by "-" (verified 114/114 — 36-DIAGNOSIS.md).
@@ -248,8 +248,13 @@ export const claudeCode: WorkerAdapter = {
   // live check ate the prompt), and --prompt-suggestions takes an OPTIONAL value — appended directly
   // before the prompt it would swallow it the same way. So the setting's value is always followed by
   // another flag, never by the prompt positional.
+  // OBS-931: the same ONE-argv-string hazard as codex (OBS-930) — over promptArgvCeiling() the TUI
+  // launch would E2BIG on Linux, so it returns null → worker-mode-fallback → the headless form.
+  // resumeCommand keeps the shape: its contract returns a string (composer delivery is 2.4.3 work).
   interactiveCommand: (promptFile: string, model: string) =>
-    `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+    promptFitsArgv(promptFile)
+      ? `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`
+      : null,
   trustDialog: CLAUDE_TRUST_DIALOG,
   inputBox: CLAUDE_INPUT_BOX,
   // A resumed attempt lands in the same painted editor, so it carries the same ghost-text suppression

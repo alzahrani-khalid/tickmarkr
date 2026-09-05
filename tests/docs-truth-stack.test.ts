@@ -208,6 +208,9 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     vi.stubEnv("CODEX_HOME", "/var/empty/tickmarkr-hermetic-codex-home");
     expect(docCommand).toBe(codex.interactiveCommand("<prompt>", "<model>"));
     expect(docCommand.endsWith(`--model '<model>' "$(cat '<prompt>')"`)).toBe(true);
+    // OBS-930 Linux: the row names the size fallback the builder carries (null over the ceiling)
+    expect(codexDocBlock(integrations)).toContain("promptArgvCeiling()");
+    expect(codexDocBlock(integrations)).toContain("worker-mode-fallback");
   });
 
   test("test: the integrations page describes the portable driving skill install command", () => {

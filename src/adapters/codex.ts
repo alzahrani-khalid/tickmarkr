@@ -5,7 +5,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
 
 // SPEND-07: codex writes per-session JSONL to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — date-partitioned,
 // NOT cwd-keyed. session_meta.payload.cwd is FILE-SCOPED (one codex exec per cwd). token_count events carry
@@ -245,8 +245,12 @@ export const codex: WorkerAdapter = {
   // census reads a command's first four tokens only — and those four never carry a suite word here.
   // Same sandbox, hook trust and MCP suppression as the headless form; `-a never` is the TUI's
   // autonomous approval policy (exec has no approvals to configure).
+  // OBS-930 (Linux): the inlined prompt is ONE argv string and Linux caps one at 131072 bytes, so a
+  // prompt over promptArgvCeiling() returns null → worker-mode-fallback → the headless form (types.ts).
   interactiveCommand: (promptFile: string, model: string) =>
-    `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
+    promptFitsArgv(promptFile)
+      ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
+      : null,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },

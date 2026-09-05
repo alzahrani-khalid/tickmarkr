@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { codex, codexConfigMcpServerNames, codexMcpSuppressionFlags } from "../../src/adapters/codex.js";
-import { shq } from "../../src/adapters/types.js";
+import { promptArgvCeiling, shq } from "../../src/adapters/types.js";
 
 // v1.57 T1 / OBS-82: codex ≥0.144 merges -c 'mcp_servers={}' with config instead of replacing it,
 // so the OBS-24 override became a no-op and a down operator-global MCP server wedges startup.
@@ -98,7 +98,7 @@ describe("codex mcp suppression (OBS-82)", () => {
     expect(cmd!.split(/\s+/, 4).join(" ")).toBe("codex -a never -s");
   });
 
-  test("test: the codex headless command run against a stub codex on PATH carries no prompt bytes in argv so the result nonce appears in no argument while the prompt reaches the process and the interactive form passes the prompt as the last argument with the model value followed by it and a 140 KB prompt fits whereas a form that inlines the prompt file's content into the headless check fails", () => {
+  test("test: the codex headless command run against a stub codex on PATH carries no prompt bytes in argv so the result nonce appears in no argument while the prompt reaches the process and the interactive form passes the prompt as the last argument with the model value followed by it and a 140 KB prompt fits on darwin whereas on linux the builder returns null for it and a 100 KB prompt fits whereas a form that inlines the prompt file's content into the headless check fails", () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-codex-argv-"));
     const promptFile = join(dir, "prompt.md");
     const argvLog = join(dir, "argv.log");
@@ -137,12 +137,27 @@ cat > "$CODEX_STDIN_LOG"
     expect(argv.slice(-(promptLines.length + 3))).toEqual(["--model", "gpt-5.2", ...promptLines, ""]);
     expect(argv.slice(0, 4)).toEqual(["-a", "never", "-s", "workspace-write"]);
     expect(argv.indexOf("exec")).toBe(-1);
-    // a real worker prompt is ~140 KB (OBS-889 measured 149,417 bytes of argv); ARG_MAX here is 1 MB
+    // a real worker prompt is ~140 KB (OBS-889 measured 149,417 bytes of argv). darwin enforces only
+    // the 1 MB total ARG_MAX, so the 140 KB positional execs there and proves the size; linux caps
+    // ONE argv string at 131072 bytes (CI run 33979013874: `codex: Argument list too long`), so there
+    // the builder refuses the TUI launch (null → headless fallback) and a ~100 KB prompt still execs.
     const big = `${"lorem ipsum vitest npm test ".repeat(5000)}${nonce}\n`;
     writeFileSync(promptFile, big);
     expect(big.length).toBeGreaterThan(140_000);
-    const bigArgv = argvOf(codex.interactiveCommand(promptFile, "gpt-5.2")!);
-    expect(bigArgv[bigArgv.length - 2]).toBe(big.replace(/\n$/, ""));
+    if (process.platform === "linux") {
+      expect(big.length).toBeGreaterThan(promptArgvCeiling("linux"));
+      expect(codex.interactiveCommand(promptFile, "gpt-5.2")).toBeNull();
+      const mid = `${"lorem ipsum vitest npm test ".repeat(3570)}${nonce}\n`;
+      writeFileSync(promptFile, mid);
+      expect(mid.length).toBeGreaterThan(99_000);
+      expect(mid.length).toBeLessThan(promptArgvCeiling("linux"));
+      const midArgv = argvOf(codex.interactiveCommand(promptFile, "gpt-5.2")!);
+      expect(midArgv[midArgv.length - 2]).toBe(mid.replace(/\n$/, ""));
+      expect(midArgv[midArgv.length - 2]!.endsWith(nonce)).toBe(true);
+    } else {
+      const bigArgv = argvOf(codex.interactiveCommand(promptFile, "gpt-5.2")!);
+      expect(bigArgv[bigArgv.length - 2]).toBe(big.replace(/\n$/, ""));
+    }
   });
 
   test("config-scanned server names reach the shell line only through shq", () => {

@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { z } from "zod";
 import type { TickmarkrConfig, Tier } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
@@ -430,6 +431,40 @@ export function channelKey(c: { adapter: string; model: string }): string {
 
 export function shq(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
+}
+
+// OBS-930 (Linux) / OBS-931: a TUI launch inlines the prompt file as ONE argv string — "$(cat prompt)"
+// as the last positional. Linux caps a single argv string at MAX_ARG_STRLEN = PAGE_SIZE × 32 =
+// 131072 bytes (E2BIG: CI run 33979013874, ubuntu, `codex: Argument list too long` on a 140 KB
+// prompt); darwin enforces only the 1 MB total ARG_MAX, which is why the macOS export proof passed.
+// A real worker prompt is 60–150 KB (OBS-889 measured 149,417 bytes), so on a Linux host the launch
+// fails in production, not only in the test. Ceilings are named BY PLATFORM — never a probe of the
+// running kernel at dispatch time:
+//   linux  120_000 — the cap is per STRING and every flag is its own argv entry, so only the prompt
+//                    counts against it; "$(cat …)" strips nothing but trailing newlines, so the
+//                    file's byte size IS the string's. 131072 − 120000 leaves ~11 KB of headroom.
+//   others 900_000 — under the 1 MB total that darwin/BSD enforce across argv + envp.
+// Over the ceiling the adapter returns null: the daemon journals worker-mode-fallback
+// {reason:"adapter"} and runs the headless form in the visible pane — the pre-OBS-930 behaviour,
+// now only for oversized prompts. An unreadable file is "not proven oversized" and keeps the TUI
+// rendering: the daemon writes the prompt before it builds the launch, a missing file fails the
+// same way in either form, and docs-truth renders the command against a placeholder path.
+// OBS-931 (2.4.3): the real fix is prompt delivery through the composer for large prompts.
+export const PROMPT_ARGV_CEILING_LINUX = 120_000;
+export const PROMPT_ARGV_CEILING_DEFAULT = 900_000;
+
+export function promptArgvCeiling(platform: string = process.platform): number {
+  return platform === "linux" ? PROMPT_ARGV_CEILING_LINUX : PROMPT_ARGV_CEILING_DEFAULT;
+}
+
+export function promptFitsArgv(promptFile: string, platform: string = process.platform): boolean {
+  let bytes: number;
+  try {
+    bytes = statSync(promptFile).size;
+  } catch {
+    return true;
+  }
+  return bytes <= promptArgvCeiling(platform);
 }
 
 // Quota exhaustion is detected from CLI errors, never predicted (spec §4).
