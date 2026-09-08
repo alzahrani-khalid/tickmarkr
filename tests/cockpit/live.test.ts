@@ -3233,6 +3233,33 @@ import { SHELL_BINDINGS, shellBindings } from "../../src/tui/cockpit/keys.js";
 import { SHELL_PALETTE, resolveShellColourMode, resolveTileColour } from "../../src/tui/cockpit/theme.js";
 import { CAPTURE_ARTIFACT_MANIFEST } from "../../src/gates/artifact-manifest.js";
 
+/**
+ * OBS-960: the mounted sweep paints every planned size through ink for three views. The default path
+ * selects sizes through the same selector the frame-contract sweep uses (stride 15x4: 130 sizes, every
+ * corner and both extremes of each axis); the exhaustive 6,697-size form runs under
+ * TICKMARKR_EXHAUSTIVE_SWEEP=1 with TICKMARKR_SWEEP_TIMEOUT_MS. The planShell oracle in C1_CRITERIA[0]
+ * stays exhaustive — every integer size is validated by the plan; the mounted paint is validated at the
+ * sampled sizes. On a single-fork CI runner the exhaustive mounted sweep exceeded 600 s (2.5.0 CI run
+ * 34193886440, both jobs) where it takes 116 s on an 18-core host.
+ */
+async function mountedViewSweep(sweep: Awaited<ReturnType<typeof mountShell>>, sizes: FrameContractSize[]): Promise<void> {
+  for (const [key, view] of [["1", "HOME"], ["4", "RUN"], ["5", "EVIDENCE"]]) {
+    await sweep.send(key!);
+    for (const { columns, rows } of sizes) {
+      await sweep.resizeAndPaint(columns, rows);
+      const frame = stripAnsi(sweep.frame());
+      const lines = frame.split("\n");
+      expect(lines.length, `${view} ${columns}x${rows}`).toBe(rows);
+      expect(lines.every(line => cellWidth(line) <= columns), `${view} ${columns}x${rows} cells`).toBe(true);
+      expect(lines[0]).toContain(`| ${view} |`);
+      expect(lines[1]).toMatch(/\d+–\d+\/\d+.*\d+ hidden/);
+      expect(lines[rows - 3]).toContain("PENDING");
+      expect(lines[rows - 2]).toContain("q Quit");
+      expect(lines.slice(3, rows - 4).join("\n")).toContain(view === "HOME" ? "MERGED" : view === "RUN" ? "RUN /" : "JOURNAL");
+    }
+  }
+}
+
 test(C1_CRITERIA[0], async () => {
   let sizes = 0;
   for (let columns = 40; columns <= 220; columns++) for (let rows = 14; rows <= 50; rows++) {
@@ -3278,29 +3305,25 @@ test(C1_CRITERIA[0], async () => {
       }
     }
     const sweep = await mountShell(f.cwd, f.runId, 120, 40, { NO_COLOR: "1" });
-    try {
-      for (const [key, view] of [["1", "HOME"], ["4", "RUN"], ["5", "EVIDENCE"]]) {
-        await sweep.send(key!);
-        for (let columns = 40; columns <= 220; columns++) for (let rows = 14; rows <= 50; rows++) {
-          await sweep.resizeAndPaint(columns, rows);
-          const frame = stripAnsi(sweep.frame());
-          const lines = frame.split("\n");
-          expect(lines.length, `${view} ${columns}x${rows}`).toBe(rows);
-          expect(lines.every(line => cellWidth(line) <= columns), `${view} ${columns}x${rows} cells`).toBe(true);
-          expect(lines[0]).toContain(`| ${view} |`);
-          expect(lines[1]).toMatch(/\d+–\d+\/\d+.*\d+ hidden/);
-          expect(lines[rows - 3]).toContain("PENDING");
-          expect(lines[rows - 2]).toContain("q Quit");
-          expect(lines.slice(3, rows - 4).join("\n")).toContain(view === "HOME" ? "MERGED" : view === "RUN" ? "RUN /" : "JOURNAL");
-        }
-      }
-    } finally { await sweep.close(); }
+    try { await mountedViewSweep(sweep, frameContractSweepSizes("sampled")); } finally { await sweep.close(); }
     for (const [w, h] of [[39, 14], [40, 13]]) {
       const m = await mountShell(f.cwd, f.runId, w, h);
       try { expect(m.frame()).toContain("q Quit"); await m.send("q"); expect(await m.result).toBeUndefined(); } finally { await m.close(); }
     }
   } finally { f.close(); }
 }, 600000);
+
+test.skipIf(process.env.TICKMARKR_EXHAUSTIVE_SWEEP !== "1")(
+  "test: the mounted Home, Run and Evidence views hold the frame contract at every integer size 40–220 by 14–50 (exhaustive opt-in; the default path samples through the same selector)",
+  async () => {
+    const f = shellFixture();
+    try {
+      const sweep = await mountShell(f.cwd, f.runId, 120, 40, { NO_COLOR: "1" });
+      try { await mountedViewSweep(sweep, frameContractSweepSizes("exhaustive")); } finally { await sweep.close(); }
+    } finally { f.close(); }
+  },
+  Number(process.env.TICKMARKR_SWEEP_TIMEOUT_MS ?? 600_000),
+);
 
 test(C1_CRITERIA[1], async () => {
   const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
@@ -3559,12 +3582,19 @@ test(C1_CRITERIA[3], async () => {
   } finally { f.close(); }
 });
 
-test(C1_CRITERIA[4], async () => {
+/**
+ * OBS-960: one heap child per test (two environments x three shapes) instead of six inside one test —
+ * the protocol (1000 warm-up, 10000 measured ticks, 64 MiB / 16 MiB) is unchanged; each child gets its
+ * own 600 s budget. On a single-fork CI runner the shared 180 s SIGKILL timer killed a child that runs
+ * in 35 s on an 18-core host ("heap child exited null", 2.5.0 CI run 34193886440).
+ */
+const HEAP_PROTOCOL_CASES = [false, true].flatMap(production => (["static", "growth", "resize"] as const).map(shape => ({ production, shape })));
+test.each(HEAP_PROTOCOL_CASES)(`${C1_CRITERIA[4]} [%o]`, async ({ production, shape }) => {
   const { spawn } = await import("node:child_process");
   const { rmSync } = await import("node:fs");
   const dir = mkdtempSync(join(tmpdir(), "final-shell-memory-"));
   try {
-    for (const production of [false, true]) for (const shape of ["static", "growth", "resize"]) {
+    {
       const destination = join(dir, `${shape}-${production}.json`);
       const env = { ...process.env }; delete env.NODE_ENV; delete env.CI; delete env.CONTINUOUS_INTEGRATION;
       if (production) env.NODE_ENV = "production";
@@ -3572,7 +3602,7 @@ test(C1_CRITERIA[4], async () => {
         const child = spawn(process.execPath, ["--import", "tsx", "--expose-gc", join(import.meta.dirname, "../fixtures/cockpit/final/heap-runner.mjs"), shape, destination], { env, stdio: ["ignore", "ignore", "pipe"] });
         let errors = "";
         child.stderr.on("data", chunk => { errors = (errors + String(chunk)).slice(-4000); });
-        const timer = setTimeout(() => child.kill("SIGKILL"), 180000);
+        const timer = setTimeout(() => child.kill("SIGKILL"), 600_000);
         child.on("error", reject);
         child.on("close", code => { clearTimeout(timer); if (code === 0) resolve(); else reject(new Error(errors || `heap child exited ${code}`)); });
       });
@@ -3589,7 +3619,7 @@ test(C1_CRITERIA[4], async () => {
       expect(result.lastFrame).toContain("heap-fixture");
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
-}, 1_100_000);
+}, 660_000);
 
 test("mounted shortcuts omit Open without a target and Filter outside Journal; Evidence export reviews the actual destination", async () => {
   const f = shellFixture();
