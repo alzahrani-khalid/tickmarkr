@@ -1,0 +1,87 @@
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, expect, test, vi } from "vitest";
+import { createLiveStore, JournalTail, STORE_LIMITS } from "../../src/tui/cockpit/live-store.js";
+import { graph, partial, rawOf, ev } from "../fixtures/operator-state/fixture.js";
+const dirs: string[] = [];
+afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+function fixture() {
+  const cwd = mkdtempSync(join(tmpdir(), "operator-state-")); dirs.push(cwd);
+  const state = join(cwd, ".tickmarkr"); const runId = "run-20260905-000000";
+  const run = join(state, "runs", runId); mkdirSync(run, { recursive: true });
+  const path = join(run, "journal.jsonl"); writeFileSync(path, rawOf(partial));
+  writeFileSync(join(state, "graph.json"), JSON.stringify(graph));
+  return { cwd, state, runId, path };
+}
+
+test("The production-facing tail interface reads append bytes once, carries torn multibyte UTF-8 until newline and keeps original journal line identities through malformed complete rows, same-size in-place rewrite, truncation and inode replacement. Its snapshots distinguish pending incomplete tails from malformed complete records and expose unreadable/corrupt input with source and error while a valid seeded journal stays readable. A malformed record becoming empty success, stale rows surviving rewrite, or selected #L becoming a filtered ordinal fails.", () => {
+  const { path } = fixture(); const tail = new JournalTail(path);
+  const seeded = tail.poll(1000); expect(seeded.status).toBe("readable"); expect(seeded.lines).toBe(7);
+  const bytes = Buffer.from(JSON.stringify(ev("worker-nudge", { text: "你好🌍" })) + "\n");
+  const cut = bytes.indexOf(Buffer.from("🌍")) + 2;
+  appendFileSync(path, bytes.subarray(0, cut));
+  const torn = tail.poll(2000); expect(torn.status).toBe("pending"); expect(torn.pending).toEqual({ line: 8, bytes: cut }); expect(torn.malformedCount).toBe(0);
+  expect(tail.poll(2500).bytesRead).toBe(torn.bytesRead);
+  appendFileSync(path, bytes.subarray(cut, -1)); expect(tail.poll(3000).pending).toBeDefined();
+  appendFileSync(path, "\n"); const joined = tail.poll(4000);
+  expect(joined.history.at(-1)).toMatchObject({ line: 8, id: `${path}#L8`, event: { data: { text: "你好🌍" } } });
+  expect(joined.bytesRead - seeded.bytesRead).toBe(bytes.length);
+  appendFileSync(path, "{malformed}\n\n" + rawOf([ev("worker-nudge")]));
+  const corrupt = tail.poll(5000); expect(corrupt.status).toBe("corrupt"); expect(corrupt.errors[0]).toMatchObject({ source: path, line: 9 }); expect(corrupt.errors[0]!.error).toBeTruthy();
+  expect(corrupt.history.at(-1)!.id).toBe(`${path}#L11`);
+  expect(tail.page(9, 3).map(r => [r.line, !!r.error])).toEqual([[9, true], [10, false], [11, false]]);
+  const same = rawOf([ev("run-start", { text: "aaaa" })]); writeFileSync(path, same); tail.poll();
+  writeFileSync(path, same.replace("aaaa", "bbbb")); const rewrite = tail.poll();
+  expect(rewrite.history).toHaveLength(1); expect(rewrite.history[0]!.event!.data.text).toBe("bbbb"); expect(rewrite.errors).toEqual([]);
+  const oldGeneration = rewrite.generation; const replacement = path + ".replacement";
+  writeFileSync(replacement, same.replace("aaaa", "cccc")); renameSync(replacement, path);
+  expect(tail.poll().generation).toBeGreaterThan(oldGeneration); expect(tail.page(1)[0]!.event!.data.text).toBe("cccc");
+  expect(() => tail.page(1, 1, oldGeneration)).toThrow(/replaced/);
+  writeFileSync(path, ""); expect(tail.poll()).toMatchObject({ lines: 0, history: [], pending: undefined });
+  rmSync(path); mkdirSync(path); expect(tail.poll()).toMatchObject({ status: "unreadable", error: { source: path } });
+  const missing = new JournalTail(path + "missing").poll(); expect(missing.status).toBe("unreadable"); expect(missing.error!.error).toMatch(/ENOENT/);
+});
+
+test("The exported store independently delivers changed graph/config/cache identity, clock/beat expiry, dead versus EPERM lock probes, input and resize while journal bytes remain static, marking observations delayed after two one-second target intervals. After 10000 appended events bounded history still pages an early multiline verdict by original #L and retains durable task/merge facts and errors. Repeated whole-file reads on idle, growth-only invalidation or evicted evidence becoming unreachable fails.", async () => {
+  const f = fixture(); let now = Date.now();
+  mkdirSync(join(f.state, "supervision")); const beat = join(f.state, "supervision", "orchestrator.beat");
+  writeFileSync(beat, JSON.stringify({ seat: "orch" })); utimesSync(beat, new Date(now), new Date(now));
+  writeFileSync(join(f.state, "graph.lock"), JSON.stringify({ pid: 123456, runId: f.runId, startedAt: now }));
+  const kill = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("protected"), { code: "EPERM" }); });
+  const store = createLiveStore({ ...f, now: () => now }); let deliveries = 0; const unsubscribe = store.subscribe(() => { deliveries++; });
+  const opening = store.snapshot(); expect(opening.lock).toMatchObject({ state: "alive", alive: true });
+  expect(opening.operator).toMatchObject({ merged: 1, planned: 3 });
+  expect(opening.supervision[0]!.state).toBe("ARMED");
+  now += 1000; store.refresh(); expect(store.snapshot().delayed).toBe(false);
+  expect(store.snapshot().journal.bytesRead).toBe(opening.journal.bytesRead);
+  now += 61000; store.refresh(); expect(store.snapshot().delayed).toBe(true); expect(store.snapshot().supervision[0]!.state).toBe("STALE");
+  kill.mockImplementation(() => { throw Object.assign(new Error("dead"), { code: "ESRCH" }); }); now += 1000; store.refresh(); expect(store.snapshot().lock.state).toBe("dead"); expect(store.snapshot().delayed).toBe(false);
+  const foreign = structuredClone(graph); foreign.tasks[0]!.goal = "changed"; writeFileSync(join(f.state, "graph.json"), JSON.stringify(foreign));
+  writeFileSync(join(f.state, "config.yaml"), "mode: risk-based\n"); writeFileSync(join(f.state, "doctor.json"), '{"revision":1}'); store.refresh();
+  const changed = store.snapshot(); expect(changed.graph.identity).not.toBe(opening.graph.identity); expect(changed.operator.comparable).toBe(false); expect(changed.config.value).toBe("mode: risk-based\n"); expect(changed.cache.value).toEqual({ revision: 1 });
+  writeFileSync(join(f.state, "doctor.json"), "{bad");
+  store.refresh();
+  expect(store.snapshot().cache.status).toBe("unreadable");
+  expect(store.snapshot().cache.value).toBeUndefined();
+  expect(store.snapshot().cache.identity).toBeUndefined();
+  writeFileSync(join(f.state, "doctor.json"), '{"revision":2}'); store.refresh(); expect(store.snapshot().cache.value).toEqual({ revision: 2 });
+  writeFileSync(join(f.state, "graph.json"), JSON.stringify(graph));
+  store.input(); store.resize(80, 24); expect(store.snapshot()).toMatchObject({ inputSequence: 1, viewport: { columns: 80, rows: 24 } }); expect(deliveries).toBeGreaterThan(5);
+  expect(store.snapshot().operator.sequence).toBe(store.snapshot().sequence);
+  expect(store.snapshot().journal.bytesRead).toBe(opening.journal.bytesRead);
+  appendFileSync(f.path, "malformed complete record\n"); store.refresh();
+  appendFileSync(f.path, rawOf(Array.from({ length: 10000 }, () => ev("worker-nudge", {}, "T1"))));
+  do { now += 1000; store.refresh(); } while (store.snapshot().journal.backlogBytes);
+  const final = store.snapshot(); expect(final.journal.history.length).toBeLessThanOrEqual(STORE_LIMITS.history); expect(final.journal.history[0]!.line).toBeGreaterThan(3);
+  expect(final.operator).toMatchObject({ merged: 1, planned: 3, green: false }); expect(final.operator.tasks[0]!.mergeEvidence!.id).toBe(`${f.path}#L4`);
+  expect(final.journal.malformedCount).toBe(1); expect(final.errors).toEqual(expect.arrayContaining([expect.objectContaining({ source: f.path, line: 8 })]));
+  expect(store.page(3, 1)[0]).toMatchObject({ id: `${f.path}#L3`, event: { data: { details: "First verdict\nSecond line\n第三行" } } });
+  expect(store.page(8, 1)[0]!.error).toBeTruthy();
+  for (let i = 0; i < 30; i++) { now += 1000; store.refresh(); }
+  const one = store.requestRefresh(); for (let i = 0; i < 100; i++) expect(store.requestRefresh()).toBe(one);
+  expect(store.diagnostics().pendingReads).toBe(1); await one;
+  expect(store.diagnostics()).toMatchObject({ pendingReads: 0, metrics: STORE_LIMITS.metrics });
+  const removers = Array.from({ length: STORE_LIMITS.subscribers - 1 }, () => store.subscribe(() => {})); expect(() => store.subscribe(() => {})).toThrow(/limit/); removers.forEach(remove => remove());
+  unsubscribe(); store.dispose(); expect(store.diagnostics().subscriptions).toBe(0);
+});

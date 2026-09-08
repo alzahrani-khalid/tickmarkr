@@ -440,7 +440,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
-  }, 240_000);
+  });
 
   test.skipIf(mutationChild)(RETAINED_CONTRACTS_CRITERION, async () => {
     const scratch = makeScratchRepo("tickmarkr-retained-contracts-");
@@ -497,5 +497,5 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
-  }, 240_000);
+  });
 });

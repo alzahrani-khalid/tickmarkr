@@ -547,7 +547,7 @@ describe("cockpit whole-domain appearance oracle", () => {
     expect(displacedRead.boundaries.keyRows).toContain(lastPainted);
     expect(displacedRead.boundaries.keyRows).not.toContain(keybarRow);
     expect(displacedRead.keybarContained).toBe(false);
-  }, 600_000);
+  });
 
   test("test: the sweep asserts those properties against frames the real renderer drew and never against inspection values the test constructs for itself, each property falsified by mutating renderer-drawn bytes, and its baseline is a per-violation fixture committed under tests/fixtures/cockpit/sweep compared by subset, so a partial renderer fix goes green on what it fixed and only a regression goes red", async () => {
     const { violations, plainPairs, samples } = await swept();
@@ -647,7 +647,7 @@ describe("cockpit whole-domain appearance oracle", () => {
     );
     expect(baseline.has(unnamed)).toBe(false);
     expect(regressions([...violations, unnamed], baseline)).toEqual([unnamed]);
-  }, 600_000);
+  });
 });
 
 describe("cockpit frozen anchor tier after the retirement", () => {
@@ -709,5 +709,5 @@ describe("cockpit frozen anchor tier after the retirement", () => {
         fixture,
       ).toBe(false);
     }
-  }, 120_000);
+  });
 });

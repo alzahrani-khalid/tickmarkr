@@ -1,3 +1,5 @@
+// Consolidated C1/C6 readers use the incremental lifecycle contract; legacy captures keep their API.
+export { readOperatorState as deriveOperatorState } from "../../run/operator-state.js";
 import { channelKey } from "../../adapters/types.js";
 import { isPidLive } from "../../run/lock.js";
 import type {

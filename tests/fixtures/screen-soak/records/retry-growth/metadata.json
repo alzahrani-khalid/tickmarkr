@@ -1,0 +1,26 @@
+{
+  "protocol": "C6-four-hour-production-v1",
+  "shape": "growth",
+  "sourceCommit": "dbfd81be5a537ef383064fd3411db0002627451c",
+  "buildRoot": "/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/c6-soak-build-vHNVmb",
+  "pid": 43159,
+  "fixture": "/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/screen-soak-growth-cVzMQG",
+  "journal": "/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/screen-soak-growth-cVzMQG/.tickmarkr/runs/run-screen-soak/journal.jsonl",
+  "durationSeconds": 14400,
+  "sinkLimit": 20000,
+  "sampleIntervalSeconds": 60,
+  "observationIntervalSeconds": 1,
+  "warmupTicks": 1000,
+  "population": "run-start plus one T1 task-dispatch; growth adds one worker-nudge every ten seconds",
+  "inputSchedule": "every 100 observations: Run, Evidence, Home, Run (400-observation cycle); both late-growth endpoints are Run at 120x40",
+  "environment": {
+    "NODE_ENV": null,
+    "node": "v26.7.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "TERM": "xterm-256color",
+    "CI": null
+  },
+  "startedAt": "2026-09-06T15:28:25.501Z",
+  "artifacts": "/Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T6/tests/fixtures/screen-soak/records/retry-growth"
+}

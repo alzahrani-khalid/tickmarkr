@@ -192,7 +192,7 @@ describe("SUP-06 the live board reports its own tier", () => {
     expect(supervisionStatus(repo, "watch").state).toBe("DISARMED");
   });
 
-  test("a last-out stand-down survives an older foreign beat after that beat loses freshness", () => {
+  test("the last orderly exit is DISARMED immediately even when the peer wrote the last beat", () => {
     const repo = seed(mkRepo("board-overlap-last-beater-first"));
     // Synchronous arming fixes the record order: B owns the last beat, then closes before A. A is the
     // last watcher out and therefore publishes the valid tier-wide hand-off with its own arm id.
@@ -204,9 +204,9 @@ describe("SUP-06 the live board reports its own tier", () => {
     expect(existsSync(supervisionStandDownPath(repo, "watch"))).toBe(true);
 
     const lastBeat = statSync(supervisionBeatPath(repo, "watch")).mtimeMs;
-    // While B's differing-id beat is fresh it still fences the arming-vs-rename race. It cannot do so
-    // forever: once stale, A's newer clean stand-down is the final record and must read DISARMED.
-    expect(supervisionStatus(repo, "watch", lastBeat + SUPERVISION_STALE_MS).state).toBe("ARMED");
+    // B released its own presence. Its old beat cannot mask the last orderly exit.
+    expect(supervisionStatus(repo, "watch").state).toBe("DISARMED");
+    expect(supervisionStatus(repo, "watch", lastBeat + SUPERVISION_STALE_MS).state).toBe("DISARMED");
     expect(supervisionStatus(repo, "watch", lastBeat + SUPERVISION_STALE_MS + 1).state).toBe("DISARMED");
   });
 

@@ -1,3 +1,4 @@
+import { borrowRuntimeTimeline, runConsolidatedCockpit, type ShellDelivery } from "./live-runtime.js";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { render, useApp, useInput } from "ink";
@@ -592,7 +593,11 @@ function LiveApp({
   });
 }
 
-export async function runLiveCockpit({
+/**
+ * The retired single-view mount remains exported only for its historical
+ * compatibility suite. Product callers must use {@link runLiveCockpit}.
+ */
+export async function runLegacyCockpit({
   input,
   output,
   cwd,
@@ -615,6 +620,7 @@ export async function runLiveCockpit({
   /** Observe and control the production delivery boundary. */
   onDelivery?: (delivery: LiveCockpitDelivery) => void;
 }): Promise<void> {
+  const releaseTimeline = borrowRuntimeTimeline();
   // Subscribe before Ink mounts so no stale-size repaint can overtake the
   // surface's newly planned frame — and before the delivery exists, which
   // routes every input against this measurement.
@@ -666,8 +672,27 @@ export async function runLiveCockpit({
           releasePointerTracking?.();
         } finally {
           size.close();
+          releaseTimeline();
         }
       }
     }
   }
+}
+
+/** The production cockpit entry: one measured FINAL shell mounting C3–C5. */
+export async function runLiveCockpit(options: {
+  input: NodeJS.ReadStream;
+  output: NodeJS.WriteStream;
+  cwd: string;
+  runId: string;
+  binaryVersion: string;
+  refreshMs?: number;
+  now?: () => number;
+  debug?: boolean;
+  /** Compatibility observer retained for the pre-existing production-mount harness. */
+  onDelivery?: (delivery: ShellDelivery) => void;
+  onShellDelivery?: (delivery: ShellDelivery) => void;
+  environment?: NodeJS.ProcessEnv;
+}): Promise<void> {
+  return runConsolidatedCockpit(options);
 }

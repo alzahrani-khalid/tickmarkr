@@ -1,0 +1,24 @@
+tickmarkr capture | RUN | run-20260905-000000
+1 Home  4 Run  5 Evidence | content | 1–17/31 | 14 hidden
+────────────────────────────────────────────────────────────────────────────────
+│RUN / RUNNING                                                                 │
+│1/4 merged | blocked T3 | current-cycle tip PENDING | RUNNING | matching g    │
+│  Task state                bu te li ev sc ac re  latest attempt              │
+│❯ T1   merged               -  -  -  -  -  -  F  attempt 0                    │
+│  T2   running              -  -  -  -  -  -  -  attempt 0                    │
+│  T3   blocked              -  -  -  -  -  -  -  never dispatched             │
+│  Txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx unknown    │
+│P pass · F fail · R running · - not run · D disabled · ? unknown | declara    │
+│SELECTED / T1 · Task T1                                                       │
+│state merged · attempt 0 · dispatches 1 · path unknown · pane unknown · al    │
+│outcome filter all (x cycles) · 7 of 7 gates shown                            │
+│- build      not run                                                          │
+│- test       not run                                                          │
+│- lint       not run                                                          │
+│- evidence   not run                                                          │
+│- scope      not run                                                          │
+│- acceptance not run                                                          │
+────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 1/4 | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,40 @@
+tickmarkr capture | EVIDENCE | run-20260905-000000
+1 Home  4 Run  5 Evidence | content | 1–17/17 | 0 hidden
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│1 Home         │EVIDENCE [JOURNAL]  REPORT  STATS  CHANNELS  LEARNING PREVIEW  | Follow on  | …│1 Home                │
+│4 Run          │JOURNAL                                                                        │4 Run                 │
+│5 Evidence     │2026-09-05T00:00:00.000Z ● running run-start — fixture                         │5 Evidence            │
+│               │2026-09-05T00:00:00.000Z ● running task-dispatch — T1                          │Tab Focus             │
+│CLI:           │2026-09-05T00:00:00.000Z ✓ passed gate-result — T1 — review passed             │Enter Open            │
+│fleet          │2026-09-05T00:00:00.000Z ✗ terminal failure gate-result — T1 — review failed   │a Actions             │
+│plan           │2026-09-05T00:0 - disabled build — gate-result — Txxxxxxxxxxxxxxxxxxxxxxxxxxxx…│/ Filter              │
+│doctor         │2026-09-05T00:00:00.000Z ✓ passed merge — T1                                   │e Export              │
+│               │2026-09-05T00:00:00.000Z ! human park task-human — T2                          │f Follow              │
+│               │2026-09-05T00:00:00.000Z ? unknown tip-verify                                  │PageUp/PageDown Page  │
+│               │2026-09-05T00:00:00.000Z ✓ passed run-end — done 1, failed 0                   │? Keys                │
+│               │2026-09-05T00:00:00.000Z ? unknown task-approved — T2                          │q Quit                │
+│               │2026-09-05T00:00:00.000Z ● running run-resume                                  │+ Widen shortcuts     │
+│               │2026-09-05T00:00:00.000Z ● running ❯ task-dispatch — T2                        │- Narrow shortcuts    │
+│               │SELECTED EVIDENCE                                                              │                      │
+│               │Original journal <engagement>/journal.jsonl                                    │                      │
+│               │Artifacts: missing                                                             │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 1/4 | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

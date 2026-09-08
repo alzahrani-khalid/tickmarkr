@@ -1,0 +1,40 @@
+tickmarkr capture | HOME | run-20260905-000000
+1 Home  4 Run  5 Evidence | content | 1–16/16 | 0 hidden
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│1 Home         │HOME / RUNNING                                                                 │1 Home                │
+│4 Run          │MERGED                    GATES RAN (historical)    GATE PASS RATE (historic…  │4 Run                 │
+│5 Evidence     │1 / 4                     1 / 2                     50%                        │5 Evidence            │
+│               │no history                                                                     │Tab Focus             │
+│CLI:           │ACTIVE SEATS              NEEDS YOU                 SPEND                      │Enter Open            │
+│fleet          │1 active                  0 parks; 1 blocked        not measurable             │a Actions             │
+│plan           │0 eligible channels       T3 blocked                                           │PageUp/PageDown Page  │
+│doctor         │PROGRESS                                                                       │? Keys                │
+│               │██████░░░░░░░░░░░░░░░░░░ 25%                                                   │q Quit                │
+│               │worker T2 | attempt 0                                                          │+ Widen shortcuts     │
+│               │CURRENT TIP: PENDING                                                           │- Narrow shortcuts    │
+│               │ACTIVITY                                                                       │                      │
+│               │2026-09-05T00:00:00.000Z ● running #L12 task-dispatch — T2                     │                      │
+│               │2026-09-05T00:00:00.000Z ● running #L11 run-resume                             │                      │
+│               │2026-09-05T00:00:00.000Z ? unknown #L10 task-approved — T2                     │                      │
+│               │PageUp history | Enter opens original journal line                             │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 1/4 | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

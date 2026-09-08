@@ -12,6 +12,18 @@ to the user with evidence.
 The mission is the skill argument. If empty, ask the user what to run end-to-end before doing anything else.
 Requires `HERDR_ENV=1`; if unset, say so and stop.
 
+Use the canonical loop skill's [cockpit, parked decisions and printed twins](../tickmarkr-loop/SKILL.md#cockpit-parked-decisions-and-printed-twins)
+when reading or relaying operator evidence. Delivered views are **1 Home, 4 Run, 5 Evidence**;
+Fleet/Bootstrap and Plan/Health remain follow-ons with existing CLI entries. A recorded
+1/3 merged, human T2, blocked T3 run is PARTIAL despite tip pass. The orchestrator owns
+the Run confirmation and read-back of the appended `task-approved` receipt after a ruling;
+permission is not dispatch, and a closed run needs explicit `tickmarkr resume <runId>`.
+Manual UI retains the receipt; the daemon-owned board gracefully stands down only its own
+presence before closing its owned pane. Non-TTY supervision keeps `status`, `report` and
+default-watch line output (`--watch --plain` is also available on a TTY). Keep the canonical
+`tickmarkr-overseer` identity and installed links to `skills/`; the linked walkthrough is
+the shared guidance source, not a new help skill.
+
 **THE ENGINE IS THE DEFAULT EXECUTOR.** A mission that names a milestone, a phase, or a spec runs the
 loop: `tickmarkr compile` → `plan` → `run` → `report`, and the JOURNAL is the record. `compile` ingests
 GSD phase plans (`src/compile/gsd.ts`), so *"this repo uses GSD"* is not a reason to bypass it. The

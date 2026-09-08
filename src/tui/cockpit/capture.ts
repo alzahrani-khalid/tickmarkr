@@ -40,7 +40,8 @@ import {
   type RunInteractionState,
   type RunKeyProjection,
 } from "./keys.js";
-import { cellWidth } from "./width.js";
+import { cellWidth, fitCells } from "./width.js";
+import { resolveShellColourMode } from "./theme.js";
 
 export type CockpitName = "run" | "setup";
 export type CockpitRenderer = "frame" | "plain";
@@ -993,3 +994,92 @@ export async function regenerateColourFrames(
 
   return regenerated;
 }
+
+/** Capture the actual FINAL mount, retaining one frame, through its production input path. */
+export async function captureShellOutput(options: {
+  cwd: string; runId: string; columns: number; rows: number;
+  view: "home" | "run" | "evidence"; binaryVersion?: string;
+  environment?: NodeJS.ProcessEnv; stripAnsi?: boolean;
+}): Promise<string> {
+  const { Writable } = await import("node:stream");
+  const { runLiveCockpit } = await import("./live.js");
+  let lastFrame = "";
+  let frameRevision = 0;
+  const frameListeners = new Set<() => void>();
+  const output = new Writable({ write(chunk, _encoding, next) {
+    const text = String(chunk);
+    if (text.includes("tickmarkr") && text.includes("q Quit")) {
+      lastFrame = text.slice(-20000);
+      frameRevision += 1;
+      for (const listener of frameListeners) listener();
+    }
+    next();
+  } }) as NodeJS.WriteStream;
+  Object.assign(output, { isTTY: true, columns: options.columns, rows: options.rows });
+  const input = new PassThrough() as unknown as NodeJS.ReadStream;
+  Object.assign(input, { isTTY: true, setRawMode: () => input, ref: () => input, unref: () => input });
+  let delivery: import("./live-runtime.js").ShellDelivery | undefined;
+  const previousColourLevel = chalk.level;
+  const mode = resolveShellColourMode(options.environment);
+  chalk.level = mode === "truecolor" ? 3 : mode === "reduced" ? 1 : 0;
+  const mounted = runLiveCockpit({ ...options, input, output, binaryVersion: options.binaryVersion ?? "capture", debug: true, refreshMs: 2 ** 30, onShellDelivery: d => { delivery = d; } });
+  const waitForFrame = (view: typeof options.view, afterRevision = -1): Promise<void> => {
+    const expected = `| ${view.toUpperCase()} |`;
+    if (frameRevision > afterRevision && lastFrame.includes(expected)) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        frameListeners.delete(inspect);
+        reject(new Error(`timed out waiting for committed ${view} capture frame`));
+      }, 2_000);
+      const inspect = () => {
+        if (frameRevision <= afterRevision || !lastFrame.includes(expected)) return;
+        clearTimeout(timeout);
+        frameListeners.delete(inspect);
+        resolve();
+      };
+      frameListeners.add(inspect);
+      inspect();
+    });
+  };
+  try {
+    await waitForFrame("home");
+    const beforeSelection = frameRevision;
+    delivery?.key({ input: { home: "1", run: "4", evidence: "5" }[options.view], key: {} });
+    await waitForFrame(options.view, beforeSelection);
+  } finally {
+    try {
+      delivery?.key({ input: "q", key: {} });
+      await mounted;
+    } finally {
+      input.destroy(); output.destroy();
+      chalk.level = previousColourLevel;
+    }
+  }
+  // The evidence identity remains absolute in the live UI and callbacks. A
+  // committed capture records the fixture role instead of its mkdtemp path,
+  // making regeneration byte-identical on macOS and Linux.
+  const portableFrame = options.stripAnsi === false
+    ? lastFrame
+    : lastFrame.replace(/Original journal [^│\n]*/gu, (line) =>
+      fitCells("Original journal <engagement>/journal.jsonl", cellWidth(line))
+    );
+  // Ink drops a row's trailing padding only when no escape survives it, so the
+  // same frame carries padding under truecolor and none under NO_COLOR. A plain
+  // capture trims its own rows; otherwise its bytes encode the capturing
+  // machine's TERM/COLORTERM and byte-identity holds on that machine alone.
+  const frame = options.stripAnsi === false
+    ? portableFrame
+    : portableFrame
+      .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+      .replace(/[^\S\n]+$/gmu, "");
+  return frame.replace(/\n$/, "");
+}
+
+/** Contract-moved retirement, not UAT re-freezing: historical anchors/source bytes stay intact. */
+export const FINAL_SHELL_RETIREMENT = {
+  reason: "FINAL §3.1–3.3 moves the integrated shell's geometry, palette and installed keys",
+  corrections: "Ship: flow the six Home tiles at 80x24, report measured overflow, select committed rows, and advertise only supported actions; retain original evidence",
+  retained: ["tests/fixtures/cockpit/anchors/", "tests/fixtures/cockpit/sources/", "tests/fixtures/cockpit/colour/sources/"],
+  replacement: ["home.120x40", "home.80x24", "run.120x40", "run.80x24", "evidence.120x40", "evidence.80x24"],
+  refreeze: "pending accepted UAT; no protected bytes rewritten",
+} as const;

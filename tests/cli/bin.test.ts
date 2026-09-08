@@ -1,9 +1,12 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
+import { COMMANDS } from "../../src/cli/index.js";
+import { commandHelp, PROFILE_HELP } from "../../src/cli/help.js";
+import { prepareBuiltCli } from "../helpers/built-cli.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ENTRY = join(ROOT, "dist/cli/index.js");
@@ -102,4 +105,47 @@ describe("package bins", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("both installed bin names serve every command and profile operation's help on stdout without changing seeded state", () => {
+    prepareBuiltCli();
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-bin-help-"));
+    try {
+      mkdirSync(join(dir, ".tickmarkr"));
+      mkdirSync(join(dir, "xdg"));
+      const sentinels = {
+        ".tickmarkr/config.yaml": "{}\n",
+        ".tickmarkr/graph.lock": "operator garbage lock\n",
+        ".tickmarkr/profile-since": "operator-cursor\n",
+        "feature.spec.md": "operator-authored\n",
+        "fake.json": '{"tasks":{}}\n',
+      };
+      for (const [path, bytes] of Object.entries(sentinels)) writeFileSync(join(dir, path), bytes);
+      const operations = [
+        ...Object.keys(COMMANDS).map((command) => [command]),
+        ...Object.keys(PROFILE_HELP).map((operation) => ["profile", operation]),
+      ];
+      for (const name of BINS) {
+        const bin = join(dir, name);
+        symlinkSync(ENTRY, bin);
+        for (const [command, ...args] of operations) {
+          for (const flag of ["--help", "-h"]) {
+            const result = spawnSync(process.execPath, [bin, command, ...args, flag], {
+              cwd: dir, encoding: "utf8", timeout: 10_000,
+              // Keep PATH intact and an available fake adapter installed; help must intercept
+              // even with executable adapters present, not succeed by hiding all CLIs.
+              env: { ...process.env, XDG_CONFIG_HOME: join(dir, "xdg"), TICKMARKR_FAKE_SCRIPT: join(dir, "fake.json") },
+            });
+            expect(result.error, `${name} ${command} ${args.join(" ")} ${flag}`).toBeUndefined();
+            expect(result.status, result.stderr).toBe(0);
+            expect(result.stderr).toBe("");
+            expect(result.stdout).toBe(`${commandHelp(command, args)}\n`);
+          }
+        }
+      }
+      for (const [path, bytes] of Object.entries(sentinels)) expect(readFileSync(join(dir, path), "utf8")).toBe(bytes);
+      expect(readdirSync(join(dir, ".tickmarkr")).sort()).toEqual(["config.yaml", "graph.lock", "profile-since"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

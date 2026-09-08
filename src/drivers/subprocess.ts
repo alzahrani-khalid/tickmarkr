@@ -117,6 +117,10 @@ export class SubprocessDriver implements ExecutorDriver {
     return this.state(slot).buf.split("\n").slice(-lines).join("\n");
   }
 
+  async focus(): Promise<import("./types.js").FocusResult> {
+    return { status: "unsupported", reason: "Subprocess workers have no visible pane; open task evidence with Enter" };
+  }
+
   async notify(msg: string, _opts?: NotifyOpts): Promise<void> {
     if (_opts?.tier === "routine") return;
     console.log(`[tickmarkr] ${msg}`);

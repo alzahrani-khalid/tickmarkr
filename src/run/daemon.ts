@@ -217,13 +217,12 @@ export function formatSummary(s: RunSummary): string {
   return `done: ${s.done.length}, failed: ${s.failed.length}, human: ${s.human.length}, blocked: ${s.blocked.length}, pending: ${s.pending.length}\nintegration branch: ${s.branch}${tip}${outstanding}`;
 }
 
-/** The narrator's command, bound to THIS run. `status` takes exactly one positional and it is the
- *  run id (cli/commands/status.ts positionalRunId), so naming it here is what stops the board from
- *  following the newest journal in a repo that already carries a second, newer run — a board showing
- *  the wrong run is a recorded incident (skills/tickmarkr-overseer/SKILL.md). */
+/** The narrator enters the production Run cockpit for this exact run. The
+ *  completed static/growing four-hour records precede this default cutover;
+ *  an explicit ID prevents a newer journal from redirecting the owned board. */
 export const daemonEntrypoint = fileURLToPath(new URL("../cli/index.js", import.meta.url));
 export const watchCommand = (runId: string): string =>
-  `${shq(process.execPath)} ${shq(daemonEntrypoint)} status --watch ${shq(runId)}`;
+  `${shq(process.execPath)} ${shq(daemonEntrypoint)} ui ${shq(runId)} --view run`;
 
 const MAX_ATTEMPTS = 10; // ponytail: hard cap so a pathological ladder can never loop forever
 
@@ -1401,14 +1400,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // slot closed once (task-done, quota reroute, gate self-clean) can never be closed twice.
   const liveSlots = new Set<Slot>();
   const closeSlot = async (s: Slot): Promise<void> => {
-    if (!liveSlots.delete(s)) return; // already closed — never twice
+    if (!liveSlots.has(s)) return; // already closed — never twice
     await driver.close(s);
+    liveSlots.delete(s);
   };
   const trackedDriver: ExecutorDriver = {
     id: driver.id,
     interactive: driver.interactive,
     ...(driver.readSource ? { readSource: driver.readSource } : {}),
     ...(driver.describe ? { describe: driver.describe.bind(driver) } : {}),
+    ...(driver.focus ? { focus: driver.focus.bind(driver) } : {}),
     slot: async (cwd, name, o) => { const s = await driver.slot(cwd, name, o); liveSlots.add(s); return s; },
     run: (s, cmd) => driver.run(s, cmd),
     waitOutput: (s, p, ms, o) => driver.waitOutput(s, p, ms, o),
@@ -1517,7 +1518,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     try {
       watchSlot = await trackedDriver.narrator(repoRoot, watchCommand(runId), runId);
     } catch (error) {
-      journal.append("watch-placement-failed", undefined, { error: error instanceof Error ? error.message : String(error) });
+      const reason = error instanceof Error ? error.message : String(error);
+      journal.append("watch-placement-failed", undefined, { error: reason });
+      console.error(`tickmarkr: narrator not opened: ${reason}`);
     }
   };
 
@@ -1672,11 +1675,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // (no run identity) is never this run's to sweep.
       if (watchSlot && watchSlot.name === watchName && !desired.has(watchName)) {
         const w = watchSlot;
-        watchSlot = undefined;
         await trackedDriver.close(w);
+        watchSlot = undefined;
       }
-    } catch {
-      /* cosmetic — visibility is never a gate */
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      journal.append("watch-cleanup-failed", undefined, { error: reason });
+      console.error(`tickmarkr: ${reason}`);
     }
   };
   // run start/resume boundary: nothing in flight, so the sweep takes this run's judge/review/consult
@@ -2860,6 +2865,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         journal.append("worker-launch", t.id, {
           attempt,
           retryMode,
+          driver: trackedDriver.id,
+          slot: { ...slot },
+          workspace: driver.id === "herdr" ? process.env.HERDR_WORKSPACE_ID : undefined,
           ...(trackedDriver.describe ? await trackedDriver.describe(slot) : {}),
         });
       };

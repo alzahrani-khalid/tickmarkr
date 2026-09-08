@@ -9,7 +9,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
 import { render } from "ink";
 import { createElement } from "react";
 import { describe, expect, test, vi } from "vitest";
@@ -26,7 +27,7 @@ import {
   liveRunViewRowIds,
   liveRunPointerSurface,
   loadEngagementSource,
-  runLiveCockpit,
+  runLegacyCockpit as runLiveCockpit,
   selectEngagementRunId,
   type LiveCockpitDelivery,
 } from "../../src/tui/cockpit/live.js";
@@ -2932,8 +2933,8 @@ describe("ui command (live cockpit)", () => {
     const done = ui([], { input: io.input, output: io.output }, repo);
     const frame = await commandFrame(io);
 
-    expect(frame).toContain("VIEWS");
-    expect(frame).toContain("RUN");
+    expect(frame).toContain("1 Home  4 Run  5 Evidence");
+    expect(frame).toContain("HOME");
     // The KEYS rail was retired with the contract's frame; keys are advertised in the keybar band alone.
     expect(frame).not.toContain("KEYS");
     expect(frame).toContain("run-20260726-171700");
@@ -2959,7 +2960,6 @@ describe("ui command (live cockpit)", () => {
     const frame = await commandFrame(io);
 
     expect(frame).toContain("run-20990102-030405");
-    expect(frame).toContain("spec/branch-no-capture-owns");
     expect(frame).toContain("noprovider:model-zero");
     expect(frame).not.toContain(COMMITTED_CAPTURE_ID);
 
@@ -2967,15 +2967,16 @@ describe("ui command (live cockpit)", () => {
     await done;
   });
 
-  test("test: when no engagement can be read the command refuses with a message and a non-zero status rather than drawing an empty surface", async () => {
-    const repo = mkRepo(); // no .tickmarkr at all
+  test("implicit no-run UI opens useful Home without arming an observer", async () => {
+    const repo = mkRepo();
     const io = makeInkStreams();
-
-    const result = await ui([], { input: io.input, output: io.output }, repo);
-
-    expect(result).toMatchObject({ code: 1 });
-    expect((result as { out: string }).out).toContain("no engagement");
-    expect(io.writes.join("")).toBe("");
+    const done = ui([], { input: io.input, output: io.output }, repo);
+    try {
+      const frame = await commandFrame(io);
+      expect(frame).toContain("HOME");
+      expect(frame).toContain("No run recorded yet.");
+      expect(frame).toContain("fleet");
+    } finally { io.input.write("q"); await done; }
   });
 
   test("test: when the journal bytes are unreadable the command refuses rather than rendering a plausible surface derived from nothing", async () => {
@@ -3003,7 +3004,6 @@ describe("ui command (live cockpit)", () => {
     const bareDone = ui([], { input: bare.input, output: bare.output }, repo);
     const bareFrame = await commandFrame(bare);
     expect(bareFrame).toContain("run-20260726-110000");
-    expect(bareFrame).toContain("spec/newer");
     expect(bareFrame).not.toContain("run-20260726-100000");
     bare.input.write("q");
     await bareDone;
@@ -3015,7 +3015,7 @@ describe("ui command (live cockpit)", () => {
     }, repo);
     const explicitFrame = await commandFrame(explicit);
     expect(explicitFrame).toContain("run-20260726-100000");
-    expect(explicitFrame).toContain("spec/older");
+    expect(explicitFrame).not.toContain("run-20260726-110000");
     explicit.input.write("q");
     await explicitDone;
   });
@@ -3219,4 +3219,710 @@ describe("live cockpit row identity", () => {
       await done;
     }
   });
+});
+
+// FINAL integration: unlike legacy frame tests these exercise the production C2/C3/C4/C5 mount.
+import chalk from "chalk";
+import { C1_CRITERIA } from "../fixtures/cockpit/final/criteria.js";
+import { FINAL_VERDICT_LINE, LONG_TASK_ID, shellFixture } from "../fixtures/cockpit/final/capture-fixture.js";
+import { mountShell } from "../fixtures/cockpit/final/mount.js";
+import { planShell } from "../../src/tui/cockpit/layout.js";
+import { captureShellOutput, FINAL_SHELL_RETIREMENT } from "../../src/tui/cockpit/capture.js";
+import { SHELL_TERMINAL_ENTER, SHELL_TERMINAL_RESTORE, runConsolidatedCockpit, type ShellDelivery } from "../../src/tui/cockpit/live-runtime.js";
+import { SHELL_BINDINGS, shellBindings } from "../../src/tui/cockpit/keys.js";
+import { SHELL_PALETTE, resolveShellColourMode, resolveTileColour } from "../../src/tui/cockpit/theme.js";
+import { CAPTURE_ARTIFACT_MANIFEST } from "../../src/gates/artifact-manifest.js";
+
+test(C1_CRITERIA[0], async () => {
+  let sizes = 0;
+  for (let columns = 40; columns <= 220; columns++) for (let rows = 14; rows <= 50; rows++) {
+    const p = planShell(columns, rows);
+    expect(p.refused).toBe(false);
+    expect(p.bodyRows + 7).toBe(rows);
+    expect(2 + p.rail + (p.rail ? 1 : 0) + p.bodyColumns + (p.shortcuts ? 1 : 0) + p.shortcuts).toBe(columns);
+    sizes++;
+  }
+  expect(sizes).toBe(6697);
+  expect(planShell(120, 40)).toMatchObject({ rail: 15, bodyColumns: 79, shortcuts: 22, bodyRows: 33 });
+  expect(planShell(80, 24)).toMatchObject({ rail: 0, bodyColumns: 78, shortcuts: 0, bodyRows: 17 });
+  const f = shellFixture();
+  try {
+    for (const [columns, rows] of [[120, 40], [80, 24]]) for (const view of ["home", "run", "evidence"] as const) {
+      const frame = await captureShellOutput({ ...f, columns, rows, view });
+      expect(frame).toContain(view.toUpperCase());
+      expect(frame).toContain("q Quit");
+      expect(frame.split("\n").length).toBe(rows);
+      expect(frame.split("\n").every(line => cellWidth(line) <= columns)).toBe(true);
+      if (view === "home") {
+        expect(frame).toContain("MERGED"); expect(frame).toContain("CURRENT TIP: PENDING");
+        const labels = ["MERGED", "GATES RAN", "GATE PASS RATE", "ACTIVE SEATS", "NEEDS YOU", "SPEND"];
+        const positions = labels.map(label => {
+          const row = frame.split("\n").findIndex(line => line.includes(label));
+          return { row, column: cellWidth(frame.split("\n")[row]!.split(label)[0]!) };
+        });
+        const tileColumns = columns === 80 ? 2 : 3;
+        expect(new Set(positions.map(position => position.row)).size).toBe(6 / tileColumns);
+        for (let i = 0; i < positions.length; i++) {
+          expect(positions[i]!.column).toBe(positions[i % tileColumns]!.column);
+          if (i % tileColumns) expect(positions[i]!.row).toBe(positions[i - 1]!.row);
+          if (i >= tileColumns) expect(positions[i]!.row).toBeGreaterThan(positions[i - tileColumns]!.row);
+        }
+      }
+      if (view === "run") {
+        expect(frame).toContain(LONG_TASK_ID.slice(0, 38));
+        expect(frame).toContain("D disabled");
+      }
+      if (view === "evidence") {
+        expect(frame).toContain("terminal failure");
+        expect(frame).toContain("- disabled");
+      }
+    }
+    const sweep = await mountShell(f.cwd, f.runId, 120, 40, { NO_COLOR: "1" });
+    try {
+      for (const [key, view] of [["1", "HOME"], ["4", "RUN"], ["5", "EVIDENCE"]]) {
+        await sweep.send(key!);
+        for (let columns = 40; columns <= 220; columns++) for (let rows = 14; rows <= 50; rows++) {
+          await sweep.resizeAndPaint(columns, rows);
+          const frame = stripAnsi(sweep.frame());
+          const lines = frame.split("\n");
+          expect(lines.length, `${view} ${columns}x${rows}`).toBe(rows);
+          expect(lines.every(line => cellWidth(line) <= columns), `${view} ${columns}x${rows} cells`).toBe(true);
+          expect(lines[0]).toContain(`| ${view} |`);
+          expect(lines[1]).toMatch(/\d+–\d+\/\d+.*\d+ hidden/);
+          expect(lines[rows - 3]).toContain("PENDING");
+          expect(lines[rows - 2]).toContain("q Quit");
+          expect(lines.slice(3, rows - 4).join("\n")).toContain(view === "HOME" ? "MERGED" : view === "RUN" ? "RUN /" : "JOURNAL");
+        }
+      }
+    } finally { await sweep.close(); }
+    for (const [w, h] of [[39, 14], [40, 13]]) {
+      const m = await mountShell(f.cwd, f.runId, w, h);
+      try { expect(m.frame()).toContain("q Quit"); await m.send("q"); expect(await m.result).toBeUndefined(); } finally { await m.close(); }
+    }
+  } finally { f.close(); }
+}, 600000);
+
+test(C1_CRITERIA[1], async () => {
+  const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
+  try {
+    for (const [key, view] of [["1", "home"], ["4", "run"], ["5", "evidence"]]) {
+      await m.send(key); expect(m.delivery.snapshot().state.view).toBe(view); expect(m.frame()).toContain(view.toUpperCase());
+    }
+    await m.send("1");
+    m.delivery.key({ input: "", key: { return: true } });
+    await m.send("");
+    expect(m.delivery.snapshot().state.view).toBe("run");
+    expect(m.frame()).toContain("❯ T3");
+    expect(m.frame()).toContain("blocked");
+    await m.send("5");
+    m.delivery.key({ input: "", key: { return: true } });
+    const evidenceOpen = m.delivery.snapshot().state.overlay?.join("\n") ?? "";
+    expect(evidenceOpen).toMatch(/task-dispatch|"event": "task-dispatch"|T2/);
+    expect(evidenceOpen).toContain("\"attempt\": 0");
+    await m.send("\x1b");
+    await m.resize(120, 40);
+    await m.send("1");
+    const openGeometry = planShell(120, 40);
+    m.delivery.pointer({
+      action: "press",
+      column: openGeometry.bodyColumn + openGeometry.bodyColumns + 2,
+      row: openGeometry.bodyRow + SHELL_BINDINGS.findIndex(binding => binding.action === "open"),
+    });
+    await m.send("");
+    expect(m.delivery.snapshot().state.view).toBe("run");
+    expect(m.frame()).toContain("❯ T3");
+    await m.send("5");
+    m.delivery.pointer({
+      action: "press",
+      column: openGeometry.bodyColumn + openGeometry.bodyColumns + 2,
+      row: openGeometry.bodyRow + SHELL_BINDINGS.findIndex(binding => binding.action === "open"),
+    });
+    expect(m.delivery.snapshot().state.overlay?.join("\n")).toMatch(/task-dispatch|"event": "task-dispatch"|T2/);
+    await m.send("\x1b");
+    // Move off both defaults: Home's Activity history and Evidence's selected
+    // row must be the same targets for terminal Enter and pointer Open.
+    await m.send("1");
+    await m.send("\x1b[C");
+    await m.send("\x1b[5~");
+    const homeTarget = m.delivery.snapshot().store.journal.history.at(-4)!;
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.view).toBe("evidence");
+    expect(m.delivery.snapshot().state.overlay).toBeUndefined();
+    expect(stripAnsi(m.frame())).toContain("Follow off");
+    m.delivery.key({ input: "", key: { return: true } });
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(homeTarget.id);
+    await m.send("\x1b");
+    await m.send("1");
+    await m.send("\x1b[C");
+    await m.send("\x1b[5~");
+    m.delivery.pointer({
+      action: "press",
+      column: openGeometry.bodyColumn + openGeometry.bodyColumns + 2,
+      row: openGeometry.bodyRow + SHELL_BINDINGS.findIndex(binding => binding.action === "open"),
+    });
+    await m.send("");
+    expect(m.delivery.snapshot().state.view).toBe("evidence");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(homeTarget.id);
+    await m.send("\x1b");
+    // A local arrow delivered by the production boundary uses the same leaf
+    // controller as stdin; Open may not silently fall back to the tail.
+    m.delivery.key({ input: "", key: { upArrow: true } });
+    await m.send("");
+    const evidenceTarget = m.delivery.snapshot().store.journal.history.find(row => row.line === homeTarget.line - 1)!;
+    m.delivery.pointer({
+      action: "press",
+      column: openGeometry.bodyColumn + openGeometry.bodyColumns + 2,
+      row: openGeometry.bodyRow + SHELL_BINDINGS.findIndex(binding => binding.action === "open"),
+    });
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(evidenceTarget.id);
+    expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain(evidenceTarget.event!.event);
+    await m.send("\x1b");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(evidenceTarget.id);
+    await m.send("\x1b");
+    await m.send("\x1b[C");
+    expect(stripAnsi(m.frame())).toContain("[REPORT]");
+    expect(stripAnsi(m.frame())).not.toContain("Enter Open");
+    m.delivery.pointer({
+      action: "press",
+      column: openGeometry.bodyColumn + openGeometry.bodyColumns + 2,
+      row: openGeometry.bodyRow + shellBindings(m.delivery.snapshot().state).findIndex(binding => binding.action === "actions"),
+    });
+    expect(m.delivery.snapshot().state.overlay).toContain("Existing CLI actions");
+    await m.send("\x1b");
+    expect(stripAnsi(m.frame())).toContain("[REPORT]");
+    expect(stripAnsi(m.frame())).not.toContain("Enter Open");
+    await m.send("\x1b[D");
+    expect(stripAnsi(m.frame())).toContain("Enter Open");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(evidenceTarget.id);
+    await m.send("\x1b");
+    await m.send("/"); await m.send("q1?");
+    expect(m.delivery.snapshot().state).toMatchObject({ view: "evidence", editor: "q1?", quit: false });
+    await m.send("\r"); expect(m.delivery.snapshot().state.query).toBe("q1?");
+    await m.send("?"); expect(m.delivery.snapshot().state.help).toBe(true);
+    await m.send("\x1b"); expect(m.delivery.snapshot().state.help).toBe(false);
+    expect(m.delivery.snapshot().state.quit).toBe(false);
+    const focusSequences = [
+      { width: 80, forward: ["content", "content"], reverse: "content" },
+      { width: 90, forward: ["rail", "content"], reverse: "rail" },
+      { width: 120, forward: ["shortcuts", "rail"], reverse: "shortcuts" },
+    ] as const;
+    for (const sample of focusSequences) {
+      await m.resize(sample.width, 24);
+      const p = planShell(sample.width, 24);
+      m.delivery.pointer({ action: "press", column: p.bodyColumn, row: p.bodyRow });
+      expect(m.delivery.snapshot().state.focus).toBe("content");
+      for (const expected of sample.forward) {
+        await m.send("\t");
+        expect(m.delivery.snapshot().state.focus).toBe(expected);
+      }
+      await m.send("\x1b[Z");
+      expect(m.delivery.snapshot().state.focus).toBe(sample.reverse);
+    }
+    await m.send("4");
+    for (let task = 0; task < 4; task++) await m.send("\x1b[A");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.join(" ")).toContain("T1");
+    await m.send("\x1b");
+    for (let task = 0; task < 3; task++) await m.send("\x1b[B");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.join(" ")).toContain(LONG_TASK_ID);
+    expect(m.delivery.snapshot().state.overlay?.join(" ")).toContain("组合文字 cafe\u0301");
+    await m.send("\x1b");
+    for (let task = 0; task < 3; task++) await m.send("\x1b[A");
+    await m.send("a");
+    expect(m.delivery.snapshot().state.overlay).toBeDefined();
+    await m.send("\x1b");
+    for (let page = 0; page < 20; page++) await m.send("\x1b[6~");
+    expect(m.frame()).toContain(FINAL_VERDICT_LINE);
+    m.delivery.stage(["config.yaml: staged preference (not written)"]);
+    await m.send("q"); expect(m.delivery.snapshot().state.reviewing).toBe(true);
+    await m.send("\r"); expect(m.delivery.snapshot().state.quit).toBe(false);
+    await m.send("n"); expect(m.delivery.snapshot().state.reviewing).toBe(false);
+    expect(m.delivery.snapshot().state.staged).toHaveLength(1);
+    await m.resize(120, 40);
+    m.delivery.pointer({ action: "press", column: 2, row: 3 });
+    expect(m.delivery.snapshot().state.view).toBe("home");
+    await m.send("q");
+    await m.send("y");
+    expect(await m.result).toBeUndefined();
+  } finally { await m.close(); f.close(); }
+}, 15000);
+
+test(C1_CRITERIA[2], async () => {
+  const f = shellFixture();
+  try {
+    for (const exit of ["q", "ctrl-c", "signal", "read failure", "render failure"]) {
+      const m = await mountShell(f.cwd, f.runId);
+      expect(m.controls()).toContain(SHELL_TERMINAL_ENTER);
+      if (exit === "q") await m.send("q");
+      if (exit === "ctrl-c") await m.send("\x03");
+      if (exit === "signal") process.emit("SIGTERM");
+      if (exit === "read failure") m.input.emit("error", new Error("induced read failure"));
+      if (exit === "render failure") m.output.emit("error", new Error("induced render failure"));
+      const result = await m.result;
+      expect(result instanceof Error).toBe(exit.includes("failure"));
+      expect(m.controls()).toContain(SHELL_TERMINAL_RESTORE);
+      expect(m.raw.at(-1)).toBe(false);
+      expect(m.input.listenerCount("readable")).toBe(0);
+      expect(m.output.listenerCount("resize")).toBe(0);
+      expect(m.delivery.diagnostics().subscriptions).toBe(0);
+      expect(m.delivery.refresh()).toBe(false);
+      let usable = ""; m.input.on("data", chunk => { usable += String(chunk); }); m.input.resume();
+      await m.send("usable"); expect(usable).toBe("usable");
+      await m.close();
+    }
+    const a = await mountShell(f.cwd, f.runId); const b = await mountShell(f.cwd, f.runId);
+    try { await a.close(); await b.send("5"); expect(b.frame()).toContain("EVIDENCE"); expect(b.delivery.refresh()).toBe(true); } finally { await b.close(); }
+  } finally { f.close(); }
+}, 15000);
+
+test(C1_CRITERIA[3], async () => {
+  expect(SHELL_PALETTE).toMatchObject({ passed: "#90C4A4", running: "#5A76AE", human: "#ffaf00", failure: "#B07BAC" });
+  expect(resolveShellColourMode({ NO_COLOR: "" })).toBe("none");
+  expect(resolveShellColourMode({ TERM: "xterm-256color" })).toBe("reduced");
+  expect(resolveShellColourMode({ COLORTERM: "truecolor" })).toBe("truecolor");
+  expect(resolveTileColour({ magnitude: 0 })).not.toEqual(resolveTileColour({ magnitude: 3 }));
+  expect(FINAL_SHELL_RETIREMENT.refreeze).toContain("pending accepted UAT");
+  for (const view of ["home", "run", "evidence"]) for (const size of ["120x40", "80x24"]) {
+    const path = `tests/fixtures/cockpit/final/${view}.${size}.txt`;
+    expect(CAPTURE_ARTIFACT_MANIFEST.artifacts.some(a => a.path === path)).toBe(true);
+    expect(readFileSync(join(import.meta.dirname, "../..", path), "utf8")).toContain("q Quit");
+  }
+  const f = shellFixture();
+  try {
+    const frame = await captureShellOutput({ ...f, columns: 80, rows: 24, view: "home" });
+    expect(frame).toContain("● running"); expect(frame).toContain("no history"); expect(frame).toContain("not measurable");
+    expect(frame).not.toContain("✓ running"); expect(frame).not.toContain("✓ human");
+    for (const sample of [
+      { mode: "truecolor", environment: { COLORTERM: "truecolor" }, failure: "38;2;176;123;172", disabled: "38;2;217;215;221" },
+      { mode: "reduced", environment: { TERM: "xterm-256color" }, failure: "35", disabled: "37" },
+      { mode: "none", environment: { NO_COLOR: "1" }, failure: "", disabled: "" },
+    ] as const) {
+      const mounted = await captureShellOutput({ ...f, columns: 120, rows: 40, view: "evidence", environment: sample.environment, stripAnsi: false });
+      expect(mounted).toContain("terminal failure");
+      // The disabled word and ink must belong to the actual build gate row,
+      // not a footer legend or another unrelated disabled component.
+      const gateRow = mounted.split("\n").find(line => stripAnsi(line).includes("- disabled"));
+      expect(gateRow).toBeDefined();
+      expect(stripAnsi(gateRow!)).toContain("- disabled build — gate-result");
+      expect(stripAnsi(gateRow!)).toContain(LONG_TASK_ID.slice(0, 20));
+      expect(mounted).not.toContain("uninstalled disabled");
+      expect(mounted.split("\n").slice(-4).join("\n")).not.toContain("disabled");
+      if (sample.mode === "none") expect(mounted).not.toMatch(/\x1b\[(?:3[0-9]|38;)/u);
+      else {
+        expect(mounted).toContain(sample.failure);
+        expect(gateRow).toMatch(new RegExp(`${sample.disabled}m- disabled`));
+      }
+    }
+    const beforeTrend = await captureShellOutput({ ...f, columns: 120, rows: 40, view: "home", environment: { COLORTERM: "truecolor" }, stripAnsi: false });
+    expect(beforeTrend).toContain("no history");
+    const journal = join(f.cwd, ".tickmarkr", "runs", f.runId, "journal.jsonl");
+    appendFileSync(journal, JSON.stringify({ ts: "2026-09-05T00:01:00.000Z", event: "merge", taskId: "T2", data: {} }) + "\n");
+    const measuredTrend = await captureShellOutput({ ...f, columns: 120, rows: 40, view: "home", environment: { COLORTERM: "truecolor" }, stripAnsi: false });
+    const trendRow = measuredTrend.split("\n").find(line => stripAnsi(line).includes("▁█"));
+    expect(trendRow).toBeDefined();
+    // Same MERGED tile: two journal magnitudes, two guarded green steps.
+    expect(trendRow).toContain("38;2;67;121;68m");
+    expect(trendRow).toContain("38;2;135;215;135m");
+    // Keep ANSI enabled in Ink: NO_COLOR must be enforced by the production
+    // shell itself, independently of captureShellOutput's chalk-level setup.
+    const previousLevel = chalk.level;
+    chalk.level = 3;
+    try {
+      for (const sample of [
+        { environment: { COLORTERM: "truecolor" }, background: "\x1b[48;2;26;26;25m", chrome: "\x1b[38;2;217;215;221m" },
+        { environment: { TERM: "xterm-256color" }, background: "\x1b[40m", chrome: "\x1b[37m" },
+        { environment: { NO_COLOR: "1" }, background: undefined, chrome: undefined },
+      ]) {
+        const m = await mountShell(f.cwd, f.runId, 120, 40, sample.environment);
+        try {
+          for (const bytes of ["1", "4", "5", "?", "\x1b", "/"]) {
+            await m.send(bytes);
+            const painted = m.frame();
+            expect(stripAnsi(painted)).toContain("q Quit");
+            if (sample.background) {
+              expect(painted).toContain(sample.background);
+              expect(painted).toContain(sample.chrome);
+              // Fill the empty body as well as text-bearing rows.
+              expect(painted.split("\n").filter(line => line.includes(sample.background!))).toHaveLength(40);
+            } else {
+              expect(painted).not.toMatch(/\x1b\[(?:[349][0-9]|10[0-7])(?:;[0-9]+)*m/u);
+            }
+          }
+          await m.send("\x1b");
+        } finally { await m.close(); }
+      }
+    } finally { chalk.level = previousLevel; }
+  } finally { f.close(); }
+});
+
+test(C1_CRITERIA[4], async () => {
+  const { spawn } = await import("node:child_process");
+  const { rmSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "final-shell-memory-"));
+  try {
+    for (const production of [false, true]) for (const shape of ["static", "growth", "resize"]) {
+      const destination = join(dir, `${shape}-${production}.json`);
+      const env = { ...process.env }; delete env.NODE_ENV; delete env.CI; delete env.CONTINUOUS_INTEGRATION;
+      if (production) env.NODE_ENV = "production";
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(process.execPath, ["--import", "tsx", "--expose-gc", join(import.meta.dirname, "../fixtures/cockpit/final/heap-runner.mjs"), shape, destination], { env, stdio: ["ignore", "ignore", "pipe"] });
+        let errors = "";
+        child.stderr.on("data", chunk => { errors = (errors + String(chunk)).slice(-4000); });
+        const timer = setTimeout(() => child.kill("SIGKILL"), 180000);
+        child.on("error", reject);
+        child.on("close", code => { clearTimeout(timer); if (code === 0) resolve(); else reject(new Error(errors || `heap child exited ${code}`)); });
+      });
+      const result = JSON.parse(readFileSync(destination, "utf8"));
+      expect(result.protocol).toBe("C1-production-mount-v1");
+      expect(result.environment.NODE_ENV).toBe(production ? "production" : null);
+      expect(result.warmupTicks).toBe(1000); expect(result.measuredTicks).toBe(10000);
+      expect(result.samples.map((s: { tick: number }) => s.tick)).toEqual(Array.from({ length: 11 }, (_, i) => (i + 1) * 1000));
+      for (const sample of result.samples) { expect(sample.heap).toBeLessThanOrEqual(64 * 1048576); expect(sample.performanceMeasures).toBeLessThan(1000); }
+      expect(result.lateGrowth).toBeLessThanOrEqual(16 * 1048576);
+      expect(result.verdict).toBe("pass"); expect(result.writes).toBeGreaterThan(10000);
+      expect(result.bytes).toBeGreaterThan(100000); expect(result.pendingOutputBytes).toBe(0);
+      expect(result.lastFrame.length).toBeLessThanOrEqual(20000);
+      expect(result.lastFrame).toContain("heap-fixture");
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 1_100_000);
+
+test("mounted shortcuts omit Open without a target and Filter outside Journal; Evidence export reviews the actual destination", async () => {
+  const f = shellFixture();
+  const journal = join(f.cwd, ".tickmarkr", "runs", f.runId, "journal.jsonl");
+  writeFileSync(journal, "");
+  const m = await mountShell(f.cwd, f.runId);
+  try {
+    expect(stripAnsi(m.frame())).toContain("No run recorded yet");
+    expect(stripAnsi(m.frame())).not.toContain("Enter Open");
+    expect(stripAnsi(m.frame())).not.toContain("/ Filter");
+    await m.send("/");
+    expect(m.delivery.snapshot().state.editor).toBeUndefined();
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay).toBeUndefined();
+    await m.send("4");
+    expect(stripAnsi(m.frame())).not.toContain("/ Filter");
+    await m.send("5");
+    expect(stripAnsi(m.frame())).not.toContain("Enter Open");
+    expect(stripAnsi(m.frame())).toContain("e Export");
+    const destination = join(f.cwd, "receipt.md");
+    writeFileSync(destination, "original receipt");
+    await m.send("e");
+    expect(m.delivery.snapshot().state.editor).toBe(join(f.cwd, `fixture.${f.runId}.report.md`));
+    while (m.delivery.snapshot().state.editor) m.delivery.key({ input: "", key: { backspace: true } });
+    await m.send(destination); await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(`Overwrite ${destination}`);
+    await m.send("\r");
+    expect(readFileSync(destination, "utf8")).toBe("original receipt");
+    await m.send("n");
+    expect(m.delivery.snapshot().state.overlay).toBeUndefined();
+    await m.send("e");
+    expect(m.delivery.snapshot().state.editor).toBe(join(f.cwd, `fixture.${f.runId}.report.md`));
+    while (m.delivery.snapshot().state.editor) m.delivery.key({ input: "", key: { backspace: true } });
+    await m.send(destination); await m.send("\r"); await m.send("y");
+    const record = readFileSync(destination, "utf8");
+    expect(record).toContain(f.runId);
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(`Exported ${destination} (${Buffer.byteLength(record)} bytes)`);
+  } finally { await m.close(); f.close(); }
+});
+
+
+test("mounted pointer selects the painted Run task and Evidence row after resize and scroll", async () => {
+  const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
+  try {
+    await m.send("4");
+    for (const width of [120, 90, 80]) {
+      await m.resize(width, 24);
+      const geometry = m.delivery.geometry()!;
+      const target = geometry.paintedRows.find(row => row.text.trimStart().startsWith("T3 "))!;
+      expect(target).toBeDefined();
+      m.delivery.pointer({ action: "press", column: target.column + 4, row: target.row });
+      await m.send("");
+      expect(stripAnsi(m.frame())).toContain("❯ T3");
+      await m.send("\r");
+      expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain("T3");
+      await m.send("\x1b"); await m.send("\x1b[A");
+    }
+    await m.resize(40, 14);
+    const longRow = m.delivery.geometry()!.paintedRows.find(row => row.text.includes(LONG_TASK_ID.slice(0, 28)))!;
+    expect(longRow).toBeDefined();
+    m.delivery.pointer({ action: "press", column: longRow.column + 3, row: longRow.row });
+    await m.send(""); await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain(LONG_TASK_ID.slice(0, 38));
+    expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain("组合文字 cafe\u0301");
+    await m.send("\x1b");
+    // With the side columns folded, the painted selector remains clickable.
+    await m.resize(80, 24);
+    const selector = m.delivery.geometry()!.paintedRows.find(row => row.text.startsWith("1 Home"))!;
+    m.delivery.pointer({ action: "press", row: selector.row, column: selector.column + cellWidth(selector.text.split("5 Evidence")[0]!) });
+    await m.send("");
+    expect(m.delivery.snapshot().state.view).toBe("evidence");
+    await m.resize(120, 40);
+    const geometry = m.delivery.geometry()!;
+    const target = geometry.paintedRows.find(row => row.text === "gate-result — T1 — review passed")!;
+    expect(target).toBeDefined();
+    m.delivery.pointer({ action: "press", column: target.column + 1, row: target.row });
+    await m.send(""); await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain('"gate": "review"');
+    expect(m.delivery.snapshot().state.overlay?.[0]).toMatch(/#L3$/);
+  } finally { await m.close(); f.close(); }
+});
+
+test("mounted Evidence reselects a previously clicked row after keyboard navigation", async () => {
+  const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
+  try {
+    await m.send("5");
+    const clickReview = async () => {
+      const target = m.delivery.geometry()!.paintedRows.find(row => row.text === "gate-result — T1 — review passed")!;
+      expect(target).toBeDefined();
+      await m.send(`\x1b[<0;${target.column + 2};${target.row + 1}M`);
+      await m.send(`\x1b[<0;${target.column + 2};${target.row + 1}m`);
+    };
+    await clickReview();
+    await m.send("\r");
+    const identity = m.delivery.snapshot().state.overlay?.[0];
+    expect(identity).toMatch(/#L3$/);
+    await m.send("\x1b");
+    await m.send("\x1b[B");
+    expect(m.delivery.geometry()!.paintedRows.find(row => row.text === "❯ ")?.evidenceId).toMatch(/#L4$/);
+    await clickReview();
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(identity);
+    expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain('"gate": "review"');
+  } finally { await m.close(); f.close(); }
+});
+
+test("mounted Home Needs-you pointer opens the same human-first target as Enter", async () => {
+  const f = shellFixture();
+  const journal = join(f.cwd, ".tickmarkr", "runs", f.runId, "journal.jsonl");
+  appendFileSync(journal, [
+    { ts: "2026-09-05T00:02:00.000Z", event: "task-blocked", taskId: "T1", data: {} },
+    { ts: "2026-09-05T00:02:01.000Z", event: "task-human", taskId: "T2", data: { reason: "operator review" } },
+  ].map(event => JSON.stringify(event) + "\n").join(""));
+  const m = await mountShell(f.cwd, f.runId);
+  try {
+    for (const width of [120, 90, 80]) {
+      await m.resize(width, 24);
+      await m.send("1");
+      expect(stripAnsi(m.frame())).toContain("T2 human");
+      await m.send("\r");
+      expect(m.delivery.snapshot().state.view).toBe("run");
+      expect(stripAnsi(m.frame())).toContain("❯ T2");
+      await m.send("1");
+      const target = m.delivery.geometry()!.paintedRows.find(row => row.text.startsWith("NEEDS YOU"))!;
+      expect(target).toBeDefined();
+      m.delivery.pointer({ action: "press", column: target.column, row: target.row });
+      await m.send("");
+      expect(m.delivery.snapshot().state.view).toBe("run");
+      expect(stripAnsi(m.frame())).toContain("❯ T2");
+      await m.send("\r");
+      expect(m.delivery.snapshot().state.overlay?.[0]).toBe("T2");
+      await m.send("\x1b");
+      await m.send("1");
+      // Move Needs-you selection down to T1 (second target):
+      await m.send("\x1b[B");
+      expect(stripAnsi(m.frame())).toContain("T1 blocked");
+      const movedTarget = m.delivery.geometry()!.paintedRows.find(row => row.text.startsWith("NEEDS YOU"))!;
+      expect(movedTarget).toBeDefined();
+      m.delivery.pointer({ action: "press", column: movedTarget.column, row: movedTarget.row });
+      await m.send("");
+      expect(m.delivery.snapshot().state.view).toBe("run");
+      expect(stripAnsi(m.frame())).toContain("❯ T1");
+      await m.send("1");
+    }
+  } finally { await m.close(); f.close(); }
+});
+test("mounted Home Needs-you pointer opens diagnostic overlay when diagnostic target is selected", async () => {
+  const f = shellFixture();
+  let lastFrame = "";
+  const raw: boolean[] = [];
+  type MockReadStream = NodeJS.ReadStream & { isRaw: boolean };
+  const input = new PassThrough() as unknown as MockReadStream;
+  Object.assign(input, { isTTY: true, isRaw: false, setRawMode: (v: boolean) => { raw.push(v); input.isRaw = v; return input; }, ref: () => input, unref: () => input });
+  const output = new Writable({ write(chunk, _encoding, next) {
+    const text = String(chunk);
+    if (text.includes("q Quit")) lastFrame = text.slice(-20000);
+    next();
+  } }) as NodeJS.WriteStream;
+  Object.assign(output, { isTTY: true, columns: 120, rows: 40 });
+  let delivery!: ShellDelivery;
+  const mounted = runConsolidatedCockpit({
+    cwd: f.cwd, runId: f.runId, input, output, binaryVersion: "fixture", debug: true, refreshMs: 2 ** 30,
+    diagnostics: [{ kind: "diagnostic", id: "lock-dead-holder", label: "lock: dead holder" }],
+    onShellDelivery: d => { delivery = d; },
+  });
+  const result = mounted.then(() => undefined, error => error as Error);
+  await sleep(50);
+  try {
+    input.write("1");
+    await sleep(30);
+    // Move down past parks (T2, T1, T3) to diagnostic target:
+    input.write("\x1b[B"); await sleep(20);
+    input.write("\x1b[B"); await sleep(20);
+    input.write("\x1b[B"); await sleep(20);
+    expect(stripAnsi(lastFrame)).toContain("lock: dead holder");
+    const target = delivery.geometry()!.paintedRows.find(row => row.text.startsWith("NEEDS YOU"))!;
+    expect(target).toBeDefined();
+    delivery.pointer({ action: "press", column: target.column, row: target.row });
+    input.write("");
+    await sleep(30);
+
+    expect(delivery.snapshot().state.overlay?.[0]).toBe("lock-dead-holder");
+  } finally {
+    delivery.key({ input: "q", key: {} });
+    delivery.key({ input: "c", key: { ctrl: true } });
+    await result;
+    input.destroy();
+    output.destroy();
+    f.close();
+  }
+});
+
+
+test("mounted divider dragging uses the same bounded resize transition as the advertised keys", async () => {
+  const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
+  try {
+    const before = m.delivery.geometry()!;
+    const divider = before.paintedRows.find(row => row.text === "│" && row.column === before.bodyColumn + before.bodyColumns)!;
+    expect(divider).toBeDefined();
+    expect(stripAnsi(m.frame())).toContain("+ Widen shortcuts");
+    const report = (button: number, column: number, released = false) => `\x1b[<${button};${column + 1};${divider.row + 1}${released ? "m" : "M"}`;
+    await m.send(report(0, divider.column));
+    await m.send(report(32, divider.column - 4));
+    await m.send(report(0, divider.column - 4, true));
+    expect(m.delivery.geometry()).toMatchObject({ shortcuts: 26, bodyColumns: 75 });
+    await m.send("-");
+    expect(m.delivery.geometry()).toMatchObject({ shortcuts: 25, bodyColumns: 76 });
+    await m.send("+");
+    expect(m.delivery.geometry()).toMatchObject({ shortcuts: 26, bodyColumns: 75 });
+    await m.resize(80, 24);
+    expect(stripAnsi(m.frame())).not.toContain("Widen shortcuts");
+    await m.send("+");
+    expect(m.delivery.geometry()).toMatchObject({ shortcuts: 0, bodyColumns: 78 });
+  } finally { await m.close(); f.close(); }
+});
+
+test("mounted Open disappears when an unfollowed Evidence selection is removed or the filter has no matches", async () => {
+  const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
+  try {
+    await m.send("5"); await m.send("\x1b[A");
+    expect(stripAnsi(m.frame())).toContain("Enter Open");
+    const path = join(f.cwd, ".tickmarkr", "runs", f.runId, "journal.jsonl");
+    writeFileSync(path, JSON.stringify({ ts: "2026-09-05T00:02:00.000Z", event: "worker-nudge", data: { reason: "replacement" } }) + "\n");
+    m.delivery.refresh(); await m.send("");
+    expect(stripAnsi(m.frame())).not.toContain("Enter Open");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay).toBeUndefined();
+    await m.send("f");
+    expect(stripAnsi(m.frame())).toContain("Enter Open");
+    await m.send("/"); await m.send("no matching evidence"); await m.send("\r");
+    expect(stripAnsi(m.frame())).not.toContain("Enter Open");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay).toBeUndefined();
+  } finally { await m.close(); f.close(); }
+});
+
+
+test("mounted pointer keeps original identities for repeated journal narrations", async () => {
+  const f = shellFixture();
+  const path = join(f.cwd, ".tickmarkr", "runs", f.runId, "journal.jsonl");
+  const duplicate = JSON.stringify({ ts: "2026-09-05T00:03:00.000Z", event: "worker-nudge", taskId: "T2", data: { reason: "identical narration" } }) + "\n";
+  appendFileSync(path, duplicate + duplicate);
+  const m = await mountShell(f.cwd, f.runId);
+  try {
+    const expected = m.delivery.snapshot().store.journal.history.at(-2)!;
+    await m.send("5");
+    const row = m.delivery.geometry()!.paintedRows.find(row => row.evidenceId === expected.id)!;
+    expect(row).toBeDefined();
+    m.delivery.pointer({ action: "press", row: row.row, column: row.column + 1 });
+    await m.send(""); await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(expected.id);
+    await m.send("\x1b"); await m.send("1");
+    const activity = m.delivery.geometry()!.paintedRows.find(row => row.text.startsWith(` #L${expected.line} `))!;
+    expect(activity).toBeDefined();
+    m.delivery.pointer({ action: "press", row: activity.row, column: activity.column + 1 });
+    await m.send(""); await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(expected.id);
+  } finally { await m.close(); f.close(); }
+});
+
+
+test("mounted row presses keep the committed view context across an unpainted view key", async () => {
+  const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
+  try {
+    await m.send("4");
+    const task = m.delivery.geometry()!.paintedRows.find(row => row.text.trimStart().startsWith("T3 "))!;
+    m.delivery.key({ input: "1", key: {} });
+    m.delivery.pointer({ action: "press", row: task.row, column: task.column + 3 });
+    await m.send("");
+    expect(m.delivery.snapshot().state.view).toBe("run");
+    expect(stripAnsi(m.frame())).toContain("❯ T3");
+    await m.send("5");
+    const expected = m.delivery.snapshot().store.journal.history[2]!;
+    const evidence = m.delivery.geometry()!.paintedRows.find(row => row.evidenceId === expected.id)!;
+    m.delivery.key({ input: "1", key: {} });
+    m.delivery.pointer({ action: "press", row: evidence.row, column: evidence.column + 1 });
+    await m.send(""); await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(expected.id);
+    await m.send("\x1b");
+    const oldRow = m.delivery.geometry()!.paintedRows.find(row => row.evidenceId === expected.id)!;
+    m.delivery.key({ input: "", key: { rightArrow: true } });
+    m.delivery.pointer({ action: "press", row: oldRow.row, column: oldRow.column + 1 });
+    await m.send("");
+    expect(stripAnsi(m.frame())).toContain("[JOURNAL]");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(expected.id);
+    await m.send("\x1b"); await m.resize(40, 14);
+    const quit = m.delivery.geometry()!.paintedRows.find(row => row.text.includes("q Quit"))!;
+    m.delivery.pointer({ action: "press", row: quit.row, column: quit.column + cellWidth(quit.text.split("q Quit")[0]!) });
+    expect(await m.result).toBeUndefined();
+    expect(m.controls()).toContain(SHELL_TERMINAL_RESTORE);
+  } finally { await m.close(); f.close(); }
+});
+
+test("test: in the mounted shell Home's selected Activity row is marked by a glyph that survives with colour disabled and pointer Open on that row opens the same original evidence identity as Enter after the selection has moved off the newest row", async () => {
+  const f = shellFixture();
+  const m = await mountShell(f.cwd, f.runId, 120, 40, { NO_COLOR: "1" });
+  try {
+    await m.send("1");
+    await m.send("\x1b[C");
+    await m.send("\x1b[B");
+
+    expect(m.frame()).not.toMatch(/\x1b\[(?:3[0-9]|38;)/u);
+    expect(m.frame()).toContain(GLYPHS.pointer);
+
+    const expected = m.delivery.snapshot().store.journal.history.at(-2)!;
+    const newest = m.delivery.snapshot().store.journal.history.at(-1)!;
+
+    const geometry = m.delivery.geometry()!;
+    const selectedRow = geometry.paintedRows.find(row => row.text.includes(GLYPHS.pointer))!;
+    expect(selectedRow).toBeDefined();
+    expect(selectedRow.text).toContain(`#L${expected.line}`);
+
+    const newestRow = geometry.paintedRows.find(row => row.text.includes(`#L${newest.line}`))!;
+    expect(newestRow.text).not.toContain(GLYPHS.pointer);
+
+    m.delivery.pointer({ action: "press", row: selectedRow.row, column: selectedRow.column + 1 });
+    await m.send("");
+    expect(m.delivery.snapshot().state.view).toBe("evidence");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(expected.id);
+
+    await m.send("\x1b");
+    await m.send("1");
+    await m.send("\x1b[C");
+    await m.send("\x1b[B");
+
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.view).toBe("evidence");
+    await m.send("\r");
+    expect(m.delivery.snapshot().state.overlay?.[0]).toBe(expected.id);
+  } finally {
+    await m.close();
+    f.close();
+  }
 });

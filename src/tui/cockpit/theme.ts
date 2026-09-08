@@ -254,3 +254,30 @@ export function guardDataRamp(
     issues,
   };
 }
+
+/** FINAL live palette. Printed TOKENS and historical evidence remain independent. */
+export const SHELL_PALETTE = {
+  surface: "#1a1a19", text: "#E6FDFF", chrome: "#D9D7DD",
+  passed: "#90C4A4", running: "#5A76AE", human: "#ffaf00",
+  failure: "#B07BAC", unknown: "#D9D7DD", disabled: "#D9D7DD",
+} as const;
+export const SHELL_REDUCED_PALETTE = {
+  surface: "black", text: "whiteBright", chrome: "white",
+  passed: "green", running: "blue", human: "yellow",
+  failure: "magenta", unknown: "white", disabled: "white",
+} as const;
+
+export type ShellColourMode = "truecolor" | "reduced" | "none";
+export type ShellPalette = typeof SHELL_PALETTE | typeof SHELL_REDUCED_PALETTE;
+
+/** Resolve the real terminal environment once, at mount time. */
+export function resolveShellColourMode(
+  environment: NodeJS.ProcessEnv = process.env,
+): ShellColourMode {
+  if (Object.hasOwn(environment, "NO_COLOR")) return "none";
+  const colourTerm = environment.COLORTERM?.toLowerCase() ?? "";
+  const term = environment.TERM?.toLowerCase() ?? "";
+  return /^(truecolor|24bit)$/u.test(colourTerm) || /(truecolor|24bit|direct)/u.test(term)
+    ? "truecolor"
+    : "reduced";
+}

@@ -117,29 +117,10 @@ describe("studio app", () => {
     expect(review).toContain("+after");
   });
 
-  test("test: the path that draws from a committed capture is asserted by running the command and observing what it draws, rather than by reading the command's own source text", async () => {
+  test("the retired public demo refuses without mounting a substitute app", async () => {
     const demo = makeInkStreams();
-    demo.output.columns = 140;
-    const done = ui(["--demo"], {
-      input: demo.input,
-      output: demo.output,
-    });
-    try {
-      await expect.poll(
-        () => stripAnsi(demo.writes.join("")),
-        { interval: 10, timeout: 2_000 },
-      ).toContain("run-20260724-231138");
-      const frame = stripAnsi(demo.writes.join(""));
-      expect(frame).toContain("VIEWS");
-      expect(frame).toContain("RUN");
-      expect(frame).toContain("tip-verify");
-      // the demo's default committed capture, observed in the drawn header
-      expect(frame).toContain("run-20260724-231138");
-      expect(frame).not.toContain("Fleet view");
-    } finally {
-      demo.input.write("q");
-      await expect(done).resolves.toBe("ui: closed");
-    }
+    expect(await ui(["--demo"], { input: demo.input, output: demo.output })).toEqual({ out: "tickmarkr ui: unknown flag --demo", code: 1 });
+    expect(demo.writes).toEqual([]);
     expect(demo.raw()).toBe(false);
   });
 

@@ -4,7 +4,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { report } from "../../src/cli/commands/report.js";
+import { stats } from "../../src/cli/commands/stats.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
+import type { ChannelCost } from "../../src/report/cost.js";
+import { buildOperatorRecord, channelRoleCounts, labelChannelUsage } from "../../src/report/operator-record.js";
+import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -124,5 +128,143 @@ describe("tickmarkr report --md against v1.17–v1.19 run fixtures", () => {
     const routing = t1.split("\n").find((line) => line.startsWith("- **routing:** "));
 
     expect(routing).toBe(`- **routing:** ${provenanceFor("old-run", "T1")}`);
+  });
+});
+
+describe("the shared operator-record (src/report/operator-record.ts)", () => {
+  const evt = (event: string, taskId: string | undefined, data: Record<string, unknown>): JournalEvent =>
+    ({ ts: "2026-09-05T00:00:00.000Z", event, data, ...(taskId ? { taskId } : {}) });
+
+  const events: JournalEvent[] = [
+    evt("task-dispatch", "T1", { assignment: { adapter: "codex", model: "gpt-5" }, attempt: 0 }),
+    // The consultant is its OWN channel identity — daemon.ts always stamps adapter/model/vendor on
+    // a consult-verdict, distinct from the worker channel (codex:gpt-5) the consult ran against.
+    evt("consult-verdict", "T1", { action: "retry", notes: "fix the test", adapter: "claude-code", model: "opus", vendor: "anthropic" }),
+    evt("task-dispatch", "T2", { assignment: { adapter: "claude-code", model: "sonnet" }, attempt: 0 }),
+    evt("gate-result", "T2", { gate: "review", pass: true, details: "reviewer codex:gpt-5 (vendor: openai): approved" }),
+    evt("task-dispatch", "T3", { assignment: { adapter: "pi", model: "glm-5" }, attempt: 0 }),
+  ];
+
+  const codexCost: ChannelCost = {
+    adapter: "codex", model: "gpt-5", channel: "api", attempts: 1, tasks: 1,
+    tokens: { input: 1_000_000, output: 500_000 }, partialMetering: false,
+    apiUsd: 6, rate: { inPerMtok: 2, outPerMtok: 8 }, measurable: true,
+  };
+  const sonnetCost: ChannelCost = {
+    adapter: "claude-code", model: "sonnet", channel: "sub", attempts: 2, tasks: 1,
+    tokens: { input: 100, output: 50 }, partialMetering: true, measurable: false,
+    reason: "no sub plan for adapter \"claude-code\" and unmetered",
+  };
+  // pi:glm-5 carries no ChannelCost row at all — journal evidence names it (a worker dispatch) but
+  // no telemetry was ever recorded for it, as a pre-telemetry run would leave it.
+
+  test("The shared operator-record consumed by report, Stats and Evidence labels worker token floors, coverage, absent telemetry, nonmeasurable money and recorded worker/review/consult channel counts from journal evidence. Complete metered fixtures retain their supported totals while subscription-only partial-worker telemetry says not measurable and missing metadata says unknown. Extrapolating a total all-role invoice, dropping learning preview or changing unrelated print defaults/Plan goldens fails.", async () => {
+    // recorded worker/review/consult channel counts from journal evidence alone — the consultant
+    // (claude-code:opus) gets its OWN consult credit; the task's worker (codex:gpt-5) it consulted
+    // on does not inherit that credit just because it was the last channel dispatched on T1.
+    const roles = channelRoleCounts(events);
+    expect(roles).toEqual([
+      { channel: "claude-code:opus", worker: 0, review: 0, consult: 1 },
+      { channel: "claude-code:sonnet", worker: 1, review: 0, consult: 0 },
+      { channel: "codex:gpt-5", worker: 1, review: 1, consult: 0 },
+      { channel: "pi:glm-5", worker: 1, review: 0, consult: 0 },
+    ]);
+
+    // complete metered fixture: real token totals and a real, unrounded-off dollar figure
+    const record = buildOperatorRecord(events, [codexCost, sonnetCost]);
+    const codexRow = record.find((r) => r.channel === "codex:gpt-5")!;
+    expect(codexRow).toMatchObject({ worker: 1, review: 1, consult: 0 });
+    const consultRow = record.find((r) => r.channel === "claude-code:opus")!;
+    expect(consultRow).toMatchObject({ worker: 0, review: 0, consult: 1 });
+    expect(codexRow.tokens).toBe("in 1,000,000  out 500,000 (1,500,000 tokens)");
+    expect(codexRow.money).toBe("price: $6.000000");
+
+    // subscription-only partial-worker telemetry: a token FLOOR ("≥"), never a fabricated price
+    const sonnetRow = record.find((r) => r.channel === "claude-code:sonnet")!;
+    expect(sonnetRow.tokens).toBe("≥ in 100  out 50 (150 tokens)");
+    expect(sonnetRow.money).toBe("price: not measurable");
+
+    // missing metadata: journal evidence names the channel, no telemetry row exists for it at all —
+    // "unknown", never coalesced with "not measurable" or a silent $0
+    const piRow = record.find((r) => r.channel === "pi:glm-5")!;
+    expect(labelChannelUsage("pi:glm-5", undefined)).toEqual({ channel: "pi:glm-5", tokens: "unknown", money: "unknown" });
+    expect(piRow.tokens).toBe("unknown");
+    expect(piRow.money).toBe("unknown");
+
+    // no extrapolated all-role invoice: each channel's money stands alone — nothing sums codex's
+    // measured $6 with sonnet's unmeasurable or pi's unknown row into one combined total field.
+    expect(record.map((r) => r.channel).sort()).toEqual(["claude-code:opus", "claude-code:sonnet", "codex:gpt-5", "pi:glm-5"]);
+    expect(record).not.toContainEqual(expect.objectContaining({ channel: "total" }));
+    expect(codexRow.money).toBe("price: $6.000000"); // unaffected by the other two rows' absence of price
+
+    // report/Stats print defaults are unchanged by the refactor into this shared module, and the
+    // learning preview subsection is never dropped from the CLI's text surface.
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    const runId = "run-20260713-093803-operator-record";
+    installRun(repo, "old-run", runId);
+    const md = await report([runId, "--md"], repo);
+    expect(md).toMatch(/\*\*codex:gpt-5\.6-sol\*\*[^\n]*price: not measurable/);
+    const text = await report([runId], repo);
+    expect(text).toMatch(/learning \(routing\.learned: /);
+  });
+
+  test("report --md and stats render per-channel worker, review and consult counts from buildOperatorRecord, so a journal whose only review is a standalone review-leg2 row shows review 1 for its author channel in both rendered outputs and 0 when that row is absent", async () => {
+    const repoWithLeg2 = makeRepo({ "keep.txt": "x\n" });
+    const j1 = Journal.create(repoWithLeg2, "run-leg2");
+    j1.append("run-start", undefined, { baseRef: "abc" });
+    j1.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "worker-1" }, attempt: 0 });
+    j1.append("review-leg2", "T1", {
+      author: "fake:worker-1",
+      meta: { reviewer: "kimi:k3" },
+      reviewer: "kimi:k3",
+      pass: true,
+      artifactPath: "/artifacts/verify.json",
+      details: "reviewer kimi:k3 approved",
+    });
+    j1.append("task-done", "T1", { attempts: 1 });
+    j1.append("run-end", undefined, { done: ["T1"], failed: [], human: [], blocked: [], pending: [] });
+
+    const mdWith = await report(["run-leg2", "--md"], repoWithLeg2);
+    const statsWith = await stats([], repoWithLeg2);
+    expect(mdWith).toMatch(/kimi:k3[^\n]*review: 1/);
+    expect(statsWith).toMatch(/kimi:k3[^\n]*review: 1/);
+    expect(statsWith).toMatch(/fake:worker-1\s*\|\s*kimi:k3/);
+
+    const repoWithoutLeg2 = makeRepo({ "keep.txt": "x\n" });
+    const j2 = Journal.create(repoWithoutLeg2, "run-no-leg2");
+    j2.append("run-start", undefined, { baseRef: "abc" });
+    j2.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "worker-1" }, attempt: 0 });
+    j2.append("task-done", "T1", { attempts: 1 });
+    j2.append("run-end", undefined, { done: ["T1"], failed: [], human: [], blocked: [], pending: [] });
+
+    const mdWithout = await report(["run-no-leg2", "--md"], repoWithoutLeg2);
+    const statsWithout = await stats([], repoWithoutLeg2);
+    expect(mdWithout).not.toMatch(/kimi:k3[^\n]*review: 1/);
+    expect(statsWithout).not.toMatch(/kimi:k3[^\n]*review: 1/);
+    expect(mdWithout).toMatch(/worker-1[^\n]*review: 0/);
+    expect(statsWithout).toMatch(/worker-1[^\n]*review: 0/);
+  });
+
+  test("review-leg2 correctly attributes review to reviewer in meta and details, not the diff author", () => {
+    const events: JournalEvent[] = [
+      { ts: "2026-09-07T00:00:00.000Z", event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "kimi", model: "k3" } } },
+      {
+        ts: "2026-09-07T00:00:01.000Z",
+        event: "review-leg2",
+        taskId: "T1",
+        data: {
+          author: "kimi:k3",
+          meta: { reviewer: "codex:gpt-5" },
+          details: "reviewer codex:gpt-5 approved",
+          pass: true,
+          artifactPath: "/artifacts/verify.json",
+        },
+      },
+    ];
+    const records = channelRoleCounts(events);
+    expect(records).toEqual([
+      { channel: "codex:gpt-5", worker: 0, review: 1, consult: 0 },
+      { channel: "kimi:k3", worker: 1, review: 0, consult: 0 },
+    ]);
   });
 });

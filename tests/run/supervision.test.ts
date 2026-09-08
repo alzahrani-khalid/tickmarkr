@@ -1,5 +1,5 @@
 import * as cp from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { rmSync, readdirSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -274,4 +274,19 @@ describe("supervision tier liveness", () => {
       expect(readTierLiveness(repo, tier)).toMatchObject({ tier, state: "ARMED", seat });
     }
   });
+});
+
+
+test("failed removal of an observer's own presence cannot publish a stand-down or acknowledge cleanup", () => {
+  const repo = mkdtempSync(join(tmpdir(), "c6-presence-failure-"));
+  const armed = armSupervision(repo, "watch", 60000);
+  const dir = join(repo, ".tickmarkr", "supervision");
+  const presence = join(dir, readdirSync(dir).find(name => name.startsWith("watch.live."))!);
+  rmSync(presence); mkdirSync(presence); writeFileSync(join(presence, "blocked"), "fixture");
+  try {
+    armed.disarm();
+    expect(armed.released?.()).toBe(false);
+    expect(existsSync(join(dir, "watch.standdown"))).toBe(false);
+    expect(supervisionStatus(repo, "watch").state).toBe("ARMED");
+  } finally { rmSync(repo, { recursive: true, force: true }); }
 });

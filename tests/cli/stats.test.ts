@@ -170,4 +170,27 @@ describe("tickmarkr stats", () => {
     expect(result).toEqual({ out: "tickmarkr stats — 0 runs\nno channels", code: 0 });
     expect(existsSync(stateDir)).toBe(false);
   });
+  test("review-leg2 records reviewer in author's reviewers set without self-crediting", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    const journal = Journal.create(repo, "run-leg2-stats");
+    journal.append("task-dispatch", "T1", { assignment: assignment("kimi", "k3"), attempt: 0 });
+    journal.append("review-leg2", "T1", {
+      author: "kimi:k3",
+      meta: { reviewer: "codex:gpt-5" },
+      details: "reviewer codex:gpt-5 approved",
+      pass: true,
+      artifactPath: "/artifacts/verify.json",
+    });
+    journal.append("task-done", "T1", { assignment: assignment("kimi", "k3"), attempts: 1 });
+
+    const report = collectChannelStats(repo);
+    const kimi = report.channels.find((c) => c.author === "kimi:k3");
+    expect(kimi).toBeDefined();
+    expect(kimi?.reviewers).toEqual(["codex:gpt-5"]);
+    expect(kimi?.reviewers).not.toContain("kimi:k3");
+
+    const text = await stats([], repo);
+    expect(text).toContain("kimi:k3 | codex:gpt-5 | 1 | 1 | 100%");
+    expect(text).not.toContain("kimi:k3 | kimi:k3");
+  });
 });

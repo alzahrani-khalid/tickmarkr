@@ -747,9 +747,13 @@ describe("v1.34 T3 probe progress", () => {
     try {
       const out = await doctor(["--"], repo, ["claude-code", "codex", "cursor-agent", "opencode", "pi"].map(stub));
       expect(out).toBe(NON_TTY_DOCTOR_PIN);
-      expect(stderrSpy.mock.calls.map((c) => c[0]).join("\n")).toBe(
-        "probing installed agent CLIs — one short LLM call per configured model, may take a minute...",
-      );
+      const stderr = stderrSpy.mock.calls.map((c) => c[0]).join("\n");
+      expect(stderr).toContain("tickmarkr doctor — probe preflight:");
+      expect(stderr).toContain("configured model-call scope:");
+      expect(stderr).toContain("cache policy:");
+      expect(stderr).toContain("affected destinations: .tickmarkr/doctor.json");
+      expect(stderr).toContain("catalog-only alternative: tickmarkr doctor --refresh-catalog");
+      expect(stderr.indexOf("probe preflight:")).toBeLessThan(stderr.indexOf("probing installed agent CLIs"));
       expect(out).not.toMatch(/fake:\S+ (ok|timeout|failed) \(\d+\.\ds\)/);
     } finally {
       stderrSpy.mockRestore();

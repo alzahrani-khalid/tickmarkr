@@ -17,7 +17,7 @@ import type { JournalEvent } from "../../src/run/journal.js";
 import {
   deriveLiveRunCockpitData,
   liveRunPointerSurface,
-  runLiveCockpit,
+  runLegacyCockpit as runLiveCockpit,
   type LiveCockpitDelivery,
 } from "../../src/tui/cockpit/live.js";
 import {

@@ -8,6 +8,15 @@ argument-hint: "[spec-or-directory ...]"
 
 Use this to execute a requested sequence of repository specs. It is SDD-agnostic: each target can be any file or directory accepted by `tickmarkr compile`.
 
+Use the canonical loop skill's [cockpit, parked decisions and printed twins](../tickmarkr-loop/SKILL.md#cockpit-parked-decisions-and-printed-twins)
+for each target: delivered views are **1 Home, 4 Run, 5 Evidence**; Fleet/Bootstrap and
+Plan/Health remain follow-ons with CLI entries. The recorded 1/3 merged, human T2, blocked
+T3 case stays PARTIAL despite tip pass. Review the Run confirmation, read back the appended
+`task-approved` receipt, and explicitly `tickmarkr resume <runId>` when no live owner exists;
+approval records permission and never dispatches work itself. Non-TTY readers keep `status`,
+`report` and default-watch line output, with `--watch --plain` as the TTY fallback.
+Keep `name: tickmarkr-auto` and the installed links to canonical `skills/` intact.
+
 ## Two-tier by default — role check before the loop
 
 When working in a multi-agent terminal environment, decide your role before starting:
@@ -85,5 +94,5 @@ After sending, **confirm delivery** by reading the target pane and verifying the
 3. **Plan** — run `tickmarkr plan`. Review routes, capability-floor warnings, and human gates before execution.
 4. **Run** — run `tickmarkr run`. Watch the run journal for its terminal events rather than polling agents, using the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800` — which takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict` and grades the run-end summary against every green clause for you. Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the relevant agent session.
 5. **Verify and consolidate** — continue only after a green run. A run is green when the run-end event exists in the journal, the tip verify is not "failed", and the summary's `failed`, `human`, `blocked` and `pending` buckets are all empty — a run with a parked task is partial, not green. Tickmarkr consolidates accepted work on `tickmarkr/<runId>` and never signs off to the main branch. A human controls any later release merge.
-6. **Record** — write `tickmarkr report <runId> --md` beside the source spec and commit the execution record when the repository tracks those records.
+6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout; redirect explicitly beside the spec (for example `tickmarkr report <runId> --md > feature.record.md`) and commit the execution record when the repository tracks those records.
 7. **Continue** — move to the next requested target. If a target fails or is parked, stop with the journal evidence rather than silently skipping it.

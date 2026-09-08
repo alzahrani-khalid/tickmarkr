@@ -1,7 +1,8 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { stateDirName } from "../../graph/graph.js";
-import { Journal } from "../../run/journal.js";
+import { assignmentChannel, buildOperatorRecord, formatOperatorRecordRow, type OperatorRecordRow } from "../../report/operator-record.js";
+import { Journal, type JournalEvent } from "../../run/journal.js";
 import { normalizeGateOutcome } from "../../run/outcome.js";
 
 // The operator-facing schema is deliberately closed. Adding a fact to the table therefore requires
@@ -35,6 +36,7 @@ export interface ChannelStats {
 export interface StatsReport {
   runs: number;
   channels: ChannelStats[];
+  operatorRecords?: OperatorRecordRow[];
 }
 
 interface MutableChannelStats {
@@ -64,19 +66,14 @@ interface TaskHistory {
   deliveries: Delivery[];
 }
 
-const assignmentAuthor = (data: Record<string, unknown>): string | undefined => {
-  const assignment = data.assignment;
-  if (!assignment || typeof assignment !== "object") return undefined;
-  const { adapter, model } = assignment as { adapter?: unknown; model?: unknown };
-  return typeof adapter === "string" && typeof model === "string"
-    ? `${adapter}:${model}`
-    : undefined;
-};
+const assignmentAuthor = assignmentChannel;
 
 // Current journals write the reviewer into review prose; the structured field is also accepted so
 // journals produced through gateResultJournalData retain their stronger identity representation.
 const reviewerFrom = (data: Record<string, unknown>): string | undefined => {
   if (typeof data.reviewer === "string" && data.reviewer.trim()) return data.reviewer.trim();
+  const meta = typeof data.meta === "object" && data.meta !== null ? data.meta : undefined;
+  if (meta && "reviewer" in meta && typeof meta.reviewer === "string" && meta.reviewer.trim()) return meta.reviewer.trim();
   if (typeof data.details !== "string") return undefined;
   return /\breviewer(?:\s+|:\s*)([\w@./+-]+:[\w@./+-]+)/iu.exec(data.details)?.[1];
 };
@@ -127,10 +124,11 @@ export function collectChannelStats(cwd = process.cwd()): StatsReport {
     return channel;
   };
 
+  const allEvents: JournalEvent[] = [];
   for (const runId of runIds) {
     const events = Journal.open(cwd, runId).read();
+    allEvents.push(...events);
     const tasks = new Map<string, TaskHistory>();
-
     for (const [eventIndex, event] of events.entries()) {
       if (!event.taskId) continue;
       const history = historyFor(tasks, event.taskId);
@@ -168,6 +166,15 @@ export function collectChannelStats(cwd = process.cwd()): StatsReport {
         if (!author) continue;
         for (const reviewer of [event.data.flaked, event.data.retried]) {
           if (typeof reviewer === "string" && reviewer.trim()) channelFor(author).reviewers.add(reviewer.trim());
+        }
+        continue;
+      }
+      if (event.event === "review-leg2") {
+        const author = dispatchedAuthorFor(history, event.data)
+          ?? (typeof event.data.author === "string" && event.data.author.includes(":") ? event.data.author : undefined);
+        if (author) {
+          const reviewer = reviewerFrom(event.data);
+          if (reviewer) channelFor(author).reviewers.add(reviewer);
         }
         continue;
       }
@@ -215,6 +222,7 @@ export function collectChannelStats(cwd = process.cwd()): StatsReport {
         infraReds: channel.infraReds,
         rescues: [...channel.rescues].sort((a, b) => a.localeCompare(b, "en")),
       })),
+    operatorRecords: buildOperatorRecord(allEvents),
   };
 }
 
@@ -222,20 +230,31 @@ const percent = (rate: number): string => `${Number((rate * 100).toFixed(1))}%`;
 
 export function renderStats(report: StatsReport): string {
   const lines = [`tickmarkr stats — ${report.runs} run${report.runs === 1 ? "" : "s"}`];
-  if (report.channels.length === 0) return [...lines, "no channels"].join("\n");
-  lines.push(STATS_COLUMNS.join(" | "));
-  for (const channel of report.channels) {
-    lines.push([
-      channel.author,
-      channel.reviewers.join(", ") || "—",
-      channel.dispatches,
-      channel.deliveries,
-      percent(channel.deliveryRate),
-      channel.attemptsToGreen === null ? "—" : Number(channel.attemptsToGreen.toFixed(2)),
-      channel.realReds,
-      channel.infraReds,
-      channel.rescues.join("; ") || "—",
-    ].join(" | "));
+  if (report.channels.length === 0 && (!report.operatorRecords || report.operatorRecords.length === 0)) {
+    return [...lines, "no channels"].join("\n");
+  }
+  if (report.channels.length > 0) {
+    lines.push(STATS_COLUMNS.join(" | "));
+    for (const channel of report.channels) {
+      lines.push([
+        channel.author,
+        channel.reviewers.join(", ") || "—",
+        channel.dispatches,
+        channel.deliveries,
+        percent(channel.deliveryRate),
+        channel.attemptsToGreen === null ? "—" : Number(channel.attemptsToGreen.toFixed(2)),
+        channel.realReds,
+        channel.infraReds,
+        channel.rescues.join("; ") || "—",
+      ].join(" | "));
+    }
+  }
+  if (report.operatorRecords && report.operatorRecords.length > 0) {
+    lines.push("");
+    lines.push("channels:");
+    for (const row of report.operatorRecords) {
+      lines.push(`  ${formatOperatorRecordRow(row)}`);
+    }
   }
   return lines.join("\n");
 }

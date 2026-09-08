@@ -20,6 +20,7 @@ import { ui } from "./commands/ui.js";
 import { unlock } from "./commands/unlock.js";
 import { verify } from "./commands/verify.js";
 import { version } from "./commands/version.js";
+import { commandHelp, hasHelpFlag } from "./help.js";
 
 export type CommandResult = string | { out: string; code: number };
 export type CommandMap = Record<string, (argv: string[]) => Promise<CommandResult>>;
@@ -27,9 +28,10 @@ export type CommandMap = Record<string, (argv: string[]) => Promise<CommandResul
 const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
-export const COMMANDS: CommandMap = {
+export const COMMANDS = {
   init, doctor, fleet, compile, scope, plan, run, status, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
-};
+} satisfies CommandMap;
+export type RegisteredCommand = keyof typeof COMMANDS;
 
 const VERSION_FLAGS = new Set(["version", "--version", "-v"]);
 
@@ -43,20 +45,24 @@ usage: tickmarkr <command>
   doctor        re-probe adapters, herdr, auth; print capability matrix (--fix writes the test-runner ignore when a safe edit exists)
   fleet         interactive fleet editor (fleet --print for CI drift checks)
   compile <src> spec → .tickmarkr/graph.json (fails without acceptance criteria)
-  scope <intent> draft a compiled native spec beside an answered intent (--force to overwrite)
+  scope <intent> preview locally with --preview; draft after confirmation or --yes (--force to overwrite)
   plan          dry-run routing table + cost estimate + floor lints
-  eval          run checked-in fixtures against every channel in isolated temp repos
+  eval          discover and validate fixtures, seed isolated temp repos, then clean them up
   run           execute the graph (--concurrency N --driver auto|herdr|subprocess|orca --route-strict; orca runs only when named)
   status        live run state (--watch --events: JSON documents on stdout, keepalives on stderr; 2>&1 corrupts the stream)
   stats         all-run channel delivery, red, rescue, author and reviewer statistics
   verify        run the gate battery standalone against merge-base(--base, HEAD)..HEAD — verdict/JSON on stdout, progress on stderr; 2>&1 corrupts the verdict stream (--base main --criteria <file> | --task <id> [--files <glob>] [--author adapter:model] [--no-review] [--json])
   resume <id>   continue a run from its journal
-  report <id>   cost/quality report (--md for committable execution record)
+  report <id>   cost/quality report (--md writes Markdown to stdout; redirect to save a record)
   profile       show learned routing profile (profile reset = forget history via cursor, keeps telemetry)
-  ui            open the Fleet Studio TUI (full-screen tabbed cockpit)
+  ui            open Home, Run or Evidence (--view home|run|evidence; --setup <id> opens Run Parks)
   unlock        remove a stale/garbage run lock (refuses if the holder is alive)
   beat <tier>   record one supervision beat for orchestrator|orchestrator-context|overseer|overseer-context|watch, --seat <identity> required (--stand-down to hand off); a supervising seat's own watcher loop calls it, and status reads the tier STALE once the beats stop
-  approve <id> <task>  release a park (--uphold sides with the reviewer and funds a fixed attempt; --by <name> --reason <text>); takes effect on resume`;
+  approve <id> <task>  release a park (--uphold sides with the reviewer and funds a fixed attempt; --by <name> --reason <text>); takes effect on resume
+  version       print the installed version (--dist adds build location and fingerprint)
+
+Use tickmarkr <command> --help (or -h) for all options and examples.
+Use tickmarkr profile <operation> --help for nested profile help.`;
 
 // pure, testable dispatcher: resolves a command, forwards argv, shapes the result — no side effects.
 // unknown/missing cmd → USAGE (exit 1 if a cmd was typed, 0 for bare `tickmarkr`); a handler throw becomes
@@ -66,12 +72,21 @@ export async function dispatch(
   argv: string[],
   commands: CommandMap = COMMANDS,
 ): Promise<{ out: string; code: number }> {
-  if (cmd && VERSION_FLAGS.has(cmd)) return { out: await version(argv), code: 0 };
   const usage = process.stdout.isTTY ? BANNER + USAGE : USAGE;
   if (!cmd || HELP_CMDS.has(cmd)) return { out: usage, code: 0 };
-  const fn = commands[cmd];
+  if (VERSION_FLAGS.has(cmd)) cmd = "version";
+  const fn = Object.hasOwn(commands, cmd) ? commands[cmd] : undefined;
   if (!fn) return { out: usage, code: 1 };
+  if (hasHelpFlag(argv)) return { out: commandHelp(cmd, argv), code: 0 };
   try {
+    // These two legacy handlers scan the entire argv for help before parsing. Preserve their
+    // direct-call API, but never let a literal positional turn back into help at the CLI boundary.
+    // verify accepts no positionals; status accepts a run ID, which cannot start with a dash.
+    const separator = argv.indexOf("--");
+    const literalHelp = separator < 0 ? undefined : argv.slice(separator + 1).find((arg) => arg === "--help" || arg === "-h");
+    if (literalHelp && (fn === verify || fn === status)) {
+      throw new Error(`literal argument ${JSON.stringify(literalHelp)} after -- ${fn === verify ? "is not accepted: verify takes no positional arguments" : "is not a valid run ID"}`);
+    }
     return normalize(await fn(argv));
   } catch (err) {
     return { out: `tickmarkr ${cmd}: ${(err as Error).message}`, code: 1 };

@@ -1065,3 +1065,97 @@ describe("§4.4 LiveBench table staleness lint", () => {
     }
   });
 });
+
+test("Production doctor --fix-only repairs a seeded supported runner-ignore defect and reports the actual diff/result with adapters present and zero fake probe calls. Normal explicitly requested doctor probing still invokes the configured fake probe and records its result. A PATH with all CLIs removed, an unchanged broken runner reported repaired or fix-only falling through into probes fails.", async () => {
+  const repo = makeRepo({
+    "package.json": JSON.stringify({ scripts: { test: "vitest run" } }),
+    "vitest.config.ts": `export default { test: { include: ["**/*.test.ts"], exclude: ["node_modules"] } };`,
+  });
+  withOverlay(repo, `tiers:
+  fixture:
+    vendor: fixture
+    channel: sub
+    models:
+      fixture-1: mid
+`);
+  const probe = vi.fn(async () => ({ installed: true, authed: true, models: [] }));
+  const modelCall = vi.fn(() => "printf OK");
+  const adapter = {
+    id: "fixture",
+    vendor: "fixture",
+    probe,
+    headlessCommand: modelCall,
+  } as unknown as WorkerAdapter;
+
+  const repaired = await doctor(["--fix-only"], repo, [adapter], { banner: false });
+  expect(probe).not.toHaveBeenCalled();
+  expect(modelCall).not.toHaveBeenCalled();
+  expect(repaired).toContain("repair result: wrote");
+  expect(repaired).toContain("repair verification: pass");
+  expect(repaired).toContain("repair diff:");
+  expect(repaired).toContain(".tickmarkr/**");
+  expect(readFileSync(join(repo, "vitest.config.ts"), "utf8")).toContain(".tickmarkr/**");
+
+  const probed = await doctor(["--probe"], repo, [adapter], { banner: false });
+  expect(probe).toHaveBeenCalledOnce();
+  expect(modelCall).toHaveBeenCalledOnce();
+  expect(probed).toContain("fixture-1");
+  const cached = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
+  expect(cached.fixture.modelAuth["fixture-1"].authed).toBe(true);
+});
+
+test("Production doctor’s probe preflight exposes configured model-call scope, cache policy and affected destinations plus the catalog-only alternative before executing probes, while its cached diagnostic interface returns source/age and unknown/unavailable states with zero calls. The same seeded adapter is positively callable by explicit probe. Cached navigation incrementing its counter or a never-probed model displayed as passed fails.", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  withOverlay(repo, `tiers:
+  fixture:
+    vendor: fixture
+    channel: sub
+    models:
+      fixture-1: mid
+      fixture-2: cheap
+`);
+  const probe = vi.fn(async () => ({ installed: true, authed: true, models: [] }));
+  const modelCall = vi.fn(() => "printf OK");
+  const adapter = {
+    id: "fixture",
+    vendor: "fixture",
+    probe,
+    headlessCommand: modelCall,
+  } as unknown as WorkerAdapter;
+
+  const preflight = await doctor(["--probe-preflight"], repo, [adapter], { banner: false });
+  expect(preflight).toContain("configured model-call scope: 2 models — fixture:fixture-1, fixture:fixture-2");
+  expect(preflight).toContain("cache policy:");
+  expect(preflight).toContain("affected destinations: .tickmarkr/doctor.json");
+  expect(preflight).toContain("catalog-only alternative: tickmarkr doctor --refresh-catalog");
+  expect(probe).not.toHaveBeenCalled();
+  expect(modelCall).not.toHaveBeenCalled();
+
+  const unavailable = await doctor(["--cached"], repo, [adapter], { banner: false });
+  expect(unavailable).toContain("cache source: unavailable");
+  expect(unavailable).toContain("cache age: unavailable");
+  expect(unavailable).toContain("fixture:fixture-1 unknown (cache unavailable)");
+  expect(unavailable).not.toContain("fixture:fixture-1 passed");
+  expect(probe).not.toHaveBeenCalled();
+  expect(modelCall).not.toHaveBeenCalled();
+
+  const active = await doctor(["--probe"], repo, [adapter], { banner: false });
+  expect(active).toContain("fixture-1");
+  expect(probe).toHaveBeenCalledOnce();
+  expect(modelCall).toHaveBeenCalledTimes(2);
+
+  const cached = await doctor(["--cached"], repo, [adapter], { banner: false });
+  expect(cached).toContain("cache source: .tickmarkr/doctor.json");
+  expect(cached).toMatch(/cache age: \d+m/);
+  expect(cached).toContain("fixture:fixture-1 passed (cached");
+  expect(probe).toHaveBeenCalledOnce();
+  expect(modelCall).toHaveBeenCalledTimes(2);
+
+  registry.writeDoctor(repo, {
+    fixture: { installed: false, authed: false, modelAuth: {} },
+  });
+  const unavailableAdapter = await doctor(["--cached"], repo, [adapter], { banner: false });
+  expect(unavailableAdapter).toContain("fixture:fixture-1 unavailable (adapter not installed)");
+  expect(probe).toHaveBeenCalledOnce();
+  expect(modelCall).toHaveBeenCalledTimes(2);
+});

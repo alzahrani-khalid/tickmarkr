@@ -545,7 +545,7 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
       async slot(cwd: string, name: string) { ops.push({ kind: "slot", name }); return inner.slot(cwd, name); },
       async run(s: { id: string; name: string; cwd: string }, cmd: string) {
         ops.push({ kind: "run", name: s.name, cmd });
-        if (cmd.includes("status --watch")) return; // the narrator is a live loop — never actually run it
+        if (cmd.includes(" ui ")) return; // the narrator is a live loop — never actually run it
         return inner.run(s, cmd);
       },
       waitOutput: inner.waitOutput.bind(inner),
@@ -587,16 +587,14 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
     expect(ops.filter((o) => o.kind === "narrator-open").at(-1)?.journalEvent).toBe("run-resume");
   });
 
-  // QUEUE-v194: the board is bound to the run that spawned it. `status` resolves the newest journal
+  // QUEUE-v194: the board is bound to the run that spawned it. `ui` resolves the newest journal
   // when no run is named, and a board showing a previous milestone's numbers under this run's id is a
   // recorded incident (skills/tickmarkr-overseer/SKILL.md).
-  test("the exported watchCommand builder names its run id as the explicit status positional and the daemon spawns the narrator through it, so a bare watch command following the newest journal in a repo carrying a second newer run fails", async () => {
-    // status takes exactly one positional and it is the run id (cli/commands/status.ts
-    // positionalRunId reads the first bare token) — so the run id must BE that bare token.
+  test("the exported watchCommand builder names its run id as the explicit UI positional and the daemon spawns the Run narrator through it, so a bare command following the newest journal in a repo carrying a second newer run fails", async () => {
     const command = watchCommand("run-board-42");
     expect(command).toContain(process.execPath);
     expect(command).toContain(daemonEntrypoint);
-    expect(command).toContain("status --watch 'run-board-42'");
+    expect(command).toContain("ui 'run-board-42' --view run");
     expect(command).not.toMatch(/^tickmarkr\b/);
 
     const { repo, fake } = setupRepo(
@@ -611,7 +609,7 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
       status: inner.status.bind(inner),
       slot: inner.slot.bind(inner),
       async run(s: { id: string; name: string; cwd: string }, cmd: string) {
-        if (cmd.includes("status --watch")) return; // the narrator is a live loop — never actually run it
+        if (cmd.includes(" ui ")) return; // the narrator is a live loop — never actually run it
         return inner.run(s, cmd);
       },
       waitOutput: inner.waitOutput.bind(inner),
@@ -625,8 +623,8 @@ describe("narrator pane (fake adapter, zero tokens)", () => {
         return inner.slot(cwd, "narrator-watch");
       },
     };
-    // the second, NEWER run this repo carries — what an unnamed `status --watch` would resolve to
-    // (Journal.latestRunId sorts run ids, status.ts:766). It exists BEFORE the board opens.
+    // The second, newer run is what an unnamed UI would resolve to. It exists
+    // before the board opens and must never redirect this run's narrator.
     Journal.create(repo, "run-zz-newer").append("run-start", undefined, {});
 
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-bound-board", driver });

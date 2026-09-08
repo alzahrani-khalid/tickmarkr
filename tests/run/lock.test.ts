@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -11,7 +11,10 @@ import { saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
-import { acquireRunLock, isPidLive, isRunLockLive, releaseRunLock, shouldRefuse } from "../../src/run/lock.js";
+import {
+  acquireRunLock, commitGarbageUnlock, commitUnlock, isPidLive, isRunLockLive,
+  previewGarbageUnlock, previewUnlock, releaseRunLock, shouldRefuse,
+} from "../../src/run/lock.js";
 import { deriveRunCockpitData } from "../../src/tui/cockpit/derive.js";
 import { writeDoctor } from "../../src/adapters/registry.js";
 import { COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
@@ -509,5 +512,169 @@ describe("LOCK-04 pid-scoped seam — one predicate for every pid-liveness call 
     } finally {
       table.forced = undefined;
     }
+  });
+});
+
+// C8/R16-17/R41: previewUnlock/commitUnlock (matching-run) and previewGarbageUnlock/
+// commitGarbageUnlock (malformed-snapshot) are the split LOCK-03 escape hatch, primitive level —
+// tests/cli/unlock.test.ts covers the CLI's argv/TTY/--yes formatting on top of these. The spike
+// this task names: matching run, malformed bytes, and holder replacement.
+describe("LOCK-03 preview/commit primitives (C8, R16-17, R41)", () => {
+  const dirs: string[] = [];
+  const mk = () => { const d = tmp(); dirs.push(d); return d; };
+  afterEach(() => { for (const d of dirs) releaseRunLock(d); dirs.length = 0; });
+
+  // Two real dead (reaped) pids, spawned once and reused across this block's tests that just need
+  // "a pid known to be dead" — a fresh spawnSync per assertion adds real-process fork pressure this
+  // block doesn't need; only the holder-replacement test, which plants two distinct pids in the
+  // SAME lock, needs both.
+  let cachedDeadPidA: number | undefined;
+  let cachedDeadPidB: number | undefined;
+  const deadPidA = () => cachedDeadPidA ??= spawnSync("true").pid!;
+  const deadPidB = () => cachedDeadPidB ??= spawnSync("true").pid!;
+
+  test("matching run: preview is eligible for a dead holder naming the same run; commit removes and returns the actual (re-read) holder", () => {
+    const dir = mk();
+    const dead = deadPidA();
+    plantLock(dir, { pid: dead, runId: "run-dead", startedAt: Date.now() });
+    const preview = previewUnlock(dir, "run-dead");
+    expect(preview).toMatchObject({ held: true, eligible: true, pid: dead, runId: "run-dead" });
+    if (!preview.held || !preview.eligible) throw new Error("unreachable");
+    const commit = commitUnlock(dir, preview);
+    expect(commit).toEqual({ removed: true, pid: dead, runId: "run-dead" });
+    expect(existsSync(lockOf(dir))).toBe(false);
+  });
+
+  test("preview refuses a live holder, an EPERM holder, and a different run — none of these are eligible to commit", () => {
+    const live = mk();
+    plantLock(live, { pid: process.pid, runId: "run-live", startedAt: Date.now() });
+    expect(previewUnlock(live, "run-live")).toMatchObject({ held: true, eligible: false, pid: process.pid });
+
+    const eperm = mk();
+    plantLock(eperm, { pid: 1, runId: "run-init", startedAt: Date.now() });
+    expect(previewUnlock(eperm, "run-init")).toMatchObject({ held: true, eligible: false, pid: 1 });
+
+    const wrongRun = mk();
+    const dead = deadPidA();
+    plantLock(wrongRun, { pid: dead, runId: "run-actual", startedAt: Date.now() });
+    const preview = previewUnlock(wrongRun, "run-guessed");
+    expect(preview).toMatchObject({ held: true, eligible: false, runId: "run-actual" });
+    if (preview.held && !preview.eligible) expect(preview.reason).toContain("run-actual");
+  });
+
+  test("malformed bytes: preview identifies garbage by ino/raw without inventing a run ID; a mismatched runId cannot commit it", () => {
+    const dir = mk();
+    plantLock(dir, "not json {{{");
+    const preview = previewGarbageUnlock(dir);
+    expect(preview).toMatchObject({ held: true, eligible: true, raw: Buffer.from("not json {{{") });
+    expect((preview as { runId?: string }).runId).toBeUndefined();
+    if (!preview.held || !preview.eligible) throw new Error("unreachable");
+    const commit = commitGarbageUnlock(dir, preview);
+    expect(commit).toEqual({ removed: true });
+    expect(existsSync(lockOf(dir))).toBe(false);
+  });
+
+  test("invalid-UTF-8 byte collision: identity is exact bytes, not lossily-decoded text — a same-inode rewrite that decodes to the identical replacement-character string is still caught as changed", () => {
+    const dir = mk();
+    const p = lockOf(dir);
+    writeFileSync(p, Buffer.from([0x80, 0x01, 0x02])); // invalid UTF-8 lead byte
+    const preview = previewGarbageUnlock(dir);
+    expect(preview).toMatchObject({ held: true, eligible: true });
+    if (!preview.held || !preview.eligible) throw new Error("unreachable");
+    // writeFileSync truncates in place (same inode); both buffers decode via lossy UTF-8 to the
+    // same "�" string, which a text-equality check would wrongly call "unchanged"
+    writeFileSync(p, Buffer.from([0x81, 0x01, 0x02]));
+    const commit = commitGarbageUnlock(dir, preview);
+    expect(commit).toMatchObject({ removed: false });
+    expect(existsSync(p)).toBe(true);
+    expect(readFileSync(p)[0]).toBe(0x81);
+  });
+
+  test("unreadable content (stat ok, read fails) is its OWN state — never identified as garbage, so --garbage cannot delete it blind", () => {
+    const dir = mk();
+    const p = plantLock(dir, { pid: process.pid });
+    chmodSync(p, 0o000);
+    try {
+      const preview = previewGarbageUnlock(dir);
+      expect(preview).toMatchObject({ held: true, eligible: false });
+      if (preview.held && !preview.eligible) expect(preview.reason).toMatch(/could not be read/);
+    } finally {
+      chmodSync(p, 0o644);
+    }
+  });
+
+  test("unreadable VALID live lock: neither the named route nor --garbage can recover it, because neither ever observed its bytes or its liveness", () => {
+    const dir = mk();
+    const p = plantLock(dir, { pid: process.pid, runId: "run-live", startedAt: Date.now() });
+    chmodSync(p, 0o000);
+    try {
+      expect(previewUnlock(dir, "run-live")).toMatchObject({ held: true, eligible: false });
+      expect(previewGarbageUnlock(dir)).toMatchObject({ held: true, eligible: false });
+    } finally {
+      chmodSync(p, 0o644);
+    }
+    expect(existsSync(p)).toBe(true);
+  });
+
+  test("previewUnlock (matching route) on a garbage payload refuses and points at --garbage, never silently recovering it", () => {
+    const dir = mk();
+    plantLock(dir, "not json {{{");
+    const preview = previewUnlock(dir, "run-x");
+    expect(preview).toMatchObject({ held: true, eligible: false });
+    if (preview.held && !preview.eligible) expect(preview.reason).toMatch(/--garbage/);
+  });
+
+  test("previewGarbageUnlock on a well-formed lock (dead or live) refuses and preserves it — --garbage is not a run-ID-free alias", () => {
+    const deadDir = mk();
+    const dead = deadPidA();
+    plantLock(deadDir, { pid: dead, runId: "run-dead", startedAt: Date.now() });
+    expect(previewGarbageUnlock(deadDir)).toMatchObject({ held: true, eligible: false });
+
+    const liveDir = mk();
+    plantLock(liveDir, { pid: process.pid, runId: "run-live", startedAt: Date.now() });
+    expect(previewGarbageUnlock(liveDir)).toMatchObject({ held: true, eligible: false });
+  });
+
+  test("holder replacement race: a matching-run preview goes stale the instant the lock is rewritten — commit refuses and the replacement survives untouched", () => {
+    const dir = mk();
+    const first = deadPidA();
+    plantLock(dir, { pid: first, runId: "run-dead", startedAt: Date.now() });
+    const preview = previewUnlock(dir, "run-dead");
+    if (!preview.held || !preview.eligible) throw new Error("unreachable");
+
+    const replacement = deadPidB();
+    plantLock(dir, { pid: replacement, runId: "run-dead", startedAt: Date.now() }); // concurrent reclaim
+    const commit = commitUnlock(dir, preview);
+    expect(commit).toMatchObject({ removed: false });
+    expect(JSON.parse(readFileSync(lockOf(dir), "utf8")).pid).toBe(replacement);
+
+    // the discriminating pair's other half: replaced by a LIVE holder instead of a new dead one
+    const dir2 = mk();
+    const dead2 = deadPidA();
+    plantLock(dir2, { pid: dead2, runId: "run-dead2", startedAt: Date.now() });
+    const preview2 = previewUnlock(dir2, "run-dead2");
+    if (!preview2.held || !preview2.eligible) throw new Error("unreachable");
+    plantLock(dir2, { pid: process.pid, runId: "run-dead2", startedAt: Date.now() }); // now live
+    const commit2 = commitUnlock(dir2, preview2);
+    expect(commit2).toMatchObject({ removed: false });
+    expect(JSON.parse(readFileSync(lockOf(dir2), "utf8")).pid).toBe(process.pid);
+  });
+
+  test("holder replacement race, garbage route: a garbage preview goes stale when the file is rewritten (still garbage, or replaced by a valid live holder) — commit refuses either way", () => {
+    const dir = mk();
+    plantLock(dir, "not json {{{");
+    const preview = previewGarbageUnlock(dir);
+    if (!preview.held || !preview.eligible) throw new Error("unreachable");
+    plantLock(dir, "still garbage but different {{{{");
+    expect(commitGarbageUnlock(dir, preview)).toMatchObject({ removed: false });
+    expect(readFileSync(lockOf(dir), "utf8")).toBe("still garbage but different {{{{");
+
+    const dir2 = mk();
+    plantLock(dir2, "not json {{{");
+    const preview2 = previewGarbageUnlock(dir2);
+    if (!preview2.held || !preview2.eligible) throw new Error("unreachable");
+    plantLock(dir2, { pid: process.pid, runId: "run-live", startedAt: Date.now() });
+    expect(commitGarbageUnlock(dir2, preview2)).toMatchObject({ removed: false });
+    expect(JSON.parse(readFileSync(lockOf(dir2), "utf8")).runId).toBe("run-live");
   });
 });

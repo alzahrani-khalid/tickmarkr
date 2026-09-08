@@ -6,9 +6,9 @@ import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, m
 import { consumePaneLaunchIntent, PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
 import { Journal, type JournalEvent } from "../run/journal.js";
-import { readSupervision } from "../run/supervision.js";
+import { readSupervision, readWatchBoard, reserveWatchBoard, stopWatchBoard, WATCH_OWNER_ENV } from "../run/supervision.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
-import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type NotifyOpts, type OwnedName, type PanesToCloseOpts, type Slot, type SlotOpts } from "./types.js";
+import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type OwnedName, type PanesToCloseOpts, type Slot, type SlotOpts } from "./types.js";
 
 // VIS-09 P43-03: adopted safety floor from 43-MEASUREMENT.md (narrowest safe 53 → floor 108).
 export const TRAILER_SAFE_FLOOR_COLS = 108;
@@ -152,6 +152,8 @@ interface GroupEntry { tabId: string; label: string; members: { name: string; pa
  *  `role:"other", taskId:"<the whole name>"` for any unrecognised string, so keying on taskId alone
  *  makes EVERY one-off pane its own "task" and gives it a group tab. `watch` is excluded for the same
  *  reason in the other direction — its taskId is the literal "run", which is a board, not a task. */
+const shortTitle = (text: string): string => [...text].slice(0, 20).join("");
+
 const TASK_TAB_ROLES = new Set(["worker", "judge", "review", "consult"]);
 export function taskGroupOf(name: string): string | undefined {
   const { role, taskId } = canonicalizeLegacyName(name, "");
@@ -171,9 +173,9 @@ export function taskGroupOf(name: string): string | undefined {
  *  title are different strings; `pane rename` still gets the identity, unchanged. */
 export function tabLabelFor(name: string): string {
   const { role, taskId, attempt } = canonicalizeLegacyName(name, "");
-  if (!TASK_TAB_ROLES.has(role) || !taskId.trim()) return name;
-  if (role !== "worker") return `${role.toUpperCase()} ${taskId}`;
-  return attempt > 0 ? `${taskId}↻${attempt}` : taskId;
+  if (!TASK_TAB_ROLES.has(role) || !taskId.trim()) return shortTitle(name);
+  if (role !== "worker") return shortTitle(`${role.toUpperCase()} ${taskId}`);
+  return shortTitle(attempt > 0 ? `${taskId}↻${attempt}` : taskId);
 }
 
 /** Gate panes ride with the task they belong to and never consume the tab cap; everything else does.
@@ -221,6 +223,7 @@ export class HerdrDriver implements ExecutorDriver {
   private ws = process.env.HERDR_WORKSPACE_ID;
   private callerPane = process.env.HERDR_PANE_ID;
   private watches = new Map<string, Slot>();
+  private watchTokens = new WeakMap<Slot, string>();
 
   constructor(
     private bin = "herdr",
@@ -538,7 +541,7 @@ export class HerdrDriver implements ExecutorDriver {
     // the worktree — that root pane IS the worker pane. The old one-shot `agent start … -- bash` verb
     // (which named a fresh bash pane) was removed; 0.7.5's `agent start` only ATTACHES to a DETECTED
     // agent CLI, so tickmarkr names the bash pane itself via `pane rename` and types the worker command in.
-    const t = await this.herdr(`tab create --label ${shq(label)} --no-focus --workspace ${shq(this.ws)} --cwd ${shq(cwd)}`);
+    const t = await this.herdr(`tab create --label ${shq(shortTitle(label))} --no-focus --workspace ${shq(this.ws)} --cwd ${shq(cwd)}`);
     if (t.code !== 0) throw new Error(`herdr tab create failed (exit ${t.code}, refusing untargeted placement): ${t.stderr || t.stdout}`);
     let res: { tab?: { tab_id?: string }; root_pane?: { pane_id?: string } };
     try {
@@ -662,7 +665,7 @@ export class HerdrDriver implements ExecutorDriver {
     const label = !token ? entry.label
       : entry.label === token ? `${token}${glyph}`
       : `${entry.label} · ${token}${glyph}`;
-    const cmd = `tab rename ${shq(entry.tabId)} ${shq(label)}`;
+    const cmd = `tab rename ${shq(entry.tabId)} ${shq(shortTitle(label))}`;
     const ok = async () => (await this.herdr(cmd)).code === 0;
     if (await ok() || await ok()) return;
     try {
@@ -1220,11 +1223,10 @@ export class HerdrDriver implements ExecutorDriver {
   }
 
   async close(slot: Slot): Promise<void> {
-    if (this.watches.get(slot.name)?.id === slot.id) {
+    if (parseOwnedName(slot.name)?.role === "watch") {
+      await this.retireWatch(slot);
       this.watches.delete(slot.name);
-      const pane = await this.namedPaneId(slot.name);
-      if (pane) await this.herdr(`pane close ${shq(pane)}`);
-      return; // run-end reconcile may already have reaped it; never close a compacted stale id
+      return;
     }
     if (slot.group && this.groups.has(slot.group)) {
       return this.serial(() => this.closeGrouped(slot));
@@ -1260,25 +1262,51 @@ export class HerdrDriver implements ExecutorDriver {
     }
   }
 
-  // Every surviving tickmarkr-owned board in this workspace — a PRIOR run's and one already wearing
-  // this run's own name alike. Both are retired before a new board opens (narrator): what a pane this
-  // process did not create is actually RUNNING cannot be read back, and the pre-v1.94 implementation
-  // launched a bare `tickmarkr status --watch`, which follows the newest journal.
-  private async ownedWatchPanes(): Promise<string[]> {
+  private async watchPanes(name: string): Promise<PaneListRow[]> {
     if (!this.ws) throw new Error("herdr watch placement requires HERDR_WORKSPACE_ID — refusing unseeded pane");
     const list = await this.herdr("pane list");
     if (list.code !== 0) throw new Error(`herdr pane list failed: ${list.stderr || list.stdout}`);
-    let panes: { label?: string; pane_id?: string; workspace_id?: string }[];
-    try {
-      panes = JSON.parse(list.stdout).result?.panes;
-    } catch {
-      throw new Error(`herdr pane list returned unparseable JSON: ${list.stdout}`);
+    const panes = JSON.parse(list.stdout).result?.panes as PaneListRow[] | undefined;
+    if (!Array.isArray(panes)) throw new Error("herdr pane list returned no panes");
+    return panes.filter(p => p.workspace_id === this.ws && p.label === name);
+  }
+
+  /** Name collisions never confer repository ownership. Unknown boards stay protected. */
+  private async retireWatch(slot: Slot): Promise<void> {
+    const runId = parseOwnedName(slot.name)?.runId;
+    const owner = runId ? readWatchBoard(slot.cwd, runId) : undefined;
+    const matches = await this.watchPanes(slot.name);
+    if (matches.length === 0) throw new Error(`watch ${slot.name} closed without presence acknowledgement; cleanup unconfirmed`);
+    if (!owner || owner.driver !== this.id || owner.name !== slot.name || owner.workspace !== this.ws ||
+        (this.watchTokens.has(slot) && this.watchTokens.get(slot) !== owner.token) ||
+        owner.pane !== slot.id || matches.length !== 1 || matches[0]?.pane_id !== owner.pane) {
+      throw new Error(`watch ownership unknown or foreign for ${slot.name}; existing board protected`);
     }
-    if (!Array.isArray(panes)) throw new Error(`herdr pane list returned no panes: ${list.stdout}`);
-    return panes.filter((p) => {
-      const owned = typeof p.label === "string" ? parseOwnedName(p.label) : null;
-      return p.workspace_id === this.ws && typeof p.pane_id === "string" && owned?.role === "watch" && owned.taskId === "run";
-    }).map((p) => p.pane_id!);
+    await stopWatchBoard(owner, this.time);
+    const verified = await this.watchPanes(slot.name);
+    if (verified.length !== 1 || verified[0]?.pane_id !== owner.pane) throw new Error("watch target changed after acknowledgement; pane protected");
+    const closed = await this.herdr(`pane close ${shq(owner.pane)}`);
+    if (closed.code !== 0 || await this.paneStillOpen(owner.pane)) throw new Error(`watch ${slot.name} survived acknowledged close`);
+  }
+
+  async focus(target: FocusTarget): Promise<FocusResult> {
+    const { slot, runId, taskId, attempt } = target;
+    if (slot.name !== formatOwnedName({ role: "worker", taskId, attempt, runId }) || !target.workspace || target.workspace !== this.ws) {
+      return { status: "foreign", reason: "Recorded run/task/attempt or workspace does not match this driver" };
+    }
+    const r = await this.herdr("pane list", slot.cwd);
+    if (r.code !== 0) return { status: "unsupported", reason: "Cannot verify the live pane list" };
+    let panes: PaneListRow[];
+    try { panes = JSON.parse(r.stdout).result?.panes; } catch { return { status: "unsupported", reason: "Unreadable pane list" }; }
+    if (!Array.isArray(panes)) return { status: "unsupported", reason: "Missing pane list" };
+    const named = panes.filter(p => p.label === slot.name && p.workspace_id === target.workspace);
+    if (!named.length) return { status: panes.some(p => p.pane_id === slot.id) ? "foreign" : "closed", reason: "Recorded pane is no longer owned by this attempt; open task evidence" };
+    if (named.length !== 1 || named[0]?.pane_id !== slot.id || (slot.tabId && named[0]?.tab_id !== slot.tabId)) {
+      return { status: "foreign", reason: "Live pane identity differs from the recorded task attempt" };
+    }
+    const focused = await this.herdr(`pane focus ${shq(slot.id)}`, slot.cwd);
+    return focused.code === 0 ? { status: "focused", reason: `Verified ${slot.name} in ${target.workspace}` }
+      : { status: "unsupported", reason: focused.stderr || focused.stdout || "Host refused pane focus" };
   }
 
   // T2: the watch is a sibling of the daemon's own pane, never a separate tab — placed to the RIGHT
@@ -1342,34 +1370,28 @@ export class HerdrDriver implements ExecutorDriver {
     throw new Error(orphan === null ? why : `${why} — and the split pane ${pane} survived its close (${orphan})`);
   }
 
-  // T6 narrator: the run's single live status surface, RUNNING THE COMMAND THIS CALL SUPPLIED. Only
-  // a board this driver instance itself opened is reused (this.watches); any other surviving board —
-  // a prior run's, or one already carrying this run's canonical name after a resume — is retired and
-  // re-split, because adoption cannot restart or even read the process inside it and a pre-v1.94 pane
-  // is running the bare `tickmarkr status --watch`, which narrates the newest journal instead of this
-  // run. The retirement is VERIFIED gone before the replacement splits: reconcile is no backstop here
-  // (panesToClose skips role "watch" by design, types.ts:92), so an unverified close would leave two
-  // boards bound to different runs. Failures propagate — the daemon swallows.
+  /** Only this repository's matching run may replace its acknowledged board. */
   async narrator(cwd: string, command: string, runId?: string): Promise<Slot> {
-    const name = runId ? formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }) : `narrator-watch-${process.pid}`;
+    if (!this.ws) throw new Error("herdr watch placement requires HERDR_WORKSPACE_ID");
+    if (!runId) throw new Error("herdr narrator requires a run identity");
+    const name = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
     return this.serial(async () => {
+      const matches = await this.watchPanes(name);
       const cached = this.watches.get(name);
-      if (cached) return cached;
-      const stale = await this.ownedWatchPanes();
-      for (const pane of stale) await this.herdr(`pane close ${shq(pane)}`);
-      if (stale.length) {
-        const survived = (await this.ownedWatchPanes()).filter((p) => stale.includes(p));
-        if (survived.length) throw new Error(`herdr watch retire failed: ${survived.join(", ")} survived close — refusing a second board`);
-      }
-      const s = await this.watchSlot(cwd, name);
-      this.watches.set(name, s);
+      if (cached && matches.length === 1 && matches[0]?.pane_id === cached.id &&
+          readWatchBoard(cwd, runId)?.token === this.watchTokens.get(cached)) return cached;
+      if (matches.length > 1) throw new Error(`watch ownership ambiguous for ${name}; existing boards protected`);
+      if (matches.length === 1) await this.retireWatch({ id: matches[0]!.pane_id!, name, cwd });
+      const slot = await this.watchSlot(cwd, name);
+      const owner = reserveWatchBoard({ repo: cwd, runId, driver: this.id, workspace: this.ws!, pane: slot.id, name });
+      this.watchTokens.set(slot, owner.token);
       try {
-        await this.deliverPersistentShellCommand(s, command);
-      } catch (err) {
-        this.watches.delete(name);
-        throw err;
+        await this.deliverPersistentShellCommand(slot, `${WATCH_OWNER_ENV}=${shq(owner.token)} ${command}`);
+        this.watches.set(name, slot);
+        return slot;
+      } catch (error) {
+        throw new Error(`watch launch unconfirmed for ${name}; pane protected: ${String(error)}`);
       }
-      return s;
     });
   }
 

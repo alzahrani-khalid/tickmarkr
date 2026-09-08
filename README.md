@@ -79,7 +79,7 @@ tickmarkr init                 # guided setup + doctor; scaffolds config and spe
 tickmarkr compile tickmarkr.spec.md # spec → task graph (fails without acceptance criteria)
 tickmarkr plan                 # dry-run routing decisions + cost estimate
 tickmarkr run                  # execute, route to best CLI, gate every result (--concurrency N)
-tickmarkr report <runId> --md  # engagement record in Markdown
+tickmarkr report <runId> --md  # Markdown on stdout; redirect to save beside the spec
 ```
 
 That's the flow: `init` scaffolds config, you write tasks with `acceptance[]` criteria, `compile`
@@ -113,16 +113,51 @@ Consent rules — every write is additive, never destructive:
 
 ## Monitor and supervise
 
+`tickmarkr ui [runId]` opens one cockpit with **1 Home, 4 Run, 5 Evidence**. Without a
+run ID it selects the latest journal; an empty repository opens Home. Use
+`tickmarkr ui <runId> --view run` or `--view evidence` to open a delivered view directly.
+`tickmarkr ui --setup <runId>` opens Run Parks and preserves the requested run identity.
+Fleet/Bootstrap and Plan/Health are explicit follow-ons: keys 2/3/6 are not installed.
+Use the existing `tickmarkr fleet`, `tickmarkr init`, `tickmarkr plan` and `tickmarkr doctor`
+commands for those workflows.
+
+`?` opens the shortcut sheet; Tab/Shift-Tab move focus through visible regions, Enter opens
+selection, and Esc closes the deepest overlay. `q` quits; text-entry mode keeps `q1?`
+literal. Run shows every task in the matching graph, its recorded attempt/path/pane/alarm,
+and current-attempt gate evidence. `o` requests focus of the recorded owned pane when the
+driver supports it; unavailable panes leave an evidence diagnostic. Evidence keeps original
+journal `#L` identities, full verdict paging, and a stable selection with Follow off.
+
 ```bash
-tickmarkr status               # engagement state (--watch to follow live)
+tickmarkr status <runId>        # preserved printed engagement state
+tickmarkr status <runId> --oneline # compact snapshot, then exit
+tickmarkr status <runId> --watch # TTY: Run cockpit; non-TTY: line output
+tickmarkr status <runId> --watch --plain # preserved line/ANSI fallback, including on a TTY
 tickmarkr resume <runId>       # continue an engagement from the local execution log
-tickmarkr approve <runId> <taskId>   # approve a parked task (--reason to document)
+tickmarkr approve <runId> <taskId>   # append permission for a non-gate park; see below
 tickmarkr report <runId>       # cost/quality report
+tickmarkr report <runId> --md > feature.record.md # explicit file write beside your spec
 tickmarkr profile              # show the learned routing profile
 tickmarkr profile --explain <shape> <channel>  # why a channel ranks where it does for a shape
 ```
 
-Green tasks land on `tickmarkr/<runId>`; merge to your mainline is always your call.
+For machines, `tickmarkr status <runId> --watch --events` replays and follows projected
+decision events as one JSON document per stdout line. `--jsonl` and `--decision-events`
+are aliases; keep stderr keepalives separate (never `2>&1`). This projection is distinct
+from raw `journal.jsonl`. Webhook delivery remains opt-in via `--webhook <url>`.
+Preserved printed twins also include separate `fleet --print` and `fleet --why` outputs,
+`plan`, `doctor`, `report --compare <baseline-runId>`, `report --bundle <path>` (an explicit
+proof-bundle write), and `stats` (all runs, no run ID). Report retains its learning preview
+and comparison warnings; absent metering stays “not measurable,” never an invented $0.
+
+A manual cockpit keeps its final receipt at run-end and follows a later resume of that run.
+By default, the daemon-owned board requests graceful shutdown at run-end and closes only its owned pane
+after checking its watch presence stood down; unconfirmed cleanup is reported. The existing
+`visibility.keepPanes: forever` debug override preserves panes. Herdr keeps
+task/gate grouping, short titles, and the board beside its caller without taking focus.
+Quitting or orderly signals restore raw mode, pointer tracking, title and alternate screen,
+and release only that observer's presence. Green tasks land on `tickmarkr/<runId>`;
+merge to your mainline is always your call.
 
 ### Escalation and consults
 
@@ -133,15 +168,57 @@ away from a failing adapter will never retry it in subsequent `tickmarkr resume`
 
 ### Approving tasks
 
-`tickmarkr approve` unblocks two task states:
+The recorded partial-human-park case has **1/3 merged**, human T2, blocked T3, and a
+passed tip verify. It is **PARTIAL**, not green: T2's `humanGate: true` parks it **before
+dispatch**. In Run (`4`, or `tickmarkr ui --setup <runId>`), select T2, press `a` for
+Actions, choose Approve with Enter, and review the confirmation: run/task, original park
+`#L`, actor/reason, exact `tickmarkr approve` argv, append-only consequence and enactor.
+Only `y` confirms; `n`/Esc cancel, and Enter never confirms.
 
-**Human gates** (attempt budget ≥ 1):
-- The task finished with a result but gates require human judgment (`humanGate: true` in the spec)
-- Approving records the Partner's verdict and the task proceeds to merge
+Read the receipt's newly appended `task-approved` line, actor/reason and disposition back
+from the journal. Approval records permission; it does not dispatch work, pass a gate or
+mark the task done. With no live owner the receipt says **approved; resume required**.
+Exit the observer and run `tickmarkr resume <runId>` explicitly. A matching live daemon
+can enact the release at its next task boundary; a different live run must end before this
+one resumes. Keep any resume refusal and its remediation visible, including a deny/prefer
+config conflict; repair the source/config as directed, never edit the compiled graph to
+force success. After resume, CURRENT TIP is PENDING until fresh evidence arrives. Completion
+requires the latest run-end, a nonfailed known tip result, and empty `failed`, `human`,
+`blocked` and `pending` buckets; the completed case has 3/3 recorded merges. An unrelated
+graph says “not comparable” and supplies no borrowed denominator. Historical GATES RAN
+does not establish current completion.
 
-**Attempt-budget exhaustion**:
-- The task has burned its full attempt budget without reaching a conclusive result
-- Approving grants a fresh attempt budget, routing around all previously-failed channels and adapters
+The CLI twin for the same decision is
+`tickmarkr approve <runId> T2 --by operator --reason 'ready to proceed'`, followed by the
+receipt check and explicit resume above. Other parks have different permitted decisions:
+
+| Park | Decision and effect |
+|---|---|
+| Human gate / other non-gate park | Plain approve records permission to dispatch. |
+| Attempt cap | Plain approve grants a fresh attempt budget; prior routing exclusions remain. |
+| Infrastructure | Plain approve or `--recheck`; recheck reruns the declared battery and satisfies no gate. |
+| Failed review gate | `--waive` satisfies only that identified gate; `--uphold` funds one fixed attempt carrying findings; `--recheck` reruns the battery. |
+| Other failed gate | `--waive` or `--recheck`; plain approve refuses. |
+| Tombstone / gate failure without identifying evidence | Diagnostic only; no invented decision. |
+
+Decisions are append-only and cannot be undone. Unknown tasks, duplicate decisions and
+changed parks refuse; no success receipt is claimed without reading back the append.
+
+### Help and recovery
+
+`tickmarkr ui --help`, `tickmarkr eval --help`, `tickmarkr unlock --help` and
+`tickmarkr profile reset --help` print guidance without opening a UI, seeding fixtures,
+unlocking or resetting history. Help flags are recognized before `--`; arguments after
+it are literal data. Help examples describe operations; printing them never executes them.
+
+Recovery remains explicit: `unlock <runId>` targets a matching provably dead lock;
+`unlock --garbage` handles malformed lock bytes without inventing a run ID. Both require
+confirmation (`--yes` for non-TTY) and refuse live, inaccessible or changed holders.
+`doctor --cached` reads cached diagnostics; `doctor --probe-preflight` discloses probe
+counts/files; `doctor --fix-only` repairs locally without model probes or catalog refresh.
+Default doctor and `--fix` still probe. `doctor --refresh-catalog` refreshes only the catalog.
+`scope <intent-file> --preview` is a local, non-writing preview; authoring requires TTY
+confirmation or `--yes` and can make model calls.
 
 ## Choosing your fleet: `tickmarkr fleet`
 
@@ -155,7 +232,7 @@ tickmarkr plan            # lint the resolved routing table against your spec
 tickmarkr run             # dispatch with the fleet you confirmed
 ```
 
-`tickmarkr doctor` is a pure sensor; `tickmarkr fleet` is the actuator. The browser is one
+`tickmarkr doctor` probes and records health; `tickmarkr fleet` edits routing config. The browser is one
 two-pane surface: the left rail lists views (**All models**, **Shapes**, **Steering**) and every
 installed agent CLI with its auth state and model count; the right pane is a searchable model list
 with tier, context, price, and probe-latency columns. `Space` allows/denies, `Enter` classifies an
@@ -283,7 +360,7 @@ the frontier-model consult is the *National Office*. The terms below use that vo
   - (bare token) — member is running normally
 - **cleanup · <taskId>**: overflow/teardown generation tabs. When a new generation starts (on retry escalation), a new cleanup tab
   opens labeled with the newest live member's task ID; it auto-closes when the generation completes
-- **watch**: a single pane running `tickmarkr status --watch` — the senior's glanceable engagement monitor
+- **watch**: a single owned pane running `tickmarkr ui <runId> --view run` — the same Run cockpit opened by TTY `status --watch`
 
 ### Pane naming (when visibility.llm = pane)
 
@@ -311,13 +388,17 @@ This keeps the Partner focused on decisions that require attention, not noise.
 
 tickmarkr closes exactly what it owns and no longer needs, no matter how any process died.
 
-Every pane and tab tickmarkr creates receives a **parseable ownership name** encoding the pane's role, task, attempt, and run:
+Tabs use short human labels (at most 20 characters); panes carry durable ownership names:
 - `<taskId>` — the task's tab, holding its worker and its judge/review/consult panes
 - `cleanup · <taskId>` — teardown generation tab for overflow attempts
-- `watch` — status monitor pane
-- `<role> · <taskId> · A<attempt> · R<runId>` — judge, review, consult, and worker panes (formats like `judge · task-abc123 · A1 · Rrun-20260713-175532`)
+- `tickmarkr:watch:run:0:<runId>` — daemon-owned Run board
+- `tickmarkr:<role>:<taskId>:<attempt>:<runId>` — durable judge, review, consult and worker pane names; display titles may be shorter
 
-tickmarkr creates all owned panes only within the run's workspace; any tickmarkr-owned panes discovered outside the run's workspace (from prior runs or placement bugs) are reconciled and closed. Any pane not matching the ownership contract is **foreign** — created by you or another tool — and is never closed automatically.
+Reconciliation stays within the run's workspace. It can retire another run's panes only
+when this repository's journal evidence proves that run ended; live or unknown runs and
+other workspaces remain protected. Pane names outside the ownership contract are **foreign**.
+Board replacement additionally checks repository/run ownership and its acknowledged watch
+presence; matching a short tab label is never sufficient.
 
 **Desired-state reconciliation**: A pure function computes the exact set of panes that should exist from the local journal at any moment:
 - Worker panes for all in-flight task attempts
@@ -326,12 +407,14 @@ tickmarkr creates all owned panes only within the run's workspace; any tickmarkr
 - Empty set (after engagement end)
 
 The daemon reconciles at every safe point:
-1. **Run start** — clean up any orphaned panes from crashed earlier runs of the same repo
+1. **Run start** — reconcile this run and older runs proven ended in this repository
 2. **Resume** — reconcile the restarted journal state and close panes for superseded attempts
 3. **After terminal events** (task done, failed, human gate) — close the corresponding worker/gate pane and its emptied tab
-4. **At engagement end** — close all remaining owned panes and tabs
+4. **At engagement end** — close remaining owned panes and tabs, with graceful board shutdown
 
-Reconciliation failures (herdr unavailable, a pane vanished mid-sweep) never fail the engagement — visibility is cosmetic, gates are law.
+`visibility.keepPanes: forever` disables this sweep. Reconciliation failures (herdr
+unavailable, a pane vanished mid-sweep) do not replace gate verdicts; unconfirmed board
+cleanup is journaled and reported.
 
 ### Workspace trust
 
@@ -372,10 +455,13 @@ them; worker-declared deviations are recorded as notes, not authority.
 
 If you clone this repo and use Claude Code, project skills are installed in `.claude/skills/`:
 
-- **`/tickmarkr-loop`** — compile a spec, review the routing plan, run the engagement, and commit the Markdown record
-- **`/tickmarkr-auto`** — autonomous multi-phase runs (GSD milestones, etc.)
+- **[/tickmarkr-loop](skills/tickmarkr-loop/SKILL.md)** — compile a spec, review the routing plan, run the engagement, and commit the Markdown record
+- **[/tickmarkr-auto](skills/tickmarkr-auto/SKILL.md)** — autonomous multi-phase runs (GSD milestones, etc.)
 
 These are optional — the CLI works standalone. Skills are repo-scoped and ship in the npm tarball for agents working in projects that have run `tickmarkr init --agent`.
+The canonical sources live in `skills/`; this repository's installed `.claude/skills/` links
+resolve there. The [overseer skill](skills/tickmarkr-overseer/SKILL.md) links to the same
+loop walkthrough for cockpit and decision guidance; skill names remain unchanged.
 
 ## Contributing
 

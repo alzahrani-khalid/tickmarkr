@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "encoding": "gzip",
+  "files": [
+    {
+      "path": "result.json",
+      "rawBytes": 58863,
+      "rawSha256": "82c616059458b61e61a2ec504ad27c4795f4396e23fd4bca5df4347381daef2b",
+      "archiveBytes": 8381,
+      "archiveSha256": "fbabddd65a5805ed7f68b1040a7499060cbe7a0876f3f7aed9748db0d43fcbd1"
+    },
+    {
+      "path": "journal.jsonl",
+      "rawBytes": 96903,
+      "rawSha256": "8ada2e4b3481fcf5fa8bf2a4e0aac7c4e5afeba768608915e254e321167bd917",
+      "archiveBytes": 2598,
+      "archiveSha256": "207dfdb2ae1f504bca5eb7895b16e7d1011720fecf21f12e6305293931319b9b"
+    }
+  ]
+}

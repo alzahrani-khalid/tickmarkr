@@ -1,0 +1,279 @@
+{
+  "recordedAt": "2026-09-06T14:26:59.614221+00:00",
+  "cutoverAllowed": false,
+  "reason": "Each measured process exceeded the 120000 ms sample-gap ceiling; catch-up does not repair the duration record.",
+  "measurements": [
+    {
+      "shape": "static",
+      "sourceCommit": "ee7132138e6cefa10ad5a8430b1a2076aa1af8c5",
+      "pid": 84870,
+      "samplesPath": "tests/fixtures/screen-soak/records/static/samples.jsonl",
+      "gaps": [
+        {
+          "fromTick": 5580,
+          "toTick": 5640,
+          "fromTimestamp": "2026-09-06T13:35:48.617Z",
+          "toTimestamp": "2026-09-06T13:38:50.651Z",
+          "monotonicGapMs": 182111.98408399988
+        },
+        {
+          "fromTick": 5760,
+          "toTick": 5820,
+          "fromTimestamp": "2026-09-06T13:38:51.184Z",
+          "toTimestamp": "2026-09-06T13:55:06.290Z",
+          "monotonicGapMs": 975102.3671249999
+        },
+        {
+          "fromTick": 6720,
+          "toTick": 6780,
+          "fromTimestamp": "2026-09-06T13:55:10.294Z",
+          "toTimestamp": "2026-09-06T14:07:35.568Z",
+          "monotonicGapMs": 745271.0610409994
+        },
+        {
+          "fromTick": 7440,
+          "toTick": 7500,
+          "fromTimestamp": "2026-09-06T14:07:38.560Z",
+          "toTimestamp": "2026-09-06T14:10:22.571Z",
+          "monotonicGapMs": 164010.1517500002
+        },
+        {
+          "fromTick": 7620,
+          "toTick": 7680,
+          "fromTimestamp": "2026-09-06T14:10:23.023Z",
+          "toTimestamp": "2026-09-06T14:13:22.334Z",
+          "monotonicGapMs": 179310.56591700017
+        }
+      ]
+    },
+    {
+      "shape": "growth",
+      "sourceCommit": "ee7132138e6cefa10ad5a8430b1a2076aa1af8c5",
+      "pid": 84871,
+      "samplesPath": "tests/fixtures/screen-soak/records/growth/samples.jsonl",
+      "gaps": [
+        {
+          "fromTick": 5580,
+          "toTick": 5640,
+          "fromTimestamp": "2026-09-06T13:35:48.620Z",
+          "toTimestamp": "2026-09-06T13:38:50.657Z",
+          "monotonicGapMs": 182114.3780410001
+        },
+        {
+          "fromTick": 5760,
+          "toTick": 5820,
+          "fromTimestamp": "2026-09-06T13:38:52.229Z",
+          "toTimestamp": "2026-09-06T13:55:06.534Z",
+          "monotonicGapMs": 974301.9134590002
+        },
+        {
+          "fromTick": 6240,
+          "toTick": 6300,
+          "fromTimestamp": "2026-09-06T13:55:10.555Z",
+          "toTimestamp": "2026-09-06T14:07:35.340Z",
+          "monotonicGapMs": 744781.8493750002
+        },
+        {
+          "fromTick": 6900,
+          "toTick": 6960,
+          "fromTimestamp": "2026-09-06T14:07:44.073Z",
+          "toTimestamp": "2026-09-06T14:10:22.833Z",
+          "monotonicGapMs": 158759.99450000003
+        },
+        {
+          "fromTick": 7500,
+          "toTick": 7560,
+          "fromTimestamp": "2026-09-06T14:10:28.200Z",
+          "toTimestamp": "2026-09-06T14:13:22.521Z",
+          "monotonicGapMs": 174320.95387499966
+        }
+      ]
+    },
+    {
+      "shape": "cutover-static",
+      "sourceCommit": "ab6eda5b5518e2fd01fcd58e96e541d9fa7e01de",
+      "pid": 87720,
+      "samplesPath": "tests/fixtures/screen-soak/records/cutover-static/samples.jsonl",
+      "gaps": [
+        {
+          "fromTick": 3420,
+          "toTick": 3480,
+          "fromTimestamp": "2026-09-06T13:35:49.845Z",
+          "toTimestamp": "2026-09-06T13:38:50.870Z",
+          "monotonicGapMs": 181102.53483399982
+        },
+        {
+          "fromTick": 3600,
+          "toTick": 3660,
+          "fromTimestamp": "2026-09-06T13:38:51.366Z",
+          "toTimestamp": "2026-09-06T13:55:06.419Z",
+          "monotonicGapMs": 975049.8161670002
+        },
+        {
+          "fromTick": 4560,
+          "toTick": 4620,
+          "fromTimestamp": "2026-09-06T13:55:10.319Z",
+          "toTimestamp": "2026-09-06T14:07:35.836Z",
+          "monotonicGapMs": 745514.4771670001
+        },
+        {
+          "fromTick": 5280,
+          "toTick": 5340,
+          "fromTimestamp": "2026-09-06T14:07:38.874Z",
+          "toTimestamp": "2026-09-06T14:10:22.658Z",
+          "monotonicGapMs": 163783.10729199927
+        },
+        {
+          "fromTick": 5460,
+          "toTick": 5520,
+          "fromTimestamp": "2026-09-06T14:10:23.213Z",
+          "toTimestamp": "2026-09-06T14:13:22.432Z",
+          "monotonicGapMs": 179218.19125000015
+        }
+      ]
+    },
+    {
+      "shape": "cutover-growth",
+      "sourceCommit": "ab6eda5b5518e2fd01fcd58e96e541d9fa7e01de",
+      "pid": 87721,
+      "samplesPath": "tests/fixtures/screen-soak/records/cutover-growth/samples.jsonl",
+      "gaps": [
+        {
+          "fromTick": 3420,
+          "toTick": 3480,
+          "fromTimestamp": "2026-09-06T13:35:49.847Z",
+          "toTimestamp": "2026-09-06T13:38:50.870Z",
+          "monotonicGapMs": 181100.66745799966
+        },
+        {
+          "fromTick": 3600,
+          "toTick": 3660,
+          "fromTimestamp": "2026-09-06T13:38:51.506Z",
+          "toTimestamp": "2026-09-06T13:55:06.953Z",
+          "monotonicGapMs": 975443.8822499998
+        },
+        {
+          "fromTick": 3960,
+          "toTick": 4020,
+          "fromTimestamp": "2026-09-06T13:55:10.306Z",
+          "toTimestamp": "2026-09-06T14:07:35.635Z",
+          "monotonicGapMs": 745326.869
+        },
+        {
+          "fromTick": 4740,
+          "toTick": 4800,
+          "fromTimestamp": "2026-09-06T14:07:45.007Z",
+          "toTimestamp": "2026-09-06T14:10:22.893Z",
+          "monotonicGapMs": 157886.1785000004
+        },
+        {
+          "fromTick": 5280,
+          "toTick": 5340,
+          "fromTimestamp": "2026-09-06T14:10:28.969Z",
+          "toTimestamp": "2026-09-06T14:13:22.285Z",
+          "monotonicGapMs": 173315.50720900018
+        }
+      ]
+    },
+    {
+      "shape": "final-static",
+      "sourceCommit": "e5c719a3626c97a09ba10e43d9031cc8fa3cd884",
+      "pid": 6754,
+      "samplesPath": "tests/fixtures/screen-soak/records/final-static/samples.jsonl",
+      "gaps": [
+        {
+          "fromTick": 2340,
+          "toTick": 2400,
+          "fromTimestamp": "2026-09-06T13:36:29.468Z",
+          "toTimestamp": "2026-09-06T13:38:50.725Z",
+          "monotonicGapMs": 141335.51091600023
+        },
+        {
+          "fromTick": 2460,
+          "toTick": 2520,
+          "fromTimestamp": "2026-09-06T13:38:51.032Z",
+          "toTimestamp": "2026-09-06T13:55:06.118Z",
+          "monotonicGapMs": 975082.7480000001
+        },
+        {
+          "fromTick": 3420,
+          "toTick": 3480,
+          "fromTimestamp": "2026-09-06T13:55:10.137Z",
+          "toTimestamp": "2026-09-06T14:07:35.375Z",
+          "monotonicGapMs": 745235.8236660003
+        },
+        {
+          "fromTick": 4200,
+          "toTick": 4260,
+          "fromTimestamp": "2026-09-06T14:07:38.564Z",
+          "toTimestamp": "2026-09-06T14:10:22.799Z",
+          "monotonicGapMs": 164234.81091600005
+        },
+        {
+          "fromTick": 4320,
+          "toTick": 4380,
+          "fromTimestamp": "2026-09-06T14:10:23.064Z",
+          "toTimestamp": "2026-09-06T14:13:22.199Z",
+          "monotonicGapMs": 179134.38554200064
+        },
+        {
+          "fromTick": 4620,
+          "toTick": 4680,
+          "fromTimestamp": "2026-09-06T14:14:29.380Z",
+          "toTimestamp": "2026-09-06T14:16:38.902Z",
+          "monotonicGapMs": 129485.70291600004
+        }
+      ]
+    },
+    {
+      "shape": "final-growth",
+      "sourceCommit": "e5c719a3626c97a09ba10e43d9031cc8fa3cd884",
+      "pid": 6753,
+      "samplesPath": "tests/fixtures/screen-soak/records/final-growth/samples.jsonl",
+      "gaps": [
+        {
+          "fromTick": 2340,
+          "toTick": 2400,
+          "fromTimestamp": "2026-09-06T13:36:29.472Z",
+          "toTimestamp": "2026-09-06T13:38:50.753Z",
+          "monotonicGapMs": 141359.87229199987
+        },
+        {
+          "fromTick": 2460,
+          "toTick": 2520,
+          "fromTimestamp": "2026-09-06T13:38:51.056Z",
+          "toTimestamp": "2026-09-06T13:55:06.123Z",
+          "monotonicGapMs": 975064.0025420003
+        },
+        {
+          "fromTick": 3000,
+          "toTick": 3060,
+          "fromTimestamp": "2026-09-06T13:55:10.446Z",
+          "toTimestamp": "2026-09-06T14:07:36.317Z",
+          "monotonicGapMs": 745868.2071669991
+        },
+        {
+          "fromTick": 3780,
+          "toTick": 3840,
+          "fromTimestamp": "2026-09-06T14:07:44.395Z",
+          "toTimestamp": "2026-09-06T14:10:23.036Z",
+          "monotonicGapMs": 158640.14462500066
+        },
+        {
+          "fromTick": 4320,
+          "toTick": 4380,
+          "fromTimestamp": "2026-09-06T14:10:28.576Z",
+          "toTimestamp": "2026-09-06T14:13:22.208Z",
+          "monotonicGapMs": 173631.15129199997
+        },
+        {
+          "fromTick": 4620,
+          "toTick": 4680,
+          "fromTimestamp": "2026-09-06T14:14:29.426Z",
+          "toTimestamp": "2026-09-06T14:16:39.354Z",
+          "monotonicGapMs": 129891.30249999929
+        }
+      ]
+    }
+  ]
+}

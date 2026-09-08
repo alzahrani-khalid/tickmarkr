@@ -3,7 +3,7 @@ import { describe, expect, test, vi } from "vitest";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { runDaemon } from "../../src/run/daemon.js";
-import { gitHead } from "../../src/run/git.js";
+import { gitHead, worktreePath } from "../../src/run/git.js";
 import { Journal, type JournalEvent, type TelemetryRow } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -52,9 +52,17 @@ function maskMeasured<T>(obj: T): T {
   return obj;
 }
 
-function normJournal(events: JournalEvent[], runId: string, baseRef: string, taskId = "T1") {
+function normJournal(events: JournalEvent[], repo: string, runId: string, baseRef: string, taskId = "T1") {
   return events.map((e, i) => {
     let row = { ...e, ts: String(i) };
+    if (row.event === "worker-launch") {
+      // Focus needs the recorded ownership. Prove the actual launch identity
+      // before normalizing the two fixtures' different repositories/runs.
+      const slot = row.data.slot as { name: string; cwd: string };
+      expect(slot.cwd).toBe(worktreePath(repo, `tickmarkr/${runId}--${taskId}`));
+      expect(slot.name).toBe(`${taskId}-worker-fake-a${row.data.attempt}-${runId.replace(/^run-/, "")}`);
+      row = { ...row, data: { ...row.data, slot: { ...slot, cwd: "<WORKTREE>", name: `<RUNID>-${taskId}-${row.data.attempt}` } } };
+    }
     if (row.event === "gate-result") {
       // Mask values only after proving the row carried one. Two equally missing durationMs fields
       // must fail this identity oracle rather than normalize into a false equality.
@@ -119,8 +127,8 @@ async function identityPair(script: object, runTag: string) {
   await runDaemon(repoB, { adapters: [fakeB], runId: runIdB, driver: noopDriver() });
   const baseA = (await gitHead(repoA)) as string;
   const baseB = (await gitHead(repoB)) as string;
-  const jA = normJournal(Journal.open(repoA, runIdA).read(), runIdA, baseA);
-  const jB = normJournal(Journal.open(repoB, runIdB).read(), runIdB, baseB);
+  const jA = normJournal(Journal.open(repoA, runIdA).read(), repoA, runIdA, baseA);
+  const jB = normJournal(Journal.open(repoB, runIdB).read(), repoB, runIdB, baseB);
   const tA = normTelemetry(Journal.open(repoA, runIdA).readTelemetry());
   const tB = normTelemetry(Journal.open(repoB, runIdB).readTelemetry());
   expect(jA).toEqual(jB);

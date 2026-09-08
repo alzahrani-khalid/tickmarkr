@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { detectPackageManager, turboContinueFindings } from "../../gates/baseline.js";
 import { version } from "./version.js";
-import { allAdapters, binaryShadowWarnings, detectCandidateClis, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readDoctor, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { shq } from "../../adapters/types.js";
 import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
@@ -406,13 +406,165 @@ export function liveBenchStalenessFinding(now: Date): string | undefined {
   return `LiveBench table pinned at ${LIVEBENCH_TABLE_DATE} is ${days} days old (>${LIVEBENCH_TABLE_MAX_AGE_DAYS}d) — list ${LIVEBENCH_RELEASES_URL} for a newer table_<date>.csv and bump LIVEBENCH_TABLE_DATE (advisory — tickmarkr never fetches that listing)`;
 }
 
+type ConfiguredModel = { adapter: string; model: string };
+
+function configuredModels(cfg: ReturnType<typeof loadConfig>, adapters?: WorkerAdapter[]): ConfiguredModel[] {
+  const allowed = adapters ? new Set(adapters.map((adapter) => adapter.id)) : undefined;
+  return Object.entries(cfg.tiers).flatMap(([adapter, tier]) =>
+    allowed && !allowed.has(adapter) ? [] :
+    Object.keys(tier.models ?? {}).map((model) => ({ adapter, model })),
+  );
+}
+
+function cacheAge(ageMs: number | null): string {
+  return ageMs === null ? "unavailable" : `${Math.floor(ageMs / 60_000)}m`;
+}
+
+/**
+ * A no-call disclosure for the action that normal doctor performs.  This is deliberately built
+ * from config alone: opening the disclosure must not turn a cache reader into a model purchase.
+ */
+export function doctorProbePreflight(
+  cwd = process.cwd(),
+  cfg = loadConfig(cwd),
+  adapters: WorkerAdapter[] = allAdapters(),
+): string {
+  const models = configuredModels(cfg, adapters);
+  const scope = models.length
+    ? models.map(({ adapter, model }) => `${adapter}:${model}`).join(", ")
+    : "none (no configured models)";
+  const state = stateDirName(cwd);
+  return [
+    "tickmarkr doctor — probe preflight:",
+    `configured model-call scope: ${models.length} model${models.length === 1 ? "" : "s"} — ${scope}`,
+    `cache policy: explicit probing replaces ${state}/doctor.json; each installed configured model receives one bounded call, with a serial retry only after a first failure (a prior timeout skips that retry)`,
+    `affected destinations: ${state}/doctor.json (adapter and model verdict cache); temporary probe prompts are removed`,
+    "catalog-only alternative: tickmarkr doctor --refresh-catalog refreshes the catalog cache without adapter or model probes",
+  ].join("\n");
+}
+
+/**
+ * Health surfaces use this cache-only reader.  It intentionally receives adapters only to render
+ * their configured identities; it never invokes adapter.probe(), listModels(), or a model command.
+ */
+export function cachedDoctorDiagnostics(
+  cwd = process.cwd(),
+  adapters: WorkerAdapter[] = allAdapters(),
+  cfg = loadConfig(cwd),
+): string {
+  const health = readDoctor(cwd);
+  const age = doctorAgeMs(cwd);
+  const configured = configuredModels(cfg, adapters);
+  const state = stateDirName(cwd);
+  const knownAdapters = new Set(adapters.map((adapter) => adapter.id));
+  const rows = configured.map(({ adapter, model }) => {
+    const cachedAdapter = health?.[adapter];
+    const cachedModel = cachedAdapter?.modelAuth?.[model];
+    const status = !health
+      ? "unknown (cache unavailable)"
+      : !knownAdapters.has(adapter)
+        ? "unknown (adapter unavailable to this reader)"
+        : !cachedAdapter
+          ? "unknown (adapter absent from cache)"
+          : !cachedAdapter.installed
+            ? "unavailable (adapter not installed)"
+            : !cachedAdapter.authed
+              ? "unavailable (adapter not authenticated)"
+              : !cachedModel
+                ? "unknown (never probed)"
+                : cachedModel.authed
+                  ? `passed (cached ${cachedModel.probedAt})`
+                  : `failed (cached ${cachedModel.reason ?? "probe failed"})`;
+    return `  ${adapter}:${model} ${status}`;
+  });
+  return [
+    "tickmarkr doctor — cached diagnostics:",
+    `cache source: ${health ? `${state}/doctor.json` : "unavailable"}`,
+    `cache age: ${cacheAge(age)}`,
+    "cache policy: read-only; adapter and model probes were not called",
+    ...(rows.length ? ["configured model status:", ...rows] : ["configured model status: none (no configured models)"]),
+  ].join("\n");
+}
+
+const RUNNER_CONFIG_PATHS = [
+  "jest.config.js",
+  "jest.config.cjs",
+  "jest.config.mjs",
+  "jest.config.ts",
+  "jest.config.json",
+  "vitest.config.ts",
+  "vitest.config.js",
+  "vitest.config.mts",
+  "vitest.config.mjs",
+  "vitest.config.cts",
+] as const;
+
+function runnerConfigSnapshot(cwd: string): Map<string, string> {
+  return new Map(RUNNER_CONFIG_PATHS.flatMap((path) => {
+    const absolute = join(cwd, path);
+    return existsSync(absolute) ? [[path, readFileSync(absolute, "utf8")] as const] : [];
+  }));
+}
+
+function actualTextDiff(path: string, before: string, after: string): string {
+  const oldLines = before.split("\n");
+  const newLines = after.split("\n");
+  let start = 0;
+  while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) start += 1;
+  let oldEnd = oldLines.length;
+  let newEnd = newLines.length;
+  while (oldEnd > start && newEnd > start && oldLines[oldEnd - 1] === newLines[newEnd - 1]) {
+    oldEnd -= 1;
+    newEnd -= 1;
+  }
+  return [
+    `--- ${path} (before)`,
+    `+++ ${path} (after)`,
+    ...oldLines.slice(start, oldEnd).map((line) => `-${line}`),
+    ...newLines.slice(start, newEnd).map((line) => `+${line}`),
+  ].join("\n");
+}
+
+/** Repair is an actuator, but never a reason to run the paid diagnostic sensor. */
+export function doctorFixOnly(cwd = process.cwd()): string {
+  const before = runnerConfigSnapshot(cwd);
+  const finding = runnerIgnoreFinding(cwd);
+  const repair = finding?.verdict === "warn"
+    ? applyRunnerIgnore(cwd)
+    : { action: "none" as const, detail: finding?.detail ?? "no recognized test runner" };
+  const verified = runnerIgnoreFinding(cwd);
+  const diffs = [...before].flatMap(([path, original]) => {
+    const current = readFileSync(join(cwd, path), "utf8");
+    return current === original ? [] : [actualTextDiff(path, original, current)];
+  });
+  const result = repair.action === "wrote" && verified?.verdict !== "pass"
+    ? "invalid repair result (verification did not pass)"
+    : `${repair.action} — ${repair.detail}`;
+  return [
+    "tickmarkr doctor --fix-only — repair-only:",
+    "model probes: skipped (repair-only; adapters were not called)",
+    "catalog: untouched",
+    `repair result: ${result}`,
+    `repair verification: ${verified?.verdict ?? "unavailable"}`,
+    "repair diff:",
+    ...(diffs.length ? diffs : ["(no runner-config bytes changed)" ]),
+  ].join("\n");
+}
+
 export async function doctor(
   _argv: string[],
   cwd = process.cwd(),
   adapters: WorkerAdapter[] = allAdapters(),
   opts: DoctorOpts = {},
 ): Promise<string> {
-  if (_argv.length === 1 && _argv[0] === "--refresh-catalog") {
+  if (_argv.includes("--fix-only")) return doctorFixOnly(cwd);
+  if (_argv.includes("--cached") || _argv.includes("--cached-only")) {
+    return cachedDoctorDiagnostics(cwd, adapters);
+  }
+  if (_argv.includes("--probe-preflight") || _argv.includes("--preflight")) {
+    return doctorProbePreflight(cwd, loadConfig(cwd), adapters);
+  }
+  if (_argv.length === 1 && (_argv[0] === "--refresh-catalog" || _argv[0] === "--catalog-only")) {
     const refreshed = await refreshCatalogCommand({ repoRoot: cwd, fetcher: opts.catalogFetcher, now: opts.catalogNow });
     return refreshed.updated
       ? `tickmarkr doctor --refresh-catalog: model catalog refreshed — ${formatCatalogRefreshLegs(refreshed.legs)}${refreshed.warning ? `; ${refreshed.warning}` : ""}`
@@ -441,9 +593,9 @@ export async function doctor(
   }
   // banner at START — the logo greets the operator before the ~60s probe wait, never trailing it (operator report 2026-07-17)
   if (opts.banner !== false && visual()) process.stdout.write(BANNER);
-  // stderr, live: auth probes are real LLM calls (up to 30s per configured model) and the CLI
-  // otherwise prints nothing until the end — silence here reads as a hang (v1.33.1)
-  console.error("probing installed agent CLIs — one short LLM call per configured model, may take a minute...");
+  // stderr, live: disclose the paid boundary before the first adapter/model call. The separate
+  // --probe-preflight route exposes these same bytes without crossing that boundary.
+  console.error(`${doctorProbePreflight(cwd, cfg, adapters)}\nprobing installed agent CLIs — one short LLM call per configured model, may take a minute...`);
   const probeProgressTTY = process.stderr.isTTY === true;
   const health = await probeAll(adapters, { cwd });
   const kimiAdapter = adapters.find((a) => a.id === kimi.id);

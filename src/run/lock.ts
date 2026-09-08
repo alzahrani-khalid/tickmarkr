@@ -1,4 +1,4 @@
-import { linkSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, linkSync, lstatSync, mkdtempSync, openSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
@@ -36,9 +36,10 @@ export interface Inspection { pid?: number; runId?: string; garbage: boolean; de
 export type RunLineEvent = { event: string; ts: string };
 
 // LOCK-04: the ONE decision table. Both acquireRunLock and isRunLockLive consume this — the two
-// hand-maintained copies of the rule cannot drift. The table changes HERE, once. unlockRun uses the
-// SAME inspect() with its own live-holder refusal (`!dead && !garbage`) — it is the escape hatch, not
-// a second copy of the rule.
+// hand-maintained copies of the rule cannot drift. The table changes HERE, once. previewUnlock /
+// commitUnlock (below) read the SAME underlying snapshot shape with their own eligibility rules
+// (matching run ID, provably dead, not garbage) — they are the escape hatch, not a second copy of
+// the rule.
 // LOCK-02 (OBS-05): refuse iff garbage OR alive. dead (ESRCH) self-clears through the reclaim branch
 // below — no 60s heartbeat wait. Expiry no longer participates in the DECISION (Inspect still carries
 // `expired` for the race guard + reclaim audit); the heartbeat mechanism itself is untouched.
@@ -122,10 +123,10 @@ export function acquireRunLock(repoRoot: string, runId: string): { reclaimed?: {
       return { reclaimed: { pid: pid ?? -1, mtimeMs }, ...again };
     }
     const stateDir = stateDirName(repoRoot);
-    if (garbage) throw new Error(`${stateDir}/graph.lock holds an unreadable/garbage payload — refusing to reclaim it; run \`tickmarkr unlock\` to remove it`);
+    if (garbage) throw new Error(`${stateDir}/graph.lock holds an unreadable/garbage payload — refusing to reclaim it; run \`tickmarkr unlock --garbage\` to remove it`);
     // LOCK-02: shouldRefuse is false whenever dead, so this throw is reached only for a LIVE holder
     // (incl. EPERM = alive-but-not-ours). The dead-but-fresh case self-clears via the reclaim branch.
-    throw new Error(`${stateDir}/graph.lock held by pid ${pid ?? "?"}${heldRun ? ` (run ${heldRun})` : ""} — another tickmarkr run? (operator escape: \`tickmarkr unlock\`)`);
+    throw new Error(`${stateDir}/graph.lock held by pid ${pid ?? "?"}${heldRun ? ` (run ${heldRun})` : ""} — another tickmarkr run? (operator escape: \`tickmarkr unlock ${heldRun ?? "<run-id>"}\`)`);
   }
 }
 
@@ -244,22 +245,194 @@ export function isRunLockLive(repoRoot: string): boolean {
   return runLockOwner(repoRoot)?.live ?? false;
 }
 
-// LOCK-03: operator escape hatch. Liveness-checked delete — removes a dead-holder or garbage lock,
-// REFUSES to remove one whose holder is alive (incl. EPERM = alive-but-not-ours). No --force: the
-// refusal names the pid; the operator kills the process. Liveness logic stays here (LOCK-04
-// discipline extends to this caller) — the CLI command is a thin formatter.
-// W4 TOCTOU: liveness is checked, THEN unlinked — a live holder that dies (or a dead pid reused)
-// between inspect() and unlinkSync is a window this does NOT close. Acceptable: unlock is
-// operator-initiated on an already-parked run; worst case is removing a lock a just-reborn process
-// would want, which the operator triggered and can recover by re-running. NOT an atomic re-check.
-export function unlockRun(repoRoot: string): { held: false } | { held: true; removed: true; pid?: number; runId?: string; garbage: boolean } {
-  const p = lockPath(repoRoot);
-  let insp: Inspection;
-  try { insp = inspect(p); }
-  catch { return { held: false }; } // statSync ENOENT ⇒ no lock
-  if (!insp.dead && !insp.garbage) {
-    throw new Error(`${stateDirName(repoRoot)}/graph.lock held by LIVE pid ${insp.pid}${insp.runId ? ` (run ${insp.runId})` : ""} — refusing to unlock; stop that run first`);
+// LOCK-03/R16-17/R41: operator escape hatch, split into the two routes a snapshot's trustworthiness
+// actually supports. A valid (parseable) payload carries a trustworthy run ID, so its recovery
+// (previewUnlock/commitUnlock) REQUIRES the operator to name that run and refuses any other. A
+// garbage payload has NO trustworthy run ID (R17) — its recovery (previewGarbageUnlock/
+// commitGarbageUnlock) identifies it by raw bytes + inode instead and never invents one.
+//
+// Both routes split into preview (read-only) and commit (mutating): the CLI shows the preview,
+// gets TTY confirmation or --yes, then calls commit. Commit atomically renames the entry into a
+// private directory, reads that captured file and repeats the identity/liveness checks. Only the
+// captured entry can be unlinked; a successor at graph.lock is never a removal target. A rejected
+// capture is restored with link(2), which cannot overwrite a successor. No caller trusts the
+// confirmed preview's verdict for the removal itself.
+export interface LockSnapshot { pid?: number; runId?: string; garbage: boolean; unreadable: boolean; dead: boolean; ino: number; mtimeMs: number; raw: Buffer }
+
+// Unlike inspect() (owned by the acquire/reclaim path this task must not change), a stat failure
+// here is never silently read as "no lock" — only ENOENT is. Any other stat error (e.g. EACCES)
+// propagates so the CLI fails closed and loud instead of returning the neutral "nothing to remove"
+// receipt over a lock it could not actually see (R41).
+//
+// A content READ failure (stat succeeds, the bytes don't — e.g. EACCES) is its OWN `unreadable`
+// state, distinct from `garbage`: we never observed the bytes, so we cannot confirm the payload is
+// malformed, and a well-formed live lock made merely unreadable must never become eligible for
+// either recovery route. `raw` stays a Buffer (never decoded) for identity: decoding invalid UTF-8
+// collapses distinct byte sequences to the same replacement-character string, which would let a
+// changed-bytes attack slip past a text-equality check (AC2's byte-confirmation requirement).
+function readLockSnapshot(p: string): LockSnapshot | undefined {
+  let st: Stats;
+  try { st = lstatSync(p); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  const unreadable = (): LockSnapshot => ({ garbage: false, unreadable: true, dead: true, ino: st.ino, mtimeMs: st.mtimeMs, raw: Buffer.alloc(0) });
+  if (!st.isFile()) return unreadable();
+  let raw: Buffer;
+  let fd: number | undefined;
+  try {
+    // Read bytes and inode from the same open file. Refuse symlinks/non-files even if the path
+    // changes after lstat; NONBLOCK prevents a substituted FIFO from hanging the command.
+    fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    st = fstatSync(fd);
+    if (!st.isFile()) return unreadable();
+    raw = readFileSync(fd);
   }
-  try { unlinkSync(p); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
-  return { held: true, removed: true, pid: insp.pid, runId: insp.runId, garbage: insp.garbage };
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; // raced away between stat and read
+    return unreadable();
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  let parsedJson: unknown = null;
+  try { parsedJson = JSON.parse(raw.toString("utf8")); } catch { /* not JSON ⇒ garbage below */ }
+  const parsed = PayloadSchema.safeParse(parsedJson);
+  const pid = parsed.success ? parsed.data.pid : undefined;
+  return {
+    pid,
+    runId: parsed.success ? parsed.data.runId : undefined,
+    garbage: !parsed.success,
+    unreadable: false,
+    dead: pid === undefined ? true : !isPidLive(pid),
+    ino: st.ino,
+    mtimeMs: st.mtimeMs,
+    raw,
+  };
+}
+
+export type UnlockPreview =
+  | { held: false }
+  | { held: true; eligible: false; reason: string; pid?: number; runId?: string }
+  | { held: true; eligible: true; pid: number; runId: string; ino: number; mtimeMs: number; raw: Buffer };
+
+type UnlockRefusal = { removed: false; reason: string };
+
+// rename is the single capture operation, not a snapshot followed by an unlink of graph.lock.
+// mkdtemp gives this commit a private destination on the same filesystem. All validation and
+// deletion happens there, so a later acquisition at graph.lock survives even during the read.
+function commitCapturedLock(
+  repoRoot: string,
+  validate: (snap: LockSnapshot) => string | undefined,
+): { removed: true; snap: LockSnapshot } | UnlockRefusal {
+  const p = lockPath(repoRoot);
+  const dir = mkdtempSync(`${p}.unlock-`);
+  const captured = join(dir, "graph.lock");
+  const restore = (reason: string): UnlockRefusal => {
+    try {
+      // Never rename back: that would clobber a successor installed while we validated.
+      linkSync(captured, p);
+    } catch (e) {
+      return { removed: false, reason: `${reason}; could not restore graph.lock (${(e as NodeJS.ErrnoException).code}) — captured entry retained at ${captured}` };
+    }
+    try { unlinkSync(captured); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { removed: false, reason: `${reason}; graph.lock restored, additional captured link retained at ${captured}: ${(e as Error).message}` };
+      }
+    }
+    return { removed: false, reason };
+  };
+  try {
+    try { renameSync(p, captured); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return { removed: false, reason: "graph.lock no longer exists — nothing captured or removed" };
+      throw e;
+    }
+    try {
+      const snap = readLockSnapshot(captured);
+      if (!snap) return { removed: false, reason: "captured graph.lock no longer exists — not removed" };
+      const reason = validate(snap);
+      if (reason) return restore(reason);
+      unlinkSync(captured);
+      return { removed: true, snap };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return { removed: false, reason: "captured graph.lock no longer exists — not removed" };
+      return restore(`graph.lock could not be removed: ${(e as Error).message}`);
+    }
+  } finally {
+    // Best-effort empty-directory cleanup only. Never recursively delete a refused capture that
+    // could not be restored, or obscure its recovery path with a cleanup error.
+    try { rmdirSync(dir); } catch { /* retained capture or directory cleanup failure */ }
+  }
+}
+
+// AC1: eligible only for a matching-run, provably-dead, non-garbage lock. Live, EPERM and any other
+// signal-probe error all read `dead: false` through the one shared isPidLive predicate — never a
+// second copy that would treat an unknown errno as death. A different run ID refuses even when the
+// holder is dead: the operator named a run, and this is not it.
+export function previewUnlock(repoRoot: string, runId: string): UnlockPreview {
+  const snap = readLockSnapshot(lockPath(repoRoot));
+  if (!snap) return { held: false };
+  const stateDir = stateDirName(repoRoot);
+  if (snap.unreadable) {
+    return { held: true, eligible: false, reason: `${stateDir}/graph.lock content could not be read — refusing to unlock without observing its payload` };
+  }
+  if (snap.garbage) {
+    return { held: true, eligible: false, reason: `${stateDir}/graph.lock holds an unreadable/garbage payload — run \`tickmarkr unlock --garbage\` to recover it, not a named unlock`, pid: snap.pid, runId: snap.runId };
+  }
+  if (snap.runId !== runId) {
+    return { held: true, eligible: false, reason: `${stateDir}/graph.lock is held for run ${snap.runId ?? "?"}, not ${runId} — refusing to unlock a different run`, pid: snap.pid, runId: snap.runId };
+  }
+  if (!snap.dead) {
+    return { held: true, eligible: false, reason: `${stateDir}/graph.lock held by LIVE pid ${snap.pid}${snap.runId ? ` (run ${snap.runId})` : ""} — refusing to unlock; stop that run first`, pid: snap.pid, runId: snap.runId };
+  }
+  return { held: true, eligible: true, pid: snap.pid!, runId: snap.runId!, ino: snap.ino, mtimeMs: snap.mtimeMs, raw: snap.raw };
+}
+
+export function commitUnlock(
+  repoRoot: string,
+  target: { pid: number; runId: string; ino: number; mtimeMs: number; raw: Buffer },
+): { removed: true; pid: number; runId: string } | { removed: false; reason: string } {
+  const commit = commitCapturedLock(repoRoot, (snap) => {
+    if (snap.unreadable || snap.garbage || snap.ino !== target.ino || snap.mtimeMs !== target.mtimeMs || snap.pid !== target.pid || !snap.raw.equals(target.raw)) {
+      return "graph.lock changed since preview — refusing to remove the new holder";
+    }
+    if (snap.runId !== target.runId) return `graph.lock now names run ${snap.runId ?? "?"}, not ${target.runId}`;
+    if (!snap.dead) return `holder pid ${snap.pid} is alive`;
+  });
+  if (!commit.removed) return commit;
+  return { removed: true, pid: commit.snap.pid!, runId: commit.snap.runId! };
+}
+
+export type UnlockGarbagePreview =
+  | { held: false }
+  | { held: true; eligible: false; reason: string; pid?: number; runId?: string }
+  | { held: true; eligible: true; ino: number; raw: Buffer };
+
+// AC2: eligible only for an ACTUALLY malformed snapshot — a well-formed payload (dead or live) is
+// refused here and pointed at the ordinary named route instead, so --garbage can never become a
+// second, run-ID-free way to remove a legitimate lock. An unreadable payload is refused too: its
+// bytes were never observed, so it is neither confirmed malformed nor confirmed well-formed.
+export function previewGarbageUnlock(repoRoot: string): UnlockGarbagePreview {
+  const snap = readLockSnapshot(lockPath(repoRoot));
+  if (!snap) return { held: false };
+  if (snap.unreadable) {
+    return { held: true, eligible: false, reason: `${stateDirName(repoRoot)}/graph.lock content could not be read — refusing to treat it as garbage without observing its bytes` };
+  }
+  if (!snap.garbage) {
+    return { held: true, eligible: false, reason: `${stateDirName(repoRoot)}/graph.lock holds a well-formed payload — run \`tickmarkr unlock ${snap.runId ?? "<run-id>"}\` instead of --garbage`, pid: snap.pid, runId: snap.runId };
+  }
+  return { held: true, eligible: true, ino: snap.ino, raw: snap.raw };
+}
+
+export function commitGarbageUnlock(
+  repoRoot: string,
+  target: { ino: number; raw: Buffer },
+): { removed: true } | { removed: false; reason: string } {
+  const commit = commitCapturedLock(repoRoot, (snap) => {
+    if (snap.unreadable) return "graph.lock content became unreadable since preview — refusing to remove it blind";
+    if (!snap.garbage) return "graph.lock now holds a well-formed payload — refusing to remove a valid holder";
+    if (snap.ino !== target.ino || !snap.raw.equals(target.raw)) {
+      return "graph.lock bytes/inode changed since preview — refusing to remove the new file";
+    }
+  });
+  return commit.removed ? { removed: true } : commit;
 }

@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { writeDoctor } from "../../src/adapters/registry.js";
 import { scope as scopeCommand } from "../../src/cli/commands/scope.js";
 import { COMMANDS, USAGE } from "../../src/cli/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { compileNative } from "../../src/compile/native.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
-import { clarificationGate, scopeIntent } from "../../src/plan/scope.js";
+import { clarificationGate, formatScopePreview, previewScope, scopeIntent } from "../../src/plan/scope.js";
 import { scopePrompt } from "../../src/plan/prompt.js";
 
 const VALID_DRAFT = `<!-- tickmarkr:spec -->
@@ -230,6 +231,65 @@ describe("scope drafting", () => {
   });
 });
 
+describe("scope preview candidate health (review finding: routing permission is not health evidence)", () => {
+  test("does not report a candidate as installed/authed when only routing.allowUnverifiedModels lets an unverified model through", () => {
+    const { repo, intentFile, cfg, fake } = fixture({ spec: VALID_DRAFT });
+    cfg.routing.allowUnverifiedModels = true;
+    // Cached health has NO modelAuth at all — every model's authed status is unknown; only
+    // allowUnverifiedModels lets discoverChannels/route treat fake-1 as routable.
+    writeDoctor(repo, { fake: { installed: true, authed: true, models: ["fake-1", "fake-2"] } });
+
+    const preview = previewScope(intentFile, repo, { cfg, adapters: [fake] });
+
+    expect(preview.candidate).toBeUndefined();
+    const text = formatScopePreview(preview);
+    expect(text).toMatch(/cached candidate: unknown/);
+    expect(text).not.toMatch(/installed\/authed/);
+  });
+
+  test("still reports the candidate when the doctor cache actually marked it authed", () => {
+    const { repo, intentFile, cfg, fake } = fixture({ spec: VALID_DRAFT });
+    writeDoctor(repo, {
+      fake: { installed: true, authed: true, models: ["fake-1", "fake-2"], modelAuth: { "fake-1": { authed: true, probedAt: "2026-09-05T00:00:00.000Z" } } },
+    });
+
+    const preview = previewScope(intentFile, repo, { cfg, adapters: [fake] });
+
+    expect(preview.candidate).toEqual({ adapter: "fake", model: "fake-1" });
+    expect(formatScopePreview(preview)).toMatch(/fake:fake-1 \(installed\/authed at last doctor run\)/);
+  });
+});
+
+describe("confirmed scope cached model health", () => {
+  test("preserves cached per-model health when a real-adapter-shaped probe omits modelAuth", async () => {
+    const { repo, intentFile, cfg, fake } = fixture({ spec: VALID_DRAFT });
+    expect(cfg.routing.allowUnverifiedModels).toBe(false);
+    writeDoctor(repo, {
+      fake: {
+        installed: true,
+        authed: true,
+        models: ["fake-1", "fake-2"],
+        modelAuth: { "fake-1": { authed: true, probedAt: "2026-09-05T00:00:00.000Z" } },
+      },
+    });
+    const preview = previewScope(intentFile, repo, { cfg, adapters: [fake] });
+    expect(preview.candidate).toEqual({ adapter: "fake", model: "fake-1" });
+
+    // Shipped adapters' probe() contract has adapter health and detected models, but no modelAuth.
+    vi.spyOn(fake, "probe").mockResolvedValue({
+      installed: true, authed: true, version: "real-shaped", models: ["fake-1", "fake-2"],
+    });
+    const author = vi.spyOn(fake, "headlessCommand");
+
+    const result = await scopeIntent(intentFile, repo, {
+      cfg, adapters: [fake], candidate: preview.candidate!,
+    });
+
+    expect(author).toHaveBeenCalledWith(expect.any(String), "fake-1");
+    expect(readFileSync(result.specFile, "utf8")).toBe(VALID_DRAFT);
+  });
+});
+
 describe("tickmarkr scope command", () => {
   test("loads config, resolves the intent path, and reports the written spec", async () => {
     const { repo, cfg: _cfg, fake } = fixture({ spec: VALID_DRAFT });
@@ -242,7 +302,7 @@ describe("tickmarkr scope command", () => {
     const oldXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = join(repo, "xdg");
     try {
-      const out = await scopeCommand(["reports.intent.md"], repo, [fake]);
+      const out = await scopeCommand(["reports.intent.md", "--yes"], repo, [fake]);
       expect(out).toMatch(/reports\.intent\.md → reports\.spec\.md \(1 task, 1 LLM call\)/);
     } finally {
       if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME;

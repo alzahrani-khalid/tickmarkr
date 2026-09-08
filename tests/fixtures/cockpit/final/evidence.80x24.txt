@@ -1,0 +1,24 @@
+tickmarkr capture | EVIDENCE | run-20260905-000000
+1 Home  4 Run  5 Evidence | content | 1–17/17 | 0 hidden
+────────────────────────────────────────────────────────────────────────────────
+│EVIDENCE [JOURNAL]  REPORT  STATS  CHANNELS  LEARNING PREVIEW  | Follow on  |…│
+│JOURNAL                                                                       │
+│2026-09-05T00:00:00.000Z ● running run-start — fixture                        │
+│2026-09-05T00:00:00.000Z ● running task-dispatch — T1                         │
+│2026-09-05T00:00:00.000Z ✓ passed gate-result — T1 — review passed            │
+│2026-09-05T00:00:00.000Z ✗ terminal failure gate-result — T1 — review failed  │
+│2026-09-05T00:0 - disabled build — gate-result — Txxxxxxxxxxxxxxxxxxxxxxxxxxx…│
+│2026-09-05T00:00:00.000Z ✓ passed merge — T1                                  │
+│2026-09-05T00:00:00.000Z ! human park task-human — T2                         │
+│2026-09-05T00:00:00.000Z ? unknown tip-verify                                 │
+│2026-09-05T00:00:00.000Z ✓ passed run-end — done 1, failed 0                  │
+│2026-09-05T00:00:00.000Z ? unknown task-approved — T2                         │
+│2026-09-05T00:00:00.000Z ● running run-resume                                 │
+│2026-09-05T00:00:00.000Z ● running ❯ task-dispatch — T2                       │
+│SELECTED EVIDENCE                                                             │
+│Original journal <engagement>/journal.jsonl                                   │
+│Artifacts: missing                                                            │
+────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 1/4 | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────

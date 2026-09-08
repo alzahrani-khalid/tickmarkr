@@ -1,7 +1,7 @@
-<!-- refreshed: 2026-07-19 -->
+<!-- refreshed: 2026-09-07 -->
 # Architecture
 
-**Analysis Date:** 2026-07-19
+**Analysis Date:** 2026-09-07 (cockpit and gate execution refresh)
 
 ## System Overview
 
@@ -47,8 +47,8 @@
                                 ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │  GATES (never trust the worker) — `src/gates/`                       │
-│  baseline(build/test/lint) → evidence → scope → acceptance(judge)    │
-│  → cross-vendor review                                               │
+│  mandatory build/test/lint/evidence/scope battery                   │
+│  → optional acceptance(judge) ‖ cross-vendor review                 │
 └──────────────────────────────┬──────────────────────────────────────┘
                                 │  every gate passes
                                 ▼
@@ -61,7 +61,7 @@ Side modules (CLI-facing, not in the dispatch loop):
   PLAN — `src/plan/` (scope/intent LLM helpers for `tickmarkr scope` / `plan`)
   REPORT — `src/report/cost.ts` (pure telemetry → cost estimates for `tickmarkr report`)
   EVAL — `src/eval/` (checked-in fixture harness for `tickmarkr eval`)
-  TUI — `src/tui/` (dependency-free alternate-screen line engine for Fleet Studio)
+  TUI — `src/tui/` (Ink 6 / React 19 cockpit plus existing Fleet/init apps)
 ```
 
 ## Component Responsibilities
@@ -76,7 +76,9 @@ Side modules (CLI-facing, not in the dispatch loop):
 | Plan helpers | LLM-backed scope/intent clarification for `tickmarkr scope` and human-in-the-loop plan gates | `src/plan/scope.ts`, `src/plan/prompt.ts` |
 | Report cost | Pure telemetry → per-channel cost estimates (no network) | `src/report/cost.ts` |
 | Eval fixture harness | Discovers checked-in fixtures, validates their required parts, and seeds each into an isolated temporary git repository before any check or dispatch runs | `src/eval/fixtures.ts` |
-| Terminal UI | Ink Studio; legacy engine and views retired | `src/tui/ink/studio-app.tsx` |
+| Cockpit entry / runtime | TTY launcher and production Ink mount for Home 1, Run 4, Evidence 5 | `src/cli/commands/ui.ts`, `src/tui/cockpit/live.ts`, `src/tui/cockpit/live-runtime.tsx` |
+| Frame / state | Measured shell, shared bounded store and pure lifecycle fold | `src/tui/cockpit/shell.tsx`, `src/tui/cockpit/layout.ts`, `src/tui/cockpit/live-store.ts`, `src/run/operator-state.ts` |
+| Existing Fleet / init UI | Separate Ink apps pending Fleet/Bootstrap follow-on | `src/tui/ink/fleet-app.tsx`, `src/tui/ink/init-app.tsx`, `src/tui/ink/frame.tsx`, `src/tui/ink/components.tsx` |
 | Adapter registry | Discovers installed/authed CLIs (`probe()`), builds the available `BillingChannel[]` | `src/adapters/registry.ts` |
 | Worker adapters | One per agent CLI: headless/interactive command strings + output parsing | `src/adapters/claude-code.ts`, `src/adapters/codex.ts`, `src/adapters/cursor-agent.ts`, `src/adapters/opencode.ts`, `src/adapters/fake.ts` |
 | Executor drivers | Slot lifecycle (pane or subprocess), wait/read/notify primitives, worktree creation | `src/drivers/herdr.ts`, `src/drivers/subprocess.ts`, `src/drivers/types.ts` |
@@ -88,7 +90,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 | Run lock | Advisory per-run lock over `.tickmarkr/graph.json` (link idiom + heartbeat) | `src/run/lock.ts` |
 | Pane reconcile | Pure fold over journal rows → desired herdr pane set for orphan cleanup | `src/run/reconcile.ts` |
 | Stall normalize | Presentation-token stripper for stall-inactivity compare (spinner-safe) | `src/run/stall.ts` |
-| Gate sequencer | Runs baseline → evidence → scope → acceptance → review in order, short-circuits on first failure | `src/gates/run-gates.ts` |
+| Gate sequencer | Mandatory deterministic battery stops at first failure; enabled acceptance/review run concurrently afterward, both fail closed | `src/gates/run-gates.ts` |
 | LLM dispatch | Shared headless-vs-pane execution for judge/review/consult prompts + defensive JSON extraction | `src/gates/llm.ts` |
 
 ## Pattern Overview
@@ -172,10 +174,21 @@ Side modules (CLI-facing, not in the dispatch loop):
 - Used by: `src/cli/commands/eval.ts`
 
 **TUI (`src/tui/`):**
-- Purpose: dependency-free terminal presentation engine for Fleet Studio
-- Location: `engine.ts` (lifecycle and resize), `frame.ts` (alternate-screen line-diff renderer), `input.ts` (keypress decoder and named-key router)
-- Depends on: Node streams and ANSI CSI only; input/output streams are injected for non-TTY tests
-- Used by: Fleet Studio command and its views
+- Public entry: `src/cli/commands/ui.ts` lazily imports `runLiveCockpit` from `src/tui/cockpit/live.ts`, which calls `runConsolidatedCockpit` in `src/tui/cockpit/live-runtime.tsx`. That runtime uses Ink 6 / React 19 and mounts `src/tui/cockpit/home-view.tsx`, `src/tui/cockpit/run-view.tsx` and `src/tui/cockpit/evidence-view.tsx` through `CockpitShell` in `src/tui/cockpit/shell.tsx`.
+- Frame: `planShell` in `src/tui/cockpit/layout.ts` budgets display cells using `src/tui/cockpit/width.ts`; `src/tui/cockpit/components.tsx`, `src/tui/cockpit/theme.ts`, `src/tui/cockpit/keys.ts` and `src/tui/cockpit/pointer.ts` own measured content, palette, input and pointer geometry. Only Home 1, Run 4 and Evidence 5 are delivered. `ui --setup <runId>` opens Run Parks; Fleet/Bootstrap and Plan/Health remain follow-ons using existing `fleet`, `init`, `plan` and `doctor` CLI entries. The public demo flag is retired; `src/tui/cockpit/demo.ts` and legacy renderers remain internal fixture/compatibility consumers.
+- State: `createLiveStore` / `JournalTail` in `src/tui/cockpit/live-store.ts` tail by byte offset and file identity, preserve UTF-8 partial lines and original `#L` identities, bound history, and page older evidence from disk. `readOperatorState` in `src/run/operator-state.ts` supplies lifecycle and graph comparability; `src/tui/cockpit/derive.ts` retains pure projections. Graph/config/cache/lock/beat changes, clock, input and resize invalidate independently of journal growth; observations delayed beyond two one-second target intervals are visible. No hard one-second latency guarantee follows from that target.
+- Decisions: `src/tui/cockpit/decision-actions.ts` previews exact argv, calls authoritative `approve` in `src/cli/commands/approve.ts`, then reads back the appended decision. Permission is not dispatch; a closed run needs `src/cli/commands/resume.ts` and its preflight. Missing reviewer-floor metadata stays unknown.
+- Print boundary: `src/cli/commands/status.ts` uses the pure lifecycle reader and its own `renderFrame` / `oneLine` formatters. Only unbounded TTY `status --watch` without `--plain` or event flags lazily launches UI on Run. Non-TTY default watch and `--watch --plain` retain line/ANSI output; `--watch --events` (aliases `--jsonl`, `--decision-events`) keeps projected JSON stdout and stderr keepalives separate. `src/cli/commands/report.ts` provides text and `renderMarkdownRecord` (Markdown stdout), compare and explicit bundle writes; `src/cli/commands/stats.ts` prints all-run statistics. These printed paths do not transitively import Ink. Separate `fleet --print` and `fleet --why` contracts remain in `src/cli/commands/fleet.ts`; one-shot colors remain `TOKENS` in `src/brand.ts`.
+- Runtime lifetime: `live-runtime.tsx` explicitly borrows/restores raw mode, pointer tracking, title and alternate screen, and disposes timers/listeners/store on quit, signals and read/render failure. `borrowRuntimeTimeline` drains React DevTools performance measures with a shared, reference-counted observer; repeated journal reads alone did not establish the historical OOM's cause. Ink is retained with this runtime mitigation, not exonerated by a source inspection or an accelerated test. Duration stability requires separately recorded production soaks; this architecture refresh makes no new soak claim.
+- Observation ownership: `src/run/supervision.ts` supplies `observeNamedRun`; each named unbounded observer owns its own presence. `watchCommand` in `src/run/daemon.ts` launches the same Run cockpit; `src/drivers/herdr.ts` checks repository/run ownership for replacement, requests graceful board shutdown and verifies presence stand-down before pane close. Manual observers keep their final receipt; unconfirmed cleanup stays diagnostic. Keep task/gate grouping, short titles and right-side placement without focus theft; optional pane focus is ownership-checked through `src/drivers/types.ts`.
+- Remaining Ink consumers: `src/tui/ink/fleet-app.tsx` and `src/tui/ink/init-app.tsx` still use `src/tui/ink/frame.tsx` and `src/tui/ink/components.tsx`. Their removal waits for Fleet/Bootstrap migration and all importers/tests. Working cockpit captures may change through explicit contract-moved retirement; frozen anchors/source bytes remain evidence and re-freezing waits for accepted UAT.
+
+The existing `visibility.keepPanes: forever` debug override disables the daemon's pane
+sweep, including automatic board close. Durable names use
+`tickmarkr:<role>:<taskId>:<attempt>:<runId>` (`formatOwnedName` in `src/drivers/types.ts`);
+human tab titles are not ownership evidence. Shared report/usage data lives in the pure
+`src/report/operator-record.ts`, consumed by report and Evidence without an Ink dependency
+on the print side.
 
 **Run (`src/run/`):**
 - Purpose: the orchestration runtime — daemon loop, ledger, git integration, merge, escalation, locking, pane hygiene, stall detection
@@ -188,6 +201,38 @@ Side modules (CLI-facing, not in the dispatch loop):
 - Location: `types.ts` (`GateResult`), `run-gates.ts` (sequencer), `baseline.ts` (build/test/lint vs pre-run baseline), `evidence.ts` (commits/diff exist), `scope.ts` (`picomatch` file-scope check), `acceptance.ts` (LLM judge vs `acceptance[]`), `review.ts` (cross-vendor LLM review + `pickReviewer`), `llm.ts` (shared headless-vs-pane LLM dispatch + `extractJson`)
 - Depends on: adapters (judge/review run through a `WorkerAdapter`), drivers (pane-visible LLM calls), config (thresholds, judge/review/consult selection)
 - Used by: `run/daemon.ts` (post-dispatch, pre-merge)
+
+`src/graph/schema.ts` declares **build test lint evidence scope acceptance review** in that
+order. The first five are mandatory; only acceptance and review may be omitted by task or
+disabled by supported shape policy. Declaration order is the Run matrix/returned-record
+order, not the execution timeline. The daemon selects `pipeline: "v185"` in
+`src/gates/run-gates.ts`: reject a dirty entry, screen evidence/scope before shell work,
+then run build, lint, evidence, scope and test, stopping at the first deterministic red.
+`src/gates/baseline.ts` compares tool failures against the recorded baseline. The cheap
+screen does not replace the later evidence/scope checks. Only after that battery passes
+do enabled acceptance and review start concurrently; both must pass, and each completion
+is journaled when it arrives. The legacy serial branch remains for compatibility fixtures.
+If a non-final round selects covering tests, a green selection is held until the full
+suite runs on the same merge-candidate commit; no subset-only result authorizes merge.
+
+A declared gate is not a passed gate. Replay `task-dispatch T1` without a build result:
+build is **not-run**, not pass. `gate-start build` makes it **running**; a `gate-result`
+without a boolean verdict is **unknown**; only a result with `pass: true` establishes a
+recorded pass. Disabled/skipped, inherited evidence and an explicitly satisfied gate
+remain separately labeled; a new attempt does not inherit an old pass silently. Missing
+or unparseable worker/judge/review results fail closed, even if their prose claims zero
+findings. In the three-task partial case, a passed tip with human T2 and blocked T3 is
+PARTIAL; approval alone is permission, resume resets current tip to PENDING, and completion
+needs the latest run-end plus matching recorded merges, known nonfailed tip and empty
+failed/human/blocked/pending buckets. See the canonical
+[loop walkthrough](../../skills/tickmarkr-loop/SKILL.md#cockpit-parked-decisions-and-printed-twins).
+
+Command help is dispatched before handlers by `src/cli/index.ts` using
+`src/cli/help.ts`; help before `--` performs no command actions, including eval seeding,
+unlock or profile reset. Canonical skill sources stay under `skills/tickmarkr-loop/SKILL.md`,
+`skills/tickmarkr-auto/SKILL.md` and `skills/tickmarkr-overseer/SKILL.md`; installed
+`.claude/skills/` links resolve to those sources. Siblings link to the loop walkthrough
+instead of introducing another help skill or independent instructions.
 
 ## Data Flow
 
@@ -202,7 +247,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 7. The task prompt is written to disk (`writePrompt`, `src/adapters/prompt.ts:27-32`) and dispatched into a named slot via `driver.slot()` + `driver.run()` — interactive TUI by default, print-mode fallback otherwise (`src/run/daemon.ts:168-218`)
 8. Daemon waits for the `TICKMARKR_RESULT` trailer (regex-anchored to avoid matching the prompt's own template text) or the `TICKMARKR_EXIT:` fast-fail marker, paging the operator once if the pane goes `blocked`/`idle` (`src/run/daemon.ts:181-211`, `src/adapters/prompt.ts:37`)
 9. Output is parsed by the adapter (`adapter.parse()` → `parseWorkerResult`, `src/adapters/prompt.ts:39-73`); a quota-exhaustion signal triggers channel failover without consuming the escalation ladder (`src/run/daemon.ts:224-238`)
-10. `runGates()` runs baseline → evidence → scope → acceptance → review, short-circuiting on the first failing gate (`src/gates/run-gates.ts:27-72`)
+10. `runGates()` runs the mandatory deterministic battery, then enabled acceptance and review concurrently; see the execution and selected/full-suite rules above (`src/gates/run-gates.ts`).
 11. All gates pass → `mergeTask()` merges the task branch into the integration branch through a serialized merge queue (`mergeSerial`, `src/run/daemon.ts:80-84`, `src/run/merge.ts:28-41`); task status becomes `done`
 12. Any gate fails → escalation ladder step (`retry` → `escalate` channel → `consult` → `human`); a `consult()` call can also fire directly on stall or merge conflict (`src/run/daemon.ts:294-315`, `src/run/consult.ts:52-81`)
 13. Every state transition is appended to `journal.jsonl` (`src/run/journal.ts:58-61`); on run end, kept panes close, an operator notification fires, and a `RunSummary` is returned (`src/run/daemon.ts:338-350`)
@@ -279,7 +324,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 ## Architectural Constraints
 
 - **Threading:** single-threaded Node event loop throughout; task concurrency is cooperative async dispatch (an `inflight` `Map<taskId, Promise<void>>` raced with `Promise.race`), not worker threads or child-process parallelism at the daemon level (`src/run/daemon.ts:318-336`)
-- **Global state:** one module-level mutable counter, `consultSeq` in `src/run/consult.ts:50`, used only to keep consult pane names unique within a process; no other module-level singletons detected
+- **Global state:** module-level counters/caches require explicit lifetimes. The cockpit's `borrowRuntimeTimeline` in `src/tui/cockpit/live-runtime.tsx` shares a reference-counted performance observer across mounts and disconnects after the last release; one observer quitting must not disable another.
 - **Merge serialization:** concurrent tasks can finish gating at the same time, but merges into the shared integration worktree are forced through one promise chain (`mergeSerial`, `src/run/daemon.ts:79-84`) because two simultaneous `git merge` invocations in the same worktree are not safe
 - **herdr availability is env-gated, not feature-detected per call:** `HerdrDriver.available()` is a single `process.env.HERDR_ENV === "1"` check (`src/drivers/herdr.ts:11-13`); `pickDriver()` uses it once at startup to choose herdr vs subprocess for the whole run, never mid-run
 - **Environment is asymmetric across a run, and which side inherits it depends on the driver (OBS-542):** the two halves of a run are seeded differently, and nothing reconciles them. Gate commands and `command:`/`test:` acceptance oracles are children of the daemon — `shell()` spawns them with `{...process.env}` minus the routing seams (`src/run/git.ts:70-79`), so they inherit whatever the daemon was launched with (`set -a; . .env.test` before `tickmarkr run` reaches every one of them). A **herdr** worker runs in a pane whose *ambient* environment is fresh — none of the daemon's exports reach it — carrying only what the seed line writes explicitly (`src/drivers/herdr.ts:547-556`): the run's workspace id, the pane's identity, and the `herdrSealShellPrefix()` seal, which exports `VITEST_MAX_FORKS` (the daemon's own value when the operator set one) and unsets the herdr control vars (`src/drivers/subprocess.ts:26-38`). That fork cap is the one daemon value that crosses; a secret, a token, or an exported `PATH` edit does not, by deliberate design. A **subprocess** worker inherits the daemon's environment wholesale, minus the sealed herdr control vars (`src/drivers/subprocess.ts:69-73`). Which of those two worker seams serves a graph is known only at **run start**: `pickDriver()` resolves `auto` against `HERDR_ENV` once, when the daemon starts (`src/drivers/index.ts:6-13`), so compile cannot know it and no spec can declare it. Consequence: an acceptance criterion demanding a credentialed worker-side observation is satisfiable under the subprocess driver and impossible under herdr, while the byte-identical command inside a `command:` oracle passes under both — same repo, same worktree, same commit, opposite outcome decided by which seam executes it.
@@ -332,4 +377,4 @@ Side modules (CLI-facing, not in the dispatch loop):
 
 ---
 
-*Architecture analysis: 2026-07-22*
+*Cockpit and gate execution checked against source: 2026-09-07; other subsystem analysis retains its earlier scope.*

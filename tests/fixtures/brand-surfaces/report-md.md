@@ -17,6 +17,10 @@
 - **consults:** 1
 - **escalations:** 0
 
+## Channels
+
+- **fake:fake-1** — worker: 1, review: 0, consult: 0; tokens: unknown; money: unknown
+
 ## Audit trail
 
 ## T1

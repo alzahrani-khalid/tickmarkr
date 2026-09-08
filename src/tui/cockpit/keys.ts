@@ -28,6 +28,10 @@ export type RunKeyEvent = {
     readonly escape?: boolean;
     readonly backspace?: boolean;
     readonly delete?: boolean;
+    readonly pageUp?: boolean;
+    readonly pageDown?: boolean;
+    readonly shift?: boolean;
+    readonly meta?: boolean;
     readonly ctrl?: boolean;
   };
 };
@@ -884,4 +888,33 @@ export function dispatchSetupKey(
   bindings: readonly SetupKeyBinding[] = SETUP_KEY_BINDINGS,
 ): SetupInteractionState | undefined {
   return resolveSetupKeyBinding(bindings, event)?.apply(state, event);
+}
+
+/** Installed FINAL actions, shared by shell dispatch, help and pointer buttons. */
+export const SHELL_BINDINGS = [
+  { key: "1", label: "Home", action: "home" },
+  { key: "4", label: "Run", action: "run" },
+  { key: "5", label: "Evidence", action: "evidence" },
+  { key: "Tab", label: "Focus", action: "focus" },
+  { key: "Enter", label: "Open", action: "open" },
+  { key: "a", label: "Actions", action: "actions" },
+  { key: "/", label: "Filter", action: "filter" },
+  { key: "e", label: "Export", action: "export" },
+  { key: "f", label: "Follow", action: "follow" },
+  { key: "PageUp/PageDown", label: "Page", action: "page" },
+  { key: "?", label: "Keys", action: "help" },
+  { key: "q", label: "Quit", action: "quit" },
+  { key: "+", label: "Widen shortcuts", action: "widen" },
+  { key: "-", label: "Narrow shortcuts", action: "narrow" },
+] as const;
+
+/** Advertise only installed operations with a target in this view. */
+export function shellBindings(context: { view: string; evidenceSection?: number; canOpen?: boolean; canResize?: boolean }) {
+  return SHELL_BINDINGS.filter(binding => {
+    if (binding.action === "open") return context.canOpen !== false && (context.view !== "evidence" || !context.evidenceSection);
+    if (binding.action === "widen" || binding.action === "narrow") return context.canResize === true;
+    if (binding.action === "export") return context.view === "evidence";
+    if (binding.action === "filter" || binding.action === "follow") return context.view === "evidence" && !context.evidenceSection;
+    return true;
+  });
 }

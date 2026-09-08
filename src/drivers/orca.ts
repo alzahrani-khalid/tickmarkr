@@ -4,7 +4,7 @@ import { shq } from "../adapters/types.js";
 import { createWorktree, sh, type ShResult } from "../run/git.js";
 import { Journal, type JournalEvent } from "../run/journal.js";
 import { MAX_BUF } from "./subprocess.js";
-import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
+import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
 // Orca (onorca.dev) as a third execution surface beside herdr and subprocess. tickmarkr keeps
 // worktrees, routing, gates, journal and merges; orca supplies visible terminals only. Everything
@@ -1111,15 +1111,41 @@ export class OrcaDriver implements ExecutorDriver {
     }
   }
 
-  async narrator(cwd: string, command: string, runId?: string): Promise<Slot> {
+  async narrator(_cwd: string, _command: string, runId?: string): Promise<Slot> {
     if (!runId) throw new OrcaError("create", "Orca narrator requires a run identity", "");
-    const slot = await this.slot(
-      cwd,
-      formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }),
-      { owned: { role: "watch", taskId: "run", attempt: 0, runId } },
-    );
-    await this.run(slot, command);
-    return slot;
+    // The recorded Orca API can create a tab but provides no right/no-focus
+    // placement receipt. Creating one would advertise a board we did not place.
+    throw new OrcaError("create", "Orca narrator placement unsupported: right/no-focus board placement is not available", "");
+  }
+
+  async focus(target: FocusTarget): Promise<FocusResult> {
+    const { slot, runId, taskId, attempt } = target;
+    const cwd = canonicalWorktreePath(slot.cwd);
+    if (slot.name !== formatOwnedName({ role: "worker", taskId, attempt, runId })) {
+      return { status: "foreign", reason: "Recorded run/task/attempt ownership does not match" };
+    }
+    try {
+      const env = await this.listAll(cwd);
+      const rows = env.result.terminals;
+      const layouts = env.result.visualLayouts;
+      if (!Array.isArray(rows) || !Array.isArray(layouts)) return { status: "unsupported", reason: "Cannot verify Orca terminal ownership" };
+      const handles: string[] = [];
+      for (const layout of layouts) {
+        if (typeof layout !== "object" || layout === null) continue;
+        const lo = layout as Record<string, unknown>;
+        if (!sameWorktree(terminalWorktree(lo), cwd)) continue;
+        const tabs: unknown[] = [];
+        collectTabs(lo.root, tabs);
+        for (const tab of tabs) {
+          if (typeof tab === "object" && tab !== null && str((tab as Record<string, unknown>).title) === slot.name) collectPaneHandles((tab as Record<string, unknown>).panes, handles);
+        }
+      }
+      if (handles.length !== 1) return { status: rows.length ? "foreign" : "closed", reason: "No unique owned terminal in the recorded worktree" };
+      const matches = rows.filter(row => typeof row === "object" && row !== null && str(row.handle) === handles[0] && sameWorktree(terminalWorktree(row), cwd));
+      if (matches.length !== 1) return { status: "foreign", reason: "Terminal worktree ownership is unverified" };
+      if (matches[0].connected === false || matches[0].orphaned === true) return { status: "closed", reason: "Recorded terminal is no longer running; open task evidence" };
+      return { status: "unsupported", reason: "Owned terminal verified; this Orca API has no focus operation. Open task evidence with Enter" };
+    } catch (error) { return { status: "unsupported", reason: `Cannot verify Orca focus target: ${String(error)}` }; }
   }
 
   async project(taskId: string, state: "in-progress" | "in-review" | "completed"): Promise<void> {

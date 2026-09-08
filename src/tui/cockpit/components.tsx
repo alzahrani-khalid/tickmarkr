@@ -1,9 +1,12 @@
 import { Box, Text } from "ink";
-import { Children, type ReactElement, type ReactNode } from "react";
+import { Children, createContext, useContext, useCallback, useId, useLayoutEffect, useState, type ReactElement, type ReactNode } from "react";
 import { GLYPHS } from "../../brand.js";
 import {
   COCKPIT_DATA_RAMP,
   COCKPIT_INKS,
+  SHELL_PALETTE,
+  type ShellColourMode,
+  type ShellPalette,
   TEXT_EMPHASIS_TOKENS,
 } from "./theme.js";
 import { SPARKLINE_BUCKET_WINDOW } from "./derive.js";
@@ -24,6 +27,46 @@ import {
  * no longer imported here.
  */
 import { cellWidth as stringWidth, sliceCells } from "./width.js";
+
+/** The consolidated shell opts in; legacy print/capture consumers retain their presentation. */
+export const ShellPresentation = createContext(false);
+export const ShellTheme = createContext<{
+  readonly mode: ShellColourMode;
+  readonly palette: ShellPalette;
+}>({ mode: "truecolor", palette: SHELL_PALETTE });
+
+/** Consecutive leaf grids may share a row at the shell's narrower breakpoint.
+ * Registration counts children, not labels or fixture identities; the leaves
+ * keep supplying the actual tiles and their input controllers. */
+const GridFlow = createContext<{
+  width: number; columns: number; rowHeight: number;
+  groups: readonly { id: string; count: number }[];
+  register: (id: string, count: number) => () => void;
+} | undefined>(undefined);
+const InlineTileTitle = createContext(0);
+export function ShellGridFlow({ width, columns, rowHeight, children }: {
+  width: number; columns: number; rowHeight: number; children: ReactNode;
+}) {
+  const [groups, setGroups] = useState<readonly { id: string; count: number }[]>([]);
+  const register = useCallback((id: string, count: number) => {
+    setGroups(old => [...old.filter(group => group.id !== id), { id, count }]);
+    return () => setGroups(old => old.filter(group => group.id !== id));
+  }, []);
+  return <GridFlow.Provider value={{ width, columns, rowHeight, groups, register }}>{children}</GridFlow.Provider>;
+}
+
+/** Data visuals retain their measured ramp in truecolor and the explicit
+ * reduced-color mapping; legacy printed consumers keep their original ink. */
+function useDataColour() {
+  const compact = useContext(ShellPresentation);
+  const shell = useContext(ShellTheme);
+  return (hex: string) => !compact || shell.mode === "truecolor"
+    ? hex
+    : shell.mode === "none" ? undefined : shell.palette.passed;
+}
+
+/** The shell observes the leaf's selected original identity, including removal. */
+export const ShellJournalSelection = createContext<((id: string | undefined) => void) | undefined>(undefined);
 
 const SPARKLINE_GLYPHS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
 
@@ -96,9 +139,11 @@ export function BodyText({
   children: ReactNode;
   emphasis?: TextEmphasis;
 }): ReactElement {
+  const compact = useContext(ShellPresentation);
+  const shell = useContext(ShellTheme);
   const token = TEXT_EMPHASIS_TOKENS[emphasis];
   return (
-    <Text bold={token.weight === "bold"} dimColor={token.dimmed}>
+    <Text wrap={compact ? "truncate-end" : "wrap"} color={compact && shell.mode !== "none" ? shell.palette.text : undefined} bold={token.weight === "bold"} dimColor={token.dimmed}>
       {children}
     </Text>
   );
@@ -331,11 +376,24 @@ function statePresentation(state: ComponentState): {
 }
 
 export function StateGlyph({ state }: { state: ComponentState }): ReactElement {
-  const presentation = statePresentation(state);
-  return (
-    <Text color={presentation.color} dimColor={presentation.dimmed}>
+  const compact = useContext(ShellPresentation);
+  const shell = useContext(ShellTheme);
+  const presentation = compact ? {
+    active: { glyph: "● running", color: shell.palette.running },
+    inactive: { glyph: "- disabled", color: shell.palette.disabled },
+    pass: { glyph: "✓ passed", color: shell.palette.passed },
+    fail: { glyph: "✗ terminal failure", color: shell.palette.failure },
+    warn: { glyph: "! human park", color: shell.palette.human },
+    neutral: { glyph: "? unknown", color: shell.palette.unknown },
+  }[state] : statePresentation(state);
+  const glyph = (
+    <Text color={compact && shell.mode === "none" ? undefined : presentation.color} dimColor={"dimmed" in presentation ? presentation.dimmed : undefined}>
       {presentation.glyph}
     </Text>
+  );
+  if (!compact) return glyph;
+  return (
+    <Box flexShrink={0}>{glyph}</Box>
   );
 }
 
@@ -352,11 +410,29 @@ export function Panel({
   flexGrow?: number;
   children: ReactNode;
 }): ReactElement {
+  const compact = useContext(ShellPresentation);
+  const shell = useContext(ShellTheme);
+  const inlineTitle = useContext(InlineTileTitle);
   const content = Children.map(children, (child) =>
     typeof child === "string" || typeof child === "number"
       ? <BodyText>{child}</BodyText>
       : child
   );
+
+  if (compact && inlineTitle) {
+    const items = Children.toArray(content);
+    return <Box flexDirection="column" flexGrow={1} flexShrink={0}>
+      <Box flexDirection="row" height={1} flexShrink={0} overflow="hidden">
+        <Box flexShrink={0}><Text color={shell.mode === "none" ? undefined : shell.palette.chrome} bold>{title.replace(" (historical)", "")} </Text></Box>
+        <Box flexShrink={1} overflow="hidden">{items[0]}</Box>
+      </Box>
+      {inlineTitle > 1 && items.slice(1)}
+    </Box>;
+  }
+  if (compact) return <Box flexDirection="column" flexShrink={0} flexGrow={flexGrow} width={width}>
+    <Text wrap="truncate-end" color={shell.mode === "none" ? undefined : shell.palette.chrome} bold>{title}</Text>
+    <Box flexDirection="column" flexShrink={0}>{content}</Box>
+  </Box>;
 
   return (
     <Box
@@ -397,10 +473,29 @@ export function CockpitGrid({
   allocation?: BandAllocationOptions;
 }): ReactElement {
   const items = Children.toArray(children);
+  const flow = useContext(GridFlow);
+  const id = useId();
+  const register = flow?.register;
+  useLayoutEffect(() => register?.(id, items.length), [register, id, items.length]);
   const widths = columns !== undefined
       && columnContents?.length === items.length
     ? allocateBandColumns(columns, columnContents, allocation)
     : undefined;
+  if (flow) {
+    const groupIndex = flow.groups.findIndex(group => group.id === id);
+    const start = flow.groups.slice(0, Math.max(0, groupIndex)).reduce((sum, group) => sum + group.count, 0);
+    const firstRow = Math.floor(start / flow.columns);
+    const tileWidth = Math.floor((flow.width - flow.columns + 1) / flow.columns);
+    const height = (Math.ceil((start + items.length) / flow.columns) - firstRow) * flow.rowHeight;
+    return <Box width={flow.width} height={height} flexShrink={0} marginTop={start % flow.columns ? -flow.rowHeight : 0}>
+      <InlineTileTitle.Provider value={flow.columns < 3 || flow.rowHeight === 1 ? flow.rowHeight : 0}>
+        {items.map((child, index) => <Box key={index} position="absolute"
+          marginLeft={((start + index) % flow.columns) * (tileWidth + 1)}
+          marginTop={(Math.floor((start + index) / flow.columns) - firstRow) * flow.rowHeight}
+          width={tileWidth} height={flow.rowHeight} overflow="hidden" flexDirection="column">{child}</Box>)}
+      </InlineTileTitle.Provider>
+    </Box>;
+  }
   return (
     <Box
       flexDirection="row"
@@ -436,6 +531,7 @@ export function Sparkline({
 }: {
   samples: readonly (number | null)[];
 }): ReactElement {
+  const dataColour = useDataColour();
   const buckets = samples
     .slice(-SPARKLINE_BUCKET_WINDOW)
     .map((sample) =>
@@ -457,7 +553,7 @@ export function Sparkline({
         return (
           <Text
             key={`${index}:${sample}`}
-            color={ink.hex}
+            color={dataColour(ink.hex)}
           >
             {SPARKLINE_GLYPHS[level]}
           </Text>
@@ -495,6 +591,7 @@ export function ProgressMeter({
   value: number;
   width?: number;
 }): ReactElement {
+  const dataColour = useDataColour();
   const safeWidth = Math.max(1, Math.floor(width));
   const percentage = Math.min(100, Math.max(0, Number.isFinite(value) ? value : 0));
   const filled = Math.round((percentage / 100) * safeWidth);
@@ -511,7 +608,7 @@ export function ProgressMeter({
       aria-role="progressbar"
       aria-label={`${valueLabel}% complete`}
     >
-      <Text color={COCKPIT_DATA_RAMP[0].hex}>
+      <Text color={dataColour(COCKPIT_DATA_RAMP[0].hex)}>
         {"█".repeat(filled)}
       </Text>
       <Text dimColor>{"░".repeat(safeWidth - filled)}</Text>
@@ -645,11 +742,17 @@ export function JournalRowPanel({
    */
   hover?: number;
 }): ReactElement {
+  const dataColour = useDataColour();
+  const reportSelection = useContext(ShellJournalSelection);
+  const compact = useContext(ShellPresentation);
+  const selectedId = selection === undefined ? undefined : rows[selection]?.id;
+  useLayoutEffect(() => { reportSelection?.(selectedId); }, [selectedId, reportSelection]);
   return (
     <Panel title={title} focused={focused} width={width}>
       {rows.map((row, index) => (
         <Box
           key={row.id}
+          ref={compact ? node => { if (node) node.attributes.shellEvidence = row.id; } : undefined}
           flexDirection="row"
           flexWrap="nowrap"
           height={1}
@@ -666,7 +769,7 @@ export function JournalRowPanel({
           )}
           {index === hover
             ? (
-              <Text inverse color={COCKPIT_DATA_RAMP[0].hex}>
+              <Text inverse color={dataColour(COCKPIT_DATA_RAMP[0].hex)}>
                 {row.text}
               </Text>
             )

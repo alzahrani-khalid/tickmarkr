@@ -1,6 +1,6 @@
 import { userInfo } from "node:os";
 import { GATE_NAMES } from "../../graph/schema.js";
-import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE } from "../../run/journal.js";
+import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
 
 export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
 export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
@@ -27,6 +27,91 @@ export function approvalDispositionForRelease(release: unknown): ApprovalDisposi
   return "dispatch";
 }
 import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
+
+/** The closed verb set every decision surface may name. Nothing outside it reaches this command. */
+export const DECISION_VERBS = ["approve", "waive", "uphold", "recheck"] as const;
+export type DecisionVerb = (typeof DECISION_VERBS)[number];
+
+/** The newest park a decision binds to, read the one way this command reads it. */
+export interface NewestPark {
+  /** Index into the journal's event array; `line` is the physical 1-based journal line. */
+  index: number;
+  line: number;
+  ts: string | undefined;
+  /** The daemon-recorded kind (task-human data.kind), never inferred from prose. */
+  kind: string | undefined;
+  reason: string | undefined;
+  /** The newest failed gate before the park — the gate a waive would satisfy. */
+  failedGate: string | undefined;
+  /** A pre-dispatch human gate whose reason marks it permanent by design (see isTombstonePark). */
+  tombstone: boolean;
+}
+
+/**
+ * There is no closed park kind for a declaration-shaped retirement, so the evidence is the one the
+ * daemon recorded: a pre-dispatch human-gate park whose reason carries the task's own title, where the
+ * spec declares the tombstone. Read narrowly on purpose — every other kind is actionable regardless of prose.
+ */
+export function isTombstonePark(kind: string | undefined, reason: string | undefined): boolean {
+  // Declaration retirements use an explicit title marker: either an em-dash-delimited
+  // `— tombstone` suffix or the canonical `tombstone, never dispatched` phrase. A task title
+  // that merely discusses tombstones is still an ordinary, actionable human gate.
+  return kind === "human-gate"
+    && /(?:\s—\s+tombstone\b|\btombstone,\s*never dispatched\b)/iu.test(reason ?? "");
+}
+
+export function newestPark(
+  events: readonly JournalEvent[],
+  taskId: string,
+  /** Physical zero-based source indexes corresponding one-for-one with `events`. */
+  sourceIndexes?: readonly number[],
+): NewestPark | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.event !== "task-human" || e.taskId !== taskId) continue;
+    const kind = typeof e.data.kind === "string" ? e.data.kind : undefined;
+    const reason = typeof e.data.reason === "string" ? e.data.reason : undefined;
+    return {
+      index: i, line: (sourceIndexes?.[i] ?? i) + 1, ts: typeof e.ts === "string" ? e.ts : undefined, kind, reason,
+      failedGate: failedGateForNewestPark(events, taskId, i), tombstone: isTombstonePark(kind, reason),
+    };
+  }
+  return undefined;
+}
+
+/** Parsed events paired with their immutable physical JSONL identities. */
+export function readJournalEvents(journal: Journal): { events: JournalEvent[]; sourceIndexes: number[] } {
+  const tracked = journal.readTracked();
+  return {
+    events: tracked.map((row) => row.raw as JournalEvent),
+    sourceIndexes: tracked.map((row) => row.sourceIndex),
+  };
+}
+
+/**
+ * FINAL §3.3's decision menu as data: human-gate/attempt-cap/other non-gate parks → approve; infra →
+ * approve or recheck; review gate-fail → waive/uphold/recheck; other gate-fail → waive/recheck; a
+ * gate-fail park with no failed-gate evidence, or a tombstone → nothing (a diagnostic, never a
+ * fabricated verb). The refusals in `approve` below enforce the same table; this is the one place a
+ * surface may read it from, so what a menu offers and what the command accepts cannot drift.
+ */
+export function permittedDecisionVerbs(park: Pick<NewestPark, "kind" | "failedGate" | "tombstone"> | undefined): readonly DecisionVerb[] {
+  if (!park || park.tombstone) return [];
+  if (park.kind === "gate-fail") {
+    if (park.failedGate === undefined) return [];
+    return park.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
+  }
+  if (park.kind === "infra") return ["approve", "recheck"];
+  return ["approve"];
+}
+
+/** The release marker this command appends for a verb on a park — the fact a read-back must match. */
+export function releaseForDecision(verb: DecisionVerb, park: Pick<NewestPark, "kind" | "failedGate">): string | undefined {
+  if (verb === "waive") return GATE_SATISFIED_RELEASE;
+  if (verb === "uphold") return REVIEW_UPHELD_RELEASE;
+  if (verb === "recheck") return RECHECK_RELEASE;
+  return park.kind === ATTEMPT_CAP_RELEASE ? ATTEMPT_CAP_RELEASE : undefined;
+}
 
 // GATE-08 (v1.12): approve a parked human gate so the run dispatches it — the live daemon owning this
 // run enacts the release at its next task boundary (v2.2 T3); with no live repository owner the next
@@ -129,19 +214,13 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
 
   // OBS-18: only the most recent task-human for this task decides whether this approval grants a
   // fresh attempt budget. The closed daemon-issued kind, never a human prose string, controls release.
-  const events = journal.read();
-  let lastHumanIndex = -1;
-  for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i]!.event === "task-human" && events[i]!.taskId === taskId) {
-      lastHumanIndex = i;
-      break;
-    }
-  }
-  const lastHuman = events[lastHumanIndex];
-  const capPark = lastHuman?.data.kind === ATTEMPT_CAP_RELEASE;
-  const gateFailPark = lastHuman?.data.kind === "gate-fail";
-  const infraPark = lastHuman?.data.kind === "infra";
-  const failedGate = gateFailPark ? failedGateForNewestPark(events, taskId, lastHumanIndex) : undefined;
+  const { events, sourceIndexes } = readJournalEvents(journal);
+  const park = newestPark(events, taskId, sourceIndexes);
+  const lastHuman = park === undefined ? undefined : events[park.index];
+  const capPark = park?.kind === ATTEMPT_CAP_RELEASE;
+  const gateFailPark = park?.kind === "gate-fail";
+  const infraPark = park?.kind === "infra";
+  const failedGate = gateFailPark ? park?.failedGate : undefined;
   if (gateFailPark && !failedGate) {
     throw new Error(`task ${taskId} is parked on gate-fail but has no failed gate result on the newest park — refusing to infer one`);
   }
@@ -191,6 +270,13 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     const choices = [`--waive (disposition waive-gate)`, `--recheck (disposition re-dispatch)`];
     if (failedGate === "review") choices.push(`--uphold (disposition fund-fixed-attempt)`);
     throw new Error(`task ${taskId} is parked on failed gate ${failedGate}; plain approve has disposition only for non-gate parks — pass ${choices.join(" or ")}`);
+  }
+
+  // A tombstone has no verb in permittedDecisionVerbs (the named decisions above already refused it
+  // as a non-gate park); the command enforces the same table for plain approve, so a surface that
+  // skips the helper still cannot release it.
+  if (park?.tombstone) {
+    throw new Error(`task ${taskId}'s newest park is a tombstone (${park.reason ?? "no reason"}) — permanent by design; no verb releases it`);
   }
 
   journal.append("task-approved", taskId, {
@@ -291,7 +377,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   return { runId, taskId, by: by ?? userInfo().username, reason, waive, uphold, recheck, reviewRoundCeiling };
 }
 
-function failedGateForNewestPark(events: ReturnType<Journal["read"]>, taskId: string, lastHumanIndex: number): string | undefined {
+function failedGateForNewestPark(events: readonly JournalEvent[], taskId: string, lastHumanIndex: number): string | undefined {
   for (let i = lastHumanIndex - 1; i >= 0; i -= 1) {
     const event = events[i]!;
     if (event.taskId !== taskId) continue;

@@ -90,4 +90,75 @@ When spawning consultants (agents gathering synthesis input for decisions like S
 3. **Plan** — run `tickmarkr plan`. Review the routing table, capability-floor warnings, and every human gate, including work that each gate blocks.
 4. **Run** — run `tickmarkr run`. Watch the run journal for its terminal events rather than polling agents, using the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800` — which takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict` and grades the run-end summary against every green clause for you. Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the agent session; do not turn them into proxy questions.
 5. **Verify and consolidate** — accept only a green run. A run is green when the run-end event exists in the journal, the tip verify is not "failed", and the summary's `failed`, `human`, `blocked` and `pending` buckets are all empty — a run with a parked task is partial, not green. Tickmarkr consolidates accepted task work on `tickmarkr/<runId>`; it never signs off to the main branch. A human may later merge that integration branch through the repository's normal release process.
-6. **Record** — write `tickmarkr report <runId> --md` beside the source spec and commit the execution record when the repository tracks those records. Then [stand down](#stand-down-mission-end-and-retirement).
+6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout. Redirect it explicitly beside the source spec (for example `tickmarkr report <runId> --md > feature.record.md`) and commit the execution record when the repository tracks those records. Then [stand down](#stand-down-mission-end-and-retirement).
+
+## Cockpit, parked decisions and printed twins
+
+The shipped cockpit is **1 Home, 4 Run, 5 Evidence**: `tickmarkr ui [runId]` defaults to
+Home on the latest journal, or empty Home with no run. `tickmarkr ui <runId> --view run`
+and `--view evidence` select delivered views; `tickmarkr ui --setup <runId>` opens Run
+Parks for that run. Fleet/Bootstrap and Plan/Health are follow-ons; keys 2/3/6 are not
+installed. Continue using `fleet`, `init`, `plan` and `doctor` as CLI workflows.
+
+Walk the recorded partial-human-park case before declaring green: **1/3 merged**, human
+T2, blocked T3, tip passed is **PARTIAL**. T2 is a `humanGate: true` park before dispatch.
+In Run select T2, press `a` Actions, choose Approve with Enter, then read the confirmation's
+run/task, original park `#L`, actor/reason, exact argv, consequence and enactor. Only `y`
+confirms; `n`/Esc cancel; Enter never confirms. Read the receipt's appended `task-approved`
+line and actor/reason back from the journal. Approval records permission, never dispatch,
+a passed gate or task completion. With no live owner it says **approved; resume required**:
+exit the observer and run `tickmarkr resume <runId>` explicitly. A matching live daemon
+enacts at its next task boundary; if a different live run owns the repository lock, wait
+for that run to end before resuming this one.
+
+For a non-TTY decision, the same command is
+`tickmarkr approve <runId> T2 --by operator --reason 'ready to proceed'`; check its receipt
+and explicitly resume. Preserve resume refusals and repair the named source/config issue
+(including deny/prefer conflicts); never edit the compiled graph to force a result. Resume
+makes CURRENT TIP PENDING; historical GATES RAN does not prove completion. The completed
+case has 3/3 recorded merges, a latest run-end, a nonfailed known tip result and empty
+`failed`, `human`, `blocked`, `pending` buckets. A mismatched graph is “not comparable.”
+
+Run offers only validated park verbs: human/attempt-cap/other non-gate parks allow approve;
+infra allows approve or `--recheck`; review gate-fail allows `--waive`, `--uphold` or
+`--recheck`; other gate-fail allows waive/recheck. Waive satisfies only the identified
+failed gate, uphold funds a fixed attempt carrying review findings, and recheck reruns the
+declared battery without satisfying a gate. Attempt-cap approval resets the budget while
+retaining routing exclusions. Tombstones and failures without identified gate evidence
+are diagnostic-only. Decisions cannot be undone; stale or duplicate decisions refuse.
+
+Use `tickmarkr status <runId>` and `tickmarkr status <runId> --oneline` for preserved
+snapshots. `tickmarkr status <runId> --watch` opens Run on a TTY and uses line output on
+non-TTY; `--watch --plain` keeps the line/ANSI fallback even on a TTY. `--watch --events`
+replays and follows projected decision JSON documents on stdout; `--jsonl` and
+`--decision-events` are aliases. Keep stderr keepalives separate, never `2>&1`; raw
+`journal.jsonl` remains distinct. Webhooks require explicit opt-in. `report` retains text,
+learning preview and comparison warnings; `report --md` stays stdout, `--compare
+<baseline-runId>` compares records, `--bundle <path>` writes a proof bundle, and `stats`
+reports all runs without a run ID. Keep `fleet --print` and `fleet --why` separate.
+Absent usage/cost evidence remains “not measurable.”
+
+Manual UI keeps a receipt at run-end and observes a later resume of that same run. The
+daemon-owned board by default gracefully stops its own watch presence before closing its owned pane;
+unconfirmed cleanup is reported; `visibility.keepPanes: forever` preserves panes. It preserves Herdr grouping, short titles and placement
+beside the caller without taking focus. `q`, Ctrl-C and SIGTERM restore raw/pointer/title/
+alternate-screen state and release only this observer's presence. `?` opens shortcuts,
+Tab/Shift-Tab traverse visible focus, and Esc closes the deepest overlay. Text input keeps
+`q1?` literal. Evidence retains original `#L` pointers and full verdict paging with stable
+selection while Follow is off; Run's `o` focuses only a verified owned pane, otherwise
+showing its evidence diagnostic. Missing historical reviewer-floor metadata stays unknown.
+
+For inert guidance use `tickmarkr ui --help`, `tickmarkr eval --help`,
+`tickmarkr unlock --help` and `tickmarkr profile reset --help`. Before `--`, help returns
+without UI/probes/writes; after `--`, arguments are literal data. Displayed examples do
+not execute. Recovery uses `unlock <runId>` for a matching dead lock or `unlock --garbage`
+for malformed bytes, with confirmation (`--yes` for non-TTY) and identity recheck; live,
+inaccessible or changed holders refuse. `doctor --cached`, `--probe-preflight`,
+`--fix-only` and `--refresh-catalog` distinguish cached reads, budget disclosure, local
+repair and catalog refresh; default doctor and `--fix` still probe. `scope <intent-file>
+--preview` performs no probes, model calls or writes; authoring requires confirmation or
+`--yes`. These actions remain CLI entries until their follow-on views ship.
+
+Keep this skill's canonical identity `tickmarkr-loop`; sibling skills link to this
+walkthrough. In this repository `skills/` is canonical and installed `.claude/skills/`
+files resolve to it; change the canonical source, never create a second help skill.

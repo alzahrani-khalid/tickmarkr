@@ -1,8 +1,9 @@
 import {
-  mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, type Stats,
+  existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type Stats,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
+import { parseRunId } from "./journal.js";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 
 // SUP-01: supervision liveness as FILE STATE, not as a report — lock.ts's proven shape, one file per
@@ -148,9 +149,9 @@ const supervisionPresencePath = (repoRoot: string, tier: SupervisionTier, id: st
   join(supervisionDir(repoRoot), `${presencePrefix(tier)}${id}`);
 
 /** Every presence file on this tier, by name. Missing directory ⇒ nobody is present. */
-const presenceNames = (repoRoot: string, tier: SupervisionTier): string[] => {
+const presenceNames = (repoRoot: string, tier: SupervisionTier): string[] | undefined => {
   try { return readdirSync(supervisionDir(repoRoot)).filter((n) => n.startsWith(presencePrefix(tier))); }
-  catch { return []; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? [] : undefined; }
 };
 
 /**
@@ -160,12 +161,14 @@ const presenceNames = (repoRoot: string, tier: SupervisionTier): string[] => {
 function stalePeersIfLast(repoRoot: string, tier: SupervisionTier, id: string, now = Date.now()): string[] | undefined {
   const own = `${presencePrefix(tier)}${id}`;
   const stale: string[] = [];
-  for (const name of presenceNames(repoRoot, tier)) {
+  const peers = presenceNames(repoRoot, tier);
+  if (!peers) return undefined;
+  for (const name of peers) {
     if (name === own) continue;
     try {
       if (now - statSync(join(supervisionDir(repoRoot), name)).mtimeMs <= SUPERVISION_STALE_MS) return undefined;
       stale.push(name);
-    } catch { /* a vanished peer needs no cleanup and is not evidence of a live watcher */ }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
   }
   return stale;
 }
@@ -294,6 +297,9 @@ export function beatSupervision(
 /** Handle a watcher holds for as long as it is supervising; disarm stands it down and is idempotent. */
 export interface ArmedSupervision {
   disarm: () => void;
+  readonly id?: string;
+  /** True only after this handle removed its own presence. */
+  released?: () => boolean;
 }
 
 // THE WATCHER-FACING ENTRY POINT — the loop SUPERVISION_BEAT_MS actually drives. A supervising seat
@@ -331,22 +337,28 @@ export function armSupervision(
   // Presence is refreshed with the beat, so it ages by the same clock and needs no separate loop.
   const mark = () => {
     try {
-      writeSupervisionBeat(repoRoot, tier, seat, id); // creates the directory presence is written into
+      tickmarkrDir(repoRoot);
+      mkdirSync(dirname(presence), { recursive: true });
       writeFileSync(presence, JSON.stringify({ tier, exitedWriterPid: process.pid, id }) + "\n");
+      writeSupervisionBeat(repoRoot, tier, seat, id);
     } catch { /* repo gone / disk full / no seat — the tier ages out rather than crashing its watcher */ }
   };
   mark();
   const timer = setInterval(mark, beatMs);
   timer.unref();
   let stoodDown = false;
+  let released = false;
   return {
+    id,
+    released: () => released,
     // Stand down: stop beating AND say so. Idempotence lets a watcher safely share cleanup across
     // multiple exit paths; the recorded instant belongs to the first stand-down.
     disarm: () => {
       if (stoodDown) return;
       stoodDown = true;
       clearInterval(timer);
-      try { rmSync(presence, { force: true, recursive: true }); } catch { /* ages out on its own */ }
+      try { rmSync(presence, { force: true }); released = !existsSync(presence); } catch { /* no acknowledgement: ages out */ }
+      if (!released) return;
       // The marker speaks for the TIER, so only the last watcher out may write one: a peer still
       // present means the tier is not down, and saying it is would render that live board's own tier
       // DISARMED. The snapshot also fixes the cleanup set: a board arming after this decision receives
@@ -366,11 +378,7 @@ export function armSupervision(
         }) + "\n");
         renameSync(tmp, p);
       } catch { /* unrecordable stand-down ages out as STALE — pessimistic, which is the safe way to fail */ }
-      // Sweep only stale names in the pre-publication snapshot. Re-reading here used to catch and
-      // delete a newer board that armed between the peer check and this older board's rename.
-      for (const name of stalePeers) {
-        try { rmSync(join(supervisionDir(repoRoot), name), { force: true, recursive: true }); } catch { /* next sweep */ }
-      }
+
     },
   };
 }
@@ -512,7 +520,8 @@ export function supervisionStatus(repoRoot: string, tier: SupervisionTier, now =
   const beatOutranksStandDown = standDown !== "NONE" && typeof beat === "object" && (
     beat.mtimeMs > standDown.mtimeMs || (
       now - beat.mtimeMs <= SUPERVISION_STALE_MS &&
-      beat.armId !== undefined && standDown.armId !== undefined && beat.armId !== standDown.armId
+      beat.armId !== undefined && standDown.armId !== undefined && beat.armId !== standDown.armId &&
+      existsSync(supervisionPresencePath(repoRoot, tier, beat.armId))
     )
   );
   if (standDown !== "NONE" && !beatOutranksStandDown) {
@@ -539,3 +548,95 @@ export const supervisionText = (tiers: readonly TierLiveness[], divider = " · "
     `${t.clearOwedSince ? ` CLEAR-OWED since ${t.clearOwedSince}` : ""}` +
     `${t.clearOwedUnreadable ? " CLEAR-OWED unreadable" : ""}`
   ).join(divider)}`;
+
+
+/** A board's durable identity is independent of its short title and of other observers. */
+export interface WatchBoardOwner {
+  repo: string; runId: string; driver: string; workspace: string; pane: string; name: string;
+  token: string; pid?: number; armId?: string;
+}
+export const WATCH_OWNER_ENV = "TICKMARKR_WATCH_OWNER";
+const boardPath = (repo: string, runId: string) => join(supervisionDir(repo), `watch-board.${parseRunId(runId)}.json`);
+const boardMessagePath = (owner: WatchBoardOwner, kind: "stop" | "ack") => {
+  if (!/^[a-f0-9-]{36}$/.test(owner.token)) throw new Error("invalid watch owner token");
+  return join(supervisionDir(owner.repo), `watch-board.${owner.token}.${kind}`);
+};
+function atomicRecord(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try { writeFileSync(tmp, JSON.stringify(value) + "\n"); renameSync(tmp, path); }
+  finally { rmSync(tmp, { force: true }); }
+}
+export function readWatchBoard(repo: string, runId: string): WatchBoardOwner | undefined {
+  try {
+    const owner = JSON.parse(readFileSync(boardPath(repo, runId), "utf8")) as WatchBoardOwner;
+    if (owner.repo !== realpathSync(repo) || owner.runId !== runId ||
+        typeof owner.name !== "string" || typeof owner.driver !== "string" ||
+        typeof owner.workspace !== "string" || typeof owner.pane !== "string" ||
+        !/^[a-f0-9-]{36}$/.test(owner.token)) return undefined;
+    return owner;
+  } catch { return undefined; }
+}
+/** Only a driver that has just verified placement may reserve this binding. */
+export function reserveWatchBoard(owner: Omit<WatchBoardOwner, "repo" | "token" | "pid" | "armId"> & { repo: string }): WatchBoardOwner {
+  const record = { ...owner, repo: realpathSync(owner.repo), token: randomUUID() };
+  atomicRecord(boardPath(record.repo, record.runId), record);
+  return record;
+}
+export function requestWatchBoardStop(owner: WatchBoardOwner): void {
+  if (readWatchBoard(owner.repo, owner.runId)?.token !== owner.token) throw new Error("watch ownership changed; cleanup protected");
+  atomicRecord(boardMessagePath(owner, "stop"), { token: owner.token });
+}
+export function watchBoardAcknowledged(owner: WatchBoardOwner): boolean {
+  try {
+    const current = readWatchBoard(owner.repo, owner.runId);
+    const ack = JSON.parse(readFileSync(boardMessagePath(owner, "ack"), "utf8"));
+    return current?.token === owner.token && typeof current.armId === "string" &&
+      ack.token === owner.token && ack.armId === current.armId && ack.pid === current.pid &&
+      !existsSync(supervisionPresencePath(owner.repo, "watch", current.armId));
+  } catch { return false; }
+}
+export async function stopWatchBoard(owner: WatchBoardOwner, time = {
+  now: () => Date.now(), sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+}, timeoutMs = 5000): Promise<void> {
+  requestWatchBoardStop(owner);
+  const deadline = time.now() + timeoutMs;
+  while (!watchBoardAcknowledged(owner)) {
+    if (time.now() >= deadline) throw new Error(`watch cleanup unacknowledged for ${owner.name}; owned pane protected`);
+    await time.sleep(Math.min(100, deadline - time.now()));
+  }
+}
+/** The UI alone publishes acknowledgement, after releasing its own presence. */
+export function observeNamedRun(repo: string, runId: string, env: NodeJS.ProcessEnv = process.env): {
+  stopRequested: () => boolean; close: () => void;
+} {
+  const armed = armWatchSupervision(repo);
+  let owner: WatchBoardOwner | undefined;
+  try {
+    const token = env[WATCH_OWNER_ENV];
+    if (token) {
+      const candidate = readWatchBoard(repo, runId);
+      if (!candidate || candidate.token !== token || candidate.pid !== undefined) throw new Error("watch ownership unknown; refusing narrator acknowledgement");
+      owner = { ...candidate, pid: process.pid, armId: armed.id };
+      atomicRecord(boardPath(repo, runId), owner);
+    }
+  } catch (error) { armed.disarm(); throw error; }
+  let closed = false;
+  return {
+    stopRequested: () => {
+      if (!owner) return false;
+      try { return JSON.parse(readFileSync(boardMessagePath(owner, "stop"), "utf8")).token === owner.token; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      armed.disarm();
+      if (!armed.released?.()) throw new Error("watch presence cleanup unacknowledged");
+      if (owner) {
+        if (readWatchBoard(repo, runId)?.token !== owner.token) throw new Error("watch owner changed before cleanup acknowledgement");
+        atomicRecord(boardMessagePath(owner, "ack"), { token: owner.token, armId: armed.id, pid: process.pid });
+      }
+    },
+  };
+}

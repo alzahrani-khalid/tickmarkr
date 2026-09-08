@@ -1,0 +1,24 @@
+tickmarkr 2.4.1 | RUN | run-screen-soak
+1 Home  4 Run  5 Evidence | content | 1–17/18 | 1 hidden
+────────────────────────────────────────────────────────────────────────────────
+│RUN / RUNNING                                                                 │
+│0/? merged | current-cycle tip PENDING | RUNNING | not comparable | snapsh    │
+│  Task state                bu te li ev sc ac re  latest attempt              │
+│❯ T1   running              -  -  -  -  -  -  -  attempt 0                    │
+│P pass · F fail · R running · - not run · D disabled · ? unknown | declara    │
+│SELECTED / T1                                                                 │
+│state running · attempt 0 · dispatches 1 · path unknown · pane unknown · a    │
+│outcome filter all (x cycles) · 7 of 7 gates shown                            │
+│- build      not run                                                          │
+│- test       not run                                                          │
+│- lint       not run                                                          │
+│- evidence   not run                                                          │
+│- scope      not run                                                          │
+│- acceptance not run                                                          │
+│- review     not run                                                          │
+│VERDICT / review · no verdict text                                            │
+│←→ gate · PageUp/PageDown page                                                │
+────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 0/? | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────

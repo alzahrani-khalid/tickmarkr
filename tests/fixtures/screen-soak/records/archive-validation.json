@@ -1,0 +1,53 @@
+{
+  "checkedAt": "2026-09-06T20:05:06.855Z",
+  "validatorSourceCommit": "0fe0125580a7c9430c3f028a1f6fce9f67eeb3d4",
+  "validatorSha256": "4cf2b0729b918e6304c16e9d64675a83c35560e4d3db4673f7cd08228de85f09",
+  "records": [
+    {
+      "path": "tests/fixtures/screen-soak/records/retry-static",
+      "sourceCommit": "dbfd81be5a537ef383064fd3411db0002627451c",
+      "pid": 43106,
+      "originalValidation": {
+        "ok": true,
+        "errors": [],
+        "lateGrowth": 83248
+      },
+      "validation": {
+        "ok": true,
+        "errors": [],
+        "lateGrowth": 83248
+      },
+      "hashes": {
+        "build.json": "4ac93951b0acd64582a8317c94e5e6ab7e6f7bdf4c947e2828427ff4b65780e1",
+        "metadata.json": "b82e86173768ca3a942216b0e86de201a461d4003452026b0edf8bfeb3b69df1",
+        "samples.jsonl": "2683f07e7c29b949b05d0c7c37ddcdf5e1df008122a0ace9ca81ceb2b2ff8cd5",
+        "result.json": "cdafb8ac592d8ec02585594837b1689adaf834d9006bb428f8e905b56fb169a1",
+        "journal.jsonl": "c17396e3b670b6e54153e14ea482a8d5aa5d06aed110d685ba702ba4a39efce9",
+        "last-frame.ansi": "e2ccac000c08cc2a154608b81a9d16706f2696e06b20b652afcecd444dacb790"
+      }
+    },
+    {
+      "path": "tests/fixtures/screen-soak/records/retry-growth",
+      "sourceCommit": "dbfd81be5a537ef383064fd3411db0002627451c",
+      "pid": 43159,
+      "originalValidation": {
+        "ok": true,
+        "errors": [],
+        "lateGrowth": 167056
+      },
+      "validation": {
+        "ok": true,
+        "errors": [],
+        "lateGrowth": 167056
+      },
+      "hashes": {
+        "build.json": "4ac93951b0acd64582a8317c94e5e6ab7e6f7bdf4c947e2828427ff4b65780e1",
+        "metadata.json": "070e51ea88ddd5a5b29dafa44bd0d2a55009313614f351aa3dc495ba5c4ef7a6",
+        "samples.jsonl": "77be3ab2d4e520d70e5e79a3ddde85731e7665716b50bab7b25aaa21e2f9e84e",
+        "result.json": "ba0d59e9c87d37b9cdcc337862b2b31ac2fa1de606960dd61413b382504b09cd",
+        "journal.jsonl": "218a1b5ce6c47365889f9afb0a6a18d7496da605102d7b4a77fd00244a18107e",
+        "last-frame.ansi": "e2ccac000c08cc2a154608b81a9d16706f2696e06b20b652afcecd444dacb790"
+      }
+    }
+  ]
+}

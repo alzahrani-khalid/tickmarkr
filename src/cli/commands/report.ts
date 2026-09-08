@@ -8,6 +8,14 @@ import { modelProvider } from "../../gates/review.js";
 import { buildProofBundle, gateDeclined } from "../../report/bundle.js";
 import { compareRuns } from "../../report/compare.js";
 import { estimateCosts, type ChannelCost } from "../../report/cost.js";
+import {
+  assignmentChannel,
+  buildOperatorRecord,
+  formatChannelMoney,
+  formatChannelTokens,
+  formatTokenUsage as fields,
+  totalTokens as total,
+} from "../../report/operator-record.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
 import { Journal, loadRoutingProfile, type JournalEvent, type TelemetryRow } from "../../run/journal.js";
 import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
@@ -15,28 +23,13 @@ import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
 const n = (x: number) => x.toLocaleString("en-US"); // explicit locale — CI/darwin flake guard
 const EM = "—";
 
-// TokenUsage fields that are actually present — filtered, never coalesced to zero (absent ⇒ unmetered).
-const fields = (u: TokenUsage): string => {
-  const parts = [`in ${n(u.input)}`, `out ${n(u.output)}`];
-  if (u.cacheRead !== undefined && u.cacheWrite !== undefined) parts.push(`cache r/w ${n(u.cacheRead)}/${n(u.cacheWrite)}`);
-  if (u.reasoning !== undefined) parts.push(`reasoning ${n(u.reasoning)}`);
-  return parts.join("  ");
-};
-const total = (u: TokenUsage): number =>
-  [u.input, u.output, u.cacheRead, u.cacheWrite, u.reasoning].filter((x): x is number => x !== undefined).reduce((a, b) => a + b, 0);
-
 const firstLine = (s: unknown): string => {
   if (typeof s !== "string" || !s) return EM;
   const i = s.indexOf("\n");
   return (i < 0 ? s : s.slice(0, i)) || EM;
 };
 
-const channelLabel = (data: Record<string, unknown>): string => {
-  const a = data.assignment;
-  if (!a || typeof a !== "object") return EM;
-  const { adapter, model } = a as { adapter?: unknown; model?: unknown };
-  return typeof adapter === "string" && typeof model === "string" ? `${adapter}:${model}` : EM;
-};
+const channelLabel = (data: Record<string, unknown>): string => assignmentChannel(data) ?? EM;
 
 const modelFromChannel = (channel: string): string => channel.slice(channel.indexOf(":") + 1);
 
@@ -55,30 +48,10 @@ const reviewerIdentity = (data: Record<string, unknown>): { reviewer: string; pr
   return { reviewer, provider, ...(vendor ? { vendor } : {}) };
 };
 
-const rateBasis = (row: ChannelCost): string => {
-  if (!row.rate) return EM;
-  const cache = row.rate.cacheReadPerMtok === undefined ? "" : `; cache-read $${row.rate.cacheReadPerMtok}/Mtok`;
-  const date = row.rate.rateDate === undefined ? "" : `; rate date ${row.rate.rateDate}`;
-  return `in/out $${row.rate.inPerMtok}/$${row.rate.outPerMtok}/Mtok${cache}${date}`;
-};
-
 const priceLine = (row: ChannelCost): string => {
   const windows = row.channel === "sub" && row.subPlan ? `windows: ${n(row.attempts)}` : `attempts/windows: ${n(row.attempts)}`;
-  const tokenText = row.tokens
-    ? `tokens: ${row.partialMetering ? "≥ " : ""}${fields(row.tokens)} (${n(total(row.tokens))} tokens)`
-    : "tokens: unmetered";
-  const prices: string[] = [];
-  const bases: string[] = [];
-  if (row.apiUsd !== undefined) prices.push(`price: $${row.apiUsd.toFixed(6)}`);
-  if (row.amortizedUsd !== undefined && row.subPlan !== undefined) {
-    const [low, high] = row.amortizedUsd;
-    prices.push(`price: $${low.toFixed(6)}–$${high.toFixed(6)} amortized`);
-    bases.push(`${n(row.attempts)} windows × $${row.subPlan.planMonthly}/month ÷ ${row.subPlan.windowsPerMonthHigh}–${row.subPlan.windowsPerMonthLow} windows/month`);
-  }
-  if (row.counterfactualUsd !== undefined) prices.push(`API-equivalent: $${row.counterfactualUsd.toFixed(6)}`);
-  if (row.rate) bases.push(rateBasis(row));
-  if (!prices.length) prices.push("price: not measurable");
-  if (!bases.length) bases.push(row.reason || "not recorded");
+  const tokenText = `tokens: ${formatChannelTokens(row)}`;
+  const { prices, bases } = formatChannelMoney(row);
   return `- **${row.adapter}:${row.model}** — ${windows}; ${tokenText}; ${prices.join("; ")}; basis: ${bases.join("; ")}`;
 };
 
@@ -264,6 +237,16 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     `- **escalations:** ${events.filter((e) => e.event === "escalation").length}`,
     "",
   ];
+  lines.push("## Channels", "");
+  const operatorRecords = buildOperatorRecord(events, prices);
+  if (operatorRecords.length) {
+    for (const row of operatorRecords) {
+      lines.push(`- **${row.channel}** — worker: ${row.worker}, review: ${row.review}, consult: ${row.consult}; tokens: ${row.tokens}; money: ${row.money}`);
+    }
+  } else {
+    lines.push("- no channel activity recorded");
+  }
+  lines.push("");
 
   lines.push("## Audit trail", "");
 

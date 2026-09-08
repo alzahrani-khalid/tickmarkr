@@ -1,0 +1,91 @@
+{
+  "recordedAt": "2026-09-06T14:35:56.487873+00:00",
+  "method": "Ctrl-C through each owned execution session after its cadence had irretrievably failed",
+  "cutoverAllowed": false,
+  "processes": [
+    {
+      "shape": "static",
+      "pid": 84870,
+      "execExitCode": 1,
+      "endedAt": "2026-09-06T14:31:02.594Z",
+      "orderlyExit": true,
+      "remainingWatchPresence": [],
+      "standdown": {
+        "tier": "watch",
+        "armId": "84870.6123bcc7-9a50-4d93-9c07-b1ef2a88afc7",
+        "exitedWriterPid": 84870,
+        "disarmedAt": "2026-09-06T14:31:01.730Z"
+      }
+    },
+    {
+      "shape": "growth",
+      "pid": 84871,
+      "execExitCode": 1,
+      "endedAt": "2026-09-06T14:32:05.594Z",
+      "orderlyExit": true,
+      "remainingWatchPresence": [],
+      "standdown": {
+        "tier": "watch",
+        "armId": "84871.99387a0e-3438-4235-82a9-1eb1821b589e",
+        "exitedWriterPid": 84871,
+        "disarmedAt": "2026-09-06T14:32:04.807Z"
+      }
+    },
+    {
+      "shape": "cutover-static",
+      "pid": 87720,
+      "execExitCode": 1,
+      "endedAt": "2026-09-06T14:32:04.808Z",
+      "orderlyExit": true,
+      "remainingWatchPresence": [],
+      "standdown": {
+        "tier": "watch",
+        "armId": "87720.73b169e9-acea-4882-82f0-8cb1da015f20",
+        "exitedWriterPid": 87720,
+        "disarmedAt": "2026-09-06T14:32:04.807Z"
+      }
+    },
+    {
+      "shape": "cutover-growth",
+      "pid": 87721,
+      "execExitCode": 1,
+      "endedAt": "2026-09-06T14:32:04.808Z",
+      "orderlyExit": true,
+      "remainingWatchPresence": [],
+      "standdown": {
+        "tier": "watch",
+        "armId": "87721.5947f92e-9372-4f92-88f3-ee35c8161bf5",
+        "exitedWriterPid": 87721,
+        "disarmedAt": "2026-09-06T14:32:04.807Z"
+      }
+    },
+    {
+      "shape": "final-static",
+      "pid": 6754,
+      "execExitCode": 1,
+      "endedAt": "2026-09-06T14:32:05.424Z",
+      "orderlyExit": true,
+      "remainingWatchPresence": [],
+      "standdown": {
+        "tier": "watch",
+        "armId": "6754.c6e01e39-7a29-47ee-b7f9-11e3bf19d0dd",
+        "exitedWriterPid": 6754,
+        "disarmedAt": "2026-09-06T14:32:04.809Z"
+      }
+    },
+    {
+      "shape": "final-growth",
+      "pid": 6753,
+      "execExitCode": 1,
+      "endedAt": "2026-09-06T14:32:05.424Z",
+      "orderlyExit": true,
+      "remainingWatchPresence": [],
+      "standdown": {
+        "tier": "watch",
+        "armId": "6753.aab98c60-3e3f-46fe-a341-e77f06131268",
+        "exitedWriterPid": 6753,
+        "disarmedAt": "2026-09-06T14:32:04.809Z"
+      }
+    }
+  ]
+}

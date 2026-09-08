@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -206,7 +206,9 @@ describe("diff cap — park('human') policy", () => {
 // and keep counting, under every shape.
 // ---------------------------------------------------------------------------
 
-const CAPTURES = REGENERABLE_CAPTURE_PATHS;
+// Frame regeneration specimens keep their fixed population and cap. Duration
+// measurements have their own producer and real-git accounting control below.
+const CAPTURES = REGENERABLE_CAPTURE_PATHS.filter(path => path.startsWith("tests/fixtures/cockpit/"));
 const FRAME_CAPTURE = CAPTURES.find((p) => p.startsWith("tests/fixtures/cockpit/frames/"))!;
 const COLOUR_CAPTURE = CAPTURES.find((p) => p.startsWith("tests/fixtures/cockpit/colour/"))!;
 const SPARE_CAPTURES = CAPTURES.filter((p) => p !== FRAME_CAPTURE && p !== COLOUR_CAPTURE);
@@ -330,20 +332,80 @@ const runAcceptance = (repo: string, base: string, fake: FakeAdapter, diffCap: n
 const runReview = (repo: string, base: string, fake: FakeAdapter, cap: number) =>
   reviewGate(reviewTask, repo, base, AUTHOR, CHANNELS, [fake], reviewCfg(cap));
 
+test("the complete soak corpus fits the dispatch budget with binary payloads counted and no new capture registrations", () => {
+  // A running daemon can predate the worker's new producer registrations. Keep
+  // the real corpus bounded even under that manifest; include Git's binary
+  // payload, not just its one-line notice, and reserve 140 KB for C6 source/tests.
+  const repo = makeRepo({ "base.txt": "base\n" });
+  try {
+    const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    const directory = join(repo, "tests/fixtures/screen-soak");
+    cpSync(new URL("../fixtures/screen-soak/", import.meta.url), directory, { recursive: true });
+    execFileSync("git", ["add", "tests/fixtures/screen-soak"], { cwd: repo });
+    execFileSync("git", ["commit", "--no-gpg-sign", "-m", "record measured corpus"], { cwd: repo });
+    const raw = execFileSync("git", ["diff", "--binary", "--full-index", "-U0", `${base}..HEAD`], { cwd: repo, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+    expect(raw).toContain("GIT binary patch");
+    expect(raw).toContain("samples.jsonl");
+    const legacy = { ...CAPTURE_ARTIFACT_MANIFEST,
+      producers: CAPTURE_ARTIFACT_MANIFEST.producers.filter(row => !row.id.startsWith("screen-soak")),
+      artifacts: CAPTURE_ARTIFACT_MANIFEST.artifacts.filter(row => !row.producer.startsWith("screen-soak")),
+    };
+    const measured = measureArtifactDiff(raw, legacy);
+    expect(measured.captureBytes).toBe(0);
+    expect(measured.logicBytes).toBe(Buffer.byteLength(raw, "utf8"));
+    expect(measured.logicBytes).toBeLessThanOrEqual(660_000);
+    for (const gate of ["acceptance", "review"]) {
+      expect(checkTaskDiffCaps(gate, { ...measured, logicBytes: measured.logicBytes + 140_000 }, 800_000)).toBeNull();
+    }
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test("real soak samples receive bounded capture accounting at both gates while neighbouring hand-authored records remain logic", async () => {
+  const path = "tests/fixtures/screen-soak/records/final-static/samples.jsonl";
+  const raw = readFileSync(new URL(`../../${path}`, import.meta.url), "utf8");
+  const { repo, base } = repoWithChange({ [path]: "" }, { [path]: raw });
+  const measured = await fetchTaskDiff(repo, base);
+  const cap = 10_000;
+  expect(measured.logicBytes).toBeLessThan(cap);
+  expect(measured.captureBytes).toBeGreaterThan(cap);
+  expect(measured.captureBytes).toBeLessThanOrEqual(captureDiffCapFor(cap));
+  expect(measured.forCap).toContain("producer screen-soak");
+  const { fake: judge, prompts: judgePrompts } = capturingFake({ judge: citing(path, 0) });
+  const { fake: reviewer, prompts: reviewPrompts } = capturingFake({ review: { approve: true, issues: [] } });
+  expect((await runAcceptance(repo, base, judge, cap)).pass).toBe(true);
+  expect((await runReview(repo, base, reviewer, cap)).pass).toBe(true);
+  for (const prompt of [judgePrompts.join(""), reviewPrompts.join("")]) {
+    expect(prompt.match(/set aside: regenerable capture/g)).toHaveLength(1);
+    expect(prompt).toContain(path);
+    expect(prompt).not.toContain(raw.trim());
+  }
+  const neighbour = path.replace("samples.jsonl", "hand-authored.jsonl");
+  const unmanifested = repoWithChange({ [neighbour]: "" }, { [neighbour]: raw });
+  const ordinary = await fetchTaskDiff(unmanifested.repo, unmanifested.base);
+  expect(ordinary.captureBytes).toBe(0);
+  expect(ordinary.logicBytes).toBeGreaterThan(cap);
+  expect(isDiffCapPark(await runAcceptance(unmanifested.repo, unmanifested.base, judge, cap))).toBe(true);
+  expect(isDiffCapPark(await runReview(unmanifested.repo, unmanifested.base, reviewer, cap))).toBe(true);
+});
+
 describe("diff cap — v1.82 T1 regenerable capture boundary", () => {
   // Clause 1's other half: the gate's member list is the SHIPPED manifest, not a hand-kept guess. The
   // gate cannot import this module (it is the Ink renderer, and dragging the TUI into every gate's
   // module graph memoises chalk's colour level and turns the fleet suite red), so the equality is
   // asserted here instead — add, rename or drop a frame case and this goes red until the gate matches.
   test("the gate's member list is exactly the shipped capture manifest, and every member exists", async () => {
-    const { COLOUR_FRAME_CASES, GOLDEN_FRAME_CASES } = await import("../../src/tui/cockpit/capture.js");
-    expect([...CAPTURES].sort()).toEqual([
+    const { COLOUR_FRAME_CASES, FINAL_SHELL_RETIREMENT, GOLDEN_FRAME_CASES } = await import("../../src/tui/cockpit/capture.js");
+    expect([...REGENERABLE_CAPTURE_PATHS].sort()).toEqual([
+      ...FINAL_SHELL_RETIREMENT.replacement.map((name) => `tests/fixtures/cockpit/final/${name}.txt`),
       ...GOLDEN_FRAME_CASES.map((c) => `tests/fixtures/cockpit/frames/${c.fixture}`),
       ...COLOUR_FRAME_CASES.map((c) => `tests/fixtures/cockpit/colour/${c.fixture}`),
+      ...["static", "growth", "cutover-static", "cutover-growth", "final-static", "final-growth", "retry-static", "retry-growth"].flatMap(attempt =>
+        ["build.json", "metadata.json", "samples.jsonl", "last-frame.ansi", "journal.jsonl.gz", "result.json.gz"].map(file =>
+          `tests/fixtures/screen-soak/records/${attempt}/${file}`)),
     ].sort());
     // and the directories are the real ones: a member that does not exist would silently discount nothing
     const repoRoot = new URL("../../", import.meta.url).pathname;
-    expect(CAPTURES.filter((p) => !existsSync(join(repoRoot, p)))).toEqual([]);
+    expect(REGENERABLE_CAPTURE_PATHS.filter((p) => !existsSync(join(repoRoot, p)))).toEqual([]);
   });
 
   test("test: a change confined to the regenerable frame corpora no longer counts toward the verifiable cap at either gate that measures it", async () => {

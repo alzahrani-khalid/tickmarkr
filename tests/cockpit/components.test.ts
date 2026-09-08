@@ -358,11 +358,14 @@ describe("cockpit component vocabulary", () => {
     }
   });
 
-  test("test: body text within a component renders through the theme's text emphasis tokens rather than through any step of the data ramp", () => {
+  test("test: body text within a component renders through the theme's text emphasis tokens rather than through any step of the data ramp", async () => {
     for (const emphasis of Object.keys(TEXT_EMPHASIS_TOKENS) as Array<
       keyof typeof TEXT_EMPHASIS_TOKENS
     >) {
-      const element = BodyText({ emphasis, children: "body" });
+      // BodyText reads the shell-presentation context, so its element is taken inside a render.
+      let element!: ReactElement;
+      const Probe = (): ReactElement => (element = BodyText({ emphasis, children: "body" }));
+      await renderComponent(createElement(Probe));
       const token = TEXT_EMPHASIS_TOKENS[emphasis];
 
       expect(element.props.bold).toBe(token.weight === "bold");

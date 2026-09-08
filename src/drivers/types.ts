@@ -181,6 +181,12 @@ export function canonicalizeLegacyName(name: string, runId: string): OwnedName {
   return { role: "other", taskId: name, attempt: 0, runId };
 }
 
+export interface FocusTarget {
+  repo: string; runId: string; taskId: string; attempt: number;
+  slot: Slot; workspace?: string;
+}
+export type FocusResult = { status: "focused" | "foreign" | "closed" | "unsupported"; reason: string };
+
 export interface SlotPlacement {
   surface?: string;
   hostPlatform?: string;
@@ -193,6 +199,8 @@ export interface ExecutorDriver {
   /** The exact terminal read surface used for liveness evidence. */
   readSource?: string;
   /** Placement facts returned by drivers whose terminal host exposes them. */
+  /** Verify the recorded identity against the live host before any focus mutation. */
+  focus?(target: FocusTarget): Promise<FocusResult>;
   describe?(slot: Slot): SlotPlacement | Promise<SlotPlacement> | undefined;
   slot(cwd: string, name: string, opts?: SlotOpts): Promise<Slot>;
   run(slot: Slot, cmd: string): Promise<void>;
@@ -223,12 +231,10 @@ export interface ExecutorDriver {
   // with the same sink it hands the daemon. Optional — subprocess journals nothing of its own.
   narrateWith?(narrate: (event: JournalEvent) => void): void;
   worktree(repo: string, branch: string, baseRef: string): Promise<string>;
-  // T6 narrator: one live status surface per run (herdr only). Splits the invoking daemon pane down
-  // and swaps the new pane ABOVE it — the board is full width with the narration rail beneath it, at
-  // every terminal width — runs the given command, and returns the slot for run-end close. Omitted on
-  // subprocess (no panes) — the daemon's optional-chain call is a no-op there. Cosmetic-only by
-  // contract: the daemon swallows any failure so a dead/failed watch pane never affects the run.
-  // T2: runId names the pane canonically (tickmarkr:watch:run:0:<runId>) so reconcile can own or reuse it.
+  // Run-bound board, placed right with no focus where supported. Drivers must
+  // verify repository/workspace/run ownership and request graceful shutdown;
+  // only the UI's own presence acknowledgement permits closing an owned board.
+  // Unsupported placement rejects visibly without claiming a board was opened.
   narrator?: (cwd: string, command: string, runId?: string) => Promise<Slot>;
   /** Best-effort projection of a task's lifecycle onto the execution host. */
   project?: (taskId: string, state: "in-progress" | "in-review" | "completed") => Promise<void>;

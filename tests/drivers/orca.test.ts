@@ -1047,22 +1047,12 @@ describe("OrcaDriver", () => {
     await expect(malformed.driver.nudge(malformedSlot, "continue now")).resolves.toBe(false);
   });
 
-  test("test: narrator creates one terminal in the repository checkout titled with the canonical watch name for the run running the supplied command and the reconcile sweep recognises that terminal as the run's board whereas a narrator that titles the terminal without the run identity fails", async () => {
+  test("narrator refuses unsupported right/no-focus placement without claiming an opened board", async () => {
     const { fake, driver } = rig();
-    const runId = "run-board-identity";
-    const command = "tickmarkr status --watch run-board-identity";
-    const title = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
-    const slot = await driver.narrator(WT, command, runId);
-
-    expect(slot.name).toBe(title);
-    expect(fake.calls.filter((call) => call[0] === "terminal" && call[1] === "create")).toEqual([[
-      "terminal", "create", "--worktree", `path:${WT}`, "--title", title,
-      "--command", command, "--json",
-    ]]);
-    await driver.reconcile(new Set([title]), runId);
-    expect(fake.terminals).toHaveLength(1);
-    expect(fake.countOf("close")).toBe(0);
-    await expect(driver.narrator(WT, command)).rejects.toThrow(/requires a run identity/);
+    await expect(driver.narrator(WT, "tickmarkr ui run-board --view run", "run-board")).rejects.toThrow(/placement unsupported/);
+    expect(fake.countOf("create")).toBe(0);
+    expect(fake.terminals).toHaveLength(0);
+    await expect(driver.narrator(WT, "true")).rejects.toThrow(/requires a run identity/);
   });
 
   test("test: project sets --workspace-status in-progress in-review and completed on the path selector of the task's own checkout never the active selector or the daemon's cwd and describe returns the create receipt's surface and hostPlatform for a created slot and undefined before creation whereas a projection that names the wrong selector or a describe that invents a surface fails", async () => {

@@ -39,7 +39,19 @@ const COLOUR_PROVENANCE = {
   revision: "colour-frame-v1",
 } as const satisfies CaptureProducerProvenance;
 
+const SHELL_PROVENANCE = {
+  source: "src/tui/cockpit/capture.ts", entrypoint: "captureShellOutput", revision: "final-shell-v1",
+} as const satisfies CaptureProducerProvenance;
+const SOAK_PROVENANCE = {
+  source: "tests/fixtures/screen-soak/soak.mjs", entrypoint: "sample", revision: "C6-four-hour-production-v1",
+} as const satisfies CaptureProducerProvenance;
+const SOAK_ARCHIVE_PROVENANCE = {
+  source: "tests/fixtures/screen-soak/archive.mjs", entrypoint: "archiveRecord", revision: "C6-lossless-gzip-v1",
+} as const satisfies CaptureProducerProvenance;
 export const CAPTURE_PRODUCERS = [
+  { id: "screen-soak", provenance: SOAK_PROVENANCE },
+  { id: "screen-soak-archive", provenance: SOAK_ARCHIVE_PROVENANCE },
+  { id: "cockpit-final-shell", provenance: SHELL_PROVENANCE },
   { id: "cockpit-golden-frames", provenance: GOLDEN_PROVENANCE },
   { id: "cockpit-colour-frames", provenance: COLOUR_PROVENANCE },
 ] as const satisfies readonly CaptureProducerRegistration[];
@@ -81,6 +93,18 @@ export const CAPTURE_ARTIFACT_MANIFEST = {
   version: 1,
   producers: CAPTURE_PRODUCERS,
   artifacts: [
+    // Exact measured artifacts only. Neighbouring harnesses, notes and unknown
+    // records remain logic; duration evidence never grants a directory exemption.
+    ...["static", "growth", "cutover-static", "cutover-growth", "final-static", "final-growth", "retry-static", "retry-growth"].flatMap(attempt =>
+      ["build.json", "metadata.json", "samples.jsonl", "last-frame.ansi", "journal.jsonl.gz", "result.json.gz"].map(file => ({
+        path: `tests/fixtures/screen-soak/records/${attempt}/${file}`,
+        producer: file.endsWith(".gz") ? "screen-soak-archive" : "screen-soak",
+        provenance: provenanceCopy(file.endsWith(".gz") ? SOAK_ARCHIVE_PROVENANCE : SOAK_PROVENANCE),
+      }))),
+    ...["home", "run", "evidence"].flatMap(view => ["120x40", "80x24"].map(size => ({
+      path: `tests/fixtures/cockpit/final/${view}.${size}.txt`,
+      producer: "cockpit-final-shell", provenance: provenanceCopy(SHELL_PROVENANCE),
+    }))),
     ...goldenFrameNames.map((fixture) => ({
       path: `tests/fixtures/cockpit/frames/${fixture}`,
       producer: "cockpit-golden-frames",

@@ -1,10 +1,14 @@
 import { expect, test } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   CAPTURE_ARTIFACT_MANIFEST,
   classifyArtifactPath,
   measureArtifactDiff,
   type CaptureArtifactManifest,
 } from "../../src/gates/artifact-manifest.js";
+import { captureShellOutput } from "../../src/tui/cockpit/capture.js";
+import { shellFixture } from "../fixtures/cockpit/final/capture-fixture.js";
 
 const provenance = {
   source: "scripts/capture-example.ts",
@@ -84,9 +88,12 @@ test("malformed manifests, missing producers, and forged protected rows fail clo
     .toMatchObject({ kind: "logic", reason: "protected-evidence" });
 });
 
-test("the shipped manifest contains only captures backed by byte-identity oracles", () => {
+test("the shipped manifest contains only captures backed by production frame or measurement oracles", async () => {
   const producerIds = new Set(CAPTURE_ARTIFACT_MANIFEST.producers.map((producer) => producer.id));
   expect(producerIds).toEqual(new Set([
+    "screen-soak",
+    "screen-soak-archive",
+    "cockpit-final-shell",
     "cockpit-golden-frames",
     "cockpit-colour-frames",
   ]));
@@ -98,6 +105,40 @@ test("the shipped manifest contains only captures backed by byte-identity oracle
   }
   expect(classifyArtifactPath("tests/fixtures/codex-mcp-spinner/frame-01.txt"))
     .toMatchObject({ kind: "logic", reason: "unmanifested" });
+
+  const fixture = shellFixture();
+  try {
+    for (const view of ["home", "run", "evidence"] as const) {
+      for (const [columns, rows] of [[120, 40], [80, 24]] as const) {
+        const path = `tests/fixtures/cockpit/final/${view}.${columns}x${rows}.txt`;
+        const regenerated = await captureShellOutput({ ...fixture, view, columns, rows });
+        expect(`${regenerated}\n`, path).toBe(readFileSync(join(process.cwd(), path), "utf8"));
+      }
+    }
+  } finally {
+    fixture.close();
+  }
+});
+
+test("soak captures require the registered measurement producer and exact output paths", () => {
+  const path = "tests/fixtures/screen-soak/records/final-static/samples.jsonl";
+  expect(classifyArtifactPath(path)).toMatchObject({
+    kind: "capture", producer: "screen-soak",
+    provenance: { source: "tests/fixtures/screen-soak/soak.mjs", entrypoint: "sample", revision: "C6-four-hour-production-v1" },
+  });
+  expect(classifyArtifactPath(path.replace("samples.jsonl", "result.json.gz"))).toMatchObject({
+    kind: "capture", producer: "screen-soak-archive",
+    provenance: { source: "tests/fixtures/screen-soak/archive.mjs", entrypoint: "archiveRecord", revision: "C6-lossless-gzip-v1" },
+  });
+  for (const file of ["archive.json", "hand-authored.json.gz", "result.json"]) {
+    expect(classifyArtifactPath(path.replace("samples.jsonl", file))).toMatchObject({ kind: "logic", reason: "unmanifested" });
+  }
+  for (const neighbour of ["tests/fixtures/screen-soak/soak.mjs", path.replace("samples.jsonl", "hand-authored.jsonl"), path.replace("final-static", "unknown")]) {
+    expect(classifyArtifactPath(neighbour)).toMatchObject({ kind: "logic", reason: "unmanifested" });
+  }
+  const artifact = CAPTURE_ARTIFACT_MANIFEST.artifacts.find(row => row.path === path)!;
+  expect(classifyArtifactPath(path, { ...CAPTURE_ARTIFACT_MANIFEST, artifacts: [{ ...artifact, provenance: { ...artifact.provenance, revision: "unverified" } }] }))
+    .toMatchObject({ kind: "logic", reason: "stale-provenance" });
 });
 
 test("a malformed manifest never turns changed payload bytes into a zero measurement", () => {

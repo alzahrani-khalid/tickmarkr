@@ -41,7 +41,7 @@ tests/
 ├── gates/          13 *.test.ts files
 ├── graph/          4 *.test.ts files
 ├── helpers/        tmprepo.ts                (shared repo/graph fixtures, not a *.test.ts file)
-├── hygiene/        2 *.test.ts files (brand-sweep, live-fixture-guard)
+├── hygiene/        3 *.test.ts files (brand-sweep, live-fixture-guard, sync-heavy-timeouts)
 ├── pane-banner.test.ts
 ├── plan/           2 *.test.ts files (scope, scope-flow)
 ├── readme-steering.test.ts

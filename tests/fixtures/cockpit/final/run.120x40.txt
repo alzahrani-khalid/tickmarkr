@@ -1,0 +1,40 @@
+tickmarkr capture | RUN | run-20260905-000000
+1 Home  4 Run  5 Evidence | content | 1–31/31 | 0 hidden
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│1 Home         │RUN / RUNNING                                                                  │1 Home                │
+│4 Run          │1/4 merged | blocked T3 | current-cycle tip PENDING | RUNNING | matching gr    │4 Run                 │
+│5 Evidence     │  Task state                bu te li ev sc ac re  latest attempt               │5 Evidence            │
+│               │❯ T1   merged               -  -  -  -  -  -  F  attempt 0                     │Tab Focus             │
+│CLI:           │  T2   running              -  -  -  -  -  -  -  attempt 0                     │Enter Open            │
+│fleet          │  T3   blocked              -  -  -  -  -  -  -  never dispatched              │a Actions             │
+│plan           │  Txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx unknown     │PageUp/PageDown Page  │
+│doctor         │P pass · F fail · R running · - not run · D disabled · ? unknown | declarat    │? Keys                │
+│               │SELECTED / T1 · Task T1                                                        │q Quit                │
+│               │state merged · attempt 0 · dispatches 1 · path unknown · pane unknown · ala    │+ Widen shortcuts     │
+│               │outcome filter all (x cycles) · 7 of 7 gates shown                             │- Narrow shortcuts    │
+│               │- build      not run                                                           │                      │
+│               │- test       not run                                                           │                      │
+│               │- lint       not run                                                           │                      │
+│               │- evidence   not run                                                           │                      │
+│               │- scope      not run                                                           │                      │
+│               │- acceptance not run                                                           │                      │
+│               │F review     failed (work) · reviewer unknown · reviewer tier unknown · aut    │                      │
+│               │VERDICT / review #L4 · lines 1–10 of 200                                       │                      │
+│               │   1 verdict line 1                                                            │                      │
+│               │   2 verdict line 2                                                            │                      │
+│               │   3 verdict line 3                                                            │                      │
+│               │   4 verdict line 4                                                            │                      │
+│               │   5 verdict line 5                                                            │                      │
+│               │   6 verdict line 6                                                            │                      │
+│               │   7 verdict line 7                                                            │                      │
+│               │   8 verdict line 8                                                            │                      │
+│               │   9 verdict line 9                                                            │                      │
+│               │  10 verdict line 10                                                           │                      │
+│               │←→ gate · PageUp/PageDown page                                                 │                      │
+│               │↑↓ Task · ←→ Verdict gate · PgUp/PgDn Page · x Outcome                         │                      │
+│               │                                                                               │                      │
+│               │                                                                               │                      │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 1/4 | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -2,6 +2,48 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.5.0 — one cockpit
+
+**v2.5.0** — Home, Run and Evidence on one frame with one palette, one key model and one memory-safe live loop.
+Release A of the screen consolidation (`.planning/FINAL-screen-consolidation.md` C1–C11), delivered by run 3522
+(11/11, tip 40dda45a) plus the four Leg-2 fixes a frontier re-review of the merged tasks demanded
+(`specs/v2.5.0-leg2-fixes.spec.md`, four tasks, all merged).
+
+- **One shell (C1).** A single consolidated mount renders Home, Run and Evidence inside one frame contract
+  (120x40: `1+15+1+79+1+22+1`, seven chrome rows; 80x24 folds the side columns) with committed row geometry that
+  pointer and keyboard both resolve against. Old public entries stay compatible.
+- **Shared observable state (C2).** One bounded live store feeds every view; a committed reproducible harness under
+  the operator-state fixtures pins the live loop under a **64 MiB** fixed-fixture ceiling measured from the C2
+  spike, and the ordinary-environment heap result is now retained as a capture at a printed stable path that
+  survives the test's own cleanup (Leg-2 F4).
+- **Home (C3).** Needs-you and Activity with a selection kept apart from the page window: arrows move it across
+  every row, paging carries it, Enter opens the selected row's original evidence, Needs-you cycles every park
+  and diagnostic, and both selections reconcile by stable identity when the live model shrinks or prepends;
+  the shell's pointer targets follow the same selection (Leg-2 F2).
+- **Run and validated decisions (C4).** Parks are decided where they are shown: Run exports a decision boundary
+  that invokes the authoritative approve path and reads back its own journal append, including infra recheck
+  from the mounted view against matching, foreign and absent lock owners. Legacy Setup callers stay compatible.
+- **Evidence and export (C5).** Evidence rows carry the tracked journal rows' own line identities (a blank or
+  malformed line no longer shifts every later `#L`) and list a `review-leg2` row's recorded artifact as its
+  durable artifact; export serializes the displayed run's full record and lands it by temp-file rename with
+  exclusive create; `report --md` and `stats` render per-channel worker/review/consult counts from the shared
+  operator record, counting standalone `review-leg2` rows (Leg-2 F3).
+- **Entries, narrator and watch lifecycle (C6).** The public entries and the daemon's narrator use the
+  consolidated mount; the daemon-owned board closes gracefully at run-end. Proven by two four-hour production
+  soaks (static and growing journal) with complete RSS/post-GC series.
+- **Inert discoverable help (C7).** Help is uniformly discoverable from the authoritative command registry and
+  parser options, and inert: no handler executes to render it.
+- **Safe lock recovery (C8).** `unlock` previews before it commits; the commit's identity now includes the
+  previewed pid and the payload bytes, capture-and-remove is one atomic rename bound to the validated entry,
+  ENOENT is never a removal receipt, and `--garbage` confirms by a sha256 digest of the observed bytes beside
+  the inode (Leg-2 F1).
+- **Probe boundary and repair-only (C9).** Cached diagnostics are exposed separately from live model probes,
+  and safe runner repair is an explicit repair-only path.
+- **Scope preview boundary (C10).** Local scope preview is separated from explicitly confirmed model authoring,
+  disclosing candidate state, destination and call budget before any model call.
+- **Shipped documentation (C11).** The shipped guidance matches the views and the gate truth.
+- Every printed twin is unchanged; `npm test` stays zero-token.
+
 ## v2.4.2 — codex workers get their screen back
 
 **v2.4.2** — a one-fix patch shipped on the operator's word during the 2.5.0 run. Every codex worker had been launched

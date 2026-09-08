@@ -29,12 +29,11 @@ import { isPidLive, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
-import { armWatchSupervision, readSupervision, supervisionText } from "../../run/supervision.js";
+import { armWatchSupervision, observeNamedRun, WATCH_OWNER_ENV, readSupervision, supervisionText } from "../../run/supervision.js";
 import {
   deriveRunCockpitData,
   type TaskRow,
 } from "../../tui/cockpit/derive.js";
-import { COCKPIT_COLUMN_FLOOR } from "../../tui/cockpit/layout.js";
 import { cellWidth, fitCells, wrapCells } from "../../tui/cockpit/width.js";
 import { version } from "./version.js";
 
@@ -1288,7 +1287,7 @@ const renderFrame = (
 
   // TTY: the operator-approved task table. The daemon gives this surface a ~110-column pane first;
   // narrower terminals keep the same facts in stacked rows. Every cut/wrap goes through width.ts.
-  const boardColumns = Math.max(COCKPIT_COLUMN_FLOOR, width);
+  const boardColumns = Math.max(40, width);
   const dot = dim(" · ");
   const separator = `  ${dim("│")}  `;
   const tipFailed = tipPhase?.state === "failed";
@@ -1552,6 +1551,14 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   const sleep = opts.sleep ?? defaultSleep;
   const now = opts.now ?? Date.now;
   const bounded = Number.isFinite(iterations);
+  // Bounded snapshots and printed twins never import Ink. Public interactive watch
+  // selects its run once through the same launcher as manual UI.
+  if (!bounded && !eventStream && !argv.includes("--plain") && process.stdin.isTTY === true && process.stdout.isTTY === true) {
+    const { ui } = await import("./ui.js");
+    const result = await ui([...(namedRunId ? [namedRunId] : []), "--view", "run"], {}, cwd);
+    if (typeof result !== "string") throw new Error(result.out);
+    return "";
+  }
   const frames: string[] = [];
   const eventLines: string[] = [];
   const sep = "\n---\n";
@@ -1655,7 +1662,8 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   // it INVERTS it: armSupervision's interval outlives the board in any host that outlives one board, so
   // a dead board keeps writing and reads ARMED. That is the over-claiming direction, the one an operator
   // acts on, and the one this instrument exists to close.
-  const armed = bounded ? undefined : armWatchSupervision(cwd, opts.supervisionBeatMs);
+  const boardObservation = !bounded && namedRunId && process.env[WATCH_OWNER_ENV] ? observeNamedRun(cwd, namedRunId) : undefined;
+  const armed = bounded || boardObservation ? undefined : armWatchSupervision(cwd, opts.supervisionBeatMs);
   let alternateScreen = false;
   const leaveAlternateScreen = () => {
     if (!alternateScreen) return;
@@ -1688,6 +1696,8 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   const exitFromSignal = (code: number) => () => {
     if (exitingFromSignal) return;
     exitingFromSignal = true;
+    armed?.disarm();
+    boardObservation?.close();
     if (titleSaved) {
       process.removeListener("exit", restoreTitle);
       restoreTitle();
@@ -1704,6 +1714,8 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     process.stdout.write(ENTER_ALTERNATE_SCREEN);
     alternateScreen = true;
     process.once("exit", leaveAlternateScreen);
+  }
+  if (!bounded) {
     for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
       const handler = exitFromSignal(code);
       signalHandlers.push([signal, handler]);
@@ -1713,6 +1725,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
 
   try {
     for (let i = 0; i < iterations; i++) {
+      if (boardObservation?.stopRequested()) break;
       const nowMs = now();
       const decisionEvents = eventStream || webhookUrl ? consumeDecisionEvents() : [];
       let frame: RenderedFrame | undefined;
@@ -1750,6 +1763,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
     // armSupervision's presence files). Otherwise the first pane closed would render the second
     // pane's own tier down while it is drawing frames.
     armed?.disarm();
+    boardObservation?.close();
     if (titleSaved) {
       process.removeListener("exit", restoreTitle);
       restoreTitle();

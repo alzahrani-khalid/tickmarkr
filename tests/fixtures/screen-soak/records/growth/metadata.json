@@ -1,0 +1,24 @@
+{
+  "protocol": "C6-four-hour-production-v1",
+  "shape": "growth",
+  "sourceCommit": "ee7132138e6cefa10ad5a8430b1a2076aa1af8c5",
+  "pid": 84871,
+  "fixture": "/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/screen-soak-growth-KuPxao",
+  "journal": "/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/screen-soak-growth-KuPxao/.tickmarkr/runs/run-screen-soak/journal.jsonl",
+  "durationSeconds": 14400,
+  "sinkLimit": 20000,
+  "sampleIntervalSeconds": 60,
+  "observationIntervalSeconds": 1,
+  "warmupTicks": 1000,
+  "population": "run-start plus one T1 task-dispatch; growth adds one worker-nudge every ten seconds",
+  "environment": {
+    "NODE_ENV": null,
+    "node": "v26.7.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "TERM": "xterm-256color",
+    "CI": null
+  },
+  "startedAt": "2026-09-06T12:02:48.395Z",
+  "artifacts": "/Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T6/tests/fixtures/screen-soak/records/growth"
+}
