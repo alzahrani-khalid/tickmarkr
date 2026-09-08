@@ -117,6 +117,12 @@ export const createVitestConfig = (forkCapValue: string | undefined) => defineCo
           include: SIGNAL_REAPER_TESTS,
           exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS],
           poolOptions: { forks: { singleFork: true } },
+          // OBS-962 / OBS-98 class: these members wait until a fake daemon world reaches a state (real git
+          // commits, gate commands, a `sleep 30` child, a group SIGKILL) and carry their own 60 s fire
+          // deadline (RECONCILE_FIRE_TIMEOUT_MS) that NAMES what was awaited. vitest's 20 s default fired
+          // first on the macOS CI runner (2.5.0 run 34202020498, 0.5 s here and on ubuntu), hiding that
+          // evidence behind a bare timeout. The project owns the ceiling; the harness deadline is the oracle.
+          testTimeout: 300_000,
         },
       },
     ],
