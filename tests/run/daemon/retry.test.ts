@@ -56,6 +56,24 @@ class NamedFake extends FakeAdapter {
 }
 
 
+// These lifecycle fixtures explicitly keep or close every material the review prompt carries.
+// Keep this responder local: malformed-verdict tests must still be able to omit closure fields.
+function closingReview(fake: FakeAdapter, scriptPath: string, disposition: "resolved" | "reraised"): FakeAdapter {
+  const headless = fake.headlessCommand.bind(fake);
+  fake.headlessCommand = (promptFile, model) => {
+    const prompt = readFileSync(promptFile, "utf8");
+    if (!prompt.startsWith("TICKMARKR-REVIEW")) return headless(promptFile, model);
+    const prior = prompt.match(/## Prior materials this attempt must close\n([\s\S]*?)\n## Diff/)?.[1] ?? "";
+    const fingerprints = [...prior.matchAll(/^Fingerprint: (.+)$/gm)].map((match) => match[1]);
+    const { review } = JSON.parse(readFileSync(scriptPath, "utf8"));
+    return `printf '%s\\n' ${shq(JSON.stringify({
+      ...review, nonce: extractPromptNonce(prompt), resolved: [], reraised: [], [disposition]: fingerprints,
+    }))}`;
+  };
+  return fake;
+}
+
+
 const addGateScripts = (repo: string, testCmd: string) => {
   writeFileSync(join(repo, "package.json"), JSON.stringify({ scripts: { test: testCmd } }));
 };
@@ -1744,7 +1762,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
 
   test("test: a dispatch death before worker-result followed by retry-failed reproduces the upheld finding bytes exactly", async () => {
     const runId = "run-obs254";
-    const { repo, fake } = setupRepo(
+    const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
       {
         review: {
@@ -1756,6 +1774,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
         tasks: { T1: [{ shell: `echo v > v.txt && ${COMMIT} v`, result: { ok: true, summary: "v" } }] },
       },
     );
+    closingReview(fake, scriptPath, "reraised");
     // 1) the reviewer requests changes until the engagement's round cap parks the task
     const first = await runDaemon(repo, { adapters: [fake], runId });
     expect(first.human).toEqual(["T1"]);
@@ -1827,7 +1846,7 @@ test("test: a revival holding both an upheld review and consult guidance carries
   const consultReason = "the parked task needs the amended scope and the upheld fix";
   const consultNotes = "RAW CONSULT NOTES: do not paste this prose into the worker brief";
   const reviewDetails = `reviewer fake:fake-2 (fake-b): requested changes (1 material)\n- [material] ${FINDING}`;
-  const { repo, fake } = setupRepo(
+  const { repo, fake, scriptPath } = setupRepo(
     [T("T1")],
     {
       tasks: {
@@ -1835,6 +1854,7 @@ test("test: a revival holding both an upheld review and consult guidance carries
       },
     },
   );
+  closingReview(fake, scriptPath, "resolved");
   const j = Journal.create(repo, runId);
   j.append("run-start", undefined, {
     baseRef: await gitHead(repo),
@@ -2055,7 +2075,7 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
       },
     );
     repo = s.repo;
-    await runDaemon(repo, { adapters: [s.fake], runId });
+    await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised")], runId });
     await approve([runId, "T1", "--uphold", "--by", "op"], repo);
 
     // run B's reviewer APPROVES. The worker's own step commits the sibling change into the live
@@ -2074,7 +2094,7 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
         { shell: `echo settled > shared.txt && ${COMMIT} w2`, result: { ok: true, summary: "a3" } },
       ] },
     }));
-    await runDaemon(repo, { adapters: [new FakeAdapter(s.scriptPath)], runId, resume: true });
+    await runDaemon(repo, { adapters: [closingReview(new FakeAdapter(s.scriptPath), s.scriptPath, "resolved")], runId, resume: true });
 
     evs = evsOf(repo, runId);
     dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
@@ -2211,7 +2231,7 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
       "gates: { test: 'test ! -f broken.txt' }\n",
     );
     repo = s.repo;
-    await runDaemon(repo, { adapters: [s.fake], runId });
+    await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised")], runId });
     // the dispatch AFTER the test-gate round: its own feedback quotes neither finding, so whatever it
     // says about them it says on the journal's evidence alone. Read here, before run B can reuse a
     // prompt path for the same attempt number.
@@ -2238,7 +2258,7 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
         { shell: `echo two >> src/mark.ts && ${COMMIT} m3`, result: { ok: true, summary: "a3 — fixed the material finding" } },
       ] },
     }));
-    await runDaemon(repo, { adapters: [new FakeAdapter(s.scriptPath)], runId, resume: true });
+    await runDaemon(repo, { adapters: [closingReview(new FakeAdapter(s.scriptPath), s.scriptPath, "resolved")], runId, resume: true });
     evs = evsOf(repo, runId);
   }, 300_000);
 

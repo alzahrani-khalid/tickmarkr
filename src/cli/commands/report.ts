@@ -288,7 +288,9 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
             pass = "pass (same-provider — independence not established)";
           }
         }
-        lines.push(`  - ${gate}: ${pass} — ${firstLine(g.data.details)}`);
+        const resolved = gate === "review" && g.data.pass === true && Array.isArray(g.data.resolved)
+          ? g.data.resolved.filter((id): id is string => typeof id === "string") : [];
+        lines.push(`  - ${gate}: ${pass} — ${firstLine(g.data.details)}${resolved.length ? `; resolved: ${resolved.join(", ")}` : ""}`);
       }
       for (const row of leg2) {
         const pass = row.data.pass === true ? "pass" : row.data.pass === false ? "fail" : EM;

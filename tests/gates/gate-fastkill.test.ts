@@ -162,7 +162,7 @@ afterEach(() => {
 });
 
 describe("v2.0 calibrated gate inactivity policy", () => {
-  test("test: a review whose wait concludes on the inactivity policy instead of on a completion trailer returns a result carrying the infrastructure marking the park predicate reads, so a gate that got no answer is not charged to the worker; the same silence returning an unparseable verdict with no marking is charged and: it fails", async () => {
+  test("test: a producing review whose wait concludes at its ceiling instead of on a completion trailer returns a result carrying the infrastructure marking the park predicate reads, so a gate that got no answer is not charged to the worker; a missing verdict without infrastructure marking is charged and: it fails", async () => {
     setGateInactivityWindowMsForTests(20);
     setHarvestCpuFlatMsForTests(0);
     useCpuModes("flat");
@@ -196,20 +196,21 @@ describe("v2.0 calibrated gate inactivity policy", () => {
       cfg: structuredClone(DEFAULT_CONFIG),
     };
 
+    baseCtx.cfg.review.timeoutMs = 50;
     const timed = await runGates(task, { ...baseCtx, via: gateVia(driver) });
     const timedReview = timed.results.find((result) => result.gate === "review");
     expect(driver.slots).toHaveLength(1);
     expect(timedReview).toMatchObject({
       pass: false,
-      meta: { unparseable: true, classification: "infra", infra: true },
+      meta: { cause: "truncated", noVerdict: true, classification: "infra", infra: true },
     });
 
-    // The same responder bytes without an inactivity-policy conclusion are an ordinary
-    // unparseable verdict: still red, but not infrastructure and therefore chargeable.
+    // A responder exiting without a nonce-bound verdict is also infrastructure.
     const ordinary = await runGates(task, { ...baseCtx, adapters: [worker, new NamedFake(fakeScript(), "fake-b", "fake-b")] });
     const ordinaryReview = ordinary.results.find((result) => result.gate === "review");
-    expect(ordinaryReview).toMatchObject({ pass: false, meta: { unparseable: true } });
-    expect(ordinaryReview?.meta?.infra).toBeUndefined();
+    expect(ordinaryReview).toMatchObject({ pass: false, meta: { noVerdict: true, infra: true } });
+    expect(ordinaryReview?.meta?.unparseable).toBeUndefined();
+    expect(timedReview?.meta?.unparseable).toBeUndefined();
   });
 
   test("test: a runViaDriver gate wait with a frozen snapshot and a cpu-flat dispatched tree and no trailer concludes at the inactivity window not the full timeout", async () => {
@@ -301,7 +302,7 @@ describe("v2.0 calibrated gate inactivity policy", () => {
     expect(extractVerdictJson(retryBytes, firstNonce)).toBeNull();
   });
 
-  test("test: through runGates reviewGate reaches the changed runViaDriver wait whose fast conclusion returns unparseable so runGates performs exactly one cross-channel review retry whose verdict decides the review gate", async () => {
+  test("test: through runGates reviewGate reaches the runViaDriver ceiling whose conclusion returns truncated infrastructure so runGates performs exactly one cross-channel review retry whose verdict decides the review gate", async () => {
     setGateInactivityWindowMsForTests(20);
     setHarvestCpuFlatMsForTests(0);
     useCpuModes("flat", "flat");
@@ -329,6 +330,7 @@ describe("v2.0 calibrated gate inactivity policy", () => {
       }],
     }).tasks[0]!;
     const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.review.timeoutMs = 50;
     const events: GateEvent[] = [];
     const { results } = await runGates(task, {
       worktree: repo,
@@ -347,6 +349,8 @@ describe("v2.0 calibrated gate inactivity policy", () => {
     });
 
     expect(driver.slots).toHaveLength(2);
+    expect(events.find((event) => event.phase === "note" && event.name === "review-no-verdict"))
+      .toMatchObject({ payload: { cause: "truncated", infra: true, noVerdict: true } });
     const review = results.find((result) => result.gate === "review");
     expect(review).toMatchObject({ gate: "review", pass: true });
     expect(review!.meta?.reviewRetry).toEqual({

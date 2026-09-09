@@ -9,7 +9,8 @@ import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
 import { harnessLine, resolveHarness } from "../../src/cli/harness.js";
 import { run } from "../../src/cli/commands/run.js";
-import { tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
+import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { Journal } from "../../src/run/journal.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { authedModels, makeRepo } from "../helpers/tmprepo.js";
 
@@ -824,4 +825,219 @@ test("test: plan prints exactly one driver line naming the resolved driver along
     if (prior === undefined) delete process.env.HERDR_ENV;
     else process.env.HERDR_ENV = prior;
   }
+});
+
+test("test: plan on a graph whose recorded run journal holds two review rows prints the review seat the run's least-recently-used rotation draws next with the count of eligible seats, and plan with no such run prints seat 1 of that count with a notice that rotation applies at run time, so a plan naming the ranked first seat while the journal shows it was the most recently used fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x\n" });
+  saveGraph(repo, validateGraph({
+    version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [{ id: "T1", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] }],
+  }));
+
+  withOverlay(repo, "routing:\n  map:\n    chore: { prefer: [fake:fake-1] }\n");
+
+  const adapter: WorkerAdapter = {
+    id: "fake",
+    channels: () => [
+      { adapter: "fake", model: "fake-1", vendor: "fake-a", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-3", vendor: "fake-c", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-4", vendor: "fake-d", channel: "sub", tier: "frontier" },
+    ],
+    async probe() {
+      return {
+        installed: true, authed: true, version: "fake",
+        models: ["fake-1", "fake-2", "fake-3", "fake-4"],
+        modelAuth: authedModels(["fake-1", "fake-2", "fake-3", "fake-4"]),
+      };
+    },
+    async runWorker() { return { ok: true, summary: "ok" }; },
+  };
+
+  writeDoctor(repo, { fake: await adapter.probe() });
+
+  // 1. Plan with NO such run: prints seat 1 of that count with a notice that rotation applies at run time
+  const outNoRun = await plan([], repo, [adapter]);
+  expect(outNoRun).toContain("review: fake:fake-2 (seat 1 of 3 — rotation applies at run time) — reviewPolicy full");
+
+  // 2. Record a run journal holding two review rows:
+  // Ranked order is fake:fake-2 (seat 1), fake:fake-3 (seat 2), fake:fake-4 (seat 3).
+  // fake:fake-2 was used, then fake:fake-3 was used.
+  // The least-recently-used rotation draws fake:fake-4 next (seat 3 of 3).
+  const runId = "run-20260908-120000-0000000000000001";
+  const j = Journal.create(repo, runId);
+  const gHash = graphDefinitionHash(loadGraph(repo));
+  j.append("run-start", undefined, { graphDefinitionHash: gHash });
+  j.append("gate-result", "T1", { gate: "review", reviewer: "fake:fake-2" });
+  j.append("gate-result", "T1", { gate: "review", reviewer: "fake:fake-3" });
+
+  const outWithRun = await plan([], repo, [adapter]);
+
+  // Prints the review seat the run's least-recently-used rotation draws next with the count of eligible seats:
+  expect(outWithRun).toContain("review: fake:fake-4 (seat 3 of 3) — reviewPolicy full");
+
+  // so a plan naming the ranked first seat while the journal shows it was the most recently used fails:
+  expect(outWithRun).not.toContain("review: fake:fake-2");
+});
+
+test("test: plan does not advance the simulated review rotation for a task the journal already recorded as done, so a pending task after it still draws the journal's actual next reviewer", async () => {
+  const repo = makeRepo({ "keep.txt": "x\n" });
+  saveGraph(repo, validateGraph({
+    version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [
+      { id: "T1", title: "t1", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] },
+      { id: "T2", title: "t2", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] },
+    ],
+  }));
+
+  withOverlay(repo, "routing:\n  map:\n    chore: { prefer: [fake:fake-1] }\n");
+
+  const adapter: WorkerAdapter = {
+    id: "fake",
+    channels: () => [
+      { adapter: "fake", model: "fake-1", vendor: "fake-a", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-3", vendor: "fake-c", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-4", vendor: "fake-d", channel: "sub", tier: "frontier" },
+    ],
+    async probe() {
+      return {
+        installed: true, authed: true, version: "fake",
+        models: ["fake-1", "fake-2", "fake-3", "fake-4"],
+        modelAuth: authedModels(["fake-1", "fake-2", "fake-3", "fake-4"]),
+      };
+    },
+    async runWorker() { return { ok: true, summary: "ok" }; },
+  };
+
+  writeDoctor(repo, { fake: await adapter.probe() });
+
+  // T1 is DONE, having gone through two review rounds (fake-2 then fake-3) before its task-done.
+  // T2 is still pending. Eligible reviewers for both are identical: fake-2, fake-3, fake-4.
+  // The real journal history is [fake-2, fake-3] — the LRU rotation's actual next draw is fake-4.
+  const runId = "run-20260908-130000-0000000000000001";
+  const j = Journal.create(repo, runId);
+  const gHash = graphDefinitionHash(loadGraph(repo));
+  j.append("run-start", undefined, { graphDefinitionHash: gHash });
+  j.append("task-dispatch", "T1", {});
+  j.append("gate-result", "T1", { gate: "review", reviewer: "fake:fake-2" });
+  j.append("gate-result", "T1", { gate: "review", reviewer: "fake:fake-3" });
+  j.append("task-done", "T1", {});
+
+  const out = await plan([], repo, [adapter]);
+
+  // T2 (pending) must draw the journal's ACTUAL next rotation seat (fake-4), never a seat consumed
+  // only by simulating T1's already-decided, already-completed review pick.
+  const t2Line = out.split("\n").findIndex((line) => line.trimStart().startsWith("T2 "));
+  expect(t2Line).toBeGreaterThan(-1);
+  expect(out.split("\n")[t2Line + 2]).toContain("review: fake:fake-4 (seat 3 of 3) — reviewPolicy full");
+  expect(out).not.toContain("review: fake:fake-2 (seat 1 of 3)");
+});
+
+test("test: plan does not advance the simulated review rotation for tasks the journal recorded as human or failed, so a later pending task still draws the journal's actual next reviewer", async () => {
+  const repo = makeRepo({ "keep.txt": "x\n" });
+  saveGraph(repo, validateGraph({
+    version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [
+      { id: "T1", title: "t1", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] },
+      { id: "T2", title: "t2", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] },
+      { id: "T3", title: "t3", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] },
+    ],
+  }));
+
+  withOverlay(repo, "routing:\n  map:\n    chore: { prefer: [fake:fake-1] }\n");
+
+  const adapter: WorkerAdapter = {
+    id: "fake",
+    channels: () => [
+      { adapter: "fake", model: "fake-1", vendor: "fake-a", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-3", vendor: "fake-c", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-4", vendor: "fake-d", channel: "sub", tier: "frontier" },
+    ],
+    async probe() {
+      return {
+        installed: true, authed: true, version: "fake",
+        models: ["fake-1", "fake-2", "fake-3", "fake-4"],
+        modelAuth: authedModels(["fake-1", "fake-2", "fake-3", "fake-4"]),
+      };
+    },
+    async runWorker() { return { ok: true, summary: "ok" }; },
+  };
+
+  writeDoctor(repo, { fake: await adapter.probe() });
+
+  // T1 is parked at a human gate, T2 failed — a default resume re-dispatches neither, exactly as it
+  // skips a done task. Only T3 is pending. Recorded history is [fake-2], so the LRU rotation's actual
+  // next draw for T3 is fake-3 (seat 2 of 3); advancing on T1 and T2 would wrap it back to fake-2.
+  const runId = "run-20260908-140000-0000000000000001";
+  const j = Journal.create(repo, runId);
+  const gHash = graphDefinitionHash(loadGraph(repo));
+  j.append("run-start", undefined, { graphDefinitionHash: gHash });
+  j.append("task-dispatch", "T1", {});
+  j.append("gate-result", "T1", { gate: "review", reviewer: "fake:fake-2" });
+  j.append("task-human", "T1", {});
+  j.append("task-dispatch", "T2", {});
+  j.append("task-failed", "T2", {});
+
+  const out = await plan([], repo, [adapter]);
+
+  const t3Line = out.split("\n").findIndex((line) => line.trimStart().startsWith("T3 "));
+  expect(t3Line).toBeGreaterThan(-1);
+  expect(out.split("\n")[t3Line + 2]).toContain("review: fake:fake-3 (seat 2 of 3) — reviewPolicy full");
+  expect(out).not.toContain("review: fake:fake-2 (seat 1 of 3)");
+});
+
+test("test: plan does not advance the simulated review rotation for a pending task whose dependency the journal recorded as human, so a later ready task still draws the journal's actual next reviewer", async () => {
+  const repo = makeRepo({ "keep.txt": "x\n" });
+  saveGraph(repo, validateGraph({
+    version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [
+      { id: "T1", title: "t1", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] },
+      { id: "T2", title: "t2", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], deps: ["T1"] },
+      { id: "T3", title: "t3", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] },
+    ],
+  }));
+
+  withOverlay(repo, "routing:\n  map:\n    chore: { prefer: [fake:fake-1] }\n");
+
+  const adapter: WorkerAdapter = {
+    id: "fake",
+    channels: () => [
+      { adapter: "fake", model: "fake-1", vendor: "fake-a", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-3", vendor: "fake-c", channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-4", vendor: "fake-d", channel: "sub", tier: "frontier" },
+    ],
+    async probe() {
+      return {
+        installed: true, authed: true, version: "fake",
+        models: ["fake-1", "fake-2", "fake-3", "fake-4"],
+        modelAuth: authedModels(["fake-1", "fake-2", "fake-3", "fake-4"]),
+      };
+    },
+    async runWorker() { return { ok: true, summary: "ok" }; },
+  };
+
+  writeDoctor(repo, { fake: await adapter.probe() });
+
+  // T1 is parked at a human gate; T2 is pending but depends on T1, so readyTasks would not dispatch
+  // it; T3 is pending with no deps and is the ONLY task the run dispatches next. Recorded history is
+  // [fake-2, fake-3], so the LRU rotation's actual next draw for T3 is fake-4 (seat 3 of 3). Letting
+  // blocked T2 consume fake-4 would wrap T3 back to fake-2 (RULING-229-14).
+  const runId = "run-20260909-073000-0000000000000001";
+  const j = Journal.create(repo, runId);
+  const gHash = graphDefinitionHash(loadGraph(repo));
+  j.append("run-start", undefined, { graphDefinitionHash: gHash });
+  j.append("task-dispatch", "T1", {});
+  j.append("gate-result", "T1", { gate: "review", reviewer: "fake:fake-2" });
+  j.append("gate-result", "T1", { gate: "review", reviewer: "fake:fake-3" });
+  j.append("task-human", "T1", {});
+
+  const out = await plan([], repo, [adapter]);
+
+  const t3Line = out.split("\n").findIndex((line) => line.trimStart().startsWith("T3 "));
+  expect(t3Line).toBeGreaterThan(-1);
+  expect(out.split("\n")[t3Line + 2]).toContain("review: fake:fake-4 (seat 3 of 3) — reviewPolicy full");
+  expect(out).not.toContain("review: fake:fake-2 (seat 1 of 3)");
 });

@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
 import { compile } from "../../src/cli/commands/compile.js";
-import { run } from "../../src/cli/commands/run.js";
+import { run, RAIL_ROWS } from "../../src/cli/commands/run.js";
 import { sha256 } from "../../src/compile/common.js";
 import { compileRefusalPath, graphPath, loadGraph, saveGraph, setStatus } from "../../src/graph/graph.js";
 import { setupRepo, authedModels, COMMIT, T } from "../helpers/tmprepo.js";
@@ -182,4 +182,12 @@ describe("stale-graph run warning", () => {
       expect(existsSync(join(changed.repo, ".tickmarkr", "runs"))).toBe(false);
     }
   }, 120_000);
+});
+
+
+test("review infrastructure events have narrator labels", () => {
+  for (const event of ["review-no-verdict", "review-pool-demotion", "review-infra-retry"]) {
+    expect(RAIL_ROWS[event]).toMatchObject({ label: expect.any(String), tone: "attention" });
+    expect(RAIL_ROWS[event]!.label).not.toBe(event);
+  }
 });

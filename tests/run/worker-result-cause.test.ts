@@ -342,8 +342,8 @@ describe("typed dead-channel failover (v1.65 T1, zero tokens)", () => {
     const evs = Journal.open(repo, "run-dead-quota").read();
     const q = evs.filter((e) => e.event === "quota-failover");
     expect(q).toHaveLength(1);
-    expect(Object.keys(q[0].data).sort()).toEqual(["from", "to"]); // exact pre-extension event shape
-    expect(q[0].data).toEqual({ from: "fake:fake-1", to: "fake:fake-2" });
+    // pre-extension routing shape intact; Q-1 (OBS-926) adds the matched bytes + offset to the row
+    expect(q[0].data).toMatchObject({ from: "fake:fake-1", to: "fake:fake-2", matched: expect.any(String), offset: expect.any(Number) });
     // a quota hit never enters the typed dead-channel path: no typed event, no run-wide demotion
     expect(evs.some((e) => e.event === "dead-channel-failover")).toBe(false);
     expect(evs.some((e) => e.event === "channel-demotion")).toBe(false);

@@ -921,7 +921,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(closed.sort()).toEqual(names.slice().sort());
   });
 
-  test("v1.1: a reviewer that produced garbage is excluded on the task's next review", async () => {
+  test("v1.1: a reviewer that produced no verdict is excluded and exhaustion parks infrastructure", async () => {
     const { repo, fake } = setupRepo(
       [T("T1", { complexity: 8 })],
       {
@@ -938,11 +938,14 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     const details = Journal.open(repo, "run-revfail").read()
       .filter((e) => e.event === "gate-result" && (e.data as { gate?: string }).gate === "review")
       .map((e) => String((e.data as { details?: string }).details));
-    expect(details.some((d) => /unparseable/.test(d))).toBe(true); // first review: garbage, fail-closed
-    expect(details.some((d) => /no cross-vendor reviewer available/.test(d))).toBe(true); // retry: corpse excluded
+    expect(details.some((d) => /cause: no-verdict/.test(d))).toBe(true);
+    const rows = Journal.open(repo, "run-revfail").read();
+    expect(rows.find((e) => e.event === "task-human")?.data.kind).toBe("infra");
+    expect(rows.filter((e) => ["escalation", "consult", "repair-attempt"].includes(e.event))).toEqual([]);
+    expect(rows.filter((e) => e.event === "task-dispatch")).toHaveLength(1);
   });
 
-  test("test: a gate note event delivered through the gate event callback is appended verbatim as a journal row of that event name under its task so a reviewer-empty-output note carrying bytes 1 appears in the journal whereas a daemon that drops the note phase or rewrites its payload fails", async () => {
+  test("test: a gate note event delivered through the gate event callback is appended verbatim as a journal row of that event name under its task so a reviewer-empty-output note carrying seat-authored bytes 0 appears in the journal whereas a daemon that drops the note phase or rewrites its payload fails", async () => {
     const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { complexity: 8 })],
       {
@@ -966,7 +969,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     await runDaemon(repo, { adapters: [fake, new EmptyReviewer(scriptPath)], runId });
     const note = Journal.open(repo, runId).read().find((event) =>
       event.event === "reviewer-empty-output" && event.taskId === "T1");
-    expect(note?.data).toEqual({ reviewer: "empty:empty-1", bytes: 1 });
+    expect(note?.data).toEqual({ reviewer: "empty:empty-1", bytes: 0 });
   });
 
   test("v1.1: retried gates get attempt-unique pane names (herdr agent_name_taken regression)", async () => {

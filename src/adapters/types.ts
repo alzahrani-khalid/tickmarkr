@@ -333,6 +333,35 @@ export function missingInputStateDeclarations(inputBox: InputBox | undefined): s
   return missing;
 }
 
+// Adapter-owned painted activity; match the frame, never normalized stall text.
+export interface BusyFrameMarker {
+  name: string;
+  match(paneText: string): boolean;
+}
+
+// OBS-957 capture retained under fixtures/opencode (the captured UI identifies as omp).
+// Anchor activity glyphs to chrome/tool rows so a quoted spinner in a summary is harmless.
+export const OPENCODE_BUSY_FRAME_MARKERS: readonly BusyFrameMarker[] = [
+  { name: "unchecked TODO", match: (text: string) => /(?:^|\n)[^\n]*[├└]─[^\n]*☐/.test(text) || /(?:^|\n)\s*[-*] \[ \]/.test(text) },
+  { name: "in-flight tool", match: (text: string) => /(?:^|\n)\s*⎋ [^\n]+/.test(text) },
+  { name: "spinner", match: (text: string) => /(?:^|\n)(?:[╭│][─ ]*|\s*)[⠁-⣿](?:\s|$)/.test(text) },
+];
+
+export class SettledTrailerTracker {
+  private idleSamples = 0;
+  readonly busyMarkersSeen = new Set<string>();
+  settled = false;
+  constructor(private readonly markers: readonly BusyFrameMarker[]) {}
+
+  sample(paneText: string, trailer: boolean): boolean {
+    const busy = this.markers.filter((marker) => marker.match(paneText));
+    if (trailer) for (const marker of busy) this.busyMarkersSeen.add(marker.name);
+    this.idleSamples = trailer && busy.length === 0 ? this.idleSamples + 1 : 0;
+    this.settled = this.idleSamples >= 2;
+    return this.settled;
+  }
+}
+
 export interface WorkerAdapter {
   id: string;
   vendor: string;
@@ -400,6 +429,7 @@ export interface WorkerAdapter {
   // v1.75 T1 / OBS-136: optional steady-state TUI input-box declaration. The herdr delivery
   // readiness/clear guards consult only this adapter-owned contract, never a driver fingerprint.
   inputBox?: InputBox;
+  busyFrameMarkers?: readonly BusyFrameMarker[];
   // v1.65 T3: the CLI flags this adapter's command strings hardcode, checked by doctor against
   // `<binary> --help` (flagDriftWarnings). Advisory only — a drift warning never changes channel
   // availability, routing, or dispatch; only doctor reads this.

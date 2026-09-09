@@ -711,3 +711,35 @@ describe("v1.79 T3 legacy wall-clock bound sweep (OBS-147)", () => {
     }
   });
 });
+
+
+test("test: an interactive worker whose window expires with its trailer seen only on busy frames journals worker-result ok false cause premature-idle naming the busy marker and never ok true with the narration sentence as summary, so the capture's summary ending so I will add it journaling as ok true fails", async () => {
+  const capture = readFileSync(new URL("../fixtures/opencode/premature-idle-T4-a0.out", import.meta.url), "utf8").replaceAll("af7c190b", "<NONCE>");
+  const { repo, fake } = setupRepo([T("T1")], {
+    tasks: { T1: [{ shell: "true", result: { ok: true, summary: "trigger trailer wait" } }] },
+    consult: { action: "human", notes: "busy trailer" },
+  }, "taskTimeoutMinutes: 0.02\n");
+  await runDaemon(repo, { adapters: [fake], runId: "run-busy-trailer", driver: stagedInteractiveDriver(repo, "run-busy-trailer", "T1", [capture]) });
+  const rows = Journal.open(repo, "run-busy-trailer").read().filter((row) => row.event === "worker-result");
+  expect(rows.length).toBeGreaterThan(0);
+  for (const row of rows) {
+    expect(row.data.ok).toBe(false);
+    expect(row.data.finished).toBe(false);
+    expect(row.data.cause).toBe("premature-idle");
+    expect(row.data.summary).toContain("unchecked TODO");
+    expect(row.data.summary).toContain("in-flight tool");
+    expect(row.data.summary).toContain("spinner");
+    expect(row.data.summary).not.toContain("so I will add it");
+  }
+});
+
+test("interactive capture waits through busy frames and two clear trailer samples", async () => {
+  const capture = readFileSync(new URL("../fixtures/opencode/premature-idle-T4-a0.out", import.meta.url), "utf8").replaceAll("af7c190b", "<NONCE>");
+  const idle = capture.split("\n").filter((line) => !line.includes("☐") && !line.includes("⎋ Search") && !line.includes("⠏")).join("\n").replace("so I will add it.", "and added it.");
+  const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [{ shell: `echo done > done.txt && ${COMMIT} done`, result: { ok: true, summary: "trigger trailer wait" } }] } });
+  await runDaemon(repo, { adapters: [fake], runId: "run-busy-cleared", driver: stagedInteractiveDriver(repo, "run-busy-cleared", "T1", [capture, capture, idle, idle]) });
+  const row = Journal.open(repo, "run-busy-cleared").read().find((event) => event.event === "worker-result");
+  expect(row?.data.ok).toBe(true);
+  expect(row?.data.finished).toBe(true);
+  expect(row?.data.summary).toContain("and added it.");
+});

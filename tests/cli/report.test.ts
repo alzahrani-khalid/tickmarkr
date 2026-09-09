@@ -75,3 +75,25 @@ describe("tickmarkr report --md usage and efficiency", () => {
     expect(out).toContain("**route deviation:** api:metered learned score 0.75 (n=6) vs static api:static 0.1");
   });
 });
+
+
+test("test: the report's review row for an approval that closed carried materials names the resolved fingerprints beside the reviewer and an approval that carried none prints no resolved list, so a report that renders the approval without the closure it certified fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x\n" });
+  const journal = Journal.create(repo, "run-closure");
+  const resolved = ["review:material|src/pointer.ts|register", "review:material|src/model.ts|reconcile"];
+  for (const [taskId, ids] of [["T1", resolved], ["T2", []]] as const) {
+    journal.append("task-dispatch", taskId, { adapter: "codex", model: "gpt-5" });
+    journal.append("gate-result", taskId, {
+      gate: "review", pass: true, reviewer: "claude-code:opus", resolved: ids,
+      details: "reviewer claude-code:opus (vendor: anthropic; provider: anthropic): approved",
+    });
+  }
+  const md = await report(["run-closure", "--md"], repo);
+  const rows = md.split("\n").filter((line) => line.includes("- review: pass"));
+  expect(rows).toHaveLength(2);
+  expect(rows[0]).toContain("reviewer claude-code:opus");
+  expect(rows[0]).toContain("approved");
+  for (const id of resolved) expect(rows[0]).toContain(id);
+  expect(rows[1]).toContain("approved");
+  expect(rows[1]).not.toContain("resolved:");
+});

@@ -482,27 +482,143 @@ describe("tickmarkr init wizard (T4)", () => {
     expect(existsSync(join(repo, ".tickmarkr", "config.yaml"))).toBe(false);
   });
 
-  test("test: the closing environments footer says auto picks orca inside an Orca terminal and the wizard seeds the driver as orca when both Orca markers are set and HERDR_ENV is unset whereas a footer saying auto never picks it or a seed of auto under the markers fails", async () => {
+  test("test: init accepting the default answer inside a Herdr pane writes the automatic driver choice with an explanation naming Herdr as what it resolves to here, and under both Orca terminal markers with the Herdr variable unset writes the automatic choice naming Orca, so a scaffold carrying a Herdr or Orca literal from the default answer fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const oldHerdr = process.env.HERDR_ENV;
     const oldTerm = process.env.TERM_PROGRAM;
     const oldTermVersion = process.env.TERM_PROGRAM_VERSION;
     const oldOrca = process.env.ORCA_TERMINAL_HANDLE;
-    delete process.env.HERDR_ENV;
-    process.env.TERM_PROGRAM = "Orca";
-    process.env.TERM_PROGRAM_VERSION = "1.4.195";
-    process.env.ORCA_TERMINAL_HANDLE = "terminal-1";
-    try {
-      const footerRepo = makeRepo({ "keep.txt": "x" });
-      stampDoctor(footerRepo, 5 * 60 * 1000);
-      const out = await runInit(footerRepo);
-      expect(out).toContain("auto picks it inside an Orca terminal");
-      expect(out).not.toContain("auto never picks it");
 
-      const wizardRepo = makeRepo({ "keep.txt": "x" });
-      stampDoctor(wizardRepo, 5 * 60 * 1000);
-      await driveInit(wizardRepo, KEY.down.repeat(9) + KEY.enter);
-      expect(loadConfig(wizardRepo).driver).toBe("orca");
+    try {
+      // 1. Inside a Herdr pane: HERDR_ENV=1
+      process.env.HERDR_ENV = "1";
+      delete process.env.TERM_PROGRAM;
+      delete process.env.TERM_PROGRAM_VERSION;
+      delete process.env.ORCA_TERMINAL_HANDLE;
+
+      const herdrRepo = makeRepo({ "keep.txt": "x" });
+      stampDoctor(herdrRepo, 5 * 60 * 1000);
+      const { io: herdrIO } = await driveInit(herdrRepo, KEY.down.repeat(9) + KEY.enter);
+
+      const herdrCfg = loadConfig(herdrRepo);
+      expect(herdrCfg.driver).toBe("auto");
+      expect(herdrCfg.driver).not.toBe("herdr");
+      expect(herdrCfg.driver).not.toBe("orca");
+
+      const herdrCfgText = readFileSync(join(tickmarkrDir(herdrRepo), "config.yaml"), "utf8");
+      expect(herdrCfgText).toMatch(/^driver: auto/m);
+      expect(herdrCfgText).not.toMatch(/^driver: (?:herdr|orca)$/m);
+      expect(herdrCfgText).toContain("resolves to herdr here");
+
+      const herdrFrames = strip(herdrIO.writes.join(""));
+      expect(herdrFrames).toContain("auto — resolves to herdr here");
+
+      // 2. Under both Orca terminal markers with HERDR_ENV unset
+      delete process.env.HERDR_ENV;
+      process.env.TERM_PROGRAM = "Orca";
+      process.env.TERM_PROGRAM_VERSION = "1.4.195";
+      process.env.ORCA_TERMINAL_HANDLE = "terminal-1";
+
+      const orcaRepo = makeRepo({ "keep.txt": "x" });
+      stampDoctor(orcaRepo, 5 * 60 * 1000);
+      const { io: orcaIO } = await driveInit(orcaRepo, KEY.down.repeat(9) + KEY.enter);
+
+      const orcaCfg = loadConfig(orcaRepo);
+      expect(orcaCfg.driver).toBe("auto");
+      expect(orcaCfg.driver).not.toBe("orca");
+      expect(orcaCfg.driver).not.toBe("herdr");
+
+      const orcaCfgText = readFileSync(join(tickmarkrDir(orcaRepo), "config.yaml"), "utf8");
+      expect(orcaCfgText).toMatch(/^driver: auto/m);
+      expect(orcaCfgText).not.toMatch(/^driver: (?:herdr|orca)$/m);
+      expect(orcaCfgText).toContain("resolves to orca here");
+
+      const orcaFrames = strip(orcaIO.writes.join(""));
+      expect(orcaFrames).toContain("auto — resolves to orca here");
+    } finally {
+      if (oldHerdr !== undefined) process.env.HERDR_ENV = oldHerdr;
+      else delete process.env.HERDR_ENV;
+      if (oldTerm !== undefined) process.env.TERM_PROGRAM = oldTerm;
+      else delete process.env.TERM_PROGRAM;
+      if (oldTermVersion !== undefined) process.env.TERM_PROGRAM_VERSION = oldTermVersion;
+      else delete process.env.TERM_PROGRAM_VERSION;
+      if (oldOrca !== undefined) process.env.ORCA_TERMINAL_HANDLE = oldOrca;
+      else delete process.env.ORCA_TERMINAL_HANDLE;
+    }
+  });
+
+  test("test: a driver the wizard cycles to explicitly is written as chosen, and init --force on a config whose literal equals the detected host rewrites it to the automatic choice naming the rewrite while a config whose literal differs from the detected host keeps it, so a force that leaves the unchosen host literal in place fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const oldHerdr = process.env.HERDR_ENV;
+    const oldTerm = process.env.TERM_PROGRAM;
+    const oldTermVersion = process.env.TERM_PROGRAM_VERSION;
+    const oldOrca = process.env.ORCA_TERMINAL_HANDLE;
+
+    try {
+      // 1. A driver the wizard cycles to explicitly is written as chosen
+      delete process.env.HERDR_ENV;
+      delete process.env.TERM_PROGRAM;
+      delete process.env.TERM_PROGRAM_VERSION;
+      delete process.env.ORCA_TERMINAL_HANDLE;
+
+      const explicitRepo = makeRepo({ "keep.txt": "x" });
+      stampDoctor(explicitRepo, 5 * 60 * 1000);
+      // Row 0 is Driver. KEY.space cycles auto → herdr. Then clamp down to Continue and press enter.
+      await driveInit(explicitRepo, KEY.space + KEY.down.repeat(9) + KEY.enter);
+      expect(loadConfig(explicitRepo).driver).toBe("herdr");
+      const explicitCfgText = readFileSync(join(tickmarkrDir(explicitRepo), "config.yaml"), "utf8");
+      expect(explicitCfgText).toMatch(/^driver: herdr$/m);
+
+      // 2. Inside Herdr (detected host = herdr):
+      process.env.HERDR_ENV = "1";
+
+      // A config whose literal equals detected host (herdr) is rewritten to auto, naming the rewrite
+      const herdrRepo = makeRepo({ ".tickmarkr/config.yaml": "concurrency: 3\ndriver: herdr\n" });
+      stampDoctor(herdrRepo, 5 * 60 * 1000);
+      const forceOut = await runInit(herdrRepo, "--force");
+      expect(loadConfig(herdrRepo).driver).toBe("auto");
+      expect(loadConfig(herdrRepo).driver).not.toBe("herdr");
+      expect(forceOut).toContain("rewrote driver: herdr to auto");
+      const herdrRewrittenText = readFileSync(join(herdrRepo, ".tickmarkr", "config.yaml"), "utf8");
+      expect(herdrRewrittenText).toMatch(/^driver: auto/m);
+      expect(herdrRewrittenText).not.toMatch(/^driver: herdr$/m);
+
+      // While a config whose literal differs from detected host (e.g. orca or subprocess) is kept
+      const differRepo = makeRepo({ ".tickmarkr/config.yaml": "concurrency: 3\ndriver: orca\n" });
+      stampDoctor(differRepo, 5 * 60 * 1000);
+      const differOut = await runInit(differRepo, "--force");
+      expect(loadConfig(differRepo).driver).toBe("orca");
+      expect(differOut).toContain("kept existing");
+      expect(differOut).not.toContain("rewrote driver");
+      const differText = readFileSync(join(differRepo, ".tickmarkr", "config.yaml"), "utf8");
+      expect(differText).toMatch(/^driver: orca$/m);
+
+      // Also test subprocess differing from herdr
+      const subRepo = makeRepo({ ".tickmarkr/config.yaml": "concurrency: 3\ndriver: subprocess\n" });
+      stampDoctor(subRepo, 5 * 60 * 1000);
+      const subOut = await runInit(subRepo, "--force");
+      expect(loadConfig(subRepo).driver).toBe("subprocess");
+      expect(subOut).toContain("kept existing");
+      expect(subOut).not.toContain("rewrote driver");
+
+      // 3. And under Orca (detected host = orca):
+      delete process.env.HERDR_ENV;
+      process.env.TERM_PROGRAM = "Orca";
+      process.env.ORCA_TERMINAL_HANDLE = "terminal-1";
+
+      const orcaMatchRepo = makeRepo({ ".tickmarkr/config.yaml": "concurrency: 3\ndriver: orca\n" });
+      stampDoctor(orcaMatchRepo, 5 * 60 * 1000);
+      const orcaForceOut = await runInit(orcaMatchRepo, "--force");
+      expect(loadConfig(orcaMatchRepo).driver).toBe("auto");
+      expect(loadConfig(orcaMatchRepo).driver).not.toBe("orca");
+      expect(orcaForceOut).toContain("rewrote driver: orca to auto");
+
+      const orcaDifferRepo = makeRepo({ ".tickmarkr/config.yaml": "concurrency: 3\ndriver: herdr\n" });
+      stampDoctor(orcaDifferRepo, 5 * 60 * 1000);
+      const orcaDifferOut = await runInit(orcaDifferRepo, "--force");
+      expect(loadConfig(orcaDifferRepo).driver).toBe("herdr");
+      expect(orcaDifferOut).toContain("kept existing");
+      expect(orcaDifferOut).not.toContain("rewrote driver");
     } finally {
       if (oldHerdr !== undefined) process.env.HERDR_ENV = oldHerdr;
       else delete process.env.HERDR_ENV;

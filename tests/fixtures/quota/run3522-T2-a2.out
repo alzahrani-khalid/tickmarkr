@@ -1,0 +1,913 @@
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+ succeeded in 1563ms:
+hook: PreToolUse
+hook: PreToolUse
+hook: PostToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+hook: PostToolUse Completed
+exec
+/bin/zsh -lc "sed -n '350,394p' .planning/FINAL-screen-consolidation.md && ls -a && if [ -f CLAUDE.md ]; then sed -n '1,200p' CLAUDE.md; fi" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 0ms:
+## 4. Rebuild versus refactor and migration
+
+Retain Ink 6/React 19 as declared in `package.json:46` and `package.json:48`; retain Panel, measured text, guarded magnitude ramp, pointer loan and binding-table approach. Rebuild shell and six view bodies; share journal lifecycle, graph comparability, telemetry and config writers. `src/cli/commands/fleet-picker.ts` is the actual picker helper. Do not set arbitrary 300-line module limits.
+Retire legacy watch rendering as the default TTY path, but keep the `--plain` fallback. Remove `fleet-app.tsx`, setup/demo product frames and shared ink/frame/components only after every production importer and fixture harness has migrated. Correct ARCHITECTURE.md's obsolete engine/path descriptions in the same release as the change.
+Memory claim boundary: historical OBS-260 records roughly four-hour OOM on a static journal; L008/L061 record mixed-activity ten-minute RSS growth only. No causal allocation profile was captured. Repeated parsing is verified, retained-object cause is not.
+New live store: tail by file identity/byte offset with UTF-8 partial-line carry; retain original line numbers; handle append, truncate, replace and malformed complete records distinctly. Keep bounded visible history and page older evidence from disk; bound frame caches, subscriptions, pending reads and metrics samples. Do not retain all raw events and derived frames forever.
+Journal changes invalidate journal projections; graph/config/cache/lock/beat changes and clock/resize/input independently invalidate their consumers. Target one-second sensor cadence; skip unchanged structural work, update visible ages as needed, and report delayed/failed observation after two target intervals. No claim of zero idle CPU or a hard wall-clock one-second guarantee.
+Proposed performance gate: production UI mount with a bounded output sink, 1,000 warm-up + 10,000 simulated idle/growth/resize ticks; post-GC retained-heap ceiling 256 MiB and final 2,000-tick increase ≤16 MiB, with selected snapshots/retainer evidence on failure. These are new design budgets, not measured current performance. A four-hour static and growing-journal soak in an isolated repo must pass before default narrator cutover; accelerated ticks alone cannot establish duration stability.
+
+| slice | deliverable and entry behavior | conditions for shipping |
+|---|---|---|
+| A — 2.5.0 | Home, Run, Evidence; shared shell/store, actionable parks, cleanup, inert help and recovery hygiene. Rail advertises only delivered 1/4/5; no fake Fleet/Plan/Health placeholder views. Existing commands remain available. | Shared shell integrates tested leaf modules; actual CLI/driver mount, goldens, pure prints, fake lifecycle and memory gates pass. `ui --setup <id>` opens Run Parks. |
+| B — follow-on | Fleet sections and Bootstrap; then interactive fleet becomes an alias. Add rail key 2. Model-flow §3(f) backend contract must have landed first. | Write/reload/race/first-touch/non-TTY init tests and catalog/route goldens move with owners. Delete shared Ink files only after Bootstrap migration. |
+| C — follow-on | Plan and Health; add keys 3/6. Retire public legacy demo and complete docs/skills migration. | Cached-reader/explicit-action tests, route/doctor/report parity and all six views' width/height/accessibility captures pass. |
+
+[changed: R37] The owned narrator remains beside its caller and closes at run-end; manual `ui` retains the receipt. Before closing an owned board, request graceful shutdown, verify its own watch presence stood down, then close its owned pane; use a bounded failure path that reports unconfirmed cleanup. Never stand down another observer's presence or fake an acknowledgement. SIGKILL/crash truth may age stale.
+Replacement filters workspace + canonical run ownership and repository association; matching run text alone is insufficient across repos. Unknown/foreign boards are not retired. Preserve `keepPanes: forever`, worker/gate grouping, ≤20-character tab labels and independent title restoration. Driver placement failures remain visible diagnostics; do not silently advertise a board that never opened.
+Unbounded named-run observers (manual UI, narrator and status event-watch) each own watch presence; snapshots/prints and a no-run Home do not. This intentionally extends presence ownership beyond today's observational UI; every orderly exit releases only its own presence handle.
+
+## 5. Spec-ready tasks and OBS-923 ownership sweep
+
+All work below is **future implementation**. No task was executed for this review. Goals are short; each listed AC is a separate `judge:` item requiring changed production-call-site and assertion hunks. Convert behavior items to exact-leaf `test:` oracles only after the named tests exist; do not turn them into source greps.
+Each task has at most eight files[] patterns and five ACs; the listed products are ≤24 and goals meet density ≤60. Brace groups are single patterns, as `src/compile/native.ts:853` specifies. New leaf/store/help/view files and their tests are to be authored; existing oracle paths below were checked. Tests use fake/local fixtures, not `.planning` or audit-private captures at runtime.
+Ownership is exclusive within a slice. C1 owns cockpit integration/capture consumers; C2–C5 add leaf capabilities. C1 exposes the consolidated mount through an internal integration option while existing CLI routing stays compatible; C6 switches the public entry after those dependencies land. Every intermediate commit must build/pass its existing callers. B/C are separate specs with fresh scopes, not overlapping concurrent tasks.
+Leaf criteria verify exported component/store boundaries with substantive fixture behavior; C1/C6 separately prove their actual CLI call sites in the integration diff. A tested but unmounted leaf is not a shipped capability. Commit each task's criteria and this design as read-only context before dispatch; the judge must receive the relevant contract, not an inaccessible audit-private path.
+
+**C1 — Shell and actual UI integration (A; deps C2–C5).**
+
+- files[]: [`src/{brand.ts,tui/cockpit/{components.tsx,layout.ts,theme.ts,keys.ts,views.ts,pointer.ts,live.ts,run-cockpit.tsx,setup-cockpit.tsx,capture.ts,demo.ts,shell.tsx}}`, `tests/{cockpit/{components,layout,theme,keys,views,pointer,width,width-class,width-migration,height,sweep,colour,frames,demo,live,setup},brand,pane-banner,hygiene/brand-sweep}.test.ts`, `tests/fixtures/cockpit/**`].
+- AC1: The production `runLiveCockpit` mounts the C3–C5 Home/Run/Evidence components from C2 live-store snapshots through the new shell at 80×24, 120×40 and every 40–220 ×14–50 planned size; measured frames preserve status/keybar and expose long task-ID/verdict content by paging; a body that pushes the footer offscreen fails.
+- AC2: The mounted input path and committed pointer geometry exercise the §3.3 registry, including `q1?` batched text, folded focus, dirty q, Esc and confirmation; a displayed key with no transition or a text digit switching views fails.
+- AC3: Production terminal mount restores raw/pointer/title/alternate modes on q, Ctrl-C, SIGTERM and read/render failure; an unmounted timer/listener or unrepaid terminal mode fails the lifecycle assertions.
+- AC4: Mounted frames apply §3.2 colors to the same state words in truecolor, reduced-color and NO_COLOR modes; a running/human state using the pass check or a magnitude ramp keyed to tile identity fails even if all color snapshots are regenerated.
+- AC5: The production mount under §4's bounded-sink 1,000+10,000 tick experiment stays within retained-heap and late-growth budgets across static/growing journal and resize cases; a harness that stores every frame or an implementation that accumulates old snapshots fails.
+- Oracles moved: working frames/colour/sweep and existing frame/layout/key/live/setup/demo assertions; source captures/digests and anchors remain evidence, with explicit contract-moved retirement rather than blanket regeneration. Re-freeze moved anchors only after accepted UAT frames.
+
+**C2 — Shared observable state and bounded store (A; no deps).**
+
+- files[]: [`src/run/operator-state.ts`, `src/tui/cockpit/{derive.ts,live-store.ts}`, `tests/cockpit/{derive,live-store}.test.ts`, `tests/fixtures/operator-state/**`].
+- AC1: The reader consumed by C1 and status derives partial→approved→resumed→complete from a three-task fixture with matching graph; one human or blocked item keeps partial, resume clears prior tip pass, and mismatched graph withholds a denominator; old-tip green and 1/2 instead of 1/3 fail.
+- AC2: Its production tail/read interface handles torn UTF-8 append, full malformed row, replacement and truncation while preserving real #L pointers and visible read errors; swallowing corruption into an empty/green snapshot fails.
+- AC3: With a static journal, changed graph identity, expired beat, dead/EPERM holder and resized viewport reach their consumers independently; bounded history still pages an early verdict after 10,000 later events. Growth-only invalidation or unreachable evicted evidence fails.
+- Oracles moved: derive assertions plus new immutable lifecycle/read-failure fixtures; old capture source bytes are read-only context for C1.
+
+**C3 — Home view (A; deps C2).**
+.
+..
+.claude
+.git
+.github
+.gitignore
+.overseer
+.oxlintrc.json
+.planning
+.tickmarkr
+ASSESSMENT-Fable.md
+ASSESSMENT-codex-sol.md
+ASSESSMENT-omp-perf.md
+ASSESSMENT-unlazy.md
+CHANGELOG.md
+CLAUDE.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+FLEET.md
+LICENSE
+README.md
+RELEASING.md
+SECURITY.md
+assets
+dist
+docs
+fixtures
+node_modules
+package-lock.json
+package.json
+schema
+scripts
+skills
+specs
+src
+tests
+tickmarkr.spec.md
+tsconfig.json
+vitest.config.ts
+# tickmarkr
+
+Spec in, verified work out.
+
+> The package ships `tickmarkr` + `tkr` only (legacy bins removed v1.31).
+
+## Commands
+- `npm test` — vitest unit+integration (no tokens spent; fake adapter only)
+- `npm run test:coverage` — must stay ≥80% on src/{graph,route,gates,run}
+- `npm run build` — tsc to dist/
+- `npm run schema` — emit schema/rungraph.schema.json from the zod schema
+- `npm run e2e` — real-CLI end-to-end (spends tokens; needs ≥1 agent CLI installed)
+
+## Invariants (do not break)
+- acceptance[] required on every task; compile fails without it
+- state is files + git only; no DB, no services
+- worker/judge/review/consult prompts end with machine-parseable trailers
+  (structured JSON verdicts); parse defensively, fail closed
+- run, merge, and gate invariants: the scaffolded `## tickmarkr` block below is
+  canonical — stated once there, restated nowhere (copies drift)
+
+## Project
+
+tickmarkr is a spec-driven orchestration harness for AI coding agent CLIs. It compiles specs into a task graph, routes each task to the best installed agent CLI by cost within capability floors, executes workers in isolated git worktrees, verifies everything through fail-closed gates, and merges green work to a `tickmarkr/<runId>` integration branch — never main.
+
+**Core Value:** Gates never trust worker claims — tickmarkr verifies everything itself, fail-closed.
+
+### Constraints
+- **Tests**: `npm test` must stay zero-token (fake adapter only); coverage ≥80% on src/{graph,route,gates,run}
+- **Dependencies**: no new runtime dependencies without cause
+- **Security**: config values flow into shells — quote everything
+
+## Native SDD workflow
+- Scope work as a native spec in `specs/<version>-<name>.spec.md` with native spec markers.
+- Drive execution with `tickmarkr compile`, `plan`, and `run`; keep `tickmarkr report <runId> --md` beside the spec as the milestone artifact.
+- Use a spec branch from main and a `tickmarkr/<runId>` integration branch; merging to main is a human decision.
+- Historical planning records are read-only archives; current project guidance belongs in this file or the shipped docs.
+
+## Codebase reference pointers
+- Editing `src/graph/` or `src/compile/`? Read [docs/codebase/ARCHITECTURE.md](docs/codebase/ARCHITECTURE.md) and [docs/codebase/STRUCTURE.md](docs/codebase/STRUCTURE.md) first.
+- Editing `src/gates/`? Read [docs/codebase/ARCHITECTURE.md](docs/codebase/ARCHITECTURE.md) first.
+- Editing `src/route/`, `src/adapters/`, `src/drivers/`, or `src/run/`? Read [docs/codebase/ARCHITECTURE.md](docs/codebase/ARCHITECTURE.md) first.
+- Changing dependencies, config, or integrations? Read [docs/codebase/STACK.md](docs/codebase/STACK.md) and [docs/codebase/INTEGRATIONS.md](docs/codebase/INTEGRATIONS.md).
+- Changing naming, style, or module conventions? Read [docs/codebase/CONVENTIONS.md](docs/codebase/CONVENTIONS.md).
+- Changing tests? Read [docs/codebase/TESTING.md](docs/codebase/TESTING.md).
+- Touching a known fragile or risky area? Read [docs/codebase/CONCERNS.md](docs/codebase/CONCERNS.md).
+
+## Fix discipline (this repository only — never shipped to consumers; v2.3 T6 moved it out of the generated block)
+
+- **EVERY fix gets a ship/no-ship decision, recorded, at the moment it is made.** Ask one question of each
+  one: *does a user hit this defect?* If yes, the fix belongs in `src/**` or `skills/**` — the only trees
+  the package carries (`files: [dist, schema, skills, fixtures]`). A script, overlay, config entry or
+  operator-side workaround that resolves the symptom **locally is not the fix; it is a decision to leave
+  every other user broken**, and it must say so in writing and name the condition that removes it.
+  **The default answer is SHIP.** A local remedy is the exception and carries the burden of proof.
+  Watch for the three shapes this hides in: a fix applied where you happened to be standing rather than
+  where the defect lives; an observation filed with a product fix named in its own text and queued
+  nowhere; and a local tool that quietly grows into a product feature nobody shipped. **A defect and its
+  fix must be recorded in the same place, or the queue silently becomes a list of things everyone assumed
+  someone else had shipped.**
+
+<!-- tickmarkr:agent-docs begin -->
+## tickmarkr
+
+tickmarkr compiles repository specs into isolated, independently verified agent work.
+
+### Invariants
+
+- Never run two tickmarkr runs in the same repository concurrently.
+- Never let tickmarkr merge work to main; new runs consolidate on `tickmarkr/<runId>`.
+- Do not edit compiled graphs to force outcomes; fix source specs and recompile.
+- Gates verify commits, diffs, acceptance criteria, and reviews independently — never trust a worker's completion claim.
+- Treat missing or unparseable machine results and verdicts as failures.
+
+### Commands
+
+- `tickmarkr compile <spec>` — spec → RunGraph
+- `tickmarkr plan` — routing table and human gates
+- `tickmarkr run` — execute the graph
+- `tickmarkr status <runId>` — run progress
+- `tickmarkr resume <runId>` — continue a paused or failed run
+- `tickmarkr approve <runId> <taskId>` — release a human gate
+- `tickmarkr report <runId> --md` — execution record beside the spec
+- `tickmarkr verify --base <ref>` — run the gate battery standalone against merge-base(base, HEAD)..HEAD: no daemon, no retries, one fail-closed verdict (`--criteria <file>` or `--task <id>` adds the semantic gates; `--no-review` for deterministic-only)
+
+Loop: compile → plan → run → report. Watch the journal for run-end rather than polling workers.
+
+### Role check (multi-agent environments)
+
+- **Orchestrator:** run the loop in your session; do not start a second run.
+- **Supervisor with a live orchestrator:** relay the mission via verified handoff (below), then supervise — do not duplicate the loop.
+- **Primary session without an orchestrator:** spawn one child orchestration session, give it the mission and these rules, then supervise.
+
+Outside multi-agent environments, run the loop directly.
+
+### Version preflight
+
+Before `tickmarkr compile` or `tickmarkr run`: run `tickmarkr version`, read `package.json` version, and stop if the versions differ anywhere (major, minor, or patch); the binary and repository must agree on the entire version, so binary `2.1.0` versus repository `2.1.1` is a stop. Tell the operator to update or link the correct binary. Never proceed on hope — stale binaries silently skip daemon gates. Also verify no run is live in this repository before starting one: lead with this repository's `.tickmarkr/graph.lock`, read its holder pid, and treat it as live until `kill -0 <pid>` proves that holder dead. Never require a machine-wide process pattern to be empty: a lawful run in another repository — or the probing shell's own argv — can match. If you use a process probe as secondary evidence, exclude the probing process, resolve every candidate's own cwd (for example with `lsof -a -p <pid> -d cwd`), and count only candidates whose cwd is this repository root.
+
+### Tip-verify-before-green
+
+A run is green only when ALL of these hold: the run-end event exists in the journal, tip verify is not "failed", AND the run-end summary's `failed`, `human`, `blocked` and `pending` buckets are every one of them empty. The shorter "run-end plus tip verify" form is NOT sufficient: a run ending `done=[T1,T3,T4] human=[T2] tipVerify=passed` is a closed PARTIAL run — three of four delivered, one parked — and calling it green is how a park becomes invisible. Never report green to the operator, tab titles, or records until every clause holds; when one does not, name the bucket that is not empty.
+
+### Verified handoffs
+
+When relaying missions between agents, never use bare send-text (`herdr agent send` / pane send-text) — it omits Enter. Use `herdr pane run <pane> "<message>"` or `herdr notification show "<message>"`. Confirm delivery by reading the target pane afterward; never report "relayed" without read-back.
+
+### Orient before you act — this block may be the ONLY guidance your host loaded
+
+These same bytes are written into EVERY repository guidance file this project has, because hosts disagree
+about which one they read: some load only `AGENTS.md`, some also load a repo-level guidance file, some load
+a user-level one instead. **Anything stated in only one file is invisible to some agent.** So do not assume
+you were handed the whole picture — list the repository root, open every guidance file present, and then:
+
+- **Read your host's PROJECT MEMORY before starting.** Hosts that keep one store it under a per-project
+  state directory keyed by the absolute working-directory path; find it and read its index plus every entry
+  whose name concerns METHOD or DISCIPLINE. It holds rules that cost real defects to learn. Entries may
+  predate a project rename, so **search by CONCEPT, not by the current product name.** A memory nobody opens
+  is worse than none: every seat assumes the lesson is recorded somewhere and no seat looks.
+- **The gates are the product.** Seven, defined in `src/graph/schema.ts`:
+  `build test lint evidence scope acceptance review`. **That is DECLARATION order, not execution order** —
+  the first five run as a battery that stops at its first red, then `acceptance` and `review` run
+  CONCURRENTLY (`run-gates.ts:39`, *"judge ‖ review"*). The first five are MANDATORY; only `acceptance` and
+  `review` may be omitted per task. Implementations are in `src/gates/` — `baseline.ts` (build/test/lint,
+  diffed against a recorded baseline so pre-existing failures are forgiven), `evidence.ts`, `scope.ts`,
+  `acceptance.ts` (its judge reads the DIFF and every criterion must cite a changed hunk), `review.ts`
+  (cross-vendor). `run-gates.ts` drives them. **A declared gate is not a passed gate, and a gate that
+  returned zero findings is not the same as a gate that ran.**
+- **Spec-authoring law ships in the spec template** that `tickmarkr init` writes: the hard bounds and which
+  direction each moves, what makes a criterion real, and why an absence or a source-text grep is never a
+  criterion. Read it before authoring or repairing acceptance items.
+- **Editing `src/gates/`, `src/compile/` or `src/graph/`?** Read `docs/codebase/ARCHITECTURE.md` first.
+<!-- tickmarkr:agent-docs end -->
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+/bin/zsh -lc "rg -n 'debug|write\\(' node_modules/ink/build/ink.js | head -45 && git diff --check && git diff --stat" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 0ms:
+102:    // This variable is used only in debug mode to store full static output
+103:    // so that it's rerendered every time, not just new static parts, like in non-debug mode
+122:        const unthrottled = options.debug || this.isScreenReaderEnabled;
+151:                    this.options.stdout.write(bsu);
+155:                    this.options.stdout.write(esu);
+171:        // This variable is used only in debug mode to store full static output
+172:        // so that it's rerendered every time, not just new static parts, like in non-debug mode
+255:        if (this.options.debug) {
+259:            this.options.stdout.write(this.fullStaticOutput + output);
+264:                this.options.stdout.write(staticOutput);
+274:                this.options.stdout.write(bsu);
+281:                this.options.stdout.write(erase + staticOutput);
+287:                    this.options.stdout.write(esu);
+298:                this.options.stdout.write(wrappedOutput);
+304:                this.options.stdout.write(erase + wrappedOutput);
+311:                this.options.stdout.write(esu);
+325:                this.options.stdout.write(bsu);
+327:            this.options.stdout.write(ansiEscapes.clearTerminal + this.fullStaticOutput + output);
+333:                this.options.stdout.write(esu);
+341:                this.options.stdout.write(bsu);
+344:            this.options.stdout.write(staticOutput);
+347:                this.options.stdout.write(esu);
+375:        if (this.options.debug) {
+376:            this.options.stdout.write(data + this.fullStaticOutput + this.lastOutput);
+380:            this.options.stdout.write(data);
+385:            this.options.stdout.write(bsu);
+388:        this.options.stdout.write(data);
+391:            this.options.stdout.write(esu);
+398:        if (this.options.debug) {
+399:            this.options.stderr.write(data);
+400:            this.options.stdout.write(this.fullStaticOutput + this.lastOutput);
+404:            this.options.stderr.write(data);
+409:            this.options.stdout.write(bsu);
+412:        this.options.stderr.write(data);
+415:            this.options.stdout.write(esu);
+476:                    this.options.stdout.write('\u001B[<u');
+485:                this.options.stdout.write(this.lastOutput + '\n');
+487:            else if (!this.options.debug) {
+526:            this.options.stdout.write('', resolveOrReject);
+546:        if (!isInCi && !this.options.debug) {
+554:        if (this.options.debug) {
+630:        stdout.write('\u001B[?u');
+633:        this.options.stdout.write(`\u001B[>${resolveFlags(flags)}u`);
+ tests/fixtures/operator-state/heap-runner.mjs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc './node_modules/.bin/vitest run tests/cockpit/live-store-heap.test.ts' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ exited 1 in 30ms:
+failed to load config from /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2/vitest.config.ts
+
+⎯⎯⎯⎯⎯⎯⎯ Startup Error ⎯⎯⎯⎯⎯⎯⎯⎯
+Error: EPERM: operation not permitted, open '/Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2/node_modules/.vite-temp/vitest.config.ts.timestamp-1788613797362-5e9b8bcfe66448.mjs'
+    at async open (node:internal/fs/promises:1360:25)
+    at async Object.writeFile (node:internal/fs/promises:2104:14)
+    at async loadConfigFromBundledFile (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35994:3)
+    at async bundleAndLoadConfigFile (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35884:17)
+    at async loadConfigFromFile (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35851:42)
+    at async resolveConfig (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35500:22)
+    at async _createServer (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:25441:67)
+    at async createViteServer (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:6921:17)
+    at async createVitest (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10212:17)
+    at async prepareVitest (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10551:14) {
+  errno: -1,
+  code: 'EPERM',
+  syscall: 'open',
+  path: '/Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2/node_modules/.vite-temp/vitest.config.ts.timestamp-1788613797362-5e9b8bcfe66448.mjs'
+}
+
+
+
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg -n 'configLoader|VITE_.*TEMP|vite-temp' node_modules/vitest/dist node_modules/vite/dist/chunks/config.js && sed -n '1,140p' docs/codebase/TESTING.md" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ exited 2 in 0ms:
+rg: node_modules/vite/dist/chunks/config.js: No such file or directory (os error 2)
+node_modules/vitest/dist/node.d.ts:59:  * Override vite config's configLoader from cli.
+node_modules/vitest/dist/node.d.ts:64:  configLoader?: InlineConfig extends {
+node_modules/vitest/dist/node.d.ts:65:          configLoader?: infer T
+node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:7397:               configLoader: ctx.vite.config.inlineConfig.configLoader,
+node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10208:              configLoader: options.configLoader,
+node_modules/vitest/dist/chunks/cac.BfaZ95xE.js:1193:   configLoader: {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+/bin/zsh -lc "./node_modules/.bin/oxlint tests/fixtures/operator-state/heap-runner.mjs --format stylish && rg --files --hidden .claude /Users/khalidalzahrani/.codex -g '*MEMORY*' -g '*memory*' -g '*method*' -g '*discipline*' -g '"'!sessions/**'"' -g '"'!*.jsonl'"' -g '"'!skills/**'"'" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ exited 1 in 0ms:
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc './node_modules/.bin/vitest run tests/cockpit/live-store-heap.test.ts --configLoader runner --cache false' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "sed -n '1,130p' docs/codebase/TESTING.md
+rg --files --hidden .claude /Users/khalidalzahrani/.codex -g '*MEMORY*' -g '*memory*' -g '*method*' -g '*discipline*' -g '"'!sessions/**'"' -g '"'!*.jsonl'"' -g '"'!skills/**'"'" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ exited 1 in 0ms:
+# Testing Patterns
+
+**Analysis Date:** 2026-07-18
+
+## Test Framework
+
+**Runner:**
+- Vitest `^3.0.0`
+- Config: `vitest.config.ts`
+
+**Assertion Library:**
+- Vitest's built-in `expect` (Chai-compatible) — no separate assertion library
+
+**Run Commands:**
+```bash
+npm test                # vitest run — full suite, 155+ tests, zero tokens spent
+npm run test:coverage   # vitest run --coverage — v8 coverage, enforces thresholds below
+npm run e2e             # TICKMARKR_E2E=1 vitest run tests/e2e --testTimeout 900000 — spends real tokens
+```
+There is no separate watch-mode script in `package.json`; run `npx vitest` directly for watch mode.
+
+## Test File Organization
+
+**Location:** `tests/` mirrors `src/` path-for-path: `src/gates/baseline.ts` → `tests/gates/baseline.test.ts`, `src/run/daemon.ts` → `tests/run/daemon.test.ts`. When adding a new source file, add its test at the matching path under `tests/`.
+
+**Naming:** `<module>.test.ts`, always under `tests/**/*.test.ts` (the only pattern `vitest.config.ts` includes).
+
+**Structure:**
+```
+tests/
+├── adapters/       21 *.test.ts files (fake, registry, prompt, per-vendor auth/usage, kimi TUI seed, etc.)
+├── brand.test.ts   byte-pinned brand exports
+├── cli/            34 *.test.ts files (init, plan, status, fleet, approve-*, doctor, report-*, mode-*, etc.)
+├── compile/        7 *.test.ts files (gsd, prd, speckit, native, collateral, scope-seam, task-unit-contract)
+├── config/         4 *.test.ts files
+├── docs-*.test.ts  export-guarded docs-truth suites (codebase, concerns, stack, testing)
+├── drivers/        7 *.test.ts files (herdr, subprocess, env-seal, trailer-width, etc.)
+├── e2e/            real-cli.test.ts          (gated, spends tokens — see below)
+├── eval/           5 *.test.ts files         (fixture harness tests for the eval lab)
+├── fixtures/       codex-mcp-spinner/capture.ts (non-*.test.ts capture helper), kimi-staged-queue/ (captured screen + provenance, OBS-552 addendum)
+├── gates/          13 *.test.ts files
+├── graph/          4 *.test.ts files
+├── helpers/        tmprepo.ts                (shared repo/graph fixtures, not a *.test.ts file)
+├── hygiene/        2 *.test.ts files (brand-sweep, live-fixture-guard)
+├── pane-banner.test.ts
+├── plan/           2 *.test.ts files (scope, scope-flow)
+├── readme-steering.test.ts
+├── repo/           9 *.test.ts files (export fixtures/manifest, readme + contact + community boundaries, build provisioning, release docs)
+├── report/         4 *.test.ts files
+├── route/          16 *.test.ts files (router, explore, failover, profile, etc.)
+├── run/            29 *.test.ts files (daemon, journal, merge, consult, stall, interactive-seed, environment, etc.)
+├── scripts/        probe-rig.test.ts
+├── seat-send.test.ts  drives the SHIPPED skills/ delivery script against a fake `herdr` (OBS-552)
+├── tui/            app active; legacy suites retired
+├── setup.ts        (setupFiles in vitest.config.ts — global env seal, not a *.test.ts file)
+├── skills-pipeline-layout.test.ts
+└── smoke.test.ts   (top-level canary: package exports a valid VERSION)
+```
+Extra test files beyond a 1:1 mirror are additive, not a different convention: `evidence-scope.test.ts` and `via-driver.test.ts` cover cross-module interactions that don't belong to one gate file; `daemon-interactive.test.ts` isolates the v1.2 interactive-worker path from the main `daemon.test.ts`; `interactive-seed.test.ts` isolates the v1.69 launch-then-seed adapter capability; `kimi-tui-seed.test.ts` covers the v1.69 T7 kimi banner model/session assertions; `reconcile-live.test.ts` covers the seed-mode pane-hygiene parity sweep.
+
+## Test Structure
+
+**Suite organization** — `describe` groups by scenario/narrative, not 1:1 with exported functions; test names are full sentences and reuse the source's own vocabulary for spec/decision/version references:
+```ts
+describe("route resolution order", () => {
+  test("1: per-task pin wins over everything", () => { ... });
+  test("1b: task pin beats a conflicting map pin", () => { ... });
+  test("floor lint: pin below floor routes but lints loudly", () => { ... });
+});
+
+describe("daemon integration (fake adapter, zero tokens)", () => {
+  test("v1.1: a reviewer that produced garbage is excluded on the task's next review", async () => { ... });
+  test("v1.1: retried gates get attempt-unique pane names (herdr agent_name_taken regression)", async () => { ... });
+});
+```
+(`tests/route/router.test.ts`, `tests/run/daemon.test.ts`)
+
+**Setup/teardown:** The default pattern is inline fixture builders — call `makeRepo`, `setupRepo`, `fakeWith`, or a local `mkTask` at the top of each `test(...)` rather than sharing mutable state across cases. Lifecycle hooks *are* used where a seam needs symmetric cleanup: `afterEach` restores TTY/`NO_COLOR` stubs (`tests/brand.test.ts`), deletes leaked env vars (`tests/cli/greenness-exit.test.ts`, `tests/route/explore-scoping.test.ts`), or calls `vi.restoreAllMocks()` after interactive CLI tests; `beforeEach`/`afterEach` pairs seal and restore herdr env (`tests/drivers/herdr.test.ts`, `tests/drivers/env-seal.test.ts`). Reach for a hook only when every test in a `describe` shares the same cleanup contract — don't use one just to avoid an inline builder.
+
+**Assertion style:** Plain `expect(...).toBe/toEqual/toMatch/toContain/toThrow`. Object-shape checks favor `toMatchObject` over exhaustive `toEqual` when only a subset of fields matters (`expect(r).toMatchObject({ gate: "acceptance", pass: true })`, `tests/gates/via-driver.test.ts:78`).
+
+## Mocking
+
+**Default seam: substitute real implementations, don't monkey-patch.** Integration and daemon tests wire `FakeAdapter` and `SubprocessDriver` (or a hand-written delegate spy) at the two interface boundaries below — that path covers the majority of the suite and spends zero tokens. Vitest mocks (`vi.fn`, `vi.mock`, `vi.spyOn`) *do* appear in narrower seams where stubbing a Node built-in or capturing stdout is the smallest honest test: auth probes mock `node:child_process`/`node:fs` (`tests/adapters/kimi-auth.test.ts`, `tests/adapters/grok-auth.test.ts`, `tests/adapters/pi-auth.test.ts`), interactive CLI flows mock `node:readline/promises` (`tests/cli/init.test.ts`, `tests/cli/fleet.test.ts`), registry/doctor tests spy on adapter methods and `process.stdout.write` for byte-pinned output, and plan/acceptance tests spy on `console.warn` or `runLlm`. Prefer the substitution patterns below for new integration coverage; reach for `vi.*` only when the seam under test is a Node built-in, TTY, or a single method on an otherwise-real object.
+
+**1. `WorkerAdapter` → `FakeAdapter`** (`src/adapters/fake.ts`)
+A deterministic, scripted adapter that implements the exact same `WorkerAdapter` interface as `claudeCode`/`codex`/`cursorAgent`/`opencode`. A JSON script maps `taskId` → an ordered list of `{ shell, result }` steps (one per attempt); `result` becomes the `TICKMARKR_RESULT` trailer, and a step with no `result` scripts a stall/quota scenario. The same instance also serves scripted `judge`/`review`/`consult` JSON when its `headlessCommand` detects the corresponding prompt marker:
+```ts
+// tests/helpers/tmprepo.ts
+export function setupRepo(tasks: unknown[], script: object, extraCfg = "") {
+  const repo = makeRepo({ "base.txt": "base\n" });
+  saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks }));
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"),
+    `judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\n${extraCfg}`);
+  const scriptPath = join(mkdtempSync(join(tmpdir(), "tickmarkr-script-")), "s.json");
+  writeFileSync(scriptPath, JSON.stringify({ judge: { pass: true, criteria: [] }, review: { approve: true, issues: [] }, ...script }));
+  return { repo, fake: new FakeAdapter(scriptPath), scriptPath };
+}
+```
+
+**2. `ExecutorDriver` → `SubprocessDriver`, or a hand-written spy wrapping it**
+`SubprocessDriver` is a real driver (spawns real local bash subprocesses) — tests use it directly wherever "herdr" would otherwise be required, since `SubprocessDriver` needs no external binary. To assert *which slots got created/closed*, tests write a plain object literal that implements `ExecutorDriver`, delegates every method to a real `SubprocessDriver` via `.bind(inner)`, and intercepts only the 1-2 methods under test:
+```ts
+function spyDriver(): { driver: ExecutorDriver; names: string[]; closed: string[] } {
+  const inner = new SubprocessDriver();
+  const names: string[] = [];
+  const closed: string[] = [];
+  const driver: ExecutorDriver = {
+    id: "spy", interactive: false,
+    status: (s) => inner.status(s),
+    async slot(cwd, name) { names.push(name); return inner.slot(cwd, name); },
+    run: (s, c) => inner.run(s, c),
+    waitOutput: (s, p, t, o) => inner.waitOutput(s, p, t, o),
+    waitAgentStatus: (s, st, t) => inner.waitAgentStatus(s, st, t),
+    read: (s, n) => inner.read(s, n),
+    notify: (m, o) => inner.notify(m, o),
+    async close(s) { closed.push(s.name); return inner.close(s); },
+    worktree: (r, b, ref) => inner.worktree(r, b, ref),
+  };
+  return { driver, names, closed };
+}
+```
+(`tests/gates/via-driver.test.ts:38-62`, repeated with task-specific tweaks in `tests/run/daemon.test.ts` and `tests/run/daemon-interactive.test.ts`'s `idriver()`). Reuse this exact shape — literal object, delegate-by-default, override only what you're asserting on — instead of adding a mocking library.
+
+**3. External CLI binaries → a real stub executable on disk**
+`tests/drivers/herdr.test.ts` writes an actual bash script to a temp file, `chmod +x`s it, and points `HerdrDriver` at that path so the driver's real subprocess-invocation code runs against a controlled fake `herdr` binary instead of the real one:
+```ts
+function makeStub(waitExit = 0) {
+  const bin = join(mkdtempSync(join(tmpdir(), "tickmarkr-herdr-")), "herdr");
+  writeFileSync(bin, `#!/usr/bin/env bash
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'node --check tests/fixtures/operator-state/heap-runner.mjs && npm run lint' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 5ms:
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "python3 - <<'PY'
+import glob, json, os, tempfile
+for directory in glob.glob(os.path.join(tempfile.gettempdir(), 'operator-heap-tests-*')):
+    for path in glob.glob(os.path.join(directory, '*.json')):
+        with open(path) as stream:
+            result = json.load(stream)
+        print(json.dumps({'file': path, 'shape': result['shape'], 'environment': result['environment']['NODE_ENV'], 'verdict': result['verdict'], 'peakMiB': round(result['peak'] / 1048576, 2), 'lateGrowthMiB': round(result['lateGrowth'] / 1048576, 2), 'writes': result['writes'], 'lastFrameContainsFixture': 'heap-fixture' in result['lastFrame'], 'performanceMeasures': result['performanceMeasures']}))
+PY
+ git diff --check && git status --short" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 1690ms:
+ M tests/fixtures/operator-state/heap-runner.mjs
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+codex
+The repair is in place, and build, lint, and syntax checks pass. The focused heap test is running all four controls. I used Vitest’s runner config loader to avoid writing temporary files through the shared `node_modules` symlink.
+
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "python3 - <<'PY'
+import glob, json, os, tempfile
+for directory in glob.glob(os.path.join(tempfile.gettempdir(), 'operator-heap-tests-*')):
+    print(directory)
+    for path in glob.glob(os.path.join(directory, '*.json')):
+        with open(path) as stream:
+            result = json.load(stream)
+        print(json.dumps({'shape': result['shape'], 'environment': result['environment']['NODE_ENV'], 'verdict': result['verdict'], 'peakMiB': round(result['peak'] / 1048576, 2), 'lateGrowthMiB': round(result['lateGrowth'] / 1048576, 2), 'writes': result['writes'], 'lastFrameContainsFixture': 'heap-fixture' in result['lastFrame'], 'performanceMeasures': result['performanceMeasures']}))
+PY" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 420ms:
+/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/operator-heap-tests-8wV2lv
+{"shape": "static", "environment": "production", "verdict": "pass", "peakMiB": 23.43, "lateGrowthMiB": 0.0, "writes": 11018, "lastFrameContainsFixture": true, "performanceMeasures": 0}
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git diff -- tests/fixtures/operator-state/heap-runner.mjs' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 0ms:
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b..23d5e911 100644
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@ import { PassThrough, Writable } from 'node:stream';
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@ let writes = 0, bytes = 0, lastChunk = '', tick = 0;
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "python3 - <<'PY'
+import glob, json, os, tempfile
+for directory in glob.glob(os.path.join(tempfile.gettempdir(), 'operator-heap-tests-*')):
+    for path in glob.glob(os.path.join(directory, '*.json')):
+        with open(path) as stream:
+            result = json.load(stream)
+        print(json.dumps({'shape': result['shape'], 'environment': result['environment']['NODE_ENV'], 'verdict': result['verdict'], 'peakMiB': round(result['peak'] / 1048576, 2), 'lateGrowthMiB': round(result['lateGrowth'] / 1048576, 2), 'writes': result['writes'], 'lastFrameContainsFixture': 'heap-fixture' in result['lastFrame'], 'performanceMeasures': result['performanceMeasures']}))
+PY" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 424ms:
+{"shape": "resize", "environment": "production", "verdict": "pass", "peakMiB": 23.54, "lateGrowthMiB": 0.0, "writes": 11183, "lastFrameContainsFixture": true, "performanceMeasures": 0}
+{"shape": "static", "environment": "production", "verdict": "pass", "peakMiB": 23.43, "lateGrowthMiB": 0.0, "writes": 11018, "lastFrameContainsFixture": true, "performanceMeasures": 0}
+{"shape": "growth", "environment": "production", "verdict": "pass", "peakMiB": 24.67, "lateGrowthMiB": 0.06, "writes": 11018, "lastFrameContainsFixture": true, "performanceMeasures": 0}
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();
+
+codex
+All three production controls pass and retain the fixture frame after shutdown. Peak post-GC heap was 23.43 MiB for static, 24.67 MiB for growth, and 23.54 MiB for resize. The ordinary-environment control is still running to capture its retention baseline for C1.
+
+ succeeded in 174134ms:
+
+ RUN  v3.2.7 /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+
+stdout | tests/cockpit/live-store-heap.test.ts > runLiveCockpit already exposes the unchanged production mounting boundary consumed by the new heap harness. The changed exported store and committed harness establish the memory protocol in the spec preamble at that boundary, with bounded read queues, history, subscriptions and metric samples. Static/growth/resize production-runtime controls complete 1000+10000 ticks at at most 64 MiB post-GC heap and at most 16 MiB late growth. Capture the ordinary-environment verdict and performance-entry count for C1 integration. A store-only microbenchmark, empty render sink counter, discarded failing environment result or unexplained missing sample fails.
+C1 ordinary-environment baseline {"verdict":"fail","heap":1475745800,"performanceMeasures":1090113,"firstFailure":{"tick":1000,"heap":159401472,"root":"node:perf_hooks performance timeline","performanceMeasures":99095,"entries":[{"name":"Update","entryType":"measure","startTime":165.160709,"duration":0.547583000000003,"detailType":"object"},{"name":"Mount","entryType":"measure","startTime":166.45325,"duration":10.18383399999999,"detailType":"object"},{"name":"Mount","entryType":"measure","startTime":198.596875,"duration":0.2867919999999913,"detailType":"object"},{"name":"Box","entryType":"measure","startTime":5070.261042,"duration":0.056582999999591266,"detailType":"object"},{"name":"RunKeybar","entryType":"measure","startTime":5070.268334,"duration":0.049290999999357155,"detailType":"object"},{"name":"Box","entryType":"measure","startTime":5070.294167,"duration":0.023457999999664025,"detailType":"object"}],"heapSpaces":[{"space_name":"read_only_space","space_size":0,"space_used_size":0,"space_available_size":0,"physical_space_size":0},{"space_name":"new_space","space_size":66846720,"space_used_size":17358928,"space_available_size":16193456,"physical_space_size":66846720},{"space_name":"old_space","space_size":301203456,"space_used_size":150012112,"space_available_size":286104,"physical_space_size":301203456},{"space_name":"code_space","space_size":3407872,"space_used_size":2874688,"space_available_size":532768,"physical_space_size":3407872},{"space_name":"shared_space","space_size":0,"space_used_size":0,"space_available_size":0,"physical_space_size":0},{"space_name":"trusted_space","space_size":4194304,"space_used_size":3770504,"space_available_size":423176,"physical_space_size":4194304},{"space_name":"shared_trusted_space","space_size":0,"space_used_size":0,"space_available_size":0,"physical_space_size":0},{"space_name":"new_large_object_space","space_size":1605632,"space_used_size":1585552,"space_available_size":31968880,"physical_space_size":1605632},{"space_name":"large_object_space","space_size":2375680,"space_used_size":2340488,"space_available_size":0,"physical_space_size":2375680},{"space_name":"code_large_object_space","space_size":442368,"space_used_size":434560,"space_available_size":0,"physical_space_size":442368},{"space_name":"shared_large_object_space","space_size":0,"space_used_size":0,"space_available_size":0,"physical_space_size":0},{"space_name":"shared_trusted_large_object_space","space_size":0,"space_used_size":0,"space_available_size":0,"physical_space_size":0},{"space_name":"trusted_large_object_space","space_size":0,"space_used_size":0,"space_available_size":0,"physical_space_size":0}],"heapStatistics":{"total_heap_size":380076032,"total_heap_size_executable":3850240,"total_physical_size":380076032,"total_available_size":1917471080,"used_heap_size":178381048,"heap_size_limit":2248146944,"malloced_memory":540720,"peak_malloced_memory":18092032,"does_zap_garbage":0,"number_of_native_contexts":1,"number_of_detached_contexts":0,"total_global_handles_size":565248,"used_global_handles_size":67904,"external_memory":4322599,"total_allocated_bytes":17563216192}}}
+
+ ✓ |suite| tests/cockpit/live-store-heap.test.ts (1 test) 173679ms
+   ✓ runLiveCockpit already exposes the unchanged production mounting boundary consumed by the new heap harness. The changed exported store and committed harness establish the memory protocol in the spec preamble at that boundary, with bounded read queues, history, subscriptions and metric samples. Static/growth/resize production-runtime controls complete 1000+10000 ticks at at most 64 MiB post-GC heap and at most 16 MiB late growth. Capture the ordinary-environment verdict and performance-entry count for C1 integration. A store-only microbenchmark, empty render sink counter, discarded failing environment result or unexplained missing sample fails.  173679ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  16:10:28
+   Duration  173.85s (transform 41ms, setup 83ms, collect 3ms, tests 173.68s, environment 0ms, prepare 18ms)
+
+
+hook: PostToolUse
+hook: PostToolUse Completed
+diff --git a/tests/fixtures/operator-state/heap-runner.mjs b/tests/fixtures/operator-state/heap-runner.mjs
+index d9f1d76b8e7d08b7c09ee443ee1aeafbfd9af288..23d5e911751aadfd2d440e14e7b6e4185fabf971
+--- a/tests/fixtures/operator-state/heap-runner.mjs
++++ b/tests/fixtures/operator-state/heap-runner.mjs
+@@ -7,6 +7,7 @@
+ import { performance } from 'node:perf_hooks';
+ import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+ import { setImmediate as yieldTick } from 'node:timers/promises';
++import { stripVTControlCharacters } from 'node:util';
+ import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+ import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+@@ -26,7 +27,11 @@
+ class CountingOutput extends Writable {
+   isTTY = true; columns = 120; rows = 40;
+   _write(chunk, _encoding, callback) {
+-    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
++    writes++; bytes += chunk.length;
++    const text = chunk.toString();
++    // Cursor/pointer cleanup writes must not replace the last rendered frame.
++    if (stripVTControlCharacters(text).trim()) lastChunk = text.slice(-20000);
++    callback();
+   }
+ }
+ const output = new CountingOutput();

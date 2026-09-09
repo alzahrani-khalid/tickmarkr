@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, doctorAgeMs, modelAuthExclusions, probeAll, readDoctor, rolePools, servableExclusions, servabilityLine } from "../../adapters/registry.js";
@@ -7,7 +7,7 @@ import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { classifyContextPath } from "../../compile/native.js";
 import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK } from "../../config/config.js";
-import { loadGraph } from "../../graph/graph.js";
+import { graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
 import { resolveRunMode } from "../../run/daemon.js";
 import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } from "../../route/preference.js";
@@ -15,7 +15,7 @@ import { staffLedEvidence } from "../../route/profile.js";
 import { route, RoutingError } from "../../route/router.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 import { modelId, modelProvider, pickReviewer } from "../../gates/review.js";
-import { Journal, loadRoutingProfile, type JournalEvent } from "../../run/journal.js";
+import { Journal, loadRoutingProfile, recordedGraphDefinitionHash, type JournalEvent } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
 import { channelKey, shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { shGit } from "../../run/git.js";
@@ -39,7 +39,12 @@ const stylizePlan = (out: string): string => {
 const fleetCanCrossVendorReview = (channels: BillingChannel[]) => {
   for (let i = 0; i < channels.length; i++)
     for (let j = 0; j < channels.length; j++)
-      if (i !== j && channels[i].vendor !== channels[j].vendor && modelId(channels[i].model) !== modelId(channels[j].model)) return true;
+      if (
+        i !== j
+        && channels[i].vendor !== channels[j].vendor
+        && modelProvider(channels[i].model, channels[i].vendor) !== modelProvider(channels[j].model, channels[j].vendor)
+        && modelId(channels[i].model) !== modelId(channels[j].model)
+      ) return true;
   return false;
 };
 
@@ -137,6 +142,42 @@ export async function plan(
     throw new Error(`--mode must be one of ${ROUTING_MODES.join(" | ")} (got ${values.mode})`);
   }
   const g = loadGraph(cwd);
+  const gHash = graphDefinitionHash(g);
+  const runsRoot = join(cwd, stateDirName(cwd), "runs");
+  let matchingEvents: JournalEvent[] | undefined;
+  let matchingRunId: string | undefined;
+  if (existsSync(runsRoot)) {
+    const locked = runLockRunId(cwd);
+    const candidates = readdirSync(runsRoot)
+      .filter((d) => d.startsWith("run-") && existsSync(join(runsRoot, d, "journal.jsonl")))
+      .sort();
+    const ordered = locked && candidates.includes(locked)
+      ? [locked, ...candidates.filter((id) => id !== locked).reverse()]
+      : candidates.reverse();
+    for (const runId of ordered) {
+      try {
+        const events = Journal.open(cwd, runId).read();
+        if (recordedGraphDefinitionHash(events) === gHash) {
+          matchingEvents = events;
+          matchingRunId = runId;
+          break;
+        }
+      } catch {
+        // ignore unreadable or torn journals
+      }
+    }
+  }
+  const hasRun = matchingEvents !== undefined;
+  const reviewHistory: string[] = matchingEvents
+    ? matchingEvents
+        .filter((event) => event.event === "gate-result" && event.data.gate === "review" && typeof event.data.reviewer === "string")
+        .map((event) => event.data.reviewer as string)
+    : [];
+  // OBS-947 repair: a resumed run re-dispatches only tasks whose replayed status is pending (or that the
+  // journal never mentions). done, failed and human are all skipped alike, so rendering their preview
+  // picks must not advance the shared reviewHistory — a phantom draw wraps the LRU and makes a later
+  // pending task print the ranked-first seat while the journal's actual next draw is a later channel.
+  const taskStatuses = matchingRunId ? Journal.open(cwd, matchingRunId).replayStatuses() : new Map<string, string>();
   const oracleRefusals = new Map<string, string[]>();
   const oracleAdvisories = new Map<string, string[]>();
   if (g.tasks.some((task) => task.acceptance.some((item) => typeof item === "object" && item.oracle === "test"))) {
@@ -308,9 +349,23 @@ export async function plan(
     if (!task.gates.includes("review") || shapeGates?.review === false) return { line: "none — review gate disabled", cost: 0 };
     const policy = effectiveReviewPolicy(task.files, cfg.review);
     if (policy === "judge-only") return { line: "none — reviewPolicy judge-only: declared leaf paths", cost: 0 };
-    const reviewer = pickReviewer(author, pools.review, [], cfg.review.prefer ?? [], task.routingHints?.floor);
+    let rotationSeat = 1;
+    let rotationCount = 0;
+    const reviewer = pickReviewer(
+      author, pools.review, [], cfg.review.prefer ?? [], task.routingHints?.floor,
+      reviewHistory, (seat, count) => { rotationSeat = seat; rotationCount = count; },
+    );
     if (!reviewer) return { line: "none — no cross-vendor reviewer available", cost: 0 };
-    return { line: `${channelKey(reviewer)} — reviewPolicy full`, cost: seatCost(reviewer) };
+    // Advance the simulated rotation only for tasks the run would actually dispatch next — the same
+    // rule as readyTasks (src/graph/graph.ts): pending, with every dependency already done. A pending
+    // task behind a parked/failed/pending dependency cannot run, so it consumes no draw (RULING-229-14).
+    const isPending = (id: string) => { const s = taskStatuses.get(id); return s === undefined || s === "pending"; };
+    const ready = isPending(task.id) && task.deps.every((d) => taskStatuses.get(d) === "done");
+    if (hasRun && ready) reviewHistory.push(channelKey(reviewer));
+    const rotationNote = rotationCount > 1
+      ? (hasRun ? ` (seat ${rotationSeat} of ${rotationCount})` : ` (seat 1 of ${rotationCount} — rotation applies at run time)`)
+      : "";
+    return { line: `${channelKey(reviewer)}${rotationNote} — reviewPolicy full`, cost: seatCost(reviewer) };
   };
   const routed: RoutedAssignment[] = [];
   for (const t of g.tasks) {

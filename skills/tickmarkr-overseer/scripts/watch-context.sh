@@ -212,19 +212,30 @@ banner_pct() {
   # The rule glyph is passed IN, never written as an escape: this host's awk (BWK 20200816) does not
   # honour \xNN, and an unsupported escape matches nothing — the selector would find no rule line and
   # report UNREADABLE on every real pane while staying green against any fixture that skipped awk.
+  # OBS-964 (2): a codex footer has NO rule line above it, so the rule selector is UNREADABLE for the whole
+  # life of a codex seat. Fall back to the self-labelled `Context N% used` row — the label IS the selector.
   banner=$(printf '%s\n' "$screen" | awk -v rule='─' '
     { line[NR] = $0
       bare = $0; gsub(/[[:space:]]/, "", bare)
       stripped = bare; gsub(rule, "", stripped)
       if (bare != "" && stripped == "") last = NR }
-    END { if (last) for (i = last + 1; i <= NR; i++) if (line[i] ~ /[0-9]+%/) print line[i] }
+    END { labelled = 0
+          for (i = 1; i <= NR; i++) if (line[i] ~ /Context [0-9]+% used/) { print line[i]; labelled = 1 }
+          if (!labelled && last) for (i = last + 1; i <= NR; i++) if (line[i] ~ /[0-9]+%/) print line[i] }
   ' | tail -1)
   # No rule line in the window, or no percentage below it: say so out loud rather than guess.
   [ -n "$banner" ] || { printf 'UNREADABLE\n'; return 0; }
   printf '%s\n' "$banner" |
     grep -Eqi '(^|[^[:alnum:]])(claude|opus|sonnet|haiku|fable|gpt|gemini|glm|kimi|grok|composer|openai|zai)[[:alnum:]_./-]*([[:space:]]|$)' ||
     { printf 'UNREADABLE\n'; return 0; }
-  pct=$(printf '%s\n' "$banner" | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
+  # OBS-964: a codex banner carries TWO percentages ("Context 16% used · weekly 96% left"); the LAST one is the
+  # quota, not the fill. Prefer the labelled context figure; fall back to the last bare % (claude-code banner).
+  pct=$(printf '%s\n' "$banner" | grep -oE 'Context [0-9]+% used' | grep -oE '[0-9]+' | head -1)
+  # OBS-964 add.3: a codex footer while WORKING drops the labelled figure but keeps `weekly N% left`; strip the
+  # quota phrase before the bare-% fallback so a quota can never be read as fill.
+  [ -n "$pct" ] || pct=$(printf '%s\n' "$banner" | sed -E 's/weekly [0-9]+% left//g' | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
+  # OBS-964 add.4: keep the row the number came from, so a false reading can be diagnosed from bytes.
+  printf '%s\t%s\n' "$(date -u +%H:%M:%SZ)" "$banner" >> "${TMPDIR:-/tmp}/tkr-watch-context-banner-$(printf '%s' "$TARGET" | tr -c 'A-Za-z0-9' _).log" 2>/dev/null || true
   [ -n "$pct" ] && printf '%s\n' "$pct" || printf 'UNREADABLE\n'
 }
 

@@ -2,6 +2,7 @@ import { Box, render, Text, useApp, useInput } from "ink";
 import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import type { InitConfigOverlay } from "../../config/config.js";
+import { orcaHostDetected } from "../../drivers/index.js";
 import { ToggleMark } from "./components.js";
 import { clip, INK, inkInput, inkOutput, KeyBar, padCell, Pointer } from "./frame.js";
 
@@ -15,12 +16,25 @@ const DRIVERS: readonly Driver[] = ["auto", "herdr", "subprocess", "orca"];
 // One line per driver, shown for the value currently selected: four environments no longer fit on
 // a single description row at 80 columns (the shipped three already clipped). Auto identifies its
 // innermost host from environment markers only; outside an Orca terminal, Orca is named explicitly.
+export type DetectedHost = "herdr" | "orca" | "subprocess";
+
+export function detectedHost(env: NodeJS.ProcessEnv = process.env): DetectedHost {
+  if (env.HERDR_ENV === "1") return "herdr";
+  if (orcaHostDetected(env)) return "orca";
+  return "subprocess";
+}
+
 const DRIVER_DESC: Record<Driver, string> = {
-  auto: "auto: herdr when HERDR_ENV=1, else orca inside an Orca terminal, else subprocess",
+  auto: "auto — resolves to subprocess here",
   herdr: "herdr: every worker runs in a visible pane you can watch and unblock",
   subprocess: "subprocess: headless child processes — no cockpit, same fail-closed gates",
   orca: "orca: visible terminals in the Orca app — picked by auto inside one; name it elsewhere",
 };
+
+export function driverDescription(driver: Driver, host: DetectedHost = detectedHost()): string {
+  if (driver === "auto") return `auto — resolves to ${host} here`;
+  return DRIVER_DESC[driver];
+}
 const VISIBILITY: readonly VisibilityLlm[] = ["pane", "headless"];
 
 export type InitWizardFields = {
@@ -29,6 +43,7 @@ export type InitWizardFields = {
   visibilityLlm: VisibilityLlm;
   offerSkills: boolean;
   skillsDefault: boolean;
+  detectedHost?: DetectedHost;
 };
 
 export type InitWizardResult =
@@ -44,9 +59,9 @@ type Section = "Run" | "Skills";
 type Row = { id: "driver" | "concurrency" | "visibility" | "skills" | "docs" | "continue"; section?: Section; label: string; desc: string };
 
 // Three fields, one toggle, one action — a descriptor array, deliberately not a forms framework.
-function buildRows(offerSkills: boolean, driver: Driver): Row[] {
+function buildRows(offerSkills: boolean, driver: Driver, host: DetectedHost): Row[] {
   const rows: Row[] = [
-    { id: "driver", section: "Run", label: "Driver", desc: DRIVER_DESC[driver] },
+    { id: "driver", section: "Run", label: "Driver", desc: driverDescription(driver, host) },
     { id: "concurrency", section: "Run", label: "Concurrency", desc: "parallel task batteries per run — min 1; an empty or zero entry reverts on leave" },
     {
       id: "visibility",
@@ -75,6 +90,7 @@ function buildRows(offerSkills: boolean, driver: Driver): Row[] {
 
 export function InitWizardApp({ fields, frameColumns = 74 }: { fields: InitWizardFields; frameColumns?: number }) {
   const { exit } = useApp();
+  const host = fields.detectedHost ?? detectedHost();
   const [cursor, setCursor] = useState(0);
   const cursorRef = useRef(0);
   const driverRef = useRef(fields.driver);
@@ -86,7 +102,7 @@ export function InitWizardApp({ fields, frameColumns = 74 }: { fields: InitWizar
   const typedRef = useRef(false);
   const doneRef = useRef(false);
   // Built per render so the description row follows the driver the cursor last cycled to.
-  const rows = buildRows(fields.offerSkills, driverRef.current);
+  const rows = buildRows(fields.offerSkills, driverRef.current, host);
   const [, setRevision] = useState(0);
   const bump = () => setRevision((n) => n + 1);
 

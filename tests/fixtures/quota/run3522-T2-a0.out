@@ -1,0 +1,968 @@
+  private passed = 0;
+  private total = 0;
+
+  apply(record: OperatorRecord): void {
+    const { event: e } = record;
+    this.lastEventAt = e.ts;
+    const ref = identity(record);
+    if (e.event === \"run-start\" || e.event === \"run-resume\") {
+      if (e.event === \"run-start\" && "'!this.start) this.start = { ...ref, event: { ...e, data: { graphDefinitionHash: e.data.graphDefinitionHash } } };
+      this.end = undefined;
+      this.active = true;
+      this.approved = false;
+      this.tipFailed = false;
+    }
+    if (e.event === "graph-rehash") this.rehash = { from: e.data.from, to: e.data.to };
+    if (e.event === "tip-verify-failed" || (e.event === "tip-verify" && e.data.pass === false)) this.tipFailed = true;
+    if (e.event === "run-end") {
+      const tip = e.data.tipVerify;
+      this.end = {
+        evidence: ref,
+        buckets: Object.fromEntries(bucketNames.map(k => [k, strings(e.data[k])])) as OperatorSnapshot["buckets"],
+        tip: tip === "passed" ? "passed" : tip === "failed" ? "failed" : tip === "not required" || tip === "not-required" || tip === "skipped" ? "not required" : "unknown",
+      };
+      this.active = false;
+      this.approved = false;
+      for (const key of bucketNames) for (const id of this.end.buckets[key] ?? []) {
+        const task = this.task(id);
+        task.state = key;
+        task.evidence = ref;
+      }
+    }
+    if (e.event === "gate-result" && e.data.skipped !== true && e.data.disabled !== true && typeof e.data.pass === "boolean") {
+      this.total++;
+      if (e.data.pass) this.passed++;
+    }
+    if (!e.taskId) return;
+    const t = this.task(e.taskId);
+    t.evidence = ref;
+    if (e.event === "task-dispatch") {
+      t.state = "running"; t.dispatches++; t.parkKind = undefined; t.gates = emptyGates();
+      t.attempt = typeof e.data.attempt === "number" ? e.data.attempt : undefined;
+      // These are recorded values only: no guessed directory or universal silence threshold.
+      t.path = typeof e.data.worktree === "string" ? e.data.worktree : typeof e.data.cwd === "string" ? e.data.cwd : undefined;
+      t.pane = typeof e.data.pane === "string" ? e.data.pane : undefined;
+      t.alarmMs = typeof e.data.alarmMs === "number" ? e.data.alarmMs : undefined;
+    }
+    if (e.event === "task-done") t.state = "completed";
+    if (e.event === "merge") { t.state = "merged"; t.merged = true; t.mergeEvidence = ref; t.parkKind = undefined; }
+    if (e.event === "task-failed") t.state = "failed";
+    if (e.event === "task-human") { t.state = "human"; t.parkKind = typeof e.data.kind === "string" ? e.data.kind : undefined; }
+    if (e.event === "task-blocked") t.state = "blocked";
+    if (e.event === "task-approved") { t.state = "pending"; t.parkKind = undefined; this.approved = !this.active; }
+    const gate = e.data.gate;
+    if (typeof gate === "string" && (GATE_NAMES as readonly string[]).includes(gate)) {
+      if (e.event === "gate-start") t.gates[gate] = { state: "running", evidence: ref };
+      if (e.event === "gate-result") t.gates[gate] = {
+        state: e.data.disabled === true ? "disabled" : e.data.skipped === true ? "not-run" : e.data.pass === true ? "passed" : e.data.pass === false ? "failed" : "unknown", evidence: ref,
+      };
+    }
+  }
+  private task(id: string): OperatorTask {
+    let t = this.tasks.get(id);
+    if (!t) { t = { id, state: "unknown", merged: false, dispatches: 0, gates: emptyGates() }; this.tasks.set(id, t); }
+    return t;
+  }
+  snapshot({ graph, sequence = 0, observedAt = Date.now(), readable = true }: {
+    graph?: RunGraph; sequence?: number; observedAt?: number; readable?: boolean;
+  } = {}): OperatorSnapshot {
+    const recorded = this.start?.event.data.graphDefinitionHash;
+    const hash = graph && graphDefinitionHash(graph);
+    const comparable = !!hash && (this.rehash
+      ? this.rehash.from === (recorded ?? null) && this.rehash.to === hash
+      : typeof recorded === "string" && recorded === hash);
+    const ids = comparable ? [...graph!.tasks.map(t => t.id), ...[...this.tasks.keys()].filter(id => !graph!.tasks.some(t => t.id === id))] : [...this.tasks.keys()];
+    const tasks = ids.map(id => {
+      const t = this.tasks.get(id) ?? { id, state: "unknown" as const, merged: false, dispatches: 0, gates: emptyGates() };
+      return { ...t, title: comparable ? graph!.tasks.find(g => g.id === id)?.title : undefined, gates: Object.fromEntries(Object.entries(t.gates).map(([g, cell]) => [g, { ...cell }])) };
+    });
+    const buckets = Object.fromEntries(bucketNames.map(k => [k, this.end?.buckets[k] === undefined ? undefined : [...this.end.buckets[k]!]])) as OperatorSnapshot["buckets"];
+    const unresolved = tasks.some(t => ["failed", "human", "blocked", "pending", "running"].includes(t.state));
+    const currentTip = this.active ? "pending" : this.tipFailed ? "failed" : this.end?.tip ?? "unknown";
+    const green = readable && !!this.start && !!this.end && !this.approved && !unresolved
+      && (currentTip === "passed" || currentTip === "not required")
+      && bucketNames.every(k => buckets[k]?.length === 0);
+    const lifecycle: OperatorSnapshot["lifecycle"] = !readable || !this.start ? "UNKNOWN" : this.active ? "RUNNING" : this.approved ? "APPROVED" : green ? "COMPLETE" : this.end ? "PARTIAL" : "PENDING";
+    return {
+      sequence, observedAt, lastEventAt: this.lastEventAt, lifecycle,
+      label: this.approved ? "approved; resume required" : lifecycle,
+      green, currentTip, comparable, comparison: comparable ? "matching graph" : "not comparable",
+      merged: tasks.filter(t => t.merged && (!comparable || graph!.tasks.some(g => g.id === t.id))).length,
+      planned: comparable ? graph!.tasks.length : undefined, tasks, buckets,
+      gatesRan: { passed: this.passed, total: this.total }, latestRunEnd: this.end?.evidence,
+      approvedResumeRequired: this.approved,
+    };
+  }
+}
+
+/** C1/C6 share this pure reader; callers supply the same observation and journal snapshot. */
+export function readOperatorState({ events, source = "journal.jsonl", ...options }: {
+  events: readonly (JournalEvent | OperatorRecord)[]; source?: string; graph?: RunGraph;
+  sequence?: number; observedAt?: number; readable?: boolean;
+}): OperatorSnapshot {
+  const fold = new OperatorStateFold();
+  events.forEach((event, i) => fold.apply(typeof event.event === "object" ? event as OperatorRecord : {
+    source, line: i + 1, id: `${source}#L${i + 1}`, event: event as JournalEvent,
+  }));
+  return fold.snapshot(options);
+}
+EOF' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 0ms:
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "cat > src/tui/cockpit/live-store.ts <<'EOF'
+import { closeSync, fstatSync, openSync, readFileSync, readSync, statSync, type BigIntStats } from \"node:fs\";
+import { join } from \"node:path\";
+import { graphPath, stateDirName } from \"../../graph/graph.js\";
+import { validateGraph, type RunGraph } from \"../../graph/schema.js\";
+import { parseRunId, type JournalEvent } from \"../../run/journal.js\";
+import { isPidLive, STALE_MS } from \"../../run/lock.js\";
+import { readTierLiveness, SUPERVISION_TIERS } from \"../../run/supervision.js\";
+import { OperatorStateFold, type OperatorRecord } from \"../../run/operator-state.js\";
+
+export const OBSERVATION_INTERVAL_MS = 1_000;
+export const STORE_LIMITS = { history: 256, historyBytes: 2 * 1024 * 1024, recordBytes: 1024 * 1024, readBytes: 1024 * 1024, subscribers: 64, metrics: 12, errors: 32 } as const;
+export interface SourceError { source: string; error: string; line?: number; id?: string }
+export interface JournalLine extends Omit<OperatorRecord, \"event\"> { event?: JournalEvent; raw: string; error?: string; offset: number; endOffset: number }
+export interface TailSnapshot {
+  source: string; generation: number; identity?: string; offset: number; lines: number;
+  history: readonly JournalLine[]; errors: readonly SourceError[]; malformedCount: number;
+  pending: { line: number; bytes: number } | undefined; backlogBytes: number;
+  status: \"readable\" | \"pending\" | \"corrupt\" | \"unreadable\"; error?: SourceError;
+  lastSuccessfulReadAt?: number; bytesRead: number;
+}
+const errorText = (e: unknown): string => e instanceof Error ? e.message : String(e);
+const fileIdentity = (st: BigIntStats): string => "'`${st.dev}:${st.ino}`;
+const stamp = (st: BigIntStats): string => `${fileIdentity(st)}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+function decodeLine(bytes: Buffer, source: string, line: number, offset: number, endOffset: number, generation: number, oversized = false): JournalLine {
+  const base = { source, line, id: `${source}#L${line}`, offset, endOffset, generation };
+  let raw = "";
+  try {
+    if (oversized) throw new Error(`record exceeds ${STORE_LIMITS.recordBytes} bytes; page raw evidence from disk`);
+    raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (!raw.trim()) return { ...base, raw };
+    const e = JSON.parse(raw);
+    if (!e || typeof e !== "object" || typeof e.ts !== "string" || !Number.isFinite(Date.parse(e.ts)) || typeof e.event !== "string" || !e.data || typeof e.data !== "object" || Array.isArray(e.data) || (e.taskId !== undefined && typeof e.taskId !== "string")) throw new Error("invalid journal record");
+    return { ...base, raw, event: e as JournalEvent };
+  } catch (e) { return { ...base, raw: raw || bytes.toString("utf8"), error: errorText(e) }; }
+}
+
+/** Byte-offset tail with a fixed read budget. Idle observations stat, but read no journal bytes. */
+export class JournalTail {
+  private st?: BigIntStats;
+  private offset = 0;
+  private line = 0;
+  private generation = 0;
+  private carry = Buffer.alloc(0);
+  private carryBytes = 0;
+  private lineOffset = 0;
+  private history: JournalLine[] = [];
+  private historyBytes = 0;
+  private errors: SourceError[] = [];
+  private malformedCount = 0;
+  private bytesRead = 0;
+  private lastSuccessfulReadAt?: number;
+  private failure?: SourceError;
+  constructor(readonly source: string, private readonly hooks: { record?: (record: OperatorRecord) => void; reset?: () => void } = {}) {}
+  private reset(): void {
+    this.offset = 0; this.line = 0; this.carry = Buffer.alloc(0); this.carryBytes = 0; this.lineOffset = 0;
+    this.history = []; this.historyBytes = 0; this.errors = []; this.malformedCount = 0; this.generation++;
+    this.hooks.reset?.();
+  }
+  poll(now = Date.now()): TailSnapshot {
+    let fd: number | undefined;
+    try {
+      const st = statSync(this.source, { bigint: true });
+      if (!st.isFile()) throw new Error("journal source is not a regular file");
+      if (!this.st || fileIdentity(st) !== fileIdentity(this.st) || st.size < this.st.size || (st.size === this.st.size && stamp(st) !== stamp(this.st))) this.reset();
+      if (Number(st.size) > this.offset) {
+        fd = openSync(this.source, "r");
+        if (stamp(fstatSync(fd, { bigint: true })) !== stamp(st)) throw new Error("journal changed before read; retry observation");
+        let remaining = STORE_LIMITS.readBytes as number;
+        const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Number(st.size) - this.offset));
+        while (this.offset < Number(st.size) && remaining > 0) {
+          const count = readSync(fd, buffer, 0, Math.min(buffer.length, Number(st.size) - this.offset, remaining), this.offset);
+          if (!count) throw new Error("journal truncated during read");
+          this.bytesRead += count; remaining -= count;
+          let begin = 0;
+          for (let index = 0; index < count; index++) if (buffer[index] === 10) {
+            this.appendCarry(buffer.subarray(begin, index));
+            const endOffset = this.offset + index + 1;
+            const row = decodeLine(this.carry, this.source, ++this.line, this.lineOffset, endOffset, this.generation, this.carryBytes > STORE_LIMITS.recordBytes);
+            this.history.push(row); this.historyBytes += Buffer.byteLength(row.raw);
+            while (this.history.length > STORE_LIMITS.history || this.historyBytes > STORE_LIMITS.historyBytes) this.historyBytes -= Buffer.byteLength(this.history.shift()!.raw);
+            if (row.error) {
+              this.malformedCount++;
+              this.errors.push({ source: row.source, error: row.error, line: row.line, id: row.id });
+              if (this.errors.length > STORE_LIMITS.errors) this.errors.shift();
+            }
+            if (row.event) this.hooks.record?.({ ...row, event: row.event });
+            this.carry = Buffer.alloc(0); this.carryBytes = 0; this.lineOffset = endOffset; begin = index + 1;
+          }
+          this.appendCarry(buffer.subarray(begin, count));
+          this.offset += count;
+        }
+      }
+      this.st = st; this.failure = undefined; this.lastSuccessfulReadAt = now;
+    } catch (e) { this.failure = { source: this.source, error: errorText(e) }; }
+    finally { if (fd !== undefined) closeSync(fd); }
+    return this.snapshot();
+  }
+  private appendCarry(bytes: Buffer): void {
+    this.carryBytes += bytes.length;
+    const available = Math.max(0, STORE_LIMITS.recordBytes - this.carry.length);
+    if (available && bytes.length) this.carry = Buffer.concat([this.carry, bytes.subarray(0, available)]);
+  }
+  snapshot(): TailSnapshot {
+    return {
+      source: this.source, generation: this.generation, identity: this.st && fileIdentity(this.st), offset: this.offset, lines: this.line,
+      history: this.history.slice(), errors: this.errors.slice(), malformedCount: this.malformedCount,
+      pending: this.carryBytes ? { line: this.line + 1, bytes: this.carryBytes } : undefined,
+      backlogBytes: Math.max(0, Number(this.st?.size ?? 0) - this.offset),
+      status: this.failure ? "unreadable" : this.malformedCount ? "corrupt" : this.carryBytes ? "pending" : "readable",
+      error: this.failure, lastSuccessfulReadAt: this.lastSuccessfulReadAt, bytesRead: this.bytesRead,
+    };
+  }
+  /** Demand paging scans with fixed buffers, independent of the retained history; no growing line index. */
+  page(firstLine: number, count = 32, generation = this.generation): readonly JournalLine[] {
+    if (!Number.isInteger(firstLine) || firstLine < 1) throw new Error("evidence line must be a positive integer");
+    if (generation !== this.generation) throw new Error("evidence belongs to a replaced journal");
+    const rows: JournalLine[] = [];
+    const reader = new JournalTail(this.source, { record: undefined });
+    // Read only enough for the requested page. The retained scanner window is bounded, even on huge files.
+    const fd = openSync(this.source, "r");
+    try {
+      const st = fstatSync(fd, { bigint: true });
+      if (this.st && stamp(st) !== stamp(this.st)) throw new Error("journal changed; refresh before paging");
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let position = 0, line = 0, start = 0;
+      const limit = Math.max(1, Math.min(STORE_LIMITS.history, Math.floor(count)));
+      while (position < Number(st.size) && rows.length < limit) {
+        const n = readSync(fd, buffer, 0, buffer.length, position);
+        if (!n) break;
+        let begin = 0;
+        for (let i = 0; i < n; i++) if (buffer[i] === 10) {
+          if (line + 1 >= firstLine) reader.appendCarry(buffer.subarray(begin, i));
+          line++;
+          if (line >= firstLine) rows.push(decodeLine(reader.carry, this.source, line, start, position + i + 1, generation, reader.carryBytes > STORE_LIMITS.recordBytes));
+          reader.carry = Buffer.alloc(0); reader.carryBytes = 0; start = position + i + 1; begin = i + 1;
+          if (rows.length >= limit) break;
+        }
+        if (line + 1 >= firstLine && rows.length < limit) reader.appendCarry(buffer.subarray(begin, n));
+        position += n;
+      }
+      if (stamp(fstatSync(fd, { bigint: true })) !== stamp(st)) throw new Error("journal changed during evidence read");
+      return rows;
+    } finally { closeSync(fd); }
+  }
+}
+
+export interface CachedSource<T = unknown> { source: string; identity?: string; value?: T; status: "readable" | "absent" | "unreadable"; error?: string; observedAt: number }
+class JsonSource<T> {
+  private cached?: CachedSource<T>;
+  constructor(private path: string, private parse: (raw: string) => T) {}
+  read(now: number): CachedSource<T> {
+    try {
+      const st = statSync(this.path, { bigint: true });
+      const id = stamp(st);
+      if (this.cached?.identity === id && this.cached.status === "readable") return this.cached = { ...this.cached, observedAt: now };
+      if (!st.isFile() || st.size > BigInt(STORE_LIMITS.recordBytes)) throw new Error("source is not a bounded regular file");
+      const value = this.parse(readFileSync(this.path, "utf8"));
+      return this.cached = { source: this.path, identity: id, value, status: "readable", observedAt: now };
+    } catch (e) {
+      const absent = (e as NodeJS.ErrnoException).code === "ENOENT";
+      return this.cached = { ...this.cached, source: this.path, status: absent ? "absent" : "unreadable", error: absent ? undefined : errorText(e), observedAt: now, ...(absent ? { value: undefined, identity: undefined } : {}) };
+    }
+  }
+}
+export interface LiveStoreOptions {
+  cwd: string; runId: string; now?: () => number; configPath?: string; cachePath?: string;
+  isDaemonAlive?: (pid: number) => boolean;
+}
+
+/** C1 mount/C6 reader boundary. No timers or presence writes: the mount owns scheduling and disarm. */
+export function createLiveStore(options: LiveStoreOptions) {
+  const now = options.now ?? Date.now;
+  const state = join(options.cwd, stateDirName(options.cwd));
+  let fold = new OperatorStateFold();
+  const tail = new JournalTail(join(state, "runs", parseRunId(options.runId), "journal.jsonl"), {
+    reset: () => { fold = new OperatorStateFold(); }, record: record => fold.apply(record),
+  });
+  const graph = new JsonSource<RunGraph>(graphPath(options.cwd), raw => validateGraph(JSON.parse(raw)));
+  const config = new JsonSource(options.configPath ?? join(state, "config.yaml"), raw => raw);
+  const cache = new JsonSource(options.cachePath ?? join(state, "doctor-cache.json"), JSON.parse);
+  const lock = new JsonSource<{ pid: number; runId: string; startedAt: number }>(join(state, "graph.lock"), raw => {
+    const v = JSON.parse(raw);
+    if (!v || !Number.isInteger(v.pid) || v.pid < 1 || typeof v.runId !== "string" || typeof v.startedAt !== "number") throw new Error("invalid lock payload");
+    return v;
+  });
+  const listeners = new Set<() => void>();
+  let sequence = 0, lastObservation: number | undefined, inputSequence = 0;
+  let viewport = { columns: 120, rows: 40 };
+  let disposed = false;
+  let queued: Promise<void> | undefined;
+  const metrics: { observedAt: number; bytesRead: number }[] = [];
+  function observe() {
+    const observedAt = now();
+    const delayed = lastObservation !== undefined && observedAt - lastObservation > 2 * OBSERVATION_INTERVAL_MS;
+    const journal = tail.poll(observedAt);
+    const graphReading = graph.read(observedAt);
+    const configReading = config.read(observedAt);
+    const cacheReading = cache.read(observedAt);
+    const owner = lock.read(observedAt);
+    const alive = owner.status === "readable" && owner.value ? (options.isDaemonAlive ?? isPidLive)(owner.value.pid) : undefined;
+    const lockState = owner.status === "absent" ? "absent" : owner.status === "unreadable" ? "unreadable" : owner.value?.runId !== options.runId ? "foreign" : alive ? "alive" : "dead";
+    const supervision = SUPERVISION_TIERS.map(t => readTierLiveness(options.cwd, t, observedAt));
+    const errors: SourceError[] = [journal.error, ...journal.errors, ...[graphReading, configReading, cacheReading, owner].filter(s => s.error).map(s => ({ source: s.source, error: s.error! })), ...supervision.filter(s => s.state === "UNREADABLE").map(s => ({ source: join(state, "supervision", s.tier), error: "unreadable supervision" }))].filter((e): e is SourceError => !!e);
+    metrics.push({ observedAt, bytesRead: journal.bytesRead });
+    if (metrics.length > STORE_LIMITS.metrics) metrics.shift();
+    lastObservation = observedAt;
+    const readable = journal.status === "readable" && journal.backlogBytes === 0;
+    return {
+      sequence: ++sequence, observedAt, delayed, freshness: errors.length ? "failed" : delayed ? "delayed" : "fresh",
+      operator: fold.snapshot({ graph: graphReading.status === "readable" ? graphReading.value : undefined, sequence, observedAt, readable }),
+      journal, graph: graphReading, config: configReading, cache: cacheReading,
+      lock: { ...owner, state: lockState, alive, expired: owner.identity ? observedAt - Number(owner.identity.split(":")[3]) / 1e6 > STALE_MS : undefined },
+      supervision, errors, actionsEnabled: readable && !errors.length && !delayed,
+      viewport, inputSequence, metrics: metrics.slice(),
+    };
+  }
+  let snapshot = observe();
+  const publish = () => { for (const listener of listeners) listener(); };
+  const refresh = () => { if (!disposed) { snapshot = observe(); publish(); } return snapshot; };
+  return {
+    snapshot: () => snapshot, refresh,
+    requestRefresh: (): Promise<void> => {
+      if (disposed) return Promise.resolve();
+      return queued ??= Promise.resolve().then(() => { refresh(); }).finally(() => { queued = undefined; });
+    },
+    subscribe: (listener: () => void) => {
+      if (disposed) throw new Error("store is disposed");
+      if (listeners.size >= STORE_LIMITS.subscribers) throw new Error("store subscription limit reached");
+      listeners.add(listener); return () => { listeners.delete(listener); };
+    },
+    input: () => { if (!disposed) { inputSequence++; snapshot = { ...snapshot, sequence: ++sequence, inputSequence }; publish(); } },
+    resize: (columns: number, rows: number) => {
+      if (!disposed) { viewport = { columns, rows }; snapshot = { ...snapshot, sequence: ++sequence, viewport }; publish(); }
+    },
+    page: (firstLine: number, count?: number, generation?: number) => tail.page(firstLine, count, generation),
+    diagnostics: () => ({ subscriptions: listeners.size, pendingReads: queued ? 1 : 0, metrics: metrics.length }),
+    dispose: () => { disposed = true; listeners.clear(); },
+  };
+}
+export type LiveStore = ReturnType<typeof createLiveStore>;
+export type LiveStoreSnapshot = ReturnType<LiveStore["snapshot"]>;
+EOF
+npm run build' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 1544ms:
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg -n 'pending|torn|malformed|partial|tip-verify' tests/cockpit/derive.test.ts | head -45; sed -n '1,75p' src/graph/schema.ts; rg -n 'type RunSummary|tipVerify\\??:' src/run/daemon.ts" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 0ms:
+379:    expect(events.some((event) => event.event === "tip-verify-failed")).toBe(
+385:      text: "tip-verify passed",
+398:        /"event":"tip-verify-failed","data":\{[^]*?\}\}\n/,
+399:        '"event":"tip-verify","data":{"gate":"test","pass":true}}\n',
+408:    expect(events.some((event) => event.event === "tip-verify-failed")).toBe(false);
+409:    expect(events.filter((event) => event.event === "tip-verify").every(
+415:      text: "tip-verify FAILED",
+429:        data: { done: [], failed: [], human: [], blocked: [], pending: [] },
+434:      event.event === "tip-verify"
+435:      || event.event === "tip-verify-failed"
+442:      text: `tip-verify ${ABSENT_FIELD}`,
+453:    const malformed = {
+458:    const data = deriveRunCockpitData(malformed, "9.8.7");
+459:    const frame = await frameFor(malformed);
+560:      { event: "tip-verify-failed", data: { gate: "test" } },
+725:      neutral: /\bneutral\b|\bdone\b|\brunning\b|\bpending\b/,
+745:    const malformed = {
+749:    const withDefect = deriveRunCockpitData(malformed, "9.8.7");
+1013:    // pending, and a task the journal never mentions claims to be done.
+1016:      { id: "T2", title: "finished task", status: "pending" },
+1042:    // the newest thing recorded about it is `task-approved` — pending, awaiting
+1070:    expect(released.state).toBe("pending");
+1216:    // and not the "pending" a row would be assuming rather than reporting.
+1219:    expect(untouched.state).not.toBe("pending");
+1270: * escalation, worker-result and tip-verify lines a hand-picked projection would
+1799:  state?: "done" | "failed" | "human" | "pending" | "running";
+1875:    ["task-approved", "pending"],
+2228:    pending: ["pending"],
+2474:        ["done", "failed", "human", "pending", "running", "interrupted", undefined],
+2713:        "tip-verify",
+import { z } from "zod";
+
+export const SHAPES = ["plan", "spec", "implement", "tests", "docs", "migration", "ui", "refactor", "chore"] as const;
+// v1.51 T2: spec-declared routing mode. Mirrors config ROUTING_MODES literally — config.ts imports this
+// module, so a runtime import back would be circular; parity is pinned by test (tests/cli/mode-sources).
+export const GRAPH_ROUTING_MODES = ["partner-led", "risk-based", "staff-led"] as const;
+export const STATUSES = ["pending", "running", "gated", "failed", "done", "human"] as const;
+export const GATE_NAMES = ["build", "test", "lint", "evidence", "scope", "acceptance", "review"] as const;
+const MANDATORY_GATES = ["build", "test", "lint", "evidence", "scope"] as const;
+export const TIERS = ["cheap", "mid", "frontier"] as const;
+export const SPEC_SOURCES = ["speckit", "gsd", "prd", "native"] as const;
+// v1.19 acceptance oracles: command (exit code), test (named test), judge (LLM, free-text rubric).
+// A plain string is the read-old/write-new compat form — semantically a judge oracle (spec §2).
+export const ORACLES = ["command", "test", "judge"] as const;
+
+export type Shape = (typeof SHAPES)[number];
+export type TaskStatus = (typeof STATUSES)[number];
+export type GateName = (typeof GATE_NAMES)[number];
+export type Oracle = (typeof ORACLES)[number];
+export type SpecSource = (typeof SPEC_SOURCES)[number];
+
+// Typed acceptance oracle: command carries the thing to run, test the test name, judge free text.
+// text is OPTIONAL non-empty on command/test (declared prose beside the oracle; judge requires it).
+// Declaring it matters: z.object strips unknown keys, and loadGraph revalidates on every read —
+// an undeclared text would be silently discarded at the next load. Anything else (a typed object
+// naming an unknown oracle, or a text that is not a non-empty string) fails validation loudly here.
+export const AcceptanceItemSchema = z.union([
+  z.string().min(1),
+  z.object({ oracle: z.literal("command"), command: z.string().min(1), text: z.string().min(1).optional() }),
+  z.object({ oracle: z.literal("test"), test: z.string().min(1), text: z.string().min(1).optional() }),
+  z.object({ oracle: z.literal("judge"), text: z.string().min(1) }),
+]);
+export type AcceptanceItem = z.infer<typeof AcceptanceItemSchema>;
+
+// Shared text rendering of one acceptance item — every consumer (worker prompt, acceptance gate,
+// review gate) renders typed items as text through THIS helper. Rendering only; oracle execution is T2.
+export function renderAcceptanceItem(item: AcceptanceItem): string {
+  if (typeof item === "string") return item;
+  if (item.oracle === "command") return item.text ?? `$ ${item.command}`;
+  if (item.oracle === "test") return item.text ?? `test: ${item.test}`;
+  return item.text; // judge — bare text, byte-identical to a plain-string judge criterion
+}
+
+export const TaskSchema = z.object({
+  // ids land in git branch names and herdr pane names — branch-safe characters only, bounded
+  // length (refs hit filesystem limits), and never "--" (the task-branch separator, locked
+  // decision 10) or a trailing dash. T1-style from prd/speckit; P07-01-style from gsd (v1.3).
+  id: z
+    .string()
+    .max(64)
+    .regex(/^[A-Za-z][A-Za-z0-9_-]*$/, "task ids look like T1 or P07-01 (letter start; letters/digits/-/_)")
+    .refine((id) => !id.includes("--") && !id.endsWith("-"), 'task ids may not contain "--" or end with "-"'),
+  title: z.string().min(1),
+  goal: z.string().min(1),
+  shape: z.enum(SHAPES),
+  complexity: z.number().int().min(1).max(10),
+  deps: z.array(z.string()).default([]),
+  files: z.array(z.string()).default([]),
+  context: z.array(z.string()).default([]),
+  acceptance: z.array(AcceptanceItemSchema).min(1, "acceptance[] is required and must be non-empty"),
+  // v1.19: purely advisory plan-time blast radius — NO gate reads this (the run-time scope gate stays
+  // authoritative fail-closed). Optional + best-effort: paths required, confidence/reason may be absent.
+  scopeHints: z
+    .array(
+      z.object({
+        paths: z.array(z.string()),
+        confidence: z.number().min(0).max(1).optional(),
+        reason: z.string().optional(),
+      }),
+    )
+    .optional(),
+  gates: z
+    .array(z.enum(GATE_NAMES))
+    .default(["build", "test", "lint", "evidence", "scope", "acceptance", "review"])
+    .superRefine((gates, ctx) => {
+145:  tipVerify?: "passed" | "failed";
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+The new reader and store compile. The tail reads within a fixed byte budget, preserves physical `#L` identities, and exposes pending tails separately from corrupt records. I’m now testing rewrite detection, independent observations and eviction, then measuring the production mount in both environments.
+
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "mkdir -p tests/fixtures/operator-state
+cat > tests/fixtures/operator-state/fixture.ts <<'EOF'
+import { graphDefinitionHash } from \"../../../src/graph/graph.js\";
+import { validateGraph } from \"../../../src/graph/schema.js\";
+import type { JournalEvent } from \"../../../src/run/journal.js\";
+export const graph = validateGraph({ version: 1, spec: { path: \"fixture.md\", hash: \"fixture-a\", source: \"native\" }, tasks: [\"T1\", \"T2\", \"T3\"].map((id, i) => ({ id, title: "'`Task ${id}`, goal: "Synthetic task", shape: "implement", complexity: 1, deps: i ? [`T${i}`] : [], files: [], acceptance: ["fixture"] })) });
+export const ev = (event: string, data: Record<string, unknown> = {}, taskId?: string): JournalEvent => ({ ts: "2026-09-05T00:00:00.000Z", event, data, ...(taskId ? { taskId } : {}) });
+export const partial = [
+  ev("run-start", { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" }),
+  ev("task-dispatch", { attempt: 0 }, "T1"),
+  ev("gate-result", { gate: "review", pass: true, details: "First verdict'"\\nSecond line\\n第三行\" }, \"T1\"),
+  ev(\"merge\", { commit: \"abc\" }, \"T1\"),
+  ev(\"task-human\", { kind: \"human-gate\" }, \"T2\"),
+  ev(\"tip-verify\", { pass: true }),
+  ev(\"run-end\", { done: [\"T1\"], failed: [], human: [\"T2\"], blocked: [\"T3\"], pending: [], tipVerify: \"passed\" }),
+];
+export const approved = [...partial, ev(\"task-approved\", {}, \"T2\")];
+export const resumed = [...approved, ev(\"run-resume\"), ev(\"task-dispatch\", { attempt: 0, worktree: \"/recorded/T2\", pane: \"p2\", alarmMs: 45000 }, \"T2\")];
+export const complete = [...resumed, ev(\"merge\", {}, \"T2\"), ev(\"merge\", {}, \"T3\"), ev(\"tip-verify\", { pass: true }), ev(\"run-end\", { done: [\"T1\", \"T2\", \"T3\"], failed: [], human: [], blocked: [], pending: [], tipVerify: \"passed\" })];
+export const rawOf = (events: readonly JournalEvent[]) => events.map(e => JSON.stringify(e)).join(\"\\n\") + \"\\n\";
+EOF
+cat > tests/run/operator-state.test.ts <<'EOF'
+import { describe, expect, test } from \"vitest\";
+import { readOperatorState } from \"../../src/run/operator-state.js\";
+import { graph, partial, approved, resumed, complete, ev } from \"../fixtures/operator-state/fixture.js\";
+
+test(\"The exported operator-state reader required by C1 and C6 replays the three-task partial→approved→resumed→complete fixture with a matching graph with merged numerator 1 then 3 and planned denominator 3. Green requires the latest run-end, tip not failed and empty failed/human/blocked/pending buckets. One human or blocked member remains PARTIAL despite historical tip pass, resume makes current tip PENDING, and a mismatched graph says not comparable. Borrowing denominator 2 from observed tasks, using an old run-end or treating unknown evidence as green fails.\", () => {
+  const read = (events = partial) => readOperatorState({ events, graph, sequence: 34, observedAt: 1000 });
+  expect(read()).toMatchObject({ lifecycle: \"PARTIAL\", green: false, currentTip: \"passed\", merged: 1, planned: 3, sequence: 34, observedAt: 1000 });
+  expect(read(approved)).toMatchObject({ lifecycle: \"APPROVED\", green: false, approvedResumeRequired: true, label: \"approved; resume required\" });
+  expect(read(resumed)).toMatchObject({ lifecycle: \"RUNNING\", currentTip: \"pending\", merged: 1, planned: 3, latestRunEnd: undefined });
+  expect(read(resumed).tasks[1]).toMatchObject({ attempt: 0, dispatches: 1, path: \"/recorded/T2\", pane: \"p2\", alarmMs: 45000 });
+  expect(read(complete)).toMatchObject({ lifecycle: \"COMPLETE\", green: true, merged: 3, planned: 3, buckets: { failed: [], human: [], blocked: [], pending: [] } });
+  const foreign = structuredClone(graph); foreign.tasks[0]"'!.goal = "a different definition";
+  expect(readOperatorState({ events: partial, graph: foreign })).toMatchObject({ comparable: false, comparison: "not comparable", planned: undefined, merged: 1 });
+  expect(readOperatorState({ events: partial })).toMatchObject({ comparable: false, planned: undefined });
+  for (const key of ["human", "blocked", "failed", "pending"]) {
+    const end = complete.at(-1)!;
+    const events = [...complete.slice(0, -1), ev("run-end", { ...end.data, [key]: ["T3"] })];
+    expect(read(events), key).toMatchObject({ lifecycle: "PARTIAL", green: false });
+    const missing = { ...end.data }; delete missing[key];
+    expect(read([...complete.slice(0, -1), ev("run-end", missing)]).green, key).toBe(false);
+    expect(read([...complete.slice(0, -1), ev("run-end", { ...end.data, [key]: "garbage" })]).green).toBe(false);
+  }
+  for (const tipVerify of [undefined, "unknown", "failed"]) expect(read([...complete.slice(0, -1), ev("run-end", { ...complete.at(-1)!.data, tipVerify })]).green).toBe(false);
+  expect(read([...complete, ev("run-resume")])).toMatchObject({ green: false, currentTip: "pending", latestRunEnd: undefined });
+  expect(readOperatorState({ events: complete, graph, readable: false })).toMatchObject({ green: false, lifecycle: "UNKNOWN" });
+  expect(read([ev("run-start", partial[0]!.data), ev("task-done", {}, "T1")]).merged).toBe(0);
+});
+
+describe("current attempt gate evidence", () => {
+  test("declaration order is independent of result order and skipped or missing results never pass", () => {
+    const events = [partial[0]!, ev("task-dispatch", { attempt: 3 }, "T1"), ev("gate-result", { gate: "review", pass: true, skipped: true }, "T1"), ev("gate-result", { gate: "acceptance", disabled: true }, "T1"), ev("gate-result", { gate: "test" }, "T1"), ev("gate-start", { gate: "build" }, "T1")];
+    const s = readOperatorState({ events, graph });
+    expect(Object.keys(s.tasks[0]!.gates)).toEqual(["build", "test", "lint", "evidence", "scope", "acceptance", "review"]);
+    expect(s.tasks[0]!.gates).toMatchObject({ build: { state: "running" }, test: { state: "unknown" }, lint: { state: "not-run" }, acceptance: { state: "disabled" }, review: { state: "not-run" } });
+    expect(s.gatesRan).toEqual({ passed: 0, total: 0 });
+    expect(readOperatorState({ events: [...events, ev("task-dispatch", { attempt: 4 }, "T1")], graph }).tasks[0]!.gates.review).toEqual({ state: "not-run" });
+  });
+});
+EOF
+cat > tests/cockpit/live-store.test.ts <<'"'EOF'
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from \"node:fs\";
+import { tmpdir } from \"node:os\";
+import { join } from \"node:path\";
+import { afterEach, expect, test, vi } from \"vitest\";
+import { createLiveStore, JournalTail, STORE_LIMITS } from \"../../src/tui/cockpit/live-store.js\";
+import { graph, partial, rawOf, ev } from \"../fixtures/operator-state/fixture.js\";
+const dirs: string[] = [];
+afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+function fixture() {
+  const cwd = mkdtempSync(join(tmpdir(), \"operator-state-\")); dirs.push(cwd);
+  const state = join(cwd, \".tickmarkr\"); const runId = \"run-20260905-000000\";
+  const run = join(state, \"runs\", runId); mkdirSync(run, { recursive: true });
+  const path = join(run, \"journal.jsonl\"); writeFileSync(path, rawOf(partial));
+  writeFileSync(join(state, \"graph.json\"), JSON.stringify(graph));
+  return { cwd, state, runId, path };
+}
+
+test(\"The production-facing tail interface reads append bytes once, carries torn multibyte UTF-8 until newline and keeps original journal line identities through malformed complete rows, same-size in-place rewrite, truncation and inode replacement. Its snapshots distinguish pending incomplete tails from malformed complete records and expose unreadable/corrupt input with source and error while a valid seeded journal stays readable. A malformed record becoming empty success, stale rows surviving rewrite, or selected #L becoming a filtered ordinal fails.\", () => {
+  const { path } = fixture(); const tail = new JournalTail(path);
+  const seeded = tail.poll(1000); expect(seeded.status).toBe(\"readable\"); expect(seeded.lines).toBe(7);
+  const bytes = Buffer.from(JSON.stringify(ev(\"worker-nudge\", { text: \"你好🌍\" })) + \"\\n\");
+  const cut = bytes.indexOf(Buffer.from(\"🌍\")) + 2;
+  appendFileSync(path, bytes.subarray(0, cut));
+  const torn = tail.poll(2000); expect(torn.status).toBe(\"pending\"); expect(torn.pending).toEqual({ line: 8, bytes: cut }); expect(torn.malformedCount).toBe(0);
+  expect(tail.poll(2500).bytesRead).toBe(torn.bytesRead);
+  appendFileSync(path, bytes.subarray(cut, -1)); expect(tail.poll(3000).pending).toBeDefined();
+  appendFileSync(path, \"\\n\"); const joined = tail.poll(4000);
+  expect(joined.history.at(-1)).toMatchObject({ line: 8, id: "'`${path}#L8`, event: { data: { text: "你好🌍" } } });
+  expect(joined.bytesRead - seeded.bytesRead).toBe(bytes.length);
+  appendFileSync(path, "{malformed}'"\\n\\n\" + rawOf([ev(\"worker-nudge\")]));
+  const corrupt = tail.poll(5000); expect(corrupt.status).toBe(\"corrupt\"); expect(corrupt.errors[0]).toMatchObject({ source: path, line: 9 }); expect(corrupt.errors[0]"'!.error).toBeTruthy();
+  expect(corrupt.history.at(-1)!.id).toBe(`${path}#L11`);
+  expect(tail.page(9, 3).map(r => [r.line, !!r.error])).toEqual([[9, true], [10, false], [11, false]]);
+  const same = rawOf([ev("run-start", { text: "aaaa" })]); writeFileSync(path, same); tail.poll();
+  writeFileSync(path, same.replace("aaaa", "bbbb")); const rewrite = tail.poll();
+  expect(rewrite.history).toHaveLength(1); expect(rewrite.history[0]!.event!.data.text).toBe("bbbb"); expect(rewrite.errors).toEqual([]);
+  const oldGeneration = rewrite.generation; const replacement = path + ".replacement";
+  writeFileSync(replacement, same.replace("aaaa", "cccc")); renameSync(replacement, path);
+  expect(tail.poll().generation).toBeGreaterThan(oldGeneration); expect(tail.page(1)[0]!.event!.data.text).toBe("cccc");
+  expect(() => tail.page(1, 1, oldGeneration)).toThrow(/replaced/);
+  writeFileSync(path, ""); expect(tail.poll()).toMatchObject({ lines: 0, history: [], pending: undefined });
+  rmSync(path); mkdirSync(path); expect(tail.poll()).toMatchObject({ status: "unreadable", error: { source: path } });
+  const missing = new JournalTail(path + "missing").poll(); expect(missing.status).toBe("unreadable"); expect(missing.error!.error).toMatch(/ENOENT/);
+});
+
+test("The exported store independently delivers changed graph/config/cache identity, clock/beat expiry, dead versus EPERM lock probes, input and resize while journal bytes remain static, marking observations delayed after two one-second target intervals. After 10000 appended events bounded history still pages an early multiline verdict by original #L and retains durable task/merge facts and errors. Repeated whole-file reads on idle, growth-only invalidation or evicted evidence becoming unreachable fails.", async () => {
+  const f = fixture(); let now = Date.now();
+  mkdirSync(join(f.state, "supervision")); const beat = join(f.state, "supervision", "orchestrator.beat");
+  writeFileSync(beat, JSON.stringify({ seat: "orch" })); utimesSync(beat, new Date(now), new Date(now));
+  writeFileSync(join(f.state, "graph.lock"), JSON.stringify({ pid: 123456, runId: f.runId, startedAt: now }));
+  const kill = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("protected"), { code: "EPERM" }); });
+  const store = createLiveStore({ ...f, now: () => now }); let deliveries = 0; const unsubscribe = store.subscribe(() => { deliveries++; });
+  const opening = store.snapshot(); expect(opening.lock).toMatchObject({ state: "alive", alive: true });
+  expect(opening.operator).toMatchObject({ merged: 1, planned: 3 });
+  expect(opening.supervision[0]!.state).toBe("ARMED");
+  now += 1000; store.refresh(); expect(store.snapshot().delayed).toBe(false);
+  expect(store.snapshot().journal.bytesRead).toBe(opening.journal.bytesRead);
+  now += 61000; store.refresh(); expect(store.snapshot().delayed).toBe(true); expect(store.snapshot().supervision[0]!.state).toBe("STALE");
+  kill.mockImplementation(() => { throw Object.assign(new Error("dead"), { code: "ESRCH" }); }); now += 1000; store.refresh(); expect(store.snapshot().lock.state).toBe("dead"); expect(store.snapshot().delayed).toBe(false);
+  const foreign = structuredClone(graph); foreign.tasks[0]!.goal = "changed"; writeFileSync(join(f.state, "graph.json"), JSON.stringify(foreign));
+  writeFileSync(join(f.state, "config.yaml"), "mode: risk-based'"\\n\"); writeFileSync(join(f.state, \"doctor-cache.json\"), '{\"revision\":1}'); store.refresh();
+  const changed = store.snapshot(); expect(changed.graph.identity).not.toBe(opening.graph.identity); expect(changed.operator.comparable).toBe(false); expect(changed.config.value).toBe(\"mode: risk-based\\n\"); expect(changed.cache.value).toEqual({ revision: 1 });
+  writeFileSync(join(f.state, \"doctor-cache.json\"), '{\"revision\":2}'); store.refresh(); expect(store.snapshot().cache.value).toEqual({ revision: 2 });
+  writeFileSync(join(f.state, \"graph.json\"), JSON.stringify(graph));
+  store.input(); store.resize(80, 24); expect(store.snapshot()).toMatchObject({ inputSequence: 1, viewport: { columns: 80, rows: 24 } }); expect(deliveries).toBeGreaterThan(5);
+  expect(store.snapshot().journal.bytesRead).toBe(opening.journal.bytesRead);
+  appendFileSync(f.path, \"malformed complete record\\n\"); store.refresh();
+  appendFileSync(f.path, rawOf(Array.from({ length: 10000 }, () => ev(\"worker-nudge\", {}, \"T1\"))));
+  do { now += 1000; store.refresh(); } while (store.snapshot().journal.backlogBytes);
+  const final = store.snapshot(); expect(final.journal.history.length).toBeLessThanOrEqual(STORE_LIMITS.history); expect(final.journal.history[0]"'!.line).toBeGreaterThan(3);
+  expect(final.operator).toMatchObject({ merged: 1, planned: 3, green: false }); expect(final.operator.tasks[0]!.mergeEvidence!.id).toBe(`${f.path}#L4`);
+  expect(final.journal.malformedCount).toBe(1); expect(final.errors).toEqual(expect.arrayContaining([expect.objectContaining({ source: f.path, line: 8 })]));
+  expect(store.page(3, 1)[0]).toMatchObject({ id: `${f.path}#L3`, event: { data: { details: "First verdict'"\\nSecond line\\n第三行\" } } });
+  expect(store.page(8, 1)[0]"'!.error).toBeTruthy();
+  for (let i = 0; i < 30; i++) { now += 1000; store.refresh(); }
+  const one = store.requestRefresh(); for (let i = 0; i < 100; i++) expect(store.requestRefresh()).toBe(one);
+  expect(store.diagnostics().pendingReads).toBe(1); await one;
+  expect(store.diagnostics()).toMatchObject({ pendingReads: 0, metrics: STORE_LIMITS.metrics });
+  const removers = Array.from({ length: STORE_LIMITS.subscribers - 1 }, () => store.subscribe(() => {})); expect(() => store.subscribe(() => {})).toThrow(/limit/); removers.forEach(remove => remove());
+  unsubscribe(); store.dispose(); expect(store.diagnostics().subscriptions).toBe(0);
+});
+EOF
+npx vitest run tests/run/operator-state.test.ts tests/cockpit/live-store.test.ts' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ exited 1 in 123ms:
+failed to load config from /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2/vitest.config.ts
+
+⎯⎯⎯⎯⎯⎯⎯ Startup Error ⎯⎯⎯⎯⎯⎯⎯⎯
+Error: EPERM: operation not permitted, open '/Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2/node_modules/.vite-temp/vitest.config.ts.timestamp-1788612292246-ddd77f705b24a8.mjs'
+    at async open (node:internal/fs/promises:1360:25)
+    at async Object.writeFile (node:internal/fs/promises:2104:14)
+    at async loadConfigFromBundledFile (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35994:3)
+    at async bundleAndLoadConfigFile (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35884:17)
+    at async loadConfigFromFile (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35851:42)
+    at async resolveConfig (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:35500:22)
+    at async _createServer (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vite/dist/node/chunks/config.js:25441:67)
+    at async createViteServer (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:6921:17)
+    at async createVitest (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10212:17)
+    at async prepareVitest (file:///Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10551:14) {
+  errno: -1,
+  code: 'EPERM',
+  syscall: 'open',
+  path: '/Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2/node_modules/.vite-temp/vitest.config.ts.timestamp-1788612292246-ddd77f705b24a8.mjs'
+}
+
+
+
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'npx vitest run --configLoader runner tests/run/operator-state.test.ts tests/cockpit/live-store.test.ts' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ exited 1 in 638ms:
+
+ RUN  v3.2.7 /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |suite| tests/cockpit/live-store.test.ts [ tests/cockpit/live-store.test.ts ]
+GraphValidationError: invalid RunGraph:
+  - spec.paths: Invalid input: expected array, received undefined
+ ❯ validateGraph src/graph/schema.ts:147:11
+    145|   const r = RunGraphSchema.safeParse(data);
+    146|   if (!r.success) {
+    147|     throw new GraphValidationError(
+       |           ^
+    148|       r.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.…
+    149|     );
+ ❯ tests/fixtures/operator-state/fixture.ts:4:22
+ ❯ tests/cockpit/live-store.test.ts:6:1
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  |suite| tests/run/operator-state.test.ts [ tests/run/operator-state.test.ts ]
+GraphValidationError: invalid RunGraph:
+  - spec.paths: Invalid input: expected array, received undefined
+ ❯ validateGraph src/graph/schema.ts:147:11
+    145|   const r = RunGraphSchema.safeParse(data);
+    146|   if (!r.success) {
+    147|     throw new GraphValidationError(
+       |           ^
+    148|       r.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.…
+    149|     );
+ ❯ tests/fixtures/operator-state/fixture.ts:4:22
+ ❯ tests/run/operator-state.test.ts:3:1
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  2 failed (2)
+      Tests  no tests
+   Start at  15:45:06
+   Duration  225ms (transform 75ms, setup 183ms, collect 0ms, tests 0ms, environment 0ms, prepare 42ms)
+
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "sed -n '115,145p' src/graph/schema.ts; rg -n 'tipVerify|summary =|summary:' src/run/daemon.ts | tail -15; git status --short" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 0ms:
+      hash: z.string(),
+      // Q11 compile half: an author-declared ref only. Runtime Git resolution/enforcement is later.
+      base: z.string().min(1).optional(),
+    }),
+    tasks: z.array(TaskSchema).min(1),
+  })
+  .superRefine((g, ctx) => {
+    const ids = new Set<string>();
+    for (const t of g.tasks) {
+      if (ids.has(t.id)) ctx.addIssue({ code: "custom", message: `duplicate task id ${t.id}` });
+      ids.add(t.id);
+    }
+    for (const t of g.tasks)
+      for (const d of t.deps)
+        if (!ids.has(d)) ctx.addIssue({ code: "custom", message: `${t.id} depends on unknown task ${d}` });
+    const cycle = findCycle(g.tasks);
+    if (cycle) ctx.addIssue({ code: "custom", message: `dependency cycle: ${cycle.join(" -> ")}` });
+  });
+
+export type Task = z.infer<typeof TaskSchema>;
+export type RunGraph = z.infer<typeof RunGraphSchema>;
+
+export class GraphValidationError extends Error {
+  constructor(public issues: string[]) {
+    super(`invalid RunGraph:\n  - ${issues.join("\n  - ")}`);
+    this.name = "GraphValidationError";
+  }
+}
+
+export function validateGraph(data: unknown): RunGraph {
+  const r = RunGraphSchema.safeParse(data);
+173: * Without this the run-end record stated only buckets and tipVerify, both accurate, over a milestone
+174: * that was silently incomplete: run …230 ended tipVerify "passed" with two upheld approvals and zero
+198:  const tip = s.tipVerify === "failed"
+200:    : s.tipVerify === "passed" ? "\ntip verify: passed" : "";
+2291:        summary: typeof workerEvent.data.summary === "string" ? workerEvent.data.summary : "",
+3597:            while (settleParsed.summary === UNPARSEABLE_TRAILER_SUMMARY && settleTries < maxSettleRetries) {
+3714:          : classifyWorkerResultCause({ output, ok: result.ok, finished: workerFinished, exitCode, summary: result.summary, timedOut, deadChannel: deadChannelKilled });
+3754:        ok: result.ok, summary: result.summary, deviations: result.deviations, finished: workerFinished, exitCode,
+3781:          result = { ok: true, summary: HARVESTED_RESULT_SUMMARY, deviations: [], raw: output };
+3784:            attempt, commits: harvestedCommits, summary: HARVESTED_RESULT_SUMMARY, source: "harvest",
+4295:  const summary: RunSummary = {
+4310:    summary.tipVerify = tipFailed ? "failed" : "passed";
+4333:      && summary.tipVerify !== "failed";
+4341:  const tipFail = summary.tipVerify === "failed"
+4346:    { tier: summary.tipVerify === "failed" ? "attention" : "routine" },
+?? src/run/operator-state.ts
+?? src/tui/cockpit/live-store.ts
+?? tests/cockpit/live-store.test.ts
+?? tests/fixtures/operator-state/
+?? tests/run/operator-state.test.ts
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "python3 - <<'PY'
+p='tests/fixtures/operator-state/fixture.ts'
+s=open(p).read().replace('path: \"fixture.md\"', 'paths: [\"fixture.md\"]')
+open(p,'w').write(s)
+p='src/tui/cockpit/derive.ts'
+s=open(p).read(); s='// Consolidated C1/C6 readers use the incremental lifecycle contract; legacy captures keep their API.\\nexport { readOperatorState as deriveOperatorState } from \"../../run/operator-state.js\";\\n'+s
+open(p,'w').write(s)
+PY
+npx vitest run --configLoader runner tests/run/operator-state.test.ts tests/cockpit/live-store.test.ts" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 684ms:
+
+ RUN  v3.2.7 /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+
+ ✓ |suite| tests/run/operator-state.test.ts (2 tests) 3ms
+ ✓ |suite| tests/cockpit/live-store.test.ts (2 tests) 26ms
+
+ Test Files  2 passed (2)
+      Tests  4 passed (4)
+   Start at  15:45:43
+   Duration  255ms (transform 78ms, setup 186ms, collect 55ms, tests 29ms, environment 0ms, prepare 44ms)
+
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "cat > tests/fixtures/operator-state/heap-runner.mjs <<'EOF'
+/** Run with node --expose-gc; imports the build, never a mock renderer. See README.md. */
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { PassThrough, Writable } from 'node:stream';
+import { performance } from 'node:perf_hooks';
+import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
+import { setImmediate as yieldTick } from 'node:timers/promises';
+import { runLiveCockpit } from '../../../dist/tui/cockpit/live.js';
+import { createLiveStore } from '../../../dist/tui/cockpit/live-store.js';
+
+const shape = process.argv[2] ?? 'static';
+const destination = process.argv[3];
+if ("'!['"'static', 'growth', 'resize'].includes(shape) || "'!global.gc || !destination) throw new Error('"'usage: node --expose-gc heap-runner.mjs static|growth|resize result.json');
+const root = resolve(import.meta.dirname, '../../..');
+const fixture = mkdtempSync(join(tmpdir(), 'operator-heap-'));
+const runId = 'run-20260905-000000';
+const runDir = join(fixture, '.tickmarkr', 'runs', runId);
+mkdirSync(runDir, { recursive: true });
+const journal = join(runDir, 'journal.jsonl');
+const start = Date.parse('2026-09-05T00:00:00Z');
+const event = (name, taskId, data = {}) => JSON.stringify({ ts: new Date(start).toISOString(), event: name, ...(taskId ? { taskId } : {}), data }) + '\\n';
+writeFileSync(journal, event('run-start', undefined, { branch: 'fixture', daemonPid: process.pid }) + event('task-dispatch', 'T1', { attempt: 0, assignment: { adapter: 'fake', model: 'fixture' } }));
+let writes = 0, bytes = 0, lastChunk = '', tick = 0;
+class CountingOutput extends Writable {
+  isTTY = true; columns = 120; rows = 40;
+  _write(chunk, _encoding, callback) {
+    writes++; bytes += chunk.length; lastChunk = chunk.toString().slice(-20000); callback();
+  }
+}
+const output = new CountingOutput();
+const input = new PassThrough();
+input.isTTY = true; input.setRawMode = () => input; input.ref = () => input; input.unref = () => input;
+const samples = [];
+let firstFailure;
+let delivery;
+let mounted;
+const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+const sourceFiles = ['src/run/operator-state.ts', 'src/tui/cockpit/live-store.ts', 'src/tui/cockpit/derive.ts', 'src/tui/cockpit/live.ts'];
+const sourceDirty = execFileSync('git', ['status', '--porcelain', '--', ...sourceFiles], { cwd: root, encoding: 'utf8' }).trim();
+const environment = { NODE_ENV: process.env.NODE_ENV ?? null, node: process.version, platform: process.platform, arch: process.arch, TERM: process.env.TERM ?? null, CI: process.env.CI ?? null };
+const store = createLiveStore({ cwd: fixture, runId, now: () => start + tick * 1000 });
+function sample() {
+  global.gc();
+  const usage = process.memoryUsage();
+  const measures = performance.getEntriesByType('measure');
+  const row = { timestamp: new Date().toISOString(), pid: process.pid, sourceCommit, environment: environment.NODE_ENV, tick, observedAt: start + tick * 1000, heap: usage.heapUsed, rss: usage.rss, writes, bytes, performanceMeasures: measures.length, store: store.diagnostics() };
+  samples.push(row);
+  // Retainer evidence is captured at the first failing sample, before later samples can replace it.
+  // The global performance timeline is an observable root retaining these entries. Keep counts and
+  // representative entries, plus V8 space sizes; never clear that root as a test-only workaround.
+  if (tick >= 1000 && usage.heapUsed > 64 * 1024 * 1024 && "'!firstFailure) firstFailure = {
+    tick, heap: usage.heapUsed, root: '"'node:perf_hooks performance timeline', performanceMeasures: measures.length,
+    entries: [...measures.slice(0, 3), ...measures.slice(-3)].map(m => ({ name: m.name, entryType: m.entryType, startTime: m.startTime, duration: m.duration, detailType: typeof m.detail })),
+    heapSpaces: getHeapSpaceStatistics(), heapStatistics: getHeapStatistics(),
+  };
+}
+try {
+  mounted = runLiveCockpit({ input, output, cwd: fixture, runId, binaryVersion: 'heap-fixture', now: () => start + tick * 1000, refreshMs: 2 ** 30, debug: true, onDelivery: d => { delivery = d; } });
+  await yieldTick();
+  for (tick = 1; tick <= 11000; tick++) {
+    if (shape === 'growth' && tick % 10 === 0) appendFileSync(journal, event('worker-nudge', 'T1', { reason: 'heap fixture' }));
+    if (shape === 'resize' && tick % 100 === 0) {
+      output.columns = output.columns === 120 ? 80 : 120; output.rows = output.columns === 120 ? 40 : 24;
+      output.emit('resize'); store.resize(output.columns, output.rows);
+    }
+    // Exercise the mounted production input stream as well as its measured refresh boundary.
+    if (tick % 1000 === 0) input.write('\\u001b[A');
+    delivery.refresh(); store.refresh();
+    await yieldTick();
+    if (tick % 1000 === 0) sample();
+  }
+  input.write('q'); await mounted;
+  const measured = samples.filter(s => s.tick >= 1000);
+  const peak = Math.max(...measured.map(s => s.heap));
+  const lateGrowth = measured.at(-1).heap - measured.find(s => s.tick === 9000).heap;
+  const verdict = peak <= 64 * 1024 * 1024 && lateGrowth <= 16 * 1024 * 1024 ? 'pass' : 'fail';
+  const result = { protocol: 'C2-production-mount-v1', shape, pid: process.pid, sourceCommit, sourceDirty, environment, warmupTicks: 1000, measuredTicks: 10000, samples, peak, lateGrowth, verdict, firstFailure, lastFrame: lastChunk, writes, bytes, sinkLimit: 20000, pendingOutputBytes: output.writableLength, performanceMeasures: performance.getEntriesByType('measure').length, store: store.diagnostics() };
+  writeFileSync(destination, JSON.stringify(result, null, 2) + '\\n');
+  process.stdout.write(JSON.stringify({ shape, environment: environment.NODE_ENV, verdict, peakMiB: peak / 1048576, lateGrowthMiB: lateGrowth / 1048576, writes, performanceMeasures: result.performanceMeasures }) + '\\n');
+} finally {
+  store.dispose();
+  if (delivery && "'!delivery.snapshot().interaction.quit) { input.write('"'q'); await mounted; }
+  input.destroy(); output.destroy(); rmSync(fixture, { recursive: true, force: true });
+}
+EOF
+cat > tests/cockpit/live-store-heap.test.ts <<'EOF'
+import { spawn } from \"node:child_process\";
+import { mkdtempSync, readFileSync, rmSync } from \"node:fs\";
+import { tmpdir } from \"node:os\";
+import { join, resolve } from \"node:path\";
+import { expect, test } from \"vitest\";
+
+const ROOT = resolve(import.meta.dirname, \"../..\");
+const harness = join(ROOT, \"tests/fixtures/operator-state/heap-runner.mjs\");
+function run(shape: string, production: boolean, destination: string): Promise<void> {
+  const env = { ...process.env };
+  delete env.NODE_ENV; delete env.CI; delete env.CONTINUOUS_INTEGRATION;
+  if (production) env.NODE_ENV = \"production\";
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(process.execPath, [\"--expose-gc\", \"--max-old-space-size=2048\", harness, shape, destination], { cwd: ROOT, env, stdio: [\"ignore\", \"ignore\", \"pipe\"] });
+    let error = \"\";
+    child.stderr.on(\"data\", chunk => { error = (error + chunk).slice(-4000); });
+    const timeout = setTimeout(() => { child.kill(\"SIGKILL\"); }, 240000);
+    child.on(\"error\", reject);
+    child.on(\"close\", code => { clearTimeout(timeout); code === 0 ? resolveRun() : reject(new Error("'`heap ${shape}: exit ${code}: ${error}`)); });
+  });
+}
+
+test("runLiveCockpit already exposes the unchanged production mounting boundary consumed by the new heap harness. The changed exported store and committed harness establish the memory protocol in the spec preamble at that boundary, with bounded read queues, history, subscriptions and metric samples. Static/growth/resize production-runtime controls complete 1000+10000 ticks at at most 64 MiB post-GC heap and at most 16 MiB late growth. Capture the ordinary-environment verdict and performance-entry count for C1 integration. A store-only microbenchmark, empty render sink counter, discarded failing environment result or unexplained missing sample fails.", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "operator-heap-tests-"));
+  try {
+    for (const [shape, production] of [["static", true], ["growth", true], ["resize", true], ["static", false]] as const) {
+      const path = join(dir, `${shape}-${production}.json`);
+      await run(shape, production, path);
+      const result = JSON.parse(readFileSync(path, "utf8"));
+      expect(result.protocol).toBe("C2-production-mount-v1");
+      expect(result.samples.map((s: { tick: number }) => s.tick)).toEqual(Array.from({ length: 11 }, (_, i) => (i + 1) * 1000));
+      expect(result.sourceCommit).toMatch(/''^[a-f0-9]{40}$/);
+      expect(result.warmupTicks).toBe(1000); expect(result.measuredTicks).toBe(10000);
+      expect(result.environment.NODE_ENV).toBe(production ? "production" : null);
+      expect(result.writes).toBeGreaterThan(1000); expect(result.bytes).toBeGreaterThan(100000);
+      expect(result.lastFrame.length).toBeLessThanOrEqual(20000); expect(result.lastFrame).toContain("heap-fixture");
+      expect(result.pendingOutputBytes).toBe(0);
+      for (const sample of result.samples) {
+        expect(sample.pid).toBe(result.pid); expect(sample.timestamp).toMatch(/''^202'"\\d-/); expect(sample.rss).toBeGreaterThan(0);
+        expect(sample.store.pendingReads).toBe(0); expect(sample.store.metrics).toBeLessThanOrEqual(12);
+        if (production) expect(sample.heap).toBeLessThanOrEqual(64 * 1024 * 1024);
+      }
+      if (production) {
+        expect(result.verdict).toBe(\"pass\"); expect(result.lateGrowth).toBeLessThanOrEqual(16 * 1024 * 1024);
+      } else {
+        // C2 owns measuring the unchanged mount. C1 owns removing its ordinary-runtime retention.
+        expect([\"pass\", \"fail\"]).toContain(result.verdict);
+        expect(typeof result.performanceMeasures).toBe(\"number\");
+        if (result.verdict === \"fail\") expect(result.firstFailure).toMatchObject({ root: \"node:perf_hooks performance timeline\", performanceMeasures: expect.any(Number) });
+        console.info(\"C1 ordinary-environment baseline\", JSON.stringify({ verdict: result.verdict, heap: result.peak, performanceMeasures: result.performanceMeasures, firstFailure: result.firstFailure }));
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 1_000_000);
+EOF
+npm run build
+npx oxlint src/run/operator-state.ts src/tui/cockpit/live-store.ts tests/run/operator-state.test.ts tests/cockpit/live-store.test.ts tests/cockpit/live-store-heap.test.ts tests/fixtures/operator-state --format stylish" in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ exited 1 in 1816ms:
+
+/Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2/tests/cockpit/live-store-heap.test.ts
+  19:56  error  Expected expression to be used  eslint(no-unused-expressions)
+
+✖ 1 problem (1 error, 0 warnings)
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git add src/run/operator-state.ts src/tui/cockpit/derive.ts src/tui/cockpit/live-store.ts tests/run/operator-state.test.ts tests/cockpit/live-store.test.ts tests/cockpit/live-store-heap.test.ts tests/fixtures/operator-state/fixture.ts tests/fixtures/operator-state/heap-runner.mjs; git commit -m "feat(cockpit): export lifecycle snapshots and bounded journal store"' in /Users/khalidalzahrani/Desktop/CodingSpace/tickmarkr/.tickmarkr/worktrees.noindex/tickmarkr-run-20260905-122005-0000000000003522--T2
+ succeeded in 0ms:
+[tickmarkr/run-20260905-122005-0000000000003522--T2 82806f4e] feat(cockpit): export lifecycle snapshots and bounded journal store
+ 8 files changed, 669 insertions(+)
+ create mode 100644 src/run/operator-state.ts
+ create mode 100644 src/tui/cockpit/live-store.ts
+ create mode 100644 tests/cockpit/live-store-heap.test.ts
+ create mode 100644 tests/cockpit/live-store.test.ts
+ create mode 100644 tests/fixtures/operator-state/fixture.ts
+ create mode 100644 tests/fixtures/operator-state/heap-runner.mjs
+ create mode 100644 tests/run/operator-state.test.ts
+
+hook: PostToolUse
+hook: PostToolUse Completed

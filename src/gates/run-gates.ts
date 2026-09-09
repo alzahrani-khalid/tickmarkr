@@ -15,7 +15,7 @@ import { pickReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
 import type { GateResult } from "./types.js";
 import { shGit } from "../run/git.js";
-import { type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
+import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 
 // v2.0 T2 (OBS-554): the host one-minute load average — the decision variable the parked load-aware
 // scheduler would key on. Injectable so a test can state the load a gate ran under; production always
@@ -156,7 +156,9 @@ export interface GateContext {
   adapters: WorkerAdapter[];
   cfg: TickmarkrConfig;
   via?: GateVia; // v1.1: present → judge/review run as visible named agents through the driver
+  carriedFindings?: readonly StructuredFinding[];
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
+  demotedReviewers?: Set<string>;
   reviewHistory?: string[]; // run-scoped LRU reviewer rotation; mutated synchronously when a seat is reserved
   artifactDir?: string; // OBS-196: run dir for raw reviewer-output persistence on unparseable verdicts
   // T4 (OBS-265): "v185" runs the pipeline mechanics this milestone buys — the cheap git checks as a
@@ -684,13 +686,23 @@ export async function runGates(
     const dispatch = async (run: (adapters: WorkerAdapter[]) => Promise<GateResult>): Promise<GateResult> => {
       const captured = await captureLlmDispatches(ctx.adapters, run);
       invocations.push(...captured.invocations);
-      return captured.value;
+      const rv = captured.value;
+      if (rv.meta?.noVerdict === true || rv.meta?.unparseable === true) {
+        await ctx.onGate?.({ phase: "note", gate: "review", name: "review-no-verdict", payload: { ...rv.meta }, result: rv });
+        if (rv.meta.seatAuthoredBytes === 0 && typeof rv.meta.reviewer === "string"
+          && !ctx.demotedReviewers?.has(rv.meta.reviewer)) {
+          ctx.demotedReviewers?.add(rv.meta.reviewer);
+          await ctx.onGate?.({ phase: "note", gate: "review", name: "review-pool-demotion",
+            payload: { reviewer: rv.meta.reviewer, cause: rv.meta.cause, seatAuthoredBytes: 0 }, result: rv });
+        }
+      }
+      return rv;
     };
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir, ctx.reviewHistory));
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings));
     // OBS-193/574: an unparseable review verdict retries the REVIEW exactly once, preferring a
     // different adapter. Only a single-adapter eligible pool may fall back to another channel on the
     // flaked adapter. The flaked verdict never enters results; an exhausted pool preserves its cause.
-    if (rv.meta?.unparseable === true && typeof rv.meta.reviewer === "string") {
+    if ((rv.meta?.unparseable === true || rv.meta?.noVerdict === true) && typeof rv.meta.reviewer === "string") {
       const flaked = rv.meta.reviewer;
       const emptyOutput = rv.meta.cause === "empty-output";
       if (emptyOutput) {
@@ -714,7 +726,7 @@ export async function runGates(
       const retryExclusions = [...priorExclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, retryExclusions, ctx.artifactDir, ctx.reviewHistory,
+        retryVia, retryExclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";

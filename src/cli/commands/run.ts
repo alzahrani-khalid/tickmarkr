@@ -127,6 +127,9 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   "gate-result": { label: "gate", tone: "pass" },
   "gate-reused": { label: "gate reused", tone: "neutral" },
   "judge-retry": { label: "judge retry", tone: "attention" },
+  "review-no-verdict": { label: "review unavailable", tone: "attention" },
+  "review-pool-demotion": { label: "review seat demoted", tone: "attention" },
+  "review-infra-retry": { label: "review infra retry", tone: "attention" },
   "review-retry": { label: "review retry", tone: "attention" },
   // repairs and escalations
   "repair-dispatch": { label: "repair", tone: "attention" },

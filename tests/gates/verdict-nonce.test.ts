@@ -169,7 +169,8 @@ describe("judge review and consult verdict surfaces all require the nonce", () =
     fake.headlessCommand = () => `printf %s ${JSON.stringify(reviewVerdict)}`;
     const r = await reviewGate(task, repo, base, author, channels, [fake], DEFAULT_CONFIG);
     expect(r.pass).toBe(false);
-    expect(r.details).toMatch(/unparseable/i);
+    expect(r.meta).toMatchObject({ cause: "no-verdict", noVerdict: true, infra: true });
+    expect(r.meta?.unparseable).toBeUndefined();
   });
 
   test("consult rejects unbound verdict output", async () => {

@@ -97,9 +97,11 @@ class ThreeTiedFake extends FakeAdapter {
 }
 
 // T1 pinned to fake-3; step 0 quota-fails (no trailer + quota text + exit 1) ⇒ mid-task failover, step 1 wins.
+// Q-1 (OBS-926): a pin is never left on a quota match ALONE — the tail also carries a channel-attributed
+// error (provider outage) so the pinned task lawfully fails over and the LEARNED tiebreak is exercised.
 const failoverScript = {
   T1: [
-    { shell: "echo 'usage limit reached for this model'; exit 1" },
+    { shell: "echo 'usage limit reached for this model'; echo 'service temporarily unavailable'; exit 1" },
     { shell: `echo x > f.txt && ${COMMIT} f`, result: { ok: true, summary: "ok" } },
   ],
 };

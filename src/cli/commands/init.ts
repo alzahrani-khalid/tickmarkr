@@ -4,6 +4,7 @@ import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
+import { parse as parseYaml } from "yaml";
 import { allAdapters, formatDoctorAgeForInit, formatDoctorReport, initDoctorReuse } from "../../adapters/registry.js";
 import { configTemplate, DEFAULT_CONFIG, globalConfigDir, loadConfig, type TickmarkrConfig, type InitConfigOverlay } from "../../config/config.js";
 import { LEGACY_PREFIX, specTemplate } from "../../compile/native.js";
@@ -223,8 +224,15 @@ const describeDrift = (d: SkillDrift) => [
 // different answer (`--agent --force`), and it is reported by name on every init path below.
 const skillsInstalled = (cwd: string) =>
   hostTargets(cwd).every((t) => AGENT_SKILLS.every((s) => existsSync(join(t.skillsDir, s, "SKILL.md"))));
-const wizardDriverDefault = (): TickmarkrConfig["driver"] => process.env.HERDR_ENV === "1" ? "herdr" : orcaHostDetected() ? "orca" : "auto";
+export type DetectedHost = "herdr" | "orca" | "subprocess";
 
+export function detectedHost(env: NodeJS.ProcessEnv = process.env): DetectedHost {
+  if (env.HERDR_ENV === "1") return "herdr";
+  if (orcaHostDetected(env)) return "orca";
+  return "subprocess";
+}
+
+const wizardDriverDefault = (): TickmarkrConfig["driver"] => "auto";
 function packageName(cwd: string): string | null {
   try {
     const parsed = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")) as { name?: unknown };
@@ -332,6 +340,7 @@ async function runInitWizard(
       visibilityLlm: DEFAULT_CONFIG.visibility.llm,
       offerSkills: !skillsInstalled(cwd),
       skillsDefault: existsSync(join(cwd, ".claude", "skills")) && !skillsInstalled(cwd),
+      detectedHost: detectedHost(),
     },
     input,
     output,
@@ -381,7 +390,35 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
 
   const repoConfigPath = join(tickmarkrDir(cwd), "config.yaml");
   const repoConfigExists = existsSync(repoConfigPath);
-  if (repoConfigExists) notes.push(`kept existing ${repoConfigPath}`);
+  if (repoConfigExists) {
+    if (values.force) {
+      const currentRaw = readFileSync(repoConfigPath, "utf8");
+      let parsedDriver: string | undefined;
+      try {
+        const parsed = parseYaml(currentRaw) as { driver?: unknown } | null;
+        if (typeof parsed?.driver === "string") parsedDriver = parsed.driver;
+      } catch {
+        // malformed: fall back to regex
+      }
+      if (!parsedDriver) {
+        const m = currentRaw.match(/^\s*driver:\s*([^\s#]+)/m);
+        if (m) parsedDriver = m[1];
+      }
+      const host = detectedHost();
+      if (parsedDriver && parsedDriver === host) {
+        const rewritten = currentRaw.replace(
+          new RegExp(`^(\\s*driver:\\s*)${parsedDriver}\\b.*$`, "m"),
+          `$1auto            # auto — resolves to ${host} here`,
+        );
+        writeFileSync(repoConfigPath, rewritten);
+        notes.push(`rewrote driver: ${parsedDriver} to auto in ${repoConfigPath}`);
+      } else {
+        notes.push(`kept existing ${repoConfigPath}`);
+      }
+    } else {
+      notes.push(`kept existing ${repoConfigPath}`);
+    }
+  }
 
   const specPath = join(cwd, SCAFFOLD_SPEC);
   if (existsSync(specPath)) {
@@ -431,7 +468,12 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
         // so costs one clause; everything else stops here. Esc and ctrl+c both land here.
         return `init: wizard quit — nothing further run (scaffolding kept: ${notes.filter((n) => n.startsWith("wrote")).length} file(s) written above). Re-run tickmarkr init to continue.`;
       }
-      writeFileSync(repoConfigPath, configTemplate(wizard.overlay));
+      const host = detectedHost();
+      const renderedConfig = configTemplate(wizard.overlay).replace(
+        /^driver: auto$/m,
+        `driver: auto            # auto — resolves to ${host} here`,
+      );
+      writeFileSync(repoConfigPath, renderedConfig);
       notes.push(`wrote ${repoConfigPath}`);
       if (wizard.installSkills) {
         await installAgentFiles(cwd, values.force ?? false, wizard.installDocs || (values.docs ?? false), notes);
@@ -477,7 +519,7 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   if (!visual()) return `${notes.join("\n")}\n${doc}\n${next}\n${ENVIRONMENTS_FOOTER}`;
 
   const noteRows = notes.map((note) => `  ${statusRow(
-    /^(?:wrote|overwrote|appended)/.test(note) ? "pass" : note.startsWith("skipped") ? "warn" : "neutral",
+    /^(?:wrote|overwrote|appended|rewrote)/.test(note) ? "pass" : note.startsWith("skipped") ? "warn" : "neutral",
     note,
   )}`);
   const footerRows = ENVIRONMENTS_FOOTER.split("\n").slice(1).map((line) => {

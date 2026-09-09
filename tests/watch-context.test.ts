@@ -585,7 +585,9 @@ describe("watch-context.sh supervision (SUP-05)", () => {
     const source = shipped.toString("utf8");
     expect(shipped.byteLength).toBeGreaterThan(0);
     expect(source).toContain("banner=$(printf '%s\\n' \"$screen\"");
-    expect(source).toContain("\"$banner\" | grep -oE '[0-9]+%'");
+    // OBS-964: the codex footer paints "weekly N% left" on the banner row, so the read may strip that
+    // token first — the anchor is still $banner, never $screen.
+    expect(source).toMatch(/"\$banner" \| (?:sed -E '[^']*' \| )?grep -oE '\[0-9\]\+%'/);
     expect(source).not.toContain("\"$screen\" | grep -oE '[0-9]+%'");
     // OBS-793: the `.claude/` twin is a PRIVATE-TREE convenience that the export deliberately
     // excludes (`scripts/export-public.sh`, `:(exclude).claude`), so it does not exist in the shipped

@@ -6,7 +6,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, OPENCODE_BUSY_FRAME_MARKERS, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter } from "./types.js";
 
 // v1.5 MODEL-01: pure parser for `opencode models` (one provider/model id per line, no header).
 // Live-verified 2026-07-10, opencode 1.17.15. Lines are already the seed id format; drop blanks.
@@ -17,9 +17,13 @@ export function parseOpencodeModels(raw: string): string[] {
     .filter((id) => MODEL_ID_RE.test(id));
 }
 
+// Keep the adapter export available without making the fake adapter import probe code.
+export { OPENCODE_BUSY_FRAME_MARKERS } from "./types.js";
+
 export const opencode: WorkerAdapter = {
   id: "opencode",
   vendor: "mixed",
+  busyFrameMarkers: OPENCODE_BUSY_FRAME_MARKERS,
   probeCwd: "neutral",
   probe: async () => probeVersion("opencode"),
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("opencode", cfg),

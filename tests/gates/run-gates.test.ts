@@ -1318,7 +1318,7 @@ describe("R3 participation is path-keyed and the nudge reaches the adapter allow
     const unbound = await gatesWith(["src/run/daemon.ts"], { "src/run/daemon.ts": "export const x = 1;\n" }, new NoncedFake(reviewerScript, "rev", "other-vendor", false));
     const unboundReview = unbound.results.find((r) => r.gate === "review")!;
     expect(unboundReview.pass).toBe(false);
-    expect(unboundReview.meta).toMatchObject({ unparseable: true, cause: "no-verdict" });
+    expect(unboundReview.meta).toMatchObject({ infra: true, noVerdict: true, cause: "no-verdict" });
 
     // ── half two: the composed fixture, nudged by the REAL driver against the DECLARED box ───────
     // The declaration is claude-code's own, resolved the way the driver resolves it — off the
@@ -1435,12 +1435,12 @@ describe("review empty-output note", () => {
     return { out, events };
   }
 
-  test("test: a reviewer that returns one byte makes the review round emit a note event reviewer-empty-output carrying the reviewer key and bytes 1 through the gate event callback and write a re-route details line saying the reviewer produced EMPTY output whereas a malformed verdict keeps the no parseable verdict wording without any note so a gate that folds both causes into one text fails", async () => {
+  test("a reviewer with zero seat-authored bytes emits an empty-output note while a malformed verdict has only parse diagnostics", async () => {
     const empty = await reviewRound(reviewerAdapter("empty", "empty"), ["empty", "good"]);
-    expect(empty.events.find((e) => e.phase === "note")).toMatchObject({
+    expect(empty.events.find((e) => e.phase === "note" && e.name === "reviewer-empty-output")).toMatchObject({
       gate: "review",
       name: "reviewer-empty-output",
-      payload: { reviewer: "empty:empty-m", bytes: 1 },
+      payload: { reviewer: "empty:empty-m", bytes: 0 },
     });
     expect(empty.out.results.find((r) => r.gate === "review")?.details).toContain("produced EMPTY output");
 
@@ -1448,7 +1448,7 @@ describe("review empty-output note", () => {
       reviewerAdapter("malformed", '{"nonce":"__NONCE__","approve":true,'),
       ["malformed", "good"],
     );
-    expect(malformed.events.some((e) => e.phase === "note")).toBe(false);
+    expect(malformed.events.some((e) => e.phase === "note" && e.name === "reviewer-empty-output")).toBe(false);
     expect(malformed.out.results.find((r) => r.gate === "review")?.details).toContain("produced no parseable verdict");
   });
 });

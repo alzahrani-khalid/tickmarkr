@@ -2,6 +2,30 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.5.1 — review-seat integrity
+
+**v2.5.1** — the review seat stops paying for its own infrastructure. Six tasks from
+`specs/v2.5.1-review-seat-integrity.spec.md`, delivered by run 20260908-174515 (6/6, tip bb549824) plus a
+Leg-2 fix branch (`fix/v2.5.1-leg2`, seven commits, standalone `verify` GREEN with a cross-vendor approval).
+
+- **Provider-true reviewer pick (T1).** `pickReviewer` applies the resolved-provider guard on the initial pick as
+  well as on failover, so an aggregator channel stamped `mixed` never seats the author's own provider; `plan`
+  renders the rotation from the run's own review history instead of a fresh simulation.
+- **A review without a verdict is infrastructure (T2).** No parseable verdict is never a rejection: the cause is
+  classified (`launch-never-started`, `silent`, `truncated`, `malformed-verdict`, `empty-output`), the harness
+  preamble is excluded from the seat-authored byte count by a single stated row grammar, a seat with no bytes of
+  its own is re-routed at the first-liveness beat, and a ceiling-killed round's raw and brief are persisted under the run dir.
+- **The re-review closes the carried materials or it is no verdict (T3).** Carried `review:material` findings
+  are listed verbatim with fingerprints; the trailer's `resolved[]`/`reraised[]` must account for each one.
+- **A trailer counts only on a settled frame (T4).** Adapters declare busy-frame markers; an interactive
+  harvest that sees the trailer while a busy marker is painted keeps waiting.
+- **`init` defaults the driver to `auto` (T5)** and writes a host literal only when the operator picks one.
+- **No false quota failover (T6).** The print branch reads the output tail exactly as the interactive branch
+  reads the banner rows, every `quota-failover` row journals the matched bytes, and a pinned task is never failed
+  over on a quota match without a channel error.
+- Overseer skill: `watch-context.sh` reads the codex footer's context percentage correctly (OBS-964).
+- Every printed twin is unchanged; `npm test` stays zero-token.
+
 ## v2.5.0 — one cockpit
 
 **v2.5.0** — Home, Run and Evidence on one frame with one palette, one key model and one memory-safe live loop.

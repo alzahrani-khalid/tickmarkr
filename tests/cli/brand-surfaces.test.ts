@@ -236,6 +236,9 @@ const RAIL_SPEC: RailSpec[] = [
   { event: "gate-result", label: "gate", tone: "pass", renders: "fail", data: { gate: "test", pass: false, details: "1 failed" } },
   { event: "gate-reused", label: "gate reused", tone: "neutral", data: { gate: "lint", commit: "deadbeefcafe" } },
   { event: "judge-retry", label: "judge retry", tone: "attention", data: { gate: "acceptance", flaked: "codex:gpt-5.6-sol", retried: "claude-code:opus" } },
+  { event: "review-no-verdict", label: "review unavailable", tone: "attention", data: { reviewer: "codex:gpt-5.6-sol", cause: "silent" } },
+  { event: "review-pool-demotion", label: "review seat demoted", tone: "attention", data: { reviewer: "codex:gpt-5.6-sol", cause: "silent", seatAuthoredBytes: 0 } },
+  { event: "review-infra-retry", label: "review infra retry", tone: "attention", data: { reviewer: "claude-code:opus", cause: "silent" } },
   { event: "review-retry", label: "review retry", tone: "attention", data: { gate: "review", flaked: "codex:gpt-5.6-sol", retried: "claude-code:opus" } },
   // repairs and escalations
   { event: "repair-dispatch", label: "repair", tone: "attention", salient: "diff 4096B", data: { diffBytes: 4096, capped: false } },
@@ -396,7 +399,11 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     const appends = (files: string[], event: string) => files.some((f) => src(f).includes(`append("${event}"`));
 
     for (const event of Object.keys(RAIL_ROWS)) {
-      expect(appends(RUN_OWNED, event), `${event} has no run-owned producer`).toBe(true);
+      // Gate notes flow through the daemon's note callback into this same journal.
+      const gateNote = ["review-no-verdict", "review-pool-demotion"].includes(event)
+        && src("src/gates/run-gates.ts").includes(`name: "${event}"`)
+        && src("src/run/daemon.ts").includes("journal.append(e.name, t.id, e.payload)");
+      expect(appends(RUN_OWNED, event) || gateNote, `${event} has no run-owned producer`).toBe(true);
     }
     // the recorded instance this guard exists for: an event whose ONLY producer is a separate CLI
     // command. It appends, it is a real journal event — and it is not on the rail.

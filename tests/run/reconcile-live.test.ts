@@ -17,6 +17,7 @@ import {
   resetHarvestCpuFlatMsForTests,
   resetHarvestSilentMsForTests,
   runDaemon,
+  closeLiveSlot,
   setDeadChannelFastKillMsForTests,
   setHarvestCpuFlatMsForTests,
   setHarvestSilentMsForTests,
@@ -791,4 +792,33 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
     expect(sweeps.at(-1)!.closed).not.toContain(w1);
     expect(sweeps.at(-1)!.closed).not.toContain(w2);
   }, 30_000);
+});
+
+
+test("test: two closes of one live slot overlapping a driver close held open for 500 ms, a task-done close and the termination sweep, reach the driver's close once, and a close that throws leaves the slot in the live set so the next sweep closes it, so a guard that reads the set before the close and deletes after it fails", async () => {
+  const slot: Slot = { id: "held", name: "held", cwd: "/tmp" };
+  const live = new Set([slot]);
+  let calls = 0;
+  const driver = { close: async () => {
+    calls++;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  } };
+  const taskDone = closeLiveSlot(live, driver, slot);
+  expect(calls).toBe(1);
+  const terminationSweep = Promise.all([...live].map((s) => closeLiveSlot(live, driver, s)));
+  await closeLiveSlot(live, driver, slot); // direct overlapping caller also cannot claim it
+  await Promise.all([taskDone, terminationSweep]);
+  expect(calls).toBe(1);
+  expect(live.has(slot)).toBe(false);
+
+  live.add(slot);
+  const failingDriver = { close: async () => {
+    calls++;
+    if (calls === 2) throw new Error("close failed");
+  } };
+  await expect(closeLiveSlot(live, failingDriver, slot)).rejects.toThrow("close failed");
+  expect(live.has(slot)).toBe(true);
+  for (const s of live) await closeLiveSlot(live, failingDriver, s);
+  expect(calls).toBe(3);
+  expect(live.size).toBe(0);
 });

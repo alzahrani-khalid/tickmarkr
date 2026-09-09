@@ -270,7 +270,7 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     const { results } = await runGates(mkTask(), await gateCtx(repo, base, [worker, garbage, garbageC], [chAuthor, chGarbage, chSecond]));
     const review = results.find((r) => r.gate === "review");
     expect(review?.pass).toBe(false);
-    expect(review?.meta?.unparseable).toBe(true);
+    expect(review?.meta?.unparseable).toBeUndefined();
     expect(review?.meta?.reviewRetry).toEqual({ flaked: "fake-b:fake-b-1", retried: "fake-c:fake-c-1", exclusion: "adapter" });
   });
 
@@ -281,7 +281,7 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     const { results } = await runGates(mkTask(), await gateCtx(repo, base, [worker, garbage], [chAuthor, chGarbage]));
     const review = results.find((r) => r.gate === "review");
     expect(review?.pass).toBe(false);
-    expect(String(review?.details)).toMatch(/unparseable/);
+    expect(String(review?.details)).toMatch(/no structurally valid nonce-bound response/);
     expect(review?.meta?.reviewRetry).toBeUndefined(); // never a synthetic no-reviewer failure
   });
 });
@@ -294,7 +294,7 @@ describe("unparseable cause + raw persistence (OBS-196)", () => {
     const artifactDir = mkdtempSync(join(tmpdir(), "tickmarkr-rev-raw-"));
     const r = await reviewGate(mkTask(), repo, base, author, [chAuthor, chGarbage], [worker, garbage], DEFAULT_CONFIG, undefined, [], artifactDir);
     expect(r.pass).toBe(false);
-    expect(r.meta?.unparseable).toBe(true);
+    expect(r.meta?.unparseable).toBeUndefined();
     expect(r.meta?.cause).toBe("no-verdict");
     expect(String(r.details)).toMatch(/cause: no-verdict/);
     const files = readdirSync(artifactDir).filter((f) => f.startsWith("review-raw-T1-"));

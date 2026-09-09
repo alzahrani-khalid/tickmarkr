@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
+import type { WorkerAdapter } from "../../src/adapters/types.js";
 import { plan } from "../../src/cli/commands/plan.js";
 import { saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -67,5 +68,68 @@ describe("plan review fleet lints", () => {
     expect(singleVendorOut).toContain(CROSS_VENDOR_PAIR_LINT);
     expect(CROSS_VENDOR_PAIR_LINT).toContain("set review.required: false to waive");
     expect(singleVendorOut).not.toContain("install or authenticate an adapter");
+  });
+
+  test("test: with review.required and differently stamped channels that both resolve to OpenAI, the cross-vendor pair lint fires", async () => {
+    const codexAdapter: WorkerAdapter = {
+      id: "codex",
+      channels: () => [
+        { adapter: "codex", model: "gpt-6-astra", vendor: "openai", channel: "sub", tier: "frontier" },
+      ],
+      async probe() {
+        return {
+          installed: true, authed: true, version: "fake",
+          models: ["gpt-6-astra"],
+          modelAuth: authedModels(["gpt-6-astra"]),
+        };
+      },
+      async runWorker() { return { ok: true, summary: "ok" }; },
+    };
+
+    const ompAdapter: WorkerAdapter = {
+      id: "omp",
+      channels: () => [
+        { adapter: "omp", model: "openai-codex/gpt-5.6-sol", vendor: "mixed", channel: "sub", tier: "frontier" },
+      ],
+      async probe() {
+        return {
+          installed: true, authed: true, version: "fake",
+          models: ["openai-codex/gpt-5.6-sol"],
+          modelAuth: authedModels(["openai-codex/gpt-5.6-sol"]),
+        };
+      },
+      async runWorker() { return { ok: true, summary: "ok" }; },
+    };
+
+    const repo = repoWithDoctor({
+      codex: await codexAdapter.probe(),
+      omp: await ompAdapter.probe(),
+    });
+    const out = await plan([], repo, [codexAdapter, ompAdapter]);
+
+    expect(out).toContain(CROSS_VENDOR_PAIR_LINT);
+    expect(out).not.toContain(ZERO_CHANNEL_LINT);
+
+    // with a third channel resolving to a different provider, the pair lint does not fire
+    const ompDiverseAdapter: WorkerAdapter = {
+      ...ompAdapter,
+      channels: () => [
+        { adapter: "omp", model: "openai-codex/gpt-5.6-sol", vendor: "mixed", channel: "sub", tier: "frontier" },
+        { adapter: "omp", model: "zai/glm-5.3", vendor: "mixed", channel: "sub", tier: "frontier" },
+      ],
+      async probe() {
+        return {
+          installed: true, authed: true, version: "fake",
+          models: ["openai-codex/gpt-5.6-sol", "zai/glm-5.3"],
+          modelAuth: authedModels(["openai-codex/gpt-5.6-sol", "zai/glm-5.3"]),
+        };
+      },
+    };
+    const diverseRepo = repoWithDoctor({
+      codex: await codexAdapter.probe(),
+      omp: await ompDiverseAdapter.probe(),
+    });
+    const diverseOut = await plan([], diverseRepo, [codexAdapter, ompDiverseAdapter]);
+    expect(diverseOut).not.toContain(CROSS_VENDOR_PAIR_LINT);
   });
 });

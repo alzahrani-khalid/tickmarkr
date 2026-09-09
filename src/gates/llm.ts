@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -5,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { matchesTrustDialog, type WorkerAdapter } from "../adapters/types.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
-import { bannerShell, paneDispatchCommand } from "../brand.js";
+import { bannerShell, paneDispatchCommand, PLAIN_BANNER } from "../brand.js";
 import { sh } from "../run/git.js";
 import {
   harvestCpuFlatWindowMs,
@@ -185,7 +186,144 @@ export interface LlmRunResult {
   output: string;
   exitCode?: number;
   timedOut: boolean;
+  launchNeverStarted?: boolean;
+  seatAuthoredBytes?: number;
 }
+
+// The harness preamble has a fixed row shape, in order: the dispatch echo rows (the identity export
+// and the START printf, each possibly re-echoed behind the shell prompt), the START acknowledgement
+// row, the banner rows, blank rows, and the identity row. RULING-229-15 add.1 makes the boundary
+// STRUCTURAL: a pane read is line-terminated, so only the LAST row of a capture can be a partial
+// paint. Every row before it is complete, and a complete row is harness only when it EQUALS a full
+// harness row in the position the preamble allows. A complete row that merely starts with "T",
+// "export", "review" or a banner glyph is seat text, and seat prose that MENTIONS a marker mid-row
+// counts in full — "contains TICKMARKR_START_ somewhere" is never by itself a reason to measure zero.
+const BANNER_ROWS = PLAIN_BANNER.replace(/\n$/, "").split("\n");
+const ECHO_OPENER = "export HERDR_WORKSPACE_ID=";
+const ECHO_START_OPENER = "printf '%s%s\\n' 'TICKMARKR_START_' '";
+const ECHO_OPENERS = [ECHO_OPENER, ECHO_START_OPENER];
+// RULING-229-15 add.4: a prompted dispatch-echo row is ONE grammar, stated once and walked token by
+// token, so that "is this row a prefix of some row in the grammar" has exactly one answer:
+//   [ <glyph: one of PROMPT_GLYPHS> <ws> <dir:\S+> <ws> [ git:( <branch:[^)]*> ) <ws> ] ] <opener> <rest>
+// "complete": the opener has been reached (a full harness row, whatever follows it).
+// "partial":  the row ends mid-token — a partial paint of a harness row.
+// "none":     the row leaves the grammar — the seat's own bytes.
+// The ONLY seat-vs-harness ambiguity left is a last row that is a real prompt glyph plus optional dir
+// and git tokens with no opener started ("➜  repo", "$ foo"): harness by the last-row rule, resolved
+// on the next read, and the running Math.max only ever grows.
+type EchoMatch = "complete" | "partial" | "none";
+// RULING-229-15 add.5: the prompt glyph set is this CLOSED list — the corpus sweeps it, the grammar
+// consumes the LONGEST glyph that matches (so ">>" is one glyph and ">" is still one).
+export const PROMPT_GLYPHS = ["➜", "❯", "$", "%", ">>", ">"] as const;
+const GIT_SEGMENT_OPEN = "git:(";
+function echoRowMatch(row: string): EchoMatch {
+  const opener = (at: number): EchoMatch => {
+    const body = row.slice(at);
+    if (ECHO_OPENERS.some((o) => body.startsWith(o))) return "complete";
+    return ECHO_OPENERS.some((o) => o.startsWith(body)) ? "partial" : "none";
+  };
+  const ws = (at: number): number | undefined => /^\s+/.exec(row.slice(at))?.[0].length;
+  const bare = opener(0);
+  if (bare !== "none") return bare;
+  const glyph = PROMPT_GLYPHS.find((g) => row.startsWith(g));
+  if (glyph === undefined) return "none";
+  let i = glyph.length;
+  const ws1 = ws(i);
+  if (ws1 === undefined) return row.length === i ? "partial" : "none";
+  i += ws1;
+  const dir = /^\S+/.exec(row.slice(i));
+  if (!dir) return "partial";
+  i += dir[0].length;
+  const ws2 = ws(i);
+  if (ws2 === undefined) return "partial";
+  i += ws2;
+  const rest = row.slice(i);
+  if (rest.startsWith(GIT_SEGMENT_OPEN)) {
+    const close = row.indexOf(")", i + GIT_SEGMENT_OPEN.length);
+    if (close < 0) return "partial";
+    i = close + 1;
+    const ws3 = ws(i);
+    if (ws3 === undefined) return row.length === i ? "partial" : "none";
+    return opener(i + ws3);
+  }
+  if (GIT_SEGMENT_OPEN.startsWith(rest)) return "partial"; // "", "g", "gi", "git", "git:"
+  return opener(i);
+}
+
+// A complete dispatch echo row: the grammar reaches the opener. Never "contains the opener" — a row
+// that mentions it mid-prose is the seat's.
+function completeEchoRow(row: string): boolean {
+  return echoRowMatch(row) === "complete";
+}
+
+// A LAST row still being painted: any prefix of a row in the grammar.
+function partialEchoRow(row: string): boolean {
+  return echoRowMatch(row) !== "none";
+}
+
+const START_MARKER = "TICKMARKR_START_";
+const START_ROW = /^TICKMARKR_START_[\w-]+$/;
+const IDENTITY_LINE = /^(?:review\s*·|tickmarkr(?::|$))/;
+const IDENTITY_OPENERS = ["review ·", "tickmarkr"];
+
+// Stages of the preamble walk. Each complete harness row is accepted only at or after its stage.
+const ECHO = 0, START = 1, BANNER = 2, IDENTITY = 3, SEAT = 4;
+
+// The char offset where the seat's own text begins, or -1 when the capture ends inside the preamble.
+function seatStart(output: string): number {
+  const rows = output.split("\n");
+  if (rows.length > 1 && rows[rows.length - 1] === "") rows.pop(); // the read's own line terminator
+  let stage = ECHO;
+  let bannerAt: number | undefined; // next banner row expected once the banner has begun
+  let offset = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!.replace(/[ \t]+$/, "");
+    const t = row.trim();
+    const last = i === rows.length - 1;
+    // Complete harness rows: equality against the shape the preamble allows at this stage.
+    let accepted = false;
+    if (stage < SEAT && t.length === 0) accepted = true; // blank rows between preamble rows
+    else if (stage <= ECHO && completeEchoRow(row)) accepted = true;
+    else if (stage <= START && START_ROW.test(row)) { stage = BANNER; accepted = true; }
+    else if (stage <= BANNER && bannerAt === undefined && BANNER_ROWS.includes(row)) { stage = BANNER; bannerAt = BANNER_ROWS.indexOf(row) + 1; accepted = true; }
+    else if (stage <= BANNER && bannerAt !== undefined && row === BANNER_ROWS[bannerAt]) { bannerAt++; accepted = true; }
+    else if (stage <= IDENTITY && IDENTITY_LINE.test(t)) { stage = SEAT; accepted = true; }
+    if (accepted) { offset += rows[i]!.length + 1; continue; }
+    if (!last) return offset;
+    // The last row may be a partial paint: a prefix of the next harness row the preamble allows.
+    if (stage <= ECHO && partialEchoRow(row)) return -1;
+    if (stage <= START && (START_MARKER.startsWith(row) || /^TICKMARKR_START_[\w-]*$/.test(row))) return -1;
+    if (stage <= BANNER && (bannerAt === undefined
+      ? BANNER_ROWS.some((b) => b.startsWith(row))
+      : BANNER_ROWS[bannerAt]?.startsWith(row) === true)) return -1;
+    // The identity row is painted right after the banner, so its prefix is a partial paint only there;
+    // with no banner in the capture, "review" or "tick" alone is the seat's own first row.
+    if (stage <= IDENTITY && bannerAt === BANNER_ROWS.length && IDENTITY_OPENERS.some((o) => o.startsWith(t))) return -1;
+    return offset;
+  }
+  return -1; // every row was harness — the seat has not taken its turn
+}
+
+// A pane's dispatch echo, start acknowledgement, banner and identity are harness bytes.
+// Remove only that leading preamble, never matching text later in the seat's response.
+// Every capture taken before the preamble finishes therefore measures ZERO seat-authored bytes,
+// which is what makes the caller's running Math.max safe: a partial banner counted once would be
+// retained for the whole call and buy a silent seat its full ceiling.
+export function reviewSeatOutput(raw: string, nonce: string): string {
+  const output = stripVTControlCharacters(raw).replace(/\r\n?/g, "\n");
+  const start = seatStart(output);
+  if (start < 0) return "";
+  const seat = output.slice(start);
+  // Anything after the nonce-bound trailer belongs to the terminal (typically the next shell
+  // prompt), not the reviewer. Deleting only the marker would count that postlude as seat output and
+  // let a zero-byte seat escape first-silence demotion.
+  const trailer = new RegExp(`(?:^|\\n)TICKMARKR_EXIT_${nonce}:\\d+[^\\n]*(?:\\n|$)`).exec(seat);
+  // A trailer row still being typed is not stripped: after the preamble a last row "T" is far more
+  // often the seat's first byte than the harness's exit marker, and the next read completes either.
+  return trailer ? seat.slice(0, trailer.index) : seat;
+}
+
+export const REVIEW_FIRST_LIVENESS_MS = 30_000;
 
 async function runHeadlessDetailed(
   adapter: WorkerAdapter,
@@ -199,7 +337,7 @@ async function runHeadlessDetailed(
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
     const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
-    return { output: r.stdout + "\n" + r.stderr, exitCode: r.code, timedOut: r.timedOut === true };
+    return { output: r.stdout + "\n" + r.stderr, exitCode: r.code, timedOut: r.timedOut === true, seatAuthoredBytes: Buffer.byteLength(r.stdout + r.stderr) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -228,6 +366,7 @@ async function runViaDriverDetailed(
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
   let slot: Slot | undefined;
   let accountant: GateCpuAccountant | undefined;
+  let forceClose = false;
   try {
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
@@ -257,6 +396,8 @@ async function runViaDriverDetailed(
     const exitPattern = `TICKMARKR_EXIT_${nonce}:\\d`;
     let out: string;
     let timedOut = false;
+    let launchNeverStarted = false;
+    let seatAuthoredBytes = 0;
     const gatePrompt = prompt.startsWith("TICKMARKR-JUDGE") || prompt.startsWith("TICKMARKR-REVIEW");
     if (!gatePrompt) {
       await via.driver.waitOutput(slot, exitPattern, timeoutMs, { regex: true });
@@ -269,6 +410,9 @@ async function runViaDriverDetailed(
       await accountant.start();
       const startedAt = Date.now();
       out = await via.driver.read(slot, 400);
+      const reviewing = prompt.startsWith("TICKMARKR-REVIEW");
+      seatAuthoredBytes = Buffer.byteLength(reviewSeatOutput(out, nonce));
+      let firstLivenessObserved = false;
       let priorSnapshot = normalizeStallSnapshot(out);
       const anchoredAt = Date.now();
       let quietSince = anchoredAt;
@@ -283,12 +427,33 @@ async function runViaDriverDetailed(
         const matched = await via.driver.waitOutput(slot, exitPattern, sliceMs, { regex: true });
         const raw = await via.driver.read(slot, 400);
         out = raw;
+        seatAuthoredBytes = Math.max(seatAuthoredBytes, Buffer.byteLength(reviewSeatOutput(raw, nonce)));
         // waitOutput is the driver's authoritative marker match. The raw check covers drivers whose
         // wait timed out at the same boundary the marker landed; either way a trailer completes
         // normally and is never mistaken for inactivity.
         if (matched || new RegExp(exitPattern).test(raw)) break;
 
         const now = Date.now();
+        // The ceiling wins if it coincides with the first beat (or the read crosses it).
+        // That seat was killed by its configured timeout, not an early launch reroute.
+        if (now - startedAt >= timeoutMs) break;
+        if (reviewing && !firstLivenessObserved && now - startedAt >= REVIEW_FIRST_LIVENESS_MS) {
+          firstLivenessObserved = true;
+          // RS-2: the beat reads seat-authored bytes ALONE. CPU evidence never holds a preamble-only
+          // capture open to the ceiling; a seat that has not written one byte of its own is re-routed.
+          // OBS-944 is why a buffering runner earns no exemption here: the claude-code seat's 901 s
+          // capture was byte-identical across two legs and ended at the pane-identity line — that
+          // seat never started, it was not quietly working. RULING-229-06 puts the beat on the PANE
+          // path only; a headless `-p` runner (runHeadlessDetailed, no pane, no beat) buffers every
+          // byte until completion and keeps its full ceiling.
+          if (seatAuthoredBytes === 0) {
+            launchNeverStarted = true;
+            forceClose = true;
+            break;
+          }
+        }
+        // Producing reviews own their full ceiling; inactivity is not a review verdict.
+        if (reviewing) continue;
         const snapshot = normalizeStallSnapshot(raw);
         if (snapshot !== priorSnapshot) {
           priorSnapshot = snapshot;
@@ -323,17 +488,20 @@ async function runViaDriverDetailed(
         }
       }
       timedOut = Date.now() - startedAt >= timeoutMs && !new RegExp(exitPattern).test(out);
+      if (timedOut) forceClose = true;
     }
     const exitCode = Number(new RegExp(`TICKMARKR_EXIT_${nonce}:(\\d+)`).exec(out)?.[1]);
     return {
       output: dewrapPaneVerdict(out, nonce),
       ...(Number.isFinite(exitCode) ? { exitCode } : {}),
       timedOut,
+      launchNeverStarted,
+      seatAuthoredBytes,
     };
   } finally {
     try {
       await accountant?.stop();
-      if (slot && !via.keep) await via.driver.close(slot);
+      if (slot && (forceClose || !via.keep)) await via.driver.close(slot);
     } finally {
       // Unconditional and synchronous: a stop/close failure must not leak this call's prompt and script.
       rmSync(dir, { recursive: true, force: true });

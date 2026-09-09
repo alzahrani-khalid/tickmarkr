@@ -17,7 +17,7 @@ import { fetchTaskDiff, modelProvider, pickReviewer, type ReviewVerdict, reviewG
 import { extractJson } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
-import { deriveSignalBasis } from "../../src/run/journal.js";
+import { structuredFindings, type StructuredFinding, deriveSignalBasis } from "../../src/run/journal.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -48,7 +48,7 @@ function repoWithCommit() {
   return { repo, base };
 }
 
-async function captureReviewPrompt(task = mkTask()): Promise<string> {
+async function captureReviewPrompt(task = mkTask(), carriedFindings: StructuredFinding[] = []): Promise<string> {
   const { repo, base } = repoWithCommit();
   const fake = fakeWith({ review: { approve: true, issues: [] } });
   const command = fake.headlessCommand.bind(fake);
@@ -57,7 +57,7 @@ async function captureReviewPrompt(task = mkTask()): Promise<string> {
     prompt = readFileSync(promptFile, "utf8");
     return command(promptFile, model);
   };
-  await reviewGate(task, repo, base, author, CH, [fake], DEFAULT_CONFIG);
+  await reviewGate(task, repo, base, author, CH, [fake], DEFAULT_CONFIG, undefined, undefined, undefined, undefined, undefined, carriedFindings);
   return prompt;
 }
 
@@ -95,6 +95,30 @@ describe("pickReviewer", () => {
     expect(new Set(reviewers.slice(0, 3)).size).toBe(3);
     expect(reviewers[3]).toBe(reviewers[0]);
     expect(rows.map((row) => row.meta?.rotationSeat)).toEqual([1, 2, 3, 1]);
+  });
+
+  test("test: a codex author whose only other-vendor channel is an omp openai-codex model stamped vendor mixed draws no reviewer on the initial pick and the gate fails closed under review.required, while an omp channel resolving to a different provider is still seated first, so a pick that seats the author's own provider because no exclusion was passed fails", async () => {
+    const codexAuthor: Assignment = { adapter: "codex", model: "gpt-6-astra", channel: "sub", tier: "frontier" };
+    const codexChannel: BillingChannel = { adapter: "codex", vendor: "openai", model: "gpt-6-astra", channel: "sub", tier: "frontier" };
+    const ompOpenAiChannel: BillingChannel = { adapter: "omp", vendor: "mixed", model: "openai-codex/gpt-5.6-sol", channel: "sub", tier: "frontier" };
+    const ompZaiChannel: BillingChannel = { adapter: "omp", vendor: "mixed", model: "zai/glm-5.3", channel: "sub", tier: "frontier" };
+
+    // Initial pick with only ompOpenAiChannel as other-vendor:
+    expect(pickReviewer(codexAuthor, [codexChannel, ompOpenAiChannel])).toBeNull();
+
+    // Gate fails closed under review.required:
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: true, issues: [] } });
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.review.required = true;
+    const gateResult = await reviewGate(mkTask(), repo, base, codexAuthor, [codexChannel, ompOpenAiChannel], [fake], cfg);
+    expect(gateResult.pass).toBe(false);
+    expect(gateResult.details).toContain("unreadable");
+    expect(gateResult.details).toContain("no cross-vendor reviewer available");
+
+    // while an omp channel resolving to a different provider is still seated first:
+    const picked = pickReviewer(codexAuthor, [codexChannel, ompOpenAiChannel, ompZaiChannel]);
+    expect(picked).toBe(ompZaiChannel);
   });
 });
 
@@ -938,13 +962,14 @@ describe("v1.1 reviewer failover", () => {
     expect(pickReviewer(author, CH, ["fake:fake-2"])).toBeNull();
   });
 
-  test("unparseable review carries the reviewer channel in meta (failover signal)", async () => {
+  test("missing review verdict carries the reviewer channel and infrastructure cause in meta (failover signal)", async () => {
     const { repo, base } = repoWithCommit();
     const bad = fakeWith({ review: "gibberish — not a verdict" });
     const r = await reviewGate(mkTask(), repo, base, author, CH, [bad], DEFAULT_CONFIG);
     expect(r.pass).toBe(false);
-    // OBS-193/196: meta additionally marks unparseable (typed retry detection) and names the cause
-    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", vendor: "fake-b", provider: "fake-b", unparseable: true, cause: "no-verdict" });
+    // A missing verdict triggers review failover without claiming malformed participation.
+    expect(r.meta).toMatchObject({ policy: "full", reviewer: "fake:fake-2", vendor: "fake-b", provider: "fake-b", noVerdict: true, infra: true, cause: "no-verdict" });
+    expect(r.meta?.unparseable).toBeUndefined();
   });
 
   test("excludeReviewers reaches reviewGate: excluded vendor → no-reviewer path", async () => {
@@ -954,4 +979,93 @@ describe("v1.1 reviewer failover", () => {
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/no cross-vendor reviewer available/);
   });
+});
+
+const carriedMaterials = structuredFindings("review", "- [material] src/pointer.ts `register` resolves index 0 only.\n- [material] src/model.ts `reconcile` loses selection on prepend.\nKeep the selected identity after shrink too.");
+
+test("test: a repair attempt carrying two review material findings renders both verbatim with their fingerprints under a prior-materials heading in the review prompt and a fresh attempt renders no such heading, so a prompt that states the count of carried materials without their text fails", async () => {
+  expect(carriedMaterials).toHaveLength(2);
+  const heading = "Prior materials this attempt must close";
+  const repair = await captureReviewPrompt(mkTask(), carriedMaterials);
+  const section = promptSection(repair, heading);
+  for (const finding of carriedMaterials) {
+    expect(section).toContain(finding.fingerprint);
+    expect(section).toContain(finding.note);
+  }
+  expect(await captureReviewPrompt()).not.toContain(`## ${heading}`);
+});
+
+test("test: an approval whose resolved list names every carried fingerprint passes, a verdict re-raising one fails as a request for changes carrying that finding, and an approval naming a carried fingerprint in neither list is unparseable and fails closed, so an approval with an empty resolved list against one carried material never passes", async () => {
+  const { repo, base } = repoWithCommit();
+  const ids = carriedMaterials.map((finding) => finding.fingerprint);
+  const run = async (resolved: unknown, reraised: unknown, carriedFindings = carriedMaterials) => {
+    const fake = fakeWith({ review: { approve: true, findings: [], resolved, reraised } });
+    return (await runGates({ ...mkTask(), gates: ["review"] }, {
+      worktree: repo, baseRef: base, author, channels: CH, adapters: [fake], cfg: DEFAULT_CONFIG,
+      commands: {}, baseline: { commands: {} }, result: { ok: true, summary: "repaired", deviations: [] }, carriedFindings,
+    })).results[0]!;
+  };
+  const approved = await run(ids, []);
+  expect(approved.pass).toBe(true);
+  expect(approved.meta?.resolved).toEqual(ids);
+  const raised = await run([ids[1]], [ids[0]]);
+  expect(raised.pass).toBe(false);
+  expect(raised.details).toContain("requested changes");
+  expect(raised.details).toContain(carriedMaterials[0].note);
+  expect(raised.meta?.findings).toContainEqual(carriedMaterials[0]);
+  expect(raised.meta?.unparseable).not.toBe(true);
+  for (const [resolved, reraised, carried] of [
+    [[ids[1]], [], carriedMaterials],
+    [[], [], [carriedMaterials[0]]],
+    [undefined, undefined, carriedMaterials],
+    [ids, [ids[0]], carriedMaterials],
+    [[...ids, "unknown"], [], carriedMaterials],
+    ["garbage", [], carriedMaterials],
+  ] as const) {
+    const invalid = await run(resolved, reraised, [...carried]);
+    expect(invalid.pass).toBe(false);
+    expect(invalid.meta?.unparseable).toBe(true);
+    expect(invalid.meta?.cause).toBe("malformed-verdict");
+  }
+});
+
+test("reviewer failover receives the same carried materials and must close them", async () => {
+  const { repo, base } = repoWithCommit();
+  const ids = carriedMaterials.map((finding) => finding.fingerprint);
+  const invalid = fakeWith({ review: { approve: true, findings: [], resolved: [], reraised: [] } });
+  const valid = fakeWith({ review: { approve: true, findings: [], resolved: ids, reraised: [] } });
+  const command = valid.headlessCommand.bind(valid);
+  const prompts: string[] = [];
+  valid.headlessCommand = (path, model) => {
+    prompts.push(readFileSync(path, "utf8"));
+    return prompts.length === 1 ? invalid.headlessCommand(path, model) : command(path, model);
+  };
+  const { results } = await runGates({ ...mkTask(), gates: ["review"] }, {
+    worktree: repo, baseRef: base, author,
+    channels: [...CH, { ...CH[1], vendor: "fake-c", model: "fake-3" }],
+    adapters: [valid], cfg: DEFAULT_CONFIG, carriedFindings: carriedMaterials,
+    commands: {}, baseline: { commands: {} }, result: { ok: true, summary: "repair", deviations: [] },
+  });
+  expect(prompts).toHaveLength(2);
+  for (const prompt of prompts) for (const finding of carriedMaterials) {
+    expect(promptSection(prompt, "Prior materials this attempt must close")).toContain(finding.note);
+    expect(prompt).toContain(finding.fingerprint);
+  }
+  expect(results[0].pass).toBe(true);
+  expect(results[0].meta?.reviewRetry).toMatchObject({ flaked: "fake:fake-2", retried: "fake:fake-3" });
+  expect(results[0].meta?.resolved).toEqual(ids);
+});
+
+
+test("a re-raised material restated in findings keeps its original failure brief exactly once", async () => {
+  const { repo, base } = repoWithCommit();
+  const findings = carriedMaterials.map(({ note }) => ({ note, severity: "material" }));
+  const initial = await reviewGate(mkTask(), repo, base, author, CH,
+    [fakeWith({ review: { approve: false, findings } })], DEFAULT_CONFIG);
+  const repeated = await reviewGate(mkTask(), repo, base, author, CH,
+    [fakeWith({ review: { approve: false, findings, resolved: [], reraised: carriedMaterials.map(({ fingerprint }) => fingerprint) } })],
+    DEFAULT_CONFIG, undefined, undefined, undefined, undefined, undefined, carriedMaterials);
+  expect(repeated.pass).toBe(false);
+  expect(repeated.details).toBe(initial.details);
+  expect(repeated.meta?.findings).toEqual(carriedMaterials);
 });

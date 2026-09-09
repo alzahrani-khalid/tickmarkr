@@ -10,6 +10,7 @@ import { filesGlob } from "../graph/files-glob.js";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
+import { structuredFindings, type StructuredFinding } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
 import { marginalCostRank } from "../route/router.js";
 import { modelProvider } from "../route/preference.js";
@@ -49,6 +50,8 @@ export interface ReviewFinding {
 // a verdict carrying it is decided by severity and the advisory `approve` flag is ignored for the gate.
 export interface ReviewVerdict {
   approve?: boolean;
+  resolved?: string[];
+  reraised?: string[];
   issues?: string[];
   findings?: ReviewFinding[];
   comments?: Array<{ path: string; line: number; body: string }>;
@@ -244,7 +247,8 @@ export function pickReviewer(
   prefer: string[] = [], // v1.53 T2: review.prefer — reorders eligible channels, never changes eligibility
   floor?: Tier, // task-declared only; config floors govern workers and must not silently move review seats
   history: string[] = [], // run-scoped picks, oldest to newest; empty preserves the established ranking
-  onSeat?: (seat: number) => void,
+  onSeat?: (seat: number, count: number) => void,
+  demoted: ReadonlySet<string> = new Set(),
 ): BillingChannel | null {
   // FLEET-05 success criterion 2: an author not resolvable in the channel list yields NO reviewer.
   // The old `?? author.adapter` fallback compared an adapter id to vendor names, matched nothing, and
@@ -254,27 +258,28 @@ export function pickReviewer(
   if (!authorChannel) return null;
   const authorProvider = modelProvider(author.model, authorChannel.vendor);
   const ranked = channels
-    // two independent axes: different vendor AND different base-model identity (ADDED TO the vendor
-    // rule, never replacing it — a future edit can't silently drop either). Failover additionally guards
-    // true provider identity; the initial pick keeps the established stamped-vendor contract. The diversity
+    // Three independent axes: different vendor, different resolved provider identity (OBS-946: on initial pick
+    // as well as failover, so an aggregator channel stamped "mixed" never seats the author's own provider),
+    // and different base-model identity (ADDED TO the vendor rule, never replacing it). The diversity
     // filter runs BEFORE preference ranking, so prefer cannot resurrect an excluded channel.
     .filter((c) => c.vendor !== authorChannel.vendor
-      && (exclude.length === 0 || modelProvider(c.model, c.vendor) !== authorProvider)
+      && modelProvider(c.model, c.vendor) !== authorProvider
       && modelId(c.model) !== modelId(author.model)
       && !exclude.includes(channelKey(c))
       && (floor === undefined || TIER_RANK[c.tier] >= TIER_RANK[floor]))
     .sort((a, b) => reviewPreferIndex(a, prefer) - reviewPreferIndex(b, prefer) || TIER_RANK[b.tier] - TIER_RANK[a.tier] || marginalCostRank(a) - marginalCostRank(b));
   const reviewer = [...ranked].sort((a, b) =>
-    history.lastIndexOf(channelKey(a)) - history.lastIndexOf(channelKey(b))
+    Number(demoted.has(channelKey(a))) - Number(demoted.has(channelKey(b)))
+    || history.lastIndexOf(channelKey(a)) - history.lastIndexOf(channelKey(b))
     || ranked.indexOf(a) - ranked.indexOf(b))[0] ?? null;
-  if (reviewer) onSeat?.(ranked.indexOf(reviewer) + 1);
+  if (reviewer) onSeat?.(ranked.indexOf(reviewer) + 1, ranked.length);
   return reviewer;
 }
 
 // OBS-196: the two observed unparseable causes are different defects — a cutoff/empty output is
 // reviewer infrastructure dying mid-flight; a malformed verdict is a parse defect. Neither is
 // evidence about the WORK, which is why run-gates retries the review, never the worker (OBS-193).
-export type ReviewUnparseableCause = VerdictUnparseableCause;
+export type ReviewUnparseableCause = VerdictUnparseableCause | "launch-never-started" | "truncated" | "silent";
 
 /**
  * This shows the reviewer what the task DECLARED, never what the diff may actually reach. The diff
@@ -304,6 +309,8 @@ export async function reviewGate(
   // direct tests) skips persistence and changes nothing else.
   artifactDir?: string,
   reviewHistory?: string[],
+  demotedReviewers?: ReadonlySet<string>,
+  carriedFindings: readonly StructuredFinding[] = [],
 ): Promise<GateResult> {
   // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
   // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
@@ -325,8 +332,9 @@ export async function reviewGate(
   // so production rounds have journaled both siblings all along — only the fixtures were blind to it.
   // Fixed in the ledger rather than in the oracles, because determinism run-to-run is a property of
   // the journal, not of three test files that happen to assert it.
+  const priorMaterials = carriedFindings.filter((finding) => finding.class === "review:material");
   const declaredPolicy = declaredReviewPolicy(task.files);
-  const policy = raiseReviewPolicy(declaredPolicy, cfg.review.policy);
+  const policy = priorMaterials.length ? "full" : raiseReviewPolicy(declaredPolicy, cfg.review.policy);
   // PROMOTION: the declared assignment is a claim about paths, and the diff is the evidence. A
   // judge-only task whose diff left the leaf class is reviewed in full — the claim never outranks
   // what actually happened, and an empty diff promotes too (a skip earned by an absence is not earned).
@@ -384,7 +392,7 @@ export async function reviewGate(
   let rotationSeat: number | undefined;
   const reviewer = pickReviewer(
     author, channels, excludeReviewers ?? [], cfg.review.prefer ?? [], reviewerFloor,
-    reviewHistory, reviewHistory ? (seat) => { rotationSeat = seat; } : undefined,
+    reviewHistory, reviewHistory ? (seat) => { rotationSeat = seat; } : undefined, demotedReviewers,
   );
   if (!reviewer) {
     // meta.noEligibleReviewer lets run-gates' review-retry keep the ORIGINAL unparseable result when
@@ -392,8 +400,8 @@ export async function reviewGate(
     const reason = reviewerFloor
       ? `no cross-vendor reviewer available at or above task-declared ${reviewerFloor} floor (diversity rule)`
       : "no cross-vendor reviewer available (diversity rule)";
-    return cfg.review.required
-      ? { gate: "review", pass: false, details: `unreadable — ${reason}; set review.required:false to waive`, meta: { noEligibleReviewer: true, unreadable: true, ...(reviewerFloor ? { reviewerFloor } : {}) } }
+    return cfg.review.required || priorMaterials.length > 0
+      ? { gate: "review", pass: false, details: `unreadable — ${reason}; ${priorMaterials.length ? "carried materials require a review verdict" : "set review.required:false to waive"}`, meta: { noEligibleReviewer: true, unreadable: true, ...(reviewerFloor ? { reviewerFloor } : {}) } }
       : { gate: "review", pass: true, details: `WARNING: ${reason} — review waived by config`, meta: { noEligibleReviewer: true, ...(reviewerFloor ? { reviewerFloor } : {}) } };
   }
   reviewHistory?.push(channelKey(reviewer));
@@ -418,7 +426,10 @@ ${task.acceptance.map((a) => `- ${renderAcceptanceItem(a)}`).join("\n")}
 
 ${renderDeclaredWriteScope(task.files)}
 
-## Diff
+${priorMaterials.length ? `## Prior materials this attempt must close
+${priorMaterials.map((finding) => `Fingerprint: ${finding.fingerprint}\n${finding.note}`).join("\n\n")}
+
+` : ""}## Diff
 \`\`\`diff
 ${diff}
 \`\`\`
@@ -431,11 +442,19 @@ block approval. For a minor concern you have decided not to block on, set "defer
 one-line "rationale" — it is recorded in the review, never dropped.
 
 Respond with ONLY this JSON:
-{"nonce": "${nonce}", "approve": true|false, "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
-Approve iff no material finding remains; an empty findings list is a clean approval.
+{"nonce": "${nonce}", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
+(still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
+Approve iff no material finding remains and every prior material is resolved.
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
-  let concludedOnInactivity = false;
+  const artifactId = `${task.id}-${nonce}`;
+  const briefPath = artifactDir ? join(artifactDir, `review-brief-${artifactId}.md`) : undefined;
+  // Persistence is evidence, not a gate input: a full disk or a removed run dir never fails the gate.
+  let savedBrief: string | undefined;
+  if (briefPath) {
+    try { writeFileSync(briefPath, redactSecrets(prompt)); savedBrief = briefPath; } catch { savedBrief = undefined; }
+  }
   const llm = await runLlmDetailed(
     getAdapter(reviewer.adapter, adapters),
     reviewer.model,
@@ -447,7 +466,6 @@ The top-level comments array is optional. Use it only for actionable line-anchor
       onSlot: via.onSlot,
       name: via.nameFor("review", reviewer.adapter),
       label: via.labelFor("review"),
-      onInactivity: () => { concludedOnInactivity = true; },
     } : undefined,
     // frontier reviewers routinely need >5min on a configured-cap-sized diff, and `claude -p` buffers all
     // output until completion — runLlm's 300s default killed reviews mid-flight, returning empty
@@ -459,52 +477,79 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const provider = modelProvider(reviewer.model, reviewer.vendor);
   const v = extractVerdictJson<ReviewVerdict>(raw, nonce);
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
+  const priorIds = new Set(priorMaterials.map((finding) => finding.fingerprint));
+  const closureLists = [v?.resolved, v?.reraised];
+  const closureInvalid = !!v && (priorIds.size > 0 || closureLists.some((list) => list !== undefined)) && (
+    closureLists.some((list) => !Array.isArray(list) || list.some((id) => typeof id !== "string" || !priorIds.has(id)))
+    || new Set([...(v?.resolved ?? []), ...(v?.reraised ?? [])]).size !== (v?.resolved?.length ?? 0) + (v?.reraised?.length ?? 0)
+    || [...priorIds].some((id) => !v?.resolved?.includes(id) && !v?.reraised?.includes(id))
+  );
   // findings decides the verdict on its own; the legacy path still needs approve + issues to parse.
-  if (!v || (findings === null && (typeof v.approve !== "boolean" || !Array.isArray(v.issues)))) {
+  if (!v || closureInvalid || (findings === null && (typeof v.approve !== "boolean" || !Array.isArray(v.issues)))) {
     // OBS-196: name the cause and persist the raw bytes — a ruled-on "unparseable" without its
     // evidence cannot be audited, and a cutoff must never be indistinguishable from a parse defect.
-    const cause: ReviewUnparseableCause = classifyVerdictCause(raw, nonce, "approve", llm);
-    const bytes = Buffer.byteLength(raw, "utf8");
+    const bytes = llm.seatAuthoredBytes ?? Buffer.byteLength(raw.trim(), "utf8");
+    const cause: ReviewUnparseableCause = closureInvalid ? "malformed-verdict" : llm.launchNeverStarted ? "launch-never-started"
+      : llm.timedOut ? (bytes > 0 ? "truncated" : "silent")
+      : classifyVerdictCause(raw, nonce, "approve", llm);
     let saved: string | undefined;
     if (artifactDir) {
       try {
-        saved = join(artifactDir, `review-raw-${task.id}-${Date.now()}.txt`);
+        saved = join(artifactDir, `review-raw-${artifactId}.txt`);
         writeFileSync(saved, redactSecrets(raw));
       } catch {
         saved = undefined; // persistence is evidence, not a gate input — never fail the gate on it
       }
     }
-    const failure = concludedOnInactivity
-      ? "review dispatch concluded on the inactivity policy without a structurally valid nonce-bound response; output unparseable"
-      : cause === "malformed-verdict"
+    const failure = cause === "malformed-verdict"
       ? "review output unparseable"
-      : "review dispatch failed — no structurally valid nonce-bound response; output unparseable";
+      : "review dispatch failed — no structurally valid nonce-bound response";
     return {
       gate: "review",
       pass: false,
-      details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: ${cause}${cause === "timeout" ? `; killed at configured review timeout ${cfg.review.timeoutMs}ms` : ""}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
+      details: `${failure} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: ${cause}${llm.timedOut ? `; killed at configured review timeout ${cfg.review.timeoutMs}ms` : ""}${saved ? `; raw saved: ${saved}` : ""}) — failing closed`,
       meta: {
         ...policyMeta,
         ...rotationMeta,
         reviewer: channelKey(reviewer),
         vendor: reviewer.vendor,
         provider,
-        unparseable: true,
+        ...(cause === "malformed-verdict" ? { unparseable: true } : { noVerdict: true, classification: "infra", infra: true }),
         cause,
-        ...(cause === "empty-output" ? { bytes } : {}),
-        ...(cause === "timeout" ? { timeoutMs: cfg.review.timeoutMs } : {}),
-        ...(concludedOnInactivity ? { classification: "infra", infra: true } : {}),
+        bytes, seatAuthoredBytes: bytes,
+        ...(saved ? { rawPath: saved } : {}),
+        ...(savedBrief ? { briefPath: savedBrief } : {}),
+        ...(llm.timedOut ? { timeoutMs: cfg.review.timeoutMs } : {}),
       },
     };
   }
   const decided = findings !== null
     ? classifyReviewFindings(findings)
     : classifyReviewIssues(v.approve as boolean, v.issues as unknown[]);
+  const reraised = priorMaterials.filter((finding) => v.reraised?.includes(finding.fingerprint));
+  if (reraised.length) {
+    if (decided.pass) decided.headline = "requested changes";
+    decided.pass = false;
+    // A reviewer may also restate a re-raised material in findings. Preserve the original
+    // prose once so an unchanged defect keeps the same failure brief across repair rounds.
+    for (const finding of reraised) {
+      const line = `- [material] ${finding.note}`;
+      if (!decided.lines.includes(line)) decided.lines.push(line);
+    }
+  }
   const prose = `reviewer ${reviewer.adapter}:${reviewer.model} (vendor: ${reviewer.vendor}; provider: ${provider}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`;
+  const details = appendAnchoredReview(prose, v);
   return {
     gate: "review",
     pass: decided.pass,
-    details: appendAnchoredReview(prose, v),
-    meta: { ...policyMeta, ...rotationMeta, reviewer: channelKey(reviewer), vendor: reviewer.vendor, provider },
+    details,
+    meta: {
+      ...policyMeta, ...rotationMeta, reviewer: channelKey(reviewer), vendor: reviewer.vendor, provider,
+      ...(priorMaterials.length ? { resolved: v.resolved, reraised: v.reraised } : {}),
+      ...(reraised.length ? { findings: [
+        ...structuredFindings("review", details).filter((finding) => !reraised.some((prior) => prior.note === finding.note)),
+        ...reraised,
+      ] } : {}),
+    },
   };
 }

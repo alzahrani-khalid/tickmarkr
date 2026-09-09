@@ -89,7 +89,7 @@ describe("init wizard act 1", () => {
     });
   });
 
-  test("test: the guided init driver cycle describes auto as herdr when HERDR_ENV is 1 else orca inside an Orca terminal else subprocess and describes orca as picked by auto inside one whereas the shipped copy saying auto never picks orca fails", async () => {
+  test("the guided init driver cycle describes auto as resolving to the detected host and describes orca as picked by auto inside one", async () => {
     // three cycles from the seeded auto: herdr → subprocess → orca. A cycle holding only
     // auto/herdr/subprocess wraps back to auto here and never renders the orca copy.
     const { result, io } = run(fields(), [KEYS.space, KEYS.space, KEYS.space, ...TO_CONTINUE, KEYS.enter], makeFrameIO());
@@ -101,8 +101,18 @@ describe("init wizard act 1", () => {
     // Orca's own environment is auto-detected; elsewhere, the named option remains available.
     expect(frames).toContain("orca: visible terminals in the Orca app");
     expect(frames).toContain("picked by auto inside one; name it elsewhere");
-    expect(frames).toContain("auto: herdr when HERDR_ENV=1, else orca inside an Orca terminal, else subprocess");
+    expect(frames).toContain("auto — resolves to subprocess here");
     expect(frames).not.toContain("never orca");
+
+    // Under detectedHost = herdr, auto resolves to herdr
+    const herdrRun = run(fields({ detectedHost: "herdr" }), [KEYS.enter], makeFrameIO());
+    const herdrFrames = strip(herdrRun.io.writes.join(""));
+    expect(herdrFrames).toContain("auto — resolves to herdr here");
+
+    // Under detectedHost = orca, auto resolves to orca
+    const orcaRun = run(fields({ detectedHost: "orca" }), [KEYS.enter], makeFrameIO());
+    const orcaFrames = strip(orcaRun.io.writes.join(""));
+    expect(orcaFrames).toContain("auto — resolves to orca here");
   });
 
   test("cycling driver twice from auto lands on subprocess", async () => {

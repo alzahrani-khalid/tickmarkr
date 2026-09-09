@@ -43,5 +43,5 @@ test("test: the review gate's reviewer choice with pi openai-codex gpt-5.5 among
   expect(pickReviewer(author, [authorChannel, openaiPi, zaiPi])).toBe(zaiPi);
 
   const staleFleet = [authorChannel, ...channels.map((channel) => ({ ...channel, vendor: "zhipu" }))];
-  expect(pickReviewer(author, staleFleet)).toMatchObject({ adapter: "pi", model: "openai-codex/gpt-5.5" });
+  expect(pickReviewer(author, staleFleet)).toMatchObject({ adapter: "pi", model: "zai/glm-5.2" });
 });
