@@ -31,14 +31,17 @@ class Seat extends FakeAdapter {
     const prompt = readFileSync(file, "utf8");
     this.calls.push(/## Task ([^:]+):/.exec(prompt)?.[1] ?? "unknown");
     if (this.mode === "silent") return "true";
-    if (this.mode === "truncated") return "printf 'Inspecting implementation'; sleep 1";
+    // The ceiling below is a BUDGET for the slowest runner (a single coverage-instrumented CI fork spawns
+    // this shell in well over 100 ms — 2.5.1's first public CI killed the good seat as "silent" at 100 ms);
+    // the truncated seat must still overrun it.
+    if (this.mode === "truncated") return "printf 'Inspecting implementation'; sleep 2";
     const nonce = /VERDICT_NONCE:\s*([0-9a-f]+)/i.exec(prompt)![1];
     return `printf '%s' ${shq(JSON.stringify({ nonce, approve: true, findings: [] }))}`;
   }
 }
 
 const config = `concurrency: 1
-review: { required: true, prefer: [seat-a, seat-b, seat-c], timeoutMs: 100 }
+review: { required: true, prefer: [seat-a, seat-b, seat-c], timeoutMs: 1000 }
 `;
 const work = (id: string) => ({ shell: `echo work > ${id}.txt && ${COMMIT} work`, result: { ok: true, summary: "work" } });
 
