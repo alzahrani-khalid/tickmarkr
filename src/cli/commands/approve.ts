@@ -145,10 +145,9 @@ export function releaseForDecision(verb: DecisionVerb, park: Pick<NewestPark, "k
 // the ENACTMENT half of each message is now chosen from the repository lock's three states. This
 // run's live daemon names its boundary sweep; no live owner names `tickmarkr resume <runId>`; and a
 // different live run names the lock holder and waits for a resume after that run ends without
-// prescribing a command that would contend for its lock. What a boundary sweep still cannot enact is
-// an approval that lands after the last boundary (during tip verify): the run's completion record
-// names that one, and every other approval that never reached a dispatch, as
-// `approvalDisposition: "outstanding"`.
+// prescribing a command that would contend for its lock.
+// Approvals during tip verify cancel that verify and return to dispatch. The completion record
+// still names decisions that never reached enactment as `approvalDisposition: "outstanding"`.
 // Liveness and the enactment sentence are both stated once, below (ownedByLiveDaemon /
 // approvalEnactment), because the setup cockpit predicts the same effect before writing and a
 // prediction free to drift from the write is worth less than none.
@@ -184,7 +183,7 @@ export function approvalRunOwner(cwd: string, runId: string): ApprovalRunOwner {
 /** The one sentence that says who enacts this release and what it buys. */
 export function approvalEnactment(token: ApprovalDisposition, run: ApprovalRunOwner): string {
   if (run.live) {
-    return `the live daemon enacts this at its next task boundary — it will ${APPROVAL_ENACTS[token]}`;
+    return `the live daemon enacts this at its next task boundary — it will ${APPROVAL_ENACTS[token]}, including in the approval window or by cancelling an in-progress tip verify`;
   }
   if (run.blockingRunId) {
     return `release recorded; live run \`${run.blockingRunId}\` holds the repository lock, so resume \`${run.runId}\` after it ends to ${APPROVAL_ENACTS[token]}`;

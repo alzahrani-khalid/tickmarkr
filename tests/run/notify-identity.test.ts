@@ -23,6 +23,18 @@ const failScript = {
   },
 };
 
+// Artifact paths (review rawPath/briefPath) are absolute and rooted in each fixture's tmp repo; mask
+// only that root so the run-relative tail — `.tickmarkr/runs/<runId>/review-raw-T1-<channel>.txt` —
+// still has to agree byte-for-byte (the runId inside it is swapped by the exact runId pass).
+function swapPrefix<T>(obj: T, from: string, to: string): T {
+  if (typeof obj === "string") return (obj.startsWith(from + "/") ? to + obj.slice(from.length) : obj) as T;
+  if (Array.isArray(obj)) return obj.map((x) => swapPrefix(x, from, to)) as T;
+  if (obj && typeof obj === "object") {
+    return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, swapPrefix(v, from, to)])) as T;
+  }
+  return obj;
+}
+
 function swapExact<T>(obj: T, from: string, to: string): T {
   if (from === to) return obj;
   if (typeof obj === "string") return (obj === from ? to : obj) as T;
@@ -70,6 +82,11 @@ function normJournal(events: JournalEvent[], repo: string, runId: string, baseRe
       expect(typeof row.data.durationMs).toBe("number");
       row = { ...row, data: maskMeasured(row.data) };
     }
+    row = swapPrefix(row, repo, "<REPO>");
+    row = row.event === "gate-result"
+      ? { ...row, data: Object.fromEntries(Object.entries(row.data).map(([k, v]) =>
+          [k, typeof v === "string" && (k === "rawPath" || k === "briefPath") ? v.replace(`/${runId}/`, "/<RUNID>/") : v])) }
+      : row;
     row = swapExact(row, runId, "<RUNID>");
     row = swapExact(row, `tickmarkr/${runId}`, "tickmarkr/<RUNID>");
     row = swapExact(row, `tickmarkr/${runId}--${taskId}`, "tickmarkr/<RUNID>--T1");

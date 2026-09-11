@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, test, vi } from "vitest";
-import { type Baseline, captureBaseline, classifyFailureOutput, compareToBaseline, fingerprint, freshFailures } from "../../src/gates/baseline.js";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { type Baseline, resetCalmWindowForTests, setCalmWindowForTests, captureBaseline, classifyFailureOutput, compareToBaseline, fingerprint, freshFailures } from "../../src/gates/baseline.js";
 import { gateSatisfied } from "../../src/run/daemon.js";
 import type { ShResult } from "../../src/run/git.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -24,7 +24,10 @@ vi.mock("../../src/run/git.js", async (importOriginal) => {
   };
 });
 
+beforeEach(() => setCalmWindowForTests({ loadProvider: () => 0 }));
+
 afterEach(() => {
+  resetCalmWindowForTests();
   shSpy.stub = undefined;
   vi.restoreAllMocks();
 });

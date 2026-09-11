@@ -116,7 +116,7 @@ A run is green only when ALL of these hold: the run-end event exists in the jour
 
 ### Verified handoffs
 
-When relaying missions between agents, never use bare send-text (\`herdr agent send\` / pane send-text) — it omits Enter. Use \`herdr pane run <pane> "<message>"\` or \`herdr notification show "<message>"\`. Confirm delivery by reading the target pane afterward; never report "relayed" without read-back.
+When relaying missions between agents, never use bare send-text (\`herdr agent send\` / pane send-text) — it omits Enter. Use \`herdr pane run <pane> "<message>"\` or \`herdr notification show "<message>"\`. Confirm delivery by reading the TARGET composer afterward; if the sent text still sits unsubmitted after ~15 s, send-keys enter to that pane once and read again (OBS-975); never report "relayed" without read-back.
 
 ### Orient before you act — this block may be the ONLY guidance your host loaded
 

@@ -26,9 +26,8 @@ export const HERDR_CONTROL_VARS = [
 
 /**
  * Copy of worker env with the fork cap applied and host control-plane vars stripped.
- * The cap is the one the enclosing run resolved (resolvedForkCap) — a worker's suites divide the
- * same machine the gate shells do, so both seams have to read the same run-owned number rather
- * than a flat constant. The operator's own export still wins.
+ * Workers retain the run's concurrency-derived cap (resolvedForkCap), independently of
+ * verification's suite-window budget. The operator's own export still wins.
  */
 export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env };

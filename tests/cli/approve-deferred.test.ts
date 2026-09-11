@@ -10,12 +10,8 @@ import { GATE_SATISFIED_RELEASE, type JournalEvent, Journal } from "../../src/ru
 import { runLockOwner } from "../../src/run/lock.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
-// T14, amended by v2.2 T3: the live daemon sweeps accepted approvals at every task boundary, so an
-// approval that lands while the task loop is still turning is enacted by that run. The approval that
-// lands after the last boundary, during tip verify, is the one that stays outstanding because no
-// further sweep remains before run-end. These tests pin both the disposition at approval time,
-// derived from the run lock's recorded owner, and the completion record that names any accepted
-// approval left outstanding.
+// Live approvals enact at task boundaries, in the approval window, or by cancelling tip verify.
+// These tests pin ownership disclosure and the serialized run-end boundary.
 //
 // Every test here is TOP-LEVEL with a verbatim title: the acceptance oracle filters with a leaf-anchored
 // `-t '(^| )…$'` over vitest's full name (OBS-511 widened it through describe prefixes), so the test's
@@ -117,10 +113,6 @@ const twoGateRepo = (extraCfg = "") => setupRepo(
   extraCfg,
 );
 
-// A gate command is what makes the run reach tip verify, and tip verify is the ONE window this run
-// still owns after its last task boundary: an approval accepted there can never be swept, which is
-// the only way to produce a real `outstanding` record now that live approvals are enacted.
-const TIP_VERIFY_GATE = `gates: { test: "true" }\n`;
 
 test("test: approve against a run whose repository lock is held by a live daemon owning a different run prints a third enactment sentence naming that other run as the reason the release waits for resume after it ends so its status record carries no deferred-live token or resume command whereas the shipped two-state owner that prints run tickmarkr resume there fails", async () => {
   const runId = "run-awaiting-owner";
@@ -162,7 +154,7 @@ test("test: approvalEnactment renders three distinct sentences from one owner ob
   expect(sentences[2]).toContain(`run \`tickmarkr resume ${runId}\``);
 });
 
-test("`tickmarkr approve` run while the run's lock pid is ALIVE prints that the live daemon enacts the release at the next task boundary and prints NO `tickmarkr resume` instruction in any of its five disposition messages, while the same command against a finished run (no live owner) still prints the `tickmarkr resume <runId>` instruction — one test drives both branches through the real approve entrypoint and fails if either message is wrong or if a live approval is told to resume", async () => {
+test("test: the approve command's live-owner sentence names the approval window and the in-verify cancel as enactment paths and prints no resume instruction, so a sentence promising enactment only at a task boundary fails", async () => {
   const runId = "run-disposition";
   const liveRepo = fiveDispositionRun(runId);
   const deadRepo = fiveDispositionRun(runId);
@@ -188,7 +180,7 @@ test("`tickmarkr approve` run while the run's lock pid is ALIVE prints that the 
     // second run in this repository, contending for the live daemon's graph.lock over an approval
     // that daemon has already scheduled.
     expect(liveCli.out).toContain(`approval disposition ${token}: `);
-    expect(liveCli.out).toContain(`the live daemon enacts this at its next task boundary — it will ${enacts}`);
+    expect(liveCli.out).toContain(`the live daemon enacts this at its next task boundary — it will ${enacts}, including in the approval window or by cancelling an in-progress tip verify`);
     expect(liveCli.out).not.toContain("tickmarkr resume");
     expect(printedStatus(liveCli.out)).toEqual({
       status: "deferred-live", disposition: token, ownerPid: process.pid, ownerRunId: runId,
@@ -285,68 +277,6 @@ test("an approval accepted against the live daemon is enacted at the next task b
   expect(dispatchesOf(events.slice(approvedAt + 1), "T1")).toBeGreaterThan(0);
 }, 240_000);
 
-test("the run-end disposition test produces and asserts a REAL `outstanding` record — an approval accepted by a live daemon that cannot be enacted before run-end (no task boundary remains after it) ends the run with `approvalDisposition: \"outstanding\"` and `outstandingApprovals` naming that task in both the summary and the journaled run-end row, alongside the `complete` record for an approval enacted at a boundary — and a daemon that never records `outstanding`, or a test that only asserts `complete`, fails", async () => {
-  // FIXTURE 1 — `complete`: B is approved while the task loop is still turning, so the boundary
-  // sweep enacts it inside this run and nothing is left over to name.
-  const swept = twoGateRepo();
-  const sweptRun = "run-disposition-complete";
-  expect((await runDaemon(swept.repo, { adapters: [swept.fake], runId: sweptRun })).human.sort()).toEqual(["A", "B"]);
-  await approve([sweptRun, "A", "--by", "operator"], swept.repo); // against the finished first run
-  const complete = await runDaemon(swept.repo, {
-    adapters: [swept.fake],
-    runId: sweptRun,
-    resume: true,
-    narrate: (e) => {
-      if (e.event !== "task-dispatch" || e.taskId !== "A") return;
-      void approve([sweptRun, "B", "--by", "operator"], swept.repo).catch(() => { /* asserted below */ });
-    },
-  });
-  expect(complete.done.sort()).toEqual(["A", "B"]);
-  expect(complete.approvalDisposition).toBe("complete");
-  expect(complete.outstandingApprovals).toBeUndefined();
-  expect(runEnd(swept.repo, sweptRun).data.approvalDisposition).toBe("complete");
-  expect(formatSummary(complete)).not.toContain("approvals outstanding");
-  const sweptEvents = Journal.open(swept.repo, sweptRun).read();
-  expect(sweptEvents.filter((e) => e.event === "task-approved")).toHaveLength(2); // the record covered real approvals
-  expect(dispatchesOf(sweptEvents, "B")).toBe(1);
-
-  // FIXTURE 2 — `outstanding`: a DISTINCT run where B's approval lands after the task loop has
-  // exited, in the tip-verify window. The daemon accepts it (its lock is still live, so the command
-  // even prints the boundary disposition) but no boundary remains to sweep it, and the run-end record
-  // is the only place that can say so. This is the live path the boundary sweep does not cover.
-  const late = twoGateRepo(TIP_VERIFY_GATE);
-  const lateRun = "run-disposition-outstanding";
-  expect((await runDaemon(late.repo, { adapters: [late.fake], runId: lateRun })).human.sort()).toEqual(["A", "B"]);
-  await approve([lateRun, "A", "--by", "operator"], late.repo);
-  let lateApproval: Promise<string> | undefined;
-  const outstanding = await runDaemon(late.repo, {
-    adapters: [late.fake],
-    runId: lateRun,
-    resume: true,
-    // approve takes the shared approval serializer synchronously inside this callback, so the
-    // daemon's own run-end sample waits behind the append rather than racing it.
-    narrate: (e) => {
-      if (e.event !== "tip-verify-start" || lateApproval) return;
-      lateApproval = approve([lateRun, "B", "--by", "operator"], late.repo);
-    },
-  });
-  expect(printedStatus((await lateApproval)!).status).toBe("deferred-live"); // accepted by the live run
-  expect(outstanding.done).toEqual(["A"]);
-  expect(outstanding.approvalDisposition).toBe("outstanding");
-  expect(outstanding.outstandingApprovals).toEqual(["B"]);
-  expect(runEnd(late.repo, lateRun).data.approvalDisposition).toBe("outstanding");
-  expect(runEnd(late.repo, lateRun).data.outstandingApprovals).toEqual(["B"]);
-  expect(formatSummary(outstanding)).toContain("approvals outstanding: B");
-  const lateEvents = Journal.open(late.repo, lateRun).read();
-  expect(lateEvents.filter((e) => e.event === "task-approved")).toHaveLength(2);
-  expect(dispatchesOf(lateEvents, "B")).toBe(0); // named because it never reached a dispatch
-
-  // the resume the record's own recovery command names enacts B — and closes the collection
-  const enacted = await runDaemon(late.repo, { adapters: [late.fake], runId: lateRun, resume: true });
-  expect(enacted.done.sort()).toEqual(["A", "B"]);
-  expect(enacted.approvalDisposition).toBe("complete");
-  expect(dispatchesOf(Journal.open(late.repo, lateRun).read(), "B")).toBe(1);
-}, 300_000);
 
 test("start runDaemon with approval A, append approval B while it runs, and record that both dispatch before run-end. Contrast with A and B present before start, where both dispatch, so a daemon that never reloads live approvals fails", async () => {
   const mid = twoGateRepo();

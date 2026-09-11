@@ -371,6 +371,7 @@ export const TickmarkrConfigSchema = z.object({
   gates: z.object({
     build: z.string(),
     test: z.string(),
+    tipTest: z.string(),
     lint: z.string(),
     diffCap: z.number().int().positive(),
     byShape: z.partialRecord(z.enum(SHAPES), ShapeGateParticipationSchema).optional(),
@@ -809,6 +810,11 @@ export type InitConfigOverlay = {
   visibility?: { llm?: TickmarkrConfig["visibility"]["llm"] };
 };
 
+/**
+ * Default config overlay template.
+ * Seam: gates.test defines the per-task gate and baseline test command;
+ * gates.tipTest optionally defines the integration tip verify test command (defaults to gates.test).
+ */
 export function configTemplate(overlay?: InitConfigOverlay): string {
   const base = `# tickmarkr config overlay — merges over built-in defaults (repo beats global beats defaults)
 # concurrency: 3

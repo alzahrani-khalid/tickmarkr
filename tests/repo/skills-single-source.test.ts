@@ -11,6 +11,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -250,7 +251,13 @@ describe.skipIf(skipReason !== undefined)(suiteName, () => {
         reason: "installed-only skill requires an explicit decision",
       })),
     ];
-    expect(checkSkillsSingleSource(CANONICAL, INSTALLED)).toEqual(explicitInstalledOnly);
+    // A gitignored installed skill is an operator-local install (e.g. a context-graph tool wired into
+    // .claude/skills by its own installer), not an orphan of the shipped tree: the exported tree never
+    // carries it, so listing it here would fail CI while forgiving it here hides nothing that ships.
+    const operatorLocal = (name: string) =>
+      spawnSync("git", ["check-ignore", "-q", join(INSTALLED, name)], { cwd: REPO }).status === 0;
+    const live = checkSkillsSingleSource(CANONICAL, INSTALLED).filter((v) => !operatorLocal(v.name));
+    expect(live).toEqual(explicitInstalledOnly);
   });
 
   test("drift guard fails when a real file shadows a canonical skill", () => {

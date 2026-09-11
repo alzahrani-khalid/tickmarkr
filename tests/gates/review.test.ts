@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
@@ -1068,4 +1068,50 @@ test("a re-raised material restated in findings keeps its original failure brief
   expect(repeated.pass).toBe(false);
   expect(repeated.details).toBe(initial.details);
   expect(repeated.meta?.findings).toEqual(carriedMaterials);
+});
+
+test("test: an approving review persists its raw bytes with secrets redacted beside the run's review artifacts and names the path in the row's meta, while a run without an artifact directory records no path and still passes, so an approval whose text is unrecoverable from disk fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const secret = "sk-ant-api03-abcdef1234567890abcdef1234567890abcdef1234567890";
+  const artifacts = mkdtempSync(join(tmpdir(), "tickmarkr-approving-review-"));
+  const fakeWithSecret = fakeWith({
+    review: {
+      approve: true,
+      findings: [],
+    },
+  });
+  const origHeadless = fakeWithSecret.headlessCommand.bind(fakeWithSecret);
+  fakeWithSecret.headlessCommand = (file, model) => {
+    const cmd = origHeadless(file, model);
+    return `${cmd} && echo 'bearer: ${secret}'`;
+  };
+
+  // 1. With artifactDir:
+  const rowWithArtifacts = await reviewGate(
+    mkTask(), repo, base, author, CH, [fakeWithSecret], DEFAULT_CONFIG,
+    undefined, undefined, artifacts,
+  );
+  expect(rowWithArtifacts.pass).toBe(true);
+  expect(rowWithArtifacts.meta?.rawPath).toBeDefined();
+  expect(rowWithArtifacts.meta?.briefPath).toBeDefined();
+  const rawPath = String(rowWithArtifacts.meta?.rawPath);
+  const briefPath = String(rowWithArtifacts.meta?.briefPath);
+  expect(rawPath.startsWith(artifacts + "/")).toBe(true);
+  expect(briefPath.startsWith(artifacts + "/")).toBe(true);
+  expect(existsSync(rawPath)).toBe(true);
+  expect(existsSync(briefPath)).toBe(true);
+
+  const rawBytes = readFileSync(rawPath, "utf8");
+  expect(rawBytes).not.toContain(secret);
+  expect(rawBytes).toContain("[REDACTED]");
+  expect(rawBytes).toContain('"approve": true');
+
+  // 2. Without artifactDir:
+  const rowWithoutArtifacts = await reviewGate(
+    mkTask(), repo, base, author, CH, [fakeWithSecret], DEFAULT_CONFIG,
+    undefined, undefined, undefined,
+  );
+  expect(rowWithoutArtifacts.pass).toBe(true);
+  expect(rowWithoutArtifacts.meta?.rawPath).toBeUndefined();
+  expect(rowWithoutArtifacts.meta?.briefPath).toBeUndefined();
 });

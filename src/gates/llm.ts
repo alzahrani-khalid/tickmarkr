@@ -337,7 +337,7 @@ async function runHeadlessDetailed(
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
     const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
-    return { output: r.stdout + "\n" + r.stderr, exitCode: r.code, timedOut: r.timedOut === true, seatAuthoredBytes: Buffer.byteLength(r.stdout + r.stderr) };
+    return { output: r.stdout + "\n" + r.stderr, exitCode: r.code, timedOut: r.timedOut === true, seatAuthoredBytes: Buffer.byteLength((r.stdout + r.stderr).trim()) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -488,7 +488,7 @@ async function runViaDriverDetailed(
         }
       }
       timedOut = Date.now() - startedAt >= timeoutMs && !new RegExp(exitPattern).test(out);
-      if (timedOut) forceClose = true;
+      if (timedOut && reviewing) forceClose = true;
     }
     const exitCode = Number(new RegExp(`TICKMARKR_EXIT_${nonce}:(\\d+)`).exec(out)?.[1]);
     return {

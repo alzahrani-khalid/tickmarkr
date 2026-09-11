@@ -1,8 +1,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Baseline } from "../../src/gates/baseline.js";
-import { fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
+import { captureBaseline, compareToBaseline, setCalmWindowForTests, resetCalmWindowForTests, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { verifyIntegrationTipCached } from "../../src/run/daemon.js";
 import { DEFAULT_SHELL_TIMEOUT_MS, type ShResult } from "../../src/run/git.js";
 import type { Journal, JournalEvent } from "../../src/run/journal.js";
@@ -31,7 +31,10 @@ vi.mock("../../src/run/git.js", async (importOriginal) => {
   };
 });
 
+beforeEach(() => setCalmWindowForTests({ loadProvider: () => 0 }));
+
 afterEach(() => {
+  resetCalmWindowForTests();
   shSpy.calls.length = 0;
   shSpy.stub = undefined;
 });
@@ -226,4 +229,168 @@ describe("tip verify — ceiling parity with the battery (OBS-534)", () => {
     expect(r!.cause).toBe("regression");
     expect(r!.fingerprints).not.toContain(UNRECOGNIZED_FAILURE);
   });
+});
+
+
+test("test: a capture records the runner's total file count from its summary line and a gate or tip suite reporting fewer files than that entry fails as infra naming both counts, while an equal count with exit 0 passes and a summary with no count records null and compares nothing, so a suite that lost six files and passed by forgiveness fails", async () => {
+  const { wt, runDir } = setup(KNOWN);
+  const commands = { test: "counted runner" };
+  let output = `${KNOWN}\n Test Files  1 failed | 306 passed (307)\n Tests 1 failed | 4049 passed (4050)`;
+  let code = 1;
+  shSpy.stub = () => ({ code, stdout: output, stderr: "", durationMs: 100 });
+  const baseline = await captureBaseline(wt, commands);
+  expect(baseline.commands.test!.fileCount).toBe(307);
+  for (const exit of [0, 1]) {
+    code = exit;
+    output = `${KNOWN}\n Test Files  301 passed (301)\n Tests 3945 passed (3945)`;
+    const [gate] = await compareToBaseline(wt, commands, baseline, ["test"]);
+    const [tip] = await verifyIntegrationTip(wt, commands, runDir, baseline);
+    expect(gate).toMatchObject({ pass: false, meta: { classification: "infra", infra: true } });
+    expect(tip).toMatchObject({ pass: false, cause: "infra" });
+    expect(tip!.forgiven).toBeUndefined();
+    for (const row of [gate!, tip!]) {
+      expect(row.details).toMatch(/^infra;/);
+      expect(row.details).toContain("301");
+      expect(row.details).toContain("307");
+    }
+  }
+  code = 0;
+  output = " Test Files 307 passed (307)\n";
+  expect((await compareToBaseline(wt, commands, baseline, ["test"]))[0]!.pass).toBe(true);
+  expect((await verifyIntegrationTip(wt, commands, runDir, baseline))[0]!.pass).toBe(true);
+  output = " Test Files all passed\n";
+  const countless = await captureBaseline(wt, commands);
+  expect(countless.commands.test!.fileCount).toBeNull();
+  output = " Test Files 1 passed (1)\n";
+  expect((await compareToBaseline(wt, commands, countless, ["test"]))[0]!.pass).toBe(true);
+  expect((await verifyIntegrationTip(wt, commands, runDir, countless))[0]!.pass).toBe(true);
+  output = " Test Files all passed\n";
+  expect((await compareToBaseline(wt, commands, baseline, ["test"]))[0]!.pass).toBe(true);
+  expect((await verifyIntegrationTip(wt, commands, runDir, baseline))[0]!.pass).toBe(true);
+});
+
+test("tip verification reruns runner infrastructure once after calm and headlines a repeated infra cause", async () => {
+  const { wt, runDir, commands } = setup(KNOWN);
+  const infra = `${UNHANDLED_BANNER}\nError: [vitest-worker]: Timeout calling "onTaskUpdate"\n Test Files 307 passed (307)`;
+  for (const second of [{ code: 0, stdout: "Test Files 307 passed (307)" }, { code: 1, stdout: infra }]) {
+    let calls = 0;
+    let samples = 0;
+    setCalmWindowForTests({ loadProvider: () => samples++ === 0 ? 10 : 0, calmLoad: () => 1, pollMs: 5 });
+    shSpy.stub = () => ({ ...(calls++ === 0 ? { code: 1, stdout: infra } : second), stderr: "", durationMs: 100 });
+    const [tip] = await verifyIntegrationTip(wt, commands, runDir);
+    expect(calls).toBe(2);
+    expect(samples).toBe(2);
+    expect(tip!.pass).toBe(second.code === 0);
+    expect(tip!.details).toContain("runner-infra rerun after waiting");
+    if (second.code) {
+      expect(tip!.cause).toBe("infra");
+      expect(tip!.details).toMatch(/^infra;/);
+    }
+  }
+  let calls = 0;
+  shSpy.stub = () => { calls++; return { code: 1, stdout: `${infra}\n${FRESH}\nAssertionError: expected true to be false`, stderr: "" }; };
+  expect((await verifyIntegrationTip(wt, commands, runDir))[0]).toMatchObject({ pass: false, cause: "regression" });
+  expect(calls).toBe(1);
+});
+
+test("test: with a tip command declared, every task's gate suite and the baseline's test entry run the task command while the tip verify runs the tip command against a baseline entry captured for that command on the base, so a tip verify that runs the task command or forgives against the task entry fails", async () => {
+  const wt = makeTestTempDir("tickmarkr-vt2-");
+  const runDir = join(wt, "run");
+  mkdirSync(runDir, { recursive: true });
+
+  const commands = {
+    test: "sh task-cmd.sh",
+    tipTest: "sh tip-cmd.sh",
+  };
+
+  shSpy.stub = (cmd: string) => {
+    if (cmd === "sh task-cmd.sh") return { code: 0, stdout: "task ok\n", stderr: "", durationMs: 50 };
+    if (cmd === "sh tip-cmd.sh") return { code: 1, stdout: `${KNOWN}\n Test Files 1 failed (1)\n`, stderr: "", durationMs: 60 };
+    return undefined;
+  };
+
+  // 1. Baseline capture on the base: baseline's test entry runs task command, tipTest entry runs tip command
+  const baseline = await captureBaseline(wt, commands);
+  expect(baseline.commands.test).toBeDefined();
+  expect(baseline.commands.test!.exitCode).toBe(0);
+  expect(baseline.commands.tipTest).toBeDefined();
+  expect(baseline.commands.tipTest!.exitCode).toBe(1);
+  expect(baseline.commands.tipTest!.fingerprints).toEqual(fingerprint(`${KNOWN}\n Test Files 1 failed (1)\n`));
+
+  // 2. Every task's gate suite runs the task command
+  shSpy.calls.length = 0;
+  const taskGateResults = await compareToBaseline(wt, commands, baseline, ["test"]);
+  expect(taskGateResults[0]!.pass).toBe(true);
+  expect(shSpy.calls.map((c) => c.cmd)).toEqual(["sh task-cmd.sh"]);
+
+  // 3. Tip verify runs the tip command against baseline entry captured for tip command on the base
+  shSpy.calls.length = 0;
+  const [tipRes] = await verifyIntegrationTip(wt, commands, runDir, baseline);
+  expect(shSpy.calls.map((c) => c.cmd)).toEqual(["sh tip-cmd.sh"]);
+  expect(tipRes!.gate).toBe("test");
+  expect(tipRes!.cmd).toBe("sh tip-cmd.sh");
+  // Forgiven vs baseline.commands.tipTest:
+  expect(tipRes!.pass).toBe(true);
+  expect(tipRes!.forgiven).toBe(true);
+
+  // 4. So a tip verify that runs the task command or forgives against the task entry fails:
+  // (a) If tip verify ran the task command (exit 0) it would have passed without running tip-cmd, but here fresh failure in tip command fails tip verify:
+  shSpy.stub = (cmd: string) => {
+    if (cmd === "sh task-cmd.sh") return { code: 0, stdout: "task ok\n", stderr: "", durationMs: 50 };
+    if (cmd === "sh tip-cmd.sh") return { code: 1, stdout: `${FRESH}\n Test Files 1 failed (1)\n`, stderr: "", durationMs: 60 };
+    return undefined;
+  };
+  const [freshTipRes] = await verifyIntegrationTip(wt, commands, runDir, baseline);
+  expect(freshTipRes!.pass).toBe(false);
+  expect(freshTipRes!.cmd).toBe("sh tip-cmd.sh");
+
+  // (b) If tip verify forgives against the task entry (where exitCode is 0, no fingerprints) instead of tipTest entry, it fails:
+  const baselineWithTaskForgivenessOnly: Baseline = {
+    commands: {
+      test: { exitCode: 1, fingerprints: fingerprint(KNOWN) },
+      tipTest: { exitCode: 0, fingerprints: [] },
+    },
+  } as unknown as Baseline;
+  shSpy.stub = (cmd: string) => {
+    if (cmd === "sh tip-cmd.sh") return { code: 1, stdout: `${KNOWN}\n Test Files 1 failed (1)\n`, stderr: "", durationMs: 60 };
+    return undefined;
+  };
+  const [noForgiveVsTask] = await verifyIntegrationTip(wt, commands, runDir, baselineWithTaskForgivenessOnly);
+  expect(noForgiveVsTask!.pass).toBe(false);
+  expect(noForgiveVsTask!.forgiven).toBeUndefined();
+
+  // (c) If baseline has ONLY task entry (no tipTest captured), tip verify does not forgive against task entry either:
+  const baselineNoTipEntry: Baseline = {
+    commands: {
+      test: { exitCode: 1, fingerprints: fingerprint(KNOWN) },
+    },
+  } as unknown as Baseline;
+  const [noForgiveWithoutTipEntry] = await verifyIntegrationTip(wt, commands, runDir, baselineNoTipEntry);
+  expect(noForgiveWithoutTipEntry!.pass).toBe(false);
+  expect(noForgiveWithoutTipEntry!.forgiven).toBeUndefined();
+});
+
+// Leg-2 T3 M1 (RULING-230-15): the baseline ENTRY is chosen by the RECORDED identity, not the current config.
+test("a tip verify whose run-start row records distinct task and tip commands selects the tip baseline entry even when the current config's task command has been changed to equal the recorded tip command, so a tip red that the original commands rejected is still rejected after that convergence, whereas selecting the entry by the current commands forgives it", async () => {
+  const wt = makeTestTempDir("tickmarkr-tip-identity-");
+  const runDir = join(wt, "run");
+  mkdirSync(runDir, { recursive: true });
+  const tip = "sh tip-cmd.sh";
+  writeFileSync(join(runDir, "journal.jsonl"), JSON.stringify({ event: "run-start", data: { commands: { test: "original-task-command", tipTest: tip } } }) + "\n");
+  shSpy.stub = (cmd: string) => cmd === tip
+    ? { code: 1, stdout: `${KNOWN}\n Test Files 1 failed (1)\n`, stderr: "", durationMs: 60 }
+    : undefined;
+  // The TASK entry would forgive this red; the TIP entry (green) rejects it.
+  const baseline: Baseline = {
+    commands: {
+      test: { exitCode: 1, fingerprints: fingerprint(`${KNOWN}\n Test Files 1 failed (1)\n`) },
+      tipTest: { exitCode: 0, fingerprints: [] },
+    },
+  } as unknown as Baseline;
+  const [original] = await verifyIntegrationTip(wt, { test: "original-task-command", tipTest: tip }, runDir, baseline);
+  expect(original!.pass).toBe(false);
+  // After a resume where the config's task command converged on the recorded tip command:
+  const [converged] = await verifyIntegrationTip(wt, { test: tip, tipTest: tip }, runDir, baseline);
+  expect(converged!.pass).toBe(false);
+  expect(converged!.forgiven).toBeUndefined();
 });

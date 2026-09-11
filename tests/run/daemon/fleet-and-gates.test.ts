@@ -7,6 +7,9 @@ import { approve } from "../../../src/cli/commands/approve.js";
 import { renderMarkdownRecord } from "../../../src/cli/commands/report.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { formatOwnedName } from "../../../src/drivers/types.js";
+import * as baselineModule from "../../../src/gates/baseline.js";
+import * as gitModule from "../../../src/run/git.js";
+import { RAIL_ROWS } from "../../../src/cli/commands/run.js";
 import { captureBaseline } from "../../../src/gates/baseline.js";
 import { gatePaneName } from "../../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../../src/graph/graph.js";
@@ -1047,4 +1050,222 @@ describe("v1.86 T7 the fatal handler cannot eat the error it reports", () => {
     expect(result.out).not.toContain("\n");
     expect(result.out).not.toContain("    at ");
   });
+});
+
+describe("VT-2 tip test vs task test seam", () => {
+  test("test: a planted red in a file only the tip command runs merges the task green and fails the tip verify naming the test gate, while the same red under a config without a tip command fails the task's own gate, so a seam that narrows the tip to the task command fails", async () => {
+    const scriptWithTip = {
+      tasks: {
+        T1: [{
+          shell: `echo ok > task.txt && echo fail > tip.txt && ${COMMIT} work`,
+          result: { ok: true, summary: "done" },
+        }],
+      },
+    };
+    const { repo: repoWithTip, fake: fakeWithTip } = setupRepo(
+      [T("T1")],
+      scriptWithTip,
+      "gates:\n  test: sh -c 'test -f task.txt && grep -q fail task.txt && exit 1 || exit 0'\n  tipTest: sh -c 'test -f tip.txt && grep -q fail tip.txt && exit 1 || exit 0'\n",
+    );
+
+    const sWithTip = await runDaemon(repoWithTip, { adapters: [fakeWithTip], runId: "run-planted-tip" });
+    expect(sWithTip.done).toContain("T1");
+    expect(sWithTip.tipVerify).toBe("failed");
+    const jWithTip = Journal.open(repoWithTip, "run-planted-tip").read();
+    const tipFailEvent = jWithTip.find((e) => e.event === "tip-verify-failed")!;
+    expect(tipFailEvent).toBeDefined();
+    expect(tipFailEvent.data.gate).toBe("test");
+
+    const { repo: repoNoTip, fake: fakeNoTip } = setupRepo(
+      [T("T1")],
+      scriptWithTip,
+      "gates:\n  test: sh -c 'test -f tip.txt && grep -q fail tip.txt && exit 1 || exit 0'\n",
+    );
+
+    const sNoTip = await runDaemon(repoNoTip, { adapters: [fakeNoTip], runId: "run-planted-notip" });
+    expect(sNoTip.done).not.toContain("T1");
+    const jNoTip = Journal.open(repoNoTip, "run-planted-notip").read();
+    const taskGateFail = jNoTip.find((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "test");
+    expect(taskGateFail).toBeDefined();
+    expect(taskGateFail!.data.pass).toBe(false);
+  });
+
+  test("removing tipTest before resuming fails tip verify against recorded tipTest rather than substituting task command", async () => {
+    const script = {
+      tasks: {
+        T1: [{
+          shell: `echo ok > task.txt && ${COMMIT} work`,
+          result: { ok: true, summary: "done" },
+        }],
+      },
+    };
+    const tipCmd = "sh -c 'test -f task.txt && exit 1 || exit 0'";
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      script,
+      `gates:\n  test: "sh -c 'exit 0'"\n  tipTest: "${tipCmd}"\n`,
+    );
+
+    const s1 = await runDaemon(repo, { adapters: [fake], runId: "run-tip-resume-subst" });
+    expect(s1.done).toContain("T1");
+    expect(s1.tipVerify).toBe("failed");
+
+    // Remove tipTest before resuming: only test command remains
+    writeFileSync(
+      join(repo, ".tickmarkr", "config.yaml"),
+      'gates:\n  test: "sh -c \'exit 0\'"\n',
+    );
+
+    // On resume, tip verify must require the recorded tipTest rather than substituting the task command
+    const s2 = await runDaemon(repo, { adapters: [fake], runId: "run-tip-resume-subst", resume: true });
+    expect(s2.tipVerify).toBe("failed");
+    const j = Journal.open(repo, "run-tip-resume-subst").read();
+    const lastTipFail = j.findLast((e) => e.event === "tip-verify-failed")!;
+    expect(lastTipFail).toBeDefined();
+    expect(lastTipFail.data.gate).toBe("test");
+    expect(lastTipFail.data.details).toContain("was not named in run-start row");
+  });
+});
+
+
+// Release capture from a lifecycle event, never a wall-clock guess. The fallback makes a
+// serialized-start regression finish and fail its ordering assertions instead of leaking a run.
+async function concurrentBaselineFixture(releaseEvent: "task-dispatch" | "baseline-wait") {
+  const runId = `run-baseline-${releaseEvent}`;
+  const command = "printf 'baseline gate command\\n'";
+  const { repo, fake } = setupRepo(
+    [T("T1", { gates: ["build", "test", "lint", "evidence", "scope"] }), T("T2", { deps: ["T1"], gates: ["build", "test", "lint", "evidence", "scope"] })],
+    { tasks: {
+      T1: [{ shell: `echo one > one.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } }],
+      T2: [{ shell: `echo two > two.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } }],
+    } },
+    `gates: { build: ${JSON.stringify(command)}, test: ${JSON.stringify(command)} }\n`,
+  );
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; release(); }, 8_000);
+  const order: string[] = [];
+  let complete = false;
+  let gateCalls = 0;
+  const realCapture = baselineModule.captureBaseline;
+  const capture = vi.spyOn(baselineModule, "captureBaseline").mockImplementation(async (...args) => {
+    order.push("capture-running");
+    await held;
+    const value = await realCapture(...args);
+    complete = true;
+    order.push("capture-complete");
+    return value;
+  });
+  const realAppend = Journal.prototype.append;
+  vi.spyOn(Journal.prototype, "append").mockImplementation(function (this: Journal, event, taskId, data) {
+    const row = realAppend.call(this, event, taskId, data);
+    order.push(event);
+    if (event === releaseEvent && taskId === "T1") {
+      expect(complete).toBe(false);
+      expect(existsSync(join(this.dir, "baseline.json"))).toBe(false);
+      expect(gateCalls).toBe(0);
+      release();
+    }
+    return row;
+  });
+  const realSh = gitModule.sh;
+  vi.spyOn(gitModule, "sh").mockImplementation(async (cmd, cwd, ...rest) => {
+    if (cmd === command && cwd !== repo) {
+      gateCalls++;
+      expect(complete).toBe(true);
+      expect(JSON.parse(readFileSync(join(Journal.open(repo, runId).dir, "baseline.json"), "utf8")).commands.build.exitCode).toBe(0);
+    }
+    return realSh(cmd, cwd, ...rest);
+  });
+  try {
+    const summary = await runDaemon(repo, { adapters: [fake], runId });
+    expect(summary.done).toEqual(["T1", "T2"]);
+    expect(timedOut).toBe(false);
+    expect(gateCalls).toBeGreaterThanOrEqual(2);
+    const events = Journal.open(repo, runId).read();
+    if (releaseEvent === "task-dispatch") {
+      const persisted = readFileSync(join(Journal.open(repo, runId).dir, "baseline.json"), "utf8");
+      await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      expect(capture).toHaveBeenCalledTimes(1);
+      expect(readFileSync(join(Journal.open(repo, runId).dir, "baseline.json"), "utf8")).toBe(persisted);
+      expect(Journal.open(repo, runId).read().filter((e) => e.event === "run-resume")).toHaveLength(1);
+    }
+    return { order, events };
+  } finally {
+    clearTimeout(timeout);
+    release();
+    vi.restoreAllMocks();
+  }
+}
+
+describe("SB-2 concurrent baseline capture", () => {
+  test("test: a fresh run journals baseline-start then run-start then the first task-dispatch before the baseline capture completes, and a resume reads the persisted baseline with no capture, so a run whose first dispatch waits for the capture to end fails", async () => {
+    const { order } = await concurrentBaselineFixture("task-dispatch");
+    expect(order.indexOf("baseline-start")).toBeLessThan(order.indexOf("run-start"));
+    expect(order.indexOf("run-start")).toBeLessThan(order.indexOf("task-dispatch"));
+    // The suite window may admit capture after dispatch; only completion must wait for dispatch.
+    expect(order.indexOf("capture-running")).toBeLessThan(order.indexOf("capture-complete"));
+    expect(order.indexOf("task-dispatch")).toBeLessThan(order.indexOf("capture-complete"));
+  }, 30_000);
+
+  test("test: a task whose worker finishes before the capture completes waits at its first gate with a baseline-wait row and runs no gate command before the capture ends, while a task reaching its gates after the capture journals no wait, so a battery that runs against an absent baseline fails", async () => {
+    const { order, events } = await concurrentBaselineFixture("baseline-wait");
+    expect(order.indexOf("worker-result")).toBeLessThan(order.indexOf("baseline-wait"));
+    expect(order.indexOf("baseline-wait")).toBeLessThan(order.indexOf("capture-complete"));
+    expect(events.filter((e) => e.event === "baseline-wait").map((e) => e.taskId)).toEqual(["T1"]);
+    expect(RAIL_ROWS["baseline-wait"]?.label).toBe("baseline wait");
+  }, 30_000);
+
+  test("test: a capture killed at its ceiling while a worker runs records its infra entry before that task's first gate reads it and a later red under it is not forgiven, so a concurrent capture whose partial entry forgives a red fails", async () => {
+    const runId = "run-baseline-killed";
+    const marker = join(makeTestTempDir("tickmarkr-baseline-worker-"), "running");
+    const command = "printf 'error TS1234: broken\\n'; exit 1";
+    const { repo, fake } = setupRepo(
+      [T("T1", { gates: ["build", "test", "lint", "evidence", "scope"] })],
+      { tasks: { T1: [{
+        shell: `touch ${shq(marker)}; for i in $(seq 1 200); do [ -f ${shq(marker + "-ended")} ] && break; sleep 0.05; done; echo work > work.txt && ${COMMIT} work`,
+        result: { ok: true, summary: "work" },
+      }] }, consult: { action: "human", reason: "red remains red" } },
+      `gates: { build: ${JSON.stringify(command)} }\n`,
+    );
+    const baselinePath = join(tickmarkrDir(repo), "runs", runId, "baseline.json");
+    const realSh = gitModule.sh;
+    let killed = false;
+    let gateReads = 0;
+    vi.spyOn(gitModule, "sh").mockImplementation(async (cmd, cwd, ...rest) => {
+      if (cmd === command && cwd === repo) {
+        const deadline = Date.now() + 8_000;
+        while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(existsSync(marker)).toBe(true);
+        expect(existsSync(baselinePath)).toBe(false);
+        expect(rest[0]).toBe(baselineModule.CAPTURE_CEILING_MS);
+        // Exercise the real process-group ceiling kill and real capture classification with a
+        // short test ceiling. The partial diagnostic must never become a forgiveness fingerprint.
+        const result = await realSh("printf 'error TS1234: broken\\n'; sleep 30", cwd, 100);
+        expect(result.timedOut).toBe(true);
+        killed = true;
+        writeFileSync(marker + "-ended", "killed");
+        return result;
+      }
+      if (cmd === command && cwd !== repo) {
+        gateReads++;
+        expect(killed).toBe(true);
+        const persisted = JSON.parse(readFileSync(baselinePath, "utf8"));
+        expect(persisted.commands.build).toMatchObject({ infra: true, fingerprints: [] });
+      }
+      return realSh(cmd, cwd, ...rest);
+    });
+    try {
+      const summary = await runDaemon(repo, { adapters: [fake], runId });
+      expect(killed).toBe(true);
+      expect(gateReads).toBeGreaterThan(0);
+      expect(summary.done).toEqual([]);
+      const events = Journal.open(repo, runId).read();
+      expect(events.some((e) => e.event === "gate-result" && e.data.gate === "build" && e.data.pass === false)).toBe(true);
+      expect(events.some((e) => e.event === "merge")).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  }, 30_000);
 });

@@ -23,9 +23,16 @@ const DAEMON_SURFACE_LAW =
   "A task changing what the daemon DOES must own every surface that TELLS the operator what the daemon does.";
 const SINGLE_CLAIM_LAW =
   "A judge criterion carries ONE claim; a semicolon-joined criterion warns — split its clauses.";
+const TEST_BUDGET_LAW =
+  "A millisecond ceiling in a test is a BUDGET for the SLOWEST RUNNER.";
+const SUBSECOND_CEILING_LAW =
+  "Any ceiling under one second must carry a SLOWEST-RUNNER note and a member that OVERRUNS it.";
 
 function statesDaemonAndJudgeLaws(written: string): boolean {
   return written.includes(DAEMON_SURFACE_LAW) && written.includes(SINGLE_CLAIM_LAW);
+}
+function statesTestBudgetLaw(written: string): boolean {
+  return written.includes(TEST_BUDGET_LAW) && written.includes(SUBSECOND_CEILING_LAW);
 }
 
 // The section authors are pointed at. Slicing it keeps every assertion below about the criterion law
@@ -114,6 +121,17 @@ describe("spec template — daemon surfaces and single-claim judges", () => {
 
     for (const missing of [DAEMON_SURFACE_LAW, SINGLE_CLAIM_LAW]) {
       expect(statesDaemonAndJudgeLaws(written.replace(missing, ""))).toBe(false);
+    }
+  });
+});
+
+describe("spec template — millisecond test budgets", () => {
+  test("test: the spec template a fresh tickmarkr init writes states that a millisecond ceiling in a test is a budget for the slowest runner and that a ceiling under one second carries a slowest-runner note and a member that overruns it, so a template without that law fails", async () => {
+    const written = await initialisedSpec();
+
+    expect(statesTestBudgetLaw(written)).toBe(true);
+    for (const law of [TEST_BUDGET_LAW, SUBSECOND_CEILING_LAW]) {
+      expect(statesTestBudgetLaw(written.replace(law, ""))).toBe(false);
     }
   });
 });

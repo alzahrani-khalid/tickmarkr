@@ -448,7 +448,12 @@ For every prior material, put its fingerprint in exactly one of resolved (verifi
 Approve iff no material finding remains and every prior material is resolved.
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
-  const artifactId = `${task.id}-${nonce}`;
+  // Filenames are journaled (daemon.ts lifts meta.rawPath/briefPath onto the gate-result row), so they
+  // must be reproducible from the same inputs — the verdict nonce is cryptographically random and would
+  // make two otherwise-identical runs diverge in their journal bytes. The reviewer channel already
+  // disambiguates every call that matters: a retry always excludes the flaked channel (run-gates.ts),
+  // so it can never collide with the attempt it replaces.
+  const artifactId = `${task.id}-${channelKey(reviewer).replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
   const briefPath = artifactDir ? join(artifactDir, `review-brief-${artifactId}.md`) : undefined;
   // Persistence is evidence, not a gate input: a full disk or a removed run dir never fails the gate.
   let savedBrief: string | undefined;
@@ -474,6 +479,15 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     cfg.review.timeoutMs,
   );
   const raw = llm.output;
+  let saved: string | undefined;
+  if (artifactDir) {
+    try {
+      saved = join(artifactDir, `review-raw-${artifactId}.txt`);
+      writeFileSync(saved, redactSecrets(raw));
+    } catch {
+      saved = undefined; // persistence is evidence, not a gate input — never fail the gate on it
+    }
+  }
   const provider = modelProvider(reviewer.model, reviewer.vendor);
   const v = extractVerdictJson<ReviewVerdict>(raw, nonce);
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
@@ -492,15 +506,6 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     const cause: ReviewUnparseableCause = closureInvalid ? "malformed-verdict" : llm.launchNeverStarted ? "launch-never-started"
       : llm.timedOut ? (bytes > 0 ? "truncated" : "silent")
       : classifyVerdictCause(raw, nonce, "approve", llm);
-    let saved: string | undefined;
-    if (artifactDir) {
-      try {
-        saved = join(artifactDir, `review-raw-${artifactId}.txt`);
-        writeFileSync(saved, redactSecrets(raw));
-      } catch {
-        saved = undefined; // persistence is evidence, not a gate input — never fail the gate on it
-      }
-    }
     const failure = cause === "malformed-verdict"
       ? "review output unparseable"
       : "review dispatch failed — no structurally valid nonce-bound response";
@@ -550,6 +555,8 @@ The top-level comments array is optional. Use it only for actionable line-anchor
         ...structuredFindings("review", details).filter((finding) => !reraised.some((prior) => prior.note === finding.note)),
         ...reraised,
       ] } : {}),
+      ...(saved ? { rawPath: saved } : {}),
+      ...(savedBrief ? { briefPath: savedBrief } : {}),
     },
   };
 }

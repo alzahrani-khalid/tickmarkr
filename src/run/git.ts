@@ -18,24 +18,13 @@ export const FORK_CAP_ENV = "VITEST_MAX_FORKS";
 export const SUITE_PARENT_ENV = "TICKMARKR_SUITE_PARENT";
 export const DEFAULT_FORK_CAP = "6";
 
-/**
- * The fork budget belongs to ONE run: how many gate suites can be in flight at once is exactly that
- * run's resolved concurrency, so the per-suite cap must divide the machine by THAT number and no
- * other. Two things rule out a module-level variable. A single Node process holds more than one
- * runDaemon call — the suites do it, and so does a supervisor driving two repositories — so a
- * captured-once global hands whichever run started first its cap to every other run, and only a
- * reset seam production never calls could hide it. And re-deriving the number at spawn time reads
- * whatever `process.argv` or the config overlay says NOW, not what the run resolved: `parseArgs`
- * settles `--concurrency 2 --concurrency 8` on the LAST occurrence, and an overlay is a mutable
- * file, so a re-derived cap can disagree with the concurrency the run is actually enforcing.
- *
- * AsyncLocalStorage is the stdlib answer to both. The store is entered once, around the run body,
- * from the single value `runDaemon` resolved; every shell that run spawns — baseline capture, gate
- * batteries, tip verify, worker environments — inherits it through the async context, and a
- * concurrent run's shells inherit their own. There is nothing to reset: leaving the run leaves
- * the store, so sequential runs cannot inherit each other either.
- */
+/** Worker concurrency is resolved once per run and isolated from other async runs. */
 const forkBudget = new AsyncLocalStorage<string>();
+const verificationBudget = new AsyncLocalStorage<RunCapacity>();
+
+/** Verification owns the serialized suite window; workers keep their concurrency budget. */
+export const runWithVerificationBudget = <T>(capacity: RunCapacity, fn: () => Promise<T>): Promise<T> =>
+  verificationBudget.run(capacity, fn);
 
 /**
  * OBS-618: how many PROCESSES one vitest fork can hold at its peak — the fork, a daemon it spawns,
@@ -77,7 +66,7 @@ export const resolvedForkCap = (): string => forkBudget.getStore() ?? DEFAULT_FO
 /**
  * T7: the CAPACITY a suite verdict was measured under — the fork cap the command's child actually
  * received, and the core count that cap was divided from. Two verdicts are comparable only when both
- * numbers match: a run resumed at a different concurrency divides the same machine by a different
+ * numbers match: a run resumed at a different capacity divides the machine by a different
  * number, so a green measured in that other world is not evidence about this one.
  *
  * This pair is the WHOLE comparable identity, and the load averages a gate row already carries beside
@@ -133,12 +122,12 @@ export const describeCapacity = (value: unknown): string => {
 
 /**
  * The capacity a child spawned on THIS async context would receive: the same precedence `shell`
- * applies below — an operator export of the cap wins over the run's own derived value — beside the
+ * applies below — the verification budget captures any operator export at run start — beside the
  * cores it was divided from. A caller holding a command's own result reads the capacity off THAT
  * result (`ShResult.capacity`, stamped where the child's environment was built); this is for the
  * decisions taken BEFORE any child exists — a cache hit, a reuse predicate.
  */
-export const resolvedCapacity = (): RunCapacity => ({
+export const resolvedCapacity = (): RunCapacity => verificationBudget.getStore() ?? ({
   forkCap: Number(FORK_CAP_ENV in process.env ? process.env[FORK_CAP_ENV] : resolvedForkCap()),
   cores: availableParallelism(),
 });
@@ -206,8 +195,10 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   // children are hermetic by construction; the daemon's own process.env stays unchanged.
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
-  // OBS-110: apply the run's own fork cap only when the operator has not already set one.
-  if (!(FORK_CAP_ENV in env)) env[FORK_CAP_ENV] = resolvedForkCap();
+  // A run freezes the operator override and cores at startup; admission can lower the round cap.
+  env[FORK_CAP_ENV] = verificationBudget.getStore()
+    ? String(resolvedCapacity().forkCap)
+    : env[FORK_CAP_ENV] ?? resolvedForkCap();
   // OBS-854: descendants can leave the checkout (nested fixture suites do), so cwd alone cannot
   // attribute them. Every daemon shell exports the daemon pid as their durable parentage marker.
   env[SUITE_PARENT_ENV] = String(process.pid);
@@ -217,7 +208,7 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
   // for; re-deriving the run's own budget after the command returned would stamp a cap no child ran
   // under. `Number` of an unparseable export is NaN, which every reader treats as malformed and
   // therefore fails closed — the honest direction when the cap in play cannot be stated.
-  const capacity: RunCapacity = { forkCap: Number(env[FORK_CAP_ENV]), cores: availableParallelism() };
+  const capacity: RunCapacity = { forkCap: Number(env[FORK_CAP_ENV]), cores: resolvedCapacity().cores };
   const attempt = (): Promise<ShResult | SpawnRefusal> => new Promise((resolve) => {
     const startedAt = Date.now();
     // detached: bash gets its own process group so a timeout can kill the whole tree —

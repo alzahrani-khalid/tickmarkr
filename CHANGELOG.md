@@ -2,6 +2,45 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.5.2 — occupancy-honest verify truth
+
+**v2.5.2** — the verifier budgets by real suite occupancy and tells infrastructure from regression on every
+reader. Seven tasks from `specs/v2.5.2-occupancy-honest-verify-truth.spec.md`, delivered by run
+20260910-084657 (7/7, tip e7cff039) plus a Leg-2 fix (`fix/v2.5.2-leg2`, standalone `verify` GREEN 6/6 with a
+cross-vendor approval).
+
+- **Verification budget by suite occupancy (T1, SB-1).** Gate batteries, the baseline capture and the tip verify
+  draw a verification budget derived from live full-suite occupancy — one while the suite window serializes —
+  capped at cores over the spawn fan-out; `suite-budget` is journaled with the count and both caps.
+- **Runner infrastructure is infra on both readers (T2, VT-1).** One runner classifier names a vitest-worker RPC
+  death (the `onTaskUpdate` timeout beside the unhandled-errors banner, no failing test named) INFRA for the
+  baseline capture and the gate alike; a runner-infra red waits for a calm window and re-runs once with
+  provenance, and a file-count deficit against the baseline is an infra tell, never a forgiveness.
+- **Task test and tip test are the suite project (T3, VT-2).** Optional `gates.tipTest` names what the tip
+  verify runs; when it differs from `gates.test` the baseline captures it as its own entry and the tip verify
+  forgives and counts files against that entry. The run-start row records both commands; a tip verify whose
+  command was not named there fails closed, and (Leg-2 fix) the baseline entry is selected by the RECORDED
+  identity, never the live config, so a post-resume config edit cannot flip a tip red into a forgiven one.
+- **Baseline captured beside the first dispatch (T4, SB-2).** A fresh run journals `baseline-start`, starts the
+  capture, journals `run-start` and dispatches workers while it runs; a task reaching its first gate before the
+  capture completes waits on a journaled `baseline-wait`; a ceiling-killed capture records infra and forgives
+  nothing.
+- **Approval window before tip verify; an approval cancels a running tip verify (T5, AW-1).** When the dispatch
+  loop drains only because parked tasks block the rest, the daemon holds a bounded approval window before tip
+  verify; an approval landing during a tip verify cancels it and re-enters dispatch; one landing after run-end
+  stays outstanding, and the live-owner approve sentence names both paths.
+- **Every review raw persisted (T6, VT-3).** An approving review persists its raw bytes beside the run's review
+  artifacts and names the path in the row's meta exactly as a no-verdict round does; `verify`'s results file
+  carries it; a timed-out seat with zero authored bytes is `silent` and demoted; `keep` spares the judge.
+- **Test-budget law in the template (T7, HL-1).** The spec template states that a millisecond ceiling in a test
+  is a budget for the slowest runner and that any sub-second ceiling carries a slowest-runner note; a hygiene
+  test sweeps `tests/run` for unnoted ones.
+
+Fixes shipped alongside: OBS-964 add.6 (the context watcher reads a self-labelled `ctx N%` statusline row);
+OBS-975 (verified handoffs read back the target composer and press Enter once if the text sits unsubmitted).
+Filed for 2.5.3: OBS-976 (whitespace-insensitive closure match), OBS-978 (resume after an audited rehash),
+OBS-979 (identical-digest battery replay), OBS-980 (silent-seat demotion), the unowned-oracle ownership lint.
+
 ## v2.5.1 — review-seat integrity
 
 **v2.5.1** — the review seat stops paying for its own infrastructure. Six tasks from

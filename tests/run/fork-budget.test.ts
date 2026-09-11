@@ -1,8 +1,9 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
 import { run } from "../../src/cli/commands/run.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
@@ -11,7 +12,7 @@ import { FORK_CAP_ENV } from "../../src/run/git.js";
 import { COMMIT, authedModels, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 /**
- * T9: the fork budget a run hands its children must come from the concurrency THAT run resolved.
+ * T9/SB-1: workers divide by resolved concurrency; verification divides by suite occupancy.
  *
  * Nothing here mocks the seam. Each run's gate commands and its worker shell are real commands that
  * append the value of VITEST_MAX_FORKS, as delivered to that process, to a per-run file — so the
@@ -20,6 +21,10 @@ import { COMMIT, authedModels, makeTestTempDir, setupRepo, T } from "../helpers/
  * re-read of the config overlay, or from a process-global captured by whichever run started first
  * writes a different number into those files than the run enforcing it.
  */
+
+vi.mock("node:os", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:os")>(),
+}));
 
 const CORES = availableParallelism();
 /** The guarantee, restated independently of the implementation. */
@@ -75,9 +80,9 @@ function expectEveryShell(label: string, log: string, cap: number): void {
   expect([...new Set(recorded)], `${label}: recorded caps`).toEqual([String(cap)]);
 }
 
-/** Assert over a run's gate shells AND its worker environment together. */
+/** Assert each seam's budget: serialized verification and concurrency-derived workers. */
 function expectRun(label: string, r: { gateLog: string; workerLog: string }, cap: number): void {
-  expectEveryShell(`${label} gate shells`, r.gateLog, cap);
+  expectEveryShell(`${label} gate shells`, r.gateLog, Number(process.env[FORK_CAP_ENV] ?? Math.max(1, Math.floor(CORES / 3))));
   expectEveryShell(`${label} worker environment`, r.workerLog, cap);
 }
 
@@ -134,7 +139,7 @@ describe("per-run fork budget (fake adapter, zero tokens)", () => {
     // A first-occurrence reading would have handed these two runs each other's caps. They differ
     // whenever the machine can tell 8 apart from 2, which is what makes the pair discriminating.
     if (expectedCap(8) !== expectedCap(2)) {
-      expect(caps(forward.gateLog)[0]).not.toBe(caps(reverse.gateLog)[0]);
+      expect(caps(forward.workerLog)[0]).not.toBe(caps(reverse.workerLog)[0]);
     }
 
     // Single-flag control: same meaning, one occurrence — and process.argv is rewritten to a
@@ -237,3 +242,20 @@ describe("per-run fork budget (fake adapter, zero tokens)", () => {
     expectRun("VITEST_MAX_FORKS=3, concurrency 8", highOverridden, 3);
   }, 600000);
 });
+
+
+test("test: the verification budget on an 18-core host reads 6 at run concurrency 1, 2 and 3 alike and reads 1 on a 2-core host, while the worker environment's budget still divides by concurrency, so a gate shell that receives 3 at concurrency 2 on 18 cores fails", async () => {
+  const cores = vi.spyOn(os, "availableParallelism");
+  try {
+    for (const [host, concurrency, gateCap, workerCap] of [[18, 1, 6, 6], [18, 2, 6, 3], [18, 3, 6, 2], [2, 2, 1, 1]]) {
+      cores.mockReturnValue(host!);
+      const fixture = budgetRepo(`occupancy-${host}-${concurrency}`);
+      const summary = await start(fixture, concurrency);
+      expect(summary.done).toEqual(["T1"]);
+      expectEveryShell("verification", fixture.gateLog, gateCap!);
+      expectEveryShell("worker", fixture.workerLog, workerCap!);
+    }
+  } finally {
+    cores.mockRestore();
+  }
+}, 120_000);

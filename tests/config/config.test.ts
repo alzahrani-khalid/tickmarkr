@@ -349,6 +349,15 @@ describe("LLM gate diff cap", () => {
   });
 });
 
+describe("gates.tipTest", () => {
+  test("loads tipTest beside test", () => {
+    const { repo, globalDir } = repoWithOverlay("gates:\n  test: npm test\n  tipTest: npm run test:all\n");
+    const cfg = loadConfig(repo, { globalDir });
+    expect(cfg.gates.test).toBe("npm test");
+    expect(cfg.gates.tipTest).toBe("npm run test:all");
+  });
+});
+
 describe("FLEET-06 config schema (V-9)", () => {
   test("V-9a: malformed deny.adapters (string not array) throws ConfigError", () => {
     const { repo, globalDir } = repoWithOverlay("routing:\n  deny:\n    adapters: codex\n");

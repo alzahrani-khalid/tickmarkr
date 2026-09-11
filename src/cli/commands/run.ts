@@ -42,6 +42,13 @@ const RAIL_TONES: Record<RailTone, { glyph: string; paint: (s: string) => string
   neutral: { glyph: GLYPHS.neutral, paint: LIVE.chrome },
 };
 
+/** Approval-close lifecycle labels extend the established closed rail vocabulary. */
+export const APPROVAL_RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
+  "approval-window-start": { label: "approval window", tone: "attention" },
+  "approval-window-expired": { label: "approval window expired", tone: "attention" },
+  "tip-verify-cancelled": { label: "tip verify cancelled", tone: "attention" },
+};
+
 /** Closed retained set: the short operator label and the row's default tone. Labels are the rail's
  *  own vocabulary — a raw journal event name is what this surface exists to stop printing. A `pass`
  *  or `ok` datum on the event overrides the default tone, so one gate row can read either way.
@@ -125,6 +132,8 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   // gate starts and verdicts
   "phase-start": { label: "gate start", tone: "active" },
   "gate-result": { label: "gate", tone: "pass" },
+  "baseline-wait": { label: "baseline wait", tone: "active" },
+  "suite-budget": { label: "suite budget", tone: "attention" },
   "gate-reused": { label: "gate reused", tone: "neutral" },
   "judge-retry": { label: "judge retry", tone: "attention" },
   "review-no-verdict": { label: "review unavailable", tone: "attention" },
@@ -324,6 +333,12 @@ const RAIL_PROJECTION: Record<string, (data: Record<string, unknown>) => string 
       : undefined,
   "trust-auto-answer": (d) =>
     typeof d.adapter === "string" ? `${d.adapter}${typeof d.phase === "string" ? ` ${d.phase}` : ""}` : undefined,
+  // SB-1: the census the ceiling released beside, and the budget the round ran under versus the one it
+  // would have had on an empty census — none of `{count, occupancyCap, conservativeCap}` is on the ladder
+  "suite-budget": (d) =>
+    typeof d.count === "number" && typeof d.conservativeCap === "number" && typeof d.occupancyCap === "number"
+      ? `beside ${d.count}, cap ${d.conservativeCap} not ${d.occupancyCap}`
+      : undefined,
 };
 
 // The row's text: the formatter's detail first, then the salient fields that detail could not carry.
@@ -356,7 +371,7 @@ const clipCells = (text: string, cells: number): string =>
  */
 export function narrationRow(event: JournalEvent, runId: string, columns = process.stdout.columns ?? 80): string | null {
   if ((TTY_NOISE_EVENTS as readonly string[]).includes(event.event)) return null;
-  const row = RAIL_ROWS[event.event];
+  const row = APPROVAL_RAIL_ROWS[event.event] ?? RAIL_ROWS[event.event];
   if (!row) return null;
   if (event.event === "phase-start" && typeof event.data.gate !== "string") return null;
   const tone = RAIL_TONES[railTone(event, row.tone)];

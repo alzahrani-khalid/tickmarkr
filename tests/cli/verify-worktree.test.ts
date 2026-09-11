@@ -159,4 +159,33 @@ describe("verify worktree truth", () => {
     const row = journal.read().find((event) => event.event === "review-leg2");
     expect(row).toMatchObject({ taskId: "T1", data: { gate: "review", pass: true } });
   }, 60_000);
+
+  test("test: verify's results file carries the review raw path beside the artifacts it already names and the file at that path holds the reviewer's verdict bytes, so a results file naming a path that does not exist fails", async () => {
+    const repo = makeRepo({ "src.txt": "base\n" });
+    branch(repo);
+    writeDoctor(repo, { fake: { installed: true, authed: true, models: [], modelAuth: authedModels(["fake-1", "fake-2"]) } });
+    const script = join(makeTestTempDir("tickmarkr-artifact-review-raw-"), "script.json");
+    writeFileSync(script, JSON.stringify({
+      tasks: {},
+      review: { approve: true, findings: [] },
+    }));
+    process.env.TICKMARKR_FAKE_SCRIPT = script;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await verify(["--json"], repo);
+    const report = JSON.parse(result.out) as { artifactPath: string };
+    const artifact = JSON.parse(readFileSync(report.artifactPath, "utf8")) as {
+      gateRows: Array<{ gate: string; meta?: { rawPath?: string; briefPath?: string } }>;
+      reviewFindings: Array<{ note: string }>;
+    };
+    const reviewRow = artifact.gateRows.find((row) => row.gate === "review");
+    expect(reviewRow).toBeDefined();
+    expect(reviewRow?.meta?.briefPath).toBeDefined();
+    expect(reviewRow?.meta?.rawPath).toBeDefined();
+    const rawPath = String(reviewRow?.meta?.rawPath);
+    const briefPath = String(reviewRow?.meta?.briefPath);
+    expect(existsSync(briefPath)).toBe(true);
+    expect(existsSync(rawPath)).toBe(true);
+    const rawBytes = readFileSync(rawPath, "utf8");
+    expect(rawBytes).toContain('"approve": true');
+  }, 60_000);
 });

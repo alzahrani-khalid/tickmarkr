@@ -8,7 +8,7 @@ import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
 import { PLAIN_BANNER } from "../../src/brand.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
-import { type GateVia, runLlmDetailed, REVIEW_FIRST_LIVENESS_MS, PROMPT_GLYPHS, reviewSeatOutput, setGateCpuAccountantFactoryForTests, resetGateCpuAccountantFactoryForTests } from "../../src/gates/llm.js";
+import { type GateVia, runLlmDetailed, REVIEW_FIRST_LIVENESS_MS, PROMPT_GLYPHS, reviewSeatOutput, setGateCpuAccountantFactoryForTests, resetGateCpuAccountantFactoryForTests, verdictNonceLine } from "../../src/gates/llm.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { runGates, type GateEvent } from "../../src/gates/run-gates.js";
 import { reviewGate } from "../../src/gates/review.js";
@@ -524,4 +524,95 @@ test("test: a reviewer killed at the ceiling after emitting prose is recorded ca
     via(new VerdictPane((nonce) => `{"nonce":"${nonce}","approve":true, broken\nTICKMARKR_EXIT_${nonce}:0`)));
   expect(malformed.meta).toMatchObject({ cause: "malformed-verdict", unparseable: true });
   expect(malformed.meta?.infra).toBeUndefined();
+});
+
+test("test: a headless review seat whose only output is whitespace counts zero seat-authored bytes and is classified silent, while one non-whitespace byte counts one, so a lone newline that escapes demotion fails", async () => {
+  class CommandReviewer extends FakeAdapter {
+    constructor(scriptPath: string, private readonly cmd: string) { super(scriptPath); }
+    override headlessCommand(): string { return this.cmd; }
+  }
+  const { repo, base } = repoWithCommit();
+  const script = join(mkdtempSync(join(tmpdir(), "tickmarkr-headless-bytes-")), "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {} }));
+
+  // The timeout below is a budget for the slowest runner (spawning bash -l on a loaded host
+  // takes >25 ms; the process must overrun the ceiling after emitting its initial byte).
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.review.timeoutMs = 300;
+
+  // 1. Whitespace only (newline):
+  const whitespace = new CommandReviewer(script, "printf '\\n'; sleep 1");
+  const demotedWhitespace = new Set<string>();
+  const whitespaceRow = await reviewGate(task, repo, base, author, channels, [whitespace], cfg,
+    undefined, undefined, undefined, undefined, demotedWhitespace);
+  expect(whitespaceRow.meta).toMatchObject({ cause: "silent", seatAuthoredBytes: 0 });
+
+  const events: GateEvent[] = [];
+  const demotedSet = new Set<string>();
+  await runGates({ ...task, gates: ["review"] }, {
+    worktree: repo, baseRef: base, author, channels,
+    adapters: [whitespace], cfg, commands: {},
+    baseline: await captureBaseline(repo, {}),
+    result: { ok: true, summary: "work", raw: "", deviations: [] },
+    demotedReviewers: demotedSet,
+    onGate: (e) => { events.push(e); },
+  });
+  expect(demotedSet.has("fake:fake-2")).toBe(true);
+  expect(events.some((e) => e.phase === "note" && e.name === "review-pool-demotion")).toBe(true);
+
+  // 2. One non-whitespace byte:
+  const nonWhitespace = new CommandReviewer(script, "printf 'x'; sleep 1");
+  const demotedNonWhitespace = new Set<string>();
+  const nonWhitespaceRow = await reviewGate(task, repo, base, author, channels, [nonWhitespace], cfg,
+    undefined, undefined, undefined, undefined, demotedNonWhitespace);
+  expect(nonWhitespaceRow.meta).toMatchObject({ cause: "truncated", seatAuthoredBytes: 1 });
+
+  const nonWhitespaceEvents: GateEvent[] = [];
+  const nonWhitespaceDemotedSet = new Set<string>();
+  await runGates({ ...task, gates: ["review"] }, {
+    worktree: repo, baseRef: base, author, channels,
+    adapters: [nonWhitespace], cfg, commands: {},
+    baseline: await captureBaseline(repo, {}),
+    result: { ok: true, summary: "work", raw: "", deviations: [] },
+    demotedReviewers: nonWhitespaceDemotedSet,
+    onGate: (e) => { nonWhitespaceEvents.push(e); },
+  });
+  expect(nonWhitespaceDemotedSet.has("fake:fake-2")).toBe(false);
+  expect(nonWhitespaceEvents.some((e) => e.phase === "note" && e.name === "review-pool-demotion")).toBe(false);
+});
+
+test("test: a judge pane that times out under keep stays open while a review seat that times out is closed, so a timed-out judge pane closed under keep fails", async () => {
+  const nonce = "12345678";
+  const judgePrompt = `TICKMARKR-JUDGE\n${verdictNonceLine(nonce)}`;
+  const reviewPrompt = `TICKMARKR-REVIEW\n${verdictNonceLine(nonce)}`;
+
+  const judgePane = new ClockedPane(PREAMBLE);
+  const judgeOrigin = Date.now();
+  const judgeClock = vi.spyOn(Date, "now").mockImplementation(() => judgeOrigin + judgePane.elapsed);
+  try {
+    await runLlmDetailed(
+      reviewer(), "fake-1", judgePrompt, process.cwd(),
+      { driver: judgePane, name: "judge", label: "JUDGE", keep: true },
+      100,
+    );
+  } finally {
+    judgeClock.mockRestore();
+  }
+  expect(judgePane.elapsed).toBeGreaterThanOrEqual(100);
+  expect(judgePane.closed).toBe(0);
+
+  const reviewPane = new ClockedPane(PREAMBLE);
+  const reviewOrigin = Date.now();
+  const reviewClock = vi.spyOn(Date, "now").mockImplementation(() => reviewOrigin + reviewPane.elapsed);
+  try {
+    await runLlmDetailed(
+      reviewer(), "fake-1", reviewPrompt, process.cwd(),
+      { driver: reviewPane, name: "review", label: "REVIEW", keep: true },
+      100,
+    );
+  } finally {
+    reviewClock.mockRestore();
+  }
+  expect(reviewPane.elapsed).toBeGreaterThanOrEqual(100);
+  expect(reviewPane.closed).toBe(1);
 });

@@ -10,10 +10,11 @@
 // comparison below: they are endpoint samples of a gate whose interior neither of them saw. Nothing
 // in this file claims a machine was calm — only that two measurements divided it by the same number.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import type { Assignment } from "../../src/adapters/types.js";
 import { shq } from "../../src/adapters/types.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -27,6 +28,10 @@ import { deriveForkCap, FORK_CAP_ENV, gitHead, type RunCapacity, sameCapacity, s
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { ensureIntegration, integrationBranch, verifyIntegrationTip } from "../../src/run/merge.js";
 import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
+
+vi.mock("node:os", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:os")>(),
+}));
 
 const CORES = availableParallelism();
 /** The one export every child of this process inherits; restored after every case. */
@@ -323,3 +328,49 @@ test("test: a record carrying no capacity keeps exactly the verdict it has today
     expect({ label, pass: tip!.pass }).toEqual({ label, pass: false });
   }
 });
+
+
+test("test: every shell a run launches for its baseline capture, its gate batteries and its tip verify carries the occupancy budget and stamps that capacity on its rows, and a gate exiting 1 with a fresh assertion under that budget parks the task red exactly as under the conservative budget, so a run whose baseline and gate rows carry different caps or that forgives a fresh red at the larger budget fails", async () => {
+  operatorExport(undefined);
+  const cores = vi.spyOn(os, "availableParallelism").mockReturnValue(18);
+  try {
+    for (const freshRed of [false, true]) {
+      for (const override of freshRed ? [undefined, 3] : [undefined]) {
+        operatorExport(override);
+        const cap = override ?? 6;
+        const log = join(makeTestTempDir("tickmarkr-occupancy-stamp-"), "caps.log");
+        const gate = `printf '%s\\n' "$VITEST_MAX_FORKS" >> ${shq(log)}; `
+          + (freshRed ? `if test -f t1.txt; then echo 'FAIL tests/fresh.test.ts > fresh assertion'; exit 1; fi` : "true");
+        const fixture = setupRepo(
+          [T("T1")],
+          { tasks: { T1: [{ shell: `echo T1 > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "done" } }] } },
+          stringify({ concurrency: 2, gates: { build: gate, test: gate, lint: gate } }),
+        );
+        const runId = `run-occupancy-stamp-${freshRed}-${cap}`;
+        const summary = await runDaemon(fixture.repo, { adapters: [fixture.fake], runId });
+        const journal = Journal.open(fixture.repo, runId);
+        const baseline: Baseline = JSON.parse(readFileSync(join(journal.dir, "baseline.json"), "utf8"));
+        for (const entry of Object.values(baseline.commands)) {
+          expect(entry.capacity).toEqual({ forkCap: cap, cores: 18 });
+        }
+        const rows = journal.read().filter((e) => ["gate-result", "tip-verify", "tip-verify-failed"].includes(e.event)
+          && ["build", "test", "lint"].includes(String(e.data.gate)));
+        expect(rows.length).toBeGreaterThanOrEqual(freshRed ? 1 : 6);
+        for (const row of rows) expect(row.data.capacity).toEqual({ forkCap: cap, cores: 18 });
+        expect([...new Set(lines(log))]).toEqual([String(cap)]);
+        expect(journal.read().some((e) => e.event === "suite-budget")).toBe(false);
+        if (freshRed) {
+          expect(summary.done).toEqual([]);
+          expect(summary.human).toEqual(["T1"]);
+          expect(rows.some((e) => e.event === "gate-result" && e.data.pass === false)).toBe(true);
+          expect(rows.some((e) => e.event === "gate-result" && e.data.forgiven === true)).toBe(false);
+        } else {
+          expect(summary.done).toEqual(["T1"]);
+          expect(rows.filter((e) => e.event === "tip-verify")).toHaveLength(3);
+        }
+      }
+    }
+  } finally {
+    cores.mockRestore();
+  }
+}, 180_000);

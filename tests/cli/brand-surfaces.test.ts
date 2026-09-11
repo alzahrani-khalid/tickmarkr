@@ -234,6 +234,10 @@ const RAIL_SPEC: RailSpec[] = [
   // gate starts and verdicts
   { event: "phase-start", label: "gate start", tone: "active", data: { phase: "gate:test", gate: "test", index: 2, total: 7 } },
   { event: "gate-result", label: "gate", tone: "pass", renders: "fail", data: { gate: "test", pass: false, details: "1 failed" } },
+  { event: "baseline-wait", label: "baseline wait", tone: "active", data: { baseRef: "abc123" } },
+  // SB-1 (v2.5.2): a verdict round released at the suite-wait ceiling beside a foreign suite ran
+  // under the conservative budget — the row names the census and both caps.
+  { event: "suite-budget", label: "suite budget", tone: "attention", salient: "beside 1, cap 3 not 6", data: { count: 1, occupancyCap: 6, conservativeCap: 3 } },
   { event: "gate-reused", label: "gate reused", tone: "neutral", data: { gate: "lint", commit: "deadbeefcafe" } },
   { event: "judge-retry", label: "judge retry", tone: "attention", data: { gate: "acceptance", flaked: "codex:gpt-5.6-sol", retried: "claude-code:opus" } },
   { event: "review-no-verdict", label: "review unavailable", tone: "attention", data: { reviewer: "codex:gpt-5.6-sol", cause: "silent" } },

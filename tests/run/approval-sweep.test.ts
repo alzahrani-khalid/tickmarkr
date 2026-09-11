@@ -6,10 +6,12 @@ import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, SlotOpts } from "../../src/drivers/types.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { approve } from "../../src/cli/commands/approve.js";
-import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import { APPROVAL_RAIL_ROWS, narrationRow } from "../../src/cli/commands/run.js";
+import { graphDefinitionHash, loadGraph, saveGraph } from "../../src/graph/graph.js";
+import { outstandingApprovals, runDaemon } from "../../src/run/daemon.js";
 import { gitHead, shOk } from "../../src/run/git.js";
 import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../src/run/journal.js";
+import { isPidLive } from "../../src/run/lock.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 const assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
@@ -259,3 +261,126 @@ test("test: a boundary sweep with no new approvals changes nothing and a resume 
   expect(after.length).toBeGreaterThan(before.length); // run-resume/run-end only; no second A dispatch
   expect(after.slice(before.length).some((e) => e.taskId === "A")).toBe(false);
 });
+
+
+function closingRepo(park = true, command = "true") {
+  return setupRepo([
+    T("S"), T("A", { humanGate: park }), T("B", { deps: ["A"] }),
+  ], { tasks: Object.fromEntries(["S", "A", "B"].map((id) => [id, [{
+    shell: `echo ${id} > ${id}.txt && ${COMMIT} ${id}`,
+    result: { ok: true, summary: id },
+  }]])) }, `gates: { test: ${JSON.stringify(command)} }\n`);
+}
+
+test("approval-close lifecycle events each render one labelled narrator row", () => {
+  const labels = {
+    "approval-window-start": "approval window",
+    "approval-window-expired": "approval window expired",
+    "tip-verify-cancelled": "tip verify cancelled",
+  };
+  expect(Object.keys(APPROVAL_RAIL_ROWS)).toEqual(Object.keys(labels));
+  for (const [event, label] of Object.entries(labels)) {
+    const row = narrationRow({ ts: "2026-09-11T00:00:00Z", event, data: {} }, "run-approval", 200);
+    expect(row).toContain(label);
+    expect(row!.split("\n")).toHaveLength(1);
+  }
+});
+
+test("test: a run whose loop drains with a parked task blocking every remaining task holds the approval window and an approval landing inside it dispatches the released task with no tip-verify-start row before that dispatch, while a drain with no parked task starts tip verify at once and a window expiring unanswered closes through tip verify, so a park that starts tip verify inside the window fails", async () => {
+  for (const mode of ["approved", "unanswered", "no-park"] as const) {
+    const { repo, fake } = closingRepo(mode !== "no-park");
+    const runId = `run-approval-window-${mode}`;
+    let approval: Promise<string> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const windowMs = mode === "no-park" ? 10_000 : 500;
+    try {
+      const summary = await runDaemon(repo, {
+        adapters: [fake], runId, approvalWindowMs: windowMs,
+        narrate: (e) => {
+          if (e.event === "approval-window-start" && mode === "approved") {
+            timer = setTimeout(() => { approval = approve([runId, "A", "--by", "test"], repo); }, 50);
+          }
+        },
+      });
+      await approval;
+      const events = Journal.open(repo, runId).read();
+      const windowAt = events.findIndex((e) => e.event === "approval-window-start");
+      const verifyAt = events.findIndex((e) => e.event === "tip-verify-start");
+      expect(verifyAt).toBeGreaterThan(-1);
+      if (mode === "no-park") {
+        expect(windowAt).toBe(-1);
+        const lastDone = events.findLast((e) => e.event === "task-done")!;
+        expect(Date.parse(events[verifyAt]!.ts) - Date.parse(lastDone.ts)).toBeLessThan(windowMs / 2);
+        expect(events.some((e) => e.event === "approval-window-expired")).toBe(false);
+      } else {
+        expect(windowAt).toBeGreaterThan(-1);
+        if (mode === "approved") {
+          const dispatchAt = events.findIndex((e) => e.event === "task-dispatch" && e.taskId === "A");
+          expect(dispatchAt).toBeGreaterThan(windowAt);
+          expect(dispatchAt).toBeLessThan(verifyAt);
+          expect(events.slice(windowAt, dispatchAt).some((e) => e.event === "tip-verify-start")).toBe(false);
+          expect(summary.done.sort()).toEqual(["A", "B", "S"]);
+        } else {
+          const expiredAt = events.findIndex((e) => e.event === "approval-window-expired");
+          expect(expiredAt).toBeGreaterThan(windowAt);
+          expect(verifyAt).toBeGreaterThan(expiredAt);
+          expect(Date.parse(events[expiredAt]!.ts) - Date.parse(events[windowAt]!.ts)).toBeGreaterThanOrEqual(windowMs);
+          expect(summary.human).toEqual(["A"]);
+        }
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+}, 120_000);
+
+test("test: an approval landing during a running tip verify cancels it with a tip-verify-cancelled row, re-enters dispatch in-process and runs tip verify once more at the final close whose run-end reports every approval enacted, while an approval landing after run-end stays outstanding, so a run-end recording outstanding over an approval that landed during its verify fails", async () => {
+  const marker = join(makeTestTempDir("tickmarkr-tip-cancel-"), "running");
+  const pidFile = `${marker}.pid`;
+  // Only the parked integration tip waits. Task gates and the final tip finish normally.
+  const command = `if test "$(basename "$PWD")" = tickmarkr-run-tip-cancel && test -f S.txt && ! test -f A.txt; then echo $$ > ${shq(pidFile)}; echo running > ${shq(marker)}; sleep 30; echo escaped >> ${shq(marker)}; fi`;
+  const { repo, fake } = closingRepo(true, command);
+  const graph = loadGraph(repo);
+  saveGraph(repo, { ...graph, tasks: [...graph.tasks, { ...graph.tasks[1]!, id: "C", title: "C" }] });
+  const runId = "run-tip-cancel";
+  let approval: Promise<string> | undefined;
+  let poll: ReturnType<typeof setInterval> | undefined;
+  try {
+    const summary = await runDaemon(repo, {
+      adapters: [fake], runId, approvalWindowMs: 0,
+      narrate: (e) => {
+        if (e.event !== "tip-verify-start" || poll) return;
+        poll = setInterval(() => {
+          // Wait for proof that the verifier's shell is actually running, not merely its start row.
+          try {
+            if (readFileSync(marker, "utf8").includes("running") && !approval) {
+              approval = approve([runId, "A", "--by", "test"], repo);
+            }
+          } catch { /* shell has not started */ }
+        }, 20);
+      },
+    });
+    await approval;
+    const journal = Journal.open(repo, runId);
+    const events = journal.read();
+    const cancelledAt = events.findIndex((e) => e.event === "tip-verify-cancelled");
+    const dispatchedAt = events.findIndex((e) => e.event === "task-dispatch" && e.taskId === "A");
+    expect(cancelledAt).toBeGreaterThan(events.findIndex((e) => e.event === "task-approved"));
+    expect(dispatchedAt).toBeGreaterThan(cancelledAt);
+    expect(events.filter((e) => e.event === "tip-verify-start")).toHaveLength(2);
+    expect(events.filter((e) => e.event === "tip-verify-cancelled")).toHaveLength(1);
+    expect(events.filter((e) => e.event === "tip-verify")).toHaveLength(1);
+    expect(readFileSync(marker, "utf8")).toBe("running\n");
+    expect(isPidLive(Number(readFileSync(pidFile, "utf8").trim()))).toBe(false);
+    expect(summary.done.sort()).toEqual(["A", "B", "S"]);
+    expect(summary.tipVerify).toBe("passed");
+    expect(events.find((e) => e.event === "run-end")?.data).toMatchObject({ approvalDisposition: "complete" });
+    expect(summary.outstandingApprovals).toBeUndefined();
+    // An append after the closed boundary belongs to the next engagement.
+    await approve([runId, "C", "--by", "test"], repo);
+    expect(outstandingApprovals(journal.read())).toEqual(["C"]);
+    expect(journal.read().filter((e) => e.event === "run-end")).toHaveLength(1);
+  } finally {
+    if (poll) clearInterval(poll);
+  }
+}, 120_000);

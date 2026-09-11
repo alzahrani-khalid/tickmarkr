@@ -69,15 +69,19 @@ describe("host-starved classification (OBS-896)", () => {
     const waitForCalm = () => {
       let samples = 0;
       setCalmWindowForTests({ loadProvider: () => samples++ === 0 ? 10 : 0, calmLoad: () => 1, pollMs: 5 });
+      return () => samples;
     };
-    waitForCalm();
+    const samples = waitForCalm();
     const green = scriptRepo([{ out: RED_TIMEOUTS, code: 1, sleep: 0.3 }, { out: " Test Files  1 passed (1)\n      Tests  2 passed (2)\n", code: 0 }]);
     const [g] = await compareToBaseline(green.repo, { test: "bash run.sh" }, base(100), ["test"]);
     expect(calls(green.counter)).toBe(2);
     expect(g).toMatchObject({ gate: "test", pass: true, meta: { hostStarvedRerun: { referenceMs: 100 } } });
     const provenance = (g!.meta as { hostStarvedRerun: { durationMs: number; waitedMs: number } }).hostStarvedRerun;
     expect(provenance.durationMs).toBeGreaterThanOrEqual(200);
-    expect(provenance.waitedMs).toBeGreaterThanOrEqual(5);
+    // OBS-966 add.3: timers may wake below their requested 5ms; assert the calm observation,
+    // which admits the rerun, rather than treating timer precision as the policy.
+    expect(samples()).toBe(2);
+    expect(provenance.waitedMs).toBeGreaterThanOrEqual(0);
     expect(g!.details).toMatch(/host-starved rerun after waiting \d+ms for a calm load window/);
 
     waitForCalm();
@@ -99,26 +103,59 @@ describe("host-starved classification (OBS-896)", () => {
   }, 30_000);
 });
 
-describe("one runner classifier on both sides (OBS-885/887)", () => {
-  test("test: a capture whose suite summary reads zero failed followed only by the teardown fingerprint records pass with the fingerprint named and the gate reads the same bytes as pass while a capture with no summary records no verdict whereas a capture that records the fingerprint as a forgivable red fails", async () => {
-    expect(classifyRunnerOutput(GREEN_TEARDOWN, 1)).toBe("green-teardown");
-    expect(classifyRunnerOutput(GREEN_TEARDOWN, 0)).toBeUndefined();
-    expect(classifyRunnerOutput(INFRA_NO_SUMMARY, 1)).toBe("infra");
-    expect(classifyRunnerOutput(RED_TIMEOUTS, 1)).toBe("regression");
+describe("one runner classifier on both sides (OBS-966)", () => {
+  afterEach(() => resetCalmWindowForTests());
 
-    const teardown = scriptRepo([{ out: GREEN_TEARDOWN, code: 1 }]);
-    const captured = await captureBaseline(teardown.repo, { test: "bash run.sh" });
-    expect(captured.commands.test).toMatchObject({ exitCode: 0, teardownFingerprint: true, fingerprints: [] });
-    expect(captured.commands.test!.infra).toBeUndefined();
-    const [gate] = await compareToBaseline(teardown.repo, { test: "bash run.sh" }, captured, ["test"]);
-    expect(gate).toMatchObject({ pass: true, meta: { teardownFingerprint: true } });
-
-    const infra = scriptRepo([{ out: INFRA_NO_SUMMARY, code: 1 }]);
+  test("test: a baseline capture whose runner output carries the vitest-worker RPC timeout under the unhandled-errors banner with every test green and exit 1 records the infra cause and no forgivable fingerprints, while a capture naming one failing test beside the same lines records that failure as a fingerprint, so a capture that records the runner timeout as a pre-existing failure fails", async () => {
     const captureSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      const verdictless = await captureBaseline(infra.repo, { test: "bash run.sh" });
-      expect(verdictless.commands.test).toMatchObject({ infra: true, invalidCause: "infra", fingerprints: [] });
-      expect(verdictless.commands.test!.exitCode).toBeUndefined();
+      for (const output of [
+        GREEN_TEARDOWN,
+        GREEN_TEARDOWN.replace(' Test Files  0 failed | 1 passed (1)', ''),
+        GREEN_TEARDOWN.split("\n").map((line) => `\x1b[?25h${line}\x1b[0m`).join("\n"),
+        GREEN_TEARDOWN.split("\n").map((line) => `pkg:test: ${line}`).join("\n"),
+      ]) {
+        expect(classifyRunnerOutput(output, 1)).toBe("infra");
+        const infra = scriptRepo([{ out: output, code: 1 }]);
+        const captured = await captureBaseline(infra.repo, { test: "bash run.sh" });
+        expect(captured.commands.test).toMatchObject({ infra: true, invalidCause: "infra", fingerprints: [], invalidatingLines: [expect.stringContaining('[vitest-worker]')] });
+        expect(captured.commands.test).not.toHaveProperty("exitCode");
+        expect(captured.commands.test!.teardownFingerprint).toBeUndefined();
+      }
+      const mixed = `${GREEN_TEARDOWN}\n FAIL tests/a.test.ts > real failure\nAssertionError: expected true to be false\n`;
+      expect(classifyRunnerOutput(mixed, 1)).toBe("regression");
+      const red = scriptRepo([{ out: mixed, code: 1 }]);
+      const captured = await captureBaseline(red.repo, { test: "bash run.sh" });
+      expect(captured.commands.test!.infra).toBeUndefined();
+      expect(captured.commands.test!.exitCode).toBe(1);
+      expect(captured.commands.test!.fingerprints).toContain("FAIL tests/a.test.ts > real failure");
+      expect(classifyRunnerOutput(INFRA_NO_SUMMARY, 1)).toBe("infra");
+      expect(classifyRunnerOutput(RED_TIMEOUTS, 1)).toBe("regression");
     } finally { captureSpy.mockRestore(); }
-  }, 30_000);
+  });
+
+  test("test: a test gate whose fresh output is runner infrastructure alone reruns once after the calm window with the row naming the rerun, a green rerun charges no repair, and a second infra read fails with the infra class first on its details line, while a fresh assertion failure never reruns on this path, so a gate that charges the first infra read as a red fails", async () => {
+    const green = " Test Files  1 passed (1)\n Tests 1 passed (1)\n";
+    for (const second of [{ out: green, code: 0 }, { out: GREEN_TEARDOWN, code: 1 }]) {
+      let samples = 0;
+      setCalmWindowForTests({ loadProvider: () => samples++ === 0 ? 10 : 0, calmLoad: () => 1, pollMs: 5 });
+      const run = scriptRepo([{ out: GREEN_TEARDOWN, code: 1 }, second]);
+      const rows = await compareToBaseline(run.repo, { test: "bash run.sh" }, base(100), ["test"]);
+      expect(calls(run.counter)).toBe(2);
+      expect(samples).toBe(2); // rerun was admitted only after the calm observation
+      expect(rows).toHaveLength(1); // no first-read red to charge to a repair
+      expect(rows[0]!.pass).toBe(second.code === 0);
+      expect(rows[0]!.details).toMatch(/runner-infra rerun after waiting \d+ms for a calm load window/);
+      expect(rows[0]!.meta?.runnerInfraRerun).toBeDefined();
+      if (second.code) {
+        expect(rows[0]!.details).toMatch(/^infra;/);
+        expect(rows[0]!.meta).toMatchObject({ classification: "infra", infra: true });
+      }
+    }
+    const mixed = scriptRepo([{ out: `${GREEN_TEARDOWN}\n FAIL tests/a.test.ts > assertion\nAssertionError: expected 1 to be 2`, code: 1 }]);
+    const [red] = await compareToBaseline(mixed.repo, { test: "bash run.sh" }, base(100), ["test"]);
+    expect(calls(mixed.counter)).toBe(1);
+    expect(red).toMatchObject({ pass: false, meta: { classification: "regression" } });
+    expect(red!.meta?.runnerInfraRerun).toBeUndefined();
+  });
 });

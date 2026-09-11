@@ -52,7 +52,9 @@ test("test: a lint runner's real default output fingerprints one entry per diagn
   ]);
   expect(fingerprint(raw)).not.toContain(UNRECOGNIZED_FAILURE);
   expect(classifyFailureOutput(raw)).toBe("regression");
-});
+// OBS-966 add.4: slowest-runner evidence exceeded 20s on the six-fork macOS host;
+// allow 60s for this real lint process, independently of the suite's 20s default.
+}, 60_000);
 
 test("test: a line that merely mentions a file position inside a sentence contributes no fingerprint; a recognizer anchored loosely enough to match it manufactures a fresh failure out of ordinary runner prose and fails", () => {
   const failure = "FAIL tests/existing.test.ts > existing failure";
@@ -227,6 +229,12 @@ describe("detectGateCommands", () => {
       test: "npm run -s test",
       lint: "npm run -s lint",
     });
+  });
+
+  test("cfg tipTest is loaded into gate commands", () => {
+    const repo = makeRepo({ "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) });
+    const cfg = { ...DEFAULT_CONFIG, gates: { test: "vitest run --project suite", tipTest: "vitest run" } };
+    expect(detectGateCommands(repo, cfg)).toEqual({ test: "vitest run --project suite", tipTest: "vitest run" });
   });
 });
 

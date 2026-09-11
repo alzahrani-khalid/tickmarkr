@@ -911,6 +911,9 @@ acceptance is required on every task (a nested list of observable outcomes).
       hard value anywhere in the domain, the criterion asserts a universal that may be FALSE ABOUT THE
       WORLD — bound it or say where it stops holding, rather than demanding a value that does not exist.
 
+    - A millisecond ceiling in a test is a BUDGET for the SLOWEST RUNNER.
+      Any ceiling under one second must carry a SLOWEST-RUNNER note and a member that OVERRUNS it.
+
   PICK THE CRITERION FORM FROM WHO COULD BE WRONG:
     - When the WORKER could be wrong because it can choose the value, use "test:" and pin the exact
       literal it could otherwise choose; an example selected by its implementer proves only itself.

@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +29,7 @@ import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { distFingerprint } from "../cli/commands/version.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
 import { runEnvironment } from "./environment.js";
-import { cleanupRunWorktrees, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, type RunCapacity, sameCapacity, sh, shGit, SUITE_PARENT_ENV, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sh, shGit, SUITE_PARENT_ENV, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingRechecks, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { isDiffCapPark, pickReviewer } from "../gates/review.js";
@@ -78,6 +79,8 @@ export interface RunOptions {
   // failure terminal and clears this task's replayed attempt seed so the new dispatch is fresh.
   retryFailed?: boolean;
   concurrency?: number;
+  /** Bounded wait at a drain caused solely by parked tasks. */
+  approvalWindowMs?: number;
   driver?: ExecutorDriver;
   driverOverride?: DriverChoice;
   adapters?: WorkerAdapter[];
@@ -177,9 +180,8 @@ const GATE_SATISFIED_ENACTMENT = "worktree-recreation";
  * T14, amended by v2.2 T3: approvals the run accepted and never acted on. `approved` above is still
  * built ONCE at startup — replay determinism depends on it — but a live approval is no longer inert:
  * the boundary sweep in the task loop releases what lands while the daemon runs, so an approval
- * written mid-run is normally enacted by this run. ONE window survives, and it is the reason this
- * fold still exists: an approval accepted after the task loop exits — during tip verify, before the
- * run-end sample below — meets no further boundary, so nothing can release it before this run ends.
+ * written mid-run is enacted at a boundary, during the approval window, or by cancelling tip verify.
+ * This fold still exposes decisions that could not enact, including a failure before dispatch.
  * Without this the run-end record stated only buckets and tipVerify, both accurate, over a milestone
  * that was silently incomplete: run …230 ended tipVerify "passed" with two upheld approvals and zero
  * subsequent dispatches. Scored per task on its NEWEST approval: a later approval is the live
@@ -393,6 +395,7 @@ let suiteWaitCeilingMs = SUITE_WAIT_CEILING_MS;
 export const setSuiteWaitCeilingForTests = (ms: number): void => { suiteWaitCeilingMs = ms; };
 export const resetSuiteWaitCeilingForTests = (): void => { suiteWaitCeilingMs = SUITE_WAIT_CEILING_MS; };
 export const APPROVAL_POLL_MS = 250;
+export const APPROVAL_WINDOW_MS = 1_000;
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
 const NO_TRAILER_DEMOTION_STREAK = 2; // OBS-57: consecutive no-trailer windows demote a channel for the rest of the run
@@ -608,6 +611,10 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
       afterRunEnd = false;
       continue;
     }
+    if (e.event === "tip-verify-cancelled") {
+      if (cur) cur.failed = true;
+      continue;
+    }
     if (e.event === "run-end") {
       afterRunEnd = true;
       continue;
@@ -640,6 +647,79 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
   return cur;
 }
 
+// Isolate the battery so cancellation can stop its control flow as well as its shell children.
+// The child uses the same verifier and capacity; only the daemon writes lifecycle verdict rows.
+async function cancellableTipBattery(
+  intWt: string, commands: Record<string, string>, runDir: string,
+  baseline: Baseline | undefined, signal: AbortSignal,
+): Promise<Awaited<ReturnType<typeof verifyIntegrationTip>>> {
+  signal.throwIfAborted();
+  const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
+  const script = `
+    import childProcess from 'node:child_process';
+    import { syncBuiltinESMExports } from 'node:module';
+    const shells = new Set();
+    let cancelled = false;
+    const spawn = childProcess.spawn;
+    childProcess.spawn = (...args) => {
+      // Preserve the owning daemon's census identity across this implementation subprocess.
+      if (args[2]?.env) args[2] = { ...args[2], env: { ...args[2].env, ${JSON.stringify(SUITE_PARENT_ENV)}: ${JSON.stringify(String(process.pid))} } };
+      const child = spawn(...args);
+      if (child.pid && args[2]?.detached) shells.add(child.pid);
+      child.once('close', () => shells.delete(child.pid));
+      return child;
+    };
+    syncBuiltinESMExports();
+    process.on('SIGTERM', () => {
+      cancelled = true;
+      for (const pid of shells) {
+        try { process.kill(-pid, 'SIGKILL'); }
+        catch (error) { if (error.code !== 'ESRCH') { console.error(error); process.exit(1); } }
+      }
+      // Reap the shell pipes before exiting; no verifier continuation may start another gate.
+      childProcess.spawn = () => { throw new Error('tip verify cancelled'); };
+      syncBuiltinESMExports();
+      const reaped = () => { if (!shells.size) process.exit(143); else setTimeout(reaped, 10); };
+      reaped();
+    });
+    const { verifyIntegrationTip } = await import(${JSON.stringify(new URL(`./merge.${extension}`, import.meta.url).href)});
+    const { runWithVerificationBudget } = await import(${JSON.stringify(new URL(`./git.${extension}`, import.meta.url).href)});
+    let input = ''; for await (const chunk of process.stdin) input += chunk;
+    const { intWt, commands, runDir, baseline, capacity } = JSON.parse(input);
+    try {
+      const result = await runWithVerificationBudget(capacity, () => verifyIntegrationTip(intWt, commands, runDir, baseline));
+      if (!cancelled) process.stdout.write(JSON.stringify(result));
+    } catch (error) { if (!cancelled) throw error; }
+  `;
+  const child = spawn(process.execPath, [
+    ...(extension === "ts" ? ["--import", createRequire(import.meta.url).resolve("tsx")] : []),
+    "--input-type=module", "-e", script,
+  ], { stdio: ["pipe", "pipe", "pipe"], detached: true });
+  let output = "";
+  let errors = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { errors += chunk; });
+  const cancel = () => { child.kill("SIGTERM"); };
+  const finished = new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (signal.aborted && (code === 143 || code === null)) reject(signal.reason);
+      else if (code !== 0) reject(new Error(`tip verifier exited ${code}: ${errors}`));
+      else resolve();
+    });
+  });
+  signal.addEventListener("abort", cancel, { once: true });
+  child.stdin.on("error", () => { /* exit/abort is reported by finished */ });
+  child.stdin.end(JSON.stringify({ intWt, commands, runDir, baseline, capacity: resolvedCapacity() }));
+  try {
+    if (signal.aborted) cancel();
+    await finished;
+    return JSON.parse(output);
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
+}
+
 /**
  * OBS-34's strict tip verify, but it stops re-paying for an unmoved tip (~334m corpus-wide; 69.5m in
  * one park-heavy run whose 18 resume cycles merged nothing new). The verify journals the SHA it
@@ -655,13 +735,14 @@ export async function verifyIntegrationTipCached(
   intWt: string,
   commands: Record<string, string>,
   journal: Journal,
-  opts: { lastMergedTask?: string; baseline?: Baseline } = {},
+  opts: { lastMergedTask?: string; baseline?: Baseline; signal?: AbortSignal } = {},
 ): Promise<boolean> {
+  opts.signal?.throwIfAborted();
   const cmdHash = commandsHash(commands);
   const tip = await gitHead(intWt);
   // T7: the capacity this session's verify children WOULD run under — the third thing a carried
   // green must match, beside the tip and the command set. A cached verdict is the one place a green
-  // crosses a session boundary with nothing re-run, and a session resumed at a different concurrency
+  // crosses a session boundary with nothing re-run, and a session resumed at a different capacity
   // divides the machine by a different number: that green was established in another world, so it is
   // not carried forward and the commands run again. A pre-T7 cycle records no capacity and keeps
   // exactly the behaviour it has today.
@@ -669,26 +750,32 @@ export async function verifyIntegrationTipCached(
   const porcelain = await shGit("git status --porcelain", intWt);
   const clean = porcelain.code === 0 && porcelain.stdout.trim() === "";
   const last = lastVerifyCycle(journal.read());
+  const gates = Object.keys(commands).filter((g) => g !== "tipTest");
+  if (!gates.includes("test") && commands.tipTest) gates.push("test");
   const cached = last !== undefined && !last.failed && !last.forgiven && last.tip === tip && last.cmdHash === cmdHash
-    && Object.keys(commands).every((g) => last.gates.has(g))
+    && gates.every((g) => last.gates.has(g))
     && last.capacities.every((recorded) => sameCapacity(recorded, capacity));
   // A pair can be verified red and then green without either SHA or command hash changing (for
   // example, an external service or ignored fixture recovers). Delimit attempts explicitly so that
   // the earlier red cannot remain latched into the later complete green cycle.
-  journal.append("tip-verify-start", undefined, { tip, cmdHash, capacity, gates: Object.keys(commands), cached: clean && cached });
+  journal.append("tip-verify-start", undefined, { tip, cmdHash, capacity, gates, cached: clean && cached });
+  opts.signal?.throwIfAborted();
   if (clean && cached) {
-    journal.append("tip-verify-cached", undefined, { tip, cmdHash, capacity, gates: Object.keys(commands) });
+    journal.append("tip-verify-cached", undefined, { tip, cmdHash, capacity, gates });
     // The skip must not read as a red. Every surface derives the tip's verdict from this cycle's
     // `tip-verify` events (cockpit derive.ts tipVerificationPassed: a run-end claiming "passed" with
     // ZERO events is fail-closed to FALSE), so a carried-forward green still journals its per-gate
     // pass — `cached: true` keeps it honest about not having re-run the command.
-    for (const gate of Object.keys(commands)) {
-      journal.append("tip-verify", undefined, { gate, cmd: commands[gate], pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity });
+    for (const gate of gates) {
+      const cmd = gate === "test" && commands.tipTest ? commands.tipTest : commands[gate]!;
+      journal.append("tip-verify", undefined, { gate, cmd, pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity });
     }
     return false;
   }
   let tipFailed = false;
-  for (const r of await verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline)) {
+  for (const r of await (opts.signal
+    ? cancellableTipBattery(intWt, commands, journal.dir, opts.baseline, opts.signal)
+    : verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline))) {
     if (r.pass) {
       // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
       journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash, capacity });
@@ -699,6 +786,7 @@ export async function verifyIntegrationTipCached(
         exitCode: r.exitCode,
         fingerprints: r.fingerprints,
         artifact: r.artifact,
+        ...(r.details ? { details: r.details } : {}),
         lastMergedTask: opts.lastMergedTask,
         tip,
         cmdHash,
@@ -1342,6 +1430,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let taskLoopStarted = false;
   let branch = "";
   let releaseApprovalSerialization: (() => void) | undefined;
+  let baselineCapture: Promise<void> = Promise.resolve();
+  let baselineFailed = false;
   try {
   let graph = loadGraph(repoRoot);
   // One bounded snapshot supplies every dispatch. On resume the current journal still participates
@@ -1380,14 +1470,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // > repo > global > default. The resolved cfg carries mode-compiled floors; route() never sees the mode.
   const rm = resolveRunMode(repoRoot, { flag: opts.mode, spec: graph.mode, globalDir: opts.globalDir });
   const cfg = rm.cfg;
-  // T9: the run's concurrency is resolved HERE, once, and this single value is both what the
-  // dispatch loop enforces below and what the fork budget divides the machine by. Resolving it
-  // twice (or re-reading argv/the overlay at spawn time) is how a run ends up enforcing one number
-  // while its shells are sized for another. The budget wraps the whole body — baseline capture,
-  // every gate battery, tip verify and every worker environment — so no shell this run launches
-  // can predate it, and it is entered per-call so a concurrent run never inherits this one's.
+  // Resolve both budgets once: worker fan-out divides by dispatch concurrency; verification
+  // divides by one suite occupying the serialized window. Explicit operator caps still win.
   const concurrency = opts.concurrency ?? cfg.concurrency;
   return await runWithForkBudget(concurrency, async () => {
+  const conservativeCapacity = resolvedCapacity();
+  const occupancyCapacity: RunCapacity = {
+    cores: conservativeCapacity.cores,
+    forkCap: FORK_CAP_ENV in process.env
+      ? conservativeCapacity.forkCap : deriveForkCap(1, conservativeCapacity.cores),
+  };
+  return await runWithVerificationBudget(occupancyCapacity, async () => {
   // v1.51 T4: every dispatch provenance line begins with the mode and its source; when a pin won
   // the route (the final "→ " segment is a pin, not a degraded-to-auto tail) it names the mode it bypassed.
   const dispatchProvenance = (p: string): string =>
@@ -1450,6 +1543,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // observer-classified abrupt death. keepPanes:"forever" (the
   // keep-everything debug override) preserves panes but still releases the lock and exits.
   let termSignal: NodeJS.Signals | undefined;
+  let activeTipVerify: { controller: AbortController; settled: Promise<void> } | undefined;
   let abortRun: (err: Error) => void = () => {};
   const aborted = new Promise<never>((_, reject) => { abortRun = reject; });
   aborted.catch(() => { /* pre-handled: a signal after the loop drained must not crash as unhandled */ });
@@ -1466,7 +1560,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
         // Stop the scheduler before the first awaited retirement. Otherwise a freed slot can fund a
         // new attempt while this reaper is still closing the old ones.
-        abortRun(new Error(`terminated by ${sig}`));
+        const termination = new Error(`terminated by ${sig}`);
+        abortRun(termination);
+        if (activeTipVerify) {
+          activeTipVerify.controller.abort(termination);
+          await activeTipVerify.settled;
+        }
         if (cfg.visibility.keepPanes !== "forever") {
           for (const s of Array.from(liveSlots)) { // snapshot: failed closes restore membership for the next sweep
             try { await closeSlot(s); } catch { /* cosmetic — reconcile is the backstop */ }
@@ -1533,8 +1632,56 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     }
   };
 
+  // OBS-829/OBS-854: one full-suite verdict round at a time in this run, and do not begin beside an
+  // externally live suite attributable to this repository. The process scan catches nested scratch
+  // suites through daemon parentage even after cwd stops naming a worktree.
+  let suiteChain: Promise<void> = Promise.resolve();
+  let suitePending = 0;
+  const withSuiteWindow = async <T>(taskId: string | undefined, enabled: boolean, run: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
+    if (!enabled) return run();
+    const previous = suiteChain;
+    let release!: () => void;
+    suiteChain = new Promise<void>((resolve) => { release = resolve; });
+    const queued = suitePending++ > 0;
+    if (queued) {
+      const count = Math.max(1, await liveSuiteCount(repoRoot));
+      journal.append("suite-wait", taskId, { count });
+    }
+    await previous;
+    try {
+      let lastCount = -1;
+      const startedAt = Date.now();
+      for (;;) {
+        signal?.throwIfAborted();
+        const count = await liveSuiteCount(repoRoot);
+        if (count === 0) break;
+        // OBS-889: a census that never reaches zero held T5's gates with no row and no end. Proceed at
+        // the ceiling, flagged: the verdict that follows was produced beside whatever is still counted.
+        if (Date.now() - startedAt >= suiteWaitCeilingMs) {
+          journal.append("suite-wait-ceiling", taskId, { count, waitedMs: Date.now() - startedAt });
+          journal.append("suite-budget", taskId, {
+            count, occupancyCap: occupancyCapacity.forkCap, conservativeCap: conservativeCapacity.forkCap,
+          });
+          return await runWithVerificationBudget(conservativeCapacity, run);
+        }
+        if (count !== lastCount) journal.append("suite-wait", taskId, { count });
+        lastCount = count;
+        await new Promise((wake) => setTimeout(wake, SUITE_POLL_MS));
+      }
+      return await run();
+    } finally {
+      suitePending--;
+      release();
+    }
+  };
+
   let baseRef: string;
-  let baseline: Baseline;
+  let baseline!: Baseline;
+  let baselinePending = false;
+  const waitForBaseline = async (taskId: string) => {
+    if (baselinePending) journal.append("baseline-wait", taskId, { baseRef });
+    await baselineCapture;
+  };
   // Phase 46 (RES-01/RES-02): the resume-state map is built ONCE here so execTask closes over it.
   // Empty Map on fresh runs — every seed below conditions on resume.get(t.id), never on opts.resume (the
   // GATE-08 lesson at the humanGate guard: condition on the data, not the code path). Dead-code
@@ -1600,10 +1747,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     await openBoard();
   } else {
     baseRef = await gitHead(repoRoot);
-    journal.append("baseline-start", undefined, { baseRef, commands });
+    journal.append("baseline-start", undefined, { baseRef, commands, capacity: resolvedCapacity() });
     await openBoard();
-    baseline = await captureBaseline(repoRoot, commands);
-    writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline, null, 2));
+    baselinePending = true;
+    // Workers can run beside capture, but no gate may observe an absent or partial baseline.
+    // Keep publication and warnings inside the same barrier as the suite's final verdict.
+    baselineCapture = withSuiteWindow(undefined, commands.test !== undefined || commands.tipTest !== undefined, async () => {
+      const captured = await captureBaseline(repoRoot, commands);
+      writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(captured, null, 2));
+      baseline = captured;
+      for (const warning of captured.warnings ?? []) journal.append("baseline-warning", undefined, { ...warning });
+      // These warning-only command oracles also run on the pristine repo before gates begin.
+      for (const w of await detectVacuousOracles(repoRoot, graph.tasks)) journal.append("baseline-warning", w.taskId, { ...w });
+    }).finally(() => { baselinePending = false; });
+    // Attach a rejection handler immediately; gate and run-close awaits still propagate the error.
+    void baselineCapture.catch(() => { baselineFailed = true; });
     writeFileSync(join(journal.dir, "graph.json"), readFileSync(join(tickmarkrDir(repoRoot), "graph.json")));
     // v1.70 T2: environment identity beside the graph/branch identity — running tickmarkr version,
     // loaded-config hash, and the probed CLI version of each adapter holding a channel in the run,
@@ -1627,10 +1785,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // v1.53 T5: mark the prior run AFTER this run's run-start exists, so the prior journal never
     // names a successor that has no journal. Append-only — the prior journal is never rewritten.
     prior?.append("superseded", undefined, { by: runId });
-    for (const warning of baseline.warnings ?? []) journal.append("baseline-warning", undefined, { ...warning });
-    // Tier A #3: run each task's command-typed acceptance oracles against the pristine baseline —
-    // one that already exits 0 verifies nothing. Warning only, taskId-stamped; never a gate input.
-    for (const w of await detectVacuousOracles(repoRoot, graph.tasks)) journal.append("baseline-warning", w.taskId, { ...w });
   }
 
   // OBS-547: ONE full per-task collateral prediction for the whole run, computed here — uncapped, and
@@ -1719,45 +1873,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     });
     mergeChain = next.catch(() => undefined);
     return next;
-  };
-
-  // OBS-829/OBS-854: one full-suite verdict round at a time in this run, and do not begin beside an
-  // externally live suite attributable to this repository. The process scan catches nested scratch
-  // suites through daemon parentage even after cwd stops naming a worktree.
-  let suiteChain: Promise<void> = Promise.resolve();
-  let suitePending = 0;
-  const withSuiteWindow = async <T>(taskId: string | undefined, enabled: boolean, run: () => Promise<T>): Promise<T> => {
-    if (!enabled) return run();
-    const previous = suiteChain;
-    let release!: () => void;
-    suiteChain = new Promise<void>((resolve) => { release = resolve; });
-    const queued = suitePending++ > 0;
-    if (queued) {
-      const count = Math.max(1, await liveSuiteCount(repoRoot));
-      journal.append("suite-wait", taskId, { count });
-    }
-    await previous;
-    try {
-      let lastCount = -1;
-      const startedAt = Date.now();
-      for (;;) {
-        const count = await liveSuiteCount(repoRoot);
-        if (count === 0) break;
-        // OBS-889: a census that never reaches zero held T5's gates with no row and no end. Proceed at
-        // the ceiling, flagged: the verdict that follows was produced beside whatever is still counted.
-        if (Date.now() - startedAt >= suiteWaitCeilingMs) {
-          journal.append("suite-wait-ceiling", taskId, { count, waitedMs: Date.now() - startedAt });
-          break;
-        }
-        if (count !== lastCount) journal.append("suite-wait", taskId, { count });
-        lastCount = count;
-        await new Promise((wake) => setTimeout(wake, SUITE_POLL_MS));
-      }
-      return await run();
-    } finally {
-      suitePending--;
-      release();
-    }
   };
 
   // gateFails/consults are execTask-scoped counters passed in so a park row is a rich verified-failure
@@ -2091,7 +2206,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // a refusal when the command left the worktree dirty (run-gates.ts, three sites: the legacy
         // batch, the per-command loop and the merge-candidate full suite), and the refusal is a
         // fresh verdict object carrying nothing off the result it replaced. That command's child DID
-        // run, so its row still owes the world it ran in. `sessionCapacity` is that world and not a
+        // run, so its row still owes the world it ran in. the active round capacity is that world and not a
         // re-derivation of it: it applies the same precedence `shell` does — an operator export
         // first — and was read inside the same fork budget every gate child of this run is spawned
         // under, so it is by construction the number that child received. The flag is set only where
@@ -2099,7 +2214,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // ran) and the round-end withdrawal (lands on a gate that runs no command) still carry
         // nothing.
         ...(g.capacity ? { capacity: g.capacity }
-          : g.meta?.dirtiedBy === g.gate ? { capacity: sessionCapacity } : {}),
+          : g.meta?.dirtiedBy === g.gate ? { capacity: resolvedCapacity() } : {}),
       });
     };
     // R3 (OBS-186): judge ‖ review are launched together and publish in COMPLETION order
@@ -2429,6 +2544,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ...(!satisfiedGate && !recheck ? { replayMeasurement: true as const } : {}),
         };
         await trackedDriver.project?.(t.id, "in-review");
+        await waitForBaseline(t.id);
         journal.phaseStart(t.id, "gates");
         const { results } = await withSuiteWindow(t.id,
           resumedTask.gates.includes("test") && commands.test !== undefined,
@@ -4043,6 +4159,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         return;
       }
 
+      // Provisioning can mutate the shared dependency tree the pristine capture is still using.
+      await waitForBaseline(t.id);
       graph = setStatus(graph, t.id, "gated");
       saveGraph(repoRoot, graph);
       // OBS-47: re-assert the node_modules link BEFORE gates run on any attempt. A worker may have
@@ -4367,114 +4485,182 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
   taskLoopStarted = true;
   const inflight = new Map<string, Promise<void>>();
-  while (true) {
-    // v1.54 T2: a signal that landed while nothing was racing `aborted` (empty inflight window)
-    // must still stop the run before it can dispatch more work or write run-end.
-    if (termSignal) throw new Error(`terminated by ${termSignal}`);
+  closeLoop: while (true) {
+    let approvalDeadline: number | undefined;
+    while (true) {
+      // v1.54 T2: a signal that landed while nothing was racing `aborted` (empty inflight window)
+      // must still stop the run before it can dispatch more work or write run-end.
+      if (termSignal) throw new Error(`terminated by ${termSignal}`);
+      sweepLiveApprovals();
+      const ready = readyTasks(graph)
+        .filter((t) => !inflight.has(t.id))
+        .slice(0, Math.max(0, concurrency - inflight.size));
+      for (const t of ready) {
+        const p = execTask(t)
+          .catch(async (err) => {
+            const taskEvents = journal.read().filter((e) => e.taskId === t.id);
+            const dispatch = [...taskEvents].reverse().find((e) => e.event === "task-dispatch");
+            // OBS-206: shared rule with `resume --retry-failed` — see classifyTaskFailure.
+            const kind: ParkKind = classifyTaskFailure(taskEvents);
+            const attempts = dispatch && Number.isInteger(dispatch.data.attempt) ? dispatch.data.attempt as number : 0;
+            graph = setStatus(graph, t.id, "failed");
+            saveGraph(repoRoot, graph);
+            journal.append("task-failed", t.id, { error: String(err), kind, attempts });
+            journal.telemetry({ taskId: t.id, shape: t.shape, adapter: "-", model: "-", channel: "-", attempts: 0, outcome: "failed", durationMs: 0 });
+            await reconcile({ spareLiveLlm: true }); // task-failed is a terminal event
+          })
+          .finally(() => inflight.delete(t.id));
+        inflight.set(t.id, p);
+      }
+      if (inflight.size === 0) {
+        const parked = new Set(graph.tasks.filter((t) => t.status === "human").map((t) => t.id));
+        const behindPark = (task: Task): boolean => task.deps.some((id) =>
+          parked.has(id) || behindPark(getTask(graph, id)));
+        const onlyParks = parked.size > 0 && graph.tasks
+          .filter((t) => t.status === "pending").every(behindPark);
+        if (onlyParks) {
+          if (approvalDeadline === undefined) {
+            const windowMs = opts.approvalWindowMs ?? APPROVAL_WINDOW_MS;
+            approvalDeadline = Date.now() + windowMs;
+            journal.append("approval-window-start", undefined, { windowMs, parked: [...parked] });
+            // The narrator may itself append a decision at this boundary.
+            sweepLiveApprovals();
+            if (readyTasks(graph).length) { approvalDeadline = undefined; continue; }
+          }
+          if (Date.now() < approvalDeadline) {
+            await Promise.race([aborted, new Promise((wake) => setTimeout(wake,
+              Math.min(APPROVAL_POLL_MS, approvalDeadline! - Date.now())))]);
+            continue;
+          }
+          journal.append("approval-window-expired", undefined, { parked: [...parked] });
+        }
+        break;
+      }
+      approvalDeadline = undefined;
+      const waiters: Promise<unknown>[] = [...inflight.values(), aborted];
+      // A free slot is itself a scheduling boundary: poll the append-only approval stream instead of
+      // sleeping until an unrelated long-running task settles.
+      if (inflight.size < concurrency) {
+        waiters.push(new Promise((wake) => setTimeout(wake, APPROVAL_POLL_MS)));
+      }
+      await Promise.race(waiters); // aborted rejects on termination — unwinds the run
+    }
+
+    // D-07: the sweep now closes only what's LEFT in keptSlots — done-closed worker slots were removed
+    // (no double-close) and self-cleaned LLM/consult panes were never added under keepLlm:false. This
+    // leaves failed/parked attempts' worker slots, which keep their failure context until run end.
+    if (cfg.visibility.keepPanes === "run") {
+      for (const s of keptSlots) await closeSlot(s); // panes persist for the run's duration, then clean up
+    }
+
+    saveGraph(repoRoot, graph);
+    const byStatus = (s: string) => graph.tasks.filter((t) => t.status === s).map((t) => t.id);
+    // buckets derived from the graph at summary time (D-01/D-02); the loop has exited with
+    // inflight.size === 0, so the five buckets sum to graph.tasks.length by construction.
+    const summary: RunSummary = {
+      runId,
+      branch,
+      done: byStatus("done"),
+      failed: byStatus("failed"),
+      human: byStatus("human"),
+      blocked: blockedTasks(graph).map((t) => t.id),
+      pending: pendingTasks(graph).map((t) => t.id),
+    };
+
+    await baselineCapture; // also drain capture when every worker parks or fails before its gates
+
+    // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
+    const lastMergedTask = [...journal.read()].reverse().find((e) => e.event === "merge" && e.taskId)?.taskId;
+    if (summary.done.length > 0 && Object.keys(commands).length > 0) {
+      const controller = new AbortController();
+      const cancellation = new Error("tip verify cancelled by approval");
+      const checkApprovals = () => {
+        try {
+          sweepLiveApprovals();
+          if (readyTasks(graph).length) controller.abort(cancellation);
+          if (termSignal) controller.abort(new Error(`terminated by ${termSignal}`));
+        } catch (error) { controller.abort(error); }
+      };
+      // One timeout belongs to this verification and is retired when it settles.
+      let poll: ReturnType<typeof setTimeout> | undefined;
+      const pollApprovals = () => {
+        checkApprovals();
+        if (!controller.signal.aborted) poll = setTimeout(pollApprovals, APPROVAL_POLL_MS);
+      };
+      poll = setTimeout(pollApprovals, APPROVAL_POLL_MS);
+      let tipFailed: boolean;
+      try {
+        const verification = withSuiteWindow(undefined, commands.test !== undefined || commands.tipTest !== undefined,
+          () => verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline, signal: controller.signal }), controller.signal);
+        activeTipVerify = { controller, settled: verification.then(() => {}, () => {}) };
+        tipFailed = await verification;
+      } catch (error) {
+        if (error !== cancellation) throw error;
+        journal.append("tip-verify-cancelled", undefined, { reason: "approval", lastMergedTask });
+        continue closeLoop;
+      } finally {
+        activeTipVerify = undefined;
+        clearTimeout(poll);
+      }
+      summary.tipVerify = tipFailed ? "failed" : "passed";
+      if (tipFailed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
+    }
+
+    // T14: read the journal, not the startup `approved` set — an approval appended DURING this run is
+    // exactly the one the set cannot see, and it is the one the record has to name.
+    //
+    // Serialize this sample WITH the run-end append. The daemon holds the boundary through its final
+    // graph.lock release in the outer finally: an approval that wins first is included below, while an
+    // approval that loses cannot append until the live owner is gone and reports recorded-no-owner.
+    // Thus no accepted approval can land after this sample while still being attributed to this run.
+    const approvalSerialization = await acquireApprovalSerialization(repoRoot, runId);
+    releaseApprovalSerialization = approvalSerialization.release;
+    // Close the last poll-to-run-end race while holding the same serializer as approve.
     sweepLiveApprovals();
-    const ready = readyTasks(graph)
-      .filter((t) => !inflight.has(t.id))
-      .slice(0, Math.max(0, concurrency - inflight.size));
-    for (const t of ready) {
-      const p = execTask(t)
-        .catch(async (err) => {
-          const taskEvents = journal.read().filter((e) => e.taskId === t.id);
-          const dispatch = [...taskEvents].reverse().find((e) => e.event === "task-dispatch");
-          // OBS-206: shared rule with `resume --retry-failed` — see classifyTaskFailure.
-          const kind: ParkKind = classifyTaskFailure(taskEvents);
-          const attempts = dispatch && Number.isInteger(dispatch.data.attempt) ? dispatch.data.attempt as number : 0;
-          graph = setStatus(graph, t.id, "failed");
-          saveGraph(repoRoot, graph);
-          journal.append("task-failed", t.id, { error: String(err), kind, attempts });
-          journal.telemetry({ taskId: t.id, shape: t.shape, adapter: "-", model: "-", channel: "-", attempts: 0, outcome: "failed", durationMs: 0 });
-          await reconcile({ spareLiveLlm: true }); // task-failed is a terminal event
-        })
-        .finally(() => inflight.delete(t.id));
-      inflight.set(t.id, p);
+    if (readyTasks(graph).length) {
+      releaseApprovalSerialization();
+      releaseApprovalSerialization = undefined;
+      if (summary.tipVerify) journal.append("tip-verify-cancelled", undefined, { reason: "approval", lastMergedTask });
+      continue closeLoop;
     }
-    if (inflight.size === 0) break;
-    const waiters: Promise<unknown>[] = [...inflight.values(), aborted];
-    // A free slot is itself a scheduling boundary: poll the append-only approval stream instead of
-    // sleeping until an unrelated long-running task settles.
-    if (inflight.size < concurrency) {
-      waiters.push(new Promise((wake) => setTimeout(wake, APPROVAL_POLL_MS)));
+    const outstanding = outstandingApprovals(journal.read());
+    summary.approvalDisposition = outstanding.length === 0 ? "complete" : "outstanding";
+    if (outstanding.length > 0) summary.outstandingApprovals = outstanding;
+
+    journal.append("run-end", undefined, { ...summary });
+    await reconcile(); // run-end boundary: nothing in flight — full sweep (empty desired set)
+    // OBS-28: lingering worktrees starve CLI probes; keepPanes:forever is the debug override.
+    if (!keepForever) {
+      const green = summary.failed.length === 0 && summary.human.length === 0
+        && summary.blocked.length === 0 && summary.pending.length === 0
+        && summary.tipVerify !== "failed";
+      await cleanupRunWorktrees(repoRoot, branch, { removeIntegration: green, removeTaskIds: summary.done });
     }
-    await Promise.race(waiters); // aborted rejects on termination — unwinds the run
+    // VIS-02: name each blocked subtree by its nearest parked/failed root, e.g. "3 blocked behind P40-02".
+    const attribution = [...attributeBlocked(graph).entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([root, count]) => `${count} blocked behind ${root}`)
+      .join(", ");
+    const tipFail = summary.tipVerify === "failed"
+      ? ` — TIP VERIFY FAILED on ${summary.lastMergedTask ? `last merge ${summary.lastMergedTask}` : "integration tip"}`
+      : "";
+    await driver.notify(
+      `tickmarkr ${runId}: ${summary.done.length} done, ${summary.failed.length} failed, ${summary.human.length} awaiting human, ${summary.blocked.length} blocked, ${summary.pending.length} pending${attribution ? ` (${attribution})` : ""}${tipFail} — integration branch ${branch} (merge to main is yours)`,
+      { tier: summary.tipVerify === "failed" ? "attention" : "routine" },
+    );
+    return summary;
   }
-
-  // D-07: the sweep now closes only what's LEFT in keptSlots — done-closed worker slots were removed
-  // (no double-close) and self-cleaned LLM/consult panes were never added under keepLlm:false. This
-  // leaves failed/parked attempts' worker slots, which keep their failure context until run end.
-  if (cfg.visibility.keepPanes === "run") {
-    for (const s of keptSlots) await closeSlot(s); // panes persist for the run's duration, then clean up
-  }
-
-  saveGraph(repoRoot, graph);
-  const byStatus = (s: string) => graph.tasks.filter((t) => t.status === s).map((t) => t.id);
-  // buckets derived from the graph at summary time (D-01/D-02); the loop has exited with
-  // inflight.size === 0, so the five buckets sum to graph.tasks.length by construction.
-  const summary: RunSummary = {
-    runId,
-    branch,
-    done: byStatus("done"),
-    failed: byStatus("failed"),
-    human: byStatus("human"),
-    blocked: blockedTasks(graph).map((t) => t.id),
-    pending: pendingTasks(graph).map((t) => t.id),
-  };
-
-  // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
-  const lastMergedTask = [...journal.read()].reverse().find((e) => e.event === "merge" && e.taskId)?.taskId;
-  if (summary.done.length > 0 && Object.keys(commands).length > 0) {
-    const tipFailed = await withSuiteWindow(undefined, commands.test !== undefined,
-      () => verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline }));
-    summary.tipVerify = tipFailed ? "failed" : "passed";
-    if (tipFailed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
-  }
-
-  // T14: read the journal, not the startup `approved` set — an approval appended DURING this run is
-  // exactly the one the set cannot see, and it is the one the record has to name.
-  //
-  // Serialize this sample WITH the run-end append. The daemon holds the boundary through its final
-  // graph.lock release in the outer finally: an approval that wins first is included below, while an
-  // approval that loses cannot append until the live owner is gone and reports recorded-no-owner.
-  // Thus no accepted approval can land after this sample while still being attributed to this run.
-  const approvalSerialization = await acquireApprovalSerialization(repoRoot, runId);
-  releaseApprovalSerialization = approvalSerialization.release;
-  const outstanding = outstandingApprovals(journal.read());
-  summary.approvalDisposition = outstanding.length === 0 ? "complete" : "outstanding";
-  if (outstanding.length > 0) summary.outstandingApprovals = outstanding;
-
-  journal.append("run-end", undefined, { ...summary });
-  await reconcile(); // run-end boundary: nothing in flight — full sweep (empty desired set)
-  // OBS-28: lingering worktrees starve CLI probes; keepPanes:forever is the debug override.
-  if (!keepForever) {
-    const green = summary.failed.length === 0 && summary.human.length === 0
-      && summary.blocked.length === 0 && summary.pending.length === 0
-      && summary.tipVerify !== "failed";
-    await cleanupRunWorktrees(repoRoot, branch, { removeIntegration: green, removeTaskIds: summary.done });
-  }
-  // VIS-02: name each blocked subtree by its nearest parked/failed root, e.g. "3 blocked behind P40-02".
-  const attribution = [...attributeBlocked(graph).entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([root, count]) => `${count} blocked behind ${root}`)
-    .join(", ");
-  const tipFail = summary.tipVerify === "failed"
-    ? ` — TIP VERIFY FAILED on ${summary.lastMergedTask ? `last merge ${summary.lastMergedTask}` : "integration tip"}`
-    : "";
-  await driver.notify(
-    `tickmarkr ${runId}: ${summary.done.length} done, ${summary.failed.length} failed, ${summary.human.length} awaiting human, ${summary.blocked.length} blocked, ${summary.pending.length} pending${attribution ? ` (${attribution})` : ""}${tipFail} — integration branch ${branch} (merge to main is yours)`,
-    { tier: summary.tipVerify === "failed" ? "attention" : "routine" },
-  );
-  return summary;
+  });
   });
   } catch (err) {
     // T7 (v1.86): guarded — a journal read/append failure while recording the fatal run-end is
     // reported alongside err, never instead of it; recordFatalRunEnd never throws, so the original
     // error (message, stack, cause) always reaches the caller verbatim.
-    if (runStarted && !taskLoopStarted) recordFatalRunEnd(journal, runId, branch, err);
+    if (runStarted && (!taskLoopStarted || baselineFailed)) recordFatalRunEnd(journal, runId, branch, err);
     throw err;
   } finally {
+    // Startup/dispatch errors must not leave a capture running after its daemon releases the lock.
+    await baselineCapture.catch(() => {});
     // v1.54 T2: deregister on EVERY exit (normal run end, throw, termination unwind) — the daemon
     // test suite runs runDaemon dozens of times in one process; a leaked handler would close a
     // later run's slots.

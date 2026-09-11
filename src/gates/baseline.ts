@@ -37,6 +37,8 @@ export interface BaselineCommand {
   durationMs?: number;
   /** Sum of the per-file durations named by the runner; null when its output names none. */
   fileDurationSumMs?: number | null;
+  /** Total files reported by the runner summary; null when unavailable. */
+  fileCount?: number | null;
   /** fileDurationSumMs / durationMs — average implied file concurrency, not a configured fork count. */
   impliedParallelism?: number | null;
   /** The slowest per-file entry named by the runner; null when per-file timing is unavailable. */
@@ -103,7 +105,7 @@ const FAIL_ANCHOR_RE = /^\s*(?:FAIL\s+|[^\w]*(?:Unhandled Errors|Uncaught Except
 // to render. Digits are written (?:\d+|#) so a shape matches both raw and digit-normalized lines.
 // Run summaries: " Tests  N failed | M passed (T)" (vitest), "# fail N" (TAP / node:test),
 // "ℹ fail N" (node:test's spec reporter) and "test result: FAILED. …" (cargo / libtest).
-const SUMMARY_FAIL_RE = /^\s*(?:Tests?\s+(?:Files?\s+)?(?:\d+|#)\s+failed|#\s+fail\s+(?!0\b)(?:\d+|#)\b|ℹ\s+fail\s+(?!0\b)(?:\d+|#)\b|test result:\s+FAILED\b)/;
+const SUMMARY_FAIL_RE = /^\s*(?:Tests?\s+(?:Files?\s+)?(?!0\b)(?:\d+|#)\s+failed|#\s+fail\s+(?!0\b)(?:\d+|#)\b|ℹ\s+fail\s+(?!0\b)(?:\d+|#)\b|test result:\s+FAILED\b)/;
 const ERROR_ANCHOR_RE = /^\s*(?:Error|[A-Za-z_$][\w$]*Error):\s+\S/;
 const TSC_ERROR_RE = /^\s*\S.*\((?:\d+|#),(?:\d+|#)\):\s+error\s+[A-Z]+(?:\d+|#):/i; // tsc
 const LINTER_ERROR_RE = /^\s*(?:\d+|#):(?:\d+|#)\s+error\s+\S/; // eslint stylish
@@ -176,9 +178,8 @@ const stripTurboPrefix = (l: string): string | undefined => {
 // Lines that NAME a failing test — the ones worth headlining to the operator. One list, so recognition
 // and reporting cannot drift apart (a shape that blocks but never gets named cost 3 attempts once).
 const namesFailure = (l: string) => FAIL_ANCHOR_RE.test(l) || RUNNER_FAIL_RE.test(l) || TRAILING_FAIL_RE.test(l) || GLYPH_FAIL_RE.test(l) || TURBO_FAIL_RE.test(l);
-// The stripped form is a second READ of the same line, for the recognition/headline paths that ask
-// "does anything here name a failure" — verdict classification (isInfraLine/namesRegression) keeps
-// reading the raw line only, so infra/regression verdicts are byte-unchanged by the prefix pass.
+// The stripped form lets recognition and headlines read the runner beneath a turbo prefix.
+// Classification applies the same prefix stripping before its infra/regression vetoes.
 const namesFailureEitherForm = (l: string): boolean => {
   if (namesFailure(l)) return true;
   const stripped = stripTurboPrefix(l);
@@ -241,8 +242,12 @@ export function classifyFailureOutput(output: string): FailureClassification | u
   // token inside a test's echoed stdout/stderr block must be as invisible to this classifier as it is
   // to fingerprint(): test-owned output is never runner evidence about the work.
   const lines = withoutVitestEchoBlocks(output).map((l) => l.replace(ANSI_RE, "")).filter((l) => !PASS_LINE_RE.test(l) && !OPERATOR_LINE_RE.test(l));
-  if (lines.some(namesRegression)) return "regression";
-  return lines.some(isInfraLine) ? "infra" : undefined;
+  const evidence = lines.map((line) => stripTurboPrefix(line) ?? line).filter((line) => !PASS_LINE_RE.test(line) && !OPERATOR_LINE_RE.test(line));
+  const infra = evidence.some(isInfraLine);
+  // A diagnostic section heading names no failing test. It cannot outvote the RPC death
+  // beneath it, but an actual FAIL/AssertionError anywhere still takes precedence.
+  if (evidence.some((line) => !(infra && UNHANDLED_HEADER_RE.test(line)) && namesRegression(line))) return "regression";
+  return infra ? "infra" : undefined;
 }
 
 /**
@@ -418,6 +423,7 @@ export function detectGateCommands(repoRoot: string, cfg: TickmarkrConfig): Reco
     if (cfg.gates[name]) out[name] = cfg.gates[name]!;
     else if (scripts[name]) out[name] = `${runPrefix} ${name}`;
   }
+  if (cfg.gates.tipTest) out.tipTest = cfg.gates.tipTest;
   return out;
 }
 
@@ -542,6 +548,7 @@ const invalidCaptureEntry = (
   fingerprints: [],
   durationMs,
   fileDurationSumMs: null,
+  fileCount: null,
   impliedParallelism: null,
   longestFile: null,
   ceilingMs: effectiveCeilingMs({ durationMs }),
@@ -551,11 +558,16 @@ const invalidCaptureEntry = (
 export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   for (const [name, cmd] of Object.entries(commands)) {
+    if (name === "tipTest" && commands.test !== undefined && cmd === commands.test) {
+      continue;
+    }
     const r = await sh(cmd, cwd, CAPTURE_CEILING_MS);
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
     // ponytail: a capture that was itself killed records the ceiling as its "measurement", which
     // scales the next ceiling up — the right direction for a suite that never finished once.
     const durationMs = r.durationMs ?? 0;
+    const combinedOutput = r.stdout + "\n" + r.stderr;
+    const raw = combinedOutput.split(cwd).join("");
     // OBS-534 (T2): a capture SIGKILLed at its ceiling never returned a verdict, so `r.code` is the
     // kill and not evidence about the command. Run 1501 recorded `test: {durationMs: 600007,
     // exitCode: 1}` for exactly this — a kill written down as a red baseline. There the accident
@@ -576,11 +588,9 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `it recorded NO fingerprints, so nothing is forgiven and every gate will treat a pre-existing `
         + `failure as a fresh one. Raise the ceiling or shorten the command.`,
       );
-      base.commands[name] = invalidCaptureEntry(durationMs, "ceiling-kill");
+      base.commands[name] = { ...invalidCaptureEntry(durationMs, "ceiling-kill"), fileCount: runnerFileCount(raw) };
       continue;
     }
-    const combinedOutput = r.stdout + "\n" + r.stderr;
-    const raw = combinedOutput.split(cwd).join("");
     // Run 2137: the child exited and printed ordinary FAIL/AssertionError lines, so the gate-side
     // discriminator correctly called the mixed output a regression. But the same output also said
     // `spawn EAGAIN`: the machine had run out of processes while the pristine-tree measurement was
@@ -594,15 +604,15 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `the measurement cannot distinguish a pre-existing failure from one caused by exhaustion. `
         + `First invalidating line: ${invalidatingLines[0]}`,
       );
-      base.commands[name] = invalidCaptureEntry(durationMs, "resource-exhaustion", invalidatingLines);
+      base.commands[name] = { ...invalidCaptureEntry(durationMs, "resource-exhaustion", invalidatingLines), fileCount: runnerFileCount(raw) };
       continue;
     }
-    // OBS-885/887: capture and gate ask the same classifier. A green summary followed only by the
-    // teardown fingerprint is a pass; infrastructure without a summary is no verdict to forgive.
+    // OBS-966: a worker RPC timeout is infra even beside an all-green summary.
+    // Capture and both gate readers share this discriminator; genuine test failures still dominate.
     const runnerVerdict = classifyRunnerOutput(raw, r.code);
     if (runnerVerdict === "infra") {
-      console.error(`tickmarkr: baseline capture for "${name}" carries runner-infrastructure evidence and no green summary — it recorded NO verdict; nothing is forgiven for this command`);
-      base.commands[name] = invalidCaptureEntry(durationMs, "infra");
+      console.error(`tickmarkr: baseline capture for "${name}" carries runner-infrastructure evidence — it recorded NO verdict; nothing is forgiven for this command`);
+      base.commands[name] = { ...invalidCaptureEntry(durationMs, "infra", withoutVitestEchoBlocks(combinedOutput).filter((line) => isInfraLine(line.replace(ANSI_RE, "")))), fileCount: runnerFileCount(raw) };
       continue;
     }
     base.commands[name] = {
@@ -614,13 +624,14 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
       missingCommand: missingConfiguredCommand(cmd, r),
       durationMs,
       ...fileTiming(raw, durationMs),
+      fileCount: runnerFileCount(raw),
       ceilingMs: effectiveCeilingMs({ durationMs }),
       // T7: the world this measurement was taken in, so a later reader can ask whether its own world
       // is the same one. Recorded from THIS command's own shell result, never re-derived here.
       ...(r.capacity ? { capacity: r.capacity } : {}),
     };
   }
-  const names = Object.keys(commands);
+  const names = Object.keys(commands).filter((name) => !(name === "tipTest" && commands.test !== undefined && commands[name] === commands.test));
   const missing = names.filter((name) => base.commands[name]?.missingCommand === true);
   if (names.length > 0 && missing.length === names.length) {
     base.warnings = [{
@@ -690,7 +701,7 @@ export async function compareToBaseline(
   commands: Record<string, string>,
   baseline: Baseline,
   enabled: string[],
-  opts: { rerunOf?: HostStarvedRerun } = {},
+  opts: { rerunOf?: HostStarvedRerun; infraRerun?: HostStarvedRerun } = {},
 ): Promise<GateResult[]> {
   const results: GateResult[] = [];
   const rerunOf = opts.rerunOf;
@@ -720,10 +731,15 @@ export async function compareToBaseline(
       const withReapError = r.reapError ? { ...withReap, meta: { ...withReap.meta, reapError: r.reapError } } : withReap;
       const withRerun = rerunOf ? {
         ...withReapError,
-        details: `host-starved rerun after waiting ${rerunOf.waitedMs}ms for a calm load window: ${withReapError.details}`,
+        details: `${g.meta?.classification === "infra" ? "infra; " : ""}host-starved rerun after waiting ${rerunOf.waitedMs}ms for a calm load window: ${withReapError.details.replace(/^infra; /, "")}`,
         meta: { ...withReapError.meta, hostStarvedRerun: rerunOf },
       } : withReapError;
-      results.push(r.capacity ? { ...withRerun, capacity: r.capacity } : withRerun);
+      const final = opts.infraRerun ? {
+        ...withRerun,
+        details: `${g.meta?.classification === "infra" ? "infra; " : ""}runner-infra rerun after waiting ${opts.infraRerun.waitedMs}ms for a calm load window: ${withRerun.details.replace(/^infra; /, "")}`,
+        meta: { ...withRerun.meta, runnerInfraRerun: opts.infraRerun },
+      } : withRerun;
+      results.push(r.capacity ? { ...final, capacity: r.capacity } : final);
     };
     // …and whether the entry that would forgive this command was measured in the same world. A
     // baseline captured under a different fork cap forgives nothing: its fingerprints describe a
@@ -752,11 +768,16 @@ export async function compareToBaseline(
       });
       continue;
     }
+    const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
+    const deficit = fileCountDeficit(entry, raw);
+    if (deficit) {
+      record({ gate: name, pass: false, details: deficit, meta: { classification: "infra", infra: true } });
+      continue;
+    }
     if (r.code === 0) {
       record({ gate: name, pass: true, details: "exit 0" });
       continue;
     }
-    const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
     // OBS-885/887: the same classifier the capture applied names a completed green suite on both sides.
     const runnerVerdict = classifyRunnerOutput(raw, r.code);
     if (runnerVerdict === "green-teardown") {
@@ -776,12 +797,16 @@ export async function compareToBaseline(
     // that known assertion outvote the fresh birpc line turns machine failure into a worker defect.
     // `classifyRunnerOutput` remains the single discriminator. When there is no fresh fingerprint,
     // retain the whole-output read so a repeated infra abort can never be baseline-forgiven as green.
-    const freshVerdict = failing.length ? classifyRunnerOutput(failing.join("\n"), r.code) : undefined;
-    const freshClassification = freshVerdict === "infra" || freshVerdict === "regression" ? freshVerdict : undefined;
-    const classification = freshClassification ?? (!failing.length && (runnerVerdict === "infra" || runnerVerdict === "regression") ? runnerVerdict : undefined);
+    const classification = classifyFreshRunnerOutput(entry, raw, r.code);
+    if (name === "test" && classification === "infra" && !rerunOf && !opts.infraRerun) {
+      const waitedMs = await waitForCalmWindow();
+      const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
+      results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { infraRerun: provenance }));
+      continue;
+    }
     // OBS-896: every fresh failure must be timeout-class, and the suite must take at least twice its
     // own baseline measurement. The first read buys one calm rerun here, never a worker repair.
-    if (name === "test" && classification !== "infra" && failing.length && !rerunOf
+    if (name === "test" && classification !== "infra" && failing.length && !rerunOf && !opts.infraRerun
       && hostStarved(failing.join("\n"), r.durationMs ?? 0, entry?.durationMs)) {
       const waitedMs = await waitForCalmWindow();
       const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
@@ -795,7 +820,7 @@ export async function compareToBaseline(
       record({
         gate: name,
         pass: false,
-        details: `exit ${r.code}; the fresh failures carry infrastructure evidence alone — the runner never completed a suite, so this gate verified nothing:\n${evidence}`,
+        details: `infra; exit ${r.code}; the fresh failures carry infrastructure evidence alone — the runner never completed a suite, so this gate verified nothing:\n${evidence}`,
         meta: { classification, infra: true },
       });
       continue;
@@ -806,7 +831,9 @@ export async function compareToBaseline(
     // entries with no exitCode keep the `?? 1` red default both readers share (merge.ts:131).
     const baselineRed = entry?.infra !== true && (entry?.exitCode ?? 1) !== 0;
     if (!failing.length && !baselineRed) {
-      const recordedCause = entry?.invalidCause === "resource-exhaustion" || entry?.invalidatingLines?.length
+      const recordedCause = entry?.invalidCause === "infra"
+        ? "was invalidated by its recorded runner-infrastructure cause"
+        : entry?.invalidCause === "resource-exhaustion" || entry?.invalidatingLines?.length
         ? `was invalidated by its recorded process/resource-exhaustion cause${entry.invalidatingLines?.[0] ? ` (${entry.invalidatingLines[0]})` : ""}`
         : "was killed at its ceiling";
       const closed = entry?.infra === true
@@ -857,7 +884,7 @@ export async function compareToBaseline(
 
 export interface HostStarvedRerun { durationMs: number; referenceMs: number; waitedMs: number }
 const SUMMARY_LINE_RE = /^[^\S\n]*Test Files[^\S\n]+(.+)$/m;
-const TEARDOWN_RE = /\[vitest-worker\]: Timeout calling\b|\[birpc\] rpc is closed, cannot call\b/;
+const TEARDOWN_RE = /\[birpc\] rpc is closed, cannot call\b/;
 const UNHANDLED_HEADER_RE = /^\s*[^\w]*(?:Unhandled Errors|Uncaught Exception)\b/;
 export type RunnerVerdict = FailureClassification | "green-teardown" | undefined;
 
@@ -866,6 +893,7 @@ export function classifyRunnerOutput(raw: string, code: number): RunnerVerdict {
   if (code === 0) return undefined;
   const lines = withoutVitestEchoBlocks(raw).map((l) => l.replace(ANSI_RE, ""));
   const text = lines.join("\n");
+  if (lines.some((line) => /\[vitest-worker\]: Timeout calling\b/.test(line) && !PASS_LINE_RE.test(line) && !OPERATOR_LINE_RE.test(line))) return classifyFailureOutput(text);
   const summary = SUMMARY_LINE_RE.exec(text);
   if (summary) {
     const failed = [...summary[1]!.matchAll(/\b(\d+)\s+failed\b/g)].map((match) => Number(match[1]));
@@ -895,14 +923,44 @@ export function hostStarved(fresh: string, durationMs: number, referenceMs: numb
 }
 
 interface CalmWindow { pollMs: number; maxWaitMs: number; loadProvider: () => number; calmLoad: () => number }
-const DEFAULT_CALM: CalmWindow = { pollMs: 5_000, maxWaitMs: 600_000, loadProvider: () => loadavg()[0] ?? 0, calmLoad: () => availableParallelism() / 2 };
+const DEFAULT_CALM: CalmWindow = {
+  pollMs: process.env.VITEST ? 10 : 5_000,
+  maxWaitMs: process.env.VITEST ? 50 : 600_000,
+  loadProvider: () => loadavg()[0] ?? 0,
+  calmLoad: () => availableParallelism() / 2,
+};
 let calm: CalmWindow = DEFAULT_CALM;
 export function setCalmWindowForTests(over: Partial<CalmWindow>): void { calm = { ...calm, ...over }; }
 export function resetCalmWindowForTests(): void { calm = DEFAULT_CALM; }
-async function waitForCalmWindow(): Promise<number> {
+export async function waitForCalmWindow(): Promise<number> {
   const started = Date.now();
   while (calm.loadProvider() > calm.calmLoad() && Date.now() - started < calm.maxWaitMs) {
     await new Promise((resolve) => setTimeout(resolve, calm.pollMs));
   }
   return Date.now() - started;
+}
+
+/** Summary totals survive digit-normalized fingerprints and exclude test-owned echoed output. */
+export function runnerFileCount(raw: string): number | null {
+  const counts = withoutVitestEchoBlocks(raw).flatMap((line) => {
+    const clean = line.replace(ANSI_RE, "");
+    const match = /^\s*Test Files\s+.*\((\d+)\)\s*$/.exec(stripTurboPrefix(clean) ?? clean);
+    return match ? [Number(match[1])] : [];
+  });
+  return counts.length ? counts.reduce((sum, count) => sum + count, 0) : null;
+}
+
+export function fileCountDeficit(entry: BaselineCommand | undefined, raw: string): string | undefined {
+  const actual = runnerFileCount(raw);
+  return entry?.fileCount != null && actual !== null && actual < entry.fileCount
+    ? `infra; runner reported ${actual} test files, below baseline ${entry.fileCount} — suite incomplete`
+    : undefined;
+}
+
+/** Both readers classify fresh evidence first, retaining the whole-output guard against infra forgiveness. */
+export function classifyFreshRunnerOutput(entry: BaselineCommand | undefined, raw: string, code: number): FailureClassification | undefined {
+  if (classifyRunnerOutput(raw, code) === "green-teardown") return undefined;
+  const { failing } = freshFailures(entry, raw);
+  const verdict = classifyRunnerOutput(failing.length ? failing.join("\n") : raw, code);
+  return verdict === "infra" || verdict === "regression" ? verdict : undefined;
 }

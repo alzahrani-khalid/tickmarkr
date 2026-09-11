@@ -1,12 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { AuthHealth, BillingChannel, WorkerAdapter } from "../../src/adapters/types.js";
-import type { TickmarkrConfig } from "../../src/config/config.js";
+import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../src/config/config.js";
+import { detectGateCommands } from "../../src/gates/baseline.js";
 import { runDaemon } from "../../src/run/daemon.js";
-import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { verifyIntegrationTip } from "../../src/run/merge.js";
 import { driverEvidence, pickDriver } from "../../src/drivers/index.js";
 import { OrcaDriver } from "../../src/drivers/orca.js";
 import { environmentComparable, recordedEnvironment } from "../../src/report/compare.js";
@@ -50,6 +51,94 @@ describe("run-start environment identity (fake adapter, zero tokens)", () => {
     expect(hashB).toBe(hashA); // deterministic: same loaded config, same hash
     expect(hashRouting).not.toBe(hashA); // a routing setting change rehashes
     expect(hashGate).not.toBe(hashA); // a gate setting change rehashes
+  });
+  test("test: a config declaring a tip test command loads it beside the task test command and the run-start row records both with a config hash that changes when the tip command changes, while a config without it resolves the tip command to the task command and records one, so a tip verify running a command the run-start row does not name fails", async () => {
+    const a = setupRepo([T("T1")], oneTask("T1"), "gates:\n  test: npm run test:task\n  tipTest: npm run test:tip\n");
+    const cfgA = loadConfig(a.repo);
+    expect(cfgA.gates.test).toBe("npm run test:task");
+    expect(cfgA.gates.tipTest).toBe("npm run test:tip");
+
+    await runDaemon(a.repo, { adapters: [a.fake], runId: "run-tip-start-a" });
+    const jA = Journal.open(a.repo, "run-tip-start-a").read();
+    const startA = jA.find((e) => e.event === "run-start")!;
+    expect(startA.data.commands).toMatchObject({
+      test: "npm run test:task",
+      tipTest: "npm run test:tip",
+    });
+    const hashA = (startA.data.environment as RunEnvironment).configHash;
+
+    const b = setupRepo([T("T1")], oneTask("T1"), "gates:\n  test: npm run test:task\n  tipTest: npm run test:tip-other\n");
+    await runDaemon(b.repo, { adapters: [b.fake], runId: "run-tip-start-b" });
+    const jB = Journal.open(b.repo, "run-tip-start-b").read();
+    const startB = jB.find((e) => e.event === "run-start")!;
+    const hashB = (startB.data.environment as RunEnvironment).configHash;
+    expect(hashB).not.toBe(hashA);
+
+    const c = setupRepo([T("T1")], oneTask("T1"), "gates:\n  test: npm run test:task\n");
+    const cfgC = loadConfig(c.repo);
+    expect(cfgC.gates.tipTest).toBeUndefined();
+    const detectedC = detectGateCommands(c.repo, cfgC);
+    expect(detectedC.test).toBe("npm run test:task");
+    expect(detectedC.tipTest).toBeUndefined();
+    await runDaemon(c.repo, { adapters: [c.fake], runId: "run-tip-start-c" });
+    const jC = Journal.open(c.repo, "run-tip-start-c").read();
+    const startC = jC.find((e) => e.event === "run-start")!;
+    expect(startC.data.commands.test).toBe("npm run test:task");
+    expect(startC.data.commands.tipTest).toBeUndefined();
+
+    const runDirC = join(c.repo, ".tickmarkr", "runs", "run-tip-start-c");
+    const wt = makeTestTempDir("tickmarkr-unnamed-cmd-");
+    const results = await verifyIntegrationTip(wt, { test: "npm run unrecorded-tip-cmd" }, runDirC);
+    expect(results[0]!.pass).toBe(false);
+    expect(results[0]!.details).toContain("was not named in run-start row");
+
+    // Task-command substitution fails: when run-start recorded tipTest, verifying the task command fails
+    const runDirTaskSubst = makeTestTempDir("tickmarkr-subst-journal-");
+    writeFileSync(
+      join(runDirTaskSubst, "journal.jsonl"),
+      JSON.stringify({ event: "run-start", data: { commands: { test: "true", tipTest: "false" } } }) + "\n",
+    );
+    const substResults = await verifyIntegrationTip(wt, { test: "true" }, runDirTaskSubst);
+    expect(substResults[0]!.pass).toBe(false);
+    expect(substResults[0]!.details).toContain("was not named in run-start row");
+
+    // Malformed row preceding run-start: recovers valid rows and still requires recorded command
+    const runDirMalformed = makeTestTempDir("tickmarkr-malformed-journal-");
+    writeFileSync(
+      join(runDirMalformed, "journal.jsonl"),
+      '{"malformed row\n' +
+      JSON.stringify({ event: "run-start", data: { commands: { test: "false" } } }) + "\n",
+    );
+    const malformedResults = await verifyIntegrationTip(wt, { test: "true" }, runDirMalformed);
+    expect(malformedResults[0]!.pass).toBe(false);
+    expect(malformedResults[0]!.details).toContain("was not named in run-start row");
+
+    // Missing run-start evidence: journal exists but contains no run-start event
+    const runDirMissing = makeTestTempDir("tickmarkr-missing-start-");
+    writeFileSync(
+      join(runDirMissing, "journal.jsonl"),
+      JSON.stringify({ event: "baseline-start", data: {} }) + "\n",
+    );
+    const missingResults = await verifyIntegrationTip(wt, { test: "true" }, runDirMissing);
+    expect(missingResults[0]!.pass).toBe(false);
+    expect(missingResults[0]!.details).toContain("could not establish command provenance");
+
+    // Malformed-only journal: provenance cannot be established
+    const runDirOnlyMalformed = makeTestTempDir("tickmarkr-only-malformed-");
+    writeFileSync(
+      join(runDirOnlyMalformed, "journal.jsonl"),
+      '{"malformed row only\n',
+    );
+    const onlyMalformedResults = await verifyIntegrationTip(wt, { test: "true" }, runDirOnlyMalformed);
+    expect(onlyMalformedResults[0]!.pass).toBe(false);
+    expect(onlyMalformedResults[0]!.details).toContain("could not establish command provenance");
+
+    // Empty journal: provenance cannot be established
+    const runDirEmpty = makeTestTempDir("tickmarkr-empty-journal-");
+    writeFileSync(join(runDirEmpty, "journal.jsonl"), "");
+    const emptyResults = await verifyIntegrationTip(wt, { test: "true" }, runDirEmpty);
+    expect(emptyResults[0]!.pass).toBe(false);
+    expect(emptyResults[0]!.details).toContain("could not establish command provenance");
   });
 
   test("test: the run-start event records the installed CLI version for every adapter with an authed channel in the run, probed the same way doctor already probes adapter versions", async () => {

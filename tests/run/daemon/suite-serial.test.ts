@@ -1,11 +1,17 @@
+import * as os from "node:os";
 import { tmpdir } from "node:os";
-import { realpathSync } from "node:fs";
-import { expect, test } from "vitest";
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import { expect, test, vi } from "vitest";
 import { codex } from "../../../src/adapters/codex.js";
 import { countLiveSuites, resetLiveSuiteCountForTests, resetSuiteWaitCeilingForTests, runDaemon, setLiveSuiteCountForTests, setSuiteWaitCeilingForTests, SUITE_POLL_MS } from "../../../src/run/daemon.js";
-import { SUITE_PARENT_ENV } from "../../../src/run/git.js";
+import { FORK_CAP_ENV, SUITE_PARENT_ENV } from "../../../src/run/git.js";
 import { Journal } from "../../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+
+vi.mock("node:os", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:os")>(),
+}));
 
 test("test: a full-suite verdict round waits while another suite is live under the run's worktrees or the repo root counting a vitest child by parentage through TICKMARKR_SUITE_PARENT as well as by cwd and journals suite-wait with the count whereas a daemon that starts the round beside a live suite or counts only suite mains fails", async () => {
   const { repo, fake } = setupRepo(
@@ -98,3 +104,47 @@ test("test: a live-suite census that never reaches zero releases the verdict rou
   expect(ceiling[0]!.data.count).toBe(1);
   expect(typeof ceiling[0]!.data.waitedMs).toBe("number");
 }, 30_000);
+
+
+test("test: a verdict round released at the suite-wait ceiling while the census still counts a foreign suite runs under the conservative budget with a suite-budget row naming the count and both caps, while a round entering on an empty census runs under the occupancy budget and journals no such row, so a ceiling release that grants the occupancy budget beside a foreign suite fails", async () => {
+  const priorCap = process.env[FORK_CAP_ENV];
+  delete process.env[FORK_CAP_ENV];
+  const cores = vi.spyOn(os, "availableParallelism").mockReturnValue(18);
+  setSuiteWaitCeilingForTests(0);
+  try {
+    for (const census of [[1, 1, 1], [0, 0, 0], [0, 1, 0]]) {
+      const samples = [...census];
+      setLiveSuiteCountForTests(async () => samples.shift() ?? 0);
+      const caps = census.map((count) => count ? 3 : 6);
+      const gate = census.every((count) => count === census[0])
+        ? `test "$VITEST_MAX_FORKS" = "${caps[0]}"`
+        : 'case "$VITEST_MAX_FORKS" in 3|6) true;; *) false;; esac';
+      const { repo, fake } = setupRepo(
+        [T("T1")],
+        { tasks: { T1: [{ shell: `echo suite > suite.txt && ${COMMIT} suite`, result: { ok: true, summary: "suite" } }] } },
+        `concurrency: 2\ngates: { test: '${gate}' }\n`,
+      );
+      const runId = `run-suite-budget-${census.join("")}`;
+      const summary = await runDaemon(repo, { adapters: [fake], runId });
+      expect(summary.done).toEqual(["T1"]);
+      const journal = Journal.open(repo, runId);
+      const rows = journal.read();
+      const budgets = rows.filter((e) => e.event === "suite-budget");
+      expect(budgets).toHaveLength(census.filter(Boolean).length); // baseline, task battery, tip
+      for (const row of budgets) expect(row.data).toEqual({ count: 1, occupancyCap: 6, conservativeCap: 3 });
+      const baseline = JSON.parse(readFileSync(join(journal.dir, "baseline.json"), "utf8"));
+      expect(baseline.commands.test.capacity).toEqual({ forkCap: caps[0], cores: 18 });
+      const verdicts = rows.filter((e) => ["gate-result", "tip-verify"].includes(e.event) && e.data.gate === "test");
+      expect(verdicts).toHaveLength(2);
+      for (const [i, row] of verdicts.entries()) {
+        expect(row.data).toMatchObject({ pass: true, capacity: { forkCap: caps[i + 1], cores: 18 } });
+      }
+    }
+  } finally {
+    if (priorCap === undefined) delete process.env[FORK_CAP_ENV];
+    else process.env[FORK_CAP_ENV] = priorCap;
+    cores.mockRestore();
+    resetLiveSuiteCountForTests();
+    resetSuiteWaitCeilingForTests();
+  }
+}, 60_000);
