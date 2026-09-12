@@ -176,7 +176,7 @@ interface RailSpec {
 
 /** The closed salient vocabulary — the fields the raw formatter's one-detail ladder cannot reach,
  *  written out here so a field quietly dropped from the shipped projection loses its fixture too. */
-const SALIENT_KEYS = ["conflict", "gates", "channel", "status", "cause", "silentMs", "tokens", "lost", "transcript"] as const;
+const SALIENT_KEYS = ["conflict", "gates", "channel", "pane", "status", "cause", "silentMs", "tokens", "lost", "transcript"] as const;
 
 const RAIL_SPEC: RailSpec[] = [
   // run lifecycle
@@ -185,8 +185,15 @@ const RAIL_SPEC: RailSpec[] = [
   // the operator's audited `--graph-changed` release (src/run/daemon.ts): the resumed run appends it
   // through the SAME journal this sink narrates, so it reaches the rail like any other lifecycle row.
   { event: "graph-rehash", label: "graph rehashed", tone: "attention", salient: "to 5f5f5f5f5f5f", run: true, data: { from: "a1a1a1a1a1a1a1a1", to: "5f5f5f5f5f5f5f5f" } },
+  { event: "tier-escalated", label: "tier climbed", tone: "attention", data: { from: "fake:mid", to: "fake:frontier", cause: "gate-fingerprint-cap", gate: "test", fingerprint: "expected true", attempt: 2, poolBefore: ["fake:frontier"], costDelta: 0 } },
+  { event: "restore-rerouted", label: "restore rerouted", tone: "attention", data: { from: "fake:mid", to: "fake:frontier", reason: "pin changed" } },
   { event: "resume-restore", label: "restored", tone: "neutral", data: { attempts: 2, tried: ["claude-code:sonnet"], assignment: { adapter: "codex", model: "gpt-5.6-sol" } } },
   { event: "lock-reclaimed", label: "lock reclaimed", tone: "neutral", run: true, data: { pid: 4321, mtimeMs: 1787294382459 } },
+  // WB-1 (OBS-988): the daemon's own cockpit died (src/run/daemon.ts) and the reopen that followed
+  { event: "watch-board-lost", label: "board lost", tone: "attention", salient: "pane wZ:p1EB", run: true, data: { pane: "wZ:p1EB", pid: 2428, beatAgeMs: 61000 } },
+  { event: "watch-board-reopened", label: "board reopened", tone: "pass", salient: "pane wZ:p1F1", run: true, data: { pane: "wZ:p1F1", attempt: 1 } },
+  // Leg-2 T7 M2: a reopen that failed is its own row — the loss above is journaled once, not once per poll
+  { event: "watch-board-reopen-failed", label: "board reopen failed", tone: "fail", salient: "pane wZ:p1EB", run: true, data: { pane: "wZ:p1EB", attempt: 2, error: "no caller pane" } },
   { event: "run-end", label: "finished", tone: "neutral", renders: "pass", run: true, data: { runId: "run-rail", done: ["T1"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed" } },
   { event: "tip-verify", label: "tip verify", tone: "pass", run: true, data: { gate: "test" } },
   { event: "tip-verify-failed", label: "tip verify", tone: "fail", run: true, data: { gate: "test", lastMergedTask: "T1" } },
@@ -409,6 +416,33 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     if (process.env.UPDATE_BRAND_GOLDEN === "1") {
       writeFileSync(join(import.meta.dirname, "../fixtures/brand-surfaces/run-narration.txt"), regenerated);
     }
+    expect(regenerated).toBe(golden("run-narration.txt"));
+  });
+
+  test("test: tier-escalated and restore-rerouted each render one labelled narrator row with a non-empty label and the run narration golden regenerated for them is byte-identical to the shipped fixture, so a journal row the narrator cannot label fails", () => {
+    onTTY();
+    for (const event of ["tier-escalated", "restore-rerouted"]) {
+      const spec = RAIL_SPEC.find((spec) => spec.event === event)!;
+      const row = narrationLine(specEvent(spec))!;
+      expect(RAIL_ROWS[event]!.label.trim()).not.toBe("");
+      expect(row.split("\n")).toHaveLength(1);
+      expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
+    }
+    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    expect(regenerated).toBe(golden("run-narration.txt"));
+  });
+
+  test("test: watch-board-lost and watch-board-reopened each render one labelled narrator row with a non-empty label and the run narration golden regenerated for them is byte-identical to the shipped fixture, so a journal row the narrator cannot label fails", () => {
+    onTTY();
+    for (const event of ["watch-board-lost", "watch-board-reopened"]) {
+      const spec = RAIL_SPEC.find((spec) => spec.event === event)!;
+      const row = narrationLine(specEvent(spec))!;
+      expect(RAIL_ROWS[event]!.label.trim()).not.toBe("");
+      expect(row.split("\n")).toHaveLength(1);
+      expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
+      expect(stripAnsi(row)).toContain(spec.salient!);
+    }
+    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     expect(regenerated).toBe(golden("run-narration.txt"));
   });
 

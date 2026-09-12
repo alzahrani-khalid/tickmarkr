@@ -11,7 +11,7 @@ import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
 import { disallowedBy } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
-import { pickReviewer, reviewGate } from "./review.js";
+import { gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
 import type { GateResult } from "./types.js";
 import { shGit } from "../run/git.js";
@@ -160,6 +160,7 @@ export interface GateContext {
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
   demotedReviewers?: Set<string>;
   reviewHistory?: string[]; // run-scoped LRU reviewer rotation; mutated synchronously when a seat is reserved
+  priorReviewers?: PriorReviewer[]; // RF-1: seats THIS task's earlier review rows name, with their journaled dispatch tier — the floor a later round holds
   artifactDir?: string; // OBS-196: run dir for raw reviewer-output persistence on unparseable verdicts
   // T4 (OBS-265): "v185" runs the pipeline mechanics this milestone buys — the cheap git checks as a
   // pre-battery screen, a battery that stops at its first red, and judge ‖ review. The daemon always
@@ -698,7 +699,11 @@ export async function runGates(
       }
       return rv;
     };
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings));
+    // RF-1: THIS task's prior reviewers — earlier rounds' seats plus the seats that produced garbage for
+    // it (excludeReviewers names only dispatched seats). Kept apart from the eligibility exclusions the
+    // retry below adds for a flaked seat's whole adapter: those sibling channels never reviewed.
+    const priorReviewers = [...(ctx.priorReviewers ?? []), ...(ctx.excludeReviewers ?? [])];
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers));
     // OBS-193/574: an unparseable review verdict retries the REVIEW exactly once, preferring a
     // different adapter. Only a single-adapter eligible pool may fall back to another channel on the
     // flaked adapter. The flaked verdict never enters results; an exhausted pool preserves its cause.
@@ -718,15 +723,19 @@ export async function runGates(
       const priorExclusions = ctx.excludeReviewers ?? [];
       const flakedAdapter = flaked.slice(0, flaked.indexOf(":"));
       const adapterExclusions = ctx.channels.filter((c) => c.adapter === flakedAdapter).map(channelKey);
+      // RF-1: the retry filters by the floor reviewGate resolves — author tier, task floor, review.floor
+      // and the prior reviewers' tiers, the flaked seat's own included, so a retry never drops a tier.
+      const retryPrior = [...priorReviewers, flaked];
+      const retryFloor = gateReviewerFloor(task, ctx.cfg, ctx.author, ctx.channels, retryPrior).floor;
       const crossAdapter = pickReviewer(
         ctx.author, ctx.channels, [...priorExclusions, ...adapterExclusions],
-        ctx.cfg.review.prefer ?? [], task.routingHints?.floor,
+        ctx.cfg.review.prefer ?? [], retryFloor,
       );
       const exclusion = crossAdapter ? "adapter" : "channel";
       const retryExclusions = [...priorExclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, retryExclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings,
+        retryVia, retryExclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
@@ -740,10 +749,11 @@ export async function runGates(
           details: `review re-route (${route}): ${flaked} produced ${emptyOutput ? "EMPTY output" : "no parseable verdict"}; replaced by ${retried}\n${second.details}`,
           meta: { ...second.meta, reviewRetry: { flaked, retried, exclusion } },
         };
-      } else if (task.routingHints?.floor) {
-        // Preserve the original no-answer cause when no replacement exists, but name the declared
-        // floor that correctly refused a lower-tier fallback.
-        rv = { ...rv, details: `${rv.details}\nreview re-route refused: ${second.details}` };
+      } else {
+        // Preserve the original no-answer cause when no replacement exists, but name the resolved
+        // floor that correctly refused a lower-tier fallback — in details AND in the row's meta.
+        const { reviewerFloor, reviewerFloorCause } = second.meta ?? {};
+        rv = { ...rv, details: `${rv.details}\nreview re-route refused: ${second.details}`, meta: { ...rv.meta, reviewerFloor, reviewerFloorCause } };
       }
     }
     return invocations.length ? { ...rv, meta: { ...rv.meta, invocations } } : rv;

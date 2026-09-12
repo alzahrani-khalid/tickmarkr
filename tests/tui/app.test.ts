@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { PassThrough } from "node:stream";
+import { ttyInput } from "../helpers/tty-input.js";
 import { render } from "ink";
 import { createElement, Fragment, type ReactElement, type ReactNode } from "react";
 import { ui } from "../../src/cli/commands/ui.js";
@@ -15,16 +16,7 @@ const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
 function makeInkStreams() {
   let raw = false;
-  const input = new PassThrough() as PassThrough & {
-    isTTY: boolean;
-    setRawMode: (mode: boolean) => void;
-    ref: () => NodeJS.ReadStream;
-    unref: () => NodeJS.ReadStream;
-  };
-  input.isTTY = true;
-  input.setRawMode = (mode) => { raw = mode; };
-  input.ref = () => input as unknown as NodeJS.ReadStream;
-  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const input = ttyInput({ onRawMode: mode => { raw = mode; } });
 
   const output = new PassThrough() as PassThrough & {
     isTTY: boolean;

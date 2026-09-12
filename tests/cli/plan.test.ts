@@ -13,6 +13,7 @@ import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../s
 import { Journal } from "../../src/run/journal.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { authedModels, makeRepo } from "../helpers/tmprepo.js";
+import { collateralHits } from "../../src/compile/collateral.js";
 
 const verifiedDefaultModels = (id: string) => authedModels(Object.keys(DEFAULT_CONFIG.tiers[id]?.models ?? {}));
 
@@ -1040,4 +1041,182 @@ test("test: plan does not advance the simulated review rotation for a pending ta
   expect(t3Line).toBeGreaterThan(-1);
   expect(out.split("\n")[t3Line + 2]).toContain("review: fake:fake-4 (seat 3 of 3) — reviewPolicy full");
   expect(out).not.toContain("review: fake:fake-2 (seat 1 of 3)");
+});
+
+describe("LN-1 climb telemetry and uncapped collateral lints (RULING-231-09, OBS-971)", () => {
+  test("test: plan over a state directory whose recent journals carry tier-escalated rows for shape implement from mid to frontier in two of three runs prints one advisory naming the shape both tiers the counts and the routing.floors.implement key while the config file's bytes are unchanged, and a state directory with no such row prints no advisory, so an advisory that omits a climbed shape or writes a floor fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    saveGraph(repo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 2, acceptance: ["a"] }],
+    }));
+    writeDoctor(repo, DOCTOR5);
+
+    const configPath = join(tickmarkrDir(repo), "config.yaml");
+    writeFileSync(configPath, "version: 1\n");
+    const beforeBytes = readFileSync(configPath);
+
+    // Seed 3 runs: 2 carry tier-escalated rows for shape implement from mid to frontier, 1 does not
+    const runsDir = join(tickmarkrDir(repo), "runs");
+    const runIds = [
+      "run-20260901-000000-0000000000000001",
+      "run-20260902-000000-0000000000000001",
+      "run-20260903-000000-0000000000000001",
+    ];
+
+    // run 1: climbed
+    const r1Dir = join(runsDir, runIds[0]);
+    mkdirSync(r1Dir, { recursive: true });
+    writeFileSync(
+      join(r1Dir, "journal.jsonl"),
+      JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", event: "run-start", data: {} }) + "\n"
+      + JSON.stringify({
+        ts: "2026-09-01T00:01:00.000Z", event: "tier-escalated", taskId: "T1",
+        data: { shape: "implement", fromTier: "mid", toTier: "frontier" },
+      }) + "\n",
+    );
+
+    // run 2: clean run, no tier-escalated
+    const r2Dir = join(runsDir, runIds[1]);
+    mkdirSync(r2Dir, { recursive: true });
+    writeFileSync(
+      join(r2Dir, "journal.jsonl"),
+      JSON.stringify({ ts: "2026-09-02T00:00:00.000Z", event: "run-start", data: {} }) + "\n",
+    );
+
+    // run 3: climbed
+    const r3Dir = join(runsDir, runIds[2]);
+    mkdirSync(r3Dir, { recursive: true });
+    writeFileSync(
+      join(r3Dir, "journal.jsonl"),
+      JSON.stringify({ ts: "2026-09-03T00:00:00.000Z", event: "run-start", data: {} }) + "\n"
+      + JSON.stringify({
+        ts: "2026-09-03T00:01:00.000Z", event: "tier-escalated", taskId: "T1",
+        data: { shape: "implement", fromTier: "mid", toTier: "frontier" },
+      }) + "\n",
+    );
+
+    const out = await plan([], repo);
+
+    // The advisory is printed under routing lints
+    expect(out).toContain("routing lints:");
+    // Naming the shape, both tiers, the counts (2 of 3 runs, weighted), and the routing.floors.implement key
+    expect(out).toContain("implement");
+    expect(out).toContain("mid");
+    expect(out).toContain("frontier");
+    expect(out).toContain("2 of 3");
+    expect(out).toContain("weighted");
+    expect(out).toContain("routing.floors.implement");
+    expect(out).toContain("consider routing.floors.implement: frontier");
+
+    // Config file bytes are unchanged (writes nothing, raises no floor)
+    const afterBytes = readFileSync(configPath);
+    expect(afterBytes).toEqual(beforeBytes);
+
+    // A state directory with no such row prints no advisory
+    const cleanRepo = makeRepo({ "keep.txt": "x\n" });
+    saveGraph(cleanRepo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 2, acceptance: ["a"] }],
+    }));
+    writeDoctor(cleanRepo, DOCTOR5);
+    const cleanRunsDir = join(tickmarkrDir(cleanRepo), "runs");
+    const cleanR1Dir = join(cleanRunsDir, "run-20260901-000000-0000000000000001");
+    mkdirSync(cleanR1Dir, { recursive: true });
+    writeFileSync(
+      join(cleanR1Dir, "journal.jsonl"),
+      JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", event: "run-start", data: {} }) + "\n",
+    );
+
+    const cleanOut = await plan([], cleanRepo);
+    expect(cleanOut).not.toContain("consider routing.floors.implement");
+    expect(cleanOut).not.toContain("climbed from mid to frontier");
+  });
+
+  test("test: plan over a prior run whose own graph.json gives T1 the shape test and whose journal carries the daemon's real tier-escalated row for T1 (taskId on the envelope, no shape) while the current graph gives T1 the shape implement prints a test advisory naming routing.floors.test and no implement advisory, so an advisory that attributes a prior run's climb to the current spec's shape fails (Leg-2 T5)", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    saveGraph(repo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 2, acceptance: ["a"] }],
+    }));
+    writeDoctor(repo, DOCTOR5);
+
+    const runsDir = join(tickmarkrDir(repo), "runs");
+    // prior run: its own snapshot says T1 was a test task, and it climbed
+    const r1Dir = join(runsDir, "run-20260901-000000-0000000000000001");
+    mkdirSync(r1Dir, { recursive: true });
+    writeFileSync(join(r1Dir, "graph.json"), JSON.stringify({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h0" },
+      tasks: [{ id: "T1", title: "old", goal: "g", shape: "test", complexity: 2, acceptance: ["a"] }],
+    }));
+    writeFileSync(
+      join(r1Dir, "journal.jsonl"),
+      JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", event: "run-start", data: {} }) + "\n"
+      + JSON.stringify({
+        ts: "2026-09-01T00:01:00.000Z", event: "tier-escalated", taskId: "T1",
+        data: { attempt: 1, cause: "gate", gate: "test", fingerprint: "f", from: "fake:m", to: "fake:f", fromTier: "mid", toTier: "frontier", poolBefore: [], costDelta: 1 },
+      }) + "\n",
+    );
+    // current run: clean, no snapshot needed
+    const r2Dir = join(runsDir, "run-20260902-000000-0000000000000001");
+    mkdirSync(r2Dir, { recursive: true });
+    writeFileSync(
+      join(r2Dir, "journal.jsonl"),
+      JSON.stringify({ ts: "2026-09-02T00:00:00.000Z", event: "run-start", data: {} }) + "\n",
+    );
+
+    const out = await plan([], repo);
+    expect(out).toContain("test: climbed from mid to frontier in 1 of 2 runs");
+    expect(out).toContain("consider routing.floors.test: frontier");
+    expect(out).not.toContain("implement: climbed");
+    expect(out).not.toContain("routing.floors.implement");
+  });
+
+  test("test: plan for a task with more predicted collateral paths than twenty prints every path with the direct importers of an owned source first and the total count, while the scope gate's own map for that task is unchanged, so a list that hides the twenty-first path fails", async () => {
+    // 10 direct importers (named with z- prefix so alphabetical sort would put them last)
+    const directFiles = Object.fromEntries(
+      Array.from({ length: 10 }, (_, i) => [
+        `tests/adapters/z-direct-${String(i).padStart(2, "0")}.test.ts`,
+        'import "../../src/adapters/codex.js";\n',
+      ]),
+    );
+    // 15 indirect mention files (named with a- prefix so alphabetical sort puts them first)
+    const indirectFiles = Object.fromEntries(
+      Array.from({ length: 15 }, (_, i) => [
+        `tests/adapters/a-mention-${String(i).padStart(2, "0")}.test.ts`,
+        '// mentions src/adapters/codex in a comment without importing it\n',
+      ]),
+    );
+    const repo = makeRepo({
+      "src/adapters/codex.ts": "export const codex = {};\n",
+      ...directFiles,
+      ...indirectFiles,
+      "tests/adapters/unrelated.test.ts": 'import "../../src/adapters/other.js";\n',
+    });
+    saveGraph(repo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T2", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], files: ["src/adapters/codex.ts"] }],
+    }));
+    writeDoctor(repo, DOCTOR5);
+
+    const gateMap = collateralHits([{ id: "T2", files: ["src/adapters/codex.ts"] }], repo).get("T2") ?? [];
+    // Scope gate's own map is unchanged: 25 total, sorted alphabetically (a-mention-00 is first)
+    expect(gateMap).toHaveLength(25);
+    expect(gateMap[0]).toBe("tests/adapters/a-mention-00.test.ts");
+
+    const out = await plan([], repo);
+    expect(out).toContain("scope lints:");
+    expect(out).toContain("25 total");
+
+    // All 25 paths are printed in plan output (including the 21st, 22nd, 23rd, 24th, 25th path)
+    for (const p of Object.keys(directFiles)) expect(out).toContain(p);
+    for (const p of Object.keys(indirectFiles)) expect(out).toContain(p);
+
+    // Direct importers of an owned source are printed FIRST, before indirect mention paths
+    const firstDirectIdx = out.indexOf("tests/adapters/z-direct-00.test.ts");
+    const firstIndirectIdx = out.indexOf("tests/adapters/a-mention-00.test.ts");
+    expect(firstDirectIdx).toBeGreaterThan(-1);
+    expect(firstIndirectIdx).toBeGreaterThan(-1);
+    expect(firstDirectIdx).toBeLessThan(firstIndirectIdx);
+  });
 });

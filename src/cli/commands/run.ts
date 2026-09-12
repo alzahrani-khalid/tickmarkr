@@ -13,6 +13,7 @@ import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js
 import { GLYPHS, LIVE } from "../../brand.js";
 import { cellWidth, fitCells } from "../../tui/cockpit/width.js";
 
+import { assertRefsWritable } from "../../run/git.js";
 // ── the operator event rail (v1.99 T2) ──────────────────────────────────────────────────────────
 // A run's TTY narration is an operator EVENT RAIL, not the journal dump it used to echo. The
 // repetitive worker-contact / worker-status polls and the ungated phase-start rows are the bulk of
@@ -71,10 +72,16 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   // run lifecycle
   "run-start": { label: "started", tone: "active" },
   "run-resume": { label: "resumed", tone: "active" },
+  "restore-rerouted": { label: "restore rerouted", tone: "attention" },
+  "tier-escalated": { label: "tier climbed", tone: "attention" },
   "resume-restore": { label: "restored", tone: "neutral" },
   // the operator's audited --graph-changed release: the resumed run journals it through this sink
   "graph-rehash": { label: "graph rehashed", tone: "attention" },
   "lock-reclaimed": { label: "lock reclaimed", tone: "neutral" },
+  // WB-1 (OBS-988): the daemon noticed its own cockpit die and what it did about it
+  "watch-board-lost": { label: "board lost", tone: "attention" },
+  "watch-board-reopened": { label: "board reopened", tone: "pass" },
+  "watch-board-reopen-failed": { label: "board reopen failed", tone: "fail" },
   "run-end": { label: "finished", tone: "neutral" },
   "tip-verify": { label: "tip verify", tone: "pass" },
   "tip-verify-failed": { label: "tip verify", tone: "fail" },
@@ -229,6 +236,8 @@ const RAIL_SALIENT: readonly { key: string; render: (value: unknown) => string |
   // both journal `gates: string[]` and neither states a scalar the ladder can pick up
   { key: "gates", render: (v) => (Array.isArray(v) && v.length > 0 ? `gates ${v.join(", ")}` : undefined) },
   { key: "channel", render: (v) => (typeof v === "string" ? `channel ${v}` : undefined) },
+  // the pane a board was lost on or reopened in — nothing on the ladder names it
+  { key: "pane", render: (v) => (typeof v === "string" ? `pane ${v}` : undefined) },
   { key: "status", render: (v) => (typeof v === "string" ? `status ${v}` : undefined) },
   { key: "cause", render: (v) => (typeof v === "string" ? `cause ${v}` : undefined) },
   { key: "silentMs", render: (v) => (typeof v === "number" ? `silent ${Math.round(v / 1000)}s` : undefined) },
@@ -526,6 +535,7 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
       const lints = graph.tasks.flatMap((t) => route(t, cfg, channels, profile, undefined, undefined, exploreCtx).lints);
       if (lints.length) throw new Error(`--route-strict: routing lints present, refusing to dispatch:\n${lints.join("\n")}`);
     }
+    await assertRefsWritable(cwd, "run");
     // The run id is minted HERE rather than inside the daemon, because the narration sink has to know
     // which run it is narrating before the first event arrives (the daemon's `narrate` callback is
     // handed an event and nothing else, and `run-start` carries no run id). `runDaemon` uses the id

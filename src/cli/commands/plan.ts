@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, doctorAgeMs, modelAuthExclusions, probeAll, readDoctor, rolePools, servableExclusions, servabilityLine } from "../../adapters/registry.js";
@@ -6,16 +6,16 @@ import { formatModelAuthLine, contextWindowLints, modelLints, preferEntryLints, 
 import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { classifyContextPath } from "../../compile/native.js";
-import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK } from "../../config/config.js";
+import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK, type TickmarkrConfig } from "../../config/config.js";
 import { graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
 import { resolveRunMode } from "../../run/daemon.js";
 import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } from "../../route/preference.js";
-import { staffLedEvidence } from "../../route/profile.js";
+import { decayWeight, HALF_LIFE_RUNS, staffLedEvidence } from "../../route/profile.js";
 import { route, RoutingError } from "../../route/router.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 import { modelId, modelProvider, pickReviewer } from "../../gates/review.js";
-import { Journal, loadRoutingProfile, recordedGraphDefinitionHash, type JournalEvent } from "../../run/journal.js";
+import { Journal, loadRoutingProfile, readProfileCursor, recordedGraphDefinitionHash, RUNS_WINDOW, type JournalEvent } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
 import { channelKey, shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { shGit } from "../../run/git.js";
@@ -300,6 +300,7 @@ export async function plan(
       }
     }
   }
+  lints.push(...tierEscalationAdvisories(cwd, cfg, g.tasks));
   for (const [role, sel] of [["judge", cfg.judge], ["consult", cfg.consult]] as const) {
     if (!health[sel.adapter]?.installed) lints.push(`${role}: ${sel.adapter}:${sel.model} not installed — that gate/consult will fail closed`);
   }
@@ -435,4 +436,160 @@ export async function plan(
   const scopeLints = [...collateralLints(g.tasks, cwd), ...sourceScopeLints(g.tasks, cwd)];
   if (scopeLints.length) lines.push("", "scope lints:", ...scopeLints.map((l) => `  ! ${l}`));
   return stylizePlan(lines.join("\n"));
+}
+
+function extractClimb(event: Record<string, unknown>, taskShapeMap: Map<string, string>): { shape: string; fromTier: string; toTier: string } | undefined {
+  if (event.event !== "tier-escalated") return undefined;
+  const d = (event.data && typeof event.data === "object") ? (event.data as Record<string, unknown>) : {};
+  const shape = (typeof d.shape === "string" && d.shape)
+    || (typeof event.shape === "string" && event.shape)
+    || (typeof event.taskId === "string" ? taskShapeMap.get(event.taskId) : undefined)
+    || (typeof d.taskId === "string" ? taskShapeMap.get(d.taskId) : undefined);
+
+  if (!shape) return undefined;
+
+  const beforeAssignment = (d.beforeAssignment && typeof d.beforeAssignment === "object") ? (d.beforeAssignment as Record<string, unknown>) : undefined;
+  const afterAssignment = (d.afterAssignment && typeof d.afterAssignment === "object") ? (d.afterAssignment as Record<string, unknown>) : undefined;
+
+  let fromTier = (typeof d.fromTier === "string" && d.fromTier)
+    || (typeof d.from === "string" && d.from)
+    || (typeof d.tierBefore === "string" && d.tierBefore)
+    || (typeof d.before === "string" && d.before)
+    || (typeof d.previousTier === "string" && d.previousTier)
+    || (typeof event.fromTier === "string" && event.fromTier)
+    || (typeof event.from === "string" && event.from)
+    || (typeof beforeAssignment?.tier === "string" && beforeAssignment.tier);
+
+  let toTier = (typeof d.toTier === "string" && d.toTier)
+    || (typeof d.to === "string" && d.to)
+    || (typeof d.tierAfter === "string" && d.tierAfter)
+    || (typeof d.after === "string" && d.after)
+    || (typeof d.nextTier === "string" && d.nextTier)
+    || (typeof d.tier === "string" && d.tier)
+    || (typeof event.toTier === "string" && event.toTier)
+    || (typeof event.to === "string" && event.to)
+    || (typeof afterAssignment?.tier === "string" && afterAssignment.tier);
+  if (!fromTier || !toTier) {
+    const text = [d.details, d.message, d.reason, d.summary, d.provenance].filter((s) => typeof s === "string").join(" ");
+    const m = /\b(cheap|mid|frontier)\s+to\s+(cheap|mid|frontier)\b/i.exec(text);
+    if (m) {
+      fromTier = fromTier || m[1].toLowerCase();
+      toTier = toTier || m[2].toLowerCase();
+    }
+  }
+
+  if (!fromTier || !toTier) return undefined;
+
+  return { shape, fromTier, toTier };
+}
+
+function tierEscalationAdvisories(cwd: string, cfg: TickmarkrConfig, graphTasks: readonly Task[]): string[] {
+  const runsRoot = join(cwd, stateDirName(cwd), "runs");
+  if (!existsSync(runsRoot)) return [];
+
+  let candidateRunIds: string[];
+  try {
+    candidateRunIds = readdirSync(runsRoot)
+      .filter((d) => d.startsWith("run-") && existsSync(join(runsRoot, d, "journal.jsonl")))
+      .sort();
+  } catch {
+    return [];
+  }
+
+  const cursor = readProfileCursor(cwd);
+  if (cursor) candidateRunIds = candidateRunIds.filter((id) => id > cursor);
+
+  const windowRunIds = candidateRunIds.slice(-RUNS_WINDOW);
+  if (!windowRunIds.length) return [];
+
+  // Leg-2 T5 (OBS-971): task ids restart at T1 every spec, so a shape lookup is only valid against the
+  // graph the run actually executed. Fallback to the current graph only when the run left no snapshot.
+  const currentShapeMap = new Map<string, string>(graphTasks.map((t) => [t.id, t.shape]));
+
+  const numDistinct = windowRunIds.length;
+  const ascIndex = new Map(windowRunIds.map((id, i) => [id, i]));
+  const halfLife = cfg.routing.learnedTuning?.halfLifeRuns ?? HALF_LIFE_RUNS;
+
+  const shapeClimbs = new Map<string, {
+    fromTier: string;
+    toTier: string;
+    runs: Set<string>;
+    weighted: number;
+  }>();
+
+  for (const runId of windowRunIds) {
+    const journalPath = join(runsRoot, runId, "journal.jsonl");
+    let lines: string[];
+    try {
+      lines = readFileSync(journalPath, "utf8").split("\n");
+    } catch {
+      continue;
+    }
+
+    let taskShapeMap = currentShapeMap;
+    const runGraphPath = join(runsRoot, runId, "graph.json");
+    if (existsSync(runGraphPath)) {
+      try {
+        const runGraph = JSON.parse(readFileSync(runGraphPath, "utf8"));
+        if (Array.isArray(runGraph.tasks)) {
+          taskShapeMap = new Map<string, string>();
+          for (const rt of runGraph.tasks) {
+            if (typeof rt?.id === "string" && typeof rt?.shape === "string") taskShapeMap.set(rt.id, rt.shape);
+          }
+        }
+      } catch {
+        // unreadable snapshot: fall back to the current graph
+      }
+    }
+
+    const runClimbedShapes = new Map<string, { fromTier: string; toTier: string }>();
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!parsed || typeof parsed !== "object") continue;
+      const event = parsed as Record<string, unknown>;
+      if (event.event !== "tier-escalated") continue;
+
+      const climb = extractClimb(event, taskShapeMap);
+      if (climb) {
+        runClimbedShapes.set(climb.shape, { fromTier: climb.fromTier, toTier: climb.toTier });
+      }
+    }
+
+    const age = numDistinct - 1 - ascIndex.get(runId)!;
+    const w = decayWeight(age, halfLife);
+
+    for (const [shape, { fromTier, toTier }] of runClimbedShapes) {
+      let entry = shapeClimbs.get(shape);
+      if (!entry) {
+        entry = { fromTier, toTier, runs: new Set(), weighted: 0 };
+        shapeClimbs.set(shape, entry);
+      }
+      const tierRank = (t: string): number => (t in TIER_RANK ? TIER_RANK[t as keyof typeof TIER_RANK] : 0);
+      if (tierRank(toTier) > tierRank(entry.toTier)) {
+        entry.toTier = toTier;
+      }
+      entry.runs.add(runId);
+      entry.weighted += w;
+    }
+  }
+
+  const advisories: string[] = [];
+  for (const shape of [...shapeClimbs.keys()].sort()) {
+    const info = shapeClimbs.get(shape)!;
+    const climbedRuns = info.runs.size;
+    const totalRuns = numDistinct;
+    const weightVal = Number.isInteger(info.weighted) ? info.weighted : Number(info.weighted.toFixed(2));
+    advisories.push(
+      `${shape}: climbed from ${info.fromTier} to ${info.toTier} in ${climbedRuns} of ${totalRuns} runs (weighted ${weightVal}) — consider routing.floors.${shape}: ${info.toTier}`,
+    );
+  }
+
+  return advisories;
 }

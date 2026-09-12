@@ -26,15 +26,21 @@ process.env.XDG_CONFIG_HOME = new URL("./tests/.xdg-empty", import.meta.url).pat
 // while parallel forks in cli.test.ts/version.test.ts spawn `node dist/cli/index.js` — a reader
 // that imports a module inside the rewrite window loads an empty/partial file (captured:
 // dist/route/router.js) and exits 1 with no stdout, the exact fresh-clone first-run signature.
-// These three files are the suite's ONLY mid-suite dist writer + readers (closure is red-pinned by
+// These files are the suite's ONLY mid-suite dist writers + readers (closure is red-pinned by
 // the OBS-96 guard test in cli.test.ts), so they run in one single fork, sequentially, after the
 // parallel fan-out (vitest per-project poolOptions.forks.singleFork) — dist access is mutually
 // exclusive by construction. Everything else keeps full parallelism: NOT a fork cap (the v1.60
 // scope consult forbids caps chosen without evidence — this serializes exactly the evidenced set).
+// The `suite` project's include is `tests/**/*.test.ts`, so a dist-coupled file ANYWHERE under
+// tests/ — tests/e2e/ included — lands in a parallel fork unless it is listed here.
 export const DIST_COUPLED_TESTS = [
   "tests/cli/bin.test.ts", // writer: rebuilds + packs ROOT dist mid-suite
   "tests/cli/cli.test.ts", // reader: spawns node dist/cli/index.js
   "tests/cli/version.test.ts", // reader: spawns node dist/cli/index.js
+  // writer + reader (OBS-965): prepareBuiltCli() rebuilds ROOT dist when stale, then pty-spawns
+  // dist/cli/index.js. Its body is TICKMARKR_E2E-gated (skipped under `npm test`), but the file is
+  // still collected, and `npm run e2e` runs it for real — so it belongs in the serialized fork.
+  "tests/e2e/deaf-board.e2e.test.ts",
 ];
 
 export const SIGNAL_REAPER_TESTS = ["tests/run/reconcile-live.test.ts"];

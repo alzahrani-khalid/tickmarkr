@@ -149,6 +149,27 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    guidance belongs in the memory file or the shipped docs.
 4. Arm the watcher and your own supervision beat (Supervision). Report the hierarchy map (pane ids + names) to the user.
 
+### Restart, seat identity, and verified launch law
+
+These rules apply after **ANY restart**, whether the overseer itself or Herdr restarted. First re-read the
+overseer's own pane id from Herdr; never continue with an id remembered before the restart. Then re-announce
+that fresh pane id to **every live seat** and re-arm **every watcher** with it, verifying each announcement and
+arm by reading back the resulting pane/process state. A live seat must never keep a pre-restart overseer pane id.
+When briefing a seat, take the overseer's address from the handoff file; never hardcode a pane id in a
+brief or command template.
+
+The orchestrator's run log, handoff, and plan live inside its sandbox root and are artifacts of that orchestrator.
+The overseer reads them from there, using the path the orchestrator reports; do not substitute the
+overseer's repository or a machine-global planning directory. The orchestrator brief must say: if the seat's
+sandbox denies writes under `.git`, report the denial to the overseer and stop; the overseer launches the daemon itself;
+and the daemon host is never sandboxed.
+
+After every `agent start`, wait for and read the model banner. Only then deliver the brief with `pane run`,
+then read the transcript back and verify that the brief's first words are present before any deadline is armed.
+That read-back proves the brief was sent; a brief absent from the transcript was not sent. Every Claude
+seat is started with `--effort high` and has its banner read. Inventories retain the **full suite log**, not a
+tail or summary, and no one runs `git checkout` in a clone while that clone's suite is running.
+
 ### Seat-spawn and Leg-2 recipes
 
 Every mission to a Claude or Grok seat is delivered only with `herdr pane run <pane> "<message>"` and

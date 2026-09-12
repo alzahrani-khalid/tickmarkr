@@ -1,11 +1,11 @@
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { compareToBaseline, fingerprint } from "../../src/gates/baseline.js";
-import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, createWorktree, gitHead, linkNodeModules, preserveWorktree, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, assertRefsWritable, createWorktree, gitHead, linkNodeModules, preserveWorktree, probeRefsWritable, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -677,4 +677,71 @@ describe("reap error visibility (§B T6)", () => {
       }
     }
   }, 20_000);
+});
+
+describe("refs probe (OBS-983/984)", () => {
+  test("test: the refs probe run from a linked worktree names the main repository's refs directory, a writable repository reports ok and leaves no preflight ref behind, and a read-only one reports the path with git's own error, so a probe that inspects the worktree's git file instead of the common dir fails", async () => {
+    const mainRepo = makeRepo({ "a.txt": "hello\n" });
+    const wt = await createWorktree(mainRepo, "probe-branch", await gitHead(mainRepo));
+    const mainRefsDir = realpathSync(join(mainRepo, ".git", "refs"));
+
+    // 1. Writable repository from linked worktree
+    const writableProbe = await probeRefsWritable(wt);
+    expect(writableProbe.ok).toBe(true);
+    expect(writableProbe.path).toBe(mainRefsDir);
+    expect(writableProbe.refsDir).toBe(mainRefsDir);
+
+    // Leaves no preflight ref behind
+    const remainingRefs = await shGit("git for-each-ref refs/tickmarkr/preflight", wt);
+    expect(remainingRefs.stdout.trim()).toBe("");
+
+    // 2. Read-only refs directory
+    // Note: in the linked worktree wt, wt/.git is a gitfile that remains writable.
+    // Making the main repo's refs directory read-only tests that git resolves to the common dir,
+    // and a probe inspecting wt/.git would fail to detect this read-only state.
+    chmodSync(mainRefsDir, 0o555);
+    try {
+      const roProbe = await probeRefsWritable(wt);
+      expect(roProbe.ok).toBe(false);
+      expect(roProbe.path).toBe(mainRefsDir);
+      expect(roProbe.refsDir).toBe(mainRefsDir);
+      if (!roProbe.ok) {
+        expect(roProbe.error).toMatch(/cannot lock ref|unable to create directory|update_ref failed/);
+        expect(roProbe.error).toContain(mainRefsDir);
+      }
+    } finally {
+      chmodSync(mainRefsDir, 0o755);
+    }
+  });
+
+  test("assertRefsWritable succeeds on writable repository and throws on read-only refs", async () => {
+    const repo = makeRepo({ "b.txt": "hello\n" });
+    const refsDir = realpathSync(join(repo, ".git", "refs"));
+    const probe = await assertRefsWritable(repo, "run");
+    expect(probe.ok).toBe(true);
+    expect(probe.path).toBe(refsDir);
+
+    chmodSync(refsDir, 0o555);
+    try {
+      await expect(assertRefsWritable(repo, "run")).rejects.toThrow(
+        new RegExp(`refusing to run: repository refs directory ${refsDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is not writable`),
+      );
+      await expect(assertRefsWritable(repo, "resume")).rejects.toThrow(
+        new RegExp(`refusing to resume: repository refs directory ${refsDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is not writable`),
+      );
+    } finally {
+      chmodSync(refsDir, 0o755);
+    }
+  });
+
+  test("probeRefsWritable returns ok false on non-git directory", async () => {
+    const nonGit = mkdtempSync(join(tmpdir(), "non-git-"));
+    try {
+      const result = await probeRefsWritable(nonGit);
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/not a git repository|fatal:/);
+    } finally {
+      rmSync(nonGit, { recursive: true, force: true });
+    }
+  });
 });

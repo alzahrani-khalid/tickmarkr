@@ -236,6 +236,12 @@ export interface ExecutorDriver {
   // only the UI's own presence acknowledgement permits closing an owned board.
   // Unsupported placement rejects visibly without claiming a board was opened.
   narrator?: (cwd: string, command: string, runId?: string) => Promise<Slot>;
+  // WB-1 (OBS-988, Leg-2 T7 M1): the daemon proved its OWN board lost (dead owner pid, stale beat, no
+  // presence). A dead UI can never acknowledge, so ownership alone — same run, token, workspace and
+  // pane, single live match — releases the pane and drops the driver's cached slot, so the next
+  // narrator call launches a NEW board instead of answering from its cache. Rejects when ownership
+  // cannot be proven or the pane survives; the daemon then records a failed reopen.
+  retireLostWatch?: (slot: Slot) => Promise<void>;
   /** Best-effort projection of a task's lifecycle onto the execution host. */
   project?: (taskId: string, state: "in-progress" | "in-review" | "completed") => Promise<void>;
   // OBS-17 T2: sweep tickmarkr-owned panes down to `desired` (the reconcile.ts journal fold) — close

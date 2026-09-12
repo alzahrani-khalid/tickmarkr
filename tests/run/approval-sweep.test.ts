@@ -389,25 +389,48 @@ async function runningVerifyApproval() {
 test("test: an approval landing during a running tip verify cancels it with a tip-verify-cancelled row, re-enters dispatch in-process and runs tip verify once more at the final close whose run-end reports every approval enacted, while an approval landing after run-end stays outstanding, so a run-end recording outstanding over an approval that landed during its verify fails", runningVerifyApproval, 120_000);
 
 
-test("test: a task whose last dependency merges in the same poll tick the final in-flight task settles is dispatched and gated before run-end and the summary lists it done, while a close attempted over such a task journals an end-condition-held row and the loop continues, so a run-end whose pending bucket names a task with every dependency done and a free slot fails", async () => {
-  const { repo, fake } = closingRepo(false);
-  const runId = "run-last-dependency";
-  const summary = await runDaemon(repo, { adapters: [fake], runId, concurrency: 1, approvalWindowMs: 1 });
-  const events = Journal.open(repo, runId).read();
-  const mergedAt = events.findIndex((e) => e.event === "merge" && e.taskId === "A");
-  const heldAt = events.findIndex((e) => e.event === "end-condition-held" && e.taskId === "B");
-  const dispatchAt = events.findIndex((e) => e.event === "task-dispatch" && e.taskId === "B");
-  const gateAt = events.findIndex((e) => e.event === "gate-result" && e.taskId === "B" && e.data.gate === "test" && e.data.pass);
-  const endAt = events.findIndex((e) => e.event === "run-end");
-  expect(mergedAt).toBeGreaterThan(-1);
-  expect(heldAt).toBeGreaterThan(mergedAt);
-  expect(events[heldAt]!.data).toMatchObject({ deps: ["A"], freeSlots: 1 });
-  expect(dispatchAt).toBeGreaterThan(heldAt);
-  expect(gateAt).toBeGreaterThan(dispatchAt);
-  expect(endAt).toBeGreaterThan(gateAt);
-  expect(summary.done.sort()).toEqual(["A", "B", "S"]);
-  expect(summary.pending).toEqual([]);
-  expect(events[endAt]!.data).toMatchObject({ done: expect.arrayContaining(["A", "B", "S"]), pending: [] });
+test("test: a concurrency-one chain whose tasks all merge journals no end-condition-held row while a close attempted over a dispatchable task still journals one and the loop continues, so a held row on a healthy boundary fails", async () => {
+  // healthy: the post-race sweep dispatches B the tick A merges and says nothing about it
+  {
+    const { repo, fake } = closingRepo(false);
+    const runId = "run-last-dependency";
+    const summary = await runDaemon(repo, { adapters: [fake], runId, concurrency: 1, approvalWindowMs: 1 });
+    const events = Journal.open(repo, runId).read();
+    const mergedAt = events.findIndex((e) => e.event === "merge" && e.taskId === "A");
+    const dispatchAt = events.findIndex((e) => e.event === "task-dispatch" && e.taskId === "B");
+    const gateAt = events.findIndex((e) => e.event === "gate-result" && e.taskId === "B" && e.data.gate === "test" && e.data.pass);
+    const endAt = events.findIndex((e) => e.event === "run-end");
+    expect(mergedAt).toBeGreaterThan(-1);
+    expect(dispatchAt).toBeGreaterThan(mergedAt);
+    expect(gateAt).toBeGreaterThan(dispatchAt);
+    expect(endAt).toBeGreaterThan(gateAt);
+    expect(events.filter((e) => e.event === "end-condition-held")).toEqual([]);
+    expect(summary.done.sort()).toEqual(["A", "B", "S"]);
+    expect(events[endAt]!.data).toMatchObject({ done: expect.arrayContaining(["A", "B", "S"]), pending: [] });
+  }
+  // a close attempt over a dispatchable task: the approval lands as the window expires, so the
+  // close finds A ready, journals the hold once, and the loop continues through A and B
+  {
+    const { repo, fake } = closingRepo(true);
+    const runId = "run-close-held";
+    const summary = await runDaemon(repo, {
+      adapters: [fake], runId, concurrency: 1, approvalWindowMs: 1,
+      narrate: (e) => {
+        if (e.event === "approval-window-expired") Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
+      },
+    });
+    const events = Journal.open(repo, runId).read();
+    const held = events.filter((e) => e.event === "end-condition-held");
+    expect(held).toHaveLength(1);
+    expect(held[0]!.taskId).toBe("A");
+    expect(held[0]!.data).toMatchObject({ deps: [], freeSlots: 1 });
+    const heldAt = events.indexOf(held[0]!);
+    expect(heldAt).toBeGreaterThan(events.findIndex((e) => e.event === "approval-window-expired"));
+    expect(events.findIndex((e) => e.event === "task-dispatch" && e.taskId === "A")).toBeGreaterThan(heldAt);
+    expect(events.findIndex((e) => e.event === "run-end")).toBeGreaterThan(events.findIndex((e) => e.event === "merge" && e.taskId === "B"));
+    expect(summary.done.sort()).toEqual(["A", "B", "S"]);
+    expect(summary.pending).toEqual([]);
+  }
 }, 120_000);
 
 test("test: an approval landing after a tip verify has completed keeps that verify's cached verdict with no tip-verify-cancelled row and the close reports it enacted, while an approval landing during a running verify still cancels it, so a completed verify labelled cancelled fails", async () => {

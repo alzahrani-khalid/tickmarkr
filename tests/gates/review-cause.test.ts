@@ -489,7 +489,7 @@ test("test: a pane review seat whose capture holds only the harness preamble thr
     const replacement = Object.assign(reviewer(), { id: "replacement", vendor: "replacement-vendor" });
     const round = await runGates({ ...task, gates: ["review"] }, {
       worktree: repo, baseRef: base, author, channels: [...channels,
-        { adapter: "replacement", vendor: "replacement-vendor", model: "replacement-1", tier: "cheap", channel: "sub" }],
+        { adapter: "replacement", vendor: "replacement-vendor", model: "replacement-1", tier: "frontier", channel: "api" }],
       adapters: [reviewer(), replacement], cfg: DEFAULT_CONFIG, commands: {},
       baseline: await captureBaseline(repo, {}), result: { ok: true, summary: "work", raw: "", deviations: [] },
       via: via(pane), onGate: (event) => { events.push(event); },

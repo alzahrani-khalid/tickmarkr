@@ -5,6 +5,7 @@ import { loadGraph } from "../../graph/graph.js";
 import { type RunSummary, formatSummary, runDaemon } from "../../run/daemon.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
 import { narrationSink, bindNarration } from "./run.js";
+import { assertRefsWritable } from "../../run/git.js";
 
 const summaryGreen = (s: RunSummary) =>
   s.failed.length === 0 && s.human.length === 0 && s.blocked.length === 0 && s.pending.length === 0
@@ -38,6 +39,7 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
   if (collisions.length) {
     throw new Error(collisions.map(denyPreferCollisionLine).join("; "));
   }
+  await assertRefsWritable(cwd, "resume");
   const narrate = narrationSink(runId);
   const s = await runDaemon(cwd, {
     runId,

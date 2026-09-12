@@ -1,8 +1,11 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq, type BillingChannel } from "../../src/adapters/types.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
+import { gitHead } from "../../src/run/git.js";
 import { Journal, journaledFailureBrief, outstandingReviewFindings } from "../../src/run/journal.js";
 import { authedModels, COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -18,7 +21,7 @@ class Author extends FakeAdapter {
 class Seat extends FakeAdapter {
   calls: string[] = [];
   override harnessBannerRows = ["SEAT HARNESS"] as const;
-  constructor(path: string, public override id: string, private mode: "silent" | "truncated" | "good") {
+  constructor(path: string, public override id: string, private mode: "silent" | "truncated" | "good", private tier: BillingChannel["tier"] = "frontier") {
     super(path);
     this.vendor = id;
   }
@@ -26,7 +29,8 @@ class Seat extends FakeAdapter {
     return { installed: true, authed: true, version: "fake", models: [this.id], modelAuth: authedModels([this.id]) };
   }
   override channels(): BillingChannel[] {
-    return [{ adapter: this.id, model: this.id, vendor: this.vendor, channel: "sub", tier: "cheap" }];
+    // RF-1: seats sit at the author's tier; api channels cost more than the author's sub seat so worker routing never picks them
+    return [{ adapter: this.id, model: this.id, vendor: this.vendor, channel: "api", tier: this.tier }];
   }
   override headlessCommand(file: string): string {
     const prompt = readFileSync(file, "utf8");
@@ -105,5 +109,29 @@ describe("review infrastructure recovery", () => {
     expect(rows.indexOf(demotions[0]!)).toBeLessThan(rows.findIndex((row) => row.event === "review-retry"));
     expect(rows.filter((row) => row.event === "review-no-verdict" && row.data.reviewer === "seat-b:seat-b")
       .map((row) => row.data.cause)).toEqual(["truncated", "truncated"]);
+  });
+
+  // Leg-2 T4 M2 (RF-1): a frontier seat's no-verdict is journaled as `review-no-verdict` (with its dispatch
+  // tier) BEFORE the in-gate retry publishes a gate-result. A daemon killed between the two leaves that row
+  // as the task's only reviewer evidence; on resume it must hold the floor exactly like a review gate-result.
+  test("test: on resume, a task whose only review evidence is a review-no-verdict row naming a frontier seat holds a frontier floor with cause prior-reviewer under a cheap author and review.floor worker, seating the frontier seat over the preferred mid seat, so a resume that seats mid after a journaled frontier no-verdict fails", async () => {
+    // implement's default advisory floor is mid — lowered so the cheap fake channel authors and the mid seat stays a reviewer
+    const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [work("T1")] } },
+      `concurrency: 1\nrouting:\n  escalateTier: "off"\n  floors: { implement: cheap }\nreview: { required: true, prefer: [seat-b, seat-a], timeoutMs: 1000 }\n`);
+    class CheapAuthor extends FakeAdapter {
+      override channels(): BillingChannel[] { return [{ ...super.channels()[0]!, tier: "cheap" }]; }
+    }
+    const seatA = new Seat(scriptPath, "seat-a", "good", "frontier");
+    const seatB = new Seat(scriptPath, "seat-b", "good", "mid");
+    const runId = "run-noverdict-resume";
+    const journal = Journal.create(repo, runId);
+    journal.append("run-start", undefined, { baseRef: await gitHead(repo), commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    journal.append("review-no-verdict", "T1", { reviewer: "seat-a:seat-a", reviewerTier: "frontier", noVerdict: true, infra: true, cause: "empty-output", bytes: 0, seatAuthoredBytes: 0 });
+    writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+    const result = await runDaemon(repo, { adapters: [new CheapAuthor(scriptPath), seatA, seatB], runId, resume: true });
+    expect(result.done).toEqual(["T1"]);
+    expect([seatA.calls, seatB.calls]).toEqual([["T1"], []]);
+    const review = Journal.open(repo, runId).read().filter((row) => row.event === "gate-result" && row.data.gate === "review").at(-1)!;
+    expect(review.data).toMatchObject({ reviewer: "seat-a:seat-a", reviewerTier: "frontier", reviewerFloor: "frontier", reviewerFloorCause: "prior-reviewer" });
   });
 });

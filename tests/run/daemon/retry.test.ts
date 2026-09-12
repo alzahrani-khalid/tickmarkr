@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { kimiSessionId } from "../../../src/adapters/kimi.js";
 import { shq } from "../../../src/adapters/types.js";
@@ -12,6 +12,7 @@ import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../../src/graph/graph.js";
 import { validateGraph } from "../../../src/graph/schema.js";
+import * as gateRunner from "../../../src/gates/run-gates.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../../src/run/git.js";
 import { activeRetryBan, deferredReviewFindings, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingConsultGuidance, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
@@ -311,7 +312,7 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
     expect(dispatches).toHaveLength(2);
     for (const d of dispatches) {
-      expect(Object.keys(d.data).sort()).toEqual(["assignment", "attempt", "excludedChannels", "provenance", "retryMode"]);
+      expect(Object.keys(d.data).sort()).toEqual(["assignment", "attempt", "excludedChannels", "exclusionReasons", "provenance", "retryMode", "routingHints"]);
       expect(d.data.excludedChannels).toEqual([]);
       expect(d.data.retryMode).toBe("fresh");
     }
@@ -323,9 +324,9 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
   test("OBS-20: consult excludeAdapter bans every channel of that adapter on the next dispatch", async () => {
     const { repo, scriptPath } = setupRepo(
       [T("T1", {
-        // pin to cursor-agent; escalate:false so the ladder hits consult before another model is tried
+        // The cheaper cursor subscription routes first; escalate:false reaches consult before another model is tried
         // (otherwise escalate would already leave the first model before the exclusion can prove itself)
-        routingHints: { pin: { via: "cursor-agent", model: "composer" }, escalate: false },
+        routingHints: { escalate: false },
       })],
       {
         consult: { action: "reroute", notes: "trust dialog blocks the CLI", excludeAdapter: "cursor-agent" },
@@ -378,7 +379,7 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
   test("v1.24: adapter exclusion is task-scoped — a sibling task can still use the excluded adapter", async () => {
     const { repo, scriptPath } = setupRepo(
       [
-        T("T1", { routingHints: { pin: { via: "cursor-agent", model: "composer" }, escalate: false } }),
+        T("T1", { routingHints: { escalate: false } }),
         // T2 depends on T1 so it starts after T1's exclusion fired — still free to pin cursor-agent
         T("T2", { deps: ["T1"], routingHints: { pin: { via: "cursor-agent", model: "composer-2.5" } } }),
       ],
@@ -423,7 +424,7 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     // Unknown adapter id → zero tried expansion → ordinary nextChannel over the current channel only.
     // With escalate:false and two cursor models + fake, post-consult lands on composer-2.5 (same adapter).
     const { repo, scriptPath } = setupRepo(
-      [T("T1", { routingHints: { pin: { via: "cursor-agent", model: "composer" }, escalate: false } })],
+      [T("T1", { routingHints: { escalate: false } })],
       {
         consult: { action: "reroute", notes: "typo'd adapter", excludeAdapter: "not-a-real-adapter" },
         tasks: {
@@ -2482,4 +2483,142 @@ describe("RT-2 red replay", () => {
       }
     }
   }, 120_000);
+});
+
+describe("ES-2 daemon tier climb", () => {
+  const fixture = (options: { pin?: boolean; off?: boolean; unowned?: boolean; refusal?: boolean; quota?: boolean; infra?: boolean; changing?: boolean; collateral?: boolean } = {}) => {
+    const made = setupRepo([T("T1", {
+      files: ["src/a.ts"],
+      ...(options.pin ? { routingHints: { pin: { via: "fake", model: "fake-1" } } } : {}),
+      acceptance: [{ oracle: "command", command: options.changing ? "cat src/a.ts; exit 1" : `echo 'expected true in ${options.unowned ? "elsewhere/b.ts" : "src/a.ts"}'; exit 1` }],
+    })], {
+      consult: { action: "human", notes: "exhausted" },
+      tasks: { T1: Array.from({ length: 7 }, (_, i) => ({
+        shell: options.quota && i === 0 ? "echo 'rate limit exceeded'; exit 1"
+          : options.refusal ? "true" : `mkdir -p src && echo value${i} > src/a.ts && ${options.collateral ? "echo collateral > README.md && " : ""}${COMMIT} change${i}`,
+        ...(options.quota && i === 0 ? {} : { result: { ok: !options.refusal, summary: options.refusal ? "Cannot edit elsewhere/b.ts outside files[] allowlist" : "done" } }),
+        // OBS-547 (Leg-2 T3 material): every dispatch is PHYSICALLY metered so the park rows below can
+        // prove who is charged for it — an unchargeable diagnostic park must not count the dispatch.
+        usage: { input: 10 + i, output: 1 },
+      })) },
+    }, `approvalWindowMs: 1\nrouting: { escalateTier: ${options.off ? "off" : "on"} }\n${options.infra ? "gates: { test: \"test ! -f src/a.ts || { echo SIGKILL; exit 137; }\" }\n" : ""}`);
+    made.fake.channels = () => [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "mid" },
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "sub", tier: "mid" },
+      { adapter: "fake", vendor: "fake-c", model: "fake-3", channel: "api", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-d", model: "fake-4", channel: "api", tier: "frontier" },
+    ];
+    made.fake.probe = async () => ({ installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2", "fake-3", "fake-4"], modelAuth: authedModels(["fake-1", "fake-2", "fake-3", "fake-4"]) });
+    return made;
+  };
+
+  test("disabled tier escalation lets a pinned fingerprint cap and changing reds reach consult without a pin hold", async () => {
+    for (const changing of [false, true]) {
+      const { repo, fake } = fixture({ pin: true, off: true, changing });
+      const runId = `run-es2-pin-off-${changing}`;
+      await runDaemon(repo, { adapters: [fake], runId });
+      const rows = Journal.open(repo, runId).read();
+      expect(rows.filter((e) => e.event === "tier-escalated")).toHaveLength(0);
+      expect(rows.some((e) => e.event === "consult-verdict")).toBe(true);
+      expect(rows.filter((e) => e.event === "task-human").some((e) => String(e.data.reason).includes("pin fake:fake-1 held:"))).toBe(false);
+      expect(rows.some((e) => e.event === (changing ? "repair-exhausted" : "gate-fingerprint-cap"))).toBe(true);
+    }
+  }, 120_000);
+
+  test("an unowned diagnostic cannot hide unpredicted scope collateral or rewind its chargeable attempt", async () => {
+    const { repo, fake } = fixture({ unowned: true, collateral: true, off: true });
+    const runId = "run-es2-mixed-scope";
+    // The live scope screen normally ends the battery early. Supply a mixed battery at
+    // the gate boundary while retaining the real scope gate's collateral attribution.
+    const runGates = gateRunner.runGates;
+    const mixed = vi.spyOn(gateRunner, "runGates").mockImplementation(async (task, ctx) => {
+      const round = await runGates(task, ctx);
+      const diagnostic = { gate: "acceptance" as const, pass: false, details: "expected true in elsewhere/b.ts" };
+      await ctx.onGate?.({ phase: "end", gate: "acceptance", result: diagnostic });
+      return { ...round, results: [...round.results, diagnostic] };
+    });
+    try {
+      await runDaemon(repo, { adapters: [fake], runId });
+    } finally {
+      mixed.mockRestore();
+    }
+    const journal = Journal.open(repo, runId);
+    const rows = journal.read();
+    expect(rows.some((e) => e.event === "gate-result" && e.data.gate === "acceptance" && e.data.pass === false && String(e.data.details).includes("elsewhere/b.ts"))).toBe(true);
+    expect(rows.find((e) => e.event === "collateral-miss")?.data.unpredicted).toEqual(["README.md"]);
+    expect(rows.filter((e) => e.event === "scope-authoring")).toHaveLength(0);
+    const charged = journal.readTelemetry().find((row) => row.taskId === "T1");
+    expect(charged).toBeDefined();
+    expect(charged?.parkKind).not.toBe("authoring");
+    expect(charged?.attempts).toBeGreaterThan(0);
+    expect(charged?.gateFails).toBeGreaterThan(0);
+  }, 60_000);
+
+  test("test: a task on a mid channel whose deterministic gate fails identically twice journals tier-escalated naming the cause the gate the fingerprint mid to frontier and the pool before and its next dispatch runs on a frontier channel with provenance naming the climb, a repair-exhausted task climbs the same way, and a later exhaustion on the same task journals no second climb, so a ladder that redraws the same tier after the cap fails", async () => {
+    for (const kind of ["repeat", "repair", "changing", "off"] as const) {
+      const { repo, fake } = fixture({ changing: kind === "changing" || kind === "repair", off: kind === "off" });
+      const runId = `run-es2-${kind}`;
+      if (kind === "repair") {
+        const j = Journal.create(repo, runId);
+        j.append("run-start", undefined, { baseRef: await gitHead(repo), commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+        for (let repair = 1; repair <= 2; repair++) {
+          j.append("repair-attempt", "T1", { repair, gates: ["acceptance"] });
+          j.append("worker-launch", "T1", {});
+          j.append("gate-result", "T1", { gate: "acceptance", pass: false, details: `old red ${repair}` });
+        }
+        writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+      }
+      await runDaemon(repo, { adapters: [fake], runId, resume: kind === "repair" });
+      const rows = Journal.open(repo, runId).read();
+      const climbs = rows.filter((e) => e.event === "tier-escalated");
+      if (kind === "off") { expect(climbs).toHaveLength(0); continue; }
+      expect(climbs).toHaveLength(1);
+      const climb = climbs[0]!;
+      expect(climb.data).toMatchObject({ cause: kind === "repeat" ? "gate-fingerprint-cap" : kind === "repair" ? "repair-exhausted" : "gate-fail", gate: "acceptance", from: "fake:fake-1", to: "fake:fake-3", costDelta: 3 });
+      const red = rows.slice(0, rows.indexOf(climb)).reverse().find((e) => e.event === "gate-result" && e.data.gate === "acceptance")!;
+      expect(climb.data.fingerprint).toBe(normalizeGateFailure(String(red.data.details)).slice(0, 500));
+      expect(climb.data.fromTier).toBe("mid");
+      expect(climb.data.toTier).toBe("frontier");
+      expect(String(climb.data.fingerprint).length).toBeGreaterThan(0);
+      expect(climb.data.poolBefore).toEqual(["fake:fake-2", "fake:fake-3", "fake:fake-4"]);
+      const dispatch = rows.slice(rows.indexOf(climb) + 1).find((e) => e.event === "task-dispatch")!;
+      expect(dispatch.data.assignment).toMatchObject({ model: "fake-3", tier: "frontier" });
+      expect(dispatch.data.attempt).toBe(climb.data.attempt);
+      expect(dispatch.data.provenance).toContain("tier-escalated fake:fake-1 → fake:fake-3");
+      expect(dispatch.data.excludedChannels).toContain("fake:fake-2");
+      expect(dispatch.data.exclusionReasons).toMatchObject({ "fake:fake-2": "tier climb skipped" });
+      expect(rows.slice(rows.indexOf(dispatch)).some((e) => e.event === "repair-exhausted")).toBe(true);
+    }
+  }, 180_000);
+
+  test("test: a worker result refusing a path outside files[] and a gate red naming only unowned paths each park as kind authoring carrying the files[] hint with no tier-escalated row, an infra park and a quota failover journal none, and a pinned task at the cap parks naming the held pin and its cause, so a climb bought by an ownership red or by a pin fails", async () => {
+    for (const kind of ["refusal", "unowned", "infra", "quota", "pin"] as const) {
+      const { repo, fake } = fixture({ [kind]: true, ...(kind === "quota" ? { unowned: true } : {}) });
+      const runId = `run-es2-${kind}`;
+      await runDaemon(repo, { adapters: [fake], runId });
+      const rows = Journal.open(repo, runId).read();
+      expect(rows.filter((e) => e.event === "tier-escalated"), kind).toHaveLength(0);
+      const park = rows.find((e) => e.event === "task-human")!;
+      const telemetry = Journal.open(repo, runId).readTelemetry().find((r) => r.taskId === "T1")!;
+      if (kind === "refusal" || kind === "unowned") {
+        expect(park.data.kind).toBe("authoring");
+        expect(park.data.reason).toContain("files[] repair hint: elsewhere/b.ts");
+        // OBS-547 on the diagnostic path (Leg-2 T3 material): the park is unchargeable, so its
+        // telemetry row carries the real spend but NO metered count beside `attempts` — a count
+        // exceeding attempts renders in `tickmarkr report` as "floor: 1/0 attempts metered".
+        const authoring = rows.find((e) => e.event === "scope-authoring")!;
+        expect(authoring.data, kind).toMatchObject({ chargeable: false, source: "diagnostic" });
+        expect(telemetry.tokens, kind).toBeDefined();
+        expect(telemetry.attempts, kind).toBe(0);
+        expect(telemetry.meteredAttempts, kind).toBeUndefined();
+      } else if (kind === "infra") {
+        expect(park.data.kind).toBe("infra");
+        // the same fixture through a chargeable park still counts every metered attempt
+        expect(telemetry.meteredAttempts, kind).toBe(telemetry.attempts);
+        expect(telemetry.attempts, kind).toBeGreaterThan(0);
+      }
+      else if (kind === "quota") expect(rows.some((e) => e.event === "quota-failover")).toBe(true);
+      else expect(park.data.reason).toContain("pin fake:fake-1 held: gate-fingerprint-cap");
+    }
+  }, 180_000);
 });

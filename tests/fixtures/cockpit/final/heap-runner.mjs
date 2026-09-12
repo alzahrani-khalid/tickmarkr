@@ -3,12 +3,13 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { PassThrough, Writable } from 'node:stream';
+import { Writable } from 'node:stream';
 import { performance } from 'node:perf_hooks';
 import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
 import { setImmediate as yieldTick } from 'node:timers/promises';
 import { runLiveCockpit } from '../../../../src/tui/cockpit/live.ts';
 import { createLiveStore } from '../../../../src/tui/cockpit/live-store.ts';
+import { ttyInput } from '../../../helpers/tty-input.ts';
 
 const shape = process.argv[2] ?? 'static';
 const destination = process.argv[3];
@@ -34,8 +35,7 @@ class CountingOutput extends Writable {
   }
 }
 const output = new CountingOutput();
-const input = new PassThrough();
-input.isTTY = true; input.setRawMode = () => input; input.ref = () => input; input.unref = () => input;
+const input = ttyInput();
 const samples = [];
 let firstFailure;
 let delivery;

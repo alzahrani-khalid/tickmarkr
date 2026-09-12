@@ -159,7 +159,8 @@ describe("pickReviewer model-identity diversity (FLEET-05)", () => {
 // v1.53 T2: review.prefer — reorders diversity-eligible channels only; the diversity filter runs first
 // and preference can never widen or narrow the eligible set.
 describe("pickReviewer review.prefer ranking (v1.53 T2)", () => {
-  const chAuthor: BillingChannel = { adapter: "claude-code", vendor: "anthropic", model: "fable", channel: "sub", tier: "frontier" };
+  // RF-1: a cheap author so the author-tier floor admits every seat and the tests below exercise ranking only
+  const chAuthor: BillingChannel = { adapter: "claude-code", vendor: "anthropic", model: "fable", channel: "sub", tier: "cheap" };
   const chOpus: BillingChannel = { adapter: "claude-code", vendor: "anthropic", model: "opus", channel: "sub", tier: "frontier" };
   const chCodexSol: BillingChannel = { adapter: "codex", vendor: "openai", model: "gpt-5.6-sol", channel: "sub", tier: "frontier" };
   const chCodexLuna: BillingChannel = { adapter: "codex", vendor: "openai", model: "gpt-5.6-luna", channel: "sub", tier: "cheap" };
@@ -795,13 +796,13 @@ describe("reviewGate", () => {
     const pool: BillingChannel[] = [
       { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
       { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "sub", tier: "frontier" },
-      { adapter: "fake", vendor: "fake-c", model: "fake-3", channel: "sub", tier: "mid" },
+      { adapter: "fake", vendor: "fake-c", model: "fake-3", channel: "sub", tier: "frontier" },
     ];
     const cfg = structuredClone(DEFAULT_CONFIG);
     cfg.review.prefer = ["fake:fake-3"];
     const r = await reviewGate(mkTask(), repo, base, author, pool, [fake], cfg);
     expect(r.pass).toBe(true);
-    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-3", vendor: "fake-c", provider: "fake-c" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-3", reviewerTier: "frontier", vendor: "fake-c", provider: "fake-c", reviewerFloor: "frontier", reviewerFloorCause: "author-tier" });
   });
 
   test("no cross-vendor channel: required → fail; not required → pass-with-warning", async () => {
@@ -895,7 +896,7 @@ describe("reviewGate material/minor classification (v1.70 T5)", () => {
     expect(r.pass).toBe(false);
     expect(r.details).toContain("off-by-one drops the last row");
     // fails closed the same way a legacy request-changes verdict does: pass:false + the reviewer channel
-    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", vendor: "fake-b", provider: "fake-b" });
+    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", reviewerTier: "frontier", vendor: "fake-b", provider: "fake-b", reviewerFloor: "frontier", reviewerFloorCause: "author-tier" });
   });
 
   test("a deferred finding is carried into the gate's recorded details with its rationale rather than silently dropped", async () => {
@@ -1116,6 +1117,28 @@ test("test: an approving review persists its raw bytes with secrets redacted bes
   expect(rowWithoutArtifacts.meta?.briefPath).toBeUndefined();
 });
 
+// RF-1 rider (OBS-990 b): the verbatim closure ids plus ONE normalised copy of each list — never a third alias.
+test("test: a passing review that closes carried materials records resolvedMatches and reraisedMatches in its meta and no further copies of either list, so a meta row carrying five arrays of one closure fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const [finding] = structuredFindings("review", "- [material] src/model.ts loses selection on prepend.");
+  const fp = finding.fingerprint;
+  const fake = fakeWith({ review: { approve: true, findings: [], resolved: [fp], reraised: [] } });
+  const passing = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG,
+    undefined, undefined, undefined, undefined, undefined, [finding]);
+  expect(passing.pass).toBe(true);
+  const meta = passing.meta!;
+  expect(meta.resolvedMatches).toEqual([fp]);
+  expect(meta.reraisedMatches).toEqual([]);
+  const arrays = Object.keys(meta).filter((k) => Array.isArray(meta[k])).sort();
+  expect(arrays).toEqual(["reraised", "reraisedMatches", "resolved", "resolvedMatches"]);
+  expect(Object.keys(meta).some((k) => k.startsWith("normalised"))).toBe(false);
+});
+
+test("the review prompt tells the reviewer a prescribed fix that breaks suites outside files[] is a scope finding, never material (OBS-990 b)", async () => {
+  const prompt = await captureReviewPrompt(mkTask({ files: ["src/a.ts"] }));
+  expect(prompt).toContain("A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.");
+});
+
 test("test: an approval whose resolved id equals a carried fingerprint with one inner space dropped parses as resolved and passes with the row's meta naming the normalised match, while a resolved id that differs from every fingerprint by one letter still fails as a malformed verdict, so a closure match that requires the verbatim string fails", async () => {
   const { repo, base } = repoWithCommit();
   const note = "src/model.ts loses selection on prepend.";
@@ -1140,7 +1163,6 @@ test("test: an approval whose resolved id equals a carried fingerprint with one 
 
   expect(passing.pass).toBe(true);
   expect(passing.meta?.resolved).toEqual([dropped]);
-  expect(passing.meta?.normalisedMatches).toEqual([fp]);
   expect(passing.meta?.resolvedMatches).toEqual([fp]);
 
   // While a resolved id that differs from every fingerprint by one letter still fails as a malformed verdict:

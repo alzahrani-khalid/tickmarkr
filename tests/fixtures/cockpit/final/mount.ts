@@ -1,12 +1,12 @@
-import { PassThrough, Writable } from "node:stream";
+import { Writable } from "node:stream";
 import { setImmediate as yieldFrame, setTimeout as wait } from "node:timers/promises";
 import { runLiveCockpit } from "../../../../src/tui/cockpit/live.js";
 import type { ShellDelivery } from "../../../../src/tui/cockpit/live-runtime.js";
+import { ttyInput } from "../../../helpers/tty-input.js";
 export async function mountShell(cwd: string, runId: string, columns = 120, rows = 40, environment?: NodeJS.ProcessEnv) {
   let lastFrame = "", controls = "", writes = 0;
   const raw: boolean[] = [];
-  const input = new PassThrough() as unknown as NodeJS.ReadStream;
-  Object.assign(input, { isTTY: true, isRaw: false, setRawMode: (v: boolean) => { raw.push(v); input.isRaw = v; return input; }, ref: () => input, unref: () => input });
+  const input = ttyInput({ onRawMode: v => { raw.push(v); } });
   const output = new Writable({ write(chunk, _encoding, next) {
     writes++;
     const text = String(chunk);

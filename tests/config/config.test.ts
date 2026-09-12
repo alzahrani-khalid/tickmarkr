@@ -306,6 +306,26 @@ describe("TickmarkrConfigSchema validation", () => {
     }
   });
 
+  // RF-1 (OBS-922 add.2/3): review.floor — worker (default) or a tier; anything else fails closed.
+  test("test: a config with review.floor absent loads worker and the template documents the key, review.floor set to a tier loads that tier, and any other value fails to load naming the key, so a floor accepted silently with a typo fails", () => {
+    const absent = repoWithOverlay("concurrency: 2\n");
+    expect(loadConfig(absent.repo, { globalDir: absent.globalDir }).review.floor).toBe("worker");
+    expect(DEFAULT_CONFIG.review.floor).toBe("worker");
+    expect(configTemplate()).toMatch(/floor: worker/);
+    expect(configTemplate()).toMatch(/# floor: worker \(default\) \| cheap \| mid \| frontier/);
+
+    const tier = repoWithOverlay("review:\n  floor: frontier\n");
+    expect(loadConfig(tier.repo, { globalDir: tier.globalDir }).review.floor).toBe("frontier");
+
+    const typo = repoWithOverlay("review:\n  floor: fronteir\n");
+    expect(() => loadConfig(typo.repo, { globalDir: typo.globalDir })).toThrow(ConfigError);
+    try {
+      loadConfig(typo.repo, { globalDir: typo.globalDir });
+    } catch (e) {
+      expect((e as ConfigError).message).toContain("review.floor");
+    }
+  });
+
   test("a tier null tombstone parses and is stripped without error", () => {
     const { repo, globalDir } = repoWithOverlay("routing:\n  map:\n    implement:\n      tier: null\n");
     const cfg = loadConfig(repo, { globalDir });
@@ -781,5 +801,26 @@ describe("v1.65 T5 quirk incident provenance", () => {
     expect(quirkLine).toMatch(/TICKMARKR_RESULT/);
     expect(quirkLine).toMatch(/v1\.46 provider-outage taxonomy/);
     expect(quirkLine).not.toMatch(/TODO|FIXME|example-id|OBS-XXX|placeholder/i);
+  });
+});
+
+describe("OBS-986: routing.escalateTier config knob", () => {
+  test("test: a config with routing.escalateTier absent loads on and the template documents the key, a config setting off loads off, and a config setting any other value fails to load naming the key, so a knob accepted silently with a typo fails", () => {
+    const absent = repoWithOverlay("routing:\n  mode: risk-based\n");
+    const cfgAbsent = loadConfig(absent.repo, { globalDir: absent.globalDir });
+    expect(cfgAbsent.routing.escalateTier).toBe("on");
+    expect(DEFAULT_CONFIG.routing.escalateTier).toBe("on");
+
+    const template = configTemplate();
+    expect(template).toMatch(/escalateTier/);
+
+    const off = repoWithOverlay("routing:\n  escalateTier: off\n");
+    const cfgOff = loadConfig(off.repo, { globalDir: off.globalDir });
+    expect(cfgOff.routing.escalateTier).toBe("off");
+
+    for (const badValue of ["invalid", "offf", "onn", "yes", "true", 123]) {
+      const bad = repoWithOverlay(`routing:\n  escalateTier: ${badValue}\n`);
+      expect(() => loadConfig(bad.repo, { globalDir: bad.globalDir })).toThrow(/escalateTier/);
+    }
   });
 });

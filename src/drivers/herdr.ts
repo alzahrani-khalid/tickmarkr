@@ -6,7 +6,7 @@ import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, m
 import { consumePaneLaunchIntent, PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
 import { createWorktree, sh } from "../run/git.js";
 import { Journal, type JournalEvent } from "../run/journal.js";
-import { readSupervision, readWatchBoard, reserveWatchBoard, stopWatchBoard, WATCH_OWNER_ENV } from "../run/supervision.js";
+import { readSupervision, readWatchBoard, requestWatchBoardStop, reserveWatchBoard, stopWatchBoard, WATCH_OWNER_ENV } from "../run/supervision.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
 import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type OwnedName, type PanesToCloseOpts, type Slot, type SlotOpts } from "./types.js";
 
@@ -1271,8 +1271,17 @@ export class HerdrDriver implements ExecutorDriver {
     return panes.filter(p => p.workspace_id === this.ws && p.label === name);
   }
 
+  /** WB-1 (OBS-988): the daemon proved this run's own board lost. Forget the cached slot FIRST — even a
+   *  retire that fails must never let the narrator answer with the ghost again — then take the pane
+   *  back on ownership alone: the dead UI can never acknowledge, so the stop request is left for a
+   *  merely stuck one to find. Serialized with the narrator so no split races the close. */
+  async retireLostWatch(slot: Slot): Promise<void> {
+    this.watches.delete(slot.name);
+    await this.serial(() => this.retireWatch(slot, true));
+  }
+
   /** Name collisions never confer repository ownership. Unknown boards stay protected. */
-  private async retireWatch(slot: Slot): Promise<void> {
+  private async retireWatch(slot: Slot, lost = false): Promise<void> {
     const runId = parseOwnedName(slot.name)?.runId;
     const owner = runId ? readWatchBoard(slot.cwd, runId) : undefined;
     const matches = await this.watchPanes(slot.name);
@@ -1282,7 +1291,8 @@ export class HerdrDriver implements ExecutorDriver {
         owner.pane !== slot.id || matches.length !== 1 || matches[0]?.pane_id !== owner.pane) {
       throw new Error(`watch ownership unknown or foreign for ${slot.name}; existing board protected`);
     }
-    await stopWatchBoard(owner, this.time);
+    if (lost) requestWatchBoardStop(owner); // a lost owner never answers; only a live one still gets the ack window
+    else await stopWatchBoard(owner, this.time);
     const verified = await this.watchPanes(slot.name);
     if (verified.length !== 1 || verified[0]?.pane_id !== owner.pane) throw new Error("watch target changed after acknowledgement; pane protected");
     const closed = await this.herdr(`pane close ${shq(owner.pane)}`);

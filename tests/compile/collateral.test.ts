@@ -79,49 +79,8 @@ describe("collateralLints (plan-time OBS-12/21 scan)", () => {
     const lints = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
     expect(lints).toEqual([]);
   });
-
-  test("test: with more matching test files than the display cap, the emitted line names the cap's worth of paths and states the true total, and that total equals the number of files that actually match", () => {
-    const matchingFiles = Object.fromEntries(
-      Array.from({ length: 25 }, (_, i) => [
-        `tests/adapters/codex-${String(i).padStart(2, "0")}.test.ts`,
-        'import "../../src/adapters/codex.js";\n',
-      ]),
-    );
-    const repo = makeRepo({
-      "src/adapters/codex.ts": "export const codex = {};\n",
-      ...matchingFiles,
-      "tests/adapters/unrelated.test.ts": 'import "../../src/adapters/other.js";\n',
-    });
-
-    const [lint] = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
-    const matchingPaths = Object.keys(matchingFiles);
-    const listedPaths = lint?.match(/tests\/adapters\/codex-\d+\.test\.ts/g) ?? [];
-
-    expect(listedPaths).toEqual(matchingPaths.slice(0, 20));
-    expect(lint).toContain(`${matchingPaths.length} total`);
-    expect(lint).toContain("capped");
-  });
-
-  test("test: a matching file ranked past the display cap is counted in the reported total, proving the scan no longer stops at the cap", () => {
-    const firstTwentyMatches = Object.fromEntries(
-      Array.from({ length: 20 }, (_, i) => [
-        `tests/adapters/a-codex-${String(i).padStart(2, "0")}.test.ts`,
-        'import "../../src/adapters/codex.js";\n',
-      ]),
-    );
-    const pastCapPath = "tests/adapters/z-codex-past-cap.test.ts";
-    const repo = makeRepo({
-      "src/adapters/codex.ts": "export const codex = {};\n",
-      ...firstTwentyMatches,
-      [pastCapPath]: 'import "../../src/adapters/codex.js";\n',
-    });
-
-    const [lint] = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
-
-    expect(lint).toContain("21 total");
-    expect(lint).not.toContain(pastCapPath);
-  });
 });
+
 
 test("compile on a task whose files patterns add a new path under the top-level scripts directory names tests repo export-manifest as likely collateral while a task adding a path under tests or src does not whereas a sweep that matches names and symbols alone fails", () => {
   const manifest = 'test("the export set is exact", () => expect(true).toBe(true));\n';
@@ -158,8 +117,7 @@ describe("OBS-547 — the map the scope gate classifies on", () => {
     const hits = collateralHits([task("T2", ["src/adapters/codex.ts"])], repo).get("T2") ?? [];
     expect(hits).toHaveLength(25);
 
-    const hidden = hits[20]!; // the 21st — computed, and never displayed
-    expect(collateralLints([task("T2", ["src/adapters/codex.ts"])], repo)[0]).not.toContain(hidden);
+    const hidden = hits[20]!; // the 21st
 
     const onFullMap = classifyScopeOffenders("T2", [hidden], hits);
     expect(onFullMap.authoring).toBe(true);
@@ -182,14 +140,48 @@ describe("OBS-547 — the map the scope gate classifies on", () => {
     expect(classifyScopeOffenders("T2", [hidden, "tests/cockpit/demo.test.ts"], hits).authoring).toBe(false);
   });
 
-  test("test: when the collateral display cap bites its line states that hidden hits remain retained and a matching scope red will print the path with its files repair; a count with no route fails", () => {
-    const repo = capBitingRepo();
-    const [lint] = collateralLints([task("T2", ["src/adapters/codex.ts"])], repo);
+  test("test: plan for a task with more predicted collateral paths than twenty prints every path with the direct importers of an owned source first and the total count, while the scope gate's own map for that task is unchanged, so a list that hides the twenty-first path fails", async () => {
+    // 10 direct importers (named with z- prefix so alphabetical sort would put them last)
+    const directFiles = Object.fromEntries(
+      Array.from({ length: 10 }, (_, i) => [
+        `tests/adapters/z-direct-${String(i).padStart(2, "0")}.test.ts`,
+        'import "../../src/adapters/codex.js";\n',
+      ]),
+    );
+    // 15 indirect mention files (named with a- prefix so alphabetical sort puts them first)
+    const indirectFiles = Object.fromEntries(
+      Array.from({ length: 15 }, (_, i) => [
+        `tests/adapters/a-mention-${String(i).padStart(2, "0")}.test.ts`,
+        '// mentions src/adapters/codex in a comment without importing it\n',
+      ]),
+    );
+    const repo = makeRepo({
+      "src/adapters/codex.ts": "export const codex = {};\n",
+      ...directFiles,
+      ...indirectFiles,
+      "tests/adapters/unrelated.test.ts": 'import "../../src/adapters/other.js";\n',
+    });
 
+    const t = task("T2", ["src/adapters/codex.ts"]);
+    const gateMap = collateralHits([t], repo).get("T2") ?? [];
+    // Scope gate's own map is unchanged: 25 total, sorted alphabetically (a-mention-00 is first)
+    expect(gateMap).toHaveLength(25);
+    expect(gateMap[0]).toBe("tests/adapters/a-mention-00.test.ts");
+
+    const [lint] = collateralLints([t], repo);
+    expect(lint).toBeDefined();
     expect(lint).toContain("25 total");
-    expect(lint).toMatch(/retained/i); // the hidden hits are kept, not discarded at the cap
-    expect(lint).toMatch(/scope red/i); // and this is where they surface
-    expect(lint).toContain("files[] repair"); // carrying the repair, not just a number
+
+    // All 25 paths are printed (including the 21st, 22nd, 23rd, 24th, 25th path)
+    for (const p of Object.keys(directFiles)) expect(lint).toContain(p);
+    for (const p of Object.keys(indirectFiles)) expect(lint).toContain(p);
+
+    // Direct importers of an owned source are printed FIRST, before indirect mention paths
+    const firstDirectIdx = lint.indexOf("tests/adapters/z-direct-00.test.ts");
+    const firstIndirectIdx = lint.indexOf("tests/adapters/a-mention-00.test.ts");
+    expect(firstDirectIdx).toBeGreaterThan(-1);
+    expect(firstIndirectIdx).toBeGreaterThan(-1);
+    expect(firstDirectIdx).toBeLessThan(firstIndirectIdx);
   });
 });
 

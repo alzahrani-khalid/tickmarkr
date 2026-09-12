@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { ttyInput } from "../helpers/tty-input.js";
 import { createElement, type ReactElement } from "react";
 import { render } from "ink";
 import { describe, expect, test } from "vitest";
@@ -19,14 +20,7 @@ import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 const stripAnsi = (value: string) => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 
 function makeInkStreams() {
-  const input = new PassThrough() as PassThrough & {
-    isTTY: boolean; setRawMode: (mode: boolean) => void;
-    ref: () => NodeJS.ReadStream; unref: () => NodeJS.ReadStream;
-  };
-  input.isTTY = true;
-  input.setRawMode = () => {};
-  input.ref = () => input as unknown as NodeJS.ReadStream;
-  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const input = ttyInput();
   const output = new PassThrough() as PassThrough & { isTTY: boolean; columns: number; rows: number };
   output.isTTY = true; output.columns = 120; output.rows = 40;
   const writes: string[] = [];

@@ -45,6 +45,47 @@ describe("tickmarkr init --agent skills location (T3)", () => {
 });
 
 describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
+  test("test: the overseer skill a fresh tickmarkr init installs states that on any restart the overseer re-announces its pane id to every live seat and re-arms every watcher with it, that briefs take the address from the handoff and never hardcode it, and that orchestrator artifacts live inside the orchestrator's sandbox root, so an installed skill that lets a seat keep a pre-restart pane id fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+
+    expect(installed).toMatch(/ANY restart[\s\S]*re-announce[\s\S]*every live seat[\s\S]*re-arm[\s\S]*every watcher/);
+    expect(installed).toMatch(/(?:must never keep|never keep) a pre-restart overseer pane id/);
+    expect(installed).toMatch(/address from the handoff file/);
+    expect(installed).toMatch(/never hardcode a pane id/);
+    expect(installed).toMatch(/run log, handoff, and plan[\s\S]*inside its sandbox root/);
+    expect(installed).toMatch(/overseer reads them from there/);
+  });
+
+  test("test: the installed overseer skill states that after agent start the seat waits for the model banner, sends the brief with pane run and reads the transcript back for its first words before any deadline is armed, and its orchestrator brief tells a seat whose sandbox denies writes under .git to report and stop so the overseer launches the daemon, so an installed skill that arms a deadline on an unread brief fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+
+    expect(installed).toMatch(/agent start[\s\S]*wait for and read the model banner[\s\S]*brief with `pane run`[\s\S]*read the transcript back[\s\S]*first words[\s\S]*before.*deadline/);
+    expect(installed).toMatch(/brief absent from the transcript was not sent/);
+    expect(installed).toMatch(/sandbox denies writes under `\.git`[\s\S]*report.*overseer[\s\S]*stop/);
+    expect(installed).toMatch(/overseer launches the daemon itself/);
+    expect(installed).toMatch(/daemon host is never sandboxed/);
+  });
+
+  test("test: the installed overseer skill requires the effort flag and a banner read on every claude seat, full suite logs for inventories and no checkout in a clone while its suite runs, and every mention of agent prompt in it sits inside a sentence forbidding it as mission delivery, so an installed skill carrying a delivery mention outside a forbid fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+
+    expect(installed).toMatch(/Every Claude[\s\S]*--effort high[\s\S]*banner read/);
+    expect(installed).toMatch(/Inventories retain the \*\*full suite log\*\*/);
+    expect(installed).toMatch(/no one runs `git checkout` in a clone while that clone's suite is running/);
+    for (const line of installed.split("\n")) {
+      if (line.includes("agent prompt")) expect(line).toMatch(/never use|forbid/i);
+    }
+  });
+
   test("test: the skills a fresh tickmarkr init installs each state in their run-watch guidance that a watch ending the seat's turn is no watch, name a blocking journal consumer re-armed at most every twenty minutes, and forbid a Monitor-only wake, so an installed skill whose watch guidance permits a turn-ending watch fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });

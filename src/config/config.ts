@@ -336,6 +336,8 @@ export const TickmarkrConfigSchema = z.object({
     }),
     floors: z.record(z.string(), TierEnum),
     learned: z.enum(["on", "off"]), // v1.6 ROUTE-09 kill switch; a typo (offf) fails loud via safeParse
+    // OBS-986 (ES-1): climb one tier on request when untried channels exist in higher tiers.
+    escalateTier: z.enum(["on", "off"]).default("on"),
     // v1.9 ROUTE-15 — optional overrides for profile.ts HALF_LIFE_RUNS/AVAIL_WEIGHT; absent ⇒ byte-identical defaults.
     // SIBLING of learned (not nested): routing.learned is the on/off enum switch.
     learnedTuning: z.object({
@@ -400,6 +402,11 @@ export const TickmarkrConfigSchema = z.object({
     // R3: globs no task may skip review on (input/demux/lifecycle, gates/run/drivers/adapters, anything
     // reaching a shell). A judge-only task intersecting one of these fails COMPILE, never silently skips.
     criticalPaths: z.array(z.string()).optional(),
+    // RF-1 (OBS-922 add.2/3): review.floor — `worker` (default) names no tier and leaves the seat
+    // ranking to the author's routed seat; a tier is folded in as max(task floor, this) by reviewGate
+    // and its retry — it can raise a seat and never lower one. Not in the template: the cockpit
+    // fixture pins the fresh-install bytes (see d0e89a9a).
+    floor: z.union([z.literal("worker"), TierEnum]).default("worker"),
   }),
   // v1.54 T1: prefer — ranked consult seat failover. Entries MUST be adapter:model (unlike
   // review.prefer's adapter|adapter:model grammar): a consult seat has no channel to inherit a
@@ -483,6 +490,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     // a workspace that has accumulated ≥MIN_SAMPLES warm telemetry per cell. Preview any workspace's effect
     // first with `tickmarkr plan` / `tickmarkr report`; flip to "off" to pin exact static routing (the kill switch stands).
     learned: "on",
+    escalateTier: "on",
     allowUnverifiedModels: false,
   },
   // Seed table (spec §13). New models = edit this (or your config.yaml), never code.
@@ -628,7 +636,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
   judge: { adapter: "claude-code", model: "fable" },
   // R3: no `policy` floor — the neutral floor leaves the compiler's per-task assignment standing, so
   // the path-keyed rule is reachable out of the box rather than raised to full by construction.
-  review: { complexityThreshold: 7, timeoutMs: 900_000, required: true, criticalPaths: [...DEFAULT_REVIEW_CRITICAL_PATHS] },
+  review: { complexityThreshold: 7, timeoutMs: 900_000, required: true, floor: "worker", criticalPaths: [...DEFAULT_REVIEW_CRITICAL_PATHS] },
   consult: { adapter: "claude-code", model: "fable", stallMinutes: 15 },
   // v1.4: gate LLM calls (judge/review/consult) run headless by default; pane opts back into visible agents.
   // v1.2: workers are the real agent TUI in the pane; "print" restores the -p-rendered-in-pane path.
@@ -837,6 +845,7 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #   floors:               # tier authority — advisory minimum bands; 'tickmarkr plan' lints violations
 #     migration: frontier
 #   learned: on            # default ON (ROUTE-14); cold profile = exact v1.5 static routing, warms per workspace. Set 'off' to pin static routing; preview with 'tickmarkr plan'
+#   escalateTier: on       # on | off (default on): climb one tier on request when untried channels exist in higher tiers
 #   learnedTuning: { halfLifeRuns: 5, availWeight: 0.05 }  # optional; defaults byte-identical
 #   explore: { mode: on, excludeShapes: [], excludeComplexityAtOrAbove: null, cap: 5 }  # optional; absent ⇒ byte-identical
 #   sla: { implement: 15 }  # optional per-shape minutes — advisory plan lint only; absent ⇒ no lint
@@ -870,7 +879,9 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #   test: npm test
 #   byShape:
 #     docs: { acceptance: false, review: false }  # baseline, evidence, and scope are mandatory
-# review: { complexityThreshold: 7, timeoutMs: 900000, required: true, prefer: [codex:gpt-5.6-sol, kimi] }
+# review: { complexityThreshold: 7, timeoutMs: 900000, required: true, floor: worker, prefer: [codex:gpt-5.6-sol, kimi] }
+#                         # floor: worker (default) | cheap | mid | frontier — the reviewer seats at or above
+#                         # max(author tier, task floor, this tier, prior reviewer); a tier here only raises it
 #                         # prefer: ordered reviewer seat preference (adapter | adapter:model); ranks
 #                         # diversity-eligible channels only — never admits a same-vendor/same-model reviewer
 # consult: { adapter: claude-code, model: fable, stallMinutes: 15, prefer: [codex:gpt-5.6-sol, kimi:kimi-code/k3] }

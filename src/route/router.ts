@@ -366,23 +366,14 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   return { assignment: toAssignment(eligible[0]), ladder: ladderFor(task, entry), lints, provenance: `${degraded}${bound}, marginal-cost auto (${chosenBy})`, ...(deviation ? { deviation } : {}) };
 }
 
-export function nextChannel(
+function candidatePool(
   current: Assignment,
-  task: Task,
-  cfg: TickmarkrConfig,
   channels: BillingChannel[],
   tried: string[],
-  profile?: RoutingProfile,
+  tierPredicate: (tier: Tier) => boolean,
   exclude?: ReadonlySet<string>,
-): Assignment | null {
+): BillingChannel[] {
   channels = withoutExcluded(channels, exclude);
-  // already cheapest-sufficient: TIER_RANK asc is the PRIMARY key so escalation climbs one band at a time.
-  // Do NOT "unify" this onto route()'s key order (marginal-cost first) — that reverses climb-one-band on mixed fleets (ROUTE-02, D2).
-  // ROUTE-13: learnedScore is the STRICTLY-LAST key — within-band tiebreak only. Precomputed
-  // outside the comparator (Pitfall 1), never arithmetic-combined with the band keys, no
-  // profile-dependent filter. NO exploration bonus here (route():110 has one; a probe on the
-  // failure path would spend a real retry). Absent profile ⇒ every score is 0 ⇒ third key
-  // all-ties ⇒ the stable sort preserves the exact v1.7 candidate ORDER.
   const triedKeys = new Set(tried);
   const triedIdentities = new Set(tried.map((key) => {
     const channel = channels.find((c) => channelKey(c) === key);
@@ -394,11 +385,105 @@ export function nextChannel(
     && channels.filter((c) => c.adapter === current.adapter).every((c) => triedKeys.has(channelKey(c)));
   const currentChannel = channels.find((c) => c.adapter === current.adapter && c.model === current.model);
   const excludedProvider = currentAdapterExcluded ? routingModelProvider(current.model, currentChannel?.vendor) : undefined;
-  const pool = channels.filter((c) => !triedIdentities.has(modelRouteIdentity(c.model, c.vendor))
+  return channels.filter((c) => !triedIdentities.has(modelRouteIdentity(c.model, c.vendor))
     && (!excludedProvider || routingModelProvider(c.model, c.vendor) !== excludedProvider)
-    && TIER_RANK[c.tier] >= TIER_RANK[current.tier]);
+    && tierPredicate(c.tier));
+}
+
+function rankFailoverCandidates(
+  pool: BillingChannel[],
+  task: Task,
+  cfg: TickmarkrConfig,
+  profile?: RoutingProfile,
+): BillingChannel[] {
   const scores = new Map(pool.map((c) => [channelKey(c), profile ? learnedScore(profile, task.shape, channelKey(c), c.channel, { availWeight: cfg.routing.learnedTuning?.availWeight }) : 0]));
   const scoreOf = (c: BillingChannel) => scores.get(channelKey(c))!;
-  const candidates = pool.sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier] || marginalCostRank(a) - marginalCostRank(b) || scoreOf(b) - scoreOf(a));
+  return pool.sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier] || marginalCostRank(a) - marginalCostRank(b) || scoreOf(b) - scoreOf(a));
+}
+
+export function nextChannel(
+  current: Assignment,
+  task: Task,
+  cfg: TickmarkrConfig,
+  channels: BillingChannel[],
+  tried: string[],
+  profile?: RoutingProfile,
+  exclude?: ReadonlySet<string>,
+): Assignment | null {
+  // already cheapest-sufficient: TIER_RANK asc is the PRIMARY key so escalation climbs one band at a time.
+  // Do NOT "unify" this onto route()'s key order (marginal-cost first) — that reverses climb-one-band on mixed fleets (ROUTE-02, D2).
+  // ROUTE-13: learnedScore is the STRICTLY-LAST key — within-band tiebreak only. Precomputed
+  // outside the comparator (Pitfall 1), never arithmetic-combined with the band keys, no
+  // profile-dependent filter. NO exploration bonus here (route():110 has one; a probe on the
+  // failure path would spend a real retry). Absent profile ⇒ every score is 0 ⇒ third key
+  // all-ties ⇒ the stable sort preserves the exact v1.7 candidate ORDER.
+  const pool = candidatePool(current, channels, tried, (tier) => TIER_RANK[tier] >= TIER_RANK[current.tier], exclude);
+  const candidates = rankFailoverCandidates(pool, task, cfg, profile);
   return candidates.length ? toAssignment(candidates[0]) : null;
+}
+
+export type ClimbPick = Assignment & {
+  climbed: boolean;
+  reason?: string;
+};
+export type ClimbResult = ClimbPick;
+
+function makeClimbPick(assignment: Assignment, climbed: boolean, reason?: string): ClimbPick {
+  const pick: ClimbPick = {
+    adapter: assignment.adapter,
+    model: assignment.model,
+    channel: assignment.channel,
+    tier: assignment.tier,
+    climbed,
+    ...(climbed ? {} : { reason }),
+  };
+  Object.defineProperty(pick, "assignment", {
+    get() {
+      return {
+        adapter: this.adapter,
+        model: this.model,
+        channel: this.channel,
+        tier: this.tier,
+      };
+    },
+    enumerable: false,
+  });
+  return pick;
+}
+
+/**
+ * v2.5.4 OBS-986 (ES-1): climb one tier on request when untried channels exist in higher tiers.
+ * With routing.escalateTier on, returns the cheapest untried live channel strictly above current.tier,
+ * ordered as nextChannel orders (tier, then marginal cost, learned score strictly last), flagged climbed: true.
+ * When the knob is off, when current is frontier, or when no higher tier has an untried channel,
+ * returns nextChannel's same-or-higher pick flagged climbed: false naming the reason.
+ */
+export function climbChannel(
+  current: Assignment,
+  task: Task,
+  cfg: TickmarkrConfig,
+  channels: BillingChannel[],
+  tried: string[],
+  profile?: RoutingProfile,
+  exclude?: ReadonlySet<string>,
+): ClimbPick | null {
+  const escalateOn = cfg.routing.escalateTier !== "off";
+  if (!escalateOn) {
+    const pick = nextChannel(current, task, cfg, channels, tried, profile, exclude);
+    return pick ? makeClimbPick(pick, false, "routing.escalateTier knob is off") : null;
+  }
+
+  if (current.tier === "frontier") {
+    const pick = nextChannel(current, task, cfg, channels, tried, profile, exclude);
+    return pick ? makeClimbPick(pick, false, "no higher tier") : null;
+  }
+
+  const higherPool = candidatePool(current, channels, tried, (tier) => TIER_RANK[tier] > TIER_RANK[current.tier], exclude);
+  if (higherPool.length > 0) {
+    const candidates = rankFailoverCandidates(higherPool, task, cfg, profile);
+    return makeClimbPick(toAssignment(candidates[0]), true);
+  }
+
+  const pick = nextChannel(current, task, cfg, channels, tried, profile, exclude);
+  return pick ? makeClimbPick(pick, false, "no higher tier has an untried channel") : null;
 }

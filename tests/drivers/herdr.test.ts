@@ -6,7 +6,7 @@ import { declareInputBox } from "../../src/adapters/types.js";
 import { DELIVERY_ATTEMPTS, DISPATCH_START_PREFIX, DeliveryReadinessError, HerdrDriver, taskGroupOf } from "../../src/drivers/herdr.js";
 import { pickDriver } from "../../src/drivers/index.js";
 import { formatOwnedName } from "../../src/drivers/types.js";
-import { reserveWatchBoard, observeNamedRun } from "../../src/run/supervision.js";
+import { readWatchBoard, reserveWatchBoard, observeNamedRun } from "../../src/run/supervision.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { classifyTaskFailure, Journal, type JournalEvent } from "../../src/run/journal.js";
 import { runDaemon } from "../../src/run/daemon.js";
@@ -1793,6 +1793,30 @@ describe("HerdrDriver narrator pane (T2)", () => {
     expect(calls).toMatch(/pane run w1:p7 printf .*tickmarkr status --watch run-new/);
     expect(calls).not.toMatch(/status --watch run-old/);
     expect(next).toEqual({ id: "w1:p7", name: "tickmarkr:watch:run:0:run-new", cwd });
+  });
+
+  // Leg-2 T7 M1 (OBS-988): a dead cockpit's pane survives with the run's name and token intact, which is
+  // exactly what makes narrator() answer from its cache. The daemon's proof of loss releases the pane on
+  // ownership alone — the dead UI can never acknowledge — and the next narrator call launches again.
+  test("test: retireLostWatch closes this run's own board without a presence acknowledgement and drops the cached slot so the next narrator call splits and launches a fresh board under a new owner token, while an owner record naming another pane keeps the board protected, so a cached ghost handed back as a reopened board fails", async () => {
+    const { bin, log, cwd, panes } = makeStub(0, { tab: true });
+    const driver = new HerdrDriver(bin);
+    const first = await driver.narrator(cwd, "tickmarkr ui run-lost --view run", "run-lost");
+    const token0 = readWatchBoard(cwd, "run-lost")!.token;
+    expect(await driver.narrator(cwd, "tickmarkr ui run-lost --view run", "run-lost")).toBe(first); // the cache, as production
+    await driver.retireLostWatch(first);
+    expect(readFileSync(log, "utf8")).toContain("pane close w1:p7");
+    expect(readFileSync(panes, "utf8")).not.toContain("tickmarkr:watch:run:0:run-lost"); // taken back, verified gone
+    const next = await driver.narrator(cwd, "tickmarkr ui run-lost --view run", "run-lost");
+    expect(next).not.toBe(first);
+    const calls = readFileSync(log, "utf8").split("\n");
+    expect(calls.filter((l) => l.startsWith("pane split"))).toHaveLength(2); // launched again, not answered from cache
+    expect(calls.filter((l) => /^pane run w1:p7 printf .*tickmarkr ui run-lost/.test(l))).toHaveLength(2);
+    expect(readWatchBoard(cwd, "run-lost")!.token).not.toBe(token0);
+    // ownership is still the gate: a record naming another pane is not this driver's board to take
+    reserveWatchBoard({ repo: cwd, runId: "run-lost", driver: "herdr", workspace: "wTEST", pane: "w1:pOTHER", name: "tickmarkr:watch:run:0:run-lost" });
+    await expect(driver.retireLostWatch(next)).rejects.toThrow(/protected/);
+    expect(readFileSync(log, "utf8").split("\n").filter((l) => l === "pane close w1:p7")).toHaveLength(1);
   });
 
   test("narrator reuses fail-closed placement: no HERDR_WORKSPACE_ID → throws (never untargeted)", async () => {

@@ -372,13 +372,16 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     output.on("resize", resize);
     const reader = createPointerReportReader();
     const stdin = new Proxy(input, { get(target, property) {
-      if (property === "read") return (...args: unknown[]) => {
+      if (property === "read") return () => {
         try {
-          const chunk = (target.read as (...args: unknown[]) => unknown)(...args);
-          if (chunk == null) return null;
-          const result = reader(String(chunk));
           let keys = "";
-          for (const token of result.tokens) { if (token.type === "pointer") pointer(token.report); else keys += token.bytes; }
+          // OBS-965: drain until the stream itself says empty. A real tty (highWaterMark 0) stops its
+          // handle after every chunk and only a read() that finds the buffer EMPTY restarts it; Ink's
+          // loop stops at the first null, so returning null after ONE pointer-only chunk left that
+          // empty read unmade and every later key queued in the kernel — the deaf board.
+          for (let chunk = target.read(); chunk != null; chunk = target.read()) {
+            for (const token of reader(String(chunk)).tokens) { if (token.type === "pointer") pointer(token.report); else keys += token.bytes; }
+          }
           // A standalone Escape is unambiguous after Ink's own input grace.
           if (reader.pending() === "\x1b") for (const token of reader.flush().tokens) if (token.type === "keys") keys += token.bytes;
           return keys || null;

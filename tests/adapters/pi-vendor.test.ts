@@ -33,7 +33,7 @@ test("test: the review gate's reviewer choice with pi openai-codex gpt-5.5 among
     channel: "sub",
     models: { "openai-codex/gpt-5.5": "frontier", "zai/glm-5.2": "mid" },
   };
-  const author: Assignment = { adapter: "codex", model: "gpt-5.6-sol", channel: "sub", tier: "frontier" };
+  const author: Assignment = { adapter: "codex", model: "gpt-5.6-sol", channel: "sub", tier: "mid" }; // RF-1: at the zai seat's tier
   const authorChannel: BillingChannel = { ...author, vendor: "openai" };
   const channels = pi.channels!(cfg);
   const openaiPi = channels.find((channel) => channel.model === "openai-codex/gpt-5.5")!;

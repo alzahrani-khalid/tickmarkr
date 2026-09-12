@@ -961,7 +961,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
         return { installed: true, authed: true, version: "empty", models: ["empty-1"], modelAuth: authedModels(["empty-1"]) };
       }
       override channels(): BillingChannel[] {
-        return [{ adapter: this.id, vendor: this.vendor, model: "empty-1", channel: "sub", tier: "cheap" }];
+        return [{ adapter: this.id, vendor: this.vendor, model: "empty-1", channel: "sub", tier: "frontier" }];
       }
       override headlessCommand(): string { return "true"; }
     }

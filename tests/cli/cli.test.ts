@@ -675,8 +675,14 @@ describe("OBS-96 fix (piece 3) — dist mid-suite rewrite race", () => {
   }
 
   test("test: the full suite passes on a first run in a freshly built dist directory with no prior warm run in the same process", () => {
-    // the rig-evidenced set: the one mid-suite dist writer + the two spawnCli readers
-    expect([...DIST_COUPLED_TESTS].sort()).toEqual(["tests/cli/bin.test.ts", "tests/cli/cli.test.ts", "tests/cli/version.test.ts"]);
+    // the rig-evidenced set: the one mid-suite dist writer + the two spawnCli readers, plus the
+    // OBS-965 real-tty e2e (rebuilds ROOT dist via prepareBuiltCli, then pty-spawns the built entry)
+    expect([...DIST_COUPLED_TESTS].sort()).toEqual([
+      "tests/cli/bin.test.ts",
+      "tests/cli/cli.test.ts",
+      "tests/cli/version.test.ts",
+      "tests/e2e/deaf-board.e2e.test.ts",
+    ]);
 
     // 1) they run in ONE fork, files sequential, after the parallel fan-out — writer ∦ readers
     const projects = (vitestConfig as { test?: { projects?: ProjectEntry[] } }).test?.projects ?? [];

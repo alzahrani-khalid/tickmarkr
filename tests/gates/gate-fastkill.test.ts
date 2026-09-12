@@ -317,7 +317,7 @@ describe("v2.0 calibrated gate inactivity policy", () => {
     const channels: BillingChannel[] = [
       { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
       { adapter: "fake-b", vendor: "fake-b", model: "fake-b-1", channel: "sub", tier: "frontier" },
-      { adapter: "fake-c", vendor: "fake-c", model: "fake-c-1", channel: "api", tier: "mid" },
+      { adapter: "fake-c", vendor: "fake-c", model: "fake-c-1", channel: "api", tier: "frontier" },
     ];
     const { repo, base } = repoWithCommit();
     const task = validateGraph({

@@ -370,4 +370,136 @@ describe("cross-task ownership", () => {
     const oraclesReported = shapeFindings.map((f) => f.oracle).sort();
     expect(oraclesReported).toEqual([...SHAPE_ORACLES].sort());
   });
+  test("a task whose files[] hold src/run/** in a repository containing the daemon yields five unowned-shape-oracle findings, the same task in a repository without the daemon yields none, and an anchored src/run/daemon.* entry still yields five, so a broad glob that owns the daemon without its oracles fails", () => {
+    const repoWithDaemon = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-broad-daemon-"));
+    put(repoWithDaemon, "src/run/daemon.ts", "export const daemon = true;\n");
+
+    const graphBroad: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "daemon worker via broad glob",
+          goal: "daemon worker via broad glob",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/run/**"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+
+    const findingsWithDaemon = ownershipFindings(graphBroad.tasks, repoWithDaemon);
+    const shapeFindingsWithDaemon = findingsWithDaemon.filter((item) => item.code === "unowned-shape-oracle");
+    expect(shapeFindingsWithDaemon).toHaveLength(5);
+    expect(shapeFindingsWithDaemon.map((f) => f.oracle).sort()).toEqual([...SHAPE_ORACLES].sort());
+
+    const repoWithoutDaemon = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-broad-nodaemon-"));
+    const findingsWithoutDaemon = ownershipFindings(graphBroad.tasks, repoWithoutDaemon);
+    const shapeFindingsWithoutDaemon = findingsWithoutDaemon.filter((item) => item.code === "unowned-shape-oracle");
+    expect(shapeFindingsWithoutDaemon).toHaveLength(0);
+
+    const graphAnchored: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "daemon worker via anchored glob",
+          goal: "daemon worker via anchored glob",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/run/daemon.*"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+
+    const findingsAnchored = ownershipFindings(graphAnchored.tasks, repoWithoutDaemon);
+    const shapeFindingsAnchored = findingsAnchored.filter((item) => item.code === "unowned-shape-oracle");
+    expect(shapeFindingsAnchored).toHaveLength(5);
+    expect(shapeFindingsAnchored.map((f) => f.oracle).sort()).toEqual([...SHAPE_ORACLES].sort());
+  });
+
+  test("a task owning a dedicated test that directly imports a source owned by no task yields unowned-source-of-owned-test naming the test and the source and compile renders it without aborting, while the same graph with the source owned by another task yields none, so an owned test whose source nobody owns passing silently fails", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-unowned-source-"));
+    put(repo, "src/widget.ts", "export function widget() { return 42; }\n");
+    put(
+      repo,
+      "tests/widget.test.ts",
+      'import { test, expect } from "vitest";\nimport { widget } from "../src/widget.js";\ntest("widget works", () => { expect(widget()).toBe(42); });\n',
+    );
+
+    const graphUnowned: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "widget test owner",
+          goal: "widget test owner",
+          shape: "implement",
+          complexity: 1,
+          files: ["tests/widget.test.ts"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+
+    const findings = ownershipFindings(graphUnowned.tasks, repo);
+    const finding = findings.find((item) => item.code === "unowned-source-of-owned-test");
+    expect(finding).toBeDefined();
+    expect(finding).toMatchObject({
+      code: "unowned-source-of-owned-test",
+      taskId: "T1",
+      test: "tests/widget.test.ts",
+      source: "src/widget.ts",
+      corroboration: { kind: "direct-import", source: "src/widget.ts" },
+    });
+    expect(finding?.detail).toContain("tests/widget.test.ts");
+    expect(finding?.detail).toContain("src/widget.ts");
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const compiled = compileRepo(
+        repo,
+        "## T1: widget test owner\n- files: tests/widget.test.ts\n- acceptance:\n  - judge: holds\n",
+      );
+      expect(compiled.spec.source).toBe("native");
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(/tickmarkr: ownership-lint\[unowned-source-of-owned-test]:.*tests\/widget\.test\.ts.*src\/widget\.ts/),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+
+    const graphOwned: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "widget test owner",
+          goal: "widget test owner",
+          shape: "implement",
+          complexity: 1,
+          files: ["tests/widget.test.ts"],
+          acceptance: ["holds"],
+        },
+        {
+          id: "T2",
+          title: "widget source owner",
+          goal: "widget source owner",
+          shape: "implement",
+          complexity: 1,
+          files: ["src/widget.ts"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+
+    const findingsOwned = ownershipFindings(graphOwned.tasks, repo);
+    expect(findingsOwned.filter((item) => item.code === "unowned-source-of-owned-test")).toHaveLength(0);
+  });
 });

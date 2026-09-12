@@ -1,8 +1,13 @@
 ❯ run-20260821-070000-0000000000001734 started — pid 4321
 ❯ run-20260821-070000-0000000000001734 resumed — pid 4321
 ! run-20260821-070000-0000000000001734 graph rehashed — a1a1a1a1a1a1a1a1, to 5f5f5f5f5f5f
+! T1 tier climbed — test, cause gate-fingerprint-cap
+! T1 restore rerouted — pin changed
 - T1 restored — codex:gpt-5.6-sol
 - run-20260821-070000-0000000000001734 lock reclaimed — pid 4321
+! run-20260821-070000-0000000000001734 board lost — pid 2428, pane wZ:p1EB
+✓ run-20260821-070000-0000000000001734 board reopened — pane wZ:p1F1
+✗ run-20260821-070000-0000000000001734 board reopen failed — no caller pane, pane wZ:p1EB
 ✓ run-rail finished — done 1, failed 0
 ✓ run-20260821-070000-0000000000001734 tip verify — test passed
 ✗ run-20260821-070000-0000000000001734 tip verify — test failed after T1

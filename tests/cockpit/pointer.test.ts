@@ -8,6 +8,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { ttyInput } from "../helpers/tty-input.js";
 import chalk from "chalk";
 import { render } from "ink";
 import { createElement } from "react";
@@ -1358,16 +1359,7 @@ async function liveCockpit(colourLevel: 0 | 3 = 3): Promise<{
   mkdirSync(join(repo, ".tickmarkr", "runs", runId), { recursive: true });
   writeFileSync(join(repo, ".tickmarkr", "runs", runId, "journal.jsonl"), POINTER_RAW);
 
-  const input = new PassThrough() as PassThrough & {
-    isTTY: boolean;
-    setRawMode: (mode: boolean) => void;
-    ref: () => NodeJS.ReadStream;
-    unref: () => NodeJS.ReadStream;
-  };
-  input.isTTY = true;
-  input.setRawMode = () => {};
-  input.ref = () => input as unknown as NodeJS.ReadStream;
-  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const input = ttyInput();
   const terminal = terminalStream(true);
 
   // The colour level the runner paints at. Level 3 is the ink-bearing terminal;

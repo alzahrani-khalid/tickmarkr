@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { PassThrough } from "node:stream";
+import { ttyInput } from "../helpers/tty-input.js";
 import { createElement, type ReactNode } from "react";
 import { render } from "ink";
 import { describe, expect, test } from "vitest";
@@ -35,16 +36,7 @@ const stripAnsi = (value: string) =>
 const wait = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function demoStreams(columns: number, rows: number) {
-  const input = new PassThrough() as PassThrough & {
-    isTTY: boolean;
-    setRawMode: (mode: boolean) => void;
-    ref: () => NodeJS.ReadStream;
-    unref: () => NodeJS.ReadStream;
-  };
-  input.isTTY = true;
-  input.setRawMode = () => {};
-  input.ref = () => input as unknown as NodeJS.ReadStream;
-  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const input = ttyInput();
 
   const output = new PassThrough() as PassThrough & {
     isTTY: boolean;

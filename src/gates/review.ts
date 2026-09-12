@@ -7,7 +7,7 @@ import {
   type TickmarkrConfig, TIER_RANK, type Tier,
 } from "../config/config.js";
 import { filesGlob } from "../graph/files-glob.js";
-import { renderAcceptanceItem, type Task } from "../graph/schema.js";
+import { renderAcceptanceItem, type Task, TIERS } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
 import { structuredFindings, type StructuredFinding } from "../run/journal.js";
@@ -276,12 +276,72 @@ function reviewPreferIndex(c: BillingChannel, prefer: string[]): number {
   return i === -1 ? prefer.length : i;
 }
 
+export type ReviewerFloorCause = "author-tier" | "task-floor" | "config" | "prior-reviewer";
+
+/**
+ * RF-1 (OBS-922 add.2/3): the tier a reviewer must meet is the maximum of the author's tier, the
+ * task-declared floor, a configured `review.floor` tier and, on a second round or a retry, the prior
+ * reviewer's tier. The cause names the input that reached the maximum (earlier inputs win a tie, so a
+ * floor the author's tier already satisfies is attributed to the author).
+ */
+export function resolveReviewerFloor(
+  authorTier: Tier,
+  taskFloor?: Tier,
+  configFloor?: Tier,
+  priorReviewerTier?: Tier,
+): { floor: Tier; cause: ReviewerFloorCause } {
+  const inputs: [Tier | undefined, ReviewerFloorCause][] = [
+    [authorTier, "author-tier"], [taskFloor, "task-floor"], [configFloor, "config"], [priorReviewerTier, "prior-reviewer"],
+  ];
+  let best: { floor: Tier; cause: ReviewerFloorCause } = { floor: authorTier, cause: "author-tier" };
+  for (const [tier, cause] of inputs) {
+    if (tier !== undefined && TIER_RANK[tier] > TIER_RANK[best.floor]) best = { floor: tier, cause };
+  }
+  return best;
+}
+
+/** A prior reviewer of THIS task: a channel key, or a journaled row's key plus the tier it was DISPATCHED at. */
+export type PriorReviewer = string | { reviewer: string; tier?: unknown };
+
+/**
+ * The highest tier among the task's prior reviewers — the prior reviewer's tier for RF-1. A recorded
+ * dispatch tier is historical evidence and wins over the current pool; an unrecorded one falls back to
+ * the seat's channel; a seat neither establishes (it left the pool on resume, or the journal holds
+ * garbage) holds frontier — fail closed, never silently dropped.
+ */
+export function priorReviewerTier(channels: BillingChannel[], priorReviewers: readonly PriorReviewer[] = []): Tier | undefined {
+  let top: Tier | undefined;
+  for (const p of priorReviewers) {
+    const key = typeof p === "string" ? p : p.reviewer;
+    const seen = (typeof p === "string" ? undefined : p.tier) ?? channels.find((ch) => channelKey(ch) === key)?.tier;
+    const tier: Tier = (TIERS as readonly unknown[]).includes(seen) ? seen as Tier : "frontier";
+    if (top === undefined || TIER_RANK[tier] > TIER_RANK[top]) top = tier;
+  }
+  return top;
+}
+
+/**
+ * The gate's floor: author tier, task floor, review.floor (a tier — `worker` names none) and the seats
+ * the caller names as THIS TASK's prior reviewers (earlier rounds' seats, a flaked seat). Eligibility
+ * exclusions are NOT evidence — a retry bans a flaked seat's whole adapter, and those sibling channels
+ * never reviewed — and neither is the run-scoped LRU rotation history, which names unrelated tasks' seats.
+ */
+export function gateReviewerFloor(
+  task: Pick<Task, "routingHints">, cfg: TickmarkrConfig, author: Assignment, channels: BillingChannel[],
+  priorReviewers: readonly PriorReviewer[] = [],
+): { floor: Tier; cause: ReviewerFloorCause } {
+  return resolveReviewerFloor(
+    author.tier, task.routingHints?.floor, cfg.review.floor === "worker" ? undefined : cfg.review.floor,
+    priorReviewerTier(channels, priorReviewers),
+  );
+}
+
 export function pickReviewer(
   author: Assignment,
   channels: BillingChannel[],
   exclude: string[] = [], // v1.1 failover: reviewer channels that already produced garbage for this task
   prefer: string[] = [], // v1.53 T2: review.prefer — reorders eligible channels, never changes eligibility
-  floor?: Tier, // task-declared only; config floors govern workers and must not silently move review seats
+  floor?: Tier, // task/config/prior floor from the caller; the author's own tier is ALWAYS applied here (RF-1)
   history: string[] = [], // run-scoped picks, oldest to newest; empty preserves the established ranking
   onSeat?: (seat: number, count: number) => void,
   demoted: ReadonlySet<string> = new Set(),
@@ -293,6 +353,8 @@ export function pickReviewer(
   const authorChannel = channels.find((c) => c.adapter === author.adapter && c.model === author.model);
   if (!authorChannel) return null;
   const authorProvider = modelProvider(author.model, authorChannel.vendor);
+  // RF-1: every caller inherits the author-tier floor — a reviewer is never seated below its author.
+  const effectiveFloor = resolveReviewerFloor(author.tier, floor).floor;
   const ranked = channels
     // Three independent axes: different vendor, different resolved provider identity (OBS-946: on initial pick
     // as well as failover, so an aggregator channel stamped "mixed" never seats the author's own provider),
@@ -302,7 +364,7 @@ export function pickReviewer(
       && modelProvider(c.model, c.vendor) !== authorProvider
       && modelId(c.model) !== modelId(author.model)
       && !exclude.includes(channelKey(c))
-      && (floor === undefined || TIER_RANK[c.tier] >= TIER_RANK[floor]))
+      && TIER_RANK[c.tier] >= TIER_RANK[effectiveFloor])
     .sort((a, b) => reviewPreferIndex(a, prefer) - reviewPreferIndex(b, prefer) || TIER_RANK[b.tier] - TIER_RANK[a.tier] || marginalCostRank(a) - marginalCostRank(b));
   const reviewer = [...ranked].sort((a, b) =>
     Number(demoted.has(channelKey(a))) - Number(demoted.has(channelKey(b)))
@@ -347,6 +409,9 @@ export async function reviewGate(
   reviewHistory?: string[],
   demotedReviewers?: ReadonlySet<string>,
   carriedFindings: readonly StructuredFinding[] = [],
+  // RF-1: channel keys of THIS task's prior reviewers (earlier rounds, a flaked seat) — task-scoped,
+  // never the run-wide rotation history nor excludeReviewers; the seat holds the highest of their tiers.
+  priorReviewers: readonly PriorReviewer[] = [],
 ): Promise<GateResult> {
   // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
   // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
@@ -422,9 +487,10 @@ export async function reviewGate(
     policy: "full" satisfies ReviewPolicy,
     ...(promotedBy ? { promotedFrom: declaredPolicy, promotedBy } : {}),
   };
-  // A reviewer floor is opt-in at the task. Applying cfg.routing.floors here would change the
-  // historical seat for every task that never asked for review-tier coupling.
-  const reviewerFloor = task.routingHints?.floor;
+  // RF-1: the floor is max(author tier, task floor, review.floor tier, prior reviewer's tier). Only
+  // review.floor is read from config — cfg.routing.floors governs workers and never moves review seats.
+  const { floor: reviewerFloor, cause: reviewerFloorCause } = gateReviewerFloor(task, cfg, author, channels, priorReviewers);
+  const floorMeta = { reviewerFloor, reviewerFloorCause };
   let rotationSeat: number | undefined;
   const reviewer = pickReviewer(
     author, channels, excludeReviewers ?? [], cfg.review.prefer ?? [], reviewerFloor,
@@ -433,12 +499,10 @@ export async function reviewGate(
   if (!reviewer) {
     // meta.noEligibleReviewer lets run-gates' review-retry keep the ORIGINAL unparseable result when
     // the retry finds no second seat — a truthful cause beats a synthetic no-reviewer failure.
-    const reason = reviewerFloor
-      ? `no cross-vendor reviewer available at or above task-declared ${reviewerFloor} floor (diversity rule)`
-      : "no cross-vendor reviewer available (diversity rule)";
+    const reason = `no cross-vendor reviewer available at or above ${reviewerFloor} floor (${reviewerFloorCause}; diversity rule)`;
     return cfg.review.required || priorMaterials.length > 0
-      ? { gate: "review", pass: false, details: `unreadable — ${reason}; ${priorMaterials.length ? "carried materials require a review verdict" : "set review.required:false to waive"}`, meta: { noEligibleReviewer: true, unreadable: true, ...(reviewerFloor ? { reviewerFloor } : {}) } }
-      : { gate: "review", pass: true, details: `WARNING: ${reason} — review waived by config`, meta: { noEligibleReviewer: true, ...(reviewerFloor ? { reviewerFloor } : {}) } };
+      ? { gate: "review", pass: false, details: `unreadable — ${reason}; ${priorMaterials.length ? "carried materials require a review verdict" : "set review.required:false to waive"}`, meta: { noEligibleReviewer: true, unreadable: true, ...floorMeta } }
+      : { gate: "review", pass: true, details: `WARNING: ${reason} — review waived by config`, meta: { noEligibleReviewer: true, ...floorMeta } };
   }
   reviewHistory?.push(channelKey(reviewer));
   const rotationMeta = rotationSeat === undefined ? {} : { rotationSeat };
@@ -476,6 +540,7 @@ Classify every concern as "material" (a correctness, security, or acceptance-cri
 block the merge) or "minor" (style, naming, or preference that should not block). ONLY material findings
 block approval. For a minor concern you have decided not to block on, set "defer": true and give a
 one-line "rationale" — it is recorded in the review, never dropped.
+A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
 
 Respond with ONLY this JSON:
 {"nonce": "${nonce}", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
@@ -563,7 +628,9 @@ The top-level comments array is optional. Use it only for actionable line-anchor
       meta: {
         ...policyMeta,
         ...rotationMeta,
+        ...floorMeta,
         reviewer: channelKey(reviewer),
+        reviewerTier: reviewer.tier,
         vendor: reviewer.vendor,
         provider,
         ...(cause === "malformed-verdict" ? { unparseable: true } : { noVerdict: true, classification: "infra", infra: true }),
@@ -598,15 +665,13 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     pass: decided.pass,
     details,
     meta: {
-      ...policyMeta, ...rotationMeta, reviewer: channelKey(reviewer), vendor: reviewer.vendor, provider,
+      ...policyMeta, ...rotationMeta, ...floorMeta, reviewer: channelKey(reviewer), reviewerTier: reviewer.tier, vendor: reviewer.vendor, provider,
+      // OBS-990 b: the verbatim ids plus ONE normalised copy of each list — never a third alias.
       ...(priorMaterials.length ? {
         resolved: v.resolved,
         reraised: v.reraised,
-        normalisedMatches: (v.resolved ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
         resolvedMatches: (v.resolved ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
         reraisedMatches: (v.reraised ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
-        normalisedResolved: (v.resolved ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
-        normalisedReraised: (v.reraised ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
       } : {}),
       ...(reraised.length ? { findings: [
         ...structuredFindings("review", details).filter((finding) => !reraised.some((prior) => prior.note === finding.note)),

@@ -302,3 +302,61 @@ describe("OBS-119 dead-channel exclusion resume (v1.71 T4, zero tokens)", () => 
     expect(resumeState.tried).toEqual(["fake:fake-1"]);
   });
 });
+
+test("test: every task-dispatch row after a ladder move names the dispatched channel in its provenance with the abandoned pin marked not re-tried and the channels the ladder skipped listed on the row, and a resume whose loaded graph pins a channel the recorded graph did not dispatches that pin journaling restore-rerouted, so a row claiming a pin it did not run on fails", async () => {
+  for (const change of ["ladder", "pin", "floor"] as const) {
+    const { repo, fake } = setupResumeRepo();
+    const original = loadGraph(repo);
+    original.tasks[0]!.routingHints = change === "ladder" ? { pin: { via: "fake", model: "fake-1" } } : { floor: "mid" };
+    saveGraph(repo, original);
+    const runId = `run-es2-restore-${change}`;
+    await seedJournal(repo, runId, [
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 0 } },
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake2, attempt: 1 } },
+    ]);
+    const journal = Journal.open(repo, runId);
+    writeFileSync(join(journal.dir, "graph.json"), JSON.stringify(original));
+    if (change !== "ladder") {
+      const loaded = loadGraph(repo);
+      loaded.tasks[0]!.routingHints = change === "pin" ? { pin: { via: "fake", model: "fake-1" } } : { floor: "frontier" };
+      saveGraph(repo, loaded);
+    }
+    await runDaemon(repo, { adapters: [fake], runId, resume: true, graphChanged: change !== "ladder" });
+    const rows = postResume(journal.read());
+    const dispatches = rows.filter((e) => e.event === "task-dispatch");
+    expect(dispatches).toHaveLength(1);
+    for (const row of dispatches) {
+      const key = channelKey(dispatchAssignment(row));
+      expect(row.data.provenance).toContain(`dispatch ${key}`);
+      if (change === "ladder") {
+        expect(key).toBe("fake:fake-2");
+        expect(row.data.provenance).toContain("pin fake:fake-1 not re-tried");
+        expect(row.data.provenance).not.toContain("pin bypasses mode");
+        expect(row.data.excludedChannels).toContain("fake:fake-1");
+        expect(row.data.exclusionReasons).toMatchObject({ "fake:fake-1": "already tried" });
+      } else {
+        expect(key).toBe("fake:fake-1");
+        expect(rows.find((e) => e.event === "restore-rerouted")?.data).toEqual({ from: "fake:fake-2", to: "fake:fake-1", reason: `${change} changed` });
+      }
+    }
+  }
+}, 60_000);
+
+test("a tier climb committed before interruption reaches the next restored dispatch with its provenance", async () => {
+  const { repo, fake } = setupResumeRepo();
+  const originalChannels = fake.channels.bind(fake);
+  fake.channels = (cfg) => originalChannels(cfg).map((c) => c.model === "fake-1" ? { ...c, tier: "mid" } : c);
+  const runId = "run-es2-pending-climb";
+  await seedJournal(repo, runId, [
+    { event: "task-dispatch", taskId: "T1", data: { assignment: { ...fake1, tier: "mid" }, attempt: 0, routingHints: {} } },
+    { event: "tier-escalated", taskId: "T1", data: { attempt: 1, cause: "repair-exhausted", gate: "test", fingerprint: "expected true", from: "fake:fake-1", to: "fake:fake-2", fromTier: "mid", toTier: "frontier", poolBefore: ["fake:fake-2"], costDelta: 3 } },
+  ]);
+  await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  const rows = Journal.open(repo, runId).read();
+  const dispatch = postResume(rows).find((e) => e.event === "task-dispatch")!;
+  expect(dispatch.data.assignment).toEqual(fake2);
+  expect(dispatch.data.attempt).toBe(1);
+  expect(dispatch.data.provenance).toContain("tier-escalated fake:fake-1 → fake:fake-2 (repair-exhausted)");
+  expect(dispatch.data.excludedChannels).toEqual(["fake:fake-1"]);
+  expect(rows.filter((e) => e.event === "tier-escalated")).toHaveLength(1);
+});

@@ -64,6 +64,7 @@ import {
   isRetiredGoldenFrame,
 } from "../../src/tui/cockpit/capture.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
+import { ttyInput } from "../helpers/tty-input.js";
 
 const inkMount = vi.hoisted(() => ({ failure: null as Error | null }));
 vi.mock("ink", async (importOriginal) => {
@@ -615,18 +616,7 @@ describe("live cockpit", () => {
 
 function makeInkStreams(columns = 140, rows = 40) {
   let raw = false;
-  const input = new PassThrough() as PassThrough & {
-    isTTY: boolean;
-    setRawMode: (mode: boolean) => void;
-    ref: () => NodeJS.ReadStream;
-    unref: () => NodeJS.ReadStream;
-  };
-  input.isTTY = true;
-  input.setRawMode = (mode) => {
-    raw = mode;
-  };
-  input.ref = () => input as unknown as NodeJS.ReadStream;
-  input.unref = () => input as unknown as NodeJS.ReadStream;
+  const input = ttyInput({ onRawMode: mode => { raw = mode; } });
 
   const output = new PassThrough() as PassThrough & {
     isTTY: boolean;
@@ -3770,9 +3760,7 @@ test("mounted Home Needs-you pointer opens diagnostic overlay when diagnostic ta
   const f = shellFixture();
   let lastFrame = "";
   const raw: boolean[] = [];
-  type MockReadStream = NodeJS.ReadStream & { isRaw: boolean };
-  const input = new PassThrough() as unknown as MockReadStream;
-  Object.assign(input, { isTTY: true, isRaw: false, setRawMode: (v: boolean) => { raw.push(v); input.isRaw = v; return input; }, ref: () => input, unref: () => input });
+  const input = ttyInput({ onRawMode: v => { raw.push(v); } });
   const output = new Writable({ write(chunk, _encoding, next) {
     const text = String(chunk);
     if (text.includes("q Quit")) lastFrame = text.slice(-20000);

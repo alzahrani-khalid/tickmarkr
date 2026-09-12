@@ -40,20 +40,29 @@ test("The production dispatcher’s ui [id] --view run, ui --setup [id] and TTY 
     writeFileSync(path, rawOf(entries));
   }
   const parks = await observer(repo, "ui", ["--setup", "run-observed"]);
+  // One key per message, each acknowledged by the frame that proves it landed. Ink hands a multi-byte
+  // chunk to the handler as ONE unknown key ("a\r" opens nothing; "n"+"a\r" coalesced to "na\r" is a
+  // no-op that leaves the first confirm open), and the 40 KB stdout tail still holds the earlier
+  // confirm, so a whole-tail poll is satisfied before the key is even read. Frame-acknowledged, not
+  // budget-widened (OBS-959/960/962).
+  const frame = () => { const out = parks.snapshot().stdout; return out.slice(Math.max(0, out.lastIndexOf("\x1b[2J"))); };
   try {
-    await expect.poll(() => parks.snapshot().stdout, { timeout: 5000 }).toContain("decisions: approve");
-    expect(parks.snapshot().stdout).toContain("no live owner");
+    await expect.poll(frame, { timeout: 5000 }).toContain("decisions: approve");
+    expect(frame()).toContain("no live owner");
     parks.send({ key: "a" });
-    await expect.poll(() => parks.snapshot().stdout).toContain("Actions — Enter reviews");
+    await expect.poll(frame, { timeout: 5000 }).toContain("Actions — Enter reviews");
     parks.send({ key: "\r" });
-    await expect.poll(() => parks.snapshot().stdout).toContain("tickmarkr approve run-observed T2 --by operator");
+    await expect.poll(frame, { timeout: 5000 }).toContain("tickmarkr approve run-observed T2 --by operator");
     const before = readFileSync(path, "utf8");
     parks.send({ key: "n" });
-    parks.send({ key: "a\r" });
-    await expect.poll(() => parks.snapshot().stdout).toContain("y approve");
+    await expect.poll(frame, { timeout: 5000 }).not.toContain("y approve");
+    parks.send({ key: "a" });
+    await expect.poll(frame, { timeout: 5000 }).toContain("Actions — Enter reviews");
+    parks.send({ key: "\r" });
+    await expect.poll(frame, { timeout: 5000 }).toContain("y approve");
     expect(readFileSync(path, "utf8")).toBe(before);
     parks.send({ key: "y" });
-    await expect.poll(() => parks.snapshot().stdout, { timeout: 5000 }).toContain("Decision recorded");
+    await expect.poll(frame, { timeout: 5000 }).toContain("Decision recorded");
     const approvals = readFileSync(path, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.event === "task-approved");
     expect(approvals).toHaveLength(1);
     expect(approvals[0]).toMatchObject({ taskId: "T2", data: { by: "operator" } });

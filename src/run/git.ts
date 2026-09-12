@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -641,3 +641,96 @@ export async function removeWorktree(repo: string, dir: string): Promise<void> {
   await shGit(`rm -rf ${shq(dir)}`, repo);
   await shGit("git worktree prune", repo);
 }
+
+export const REFS_PREFLIGHT_PREFIX = "refs/tickmarkr/preflight";
+export const REFS_PROBE_REMEDY =
+  "run from the main repository or a full clone; a sandbox that denies writes under that path cannot host a run";
+
+export interface RefsProbeOk {
+  ok: true;
+  path: string;
+  refsDir: string;
+}
+
+export interface RefsProbeRefusal {
+  ok: false;
+  path: string;
+  refsDir: string;
+  error: string;
+}
+
+export type RefsProbeResult = RefsProbeOk | RefsProbeRefusal;
+
+export function refsRefusalMessage(action: "run" | "resume", path: string, error: string): string {
+  return `refusing to ${action}: repository refs directory ${path} is not writable (${error}). `
+    + `Remedy: ${REFS_PROBE_REMEDY}.`;
+}
+
+/**
+ * OBS-983/984: prove the repository's common git directory accepts a ref write before starting
+ * the daemon. In a linked worktree, git resolves refs to the main repository's git directory.
+ * Creates and deletes a real ref under refs/tickmarkr/preflight/ through git itself, leaving
+ * nothing behind on success.
+ */
+export async function probeRefsWritable(cwd: string = process.cwd()): Promise<RefsProbeResult> {
+  const refsPathRes = await shGit("git rev-parse --git-path refs", cwd);
+  if (refsPathRes.code !== 0) {
+    const error = (refsPathRes.stderr || refsPathRes.stdout).trim() || "git rev-parse --git-path refs failed";
+    return { ok: false, path: "", refsDir: "", error };
+  }
+  const raw = refsPathRes.stdout.trim();
+  let refsDir = resolve(cwd, raw);
+  try {
+    refsDir = realpathSync(refsDir);
+  } catch {
+    // keep resolved path if realpath fails
+  }
+
+  const headRes = await shGit("git rev-parse HEAD", cwd);
+  const target = headRes.code === 0 && headRes.stdout.trim()
+    ? headRes.stdout.trim()
+    : "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+  const probeId = `probe-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const ref = `${REFS_PREFLIGHT_PREFIX}/${probeId}`;
+
+  const createRes = await shGit(`git update-ref ${shq(ref)} ${shq(target)}`, cwd);
+  if (createRes.code !== 0) {
+    const error = (createRes.stderr || createRes.stdout).trim() || `git update-ref failed (${createRes.code})`;
+    return { ok: false, path: refsDir, refsDir, error };
+  }
+
+  const delRes = await shGit(`git update-ref -d ${shq(ref)}`, cwd);
+  if (delRes.code !== 0) {
+    const error = (delRes.stderr || delRes.stdout).trim() || `git update-ref -d failed (${delRes.code})`;
+    return { ok: false, path: refsDir, refsDir, error };
+  }
+
+  // Clean up empty directories left behind by git
+  try {
+    const preflightDir = join(refsDir, "tickmarkr", "preflight");
+    if (existsSync(preflightDir) && readdirSync(preflightDir).length === 0) {
+      rmSync(preflightDir, { recursive: true, force: true });
+    }
+    const tmDir = join(refsDir, "tickmarkr");
+    if (existsSync(tmDir) && readdirSync(tmDir).length === 0) {
+      rmSync(tmDir, { recursive: true, force: true });
+    }
+  } catch {
+    // best-effort cleanup of empty dirs
+  }
+
+  return { ok: true, path: refsDir, refsDir };
+}
+
+export const probeRefs = probeRefsWritable;
+export const refsProbe = probeRefsWritable;
+
+export async function assertRefsWritable(cwd: string = process.cwd(), action: "run" | "resume" = "run"): Promise<RefsProbeResult> {
+  const probe = await probeRefsWritable(cwd);
+  if (!probe.ok) {
+    throw new Error(refsRefusalMessage(action, probe.path, probe.error));
+  }
+  return probe;
+}
+

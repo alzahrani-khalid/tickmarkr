@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, extname, join, posix } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
 import type { Task } from "../graph/schema.js";
@@ -12,7 +12,8 @@ export type OwnershipFinding =
   | { code: "unowned-test"; test: string; taskIds: string[]; corroboration?: OwnershipCorroboration; detail: string }
   | { code: "unowned-shape-oracle"; taskId: string; source: string; oracle: string; detail: string }
   | { code: "test-path-outside-allowlist"; taskId: string; test: string; path: string; detail: string }
-  | { code: "unordered-context-write"; taskId: string; ownerTaskId: string; path: string; detail: string };
+  | { code: "unordered-context-write"; taskId: string; ownerTaskId: string; path: string; detail: string }
+  | { code: "unowned-source-of-owned-test"; taskId: string; test: string; source: string; corroboration?: OwnershipCorroboration; detail: string };
 
 export const SHAPE_ORACLES = [
   "tests/run/narration.test.ts",
@@ -32,20 +33,20 @@ export const SHAPE_ORACLE_MAP: Record<string, readonly string[]> = {
   "src/cli/commands/run.ts": SHAPE_ORACLES,
 };
 
-// Anchored-glob only: a files[] entry touches a mapped source when it names the source (or its
-// extensionless stem) exactly, or when its glob's literal head — everything before the first
-// wildcard — is the stem plus a literal dot, i.e. the wildcard only ever spans the extension
-// ("src/run/daemon.*"). A broad multi-file glob like "src/**" that merely happens to cover the
-// source is an unrelated task casting a wide net, not one touching daemon narration — that
-// distinction is what broke every fixture using tests/fixtures/sample.prd.md's files: src/** task.
-function touchesSource(files: readonly string[], source: string): boolean {
+// A files[] entry touches a mapped shape-oracle source when it names it literally or by stem, or when
+// the entry's glob — anchored or broad — matches the source AND the source exists in the repository
+// being compiled: "src/run/**" owning this repository's daemon owns the five oracles, while the
+// shipped sample PRD's "src/**" task in a repository holding no mapped source compiles clean.
+// Anchored globs like "src/run/daemon.*" target the source specifically and touch it regardless.
+function touchesSource(files: readonly string[], source: string, repoRoot?: string): boolean {
   const stem = source.replace(/\.(?:[cm]?[jt]sx?)$/, "");
   return files.some((entry) => {
     if (entry === source || entry === stem) return true;
     const special = entry.search(/[*?{[]/);
-    // Leg-2 v2.5.3: the anchored head is necessary, not sufficient — the pattern must also MATCH the
-    // source under the shared matcher, or "src/run/daemon.{js,jsx}" (never daemon.ts) would count as a touch.
-    return special !== -1 && entry.slice(0, special) === `${stem}.` && filesGlob([entry])(source);
+    if (special === -1) return false;
+    if (!filesGlob([entry])(source)) return false;
+    if (entry.slice(0, special) === `${stem}.`) return true;
+    return repoRoot !== undefined && existsSync(join(repoRoot, source));
   });
 }
 
@@ -159,17 +160,22 @@ function mentionsCommandEntry(text: string): boolean {
     || /["'`]src["'`]\s*,\s*["'`]cli["'`]\s*,\s*["'`]index\.(?:ts|js)["'`]/.test(text);
 }
 
-function corroboration(test: TestSource, matches: readonly NamedSource[]): OwnershipCorroboration | undefined {
-  // A .test.ts-shaped collateral fixture is not by itself a dedicated test. Requiring a runner leaf
-  // keeps import-only scan fixtures advisory while every executable subject in the measured union stays.
+function corroborateSource(test: TestSource, sourcePath: string): OwnershipCorroboration | undefined {
   const executable = test.text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
   if (!/\b(?:test|it)(?:\.(?:concurrent|each|fails|only|skip|todo))*\s*\(/.test(executable)) return undefined;
-  for (const match of matches) {
-    if (directlyImports(test, match.source)) return { kind: "direct-import", source: match.source };
-  }
+  if (directlyImports(test, sourcePath)) return { kind: "direct-import", source: sourcePath };
   if (invokesChildProcessSpawn(test.text) && mentionsCommandEntry(test.text)) {
-    const command = matches.find(({ source }) => /^src\/cli\/commands\/[^/]+\.(?:[cm]?[jt]sx?)$/.test(source));
-    if (command) return { kind: "command-entry-spawn", source: command.source, entry: "src/cli/index.ts" };
+    if (/^src\/cli\/commands\/[^/]+\.(?:[cm]?[jt]sx?)$/.test(sourcePath)) {
+      return { kind: "command-entry-spawn", source: sourcePath, entry: "src/cli/index.ts" };
+    }
+  }
+  return undefined;
+}
+
+function corroboration(test: TestSource, matches: readonly NamedSource[]): OwnershipCorroboration | undefined {
+  for (const match of matches) {
+    const evidence = corroborateSource(test, match.source);
+    if (evidence) return evidence;
   }
   return undefined;
 }
@@ -263,7 +269,7 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
   }
   for (const entry of indexed) {
     for (const [source, oracles] of Object.entries(SHAPE_ORACLE_MAP)) {
-      if (!touchesSource(entry.files, source)) continue;
+      if (!touchesSource(entry.files, source, repoRoot)) continue;
       for (const oracle of oracles) {
         if (!entry.owns(oracle)) {
           findings.push({
@@ -274,6 +280,32 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
             detail: `${entry.task.id} touches ${source} without owning shape oracle ${oracle}`,
           });
         }
+      }
+    }
+  }
+
+  for (const test of sources) {
+    const testOwners = owners(test.path);
+    if (testOwners.length === 0) continue;
+    const testStem = basename(test.path).replace(/\.test\.ts$/, "");
+    for (const sourcePath of allSources) {
+      if (owners(sourcePath).length > 0) continue;
+      const sourceStem = basename(sourcePath, extname(sourcePath));
+      if (testStem !== sourceStem && !testStem.startsWith(`${sourceStem}-`)) continue;
+      const evidence = corroborateSource(test, sourcePath);
+      if (!evidence) continue;
+      for (const owner of testOwners) {
+        findings.push({
+          code: "unowned-source-of-owned-test",
+          taskId: owner.task.id,
+          test: test.path,
+          source: sourcePath,
+          corroboration: evidence,
+          detail: `${test.path} owned by ${owner.task.id} is a dedicated test of ${sourcePath} but no task owns ${sourcePath}`
+            + (evidence.kind === "direct-import" ? `; it imports ${evidence.source} directly`
+              : evidence.kind === "command-entry-spawn"
+                ? `; it spawns ${evidence.entry} to exercise ${evidence.source}` : ""),
+        });
       }
     }
   }
@@ -315,6 +347,7 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
       case "unowned-shape-oracle": return f.oracle;
       case "test-path-outside-allowlist": return f.test;
       case "unordered-context-write": return f.path;
+      case "unowned-source-of-owned-test": return f.test;
     }
   };
   return findings.sort((a, b) => {

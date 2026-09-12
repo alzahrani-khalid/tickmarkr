@@ -332,7 +332,7 @@ class GarbageReviewer extends FakeAdapter {
     return { installed: true, authed: true, version: "fakeg", models: ["g-1"], modelAuth: authedModels(["g-1"]) };
   }
   override channels(): BillingChannel[] {
-    return [{ adapter: this.id, vendor: this.vendor, model: "g-1", channel: "sub", tier: "cheap" }];
+    return [{ adapter: this.id, vendor: this.vendor, model: "g-1", channel: "sub", tier: "frontier" }];
   }
   override headlessCommand(promptFile: string, model: string): string {
     const command = super.headlessCommand(promptFile, model);

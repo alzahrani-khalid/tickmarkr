@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { extname, join, relative } from "node:path";
+import { extname, join, posix, relative } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
 import {
   criticalPathHits, DEFAULT_CONFIG, DEFAULT_REVIEW_CRITICAL_PATHS, effectiveReviewPolicy, loadConfig,
@@ -177,20 +177,68 @@ export function classifyScopeOffenders(
   return { authoring: hard.length > 0 && missed.length === 0, predicted: hit, missed, repair: filesRepair(taskId, hit) };
 }
 
+const moduleKey = (path: string): string => path.replace(/\\/g, "/").replace(/\.(?:[cm]?[jt]sx?)$/, "");
+
+function directImportSpecifiers(text: string): string[] {
+  // Comments cannot create an edge. Keep strings intact because they are the import target.
+  const source = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const specifiers = new Set<string>();
+  for (const match of source.matchAll(/\bimport\s+(?:type\s+)?(?:[\w$*{},\s]+?\s+from\s+)?["']([^"']+)["']/g)) {
+    specifiers.add(match[1]);
+  }
+  for (const match of source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) {
+    specifiers.add(match[1]);
+  }
+  return [...specifiers];
+}
+
+function directlyImports(testPath: string, testText: string, sourcePath: string): boolean {
+  const target = moduleKey(sourcePath);
+  const testDir = posix.dirname(testPath.replace(/\\/g, "/"));
+  return directImportSpecifiers(testText).some((specifier) => {
+    const imported = specifier.startsWith(".")
+      ? posix.normalize(posix.join(testDir, specifier))
+      : specifier.startsWith("src/") ? specifier : "";
+    return imported !== "" && moduleKey(imported) === target;
+  });
+}
+
 /**
  * Return human-readable scope-lint lines for plan output (no `!` prefix — plan owns that).
  * Each line names the task id and at least one missing collateral test path.
+ * OBS-971: uncapped — every predicted path is listed, with direct importers of an owned source
+ * sorted first, followed by the total count. The runtime map (collateralHits) remains unchanged.
  */
 export function collateralLints(tasks: ReadonlyArray<Pick<Task, "id" | "files">>, repoRoot: string): string[] {
   const lines: string[] = [];
-  for (const [id, hits] of collateralHits(tasks, repoRoot)) {
-    const listed = hits.slice(0, MAX_HITS_PER_TASK).join(", ");
-    // OBS-547: the cap hides names, never predictions. Say so, and say where the hidden ones surface —
-    // a count with no route is exactly what left one run's victim unreadable.
-    const tail = hits.length > MAX_HITS_PER_TASK
-      ? ` (${hits.length} total; ${MAX_HITS_PER_TASK} shown, ${hits.length - MAX_HITS_PER_TASK} capped out of view`
-        + ` but RETAINED for the scope gate — a matching scope red prints the hidden path with its files[] repair)`
-      : "";
+  const hitsMap = collateralHits(tasks, repoRoot);
+  const read = makeReader(repoRoot);
+  const tasksById = new Map(tasks.map((t) => [t.id, t]));
+
+  for (const [id, hits] of hitsMap) {
+    const t = tasksById.get(id);
+    const files = (t?.files ?? []).map((f) => f.replace(/^\.\//, ""));
+    const ownedSources = files.filter(isSrcPath);
+
+    const direct: string[] = [];
+    const indirect: string[] = [];
+
+    for (const h of hits) {
+      const text = read(h) ?? "";
+      const isDirect = ownedSources.some((src) => directlyImports(h, text, src));
+      if (isDirect) {
+        direct.push(h);
+      } else {
+        indirect.push(h);
+      }
+    }
+
+    direct.sort((a, b) => a.localeCompare(b));
+    indirect.sort((a, b) => a.localeCompare(b));
+    const ordered = [...direct, ...indirect];
+
+    const listed = ordered.join(", ");
+    const tail = hits.length > MAX_HITS_PER_TASK ? ` (${hits.length} total)` : "";
     lines.push(`${id}: likely collateral tests not in files[]: ${listed}${tail}`);
   }
   return lines;

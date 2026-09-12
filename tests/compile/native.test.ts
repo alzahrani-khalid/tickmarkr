@@ -804,3 +804,26 @@ describe("spec law: shape oracle ownership (OL-1)", () => {
     expect(graph.tasks[0].files).toContain("tests/cli/brand-surfaces.test.ts");
   });
 });
+
+describe("spec law: broad glob shape oracle ownership (OL-2, OBS-990)", () => {
+  test("compiling the shipped sample PRD in a repository whose src holds no mapped source aborts on nothing, while a native spec owning src/run/** in this repository without the oracles aborts naming them through the ownership line, so a compile that turns the fixture's glob into a refusal fails", () => {
+    const repoNoMapped = mkdtempSync(join(tmpdir(), "tickmarkr-prd-nomapped-"));
+    mkdirSync(join(repoNoMapped, "src"), { recursive: true });
+    writeFileSync(join(repoNoMapped, "src/greet.js"), "module.exports = function greet() {};\n");
+
+    expect(() => compileSource("fixtures/sample.prd.md", "prd", repoNoMapped)).not.toThrow();
+    const graph = compileSource("fixtures/sample.prd.md", "prd", repoNoMapped);
+    expect(graph.spec.source).toBe("prd");
+
+    const specFile = join(mkdtempSync(join(tmpdir(), "tickmarkr-native-broad-daemon-")), "spec.md");
+    writeFileSync(
+      specFile,
+      "<!-- tickmarkr:spec -->\n## T1: Broad daemon owner\n- goal: touch daemon\n- files: src/run/**\n- acceptance:\n  - judge: holds\n",
+    );
+
+    expect(() => compileSource(specFile, "native", process.cwd())).toThrow(CompileError);
+    expect(() => compileSource(specFile, "native", process.cwd())).toThrow(
+      /ownership-lint\[unowned-shape-oracle]/,
+    );
+  });
+});
