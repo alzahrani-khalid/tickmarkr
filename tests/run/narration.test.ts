@@ -19,7 +19,7 @@ describe("narration side-channel (fake adapter, zero tokens)", () => {
       { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
     );
     const lines: string[] = [];
-    await runDaemon(repo, { adapters: [fake], runId: "run-narr-events", narrate: (e) => lines.push(formatJournalNarration(e)) });
+    await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId: "run-narr-events", narrate: (e) => lines.push(formatJournalNarration(e)) });
     // each load-bearing event is the leading token of at least one formatted narration line
     for (const required of ["run-start", "task-dispatch", "run-end"]) {
       expect(lines.some((l) => l.startsWith(required))).toBe(true);
@@ -54,10 +54,10 @@ describe("narration side-channel (fake adapter, zero tokens)", () => {
 
       const narrated: JournalEvent[] = [];
       const on = scripted();
-      await runDaemon(on.repo, { adapters: [on.fake], runId: "run-byte", narrate: (e) => narrated.push(e) });
+      await runDaemon(on.repo, { approvalWindowMs: 1, adapters: [on.fake], runId: "run-byte", narrate: (e) => narrated.push(e) });
 
       const off = scripted();
-      await runDaemon(off.repo, { adapters: [off.fake], runId: "run-byte" });
+      await runDaemon(off.repo, { approvalWindowMs: 1, adapters: [off.fake], runId: "run-byte" });
 
       // The identity mask is allowed to erase a VALUE, never the field's existence. If production
       // omits durationMs from either run, this oracle fails before normalizing the two ledgers.
@@ -93,14 +93,14 @@ describe("narration side-channel (fake adapter, zero tokens)", () => {
       [T("T1")],
       { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
     );
-    await runDaemon(ref.repo, { adapters: [ref.fake], runId: "run-throw-ref" });
+    await runDaemon(ref.repo, { approvalWindowMs: 1, adapters: [ref.fake], runId: "run-throw-ref" });
     const refEvents = Journal.open(ref.repo, "run-throw-ref").read().map((e) => e.event);
 
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
     );
-    const s = await runDaemon(repo, {
+    const s = await runDaemon(repo, { approvalWindowMs: 1,
       adapters: [fake], runId: "run-throw",
       narrate: () => { throw new Error("narration sink is broken"); },
     });
@@ -132,7 +132,7 @@ test("The actual daemon/driver narrator opens right with no focus, retains canon
       override close(slot: Slot) { return slot.name.includes(":watch:") ? herdr.close(slot) : super.close(slot); }
     }
     const { runDaemon: runBuiltDaemon } = await import(join(isolatedBuild(), "dist/run/daemon.js"));
-    const summary = await runBuiltDaemon(repo, { adapters: [fake], driver: new Narrated(), runId: "run-owned" });
+    const summary = await runBuiltDaemon(repo, { approvalWindowMs: 1, adapters: [fake], driver: new Narrated(), runId: "run-owned" });
     expect(summary.human).toEqual(["T1"]);
     const owner = readWatchBoard(repo, "run-owned")!;
     expect(owner).toMatchObject({ runId: "run-owned", workspace: "wC6", name: "tickmarkr:watch:run:0:run-owned", driver: "herdr" });
@@ -185,7 +185,7 @@ test("The actual daemon/driver narrator opens right with no focus, retains canon
     const diagnostics: string[] = [];
     const errors = vi.spyOn(console, "error").mockImplementation(message => { diagnostics.push(String(message)); });
     try {
-      await runBuiltDaemon(failed.repo, { adapters: [failed.fake], driver: new FailedCleanup(), runId: "run-cleanup-refused" });
+      await runBuiltDaemon(failed.repo, { approvalWindowMs: 1, adapters: [failed.fake], driver: new FailedCleanup(), runId: "run-cleanup-refused" });
       expect(Journal.open(failed.repo, "run-cleanup-refused").read().find(row => row.event === "watch-cleanup-failed")?.data.error).toMatch(/unacknowledged/);
       expect(diagnostics.some(message => message.includes("cleanup unacknowledged"))).toBe(true);
       const refused = readWatchBoard(failed.repo, "run-cleanup-refused")!;

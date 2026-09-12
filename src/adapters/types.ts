@@ -374,6 +374,10 @@ export interface WorkerAdapter {
   probe(): Promise<AuthHealth>;
   channels(cfg: TickmarkrConfig): BillingChannel[];
   headlessCommand(promptFile: string, model: string): string;
+  // Adapter-owned launch notices are emitted by the CLI, not by the review seat. Each entry is one
+  // complete recorded terminal row, in render order. The seat-byte grammar treats only this closed
+  // list (and partial paints of its next row) as harness at the banner boundary.
+  harnessBannerRows?: readonly string[];
   // v1.2: launch the CLI's real interactive TUI with the prompt injected; null = adapter can't → print fallback
   interactiveCommand(promptFile: string, model: string): string | null;
   // v1.69 T6: launch the real TUI without a prompt, wait for readiness, then inject one seed turn.

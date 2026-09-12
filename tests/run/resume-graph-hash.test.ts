@@ -100,4 +100,60 @@ describe("T3 resume engagement-identity guard (Sol #2 / Fable F2)", () => {
     const out = await status([], repo);
     expect(out).toContain("not comparable");
   });
+
+  test("test: a run started on graph A and rehashed to B by one graph-changed resume is resumed plainly on B with no refusal and no second rehash row, refuses a plain resume on C naming B as recorded, and status renders the B journal comparable through the same comparator, so a plain resume refused on the rehashed graph fails", async () => {
+    const { repo, loadedHash: hashB, fake } = setupResumeRepo();
+    const runId = "run-t2-criterion";
+    const hashA = STALE_HASH;
+
+    // 1. A run started on graph A
+    await seedResumeJournal(repo, runId, hashA);
+
+    // Rehashed to B by one graph-changed resume
+    const s1 = await runDaemon(repo, { adapters: [fake], runId, resume: true, graphChanged: true });
+    expect(s1.done).toEqual(["T1"]);
+
+    const journalAfterRehash = Journal.open(repo, runId).read();
+    const rehashes1 = journalAfterRehash.filter((e) => e.event === "graph-rehash");
+    expect(rehashes1).toHaveLength(1);
+    expect(rehashes1[0]!.data).toEqual({ from: hashA, to: hashB });
+
+    // 2. Is resumed plainly on B with no refusal and no second rehash row
+    const s2 = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(s2.done).toEqual(["T1"]);
+
+    const journalAfterPlainResume = Journal.open(repo, runId).read();
+    const rehashes2 = journalAfterPlainResume.filter((e) => e.event === "graph-rehash");
+    expect(rehashes2).toHaveLength(1);
+
+    // A second --graph-changed on the rehashed graph journals nothing
+    await runDaemon(repo, { adapters: [fake], runId, resume: true, graphChanged: true });
+    const journalAfterSecondChanged = Journal.open(repo, runId).read();
+    const rehashes3 = journalAfterSecondChanged.filter((e) => e.event === "graph-rehash");
+    expect(rehashes3).toHaveLength(1);
+
+    // 3. Refuses a plain resume on C naming B as recorded
+    const graphC = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "spec-c" },
+      tasks: [T("T1", "task 1 with different goal for C")],
+    });
+    const hashC = graphDefinitionHash(graphC);
+    saveGraph(repo, graphC);
+
+    await expect(runDaemon(repo, { adapters: [fake], runId, resume: true }))
+      .rejects.toThrow(`graph changed since this run (recorded ${hashB} ≠ loaded ${hashC}) — pass --graph-changed to override`);
+
+    // 4. And status renders the B journal comparable through the same comparator
+    const graphB = validateGraph({
+      version: 1,
+      spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [T("T1")],
+    });
+    saveGraph(repo, graphB);
+
+    const out = await status([], repo);
+    expect(out).not.toContain("not comparable");
+    expect(out).not.toContain("recompiled");
+  });
 }, 120000);

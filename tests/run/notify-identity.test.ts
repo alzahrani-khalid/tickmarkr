@@ -140,8 +140,8 @@ async function identityPair(script: object, runTag: string) {
   const runIdA = `run-id-a-${runTag}`;
   const runIdB = `run-id-b-${runTag}`;
   const captured: string[] = [];
-  await runDaemon(repoA, { adapters: [fakeA], runId: runIdA, driver: driverWithNotify(captured) });
-  await runDaemon(repoB, { adapters: [fakeB], runId: runIdB, driver: noopDriver() });
+  await runDaemon(repoA, { approvalWindowMs: 1, adapters: [fakeA], runId: runIdA, driver: driverWithNotify(captured) });
+  await runDaemon(repoB, { approvalWindowMs: 1, adapters: [fakeB], runId: runIdB, driver: noopDriver() });
   const baseA = (await gitHead(repoA)) as string;
   const baseB = (await gitHead(repoB)) as string;
   const jA = normJournal(Journal.open(repoA, runIdA).read(), repoA, runIdA, baseA);
@@ -180,7 +180,7 @@ describe("T7 notification tiers", () => {
     driver.notify = async (message, opts) => { calls.push({ message, tier: opts?.tier }); };
     const { repo, fake } = setupRepo([T("T1")], cleanScript);
 
-    await runDaemon(repo, { adapters: [fake], runId: "run-routine-tier", driver });
+    await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId: "run-routine-tier", driver });
 
     expect(calls.find((call) => call.message.includes("integration branch"))?.tier).toBe("routine");
   });
@@ -194,7 +194,7 @@ describe("T7 notification tiers", () => {
         { shell: `echo two > t2.txt && ${COMMIT} t2`, result: { ok: true, summary: "t2" } },
       ] } },
     );
-    await runDaemon(repo, { adapters: [fake], runId: "run-tiers", driver: driverWithNotify(captured) });
+    await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId: "run-tiers", driver: driverWithNotify(captured) });
     const messages = captured.filter((m) => !m.startsWith("sound:"));
     expect(messages.filter((m) => /T1 needs a human/.test(m))).toHaveLength(1);
     expect(messages.filter((m) => /T2 quota failover/.test(m))).toHaveLength(1);

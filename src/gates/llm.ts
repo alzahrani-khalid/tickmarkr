@@ -270,11 +270,13 @@ const IDENTITY_OPENERS = ["review ·", "tickmarkr"];
 const ECHO = 0, START = 1, BANNER = 2, IDENTITY = 3, SEAT = 4;
 
 // The char offset where the seat's own text begins, or -1 when the capture ends inside the preamble.
-function seatStart(output: string): number {
+function seatStart(output: string, adapterBannerRows: readonly string[]): number {
   const rows = output.split("\n");
   if (rows.length > 1 && rows[rows.length - 1] === "") rows.pop(); // the read's own line terminator
   let stage = ECHO;
   let bannerAt: number | undefined; // next banner row expected once the banner has begun
+  let adapterBannerAt: number | undefined;
+  let identitySeen = false;
   let offset = 0;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!.replace(/[ \t]+$/, "");
@@ -282,12 +284,18 @@ function seatStart(output: string): number {
     const last = i === rows.length - 1;
     // Complete harness rows: equality against the shape the preamble allows at this stage.
     let accepted = false;
-    if (stage < SEAT && t.length === 0) accepted = true; // blank rows between preamble rows
+    if (!identitySeen && stage < SEAT && t.length === 0) accepted = true; // blank rows between preamble rows
     else if (stage <= ECHO && completeEchoRow(row)) accepted = true;
     else if (stage <= START && START_ROW.test(row)) { stage = BANNER; accepted = true; }
-    else if (stage <= BANNER && bannerAt === undefined && BANNER_ROWS.includes(row)) { stage = BANNER; bannerAt = BANNER_ROWS.indexOf(row) + 1; accepted = true; }
-    else if (stage <= BANNER && bannerAt !== undefined && row === BANNER_ROWS[bannerAt]) { bannerAt++; accepted = true; }
-    else if (stage <= IDENTITY && IDENTITY_LINE.test(t)) { stage = SEAT; accepted = true; }
+    else if (!identitySeen && stage <= BANNER && bannerAt === undefined && BANNER_ROWS.includes(row)) { stage = BANNER; bannerAt = BANNER_ROWS.indexOf(row) + 1; accepted = true; }
+    else if (!identitySeen && stage <= BANNER && bannerAt !== undefined && row === BANNER_ROWS[bannerAt]) { bannerAt++; accepted = true; }
+    else if (stage <= IDENTITY && adapterBannerAt === undefined && adapterBannerRows.includes(row)) {
+      stage = BANNER;
+      adapterBannerAt = adapterBannerRows.indexOf(row) + 1;
+      accepted = true;
+    }
+    else if (stage <= IDENTITY && adapterBannerAt !== undefined && row === adapterBannerRows[adapterBannerAt]) { adapterBannerAt++; accepted = true; }
+    else if (!identitySeen && stage <= IDENTITY && IDENTITY_LINE.test(t)) { stage = IDENTITY; identitySeen = true; accepted = true; }
     if (accepted) { offset += rows[i]!.length + 1; continue; }
     if (!last) return offset;
     // The last row may be a partial paint: a prefix of the next harness row the preamble allows.
@@ -296,9 +304,15 @@ function seatStart(output: string): number {
     if (stage <= BANNER && (bannerAt === undefined
       ? BANNER_ROWS.some((b) => b.startsWith(row))
       : BANNER_ROWS[bannerAt]?.startsWith(row) === true)) return -1;
+    if (stage <= IDENTITY && (adapterBannerAt === undefined
+      ? adapterBannerRows.some((b) => b.startsWith(row))
+      : adapterBannerRows[adapterBannerAt]?.startsWith(row) === true)) return -1;
     // The identity row is painted right after the banner, so its prefix is a partial paint only there;
     // with no banner in the capture, "review" or "tick" alone is the seat's own first row.
-    if (stage <= IDENTITY && bannerAt === BANNER_ROWS.length && IDENTITY_OPENERS.some((o) => o.startsWith(t))) return -1;
+    if (!identitySeen && stage <= IDENTITY
+      && (bannerAt === BANNER_ROWS.length
+        || (adapterBannerRows.length > 0 && adapterBannerAt === adapterBannerRows.length))
+      && IDENTITY_OPENERS.some((o) => o.startsWith(t))) return -1;
     return offset;
   }
   return -1; // every row was harness — the seat has not taken its turn
@@ -309,9 +323,9 @@ function seatStart(output: string): number {
 // Every capture taken before the preamble finishes therefore measures ZERO seat-authored bytes,
 // which is what makes the caller's running Math.max safe: a partial banner counted once would be
 // retained for the whole call and buy a silent seat its full ceiling.
-export function reviewSeatOutput(raw: string, nonce: string): string {
+export function reviewSeatOutput(raw: string, nonce: string, adapterBannerRows: readonly string[] = []): string {
   const output = stripVTControlCharacters(raw).replace(/\r\n?/g, "\n");
-  const start = seatStart(output);
+  const start = seatStart(output, adapterBannerRows);
   if (start < 0) return "";
   const seat = output.slice(start);
   // Anything after the nonce-bound trailer belongs to the terminal (typically the next shell
@@ -337,7 +351,10 @@ async function runHeadlessDetailed(
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
     const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
-    return { output: r.stdout + "\n" + r.stderr, exitCode: r.code, timedOut: r.timedOut === true, seatAuthoredBytes: Buffer.byteLength((r.stdout + r.stderr).trim()) };
+    const output = r.stdout + "\n" + r.stderr;
+    const nonce = extractPromptNonce(prompt) ?? "";
+    return { output, exitCode: r.code, timedOut: r.timedOut === true,
+      seatAuthoredBytes: Buffer.byteLength(reviewSeatOutput(output, nonce, adapter.harnessBannerRows).trim()) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -411,7 +428,7 @@ async function runViaDriverDetailed(
       const startedAt = Date.now();
       out = await via.driver.read(slot, 400);
       const reviewing = prompt.startsWith("TICKMARKR-REVIEW");
-      seatAuthoredBytes = Buffer.byteLength(reviewSeatOutput(out, nonce));
+      seatAuthoredBytes = Buffer.byteLength(reviewSeatOutput(out, nonce, adapter.harnessBannerRows));
       let firstLivenessObserved = false;
       let priorSnapshot = normalizeStallSnapshot(out);
       const anchoredAt = Date.now();
@@ -427,7 +444,7 @@ async function runViaDriverDetailed(
         const matched = await via.driver.waitOutput(slot, exitPattern, sliceMs, { regex: true });
         const raw = await via.driver.read(slot, 400);
         out = raw;
-        seatAuthoredBytes = Math.max(seatAuthoredBytes, Buffer.byteLength(reviewSeatOutput(raw, nonce)));
+        seatAuthoredBytes = Math.max(seatAuthoredBytes, Buffer.byteLength(reviewSeatOutput(raw, nonce, adapter.harnessBannerRows)));
         // waitOutput is the driver's authoritative marker match. The raw check covers drivers whose
         // wait timed out at the same boundary the marker landed; either way a trailer completes
         // normally and is never mistaken for inactivity.

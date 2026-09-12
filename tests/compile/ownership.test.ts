@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
 import { compileSource } from "../../src/compile/index.js";
-import { ownershipFindings } from "../../src/compile/ownership.js";
+import { ownershipFindings, SHAPE_ORACLES } from "../../src/compile/ownership.js";
 import { type RunGraph, validateGraph } from "../../src/graph/schema.js";
 
 const FIXTURES = "tests/fixtures/graphs";
@@ -236,5 +236,138 @@ describe("cross-task ownership", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  test("test: a graph whose task lists the daemon in files[] and owns none of the five shape oracles yields five unowned-shape-oracle findings each naming the daemon and one oracle, while a task owning all five yields none and a task touching neither the daemon nor the label map yields none, so a checker that reports nothing for an unowned shape oracle fails", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-"));
+
+    const graphUnowned: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "daemon worker",
+          goal: "daemon worker",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/run/daemon.ts"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+    const findingsUnowned = ownershipFindings(graphUnowned.tasks, repo);
+    const shapeFindings = findingsUnowned.filter((item) => item.code === "unowned-shape-oracle");
+    expect(shapeFindings).toHaveLength(5);
+    for (const finding of shapeFindings) {
+      expect(finding.source).toBe("src/run/daemon.ts");
+      expect(finding.detail).toContain("src/run/daemon.ts");
+      expect(finding.detail).toContain(finding.oracle);
+    }
+    const oraclesReported = shapeFindings.map((f) => f.oracle).sort();
+    expect(oraclesReported).toEqual([...SHAPE_ORACLES].sort());
+
+    const graphOwned: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "daemon worker owning all oracles",
+          goal: "daemon worker owning all oracles",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/run/daemon.ts", ...SHAPE_ORACLES],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+    const findingsOwned = ownershipFindings(graphOwned.tasks, repo);
+    expect(findingsOwned.filter((item) => item.code === "unowned-shape-oracle")).toHaveLength(0);
+
+    const graphNeither: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "unrelated worker",
+          goal: "unrelated worker",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/feature.ts"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+    const findingsNeither = ownershipFindings(graphNeither.tasks, repo);
+    expect(findingsNeither.filter((item) => item.code === "unowned-shape-oracle")).toHaveLength(0);
+  });
+
+  test("a task owning the daemon through a files[] glob still yields five unowned-shape-oracle findings", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-glob-"));
+    const graph: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "daemon worker via glob",
+          goal: "daemon worker via glob",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/run/daemon.*"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+    const shapeFindings = ownershipFindings(graph.tasks, repo).filter((item) => item.code === "unowned-shape-oracle");
+    expect(shapeFindings).toHaveLength(5);
+    const oraclesReported = shapeFindings.map((f) => f.oracle).sort();
+    expect(oraclesReported).toEqual([...SHAPE_ORACLES].sort());
+  });
+
+  test("an anchored glob that does not match the daemon (daemon.{js,jsx}, daemon.?, daemon.*.test.ts) is no touch and yields zero shape-oracle findings (Leg-2 v2.5.3)", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-nomatch-glob-"));
+    const graph: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "daemon worker via glob",
+          goal: "daemon worker via glob",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/run/daemon.{js,jsx}", "src/run/daemon.?", "src/run/daemon.*.test.ts"],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+    const shapeFindings = ownershipFindings(graph.tasks, repo).filter((item) => item.code === "unowned-shape-oracle");
+    expect(shapeFindings).toHaveLength(0);
+  });
+
+  test("declaring an oracle's extensionless stem does not count as owning the oracle", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-stem-"));
+    const graph: RunGraph = validateGraph({
+      version: 1,
+      spec: { source: "native", paths: ["spec.md"], hash: "hash" },
+      tasks: [
+        {
+          id: "T1",
+          title: "daemon worker with extensionless declarations",
+          goal: "daemon worker with extensionless declarations",
+          shape: "implement",
+          complexity: 2,
+          files: ["src/run/daemon.ts", ...SHAPE_ORACLES.map((oracle) => oracle.replace(/\.test\.ts$/, ""))],
+          acceptance: ["holds"],
+        },
+      ],
+    });
+    const shapeFindings = ownershipFindings(graph.tasks, repo).filter((item) => item.code === "unowned-shape-oracle");
+    expect(shapeFindings).toHaveLength(5);
+    const oraclesReported = shapeFindings.map((f) => f.oracle).sort();
+    expect(oraclesReported).toEqual([...SHAPE_ORACLES].sort());
   });
 });

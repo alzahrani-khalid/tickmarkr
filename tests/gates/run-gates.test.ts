@@ -10,7 +10,7 @@ import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
-import { captureBaseline, type Baseline } from "../../src/gates/baseline.js";
+import { captureBaseline, compareToBaseline, type Baseline } from "../../src/gates/baseline.js";
 import { extractPromptNonce } from "../../src/gates/llm.js";
 import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import type { GateResult } from "../../src/gates/types.js";
@@ -954,6 +954,131 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
     expect(verdict).toEqual(results.find((r) => r.gate === "test")); // stream and record agree
     expect(argvLines(repo).slice(1)).toEqual(["tests/a.test.ts"]); // the subset really is all that ran
     expect(results.every((r) => r.pass)).toBe(false);
+  }, 30_000);
+
+  test("test: a test gate whose selection covers fewer files than the baseline's recorded count passes on exit 0 and its row names the selection with no infra classification, while the same runner output on a full-suite run with fewer files than the baseline parks as infra naming both counts, so a selected screen is judged by its verdict and only a whole-suite run can be a deficit", async () => {
+    const { repo } = corpusRepo();
+    writeFileSync(join(repo, "run.sh"), [
+      'echo " Test Files  1 passed (1)"',
+      'echo " Tests 1 passed (1)"',
+      'exit 0',
+    ].join("\n"));
+    commitAll(repo, "arm-runner");
+    const base = await gitHead(repo);
+    writeFileSync(join(repo, "src/a.ts"), 'import { deep } from "./deep.js";\nexport const a = () => deep() + 4;\n');
+    commitAll(repo, "work");
+
+    const commands = { test: "sh run.sh" };
+    const baseline = await captureBaseline(repo, commands);
+    baseline.commands.test = {
+      ...baseline.commands.test!,
+      fileCount: 10,
+    };
+
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.judge.adapter = "fake";
+
+    const selectedRound = await runGates(mkTask({ files: ["**"] }), {
+      worktree: repo, baseRef: base, author,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands, baseline, channels,
+      adapters: [fakeWith({
+        judge: { pass: false, criteria: [{ criterion: "a", met: false, reason: "screen-only" }] },
+        review: { approve: true, issues: [] },
+      }).adapter],
+      cfg, pipeline: "v185", selectTests: true,
+    });
+    const selectedGate = selectedRound.results.find((r) => r.gate === "test")!;
+    expect(selectedGate.pass).toBe(true);
+    expect(selectedGate.details).toBe("exit 0");
+    expect(selectedGate.meta?.selectedTests).toEqual(["tests/a.test.ts"]);
+    expect(selectedGate.meta?.classification).toBeUndefined();
+    expect(selectedGate.meta?.infra).toBeUndefined();
+
+    const [selectedCompare] = await compareToBaseline(repo, commands, baseline, ["test"], { selected: ["tests/a.test.ts"] });
+    expect(selectedCompare.pass).toBe(true);
+    expect(selectedCompare.meta?.selectedTests).toEqual(["tests/a.test.ts"]);
+    expect(selectedCompare.meta?.classification).toBeUndefined();
+    expect(selectedCompare.meta?.infra).toBeUndefined();
+
+    const fullRound = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
+      worktree: repo, baseRef: base, author,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands, baseline, channels,
+      adapters: [fakeWith({}).adapter],
+      cfg, pipeline: "v185", selectTests: false,
+    });
+    const fullGate = fullRound.results.find((r) => r.gate === "test")!;
+    expect(fullGate.pass).toBe(false);
+    expect(fullGate.meta?.classification).toBe("infra");
+    expect(fullGate.meta?.infra).toBe(true);
+    expect(fullGate.meta?.selectedTests).toBeUndefined();
+    expect(fullGate.details).toMatch(/^infra;/);
+    expect(fullGate.details).toContain("1");
+    expect(fullGate.details).toContain("10");
+    expect(fullRound.results.every((r) => r.pass)).toBe(false);
+
+    const [fullCompare] = await compareToBaseline(repo, commands, baseline, ["test"]);
+    expect(fullCompare.pass).toBe(false);
+    expect(fullCompare.meta?.classification).toBe("infra");
+    expect(fullCompare.meta?.infra).toBe(true);
+    expect(fullCompare.details).toMatch(/^infra;/);
+    expect(fullCompare.details).toContain("1");
+    expect(fullCompare.details).toContain("10");
+  }, 30_000);
+
+  test("test: the merge-candidate full-suite round that follows a green selected screen still applies the deficit guard and parks infra when the runner reports fewer files than the baseline, so the selected exemption never leaks into the round that merges", async () => {
+    const { repo } = corpusRepo();
+    writeFileSync(join(repo, "run.sh"), [
+      'if [ "$#" -gt 0 ]; then',
+      '  echo "$*" >> argv.log',
+      '  echo " Test Files  1 passed (1)"',
+      '  echo " Tests 1 passed (1)"',
+      '  exit 0',
+      'fi',
+      'echo "" >> argv.log',
+      'echo " Test Files  8 passed (8)"',
+      'echo " Tests 8 passed (8)"',
+      'exit 0',
+    ].join("\n"));
+    commitAll(repo, "arm-runner");
+    const base = await gitHead(repo);
+    writeFileSync(join(repo, "src/a.ts"), 'import { deep } from "./deep.js";\nexport const a = () => deep() + 5;\n');
+    commitAll(repo, "work");
+
+    const commands = { test: "sh run.sh" };
+    const baseline = await captureBaseline(repo, commands);
+    baseline.commands.test = {
+      ...baseline.commands.test!,
+      fileCount: 10,
+    };
+
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.judge.adapter = "fake";
+    const ends: GateEvent[] = [];
+    const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
+      worktree: repo, baseRef: base, author,
+      result: { ok: true, summary: "", deviations: [], raw: "" },
+      commands, baseline, channels,
+      adapters: [fakeWith({
+        judge: { pass: true, criteria: [] },
+        review: { approve: true, issues: [] },
+      }).adapter],
+      cfg, pipeline: "v185", selectTests: true,
+      onGate: (e) => { if (e.phase === "end") ends.push(e); },
+    });
+
+    const testGate = results.find((r) => r.gate === "test")!;
+    expect(testGate.pass).toBe(false);
+    expect(testGate.meta?.classification).toBe("infra");
+    expect(testGate.meta?.infra).toBe(true);
+    expect(testGate.meta?.fullSuite).toBe(true);
+    expect(testGate.meta?.selectedTests).toEqual(["tests/a.test.ts"]);
+    expect(testGate.details).toMatch(/^infra;/);
+    expect(testGate.details).toContain("8");
+    expect(testGate.details).toContain("10");
+    expect(results.every((r) => r.pass)).toBe(false);
+    expect(argvLines(repo).slice(1)).toEqual(["tests/a.test.ts", ""]);
   }, 30_000);
 
   // The selector's ban is a fact about the TASK, and the journal is the only state that survives a

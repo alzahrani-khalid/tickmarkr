@@ -44,6 +44,35 @@ describe("tickmarkr init --agent skills location (T3)", () => {
 
 });
 
+describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
+  test("test: the skills a fresh tickmarkr init installs each state in their run-watch guidance that a watch ending the seat's turn is no watch, name a blocking journal consumer re-armed at most every twenty minutes, and forbid a Monitor-only wake, so an installed skill whose watch guidance permits a turn-ending watch fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+
+    for (const name of ["tickmarkr-overseer", "tickmarkr-auto", "tickmarkr-loop"]) {
+      const installed = readFileSync(join(repo, ".agents/skills", name, "SKILL.md"), "utf8");
+      expect(installed).toMatch(/watch ending the seat's turn is no watch/);
+      expect(installed).toMatch(/blocking journal consumer/);
+      expect(installed).toMatch(/re-arm(?:ed|ing)? (?:it )?at most every twenty minutes/);
+      expect(installed).toMatch(/(?:Never )?rely on a `Monitor`-only wake/);
+    }
+  });
+
+  test("test: the installed overseer skill names pane run with read-back as the only verified mission delivery to claude and grok seats, the grok model flag, and an in-worktree verdict path for a codex reviewer under workspace-write, so an installed overseer skill that still names agent prompt as a delivery fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+
+    expect(installed).toMatch(/pane run[\s\S]*read(?:ing)? the pane back/);
+    expect(installed).toMatch(/Claude or Grok seat/);
+    expect(installed).toMatch(/never use `agent prompt`/);
+    expect(installed).toContain("-m grok-4.6");
+    expect(installed).toMatch(/Codex reviewer under[\s\S]*workspace-write[\s\S]*in-worktree verdict path/);
+  });
+});
+
 describe("tickmarkr init --agent multi-host install (T10)", () => {
   test("test: init --agent --force in a consumer repository whose committed scaffold skill copy differs from the package copy overwrites it and prints a note naming the file as tracked so the refresh is reviewable while the same repository without --force keeps the copy and prints the skipped note whereas an install that refuses the committed copy or overwrites it silently fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);

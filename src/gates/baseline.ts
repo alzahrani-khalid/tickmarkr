@@ -701,7 +701,7 @@ export async function compareToBaseline(
   commands: Record<string, string>,
   baseline: Baseline,
   enabled: string[],
-  opts: { rerunOf?: HostStarvedRerun; infraRerun?: HostStarvedRerun } = {},
+  opts: { rerunOf?: HostStarvedRerun; infraRerun?: HostStarvedRerun; selected?: readonly string[] } = {},
 ): Promise<GateResult[]> {
   const results: GateResult[] = [];
   const rerunOf = opts.rerunOf;
@@ -739,7 +739,16 @@ export async function compareToBaseline(
         details: `${g.meta?.classification === "infra" ? "infra; " : ""}runner-infra rerun after waiting ${opts.infraRerun.waitedMs}ms for a calm load window: ${withRerun.details.replace(/^infra; /, "")}`,
         meta: { ...withRerun.meta, runnerInfraRerun: opts.infraRerun },
       } : withRerun;
-      results.push(r.capacity ? { ...final, capacity: r.capacity } : final);
+      const withSelected = name === "test" && opts.selected
+        ? {
+            ...final,
+            meta: {
+              ...final.meta,
+              ...(Array.isArray(opts.selected) ? { selectedTests: [...opts.selected] } : {}),
+            },
+          }
+        : final;
+      results.push(r.capacity ? { ...withSelected, capacity: r.capacity } : withSelected);
     };
     // …and whether the entry that would forgive this command was measured in the same world. A
     // baseline captured under a different fork cap forgives nothing: its fingerprints describe a
@@ -769,7 +778,7 @@ export async function compareToBaseline(
       continue;
     }
     const raw = (r.stdout + "\n" + r.stderr).split(cwd).join("");
-    const deficit = fileCountDeficit(entry, raw);
+    const deficit = fileCountDeficit(entry, raw, { name, selected: opts.selected });
     if (deficit) {
       record({ gate: name, pass: false, details: deficit, meta: { classification: "infra", infra: true } });
       continue;
@@ -801,7 +810,7 @@ export async function compareToBaseline(
     if (name === "test" && classification === "infra" && !rerunOf && !opts.infraRerun) {
       const waitedMs = await waitForCalmWindow();
       const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
-      results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { infraRerun: provenance }));
+      results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, infraRerun: provenance }));
       continue;
     }
     // OBS-896: every fresh failure must be timeout-class, and the suite must take at least twice its
@@ -810,7 +819,7 @@ export async function compareToBaseline(
       && hostStarved(failing.join("\n"), r.durationMs ?? 0, entry?.durationMs)) {
       const waitedMs = await waitForCalmWindow();
       const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
-      results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { rerunOf: provenance }));
+      results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, rerunOf: provenance }));
       continue;
     }
     if (classification === "infra") {
@@ -950,7 +959,14 @@ export function runnerFileCount(raw: string): number | null {
   return counts.length ? counts.reduce((sum, count) => sum + count, 0) : null;
 }
 
-export function fileCountDeficit(entry: BaselineCommand | undefined, raw: string): string | undefined {
+export function fileCountDeficit(
+  entry: BaselineCommand | undefined,
+  raw: string,
+  opts?: { name?: string; selected?: readonly string[] },
+): string | undefined {
+  // OBS-985: only a real, named selected-test run of the TEST gate is exempt — a truthy flag or an
+  // empty list named no selection and let a full-suite call opt itself out of the deficit guard.
+  if (opts?.name === "test" && opts.selected !== undefined && opts.selected.length > 0) return undefined;
   const actual = runnerFileCount(raw);
   return entry?.fileCount != null && actual !== null && actual < entry.fileCount
     ? `infra; runner reported ${actual} test files, below baseline ${entry.fileCount} — suite incomplete`

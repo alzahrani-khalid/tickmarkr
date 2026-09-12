@@ -15,6 +15,14 @@ import {
 export const QWEN_VERSION_IDENTITY = /^\d+\.\d+\.\d+/;
 const QWEN_SKIP_UPDATE = "QWEN_CODE_SKIP_UPDATE_CHECK_ONCE=true";
 
+// Verbatim stderr from tests/fixtures/qwen/safe-mode.stderr (qwen 0.21.15). These bytes are launch
+// harness, not evidence that a reviewer took a turn. Keep the declaration closed and row-shaped so
+// llm.ts can sweep partial terminal paints without a broad SAFE MODE/warning regex.
+export const QWEN_HARNESS_BANNER_ROWS = [
+  "⚠ SAFE MODE — all customizations disabled (hooks, extensions, skills, MCP servers, QWEN.md). Restart without --safe-mode to resume normal operation.",
+  "Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.",
+] as const;
+
 interface DecodedQwenEvents {
   assistantText: string;
   failure?: string;
@@ -147,6 +155,7 @@ export const qwen: WorkerAdapter = {
   hardcodedFlags: { binary: "qwen", flags: ["--safe-mode", "--approval-mode", "-m", "-o", "-p"] },
   headlessCommand: (promptFile: string, model: string) =>
     `${QWEN_SKIP_UPDATE} qwen --safe-mode --approval-mode yolo -m ${shq(model)} -o json -p '' < ${shq(promptFile)}`,
+  harnessBannerRows: QWEN_HARNESS_BANNER_ROWS,
   // OBS-905: qwen has NO interactive form. The `-i "$(cat prompt)"` TUI launch put the whole prompt in
   // argv (the OBS-889 leak-and-census shape) and produced a rendered transcript the JSON decoder above
   // can never read — under the herdr driver every qwen task read "unparseable" and merged only by harvest.

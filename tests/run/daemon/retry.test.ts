@@ -2405,3 +2405,81 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
     expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([]);
   });
 });
+
+describe("RT-2 red replay", () => {
+  test("test: a repair attempt whose gate subject digest equals the previous attempt's red gate-result digest journals a gate-replayed row naming that attempt and the replayed gate, runs no gate command, and parks or escalates exactly as the prior red did, while a repair attempt on a different digest runs every declared gate command, so an unchanged tree that re-runs the battery fails", async () => {
+    const runs: JournalEvent[][] = [];
+    for (const changed of [false, true]) {
+      const runId = "run-red-replay";
+      const { repo, fake } = setupRepo(
+        [T("T1", { acceptance: [{ oracle: "command", command: "echo 'ASSERT marker is broken'; exit 1" }] })],
+        {
+          consult: { action: "human", notes: "repair needs an operator" },
+          tasks: { T1: [
+            { shell: `echo one > marker.txt && ${COMMIT} first`, result: { ok: true, summary: "first" } },
+            { shell: changed ? `echo two > marker.txt && ${COMMIT} second` : "true",
+              result: { ok: false, summary: "cannot repair" } },
+          ] },
+        },
+      );
+      const log = join(repo, "gate-commands.log");
+      const command = (gate: string) => `if test -f marker.txt; then echo ${gate} >> ${shq(log)}; fi`;
+      writeFileSync(join(tickmarkrDir(repo), "config.yaml"),
+        `judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\ngates: ${JSON.stringify({
+          build: command("build"), test: command("test"), lint: command("lint"),
+        })}\n`);
+      const summary = await runDaemon(repo, { adapters: [fake], runId });
+      expect(summary.human).toEqual(["T1"]);
+      const events = Journal.open(repo, runId).read();
+      runs.push(events);
+      const rows = events.filter((e) => e.event === "gate-result");
+      const prior = rows.filter((e) => e.data.attempt === 0);
+      const next = rows.filter((e) => e.data.attempt === 1);
+      expect(prior.some((e) => e.data.pass === false)).toBe(true);
+      expect(next.map((e) => [e.data.gate, e.data.pass]))
+        .toEqual(prior.map((e) => [e.data.gate, e.data.pass]));
+      const replayed = events.filter((e) => e.event === "gate-replayed");
+      if (changed) {
+        expect(next[0]!.data.commit).not.toBe(prior[0]!.data.commit);
+        expect(replayed).toEqual([]);
+      } else {
+        expect(next.map((e) => e.data.details)).toEqual(prior.map((e) => e.data.details));
+        expect(next.every((e) => e.data.replayedFromAttempt === 0 && e.data.durationMs === undefined)).toBe(true);
+        expect(next[0]!.data.commit).toBe(prior[0]!.data.commit);
+        expect(replayed.map((e) => e.data.gate)).toEqual(prior.map((e) => e.data.gate));
+        expect(replayed.every((e) => e.data.attempt === 1 && e.data.priorAttempt === 0
+          && e.data.commit === prior[0]!.data.commit)).toBe(true);
+      }
+      const commands = readFileSync(log, "utf8").trim().split("\n");
+      expect(commands).toEqual(changed ? ["build", "lint", "test", "build", "lint", "test"] : ["build", "lint", "test"]);
+      expect(events.filter((e) => e.event === "gate-fingerprint-cap")).toHaveLength(1);
+    }
+    const disposition = (events: JournalEvent[]) => events
+      .filter((e) => ["escalation", "consult-verdict", "task-human"].includes(e.event))
+      .map((e) => [e.event, e.data]);
+    expect(disposition(runs[0]!)).toEqual(disposition(runs[1]!));
+  }, 120_000);
+
+  test("test: a worker result that is not ok with a summary naming a repository path outside the task's files[] produces a park reason carrying that path as a files[] repair hint, while a not-ok result whose summary names no path produces a park reason with no hint, so a refusal text that never reaches the park reason fails", async () => {
+    for (const summary of ["needs tests/cli/brand-surfaces.test.ts outside the allowlist", "cannot repair", "cannot repair src/mark.ts"]) {
+      const { repo, fake } = setupRepo(
+        [T("T1", { files: ["src/**"], acceptance: [{ oracle: "command", command: "echo 'ASSERT broken'; exit 1" }] })],
+        {
+          consult: { action: "human", notes: "repair needs an operator" },
+          tasks: { T1: [
+            { shell: `mkdir -p src && echo one > src/mark.ts && ${COMMIT} first`, result: { ok: true, summary: "first" } },
+            { shell: "true", result: { ok: false, summary } },
+          ] },
+        },
+      );
+      await runDaemon(repo, { adapters: [fake], runId: "run-refusal-hint" });
+      const park = Journal.open(repo, "run-refusal-hint").read().find((e) => e.event === "task-human")!;
+      expect(park, JSON.stringify(Journal.open(repo, "run-refusal-hint").read().slice(-5))).toBeDefined();
+      if (summary.includes("outside")) {
+        expect(park.data.reason).toContain("files[] repair hint: tests/cli/brand-surfaces.test.ts");
+      } else {
+        expect(park.data.reason).not.toContain("files[] repair hint");
+      }
+    }
+  }, 120_000);
+});

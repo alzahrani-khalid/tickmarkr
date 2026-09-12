@@ -33,7 +33,7 @@ function liveApprovalRepo() {
 test("test: a task-approved row appended while a slot is free and no in-flight task has settled dispatches the released task within one poll interval whereas the shipped loop that consumes it only at the next task boundary fails", async () => {
   const runId = "run-live-approval-boundary";
   const { repo, fake } = liveApprovalRepo();
-  const summary = await runDaemon(repo, {
+  const summary = await runDaemon(repo, { approvalWindowMs: 1,
     adapters: [fake],
     runId,
     concurrency: 2,
@@ -143,7 +143,7 @@ async function recheckPark(kind: "gate-fail" | "infra") {
   journal.append("task-human", "T1", { kind, reason: "parked" });
   writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline));
   await approve([runId, "T1", "--recheck", "--by", "test"], repo);
-  await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId, resume: true });
   return { events: journal.read(), declared: loadGraph(repo).tasks[0]!.gates };
 }
 
@@ -166,7 +166,7 @@ test("test: a recheck release of a gate-fail park and of an infra park each re-r
 test("each live release encoding reaches its production path, including a worker-free recheck battery", async () => {
   const runId = "run-live-release-kinds";
   const { repo, fake, suiteLog } = await seededReleaseRun(runId);
-  await runDaemon(repo, {
+  await runDaemon(repo, { approvalWindowMs: 1,
     adapters: [fake],
     runId,
     resume: true,
@@ -211,14 +211,14 @@ test("test: the daemon's worker slot request carries the assignment's adapter id
     read: inner.read.bind(inner), notify: inner.notify.bind(inner), close: inner.close.bind(inner),
     worktree: inner.worktree.bind(inner),
   };
-  await runDaemon(repo, { adapters: [fake], runId: "run-worker-agent-slot", driver });
+  await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId: "run-worker-agent-slot", driver });
   expect(agents).toEqual(["fake"]);
 });
 
 test("test: a run whose live approvals were all consumed at task boundaries ends with approvalDisposition complete while the shipped run ending outstanding over an approval accepted hours before run-end fails", async () => {
   const runId = "run-live-approval-complete";
   const { repo, fake } = liveApprovalRepo();
-  const summary = await runDaemon(repo, {
+  const summary = await runDaemon(repo, { approvalWindowMs: 1,
     adapters: [fake],
     runId,
     concurrency: 2,
@@ -236,7 +236,7 @@ test("test: a run whose live approvals were all consumed at task boundaries ends
 test("test: a boundary sweep with no new approvals changes nothing and a resume replay of a run that consumed approvals mid-run reconstructs the same task statuses from the journal alone while a sweep that double-consumes an approval on replay fails", async () => {
   const runId = "run-live-approval-replay";
   const { repo, fake } = liveApprovalRepo();
-  const first = await runDaemon(repo, {
+  const first = await runDaemon(repo, { approvalWindowMs: 1,
     adapters: [fake],
     runId,
     concurrency: 2,
@@ -252,7 +252,7 @@ test("test: a boundary sweep with no new approvals changes nothing and a resume 
   expect(replay.get("A")).toBe("done");
   expect(replay.get("B")).toBe("done");
 
-  const second = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  const second = await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId, resume: true });
   const after = Journal.open(repo, runId).read();
   expect(second.done.sort()).toEqual(["A", "B"]);
   expect(dispatches(after, "A")).toHaveLength(1);
@@ -274,6 +274,7 @@ function closingRepo(park = true, command = "true") {
 
 test("approval-close lifecycle events each render one labelled narrator row", () => {
   const labels = {
+    "end-condition-held": "close held",
     "approval-window-start": "approval window",
     "approval-window-expired": "approval window expired",
     "tip-verify-cancelled": "tip verify cancelled",
@@ -334,7 +335,7 @@ test("test: a run whose loop drains with a parked task blocking every remaining 
   }
 }, 120_000);
 
-test("test: an approval landing during a running tip verify cancels it with a tip-verify-cancelled row, re-enters dispatch in-process and runs tip verify once more at the final close whose run-end reports every approval enacted, while an approval landing after run-end stays outstanding, so a run-end recording outstanding over an approval that landed during its verify fails", async () => {
+async function runningVerifyApproval() {
   const marker = join(makeTestTempDir("tickmarkr-tip-cancel-"), "running");
   const pidFile = `${marker}.pid`;
   // Only the parked integration tip waits. Task gates and the final tip finish normally.
@@ -383,4 +384,59 @@ test("test: an approval landing during a running tip verify cancels it with a ti
   } finally {
     if (poll) clearInterval(poll);
   }
+}
+
+test("test: an approval landing during a running tip verify cancels it with a tip-verify-cancelled row, re-enters dispatch in-process and runs tip verify once more at the final close whose run-end reports every approval enacted, while an approval landing after run-end stays outstanding, so a run-end recording outstanding over an approval that landed during its verify fails", runningVerifyApproval, 120_000);
+
+
+test("test: a task whose last dependency merges in the same poll tick the final in-flight task settles is dispatched and gated before run-end and the summary lists it done, while a close attempted over such a task journals an end-condition-held row and the loop continues, so a run-end whose pending bucket names a task with every dependency done and a free slot fails", async () => {
+  const { repo, fake } = closingRepo(false);
+  const runId = "run-last-dependency";
+  const summary = await runDaemon(repo, { adapters: [fake], runId, concurrency: 1, approvalWindowMs: 1 });
+  const events = Journal.open(repo, runId).read();
+  const mergedAt = events.findIndex((e) => e.event === "merge" && e.taskId === "A");
+  const heldAt = events.findIndex((e) => e.event === "end-condition-held" && e.taskId === "B");
+  const dispatchAt = events.findIndex((e) => e.event === "task-dispatch" && e.taskId === "B");
+  const gateAt = events.findIndex((e) => e.event === "gate-result" && e.taskId === "B" && e.data.gate === "test" && e.data.pass);
+  const endAt = events.findIndex((e) => e.event === "run-end");
+  expect(mergedAt).toBeGreaterThan(-1);
+  expect(heldAt).toBeGreaterThan(mergedAt);
+  expect(events[heldAt]!.data).toMatchObject({ deps: ["A"], freeSlots: 1 });
+  expect(dispatchAt).toBeGreaterThan(heldAt);
+  expect(gateAt).toBeGreaterThan(dispatchAt);
+  expect(endAt).toBeGreaterThan(gateAt);
+  expect(summary.done.sort()).toEqual(["A", "B", "S"]);
+  expect(summary.pending).toEqual([]);
+  expect(events[endAt]!.data).toMatchObject({ done: expect.arrayContaining(["A", "B", "S"]), pending: [] });
+}, 120_000);
+
+test("test: an approval landing after a tip verify has completed keeps that verify's cached verdict with no tip-verify-cancelled row and the close reports it enacted, while an approval landing during a running verify still cancels it, so a completed verify labelled cancelled fails", async () => {
+  // A's approved attempt parks without changes, leaving the integration tip unchanged. A
+  // fresh verification at the second close would reveal that the verdict was lost.
+  const { repo, fake } = setupRepo([T("S"), T("A", { humanGate: true })], {
+    consult: { action: "human", notes: "no changes to merge" },
+    tasks: {
+      S: [{ shell: `echo s > S.txt && ${COMMIT} S`, result: { ok: true, summary: "S" } }],
+      A: [{ shell: "true", result: { ok: false, summary: "no changes" } }],
+    },
+  }, 'gates: { test: "true" }\n');
+  const runId = "run-completed-verify-approval";
+  let released = false;
+  const summary = await runDaemon(repo, {
+    adapters: [fake], runId, approvalWindowMs: 1,
+    narrate: (e) => {
+      if (e.event === "tip-verify" && !released) {
+        released = true;
+        Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
+      }
+    },
+  });
+  const events = Journal.open(repo, runId).read();
+  expect(released).toBe(true);
+  expect(events.filter((e) => e.event === "tip-verify-cancelled")).toEqual([]);
+  expect(events.filter((e) => e.event === "tip-verify-cached")).toHaveLength(1);
+  expect(summary.tipVerify).toBe("passed");
+  expect(summary.approvalDisposition).toBe("complete");
+  expect(events.findLast((e) => e.event === "run-end")?.data.approvalDisposition).toBe("complete");
+  await runningVerifyApproval();
 }, 120_000);

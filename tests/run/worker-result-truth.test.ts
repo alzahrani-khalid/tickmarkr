@@ -106,7 +106,7 @@ test("test: a worker whose trailer arrives inside a JSON envelope the adapter de
     },
   });
 
-  const summary = await runDaemon(repo, { adapters: [adapter], runId: "run-envelope-finished", driver });
+  const summary = await runDaemon(repo, { approvalWindowMs: 1, adapters: [adapter], runId: "run-envelope-finished", driver });
   expect(summary.done).toEqual(["T1"]);
   const events = Journal.open(repo, "run-envelope-finished").read();
   const result = events.find((event) => event.event === "worker-result")!;
@@ -128,7 +128,7 @@ test("test: a worker whose trailer arrives inside a JSON envelope the adapter de
   const scoped = setupRepo([T("T1")], { tasks: { T1: [{
     shell: `node -e ${shq('console.log("Unable to reach the model provider"); for (let i = 0; i < 600; i++) console.log(`ordinary line ${i}`)')} && echo scoped > scoped.txt && ${COMMIT} scoped`,
   }] } }, "visibility:\n  worker: print\n");
-  const scopedSummary = await runDaemon(scoped.repo, { adapters: [scoped.fake], runId: "run-bounded-classifiers" });
+  const scopedSummary = await runDaemon(scoped.repo, { approvalWindowMs: 1, adapters: [scoped.fake], runId: "run-bounded-classifiers" });
   expect(scopedSummary.done).toEqual(["T1"]);
   const scopedEvents = Journal.open(scoped.repo, "run-bounded-classifiers").read();
   expect(scopedEvents.some((event) => event.event === "provider-death-requeue")).toBe(false);
@@ -142,7 +142,7 @@ test("test: a worker whose envelope decodes to a no-auth API failure journals wo
     { shell: `echo recovered > recovered.txt && ${COMMIT} recovered`, result: { ok: true, summary: "recovered" } },
   ]);
 
-  const summary = await runDaemon(repo, { adapters: [adapter], runId: "run-envelope-auth" });
+  const summary = await runDaemon(repo, { approvalWindowMs: 1, adapters: [adapter], runId: "run-envelope-auth" });
   expect(summary.done).toEqual(["T1"]);
   const journal = Journal.open(repo, "run-envelope-auth");
   const events = journal.read();
@@ -166,7 +166,7 @@ test("test: a stall-timeout harvest reaps the still-running worker before it rea
   const inner = new SubprocessDriver();
   const driver = wrappedDriver(inner);
 
-  const summary = await runDaemon(repo, { adapters: [fake], runId: "run-reap-before-harvest", driver });
+  const summary = await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId: "run-reap-before-harvest", driver });
   expect(summary.done).toEqual(["T1"]);
   await new Promise((resolve) => setTimeout(resolve, 2_100));
   expect(execSync(`git show ${shq(summary.branch)}:late.txt`, { cwd: repo, encoding: "utf8" })).toBe("first\n");
@@ -198,7 +198,7 @@ test("test: a worker whose driver cannot stop it at harvest parks stall naming t
     },
   });
   try {
-    const summary = await runDaemon(stuck.repo, { adapters: [stuck.fake], runId: "run-unstoppable-harvest", driver: stuckDriver });
+    const summary = await runDaemon(stuck.repo, { approvalWindowMs: 1, adapters: [stuck.fake], runId: "run-unstoppable-harvest", driver: stuckDriver });
     expect(summary.human).toEqual(["T1"]);
     const events = Journal.open(stuck.repo, "run-unstoppable-harvest").read();
     expect(events.find((event) => event.event === "task-human")?.data).toMatchObject({ kind: "stall" });
@@ -226,7 +226,7 @@ test("test: a worker whose driver cannot stop it at harvest parks stall naming t
       return retryInner.close(slot);
     },
   });
-  const retried = await runDaemon(retry.repo, { adapters: [retry.fake], runId: "run-sweep-before-redispatch", driver: retryDriver });
+  const retried = await runDaemon(retry.repo, { approvalWindowMs: 1, adapters: [retry.fake], runId: "run-sweep-before-redispatch", driver: retryDriver });
   expect(retried.done).toEqual(["T1"]);
   const closeFirst = operations.findIndex((operation) => operation.startsWith("close:") && operation.includes("-a0-"));
   const launchSecond = operations.findIndex((operation) => operation.startsWith("slot:") && operation.includes(":1:run-sweep-before-redispatch"));
@@ -249,7 +249,7 @@ test("test: a model-not-found banner that first appears after the startup window
   const lateDriver = wrappedDriver(lateInner, {
     waitOutput: (slot, pattern, timeoutMs, opts) => lateInner.waitOutput(slot, pattern, Math.min(timeoutMs, 50), opts),
   });
-  const lateSummary = await runDaemon(late.repo, { adapters: [late.fake], runId: "run-late-startup-banner", driver: lateDriver });
+  const lateSummary = await runDaemon(late.repo, { approvalWindowMs: 1, adapters: [late.fake], runId: "run-late-startup-banner", driver: lateDriver });
   expect(lateSummary.done).toEqual(["T1"]);
   const lateEvents = Journal.open(late.repo, "run-late-startup-banner").read();
   expect(lateEvents.find((event) => event.event === "worker-result")?.data.cause).toBeUndefined();
@@ -286,7 +286,7 @@ test("test: a model-not-found banner that first appears after the startup window
       return earlyInner.close(slot);
     },
   });
-  const earlySummary = await runDaemon(early.repo, { adapters: [early.fake], runId: "run-early-startup-banner", driver: earlyDriver });
+  const earlySummary = await runDaemon(early.repo, { approvalWindowMs: 1, adapters: [early.fake], runId: "run-early-startup-banner", driver: earlyDriver });
   expect(earlySummary.done).toEqual(["T1"]);
   expect(firstAttemptPolls).toBeLessThanOrEqual(1);
   expect(Journal.open(early.repo, "run-early-startup-banner").read()

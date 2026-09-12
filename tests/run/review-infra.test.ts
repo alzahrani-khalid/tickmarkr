@@ -17,6 +17,7 @@ class Author extends FakeAdapter {
 
 class Seat extends FakeAdapter {
   calls: string[] = [];
+  override harnessBannerRows = ["SEAT HARNESS"] as const;
   constructor(path: string, public override id: string, private mode: "silent" | "truncated" | "good") {
     super(path);
     this.vendor = id;
@@ -30,7 +31,7 @@ class Seat extends FakeAdapter {
   override headlessCommand(file: string): string {
     const prompt = readFileSync(file, "utf8");
     this.calls.push(/## Task ([^:]+):/.exec(prompt)?.[1] ?? "unknown");
-    if (this.mode === "silent") return "true";
+    if (this.mode === "silent") return "printf 'SEAT HARNESS'; sleep 2";
     // The ceiling below is a BUDGET for the slowest runner (a single coverage-instrumented CI fork spawns
     // this shell in well over 100 ms — 2.5.1's first public CI killed the good seat as "silent" at 100 ms);
     // the truncated seat must still overrun it.
@@ -83,7 +84,7 @@ describe("review infrastructure recovery", () => {
       .toMatchObject({ gateFails: 0, consults: 0 });
   });
 
-  test("test: a review seat that returns no bytes of its own is journaled demoted at that first silence and a later task's review in the same run seats another eligible reviewer ahead of it while a seat truncated at the ceiling keeps its rank, so a demotion that waits for a second silence or excludes the truncated seat fails", async () => {
+  test("test: a review seat whose capture holds only harness rows to the ceiling is recorded cause silent and journaled demoted at that round, and a later task's review in the same run never seats it, while a seat that emitted prose before the ceiling is recorded truncated and stays seatable, so a zero-authored seat recorded truncated or re-seated fails", async () => {
     const { repo, scriptPath } = setupRepo([
       T("T1", { acceptance: [{ oracle: "command", command: "true" }] }),
       T("T2", { deps: ["T1"], acceptance: [{ oracle: "command", command: "true" }] }),
@@ -100,7 +101,7 @@ describe("review infrastructure recovery", () => {
     const rows = Journal.open(repo, "run-review-demotion").read();
     const demotions = rows.filter((row) => row.event === "review-pool-demotion");
     expect(demotions).toHaveLength(1);
-    expect(demotions[0]).toMatchObject({ taskId: "T1", data: { reviewer: "seat-a:seat-a", seatAuthoredBytes: 0 } });
+    expect(demotions[0]).toMatchObject({ taskId: "T1", data: { reviewer: "seat-a:seat-a", cause: "silent", seatAuthoredBytes: 0 } });
     expect(rows.indexOf(demotions[0]!)).toBeLessThan(rows.findIndex((row) => row.event === "review-retry"));
     expect(rows.filter((row) => row.event === "review-no-verdict" && row.data.reviewer === "seat-b:seat-b")
       .map((row) => row.data.cause)).toEqual(["truncated", "truncated"]);

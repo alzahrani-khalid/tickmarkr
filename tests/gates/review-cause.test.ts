@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { qwen } from "../../src/adapters/qwen.js";
 import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
 import { PLAIN_BANNER } from "../../src/brand.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
@@ -200,6 +201,23 @@ const MID_PAINT = [
   PLAIN_BANNER.slice(0, PLAIN_BANNER.indexOf("verified wo") + "verified wo".length) + "\n",
   PLAIN_BANNER,
 ];
+
+test("test: a pane capture holding the dispatch echo, the qwen SAFE MODE banner rows from the recorded fixture and the identity line measures zero seat-authored bytes at every read position, while the same capture followed by one seat-authored word measures that word's bytes, so a banner row measured as seat output fails", () => {
+  const dispatch = PREAMBLE.split("\n")[0]!;
+  const recordedRows = readFileSync(new URL("../fixtures/qwen/safe-mode.stderr", import.meta.url), "utf8").trimEnd().split("\n");
+  expect(qwen.harnessBannerRows).toEqual(recordedRows);
+  const harness = `${dispatch}\n${recordedRows.join("\n")}\nreview · T1 · attempt 0 · run-test\n`;
+  const wrong: string[] = [];
+  for (let n = 1; n <= harness.length; n++) {
+    for (const capture of [harness.slice(0, n), harness.slice(0, n).replace(/\n$/, "") + "\n"]) {
+      const measured = reviewSeatOutput(capture, "test-nonce", qwen.harnessBannerRows);
+      if (measured !== "") wrong.push(`@${n}: ${JSON.stringify(measured)}`);
+    }
+  }
+  expect(wrong).toEqual([]);
+  expect(reviewSeatOutput(`${harness}verdict`, "test-nonce", qwen.harnessBannerRows)).toBe("verdict");
+  expect(Buffer.byteLength(reviewSeatOutput(`${harness}verdict`, "test-nonce", qwen.harnessBannerRows))).toBe(7);
+});
 
 test("no read position inside the preamble measures a seat-authored byte", () => {
   // Hand-picked shapes only prove the positions someone thought of; the running Math.max means ONE

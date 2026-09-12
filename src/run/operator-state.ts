@@ -34,7 +34,7 @@ export class OperatorStateFold {
   private tasks = new Map<string, OperatorTask>();
   private start?: OperatorRecord;
   private startEvent?: JournalEvent;
-  private latestGraphRehash?: JournalEvent;
+  private rehashes: JournalEvent[] = [];
   private end?: { evidence: EvidenceIdentity; buckets: OperatorSnapshot["buckets"]; tip: OperatorSnapshot["currentTip"] };
   private active = false;
   private approved = false;
@@ -58,7 +58,7 @@ export class OperatorStateFold {
       this.approved = false;
       this.tipFailed = false;
     }
-    if (e.event === "graph-rehash") this.latestGraphRehash = { ...e, data: { from: e.data.from, to: e.data.to } };
+    if (e.event === "graph-rehash") this.rehashes = [...this.rehashes, { ...e, data: { from: e.data.from, to: e.data.to } }];
     if (e.event === "tip-verify-failed" || (e.event === "tip-verify" && e.data.pass === false)) this.tipFailed = true;
     if (e.event === "run-end") {
       const tip = e.data.tipVerify;
@@ -144,13 +144,9 @@ export class OperatorStateFold {
   }
   private comparableTo(hash: string | undefined): boolean {
     if (!hash) return false;
-    const events = [this.startEvent, this.latestGraphRehash].filter((e): e is JournalEvent => e !== undefined);
-    const baseline = engagementComparable(events, hash);
-    if (this.latestGraphRehash) {
-      const from = baseline.comparable ? baseline.recorded : baseline.reason === "mismatch" ? baseline.recorded : null;
-      return this.latestGraphRehash.data.to === hash && this.latestGraphRehash.data.from === from;
-    }
-    return baseline.comparable;
+    // The shared comparator audits the rehash chain; the fold keeps only the rows it reads.
+    const events = [this.startEvent, ...this.rehashes].filter((e): e is JournalEvent => e !== undefined);
+    return engagementComparable(events, hash).comparable;
   }
 }
 

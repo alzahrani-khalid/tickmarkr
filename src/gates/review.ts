@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Assignment, type BillingChannel, channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
 import {
@@ -232,6 +232,42 @@ export function modelId(model: string): string {
 
 export { modelProvider };
 
+/**
+ * One function decides whether a reviewer's `resolved` or `reraised` id names a carried fingerprint,
+ * comparing both sides with every whitespace run removed (`s.replace(/\s+/g, "")`).
+ */
+export function matchClosureId(candidate: unknown, fingerprint: string): boolean;
+export function matchClosureId(candidate: unknown, fingerprints: Iterable<string>): string | undefined;
+export function matchClosureId(candidate: unknown, target: string | Iterable<string>): boolean | string | undefined {
+  if (typeof candidate !== "string") return typeof target === "string" ? false : undefined;
+  const normCandidate = candidate.replace(/\s+/g, "");
+  if (typeof target === "string") {
+    return normCandidate === target.replace(/\s+/g, "");
+  }
+  for (const fp of target) {
+    if (typeof fp === "string" && normCandidate === fp.replace(/\s+/g, "")) return fp;
+  }
+  return undefined;
+}
+
+/**
+ * Validates closure ids in a review verdict: membership, duplication, and coverage of every prior id
+ * all route through matchClosureId.
+ */
+export function isReviewClosureInvalid(
+  v: Pick<ReviewVerdict, "resolved" | "reraised"> | null | undefined,
+  priorIds: ReadonlySet<string> | readonly string[],
+): boolean {
+  const priors = priorIds instanceof Set ? priorIds : new Set(priorIds);
+  const closureLists = [v?.resolved, v?.reraised];
+  const allCandidateIds = [...(v?.resolved ?? []), ...(v?.reraised ?? [])];
+  return !!v && (priors.size > 0 || closureLists.some((list) => list !== undefined)) && (
+    closureLists.some((list) => !Array.isArray(list) || list.some((id) => !matchClosureId(id, priors)))
+    || new Set(allCandidateIds.map((id) => matchClosureId(id, priors) ?? id)).size !== allCandidateIds.length
+    || [...priors].some((id) => !allCandidateIds.some((candidate) => matchClosureId(candidate, id)))
+  );
+}
+
 // v1.53 T2: same entry grammar as routing.map.prefer (router.ts preferIndex — router is out of this
 // module's dependency direction for a private fn, so the 3 lines live here too): `adapter` matches
 // every channel of that adapter, `adapter:model` exactly one; unmatched channels sort after all entries.
@@ -453,7 +489,23 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   // make two otherwise-identical runs diverge in their journal bytes. The reviewer channel already
   // disambiguates every call that matters: a retry always excludes the flaked channel (run-gates.ts),
   // so it can never collide with the attempt it replaces.
-  const artifactId = `${task.id}-${channelKey(reviewer).replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+  const baseArtifactId = `${task.id}-${channelKey(reviewer).replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+  let artifactId = baseArtifactId;
+  if (artifactDir) {
+    if (
+      existsSync(join(artifactDir, `review-brief-${baseArtifactId}.md`)) ||
+      existsSync(join(artifactDir, `review-raw-${baseArtifactId}.txt`))
+    ) {
+      let counter = 2;
+      while (
+        existsSync(join(artifactDir, `review-brief-${baseArtifactId}-${counter}.md`)) ||
+        existsSync(join(artifactDir, `review-raw-${baseArtifactId}-${counter}.txt`))
+      ) {
+        counter++;
+      }
+      artifactId = `${baseArtifactId}-${counter}`;
+    }
+  }
   const briefPath = artifactDir ? join(artifactDir, `review-brief-${artifactId}.md`) : undefined;
   // Persistence is evidence, not a gate input: a full disk or a removed run dir never fails the gate.
   let savedBrief: string | undefined;
@@ -492,12 +544,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const v = extractVerdictJson<ReviewVerdict>(raw, nonce);
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
   const priorIds = new Set(priorMaterials.map((finding) => finding.fingerprint));
-  const closureLists = [v?.resolved, v?.reraised];
-  const closureInvalid = !!v && (priorIds.size > 0 || closureLists.some((list) => list !== undefined)) && (
-    closureLists.some((list) => !Array.isArray(list) || list.some((id) => typeof id !== "string" || !priorIds.has(id)))
-    || new Set([...(v?.resolved ?? []), ...(v?.reraised ?? [])]).size !== (v?.resolved?.length ?? 0) + (v?.reraised?.length ?? 0)
-    || [...priorIds].some((id) => !v?.resolved?.includes(id) && !v?.reraised?.includes(id))
-  );
+  const closureInvalid = isReviewClosureInvalid(v, priorIds);
   // findings decides the verdict on its own; the legacy path still needs approve + issues to parse.
   if (!v || closureInvalid || (findings === null && (typeof v.approve !== "boolean" || !Array.isArray(v.issues)))) {
     // OBS-196: name the cause and persist the raw bytes — a ruled-on "unparseable" without its
@@ -531,7 +578,9 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const decided = findings !== null
     ? classifyReviewFindings(findings)
     : classifyReviewIssues(v.approve as boolean, v.issues as unknown[]);
-  const reraised = priorMaterials.filter((finding) => v.reraised?.includes(finding.fingerprint));
+  const reraised = priorMaterials.filter((finding) =>
+    v.reraised?.some((id) => matchClosureId(id, finding.fingerprint)),
+  );
   if (reraised.length) {
     if (decided.pass) decided.headline = "requested changes";
     decided.pass = false;
@@ -550,7 +599,15 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     details,
     meta: {
       ...policyMeta, ...rotationMeta, reviewer: channelKey(reviewer), vendor: reviewer.vendor, provider,
-      ...(priorMaterials.length ? { resolved: v.resolved, reraised: v.reraised } : {}),
+      ...(priorMaterials.length ? {
+        resolved: v.resolved,
+        reraised: v.reraised,
+        normalisedMatches: (v.resolved ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
+        resolvedMatches: (v.resolved ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
+        reraisedMatches: (v.reraised ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
+        normalisedResolved: (v.resolved ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
+        normalisedReraised: (v.reraised ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
+      } : {}),
       ...(reraised.length ? { findings: [
         ...structuredFindings("review", details).filter((finding) => !reraised.some((prior) => prior.note === finding.note)),
         ...reraised,

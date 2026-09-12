@@ -44,6 +44,7 @@ const RAIL_TONES: Record<RailTone, { glyph: string; paint: (s: string) => string
 
 /** Approval-close lifecycle labels extend the established closed rail vocabulary. */
 export const APPROVAL_RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
+  "end-condition-held": { label: "close held", tone: "attention" },
   "approval-window-start": { label: "approval window", tone: "attention" },
   "approval-window-expired": { label: "approval window expired", tone: "attention" },
   "tip-verify-cancelled": { label: "tip verify cancelled", tone: "attention" },
@@ -134,6 +135,7 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   "gate-result": { label: "gate", tone: "pass" },
   "baseline-wait": { label: "baseline wait", tone: "active" },
   "suite-budget": { label: "suite budget", tone: "attention" },
+  "gate-replayed": { label: "gate replayed", tone: "attention" },
   "gate-reused": { label: "gate reused", tone: "neutral" },
   "judge-retry": { label: "judge retry", tone: "attention" },
   "review-no-verdict": { label: "review unavailable", tone: "attention" },

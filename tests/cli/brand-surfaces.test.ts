@@ -238,6 +238,7 @@ const RAIL_SPEC: RailSpec[] = [
   // SB-1 (v2.5.2): a verdict round released at the suite-wait ceiling beside a foreign suite ran
   // under the conservative budget — the row names the census and both caps.
   { event: "suite-budget", label: "suite budget", tone: "attention", salient: "beside 1, cap 3 not 6", data: { count: 1, occupancyCap: 6, conservativeCap: 3 } },
+  { event: "gate-replayed", label: "gate replayed", tone: "attention", renders: "fail", data: { gate: "test", attempt: 1, priorAttempt: 0, commit: "deadbeefcafe", pass: false, details: "assertion failed" } },
   { event: "gate-reused", label: "gate reused", tone: "neutral", data: { gate: "lint", commit: "deadbeefcafe" } },
   { event: "judge-retry", label: "judge retry", tone: "attention", data: { gate: "acceptance", flaked: "codex:gpt-5.6-sol", retried: "claude-code:opus" } },
   { event: "review-no-verdict", label: "review unavailable", tone: "attention", data: { reviewer: "codex:gpt-5.6-sol", cause: "silent" } },
@@ -397,6 +398,20 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
   // it, so no `narrate` callback in the running process ever sees it — a synthetic event fed to
   // `narrationLine` was the only thing that made it look retained. Every remaining row is written
   // by the daemon itself or by the driver whose journal `bindNarration` binds to this sink.
+  test("test: the gate-replayed row renders one labelled narrator row with a non-empty label and the run narration golden regenerated for it is byte-identical to the shipped fixture, so a journal row the narrator cannot label fails", () => {
+    onTTY();
+    const replay = RAIL_SPEC.find((spec) => spec.event === "gate-replayed")!;
+    const row = narrationLine(specEvent(replay))!;
+    expect(RAIL_ROWS["gate-replayed"]!.label.trim()).not.toBe("");
+    expect(row.split("\n")).toHaveLength(1);
+    expect(stripAnsi(row)).toContain(RAIL_ROWS["gate-replayed"]!.label);
+    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    if (process.env.UPDATE_BRAND_GOLDEN === "1") {
+      writeFileSync(join(import.meta.dirname, "../fixtures/brand-surfaces/run-narration.txt"), regenerated);
+    }
+    expect(regenerated).toBe(golden("run-narration.txt"));
+  });
+
   test("every retained event has a producer that appends through the run's own journal, so a row nothing in this process can ever emit fails", () => {
     const RUN_OWNED = ["src/run/daemon.ts", "src/run/journal.ts", "src/drivers/herdr.ts"];
     const src = (path: string) => readFileSync(join(import.meta.dirname, "../..", path), "utf8");

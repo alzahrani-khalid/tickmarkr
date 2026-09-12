@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { detectPackageManager, turboContinueFindings } from "../../gates/baseline.js";
 import { version } from "./version.js";
@@ -30,6 +30,39 @@ const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === u
 const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value: string) =>
   `  ${statusRow(verdict, kvRow(key, value).slice(2))}`;
 const attentionRow = (text: string) => `  ${statusRow("warn", text)}`;
+
+type ReviewDemotionSummary = { reviewer: string; count: number; causes: Record<string, number> };
+
+// Use the routing profile's established 50-run recency horizon without importing journal machinery
+// into doctor. Torn/malformed rows are ignored one at a time: diagnostics must survive a killed write.
+export function recentReviewDemotions(cwd: string, lastRuns = 50): ReviewDemotionSummary[] {
+  const runs = join(cwd, stateDirName(cwd), "runs");
+  if (!existsSync(runs)) return [];
+  const grouped = new Map<string, ReviewDemotionSummary>();
+  const ids = readdirSync(runs, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("run-")
+      && existsSync(join(runs, entry.name, "journal.jsonl")))
+    .map((entry) => entry.name).sort().slice(-lastRuns);
+  for (const id of ids) {
+    const lines = readFileSync(join(runs, id, "journal.jsonl"), "utf8").split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let row: unknown;
+      try { row = JSON.parse(line); } catch { continue; }
+      if (!row || typeof row !== "object") continue;
+      const event = row as { event?: unknown; data?: unknown };
+      if (event.event !== "review-pool-demotion" || !event.data || typeof event.data !== "object") continue;
+      const data = event.data as { reviewer?: unknown; cause?: unknown };
+      if (typeof data.reviewer !== "string" || !data.reviewer.trim()) continue;
+      const cause = typeof data.cause === "string" && data.cause.trim() ? data.cause : "unknown";
+      const summary = grouped.get(data.reviewer) ?? { reviewer: data.reviewer, count: 0, causes: {} };
+      summary.count++;
+      summary.causes[cause] = (summary.causes[cause] ?? 0) + 1;
+      grouped.set(data.reviewer, summary);
+    }
+  }
+  return [...grouped.values()].sort((a, b) => a.reviewer.localeCompare(b.reviewer));
+}
 
 export type DoctorOpts = {
   banner?: boolean;
@@ -656,6 +689,16 @@ export async function doctor(
     const healthy = h.installed && (a.id !== kimi.id || h.authed);
     return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
   });
+  const reviewDemotions = recentReviewDemotions(cwd);
+  if (reviewDemotions.length) {
+    rows.push(legend("recent review-seat demotions:"));
+    for (const demotion of reviewDemotions) {
+      const causes = Object.entries(demotion.causes)
+        .map(([cause, count]) => `${cause}${count === demotion.count ? "" : ` ×${count}`}`).join(", ");
+      rows.push(alignedStatusRow("warn", demotion.reviewer,
+        `${demotion.count} review seat${demotion.count === 1 ? "" : "s"} demoted · cause ${causes}`));
+    }
+  }
   if (existsSync(graphPath(cwd))) {
     try {
       const graph = loadGraph(cwd);

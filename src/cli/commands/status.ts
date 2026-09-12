@@ -987,22 +987,15 @@ type StatusEngagement = {
   rehashAt?: number;
 };
 
-// Resume's shared comparator remains the fail-closed baseline. Status may additionally accept the
-// daemon's audited graph-rehash release, but only when its `from` names that baseline identity (or
-// null for an explicitly released legacy journal) and its `to` names the graph loaded now.
+// OBS-978: the one comparator resume, plan and the operator fold read decides the join — it already
+// audits the rehash chain. When it binds and the journal holds a graph-rehash, the newest row is the
+// audit that bound the loaded graph; rehashAt marks the facts recorded against a prior graph.
 const statusEngagement = (events: JournalEvent[], loadedHash: string): StatusEngagement => {
-  const baseline = engagementComparable(events, loadedHash);
+  if (!engagementComparable(events, loadedHash).comparable) return { comparable: false };
   for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i]!;
-    if (event.event !== "graph-rehash") continue;
-    const auditsBaseline = baseline.comparable || baseline.reason === "mismatch"
-      ? event.data.from === baseline.recorded
-      : event.data.from === null;
-    return event.data.to === loadedHash && auditsBaseline
-      ? { comparable: true, rehashAt: i }
-      : { comparable: false };
+    if (events[i]!.event === "graph-rehash") return { comparable: true, rehashAt: i };
   }
-  return { comparable: baseline.comparable };
+  return { comparable: true };
 };
 
 // The journal's own reader rule (src/run/journal.ts readJsonl), applied to bytes already in hand:

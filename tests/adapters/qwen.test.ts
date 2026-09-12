@@ -6,7 +6,7 @@ import { describe, expect, test } from "vitest";
 import { claudeCode } from "../../src/adapters/claude-code.js";
 import { isNativeCliDrive, projectCliEntries, SHIPPED_CLI_CATALOG } from "../../src/adapters/catalog.js";
 import { parseWorkerResult } from "../../src/adapters/prompt.js";
-import { parseQwenResult, qwen, QWEN_VERSION_IDENTITY } from "../../src/adapters/qwen.js";
+import { parseQwenResult, qwen, QWEN_HARNESS_BANNER_ROWS, QWEN_VERSION_IDENTITY } from "../../src/adapters/qwen.js";
 import { declaredPromptGlyphForAdapter } from "../../src/adapters/types.js";
 import { bannerShell } from "../../src/brand.js";
 
@@ -51,6 +51,13 @@ function initEvent(name: string): QwenInit {
 }
 
 describe("qwen native drive", () => {
+  test("qwen declares each recorded SAFE MODE stderr row as harness banner bytes", () => {
+    const recorded = fixture("safe-mode.stderr").trimEnd().split("\n");
+    expect(QWEN_HARNESS_BANNER_ROWS).toEqual(recorded);
+    expect(qwen.harnessBannerRows).toBe(QWEN_HARNESS_BANNER_ROWS);
+    expect(recorded).toHaveLength(2);
+  });
+
   test("test: the qwen headless command run against a stub qwen on PATH passes --safe-mode beside --approval-mode yolo -m the model -o json and -p with an empty argument and declares --safe-mode among its hardcoded flags whereas a form without --safe-mode or one that drops -o json fails", () => {
     const capture = makeCaptureStub("qwen");
     const prompt = join(capture.dir, "prompt.md");

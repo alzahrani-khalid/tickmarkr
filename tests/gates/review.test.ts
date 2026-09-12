@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
+import { type Assignment, type BillingChannel, channelKey } from "../../src/adapters/types.js";
 import {
   goalDensityErrors, reviewParticipationErrors, surfaceErrors, symbolOwnershipErrors, taskUnitContractErrors,
 } from "../../src/compile/collateral.js";
@@ -13,7 +13,7 @@ import { compileSource } from "../../src/compile/index.js";
 import { compileNative } from "../../src/compile/native.js";
 import { criticalPathHits, declaredReviewPolicy, DEFAULT_CONFIG, effectiveReviewPolicy, isReviewLeafPath, repoOverlayPath } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
-import { fetchTaskDiff, modelProvider, pickReviewer, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
+import { fetchTaskDiff, matchClosureId, modelProvider, pickReviewer, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
 import { extractJson } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
@@ -1114,4 +1114,98 @@ test("test: an approving review persists its raw bytes with secrets redacted bes
   expect(rowWithoutArtifacts.pass).toBe(true);
   expect(rowWithoutArtifacts.meta?.rawPath).toBeUndefined();
   expect(rowWithoutArtifacts.meta?.briefPath).toBeUndefined();
+});
+
+test("test: an approval whose resolved id equals a carried fingerprint with one inner space dropped parses as resolved and passes with the row's meta naming the normalised match, while a resolved id that differs from every fingerprint by one letter still fails as a malformed verdict, so a closure match that requires the verbatim string fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const note = "src/model.ts loses selection on prepend.";
+  const [finding] = structuredFindings("review", `- [material] ${note}`);
+  const carried = [finding];
+  const fp = finding.fingerprint;
+  expect(fp).toContain(" ");
+  const spaceIdx = fp.indexOf(" ");
+  const dropped = fp.slice(0, spaceIdx) + fp.slice(spaceIdx + 1);
+
+  // Verbatim string comparison fails because one inner space was dropped:
+  expect(dropped === fp).toBe(false);
+  expect(matchClosureId(dropped, fp)).toBe(true);
+
+  // An approval whose resolved id equals the fingerprint with one inner space dropped:
+  const fake = fakeWith({ review: { approve: true, findings: [], resolved: [dropped], reraised: [] } });
+  const passing = (await runGates({ ...mkTask(), gates: ["review"] }, {
+    worktree: repo, baseRef: base, author, channels: CH, adapters: [fake], cfg: DEFAULT_CONFIG,
+    commands: {}, baseline: { commands: {} }, result: { ok: true, summary: "repaired", deviations: [] },
+    carriedFindings: carried,
+  })).results[0]!;
+
+  expect(passing.pass).toBe(true);
+  expect(passing.meta?.resolved).toEqual([dropped]);
+  expect(passing.meta?.normalisedMatches).toEqual([fp]);
+  expect(passing.meta?.resolvedMatches).toEqual([fp]);
+
+  // While a resolved id that differs from every fingerprint by one letter still fails as a malformed verdict:
+  const corrupted = fp + "x";
+  const fakeCorrupted = fakeWith({ review: { approve: true, findings: [], resolved: [corrupted], reraised: [] } });
+  const failing = (await runGates({ ...mkTask(), gates: ["review"] }, {
+    worktree: repo, baseRef: base, author, channels: CH, adapters: [fakeCorrupted], cfg: DEFAULT_CONFIG,
+    commands: {}, baseline: { commands: {} }, result: { ok: true, summary: "repaired", deviations: [] },
+    carriedFindings: carried,
+  })).results[0]!;
+
+  expect(failing.pass).toBe(false);
+  expect(failing.meta?.unparseable).toBe(true);
+  expect(failing.meta?.cause).toBe("malformed-verdict");
+
+  // So a closure match that requires the verbatim string fails:
+  const verbatimMatch = [dropped].every((id) => carried.map((f) => f.fingerprint).includes(id));
+  expect(verbatimMatch).toBe(false);
+});
+
+test("test: a repair round that re-picks the reviewer of an earlier round writes its raw and brief to paths distinct from that round's and both earlier files keep their bytes, while a first round writes the paths it writes today, so a re-picked seat that overwrites an earlier round's raw fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const artifacts = mkdtempSync(join(tmpdir(), "tickmarkr-repair-round-"));
+  const fake1 = fakeWith({ review: { approve: true, findings: [] } });
+
+  // First round writes the paths it writes today:
+  const task = mkTask();
+  const pickedReviewer = pickReviewer(author, CH)!;
+  const baseArtifactId = `${task.id}-${channelKey(pickedReviewer).replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+  const expectedFirstBrief = join(artifacts, `review-brief-${baseArtifactId}.md`);
+  const expectedFirstRaw = join(artifacts, `review-raw-${baseArtifactId}.txt`);
+
+  const round1 = await reviewGate(
+    task, repo, base, author, CH, [fake1], DEFAULT_CONFIG,
+    undefined, undefined, artifacts,
+  );
+  expect(round1.pass).toBe(true);
+  expect(round1.meta?.briefPath).toBe(expectedFirstBrief);
+  expect(round1.meta?.rawPath).toBe(expectedFirstRaw);
+  expect(existsSync(expectedFirstBrief)).toBe(true);
+  expect(existsSync(expectedFirstRaw)).toBe(true);
+
+  const briefBytes1 = readFileSync(expectedFirstBrief, "utf8");
+  const rawBytes1 = readFileSync(expectedFirstRaw, "utf8");
+
+  // Repair round re-picks the reviewer of the earlier round:
+  const fake2 = fakeWith({ review: { approve: true, findings: [] } });
+  const round2 = await reviewGate(
+    task, repo, base, author, CH, [fake2], DEFAULT_CONFIG,
+    undefined, undefined, artifacts,
+  );
+  expect(round2.pass).toBe(true);
+
+  // Writes its raw and brief to paths distinct from that round's:
+  expect(round2.meta?.briefPath).toBeDefined();
+  expect(round2.meta?.rawPath).toBeDefined();
+  expect(round2.meta?.briefPath).not.toBe(round1.meta?.briefPath);
+  expect(round2.meta?.rawPath).not.toBe(round1.meta?.rawPath);
+
+  // And both earlier files keep their bytes:
+  expect(readFileSync(expectedFirstBrief, "utf8")).toBe(briefBytes1);
+  expect(readFileSync(expectedFirstRaw, "utf8")).toBe(rawBytes1);
+  expect(existsSync(String(round2.meta?.briefPath))).toBe(true);
+  expect(existsSync(String(round2.meta?.rawPath))).toBe(true);
+
+  // So a re-picked seat that overwrites an earlier round's raw fails:
+  expect(round2.meta?.rawPath === round1.meta?.rawPath).toBe(false);
 });

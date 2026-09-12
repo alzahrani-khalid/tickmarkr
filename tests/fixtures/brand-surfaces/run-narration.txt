@@ -1,0 +1,61 @@
+❯ run-20260821-070000-0000000000001734 started — pid 4321
+❯ run-20260821-070000-0000000000001734 resumed — pid 4321
+! run-20260821-070000-0000000000001734 graph rehashed — a1a1a1a1a1a1a1a1, to 5f5f5f5f5f5f
+- T1 restored — codex:gpt-5.6-sol
+- run-20260821-070000-0000000000001734 lock reclaimed — pid 4321
+✓ run-rail finished — done 1, failed 0
+✓ run-20260821-070000-0000000000001734 tip verify — test passed
+✗ run-20260821-070000-0000000000001734 tip verify — test failed after T1
+❯ run-20260821-070000-0000000000001734 tip verify — gates build, test
+✓ run-20260821-070000-0000000000001734 tip verify — gates build, test
+- run-20260821-070000-0000000000001734 exit cause — cause unclean
+❯ T1 dispatch — claude-code:sonnet
+! T1 redispatch — the delivery read-back never landed
+! T1 reroute — preferred channel quota-banned this run
+! T1 reroute — to codex:gpt-5.6-sol over claude-code:sonnet
+! T1 failover — claude-code:sonnet
+! T1 failover — channel produced no output twice
+! T1 requeue — claude-code:sonnet
+! T1 channel demoted — channel claude-code:sonnet
+! T1 channel excluded — no output twice, channel claude-code:sonnet
+! T1 consult — retry
+! T1 trust accepted — claude-code seed
+! T1 channel recycled — channel claude-code:sonnet
+! T1 retry banned — review
+! T1 repeat capped — test, channel claude-code:sonnet
+! T1 authoring defect — scope, channel claude-code:sonnet
+! T1 session reset — tokens 174000
+! T1 dispatch mode — adapter
+✗ T1 delivery failed — the input box never took the dispatch
+✓ T1 worker — narration became a rail
+! T1 worker — harvested: the worktree carries committed work; the worker emitted no TICKMARKR_RESULT trailer
+! T1 nudged — attempt 2
+✓ T1 nudge answered — attempt 2
+! T1 nudge undelivered — attempt 2
+! T1 nudge expired — attempt 2, grace 240s
+✗ T1 worker dead — silent 900s
+! T1 harvested — silent 900s
+✗ T1 work lost — lost 1
+✓ T1 done — green
+✗ T1 failed — gate battery red after three attempts
+! T1 parked — attempt cap reached
+❯ T1 gate start — test
+✗ T1 gate — test failed
+❯ T1 baseline wait — base abc123
+! T1 suite budget — beside 1, cap 3 not 6
+✗ T1 gate replayed — test
+- T1 gate reused — lint
+! T1 judge retry — acceptance
+! T1 review unavailable — cause silent
+! T1 review seat demoted — cause silent
+! T1 review infra retry — cause silent
+! T1 review retry — review
+! T1 repair — diff 4096B
+! T1 repair — gates test, lint
+! T1 repair off — carry incomplete, lost 1
+✗ T1 repair spent — gates review
+! T1 escalated — retry
+! T1 page — status blocked
+! T1 tip moved — gated deadbeefcafe, tip c0ffeebabe11
+✓ T1 integrated — tickmarkr/run-rail--T1
+✗ T1 conflict — CONFLICT (content): Merge conflict in src/cli/commands/run.ts

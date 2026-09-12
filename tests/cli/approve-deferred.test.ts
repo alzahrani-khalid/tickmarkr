@@ -1,11 +1,11 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test } from "vitest";
 import { approvalEnactment, approvalRunOwner, type ApprovalDisposition, type ApprovalStatus, approve } from "../../src/cli/commands/approve.js";
 import { COMMANDS, dispatch } from "../../src/cli/index.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
-import { formatSummary, outstandingApprovals, runDaemon } from "../../src/run/daemon.js";
+import { APPROVAL_WINDOW_MS, formatSummary, outstandingApprovals, resetApprovalWindowForTests, runDaemon, setApprovalWindowForTests } from "../../src/run/daemon.js";
 import { GATE_SATISFIED_RELEASE, type JournalEvent, Journal } from "../../src/run/journal.js";
 import { runLockOwner } from "../../src/run/lock.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
@@ -16,6 +16,9 @@ import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 // Every test here is TOP-LEVEL with a verbatim title: the acceptance oracle filters with a leaf-anchored
 // `-t '(^| )…$'` over vitest's full name (OBS-511 widened it through describe prefixes), so the test's
 // OWN title must still equal the criterion — a shortened or decorated leaf stays unmatchable.
+
+beforeEach(() => setApprovalWindowForTests(1));
+afterEach(() => resetApprovalWindowForTests());
 
 const lockPath = (repo: string) => join(tickmarkrDir(repo), "graph.lock");
 
@@ -230,10 +233,10 @@ test("the liveness answer is derived from the run lock's own recorded owner pid 
 // v2.2 T3 moved this fixture's promise: both approvals land WHILE the loop is turning, so the
 // boundary sweep enacts them and the record is `complete`. The outstanding half of the disclosure is
 // pinned by the disposition-records test above, which lands its approval after the last boundary.
-test("an approval accepted against the live daemon is enacted at the next task boundary over both kinds of park, and the run's completion record reports complete rather than naming it outstanding", async () => {
+async function bothParkScenario() {
   // T1/T2 park BEFORE dispatch (humanGate); T3/T4 park after a failed acceptance gate the consult
   // sends to a human (gate-fail). One of each kind is approved while the daemon is live — that
-  // approval cannot be enacted by this run, and the record has to say so.
+  // approval must be enacted by this run before it closes.
   const { repo, fake } = setupRepo(
     [T("T1", { humanGate: true }), T("T2", { humanGate: true }), T("T3"), T("T4")],
     {
@@ -259,6 +262,7 @@ test("an approval accepted against the live daemon is enacted at the next task b
   });
 
   const events = Journal.open(repo, runId).read();
+  expect(events.filter((e) => e.event === "approval-window-start").map((e) => e.data.windowMs)).toEqual([1]);
   const parkKind = (taskId: string) => events.find((e) => e.event === "task-human" && e.taskId === taskId)?.data.kind;
   expect(parkKind("T1")).toBe("human-gate");
   expect(parkKind("T2")).toBe("human-gate");
@@ -275,7 +279,9 @@ test("an approval accepted against the live daemon is enacted at the next task b
   const approvedAt = events.findIndex((e) => e.event === "task-approved" && e.taskId === "T1");
   expect(approvedAt).toBeGreaterThan(-1);
   expect(dispatchesOf(events.slice(approvedAt + 1), "T1")).toBeGreaterThan(0);
-}, 240_000);
+}
+
+test("an approval accepted against the live daemon is enacted at the next task boundary over both kinds of park, and the run's completion record reports complete rather than naming it outstanding", bothParkScenario, 240_000);
 
 
 test("start runDaemon with approval A, append approval B while it runs, and record that both dispatch before run-end. Contrast with A and B present before start, where both dispatch, so a daemon that never reloads live approvals fails", async () => {
@@ -326,7 +332,7 @@ test("start runDaemon with approval A, append approval B while it runs, and reco
 
 // Independent terminal observer: an approval that already owns the serializer must land before the
 // sample; one invoked by the run-end append cannot land behind that sample while graph.lock is live.
-test("approval append and run-end sampling are serialized across the terminalization boundary", async () => {
+async function postCloseScenario() {
   const { repo, fake } = twoGateRepo();
   const runId = "run-terminalization";
   let before: Promise<string> | undefined;
@@ -356,7 +362,11 @@ test("approval append and run-end sampling are serialized across the terminaliza
   const bApprovedAt = events.findIndex((e) => e.event === "task-approved" && e.taskId === "B");
   expect(events.slice(0, bApprovedAt).some((e) => e.event === "run-end")).toBe(true);
   expect(dispatchesOf(events, "B")).toBe(0);
-}, 240_000);
+  expect(outstandingApprovals(events)).toEqual(["B"]);
+  expect(events.filter((e) => e.event === "approval-window-start").map((e) => e.data.windowMs)).toEqual([1]);
+}
+
+test("approval append and run-end sampling are serialized across the terminalization boundary", postCloseScenario, 240_000);
 
 test("test: a journal with task-approved then resume-restore then green gates then merge reports outstandingApprovals empty at run-end while the run-230 fixture with two upheld approvals and no later enactment still reports both outstanding whereas a fold that ignores resume-restore or counts any later event fails", () => {
   const at = (event: string, taskId: string, data: Record<string, unknown> = {}): JournalEvent =>
@@ -401,4 +411,26 @@ test("an approved task that fails before any dispatch stays outstanding, and the
   const parked = formatSummary({ ...base, failed: [], human: ["T1", "T2"], outstandingApprovals: ["T1", "T2"] });
   expect(parked).toContain("`tickmarkr resume r` enacts T1, T2");
   expect(parked).not.toContain("failed before any dispatch");
+});
+
+
+test("test: the exported approval window constant is at least one hundred and twenty seconds, and both approve-deferred park scenarios drive the window through the daemon's test seam so the in-flight approval is enacted and the post-close approval stays outstanding under a one-millisecond seam, so a one-second window or a scenario that waits on wall time fails", async () => {
+  expect(APPROVAL_WINDOW_MS).toBeGreaterThanOrEqual(120_000);
+  await bothParkScenario();
+  await postCloseScenario();
+}, 240_000);
+
+
+test("the approval window setter overrides the Vitest default and reset restores a short park wait", async () => {
+  setApprovalWindowForTests(7);
+  for (const windowMs of [7, 1]) {
+    if (windowMs === 1) resetApprovalWindowForTests();
+    const { repo, fake } = setupRepo([T("A", { humanGate: true })], { tasks: {} });
+    const runId = `run-window-seam-${windowMs}`;
+    const summary = await runDaemon(repo, { adapters: [fake], runId });
+    expect(summary.human).toEqual(["A"]);
+    const events = Journal.open(repo, runId).read();
+    expect(events.filter((e) => e.event === "approval-window-start").map((e) => e.data.windowMs)).toEqual([windowMs]);
+    expect(events.filter((e) => e.event === "approval-window-expired")).toHaveLength(1);
+  }
 });

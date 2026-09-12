@@ -36,6 +36,24 @@ const stub = (id: string) =>
 const ADAPTERS5 = ["claude-code", "codex", "cursor-agent", "opencode", "pi"].map(stub);
 const retiredBanner = `${["dro", "vr"].join("")} —`;
 
+test("test: doctor run over a state directory whose recent journals hold two demotion rows for one channel prints that channel with the count and the recorded cause, while a state directory whose journals hold no demotion row prints no such line, so a doctor that omits a twice-demoted channel fails", async () => {
+  const withDemotions = makeRepo({ "keep.txt": "x" });
+  for (const [runId, taskId] of [["run-20260911-000001-0000000000000001", "T1"], ["run-20260911-000002-0000000000000002", "T2"]] as const) {
+    Journal.create(withDemotions, runId).append("review-pool-demotion", taskId, {
+      reviewer: "qwen:qwen3.8-max", cause: "silent", seatAuthoredBytes: 0,
+    });
+  }
+  const output = await doctor(["--"], withDemotions, [stub("fixture")], { banner: false });
+  expect(output).toMatch(/qwen:qwen3\.8-max\s+2 review seats demoted · cause silent/);
+
+  const withoutDemotions = makeRepo({ "keep.txt": "x" });
+  Journal.create(withoutDemotions, "run-20260911-000003-0000000000000003")
+    .append("run-start", undefined, { branch: "test" });
+  const quiet = await doctor(["--"], withoutDemotions, [stub("fixture")], { banner: false });
+  expect(quiet).not.toContain("recent review-seat demotions:");
+  expect(quiet).not.toContain("review seats demoted");
+});
+
 describe("OBS-141 kimi doctor turn probe", () => {
   const stubKimi = (authed: boolean, note: string) =>
     ({

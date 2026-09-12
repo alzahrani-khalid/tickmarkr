@@ -395,7 +395,13 @@ let suiteWaitCeilingMs = SUITE_WAIT_CEILING_MS;
 export const setSuiteWaitCeilingForTests = (ms: number): void => { suiteWaitCeilingMs = ms; };
 export const resetSuiteWaitCeilingForTests = (): void => { suiteWaitCeilingMs = SUITE_WAIT_CEILING_MS; };
 export const APPROVAL_POLL_MS = 250;
-export const APPROVAL_WINDOW_MS = 1_000;
+export const APPROVAL_WINDOW_MS = 120_000;
+// Keep ordinary park tests off the operator's production wait. Explicit timing tests
+// use the same setter/reset pattern as the suite wait ceiling above.
+const DEFAULT_APPROVAL_WINDOW_MS = process.env.VITEST ? 1 : APPROVAL_WINDOW_MS;
+let approvalWindowMs = DEFAULT_APPROVAL_WINDOW_MS;
+export const setApprovalWindowForTests = (ms: number): void => { approvalWindowMs = ms; };
+export const resetApprovalWindowForTests = (): void => { approvalWindowMs = DEFAULT_APPROVAL_WINDOW_MS; };
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
 const NO_TRAILER_DEMOTION_STREAK = 2; // OBS-57: consecutive no-trailer windows demote a channel for the rest of the run
@@ -1887,6 +1893,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   };
 
   const park = async (t: Task, reason: string, kind: ParkKind, assignment: Assignment | null, attempts: number, startMs: number, gateFails = 0, consults = 0, tokens?: TokenUsage, metered = 0, retryMode: RetryMode = "fresh", details: Record<string, unknown> = {}) => {
+    // OBS-979: a worker refusal can identify the missing authoring scope even when gates
+    // subsequently supply the park's disposition. Keep that actionable path on the park itself.
+    const worker = journal.read().reverse().find((e) => e.taskId === t.id && e.event === "worker-result");
+    if (t.files.length > 0 && worker?.data.ok === false && typeof worker.data.summary === "string") {
+      const allowed = filesGlob(t.files);
+      const paths = [...worker.data.summary.matchAll(/(?:^|[\s`'"(])((?:[A-Za-z0-9_@.()[\]-]+\/)+[A-Za-z0-9_@.[\]-]+|[A-Za-z0-9_@-]+(?:\.[A-Za-z0-9_-]+)+)(?=$|[\s`'"),:;.!?])/g)]
+        .map((match) => match[1]!.replace(/^\.\//, "").replace(/\.$/, ""))
+        .filter((path) => !path.split("/").includes("..") && !allowed(path));
+      if (paths.length) reason += ` — files[] repair hint: ${[...new Set(paths)].join(", ")}`;
+    }
     graph = setStatus(graph, t.id, "human");
     saveGraph(repoRoot, graph);
     journal.append("task-human", t.id, { ...details, reason, kind });
@@ -2110,7 +2126,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // structured — class + canonical path + stable symbol — so a retry, a consult or an auto-uphold
     // decision reads identity instead of re-parsing prose, and line-number churn is not a new finding.
     // One helper, both onGate sites (satisfied-gate resume + main attempt loop).
-    let gateSubject: { commit: string; attempt: number; replayMeasurement?: true } | undefined;
+    let gateSubject: { commit: string; attempt: number; replayMeasurement?: true; replayedFromAttempt?: number } | undefined;
     const journalGateResult = (g: GateResult) => {
       const blocking = g.meta?.infra !== true && gateFailed(g) && (g.gate === "review" || g.gate === "acceptance");
       // T2: a review that PASSED while DEFERRING a concern still recorded a defect — the prompt
@@ -2143,6 +2159,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         gate: g.gate, ...(unverdicted ? {} : { pass: g.pass }), details: g.details,
         ...(gateSubject ? { commit: gateSubject.commit, attempt: gateSubject.attempt } : {}),
         ...(gateSubject?.replayMeasurement ? { replayMeasurement: true } : {}),
+        ...(gateSubject?.replayedFromAttempt !== undefined ? { replayedFromAttempt: gateSubject.replayedFromAttempt } : {}),
         ...(g.meta?.skipped === true || noVerdictReview ? { skipped: true } : {}),
         // T9: an infra-only exit is journaled AS one. The operator reading a red `test` row has to
         // be able to tell "the suite found a defect" from "the runner never ran", and the merge
@@ -4228,35 +4245,66 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const gated = await gitHead(wt);
         gateSubject = { commit: await gateCommitSubject(taskBase, gated, wt), attempt };
         await trackedDriver.project?.(t.id, "in-review");
+        // Only the immediately preceding attempt can lend a red. Re-journal its results
+        // as this attempt's verdicts so all existing disposition and fingerprint accounting
+        // sees the replay, without buying another command or reviewer invocation.
+        const taskEvents = journal.read().filter((e) => e.taskId === t.id);
+        const previousRound = taskEvents.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true);
+        const previousRows = retryMode === "repair"
+          ? taskEvents.slice(previousRound + 1).filter((e) => e.event === "gate-result"
+            && e.data.attempt === attempt - 1)
+          : [];
         journal.phaseStart(t.id, "gates");
-        ({ results, commits } = await withSuiteWindow(t.id,
-          t.gates.includes("test") && commands.test !== undefined,
-          () => runReviewRecovery(t, {
-          carriedFindings: outstandingFindings,
-          worktree: wt, baseRef: taskBase, result, author: assignment,
-          commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
-          collateral: collateral.get(t.id) ?? [],
-          pipeline: "v185", selectTests: !testGateFailed,
-          via: cfg.visibility.llm === "pane"
-            ? {
-                driver: trackedDriver,
-                // D-07: judge/review panes self-clean when their verdict is read (keepLlm) — only "forever" keeps them.
-                keep: keepLlm,
-                onSlot: keepLlm ? (s: Slot) => keptSlots.push(s) : undefined,
-                // T2 ownership contract: canonical names (tickmarkr:<role>:<task>:0:<runId>) so reconcile
-                // owns judge/review panes; run-gates' -r1 retry suffix becomes attempt 1 in llm.ts.
-                // Same-name reuse across worker attempts is safe: panes self-clean when read (keepLlm),
-                // and herdr's DEFECT-01 reclaim covers a kept holdover under keepPanes:forever.
-                nameFor: (role) => formatOwnedName({ role, taskId: t.id, attempt: 0, runId }),
-                // role-tab label (SUP-01): role-first + task id, unique per concurrent instance within a run.
-                // Duplicate labels from a resumed run or operator-made tabs are accepted (per-process state).
-                labelFor: (role) => `${role.toUpperCase()} ${t.id}`,
-              }
-            : undefined,
-          excludeReviewers: badReviewers,
-          reviewHistory, demotedReviewers,
-          onGate,
-        })));
+        const replay = previousRows.length > 0
+          && previousRows.every((e) => e.data.commit === gateSubject!.commit)
+          && previousRows.some((e) => e.data.pass === false && e.data.skipped !== true);
+        if (replay) {
+          gateSubject.replayedFromAttempt = attempt - 1;
+          results = previousRows.map(({ data }) => ({
+            gate: String(data.gate), pass: data.pass === true, details: String(data.details),
+            // The verdict is reused; its old timing is not a measurement of this attempt.
+            meta: Object.fromEntries(Object.entries(data).filter(([key]) =>
+              !(GATE_TELEMETRY_KEYS as readonly string[]).includes(key) && key !== "capacity")),
+          }));
+          commits = await commitsAheadOf(taskBase, wt);
+          for (const g of results) {
+            journal.append("gate-replayed", t.id, {
+              attempt, priorAttempt: attempt - 1, gate: g.gate, commit: gateSubject.commit,
+              ...(g.meta?.skipped === true ? { skipped: true } : { pass: g.pass }),
+              details: g.details,
+            });
+            journalGateResult(g);
+          }
+        } else {
+          ({ results, commits } = await withSuiteWindow(t.id,
+            t.gates.includes("test") && commands.test !== undefined,
+            () => runReviewRecovery(t, {
+            carriedFindings: outstandingFindings,
+            worktree: wt, baseRef: taskBase, result, author: assignment,
+            commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
+            collateral: collateral.get(t.id) ?? [],
+            pipeline: "v185", selectTests: !testGateFailed,
+            via: cfg.visibility.llm === "pane"
+              ? {
+                  driver: trackedDriver,
+                  // D-07: judge/review panes self-clean when their verdict is read (keepLlm) — only "forever" keeps them.
+                  keep: keepLlm,
+                  onSlot: keepLlm ? (s: Slot) => keptSlots.push(s) : undefined,
+                  // T2 ownership contract: canonical names (tickmarkr:<role>:<task>:0:<runId>) so reconcile
+                  // owns judge/review panes; run-gates' -r1 retry suffix becomes attempt 1 in llm.ts.
+                  // Same-name reuse across worker attempts is safe: panes self-clean when read (keepLlm),
+                  // and herdr's DEFECT-01 reclaim covers a kept holdover under keepPanes:forever.
+                  nameFor: (role) => formatOwnedName({ role, taskId: t.id, attempt: 0, runId }),
+                  // role-tab label (SUP-01): role-first + task id, unique per concurrent instance within a run.
+                  // Duplicate labels from a resumed run or operator-made tabs are accepted (per-process state).
+                  labelFor: (role) => `${role.toUpperCase()} ${t.id}`,
+                }
+              : undefined,
+            excludeReviewers: badReviewers,
+            reviewHistory, demotedReviewers,
+            onGate,
+          })));
+        }
         results.forEach(classifySignalOnlyTest);
         graph = addEvidence(graph, t.id, { commits, gateResults: results, artifacts: [promptFile] });
         saveGraph(repoRoot, graph);
@@ -4485,6 +4533,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
   taskLoopStarted = true;
   const inflight = new Map<string, Promise<void>>();
+  // A settled worker can release a dependency or an approval in the same poll tick.
+  // Audit the current graph at every empty-flight boundary, never a prior ready snapshot.
+  const holdEndCondition = (): boolean => {
+    sweepLiveApprovals();
+    const freeSlots = Math.max(0, concurrency - inflight.size);
+    const dispatchable = readyTasks(graph).filter((t) => !inflight.has(t.id));
+    if (freeSlots === 0 || dispatchable.length === 0) return false;
+    for (const task of dispatchable) {
+      journal.append("end-condition-held", task.id, { deps: task.deps, freeSlots });
+    }
+    return true;
+  };
   closeLoop: while (true) {
     let approvalDeadline: number | undefined;
     while (true) {
@@ -4520,7 +4580,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           .filter((t) => t.status === "pending").every(behindPark);
         if (onlyParks) {
           if (approvalDeadline === undefined) {
-            const windowMs = opts.approvalWindowMs ?? APPROVAL_WINDOW_MS;
+            const windowMs = opts.approvalWindowMs ?? approvalWindowMs;
             approvalDeadline = Date.now() + windowMs;
             journal.append("approval-window-start", undefined, { windowMs, parked: [...parked] });
             // The narrator may itself append a decision at this boundary.
@@ -4534,6 +4594,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           journal.append("approval-window-expired", undefined, { parked: [...parked] });
         }
+        if (holdEndCondition()) { approvalDeadline = undefined; continue; }
         break;
       }
       approvalDeadline = undefined;
@@ -4544,6 +4605,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         waiters.push(new Promise((wake) => setTimeout(wake, APPROVAL_POLL_MS)));
       }
       await Promise.race(waiters); // aborted rejects on termination — unwinds the run
+      if (inflight.size === 0) holdEndCondition();
     }
 
     // D-07: the sweep now closes only what's LEFT in keptSlots — done-closed worker slots were removed
@@ -4616,11 +4678,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const approvalSerialization = await acquireApprovalSerialization(repoRoot, runId);
     releaseApprovalSerialization = approvalSerialization.release;
     // Close the last poll-to-run-end race while holding the same serializer as approve.
-    sweepLiveApprovals();
-    if (readyTasks(graph).length) {
+    if (holdEndCondition()) {
       releaseApprovalSerialization();
       releaseApprovalSerialization = undefined;
-      if (summary.tipVerify) journal.append("tip-verify-cancelled", undefined, { reason: "approval", lastMergedTask });
+      // Verification has settled: retain its verdict. The cache key will require a
+      // new battery if dispatch actually moves the tip or changes its commands.
       continue closeLoop;
     }
     const outstanding = outstandingApprovals(journal.read());

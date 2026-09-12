@@ -1075,17 +1075,25 @@ export function gateResultJournalData(
   return { gate, pass, details, ...meta, signalBasis, signalQuality: signalQualityFromBasis(signalBasis) };
 }
 
-// T3 (Sol #2 / Fable F2): one canonical engagement identity, shared by status AND resume. The run-start
-// event records graphDefinitionHash (over compiled task definitions only — see graph.graphDefinitionHash);
-// this is the single field both consumers read, and the single comparator below is the single place the
-// journal↔graph join is decided. unbound (no recorded definition hash, e.g. a pre-v1.44 journal) and
+// T3 (Sol #2 / Fable F2) + OBS-978: one canonical engagement identity, shared by status, plan, the operator
+// fold AND resume. The run-start event records graphDefinitionHash (over compiled task definitions only — see
+// graph.graphDefinitionHash); each audited graph-rehash row (resume --graph-changed) then moves the identity to
+// its `to`, so the recorded hash is the last audited rehash, else run-start. A row is audited when its `from`
+// names the identity it replaced, or the run-start one (all pre-OBS-978 daemons wrote); a row auditing neither
+// binds nothing — the journal is unbound until a release from null. unbound (also a pre-v1.44 journal) and
 // mismatch are both not-comparable — status renders the notice either way; resume refuses either way and
 // distinguishes the reason only for its message and the --graph-changed release event.
 export function recordedGraphDefinitionHash(events: JournalEvent[]): string | undefined {
+  const start = events.find((e) => e.event === "run-start");
+  if (!start) return undefined;
+  const origin = typeof start.data.graphDefinitionHash === "string" ? start.data.graphDefinitionHash : null;
+  let recorded = origin;
   for (const e of events) {
-    if (e.event === "run-start" && typeof e.data.graphDefinitionHash === "string") return e.data.graphDefinitionHash;
+    if (e.event !== "graph-rehash") continue;
+    const audited = e.data.from === recorded || e.data.from === origin;
+    recorded = audited && typeof e.data.to === "string" ? e.data.to : null;
   }
-  return undefined;
+  return recorded ?? undefined;
 }
 
 export type EngagementCompare =

@@ -149,6 +149,14 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    guidance belongs in the memory file or the shipped docs.
 4. Arm the watcher and your own supervision beat (Supervision). Report the hierarchy map (pane ids + names) to the user.
 
+### Seat-spawn and Leg-2 recipes
+
+Every mission to a Claude or Grok seat is delivered only with `herdr pane run <pane> "<message>"` and
+verified by reading the pane back; never use `agent prompt` for mission delivery. Launch a Grok seat with
+`herdr agent start <seat> --kind grok --pane <pane> -- -m grok-4.6`. For Leg-2, a Codex reviewer under
+`workspace-write` must be briefed with an in-worktree verdict path such as
+`<repo>/.tickmarkr/overseer/verdicts/<task>.md`, and its verdict must be written there before it is read.
+
 ## Supervising tickmarkr as the executor — WHO DOES WHAT
 
 When the mission runs `/tickmarkr-auto` (tickmarkr dispatches the workers), supervision changes shape —
@@ -204,6 +212,9 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
 - **The journal is the source of truth**, not panes. Watchers go on `run-end` / `task-human` /
   `task-failed` / `consult-verdict`; never sleep-poll inside an agent turn. **Never key a watcher on an
   agent's `done`** — that is turn end and fires the moment a seat finishes acknowledging you.
+  A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for those terminal
+  events — the shipped watcher below, or a foreground `until grep` on the run's terminal events — and
+  ensure it is re-armed at most every twenty minutes. Never rely on a `Monitor`-only wake.
   **All four are covered by one shipped instrument** — `scripts/watch-journal.sh <runs-dir> [poll] [cap]
   [events-csv]` — which arms on a line baseline, wakes once, and grades a `run-end` against every green
   clause. `scripts/watch-parks.sh` stays the park-specific wake for THIS seat (it counts parks and speaks
@@ -476,6 +487,52 @@ number — an unmeasured budget is not a small budget.
 .claude/skills/tickmarkr-overseer/scripts/watch-context.sh overseer <overseer-agent-or-pane> 50 50 <handoff-file>
 ```
 
+### A GO has a deadline — arm `watch-launch.sh` in the same act as the GO
+
+A GO that produces no run is a silent failure until someone notices; on 2026-09-11 an orchestrator's codex
+sandbox was rooted at the main repo, the spec worktree was outside its writable roots, it stopped at the
+denial without reporting, the overseer's 10-minute wake expired un-re-armed, and three hours passed.
+Two rules close that hole:
+
+- **Every orchestrator seat is sandbox-rooted at the worktree it will run in** (`cd <worktree>` before
+  `herdr agent start … --sandbox workspace-write`), and its brief says: *a denied path or refused command
+  is reported to the overseer pane within 60 s — never a silent stop.*
+- **The overseer arms the launch watcher in the SAME act as the GO**, with the lock path the run will
+  create, and treats `LAUNCH_OVERDUE` as a first-class event (read the orchestrator pane, fix the seat,
+  re-issue the GO):
+
+```bash
+.claude/skills/tickmarkr-overseer/scripts/watch-launch.sh <worktree>/.tickmarkr/graph.lock 900 <overseer-pane> &
+```
+
+It prints `LAUNCH_OK` with the lock's contents when the run starts (exit 0) and, past the deadline, delivers
+`LAUNCH OVERDUE …` to the overseer pane AND as an OS notification (exit 3). Any wake you arm yourself with
+a cap (a background `until` loop) must be RE-ARMED on every expiry; an expired wake is not a watch.
+
+
+### A GO has a deadline — arm `watch-launch.sh` in the same act as the GO
+
+A GO that produces no run is a silent failure until someone notices; on 2026-09-11 an orchestrator's codex
+sandbox was rooted at the main repo, the spec worktree was outside its writable roots, it stopped at the
+denial without reporting, the overseer's 10-minute wake expired un-re-armed, and three hours passed.
+Two rules close that hole:
+
+- **Every orchestrator seat is sandbox-rooted at the worktree it will run in** (`cd <worktree>` before
+  `herdr agent start … --sandbox workspace-write`), and its brief says: *a denied path or refused command
+  is reported to the overseer pane within 60 s — never a silent stop.*
+- **The overseer arms the launch watcher in the SAME act as the GO**, with the lock path the run will
+  create, and treats `LAUNCH_OVERDUE` as a first-class event (read the orchestrator pane, fix the seat,
+  re-issue the GO):
+
+```bash
+.claude/skills/tickmarkr-overseer/scripts/watch-launch.sh <worktree>/.tickmarkr/graph.lock 900 <overseer-pane> &
+```
+
+It prints `LAUNCH_OK` with the lock's contents when the run starts (exit 0) and, past the deadline, delivers
+`LAUNCH OVERDUE …` to the overseer pane AND as an OS notification (exit 3). Any wake you arm yourself with
+a cap (a background `until` loop) must be RE-ARMED on every expiry; an expired wake is not a watch.
+
+
 The first argument chooses the closed per-seat tier (`orchestrator-context` or `overseer-context`),
 and every beat names the second argument as that tier's seat. The watcher beats only after reading a
 rendered percentage, keeps beating on the supervision cadence even when its requested poll is slower,
@@ -580,9 +637,9 @@ they are left implicit:
   Send only when the seat is idle and the ANSI prompt line is empty or dim-only (the Esc/SGR discriminator
   separates an autosuggest ghost from typed input), then read back activity or an ACK; presence is not
   delivery. If a stale draft must be replaced, supersede it explicitly with
-  `agent prompt " <-- disregard … ACTUAL: …"` instead of stacking another instruction behind it.
+  `herdr pane run <pane> "<-- disregard … ACTUAL: …"` instead of stacking another instruction behind it.
 - **A MESSAGE TO A WORKING SEAT IS A QUEUED MESSAGE, AND THE QUEUE DRAINS ONLY AT TURN BOUNDARIES.**
-  Delivery is not arrival: `agent prompt` to a `working` claude seat lands in its queue (`Press up to
+  Delivery is not arrival: a message sent to a `working` claude seat lands in its queue (`Press up to
   edit queued messages` on the seat's prompt line is the tell) and is READ only when the current turn
   ends — and with in-process teammates a turn runs 20–40 minutes, so steering latency equals subagent
   runtime. Measured 2026-08-17/18 (P98 leg 1): a FREEZE HOLD and a checker-release directive stacked
@@ -622,7 +679,7 @@ they are left implicit:
 - **AGENT NAMES ARE GLOBAL ACROSS WORKSPACES — verify a seat you spawned by PANE ID, never by name.**
   Names must be unique among live agents *everywhere*, not within your workspace, so another workspace can
   already hold `opus`, `sol`, `reviewer` or `orch`. When it does, your `agent start` **fails**, your pane
-  is left a bare shell, and `agent list` / `agent read` / `agent prompt` for that name then resolve to the
+  is left a bare shell, and `agent list` / `agent read` for that name then resolve to the
   **stranger's seat**. Measured 2026-08-06 (OBS-392): a spawn of `fable` collided with a live seat in
   another workspace; `agent list` reported `fable -> blocked` and it was read as *this* seat coming up
   blocked. It was an operator research session sitting on a *"Resume full session?"* prompt. One more
@@ -644,7 +701,7 @@ they are left implicit:
   Re-arm name-keyed watchers in the same act as the rename; file-keyed artifact watchers are
   unaffected (one more reason to prefer them).
 - Stale typed input is unclearable via CLI — supersede it:
-  `pane run "<-- disregard everything before this arrow (stale draft). ACTUAL: <message>"`.
+  `herdr pane run <pane> "<-- disregard everything before this arrow (stale draft). ACTUAL: <message>"`.
   **But DISCRIMINATE before you supersede or file it: text on an idle seat's prompt line has FOUR
   authors** — the seat's own draft, an operator, another agent's `agent send` (writes WITHOUT Enter),
   and claude-code's AUTOSUGGEST, which renders context-plausible ghost text BYTE-IDENTICAL to a typed

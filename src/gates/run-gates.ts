@@ -450,7 +450,7 @@ export async function runGates(
       // ponytail: legacy runs adjacent tools in ONE compareToBaseline call, so there is one interval
       // to measure and each of its gates carries it. Split it only if this branch ever stops batching.
       const finish = startMeasurement();
-      const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, [...gates]);
+      const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, [...gates], selected ? { selected } : {});
       const batch = finish();
       for (const g of gates) addMeasurement(g, batch);
       // The same refusal AFTER the commands, because a green command can dirty the tree the check
@@ -469,7 +469,7 @@ export async function runGates(
     // any later tool before anyone reads its verdict.
     for (const g of gates) {
       await emitStart(g);
-      const [r] = await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g]));
+      const [r] = await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], g === "test" && selected ? { selected } : {}));
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
       if (g === "test" && selected) selectedDurationMs = spans.get("test")!.durationMs;
       // The pre-battery check proves the tree clean ONCE; a command that exits 0 having rewritten a

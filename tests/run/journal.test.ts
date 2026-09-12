@@ -198,6 +198,49 @@ describe("journal", () => {
     expect(engagementComparable(without, "abc")).toEqual({ comparable: false, reason: "unbound" });
   });
 
+  test("test: a journal whose run-start records hash A and whose last graph-rehash row records to B reports B as the recorded hash and compares comparable to B and mismatched to A and C, while a journal with no rehash row reports its run-start hash, so a reader that returns the run-start hash after a rehash fails", () => {
+    const journalWithRehash = [
+      { ts: "t1", event: "run-start", data: { graphDefinitionHash: "A" } },
+      { ts: "t2", event: "graph-rehash", data: { from: "A", to: "B" } },
+    ] as JournalEvent[];
+    const journalNoRehash = [
+      { ts: "t1", event: "run-start", data: { graphDefinitionHash: "A" } },
+    ] as JournalEvent[];
+
+    // Reports B as the recorded hash
+    expect(recordedGraphDefinitionHash(journalWithRehash)).toBe("B");
+    // Compares comparable to B
+    expect(engagementComparable(journalWithRehash, "B")).toEqual({ comparable: true, recorded: "B" });
+    // Compares mismatched to A and C
+    expect(engagementComparable(journalWithRehash, "A")).toEqual({ comparable: false, reason: "mismatch", recorded: "B" });
+    expect(engagementComparable(journalWithRehash, "C")).toEqual({ comparable: false, reason: "mismatch", recorded: "B" });
+
+    // While a journal with no rehash row reports its run-start hash
+    expect(recordedGraphDefinitionHash(journalNoRehash)).toBe("A");
+    expect(engagementComparable(journalNoRehash, "A")).toEqual({ comparable: true, recorded: "A" });
+    expect(engagementComparable(journalNoRehash, "B")).toEqual({ comparable: false, reason: "mismatch", recorded: "A" });
+
+    // Multiple rehashes: last one wins
+    const journalMultipleRehashes = [
+      { ts: "t1", event: "run-start", data: { graphDefinitionHash: "A" } },
+      { ts: "t2", event: "graph-rehash", data: { from: "A", to: "Z" } },
+      { ts: "t3", event: "graph-rehash", data: { from: "Z", to: "B" } },
+    ] as JournalEvent[];
+    expect(recordedGraphDefinitionHash(journalMultipleRehashes)).toBe("B");
+    expect(engagementComparable(journalMultipleRehashes, "B")).toEqual({ comparable: true, recorded: "B" });
+  });
+
+  test("a graph-rehash naming neither the identity it replaced nor the run-start one binds nothing until a release from null", () => {
+    const start = { ts: "t1", event: "run-start", data: { graphDefinitionHash: "A" } };
+    const forged = [start, { ts: "t2", event: "graph-rehash", data: { from: "X", to: "B" } }] as JournalEvent[];
+    expect(engagementComparable(forged, "B")).toEqual({ comparable: false, reason: "unbound" });
+    const released = [...forged, { ts: "t3", event: "graph-rehash", data: { from: null, to: "C" } }] as JournalEvent[];
+    expect(recordedGraphDefinitionHash(released)).toBe("C");
+    // pre-OBS-978 daemons named the run-start hash on every release
+    const legacy = [start, { ts: "t2", event: "graph-rehash", data: { from: "A", to: "B" } }, { ts: "t3", event: "graph-rehash", data: { from: "A", to: "C" } }] as JournalEvent[];
+    expect(recordedGraphDefinitionHash(legacy)).toBe("C");
+  });
+
   test("append/read round-trip with ts and data", () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-j-"));
     const j = Journal.create(dir, "run-1");

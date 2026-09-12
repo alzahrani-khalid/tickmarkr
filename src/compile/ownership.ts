@@ -10,8 +10,44 @@ export type OwnershipCorroboration =
 
 export type OwnershipFinding =
   | { code: "unowned-test"; test: string; taskIds: string[]; corroboration?: OwnershipCorroboration; detail: string }
+  | { code: "unowned-shape-oracle"; taskId: string; source: string; oracle: string; detail: string }
   | { code: "test-path-outside-allowlist"; taskId: string; test: string; path: string; detail: string }
   | { code: "unordered-context-write"; taskId: string; ownerTaskId: string; path: string; detail: string };
+
+export const SHAPE_ORACLES = [
+  "tests/run/narration.test.ts",
+  "tests/cli/brand-surfaces.test.ts",
+  "tests/run/notify-identity.test.ts",
+  "tests/run/outcome-projections.test.ts",
+  "tests/cockpit/setup.test.ts",
+] as const;
+
+export const SHAPE_ORACLE_SOURCES = [
+  "src/run/daemon.ts",
+  "src/cli/commands/run.ts",
+] as const;
+
+export const SHAPE_ORACLE_MAP: Record<string, readonly string[]> = {
+  "src/run/daemon.ts": SHAPE_ORACLES,
+  "src/cli/commands/run.ts": SHAPE_ORACLES,
+};
+
+// Anchored-glob only: a files[] entry touches a mapped source when it names the source (or its
+// extensionless stem) exactly, or when its glob's literal head — everything before the first
+// wildcard — is the stem plus a literal dot, i.e. the wildcard only ever spans the extension
+// ("src/run/daemon.*"). A broad multi-file glob like "src/**" that merely happens to cover the
+// source is an unrelated task casting a wide net, not one touching daemon narration — that
+// distinction is what broke every fixture using tests/fixtures/sample.prd.md's files: src/** task.
+function touchesSource(files: readonly string[], source: string): boolean {
+  const stem = source.replace(/\.(?:[cm]?[jt]sx?)$/, "");
+  return files.some((entry) => {
+    if (entry === source || entry === stem) return true;
+    const special = entry.search(/[*?{[]/);
+    // Leg-2 v2.5.3: the anchored head is necessary, not sufficient — the pattern must also MATCH the
+    // source under the shared matcher, or "src/run/daemon.{js,jsx}" (never daemon.ts) would count as a touch.
+    return special !== -1 && entry.slice(0, special) === `${stem}.` && filesGlob([entry])(source);
+  });
+}
 
 type TestSource = { path: string; text: string };
 
@@ -175,6 +211,7 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
     const context = task.context.map(normalize);
     return {
       task,
+      files,
       owns: files.length === 0 ? () => false : filesGlob(files),
       allows: files.length === 0 ? () => true : filesGlob([...files, ...context]),
     };
@@ -224,6 +261,23 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
       });
     }
   }
+  for (const entry of indexed) {
+    for (const [source, oracles] of Object.entries(SHAPE_ORACLE_MAP)) {
+      if (!touchesSource(entry.files, source)) continue;
+      for (const oracle of oracles) {
+        if (!entry.owns(oracle)) {
+          findings.push({
+            code: "unowned-shape-oracle",
+            taskId: entry.task.id,
+            source,
+            oracle,
+            detail: `${entry.task.id} touches ${source} without owning shape oracle ${oracle}`,
+          });
+        }
+      }
+    }
+  }
+
 
   for (const source of sources) {
     for (const owner of owners(source.path)) {
@@ -255,8 +309,19 @@ export function ownershipFindings(tasks: readonly Task[], repoRoot: string): Own
       }
     }
   }
-
-  return findings.sort((a, b) => `${a.code}:${"test" in a ? a.test : a.path}:${"taskId" in a ? a.taskId : ""}`.localeCompare(`${b.code}:${"test" in b ? b.test : b.path}:${"taskId" in b ? b.taskId : ""}`));
+  const target = (f: OwnershipFinding): string => {
+    switch (f.code) {
+      case "unowned-test": return f.test;
+      case "unowned-shape-oracle": return f.oracle;
+      case "test-path-outside-allowlist": return f.test;
+      case "unordered-context-write": return f.path;
+    }
+  };
+  return findings.sort((a, b) => {
+    const taskA = "taskId" in a ? a.taskId : "";
+    const taskB = "taskId" in b ? b.taskId : "";
+    return `${a.code}:${target(a)}:${taskA}`.localeCompare(`${b.code}:${target(b)}:${taskB}`);
+  });
 }
 
 export function renderOwnershipFinding(finding: OwnershipFinding): string {
@@ -264,5 +329,6 @@ export function renderOwnershipFinding(finding: OwnershipFinding): string {
 }
 
 export function blocksCompile(finding: OwnershipFinding): boolean {
-  return finding.code === "unowned-test" && finding.corroboration !== undefined;
+  return (finding.code === "unowned-test" && finding.corroboration !== undefined)
+    || finding.code === "unowned-shape-oracle";
 }

@@ -769,3 +769,38 @@ describe("context: resolution from a spec that is not at the repo root", () => {
     expect(() => compileSource(spec, "native")).toThrow(/did you mean notes\/SEEDS\.md/);
   });
 });
+
+describe("spec law: shape oracle ownership (OL-1)", () => {
+  test("test: compiling a native spec whose task touches the narrator label map without owning the brand-surfaces oracle aborts naming that oracle through the ownership line, while the same spec with the oracle added to files[] compiles, so a compile that warns instead of aborting fails", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-compile-"));
+    const specWithout = [
+      "<!-- tickmarkr:spec -->",
+      "## T1: Narrator change",
+      "- goal: update narrator row labels",
+      "- shape: implement",
+      "- files: src/cli/commands/run.ts, tests/run/narration.test.ts, tests/run/notify-identity.test.ts, tests/run/outcome-projections.test.ts, tests/cockpit/setup.test.ts",
+      "- acceptance:",
+      "  - judge: holds",
+    ].join("\n");
+    const specFile = join(repo, "spec.md");
+    writeFileSync(specFile, specWithout);
+
+    expect(() => compileSource(specFile, "native", repo)).toThrow(CompileError);
+    expect(() => compileSource(specFile, "native", repo)).toThrow(
+      /ownership-lint\[unowned-shape-oracle].*brand-surfaces/,
+    );
+
+    const specWith = [
+      "<!-- tickmarkr:spec -->",
+      "## T1: Narrator change",
+      "- goal: update narrator row labels",
+      "- shape: implement",
+      "- files: src/cli/commands/run.ts, tests/run/narration.test.ts, tests/run/notify-identity.test.ts, tests/run/outcome-projections.test.ts, tests/cockpit/setup.test.ts, tests/cli/brand-surfaces.test.ts",
+      "- acceptance:",
+      "  - judge: holds",
+    ].join("\n");
+    writeFileSync(specFile, specWith);
+    const graph = compileSource(specFile, "native", repo);
+    expect(graph.tasks[0].files).toContain("tests/cli/brand-surfaces.test.ts");
+  });
+});
