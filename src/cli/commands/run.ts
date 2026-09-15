@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, probeAll, readDoctor } from "../../adapters/registry.js";
 import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
-import { parseDriverOverride, pickDriver } from "../../drivers/index.js";
+import { classifyHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
 import type { ExecutorDriver } from "../../drivers/types.js";
 import { loadGraph, onDiskSpecHash, readCompileRefusal } from "../../graph/graph.js";
 import { type TaskStatus } from "../../graph/schema.js";
@@ -116,6 +116,7 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   "gate-fingerprint-cap": { label: "repeat capped", tone: "attention" },
   // a scope red every collateral prediction already named: the daemon parks the task WITHOUT
   // charging an attempt, which is the most consequential unchargeable decision it makes
+  "scope-request": { label: "scope requested", tone: "attention" },
   "scope-authoring": { label: "authoring defect", tone: "attention" },
   "session-reset": { label: "session reset", tone: "attention" },
   "worker-mode-fallback": { label: "dispatch mode", tone: "attention" },
@@ -141,6 +142,9 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   "phase-start": { label: "gate start", tone: "active" },
   "gate-result": { label: "gate", tone: "pass" },
   "baseline-wait": { label: "baseline wait", tone: "active" },
+  "suite-wait": { label: "suite wait", tone: "active" },
+  "suite-wait-ceiling": { label: "suite wait ceiling", tone: "attention" },
+  "worker-reaped-before-harvest": { label: "worker reaped", tone: "attention" },
   "suite-budget": { label: "suite budget", tone: "attention" },
   "gate-replayed": { label: "gate replayed", tone: "attention" },
   "gate-reused": { label: "gate reused", tone: "neutral" },
@@ -335,6 +339,7 @@ const RAIL_PROJECTION: Record<string, (data: Record<string, unknown>) => string 
       ? `to ${d.chosen}${typeof d.static === "string" ? ` over ${d.static}` : ""}`
       : undefined,
   // both rehash hashes: the ladder reaches `from` (null on an unbound journal) and never `to`
+  "scope-request": (d) => Array.isArray(d.paths) ? `files[]: ${d.paths.join(", ")}` : undefined,
   "graph-rehash": (d) => (typeof d.to === "string" ? `to ${d.to.slice(0, 12)}` : undefined),
   "repair-dispatch": (d) =>
     typeof d.diffBytes === "number" ? `diff ${d.diffBytes}B${d.capped === true ? ", capped" : ""}` : undefined,
@@ -346,6 +351,8 @@ const RAIL_PROJECTION: Record<string, (data: Record<string, unknown>) => string 
     typeof d.adapter === "string" ? `${d.adapter}${typeof d.phase === "string" ? ` ${d.phase}` : ""}` : undefined,
   // SB-1: the census the ceiling released beside, and the budget the round ran under versus the one it
   // would have had on an empty census — none of `{count, occupancyCap, conservativeCap}` is on the ladder
+  "suite-wait": (d) => typeof d.count === "number" ? `waiting for ${d.count} command(s)` : undefined,
+  "suite-wait-ceiling": (d) => typeof d.count === "number" ? `${d.count} still live after ${d.waitedMs}ms` : undefined,
   "suite-budget": (d) =>
     typeof d.count === "number" && typeof d.conservativeCap === "number" && typeof d.occupancyCap === "number"
       ? `beside ${d.count}, cap ${d.conservativeCap} not ${d.occupancyCap}`
@@ -536,6 +543,8 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
       if (lints.length) throw new Error(`--route-strict: routing lints present, refusing to dispatch:\n${lints.join("\n")}`);
     }
     await assertRefsWritable(cwd, "run");
+    const host = classifyHost();
+    preflightHostDriver(cfg, driverOverride, host);
     // The run id is minted HERE rather than inside the daemon, because the narration sink has to know
     // which run it is narrating before the first event arrives (the daemon's `narrate` callback is
     // handed an event and nothing else, and `run-start` carries no run id). `runDaemon` uses the id
@@ -545,7 +554,7 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     const s = await runDaemon(cwd, {
       runId,
       concurrency: values.concurrency ? Number(values.concurrency) : undefined,
-      driver: bindNarration(pickDriver(cfg, driverOverride), narrate),
+      driver: bindNarration(pickDriver(cfg, driverOverride, host), narrate),
       mode: flagMode,
       supersedes: values.supersedes,
       narrate,

@@ -9,6 +9,7 @@ import type { Journal, JournalEvent } from "../../src/run/journal.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
+
 // OBS-534: the ceiling is an ARGUMENT to the shell, observable only at the seam that receives it.
 // This spy passes every call through to the real shell — every other test in this file keeps running
 // real commands, byte-identically — while recording the timeout each caller asked for, and lets one
@@ -394,3 +395,4 @@ test("a tip verify whose run-start row records distinct task and tip commands se
   expect(converged!.pass).toBe(false);
   expect(converged!.forgiven).toBeUndefined();
 });
+

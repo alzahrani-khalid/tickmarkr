@@ -1,6 +1,8 @@
+import { graphDefinitionHash, loadGraph, saveGraph } from "../../graph/graph.js";
 import { userInfo } from "node:os";
+import { separabilityErrors } from "../../compile/collateral.js";
 import { GATE_NAMES } from "../../graph/schema.js";
-import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
+import { applyScopeAmendments, engagementComparable, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
 
 export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
 export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
@@ -41,6 +43,7 @@ export interface NewestPark {
   /** The daemon-recorded kind (task-human data.kind), never inferred from prose. */
   kind: string | undefined;
   reason: string | undefined;
+  approveCommand?: string;
   /** The newest failed gate before the park — the gate a waive would satisfy. */
   failedGate: string | undefined;
   /** A pre-dispatch human gate whose reason marks it permanent by design (see isTombstonePark). */
@@ -73,6 +76,7 @@ export function newestPark(
     const reason = typeof e.data.reason === "string" ? e.data.reason : undefined;
     return {
       index: i, line: (sourceIndexes?.[i] ?? i) + 1, ts: typeof e.ts === "string" ? e.ts : undefined, kind, reason,
+      approveCommand: typeof e.data.approveCommand === "string" ? e.data.approveCommand : undefined,
       failedGate: failedGateForNewestPark(events, taskId, i), tombstone: isTombstonePark(kind, reason),
     };
   }
@@ -96,7 +100,7 @@ export function readJournalEvents(journal: Journal): { events: JournalEvent[]; s
  * surface may read it from, so what a menu offers and what the command accepts cannot drift.
  */
 export function permittedDecisionVerbs(park: Pick<NewestPark, "kind" | "failedGate" | "tombstone"> | undefined): readonly DecisionVerb[] {
-  if (!park || park.tombstone) return [];
+  if (!park || park.tombstone || park.kind === "scope-request") return [];
   if (park.kind === "gate-fail") {
     if (park.failedGate === undefined) return [];
     return park.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
@@ -193,7 +197,7 @@ export function approvalEnactment(token: ApprovalDisposition, run: ApprovalRunOw
 
 /** The production command registered in COMMANDS; its returned bytes are what the CLI prints. */
 export async function approve(argv: string[], cwd = process.cwd()): Promise<string> {
-  const { runId, taskId, by, reason, waive, uphold, recheck, reviewRoundCeiling } = parseArgs(argv);
+  const { runId, taskId, by, reason, waive, uphold, recheck, reviewRoundCeiling, files } = parseArgs(argv);
   const decisions = [waive, uphold, recheck].filter(Boolean).length;
   if (decisions > 1) throw new Error("--waive, --uphold and --recheck are different decisions — pass one");
   const serialization = await acquireApprovalSerialization(cwd, runId);
@@ -220,6 +224,35 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   const gateFailPark = park?.kind === "gate-fail";
   const infraPark = park?.kind === "infra";
   const failedGate = gateFailPark ? park?.failedGate : undefined;
+  if ((park?.kind === "scope-request" && !decisions) || files !== undefined) {
+    if (park?.kind !== "scope-request") throw new Error("--files requires a scope-request park");
+    if (!files?.length) throw new Error(`scope-request for ${taskId} requires --files <glob,…>`);
+    if (decisions) throw new Error("--files cannot be combined with --waive, --uphold or --recheck");
+    const graph = applyScopeAmendments(loadGraph(cwd), journal);
+    const from = graphDefinitionHash(graph);
+    if (!engagementComparable(journal.read(), from).comparable
+        || (lastHuman?.data.graphDefinitionHash !== undefined && lastHuman.data.graphDefinitionHash !== from)) {
+      throw new Error(`refusing stale scope-request approval for ${taskId}: graph revision changed`);
+    }
+    const task = graph.tasks.find((t) => t.id === taskId);
+    if (!task) throw new Error(`unknown task ${taskId}`);
+    const amendedFiles = [...new Set([...task.files, ...files])];
+    if (amendedFiles.length === task.files.length) throw new Error("--files must extend the parked files[] revision");
+    const amended = { ...graph, tasks: graph.tasks.map((t) => t.id === taskId ? { ...t, files: amendedFiles } : t) };
+    const conflicts = separabilityErrors(amended.tasks);
+    if (conflicts.length) throw new Error(`refusing scope-request approval for ${taskId}: ${conflicts.join("\n")}`);
+    journal.append("task-approved", taskId, {
+      by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request",
+      amendment: { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park.line },
+    });
+    // Do not write graph.json from this process while the daemon owns it: its sweep materializes
+    // the amendment without replacing a sibling's running state with this command's snapshot.
+    const projected = applyScopeAmendments(graph, journal);
+    const owner = approvalRunOwner(cwd, runId);
+    if (!owner.live && !owner.blockingRunId) saveGraph(cwd, projected);
+    return disposition(cwd, runId, "dispatch", `approved files[] for ${taskId} in ${runId} — by ${by}`, serialization.contended);
+  }
+
   if (gateFailPark && !failedGate) {
     throw new Error(`task ${taskId} is parked on gate-fail but has no failed gate result on the newest park — refusing to infer one`);
   }
@@ -322,6 +355,7 @@ function disposition(cwd: string, runId: string, token: ApprovalDisposition, mes
 }
 
 interface ParsedArgs {
+  files?: string[];
   runId: string;
   taskId: string;
   by: string;
@@ -332,12 +366,13 @@ interface ParsedArgs {
   reviewRoundCeiling?: number;
 }
 
-const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--waive|--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
+const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--files <glob,…>] [--waive|--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
 
 // hand-parsed argv — no CLI framework (house style). Positionals are runId then taskId; decision,
 // ceiling, actor and reason are flags. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
+  let files: string[] | undefined;
   let by: string | undefined;
   let reason: string | undefined;
   let waive = false;
@@ -346,7 +381,14 @@ function parseArgs(argv: string[]): ParsedArgs {
   let reviewRoundCeiling: number | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--by") {
+    if (a === "--files") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error("--files requires <glob,…>");
+      files = value.split(",").map((file) => file.trim());
+      if (files.some((file) => !file || file.startsWith("/") || file.startsWith("!") || file.split("/").includes(".."))) {
+        throw new Error("--files requires non-empty repository-relative globs");
+      }
+    } else if (a === "--by") {
       by = argv[++i];
       if (!by) throw new Error(USAGE);
     } else if (a === "--reason") {
@@ -373,7 +415,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   if (!runId || !taskId) {
     throw new Error(USAGE);
   }
-  return { runId, taskId, by: by ?? userInfo().username, reason, waive, uphold, recheck, reviewRoundCeiling };
+  return { runId, taskId, by: by ?? userInfo().username, reason, waive, uphold, recheck, reviewRoundCeiling, files };
 }
 
 function failedGateForNewestPark(events: readonly JournalEvent[], taskId: string, lastHumanIndex: number): string | undefined {

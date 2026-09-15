@@ -318,7 +318,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     worktree: cwd, baseRef: mergeBase,
     result: { ok: true, summary: "standalone verify — no worker claims to trust", deviations: [], raw: "" },
     author, commands, baseline, channels, ...(judgeChannels ? { judgeChannels } : {}), adapters, cfg,
-    pipeline: "v185", artifactDir,
+    pipeline: "v185", verificationScope: "standalone", artifactDir, stateDir: join(stateRoot, ".tickmarkr"),
     onGate: (e) => {
       if (e.phase === "start") console.error(`verify: → ${e.gate} (${e.index}/${e.total})`);
       else if (e.phase === "note") console.error(`verify: note ${e.gate} ${e.name} ${JSON.stringify(e.payload)}`);

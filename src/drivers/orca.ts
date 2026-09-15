@@ -1,8 +1,11 @@
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 import { shq } from "../adapters/types.js";
 import { createWorktree, sh, type ShResult } from "../run/git.js";
-import { Journal, type JournalEvent } from "../run/journal.js";
+import { Journal, type JournalEvent, parseRunId } from "../run/journal.js";
+import { stateDirName } from "../graph/graph.js";
+import { readWatchBoard, requestWatchBoardStop, stopWatchBoard, WATCH_OWNER_ENV, type WatchBoardOwner } from "../run/supervision.js";
 import { MAX_BUF } from "./subprocess.js";
 import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
@@ -31,12 +34,17 @@ import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, typ
 //    focused — a driver that lets the app pick has given away the isolation the worktree exists
 //    for, so every call this driver makes names `path:` and verifies what came back (T2);
 //  - `terminal list`'s `--worktree` is OPTIONAL (same help): the reconcile sweep omits it, because
-//    an older run's leftover sits in a checkout this run never knew (T2).
+//    an older run's leftover sits in a checkout this run never knew (T2);
+//  - Orca tracks only the worktrees it created or the operator opened (1.4.200, OBS-1004): a task
+//    checkout the daemon adds under the clone is not a selector, `worktree current` from inside it
+//    answers the enclosing clone, and there is no adopt verb — so every terminal is created ON the
+//    tracked worktree with its command cd'ed into the checkout, and `worktree set` names the
+//    tracked worktree; identity stays the handle plus the owned tab title.
 
 /** The response families the ONE shared envelope parser serves. There is no second JSON seam. */
 export const ORCA_RESPONSE_FAMILIES = [
   "status", "create", "list", "read", "send", "wait", "show", "close",
-  "worktree-current", "worktree-set", "hooks-status",
+  "worktree-current", "worktree-set", "hooks-status", "split",
 ] as const;
 export type OrcaFamily = (typeof ORCA_RESPONSE_FAMILIES)[number];
 
@@ -60,9 +68,6 @@ const PAGE_LINES = 500; // per-page ask; orca caps server-side and reports `limi
 const LIST_LIMIT = 10000; // well past orca's own row default; `truncated` still decides (listAll)
 const MAX_PAGES = 400; // runaway guard: a cursor that stops advancing ends the sweep, never loops
 const POLL_MS = 200;
-export const WORKTREE_ADOPTION_TIMEOUT_MS = 60_000;
-const WORKTREE_ADOPTION_POLL_MS = 1_000;
-const WORKTREE_ADOPTION_JOURNAL_MS = 2_000;
 const NUDGE_ECHO_TIMEOUT_MS = 2_000;
 /** A missing slot gets the same bounded chance to appear as a reaped shell gets to settle. */
 export const PENDING_PROJECT_GRACE_MS = 2_000;
@@ -214,6 +219,71 @@ function sameWorktree(reported: string | undefined, canonical: string): boolean 
   return reported !== undefined && canonicalWorktreePath(reported) === canonical;
 }
 
+/** OBS-1004: a reported (tracked) worktree encloses a checkout when it IS the checkout or a parent of it. */
+function enclosesCheckout(reported: string | undefined, checkout: string): boolean {
+  if (reported === undefined) return false;
+  const tracked = canonicalWorktreePath(reported);
+  return tracked === checkout || checkout.startsWith(`${tracked}/`);
+}
+
+/** The proof line a worker terminal prints first: recovery and focus read it back (FX-N01). */
+export const CHECKOUT_MARK = "TICKMARKR_CHECKOUT";
+// FX-N05: the proof is a FRAMED value — `TICKMARKR_CHECKOUT <byteLength>:<utf8 bytes as hex>;` — so it
+// carries no whitespace or quotes, survives renderer wrapping (hex rows re-join losslessly), and is
+// either complete (length matches, terminator present) or nothing. A prefix of another checkout can
+// never decode to this one; `A` versus `A B`, `…--T1` versus `…--T10` are different frames.
+const CHECKOUT_FRAME_RE = /TICKMARKR_CHECKOUT (\d+):([0-9a-f]*)(;?)/g;
+const PROOF_PAGES = 16; // pages read from the oldest cursor before the proof is declared absent
+
+/** The exact bytes the create command prints as its first line. */
+export function checkoutProofLine(checkout: string): string {
+  const bytes = Buffer.from(checkout, "utf8");
+  return `${CHECKOUT_MARK} ${bytes.length}:${bytes.toString("hex")};`;
+}
+
+/** Every complete frame in a scrollback, decoded and canonicalized; whether an incomplete one was seen. */
+export function checkoutFrames(text: string): { complete: string[]; incomplete: boolean } {
+  const complete: string[] = [];
+  let incomplete = false;
+  // Rows are re-joined first: a wrapped frame is whole again, and joining can never complete a
+  // frame that was not printed whole — the declared length and the terminator decide.
+  for (const m of joinWrapped(text).matchAll(CHECKOUT_FRAME_RE)) {
+    const length = Number(m[1]);
+    const hex = m[2]!;
+    if (m[3] !== ";" || hex.length !== length * 2 || !Number.isInteger(length)) { incomplete = true; continue; }
+    complete.push(canonicalWorktreePath(Buffer.from(hex, "hex").toString("utf8")));
+  }
+  return { complete, incomplete };
+}
+
+/** Does a scrollback prove exactly `checkout`: at least one complete frame equals it, no complete
+ *  frame names anything else, and no frame is incomplete. Full-path equality after canonicalization —
+ *  never a prefix, a substring, or a whitespace-terminated fragment. */
+export function provesCheckout(text: string, checkout: string): boolean {
+  const { complete, incomplete } = checkoutFrames(text);
+  return !incomplete && complete.includes(checkout) && complete.every((c) => c === checkout);
+}
+
+/**
+ * Everything a terminal on the tracked worktree runs before the payload: enter the checkout (a
+ * failed cd stops the whole line — nothing of the payload ever runs in the enclosing path), print
+ * the proof line, then hand the WHOLE payload to one `sh -c` so a background list, a `;` list or a
+ * subshell inside it all start in the checkout and its exit status is the payload's (FX-N02).
+ */
+export function checkoutPrefix(checkout: string): string {
+  return `cd ${shq(checkout)} && printf '%s\\n' ${shq(checkoutProofLine(checkout))} && sh -c `;
+}
+
+/** The command a terminal on the tracked worktree runs so that it executes INSIDE the checkout. */
+export function inCheckout(checkout: string, cmd: string): string {
+  return `${checkoutPrefix(checkout)}${shq(cmd)}`;
+}
+
+/** Every checkout the complete proof frames in a scrollback name, in order of appearance. */
+export function checkoutsNamed(text: string): string[] {
+  return checkoutFrames(text).complete;
+}
+
 // Orca has ONE terminal space — no workspace dimension for a terminal to be outside of — so every
 // reconcile candidate takes panesToClose's in-workspace branch: owned-and-undesired closes whichever
 // run (or which daemon) created it, and an unparseable title is never a candidate anywhere.
@@ -229,23 +299,173 @@ export function mapAgentState(term: Record<string, unknown>, tuiIdle: boolean): 
   return "unknown"; // absent fields: unknown, never blocked/idle
 }
 
+/**
+ * The Orca board owner record is the board's ONE lifecycle, and it lives on disk: every step below is
+ * decided from the file (plus Orca's own terminal table), so a fresh OrcaDriver — a restarted daemon —
+ * reaches the same answer as the instance that placed the board. No instance map or set carries it.
+ *
+ *   reserved  pane "", no claim            narrator, create-only, before the split can read its token
+ *   claimed   pid + armId, pane ""         observer (observeNamedRun), written exactly once
+ *   bound     claim + the receipt's handle and the split envelope's runtimeId
+ *   retired   bound + retired:true         tombstone, CAS on the bound bytes; never answered again
+ *
+ * A retired record is replaced by a new reservation (CAS on the tombstone bytes) only once its pane
+ * is proven gone. Everything else — a reservation or claim with no bound pane, a failed cleanup, a
+ * record another driver holds with a live observer — refuses and keeps the record exactly as it is.
+ */
+type BoardRecord = WatchBoardOwner & { retired?: true; runtimeId?: string };
+type BoardState = "reserved" | "claimed" | "bound" | "retired";
+
+function boardState(r: BoardRecord): BoardState {
+  if (r.retired === true) return "retired";
+  if (typeof r.pid !== "number" || typeof r.armId !== "string") return "reserved";
+  return r.pane === "" ? "claimed" : "bound";
+}
+
+/** The record's exact bytes and their parse; undefined only when no record exists. A torn or foreign
+ *  file throws — it is indeterminate, never absent. */
+function readBoard(path: string, repo: string, runId: string): { raw: string; record: BoardRecord } | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  const record = JSON.parse(raw) as BoardRecord;
+  if (record.repo !== realpathSync(repo) || record.runId !== runId || typeof record.token !== "string" || typeof record.pane !== "string") {
+    throw new Error(`watch owner record ${path} does not describe run ${runId} in ${repo}`);
+  }
+  return { raw, record };
+}
+
+/**
+ * Whole-record compare-and-swap. The canonical path stays readable until commit: a mkdir lock
+ * excludes other writers, then create-only `link`s the new inode (fails if anything exists) or
+ * `rename`s the new file over the live path (POSIX atomic replace — readers see old or new, never
+ * absence). A crash that leaves a `.tmp` or `.lock` does not drop the previous record.
+ * ponytail: observeNamedRun (supervision.ts) renames without CAS. It cannot interleave with a swap
+ * because the narrator writes nothing between reserve and claim, and no transition here swaps one.
+ */
+export function casBoard(family: string, path: string, expected: string | undefined, next: BoardRecord): string {
+  const raw = JSON.stringify(next) + "\n";
+  const refused = () => new OrcaError(family, `watch owner record ${path} changed underneath; swap refused and the current record kept`, "");
+  mkdirSync(dirname(path), { recursive: true });
+  const lock = `${path}.lock`;
+  const deadline = Date.now() + 2_000;
+  for (;;) {
+    try { mkdirSync(lock); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new OrcaError(family, `watch owner record ${path} lock not acquired; current record kept`, "");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  try {
+    let current: string | undefined;
+    try { current = readFileSync(path, "utf8"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (current !== expected) throw refused();
+    const tmp = `${path}.${randomUUID()}.tmp`;
+    writeFileSync(tmp, raw);
+    try {
+      if (expected === undefined) {
+        try { linkSync(tmp, path); } catch { throw refused(); }
+      } else {
+        renameSync(tmp, path);
+      }
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+    return raw;
+  } finally {
+    rmSync(lock, { recursive: true, force: true });
+  }
+}
+
+function pidLive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function terminalRows(env: OrcaEnvelope): Record<string, unknown>[] {
+  const rows = env.result.terminals;
+  if (!Array.isArray(rows)) throw new OrcaError("list", "list response carries no terminals array", env.raw);
+  return rows.filter((r): r is Record<string, unknown> => typeof r === "object" && r !== null);
+}
+
+function listsHandle(env: OrcaEnvelope, handle: string): boolean {
+  return terminalRows(env).some((r) => str(r.handle) === handle);
+}
+
+/** A handle listed by a different runtime is not the recorded pane — Orca handles are runtime-scoped. */
+function listedOnRuntime(env: OrcaEnvelope, handle: string, runtimeId: string | undefined): boolean {
+  return typeof runtimeId === "string" && env.runtimeId === runtimeId && listsHandle(env, handle);
+}
+
+function terminalTabId(env: OrcaEnvelope, handle: string): string | undefined {
+  for (const row of terminalRows(env)) {
+    if (str(row.handle) === handle) return str(row.tabId);
+  }
+  return undefined;
+}
+
+/**
+ * Orca 1.4.200 split contract: child at `result.split.handle`, parent tab at `result.split.tabId`.
+ * A receipt that only happens to contain a handle is malformed — it does not establish that the
+ * child belongs to the launching terminal's tab.
+ */
+function splitReceipt(env: OrcaEnvelope): { handle: string; tabId: string } {
+  const receipt = env.result.split;
+  if (typeof receipt !== "object" || receipt === null || Array.isArray(receipt)) {
+    throw new OrcaError("split", "split receipt is unknown, malformed or handle-less", env.raw);
+  }
+  const rec = receipt as Record<string, unknown>;
+  const handle = str(rec.handle);
+  const tabId = str(rec.tabId);
+  if (!handle || !tabId) {
+    throw new OrcaError("split", "split receipt is unknown, malformed or handle-less", env.raw);
+  }
+  return { handle, tabId };
+}
+
+function watchSlot(cwd: string, name: string, handle: string): Slot {
+  return { id: handle, name, cwd: canonicalWorktreePath(cwd) };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /** Terminal-pane handles under a layout tab node: a pane object, an array of them, or a nested
  *  group/split carrying `panes`, `first`, `second`. Only `type:"terminal"` leaves count — anything else is chrome. */
-function collectPaneHandles(node: unknown, out: string[]): void {
+function collectLeaves(node: unknown, out: { handle: string; title?: string }[]): void {
   if (Array.isArray(node)) {
-    for (const n of node) collectPaneHandles(n, out);
+    for (const n of node) collectLeaves(n, out);
     return;
   }
   if (typeof node !== "object" || node === null) return;
   const o = node as Record<string, unknown>;
   if (o.type === "terminal") {
     const h = str(o.handle);
-    if (h) out.push(h);
+    if (h) out.push({ handle: h, title: str(o.title) });
     return;
   }
-  collectPaneHandles(o.panes, out);
-  collectPaneHandles(o.first, out);
-  collectPaneHandles(o.second, out);
+  collectLeaves(o.panes, out);
+  collectLeaves(o.first, out);
+  collectLeaves(o.second, out);
+}
+
+function collectPaneHandles(node: unknown, out: string[]): void {
+  const leaves: { handle: string; title?: string }[] = [];
+  collectLeaves(node, leaves);
+  for (const l of leaves) out.push(l.handle);
 }
 
 function collectTabs(node: unknown, out: unknown[]): void {
@@ -276,7 +496,14 @@ export function joinWrapped(raw: string): string {
 
 interface OrcaSlotState {
   title: string; // the FULL owned title — the durable TAB identity a relist matches on
-  cwd: string; // the slot's exact worktree, canonicalized — the `path:` selector AND the identity
+  cwd: string; // the slot's exact checkout, canonicalized — where the command runs; the ownership identity
+  // OBS-1004: the Orca-TRACKED worktree that encloses `cwd`, canonicalized — the only `path:` selector
+  // Orca 1.4.200 resolves. Orca tracks the worktrees it created or the operator opened; a git worktree
+  // the daemon adds under `.tickmarkr/worktrees.noindex/` is never adopted (`orca worktree --help`:
+  // list/show/current/create/set/rm/ps — no adopt), and `worktree current` from inside it answers the
+  // enclosing clone. Terminals are created ON this path with the command cd'ed into `cwd`; identity
+  // is the handle plus the owned tab title, never the checkout.
+  tracked?: string;
   // Where the `orca` CLI is invoked from. Every command names its target with an explicit `path:`
   // selector or a handle, so the CLI's own cwd selects nothing — but it must still EXIST, and
   // reconcile sweeps checkouts an older run already removed. Defaults to the worktree itself.
@@ -304,6 +531,7 @@ export interface OrcaDriverOpts {
   pollMs?: number;
   /** Bounded, seam-adjustable staleness window for runtime probes before mutations. */
   probeStalenessMs?: number;
+  launchingHandle?: string;
 }
 
 export class OrcaDriver implements ExecutorDriver {
@@ -321,12 +549,24 @@ export class OrcaDriver implements ExecutorDriver {
   private narrate?: (event: JournalEvent) => void;
   private hookCoverage?: Promise<{ enabled: boolean; states: Map<string, string> }>;
   private taskWorktrees = new Map<string, string>();
+  private trackedByCheckout = new Map<string, string>(); // OBS-1004: checkout → the tracked worktree enclosing it
   private pendingProjects = new Map<string, {
     state: "in-progress" | "in-review" | "completed";
     since: number;
   }>();
+  private env: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  private launchingHandle?: string;
+  private serialQueue: Promise<unknown> = Promise.resolve();
+
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.serialQueue.then(fn, fn);
+    this.serialQueue = next.then(() => {}, () => {});
+    return next;
+  }
 
   constructor(opts: OrcaDriverOpts = {}) {
+    this.env = opts.env ?? process.env;
+    this.launchingHandle = opts.launchingHandle ?? this.env.ORCA_TERMINAL_HANDLE;
     this.bin = opts.bin ?? resolveOrcaCliBinary(process.cwd(), { env: opts.env, platform: opts.platform }) ?? "orca";
     // Config values flow into a shell here: every argv element is quoted, always.
     this.exec = opts.exec ?? ((args, cwd, timeoutMs) => {
@@ -516,19 +756,22 @@ export class OrcaDriver implements ExecutorDriver {
 
   private async create(st: OrcaSlotState, cmd: string): Promise<void> {
     await this.probeRuntime(this.cliCwd(st));
-    await this.awaitWorktreeAdoption(st);
-    // The selector names THIS slot's checkout outright, and the CLI child is bound to it too, so
-    // neither the UI's active worktree (`active`/`current`) nor the daemon's cwd can place it.
+    const tracked = await this.trackedWorktree(st.cwd);
+    st.tracked = tracked;
+    // The selector names the TRACKED worktree enclosing this slot's checkout outright — never the
+    // UI's active worktree (`active`/`current`) nor the daemon's cwd — and the command itself moves
+    // into the checkout, because Orca cannot be asked to place a terminal in a path it does not
+    // track (OBS-1004). `--command` runs inside Orca's wrapper shell, so a `cd` prefix is honoured.
     const env = await this.call("create", [
-      "terminal", "create", "--worktree", `path:${st.cwd}`, "--title", st.title, "--command", cmd,
+      "terminal", "create", "--worktree", `path:${tracked}`, "--title", st.title, "--command", inCheckout(st.cwd, cmd),
     ], this.cliCwd(st));
     const term = requireTerminal("create", env);
     const handle = str(term.handle);
     if (!handle) throw new OrcaError("create", "create receipt carries no terminal handle", env.raw);
-    // Asking is not getting: the receipt says which checkout the runtime actually resolved, and a
-    // terminal in the wrong one has already lost the isolation this run is built on.
+    // Asking is not getting: the receipt says which worktree the runtime actually resolved, and a
+    // terminal bound elsewhere has already lost the isolation this run is built on.
     const worktree = terminalWorktree(term);
-    if (!sameWorktree(worktree, st.cwd)) {
+    if (!sameWorktree(worktree, tracked)) {
       // `terminal create` has ALREADY launched the command in that wrong checkout, so refusing the
       // receipt is not yet fail-closed: the agent keeps mutating it. Close the exact handle this
       // receipt named, under the runtime that answered it (closeTerminal re-proves that identity
@@ -538,7 +781,7 @@ export class OrcaDriver implements ExecutorDriver {
       try {
         await this.closeTerminal({ ...st, handle, runtimeId: env.runtimeId });
       } catch { /* already gone, or no longer provably ours — never a blind retry */ }
-      throw this.latched("create", st, `create receipt bound to ${worktree ?? "no worktree"}, not the slot's ${st.cwd}`, env.raw);
+      throw this.latched("create", st, `create receipt bound to ${worktree ?? "no worktree"}, not the tracked ${tracked} enclosing ${st.cwd}`, env.raw);
     }
     st.handle = handle;
     // The handle is bound to the runtime identity that ANSWERED its create.
@@ -551,66 +794,28 @@ export class OrcaDriver implements ExecutorDriver {
   }
 
   /**
-   * A freshly-created git checkout does not become a valid Orca selector atomically. Ask
-   * `worktree current` FROM that checkout until Orca itself resolves the exact filesystem identity;
-   * an enclosing checkout is still not adoption. Only selector_not_found is a retryable refusal —
-   * malformed envelopes and every other refusal remain explicit driver failures.
+   * OBS-1004: the tracked worktree that encloses a checkout, asked ONCE of `worktree current` from
+   * inside that checkout. Orca answers the exact path when it tracks the checkout itself, the
+   * enclosing tracked clone for a git worktree the daemon added beneath it (1.4.200, verified from
+   * `.tickmarkr/worktrees.noindex/<task>`), and selector_not_found when nothing it tracks encloses
+   * the cwd — which is a driver failure, not something to wait out: Orca has no adopt verb.
    */
-  private async awaitWorktreeAdoption(st: OrcaSlotState): Promise<void> {
-    const started = this.time.now();
-    const deadline = started + WORKTREE_ADOPTION_TIMEOUT_MS;
-    let lastReported: string | undefined;
-    for (;;) {
-      const left = deadline - this.time.now();
-      if (left < 0) break;
-      try {
-        const env = await this.call(
-          "worktree-current",
-          ["worktree", "current"],
-          st.cwd,
-          Math.max(1, left),
-        );
-        const worktree = env.result.worktree;
-        if (typeof worktree !== "object" || worktree === null || Array.isArray(worktree)) {
-          throw new OrcaError("worktree-current", "response carries no worktree record", env.raw, { runtimeId: env.runtimeId });
-        }
-        const reported = terminalWorktree(worktree as Record<string, unknown>);
-        if (!reported) {
-          throw new OrcaError("worktree-current", "worktree record carries no path", env.raw, { runtimeId: env.runtimeId });
-        }
-        lastReported = canonicalWorktreePath(reported);
-        if (lastReported === st.cwd) {
-          const waitedMs = this.time.now() - started;
-          if (waitedMs > WORKTREE_ADOPTION_JOURNAL_MS) this.appendAdoptionWait(st, waitedMs);
-          return;
-        }
-      } catch (error) {
-        if (!(error instanceof OrcaError) || error.code !== "selector_not_found") throw error;
-        lastReported = undefined;
-      }
-      const remaining = deadline - this.time.now();
-      if (remaining <= 0) break;
-      await this.time.sleep(Math.min(WORKTREE_ADOPTION_POLL_MS, remaining));
+  private async trackedWorktree(checkout: string): Promise<string> {
+    const cached = this.trackedByCheckout.get(checkout);
+    if (cached) return cached;
+    const env = await this.call("worktree-current", ["worktree", "current"], checkout);
+    const worktree = env.result.worktree;
+    if (typeof worktree !== "object" || worktree === null || Array.isArray(worktree)) {
+      throw new OrcaError("worktree-current", "response carries no worktree record", env.raw, { runtimeId: env.runtimeId });
     }
-    const waitedMs = this.time.now() - started;
-    throw new OrcaUnavailableError(
-      "worktree-current",
-      `Orca did not adopt ${st.cwd} within ${WORKTREE_ADOPTION_TIMEOUT_MS}ms${lastReported ? ` (last answered ${lastReported})` : ""}`,
-      `waitedMs=${waitedMs}`,
-    );
-  }
-
-  /** Same repo/run/narration path Herdr uses for its driver-owned dispatch-retry row. */
-  private appendAdoptionWait(st: OrcaSlotState, waitedMs: number): void {
-    const owned = parseOwnedName(st.title);
-    if (!owned) throw new Error(`cannot journal worktree-adoption-wait: slot ${st.title} carries no run identity`);
-    const repoRoot = this.journalRoots.get(st.cwd);
-    if (!repoRoot) {
-      throw new Error(`cannot journal worktree-adoption-wait: slot ${st.title} has no daemon repo binding for ${st.cwd}`);
+    const reported = terminalWorktree(worktree as Record<string, unknown>);
+    if (!reported) throw new OrcaError("worktree-current", "worktree record carries no path", env.raw, { runtimeId: env.runtimeId });
+    const tracked = canonicalWorktreePath(reported);
+    if (tracked !== checkout && !checkout.startsWith(`${tracked}/`)) {
+      throw new OrcaError("worktree-current", `Orca answered ${tracked}, which does not enclose ${checkout}`, env.raw, { runtimeId: env.runtimeId });
     }
-    Journal.open(repoRoot, owned.runId, this.narrate).append("worktree-adoption-wait", owned.taskId, {
-      milliseconds: waitedMs,
-    });
+    this.trackedByCheckout.set(checkout, tracked);
+    return tracked;
   }
 
   // ---- handle identity and restart recovery ----------------------------------------------------
@@ -690,6 +895,63 @@ export class OrcaDriver implements ExecutorDriver {
     }
   }
 
+  /**
+   * FX-N01/N05/N06: under a shared enclosing worktree every task terminal lists with the same
+   * worktreePath, so the tracked path + owned title cannot tell two nested checkouts apart. The
+   * runtime's own proof is the terminal's earliest scrollback, where the create command printed a
+   * framed `TICKMARKR_CHECKOUT` line before its payload (checkoutProofLine). READ-only calls: the
+   * anchor (for `oldestCursor`), then pages from the oldest cursor until a frame is complete or the
+   * bound is hit. Every page is evidence only when the response's own identity is the candidate's:
+   * the terminal record must name `handle` and `_meta.runtimeId` must be `runtimeId` — the runtime
+   * that supplied the ownership listing — else another terminal's or another runtime's bytes were
+   * answered and nothing is proven. Proven means provesCheckout: exact canonical full-path equality
+   * of a complete frame, no other checkout named, no incomplete frame.
+   */
+  private async checkoutProven(handle: string, checkout: string | undefined, from: string, runtimeId: string): Promise<{ proven: boolean; reason: string }> {
+    const page = async (cursor?: string): Promise<Record<string, unknown>> => {
+      const env = await this.call("read", [
+        "terminal", "read", "--terminal", handle, ...(cursor === undefined ? [] : ["--cursor", cursor]), "--limit", String(this.pageLines),
+      ], from);
+      if (env.runtimeId !== runtimeId) {
+        throw new OrcaError("read", `proof page answered by runtime ${env.runtimeId}, not the listing's ${runtimeId}`, env.raw);
+      }
+      const term = requireTerminal("read", env);
+      if (str(term.handle) !== handle) {
+        throw new OrcaError("read", `proof page names terminal ${str(term.handle) ?? "none"}, not the candidate ${handle}`, env.raw);
+      }
+      return term;
+    };
+    const lines = (term: Record<string, unknown>): string[] =>
+      Array.isArray(term.tail) ? term.tail.filter((l): l is string => typeof l === "string") : [];
+    try {
+      const anchor = await page();
+      let cursor = str(anchor.oldestCursor);
+      let text = cursor === undefined ? lines(anchor).join("\n") : "";
+      for (let n = 0; cursor !== undefined && n < PROOF_PAGES; n++) {
+        const term = await page(cursor);
+        text += `${lines(term).join("\n")}\n`;
+        const frames = checkoutFrames(text);
+        if (frames.complete.length > 0 && !frames.incomplete) break; // whole frames, nothing dangling
+        const next = str(term.nextCursor);
+        if (term.limited !== true || next === undefined || next === cursor) break;
+        cursor = next;
+      }
+      const frames = checkoutFrames(text);
+      // Reconcile has no task-checkout path after a daemon restart, but the proof itself remains
+      // an ownership record: exactly one complete, unambiguous checkout frame can only have been
+      // written by tickmarkr's create command.  Slot recovery additionally requires its exact path.
+      if (checkout === undefined
+        ? !frames.incomplete && frames.complete.length > 0 && new Set(frames.complete).size === 1
+        : provesCheckout(text, checkout)) return { proven: true, reason: "" };
+      return {
+        proven: false,
+        reason: `its scrollback ${frames.complete.length ? `names ${[...new Set(frames.complete)].join(", ")}` : "names no checkout"}${frames.incomplete ? " and carries an incomplete proof frame" : ""}`,
+      };
+    } catch (error) {
+      return { proven: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   private async recover(family: string, st: OrcaSlotState, newRuntimeId: string | undefined, raw: string): Promise<void> {
     if (st.recovering) throw this.latched(family, st, "handle recovery re-entered", raw);
     st.recovering = true;
@@ -697,7 +959,8 @@ export class OrcaDriver implements ExecutorDriver {
       const old = st.handle;
       // visualLayouts is required: the owned title survives at TAB identity only, and rows carry
       // just the shell-controlled pane title (recorded: "…probe…" at create → "bash" on the row).
-      const env = await this.call("list", ["terminal", "list", "--worktree", `path:${st.cwd}`, "--include-visual-layouts", "--limit", String(LIST_LIMIT)], this.cliCwd(st));
+      const home = st.tracked ?? st.cwd; // the worktree Orca placed this terminal in (OBS-1004)
+      const env = await this.call("list", ["terminal", "list", "--worktree", `path:${home}`, "--include-visual-layouts", "--limit", String(LIST_LIMIT)], this.cliCwd(st));
       const listed = env.result.terminals;
       if (!Array.isArray(listed)) throw new OrcaError("list", "list response carries no terminals array", env.raw);
       if (env.result.truncated === true) throw new OrcaError("list", "terminal list is truncated, cannot safely recover handle", env.raw);
@@ -707,7 +970,7 @@ export class OrcaDriver implements ExecutorDriver {
       // the slot's exact worktree backs it. A same-titled tab in another worktree is a lookalike.
       const inWorktree = new Set(
         listed
-          .filter((t): t is Record<string, unknown> => typeof t === "object" && t !== null && sameWorktree(terminalWorktree(t), st.cwd))
+          .filter((t): t is Record<string, unknown> => typeof t === "object" && t !== null && sameWorktree(terminalWorktree(t), home))
           .map((t) => str(t.handle))
           .filter((h): h is string => h !== undefined),
       );
@@ -718,7 +981,7 @@ export class OrcaDriver implements ExecutorDriver {
       for (const layout of layouts) {
         if (typeof layout !== "object" || layout === null) continue;
         const lo = layout as Record<string, unknown>;
-        if (!sameWorktree(terminalWorktree(lo), st.cwd)) continue; // another worktree's tabs are never candidates
+        if (!sameWorktree(terminalWorktree(lo), home)) continue; // another worktree's tabs are never candidates
         const tabs: unknown[] = [];
         collectTabs(lo.root, tabs);
         for (const tab of tabs) {
@@ -729,20 +992,28 @@ export class OrcaDriver implements ExecutorDriver {
         }
       }
       if (ownedTabs.length === 0) {
-        throw this.latched(family, st, `no tab in ${st.cwd} carries the owned title ${st.title} (row titles are shell-controlled and are never ownership keys)`, env.raw);
+        throw this.latched(family, st, `no tab in ${home} carries the owned title ${st.title} (row titles are shell-controlled and are never ownership keys)`, env.raw);
       }
       if (ownedTabs.length > 1) {
-        throw this.latched(family, st, `${ownedTabs.length} tabs in ${st.cwd} carry the owned title ${st.title} — ambiguous`, env.raw);
+        throw this.latched(family, st, `${ownedTabs.length} tabs in ${home} carry the owned title ${st.title} — ambiguous`, env.raw);
       }
       const panes = ownedTabs[0].filter((h) => inWorktree.has(h));
       if (panes.length !== 1) {
-        throw this.latched(family, st, `the owned tab resolves to ${panes.length} terminals in ${st.cwd}`, env.raw);
+        throw this.latched(family, st, `the owned tab resolves to ${panes.length} terminals in ${home}`, env.raw);
       }
       const handle = panes[0];
       if (handle === old) {
         // Handles are runtime-scoped: the same VALUE under a different runtime proves nothing about
         // which terminal it addresses, so it is never adopted.
         throw this.latched(family, st, `replacement handle ${handle} is the old handle value reused by runtime ${newRuntimeId ?? env.runtimeId ?? "unknown"}`, env.raw);
+      }
+      if (st.tracked !== undefined && st.tracked !== st.cwd) {
+        // FX-N01: a nested checkout shares its worktreePath with every sibling task's terminal, so
+        // the candidate must prove the checkout itself (read-only) before it is addressed as ours.
+        const proof = await this.checkoutProven(handle, st.cwd, this.cliCwd(st), env.runtimeId);
+        if (!proof.proven) {
+          throw this.latched(family, st, `candidate ${handle} does not prove checkout ${st.cwd} (${proof.reason}); the sole same-titled tab on ${home} is not adopted`, env.raw);
+        }
       }
       st.handle = handle;
       // The list response is the identity proof for the replacement. A stale refusal may have been
@@ -1111,11 +1382,178 @@ export class OrcaDriver implements ExecutorDriver {
     }
   }
 
-  async narrator(_cwd: string, _command: string, runId?: string): Promise<Slot> {
-    if (!runId) throw new OrcaError("create", "Orca narrator requires a run identity", "");
-    // The recorded Orca API can create a tab but provides no right/no-focus
-    // placement receipt. Creating one would advertise a board we did not place.
-    throw new OrcaError("create", "Orca narrator placement unsupported: right/no-focus board placement is not available", "");
+  async narrator(cwd: string, command: string, runId?: string): Promise<Slot> {
+    if (!runId) throw new OrcaError("split", "Orca narrator requires a run identity", "");
+    const launchingHandle = (this.launchingHandle ?? this.env.ORCA_TERMINAL_HANDLE)?.trim();
+    if (!launchingHandle) throw new OrcaError("split", "Orca narrator requires ORCA_TERMINAL_HANDLE", "");
+
+    return this.serial(async () => {
+      const name = formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId });
+      const path = this.boardPath(cwd, runId);
+      const kept = `indeterminate cleanup refused — owner record ${path} kept`;
+      let current = readBoard(path, cwd, runId);
+      if (current && (current.record.driver !== this.id || current.record.name !== name)) {
+        // Never overwrite a record this driver did not create, unless its observer is provably gone.
+        const { driver, pid } = current.record;
+        if (typeof pid !== "number" || pidLive(pid)) {
+          throw new OrcaError("split", `Orca narrator placement refused for ${name}: the record is held by driver ${driver} with a live or unclaimed observer; ${kept}`, "");
+        }
+      } else if (current) {
+        const state = boardState(current.record);
+        if (state === "reserved" || state === "claimed") {
+          throw new OrcaError("split", `Orca narrator placement remains unresolved for ${name} (${state}, no bound pane); ${kept}`, "");
+        }
+        if (state === "bound") {
+          // The bound record is the durable truth of placement: the child handle PLUS the split
+          // envelope's runtime identity. A handle listed by a later runtime is a different pane.
+          if (listedOnRuntime(await this.listAll(cwd), current.record.pane, current.record.runtimeId)) {
+            return watchSlot(cwd, name, current.record.pane);
+          }
+          // Lost: this runtime no longer has that pane. Tombstone before anything else.
+          const retired: BoardRecord = { ...current.record, retired: true };
+          current = { raw: casBoard("split", path, current.raw, retired), record: retired };
+        }
+        // A tombstone can be an acknowledgement timeout, not completed observer cleanup. A live
+        // observer must stop and ack on injected time before the handle-bound close; timeout keeps
+        // the tombstone and does not replace it.
+        try {
+          if (typeof current.record.pid === "number" && pidLive(current.record.pid)) {
+            await stopWatchBoard(current.record, this.time);
+          } else {
+            requestWatchBoardStop(current.record);
+          }
+        } catch (error) {
+          throw new OrcaError("split", `Orca narrator placement refused for ${name}: retired board observer unacknowledged; ${kept}; ${errorText(error)}`, "");
+        }
+        try {
+          await this.closeRecordedPane(cwd, name, current.record.pane, current.record.runtimeId);
+        } catch (error) {
+          throw new OrcaError("split", `Orca narrator placement refused for ${name}: retired board pane ${current.record.pane} not proven closed; ${kept}; ${errorText(error)}`, "");
+        }
+      }
+
+      // Reserve before any command can read the token: create-only, or a swap of the exact record
+      // judged replaceable above.
+      const token = randomUUID();
+      casBoard("split", path, current?.raw, { repo: realpathSync(cwd), runId, driver: this.id, workspace: ORCA_SPACE, pane: "", name, token });
+
+      // Exactly one terminal split of the launching handle, horizontal, carrying token and command.
+      // An unknown receipt (transport failure, refusal, unparseable output) after the verb was issued
+      // is as indeterminate as a handle-less one: the pane may exist, so the reservation stays.
+      const env = await this.call("split", [
+        "terminal", "split",
+        "--terminal", launchingHandle,
+        "--direction", "horizontal",
+        "--command", `${WATCH_OWNER_ENV}=${shq(token)} ${command}`,
+      ], cwd).catch((error: unknown) => {
+        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown (${error instanceof OrcaError ? error.reason : errorText(error)}); ${kept}`, error instanceof OrcaError ? error.raw : "");
+      });
+      let child: { handle: string; tabId: string };
+      try {
+        child = splitReceipt(env);
+      } catch {
+        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, env.raw);
+      }
+      // Parent tabId must name the launching terminal's tab, and the child must actually appear
+      // there. A handle-only object, a tabId for some other tab, or a handle the list does not
+      // place in that tab is malformed — closing it would be a guessed handle.
+      let listing: OrcaEnvelope;
+      try {
+        listing = await this.listAll(cwd);
+      } catch (error) {
+        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, error instanceof OrcaError ? error.raw : env.raw);
+      }
+      const launchingTabId = terminalTabId(listing, launchingHandle);
+      if (
+        !launchingTabId
+        || child.tabId !== launchingTabId
+        || child.handle === launchingHandle
+        || terminalTabId(listing, child.handle) !== launchingTabId
+      ) {
+        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, env.raw);
+      }
+      const childHandle = child.handle;
+
+      // The narrator writes nothing until the observer's single claim is visible, so neither write
+      // can erase the other; after it the observer never writes the record again.
+      const claimDeadline = this.time.now() + 5000;
+      let claim: { raw: string; record: BoardRecord } | undefined;
+      for (;;) {
+        const check = readBoard(path, cwd, runId);
+        if (check?.record.token !== token) break;
+        if (boardState(check.record) === "claimed") {
+          claim = check;
+          break;
+        }
+        if (this.time.now() > claimDeadline) break;
+        await this.time.sleep(20);
+      }
+      if (!claim) {
+        // The receipt's handle may be closed, but the refused placement's record stays as it is.
+        let pane: string;
+        try {
+          await this.closeRecordedPane(cwd, name, childHandle, env.runtimeId);
+          pane = `its pane ${childHandle} was closed`;
+        } catch (error) {
+          pane = `its pane ${childHandle} was not proven closed (${errorText(error)})`;
+        }
+        throw new OrcaError("split", `Orca narrator board unclaimed for ${name}: the observer never claimed the record (unclaimed board); ${kept}; ${pane}`, env.raw);
+      }
+
+      casBoard("split", path, claim.raw, { ...claim.record, pane: childHandle, runtimeId: env.runtimeId });
+      return watchSlot(cwd, name, childHandle);
+    });
+  }
+
+  private boardPath(cwd: string, runId: string): string {
+    return join(cwd, stateDirName(cwd), "supervision", `watch-board.${parseRunId(runId)}.json`);
+  }
+
+  /** A recorded pane (a receipt's handle bound to the split envelope's runtime, never a guess) is
+   *  gone when that runtime no longer lists it, or when a handle-bound close receipt names it.
+   *  A handle listed by a different runtime is a different pane — not closed, treated as gone. */
+  private async closeRecordedPane(cwd: string, name: string, handle: string, runtimeId?: string): Promise<void> {
+    const listing = await this.listAll(cwd);
+    if (!listedOnRuntime(listing, handle, runtimeId)) return;
+    await this.closeTerminal({
+      title: name, cwd: canonicalWorktreePath(cwd), handle, runtimeId, buf: "", recoveries: 0, recovering: false,
+    });
+  }
+
+  /** bound → retired, decided from the record alone: it must be this driver's board for exactly this
+   *  slot's pane. Already retired is returned as it is. */
+  private retireBoard(family: string, slot: Slot): BoardRecord {
+    const runId = parseOwnedName(slot.name)?.runId;
+    const path = runId ? this.boardPath(slot.cwd, runId) : undefined;
+    const current = path && runId ? readBoard(path, slot.cwd, runId) : undefined;
+    const r = current?.record;
+    if (!path || !current || !r || r.driver !== this.id || r.name !== slot.name || r.pane !== slot.id || boardState(r) === "reserved" || boardState(r) === "claimed") {
+      throw new OrcaError(family, `watch ownership unknown or foreign for ${slot.name}; existing board protected`, "");
+    }
+    if (r.retired) return r;
+    const retired: BoardRecord = { ...r, retired: true };
+    casBoard(family, path, current.raw, retired);
+    return retired;
+  }
+
+  /** bound → retired first: whatever fails below, no later call answers this board again. A live
+   *  observer is asked to stop and its acknowledgement awaited on injected time before the
+   *  handle-bound close (timeout keeps the tombstone and the pane); a dead one never acknowledges,
+   *  so it is only asked. */
+  private async retireAndClose(slot: Slot): Promise<void> {
+    await this.serial(async () => {
+      const retired = this.retireBoard("close", slot);
+      if (typeof retired.pid === "number" && pidLive(retired.pid)) await stopWatchBoard(retired, this.time);
+      else requestWatchBoardStop(retired);
+      await this.closeRecordedPane(slot.cwd, slot.name, slot.id, retired.runtimeId);
+    });
+  }
+
+  /** WB-1 seam: the daemon reports this board lost. "Lost" can be a stale beat or missing presence
+   *  under a still-live owner pid, so it is not proof of a dead observer — retirement keeps close's
+   *  acknowledgement discipline (Leg-2 T9 P1). */
+  async retireLostWatch(slot: Slot): Promise<void> {
+    await this.retireAndClose(slot);
   }
 
   async focus(target: FocusTarget): Promise<FocusResult> {
@@ -1133,7 +1571,7 @@ export class OrcaDriver implements ExecutorDriver {
       for (const layout of layouts) {
         if (typeof layout !== "object" || layout === null) continue;
         const lo = layout as Record<string, unknown>;
-        if (!sameWorktree(terminalWorktree(lo), cwd)) continue;
+        if (!enclosesCheckout(terminalWorktree(lo), cwd)) continue; // the tracked worktree Orca placed it in (OBS-1004)
         const tabs: unknown[] = [];
         collectTabs(lo.root, tabs);
         for (const tab of tabs) {
@@ -1141,8 +1579,13 @@ export class OrcaDriver implements ExecutorDriver {
         }
       }
       if (handles.length !== 1) return { status: rows.length ? "foreign" : "closed", reason: "No unique owned terminal in the recorded worktree" };
-      const matches = rows.filter(row => typeof row === "object" && row !== null && str(row.handle) === handles[0] && sameWorktree(terminalWorktree(row), cwd));
+      const matches = rows.filter(row => typeof row === "object" && row !== null && str(row.handle) === handles[0] && enclosesCheckout(terminalWorktree(row), cwd));
       if (matches.length !== 1) return { status: "foreign", reason: "Terminal worktree ownership is unverified" };
+      if (!sameWorktree(terminalWorktree(matches[0]), cwd)) {
+        // FX-N01: the row only ENCLOSES the recorded checkout — require the terminal's own proof line.
+        const proof = await this.checkoutProven(handles[0]!, cwd, cwd, env.runtimeId);
+        if (!proof.proven) return { status: "foreign", reason: `Terminal checkout ownership is unverified: ${proof.reason}` };
+      }
       if (matches[0].connected === false || matches[0].orphaned === true) return { status: "closed", reason: "Recorded terminal is no longer running; open task evidence" };
       return { status: "unsupported", reason: "Owned terminal verified; this Orca API has no focus operation. Open task evidence with Enter" };
     } catch (error) { return { status: "unsupported", reason: `Cannot verify Orca focus target: ${String(error)}` }; }
@@ -1160,14 +1603,17 @@ export class OrcaDriver implements ExecutorDriver {
   }
 
   private async setWorkspaceStatus(
-    worktree: string,
+    checkout: string,
     state: "in-progress" | "in-review" | "completed",
   ): Promise<void> {
+    // OBS-1004: the task checkout is not an Orca selector (`selector_not_found`, recorded on run
+    // 0004's T5); the projection lands on the tracked worktree that encloses it.
+    const tracked = await this.trackedWorktree(checkout);
     // UNRECORDED SHAPE: no Orca 1.4.195 `worktree set` receipt was captured. The shared envelope
     // parser is the complete success proof here; no result payload is assumed or fabricated.
     await this.call("worktree-set", [
-      "worktree", "set", "--worktree", `path:${worktree}`, "--workspace-status", state,
-    ], worktree);
+      "worktree", "set", "--worktree", `path:${tracked}`, "--workspace-status", state,
+    ], checkout);
   }
 
   async notify(msg: string, opts?: NotifyOpts): Promise<void> {
@@ -1180,9 +1626,15 @@ export class OrcaDriver implements ExecutorDriver {
   }
 
   async close(slot: Slot): Promise<void> {
+    if (parseOwnedName(slot.name)?.role === "watch") {
+      await this.retireAndClose(slot);
+      return;
+    }
     const st = this.slots.get(slot.id);
     if (!st) return;
-    if (st.handle) await this.closeTerminal(st);
+    if (st.handle) {
+      await this.closeTerminal(st);
+    }
     this.slots.delete(slot.id);
   }
 
@@ -1308,9 +1760,20 @@ export class OrcaDriver implements ExecutorDriver {
           const t = tab as Record<string, unknown>;
           const title = str(t.title);
           if (!title) continue;
-          const handles: string[] = [];
-          collectPaneHandles(t.panes, handles); // a split tab holds more than one, and both are ours
-          for (const handle of handles) candidates.set(handle, { title, worktree: canonicalWorktreePath(worktree) });
+          const leaves: { handle: string; title?: string }[] = [];
+          collectLeaves(t.panes, leaves);
+          const launching = (this.launchingHandle ?? this.env.ORCA_TERMINAL_HANDLE)?.trim();
+          // A tab title belongs to the tab, not to a leaf. After the operator moves the worker
+          // out, a foreign shell can sit alone under that owned title — so every leaf, including
+          // the only leaf of a single-leaf tab, needs the durable checkout proof. A title that
+          // does not parse is never a candidate.
+          if (!parseOwnedName(title)) continue;
+          for (const leaf of leaves) {
+            if (launching && leaf.handle === launching) continue;
+            if (this.isRecordedWatchHandle(leaf.handle, worktree, runId, env.runtimeId)) continue;
+            if (!await this.isRecordedWorkerHandle(leaf.handle, from, env.runtimeId)) continue;
+            candidates.set(leaf.handle, { title, worktree: canonicalWorktreePath(worktree) });
+          }
         }
       }
       const toClose = panesToClose(
@@ -1338,6 +1801,35 @@ export class OrcaDriver implements ExecutorDriver {
       }
     } catch { /* cosmetic — visibility hygiene never fails the run */ }
   }
+  private isRecordedWatchHandle(handle: string, cwd: string, runId: string | undefined, runtimeId: string): boolean {
+    const matches = (record: { pane?: unknown; runtimeId?: unknown } | undefined): boolean =>
+      !!record && record.pane === handle && record.runtimeId === runtimeId;
+    if (runId && matches(readWatchBoard(cwd, runId))) return true;
+    try {
+      const dir = join(cwd, stateDirName(cwd), "supervision");
+      if (existsSync(dir)) {
+        for (const f of readdirSync(dir)) {
+          if (f.startsWith("watch-board.") && f.endsWith(".json")) {
+            const content = JSON.parse(readFileSync(join(dir, f), "utf8"));
+            if (content && typeof content === "object" && matches(content as { pane?: unknown; runtimeId?: unknown })) return true;
+          }
+        }
+      }
+    } catch (error) {
+      // Ownership uncertainty fails closed: abort this best-effort reconcile before it can treat a
+      // recorded watch as an ordinary title-keyed worker. The outer reconcile boundary remains
+      // cosmetic, but no close is attempted from a partial supervision-directory read.
+      throw new OrcaError("list", `watch ownership unreadable in ${cwd}: ${errorText(error)}`, "");
+    }
+    return false;
+  }
+  private async isRecordedWorkerHandle(handle: string, from: string, runtimeId: string): Promise<boolean> {
+    // Do not use the driver's in-memory slots as the boundary: reconcile is also responsible for
+    // terminals made before this driver process started.  `create()` writes this proof before its
+    // worker payload, and checkoutProven reads it from Orca rather than trusting a fixture handle.
+    return (await this.checkoutProven(handle, undefined, from, runtimeId)).proven;
+  }
+
 
   // tickmarkr's own createWorktree stays the sole checkout authority — orca never makes worktrees.
   async worktree(repo: string, branch: string, baseRef: string): Promise<string> {

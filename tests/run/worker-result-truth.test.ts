@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { parseQwenResult } from "../../src/adapters/qwen.js";
 import { trailerPattern } from "../../src/adapters/prompt.js";
@@ -295,4 +295,63 @@ test("test: a model-not-found banner that first appears after the startup window
   expect(WORKER_RESULT_CAUSES).toEqual([
     "provider-death", "dead-channel", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer", "startup-failure",
   ]);
+}, 30_000);
+
+test("test: a pane whose first tool output echoes model-not-found twenty seconds of fixture time after launch is not reaped and the attempt harvests normally, the same phrase in the banner rows before the input box is reaped as startup-failure within one poll, and the reaped row names the matched bytes, their offset and the row they came from, so a detector that reads tool output or a reap with no evidence fails", async () => {
+  const { StartupFailureDetector } = await import("../../src/run/daemon.js");
+  const realNow = Date.now.bind(Date);
+  let elapsed = 0;
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + elapsed);
+  const declaration = { inputBox: { fingerprint: "> ready", match: (text: string) => text.includes("> ready") }, harnessBannerRows: ["harness model-not-found example"] };
+  try {
+    for (const early of [false, true]) {
+      elapsed = 0;
+      const fixture = setupRepo([T("T1")], { tasks: { T1: early ? [
+        { shell: "true" },
+        { shell: `echo recovered > recovered.txt && ${COMMIT} recovered`, result: { ok: true, summary: "recovered" } },
+      ] : [{ shell: `echo normal > normal.txt && ${COMMIT} normal`, result: { ok: true, summary: "normal" } }] } }, "visibility:\n  worker: print\n");
+      Object.assign(fixture.fake, declaration);
+      const inner = new SubprocessDriver();
+      let first = true, reads = 0, polls = 0;
+      const banner = "λ welcome\nError: model-not-found\n> ready\n";
+      const driver = wrappedDriver(inner, {
+        async run(slot, command) { if (!(early && first)) await inner.run(slot, command); },
+        async read(slot, lines) {
+          if (first && reads++ === 0) {
+            elapsed = 20_000;
+            return early ? banner : 'tool-output: shell\nError: model-not-found\n> ready\n';
+          }
+          return inner.read(slot, lines);
+        },
+        async waitOutput(slot, pattern, ms, opts) { if (first) polls++; return inner.waitOutput(slot, pattern, ms, opts); },
+        async close(slot) { first = false; await inner.close(slot); },
+      });
+      const id = `run-startup-seat-${early}`;
+      const summary = await runDaemon(fixture.repo, { adapters: [fixture.fake], driver, runId: id });
+      expect(summary.done).toEqual(["T1"]);
+      const events = Journal.open(fixture.repo, id).read();
+      const reap = events.find(row => row.event === "worker-reaped-before-harvest");
+      if (early) {
+        expect(polls).toBeLessThanOrEqual(1);
+        expect(reap?.data).toMatchObject({ cause: "startup-failure", evidence: {
+          matchedBytes: "model-not-found", offset: Buffer.byteLength("λ welcome\nError: "), row: "Error: model-not-found", rowNumber: 2,
+        } });
+      } else {
+        expect(reap).toBeUndefined();
+        expect(events.find(row => row.event === "worker-result")?.data).toMatchObject({ ok: true });
+      }
+    }
+    const detector = new StartupFailureDetector(declaration);
+    const start = Date.now();
+    expect(detector.sample('harness model-not-found example\ntool-call: read\nmodel-not-found', start)).toBeUndefined();
+    expect(detector.sample('model-not-found', start)).toBeUndefined(); // a later scrolled pane cannot reopen startup
+    const input = new StartupFailureDetector(declaration);
+    expect(input.sample('> ready\nmodel-not-found', start)).toBeUndefined();
+    const { codex } = await import("../../src/adapters/codex.js");
+    expect(new StartupFailureDetector(codex).sample('› inspect model-not-found\n  gpt-5.6-sol · high\n', start)).toBeUndefined();
+    expect(new StartupFailureDetector(codex).sample('\u001b[32m• Explored\u001b[0m\nmodel-not-found', start)).toBeUndefined();
+    const scrolled = new StartupFailureDetector(declaration);
+    expect(scrolled.sample('source row\n'.repeat(500) + 'model-not-found', start)).toBeUndefined();
+    expect(scrolled.sample('model-not-found', start)).toBeUndefined();
+  } finally { clock.mockRestore(); }
 }, 30_000);

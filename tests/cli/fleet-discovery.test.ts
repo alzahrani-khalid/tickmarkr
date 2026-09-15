@@ -6,9 +6,12 @@ import { expect, test, vi } from "vitest";
 import { parse } from "yaml";
 
 import { fleetUnclassifiedModels, modelLints, suggestOverlay } from "../../src/adapters/model-lints.js";
+import { FakeAdapter } from "../../src/adapters/fake.js";
 import * as registry from "../../src/adapters/registry.js";
+import { rolePools } from "../../src/adapters/registry.js";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../src/adapters/types.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { plan } from "../../src/cli/commands/plan.js";
 import { readCachedCatalog } from "../../src/adapters/catalog-remote.js";
 import {
   DEFAULT_CONFIG,
@@ -23,7 +26,9 @@ import {
   type FleetEditorState,
   type FleetModelGroup,
 } from "../../src/tui/ink/fleet-app.js";
-import { tickmarkrDir } from "../../src/graph/graph.js";
+import { route } from "../../src/route/router.js";
+import { saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const KEYS = {
@@ -32,6 +37,7 @@ const KEYS = {
   backspace: "\x7f",
   down: "\x1b[B",
   left: "\x1b[D",
+  space: " ",
   q: "q",
   t: "t",
   n: "n",
@@ -456,4 +462,91 @@ test("no classification the operator made is lost between the keystroke and the 
     channel: "api",
     models: { "nova-1": "mid" },
   });
+});
+
+test("test: after a workers-scope toggle is written the four role pools discovered from the loaded config and the route of an implement task agree row by row with the reach the browser showed and plan lists the toggled entry as reaching the worker seat, so a surface whose reach disagrees with discovery fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-plan-g-"));
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+    "tiers:",
+    "  fake:",
+    "    vendor: fake",
+    "    channel: sub",
+    "    models:",
+    "      fake-1: mid",
+    "      fake-2: mid",
+    "",
+  ].join("\n"));
+  // discoverChannels/route drive off the adapter's own channels() declaration, not cfg.tiers —
+  // the real FakeAdapter (not the classify-only declaredAdapter stub) declares both fake-1/fake-2.
+  const scriptPath = join(repo, "fake.json");
+  writeFileSync(scriptPath, JSON.stringify({ tasks: {} }));
+  const adapter = new FakeAdapter(scriptPath);
+  registry.writeDoctor(repo, {
+    fake: {
+      installed: true,
+      authed: true,
+      version: "fake",
+      models: ["fake-1", "fake-2"],
+      modelAuth: {
+        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+      },
+    },
+  });
+  const now = new Date();
+  utimesSync(join(tickmarkrDir(repo), "doctor.json"), now, now);
+
+  const io = terminal();
+  const done = fleet(
+    ["--global-dir", globalDir],
+    repo,
+    [adapter],
+    { input: io.input, output: io.output } as unknown as FleetIO,
+  );
+  // one Space on the first model row (fake-1): in → out(workers) — the reach the browser showed
+  io.input.write(KEYS.space + KEYS.w + KEYS.y);
+  const out = await done;
+  expect(out).toMatch(/^fleet: wrote /);
+
+  const cfg = loadConfig(repo, { globalDir });
+  expect(cfg.routing.deny?.workers?.models).toEqual(["fake:fake-1"]);
+
+  // the four role pools discovered from the loaded config agree row by row with that reach:
+  // fake-1 is absent from the worker pool and present in every other role's pool
+  const health = registry.readDoctor(repo)!;
+  const pools = rolePools(cfg, [adapter], health);
+  for (const role of ["worker", "judge", "review", "consult"] as const) {
+    const hasFakeOne = pools[role].some((c) => c.adapter === "fake" && c.model === "fake-1");
+    expect(hasFakeOne, role).toBe(role !== "worker");
+  }
+
+  // the route of an implement task agrees: it never lands on the workers-denied channel
+  const graph = validateGraph({
+    version: 1,
+    spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 2, acceptance: ["a"] }],
+  });
+  saveGraph(repo, graph);
+  const routed = route(graph.tasks[0], cfg, pools.worker);
+  expect(`${routed.assignment.adapter}:${routed.assignment.model}`).not.toBe("fake:fake-1");
+  expect(routed.assignment.adapter).toBe("fake");
+  expect(routed.assignment.model).toBe("fake-2");
+
+  // plan lists the toggled entry as reaching the worker seat only
+  const planOut = await plan([], repo, [adapter]);
+  expect(planOut).toContain("routing.deny.workers.models 'fake:fake-1' reaches seats: worker");
+});
+
+test("judge c2: a staged policy the loader refuses shows the row's reach as unknown with the refusal on its row, and Space does not toggle it", async () => {
+  const groups: FleetModelGroup[] = [{ adapter: "nova", rows: [{ model: "nova-1", tier: "mid" }] }];
+  const { writes, result } = await driveInk(groups, KEYS.space + KEYS.q + KEYS.q, {
+    stagedRouting: () => ({ ok: false, error: "routing.map.docs: pin and pool are one declaration" }),
+  });
+  expect(result).toEqual({ kind: "quit" });
+  const all = stripAnsi(writes.join(""));
+  expect(all).toContain("reach: unknown — preview unavailable (routing.map.docs: pin and pool are one declaration)");
+  expect(all).toContain("unknown");
+  expect(all).toContain("nova:nova-1 reach is unknown — Space does not toggle");
 });

@@ -118,6 +118,27 @@ function park(j: Journal, taskId: string, kind: string, opts: { failedGate?: str
 }
 
 describe("C4 — Run and validated decisions", () => {
+  test("a mounted Run scope request shows its exact files approval diagnostic and cannot open a bare approve confirmation", async () => {
+    const root = repo();
+    const runId = "run-scope-view";
+    const graph = graphOf(["T1", "T2"]);
+    const journal = Journal.create(root, runId);
+    journal.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph) });
+    const command = `tickmarkr approve ${runId} T1 --files src/needed.ts`;
+    journal.append("task-human", "T1", { kind: "scope-request", paths: ["src/needed.ts"], reason: "outside files[]", approveCommand: command });
+    journal.append("task-human", "T2", { kind: "human-gate", reason: "human approval" });
+    const decisions = deriveRunDecisions(journal, graph);
+    const session = initialRunViewSession();
+    const frame = await drawRun(root, runId, session, 150, graph);
+    expect(frame).toContain(command);
+    expect(decisions[0]!.verbs).toEqual([]);
+    expect(decisions[1]!.verbs).toEqual(["approve"]);
+    const { snapshot } = readRun(root, runId, graph);
+    const pressed = applyRunViewKey(session, key("a"), { tasks: snapshot.tasks, decisions, verdictLines: 0 });
+    expect(pressed.session.decisions.confirming).toBeNull();
+    expect(journal.read().some((e) => e.event === "task-approved")).toBe(false);
+  });
+
   test("The Run body consumed by C1 shows every matching graph task, its recorded attempt/path/pane/alarm and current-attempt build test lint evidence scope acceptance review cells in declaration order. Evidence-backed passed, failed, running, not-run, disabled and unknown remain distinct, with inherited/satisfied labels and full 200-line verdict paging. Baseline-forgiven build/test/lint and infra/work outcomes retain their evidence labels. Acceptance/review are concurrent and optional. An earlier-attempt pass, missing reviewer tier inferred from policy, or passing prose containing infrastructure admitted by the infra-failure filter fails.", async () => {
     const root = repo();
     const runId = "run-view-matrix";
@@ -226,15 +247,19 @@ describe("C4 — Run and validated decisions", () => {
     const opening = initialRunViewSession();
     const frame = await drawRun(root, runId, opening, 150, graph);
     for (const id of graph.tasks.map((t) => t.id)) expect(frame).toContain(`${id} `);
-    expect(frame).toContain("T1   merged               P  P  P  P  P  P  P  attempt 0");
-    expect(frame).toContain("T2   human · infra        P  F  -  -  -  -  -  attempt 0");
-    expect(frame).toContain("T3   blocked              -  -  -  -  -  -  -  never dispatched");
-    expect(frame).toContain("T4   pending              -  -  -  -  ?  D  P  attempt 0");
-    expect(frame).toContain("T5   pending              P  P  P  R  -  -  -  attempt 0");
-    expect(frame).toContain("T7   pending              R  -  -  -  -  -  -  attempt 1");
-    expect(frame).toContain("1/7 merged | human T2 | blocked T3 | pending T4,T5,T6,T7 | current-cycle tip PENDING | RUNNING | matching graph");
-    expect(frame).toContain("T6   pending              -  -  -  -  -  -  F  attempt 0");
-    expect(frame).toContain("acceptance/review concurrent, optional");
+    // BD-1: the board rows — id, area, deps, title, seven ✔ ✖ · cells, channel, attempts, note.
+    const row = (id: string) => frame.split("\n").find((line) => /^(?: {4}| {2}❯ )/u.test(line) && line.slice(4).startsWith(`${id} `)) ?? "";
+    expect(row("T1")).toMatch(/^ {2}❯ T1 {3}— {15}— {13}Task T1 .*✔ {2}✔ {2}✔ {2}✔ {2}✔ {2}✔ {2}✔ {4}fake:fake-1 +1 *$/u);
+    expect(row("T2")).toMatch(/✔ {2}✖ {2}· {2}· {2}· {2}· {2}· {4}fake:fake-1 +1 +✖ test · 2\/7 gates run$/u);
+    expect(row("T3")).toMatch(/T3 {3}— {15}T2 {12}Task T3 .*· {2}· {2}· {2}· {2}· {2}· {2}· {4}— +0 +waiting on T2$/u);
+    expect(row("T4")).toMatch(/· {2}· {2}· {2}· {2}· {2}· {2}✔ {4}fake:fake-1 +1 +1\/7 gates run$/u);
+    expect(row("T5")).toMatch(/✔ {2}✔ {2}✔ {2}· {2}· {2}· {2}· {4}fake:fake-1 +1 +3\/7 gates run$/u);
+    expect(row("T7")).toMatch(/· {2}· {2}· {2}· {2}· {2}· {2}· {4}fake:fake-1 +2 +in flight$/u);
+    expect(frame).toContain("RUN / RUNNING · 1/7 merged | human T2 | blocked T3 | pending T4,T5,T6,T7 | current-cycle tip PENDING | RUNNING | matching graph");
+    expect(row("T6")).toMatch(/· {2}· {2}· {2}· {2}· {2}· {2}✖ {4}fake:fake-1 +1 +✖ review · 1\/7 gates run$/u);
+    expect(frame).toContain("gates left→right in declaration order");
+    expect(frame).toContain("─ not declared (acceptance and review are the optional two)");
+    expect(frame).toContain("WHERE THE EFFORT WENT");
     expect(frame).toContain(`path /wt/T1 · pane pane-T1 · alarm 600000ms · merged #L${lineOf((e) => e.event === "merge" && e.taskId === "T1")}`);
     expect(frame).toContain("reviewer tier unknown");
     expect(frame).toContain(`VERDICT / review #L${lineOf((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "review")} · lines 1–10 of 200`);
@@ -283,7 +308,8 @@ describe("C4 — Run and validated decisions", () => {
       { name: "gate-fail without failed-gate evidence", kind: "gate-fail", verbs: [] },
       { name: "infra", kind: "infra", failedGate: "test", verbs: ["approve", "recheck"] },
       { name: "tombstone", kind: "human-gate", reason: "T1 — tombstone: retained only so the engagement resumes", verbs: [] },
-      ...PARK_KINDS.filter((k) => k !== "gate-fail" && k !== "infra").map((kind) => ({ name: kind, kind, verbs: ["approve"] as const })),
+      { name: "scope-request", kind: "scope-request", verbs: [] },
+      ...PARK_KINDS.filter((k) => k !== "gate-fail" && k !== "infra" && k !== "scope-request").map((kind) => ({ name: kind, kind, verbs: ["approve"] as const })),
     ];
     for (const c of cases) {
       const root = repo();
@@ -294,12 +320,12 @@ describe("C4 — Run and validated decisions", () => {
       expect(decision!.verbs, c.name).toEqual(c.verbs);
       expect(permittedDecisionVerbs(decision!.park)).toEqual(c.verbs);
       if (c.verbs.length === 0) {
-        expect(decision!.diagnostic, c.name).toMatch(/tombstone|no failed gate result/);
+        expect(decision!.diagnostic, c.name).toMatch(/tombstone|no failed gate result|scope-request requires/);
         // No fabricated verb: every verb is refused before the command, and the command refuses a forced argv.
         for (const verb of DECISION_VERBS) expect(previewDecision({ verb, taskId: "T1" }, { cwd: root, runId, by: "operator" }).ok, `${c.name} ${verb}`).toBe(false);
         // The production command itself, called directly with every verb's argv, refuses too.
         for (const verb of DECISION_VERBS) {
-          await expect(approve(decisionArgv({ verb, taskId: "T1" }, { runId, by: "operator" }), root), `${c.name} ${verb} via command`).rejects.toThrow(/permanent by design; no verb releases it|no failed gate result|applies to a (review )?gate-fail/);
+          await expect(approve(decisionArgv({ verb, taskId: "T1" }, { runId, by: "operator" }), root), `${c.name} ${verb} via command`).rejects.toThrow(/permanent by design; no verb releases it|no failed gate result|applies to a (review )?gate-fail|requires --files/);
         }
         expect(approvals(root, runId, "T1")).toEqual([]);
         continue;
@@ -485,8 +511,8 @@ describe("C4 — Run and validated decisions", () => {
       const receiptSession = { ...confirmed.session, decisions: withDecisionReceipt(confirmed.session.decisions, receipt) };
       const receiptFrame = await drawRun(root, runId, receiptSession, 200, graph);
       expect(receiptFrame).toContain("RECEIPT · appended");
-      expect(receiptFrame).toContain("T1   pending");
-      expect(receiptFrame).not.toContain("T1   merged");
+      expect(receiptFrame).toContain("state pending");
+      expect(receiptFrame).not.toContain("state merged");
       expect(receiptFrame).not.toMatch(/T1 .*dispatched\b/u);
       expect(readRun(root, runId, graph).snapshot.green).toBe(false);
 

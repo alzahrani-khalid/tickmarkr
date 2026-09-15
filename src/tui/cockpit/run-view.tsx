@@ -1,12 +1,13 @@
 import { Box } from "ink";
-import type { ReactElement } from "react";
+import { useContext, type ReactElement } from "react";
 import { GLYPHS } from "../../brand.js";
 import type { ApprovalRunOwner } from "../../cli/commands/approve.js";
 import { GATE_NAMES, type GateName, type RunGraph } from "../../graph/schema.js";
 import type { JournalEvent } from "../../run/journal.js";
 import { normalizeGateOutcome, type GateOutcome } from "../../run/outcome.js";
 import type { OperatorGateState, OperatorSnapshot, OperatorTask } from "../../run/operator-state.js";
-import { BodyText, Panel } from "./components.js";
+import { BOARD_KEYS, boardFooter, clipBoard, renderBoardLines } from "./board.js";
+import { BodyText, Panel, ShellTheme } from "./components.js";
 import {
   applyDecisionKey,
   decisionConfirmLines,
@@ -226,10 +227,8 @@ export function runSummaryLine(s: OperatorSnapshot): string {
 const attemptLabel = (t: OperatorTask): string => (t.attempt !== undefined ? `attempt ${t.attempt}` : t.dispatches === 0 ? "never dispatched" : "attempt unknown");
 const parkOf = (t: OperatorTask): string => (t.state === "human" ? `human · ${t.parkKind ?? "unknown kind"}` : t.state);
 
-/** One matrix row: id, state, the seven letters in declaration order, the recorded attempt. */
-export function runTaskRow(t: OperatorTask, cells: readonly Pick<RunGateCell, "letter">[]): string {
-  return `${t.id.padEnd(4)} ${parkOf(t).padEnd(20)} ${cells.map((c) => c.letter).join("  ")}  ${attemptLabel(t)}`;
-}
+/** The board's footer keys merged with the cockpit's own — every one of them handled by this view or the shell. */
+export const RUN_VIEW_KEYS: readonly string[] = [...BOARD_KEYS.slice(0, 2), "←→ verdict gate", "PgUp/PgDn page", "x outcome", "a actions", "o pane", "Tab focus", "? keys", BOARD_KEYS[2]];
 
 export interface RunViewProps {
   readonly snapshot: OperatorSnapshot;
@@ -241,14 +240,15 @@ export interface RunViewProps {
   readonly session: RunViewSession;
   readonly columns: number;
   readonly run: ApprovalRunOwner;
+  /** The clock the board header reads; injectable so a pinned frame does not drift. */
+  readonly now?: () => number;
 }
 
-const MATRIX_HEADER = `${"Task".padEnd(4)} ${"state".padEnd(20)} ${GATE_NAMES.map((g) => g.slice(0, 2)).join(" ")}  latest attempt`;
-const MATRIX_LEGEND = "P pass · F fail · R running · - not run · D disabled · ? unknown | declaration order, not a timeline · acceptance/review concurrent, optional";
-
-/** The Run body. Every line is measured through the width module; nothing overflows its column. */
-export function RunView({ snapshot, rows, page, graph, decisions, session, columns, run }: RunViewProps): ReactElement {
+/** The Run body: the approved board (BD-1) over the fold, then the selected task's detail panels. */
+export function RunView({ snapshot, rows, page, graph, decisions, session, columns, run, now = Date.now }: RunViewProps): ReactElement {
   const inner = Math.max(1, Math.floor(columns) - 4);
+  const colour = useContext(ShellTheme).mode !== "none";
+  const width = Math.max(1, Math.floor(columns));
   const fit = (text: string): string => fitCells(text, inner);
   const decisionLines = (lines: readonly string[]): string[] => lines.flatMap((line) => wrapCells(line, inner));
   const lookup = evidenceLookup(rows, page);
@@ -264,19 +264,13 @@ export function RunView({ snapshot, rows, page, graph, decisions, session, colum
   const decision = task === undefined ? undefined : decisions.find((d) => d.taskId === task.id);
   const { menu, confirming, receipt, notice } = session.decisions;
   const blocked = task === undefined ? [] : graph?.tasks.filter((g) => g.deps.includes(task.id)).map((g) => g.id) ?? decision?.blocks ?? [];
+  const board = renderBoardLines({ runId: run.runId, snapshot, graph, now: now(), live: run.live, selection: task?.id, keys: false, colour }, width);
   return (
     <Box flexDirection="column" width={columns}>
-      <Panel title={`RUN / ${snapshot.lifecycle}`} focused>
-        <BodyText emphasis="dim">{fit(runSummaryLine(snapshot))}</BodyText>
-        <BodyText emphasis="dim">{fit(`  ${MATRIX_HEADER}`)}</BodyText>
-        {tasks.map((t, i) => (
-          <BodyText key={t.id} emphasis={i === selection ? "strong" : "normal"}>
-            {fit(`${i === selection ? `${GLYPHS.pointer} ` : "  "}${runTaskRow(t, GATE_NAMES.map((gate) => ({ letter: GATE_CELL_LETTERS[t.gates[gate].state] })))}`)}
-          </BodyText>
-        ))}
-        {tasks.length === 0 && <BodyText>{fit("no tasks recorded — no plan")}</BodyText>}
-        <BodyText emphasis="dim">{fit(MATRIX_LEGEND)}</BodyText>
-      </Panel>
+      <BodyText emphasis="dim">{fitCells(`RUN / ${snapshot.lifecycle} · ${runSummaryLine(snapshot)}`, width)}</BodyText>
+      {/* an empty Text has no height in Ink; the prototype's blank rows are one space so they keep their row */}
+      {board.map((line, i) => <BodyText key={`${i}:${line}`}>{line || " "}</BodyText>)}
+      {tasks.length === 0 && <BodyText>{fitCells("no tasks recorded — no plan", width)}</BodyText>}
       {task !== undefined && (
         <Panel title={`SELECTED / ${task.id}${task.title ? ` · ${task.title}` : ""}`}>
           <BodyText>{fit(`state ${parkOf(task)} · ${attemptLabel(task)} · dispatches ${task.dispatches} · path ${task.path ?? "unknown"} · pane ${task.pane ?? "unknown"} · alarm ${task.alarmMs === undefined ? "unknown" : `${task.alarmMs}ms`}${task.mergeEvidence ? ` · merged #L${task.mergeEvidence.line}` : ""}`)}</BodyText>
@@ -324,7 +318,7 @@ export function RunView({ snapshot, rows, page, graph, decisions, session, colum
         </Panel>
       )}
       {notice !== null && <BodyText>{notice}</BodyText>}
-      <BodyText emphasis="dim">{fitCells(["↑↓ Task", "←→ Verdict gate", "PgUp/PgDn Page", "x Outcome", decisionKeybar(session.decisions, decision)].filter(Boolean).join(" · "), Math.max(1, Math.floor(columns)))}</BodyText>
+      <BodyText emphasis="dim">{clipBoard(boardFooter([...RUN_VIEW_KEYS, decisionKeybar(session.decisions, decision)].filter(Boolean), colour), width)}</BodyText>
     </Box>
   );
 }

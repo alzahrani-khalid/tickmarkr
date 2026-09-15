@@ -125,6 +125,32 @@ function withoutExcluded(channels: BillingChannel[], exclude?: ReadonlySet<strin
   return channels.filter((c) => !exclude.has(channelKey(c)));
 }
 
+// Pools spread providers before tier, independently within each marginal-cost run. Stable
+// cost sorting preserves declaration order when forming groups; gateways share the served
+// model's provider, so adding a second transport does not buy that provider another turn.
+function rankAnyPool(live: BillingChannel[], task: Task): BillingChannel[] {
+  const sorted = [...live].sort((a, b) => marginalCostRank(a) - marginalCostRank(b));
+  const out: BillingChannel[] = [];
+  for (let i = 0; i < sorted.length;) {
+    let j = i + 1;
+    while (j < sorted.length && marginalCostRank(sorted[j]) === marginalCostRank(sorted[i])) j++;
+    const groups = new Map<string, BillingChannel[]>();
+    for (const c of sorted.slice(i, j)) {
+      const provider = routingModelProvider(c.model, c.vendor);
+      const group = groups.get(provider) ?? [];
+      group.push(c);
+      groups.set(provider, group);
+    }
+    const ordered = [...groups.values()];
+    const k = spreadOffset(task) % ordered.length;
+    for (const group of [...ordered.slice(k), ...ordered.slice(0, k)]) {
+      out.push(...group.sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier]));
+    }
+    i = j;
+  }
+  return out;
+}
+
 const maybeSlaLint = (
   lints: string[], task: Task, profile: RoutingProfile | undefined, slaMinutes: number | undefined, c: BillingChannel,
 ): void => {
@@ -242,24 +268,23 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     // live preserves pool declaration order — ordered mode and any-mode stable-sort ties depend on it
     const live = pool.channels
       .map((id) => channels.find((c) => channelKey(c) === id))
-      .filter((c): c is BillingChannel => c !== undefined);
+      .filter((c): c is BillingChannel => c !== undefined && (!taskFloor || TIER_RANK[c.tier] >= TIER_RANK[taskFloor]));
     if (!live.length) {
       throw new RoutingError(
-        `${task.id}: routing.map.${task.shape}.pool has no live channel — declared: ${pool.channels.join(", ")}; doctor found: ${channels.map(channelKey).join(", ") || "(nothing)"}`,
+        `${task.id}: routing.map.${task.shape}.pool has no live channel${taskFloor ? ` at task floor ${taskFloor}` : ""} — declared: ${pool.channels.join(", ")}; doctor found: ${channels.map(channelKey).join(", ") || "(nothing)"}`,
       );
     }
-    // ponytail: no learned/explore/spread inside pools in v1 — a pool pick is fully static; the
-    // upgrade path is feeding the pool-filtered set through the learned path below.
+    // No learned/explore inside pools: any spreads deterministically; ordered keeps declaration order.
     const chosen = pool.mode === "ordered"
       ? live[0]
-      : [...live].sort((a, b) => marginalCostRank(a) - marginalCostRank(b) || TIER_RANK[a.tier] - TIER_RANK[b.tier])[0];
+      : rankAnyPool(live, task)[0];
     lintMapPinFloor(chosen.tier, "pool");
     maybeSlaLint(lints, task, profile, slaMinutes, chosen);
     return { assignment: toAssignment(chosen), ladder: ladderFor(task, entry), lints, provenance: `${degraded}pool ${pool.mode} ${channelKey(chosen)} (config routing.map)` };
   }
 
   const baseTier: Tier = floor ?? "cheap";
-  // D-04: a task floor is hard only on floor/auto paths; the map-pin branch above stays supreme.
+  // A task floor is hard on pool and floor/auto paths; the map-pin branch above stays supreme.
   const minTier: Tier = taskFloor && TIER_RANK[taskFloor] > TIER_RANK[baseTier] ? taskFloor : baseTier;
   if (prefActive) for (const p of prefer ?? []) preflightPrefer(p);
   // key order is a contract: prefer > marginal cost > tier (cheapest sufficient) > learned score (v1.6 ROUTE-06)

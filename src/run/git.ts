@@ -1,3 +1,4 @@
+import { commandLeaseEnvironment, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -22,7 +23,7 @@ export const DEFAULT_FORK_CAP = "6";
 const forkBudget = new AsyncLocalStorage<string>();
 const verificationBudget = new AsyncLocalStorage<RunCapacity>();
 
-/** Verification owns the serialized suite window; workers keep their concurrency budget. */
+/** Verification uses command leases; workers keep their concurrency budget. */
 export const runWithVerificationBudget = <T>(capacity: RunCapacity, fn: () => Promise<T>): Promise<T> =>
   verificationBudget.run(capacity, fn);
 
@@ -140,6 +141,7 @@ export const DEFAULT_SHELL_TIMEOUT_MS = 600000;
 // disagreeing with itself). On a timeout it is the elapsed time at the kill, not the ceiling.
 export interface ShResult {
   code: number;
+  signalExit?: boolean;
   stdout: string;
   stderr: string;
   timedOut?: boolean;
@@ -188,12 +190,25 @@ const SHELL_REAP_GRACE_MS = 2000;
 
 // stdin "ignore": same class as HARD-05 / SubprocessDriver — never leave an open pipe a child can block on
 // (pi -p / codex exec wait for stdin EOF). timedOut distinguishes SIGKILL-timeout from a real nonzero exit.
-function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Promise<ShResult> {
+export interface ShellOptions {
+  env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+  onSpawn?: (pid: number | undefined) => void;
+  onTimeout?: () => void;
+}
+
+/** Shared command seam, including invocation-bound manifested runners. */
+export function shell(cmd: string, cwd: string, timeoutMs: number, login = false, options: ShellOptions = {}): Promise<ShResult> {
+  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, options));
+}
+
+function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolean, options: ShellOptions): Promise<ShResult> {
+  options.signal?.throwIfAborted();
   // OBS-74: scrub tickmarkr's own routing env seams from every child — a daemon carrying
   // TICKMARKR_QUALITY leaked it into baseline/gate/tip-verify children, turning a dogfood
   // repo's route() tests red inside the gates. Scrub a copy at this one choke point so
   // children are hermetic by construction; the daemon's own process.env stays unchanged.
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  const env = commandLeaseEnvironment(options.env ?? process.env);
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // A run freezes the operator override and cores at startup; admission can lower the round cap.
   env[FORK_CAP_ENV] = verificationBudget.getStore()
@@ -220,16 +235,21 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
     const stderrDecoder = new StringDecoder("utf8");
     let timedOut = false, reapedGroup = false, done = false, started = false, outputSeen = false;
     let reapError: string | undefined, exitedCode: number | undefined;
+    let signalExit = false;
     let reapTimer: NodeJS.Timeout | undefined;
+    let drainTimer: NodeJS.Timeout | undefined;
     const finish = (code: number, err?: string) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       clearTimeout(reapTimer);
+      clearTimeout(drainTimer);
+      options.signal?.removeEventListener("abort", abort);
       stdout += stdoutDecoder.end();
       stderr += stderrDecoder.end();
       resolve({
         code,
+        ...(signalExit ? { signalExit: true } : {}),
         stdout,
         stderr: err ?? stderr,
         timedOut,
@@ -239,8 +259,17 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
         ...(reapError ? { reapError } : {}),
       });
     };
+    // Escaped descendants can retain pipes even after the shell and its group are dead.
+    const boundDrain = () => {
+      if (!done && !drainTimer) drainTimer = setTimeout(() => {
+        p.stdout?.destroy();
+        p.stderr?.destroy();
+        finish(exitedCode ?? 1);
+      }, 100);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
+      options.onTimeout?.();
       try {
         process.kill(-p.pid!, "SIGKILL");
       } catch (error) {
@@ -252,7 +281,15 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
         // A failed group kill can leave inherited pipes open forever; the command ceiling still wins.
         if (code !== "ESRCH") finish(exitedCode ?? 1);
       }
+      boundDrain();
     }, timeoutMs);
+    const abort = () => {
+      try { process.kill(-p.pid!, "SIGKILL"); } catch { p.kill("SIGKILL"); }
+      boundDrain();
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    options.onSpawn?.(p.pid);
+    if (options.signal?.aborted) abort();
     p.on("spawn", () => { started = true; }); // the command exists from here on — never retryable past it
     // OBS-716: one stateful decoder per stream carries an incomplete UTF-8 sequence into that
     // stream's next pipe chunk; decoding each chunk through string concatenation corrupts bytes at
@@ -271,22 +308,22 @@ function shell(cmd: string, cwd: string, timeoutMs: number, login: boolean): Pro
       if (!done && !started && !outputSeen && e.code === RETRYABLE_SPAWN_CODE) {
         done = true;
         clearTimeout(timer);
+        options.signal?.removeEventListener("abort", abort);
         resolve({ refused: e });
         return;
       }
       finish(127, String(e));
     });
-    p.on("close", (code) => finish(code ?? 1));
+    p.on("close", (code) => { signalExit = code === null; finish(code ?? 1); });
     // "close" waits for stdio to drain. Once bash exits normally, give descendants a bounded grace
     // to exit with it; a survivor still in bash's detached group is then reaped so its inherited pipe
     // cannot hold this promise until the command ceiling. A real timeout wins first and is never
     // reclassified as a grace reap.
     p.on("exit", (code) => {
+      signalExit = code === null;
       exitedCode = code ?? 1;
-      if (timedOut) {
-        finish(exitedCode);
-        return;
-      }
+      // Allow a short pipe drain after killing, bounded even for an escaped descendant.
+      if (timedOut) return;
       reapTimer = setTimeout(() => {
         if (done) return;
         try {
@@ -733,4 +770,3 @@ export async function assertRefsWritable(cwd: string = process.cwd(), action: "r
   }
   return probe;
 }
-

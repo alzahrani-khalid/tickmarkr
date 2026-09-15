@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
@@ -9,10 +9,11 @@ import { allAdapters, formatDoctorAgeForInit, formatDoctorReport, initDoctorReus
 import { configTemplate, DEFAULT_CONFIG, globalConfigDir, loadConfig, type TickmarkrConfig, type InitConfigOverlay } from "../../config/config.js";
 import { LEGACY_PREFIX, specTemplate } from "../../compile/native.js";
 import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
-import { tickmarkrDir } from "../../graph/graph.js";
+import { stateDirName, tickmarkrDir } from "../../graph/graph.js";
 import { orcaHostDetected } from "../../drivers/index.js";
+import { WORKTREES_DIR } from "../../run/git.js";
 import { Journal, type JournalEvent } from "../../run/journal.js";
-import { runLockRunId, runStatusLine } from "../../run/lock.js";
+import { runLockOwner, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { doctor } from "./doctor.js";
 import { assembleFleetEditor } from "./fleet.js";
 
@@ -348,6 +349,203 @@ async function runInitWizard(
   if (result.kind === "quit") return null;
   return { overlay: result.overlay, installSkills: result.installSkills, installDocs: result.installDocs };
 }
+function realpathSafe(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    const parent = dirname(p);
+    if (parent === p) return p;
+    return join(realpathSafe(parent), basename(p));
+  }
+}
+
+function isPathInside(parentDir: string, candidatePath: string): boolean {
+  const resolvedParent = realpathSafe(resolve(parentDir));
+  const resolvedCandidate = realpathSafe(resolve(candidatePath));
+  const rel = relative(resolvedParent, resolvedCandidate);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+/**
+ * The ONLY way the --remove path runs git: GIT_DIR, GIT_WORK_TREE and GIT_COMMON_DIR are stripped so the repository acted on
+ * is always cwd's own, and LC_ALL=C keeps stderr parseable. Throws execFileSync's error (status, stderr) unchanged.
+ */
+function removeGit(cwd: string, args: string[]): string {
+  const { GIT_DIR: _dir, GIT_WORK_TREE: _workTree, GIT_COMMON_DIR: _commonDir, ...env } = process.env;
+  return execFileSync("git", args, { cwd, env: { ...env, LC_ALL: "C" }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+function isLinkedWorktree(cwd: string): boolean {
+  try {
+    const gitDir = removeGit(cwd, ["rev-parse", "--git-dir"]).trim();
+    const gitCommonDir = removeGit(cwd, ["rev-parse", "--git-common-dir"]).trim();
+    return resolve(cwd, gitDir) !== resolve(cwd, gitCommonDir);
+  } catch {
+    return false;
+  }
+}
+
+function checkLiveLock(cwd: string): { pid?: number; live: boolean } | undefined {
+  const localOwner = runLockOwner(cwd);
+  if (localOwner?.live) return localOwner;
+
+  try {
+    const gitDir = removeGit(cwd, ["rev-parse", "--git-dir"]).trim();
+    const gitCommonDir = removeGit(cwd, ["rev-parse", "--git-common-dir"]).trim();
+    if (resolve(cwd, gitDir) !== resolve(cwd, gitCommonDir)) {
+      const mainRepo = dirname(resolve(cwd, gitCommonDir));
+      const mainOwner = runLockOwner(mainRepo);
+      if (mainOwner?.live) return mainOwner;
+    }
+  } catch {
+    // not a git repo
+  }
+
+  return undefined;
+}
+
+/**
+ * Only git's discovery answer — exit 128, stderr `fatal: not a git repository (or any of the parent directories)` — means false.
+ * Every other failure (explicit bad GIT_DIR, invalid gitfile, permission, missing binary) refuses: unregistration could not be verified.
+ */
+function isGitRepo(cwd: string): boolean {
+  try {
+    removeGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
+    return true;
+  } catch (err) {
+    const e = err as { status?: unknown; stderr?: unknown; message?: string };
+    const stderr = String(e.stderr ?? "").trim();
+    if (e.status === 128 && stderr.startsWith("fatal: not a git repository (or any of the parent directories)")) return false;
+    throw new Error(`cannot remove: git repository probe failed: ${stderr || e.message || "unknown error"}`);
+  }
+}
+
+/** Runs git and throws `message` plus git's stderr on failure — a remove never proceeds past a failed step. */
+function git(cwd: string, args: string[], message: string): string {
+  try {
+    return removeGit(cwd, args);
+  } catch (err) {
+    const stderr = String((err as { stderr?: unknown }).stderr ?? "").trim();
+    throw new Error(stderr ? `${message}: ${stderr}` : message);
+  }
+}
+
+function registeredWorktrees(cwd: string, worktreesDir: string): string[] {
+  const out = git(cwd, ["worktree", "list", "--porcelain"], "cannot remove: git worktree list failed");
+  return out
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length).trim())
+    .filter((wt) => isPathInside(worktreesDir, wt));
+}
+
+function handleRemove(cwd: string): string {
+  const owner = checkLiveLock(cwd);
+  if (owner?.live) {
+    const holder = typeof owner.pid === "number" ? `live pid ${owner.pid}` : (owner.pid ?? "unreadable payload");
+    throw new Error(`cannot remove: graph.lock held by ${holder}`);
+  }
+
+  if (isLinkedWorktree(cwd)) {
+    throw new Error("cannot remove from inside a linked worktree");
+  }
+
+  const notes: string[] = [];
+  const stateDir = join(cwd, stateDirName(cwd));
+  const worktreesDir = join(stateDir, WORKTREES_DIR);
+
+  // 1. Unregister every git worktree under stateDir/WORKTREES_DIR, and prove it, before deleting anything
+  if (isGitRepo(cwd)) {
+    for (const wt of registeredWorktrees(cwd, worktreesDir)) {
+      // double --force: git refuses a locked worktree (present or already deleted) with a single one
+      git(cwd, ["worktree", "remove", "--force", "--force", wt], `cannot remove: failed to unregister worktree ${wt}`);
+    }
+    git(cwd, ["worktree", "prune"], "cannot remove: git worktree prune failed");
+    const left = registeredWorktrees(cwd, worktreesDir);
+    if (left.length > 0) {
+      throw new Error(`cannot remove: worktrees still registered: ${left.join(", ")}`);
+    }
+  }
+
+  // 2. Delete .tickmarkr state directory
+  if (existsSync(stateDir)) {
+    rmSync(stateDir, { recursive: true, force: true });
+    notes.push(`deleted state directory ${stateDir}`);
+  }
+
+  // 3. Delete shipped skill directories at every host location
+  const targetSkillDirs = [
+    join(cwd, ".agents", "skills"),
+    join(cwd, ".claude", "skills"),
+  ];
+  for (const dir of targetSkillDirs) {
+    for (const skill of AGENT_SKILLS) {
+      const skillPath = join(dir, skill);
+      if (existsSync(skillPath)) {
+        rmSync(skillPath, { recursive: true, force: true });
+        notes.push(`deleted skill ${skillPath}`);
+      }
+    }
+  }
+
+  // 4. Delete marker-bounded guidance block in AGENTS.md and CLAUDE.md leaving every byte outside identical
+  const marked = new RegExp(
+    `<!-- (?:tickmarkr|${LEGACY_PREFIX}):agent-docs begin -->[\\s\\S]*?`
+    + `<!-- (?:tickmarkr|${LEGACY_PREFIX}):agent-docs end -->`,
+  );
+  for (const doc of ["AGENTS.md", "CLAUDE.md"]) {
+    const docPath = join(cwd, doc);
+    if (existsSync(docPath)) {
+      const current = readFileSync(docPath, "utf8");
+      const m = current.match(marked);
+      if (m && m.index !== undefined) {
+        const before = current.slice(0, m.index);
+        const after = current.slice(m.index + m[0].length);
+        writeFileSync(docPath, before + after);
+        notes.push(`removed guidance block from ${docPath}`);
+      }
+    }
+  }
+
+  // 5. Delete scaffold spec only while it still equals the shipped template
+  const specPath = join(cwd, SCAFFOLD_SPEC);
+  if (existsSync(specPath)) {
+    const currentSpec = readFileSync(specPath, "utf8");
+    if (currentSpec === specTemplate()) {
+      rmSync(specPath, { force: true });
+      notes.push(`deleted scaffold spec ${specPath}`);
+    } else {
+      notes.push(`kept edited spec ${specPath}`);
+    }
+  }
+
+  // 6. Query and print remaining branches and preserved refs
+  let branches: string[] = [];
+  try {
+    const out = removeGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads/tickmarkr/"]);
+    branches = out.split("\n").map((b) => b.trim()).filter(Boolean);
+  } catch {
+    // ignore
+  }
+
+  let preservedRefs: string[] = [];
+  try {
+    const out = removeGit(cwd, ["for-each-ref", "--format=%(refname)", "refs/tickmarkr/preserved/"]);
+    preservedRefs = out.split("\n").map((r) => r.trim()).filter(Boolean);
+  } catch {
+    // ignore
+  }
+
+  for (const b of branches) {
+    notes.push(`left branch: ${b}`);
+  }
+  for (const r of preservedRefs) {
+    notes.push(`left ref: ${r}`);
+  }
+
+  return notes.join("\n");
+}
+
 
 /** Test seam mirroring FleetIO: production callers omit it and get the process streams. */
 export type InitIO = { input?: NodeJS.ReadStream; output?: NodeJS.WriteStream };
@@ -360,6 +558,8 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
       process.stdout.write(BANNER);
     }
   };
+  // banner at START on the visual surface — every init path, not just the wizard, and never trailing the probe (operator report 2026-07-17)
+  emitBanner();
 
   const { values } = parseArgs({
     args: argv,
@@ -370,12 +570,14 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
       docs: { type: "boolean" },
       fresh: { type: "boolean" },
       yes: { type: "boolean" },
+      remove: { type: "boolean" },
     },
   });
-  // banner at START on the visual surface — every init path, not just the wizard, and never trailing the probe (operator report 2026-07-17)
-  emitBanner();
   if (packageName(cwd) === "tickmarkr") {
     throw new Error("OBS-584: tickmarkr init refuses to run inside the tickmarkr source repository");
+  }
+  if (values.remove) {
+    return handleRemove(cwd);
   }
   const gdir = values["global-dir"] ?? globalConfigDir();
   mkdirSync(gdir, { recursive: true });

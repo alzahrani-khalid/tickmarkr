@@ -39,8 +39,8 @@ describe("pool mode any — economy engine inside the pool", () => {
     expect(r.provenance).toBe("pool any opencode:zai/glm-5.2 (config routing.map)");
   });
 
-  test("cost+tier ties resolve by pool declaration order (stable sort)", () => {
-    // two mid subs tie on every key — the pool's declared order decides, not discovery order
+  test("a zero-offset provider rotation preserves pool declaration order", () => {
+    // T1/g has an even offset: the first of these two provider groups keeps its turn.
     const cfg = poolCfg("any", ["codex:gpt-5.6-terra", "claude-code:sonnet"]);
     expect(route(mkTask(), cfg, CH).assignment).toMatchObject({ adapter: "codex", model: "gpt-5.6-terra" });
   });

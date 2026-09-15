@@ -70,3 +70,9 @@ export function projectFleetWhy<Id extends string>(
 export function renderFleetWhy(rows: readonly FleetWhyRow[]): string {
   return ["tickmarkr fleet --why — effective shape routing", ...rows.map((row) => row.label)].join("\n");
 }
+
+/** LEG2-T3: one exclusion-collector scope as the reason a fleet row shows — its config path, then
+ * the entry that matched (a deny) or the fact the allowlist does not admit the channel. */
+export function exclusionReason(scope: { by: "deny" | "allow"; configPath: string; entry: string }): string {
+  return scope.by === "allow" ? `${scope.configPath} (not admitted)` : `${scope.configPath} (${scope.entry})`;
+}

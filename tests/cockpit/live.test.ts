@@ -3286,8 +3286,10 @@ test(C1_CRITERIA[0], async () => {
         }
       }
       if (view === "run") {
-        expect(frame).toContain(LONG_TASK_ID.slice(0, 38));
-        expect(frame).toContain("D disabled");
+        // BD-1: the board's rows are taller than the letter matrix was; the fourth task's row sits
+        // below a 17-row body, so the long identity is asserted where the body can hold it.
+        if (rows === 40) { expect(frame).toContain(LONG_TASK_ID.slice(0, 38)); expect(frame).toContain("─ not declared"); }
+        expect(frame).toContain("❯ T1   ");
       }
       if (view === "evidence") {
         expect(frame).toContain("terminal failure");
@@ -3325,8 +3327,8 @@ test(C1_CRITERIA[1], async () => {
     m.delivery.key({ input: "", key: { return: true } });
     await m.send("");
     expect(m.delivery.snapshot().state.view).toBe("run");
-    expect(m.frame()).toContain("❯ T3");
-    expect(m.frame()).toContain("blocked");
+    expect(stripAnsi(m.frame())).toContain("❯ T3");
+    expect(stripAnsi(m.frame())).toContain("blocked");
     await m.send("5");
     m.delivery.key({ input: "", key: { return: true } });
     const evidenceOpen = m.delivery.snapshot().state.overlay?.join("\n") ?? "";
@@ -3343,7 +3345,7 @@ test(C1_CRITERIA[1], async () => {
     });
     await m.send("");
     expect(m.delivery.snapshot().state.view).toBe("run");
-    expect(m.frame()).toContain("❯ T3");
+    expect(stripAnsi(m.frame())).toContain("❯ T3");
     await m.send("5");
     m.delivery.pointer({
       action: "press",
@@ -3658,7 +3660,7 @@ test("mounted pointer selects the painted Run task and Evidence row after resize
     for (const width of [120, 90, 80]) {
       await m.resize(width, 24);
       const geometry = m.delivery.geometry()!;
-      const target = geometry.paintedRows.find(row => row.text.trimStart().startsWith("T3 "))!;
+      const target = geometry.paintedRows.find(row => stripAnsi(row.text).trimStart().startsWith("T3 "))!;
       expect(target).toBeDefined();
       m.delivery.pointer({ action: "press", column: target.column + 4, row: target.row });
       await m.send("");
@@ -3667,9 +3669,14 @@ test("mounted pointer selects the painted Run task and Evidence row after resize
       expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain("T3");
       await m.send("\x1b"); await m.send("\x1b[A");
     }
+    // 40×14 stacks the board and holds only a few of its rows: Down keys select the fourth task and
+    // the shell scrolls its row into the body, where the pointer then finds it.
     await m.resize(40, 14);
-    const longRow = m.delivery.geometry()!.paintedRows.find(row => row.text.includes(LONG_TASK_ID.slice(0, 28)))!;
+    for (let i = 0; i < 4; i++) await m.send("\x1b[B");
+    const plan = m.delivery.geometry()!;
+    const longRow = plan.paintedRows.find(row => row.text.includes(LONG_TASK_ID.slice(0, 28)))!;
     expect(longRow).toBeDefined();
+    expect(longRow.row).toBeGreaterThanOrEqual(plan.bodyRow); expect(longRow.row).toBeLessThan(plan.bodyRow + plan.bodyRows);
     m.delivery.pointer({ action: "press", column: longRow.column + 3, row: longRow.row });
     await m.send(""); await m.send("\r");
     expect(m.delivery.snapshot().state.overlay?.join("\n")).toContain(LONG_TASK_ID.slice(0, 38));
@@ -3873,7 +3880,7 @@ test("mounted row presses keep the committed view context across an unpainted vi
   const f = shellFixture(); const m = await mountShell(f.cwd, f.runId);
   try {
     await m.send("4");
-    const task = m.delivery.geometry()!.paintedRows.find(row => row.text.trimStart().startsWith("T3 "))!;
+    const task = m.delivery.geometry()!.paintedRows.find(row => stripAnsi(row.text).trimStart().startsWith("T3 "))!;
     m.delivery.key({ input: "1", key: {} });
     m.delivery.pointer({ action: "press", row: task.row, column: task.column + 3 });
     await m.send("");

@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,40 @@ const processGroupExists = (groupId: number): boolean => {
 };
 
 describe("sh", () => {
+  test.each(["timeout", "already-exited", "abort"])("%s bounds draining when an escaped descendant never closes the pipes", async (mode) => {
+    const { shell } = await import("../../src/run/git.js");
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      pid: 800001, stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+    });
+    setSpawnForTests((() => child) as unknown as Parameters<typeof setSpawnForTests>[0]);
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      if (mode === "already-exited") throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      child.emit("exit", null);
+      return true;
+    });
+    const controller = new AbortController();
+    try {
+      const result = shell("sleep 30", "/tmp", 1000, false, { signal: controller.signal });
+      let settled = false;
+      void result.then(() => { settled = true; });
+      if (mode === "already-exited") child.emit("exit", 0);
+      if (mode === "abort") controller.abort();
+      else await vi.advanceTimersByTimeAsync(1000);
+      expect(settled).toBe(false);
+      child.stdout.write("last buffered bytes");
+      await vi.advanceTimersByTimeAsync(100);
+      expect(settled).toBe(true);
+      expect(await result).toMatchObject({ stdout: "last buffered bytes", timedOut: mode !== "abort" });
+      expect(kill).toHaveBeenCalledWith(-child.pid, "SIGKILL");
+      expect(child.stdout.destroyed).toBe(true);
+      expect(child.stderr.destroyed).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      resetSpawnForTests(); kill.mockRestore(); vi.useRealTimers();
+    }
+  });
+
   test("captures stdout/stderr/code", async () => {
     const r = await sh("echo out; echo err >&2; exit 3", "/tmp");
     expect(r.stdout.trim()).toBe("out");

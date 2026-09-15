@@ -6,6 +6,7 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { kimiSessionId } from "../../../src/adapters/kimi.js";
 import { shq } from "../../../src/adapters/types.js";
+import { deriveRunDecisions } from "../../../src/tui/cockpit/decision-actions.js";
 import { approve } from "../../../src/cli/commands/approve.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
@@ -2591,7 +2592,7 @@ describe("ES-2 daemon tier climb", () => {
     }
   }, 180_000);
 
-  test("test: a worker result refusing a path outside files[] and a gate red naming only unowned paths each park as kind authoring carrying the files[] hint with no tier-escalated row, an infra park and a quota failover journal none, and a pinned task at the cap parks naming the held pin and its cause, so a climb bought by an ownership red or by a pin fails", async () => {
+  test("test: a worker result refusing a path outside files[] parks as kind scope-request naming that path with no attempt charged and no tier-escalated row, a gate red naming only unowned paths still parks as kind authoring carrying the files[] hint, and the Run view over the scope-request park shows the exact approve command with files as its diagnostic and offers no verb while a human-gate park keeps its approve verb, so a typed park that swallows the ownership kind or a decision flow that offers a bare approve fails", async () => {
     for (const kind of ["refusal", "unowned", "infra", "quota", "pin"] as const) {
       const { repo, fake } = fixture({ [kind]: true, ...(kind === "quota" ? { unowned: true } : {}) });
       const runId = `run-es2-${kind}`;
@@ -2601,12 +2602,21 @@ describe("ES-2 daemon tier climb", () => {
       const park = rows.find((e) => e.event === "task-human")!;
       const telemetry = Journal.open(repo, runId).readTelemetry().find((r) => r.taskId === "T1")!;
       if (kind === "refusal" || kind === "unowned") {
-        expect(park.data.kind).toBe("authoring");
+        expect(park.data.kind).toBe(kind === "refusal" ? "scope-request" : "authoring");
+        if (kind === "refusal") {
+          const journal = Journal.open(repo, runId);
+          const decision = deriveRunDecisions(journal).find((d) => d.taskId === "T1")!;
+          expect(decision.verbs).toEqual([]);
+          expect(decision.diagnostic).toBe(`tickmarkr approve ${runId} T1 --files elsewhere/b.ts`);
+          expect(journal.replayResumeState().get("T1")?.attempts).toBe(0);
+          journal.append("task-human", "H", { kind: "human-gate", reason: "approve me" });
+          expect(deriveRunDecisions(journal).find((d) => d.taskId === "H")?.verbs).toEqual(["approve"]);
+        }
         expect(park.data.reason).toContain("files[] repair hint: elsewhere/b.ts");
         // OBS-547 on the diagnostic path (Leg-2 T3 material): the park is unchargeable, so its
         // telemetry row carries the real spend but NO metered count beside `attempts` — a count
         // exceeding attempts renders in `tickmarkr report` as "floor: 1/0 attempts metered".
-        const authoring = rows.find((e) => e.event === "scope-authoring")!;
+        const authoring = rows.find((e) => e.event === (kind === "refusal" ? "scope-request" : "scope-authoring"))!;
         expect(authoring.data, kind).toMatchObject({ chargeable: false, source: "diagnostic" });
         expect(telemetry.tokens, kind).toBeDefined();
         expect(telemetry.attempts, kind).toBe(0);

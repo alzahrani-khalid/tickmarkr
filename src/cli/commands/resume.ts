@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 import { loadConfig } from "../../config/config.js";
-import { parseDriverOverride, pickDriver } from "../../drivers/index.js";
+import { classifyHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
 import { type RunSummary, formatSummary, runDaemon } from "../../run/daemon.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
@@ -40,6 +40,8 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     throw new Error(collisions.map(denyPreferCollisionLine).join("; "));
   }
   await assertRefsWritable(cwd, "resume");
+  const host = classifyHost();
+  preflightHostDriver(cfg, driverOverride, host);
   const narrate = narrationSink(runId);
   const s = await runDaemon(cwd, {
     runId,
@@ -47,7 +49,7 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     graphChanged,
     retryFailed,
     // bound to the same sink the daemon gets, so a driver-journaled recovery reaches this rail too
-    driver: bindNarration(pickDriver(cfg, driverOverride), narrate),
+    driver: bindNarration(pickDriver(cfg, driverOverride, host), narrate),
     // v1.99 T2: the ONE narration sink — the quiet rail on a TTY, the raw journal formatter on a
     // pipe. A resumed run meets the same surface a fresh one does; printing the raw formatter here
     // would leave `resume` as the last place the old unfiltered dump survives. Bound to the run id

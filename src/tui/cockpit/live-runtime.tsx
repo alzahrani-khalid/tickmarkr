@@ -8,7 +8,8 @@ import { render, useInput, useStdin } from "ink";
 import { useLayoutEffect, useSyncExternalStore } from "react";
 import { createLiveStore, type LiveStore, type LiveStoreSnapshot } from "./live-store.js";
 import { HomeView, deriveHomeView, selectNeedsYouTarget, type HomeNeedsYouTarget } from "./home-view.js";
-import { RunView, applyRunViewKey, initialRunViewSession, runGateCells, evidenceLookup, runTaskRow, GATE_CELL_LETTERS } from "./run-view.js";
+import { RunView, applyRunViewKey, initialRunViewSession, runGateCells, evidenceLookup } from "./run-view.js";
+import { renderBoardLines, stripBoardAnsi } from "./board.js";
 import { EvidenceView, deriveEvidenceView, type EvidenceRow, defaultExportPath, planEvidenceExport, writeEvidenceExport } from "./evidence-view.js";
 import { ShellGridFlow, ShellJournalSelection } from "./components.js";
 import { CockpitShell, initialShellState, type ShellState, type ShellCommit } from "./shell.js";
@@ -17,13 +18,12 @@ import { shellBindings, type RunKeyEvent } from "./keys.js";
 import { createPointerReportReader, POINTER_TRACKING_ON, POINTER_TRACKING_OFF, type PointerReport } from "./pointer.js";
 import { deriveRunDecisions, previewDecision, executeDecision, withDecisionPreview, withDecisionReceipt, decisionConfirmLines } from "./decision-actions.js";
 import { approvalRunOwner } from "../../cli/commands/approve.js";
-import { GATE_NAMES } from "../../graph/schema.js";
 import { GLYPHS } from "../../brand.js";
 import { Journal } from "../../run/journal.js";
-import { observeNamedRun } from "../../run/supervision.js";
+import { observeNamedRun, WATCH_OWNER_ENV } from "../../run/supervision.js";
 import { formatOwnedName, type FocusTarget, type FocusResult } from "../../drivers/types.js";
 import type { EvidenceIdentity } from "../../run/operator-state.js";
-import { cellWidth, fitCells, wrapCells } from "./width.js";
+import { cellWidth, wrapCells } from "./width.js";
 import { resolveShellColourMode } from "./theme.js";
 
 let timelineUsers = 0;
@@ -117,7 +117,10 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     store = createLiveStore({ cwd, runId, now: options.now });
     const source = store;
     if (options.observeRun !== false) observation = observeNamedRun(cwd, runId, options.environment);
-    let state = { ...initialShellState(), view: options.initialView ?? "home" };
+    // BD-1 (RULING-231-19 §2): the daemon-placed board carries the watch owner token and mounts
+    // rail-less — a zero shortcut budget the plan honours at every width. The manual cockpit keeps its rail.
+    const railless = Boolean((options.environment ?? process.env)[WATCH_OWNER_ENV]);
+    let state = { ...initialShellState(), view: options.initialView ?? "home", ...(railless ? { shortcutColumns: 0 } : {}) };
     let runSession = initialRunViewSession();
     if (options.initialParks) {
       runSession = { ...runSession, selection: Math.max(0, source.snapshot().operator.tasks.findIndex(t => t.state === "human" || t.state === "blocked")) };
@@ -184,6 +187,24 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
       state = { ...state, overlay: [result.status === "focused" ? `Focused ${task.id}` : `Pane ${result.status}`, result.reason, "Enter opens task evidence after Esc"], overlayOffset: 0 };
       publish();
     };
+    // The board is taller than a small body; a selection moved by keys or a park opened from Home
+    // scrolls the shell's viewport just far enough that the selected row (and the rows that wrap
+    // under it) is seen. The rows are the very lines the Run view draws at this body width.
+    const followSelection = () => {
+      const snap = source.snapshot();
+      const task = snap.operator.tasks[runSession.selection];
+      if (!task) return;
+      const g = geometry();
+      const lines = renderBoardLines({ runId, snapshot: snap.operator, graph: snap.graph.value, now: (options.now ?? Date.now)(), selection: task.id, keys: false, colour: false }, g.bodyColumns);
+      const first = lines.findIndex(l => l.startsWith("  ❯ "));
+      if (first < 0) return;
+      let last = first;
+      while (last + 1 < lines.length && lines[last + 1]!.startsWith(" ".repeat(9))) last++;
+      const top = first + 1, bottom = last + 1; // the RUN summary line sits above the board
+      const scroll = state.scroll;
+      if (top < scroll) state = { ...state, scroll: top };
+      else if (bottom >= scroll + g.bodyRows) state = { ...state, scroll: bottom - g.bodyRows + 1 };
+    };
     const openDetail = () => {
       const snap = source.snapshot();
       const task = state.view === "run" ? snap.operator.tasks[runSession.selection] : undefined;
@@ -200,6 +221,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     // from the snapshot. The guard prevents the shell from dispatching its echo.
     let leafInput: ReturnType<typeof useStdin>["internal_eventEmitter"] | undefined;
     let forwarding = false;
+    let lastRawInput = "";
     const forwardLeaf = (bytes: string) => {
       forwarding = true;
       try { leafInput?.emit("input", bytes); } finally { forwarding = false; }
@@ -295,11 +317,13 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
           const task = snap.operator.tasks[runSession.selection];
           const cells = task ? runGateCells(task, evidenceLookup(snap.journal.history, source.page)) : [];
           runSession = applyRunViewKey(runSession, event, { tasks: snap.operator.tasks, decisions, verdictLines: cells[runSession.verdictGate]?.verdict.length ?? 0 }).session;
+          if (k.upArrow || k.downArrow) followSelection();
           if (k.pageDown || k.pageUp) state = {
             ...state,
-            // The Run leaf owns verdict paging; the shell only moves its
-            // viewport far enough for that leaf's verdict panel to be seen.
-            scroll: k.pageDown ? geometry().bodyRows : 0,
+            // The Run leaf owns verdict paging; the shell only moves its viewport so that leaf's
+            // verdict panel is seen — it sits below the board and the selected task's cells, so the
+            // viewport goes to the leaf's end (clamped by the shell), not one page down.
+            scroll: k.pageDown ? Number.MAX_SAFE_INTEGER : 0,
           };
           if (runSession.decisions.menu) state = { ...state, overlay: ["Actions — Enter reviews; Esc cancels", ...runSession.decisions.menu.verbs], overlayOffset: 0 };
           else if (text === "a") state = { ...state, overlay: ["No actionable park selected", "tickmarkr resume " + runId], overlayOffset: 0 };
@@ -394,14 +418,35 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
       useSyncExternalStore(listener => { listeners.add(listener); return () => { listeners.delete(listener); }; }, () => revision);
       const stdinContext = useStdin();
       useLayoutEffect(() => {
-        leafInput = stdinContext.internal_eventEmitter;
-        return () => { leafInput = undefined; };
+        const emitter = stdinContext.internal_eventEmitter;
+        leafInput = emitter;
+        // Ink strips an escape sequence's ESC before useInput sees it, so an unnamed CSI and typed
+        // "[..." look alike there. Its parser emits every escape sequence as its own event, so the RAW
+        // event says which it was. Registered in a layout effect, this listener runs before useInput's.
+        const raw = (data: string) => { lastRawInput = data; };
+        emitter?.on("input", raw);
+        return () => { leafInput = undefined; emitter?.off("input", raw); };
       }, [stdinContext.internal_eventEmitter]);
       const renderedView = state.view;
       const leafActive = state.editor === undefined && !state.overlay && !state.help && !state.reviewing;
       useInput((text, k) => {
         if (forwarding || (leafActive && renderedView !== "run" && (k.return || (renderedView === "evidence" && text === "e")))) return;
-        try { key({ input: text, key: k }, true); } catch (error) { stop(error); }
+        // OBS-1002: Ink hands a coalesced chunk ("a\r", "na\r" — a paste, key repeat under load, a
+        // `pane run` message) to the handler as ONE string with no key flags, and a single-key map
+        // ignores it. Split every non-escape chunk into one event per code point; an escape sequence
+        // (arrows, page keys) is one key and already carries its flags.
+        const flagged = k.ctrl || k.meta || k.upArrow || k.downArrow || k.leftArrow || k.rightArrow || k.pageUp || k.pageDown || k.return || k.escape || k.tab || k.backspace || k.delete;
+        const points = !flagged && !lastRawInput.startsWith("\x1b") && [...text].length > 1 ? [...text] : [text];
+        try {
+          for (const point of points) {
+            const event = points.length === 1 ? { input: text, key: k }
+              : point === "\r" || point === "\n" ? { input: "", key: { return: true } }
+              : point === "\t" ? { input: "", key: { tab: true } }
+              : point === "\x1b" ? { input: "", key: { escape: true } }
+              : { input: point, key: { shift: /[A-Z]/.test(point) } };
+            key(event, true);
+          }
+        } catch (error) { stop(error); }
       });
       const snap = source.snapshot();
       const p = geometry();
@@ -448,10 +493,9 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
       return <CockpitShell snapshot={options.observeRun === false ? { ...snap, journal: { ...snap.journal, source: "no run/journal.jsonl" } } : snap} state={state} columns={p.columns} rows={p.rows} version={options.binaryVersion} colour={colour} onCommit={plan => {
         committed = plan;
         const targets: Target[] = [];
-        const taskRows = snap.operator.tasks.map((task, index) => ({
-          id: task.id,
-          text: fitCells(`${index === Math.min(runSession.selection, snap.operator.tasks.length - 1) ? `${GLYPHS.pointer} ` : "  "}${runTaskRow(task, GATE_NAMES.map(gate => ({ letter: GATE_CELL_LETTERS[task.gates[gate].state] })))}`, Math.max(1, plan.bodyColumns - 4)),
-        }));
+        // A board row opens with the prototype's four-cell indent or the focus marker, then the id;
+        // the first painted row naming a task is that task's target (the effort fold names it again, later).
+        const boardRowId = (text: string): string | undefined => /^(?: {4}| {2}❯ )(\S+)/u.exec(stripBoardAnsi(text))?.[1];
         const usedTasks = new Set<string>();
         for (const row of plan.paintedRows) {
           if (row.row < plan.bodyRow && (row.text.startsWith("1 Home") || row.text.startsWith("1H"))) {
@@ -478,8 +522,10 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
             continue;
           }
           if (state.view === "run") {
-            const task = taskRows.find(task => !usedTasks.has(task.id) && row.text === task.text);
-            if (task) { usedTasks.add(task.id); targets.push({ ...row, kind: "task", id: task.id }); }
+            const drawn = boardRowId(row.text);
+            // A narrow body clips the row inside a long id; the drawn prefix still names one task.
+            const id = drawn === undefined ? undefined : (snap.operator.tasks.find(task => task.id === drawn) ?? snap.operator.tasks.find(task => task.id.startsWith(drawn)))?.id;
+            if (id !== undefined && !usedTasks.has(id)) { usedTasks.add(id); targets.push({ ...row, kind: "task", id }); }
           } else {
             const cleanText = row.text.trim().startsWith(GLYPHS.pointer)
               ? row.text.trim().slice(GLYPHS.pointer.length).trim()
@@ -499,10 +545,10 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
         committedTargets = targets;
       }}>
         {state.view === "home" ? <ShellGridFlow width={p.bodyColumns} columns={p.columns < 120 ? 2 : 3} rowHeight={p.rows < 20 ? 1 : p.columns < 120 ? 2 : 3}><HomeView key={String(homeModel.needsYou.length > 0)} width={p.bodyColumns} model={homeModel} focused={focused}
-          onOpenPark={id => { runSession = { ...runSession, selection: Math.max(0, snap.operator.tasks.findIndex(t => t.id === id)) }; state = { ...state, view: "run", scroll: 0 }; publish(); }}
+          onOpenPark={id => { runSession = { ...runSession, selection: Math.max(0, snap.operator.tasks.findIndex(t => t.id === id)) }; state = { ...state, view: "run", scroll: 0 }; followSelection(); publish(); }}
           onOpenDiagnostic={id => { state = { ...state, overlay: [id], overlayOffset: 0 }; publish(); }} onOpenEvidence={openEvidence}
           onSelectNeedsYou={reportHomeNeedsYouSelection} /></ShellGridFlow> :
-        state.view === "run" ? <RunView snapshot={snap.operator} rows={snap.journal.history} page={source.page} graph={snap.graph.value} decisions={visibleDecisions} session={runSession} columns={p.bodyColumns} run={approvalRunOwner(cwd, runId)} /> :
+        state.view === "run" ? <RunView snapshot={snap.operator} rows={snap.journal.history} page={source.page} graph={snap.graph.value} decisions={visibleDecisions} session={runSession} columns={p.bodyColumns} run={approvalRunOwner(cwd, runId)} now={options.now} /> :
         <ShellJournalSelection.Provider value={reportEvidenceSelection}><EvidenceView key={`${state.query}:${evidenceNavigation}`} width={p.bodyColumns} model={{ ...model, journal: evidenceRows }} focusEvidence={selectedEvidence} focused={focused} onExport={beginExport} onSelect={id => { selectedEvidence = id; openDetail(); publish(); }} /></ShellJournalSelection.Provider>}
       </CockpitShell>;
     }

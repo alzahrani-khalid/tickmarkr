@@ -1,7 +1,28 @@
-import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/drivers/orca.js";
+import { execFileSync, spawn } from "node:child_process";
+import { realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { canonicalWorktreePath, ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/drivers/orca.js";
+
+/**
+ * Orca 1.4.200 split receipt capture, taken 2026-09-14T01:00:09Z with:
+ * `orca terminal split --terminal term_f7025cec-fd0e-414f-be5a-5bc1e767796a --direction horizontal --command "echo split-test" --json`
+ *
+ * The raw response is deliberately a fixture value, not a parser-shaped object invented by this
+ * fake.  Orca documents the child terminal at `result.split.handle` and parent tab at
+ * `result.split.tabId`; the fake replaces only those runtime-generated identifiers per invocation.
+ * Independently re-verified 2026-09-14 against the installed Orca 1.4.200 CLI:
+ * `orca terminal split --help` prints
+ * `Usage: orca terminal split [--terminal <handle>] [--direction horizontal|vertical] [--command <text>] [--json]`
+ * — the exact verb, flags and direction vocabulary the driver issues and the capture command used.
+ * Keys are asserted below so a hand edit that drifts from the capture fails at import.
+ */
+export const ORCA_1_4_200_SPLIT_CAPTURE_RAW = "{\"id\":\"83ae34f5-eb73-41eb-992a-a35e8e506dc5\",\"ok\":true,\"result\":{\"split\":{\"handle\":\"term_77d537c6-8e8b-43dd-9377-60d810bf40b3\",\"tabId\":\"1e45d1cd-b246-47b8-bc3f-d824714af706\",\"paneRuntimeId\":1,\"leafId\":\"0fbecad3-5d7a-410e-adb3-85ec2273c1e4\"}},\"_meta\":{\"runtimeId\":\"36d1527d-bd69-44f1-ba33-b33e76d4861a\"}}";
+const ORCA_1_4_200_SPLIT_CAPTURE = JSON.parse(ORCA_1_4_200_SPLIT_CAPTURE_RAW) as {
+  result: { split: Record<string, unknown> };
+};
+if (Object.keys(ORCA_1_4_200_SPLIT_CAPTURE.result.split).sort().join() !== "handle,leafId,paneRuntimeId,tabId") {
+  throw new Error("fake-orca: ORCA_1_4_200_SPLIT_CAPTURE_RAW no longer matches the recorded 1.4.200 split receipt keys");
+}
 
 // A deterministic in-process stand-in for the `orca` CLI, replaying the envelope shapes RECORDED
 // against live Orca 1.4.195 (.planning/assessments/2026-09-02-orca-1.4.195-capture/).
@@ -31,8 +52,18 @@ import { ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/
 //              by default, with the recorded 1.4.186 ok:true satisfied:false receipt selectable
 //   close    → {ok, result:{close:{handle, tabId, ptyKilled:<boolean>}}, _meta}; ptyKilled:false
 //              is a successful close of an exited/no-live-PTY terminal
-//   worktree current → {ok, result:{worktree:{path,...}}, _meta}; a fresh checkout may answer
-//              selector_not_found or an enclosing checkout until Orca indexes the exact cwd
+//   split    → ORCA_1_4_200_SPLIT_CAPTURE_RAW above; child is result.split.handle, parent tab is
+//              result.split.tabId.
+//   worktree current → {ok, result:{worktree:{id:"<repoId>::<path>", path, git:{path}}}, _meta} — the
+//              TRACKED worktree that encloses the invoking cwd. Orca 1.4.200 tracks only the
+//              worktrees it created or the operator opened (`orca worktree --help`: list/show/current/
+//              create/set/rm/ps — no adopt); from a git worktree the daemon added under the clone it
+//              answers the ENCLOSING clone, and it never "adopts" that checkout later (OBS-1004, run
+//              0004: every worker waited 60 s for an adoption that cannot happen). Untracked cwd →
+//              selector_not_found. The pre-OBS-1004 fixture that answered the task checkout as its
+//              own tracked path was the NON-Orca shape that hid the defect; it is gone.
+//   path:<p> selectors (create/list/worktree set) resolve only against tracked worktrees; a task
+//              checkout path is refused selector_not_found (recorded on 0004's T5 `worktree set`).
 //   worktree set → NO 1.4.195 capture; the fixture deliberately returns an empty successful result
 //              so the driver validates the shared envelope without inventing payload semantics.
 //   agent hooks status → {ok, result:{enabled,statuses:[{agent,state,...}]}, _meta}
@@ -138,8 +169,16 @@ export interface FakeOrcaOpts {
   createSurface?: string | null;
   /** elapsed wait transport. Default: 1.4.195 timeout refusal; old receipt remains selectable. */
   elapsedWaitTransport?: "1.4.195-timeout" | "1.4.186-satisfied-false";
-  /** Sequential `worktree current` answers; the final answer repeats after the array is exhausted. */
-  worktreeCurrentAnswers?: Array<string | "selector_not_found">;
+  /** The worktrees Orca tracks (created by it or opened by the operator). `worktree current` answers
+   *  the nearest tracked ancestor-or-self of the invoking cwd; `path:` selectors resolve only to
+   *  these. Seeded terminals' worktrees and `worktree create` results are tracked implicitly.
+   *  Absent: the ENCLOSING directory of the first cwd asked is the one tracked clone — the 1.4.200
+   *  answer for a task checkout nested under the clone (OBS-1004). */
+  trackedWorktrees?: string[];
+  /** Really run each `terminal create --command` through `sh -c` in the tracked worktree, streaming
+   *  its stdout/stderr into the terminal's scrollback (zero Orca, zero tokens). The wrapper shell
+   *  outlives the command as real Orca's does: status stays "running" after exit. */
+  executeCommands?: boolean;
   hooksEnabled?: boolean;
   hookStatuses?: FakeHookStatus[];
   /** Whether accepted text sends are echoed into the cursor stream. Real interactive shells do. */
@@ -147,13 +186,18 @@ export interface FakeOrcaOpts {
   /** where `worktree create` puts the checkout — Orca's own root, never the caller's choice.
    *  Default: an `orca-worktrees` directory beside the repo. */
   worktreeRoot?: string;
+  splitReceipt?: Record<string, unknown> | null;
 }
 
-interface FakeTerminal extends FakeTerminalSpec { lines: string[] }
+interface FakeTerminal extends FakeTerminalSpec {
+  lines: string[];
+  parentHandle?: string;
+  splitDirection?: string;
+}
 
 const KNOWN_FAMILIES = new Set<string>([
   "status", "create", "list", "read", "send", "wait", "show", "close", "worktree",
-  "worktree-current", "worktree-set", "hooks-status",
+  "worktree-current", "worktree-set", "hooks-status", "split",
 ]);
 
 const ALLOWED_FLAGS: Record<string, Set<string>> = {
@@ -165,6 +209,7 @@ const ALLOWED_FLAGS: Record<string, Set<string>> = {
   wait: new Set(["--terminal", "--for", "--timeout-ms", "--json"]),
   show: new Set(["--terminal", "--json"]),
   close: new Set(["--terminal", "--json"]),
+  split: new Set(["--terminal", "--direction", "--command", "--json"]),
   worktree: new Set(["--name", "--repo", "--base-branch", "--json"]),
   "worktree-current": new Set(["--json"]),
   "worktree-set": new Set(["--worktree", "--workspace-status", "--json"]),
@@ -194,8 +239,13 @@ function sameCheckout(a: string, b: string): boolean {
 export class FakeOrca {
   /** every argv the driver issued, in order */
   readonly calls: string[][] = [];
-  /** invoking cwd beside every argv; adoption must use the slot checkout, never the daemon cwd. */
+  /** invoking cwd beside every argv; `worktree current` must be asked FROM the checkout (OBS-1004). */
   readonly callCwds: string[] = [];
+  /** worktrees tracked beyond `opts.trackedWorktrees`: seeded rows, `worktree create` results, and
+   *  the enclosing-directory default learned on the first `worktree current` */
+  readonly learnedTracked: string[] = [];
+  /** commands `terminal create` launched under `executeCommands`, with their exit codes once known */
+  readonly executed: Array<{ handle: string; command: string; cwd: string; exitCode?: number }> = [];
   /** text submitted by a successful `terminal send --enter`, per handle */
   readonly sent = new Map<string, string[]>();
   /** text typed without `--enter`; real Orca writes the bytes but nothing is submitted. */
@@ -210,7 +260,6 @@ export class FakeOrca {
   private pageSize: number;
   private reads = new Map<string, number>();
   private seq = 0;
-  private currentSeq = 0;
   private closed = new Set<string>(); // closed handles keep answering close ok:true (recorded)
 
   constructor(private opts: FakeOrcaOpts = {}) {
@@ -230,6 +279,17 @@ export class FakeOrca {
 
   of(handle: string): FakeTerminal | undefined {
     return this.terminals.find((t) => t.handle === handle);
+  }
+
+  /** Move a leaf out of its split into a new tab, as an operator can do in the layout. */
+  moveToTab(handle: string, tabId: string, title: string): void {
+    const terminal = this.of(handle);
+    if (!terminal) throw new Error(`unknown terminal ${handle}`);
+    if (this.terminals.some((t) => t.parentHandle === handle)) throw new Error("moveToTab requires a leaf");
+    delete terminal.parentHandle;
+    delete terminal.splitDirection;
+    terminal.tabId = tabId;
+    terminal.title = title;
   }
 
   /** the terminal the most recent `terminal create` produced */
@@ -296,29 +356,58 @@ export class FakeOrca {
     for (const t of scoped) {
       byWorktree.set(t.worktree, [...(byWorktree.get(t.worktree) ?? []), t]);
     }
-    return [...byWorktree].map(([wt, ts]) => ({
-      worktreeId: `repo-fixture::${wt}`,
-      worktreePath: wt,
-      root: {
-        type: "group",
-        groupId: `headless-terminals:repo-fixture::${wt}`,
-        activeTabId: this.tabId(ts[0]),
-        tabs: ts.map((t) => ({
-          tabId: this.tabId(t),
-          title: t.title,
-          activeLeafId: `${t.handle}-leaf`,
-          panes: {
-            type: "terminal",
-            handle: t.handle,
-            tabId: this.tabId(t),
-            leafId: `${t.handle}-leaf`,
-            title: t.paneTitle ?? "bash",
-            connected: this.connected(t),
-            active: true,
-          },
-        })),
-      },
-    }));
+    return [...byWorktree].map(([wt, ts]) => {
+      const splitsByParent = new Map<string, FakeTerminal[]>();
+      for (const t of ts) {
+        if (t.parentHandle) {
+          splitsByParent.set(t.parentHandle, [...(splitsByParent.get(t.parentHandle) ?? []), t]);
+        }
+      }
+      const topLevel = ts.filter((t) => !t.parentHandle);
+      return {
+        worktreeId: `repo-fixture::${wt}`,
+        worktreePath: wt,
+        root: {
+          type: "group",
+          groupId: `headless-terminals:repo-fixture::${wt}`,
+          activeTabId: this.tabId(ts[0]),
+          tabs: topLevel.map((t) => {
+            const splits = splitsByParent.get(t.handle) ?? [];
+            let panesNode: Record<string, unknown> = {
+              type: "terminal",
+              handle: t.handle,
+              tabId: this.tabId(t),
+              leafId: `${t.handle}-leaf`,
+              title: t.paneTitle ?? "bash",
+              connected: this.connected(t),
+              active: true,
+            };
+            for (const child of splits) {
+              panesNode = {
+                type: "pane-split",
+                direction: child.splitDirection ?? "horizontal",
+                first: panesNode,
+                second: {
+                  type: "terminal",
+                  handle: child.handle,
+                  tabId: this.tabId(t),
+                  leafId: `${child.handle}-leaf`,
+                  title: child.paneTitle ?? "bash",
+                  connected: this.connected(child),
+                  active: false,
+                },
+              };
+            }
+            return {
+              tabId: this.tabId(t),
+              title: t.title,
+              activeLeafId: `${t.handle}-leaf`,
+              panes: panesNode,
+            };
+          }),
+        },
+      };
+    });
   }
 
   private page(t: FakeTerminal, cursor: string | undefined, lines: number): Record<string, unknown> {
@@ -333,6 +422,26 @@ export class FakeOrca {
     const tail = t.lines.slice(from, from + cap);
     const next = from + tail.length;
     return { tail, truncated: false, limited: next < total, oldestCursor: "0", nextCursor: String(next), latestCursor: String(total), returnedLineCount: tail.length };
+  }
+
+  /** `executeCommands`: the wrapper shell runs the command and its bytes land in the scrollback. */
+  private execute(t: FakeTerminal, command: string, cwd: string): void {
+    const record: { handle: string; command: string; cwd: string; exitCode?: number } = { handle: t.handle, command, cwd };
+    this.executed.push(record);
+    const child = spawn("sh", ["-c", command], { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    let pending = "";
+    const sink = (chunk: Buffer): void => {
+      pending += chunk.toString("utf8");
+      const parts = pending.split("\n");
+      pending = parts.pop() ?? "";
+      t.lines.push(...parts);
+    };
+    child.stdout.on("data", sink);
+    child.stderr.on("data", sink);
+    child.on("close", (code) => {
+      if (pending) { t.lines.push(pending); pending = ""; }
+      record.exitCode = code ?? -1;
+    });
   }
 
   readonly exec: OrcaExec = async (args, cwd) => {
@@ -387,6 +496,7 @@ export class FakeOrca {
       wait: ["--terminal", "--for", "--timeout-ms"],
       show: ["--terminal"],
       close: ["--terminal"],
+      split: ["--terminal"],
     };
     const missing = required[family].find((name) => flag(args, name) === undefined);
     if (missing) return `${family} requires ${missing}`;
@@ -425,6 +535,52 @@ export class FakeOrca {
     return selector;
   }
 
+  /** Every worktree the fake runtime tracks right now. */
+  private tracked(): string[] {
+    return [...(this.opts.trackedWorktrees ?? []), ...this.learnedTracked, ...this.terminals.map((t) => t.worktree)];
+  }
+
+  private isTracked(path: string): boolean {
+    return this.tracked().some((w) => canonicalWorktreePath(w) === canonicalWorktreePath(path));
+  }
+
+  /** `worktree current` from `cwd`: the nearest tracked ancestor-or-self (OBS-1004), or undefined. */
+  private enclosingTracked(cwd: string): string | undefined {
+    // The driver's own canonicalization, so a fixture path that exists nowhere (/tmp vs /private/tmp)
+    // still compares the way the driver spells it.
+    const here = canonicalWorktreePath(cwd);
+    const hits = this.tracked().filter((w) => { const t = canonicalWorktreePath(w); return here === t || here.startsWith(`${t}/`); });
+    if (hits.length) return hits.sort((a, b) => canonicalWorktreePath(b).length - canonicalWorktreePath(a).length)[0];
+    if (this.opts.trackedWorktrees !== undefined) return undefined;
+    // Default, learned once: Orca tracks the CLONE. Walk up from cwd — a `.git` DIRECTORY is the
+    // clone root and the answer; a `.git` FILE marks a linked worktree the daemon added, which Orca
+    // never tracks, so the walk continues to the clone above it (OBS-1004). A path with no git
+    // anywhere (a bare fixture path) is not a daemon checkout and is tracked as itself.
+    let dir = here;
+    let linked = false;
+    for (;;) {
+      try {
+        const st = statSync(join(dir, ".git"));
+        if (st.isDirectory()) { this.learnedTracked.push(dir); return dir; }
+        if (st.isFile()) linked = true;
+      } catch { /* no .git here */ }
+      const up = dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+    if (linked) return undefined; // a linked worktree with no clone above it: nothing Orca tracks encloses it
+    this.learnedTracked.push(here);
+    return here;
+  }
+
+  /** A `path:` selector is honoured only for a tracked worktree; anything else is selector_not_found. */
+  private trackedSelector(selector: string | undefined, cwd: string): { path?: string; refusal?: { code: number; stdout: string; stderr: string } } {
+    const path = this.selected(selector, cwd);
+    if (path === undefined) return {};
+    if (!this.isTracked(path)) return { refusal: this.refusal("selector_not_found", `selector_not_found`) };
+    return { path };
+  }
+
   private answer(family: string, args: string[], cwd: string): { code: number; stdout: string; stderr: string } {
     if (family === "status") {
       return this.ok({
@@ -436,7 +592,9 @@ export class FakeOrca {
       });
     }
     if (family === "create") {
-      const worktree = this.selected(flag(args, "--worktree"), cwd) ?? cwd;
+      const sel = this.trackedSelector(flag(args, "--worktree"), cwd);
+      if (sel.refusal) return sel.refusal;
+      const worktree = sel.path ?? cwd;
       const t: FakeTerminal = {
         handle: this.opts.nextHandle ?? `term_${++this.seq}`,
         title: flag(args, "--title") ?? "",
@@ -445,6 +603,8 @@ export class FakeOrca {
         lines: [],
       };
       this.terminals.push(t);
+      const command = flag(args, "--command");
+      if (this.opts.executeCommands && command !== undefined) this.execute(t, command, worktree);
       // Recorded create receipt: durable tabId + composite worktree identity; status is absent.
       const terminal: Record<string, unknown> = {
         handle: t.handle,
@@ -459,11 +619,8 @@ export class FakeOrca {
       return this.ok({ terminal });
     }
     if (family === "worktree-current") {
-      const answers = this.opts.worktreeCurrentAnswers;
-      const answer = answers && answers.length > 0
-        ? answers[Math.min(this.currentSeq++, answers.length - 1)]
-        : cwd;
-      if (answer === "selector_not_found") {
+      const answer = this.enclosingTracked(cwd);
+      if (answer === undefined) {
         return this.refusal("selector_not_found", `no worktree selector resolves from ${cwd}`);
       }
       return this.ok({
@@ -476,7 +633,9 @@ export class FakeOrca {
       });
     }
     if (family === "worktree-set") {
-      const worktree = this.selected(flag(args, "--worktree"), cwd);
+      const sel = this.trackedSelector(flag(args, "--worktree"), cwd);
+      if (sel.refusal) return sel.refusal;
+      const worktree = sel.path;
       const status = flag(args, "--workspace-status");
       if (worktree && status) this.workspaceStatuses.set(worktree, status);
       // UNRECORDED SHAPE: intentionally no invented receipt beyond the shared success envelope.
@@ -513,7 +672,9 @@ export class FakeOrca {
       return this.ok({ worktree: { id: `repo-fixture::${path}`, repoId: "repo-fixture", displayName: name, ...git, git } });
     }
     if (family === "list") {
-      const wt = this.selected(flag(args, "--worktree"), cwd);
+      const sel = this.trackedSelector(flag(args, "--worktree"), cwd);
+      if (sel.refusal) return sel.refusal;
+      const wt = sel.path;
       const listed = wt === undefined ? this.terminals : this.terminals.filter((t) => sameCheckout(t.worktree, wt));
       const result: Record<string, unknown> = { terminals: listed.map((t) => this.row(t)), topologyRevisions: {}, totalCount: listed.length, truncated: false };
       if (args.includes("--include-visual-layouts")) result.visualLayouts = this.visualLayouts(listed);
@@ -598,6 +759,35 @@ export class FakeOrca {
       }
       // Recorded close receipt; an exited/no-live-PTY leaf is still removed but reports false.
       return this.ok({ close: { handle, tabId: this.tabId(t), ptyKilled: this.reportedStatus(t) === "running" } });
+    }
+    if (family === "split") {
+      const handle = flag(args, "--terminal") ?? "";
+      const parent = this.of(handle);
+      if (!parent) return this.refusal("terminal_handle_stale", `no such terminal ${handle}`);
+      const t: FakeTerminal = {
+        handle: this.opts.nextHandle ?? `term_${++this.seq}`,
+        title: parent.title,
+        worktree: parent.worktree,
+        tabId: this.tabId(parent),
+        parentHandle: parent.handle,
+        splitDirection: flag(args, "--direction") ?? "horizontal",
+        status: "running",
+        lines: [],
+      };
+      this.terminals.push(t);
+      const command = flag(args, "--command");
+      if (this.opts.executeCommands && command !== undefined) this.execute(t, command, parent.worktree);
+      if (this.opts.splitReceipt !== undefined) {
+        return this.ok(this.opts.splitReceipt === null ? {} : { split: this.opts.splitReceipt });
+      }
+      return this.ok({
+        split: {
+          ...ORCA_1_4_200_SPLIT_CAPTURE.result.split,
+          handle: t.handle,
+          tabId: this.tabId(parent),
+          leafId: `${t.handle}-leaf`,
+        },
+      });
     }
     return this.refusal("unsupported", family);
   }

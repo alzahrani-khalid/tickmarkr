@@ -13,9 +13,13 @@ export interface OperatorTask {
   dispatches: number; attempt?: number; path?: string; pane?: string; alarmMs?: number;
   parkKind?: string; evidence?: EvidenceIdentity; mergeEvidence?: EvidenceIdentity;
   gates: Record<string, OperatorGate>;
+  /** BD-1: the board's per-task counters — latest dispatch channel, review verdicts drawn, human parks. */
+  channel?: string; reviewRounds: number; parks: number;
 }
 export interface OperatorSnapshot {
-  sequence: number; observedAt: number; lastEventAt?: string;
+  sequence: number; observedAt: number; lastEventAt?: string; firstEventAt?: string;
+  /** BD-1 header counts: run-resume and escalation rows seen. */
+  resumes: number; escalations: number;
   lifecycle: "PENDING" | "RUNNING" | "PARTIAL" | "APPROVED" | "COMPLETE" | "UNKNOWN";
   label: string; green: boolean; currentTip: "passed" | "not required" | "pending" | "failed" | "unknown";
   comparable: boolean; comparison: "matching graph" | "not comparable";
@@ -40,12 +44,18 @@ export class OperatorStateFold {
   private approved = false;
   private tipFailed = false;
   private lastEventAt?: string;
+  private firstEventAt?: string;
+  private resumes = 0;
+  private escalations = 0;
   private passed = 0;
   private total = 0;
 
   apply(record: OperatorRecord): void {
     const { event: e } = record;
     this.lastEventAt = e.ts;
+    this.firstEventAt ??= e.ts;
+    if (e.event === "run-resume") this.resumes++;
+    if (e.event === "escalation") this.escalations++;
     const ref = identity(record);
     if (e.event === "run-start" || e.event === "run-resume") {
       if (e.event === "run-start" && !this.start) {
@@ -89,16 +99,19 @@ export class OperatorStateFold {
       t.path = typeof e.data.worktree === "string" ? e.data.worktree : typeof e.data.cwd === "string" ? e.data.cwd : undefined;
       t.pane = typeof e.data.pane === "string" ? e.data.pane : undefined;
       t.alarmMs = typeof e.data.alarmMs === "number" ? e.data.alarmMs : undefined;
+      const a = e.data.assignment as { adapter?: unknown; model?: unknown } | undefined;
+      if (a && typeof a.adapter === "string" && typeof a.model === "string") t.channel = `${a.adapter}:${a.model}`;
     }
     if (e.event === "task-done") t.state = "completed";
     if (e.event === "merge") { t.state = "merged"; t.merged = true; t.mergeEvidence = ref; t.parkKind = undefined; }
     if (e.event === "task-failed") t.state = "failed";
-    if (e.event === "task-human") { t.state = "human"; t.parkKind = typeof e.data.kind === "string" ? e.data.kind : undefined; }
+    if (e.event === "task-human") { t.state = "human"; t.parks++; t.parkKind = typeof e.data.kind === "string" ? e.data.kind : undefined; }
     if (e.event === "task-blocked") t.state = "blocked";
     if (e.event === "task-approved") { t.state = "pending"; t.parkKind = undefined; this.approved = !this.active; }
     const gate = e.data.gate;
     if (typeof gate === "string" && (GATE_NAMES as readonly string[]).includes(gate)) {
       if (e.event === "gate-start") t.gates[gate] = { state: "running", evidence: ref };
+      if (e.event === "gate-result" && gate === "review") t.reviewRounds++;
       if (e.event === "gate-result") t.gates[gate] = {
         state: e.data.disabled === true ? "disabled" : e.data.skipped === true ? "not-run" : e.data.pass === true ? "passed" : e.data.pass === false ? "failed" : "unknown", evidence: ref,
       };
@@ -106,7 +119,7 @@ export class OperatorStateFold {
   }
   private task(id: string): OperatorTask {
     let t = this.tasks.get(id);
-    if (!t) { t = { id, state: "unknown", merged: false, dispatches: 0, gates: emptyGates() }; this.tasks.set(id, t); }
+    if (!t) { t = { id, state: "unknown", merged: false, dispatches: 0, reviewRounds: 0, parks: 0, gates: emptyGates() }; this.tasks.set(id, t); }
     return t;
   }
   snapshot({ graph, sequence = 0, observedAt = Date.now(), readable = true }: {
@@ -116,7 +129,7 @@ export class OperatorStateFold {
     const comparable = this.comparableTo(hash);
     const ids = comparable ? [...graph!.tasks.map(t => t.id), ...[...this.tasks.keys()].filter(id => !graph!.tasks.some(t => t.id === id))] : [...this.tasks.keys()];
     const tasks = ids.map(id => {
-      const t = this.tasks.get(id) ?? { id, state: "unknown" as const, merged: false, dispatches: 0, gates: emptyGates() };
+      const t = this.tasks.get(id) ?? { id, state: "unknown" as const, merged: false, dispatches: 0, reviewRounds: 0, parks: 0, gates: emptyGates() };
       return { ...t, title: comparable ? graph!.tasks.find(g => g.id === id)?.title : undefined, gates: Object.fromEntries(Object.entries(t.gates).map(([g, cell]) => [g, { ...cell }])) };
     });
     const buckets = Object.fromEntries(bucketNames.map(k => [k, this.end?.buckets[k] === undefined ? undefined : [...this.end.buckets[k]!]])) as OperatorSnapshot["buckets"];
@@ -133,7 +146,7 @@ export class OperatorStateFold {
       && bucketNames.every(k => buckets[k]?.length === 0);
     const lifecycle: OperatorSnapshot["lifecycle"] = !readable || !this.start ? "UNKNOWN" : this.active ? "RUNNING" : this.approved ? "APPROVED" : green ? "COMPLETE" : this.end ? "PARTIAL" : "PENDING";
     return {
-      sequence, observedAt, lastEventAt: this.lastEventAt, lifecycle,
+      sequence, observedAt, lastEventAt: this.lastEventAt, firstEventAt: this.firstEventAt, resumes: this.resumes, escalations: this.escalations, lifecycle,
       label: this.approved ? "approved; resume required" : lifecycle,
       green, currentTip, comparable, comparison: comparable ? "matching graph" : "not comparable",
       merged,

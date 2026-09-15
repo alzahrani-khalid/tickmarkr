@@ -4,18 +4,25 @@ import { join } from "node:path";
 import { expect, test } from "vitest";
 import { parse } from "yaml";
 
-import { fleet, writeFleetOverlay } from "../../src/cli/commands/fleet.js";
+import * as registry from "../../src/adapters/registry.js";
+import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
+import { assembleFleetEditor, fleet, writeFleetOverlay } from "../../src/cli/commands/fleet.js";
 import {
   fleetEditableFromConfig,
   fleetRepoOverlayFromDelta,
   loadConfig,
+  loadConfigWithMode,
   renderFleetOverlayWrite,
   type FleetEditable,
 } from "../../src/config/config.js";
+import { disallowedBy } from "../../src/route/preference.js";
+import { makeRepo } from "../helpers/tmprepo.js";
 
 const editable = (over: Partial<FleetEditable> = {}): FleetEditable => ({
   denyAdapters: [],
   denyModels: [],
+  denyWorkersAdapters: [],
+  denyWorkersModels: [],
   tiers: {},
   map: {},
   floors: {},
@@ -207,7 +214,7 @@ test("test: fleet --print output parses as YAML and its parsed routing and tiers
   }
 });
 
-test("v1.92 membership write: changed exclusion sets emit the minimal routing.allow form — bare ids for fully-in adapters, adapter:model keys for partially-in — and tombstone the deny adapters/models scopes while deny.workers survives byte-for-byte", () => {
+test("v1.92 membership write: changed exclusion sets emit the minimal routing.allow form — bare ids for fully-in adapters, adapter:model keys for partially-in — and tombstone the changed deny scope while the untouched deny adapters scope and deny.workers survive byte-for-byte", () => {
   const prior = [
     "routing:",
     "  deny:",
@@ -232,11 +239,13 @@ test("v1.92 membership write: changed exclusion sets emit the minimal routing.al
   // grok fully out ⇒ absent; claude-code fully in ⇒ bare id; codex partially in ⇒ adapter:model
   expect(parsed.routing.allow.adapters).toEqual(["claude-code"]);
   expect(parsed.routing.allow.models).toEqual(["codex:gpt-5.6-luna"]);
-  expect(parsed.routing.deny.adapters).toBeNull();
+  // LEG2-T3 finding 4: the adapters scope is untouched (grok stays out, same set) — its raw bytes
+  // and comment survive; only the changed models scope is tombstoned
+  expect(parsed.routing.deny.adapters).toEqual(["grok"]);
   expect(parsed.routing.deny.models).toBeNull();
   expect(parsed.routing.deny.workers).toEqual({ adapters: ["pi"] });
   expect(written).toContain("    workers:\n      adapters:\n        - pi  # reviewer-only mask, fleet never touches it");
-  expect(written).toMatch(/^    adapters: null {2}# rail mask$/m);
+  expect(written).not.toContain("adapters: null");
   expect(occurrences(written, "rail mask")).toBe(1);
 });
 
@@ -413,12 +422,14 @@ test("OBS-517 deny fail-open: a denied model the probe universe does not serve s
   expect(initial.denyModels).toContain("claude-code:fable");
   expect(initial.denyModels).toContain("codex:gpt-5.5");
 
-  // write leg: an unrelated membership change keeps the residual in routing.deny
+  // write leg: an unrelated membership change keeps the residual in routing.deny — and (LEG2-T3
+  // round 2 finding 2) every entry the overlay authored that is still staged, so codex:gpt-5.5
+  // stays its own reason instead of being re-expressed through the allow form
   const edited = structuredClone(initial);
   edited.denyModels = [...new Set([...edited.denyModels, "codex:gpt-5.6-sol"])].sort();
   const written = renderFleetOverlayWrite(prior, { initial, edited, universe });
   const parsed = parse(written);
-  expect(parsed.routing.deny.models).toEqual(["claude-code:fable"]);
+  expect(parsed.routing.deny.models).toEqual(["claude-code:fable", "codex:gpt-5.5"]);
   expect(parsed.routing.deny.adapters).toBeNull();
   expect(parsed.routing.allow).toEqual({ adapters: ["claude-code"] });
   expect(written).toContain("# operator-directed: replaced by claude-opus-5 at lower cost");
@@ -487,4 +498,272 @@ test("OBS-533 tombstone crash: a fleet write stays total over legal scalar inter
   expect(parse(repinned).routing.map.spec.pin).toEqual({ via: "claude-code", model: "fable" });
 
   expect(renderFleetOverlayWrite("", { initial: pinned, edited: bare })).toBe("");
+});
+
+test("test: for each of the four deny scopes loading the overlay written from the staged edit yields exactly the staged reach, an untouched scope keeps its raw bytes and comments and an entry outside the probe universe survives byte for byte, a cleared scope is absent from the loaded policy, an empty map, an empty list, null and absence written unchanged read back as the same raw form, and the preview equals the loader over the candidate bytes under a global layer the repo overlay tombstones, so a writer that drops the workers scope, merges two raw forms, or previews through a second merge fails", () => {
+  const freshRepo = () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-"));
+    mkdirSync(join(dir, ".tickmarkr"), { recursive: true });
+    return dir;
+  };
+  const freshGlobal = () => mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-g-"));
+  const load = (written: string) => {
+    const repo = freshRepo();
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), written);
+    return loadConfig(repo, { globalDir: freshGlobal() });
+  };
+
+  // 1) each of the four deny scopes: the overlay written from a staged edit yields exactly the
+  //    staged reach when reloaded — proven per scope rather than generically over a path table
+  const staged = ["fake:one", "fake:two"];
+  const adapters = load(renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyAdapters: staged }) }));
+  expect(adapters.routing.deny?.adapters).toEqual(staged);
+  const models = load(renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyModels: staged }) }));
+  expect(models.routing.deny?.models).toEqual(staged);
+  const workersAdapters = load(renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyWorkersAdapters: staged }) }));
+  expect(workersAdapters.routing.deny?.workers?.adapters).toEqual(staged);
+  const workersModels = load(renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyWorkersModels: staged }) }));
+  expect(workersModels.routing.deny?.workers?.models).toEqual(staged);
+
+  // 2) an untouched scope keeps its raw bytes and comments, and an entry outside the probe
+  //    universe survives byte for byte — editing the flat scope leaves a workers entry the
+  //    universe never served completely alone
+  const prior = [
+    "routing:",
+    "  deny:",
+    "    workers:",
+    "      models:",
+    "        - fake:outside-universe  # operator note, untouched scope",
+    "",
+  ].join("\n");
+  const universe = [{ adapter: "fake", models: ["one"] }];
+  const untouched = renderFleetOverlayWrite(prior, {
+    initial: editable(),
+    edited: editable({ denyModels: ["fake:one"] }),
+    universe,
+  });
+  expect(untouched).toContain("        - fake:outside-universe  # operator note, untouched scope");
+  expect(occurrences(untouched, "operator note, untouched scope")).toBe(1);
+  expect(load(untouched).routing.deny?.workers?.models).toEqual(["fake:outside-universe"]);
+
+  // 3) a cleared scope is absent from the loaded policy — every deny scope tombstones to nothing
+  const clearAdapters = load(renderFleetOverlayWrite(
+    renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyAdapters: staged }) }),
+    { initial: editable({ denyAdapters: staged }), edited: editable() },
+  ));
+  expect(clearAdapters.routing.deny?.adapters).toBeUndefined();
+  const clearModels = load(renderFleetOverlayWrite(
+    renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyModels: staged }) }),
+    { initial: editable({ denyModels: staged }), edited: editable() },
+  ));
+  expect(clearModels.routing.deny?.models).toBeUndefined();
+  const clearWorkersAdapters = load(renderFleetOverlayWrite(
+    renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyWorkersAdapters: staged }) }),
+    { initial: editable({ denyWorkersAdapters: staged }), edited: editable() },
+  ));
+  expect(clearWorkersAdapters.routing.deny?.workers?.adapters).toBeUndefined();
+  const clearWorkersModels = load(renderFleetOverlayWrite(
+    renderFleetOverlayWrite("", { initial: editable(), edited: editable({ denyWorkersModels: staged }) }),
+    { initial: editable({ denyWorkersModels: staged }), edited: editable() },
+  ));
+  expect(clearWorkersModels.routing.deny?.workers?.models).toBeUndefined();
+
+  // 4) an empty map, an empty list, null and absence written UNCHANGED read back as the same raw
+  //    form — a no-op write over any of the four states must not normalize it into another
+  const rawForms: Array<[string, string]> = [
+    ["empty map", "routing:\n  deny:\n    workers: {}\n"],
+    ["empty list", "routing:\n  deny:\n    workers:\n      adapters: []\n"],
+    ["null", "routing:\n  deny:\n    workers: null\n"],
+    ["absence", "routing:\n  concurrency: 3\n"],
+  ];
+  for (const [name, raw] of rawForms) {
+    const state = editable();
+    expect(renderFleetOverlayWrite(raw, { initial: state, edited: state }), name).toBe(raw);
+  }
+
+  // 5) the preview resolves the candidate bytes through the config loader's overlay seam — a
+  //    global layer's workers deny, tombstoned by a staged repo edit, previews (loadConfigWithMode
+  //    over the candidate bytes) EXACTLY what a real write of those same bytes then loads, never a
+  //    second merge on top of the already-merged initial state
+  const previewRepo = freshRepo();
+  const previewGlobal = freshGlobal();
+  writeFileSync(join(previewGlobal, "config.yaml"), "routing:\n  deny:\n    workers:\n      models: [global:banned]\n");
+  const inherited = fleetEditableFromConfig(loadConfig(previewRepo, { globalDir: previewGlobal }));
+  expect(inherited.denyWorkersModels).toEqual(["global:banned"]);
+  const candidate = renderFleetOverlayWrite("", {
+    initial: inherited,
+    edited: { ...inherited, denyWorkersModels: [] },
+  });
+  const preview = loadConfigWithMode(previewRepo, { globalDir: previewGlobal, repoOverlayText: candidate }).cfg;
+  writeFileSync(join(previewRepo, ".tickmarkr", "config.yaml"), candidate);
+  const real = loadConfig(previewRepo, { globalDir: previewGlobal });
+  expect(preview.routing.deny?.workers?.models).toBeUndefined();
+  expect(preview.routing).toEqual(real.routing);
+});
+
+// ── Leg-2 T3 fix leg (LEG2-T3-ASTRA findings 2 and 4) ──────────────────────────────────────────
+
+test("finding 4: the universe-bearing membership write keeps an untouched flat deny scope's raw bytes and comments, and rewrites a scope only when its set changed or one of its entries still covers a channel the edit admits", () => {
+  const universe = [
+    { adapter: "fake", models: ["one", "two"] },
+    { adapter: "other", models: ["x", "y"] },
+  ];
+  const load = (written: string) => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-untouched-"));
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), written);
+    return loadConfig(repo, { globalDir: mkdtempSync(join(tmpdir(), "tickmarkr-fleet-untouched-g-")) });
+  };
+  const out = (cfg: ReturnType<typeof loadConfig>, adapter: string, model: string) =>
+    disallowedBy({ adapter, model }, cfg.routing, "judge") !== null;
+
+  // changing ONLY the models exclusion leaves the adapters scope byte-for-byte, comment included
+  const prior = "routing:\n  deny:\n    adapters: [fake] # keep this adapter policy\n";
+  const written = renderFleetOverlayWrite(prior, {
+    initial: editable({ denyAdapters: ["fake"] }),
+    edited: editable({ denyAdapters: ["fake"], denyModels: ["other:x"] }),
+    universe,
+  });
+  expect(written).toContain("    adapters: [fake] # keep this adapter policy\n");
+  const cfg = load(written);
+  expect(cfg.routing.deny?.adapters).toEqual(["fake"]);
+  expect([out(cfg, "fake", "one"), out(cfg, "fake", "two"), out(cfg, "other", "x"), out(cfg, "other", "y")])
+    .toEqual([true, true, true, false]);
+
+  // an unchanged set whose entry covers a channel the edit admits is NOT untouched: it must go,
+  // or the admitted channel would stay excluded behind the preserved bytes
+  const crossList = "routing:\n  deny:\n    adapters: [other:x]  # a model key in the adapters list\n";
+  const admitted = renderFleetOverlayWrite(crossList, {
+    initial: editable({ denyModels: ["other:x"] }),
+    edited: editable(),
+    universe,
+  });
+  expect(out(load(admitted), "other", "x")).toBe(false);
+});
+
+test("finding 2: the production preview loads the candidate bytes through the config loader's overlay seam — clearing an on-disk and a global workers deny returns both channels to the picker, and the staged routing equals the loader over the reviewed bytes", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-preview-g-"));
+  writeFileSync(join(globalDir, "config.yaml"), "routing:\n  deny:\n    workers:\n      adapters: [fake]\n");
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+    "tiers:",
+    "  fake:",
+    "    vendor: fake",
+    "    channel: sub",
+    "    models:",
+    "      fake-1: frontier",
+    "      fake-2: frontier",
+    "routing:",
+    "  deny:",
+    "    workers:",
+    "      models: [fake:fake-1]  # on-disk worker ban",
+    "",
+  ].join("\n"));
+  const adapter: WorkerAdapter = {
+    id: "fake",
+    vendor: "fake",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (c) => channelsFromConfig("fake", c),
+    headlessCommand: () => "fake",
+    interactiveCommand: () => null,
+    invoke: () => ({ command: "fake" }),
+    parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+    listModels: async () => [],
+  };
+  registry.writeDoctor(repo, {
+    fake: {
+      installed: true,
+      authed: true,
+      version: "fake",
+      models: ["fake-1", "fake-2"],
+      modelAuth: {
+        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+      },
+    },
+  });
+  const assembled = await assembleFleetEditor(repo, [adapter], {}, { globalDir });
+  if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+  const { props } = assembled;
+  expect(props.initialDenyWorkersModels).toEqual(["fake:fake-1"]);
+  expect(props.initialDenyWorkersAdapters).toEqual(["fake"]);
+
+  const cleared = { adapters: [], models: [], workersAdapters: [], workersModels: [] };
+  const ids = props.candidatesForShape("implement", props.initialMode, props.initialMap, cleared).rows.map((r) => r.id);
+  expect(ids).toEqual(expect.arrayContaining(["fake:fake-1", "fake:fake-2"]));
+
+  const review = props.reviewOverlay({
+    denyAdapters: [],
+    denyModels: [],
+    denyWorkersAdapters: [],
+    denyWorkersModels: [],
+    classifications: [],
+    selectedMode: props.initialMode,
+    map: props.initialMap,
+    steering: props.initialSteering,
+  });
+  if (review.kind !== "diff") throw new Error("clearing both worker bans must stage a diff");
+  const loaded = loadConfigWithMode(repo, { globalDir, repoOverlayText: review.after }).cfg;
+  expect(loaded.routing.deny?.workers?.models).toBeUndefined();
+  expect(loaded.routing.deny?.workers?.adapters).toBeUndefined();
+  expect(props.stagedRouting?.(cleared)).toEqual({ ok: true, routing: loaded.routing });
+});
+
+test("judge c2: a staged edit whose candidate bytes the loader refuses renders an explicit preview-unavailable state naming the refusal on every preview surface, never the mode's resolved config in its place", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-refused-g-"));
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+    "tiers:",
+    "  fake:",
+    "    vendor: fake",
+    "    channel: sub",
+    "    models:",
+    "      fake-1: frontier",
+    "      fake-2: frontier",
+    "",
+  ].join("\n"));
+  const adapter: WorkerAdapter = {
+    id: "fake",
+    vendor: "fake",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (c) => channelsFromConfig("fake", c),
+    headlessCommand: () => "fake",
+    interactiveCommand: () => null,
+    invoke: () => ({ command: "fake" }),
+    parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+    listModels: async () => [],
+  };
+  registry.writeDoctor(repo, {
+    fake: {
+      installed: true,
+      authed: true,
+      version: "fake",
+      models: ["fake-1", "fake-2"],
+      modelAuth: {
+        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+      },
+    },
+  });
+  const assembled = await assembleFleetEditor(repo, [adapter], {}, { globalDir });
+  if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+  const { props } = assembled;
+  const deny = { adapters: [], models: [], workersAdapters: [], workersModels: [] };
+  // pin AND pool on one shape: the writer emits both, the loader's exclusivity refine refuses them
+  const refused = {
+    ...props.initialMap,
+    docs: { pin: { via: "fake", model: "fake-1" }, pool: { mode: "any" as const, channels: ["fake:fake-2"] } },
+  };
+
+  const picked = props.candidatesForShape("docs", props.initialMode, refused, deny);
+  expect(picked.rows).toEqual([]);
+  expect(picked.excludedNote).toContain("preview unavailable");
+  expect(picked.excludedNote).toContain("pin and pool are one declaration");
+  expect(props.modePreview(props.initialMode, refused, deny).join("\n")).toContain("preview unavailable");
+  expect(props.shapeRows(props.initialMode, refused, deny).every((row) => row.label.includes("preview unavailable"))).toBe(true);
+  // the loadable staged state still previews normally
+  expect(props.candidatesForShape("docs", props.initialMode, props.initialMap, deny).rows.length).toBeGreaterThan(0);
+  expect(props.stagedRouting?.(deny)).toMatchObject({ ok: true });
 });

@@ -2,8 +2,10 @@ import { Box, render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
 import { retiredModelReason } from "../../adapters/model-lints.js";
-import type { MapEntry, RoutingMode, Tier } from "../../config/config.js";
+import type { MapEntry, RoutingMode, Tier, TickmarkrConfig } from "../../config/config.js";
 import { fleetFirstTouchProvenance } from "../../config/fleet-overlay.js";
+import { exclusionReason } from "../../config/fleet-why.js";
+import { entryMatchesChannel, exclusionCollector } from "../../route/preference.js";
 import { TIERS, type Shape } from "../../graph/schema.js";
 import { windowRows } from "./components.js";
 import {
@@ -33,6 +35,9 @@ const STEERING_KEYS: FleetSteeringKey[] = ["review", "consult"];
 export type FleetEditorState = {
   denyAdapters: string[];
   denyModels: string[];
+  // OBS-994/FL-1: the worker-only deny scope, staged and written beside the flat scopes above.
+  denyWorkersAdapters: string[];
+  denyWorkersModels: string[];
   classifications: FleetClassification[];
   selectedMode: RoutingMode;
   map: Record<string, MapEntry>;
@@ -77,7 +82,12 @@ export type FleetModelEvidence = {
   probeMs?: number;
   /** OBS-519: doctor's failed model-auth verdict reason — the row must not render like a healthy one */
   unauthed?: string;
+  /** OBS-972/FL-1: a floating alias's resolved concrete model id (e.g. "opus" → "claude-opus-5") */
+  identity?: string;
 };
+
+/** The four staged deny sets every preview and the staged routing policy are computed from. */
+export type FleetStagedDeny = { adapters: string[]; models: string[]; workersAdapters: string[]; workersModels: string[] };
 
 export type FleetModelGroup = {
   adapter: string;
@@ -147,7 +157,17 @@ type ClassifyBulk = { adapter: string; vendor: string; rows: Array<{ model: stri
 
 /** OBS-530: `excludedNote` names the channels the picker CANNOT offer (staged out, denied,
  * unauthed, unclassified) — the picker's silence was indistinguishable from a bug. */
-type CandidatesOverlay = { kind: "candidates"; shape: Shape; rows: FleetCandidateOption[]; excludedNote?: string; chain: string[]; at: number };
+type CandidatesOverlay = {
+  kind: "candidates";
+  shape: Shape;
+  rows: FleetCandidateOption[];
+  excludedNote?: string;
+  /** LEG2-T3 round 2 finding 4: one line per channel naming its reasons — navigable rows below the
+   * candidates, so no explanation is ever elided on a short terminal */
+  ledger: string[];
+  chain: string[];
+  at: number;
+};
 
 type Overlay =
   | { kind: "presets"; at: number; home: boolean }
@@ -179,6 +199,15 @@ type RailRow =
   | { kind: "view"; view: View; label: string; count: number }
   | { kind: "adapter"; index: number };
 
+// OBS-994/FL-1: a channel's fleet reach — "in" (every role), "out-workers" (worker seats only
+// excluded, judge/review/consult unaffected), "out-all" (a flat deny excludes it for every role) or
+// "out-allow" (every role, because routing.allow does not admit it).
+// "unknown" means the staged policy itself does not load (judge c2): no reach is claimed.
+export type FleetReach = "in" | "out-workers" | "out-all" | "out-allow" | "unknown";
+
+/** The staged routing policy, or the loader's refusal of the staged overlay. */
+export type FleetStagedRouting = { ok: true; routing: TickmarkrConfig["routing"] } | { ok: false; error: string };
+
 type ModelRow = {
   adapter: string;
   model: string;
@@ -192,6 +221,11 @@ type ModelRow = {
   foldedModels?: string[];
   score?: number;
   denied: boolean;
+  reach: FleetReach;
+  /** every exclusion-collector scope for the worker seat, as `config.path (entry)` */
+  reasons: string[];
+  /** a resolved alias no deny scope of the staged policy covers */
+  uncoveredAlias: boolean;
 };
 
 type Ui = {
@@ -212,8 +246,13 @@ type Ui = {
   /** v1.92: the FIRST Shapes entry per session auto-raises the presets overlay (both entries) */
   presetsSeen: boolean;
   notice: string;
+  /** judge c3: the one entry the last Space press edited, named on that channel's detail line */
+  lastEdit: { id: string; text: string } | null;
   deny: Set<string>;
   denyModels: Set<string>;
+  /** OBS-994/FL-1: worker-only deny scope, staged in parallel with the flat sets above */
+  denyWorkersAdapters: Set<string>;
+  denyWorkersModels: Set<string>;
   classifications: FleetClassification[];
   selectedMode: RoutingMode;
   map: Record<string, MapEntry>;
@@ -229,6 +268,8 @@ export function FleetApp({
   agents,
   initialDenyAdapters,
   initialDenyModels,
+  initialDenyWorkersAdapters = [],
+  initialDenyWorkersModels = [],
   modelGroups,
   initialMode,
   modeOptions,
@@ -241,6 +282,7 @@ export function FleetApp({
   steeringOptionsFor,
   reviewOverlay,
   reloadGuard,
+  stagedRouting,
   entry = "probe",
   initialJudge = "",
   judgeSeats = [],
@@ -252,23 +294,28 @@ export function FleetApp({
   agents: AgentCli[];
   initialDenyAdapters: string[];
   initialDenyModels: string[];
+  initialDenyWorkersAdapters?: string[];
+  initialDenyWorkersModels?: string[];
   modelGroups: FleetModelGroup[];
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
   initialMap: Record<string, MapEntry>;
-  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => string[];
-  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => FleetShapeRow[];
+  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => string[];
+  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => FleetShapeRow[];
   candidatesForShape: (
     shape: Shape,
     mode: RoutingMode,
     map: Record<string, MapEntry>,
-    deny: { adapters: string[]; models: string[] },
-  ) => { rows: FleetCandidateOption[]; excludedNote?: string };
+    deny: FleetStagedDeny,
+  ) => { rows: FleetCandidateOption[]; excludedNote?: string; ledger?: string[] };
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
+  /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
+   * bytes); absent ⇒ the four staged sets alone, with no allowlist */
+  stagedRouting?: (deny: FleetStagedDeny) => FleetStagedRouting;
   // "presets" is init's entry point: the browser still opens on the models view (fleet scoping
   // first), but Esc is HOME to the routing-preset overlay instead of quit; Enter on a preset
   // there goes straight to the review diff, custom closes back into the browser.
@@ -300,8 +347,11 @@ export function FleetApp({
     showAll: false,
     presetsSeen: false,
     notice: "",
+    lastEdit: null,
     deny: new Set(initialDenyAdapters),
     denyModels: new Set(initialDenyModels),
+    denyWorkersAdapters: new Set(initialDenyWorkersAdapters),
+    denyWorkersModels: new Set(initialDenyWorkersModels),
     classifications: [],
     selectedMode: initialMode,
     map: structuredClone(initialMap),
@@ -320,6 +370,8 @@ export function FleetApp({
   // chip, and the empty-`w` notice all read it. Counts staged EDITS, not diff hunks.
   const initialDenySet = new Set(initialDenyAdapters);
   const initialDenyModelSet = new Set(initialDenyModels);
+  const initialDenyWorkersAdapterSet = new Set(initialDenyWorkersAdapters);
+  const initialDenyWorkersModelSet = new Set(initialDenyWorkersModels);
   const stagedCount = (): number => {
     let n = ui.classifications.length
       + (ui.selectedMode !== initialMode ? 1 : 0)
@@ -328,6 +380,10 @@ export function FleetApp({
     for (const adapter of initialDenySet) if (!ui.deny.has(adapter)) n += 1;
     for (const model of ui.denyModels) if (!initialDenyModelSet.has(model)) n += 1;
     for (const model of initialDenyModelSet) if (!ui.denyModels.has(model)) n += 1;
+    for (const adapter of ui.denyWorkersAdapters) if (!initialDenyWorkersAdapterSet.has(adapter)) n += 1;
+    for (const adapter of initialDenyWorkersAdapterSet) if (!ui.denyWorkersAdapters.has(adapter)) n += 1;
+    for (const model of ui.denyWorkersModels) if (!initialDenyWorkersModelSet.has(model)) n += 1;
+    for (const model of initialDenyWorkersModelSet) if (!ui.denyWorkersModels.has(model)) n += 1;
     for (const shape of new Set([...Object.keys(initialMap), ...Object.keys(ui.map)])) {
       // {} ≡ absent: pin-then-auto leaves an empty entry that writes nothing — not staged work
       if (JSON.stringify(initialMap[shape] ?? {}) !== JSON.stringify(ui.map[shape] ?? {})) n += 1;
@@ -340,11 +396,48 @@ export function FleetApp({
 
   // ── derived data ───────────────────────────────────────────────────────────
 
-  const enabledGroups = () => modelGroups.filter((group) => !ui.deny.has(group.adapter));
+  // OBS-994/FL-1 repair: a flatly (or workers-) denied adapter's channels stay VISIBLE here —
+  // every channel needs a reach cell, and Space below can only cycle a scope it can see.
+  const enabledGroups = () => modelGroups;
   const scopedGroups = (): FleetModelGroup[] => {
     if (ui.adapterAt === -1) return enabledGroups();
     const group = modelGroups[ui.adapterAt];
-    return group && !ui.deny.has(group.adapter) ? [group] : [];
+    return group ? [group] : [];
+  };
+
+  // LEG2-T3 finding 1: a channel's reach and every reason come from the exclusion collector over
+  // the STAGED policy (fleet loads the candidate bytes; see stagedRouting) and the recorded
+  // identity — never literal membership of the staged sets, which missed identity, bare-model and
+  // family entries and could not tell an allowlist exclusion from a deny.
+  let routingMemo: { key: string; policy: FleetStagedRouting } | null = null;
+  const stagedPolicy = (): FleetStagedRouting => {
+    const deny = stagedDeny();
+    const key = JSON.stringify(deny);
+    if (routingMemo?.key !== key) {
+      routingMemo = {
+        key,
+        policy: stagedRouting
+          ? stagedRouting(deny)
+          : { ok: true, routing: { deny: { adapters: deny.adapters, models: deny.models, workers: { adapters: deny.workersAdapters, models: deny.workersModels } } } as TickmarkrConfig["routing"] },
+      };
+    }
+    return routingMemo.policy;
+  };
+  const reachFor = (adapter: string, model: string, identity?: string): Pick<ModelRow, "reach" | "reasons" | "uncoveredAlias"> => {
+    const policy = stagedPolicy();
+    if (!policy.ok) return { reach: "unknown", reasons: [`preview unavailable (${policy.error})`], uncoveredAlias: false };
+    const channel = { adapter, model, ...(identity !== undefined ? { identity } : {}) };
+    const worker = exclusionCollector(channel, policy.routing, "worker");
+    const allSeats = exclusionCollector(channel, policy.routing, "judge");
+    const reach: FleetReach = allSeats.some((scope) => scope.by === "deny") ? "out-all"
+      : allSeats.length ? "out-allow"
+      : worker.length ? "out-workers"
+      : "in";
+    return {
+      reach,
+      reasons: worker.map(exclusionReason),
+      uncoveredAlias: identity !== undefined && !worker.some((scope) => scope.by === "deny"),
+    };
   };
 
   const groupRows = (group: FleetModelGroup): ModelRow[] => {
@@ -353,6 +446,7 @@ export function FleetApp({
         (classification) => classification.adapter === group.adapter
           && (classification.model === row.model || classification.model === row.classifyModel),
       );
+      const reach = reachFor(group.adapter, row.model, row.evidence?.identity);
       return {
         adapter: group.adapter,
         model: row.model,
@@ -365,18 +459,21 @@ export function FleetApp({
         variants: row.variants,
         foldedModels: row.foldedModels,
         score: row.score,
-        denied: ui.denyModels.has(`${group.adapter}:${row.model}`),
+        denied: reach.reach !== "in",
+        ...reach,
       };
     });
     const known = new Set(rows.flatMap((row) => row.classifyModel ? [row.model, row.classifyModel] : [row.model]));
     for (const staged of ui.classifications) {
       if (staged.adapter === group.adapter && !known.has(staged.model)) {
+        const reach = reachFor(group.adapter, staged.model);
         rows.push({
           adapter: group.adapter,
           model: staged.model,
           tier: staged.tier,
           channel: group.channel,
-          denied: ui.denyModels.has(`${group.adapter}:${staged.model}`),
+          denied: reach.reach !== "in",
+          ...reach,
         });
       }
     }
@@ -413,8 +510,14 @@ export function FleetApp({
       .filter((row) => ui.showAll || row.tier !== undefined || retiredModelReason(row.model) === null).length;
   };
 
-  // three preview callbacks share it in lockstep — the staged deny truth every preview ranks under
-  const stagedDeny = () => ({ adapters: [...ui.deny].sort(), models: [...ui.denyModels].sort() });
+  // three preview callbacks share it in lockstep — the staged deny truth every preview ranks under.
+  // LEG2-T3 finding 2: all four scopes travel distinct; the preview loads them as written.
+  const stagedDeny = (): FleetStagedDeny => ({
+    adapters: [...ui.deny].sort(),
+    models: [...ui.denyModels].sort(),
+    workersAdapters: [...ui.denyWorkersAdapters].sort(),
+    workersModels: [...ui.denyWorkersModels].sort(),
+  });
   const shapeList = () => shapeRows(ui.selectedMode, ui.map, stagedDeny());
   const steeringList = () => [
     ...STEERING_KEYS.map((key) => ({
@@ -444,6 +547,8 @@ export function FleetApp({
   const editorState = (): FleetEditorState => ({
     denyAdapters: [...ui.deny].sort(),
     denyModels: [...ui.denyModels].sort(),
+    denyWorkersAdapters: [...ui.denyWorkersAdapters].sort(),
+    denyWorkersModels: [...ui.denyWorkersModels].sort(),
     classifications: ui.classifications.map((classification) =>
       classification.vendor && classification.channel
         ? {
@@ -886,12 +991,13 @@ export function FleetApp({
 
       if (overlay.kind === "candidates") {
         const rows = overlay.rows.filter((candidate) => matches(candidate.label, ui.filter));
+        const ledger = overlay.ledger.filter((line) => matches(line, ui.filter));
         if (key.escape) {
           setOverlay(null);
           return;
         }
         if (key.downArrow) {
-          overlay.at = Math.min(overlay.at + 1, Math.max(rows.length - 1, 0));
+          overlay.at = Math.min(overlay.at + 1, Math.max(rows.length + ledger.length - 1, 0));
           bump();
           return;
         }
@@ -924,7 +1030,8 @@ export function FleetApp({
           return;
         }
         editFilter(
-          (f) => overlay.rows.filter((candidate) => matches(candidate.label, f)).length,
+          (f) => overlay.rows.filter((candidate) => matches(candidate.label, f)).length
+            + overlay.ledger.filter((line) => matches(line, f)).length,
           (max) => {
             overlay.at = Math.min(overlay.at, max);
           },
@@ -1218,11 +1325,67 @@ export function FleetApp({
           beginClassification(row.adapter, row.model);
           return;
         }
+        // OBS-994/FL-1: membership can't fix an auth failure either — the row's reach stays
+        // whatever it is and the operator is pointed at doctor instead of a toggle that lies.
+        if (row.evidence?.unauthed !== undefined) {
+          ui.notice = `${row.adapter}:${row.model} is unauthed — re-probe with tickmarkr doctor before its fleet reach can change`;
+          bump();
+          return;
+        }
         const id = `${row.adapter}:${row.model}`;
-        const next = new Set(ui.denyModels);
-        if (next.has(id)) next.delete(id);
-        else next.add(id);
-        ui.denyModels = next;
+        // OBS-994/FL-1, LEG2-T3 finding 3: Space cycles in → out(workers) → out(all) → in by editing
+        // only THIS channel's own entries in the per-model scopes — its adapter:model key, or an
+        // identity/bare-model entry no other browser row matches. An adapter-wide or shared entry
+        // is never promoted or cleared from a channel row: that would move sibling channels and
+        // wipe reasons that are not this row's to clear. The row's detail line names the entry each
+        // press edited; a refused press names the shared entry in the notice instead.
+        const self = { adapter: row.adapter, model: row.model, identity: row.evidence?.identity };
+        const others = modelGroups.flatMap((group) => group.rows
+          .filter((other) => group.adapter !== row.adapter || other.model !== row.model)
+          .map((other) => ({ adapter: group.adapter, model: other.model, identity: other.evidence?.identity })));
+        // Judge c3 (R107): exactly ONE selected entry per press — the channel's adapter:model key when
+        // it is a candidate, else the first candidate in sorted order. The cycle is three states over
+        // two scopes, so the out-workers → out-all press re-scopes that one entry from
+        // routing.deny.workers.models to routing.deny.models; every other press adds or clears one
+        // entry in one scope. The channel's other entries keep their reasons for later presses.
+        // LEG2-T3 round 2 finding 1: promotion widens the selected ban as spelled — a bare model id
+        // then excludes every seat serving that model — while a CLEAR only takes an entry no other
+        // row matches, so no sibling is ever admitted by a channel toggle.
+        const select = (entries: Set<string>, ownOnly: boolean): string | undefined => {
+          const candidates = [...entries].filter((entry) => entryMatchesChannel(entry, self, true)
+            && (!ownOnly || !others.some((other) => entryMatchesChannel(entry, other, true))));
+          return candidates.includes(id) ? id : candidates.sort()[0];
+        };
+        if (row.reach === "unknown") {
+          ui.notice = `${id} reach is unknown — Space does not toggle it until the staged overlay loads: ${row.reasons.join("; ")}`;
+          bump();
+          return;
+        }
+        if (row.reach === "in") {
+          ui.denyWorkersModels = new Set([...ui.denyWorkersModels, id]);
+          ui.lastEdit = { id, text: `space: added ${id} to routing.deny.workers.models` };
+        } else if (row.reach === "out-workers") {
+          const entry = select(ui.denyWorkersModels, false) ?? id;
+          ui.denyWorkersModels = new Set([...ui.denyWorkersModels].filter((staged) => staged !== entry));
+          ui.denyModels = new Set([...ui.denyModels, entry]);
+          ui.lastEdit = { id, text: `space: moved ${entry} to routing.deny.models` };
+        } else {
+          // round 2 finding 2: either flat list may carry this channel's own reason
+          const fromModels = select(ui.denyModels, true);
+          const fromAdapters = fromModels === undefined ? select(ui.deny, true) : undefined;
+          const entry = fromModels ?? fromAdapters;
+          if (entry === undefined) {
+            const shared = ui.deny.has(row.adapter)
+              ? `every ${row.adapter} channel is out together — take the adapter back in on the rail`
+              : "a shared entry covers other channels too";
+            ui.notice = `${id} stays out — ${row.reasons.join("; ")} — Space edits only this channel's own entries; ${shared}`;
+            bump();
+            return;
+          }
+          if (fromModels !== undefined) ui.denyModels = new Set([...ui.denyModels].filter((staged) => staged !== entry));
+          else ui.deny = new Set([...ui.deny].filter((staged) => staged !== entry));
+          ui.lastEdit = { id, text: `space: cleared ${entry} from routing.deny.${fromModels !== undefined ? "models" : "adapters"}` };
+        }
         bump();
         return;
       }
@@ -1337,6 +1500,7 @@ export function FleetApp({
           shape,
           rows: picked.rows,
           excludedNote: picked.excludedNote,
+          ledger: picked.ledger ?? [],
           // OBS-525: an existing pool round-trips — reopening the picker starts from the staged
           // channels instead of an empty selection that would silently replace the pool with a pin.
           chain: ui.map[shape]?.pool?.channels.slice() ?? [],
@@ -1402,10 +1566,35 @@ export function FleetApp({
     return usd;
   };
 
+  // OBS-994/FL-1: the reach line — every collector scope that excludes this row, each with its
+  // config path and matching entry (an unauthed row instead points at the doctor re-probe).
+  const reachDetail = (row: ModelRow): string => {
+    if (row.evidence?.unauthed !== undefined) return "unauthed — re-probe with tickmarkr doctor (Space does not toggle reach)";
+    const reasons = row.reasons.join("; ");
+    if (row.reach === "out-all") return `reach: out · all seats — ${reasons}`;
+    if (row.reach === "out-allow") return `reach: out · all seats · allow — ${reasons}`;
+    if (row.reach === "out-workers") return `reach: out · workers only (judge/review/consult unaffected) — ${reasons}`;
+    if (row.reach === "unknown") return `reach: unknown — ${reasons}`;
+    return "reach: in — Space cycles to out · workers";
+  };
+
+  const reachCell = (row: ModelRow): string =>
+    row.reach === "in" || row.reach === "unknown" ? row.reach : `out ${row.reach === "out-workers" ? "workers" : row.reach.slice(4)}`;
+
+  const identityDetail = (row: ModelRow): string => {
+    if (row.evidence?.identity === undefined) return "";
+    return row.uncoveredAlias
+      ? `resolved identity ${row.evidence.identity} — no deny entry covers it`
+      : `resolved identity ${row.evidence.identity}`;
+  };
+
   const modelDetail = (row: ModelRow): string => {
     const parts = [
       `${row.adapter}:${row.model}`,
       row.tier ?? "unclassified",
+      ui.lastEdit?.id === `${row.adapter}:${row.model}` ? ui.lastEdit.text : "",
+      identityDetail(row),
+      row.tier ? reachDetail(row) : "",
       row.variants?.length ? `variants ${row.variants.join(", ")}` : "",
       row.classifyModel ? `classify writes ${row.classifyModel}` : "",
       row.foldedModels?.length ? `${row.foldedModels.length} gateway ids folded: ${row.foldedModels.join(", ")}` : "",
@@ -1425,8 +1614,8 @@ export function FleetApp({
     const tier = tierCell(row);
     const showProbe = bodyW >= 76;
     const showPrice = bodyW >= 60;
-    // every cell accounted for: pointer 2 + glyph 1 + gap 1 + tier 11 + ctx 6 (+ price 12 + probe 7)
-    const nameW = bodyW - 4 - 11 - 6 - (showPrice ? 12 : 0) - (showProbe ? 7 : 0);
+    // every cell accounted for: pointer 2 + glyph 1 + gap 1 + tier 11 + reach 12 + ctx 6 (+ price 12 + probe 7)
+    const nameW = bodyW - 4 - 11 - 12 - 6 - (showPrice ? 12 : 0) - (showProbe ? 7 : 0);
     // OBS-531: deep router ids (omp/prime-agent) clip tail-preserving — the LAST segment is the
     // distinguishing half; end-clipping rendered ten identical "prime-agent/anthropic/claude-…" rows.
     const folded = row.foldedModels?.length ?? 1;
@@ -1435,19 +1624,22 @@ export function FleetApp({
     return (
       <Text key={`${row.adapter}:${row.model}`} wrap="truncate">
         <Pointer on={selected} />
-        {row.denied
+        {row.reach === "out-all" || row.reach === "out-allow"
           ? <Glyph kind="off" />
-          : row.evidence?.unauthed !== undefined
+          : row.evidence?.unauthed !== undefined || row.reach === "unknown"
             ? <Glyph kind="fail" />
-            : row.tier
-              ? <Glyph kind="on" />
-              : <Glyph kind="unknown" />}
+            : row.reach === "out-workers"
+              ? <Glyph kind="warn" />
+              : row.tier
+                ? <Glyph kind="on" />
+                : <Glyph kind="unknown" />}
         <Text> </Text>
         <Text dimColor={row.denied}>
           <Text dimColor>{name.slice(0, prefixLen)}</Text>
           <Text bold={selected}>{name.slice(prefixLen).padEnd(Math.max(nameW - prefixLen, 0))}</Text>
         </Text>
         <Text color={tier.color} dimColor={tier.dim}>{padCellStart(tier.text, 11)}</Text>
+        <Text dimColor={row.reach === "in"}>{padCellStart(row.tier ? reachCell(row) : "", 12)}</Text>
         <Text dimColor>{padCellStart(fmtCtx(row.evidence?.contextWindow), 6)}</Text>
         {showPrice && <Text dimColor={priceCell(row) === "sub"}>{padCellStart(priceCell(row), 12)}</Text>}
         {showProbe && <Text dimColor>{padCellStart(fmtMs(row.evidence?.probeMs), 7)}</Text>}
@@ -1650,18 +1842,37 @@ export function FleetApp({
 
     if (overlay.kind === "candidates") {
       const rows = overlay.rows.filter((candidate) => matches(candidate.label, ui.filter));
-      const { visible, start, above, below } = windowRows(rows, overlay.at, capacity);
+      // the shape-wide captions, bounded to half the list; per-channel ledger rows are list items below
+      const notes = overlay.excludedNote?.split("\n") ?? [];
+      const noteRoom = Math.max(2, Math.floor(capacity / 2));
+      const noteLines = notes.length > noteRoom
+        ? [...notes.slice(0, noteRoom - 1), `… +${notes.length - noteRoom + 1} more notes`]
+        : notes;
+      const items = [
+        ...rows.map((candidate) => ({ candidate, line: candidate.label })),
+        ...overlay.ledger.filter((line) => matches(line, ui.filter)).map((line) => ({ candidate: undefined, line })),
+      ];
+      const { visible, start, above, below } = windowRows(items, overlay.at, Math.max(1, capacity - noteLines.length + 1));
       const chained = overlay.chain.length > 0;
       return (
         <OverlayPanel title={chained ? `pool · ${overlay.shape}` : `pin · ${overlay.shape}`} width={bodyW}>
           <Text dimColor wrap="truncate">{clip("Enter pins one channel · Space selects a pool in order — Enter then asks its mode (pool replaces pin)", bodyW - 4)}</Text>
           <SearchRow filter={ui.filter} active />
-          {overlay.excludedNote !== undefined
-            && <Text dimColor wrap="truncate">{clip(overlay.excludedNote, bodyW - 4)}</Text>}
+          {noteLines.map((line, index) =>
+            <Text key={`excluded-${index}`} dimColor wrap="truncate">{clip(line, bodyW - 4)}</Text>)}
           {above > 0 && <ElisionMark count={above} side="above" />}
-          {visible.map((candidate, index) => {
-            const at = overlay.chain.indexOf(candidate.id);
+          {visible.map(({ candidate, line }, index) => {
             const selected = start + index === overlay.at;
+            if (candidate === undefined) {
+              return (
+                <Text key={`ledger-${start + index}`} wrap="truncate">
+                  <Pointer on={selected} />
+                  <Text dimColor>{"✗ "}</Text>
+                  <Text bold={selected} dimColor={!selected}>{clip(line, bodyW - 10)}</Text>
+                </Text>
+              );
+            }
+            const at = overlay.chain.indexOf(candidate.id);
             return (
               <Text key={candidate.id} wrap="truncate">
                 <Pointer on={selected} />
@@ -1759,7 +1970,8 @@ export function FleetApp({
       const scopeLabel = ui.adapterAt === -1
         ? "All models"
         : modelGroups[ui.adapterAt]?.adapter ?? "";
-      const scopeDenied = ui.adapterAt !== -1 && ui.deny.has(modelGroups[ui.adapterAt]?.adapter ?? "");
+      // OBS-994/FL-1 repair: an adapter-wide deny (flat or workers) no longer hides this
+      // scope's rows — every channel still needs its own reach cell, toggleable right here.
       return (
         <Box flexDirection="column">
           <Text>
@@ -1768,11 +1980,10 @@ export function FleetApp({
           </Text>
           <SearchRow filter={ui.filter} active={ui.searching} hint="/ to search" />
           {modelVisibilityLine() && <Text dimColor>{`  ${modelVisibilityLine()}`}</Text>}
-          {scopeDenied && <Text color={INK.warn}>{`${modelGroups[ui.adapterAt]?.adapter} is out of the fleet — Space on its rail row adds it back`}</Text>}
           {above > 0 && <ElisionMark count={above} side="above" />}
           {visible.map((row, index) => renderModelRow(row, ui.focus === "list" && start + index === ui.listAt))}
           {below > 0 && <ElisionMark count={below} side="below" hint="/ to search" />}
-          {rows.length === 0 && !scopeDenied && <Text dimColor>{"  no models match"}</Text>}
+          {rows.length === 0 && <Text dimColor>{"  no models match"}</Text>}
         </Box>
       );
     }
@@ -1810,7 +2021,9 @@ export function FleetApp({
     if (overlay) {
       if (overlay.kind === "candidates") {
         const rows = overlay.rows.filter((candidate) => matches(candidate.label, ui.filter));
-        return rows[overlay.at] ? [rows[overlay.at].label] : [];
+        const ledger = overlay.ledger.filter((line) => matches(line, ui.filter));
+        const line = rows[overlay.at]?.label ?? ledger[overlay.at - rows.length];
+        return line ? [line] : [];
       }
       if (overlay.kind === "prefer") {
         return overlay.chain.length ? [`chain: ${overlay.chain.join(" → ")}`] : [];
@@ -1967,6 +2180,8 @@ export async function runFleetInkEditor({
   health,
   initialDenyAdapters,
   initialDenyModels,
+  initialDenyWorkersAdapters = [],
+  initialDenyWorkersModels = [],
   modelGroups,
   initialMode,
   modeOptions,
@@ -1979,6 +2194,7 @@ export async function runFleetInkEditor({
   steeringOptionsFor,
   reviewOverlay,
   reloadGuard,
+  stagedRouting,
   entry = "probe",
   initialJudge = "",
   judgeSeats = [],
@@ -1992,23 +2208,28 @@ export async function runFleetInkEditor({
   health: Record<string, AuthHealth>;
   initialDenyAdapters: string[];
   initialDenyModels: string[];
+  initialDenyWorkersAdapters?: string[];
+  initialDenyWorkersModels?: string[];
   modelGroups: FleetModelGroup[];
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
   initialMap: Record<string, MapEntry>;
-  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => string[];
-  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: { adapters: string[]; models: string[] }) => FleetShapeRow[];
+  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => string[];
+  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => FleetShapeRow[];
   candidatesForShape: (
     shape: Shape,
     mode: RoutingMode,
     map: Record<string, MapEntry>,
-    deny: { adapters: string[]; models: string[] },
-  ) => { rows: FleetCandidateOption[]; excludedNote?: string };
+    deny: FleetStagedDeny,
+  ) => { rows: FleetCandidateOption[]; excludedNote?: string; ledger?: string[] };
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
+  /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
+   * bytes); absent ⇒ the four staged sets alone, with no allowlist */
+  stagedRouting?: (deny: FleetStagedDeny) => FleetStagedRouting;
   /** "presets" = init's entry: Esc in the browser is HOME to the preset overlay, not quit */
   entry?: "presets" | "probe";
   initialJudge?: string;
@@ -2046,6 +2267,8 @@ export async function runFleetInkEditor({
       agents={agents}
       initialDenyAdapters={initialDenyAdapters}
       initialDenyModels={initialDenyModels}
+      initialDenyWorkersAdapters={initialDenyWorkersAdapters}
+      initialDenyWorkersModels={initialDenyWorkersModels}
       modelGroups={declaredModelGroups}
       initialMode={initialMode}
       modeOptions={modeOptions}
@@ -2058,6 +2281,7 @@ export async function runFleetInkEditor({
       steeringOptionsFor={steeringOptionsFor}
       reviewOverlay={reviewOverlay}
       reloadGuard={reloadGuard}
+      stagedRouting={stagedRouting}
       entry={entry}
       initialJudge={initialJudge}
       judgeSeats={judgeSeats}

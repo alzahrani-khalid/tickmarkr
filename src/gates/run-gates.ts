@@ -6,16 +6,27 @@ import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate } from "./acceptance.js";
-import { type Baseline, compareToBaseline } from "./baseline.js";
+import { type Baseline, compareToBaseline, effectiveCeilingMs } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
 import { disallowedBy } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
 import { gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
+import { evaluateManifestedTest, isVitestTestCommand } from "./test-manifest.js";
 import type { GateResult } from "./types.js";
-import { shGit } from "../run/git.js";
+import { shGit, resolvedCapacity } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
+import {
+  computeVerificationIdentity,
+  formatReusedRow,
+  getVerdictStore,
+  isInfraResult,
+  resolveStateDir,
+  reusedIdentity,
+  type VerificationIdentity,
+  type VerificationScope,
+} from "./cache.js";
 
 // v2.0 T2 (OBS-554): the host one-minute load average — the decision variable the parked load-aware
 // scheduler would key on. Injectable so a test can state the load a gate ran under; production always
@@ -143,6 +154,7 @@ export type GateEvent =
   | { phase: "note"; gate: GateName; name: string; payload: Record<string, unknown>; result: GateResult };
 
 export interface GateContext {
+  verificationScope?: VerificationScope;
   worktree: string;
   baseRef: string;
   result: WorkerResult;
@@ -175,6 +187,7 @@ export interface GateContext {
   // in the daemon). The gate classifies its red against it; absent ⇒ no classification.
   collateral?: ReadonlyArray<string>;
   onGate?: (e: GateEvent) => void | Promise<void>;
+  stateDir?: string;
 }
 
 const TEST_FILE_RE = /(?:^|\/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$/;
@@ -267,12 +280,56 @@ export function testCommandForFiles(testCmd: string, files: string[]): string {
   return `${testCmd}${fwd} ${files.map(shq).join(" ")}`;
 }
 
+/** The manifest-report path for a detected vitest test command — never the stdout-count/file-count path. */
+async function runVitestManifestGate(
+  worktree: string,
+  cmd: string,
+  baseline: Baseline,
+  selected: readonly string[] | undefined,
+  artifactDir?: string,
+): Promise<GateResult> {
+  const entry = baseline.commands.test;
+  const outcome = await evaluateManifestedTest(cmd, worktree, {
+    baselineDurations: entry?.fileDurations,
+    longestFile: entry?.longestFile,
+    overallCeilingMs: effectiveCeilingMs(entry),
+    artifactDir,
+  });
+  const reportPath = outcome.reportPath;
+  return {
+    gate: "test",
+    pass: outcome.pass,
+    details: outcome.details,
+    meta: { ...outcome.meta, reportPath, ...(selected ? { selectedTests: [...selected] } : {}) },
+  };
+}
+
+const SIGNAL_EXIT_RE = /\b(?:SIGTERM|SIGKILL|signal\s+(?:9|15)|exit(?:s|ed|\s+code)?\s+(?:137|143))\b/i;
+const FAILURE_IDENTITY_RE = /\b(?:AssertionError|FAIL\s+\S|Tests?\s+\d+\s+failed|expected\s+.+\s+to\s+)\b/i;
+
+/** D1: apply the daemon's signal-only rider before either battery cache read or write. Its onGate
+ * classification happens after persistence, too late to keep a scripted runner's non-verdict out.
+ * Keep named failures as work verdicts and preserve details for failure-policy fingerprinting. */
+function classifySignalOnlyTest(g: GateResult): void {
+  if (g.gate !== "test" || g.pass || g.meta?.infra === true || !SIGNAL_EXIT_RE.test(g.details)) return;
+  const named = Array.isArray(g.meta?.failingTests) && g.meta.failingTests.length > 0;
+  if (named || FAILURE_IDENTITY_RE.test(g.details)) return;
+  g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false, kind: "signal-exit" };
+}
+
 export async function runGates(
   task: Task,
   ctx: GateContext,
 ): Promise<{ results: GateResult[]; commits: string[] }> {
   const results: GateResult[] = [];
   let commits: string[] = [];
+  const stateDir = ctx.stateDir ?? resolveStateDir(ctx.worktree, ctx.artifactDir);
+  const verdictStore = getVerdictStore(stateDir);
+  // VC-1: a reused verdict is journaled as its own row (the daemon appends every note by name) so
+  // the ledger names the reuse and the identity even where the gate-result row's details must stay
+  // the fresh verdict's (see formatReusedRow).
+  const noteReuse = (gate: GateName, r: GateResult, id: VerificationIdentity) =>
+    ctx.onGate?.({ phase: "note", gate, name: "gate-reused-verdict", payload: { gate, pass: r.pass, details: r.meta?.reusedDetails, ...reusedIdentity(id) }, result: r });
   const shapeGates = ctx.cfg.gates.byShape?.[task.shape];
   const enabled = (g: GateName) =>
     task.gates.includes(g) && (g !== "acceptance" && g !== "review" || shapeGates?.[g] !== false);
@@ -444,7 +501,7 @@ export async function runGates(
   // shell tools vs the shared baseline
   const runBattery = async (commands: Record<string, string>, selected?: string[], gates: readonly GateName[] = toolGates): Promise<void> => {
     if (!gates.length) return;
-    if (!v185) {
+    if (!v185 && !(commands.test && isVitestTestCommand(commands.test, ctx.worktree))) {
       // ponytail: compareToBaseline batches adjacent tools — their starts are emitted at iteration,
       // not at true execution start. They are collectively sub-second (measured), so the debounce
       // suppresses them anyway; split compareToBaseline only if a tool gate ever gets slow.
@@ -470,24 +527,57 @@ export async function runGates(
     // any later tool before anyone reads its verdict.
     for (const g of gates) {
       await emitStart(g);
-      const [r] = await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], g === "test" && selected ? { selected } : {}));
+      const cmd = commands[g];
+      let r: GateResult | undefined;
+      let cached = false;
+      let identity: VerificationIdentity | undefined;
+      if (cmd !== undefined) {
+        identity = await computeVerificationIdentity({
+          worktree: ctx.worktree,
+          gate: g,
+          scope: ctx.verificationScope,
+          command: cmd,
+          baseline: ctx.baseline,
+          selectedSet: g === "test" ? selected : undefined,
+          capacity: resolvedCapacity(),
+        });
+        const hit = verdictStore.get(identity);
+        if (hit) classifySignalOnlyTest(hit); // Older entries predate classification at the write seam.
+        if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")) {
+          r = formatReusedRow(hit, identity);
+          cached = true;
+          await noteReuse(g, r, identity);
+        }
+      }
+      if (!r) {
+        // VL-1: a detected vitest test command is judged by its own invocation-bound report — the
+        // stdout-count/file-count path (compareToBaseline's fileCountDeficit) never runs for it. Any
+        // other scripted test command keeps today's exit-code contract byte-identically.
+        const useManifest = g === "test" && commands.test !== undefined && isVitestTestCommand(commands.test, ctx.worktree);
+        r = useManifest
+          ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir))
+          : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], g === "test" && selected ? { selected } : {})))[0];
+      }
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
-      if (g === "test" && selected) selectedDurationMs = spans.get("test")!.durationMs;
+      if (g === "test" && selected) selectedDurationMs = spans.get("test")?.durationMs ?? 0;
       // The pre-battery check proves the tree clean ONCE; a command that exits 0 having rewritten a
       // tracked file makes it dirty again, and every gate after it — including the next shell gate,
       // which would then run against bytes HEAD does not hold — inherits that. So re-check after each
       // command, the last one included, and fail the gate whose command did it. (A red command needs
       // no check: it already ends the round, and its own output is the truer verdict.)
-      if (r!.pass && commands[g]) {
+      if (!cached && r!.pass && commands[g]) {
         const dirt = await dirtyWorktree();
         if (dirt) {
           await record(dirtyRefusal(g, dirt, commands[g]!));
           return;
         }
       }
+      if (r) classifySignalOnlyTest(r);
+      if (!cached && identity && r && !isInfraResult(r)) {
+        verdictStore.set(identity, { ...r, meta: { ...r.meta, source: "gate", runDir: ctx.artifactDir } });
+      }
       if (g === "test" && selected) {
         const screened = { ...r!, meta: { ...r!.meta, selectedTests: selected } };
-        // green: held (see heldTest) so the full suite below can supersede it with ONE verdict.
         if (!screened.pass) await record(screened);
         else {
           heldTest = withTelemetry(screened);
@@ -847,9 +937,41 @@ export async function runGates(
     // This is the last shell command a round can run — the judge's named-test oracle (acceptance.ts)
     // may have run one before it, and every gate between the battery and here reads commits only, so
     // a clean tree HERE is what makes "the gated commit is the tested tree" true at merge time.
-    const [full] = await measure("test", () => compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"]));
-    fullDurationMs = spans.get("test")!.durationMs - (selectedDurationMs ?? 0);
-    const dirt = full!.pass ? await dirtyWorktree() : undefined;
+    // VL-1: the merge-candidate's manifest is the FULL set — a full suite whose report lacks one
+    // manifest file never reaches the pass branch below, so a selected-only green can never merge.
+    let full: GateResult | undefined;
+    let cached = false;
+    let identity: VerificationIdentity | undefined;
+    if (ctx.commands.test !== undefined) {
+      identity = await computeVerificationIdentity({
+        worktree: ctx.worktree,
+        gate: "test",
+        scope: ctx.verificationScope,
+        command: ctx.commands.test,
+        baseline: ctx.baseline,
+        selectedSet: undefined,
+        capacity: resolvedCapacity(),
+      });
+      const hit = verdictStore.get(identity);
+      if (hit) classifySignalOnlyTest(hit);
+      if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")) {
+        full = formatReusedRow(hit, identity);
+        cached = true;
+        await noteReuse("test", full, identity);
+      }
+    }
+    if (!full) {
+      const fullUsesManifest = ctx.commands.test !== undefined && isVitestTestCommand(ctx.commands.test, ctx.worktree);
+      full = fullUsesManifest
+        ? await measure("test", () => runVitestManifestGate(ctx.worktree, ctx.commands.test!, ctx.baseline, undefined, ctx.artifactDir))
+        : (await measure("test", () => compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"])))[0];
+    }
+    fullDurationMs = spans.get("test") ? spans.get("test")!.durationMs - (selectedDurationMs ?? 0) : 0;
+    const dirt = (!cached && full!.pass) ? await dirtyWorktree() : undefined;
+    if (full) classifySignalOnlyTest(full);
+    if (!cached && identity && full && !dirt && !isInfraResult(full)) {
+      verdictStore.set(identity, { ...full, meta: { ...full.meta, source: "gate", runDir: ctx.artifactDir } });
+    }
     const merged = withTelemetry(dirt
       ? dirtyRefusal("test", dirt, ctx.commands.test!)
       : { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } });

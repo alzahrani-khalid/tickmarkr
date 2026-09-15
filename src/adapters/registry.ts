@@ -655,7 +655,12 @@ export function discoverChannels(
       // channel — routing an unknown or 403 into dispatch is fail-closed. Operators with pre-v1.21 doctor.json
       // can opt into the prior unknown-is-routable behavior with routing.allowUnverifiedModels.
       // OBS-117: configured aliases absent from the adapter CLI's own model list are not dispatchable.
-      return a.channels(cfg).filter((c) => !invalid.has(c.model) && modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)));
+      return a.channels(cfg)
+        .filter((c) => !invalid.has(c.model) && modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)))
+        .map((c) => {
+          const identity = h?.modelAuth?.[c.model]?.identity ?? h?.modelIdentities?.[c.model];
+          return identity ? { ...c, identity } : c;
+        });
     });
   if (!cfg.routing.allow && !cfg.routing.deny) return base;
   return base.filter((c) => disallowedBy(c, cfg.routing, role) === null);

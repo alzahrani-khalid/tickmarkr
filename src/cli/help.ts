@@ -14,7 +14,8 @@ export const COMMAND_HELP = {
       "--docs": "Include agent guidance documents with --agent.",
       "--fresh": "Force fresh adapter probes instead of reusing recent health.",
       "--yes": "Skip the interactive setup wizard and use defaults.",
-    }, examples: ["init --yes", "init --agent --force --docs"],
+      "--remove": "Reverse init without scaffolding: delete state, skills, docs block, unedited spec, and prune worktrees.",
+    }, examples: ["init --yes", "init --agent --force --docs", "init --remove"],
   },
   doctor: {
     usage: "doctor [options]", description: "Probe configured adapters and models and print diagnostics. Default probing may make model calls and refresh a stale catalog.",
@@ -132,6 +133,7 @@ export const COMMAND_HELP = {
   approve: {
     usage: "approve <run-id> <task-id> [options]", description: "Append a validated park decision. A running owner may enact it; a closed run requires a separate resume. Decisions cannot be undone.",
     options: {
+      "--files <glob,…>": "Extend files[] for a scope-request park with comma-separated repository-relative globs; required for scope approval.",
       "--by <name>": "Name the actor (default: current OS user).",
       "--reason <text>": "Record the decision reason.",
       "--waive": "Waive only the identified failed gate.",

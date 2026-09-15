@@ -1,0 +1,40 @@
+tickmarkr fixture | RUN | run-20260912-100000
+1 Home  4 Run  5 Evidence | content | 1–33/55 | 22 hidden
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│RUN / RUNNING · 1/8 merged | human T1,T3 | current-cycle tip PENDING | RUNNING | matching graph | snapshot #1  │
+│ tickmarkr  run-20260912-100000  │  1/8 done  │  2 esc  │  0h38m                                               │
+│                                                                                                               │
+│  ▌ TASKS   1 of 8 merged in this graph                                                                        │
+│                                                                                                               │
+│         area            deps          task               bu te li ev sc ac re   channel     att  note         │
+│    ──────────────────────────────────────────────────────────────────────────────────────────────             │
+│  ❯ T1   SPEC+GATE       —             Spec loader parks  ✔  ✔  ✔  ·  ·  ·  ·    claude-cod  3                 │
+│         ◍ parked ×3 · 3/7 gates run                                                                           │
+│    T2   RUN             —             Runner survives t  ✔  ✔  ✔  ✔  ✔  ✔  ✔    claude-cod  1                 │
+│         ↻ 3 review rounds                                                                                     │
+│    T3   UI              —             Board renderer fa  ✔  ✖  ·  ·  ·  ·  ·    claude-cod  1                 │
+│         ✖ test · 2/7 gates run                                                                                │
+│    T4   DOCS            T3            Docs wait on the   ·  ·  ·  ·  ·  ·  ·    —           0    waiting on T3│
+│    T5   UI              —             CLI flag in fligh  ·  ·  ·  ·  ·  ·  ·    claude-cod  1    in flight    │
+│    T6   GATE            —             Gate test task th  ✔  ✔  ✔  ·  ·  ·  ─    claude-cod  1    3/6 gates run│
+│    T7   FLEET           —             Router asset outs  ✔  ·  ·  ·  ·  ·  ·    claude-cod  1    1/7 gates run│
+│    T8   —               —             Queued task with   ·  ·  ·  ·  ·  ·  ·    —           0    queued       │
+│                                                                                                               │
+│    area    SPEC · FLEET · RUN · GATE · UI · DOCS · REPO   2 unmapped                                          │
+│            UNMAPPED tests/cockpit/board.test.ts  assets/board.png                                             │
+│    gates   bu build  te test  li lint  ev evidence  sc scope  ac acceptance  re review                        │
+│            ✔ passed   ✖ failed   · pending   ─ not declared (acceptance and review are the optional two)      │
+│                                                                                                               │
+│    T9  — not in this graph (retired at compile)                                                               │
+│                                                                                                               │
+│───────────────────────────────────────────────────────────────────────────────────────────────────────────────│
+│                                                                                                               │
+│  ▌ WHERE THE EFFORT WENT   dispatches · review rounds · human parks — top 4 of 8 tasks                        │
+│                                                                                                               │
+│    T1    ██████████████████████████████████████████████  3 dispatch · 0 review · 3 park                       │
+│    T2    ███████████████████████████████  1 dispatch · 3 review · 0 park                                      │
+│    T3    ████████████████  1 dispatch · 0 review · 1 park                                                     │
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 1/8 | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────

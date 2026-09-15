@@ -1,9 +1,13 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { trailerPattern } from "../../src/adapters/prompt.js";
 import {
   joinWrapped,
   mapAgentState,
   NOT_WRITABLE_CODE,
+  inCheckout,
   OrcaDriver,
   OrcaError,
   OrcaUnavailableError,
@@ -24,9 +28,12 @@ const TITLE = formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId:
 const OTHER_TITLE = formatOwnedName({ role: "worker", taskId: "T2", attempt: 0, runId: "run-orca" });
 const TRAILER_RE = trailerPattern(ORCA_FIXTURE_NONCE);
 
-function rig(opts: FakeOrcaOpts = {}): { fake: FakeOrca; driver: OrcaDriver } {
-  const fake = new FakeOrca(opts);
-  return { fake, driver: new OrcaDriver({ exec: fake.exec, time: steppedTime() }) };
+// OBS-1004: the fixture checkouts are declared as worktrees Orca TRACKS (as if Orca created them), so
+// `worktree current` answers each as itself and `path:` selectors resolve; the nested-checkout case
+// (Orca answering the enclosing clone) is exercised in orca-placement.test.ts.
+function rig(opts: FakeOrcaOpts & { launchingHandle?: string } = {}): { fake: FakeOrca; driver: OrcaDriver } {
+  const fake = new FakeOrca({ trackedWorktrees: [WT, OTHER_WT], ...opts });
+  return { fake, driver: new OrcaDriver({ exec: fake.exec, time: steppedTime(), launchingHandle: opts.launchingHandle ?? "term_launch" }) };
 }
 
 /** A slot whose first run() created its terminal, with `lines` seeded as that terminal's scrollback. */
@@ -118,7 +125,7 @@ describe("OrcaDriver", () => {
     // Production argv and the shim speak the real 1.4.186 contract, not an invented lookalike.
     expect(fake.calls.every((args) => args.at(-1) === "--json")).toBe(true);
     expect(fake.calls.find((args) => args[1] === "create")).toEqual([
-      "terminal", "create", "--worktree", `path:${WT}`, "--title", TITLE, "--command", "bash", "--json",
+      "terminal", "create", "--worktree", `path:${WT}`, "--title", TITLE, "--command", inCheckout(WT, "bash"), "--json",
     ]);
     expect(fake.calls.filter((args) => args[1] === "read" && !args.includes("--screen"))
       .every((args) => args.includes("--limit") && !args.includes("--lines"))).toBe(true);
@@ -284,7 +291,7 @@ describe("OrcaDriver", () => {
   test("test: one shared envelope parser serves runtime status, terminal create, list, read, send, wait, show and close, and a table of malformed, truncated and ok-false fixtures per response family fails each invoking operation closed with raw bytes preserved for diagnostics, while a caller that reinterprets parser failure as empty output, unknown-but-successful status or a successful close fails", async () => {
     expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
       "status", "create", "list", "read", "send", "wait", "show", "close",
-      "worktree-current", "worktree-set", "hooks-status",
+      "worktree-current", "worktree-set", "hooks-status", "split",
     ]);
 
     // The shared parser itself refuses every degenerate fixture, for every family.
@@ -327,6 +334,13 @@ describe("OrcaDriver", () => {
         const s = await r.driver.slot(WT, TITLE, { agent: "claude-code" });
         await r.driver.run(s, "bash");
         return r.driver.status(s);
+      },
+      split: async (o) => {
+        // A fresh repo per fixture: the narrator's durable reservation would otherwise outlive one raw
+        // and refuse the next call before the split verb (and its raw bytes) are ever reached.
+        const cwd = mkdtempSync(join(tmpdir(), "orca-split-"));
+        const r = rig({ terminals: [{ handle: "term_launch", title: "bash", worktree: cwd }], ...o });
+        return r.driver.narrator(cwd, "bash", "run-degen");
       },
     };
     for (const family of ORCA_RESPONSE_FAMILIES) {
@@ -912,7 +926,7 @@ describe("OrcaDriver", () => {
   test("test: the shared envelope parser serves worktree current and agent hooks status exactly as it serves the eight terminal families so a malformed truncated or ok-false body on either fails the invoking method explicitly whereas a driver that reads a parse failure as not-yet-adopted or as fully hooked fails", async () => {
     expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
       "status", "create", "list", "read", "send", "wait", "show", "close",
-      "worktree-current", "worktree-set", "hooks-status",
+      "worktree-current", "worktree-set", "hooks-status", "split",
     ]);
     for (const family of ["worktree-current", "hooks-status"] as const) {
       for (const raw of [MALFORMED, TRUNCATED, OK_FALSE]) {
@@ -1047,13 +1061,6 @@ describe("OrcaDriver", () => {
     await expect(malformed.driver.nudge(malformedSlot, "continue now")).resolves.toBe(false);
   });
 
-  test("narrator refuses unsupported right/no-focus placement without claiming an opened board", async () => {
-    const { fake, driver } = rig();
-    await expect(driver.narrator(WT, "tickmarkr ui run-board --view run", "run-board")).rejects.toThrow(/placement unsupported/);
-    expect(fake.countOf("create")).toBe(0);
-    expect(fake.terminals).toHaveLength(0);
-    await expect(driver.narrator(WT, "true")).rejects.toThrow(/requires a run identity/);
-  });
 
   test("test: project sets --workspace-status in-progress in-review and completed on the path selector of the task's own checkout never the active selector or the daemon's cwd and describe returns the create receipt's surface and hostPlatform for a created slot and undefined before creation whereas a projection that names the wrong selector or a describe that invents a surface fails", async () => {
     const { fake, driver } = rig({ activeWorktree: OTHER_WT });
@@ -1083,7 +1090,7 @@ describe("OrcaDriver", () => {
   test("the fake Orca's send --interrupt and worktree set receipts are either recorded from Orca 1.4.195 with the capture file named in the fixture or marked as unrecorded shapes beside a driver that validates only the envelope and the handle for those two families as the diff shows in the fixture and driver hunks", async () => {
     expect([...ORCA_RESPONSE_FAMILIES]).toEqual([
       "status", "create", "list", "read", "send", "wait", "show", "close",
-      "worktree-current", "worktree-set", "hooks-status",
+      "worktree-current", "worktree-set", "hooks-status", "split",
     ]);
     const { fake, driver } = rig();
     const slot = await bound(driver, fake);

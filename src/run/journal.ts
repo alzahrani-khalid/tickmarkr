@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import { channelKey, shq, TokenUsageSchema, type Assignment } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
-import { stateDirName, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
-import { GATE_NAMES, TIERS, type GateName, type Task, type TaskStatus } from "../graph/schema.js";
+import { graphDefinitionHash, stateDirName, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
+import { GATE_NAMES, TIERS, type GateName, type RunGraph, type Task, type TaskStatus } from "../graph/schema.js";
 import { channelRouteIdentity } from "../route/preference.js";
 import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
 import {
@@ -868,7 +868,7 @@ const DispatchAssignmentSchema = z.object({
 // routing profile's QUALITY_FAIL_PARKS (route/profile.ts): the channel did nothing wrong.
 export const PARK_KINDS = ["human-gate", "ladder-exhausted", "attempt-cap", "gate-fail", "quota",
   "reroute-exhausted", "setup", "stall", "merge-conflict", "tip-moved", "infra", "dispatch",
-  "authoring"] as const;
+  "authoring", "scope-request"] as const;
 export type ParkKind = (typeof PARK_KINDS)[number];
 // v1.85 T3: "repair" is a third dispatch mode beside the v1.29 session pair — a fix-only attempt that
 // carries the failing findings and the diff CONTENT of the work already landed, instead of re-buying
@@ -1094,6 +1094,64 @@ export function recordedGraphDefinitionHash(events: JournalEvent[]): string | un
     recorded = audited && typeof e.data.to === "string" ? e.data.to : null;
   }
   return recorded ?? undefined;
+}
+
+/** An approval is the durable authority; graph.json is only its materialized projection. */
+export const ScopeAmendmentSchema = z.object({
+  from: z.string(), to: z.string(), beforeFiles: z.array(z.string()), files: z.array(z.string()),
+  parkLine: z.number().int().positive(),
+});
+
+export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[]): RunGraph {
+  const amendments = events.filter((e) => e.event === "task-approved" && e.data.release === "scope-request")
+    .map((event) => ({ event, amendment: ScopeAmendmentSchema.parse(event.data.amendment) }));
+  if (!amendments.length) return graph;
+  let result = graph;
+  // Accept any materialized revision, including a fresh compilation of the original definition.
+  // Undo only recognized files[] values. Everything else must still hash to the approved definition.
+  const taskIds = new Set(amendments.map(({ event }) => event.taskId));
+  for (const id of taskIds) {
+    const history = amendments.filter(({ event }) => event.taskId === id);
+    const task = result.tasks.find((t) => t.id === id);
+    const original = history[0]!.amendment.beforeFiles;
+    if (!task || ![original, ...history.map(({ amendment }) => amendment.files)]
+      .some((files) => JSON.stringify(files) === JSON.stringify(task.files))) {
+      throw new Error(`refusing scope amendment replay: ${id} files[] changed beyond the approved amendment`);
+    }
+    result = { ...result, tasks: result.tasks.map((t) => t.id === id ? { ...t, files: original } : t) };
+  }
+  for (const { event, amendment } of amendments) {
+    if (graphDefinitionHash(result) !== amendment.from) {
+      throw new Error(`refusing scope amendment replay: graph task definition changed beyond approval for ${event.taskId}`);
+    }
+    result = { ...result, tasks: result.tasks.map((t) => t.id === event.taskId ? { ...t, files: amendment.files } : t) };
+    if (graphDefinitionHash(result) !== amendment.to) throw new Error("refusing invalid scope amendment hash");
+  }
+  return result;
+}
+
+/** Publish/recover the audit before dispatch, even after a crash between approval and rehash. */
+export function applyScopeAmendments(graph: RunGraph, journal: Journal, auditReplay = false): RunGraph {
+  const events = journal.read();
+  const result = replayScopeAmendments(graph, events); // validate all before moving any identity
+  const approvals = events.filter((e) => e.event === "task-approved" && e.data.release === "scope-request");
+  for (const approval of approvals) {
+    const amendment = ScopeAmendmentSchema.parse(approval.data.amendment);
+    if (!events.some((e) => e.event === "graph-rehash" && e.data.approval === approval.ts && e.taskId === approval.taskId
+        && e.data.from === amendment.from && e.data.to === amendment.to)) {
+      journal.append("graph-rehash", approval.taskId, {
+        from: amendment.from, to: amendment.to, approval: approval.ts, by: approval.data.by, source: "approval",
+      });
+    }
+  }
+  if (auditReplay && graphDefinitionHash(graph) !== graphDefinitionHash(result) && approvals.length) {
+    const recorded = recordedGraphDefinitionHash(journal.read());
+    journal.append("graph-rehash", approvals.at(-1)!.taskId, {
+      from: recorded, to: graphDefinitionHash(result), approval: approvals.at(-1)!.ts, source: "approval", replay: true,
+      loaded: graphDefinitionHash(graph),
+    });
+  }
+  return result;
 }
 
 export type EngagementCompare =
@@ -1386,12 +1444,23 @@ export class Journal {
       : { ts: new Date().toISOString(), event, ...(taskId ? { taskId } : {}), data: persistedData };
     // T3 secret redaction: only the persisted bytes are masked — the caller's data stays untouched in
     // memory. The narrator receives the persisted (masked) row so a pane sink never shows a credential.
-    const line = redactSecrets(JSON.stringify(row));
-    appendFileSync(this.journalPath, line + "\n");
-    try {
-      this.narrate?.(JSON.parse(line) as JournalEvent);
-    } catch {
-      // narration is observational; a broken sink must not affect the journal or run
+    const rows = [row];
+    if (event === "task-approved" && row.data.release === "scope-request") {
+      const amendment = ScopeAmendmentSchema.parse(row.data.amendment);
+      // Publish permission and its graph audit in one append. Otherwise a live sweep can read
+      // permission between the two writes, race the CLI's rehash, and audit the revision twice.
+      rows.push({ ts: row.ts, event: "graph-rehash", taskId: row.taskId, data: {
+        from: amendment.from, to: amendment.to, approval: row.ts, by: row.data.by, source: "approval",
+      } });
+    }
+    const lines = rows.map((entry) => redactSecrets(JSON.stringify(entry)));
+    appendFileSync(this.journalPath, lines.join("\n") + "\n");
+    for (const line of lines) {
+      try {
+        this.narrate?.(JSON.parse(line) as JournalEvent);
+      } catch {
+        // narration is observational; a broken sink must not affect the journal or run
+      }
     }
     if (evidence && !evidence.written && (event === "judge-retry" || event === "gate-result")) {
       evidence.written = true;
@@ -1474,7 +1543,7 @@ export class Journal {
         const parsed = DispatchAssignmentSchema.safeParse(e.data.assignment);
         outstanding = parsed.success ? { assignment: parsed.data } : {}; // malformed: closable, unattributable
         classified = null;
-      } else if (e.event === "scope-authoring" && outstanding) {
+      } else if ((e.event === "scope-authoring" || e.event === "scope-request") && outstanding) {
         classified = outstanding; // a duplicate classification closes nothing more (same rule as the replay)
         outstanding = null;
       }
@@ -1526,7 +1595,7 @@ export class Journal {
           // poisons only lastAssignment (a malformed LAST dispatch must not be restored).
           st.lastAssignment = undefined;
         }
-      } else if (e.event === "scope-authoring") {
+      } else if (e.event === "scope-authoring" || e.event === "scope-request") {
         // OBS-547: the dispatch this event closes was an authoring defect — the spec is missing a
         // files[] line and the worker was never at fault. Rewind its accounting so a resume neither
         // charges the attempt nor treats its channel as burned.

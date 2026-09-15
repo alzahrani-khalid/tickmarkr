@@ -515,16 +515,18 @@ describe("tickmarkr fleet", () => {
     expect(frames.slice(denied + 1).some((f) => f.includes(`${GLYPHS.toggleActive} fake`))).toBe(true);
   });
 
-  test("the space key toggles deny on the highlighted model", async () => {
+  test("the space key cycles a model's reach through in, out workers, out all seats and back to in", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.space + KEYS.space + KEYS.q);
+    const out = await drive(repo, adapter, io, KEYS.space + KEYS.space + KEYS.space + KEYS.q);
     expect(out).toBe("fleet: quit without writing");
     const frames = writes.map(strip);
     expect(frames[0]).toContain(`${GLYPHS.toggleActive} fake/fake-1`);
-    const denied = frames.findIndex((f) => f.includes(`${GLYPHS.toggleInactive} fake/fake-1`));
-    expect(denied).toBeGreaterThan(0);
-    expect(frames.slice(denied + 1).some((f) => f.includes(`${GLYPHS.toggleActive} fake/fake-1`))).toBe(true);
+    const outWorkers = frames.findIndex((f) => f.includes(`${GLYPHS.attention} fake/fake-1`));
+    expect(outWorkers).toBeGreaterThan(0);
+    const outAll = frames.slice(outWorkers + 1).findIndex((f) => f.includes(`${GLYPHS.toggleInactive} fake/fake-1`));
+    expect(outAll).toBeGreaterThanOrEqual(0);
+    expect(frames.slice(outWorkers + 1 + outAll + 1).some((f) => f.includes(`${GLYPHS.toggleActive} fake/fake-1`))).toBe(true);
   });
 
   test("every browser view renders its list header and the frame header names the probe age and mode", async () => {
@@ -586,7 +588,8 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     const overlayPath = join(repo, ".tickmarkr", "config.yaml");
     const before = readFileSync(overlayPath, "utf8");
-    const bytes = KEYS.space + KEYS.w;
+    // OBS-994/FL-1: two presses reach out(all) — the allow-form write this test targets.
+    const bytes = KEYS.space + KEYS.space + KEYS.w;
 
     queueAnswers("n");
     const declined = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
@@ -765,7 +768,8 @@ describe("tickmarkr fleet", () => {
     const { io, writes } = makeIO();
     // the extra trailing Esc pair: the first Esc dismisses the auto-raised presets overlay on the
     // Shapes entry (v1.92); the staged toggle arms the quit guard so TWO more Esc quit the browser
-    const out = await drive(repo, adapter, io, " \x1b[D\x1b[B\r\x1b\x1b\x1b", ["--global-dir", isolatedGlobal()]);
+    // OBS-994/FL-1: two spaces cycle in → out(workers) → out(all), the state this test asserts.
+    const out = await drive(repo, adapter, io, "  \x1b[D\x1b[B\r\x1b\x1b\x1b", ["--global-dir", isolatedGlobal()]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain(`${GLYPHS.toggleInactive} fake/fake-1`);
@@ -925,10 +929,19 @@ describe("tickmarkr fleet", () => {
     expect(writes[0]).toMatch(/\x1b\[38;5;41m✓\x1b\[39m fake/);
   });
 
-  test("a denied row renders a dim circle in the fleet frame on a tty", async () => {
+  test("OBS-994/FL-1: a workers-only reach row renders the warn glyph on a tty", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
     await drive(repo, adapter, io, KEYS.space + KEYS.q + KEYS.q);
+    const outWorkers = writes.find((f) => strip(f).includes(`${GLYPHS.attention} fake/fake-1`));
+    expect(outWorkers).toBeDefined();
+  });
+
+  test("a denied row renders a dim circle in the fleet frame on a tty", async () => {
+    const { repo, adapter } = setup();
+    const { io, writes } = makeIO();
+    // OBS-994/FL-1: two presses reach out(all) — the dim-circle state this test targets.
+    await drive(repo, adapter, io, KEYS.space + KEYS.space + KEYS.q + KEYS.q);
     const denied = writes.find((f) => strip(f).includes("○ fake/fake-1"));
     expect(denied).toBeDefined();
     expect(denied).toMatch(/\x1b\[2m○\x1b\[22m/);
@@ -1597,7 +1610,9 @@ review:
     withOverlay(a.repo, TWO_CLASSIFIED);
     const aIO = makeIO();
     const aDone = fleet(["--global-dir", isolatedGlobal()], a.repo, [a.adapter], aIO.io);
-    aIO.input.write(KEYS.space + TO_DOCS + KEYS.p);
+    // OBS-994/FL-1: Space now cycles in → out(workers) → out(all) → in — two presses reach the
+    // all-seats exclusion this test's allow-form assertions target.
+    aIO.input.write(KEYS.space + KEYS.space + TO_DOCS + KEYS.p);
     await settle(() => strip(aIO.writes.join("")).includes("pin · docs"));
     aIO.input.write(KEYS.escape + KEYS.w + KEYS.y);
     expect(await aDone).toMatch(/^fleet: wrote /);
@@ -2004,7 +2019,8 @@ review:
     const { repo, adapter } = setup();
     const io = makeIO();
     queueAnswers("y");
-    const bytes = KEYS.space + KEYS.down + KEYS.t + KEYS.down + KEYS.enter + KEYS.enter
+    // OBS-994/FL-1: two presses reach out(all) — this test targets the all-seats allow form.
+    const bytes = KEYS.space + KEYS.space + KEYS.down + KEYS.t + KEYS.down + KEYS.enter + KEYS.enter
       + "AA Index 54" + KEYS.enter + KEYS.w;
     const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", isolatedGlobal()]);
     expect(out).toMatch(/^fleet: wrote /);
@@ -2076,7 +2092,8 @@ review:
     queueAnswers("n");
     const out = await drive(
       repo, adapter, io.io,
-      KEYS.space + KEYS.t + KEYS.down + KEYS.t
+      // OBS-994/FL-1: two presses reach out(all) — this test targets the all-seats allow form.
+      KEYS.space + KEYS.space + KEYS.t + KEYS.down + KEYS.t
         + KEYS.down + KEYS.down + KEYS.enter + KEYS.enter
         + "AA Index 54" + KEYS.enter + KEYS.w,
       ["--global-dir", isolatedGlobal()],
@@ -2324,7 +2341,10 @@ review:
     const io = makeIO();
     io.output.rows = 18; // viewRows = max(8, 18-12) = 8 → review window 9 rows
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
-    io.input.write(KEYS.space + KEYS.w); // membership toggle → allow form + tombstones > 9 diff lines
+    // OBS-994/FL-1: two presses reach out(all) — the all-seats membership toggle this test's
+    // allow-form + tombstones diff (> 9 lines) targets; one press alone only stages the much
+    // smaller workers-only scope.
+    io.input.write(KEYS.space + KEYS.space + KEYS.w);
     await settle(() => strip(io.writes.join("")).includes("review · "));
     const first = strip(io.writes.at(-1)!);
     expect(first).toMatch(/… \d+ below — ↓ scrolls/);
@@ -2414,7 +2434,9 @@ review:
     await settle(() => io.writes.map(strip).some((f) => f.includes("· 1 staged")));
     expect(io.writes.map(strip).some((f) => f.includes("· 1 staged"))).toBe(true);
     const mark = io.writes.length;
-    io.input.write(KEYS.space); // untoggle — back to zero staged
+    // OBS-994/FL-1: Space now cycles in → out(workers) → out(all) → in — a third press is the
+    // one that returns to zero staged.
+    io.input.write(KEYS.space + KEYS.space); // cycle through out(all) — back to zero staged
     await settle(() => io.writes.slice(mark).map(strip).some((f) => !f.includes("staged") && f.includes("tickmarkr fleet")));
     expect(strip(io.writes.at(-1)!)).not.toContain("· 1 staged");
     io.input.write(KEYS.q); // zero staged ⇒ one q suffices

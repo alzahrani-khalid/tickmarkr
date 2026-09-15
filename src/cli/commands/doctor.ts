@@ -681,6 +681,46 @@ export async function doctor(
   if (probeProgressTTY && probeOk + probeBad > 0) {
     process.stderr.write(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""}\n`);
   }
+  const identityResolver = opts.resolveClaudeAliasIdentity
+    ?? (adapters.some((a) => a.id === claudeCode.id) ? resolveClaudeAliasIdentity : undefined);
+  const aliasDriftFindings: string[] = [];
+  // Single pre-write snapshot of the resolver's outcome per alias (including undefined/failure).
+  // Catalog rendering below reads only this map — never calls the resolver again — so a transient
+  // resolver that succeeds on a later call can never produce a result that stays display-only
+  // while doctor.json and discovery keep the earlier undefined/failed outcome.
+  const resolvedIdentitySnapshot: Partial<Record<ClaudeAlias, string | undefined>> = {};
+  if (identityResolver && health["claude-code"]?.installed) {
+    const configured = cfg.tiers["claude-code"]?.models ?? {};
+    for (const [alias, stampedIdentity] of Object.entries(CLAUDE_ALIAS_IDENTITY_STAMPS) as [ClaudeAlias, string][]) {
+      if (!(alias in configured)) continue;
+      let resolvedIdentity: string | undefined;
+      try {
+        resolvedIdentity = identityResolver(cwd, alias);
+      } catch {
+        resolvedIdentitySnapshot[alias] = undefined;
+        continue; // advisory source failure is unknown, never a doctor failure
+      }
+      resolvedIdentitySnapshot[alias] = resolvedIdentity;
+      if (resolvedIdentity) {
+        if (!health["claude-code"].modelAuth) {
+          health["claude-code"].modelAuth = {};
+        }
+        const existing = health["claude-code"].modelAuth[alias] ?? {
+          authed: true,
+          probedAt: new Date().toISOString(),
+        };
+        health["claude-code"].modelAuth[alias] = {
+          ...existing,
+          identity: resolvedIdentity,
+        };
+      }
+      if (resolvedIdentity && resolvedIdentity !== stampedIdentity) {
+        aliasDriftFindings.push(
+          `resolved-identity drift: claude-code:${alias} resolved to ${resolvedIdentity}, stamped identity ${stampedIdentity} — reclassify per benchmark policy (advisory — routing unchanged)`,
+        );
+      }
+    }
+  }
   writeDoctor(cwd, health);
   const rows = adapters.map((a) => {
     const h = health[a.id];
@@ -812,35 +852,11 @@ export async function doctor(
   // v1.65 T3: hardcoded-flag drift — advisory warn rows only. Runs AFTER writeDoctor so the verdicts
   // can never leak into doctor.json, and discoverChannels/routing never read them.
   lintRows.push(...flagDriftWarnings(adapters, health).map(attentionRow));
-  // OBS-145: resolved-identity drift is the same class of display-only doctor warning. Stamps live
-  // beside the alias-owning adapter; the comparison runs only for configured floating aliases and
-  // never enters health/doctor.json, config, channel discovery, learned profiles, or route().
-  const identityResolver = opts.resolveClaudeAliasIdentity
-    ?? (adapters.includes(claudeCode) ? resolveClaudeAliasIdentity : undefined);
-  if (identityResolver && health["claude-code"]?.installed) {
-    const configured = cfg.tiers["claude-code"]?.models ?? {};
-    for (const [alias, stampedIdentity] of Object.entries(CLAUDE_ALIAS_IDENTITY_STAMPS) as [ClaudeAlias, string][]) {
-      if (!(alias in configured)) continue;
-      let resolvedIdentity: string | undefined;
-      try {
-        resolvedIdentity = identityResolver(cwd, alias);
-      } catch {
-        continue; // advisory source failure is unknown, never a doctor failure
-      }
-      if (resolvedIdentity && resolvedIdentity !== stampedIdentity) {
-        lintRows.push(attentionRow(
-          `resolved-identity drift: claude-code:${alias} resolved to ${resolvedIdentity}, stamped identity ${stampedIdentity} — reclassify per benchmark policy (advisory — routing unchanged)`,
-        ));
-      }
-    }
-  }
+  // OBS-145: resolved-identity drift is advisory display warning.
+  lintRows.push(...aliasDriftFindings.map(attentionRow));
   const resolvedCatalogModel = (adapter: string, model: string): string | undefined => {
-    if (adapter !== "claude-code" || !identityResolver || !(model in CLAUDE_ALIAS_IDENTITY_STAMPS)) return undefined;
-    try {
-      return identityResolver(cwd, model as ClaudeAlias);
-    } catch {
-      return undefined;
-    }
+    if (adapter !== "claude-code" || !(model in CLAUDE_ALIAS_IDENTITY_STAMPS)) return undefined;
+    return resolvedIdentitySnapshot[model as ClaudeAlias];
   };
   // MODEL-05/06: print-only drift fragment; advisory, whole-line-commented additions, tickmarkr NEVER applies it.
   // TTY gets a one-line summary + the fragment as a file (the full dump drowned everything else,

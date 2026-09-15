@@ -42,6 +42,7 @@ export interface RunDecision {
 }
 
 const parkDiagnostic = (park: NewestPark): string | undefined => {
+  if (park.kind === "scope-request") return park.approveCommand ?? "scope-request requires tickmarkr approve with --files <glob,…>";
   if (park.tombstone) return "tombstone — permanent by design; no verb releases it";
   if (park.kind === "gate-fail" && park.failedGate === undefined) {
     return "parked on gate-fail with no failed gate result on the newest park — refusing to infer one";

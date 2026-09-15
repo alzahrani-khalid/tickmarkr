@@ -1,3 +1,4 @@
+import { commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, runWithCommandLease, withCommandLease } from "./lease.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
@@ -9,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { stringify } from "yaml";
 import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
-import { type Assignment, SettledTrailerTracker, addUsage, channelKey, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
+import { type Assignment, SettledTrailerTracker, addUsage, channelKey, matchesInputBox, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { collateralHits, type ScopeCollateralVerdict } from "../compile/collateral.js";
 import {
@@ -31,7 +32,7 @@ import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } 
 import { runEnvironment } from "./environment.js";
 import { cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sh, shGit, SUITE_PARENT_ENV, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingRechecks, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { applyScopeAmendments, activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingRechecks, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { isDiffCapPark, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
@@ -471,13 +472,66 @@ export function resetWorkerStartupWindowMsForTests(): void {
   workerStartupWindowMs = WORKER_STARTUP_WINDOW_MS;
 }
 
-function startupFailureInWindow(output: string, launchedAt: number | undefined): boolean {
-  if (launchedAt === undefined || Date.now() - launchedAt > workerStartupWindowMs) return false;
-  const bytes = Buffer.from(output);
-  const bounded = bytes.length <= WORKER_STARTUP_WINDOW_BYTES
-    ? output
-    : bytes.subarray(0, WORKER_STARTUP_WINDOW_BYTES).toString("utf8");
-  return WORKER_STARTUP_FAILURE_RE.test(stallSnapshotBannerRows(bounded));
+export interface StartupFailureEvidence {
+  matchedBytes: string;
+  offset: number;
+  row: string;
+  rowNumber: number;
+}
+
+/** One seat, one startup prefix. Once execution or its input box is seen, later panes are ineligible. */
+export class StartupFailureDetector {
+  private closed = false;
+  constructor(private readonly adapter: Pick<WorkerAdapter, "inputBox" | "harnessBannerRows">) {}
+
+  sample(output: string, launchedAt: number | undefined): StartupFailureEvidence | undefined {
+    if (this.closed || launchedAt === undefined || Date.now() - launchedAt > workerStartupWindowMs) return;
+    // read() returns a tail, not a guaranteed transcript origin. A saturated read cannot
+    // establish startup ownership: the first tool frame may already have scrolled out.
+    if (Buffer.byteLength(output) >= WORKER_STARTUP_WINDOW_BYTES || output.split("\n").length >= 500) {
+      this.closed = true;
+      return;
+    }
+    const bounded = output;
+    const rows = bounded.split("\n");
+    let inputStart = rows.length;
+    const input = this.adapter.inputBox;
+    if (input && matchesInputBox(bounded, input)) {
+      // Locate the beginning, including multi-row composers whose footer proves the matcher.
+      let end = rows.length;
+      let low = 1;
+      while (low < end) {
+        const mid = Math.floor((low + end) / 2);
+        if (matchesInputBox(rows.slice(0, mid).join("\n"), input)) end = mid;
+        else low = mid + 1;
+      }
+      inputStart = 0;
+      let high = end;
+      while (inputStart + 1 < high) {
+        const mid = Math.floor((inputStart + high) / 2);
+        if (matchesInputBox(rows.slice(mid, end).join("\n"), input)) inputStart = mid;
+        else high = mid;
+      }
+    }
+    let offset = 0;
+    for (const [index, row] of rows.entries()) {
+      const cleanRow = row.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+      // Structured tool frames and the terminal's tool headings close the prefix BEFORE their body.
+      const toolFrame = /"(?:type|role)"\s*:\s*"(?:tool[^" ]*|function_call[^" ]*|command_execution)"|^\s*(?:[•⏺]\s*(?:Ran|Explored|Searched|Called|Bash|Read|Write|Edit|Shell|Exec|Tool)\b|⎋ |(?:tool[-_ ](?:call|output|result)|function_call)\b)/i.test(cleanRow);
+      if (toolFrame || index >= inputStart) {
+        this.closed = true;
+        return;
+      }
+      if (!this.adapter.harnessBannerRows?.includes(cleanRow)) {
+        const match = WORKER_STARTUP_FAILURE_RE.exec(row);
+        if (match) return {
+          matchedBytes: match[0], offset: offset + Buffer.byteLength(row.slice(0, match.index)),
+          row, rowNumber: index + 1,
+        };
+      }
+      offset += Buffer.byteLength(row) + 1;
+    }
+  }
 }
 
 // OBS-901/906: one daemon-owned writer for every execution surface. Drivers expose one retained
@@ -691,39 +745,75 @@ async function cancellableTipBattery(
     });
     const { verifyIntegrationTip } = await import(${JSON.stringify(new URL(`./merge.${extension}`, import.meta.url).href)});
     const { runWithVerificationBudget } = await import(${JSON.stringify(new URL(`./git.${extension}`, import.meta.url).href)});
+    const { runWithCommandLease } = await import(${JSON.stringify(new URL(`./lease.${extension}`, import.meta.url).href)});
+    let sequence = 0;
+    const grants = new Map();
+    const commandCapacities = new Map();
+    process.on('message', (message) => {
+      if (message.type === 'lease-grant') { grants.get(message.id)?.(message); grants.delete(message.id); }
+    });
+    const lease = async (command, execute) => {
+      const id = ++sequence;
+      const grant = new Promise(resolve => grants.set(id, resolve));
+      process.send({ type: 'lease-acquire', id, command });
+      const { capacity, token } = await grant;
+      commandCapacities.set(command, capacity);
+      try { return await runWithVerificationBudget(capacity, () => execute(token)); }
+      finally { process.send({ type: 'lease-release', id }); }
+    };
     let input = ''; for await (const chunk of process.stdin) input += chunk;
     const { intWt, commands, runDir, baseline, capacity } = JSON.parse(input);
     try {
-      const result = await runWithVerificationBudget(capacity, () => verifyIntegrationTip(intWt, commands, runDir, baseline));
-      if (!cancelled) process.stdout.write(JSON.stringify(result));
+      const result = await runWithVerificationBudget(capacity, () => runWithCommandLease(lease, () => verifyIntegrationTip(intWt, commands, runDir, baseline)));
+      if (!cancelled) process.stdout.write(JSON.stringify(result.map(row => ({ ...row, capacity: [...commandCapacities].reverse().find(([command]) => command === row.cmd || command.startsWith(row.cmd + " "))?.[1] ?? capacity }))));
     } catch (error) { if (!cancelled) throw error; }
+    finally { process.disconnect(); }
   `;
   const child = spawn(process.execPath, [
     ...(extension === "ts" ? ["--import", createRequire(import.meta.url).resolve("tsx")] : []),
     "--input-type=module", "-e", script,
-  ], { stdio: ["pipe", "pipe", "pipe"], detached: true });
+  ], { env: commandLeaseEnvironment(process.env), stdio: ["pipe", "pipe", "pipe", "ipc"], detached: true });
+  const releases = new Map<number, () => void>();
+  const leases = new Set<Promise<unknown>>();
+  let closed = false;
+  child.on("message", (message: { type: string; id: number; command: string }) => {
+    if (message.type === "lease-release") { releases.get(message.id)?.(); releases.delete(message.id); }
+    if (message.type !== "lease-acquire") return;
+    const held = withCommandLease(message.command, async () => {
+      if (closed || signal.aborted) return;
+      const released = new Promise<void>((resolve) => releases.set(message.id, resolve));
+      child.send({ type: "lease-grant", id: message.id, capacity: resolvedCapacity(), token: currentCommandLeaseToken() });
+      await released;
+    });
+    leases.add(held);
+    void held.catch(() => {}).finally(() => leases.delete(held));
+  });
   let output = "";
   let errors = "";
-  child.stdout.on("data", (chunk) => { output += chunk; });
-  child.stderr.on("data", (chunk) => { errors += chunk; });
+  child.stdout!.on("data", (chunk) => { output += chunk; });
+  child.stderr!.on("data", (chunk) => { errors += chunk; });
   const cancel = () => { child.kill("SIGTERM"); };
   const finished = new Promise<void>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code) => {
+      closed = true;
+      for (const release of releases.values()) release();
+      releases.clear();
       if (signal.aborted && (code === 143 || code === null)) reject(signal.reason);
       else if (code !== 0) reject(new Error(`tip verifier exited ${code}: ${errors}`));
       else resolve();
     });
   });
   signal.addEventListener("abort", cancel, { once: true });
-  child.stdin.on("error", () => { /* exit/abort is reported by finished */ });
-  child.stdin.end(JSON.stringify({ intWt, commands, runDir, baseline, capacity: resolvedCapacity() }));
+  child.stdin!.on("error", () => { /* exit/abort is reported by finished */ });
+  child.stdin!.end(JSON.stringify({ intWt, commands, runDir, baseline, capacity: resolvedCapacity() }));
   try {
     if (signal.aborted) cancel();
     await finished;
     return JSON.parse(output);
   } finally {
     signal.removeEventListener("abort", cancel);
+    await Promise.allSettled(leases);
   }
 }
 
@@ -783,9 +873,10 @@ export async function verifyIntegrationTipCached(
   for (const r of await (opts.signal
     ? cancellableTipBattery(intWt, commands, journal.dir, opts.baseline, opts.signal)
     : verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline))) {
+    const measuredCapacity = (r as typeof r & { capacity?: RunCapacity }).capacity ?? capacity;
     if (r.pass) {
       // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
-      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash, capacity });
+      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash, capacity: measuredCapacity });
     } else {
       journal.append("tip-verify-failed", undefined, {
         gate: r.gate,
@@ -797,7 +888,7 @@ export async function verifyIntegrationTipCached(
         lastMergedTask: opts.lastMergedTask,
         tip,
         cmdHash,
-        capacity,
+        capacity: measuredCapacity,
       });
       tipFailed = true;
     }
@@ -864,7 +955,6 @@ async function observeWorkerProcessTree(marker: string, cwd: string): Promise<Wo
 }
 
 interface ProcessRow { pid: number; ppid: number; command: string }
-const SUITE_COMMAND_RE = /(?:^|[\s/])(vitest(?:\.mjs)?|jest|mocha)(?:[\s/]|$)|\bnpm(?:\s+run)?\s+test\b/i;
 
 type SuitePidProbe = (pid: number) => number | undefined;
 
@@ -936,7 +1026,7 @@ export function countLiveSuites(
   // runner ("…as a vitest test whose…"), so a finished interactive worker counted as a live suite and
   // held a task's gates for 9 min 46 s. A runner is named in a command's HEAD — `node <bin>`,
   // `npm test`, `npx vitest`, `sh -c npm test` — never 140 KB into it: read the first four tokens only.
-  const candidates = rows.filter((row) => !ancestors.has(row.pid) && SUITE_COMMAND_RE.test(row.command.split(/\s+/, 4).join(" ")));
+  const candidates = rows.filter((row) => !ancestors.has(row.pid) && isRunnerCommand(row.command));
   const attributable = new Set(candidates.filter((row) => {
     if (descendants.has(row.pid)) return true;
     const cwd = cwdForPid(row.pid);
@@ -1478,7 +1568,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const rm = resolveRunMode(repoRoot, { flag: opts.mode, spec: graph.mode, globalDir: opts.globalDir });
   const cfg = rm.cfg;
   // Resolve both budgets once: worker fan-out divides by dispatch concurrency; verification
-  // divides by one suite occupying the serialized window. Explicit operator caps still win.
+  // divides by one runner command holding a lease. Explicit operator caps still win.
   const concurrency = opts.concurrency ?? cfg.concurrency;
   return await runWithForkBudget(concurrency, async () => {
   const conservativeCapacity = resolvedCapacity();
@@ -1717,48 +1807,29 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     console.error(`tickmarkr: board not reopened (attempt ${attempt}): ${reopened.error}`);
   };
 
-  // OBS-829/OBS-854: one full-suite verdict round at a time in this run, and do not begin beside an
-  // externally live suite attributable to this repository. The process scan catches nested scratch
-  // suites through daemon parentage even after cwd stops naming a worktree.
-  let suiteChain: Promise<void> = Promise.resolve();
-  let suitePending = 0;
-  const withSuiteWindow = async <T>(taskId: string | undefined, enabled: boolean, run: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
-    if (!enabled) return run();
-    const previous = suiteChain;
-    let release!: () => void;
-    suiteChain = new Promise<void>((resolve) => { release = resolve; });
-    const queued = suitePending++ > 0;
-    if (queued) {
-      const count = Math.max(1, await liveSuiteCount(repoRoot));
-      journal.append("suite-wait", taskId, { count });
-    }
-    await previous;
-    try {
+  // Context carries attribution through gates and remote inference; only shell commands acquire.
+  const commandLeases = new CommandLeases();
+  const withCommandContext = <T>(taskId: string | undefined, run: () => Promise<T>, signal?: AbortSignal): Promise<T> =>
+    runWithCommandLease((_command, execute) => commandLeases.run(async () => {
       let lastCount = -1;
       const startedAt = Date.now();
       for (;;) {
         signal?.throwIfAborted();
         const count = await liveSuiteCount(repoRoot);
         if (count === 0) break;
-        // OBS-889: a census that never reaches zero held T5's gates with no row and no end. Proceed at
-        // the ceiling, flagged: the verdict that follows was produced beside whatever is still counted.
+        if (count !== lastCount) journal.append("suite-wait", taskId, { count });
+        lastCount = count;
         if (Date.now() - startedAt >= suiteWaitCeilingMs) {
           journal.append("suite-wait-ceiling", taskId, { count, waitedMs: Date.now() - startedAt });
           journal.append("suite-budget", taskId, {
             count, occupancyCap: occupancyCapacity.forkCap, conservativeCap: conservativeCapacity.forkCap,
           });
-          return await runWithVerificationBudget(conservativeCapacity, run);
+          return await runWithVerificationBudget(conservativeCapacity, execute);
         }
-        if (count !== lastCount) journal.append("suite-wait", taskId, { count });
-        lastCount = count;
         await new Promise((wake) => setTimeout(wake, SUITE_POLL_MS));
       }
-      return await run();
-    } finally {
-      suitePending--;
-      release();
-    }
-  };
+      return await execute();
+    }, (count) => journal.append("suite-wait", taskId, { count }), SUITE_POLL_MS, signal), run);
 
   let baseRef: string;
   let baseline!: Baseline;
@@ -1794,6 +1865,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // The SAME comparator status uses (engagementComparable); one decision, two consumers. Fail closed:
     // no resume path silently accepts a mismatched or unbound journal. --graph-changed is the operator's
     // audited release for the stop-amend-resume workflow, journaling a graph-rehash naming both hashes.
+    graph = applyScopeAmendments(graph, journal, true);
     const loadedHash = graphDefinitionHash(graph);
     const cmp = engagementComparable(journal.read(), loadedHash);
     if (!cmp.comparable) {
@@ -1837,7 +1909,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     baselinePending = true;
     // Workers can run beside capture, but no gate may observe an absent or partial baseline.
     // Keep publication and warnings inside the same barrier as the suite's final verdict.
-    baselineCapture = withSuiteWindow(undefined, commands.test !== undefined || commands.tipTest !== undefined, async () => {
+    baselineCapture = withCommandContext(undefined, async () => {
       const captured = await captureBaseline(repoRoot, commands);
       writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(captured, null, 2));
       baseline = captured;
@@ -2029,16 +2101,20 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // worker made. Do not replace the scope gate's stronger attribution with that inference.
       const paths = reds.filter((g) => g.gate !== "scope" || !g.meta?.collateral).flatMap((g) => namedPaths(g.details));
       if (refusal.length || (paths.length > 0 && paths.every((path) => !allowed(path)))) {
-        journal.append("scope-authoring", t.id, {
+        const classification = {
           gate: refusal.length ? "worker" : reds[0]?.gate,
           paths: [...new Set(refusal.length ? refusal : paths)],
           repair: `files[] repair hint: ${[...new Set(refusal.length ? refusal : paths)].join(", ")}`,
           attempt: attempts + 1, chargeable: false, source: "diagnostic",
-        });
+        };
+        if (refusal.length) journal.append("scope-request", t.id, classification);
+        else journal.append("scope-authoring", t.id, classification);
         // OBS-547 (Leg-2 T3 material): unchargeable ⇒ metered 0, exactly as the predicted path below —
         // passing the physical count would write `meteredAttempts: 1` beside `attempts: 0`.
-        await park(t, `authoring defect — files[] repair hint: ${[...new Set(refusal.length ? refusal : paths)].join(", ")}; current files[]: ${t.files.join(", ")}`,
-          "authoring", assignment, attempts, startMs, gateFails, consults, tokens, 0, retryMode);
+        const approveCommand = `tickmarkr approve ${runId} ${t.id} --files ${[...new Set(refusal)].map((path) => /^[\w./-]+$/.test(path) ? path : shq(path)).join(",")}`;
+        await park(t, `${refusal.length ? "scope request" : "authoring defect"} — files[] repair hint: ${[...new Set(refusal.length ? refusal : paths)].join(", ")}; current files[]: ${t.files.join(", ")}`,
+          refusal.length ? "scope-request" : "authoring", assignment, attempts, startMs, gateFails, consults, tokens, 0, retryMode,
+          refusal.length ? { paths: [...new Set(refusal)], approveCommand, graphDefinitionHash: graphDefinitionHash(graph) } : {});
         return true;
       }
     }
@@ -2079,6 +2155,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     approvalSweepCursor = events.length;
     if (approvals.length === 0) return;
 
+    graph = applyScopeAmendments(graph, journal);
     resume = journal.replayResumeState();
     satisfiedGates = journal.replaySatisfiedGates();
     replayedGateResults = resumeLifecycleOpen
@@ -2726,8 +2803,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await trackedDriver.project?.(t.id, "in-review");
         await waitForBaseline(t.id);
         journal.phaseStart(t.id, "gates");
-        const { results } = await withSuiteWindow(t.id,
-          resumedTask.gates.includes("test") && commands.test !== undefined,
+        const { results } = await withCommandContext(t.id,
           () => runReviewRecovery(resumedTask, {
           carriedFindings: outstandingReviewFindings(journal.read(), t.id),
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
@@ -3002,7 +3078,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           feedback = feedback ? `${feedback}\n\n${consultBrief}` : consultBrief;
         }
       }
-      retryMode = repairFindings
+      const scopeApproval = [...journaledSoFar].reverse().find((e) => e.taskId === t.id && (e.event === "task-approved" || e.event === "task-dispatch"));
+      retryMode = scopeApproval?.data.release === "scope-request" ? "fresh" : repairFindings
         ? "repair"
         : priorSession
         && priorSession.channel === channelKey(assignment)
@@ -3029,6 +3106,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // ledger cannot tell a carried dispatch from an amnesiac one — the exact question a run that
       // spends two frontier attempts re-deriving a known defect has to be able to answer afterwards.
       journal.append("task-dispatch", t.id, {
+        ...(scopeApproval?.data.release === "scope-request" ? { files: t.files, graphDefinitionHash: graphDefinitionHash(graph) } : {}),
         assignment, attempt, provenance: dispatchProvenance([
           channelKey(assignment) === channelKey(r.assignment) ? r.provenance
             : t.routingHints?.pin ? `pin ${t.routingHints.pin.via}:${t.routingHints.pin.model} not re-tried` : "ladder assignment",
@@ -3366,6 +3444,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let processExited = false;
       let earlyLaunchDead = false;
       let startupFailure = false;
+      let startupEvidence: StartupFailureEvidence | undefined;
+      const startupDetector = new StartupFailureDetector(adapter);
+      const startupFailureInWindow = (text: string, launchedAt: number | undefined): boolean => {
+        startupEvidence ??= startupDetector.sample(text, launchedAt);
+        return startupEvidence !== undefined;
+      };
       let deadWorkerPark: { ref: string; reason: string } | undefined;
       let settleParsed: WorkerResult | undefined;
       const trailerFrames = interactive && adapter.busyFrameMarkers
@@ -4117,6 +4201,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (!workerFinished) {
             journal.append("worker-reaped-before-harvest", t.id, {
               slot: slot.name, attempt, cause: workerCause ?? "stall-timeout",
+              ...(startupEvidence ? { evidence: startupEvidence } : {}),
             });
           }
         } catch (error) {
@@ -4450,8 +4535,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             journalGateResult(g);
           }
         } else {
-          ({ results, commits } = await withSuiteWindow(t.id,
-            t.gates.includes("test") && commands.test !== undefined,
+          ({ results, commits } = await withCommandContext(t.id,
             () => runReviewRecovery(t, {
             carriedFindings: outstandingFindings,
             worktree: wt, baseRef: taskBase, result, author: assignment,
@@ -4845,7 +4929,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       poll = setTimeout(pollApprovals, APPROVAL_POLL_MS);
       let tipFailed: boolean;
       try {
-        const verification = withSuiteWindow(undefined, commands.test !== undefined || commands.tipTest !== undefined,
+        const verification = withCommandContext(undefined,
           () => verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline, signal: controller.signal }), controller.signal);
         activeTipVerify = { controller, settled: verification.then(() => {}, () => {}) };
         tipFailed = await verification;

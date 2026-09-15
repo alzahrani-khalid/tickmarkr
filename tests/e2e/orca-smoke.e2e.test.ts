@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import { shq } from "../../src/adapters/types.js";
 import { USAGE } from "../../src/cli/index.js";
 import { DRIVER_CHOICES } from "../../src/drivers/index.js";
-import { canonicalWorktreePath, OrcaDriver, OrcaError, parseEnvelope, resolveOrcaCliBinary, terminalWorktree, type OrcaExec } from "../../src/drivers/orca.js";
+import { canonicalWorktreePath, OrcaDriver, OrcaError, parseEnvelope, provesCheckout, resolveOrcaCliBinary, terminalWorktree, type OrcaExec } from "../../src/drivers/orca.js";
 import type { Slot } from "../../src/drivers/types.js";
 import { removeWorktree, sh, shGit, shOk, type ShResult } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
@@ -14,8 +14,10 @@ import { Journal } from "../../src/run/journal.js";
  * TICKMARKR_E2E=1 AND the runtime probe answers reachable, and even then it launches NO agent CLI —
  * the terminal runs two `printf`s that emit a synthetic per-run nonce trailer, so the smoke spends
  * zero tokens. What it proves is exactly what a fake can never prove: a real `terminal create`
- * receipt binds to the worktree the smoke made, real cursor-paged reads carry the trailer back
- * byte-exact, and the real close removes the terminal.
+ * receipt binds to the TRACKED worktree enclosing the checkout the smoke made (OBS-1004: Orca never
+ * tracks a daemon-added checkout, so the terminal is created on the enclosing clone with its
+ * command cd'ed into the checkout, and the terminal's own proof line names that checkout), real
+ * cursor-paged reads carry the trailer back byte-exact, and the real close removes the terminal.
  *
  * Fail-closed by construction: `smokeVerdict` is the ONLY place a green is minted, and it mints one
  * only from observations that were actually made. A missing observation is a failure, never a
@@ -64,14 +66,20 @@ interface SmokeObservations {
   reachable: boolean;
   /** why the runtime was not usable, when it was not */
   unreachable?: string;
-  /** the temporary worktree this smoke created and asked orca to bind the terminal to */
+  /** the temporary checkout this smoke created — the terminal's command runs INSIDE it */
   smokeWorktree?: string;
+  /** the TRACKED worktree orca resolved for that checkout (`worktree current` asked from it) —
+   *  the enclosing clone, the only `path:` selector orca honours (OBS-1004) */
+  trackedWorktree?: string;
   /** the worktree orca's own create receipt named (canonicalized), or undefined when unbound */
   createReceiptWorktree?: string;
   /** the nonce trailer came back contiguous and byte-exact through OrcaDriver reads */
   trailerObserved: boolean;
-  /** OrcaDriver itself proved the fresh checkout through worktree current from that checkout */
-  adoptionWaitExercised: boolean;
+  /** OrcaDriver itself resolved the tracked worktree by asking worktree current FROM the checkout */
+  trackedWorktreeResolved: boolean;
+  /** the terminal's scrollback carries the driver's proof line naming the smoke checkout — the
+   *  payload really ran inside it, not in the enclosing clone */
+  checkoutObserved: boolean;
   /** driver.status() issued a rendered-frame read rather than reading repainting stream fragments */
   screenReadExercised: boolean;
   /** driver.status() deliberately exercised an elapsed terminal wait against the installed Orca */
@@ -105,11 +113,17 @@ export function smokeVerdict(o: SmokeObservations): { status: SmokeStatus; reaso
   if (!o.reachable) return { status: "skipped", reasons: [o.unreachable ?? "orca runtime is not reachable"] };
   const reasons: string[] = [];
   if (!o.trailerObserved) reasons.push("no byte-exact nonce trailer observed through OrcaDriver reads");
-  if (!o.adoptionWaitExercised) reasons.push("no worktree adoption wait exercised through OrcaDriver create");
+  if (!o.trackedWorktreeResolved) reasons.push("no tracked-worktree resolution exercised through OrcaDriver create (worktree current from the checkout)");
+  if (!o.checkoutObserved) reasons.push("no proof line naming the smoke checkout observed through OrcaDriver reads — the payload's cwd is unproven");
   if (!o.screenReadExercised) reasons.push("no rendered screen read exercised through OrcaDriver status");
   if (!o.elapsedWaitExercised) reasons.push("no elapsed terminal wait exercised through OrcaDriver status");
-  if (o.smokeWorktree === undefined || o.createReceiptWorktree !== o.smokeWorktree) {
-    reasons.push(`create receipt bound to ${o.createReceiptWorktree ?? "no worktree"}, not the smoke's ${o.smokeWorktree ?? "unknown"}`);
+  // OBS-1004: the receipt binds to the TRACKED worktree, which must enclose the smoke checkout.
+  if (o.trackedWorktree === undefined || o.smokeWorktree === undefined
+    || !(o.smokeWorktree === o.trackedWorktree || o.smokeWorktree.startsWith(`${o.trackedWorktree}/`))) {
+    reasons.push(`tracked worktree ${o.trackedWorktree ?? "unresolved"} does not enclose the smoke's checkout ${o.smokeWorktree ?? "unknown"}`);
+  }
+  if (o.trackedWorktree === undefined || o.createReceiptWorktree !== o.trackedWorktree) {
+    reasons.push(`create receipt bound to ${o.createReceiptWorktree ?? "no worktree"}, not the tracked worktree ${o.trackedWorktree ?? "unresolved"} enclosing the smoke's ${o.smokeWorktree ?? "unknown"}`);
   }
   if (!o.listedBeforeClose) {
     reasons.push("orca never listed the created terminal before the close attempt — a later absence proves no close");
@@ -144,11 +158,18 @@ export function recordingExec(tape: OrcaCall[], run: typeof sh = sh): OrcaExec {
   };
 }
 
-function adoptionWaitSeen(tape: OrcaCall[], worktree: string): boolean {
-  return tape.some(({ args, cwd }) =>
-    args[0] === "worktree"
-    && args[1] === "current"
-    && canonicalWorktreePath(cwd) === worktree);
+/** The tracked worktree the driver resolved: the answer to the `worktree current` it asked FROM the
+ *  smoke checkout (OBS-1004 — an enclosing clone, never the checkout unless orca tracks it). */
+function trackedResolution(tape: OrcaCall[], checkout: string): { resolved: boolean; tracked?: string } {
+  const call = tape.find(({ args, cwd }) => args[0] === "worktree" && args[1] === "current" && canonicalWorktreePath(cwd) === checkout);
+  if (!call) return { resolved: false };
+  try {
+    const record = parseEnvelope("worktree-current", call.result.stdout).result.worktree;
+    const path = typeof record === "object" && record !== null ? terminalWorktree(record as Record<string, unknown>) : undefined;
+    return { resolved: true, tracked: path === undefined ? undefined : canonicalWorktreePath(path) };
+  } catch {
+    return { resolved: true };
+  }
 }
 
 function screenReadSeen(tape: OrcaCall[]): boolean {
@@ -266,7 +287,8 @@ export async function runOrcaSmoke(opts: {
     gate: opts.gate ?? process.env.TICKMARKR_E2E === "1",
     reachable: false,
     trailerObserved: false,
-    adoptionWaitExercised: false,
+    trackedWorktreeResolved: false,
+    checkoutObserved: false,
     screenReadExercised: false,
     elapsedWaitExercised: false,
     listedBeforeClose: false,
@@ -311,7 +333,9 @@ export async function runOrcaSmoke(opts: {
       slot,
       `printf '%s' ${shq(TRAILER_HEAD)}; printf '%s\\n' ${shq(TRAILER_TAIL)}; sleep ${IDLE_SECONDS}`,
     );
-    observations.adoptionWaitExercised = adoptionWaitSeen(tape, slot.cwd);
+    const resolution = trackedResolution(tape, slot.cwd);
+    observations.trackedWorktreeResolved = resolution.resolved;
+    observations.trackedWorktree = resolution.tracked;
     const receipt = createReceipt(tape);
     observations.createReceiptWorktree = receipt.worktree;
     observations.createRuntimeId = receipt.runtimeId;
@@ -320,7 +344,11 @@ export async function runOrcaSmoke(opts: {
     await driver.status(slot);
     observations.screenReadExercised = screenReadSeen(tape);
     observations.elapsedWaitExercised = elapsedWaitSeen(tape);
-    observations.trailerObserved = matched && (await driver.read(slot, 200)).includes(TRAILER);
+    const text = await driver.read(slot, 200);
+    observations.trailerObserved = matched && text.includes(TRAILER);
+    // The driver's own proof line, printed by the create command before the payload: the terminal
+    // was created on the tracked clone, but the payload ran INSIDE the smoke checkout.
+    observations.checkoutObserved = provesCheckout(text, slot.cwd);
     if (receipt.handle === undefined) throw new Error("the create receipt carries no handle — no close can be proven against it");
     if (receipt.runtimeId === undefined) throw new Error("the create receipt carries no runtime identity — its handle is scoped to nothing provable");
     // Presence FIRST, from the same runtime and the same listing the absence will be read from. An
@@ -328,7 +356,9 @@ export async function runOrcaSmoke(opts: {
     // held, is missing from the later list exactly like a closed one — and reading that as green is
     // how a close that never happened would ship. The answering identity is recorded with it, and
     // smokeVerdict requires both listings to be the create's own runtime.
-    const before = await listsHandle(exec, cwd, worktree, receipt.handle);
+    if (observations.trackedWorktree === undefined) throw new Error("the driver resolved no tracked worktree — the created handle cannot be listed under a selector orca honours");
+    const tracked = observations.trackedWorktree;
+    const before = await listsHandle(exec, cwd, tracked, receipt.handle);
     observations.listedBeforeClose = before.listed;
     observations.listedBeforeRuntimeId = before.runtimeId;
     // Orca answers a LIVE terminal's close with a tab_not_found refusal while still removing it, so
@@ -345,7 +375,7 @@ export async function runOrcaSmoke(opts: {
       observations.closeRefused = `${e.reason} from ${e.runtimeId}`;
     }
     slot = undefined;
-    const after = await listsHandle(exec, cwd, worktree, receipt.handle);
+    const after = await listsHandle(exec, cwd, tracked, receipt.handle);
     observations.terminalClosed = !after.listed;
     observations.closedRuntimeId = after.runtimeId;
   } catch (e) {
@@ -404,10 +434,11 @@ export async function liveLeg(ctx: SkipChannel, smoke: SmokeResult): Promise<"sk
   expect(smoke.reasons, "smoke reasons must be empty to pass").toEqual([]);
   expect(smoke.status).toBe("passed");
   expect(smoke.observations.trailerObserved).toBe(true);
-  expect(smoke.observations.adoptionWaitExercised).toBe(true);
+  expect(smoke.observations.trackedWorktreeResolved).toBe(true);
+  expect(smoke.observations.checkoutObserved).toBe(true);
   expect(smoke.observations.screenReadExercised).toBe(true);
   expect(smoke.observations.elapsedWaitExercised).toBe(true);
-  expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.smokeWorktree);
+  expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.trackedWorktree);
   expect(smoke.observations.listedBeforeClose).toBe(true);
   expect(smoke.observations.terminalClosed).toBe(true);
   expect(smoke.observations.listedBeforeRuntimeId).toBe(smoke.observations.createRuntimeId);
@@ -429,10 +460,12 @@ describe("e2e: orca driver smoke", () => {
     const green: SmokeObservations = {
       gate: true,
       reachable: true,
-      smokeWorktree: "/tmp/smoke-wt",
-      createReceiptWorktree: "/tmp/smoke-wt",
+      smokeWorktree: "/tmp/smoke-clone/checkouts/smoke-wt",
+      trackedWorktree: "/tmp/smoke-clone",
+      createReceiptWorktree: "/tmp/smoke-clone",
       trailerObserved: true,
-      adoptionWaitExercised: true,
+      trackedWorktreeResolved: true,
+      checkoutObserved: true,
       screenReadExercised: true,
       elapsedWaitExercised: true,
       createRuntimeId: "rt-1",
@@ -443,11 +476,18 @@ describe("e2e: orca driver smoke", () => {
     };
     expect(smokeVerdict(green).status).toBe("passed");
     expect(smokeVerdict({ ...green, trailerObserved: false }).status).toBe("failed");
-    expect(smokeVerdict({ ...green, adoptionWaitExercised: false }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, trackedWorktreeResolved: false }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, checkoutObserved: false }).status).toBe("failed");
     expect(smokeVerdict({ ...green, screenReadExercised: false }).status).toBe("failed");
     expect(smokeVerdict({ ...green, elapsedWaitExercised: false }).status).toBe("failed");
     expect(smokeVerdict({ ...green, createReceiptWorktree: "/tmp/some-other-wt" }).status).toBe("failed");
     expect(smokeVerdict({ ...green, createReceiptWorktree: undefined }).status).toBe("failed");
+    // OBS-1004: the receipt binds to the tracked worktree, which must ENCLOSE the checkout — a
+    // receipt bound to the checkout itself (the pre-OBS-1004 expectation) is not what orca does.
+    expect(smokeVerdict({ ...green, createReceiptWorktree: green.smokeWorktree }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, trackedWorktree: undefined }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, trackedWorktree: "/tmp/elsewhere", createReceiptWorktree: "/tmp/elsewhere" }).status).toBe("failed");
+    expect(smokeVerdict({ ...green, smokeWorktree: green.trackedWorktree }).status).toBe("passed"); // a tracked checkout is its own enclosure
     expect(smokeVerdict({ ...green, terminalClosed: false }).status).toBe("failed");
     // Absence alone is not a close: a handle the runtime never listed before the attempt is missing
     // afterwards whether or not this smoke closed anything.
@@ -466,10 +506,11 @@ describe("e2e: orca driver smoke", () => {
     if (smoke.status !== "skipped") {
       expect(smoke.status, `live smoke: ${smoke.reasons.join(" · ")}`).toBe("passed");
       expect(smoke.observations.trailerObserved).toBe(true);
-      expect(smoke.observations.adoptionWaitExercised).toBe(true);
+      expect(smoke.observations.trackedWorktreeResolved).toBe(true);
+      expect(smoke.observations.checkoutObserved).toBe(true);
       expect(smoke.observations.screenReadExercised).toBe(true);
       expect(smoke.observations.elapsedWaitExercised).toBe(true);
-      expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.smokeWorktree);
+      expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.trackedWorktree);
       expect(smoke.observations.listedBeforeClose).toBe(true);
       expect(smoke.observations.terminalClosed).toBe(true);
       expect(smoke.observations.listedBeforeRuntimeId).toBe(smoke.observations.createRuntimeId);
@@ -514,10 +555,12 @@ describe("e2e: orca driver smoke", () => {
     const claimsGreen: SmokeObservations = {
       gate: false,
       reachable: false,
-      smokeWorktree: "/tmp/smoke-wt",
-      createReceiptWorktree: "/tmp/smoke-wt",
+      smokeWorktree: "/tmp/smoke-clone/checkouts/smoke-wt",
+      trackedWorktree: "/tmp/smoke-clone",
+      createReceiptWorktree: "/tmp/smoke-clone",
       trailerObserved: true,
-      adoptionWaitExercised: true,
+      trackedWorktreeResolved: true,
+      checkoutObserved: true,
       screenReadExercised: true,
       elapsedWaitExercised: true,
       listedBeforeClose: true,

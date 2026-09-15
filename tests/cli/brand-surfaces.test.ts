@@ -1,12 +1,12 @@
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { allAdapters, writeDoctor } from "../../src/adapters/registry.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { plan } from "../../src/cli/commands/plan.js";
 import { report } from "../../src/cli/commands/report.js";
-import { narrationLine as railLine, narrationRow as railRow, RAIL_ROWS, TTY_NOISE_EVENTS } from "../../src/cli/commands/run.js";
+import { narrationSink, narrationLine as railLine, narrationRow as railRow, RAIL_ROWS, TTY_NOISE_EVENTS } from "../../src/cli/commands/run.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
 import { saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -217,6 +217,7 @@ const RAIL_SPEC: RailSpec[] = [
   { event: "channel-recycle", label: "channel recycled", tone: "attention", salient: "channel claude-code:sonnet", data: { site: "gate-fail", channel: "claude-code:sonnet" } },
   { event: "retry-same-banned", label: "retry banned", tone: "attention", data: { gate: "review", from: "claude-code:sonnet", to: "codex:gpt-5.6-sol" } },
   { event: "gate-fingerprint-cap", label: "repeat capped", tone: "attention", salient: "channel claude-code:sonnet", data: { gate: "test", occurrences: 2, fingerprint: "expected 7 to be 6", retrySameBanned: true, channel: "claude-code:sonnet", attempt: 3 } },
+  { event: "scope-request", label: "scope requested", tone: "attention", data: { paths: ["src/run/daemon.ts"], chargeable: false } },
   { event: "scope-authoring", label: "authoring defect", tone: "attention", salient: "channel claude-code:sonnet", data: { gate: "scope", predicted: ["src/run/daemon.ts"], repair: "declare src/run/daemon.ts in files[]", attempt: 1, chargeable: false, channel: "claude-code:sonnet" } },
   { event: "session-reset", label: "session reset", tone: "attention", salient: "tokens 174000", data: { tokens: 174000, threshold: 160000, attempt: 2 } },
   { event: "worker-mode-fallback", label: "dispatch mode", tone: "attention", data: { reason: "adapter" } },
@@ -244,6 +245,9 @@ const RAIL_SPEC: RailSpec[] = [
   { event: "baseline-wait", label: "baseline wait", tone: "active", data: { baseRef: "abc123" } },
   // SB-1 (v2.5.2): a verdict round released at the suite-wait ceiling beside a foreign suite ran
   // under the conservative budget — the row names the census and both caps.
+  { event: "suite-wait", label: "suite wait", tone: "active", data: { count: 1 } },
+  { event: "suite-wait-ceiling", label: "suite wait ceiling", tone: "attention", data: { count: 1, waitedMs: 600000 } },
+  { event: "worker-reaped-before-harvest", label: "worker reaped", tone: "attention", data: { cause: "startup-failure", evidence: { matchedBytes: "model-not-found", offset: 7, row: "Error: model-not-found", rowNumber: 1 } } },
   { event: "suite-budget", label: "suite budget", tone: "attention", salient: "beside 1, cap 3 not 6", data: { count: 1, occupancyCap: 6, conservativeCap: 3 } },
   { event: "gate-replayed", label: "gate replayed", tone: "attention", renders: "fail", data: { gate: "test", attempt: 1, priorAttempt: 0, commit: "deadbeefcafe", pass: false, details: "assertion failed" } },
   { event: "gate-reused", label: "gate reused", tone: "neutral", data: { gate: "lint", commit: "deadbeefcafe" } },
@@ -416,6 +420,36 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     if (process.env.UPDATE_BRAND_GOLDEN === "1") {
       writeFileSync(join(import.meta.dirname, "../fixtures/brand-surfaces/run-narration.txt"), regenerated);
     }
+    expect(regenerated).toBe(golden("run-narration.txt"));
+  });
+
+  test("test: the scope-request park and the approval-authored graph-rehash each render one labelled narrator row and the run narration golden regenerated for them is byte-identical to the shipped fixture, so a journal row the narrator cannot label fails", () => {
+    onTTY();
+    for (const event of ["scope-request", "graph-rehash"]) {
+      const spec = RAIL_SPEC.find((s) => s.event === event)!;
+      const row = narrationLine({ ...specEvent(spec), data: { ...spec.data, source: "approval", approval: "2026-09-14T00:00:00Z" } })!;
+      expect(RAIL_ROWS[event]!.label.trim()).not.toBe("");
+      expect(row.split("\n")).toHaveLength(1);
+      expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
+    }
+    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    expect(regenerated).toBe(golden("run-narration.txt"));
+  });
+
+  test("test: suite-wait, suite-wait-ceiling and worker-reaped-before-harvest each render one labelled narrator row with a non-empty label through the production narration sink and the run narration golden regenerated for them is byte-identical to the shipped fixture, so a journal row the narrator cannot label fails", () => {
+    onTTY();
+    const output = vi.spyOn(console, "log").mockImplementation(() => {});
+    for (const event of ["suite-wait", "suite-wait-ceiling", "worker-reaped-before-harvest"]) {
+      const spec = RAIL_SPEC.find((spec) => spec.event === event)!;
+      narrationSink("run-brand-pin")(specEvent(spec));
+      const row = String(output.mock.calls.at(-1)![0]);
+      expect(RAIL_ROWS[event]!.label.trim()).not.toBe("");
+      expect(row.split("\n")).toHaveLength(1);
+      expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
+    }
+    expect(output).toHaveBeenCalledTimes(3);
+    output.mockRestore();
+    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     expect(regenerated).toBe(golden("run-narration.txt"));
   });
 

@@ -28,6 +28,7 @@
 ! T1 channel recycled — channel claude-code:sonnet
 ! T1 retry banned — review
 ! T1 repeat capped — test, channel claude-code:sonnet
+! T1 scope requested — files[]: src/run/daemon.ts
 ! T1 authoring defect — scope, channel claude-code:sonnet
 ! T1 session reset — tokens 174000
 ! T1 dispatch mode — adapter
@@ -47,6 +48,9 @@
 ❯ T1 gate start — test
 ✗ T1 gate — test failed
 ❯ T1 baseline wait — base abc123
+❯ T1 suite wait — waiting for 1 command(s)
+! T1 suite wait ceiling — 1 still live after 600000ms
+! T1 worker reaped — cause startup-failure
 ! T1 suite budget — beside 1, cap 3 not 6
 ✗ T1 gate replayed — test
 - T1 gate reused — lint

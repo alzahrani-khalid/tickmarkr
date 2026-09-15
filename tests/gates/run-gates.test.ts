@@ -1121,7 +1121,7 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
 });
 
 describe("T4 — a verified tip is verified for the SHA it verified (OBS-266)", () => {
-  test("an unmoved verified tip skips re-verification and a moved tip or changed command hash runs it in full", async () => {
+  test("the cycle cache skips an unmoved tip while changed trees and commands consult the scoped verdict store", async () => {
     // verify.log is the witness: gitignored, exactly like the artifacts a real suite drops, so the
     // integration tree stays clean between run-ends.
     const repo = makeRepo({ "a.txt": "x\n", "verify.sh": "echo ran >> verify.log\nexit 0\n", ".gitignore": "verify.log\n.tickmarkr/\n" });
@@ -1161,17 +1161,20 @@ describe("T4 — a verified tip is verified for the SHA it verified (OBS-266)", 
     // the real verify, the carried-forward green, the dirty-tree re-verify, then the moved tip
     expect(events().filter((e) => e.event === "tip-verify").map((e) => e.data.tip)).toEqual([tip, tip, tip, moved]);
 
-    // 5. same tip, different commands: a different verify, so it runs in full
+    // 5. A changed command SET misses the cycle cache. The unchanged test command
+    // still has its exact tip-scope identity; only the newly requested lint gate runs.
     expect(await verifyIntegrationTipCached(repo, { test: "sh verify.sh", lint: "sh verify.sh" }, journal)).toBe(false);
-    expect(runs()).toBe(5); // two commands, both really executed
-    // …and switching BACK is not a hit. The skip is licensed by the LAST green verify, never by a
-    // history of every pair ever green: the last thing that ran on this SHA was the other command
-    // set, so A→B→A re-verifies. Only once A is the last one again does the next run-end skip.
+    expect(runs()).toBe(4);
+    expect(events().filter((e) => e.event === "tip-verify-cached")).toHaveLength(1);
+    expect(events().filter((e) => e.event === "tip-verify" && e.data.gate === "test").at(-1)?.data.details).toContain("reused tip verdict (identity:");
+    // Switching back also misses the cycle cache, but its tool verdict is reusable.
     expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
-    expect(runs()).toBe(6);
+    expect(runs()).toBe(4);
+    expect(events().filter((e) => e.event === "tip-verify-cached")).toHaveLength(1);
+    expect(events().filter((e) => e.event === "tip-verify").at(-1)?.data.details).toContain("reused tip verdict (identity:");
     expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
-    expect(runs()).toBe(6);
-
+    expect(runs()).toBe(4);
+    expect(events().filter((e) => e.event === "tip-verify-cached")).toHaveLength(2);
     // 6. a RED tip is never cached — the failure is re-run, every time
     writeFileSync(join(repo, "verify.sh"), "echo ran >> verify.log\nexit 1\n");
     commitAll(repo, "break-it");
@@ -1182,9 +1185,8 @@ describe("T4 — a verified tip is verified for the SHA it verified (OBS-266)", 
     expect(runs()).toBe(after + 1);
   }, 30_000);
 
-  // The tip half of the same rule: the skip is licensed by the LAST green verify, never by a history
-  // of every SHA ever green. A tip that moves away and back really moved, so it is verified again.
-  test("a tip that moves away and back is re-verified — only the most recent green licenses a skip", async () => {
+  // Returning to a prior tree misses the cycle cache but can reuse durable tip evidence.
+  test("a tip that moves away and back reuses its scoped verdict before establishing a new cycle cache", async () => {
     const repo = makeRepo({ "a.txt": "x\n", "verify.sh": "echo ran >> verify.log\nexit 0\n", ".gitignore": "verify.log\n.tickmarkr/\n" });
     const journal = Journal.create(repo, "run-20260803-000000");
     const commands = { test: "sh verify.sh" };
@@ -1199,15 +1201,17 @@ describe("T4 — a verified tip is verified for the SHA it verified (OBS-266)", 
     expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
     expect(runs()).toBe(2);
 
-    // back to A: green once, long ago — but B is what the last verify spoke for, so A is re-verified.
-    // A history-wide cache would skip here and report an unverified state as green.
+    // B is the last cycle, so returning to A consults its durable verification identity.
     git(repo, `reset --hard ${a}`);
     expect(await gitHead(repo)).toBe(a);
     expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
-    expect(runs()).toBe(3);
-    // …and now A IS the last green verify, so the next run-end on it skips
+    expect(runs()).toBe(2);
+    expect(journal.read().filter((e) => e.event === "tip-verify-cached")).toHaveLength(0);
+    expect(journal.read().filter((e) => e.event === "tip-verify").at(-1)?.data.details).toContain("reused tip verdict (identity:");
+    // Now A is the last green cycle, and the original cycle-cache row answers first.
     expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
-    expect(runs()).toBe(3);
+    expect(runs()).toBe(2);
+    expect(journal.read().filter((e) => e.event === "tip-verify-cached")).toHaveLength(1);
   }, 30_000);
 
   test("a same-tip red-to-green recovery establishes a new cacheable verification cycle", async () => {
@@ -1577,3 +1581,4 @@ describe("review empty-output note", () => {
     expect(malformed.out.results.find((r) => r.gate === "review")?.details).toContain("produced no parseable verdict");
   });
 });
+

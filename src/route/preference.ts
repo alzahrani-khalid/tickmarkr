@@ -11,13 +11,17 @@ const PREFERENCE_ROLES: PreferenceRole[] = ["worker", "judge", "review", "consul
 /** Provider identity comes from the served model, not a gateway adapter's stamped vendor. */
 export function modelProvider(model: string, fallback = "unknown"): string {
   const id = model.toLowerCase();
-  const prefix = id.includes("/") ? id.slice(0, id.indexOf("/")) : "";
-  if (prefix === "openai" || prefix === "openai-codex" || /^(?:gpt|o\d)/.test(id)) return "openai";
-  if (prefix === "anthropic" || /^(?:claude|opus|sonnet|haiku|fable)(?:-|$)/.test(id)) return "anthropic";
-  if (prefix === "google" || /^gemini(?:-|$)/.test(id)) return "google";
-  if (prefix === "xai" || /^grok(?:-|$)/.test(id)) return "xai";
-  if (["zai", "zhipu", "zai-coding-plan"].includes(prefix) || /^glm(?:-|$)/.test(id)) return "zhipu";
-  if (["kimi-code", "moonshot"].includes(prefix) || /^kimi(?:-|$)/.test(id)) return "moonshot";
+  const sepIdx = id.search(/[/:\s]/);
+  const prefix = sepIdx !== -1 ? id.slice(0, sepIdx) : "";
+  const remainder = sepIdx !== -1 ? id.slice(sepIdx + 1) : id;
+  if (prefix === "openai" || prefix === "openai-codex" || /^(?:gpt|o\d)/.test(remainder)) return "openai";
+  if (prefix === "anthropic" || /^(?:claude|opus|sonnet|haiku|fable)(?:-|$)/.test(remainder)) return "anthropic";
+  if (prefix === "google" || /^gemini(?:-|$)/.test(remainder)) return "google";
+  if (prefix === "xai" || prefix === "xai-oauth" || /^(?:grok|xai)(?:-|$)/.test(remainder) || id.startsWith("xai-oauth")) return "xai";
+  if (["zai", "zhipu", "zai-coding-plan"].includes(prefix) || /^glm(?:-|$)/.test(remainder)) return "zhipu";
+  if (["kimi-code", "moonshot"].includes(prefix) || /^kimi(?:-|$)/.test(remainder)) return "moonshot";
+  const normalizedFallback = fallback.toLowerCase();
+  if (normalizedFallback === "xai-oauth" || normalizedFallback === "xai") return "xai";
   return fallback;
 }
 
@@ -60,7 +64,9 @@ export function excludedChannels(
   for (const id of adapterIds(adapters)) {
     if (!health[id]?.installed || !health[id]?.authed) continue;
     for (const c of channelsFromConfig(id, cfg)) {
-      const d = disallowedBy(c, cfg.routing);
+      const identity = health[id]?.modelAuth?.[c.model]?.identity ?? health[id]?.modelIdentities?.[c.model];
+      const chan = identity ? { ...c, identity } : c;
+      const d = disallowedBy(chan, cfg.routing);
       if (d) out.push({ key: channelKey(c), d });
     }
   }
@@ -85,27 +91,136 @@ export function preferRanks(c: { adapter: string; model: string }, cfg: Tickmark
   return out;
 }
 
+export function isExplicitIdOfAliasFamily(candidateModel: string, alias: string): boolean {
+  if (candidateModel === alias) return true;
+  const tokens = candidateModel.toLowerCase().split(/[^a-z0-9]+/);
+  return tokens.includes(alias.toLowerCase());
+}
+
+export function entryMatchesChannel(
+  entry: string,
+  c: { adapter: string; model: string; identity?: string },
+  allowFamilyMatching = false,
+): boolean {
+  if (entry === c.adapter) return true;
+  if (entry === c.model) return true;
+  if (entry === channelKey(c)) return true;
+  if (c.identity) {
+    if (entry === c.identity) return true;
+    if (entry === `${c.adapter}:${c.identity}`) return true;
+  }
+  if (!c.identity && allowFamilyMatching) {
+    const colon = entry.indexOf(":");
+    if (colon !== -1) {
+      const entryAdapter = entry.slice(0, colon);
+      const entryModel = entry.slice(colon + 1);
+      if (entryAdapter === c.adapter && isExplicitIdOfAliasFamily(entryModel, c.model)) {
+        return true;
+      }
+    } else {
+      if (isExplicitIdOfAliasFamily(entry, c.model)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export interface ExclusionScope {
+  scope: string;
+  path: string;
+  configPath: string;
+  entry: string;
+  by: "deny" | "allow";
+}
+
+export function exclusionCollector(
+  c: { adapter: string; model: string; identity?: string },
+  routingOrCfg: TickmarkrConfig["routing"] | TickmarkrConfig,
+  role: PreferenceRole = "worker",
+): ExclusionScope[] {
+  const routing = "routing" in routingOrCfg ? routingOrCfg.routing : routingOrCfg;
+  const out: ExclusionScope[] = [];
+  const { allow, deny } = routing ?? {};
+  for (const entry of deny?.adapters ?? []) {
+    if (entryMatchesChannel(entry, c, true)) {
+      out.push({
+        scope: "routing.deny.adapters",
+        path: "routing.deny.adapters",
+        configPath: "routing.deny.adapters",
+        entry,
+        by: "deny",
+      });
+    }
+  }
+
+  for (const entry of deny?.models ?? []) {
+    if (entryMatchesChannel(entry, c, true)) {
+      out.push({
+        scope: "routing.deny.models",
+        path: "routing.deny.models",
+        configPath: "routing.deny.models",
+        entry,
+        by: "deny",
+      });
+    }
+  }
+
+  if (role === "worker") {
+    for (const entry of deny?.workers?.adapters ?? []) {
+      if (entryMatchesChannel(entry, c, true)) {
+        out.push({
+          scope: "routing.deny.workers.adapters",
+          path: "routing.deny.workers.adapters",
+          configPath: "routing.deny.workers.adapters",
+          entry,
+          by: "deny",
+        });
+      }
+    }
+    for (const entry of deny?.workers?.models ?? []) {
+      if (entryMatchesChannel(entry, c, true)) {
+        out.push({
+          scope: "routing.deny.workers.models",
+          path: "routing.deny.workers.models",
+          configPath: "routing.deny.workers.models",
+          entry,
+          by: "deny",
+        });
+      }
+    }
+  }
+
+  if (allow) {
+    const allAllow = [...(allow.adapters ?? []), ...(allow.models ?? [])];
+    const admitted = allAllow.some((e) => entryMatchesChannel(e, c, false));
+    if (!admitted) {
+      out.push({
+        scope: "routing.allow",
+        path: "routing.allow",
+        configPath: "routing.allow",
+        entry: allAllow.join(", ") || "(empty allowlist)",
+        by: "allow",
+      });
+    }
+  }
+
+  return out;
+}
+
+export const collectExclusions = exclusionCollector;
+export const exclusionProvenance = exclusionCollector;
+
 // entries in either list accept adapter id, model id, or adapter:model (grammar A1)
 export function disallowedBy(
-  c: { adapter: string; model: string },
-  routing: TickmarkrConfig["routing"],
+  c: { adapter: string; model: string; identity?: string },
+  routingOrCfg: TickmarkrConfig["routing"] | TickmarkrConfig,
   role: PreferenceRole = "worker",
 ): Disallowed | null {
-  const { allow, deny } = routing;
-  const matches = (e: string) => e === c.adapter || e === c.model || e === channelKey(c);
-  const workerDeny = role === "worker" ? deny?.workers : undefined;
-  const d = [
-    ...(deny?.adapters ?? []),
-    ...(deny?.models ?? []),
-    ...(workerDeny?.adapters ?? []),
-    ...(workerDeny?.models ?? []),
-  ].find(matches);
-  if (d) return { by: "deny", entry: d };
-  if (allow) {
-    const entries = [...(allow.adapters ?? []), ...(allow.models ?? [])];
-    if (!entries.some(matches)) return { by: "allow", entry: entries.join(", ") || "(empty allowlist)" };
-  }
-  return null;
+  const exclusions = exclusionCollector(c, routingOrCfg, role);
+  if (exclusions.length === 0) return null;
+  const first = exclusions[0];
+  return { by: first.by, entry: first.entry };
 }
 
 export interface DenyPreferCollision {

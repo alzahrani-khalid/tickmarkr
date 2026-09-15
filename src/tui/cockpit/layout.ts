@@ -622,12 +622,17 @@ export function resolveCockpitLayout(columns: number, rows: number): CockpitLayo
   };
 }
 
-/** FINAL §3.1: one geometry for paint, focus and pointer hit testing. */
+/**
+ * FINAL §3.1: one geometry for paint, focus and pointer hit testing. A ZERO shortcut budget is the
+ * rail-less mount (BD-1, RULING-231-19 §2): the daemon-placed board is a one-view observer, so it
+ * plans no rail and no shortcuts at any width — the budget is honoured, never floored back to 20.
+ */
 export function planShell(columns: number, rows: number, shortcutColumns = 22) {
   columns = Math.max(0, Math.floor(columns));
   rows = Math.max(0, Math.floor(rows));
-  const rail = columns >= 90 ? 15 : 0;
-  const shortcuts = columns >= 120 ? Math.max(20, Math.min(columns - 59, Math.floor(shortcutColumns))) : 0;
+  const railless = shortcutColumns === 0;
+  const rail = columns >= 90 && !railless ? 15 : 0;
+  const shortcuts = columns >= 120 && !railless ? Math.max(20, Math.min(columns - 59, Math.floor(shortcutColumns))) : 0;
   const bodyColumn = 1 + (rail ? rail + 1 : 0);
   return {
     columns, rows, refused: columns < 40 || rows < 14,

@@ -14,8 +14,18 @@ import {
   fingerprint,
   freshFailures,
 } from "../gates/baseline.js";
+import { evaluateManifestedTest, isVitestTestCommand } from "../gates/test-manifest.js";
+import {
+  computeVerificationIdentity,
+  formatReusedDetails,
+  getVerdictStore,
+  getWorktreeTree,
+  resolveStateDir,
+  isInfraResult,
+  type VerificationIdentity,
+} from "../gates/cache.js";
 import { tickmarkrDir } from "../graph/graph.js";
-import { describeCapacity, gitHead, linkNodeModules, resolveIntegrationBranch, sameCapacity, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
+import { describeCapacity, gitHead, linkNodeModules, resolveIntegrationBranch, resolvedCapacity, sameCapacity, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
 
 export interface TipVerifyResult {
   gate: string;
@@ -25,6 +35,8 @@ export interface TipVerifyResult {
   fingerprints: string[];
   details: string;
   artifact?: string;
+  reportPath?: string;
+  spawnedCommand?: string;
   /** Q121s: nonzero exit whose failures are ALL baseline-recorded — forgiven exactly as the battery forgives. */
   forgiven?: boolean;
   /**
@@ -159,6 +171,12 @@ export async function verifyIntegrationTip(
     return results;
   }
 
+  const stateDir = resolveStateDir(intWt, runDir);
+  const store = getVerdictStore(stateDir);
+  // Publish only after the entire verification completes. The daemon kills a cancelled
+  // verifier process, so completed early gates must remain in memory until then.
+  const pending = new Map<string, VerificationIdentity>();
+
   for (const [gate, cmd] of gatesToRun) {
     if (runStartCommands !== undefined) {
       const expectedCmd = gate === "test"
@@ -189,6 +207,69 @@ export async function verifyIntegrationTip(
     const entry = gate === "test" && (hasTipCommand || (!identity.test && identity.tipTest))
       ? baseline?.commands.tipTest
       : baseline?.commands[gate];
+    // A distinct tipTest selects a different forgiveness entry even when the command
+    // converges with the task command. Include that effective entry in the identity.
+    const verificationBaseline = baseline ? { commands: { ...baseline.commands } } : undefined;
+    if (verificationBaseline) {
+      if (entry) verificationBaseline.commands[gate] = entry;
+      else delete verificationBaseline.commands[gate];
+    }
+    // A tip verifier may reuse only a completed green from its own scope.
+    const id = await computeVerificationIdentity({
+      worktree: intWt,
+      gate,
+      scope: "tip",
+      command: cmd,
+      baseline: verificationBaseline,
+      selectedSet: undefined,
+      capacity: resolvedCapacity(),
+    });
+    // Persistent reuse requires the run's durable journal. Without it there is no
+    // recorded cycle provenance to reconcile with the caller's capacity checks.
+    const hit = journalFound ? store.get(id) : undefined;
+    if (hit && id && hit.pass && !isInfraResult(hit)) {
+      results.push({
+        gate,
+        cmd,
+        pass: hit.pass,
+        exitCode: hit.exitCode ?? 0,
+        fingerprints: (hit.meta?.fingerprints as string[] | undefined) ?? [],
+        ...(hit.meta?.forgiven ? { forgiven: true } : {}),
+        details: formatReusedDetails(hit.details, id),
+        ...(hit.meta?.reportPath ? { reportPath: hit.meta.reportPath as string } : {}),
+        ...(hit.meta?.spawnedCommand ? { spawnedCommand: hit.meta.spawnedCommand as string } : {}),
+        ...(hit.meta?.artifact ? { artifact: hit.meta.artifact as string } : {}),
+      });
+      continue;
+    }
+    if (id && journalFound) pending.set(gate, id);
+    // VL-1: tip verify and standalone verify read the SAME invocation-bound report the gate would —
+    // a detected vitest test command never reaches the stdout-count/file-count path below (this
+    // gate's own manifest is always the FULL suite; verify has no selected screen to hold). A
+    // scripted test command that is not the detected runner falls through unchanged.
+    if (gate === "test" && isVitestTestCommand(cmd, intWt)) {
+      const outcome = await evaluateManifestedTest(cmd, intWt, {
+        baselineDurations: entry?.fileDurations,
+        longestFile: entry?.longestFile,
+        overallCeilingMs: effectiveCeilingMs(entry),
+        artifactDir: runDir,
+      });
+      const artifact = join(runDir, `tip-verify-${gate}.log`);
+      if (!outcome.pass) writeFileSync(artifact, outcome.details);
+      results.push({
+        gate,
+        cmd,
+        pass: outcome.pass,
+        exitCode: outcome.exitCode,
+        reportPath: outcome.reportPath,
+        spawnedCommand: outcome.meta.spawnedCommand as string,
+        fingerprints: (outcome.meta as Record<string, unknown>).failingTests as string[] | undefined ?? [],
+        details: outcome.details,
+        ...(outcome.classification ? { cause: outcome.classification } : {}),
+        ...(outcome.pass ? {} : { artifact }),
+      });
+      continue;
+    }
     // OBS-534: the ceiling is the BATTERY's, derived by effectiveCeilingMs from the same baseline entry
     // this loop already reads for forgiveness two lines down — never the flat DEFAULT_SHELL_TIMEOUT_MS
     // `sh` defaults to. A suite whose capture measured 600007ms carries a recorded 1800021ms ceiling;
@@ -254,7 +335,7 @@ export async function verifyIntegrationTip(
       && comparable;
     const pass = !deficit && (r.code === 0 || greenTeardown || forgiven);
     if (!pass) writeFileSync(artifact, raw);
-    results.push({
+    const tipResult: TipVerifyResult = {
       gate,
       cmd,
       pass,
@@ -271,7 +352,21 @@ export async function verifyIntegrationTip(
       ...(forgiven && !deficit ? { forgiven: true } : {}),
       ...(cause ? { cause } : {}),
       ...(pass ? {} : { artifact }),
-    });
+    };
+    results.push(tipResult);
+  }
+  // Recheck through the Git runner before publishing: cancellation disables further
+  // spawns in the daemon child, and a command that changed the tree invalidates reuse.
+  const completedTree = pending.size ? await getWorktreeTree(intWt) : undefined;
+  for (const result of results) {
+    const id = pending.get(result.gate);
+    if (id && id.tree === completedTree && !isInfraResult(result)) {
+      store.set(id, { ...result, meta: {
+        fingerprints: result.fingerprints, forgiven: result.forgiven,
+        reportPath: result.reportPath, spawnedCommand: result.spawnedCommand,
+        artifact: result.artifact,
+      } });
+    }
   }
   return results;
 }

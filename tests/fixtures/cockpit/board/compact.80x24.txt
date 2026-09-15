@@ -1,0 +1,24 @@
+tickmarkr fixture | RUN | run-20260912-100000
+1 Home  4 Run  5 Evidence | content | 1–17/69 | 52 hidden
+────────────────────────────────────────────────────────────────────────────────
+│RUN / RUNNING · 1/8 merged | human T1,T3 | current-cycle tip PENDING | RUNNING│
+│ tickmarkr  run-20260912-100000  │  1/8 done  │  2 esc  │  0h38m              │
+│                                                                              │
+│  ▌ TASKS   1 of 8 merged in this graph                                       │
+│                                                                              │
+│         area            deps          task                                   │
+│         bu te li ev sc ac re   channel     att  note                         │
+│    ──────────────────────────────────────────────────────────────────────────│
+│  ❯ T1   SPEC+GATE       —             Spec loader parks                      │
+│         ✔  ✔  ✔  ·  ·  ·  ·    claude-cod  3                                 │
+│         ◍ parked ×3 · 3/7 gates run                                          │
+│    T2   RUN             —             Runner survives t                      │
+│         ✔  ✔  ✔  ✔  ✔  ✔  ✔    claude-cod  1                                 │
+│         ↻ 3 review rounds                                                    │
+│    T3   UI              —             Board renderer fa                      │
+│         ✔  ✖  ·  ·  ·  ·  ·    claude-cod  1                                 │
+│         ✖ test · 2/7 gates run                                               │
+────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 1/8 | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────

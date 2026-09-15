@@ -941,6 +941,13 @@ export type FleetTierAssignment = { tier: Tier; provenance?: string };
 export type FleetEditable = {
   denyAdapters: string[];
   denyModels: string[];
+  // OBS-994/FL-1: the worker-only deny scope, read and written beside the flat (all-seats)
+  // scopes above — NEVER folded into the allow-complement (workers is not a universe-derived
+  // membership scope, it is a raw literal deny list). Optional so a pre-existing FleetEditable
+  // literal elsewhere in the tree (a fixture this task does not own) still type-checks; every
+  // reader/writer in this task treats an absent array as empty.
+  denyWorkersAdapters?: string[];
+  denyWorkersModels?: string[];
   tiers: Record<string, Record<string, FleetTierAssignment | null>>;
   map: Record<string, MapEntry>;
   floors: Record<string, Tier>;
@@ -957,12 +964,24 @@ export function readOverlayFile(path: string): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 
+/** A discovered fleet universe row: the served models of one adapter and, per model, the resolved
+ * identity doctor recorded for a floating alias (LEG2-T3 round 2 finding 3). */
+export type FleetUniverseRow = { adapter: string; models: string[]; identities?: Record<string, string> };
+
+/** Does a deny/allow entry name this universe channel? Grammar A1 (adapter id, bare model id,
+ * adapter:model) plus the recorded identity (bare or adapter:identity) — the collector's authority. */
+export function universeEntryMatches(row: FleetUniverseRow, model: string, entry: string): boolean {
+  if (entry === row.adapter || entry === model || entry === `${row.adapter}:${model}`) return true;
+  const identity = row.identities?.[model];
+  return identity !== undefined && (entry === identity || entry === `${row.adapter}:${identity}`);
+}
+
 /** Grammar A1 membership test: does any discovered universe row cover this deny/allow entry
  * (adapter id, bare model id, or adapter:model)? Uncovered entries name channels the probe
  * did not serve this session (failed auth, rate limit, retired sku) — they are NOT editable
  * membership state and must survive a membership write verbatim, never be re-derived away. */
 export function universeCovers(
-  universe: { adapter: string; models: string[] }[],
+  universe: FleetUniverseRow[],
   entry: string,
 ): boolean {
   return universe.some((row) =>
@@ -970,12 +989,14 @@ export function universeCovers(
 }
 
 // v1.92 fleet membership: with a discovered `universe` (classified models only) the deny sets become
-// the EFFECTIVE out-of-fleet complement — anything routing.allow does not admit (fail-closed) UNION
-// routing.deny adapters/models scopes (never workers). Absent universe ⇒ deny arrays verbatim, so
-// non-UI callers stay byte-identical.
+// the EFFECTIVE out-of-fleet set — the routing.allow complement (fail-closed) as adapter ids and
+// adapter:model keys, UNION every authored routing.deny adapters/models entry VERBATIM in its own list
+// (never workers). LEG2-T3 round 2 finding 2: authored entries are never collapsed into a membership
+// key, so one Space press clears one reason; finding 3: allow admission honours recorded identity.
+// Absent universe ⇒ deny arrays verbatim, so non-UI callers stay byte-identical.
 export function fleetEditableFromConfig(
   cfg: TickmarkrConfig,
-  universe?: { adapter: string; models: string[] }[],
+  universe?: FleetUniverseRow[],
 ): FleetEditable {
   const tiers: FleetEditable["tiers"] = {};
   for (const [adapter, entry] of Object.entries(cfg.tiers)) {
@@ -987,41 +1008,32 @@ export function fleetEditableFromConfig(
   let denyAdapters = [...(cfg.routing.deny?.adapters ?? [])].sort();
   let denyModels = [...(cfg.routing.deny?.models ?? [])].sort();
   if (universe !== undefined) {
-    const { allow, deny } = cfg.routing;
-    // Grammar A1 (disallowedBy precedent): entries match adapter id, bare model id, or adapter:model.
-    // Inlined rather than imported — route/preference.ts imports this module.
-    const denyEntries = [...(deny?.adapters ?? []), ...(deny?.models ?? [])];
+    const { allow } = cfg.routing;
     const allowEntries = allow ? [...(allow.adapters ?? []), ...(allow.models ?? [])] : null;
-    const outOfFleet = (adapter: string, model: string): boolean => {
-      const matches = (e: string) => e === adapter || e === model || e === `${adapter}:${model}`;
-      if (denyEntries.some(matches)) return true;
-      return allowEntries !== null && !allowEntries.some(matches);
-    };
+    const notAdmitted = (row: FleetUniverseRow, model: string): boolean =>
+      allowEntries !== null && !allowEntries.some((entry) => universeEntryMatches(row, model, entry));
     const adaptersOut: string[] = [];
     const modelsOut: string[] = [];
     for (const row of universe) {
-      const out = row.models.filter((m) => outOfFleet(row.adapter, m));
-      if (row.models.length ? out.length === row.models.length : outOfFleet(row.adapter, "")) {
+      const out = row.models.filter((m) => notAdmitted(row, m));
+      if (row.models.length ? out.length === row.models.length : notAdmitted(row, "")) {
         adaptersOut.push(row.adapter);
       } else {
         modelsOut.push(...out.map((m) => `${row.adapter}:${m}`));
       }
     }
-    // OBS-517: deny entries the probe universe does not cover (failed/rate-limited probes drop the
-    // channel from discoverChannels) are preserved VERBATIM — deriving membership purely from the
-    // universe silently un-denied them on the next write (fail-open on the operator's own ban list).
-    denyAdapters = [...new Set([
-      ...adaptersOut,
-      ...(deny?.adapters ?? []).filter((e) => !universeCovers(universe, e)),
-    ])].sort();
-    denyModels = [...new Set([
-      ...modelsOut,
-      ...(deny?.models ?? []).filter((e) => !universeCovers(universe, e)),
-    ])].sort();
+    // OBS-517: authored deny entries — covered by the probe universe or not — ride verbatim, so a
+    // transient probe failure can never un-deny one on the next write (fail-open on the ban list).
+    denyAdapters = [...new Set([...adaptersOut, ...denyAdapters])].sort();
+    denyModels = [...new Set([...modelsOut, ...denyModels])].sort();
   }
   return {
     denyAdapters,
     denyModels,
+    // OBS-994: workers-only deny is never folded into the all-seats complement above — it is
+    // returned verbatim beside the flat scopes so the fleet browser can show and toggle it.
+    denyWorkersAdapters: [...(cfg.routing.deny?.workers?.adapters ?? [])].sort(),
+    denyWorkersModels: [...(cfg.routing.deny?.workers?.models ?? [])].sort(),
     tiers,
     map: structuredClone(cfg.routing.map),
     floors: { ...cfg.routing.floors },
@@ -1065,6 +1077,8 @@ export function formatFleetPrint(repoRoot: string, opts: { globalDir?: string } 
   };
   if (effective.routing.deny?.adapters !== undefined) annotate(["routing", "deny", "adapters"]);
   if (effective.routing.deny?.models !== undefined) annotate(["routing", "deny", "models"]);
+  if (effective.routing.deny?.workers?.adapters !== undefined) annotate(["routing", "deny", "workers", "adapters"]);
+  if (effective.routing.deny?.workers?.models !== undefined) annotate(["routing", "deny", "workers", "models"]);
   for (const shape of Object.keys(effective.routing.map)) annotate(["routing", "map", shape]);
   annotate(["routing", "floors"]);
   for (const [adapter, entry] of Object.entries(effective.tiers)) {

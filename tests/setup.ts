@@ -10,4 +10,12 @@ import { reapTestTempDirs } from "./helpers/tmprepo.js";
 
 for (const k of [QUALITY_ENV, NO_EXPLORE_ENV]) delete process.env[k];
 
+// OBS-1005 (2026-09-12): the same leak class for HOST markers. A suite launched from an Orca terminal
+// inherits TERM_PROGRAM=Orca + ORCA_TERMINAL_HANDLE, so every `auto` driver pick resolves to orca —
+// seven byte-pinned plan/init/brand tests red, and the built CLI's resume dispatched on the REAL
+// `orca` binary. vitest.config.ts seals HERDR_ENV/HERDR_SOCKET_PATH in the parent before workers
+// fork; this per-worker scrub seals the Orca pair (and HERDR_ENV again, for a worker whose parent
+// was not that config). Tests that need a host set it explicitly inside the test.
+for (const k of ["TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "HERDR_ENV"]) delete process.env[k];
+
 afterAll(reapTestTempDirs);

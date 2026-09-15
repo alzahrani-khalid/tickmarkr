@@ -30,10 +30,10 @@ export function addUsage(a: TokenUsage | undefined, b: TokenUsage): TokenUsage {
 }
 
 export interface Assignment { adapter: string; model: string; channel: "sub" | "api"; tier: Tier }
-export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier }
+export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier; identity?: string }
 export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
 export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
-export interface ModelAuth { authed: boolean; reason?: string; probeError?: ModelProbeError; probedAt: string }
+export interface ModelAuth { authed: boolean; reason?: string; probeError?: ModelProbeError; probedAt: string; identity?: string }
 export interface AuthHealth {
   installed: boolean; authed: boolean; version?: string; models: string[]; note?: string;
   // v1.5 MODEL-02: ISO timestamp — additive-optional, pre-v1.5 doctor.json lacks it, readers use ?.
@@ -46,6 +46,7 @@ export interface AuthHealth {
   // v1.21: doctor probes only configured models. Missing from old doctor.json is unknown and fails closed
   // for routing unless cfg.routing.allowUnverifiedModels restores legacy compatibility.
   modelAuth?: Record<string, ModelAuth>;
+  modelIdentities?: Record<string, string>;
 }
 
 export function modelAuthed(health: AuthHealth | undefined, model: string, allowUnverifiedModels = false): boolean {

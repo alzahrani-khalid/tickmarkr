@@ -43,6 +43,9 @@ export interface BaselineCommand {
   impliedParallelism?: number | null;
   /** The slowest per-file entry named by the runner; null when per-file timing is unavailable. */
   longestFile?: BaselineFileDuration | null;
+  /** VL-1: every per-file duration the runner named, so a later per-file hang budget (test-manifest.ts)
+   * can be derived per file rather than from one slowest-file number; null when unavailable. */
+  fileDurations?: BaselineFileDuration[] | null;
   /** The ceiling that measurement implies, persisted so every later battery uses the same number. */
   ceilingMs?: number;
   /**
@@ -303,7 +306,7 @@ const FILE_DURATION_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)[✓✔×❯]\s+(?:\|[^|\r\n
 
 const durationUnitMs = (unit: string): number => unit === "m" ? 60_000 : unit === "s" ? 1_000 : 1;
 
-function fileTiming(output: string, wallClockMs: number): Pick<BaselineCommand, "fileDurationSumMs" | "impliedParallelism" | "longestFile"> {
+function fileTiming(output: string, wallClockMs: number): Pick<BaselineCommand, "fileDurationSumMs" | "impliedParallelism" | "longestFile" | "fileDurations"> {
   const files: BaselineFileDuration[] = [];
   for (const line of output.split("\n")) {
     const match = FILE_DURATION_RE.exec(line.replace(ANSI_RE, ""));
@@ -311,13 +314,14 @@ function fileTiming(output: string, wallClockMs: number): Pick<BaselineCommand, 
     const durationMs = Number(match[2]) * durationUnitMs(match[3]);
     if (Number.isFinite(durationMs)) files.push({ file: match[1], durationMs });
   }
-  if (!files.length) return { fileDurationSumMs: null, impliedParallelism: null, longestFile: null };
+  if (!files.length) return { fileDurationSumMs: null, impliedParallelism: null, longestFile: null, fileDurations: null };
   const fileDurationSumMs = files.reduce((sum, entry) => sum + entry.durationMs, 0);
   const longestFile = files.reduce((longest, entry) => entry.durationMs > longest.durationMs ? entry : longest);
   return {
     fileDurationSumMs,
     impliedParallelism: wallClockMs > 0 ? fileDurationSumMs / wallClockMs : null,
     longestFile,
+    fileDurations: files,
   };
 }
 

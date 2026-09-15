@@ -7,12 +7,15 @@ import { describe, expect, test } from "vitest";
 
 import * as registry from "../../src/adapters/registry.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import { fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
+import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { loadConfig } from "../../src/config/config.js";
 import {
   projectFleetWhy,
   renderFleetWhy,
   type FleetWhyValue,
 } from "../../src/config/fleet-why.js";
+import { disallowedBy } from "../../src/route/preference.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -43,7 +46,7 @@ type TestInput = PassThrough & {
   unref: () => TestInput;
 };
 
-function ttyIO(): { io: FleetIO; input: TestInput; frames: string[] } {
+function ttyIO(rows = 60): { io: FleetIO; input: TestInput; frames: string[] } {
   const input = new PassThrough() as TestInput;
   input.isTTY = true;
   input.setRawMode = () => {};
@@ -61,7 +64,7 @@ function ttyIO(): { io: FleetIO; input: TestInput; frames: string[] } {
   const output = {
     isTTY: true,
     columns: 120,
-    rows: 60,
+    rows,
     write: (chunk: string) => {
       frames.push(chunk);
       return true;
@@ -100,6 +103,80 @@ const FAKE_TIERS = `tiers:
     models:
       fake-1: mid
 `;
+
+function mechanismsRepo(): { repoRoot: string; globalDir: string; adapter: WorkerAdapter } {
+  const repoRoot = makeRepo({ "keep.txt": "x" });
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-why-mechanisms-g-"));
+  mkdirSync(join(repoRoot, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repoRoot, ".tickmarkr", "config.yaml"), [
+    "tiers:",
+    "  fake:",
+    "    vendor: fake",
+    "    channel: sub",
+    "    models:",
+    "      fake-1: cheap", // in allow, IN pool, but below the implement floor
+    "      fake-2: mid", // in allow, in every pool
+    "      fake-3: frontier", // in allow, in every pool
+    "      fake-4: mid", // in allow, but unauthed (doctor)
+    "      fake-5: mid", // NOT in allow — the deny∩prefer collision target
+    "      fake-6: mid", // NOT in allow AND explicitly denied — first-match provenance target
+    "routing:",
+    "  allow:",
+    "    models: [fake:fake-1, fake:fake-2, fake:fake-3, fake:fake-4]",
+    "  deny:",
+    "    models: [fake:fake-6]",
+    "  floors:",
+    "    implement: mid",
+    "  map:",
+    "    spec:", // bare key ⇒ null: tombstones the DEFAULT_CONFIG seed pin for "spec"
+    "    tests:",
+    "      pin: { via: fake, model: fake-3 }",
+    "    docs:",
+    "      pool: { mode: any, channels: [fake:fake-2, fake:fake-3] }",
+    "    chore:",
+    "      prefer: [fake:fake-2]",
+    "    refactor:",
+    "      prefer: [fake:fake-5]",
+    "  explore:",
+    "    mode: off",
+    "  learned: off",
+    "",
+  ].join("\n"));
+  const scriptPath = join(repoRoot, "fake.json");
+  writeFileSync(scriptPath, JSON.stringify({ tasks: {} }));
+  // channels() reads cfg.tiers directly (unlike FakeAdapter's hardcoded pair) so every tier
+  // band above actually reaches the pool this task's floor/pool/pin mechanisms filter.
+  const adapter: WorkerAdapter = {
+    id: "fake",
+    vendor: "fake",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (cfg) => channelsFromConfig("fake", cfg),
+    headlessCommand: () => "fake",
+    interactiveCommand: () => null,
+    invoke: () => ({ command: "fake" }),
+    parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+    listModels: async () => [],
+  };
+  registry.writeDoctor(repoRoot, {
+    fake: {
+      installed: true,
+      authed: true,
+      version: "fake",
+      models: ["fake-1", "fake-2", "fake-3", "fake-4", "fake-5", "fake-6"],
+      modelAuth: {
+        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-3": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-4": { authed: false, reason: "quota exceeded", probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-5": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-6": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+      },
+    },
+  });
+  const fresh = new Date(Date.now() - 60_000);
+  utimesSync(join(tickmarkrDir(repoRoot), "doctor.json"), fresh, fresh);
+  return { repoRoot, globalDir, adapter };
+}
 
 async function fleetWhyText(overlay: string, global = ""): Promise<string> {
   const { repoRoot, globalDir } = repoWith(overlay);
@@ -213,5 +290,80 @@ describe("fleet --why", () => {
     expect(rows.every((row) => row.label.includes(row.effective) && row.label.includes("source:"))).toBe(true);
     expect(renderFleetWhy(rows).split("\n").filter((line) => line.includes("→")))
       .toEqual(rows.map((row) => row.label.split("\n")[0]));
+  });
+
+  test("test: a channel excluded by allow, by a pin or pool, by a floor, by an unauthed probe, by a tombstone, by an explore or learned knob, by a task hint, by a deny∩prefer collision and by first-match provenance each render a reason or the not-manageable caption on their row, so a row that shows an exclusion with no reason fails", async () => {
+    const { repoRoot, globalDir, adapter } = mechanismsRepo();
+
+    const assembled = await assembleFleetEditor(repoRoot, [adapter], {}, { globalDir });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    const { candidatesForShape, initialMap } = assembled.props;
+    const deny = {
+      adapters: assembled.props.initialDenyAdapters,
+      models: assembled.props.initialDenyModels,
+      workersAdapters: assembled.props.initialDenyWorkersAdapters ?? [],
+      workersModels: assembled.props.initialDenyWorkersModels ?? [],
+    };
+    const pick = (shape: string) => candidatesForShape(shape as Parameters<typeof candidatesForShape>[0], "risk-based", initialMap, deny);
+    const noteFor = (shape: string) => pick(shape).excludedNote ?? "";
+    // LEG2-T3 finding 1: the reason renders on the CHANNEL's own ledger row, not only in an aggregate
+    const rowFor = (shape: string, key: string) =>
+      (pick(shape).ledger ?? []).find((line) => line.startsWith(`${key.replace(":", "/")} — `)) ?? "";
+
+    // no channel the picker leaves out is left without a row naming why
+    for (const shape of ["implement", "tests", "docs", "chore", "refactor", "spec"]) {
+      const offered = new Set(pick(shape).rows.map((row) => row.id));
+      for (const model of ["fake-1", "fake-2", "fake-3", "fake-4", "fake-5", "fake-6"]) {
+        if (!offered.has(`fake:${model}`)) expect(rowFor(shape, `fake:${model}`), `${shape} fake:${model}`).not.toBe("");
+      }
+    }
+    // 1. allow — the channel's row names the allowlist that does not admit it
+    expect(rowFor("implement", "fake:fake-5")).toContain("fake/fake-5 — routing.allow (not admitted)");
+    // 2. pin — a channel that is not the pin names the pin, not manageable here
+    expect(rowFor("tests", "fake:fake-2")).toContain("not routing.map.tests.pin (fake:fake-3) — not manageable here");
+    // 2. pool — a channel outside the declared pool names the pool, not manageable here
+    expect(rowFor("docs", "fake:fake-1")).toContain("outside routing.map.docs.pool — not manageable here");
+    // 3. floor — the below-floor channel names the shape's floor
+    expect(rowFor("implement", "fake:fake-1")).toContain("below routing.floors.implement (mid) — not manageable here");
+    // 4. unauthed probe — the unauthed channel's row points at the doctor re-probe
+    expect(rowFor("implement", "fake:fake-4")).toContain("unauthed (quota exceeded) — re-probe with tickmarkr doctor");
+    // 7. task hint — the channel a shape's prefer names carries the not-manageable caption
+    expect(rowFor("chore", "fake:fake-2")).toContain("task hint: routing.map.chore.prefer names it — not manageable here");
+    // 8. deny∩prefer — the collided channel's row carries the standing lint, with the ACTUAL scope
+    // (fake-5 is outside the allowlist; nothing denies it)
+    expect(rowFor("refactor", "fake:fake-5")).toContain("deny∩prefer: routing.map.refactor.prefer fake:fake-5 fully disallowed by routing.allow");
+    // 9. first-match provenance — a channel both denied and outside the allowlist lists BOTH scopes
+    expect(rowFor("implement", "fake:fake-6")).toContain("fake/fake-6 — routing.deny.models (fake:fake-6); routing.allow (not admitted)");
+    expect(disallowedBy({ adapter: "fake", model: "fake-6" }, loadConfig(repoRoot, { globalDir }).routing)).toEqual({ by: "deny", entry: "fake:fake-6" });
+    // 5. tombstone and 6. explore/learned knobs mask or tune a whole shape rather than one channel —
+    // each keeps its not-manageable caption row
+    expect(noteFor("spec")).toContain("tombstone: routing.map.spec: null masks a lower layer's declaration — not manageable here");
+    expect(noteFor("implement")).toContain("explore: routing.explore.mode is off — a global knob, not manageable here");
+    expect(noteFor("implement")).toContain("learned: routing.learned is off — a global knob, not manageable here");
+    // the aggregate bucket line stays beside the rows
+    expect(noteFor("implement")).toContain("denied in config");
+  });
+  test("round 2 finding 4: on a 24-row terminal every channel's ledger row in the shape picker is reachable by navigation — none is elided behind the aggregate captions", async () => {
+    const { repoRoot, globalDir, adapter } = mechanismsRepo();
+    const { io, input, frames } = ttyIO(24);
+    const done = fleet(["--global-dir", globalDir], repoRoot, [adapter], io);
+    // rail → Shapes → close the first-entry presets overlay → docs (5th shape) → open its picker,
+    // then walk the cursor down past every candidate and every ledger row
+    const keys = ["\x1b[D", "\x1b[B", "\r", "\x1b", ...Array(4).fill("\x1b[B"), "p", ...Array(14).fill("\x1b[B"), "\x1b", "q", "q"];
+    for (const key of keys) {
+      input.write(key); // one key per macrotask: a bare Esc must not merge into the next arrow's sequence
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(await done).toBe("fleet: quit without writing");
+    const all = stripAnsi(frames.join(""));
+    expect(all).toContain("pool · docs"); // docs declares a pool, so its picker opens as the pool chain
+    for (const row of [
+      "fake/fake-1 — outside routing.map.docs.pool — not manageable here",
+      "fake/fake-4 — unauthed (quota exceeded) — re-probe with tickmarkr doctor",
+      "fake/fake-5 — routing.allow (not admitted); outside routing.map.docs.pool — not manageable here",
+      "fake/fake-6 — routing.deny.models (fake:fake-6); routing.allow (not admitted); outside routing.map.docs.pool",
+    ]) {
+      expect(all, row).toContain(row);
+    }
   });
 });
