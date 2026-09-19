@@ -12,7 +12,7 @@ import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { graphDefinitionHash, loadGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import type { GateName } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
-import { gitHead, shGitOk } from "../../src/run/git.js";
+import { gitHead, shGitOk, VERIFICATION_PROTOCOL, verificationProtocol } from "../../src/run/git.js";
 import { Journal, reviewRoundsSinceApproval, type JournalEvent } from "../../src/run/journal.js";
 import { ensureIntegration, integrationBranch } from "../../src/run/merge.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
@@ -26,6 +26,8 @@ interface SeedGate {
   gate: GateName;
   pass: boolean;
   details?: string;
+  /** R41: the verification stamp to seed on the row — omitted (`null`) for a pre-stamp row. */
+  verification?: Record<string, unknown> | null;
 }
 
 interface SeededResume {
@@ -67,6 +69,7 @@ async function seedResume(
   approval?: Record<string, unknown>,
   failingShell?: (typeof SHELL_GATES)[number],
   scriptOverride: Record<string, unknown> = {},
+  repoFiles: Record<string, string> = {},
 ): Promise<SeededResume> {
   const marker = join(makeTestTempDir("tickmarkr-resume-gates-"), "shells.log");
   const commands = Object.fromEntries(SHELL_GATES.map((gate) => [
@@ -87,6 +90,8 @@ async function seedResume(
     },
     stringify({ gates: commands }),
   );
+  for (const [path, body] of Object.entries(repoFiles)) writeFileSync(join(repo, path), body);
+  if (Object.keys(repoFiles).length) await shGitOk("git add -A && git commit --no-gpg-sign -m repo-files", repo);
   const baseRef = await gitHead(repo);
   const cfg = loadConfig(repo);
   const branch = integrationBranch(cfg, runId);
@@ -110,6 +115,8 @@ async function seedResume(
       journal.append("gate-result", "T1", {
         gate: result.gate, pass: result.pass,
         details: result.details ?? (result.pass ? "exit 0" : "exit 1"),
+        // R41: a daemon-written row carries the verification protocol of the session that wrote it.
+        ...(result.verification === null ? {} : { verification: result.verification ?? verificationProtocol() }),
         commit, attempt, ...(result.gate === "test" && result.pass ? { fullSuite: true } : {}),
       });
     }
@@ -404,3 +411,66 @@ test("a prior-attempt pass plus current-attempt failure resumes at the failed ga
     await resume(released);
     expect(markerLines(released.marker)[0]).toBe("lint");
   }, 120_000);
+
+test("resuming a green current-commit prefix whose rows carry no verification stamp re-runs every gate and journals gate-replay-verification-changed naming the unrecorded rows and this session's protocol, the same prefix stamped with another protocol, another lifecycle or an unknown lifecycle is likewise re-run and named, and the prefix stamped with this session's protocol and effective lifecycle is replayed with zero gate-shell invocations, so a replay that inherits a green measured by an older discovery implementation, under another npm lifecycle policy, or under a policy nobody measured fails", async () => {
+  const current = verificationProtocol();
+  expect(current.lifecycle).not.toBe("unknown");
+  const cases: Array<{ label: string; stamp: Record<string, unknown> | null; replayed: boolean }> = [
+    { label: "unstamped", stamp: null, replayed: false },
+    { label: "other-protocol", stamp: { ...current, protocol: "vl1.1" }, replayed: false },
+    { label: "other-lifecycle", stamp: { ...current, lifecycle: current.lifecycle === "hooks" ? "ignore-scripts" : "hooks" }, replayed: false },
+    { label: "unknown-lifecycle", stamp: { ...current, lifecycle: "unknown", source: "unknown" }, replayed: false },
+    { label: "current", stamp: current, replayed: true },
+  ];
+  for (const c of cases) {
+    const seed = await seedResume(`run-replay-verification-${c.label}`,
+      [SHELL_GATES.map((gate) => ({ gate, pass: true, verification: c.stamp }))]);
+    const events = await resume(seed);
+    const reused = events.filter((e) => e.event === "gate-reused").map((e) => e.data.gate);
+    const changed = events.filter((e) => e.event === "gate-replay-verification-changed");
+    if (c.replayed) {
+      expect({ label: c.label, reused, changed: changed.length, shells: markerLines(seed.marker) })
+        .toEqual({ label: c.label, reused: [...SHELL_GATES], changed: 0, shells: [] });
+    } else {
+      // Every shell gate re-runs (the full test suite runs last, as the merge candidate).
+      expect({ label: c.label, reused, changed: changed.length, shells: [...markerLines(seed.marker)].sort() })
+        .toEqual({ label: c.label, reused: [], changed: 1, shells: [...SHELL_GATES].sort() });
+      expect(changed[0]!.data).toMatchObject({ commit: seed.commit, resolved: current });
+      expect((changed[0]!.data.recorded as unknown[]).length).toBe(SHELL_GATES.length);
+      if (c.stamp) expect(changed[0]!.data.recorded).toEqual(SHELL_GATES.map(() => c.stamp));
+      else expect((changed[0]!.data.recorded as unknown[]).every((r) => r === null || r === undefined)).toBe(true);
+    }
+    const written = events.filter((e) => e.event === "gate-result" && e.taskId === "T1");
+    expect(written.length).toBeGreaterThan(0);
+    expect(written.every((e) => JSON.stringify(e.data.verification) === JSON.stringify(current))).toBe(true);
+  }
+}, 300_000);
+
+test("with no explicit lifecycle export the replay guard measures the effective policy for the recreated task worktree, so over a repository whose committed project npmrc sets ignore-scripts=false a green prefix stamped hooks from npm config is replayed with zero gate-shell invocations while the same prefix stamped ignore-scripts is re-run and gate-replay-verification-changed names hooks as resolved, and every gate-result row the resumed session writes carries the policy measured for that worktree, so a replay that compares against a session-wide policy resolved at the repository root instead of the task checkout's own fails", async () => {
+  const prior = process.env.npm_config_ignore_scripts;
+  delete process.env.npm_config_ignore_scripts;
+  try {
+    const projectNpmrc = { ".npmrc": "ignore-scripts=false\n" };
+    const expected = { protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "npm-config" };
+    const replayed = await seedResume("run-replay-project-npmrc-same",
+      [SHELL_GATES.map((gate) => ({ gate, pass: true, verification: expected }))], undefined, undefined, {}, projectNpmrc);
+    const sameEvents = await resume(replayed);
+    expect({ reused: sameEvents.filter((e) => e.event === "gate-reused").map((e) => e.data.gate), shells: markerLines(replayed.marker),
+      changed: sameEvents.filter((e) => e.event === "gate-replay-verification-changed").length })
+      .toEqual({ reused: [...SHELL_GATES], shells: [], changed: 0 });
+
+    const stale = { protocol: VERIFICATION_PROTOCOL, lifecycle: "ignore-scripts", source: "npm-config" };
+    const rerun = await seedResume("run-replay-project-npmrc-other",
+      [SHELL_GATES.map((gate) => ({ gate, pass: true, verification: stale }))], undefined, undefined, {}, projectNpmrc);
+    const otherEvents = await resume(rerun);
+    const changed = otherEvents.filter((e) => e.event === "gate-replay-verification-changed");
+    expect({ reused: otherEvents.filter((e) => e.event === "gate-reused").map((e) => e.data.gate), shells: [...markerLines(rerun.marker)].sort(), changed: changed.length })
+      .toEqual({ reused: [], shells: [...SHELL_GATES].sort(), changed: 1 });
+    expect(changed[0]!.data).toMatchObject({ commit: rerun.commit, resolved: expected, recorded: SHELL_GATES.map(() => stale) });
+    const written = otherEvents.filter((e) => e.event === "gate-result" && e.taskId === "T1" && SHELL_GATES.includes(e.data.gate as never));
+    expect(written.length).toBe(SHELL_GATES.length);
+    expect(written.map((e) => e.data.verification)).toEqual(SHELL_GATES.map(() => expected));
+  } finally {
+    if (prior === undefined) delete process.env.npm_config_ignore_scripts; else process.env.npm_config_ignore_scripts = prior;
+  }
+}, 300_000);

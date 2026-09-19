@@ -214,7 +214,7 @@ test("test: fleet --print output parses as YAML and its parsed routing and tiers
   }
 });
 
-test("v1.92 membership write: changed exclusion sets emit the minimal routing.allow form — bare ids for fully-in adapters, adapter:model keys for partially-in — and tombstone the changed deny scope while the untouched deny adapters scope and deny.workers survive byte-for-byte", () => {
+test("v1.92 membership write: changed exclusion sets emit the minimal routing.allow form — bare ids for fully-in adapters, adapter:model keys for partially-in — and an addition the allow form carries writes no deny tombstone (OBS-1046) while the untouched deny adapters scope and deny.workers survive byte-for-byte", () => {
   const prior = [
     "routing:",
     "  deny:",
@@ -242,14 +242,16 @@ test("v1.92 membership write: changed exclusion sets emit the minimal routing.al
   // LEG2-T3 finding 4: the adapters scope is untouched (grok stays out, same set) — its raw bytes
   // and comment survive; only the changed models scope is tombstoned
   expect(parsed.routing.deny.adapters).toEqual(["grok"]);
-  expect(parsed.routing.deny.models).toBeNull();
+  // OBS-1046: the added exclusion rides the allow form alone — the absent models scope stays absent
+  expect(parsed.routing.deny.models).toBeUndefined();
+  expect(written).not.toContain("models: null");
   expect(parsed.routing.deny.workers).toEqual({ adapters: ["pi"] });
   expect(written).toContain("    workers:\n      adapters:\n        - pi  # reviewer-only mask, fleet never touches it");
   expect(written).not.toContain("adapters: null");
   expect(occurrences(written, "rail mask")).toBe(1);
 });
 
-test("v1.92 membership write: clearing every exclusion removes the routing.allow block entirely and tombstones both deny scopes", () => {
+test("v1.92 membership write: clearing every exclusion removes the routing.allow block entirely and tombstones the authored deny scope it cleared (OBS-1046: never a scope that was absent)", () => {
   const prior = [
     "routing:",
     "  allow:",
@@ -259,8 +261,8 @@ test("v1.92 membership write: clearing every exclusion removes the routing.allow
     "",
   ].join("\n");
   const written = renderFleetOverlayWrite(prior, {
-    initial: editable({ denyAdapters: ["codex", "grok"] }),
-    edited: editable(),
+    initial: editable({ denyModels: ["codex:o5-mini"], allowOut: ["codex", "grok"] }),
+    edited: editable({ allowOut: [] }),
     universe: [
       { adapter: "claude-code", models: ["fable"] },
       { adapter: "codex", models: ["gpt-5.6-luna"] },
@@ -270,7 +272,7 @@ test("v1.92 membership write: clearing every exclusion removes the routing.allow
   const parsed = parse(written);
   expect(parsed.routing.allow).toBeUndefined();
   expect(written).not.toContain("allow");
-  expect(parsed.routing.deny.adapters).toBeNull();
+  expect(parsed.routing.deny.adapters).toBeUndefined();
   expect(parsed.routing.deny.models).toBeNull();
 });
 
@@ -364,9 +366,12 @@ test("v1.92 membership round-trip: the written allow form reloads into the same 
   writeFileSync(join(repo, ".tickmarkr", "config.yaml"), written);
   const cfg = loadConfig(repo, { globalDir });
   const reloaded = fleetEditableFromConfig(cfg, universe);
-  expect(reloaded.denyAdapters).toEqual(["grok"]);
-  expect(reloaded.denyModels).toEqual(["codex:o5-mini"]);
-  // absent universe ⇒ deny arrays verbatim: the tombstoned scopes reload as empty
+  // OBS-1046: the allow complement reloads as its own reason, beside the (empty) authored lists
+  expect(reloaded.allowOut).toEqual(["codex:o5-mini", "grok"]);
+  expect(reloaded.denyAdapters).toEqual([]);
+  expect(reloaded.denyModels).toEqual([]);
+  // absent universe ⇒ deny arrays verbatim and no allowOut: the scopes reload as empty
+  expect(fleetEditableFromConfig(cfg).allowOut).toBeUndefined();
   expect(fleetEditableFromConfig(cfg).denyAdapters).toEqual([]);
   expect(fleetEditableFromConfig(cfg).denyModels).toEqual([]);
 });
@@ -430,7 +435,7 @@ test("OBS-517 deny fail-open: a denied model the probe universe does not serve s
   const written = renderFleetOverlayWrite(prior, { initial, edited, universe });
   const parsed = parse(written);
   expect(parsed.routing.deny.models).toEqual(["claude-code:fable", "codex:gpt-5.5"]);
-  expect(parsed.routing.deny.adapters).toBeNull();
+  expect(parsed.routing.deny.adapters).toBeUndefined();
   expect(parsed.routing.allow).toEqual({ adapters: ["claude-code"] });
   expect(written).toContain("# operator-directed: replaced by claude-opus-5 at lower cost");
   expect(written).toContain("# restore by deleting this line on dated evidence");
@@ -441,8 +446,9 @@ test("OBS-517 deny fail-open: a denied model the probe universe does not serve s
   const reloaded = fleetEditableFromConfig(loadConfig(repo, { globalDir }), universe);
   expect(reloaded.denyModels).toContain("claude-code:fable");
   // both codex universe models are now excluded — the derivation folds them into ONE
-  // adapter-level exclusion (grok-round-trip precedent above)
-  expect(reloaded.denyAdapters).toContain("codex");
+  // adapter-level allow exclusion (grok-round-trip precedent above), beside the authored deny
+  expect(reloaded.allowOut).toContain("codex");
+  expect(reloaded.denyModels).toContain("codex:gpt-5.5");
 });
 
 test("OBS-517 plain-object delta: residual deny entries land in the overlay fragment instead of the null tombstone, alongside the universe-derived allow form", () => {
@@ -766,4 +772,37 @@ test("judge c2: a staged edit whose candidate bytes the loader refuses renders a
   // the loadable staged state still previews normally
   expect(props.candidatesForShape("docs", props.initialMode, props.initialMap, deny).rows.length).toBeGreaterThan(0);
   expect(props.stagedRouting?.(deny)).toMatchObject({ ok: true });
+});
+
+test("test: an untouched entry's inline comment keeps the exact whitespace before its hash sign, and the key-line comment above the deny block and the blank line after it survive a write that clears a sibling entry, so a writer that renormalises comment spacing or drops a comment fails", () => {
+  const prior = [
+    "routing:",
+    "  # key-line comment above the deny block",
+    "  deny:",
+    "    models:",
+    "      - fake:one    # four spaces before the hash",
+    "      - fake:two # one space before the hash",
+    "      - fake:three",
+    "",
+    "  concurrency: 3",
+    "",
+  ].join("\n");
+  const universe = [{ adapter: "fake", models: ["one", "two", "three"] }];
+  for (const write of [
+    { initial: editable({ denyModels: ["fake:one", "fake:three", "fake:two"] }), edited: editable({ denyModels: ["fake:one", "fake:two"] }), universe },
+    { initial: editable({ denyModels: ["fake:one", "fake:three", "fake:two"] }), edited: editable({ denyModels: ["fake:one", "fake:two"] }) },
+  ]) {
+    const written = renderFleetOverlayWrite(prior, write);
+    expect(written).toContain("      - fake:one    # four spaces before the hash\n");
+    expect(written).toContain("      - fake:two # one space before the hash\n");
+    expect(parse(written).routing.deny.models).toEqual(["fake:one", "fake:two"]);
+    expect(written).toContain("routing:\n  # key-line comment above the deny block\n  deny:\n");
+    expect(written).toContain("      - fake:two # one space before the hash\n\n  concurrency: 3\n");
+  }
+  // a note fleet itself authors still lands in the two-space style
+  const fresh = renderFleetOverlayWrite("", {
+    initial: editable(),
+    edited: editable({ tiers: { fake: { one: { tier: "mid", provenance: "note" } } } }),
+  });
+  expect(fresh).toContain("one: mid  # note");
 });

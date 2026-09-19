@@ -24,7 +24,7 @@ import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import type { GateName } from "../../src/graph/schema.js";
 import { runDaemon, verifyIntegrationTipCached } from "../../src/run/daemon.js";
-import { deriveForkCap, FORK_CAP_ENV, gitHead, type RunCapacity, sameCapacity, shGitOk } from "../../src/run/git.js";
+import { deriveForkCap, FORK_CAP_ENV, gitHead, type RunCapacity, sameCapacity, shGitOk, verificationProtocol } from "../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { ensureIntegration, integrationBranch, verifyIntegrationTip } from "../../src/run/merge.js";
 import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
@@ -261,6 +261,7 @@ async function seedGreenAttempt(runId: string, capacity: unknown): Promise<{ rep
   for (const gate of SHELL_GATES) {
     journal.append("gate-result", "T1", {
       gate: gate as GateName, pass: true, details: "exit 0", commit, attempt: 0,
+      verification: verificationProtocol(), // R41: a current-session row; the capacity is what this test varies
       ...(gate === "test" ? { fullSuite: true } : {}),
       ...(capacity === undefined ? {} : { capacity }),
     });

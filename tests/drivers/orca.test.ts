@@ -1028,8 +1028,8 @@ describe("OrcaDriver", () => {
       .rejects.toThrow(/term_other.*addressed/);
   });
 
-  test("test: nudge answers true only after a satisfied tui-idle probe a handle-bound send receipt and a cursor-paged read that carries the submitted text back and answers false when the probe elapses or the echo is absent and never throws whereas a nudge that reports delivery without the read-back fails", async () => {
-    const delivered = rig();
+  test("test: nudge answers true only after a satisfied tui-idle probe and a handle-bound send receipt proven by its turn_started stage or by the composer emptying on a screen read and answers false when the probe elapses or the text still sits on the frame and never throws whereas a nudge that reports delivery from stream echo fails", async () => {
+    const delivered = rig({ echoSends: false });
     const deliveredSlot = await bound(delivered.driver, delivered.fake, ["ready"]);
     delivered.fake.last()!.tuiIdle = true;
     expect(await delivered.driver.nudge(deliveredSlot, "continue now")).toBe(true);
@@ -1038,8 +1038,8 @@ describe("OrcaDriver", () => {
     const sendAt = families.indexOf("send");
     expect(waitAt).toBeGreaterThanOrEqual(0);
     expect(sendAt).toBeGreaterThan(waitAt);
-    expect(delivered.fake.calls.slice(sendAt + 1).some((call) =>
-      call[0] === "terminal" && call[1] === "read" && call.includes("--cursor"))).toBe(true);
+    expect(delivered.fake.calls.slice(sendAt + 1).some((call) => call[1] === "read" && call.includes("--screen"))).toBe(true);
+    expect(delivered.fake.calls.some((call) => call[1] === "read" && call.includes("--cursor"))).toBe(false);
     expect(delivered.fake.sent.get(delivered.fake.last()!.handle)).toEqual(["continue now"]);
 
     const busy = rig();
@@ -1047,13 +1047,12 @@ describe("OrcaDriver", () => {
     expect(await busy.driver.nudge(busySlot, "continue now")).toBe(false);
     expect(busy.fake.countOf("send")).toBe(0);
 
-    const silent = rig({ echoSends: false });
-    const silentSlot = await bound(silent.driver, silent.fake, ["ready"]);
-    silent.fake.last()!.tuiIdle = true;
-    expect(await silent.driver.nudge(silentSlot, "continue now")).toBe(false);
-    expect(silent.fake.countOf("send")).toBe(1);
-    expect(silent.fake.calls.filter((call) => call[1] === "read" && call.includes("--cursor")).length)
-      .toBeGreaterThan(1);
+    const stuck = rig(); // echoed into the frame: the composer still shows the text
+    const stuckSlot = await bound(stuck.driver, stuck.fake, ["ready"]);
+    stuck.fake.last()!.tuiIdle = true;
+    expect(await stuck.driver.nudge(stuckSlot, "continue now")).toBe(false);
+    expect(stuck.fake.countOf("send")).toBe(1);
+    expect(stuck.fake.calls.filter((call) => call[1] === "read" && call.includes("--screen")).length).toBeGreaterThan(1);
 
     const malformed = rig({ raw: { send: MALFORMED } });
     const malformedSlot = await bound(malformed.driver, malformed.fake, ["ready"]);

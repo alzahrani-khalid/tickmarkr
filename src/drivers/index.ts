@@ -21,7 +21,8 @@ const hostByDriver = new WeakMap<ExecutorDriver, ClassifiedHost>();
  */
 export function classifyHost(env: NodeJS.ProcessEnv = process.env): ClassifiedHost {
   if (env.HERDR_ENV === "1") return "herdr";
-  if (env.TERM_PROGRAM === "Orca" && env.ORCA_TERMINAL_HANDLE !== undefined && env.ORCA_TERMINAL_HANDLE !== "") return "orca";
+  // A whitespace-only handle is no handle: the narrator trims it and would refuse the split.
+  if (env.TERM_PROGRAM === "Orca" && (env.ORCA_TERMINAL_HANDLE ?? "").trim() !== "") return "orca";
   return "none";
 }
 

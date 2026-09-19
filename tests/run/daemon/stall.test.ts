@@ -1,3 +1,4 @@
+import { writeBashEnvFixture } from "../../helpers/bash-env.js";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +19,7 @@ import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js"
 // whose `ps` works and on one that denies it, so a test can vary the leg it actually means to test.
 function flatCpuProbe(): () => void {
   const bashEnv = join(makeTestTempDir("tickmarkr-ps-flat-"), "bash-env");
-  writeFileSync(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+  writeBashEnvFixture(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
   const prior = process.env.BASH_ENV;
   process.env.BASH_ENV = bashEnv;
   return () => {
@@ -153,7 +154,10 @@ describe("OBS-117 early-launch liveness (fake adapter, zero tokens)", () => {
         [T("T1")],
         {
           tasks: {
-            T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "recovered" } }],
+            // Stay silent past the 50 ms fixture deadline. Without the sleep this worker can commit and
+            // exit inside that window on a lightly loaded host, making the test depend on scheduler timing
+            // instead of the silent-launch deadline it is meant to pin.
+            T1: [{ shell: `sleep 1; echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "recovered" } }],
           },
         },
         "taskTimeoutMinutes: 5\nvisibility:\n  worker: print\n",
@@ -863,7 +867,7 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
     const probeDir = makeTestTempDir("tickmarkr-ps-running-");
     const bashEnv = join(probeDir, "bash-env");
     const firstProbe = join(probeDir, "first-probe");
-    writeFileSync(bashEnv, [
+    writeBashEnvFixture(bashEnv, [
       "ps() {",
       `  if [ -f '${firstProbe}' ]; then echo '4242 1 bash ${marker}';`,
       `  else : > '${firstProbe}'; echo '1 1 unrelated-process'; fi`,

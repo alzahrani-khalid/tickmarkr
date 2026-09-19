@@ -1,3 +1,4 @@
+import { writeBashEnvFixture } from "../helpers/bash-env.js";
 import { execSync } from "node:child_process";
 import { chmodSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -35,7 +36,7 @@ function flatCpuProbe(): () => void {
   const bashEnv = join(dir, "bash-env");
   const calls = join(dir, "calls");
   writeFileSync(calls, "");
-  writeFileSync(bashEnv, "ps() { printf x >> \"$TICKMARKR_TEST_PS_CALLS\"; echo '1 1 0:00.00 unrelated-process'; }\n");
+  writeBashEnvFixture(bashEnv, "ps() { printf x >> \"$TICKMARKR_TEST_PS_CALLS\"; echo '1 1 0:00.00 unrelated-process'; }\n");
   const prior = { bashEnv: process.env.BASH_ENV, calls: process.env.TICKMARKR_TEST_PS_CALLS };
   process.env.BASH_ENV = bashEnv;
   process.env.TICKMARKR_TEST_PS_CALLS = calls;
@@ -243,8 +244,8 @@ test("an observation runDaemon cannot complete is recorded unreadable and never 
 }, 60_000);
 
 test("a worktree change runDaemon detects rearms the stall window and not only the journal, with a stall window shorter than the nudge grace a worker whose tree changes once just before the old deadline is concluded only at a new deadline measured from that change, while the identical worker whose tree never changes is concluded at the old deadline, so a contact row written without moving the progress clock fails", async () => {
-  NUDGEABLE_ADAPTERS.add("fake");
-  setNudgeTimingForTests(100, 1_000);
+  // Isolate the rolling worktree clock from the independent nudge-grace hold.
+  setHarvestCpuFlatMsForTests(50);
   setDeadChannelFastKillMsForTests(5_000);
 
   const run = async (changed: boolean) => {
@@ -256,11 +257,10 @@ test("a worktree change runDaemon detects rearms the stall window and not only t
         adapters: [fake],
         runId,
         driver: evidenceDriver({
-          nudge: async (slot) => {
+          actAfterLaunch: (worktree) => {
             if (changed && timer === undefined) {
-              timer = setTimeout(() => writeFileSync(join(slot.cwd, "late.txt"), "late change\n"), 220);
+              timer = setTimeout(() => writeFileSync(join(worktree, "late.txt"), "late change\n"), 450);
             }
-            return true;
           },
         }),
       });
@@ -382,10 +382,9 @@ test("test: an undeliverable nudge leaves the fast-kill and harvest holds standi
   // both holds stand: the failure is a delivery outcome, never proof the channel is dead
   expect(rows(killHeld, "worker-dead")).toHaveLength(0);
   expect(rows(harvestHeld, "worker-harvest")).toHaveLength(0);
-  // A hold gates the shared instrument too: neither reader is eligible, so a long held window
-  // must not fork the accountant's shell + ps sampler ten times a second for no possible reader.
-  expect(killHeld.cpuCalls).toBe(0);
-  expect(harvestHeld.cpuCalls).toBe(0);
+  // CPU accounting remains continuous through delivery holds for the stall leg.
+  expect(killHeld.cpuCalls).toBeGreaterThan(0);
+  expect(harvestHeld.cpuCalls).toBeGreaterThan(0);
   // and holding costs only the window, never the work — the trailer-less tail still gates the commits
   expect(rows(harvestHeld, "worker-result-harvested")).toHaveLength(1);
 

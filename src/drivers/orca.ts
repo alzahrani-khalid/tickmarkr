@@ -1,4 +1,4 @@
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { shq } from "../adapters/types.js";
@@ -313,7 +313,10 @@ export function mapAgentState(term: Record<string, unknown>, tuiIdle: boolean): 
  * is proven gone. Everything else — a reservation or claim with no bound pane, a failed cleanup, a
  * record another driver holds with a live observer — refuses and keeps the record exactly as it is.
  */
-type BoardRecord = WatchBoardOwner & { retired?: true; runtimeId?: string };
+/** `placer` is the pid of the narrator that wrote the reservation: a reserved or claimed record is a
+ *  normal intermediate state while that pid lives (another driver awaiting listing or bind) and a
+ *  crash to recover only once it is dead. */
+type BoardRecord = WatchBoardOwner & { retired?: true; runtimeId?: string; placer?: number };
 type BoardState = "reserved" | "claimed" | "bound" | "retired";
 
 function boardState(r: BoardRecord): BoardState {
@@ -344,21 +347,50 @@ function readBoard(path: string, repo: string, runId: string): { raw: string; re
  * excludes other writers, then create-only `link`s the new inode (fails if anything exists) or
  * `rename`s the new file over the live path (POSIX atomic replace — readers see old or new, never
  * absence). A crash that leaves a `.tmp` or `.lock` does not drop the previous record.
+ * Each lock generation publishes its pid and nonce atomically in a symlink target. A holder that died
+ * between taking and releasing it is recovered at once (its lock is taken over in place); a live
+ * holder bounds the wait on injected time and is then refused with the record untouched. A legacy
+ * pid-less or malformed generation is recoverable too: a contender atomically creates the next owner
+ * generation, and release removes the directory only while that exact generation is still current.
  * ponytail: observeNamedRun (supervision.ts) renames without CAS. It cannot interleave with a swap
  * because the narrator writes nothing between reserve and claim, and no transition here swaps one.
  */
-export function casBoard(family: string, path: string, expected: string | undefined, next: BoardRecord): string {
+export async function casBoard(family: string, path: string, expected: string | undefined, next: BoardRecord, time: OrcaTimeSource = SYSTEM_TIME): Promise<string> {
   const raw = JSON.stringify(next) + "\n";
   const refused = () => new OrcaError(family, `watch owner record ${path} changed underneath; swap refused and the current record kept`, "");
   mkdirSync(dirname(path), { recursive: true });
   const lock = `${path}.lock`;
-  const deadline = Date.now() + 2_000;
+  const deadline = time.now() + LOCK_WAIT_MS;
+  const ownerTarget = `${process.pid}:${randomUUID()}`;
+  let ownerEntry = "";
+  let acquiredEntries: string[] = [];
   for (;;) {
-    try { mkdirSync(lock); break; }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (Date.now() >= deadline) throw new OrcaError(family, `watch owner record ${path} lock not acquired; current record kept`, "");
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    try { mkdirSync(lock); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+
+    // The marker's directory entry and target appear as one filesystem operation. If the creator
+    // dies after mkdir but before this call, a contender claims owner.0; if both race, only one
+    // symlink wins and the loser judges that published owner before entering the CAS section.
+    const holder = lockHolder(lock);
+    if (holder?.pid !== undefined && pidLive(holder.pid)) {
+      if (time.now() >= deadline) throw new OrcaError(family, `watch owner record ${path} lock not acquired; current record kept`, "");
+      await time.sleep(10);
+      continue;
+    }
+    ownerEntry = `owner.${(holder?.gen ?? -1) + 1}`;
+    try {
+      symlinkSync(ownerTarget, join(lock, ownerEntry));
+      // Snapshot only generations that this takeover superseded, with our marker last. Release must
+      // never recursively scan: after our final unlink a contender may publish a replacement marker
+      // before rmdir, and that marker belongs to the contender, not to this generation.
+      acquiredEntries = readdirSync(lock)
+        .filter((entry) => entry === ownerEntry || lockEntryGeneration(entry) !== undefined)
+        .sort((a, b) => Number(a === ownerEntry) - Number(b === ownerEntry));
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST" && code !== "ENOENT") throw error;
+      continue; // another contender published this generation, or the prior holder just released
     }
   }
   try {
@@ -381,8 +413,61 @@ export function casBoard(family: string, path: string, expected: string | undefi
     }
     return raw;
   } finally {
-    rmSync(lock, { recursive: true, force: true });
+    releaseBoardLock(lock, ownerEntry, ownerTarget, acquiredEntries);
   }
+}
+
+const LOCK_WAIT_MS = 2_000;
+
+/** Best-effort release cannot invalidate a committed CAS. Superseded entries go first and our marker
+ * goes last; after that unlink, a non-recursive rmdir either removes the empty old generation or
+ * leaves a contender's newly published marker untouched. Any abnormal filesystem error leaves the
+ * lock for the next generation's stale-owner recovery instead of escaping from the caller's finally. */
+function releaseBoardLock(lock: string, ownerEntry: string, ownerTarget: string, acquiredEntries: string[]): void {
+  const holder = lockHolder(lock);
+  if (holder?.entry !== ownerEntry || holder.target !== ownerTarget) return;
+  for (const entry of acquiredEntries) {
+    try { unlinkSync(join(lock, entry)); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    }
+  }
+  try { rmdirSync(lock); }
+  catch { /* ENOTEMPTY means a contender owns it; any other failure is recoverable stale state. */ }
+}
+
+/** The highest published generation. `pid*` files are accepted for recovery compatibility; new
+ * owners use atomic `owner.N -> pid:nonce` symlinks. Missing or malformed contents return a
+ * generation with no pid, which is stale and can only be superseded by creating the next marker. */
+function lockHolder(lock: string): { gen: number; entry: string; target?: string; pid?: number } | undefined {
+  try {
+    const candidates = readdirSync(lock).flatMap((entry) => {
+      const owner = /^owner\.(\d+)$/.exec(entry);
+      const gen = lockEntryGeneration(entry);
+      return gen === undefined ? [] : [{ gen, entry, owner: owner !== null }];
+    }).sort((a, b) => b.gen - a.gen || Number(b.owner) - Number(a.owner));
+    const current = candidates[0];
+    if (!current) return undefined;
+    let target: string;
+    try {
+      target = current.owner
+        ? readlinkSync(join(lock, current.entry))
+        : readFileSync(join(lock, current.entry), "utf8").trim();
+    } catch {
+      return { gen: current.gen, entry: current.entry };
+    }
+    const pidText = current.owner ? /^([1-9]\d*):.+$/.exec(target)?.[1] : target;
+    const pid = Number(pidText);
+    return Number.isInteger(pid) && pid > 0
+      ? { gen: current.gen, entry: current.entry, target, pid }
+      : { gen: current.gen, entry: current.entry, target };
+  } catch { return undefined; }
+}
+
+function lockEntryGeneration(entry: string): number | undefined {
+  const owner = /^owner\.(\d+)$/.exec(entry);
+  const legacy = /^pid(?:\.(\d+))?$/.exec(entry);
+  return owner ? Number(owner[1]) : legacy ? Number(legacy[1] ?? 0) : undefined;
 }
 
 function pidLive(pid: number): boolean {
@@ -492,6 +577,14 @@ function collectTabs(node: unknown, out: unknown[]): void {
  */
 export function joinWrapped(raw: string): string {
   return raw.split("\n").map((l) => l.replace(/^[\s│|]+/, "").replace(/[\s│|]+$/, "")).join("");
+}
+
+/** The OBS-1011 add.1 capture: `status:"exited", tail:[], returnedLineCount 0` from a stream read. */
+export function isBlindStreamPage(term: Record<string, unknown>): boolean {
+  return str(term.status) === "exited"
+    && term.source !== "screen"
+    && Array.isArray(term.tail) && term.tail.length === 0
+    && (term.returnedLineCount === undefined || term.returnedLineCount === 0);
 }
 
 interface OrcaSlotState {
@@ -727,10 +820,10 @@ export class OrcaDriver implements ExecutorDriver {
     await this.sendText(st, cmd);
   }
 
-  private async sendText(st: OrcaSlotState, text: string): Promise<void> {
+  private async sendText(st: OrcaSlotState, text: string, waitSubmit = false): Promise<Record<string, unknown>> {
     const env = await this.terminalOp("send", st, (h) => this.call(
       "send",
-      ["terminal", "send", "--terminal", h, "--text", text, "--enter"],
+      ["terminal", "send", "--terminal", h, "--text", text, "--enter", ...(waitSubmit ? ["--wait-submit", "15"] : [])],
       this.cliCwd(st),
     ), { mutating: true });
     // Recorded 1.4.195 send receipt: result.send = {handle, accepted, bytesWritten}. `ok:true`
@@ -740,6 +833,7 @@ export class OrcaDriver implements ExecutorDriver {
     if (receipt.accepted !== true || typeof receipt.bytesWritten !== "number" || receipt.bytesWritten !== expectedBytes) {
       throw new OrcaError("send", `send receipt does not report expected byte delivery (accepted: ${JSON.stringify(receipt.accepted)}, bytesWritten: ${receipt.bytesWritten}, expected: ${expectedBytes})`, env.raw);
     }
+    return receipt;
   }
 
   private sendReceipt(env: OrcaEnvelope, st: OrcaSlotState): Record<string, unknown> {
@@ -1096,7 +1190,35 @@ export class OrcaDriver implements ExecutorDriver {
       ...(cursor === undefined || recovered ? [] : ["--cursor", cursor]),
       "--limit", String(lines),
     ], this.cliCwd(st)), { onRecovered: () => { recovered = true; } });
+    if (isBlindStreamPage(requireTerminal(family, env))) {
+      return { term: await this.screenBehindBlindStream(family, st, env), raw: env.raw, recovered };
+    }
     return { term: this.validated(family, st, env), raw: env.raw, recovered };
+  }
+
+  /**
+   * OBS-1011 add.1 / OBS-1016: the captured incident shape — a stream page answering status exited
+   * with an empty tail on a terminal that accepted a send seconds earlier — is BLIND, not dead, when
+   * the same handle's show record on the same runtime reports connected and not orphaned (show carries
+   * no status field; none is demanded) and its screen read reports running. Then the rendered frame is
+   * the terminal's bytes. Anything less — disconnected, orphaned, another handle or runtime, a screen
+   * that is unavailable or exited — is refused as unavailable, exactly as the dead record would be.
+   */
+  private async screenBehindBlindStream(family: string, st: OrcaSlotState, blind: OrcaEnvelope): Promise<Record<string, unknown>> {
+    const handle = str(requireTerminal(family, blind).handle);
+    if (handle !== st.handle) {
+      throw new OrcaUnavailableError(family, `terminal record names ${handle ?? "no handle"}, not the addressed ${st.handle}`, blind.raw);
+    }
+    const show = await this.call("show", ["terminal", "show", "--terminal", st.handle!], this.cliCwd(st));
+    if (show.runtimeId !== st.runtimeId) {
+      throw new OrcaUnavailableError(family, `exited-shaped stream page: show answered by runtime ${show.runtimeId}, not the bound ${st.runtimeId}`, show.raw, "exited");
+    }
+    this.liveShowTerm(family, st, show);
+    const screen = await this.readScreen(st);
+    if (screen.source !== "screen") {
+      throw new OrcaUnavailableError(family, `exited-shaped stream page and no rendered screen for ${st.handle}`, blind.raw, "exited");
+    }
+    return screen.term;
   }
 
   /** A rendered-frame liveness read. `--screen` and `--cursor` are mutually exclusive in Orca. */
@@ -1362,17 +1484,24 @@ export class OrcaDriver implements ExecutorDriver {
     try {
       const st = this.state(slot);
       if (!await this.waitCondition(st, "tui-idle", 1)) return false;
-
-      // Drain to the current stream cursor before sending. A message already present makes the
-      // proof ambiguous, so decline rather than reporting delivery from old scrollback.
-      const before = await this.sweep(st);
-      if (before.includes(message) || joinWrapped(before).includes(message)) return false;
-      await this.sendText(st, message);
-
+      const receipt = await this.sendText(st, message, true);
+      // OBS-1016: delivery is proven by the receipt — a prompt stage of turn_started — or by the
+      // composer emptying on a screen read, never by stream echo: the stream is blind on a live Orca
+      // terminal (OBS-1011 add.1), so an echo sweep fails every nudge and latches the harvest hold.
+      const prompt = typeof receipt.prompt === "object" && receipt.prompt !== null && !Array.isArray(receipt.prompt)
+        ? receipt.prompt as Record<string, unknown>
+        : {};
+      const stages = Array.isArray(prompt.stages) ? prompt.stages : [];
+      if (stages.includes("turn_started")) return true;
       const deadline = this.time.now() + NUDGE_ECHO_TIMEOUT_MS;
       for (;;) {
-        const after = await this.sweep(st);
-        if (after.includes(message) || joinWrapped(after).includes(message)) return true;
+        const screen = await this.readScreen(st);
+        // ponytail: "composer emptied" is "the text is no longer on the frame" — a TUI that keeps the
+        // submitted turn on screen reads as undelivered until the timeout; the receipt stage is primary.
+        if (screen.source === "screen") {
+          const frame = this.tailText("status", screen.term, "");
+          if (!frame.includes(message) && !joinWrapped(frame).includes(message)) return true;
+        }
         const left = deadline - this.time.now();
         if (left <= 0) return false;
         await this.time.sleep(Math.min(this.pollMs, left));
@@ -1401,7 +1530,35 @@ export class OrcaDriver implements ExecutorDriver {
       } else if (current) {
         const state = boardState(current.record);
         if (state === "reserved" || state === "claimed") {
-          throw new OrcaError("split", `Orca narrator placement remains unresolved for ${name} (${state}, no bound pane); ${kept}`, "");
+          // A reservation or claim with no bound pane is the placing narrator's normal intermediate
+          // state while that narrator lives (awaiting its receipt, listing, claim or bind): refused
+          // untouched, its observer never asked to stop. Only a DEAD placer (or one unrecorded) makes
+          // it a crash to recover.
+          const { placer } = current.record;
+          if (typeof placer !== "number" || pidLive(placer)) {
+            throw new OrcaError("split", `Orca narrator placement remains unresolved for ${name} (${state}, no bound pane) while placing narrator ${placer ?? "unrecorded"} lives; ${kept}`, "");
+          }
+        }
+        if (state === "claimed") {
+          // The placing driver crashed between the observer's claim and its bind. The record is
+          // replaced only once that observer is proven gone: dead outright, or live and stopped with
+          // its acknowledgement awaited on injected time — unacknowledged, it is refused untouched.
+          const pid = current.record.pid as number;
+          if (pidLive(pid)) {
+            try {
+              await stopWatchBoard(current.record, this.time);
+            } catch (error) {
+              throw new OrcaError("split", `Orca narrator placement refused for ${name}: claimed board's live observer unacknowledged; ${kept}; ${errorText(error)}`, "");
+            }
+          }
+          const retired: BoardRecord = { ...current.record, retired: true };
+          current = { raw: await casBoard("split", path, current.raw, retired, this.time), record: retired };
+        }
+        if (state === "reserved") {
+          // The placer died before any claim: no observer exists, its split pane (if any) is unknown
+          // to the record. Tombstoned in place so the generic tail below replaces it.
+          const retired: BoardRecord = { ...current.record, retired: true };
+          current = { raw: await casBoard("split", path, current.raw, retired, this.time), record: retired };
         }
         if (state === "bound") {
           // The bound record is the durable truth of placement: the child handle PLUS the split
@@ -1411,7 +1568,7 @@ export class OrcaDriver implements ExecutorDriver {
           }
           // Lost: this runtime no longer has that pane. Tombstone before anything else.
           const retired: BoardRecord = { ...current.record, retired: true };
-          current = { raw: casBoard("split", path, current.raw, retired), record: retired };
+          current = { raw: await casBoard("split", path, current.raw, retired, this.time), record: retired };
         }
         // A tombstone can be an acknowledgement timeout, not completed observer cleanup. A live
         // observer must stop and ack on injected time before the handle-bound close; timeout keeps
@@ -1435,7 +1592,18 @@ export class OrcaDriver implements ExecutorDriver {
       // Reserve before any command can read the token: create-only, or a swap of the exact record
       // judged replaceable above.
       const token = randomUUID();
-      casBoard("split", path, current?.raw, { repo: realpathSync(cwd), runId, driver: this.id, workspace: ORCA_SPACE, pane: "", name, token });
+      await casBoard("split", path, current?.raw, { repo: realpathSync(cwd), runId, driver: this.id, workspace: ORCA_SPACE, pane: "", name, token, placer: process.pid }, this.time);
+      // A reservation that can never be bound — no usable receipt, or no claim — is tombstoned so the
+      // next narrator call splits afresh instead of refusing forever. Only THIS reservation, and only
+      // while it is still the untouched reservation; a record anyone else moved is left to them.
+      const tombstone = async (extra: Partial<BoardRecord> = {}): Promise<void> => {
+        try {
+          const now = readBoard(path, cwd, runId);
+          if (now?.record.token === token && boardState(now.record) === "reserved") {
+            await casBoard("split", path, now.raw, { ...now.record, ...extra, retired: true }, this.time);
+          }
+        } catch { /* the record is kept as it stands; the next narrator judges it */ }
+      };
 
       // Exactly one terminal split of the launching handle, horizontal, carrying token and command.
       // An unknown receipt (transport failure, refusal, unparseable output) after the verb was issued
@@ -1445,13 +1613,15 @@ export class OrcaDriver implements ExecutorDriver {
         "--terminal", launchingHandle,
         "--direction", "horizontal",
         "--command", `${WATCH_OWNER_ENV}=${shq(token)} ${command}`,
-      ], cwd).catch((error: unknown) => {
+      ], cwd).catch(async (error: unknown) => {
+        await tombstone();
         throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown (${error instanceof OrcaError ? error.reason : errorText(error)}); ${kept}`, error instanceof OrcaError ? error.raw : "");
       });
       let child: { handle: string; tabId: string };
       try {
         child = splitReceipt(env);
       } catch {
+        await tombstone();
         throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, env.raw);
       }
       // Parent tabId must name the launching terminal's tab, and the child must actually appear
@@ -1461,6 +1631,7 @@ export class OrcaDriver implements ExecutorDriver {
       try {
         listing = await this.listAll(cwd);
       } catch (error) {
+        await tombstone();
         throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, error instanceof OrcaError ? error.raw : env.raw);
       }
       const launchingTabId = terminalTabId(listing, launchingHandle);
@@ -1470,6 +1641,7 @@ export class OrcaDriver implements ExecutorDriver {
         || child.handle === launchingHandle
         || terminalTabId(listing, child.handle) !== launchingTabId
       ) {
+        await tombstone();
         throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, env.raw);
       }
       const childHandle = child.handle;
@@ -1489,7 +1661,9 @@ export class OrcaDriver implements ExecutorDriver {
         await this.time.sleep(20);
       }
       if (!claim) {
-        // The receipt's handle may be closed, but the refused placement's record stays as it is.
+        // The receipt's handle may be closed; the reservation is tombstoned naming that pane so the
+        // next narrator can prove it gone (or close it) and split afresh.
+        await tombstone({ pane: childHandle, runtimeId: env.runtimeId });
         let pane: string;
         try {
           await this.closeRecordedPane(cwd, name, childHandle, env.runtimeId);
@@ -1500,7 +1674,7 @@ export class OrcaDriver implements ExecutorDriver {
         throw new OrcaError("split", `Orca narrator board unclaimed for ${name}: the observer never claimed the record (unclaimed board); ${kept}; ${pane}`, env.raw);
       }
 
-      casBoard("split", path, claim.raw, { ...claim.record, pane: childHandle, runtimeId: env.runtimeId });
+      await casBoard("split", path, claim.raw, { ...claim.record, pane: childHandle, runtimeId: env.runtimeId }, this.time);
       return watchSlot(cwd, name, childHandle);
     });
   }
@@ -1522,7 +1696,7 @@ export class OrcaDriver implements ExecutorDriver {
 
   /** bound → retired, decided from the record alone: it must be this driver's board for exactly this
    *  slot's pane. Already retired is returned as it is. */
-  private retireBoard(family: string, slot: Slot): BoardRecord {
+  private async retireBoard(family: string, slot: Slot): Promise<BoardRecord> {
     const runId = parseOwnedName(slot.name)?.runId;
     const path = runId ? this.boardPath(slot.cwd, runId) : undefined;
     const current = path && runId ? readBoard(path, slot.cwd, runId) : undefined;
@@ -1532,7 +1706,7 @@ export class OrcaDriver implements ExecutorDriver {
     }
     if (r.retired) return r;
     const retired: BoardRecord = { ...r, retired: true };
-    casBoard(family, path, current.raw, retired);
+    await casBoard(family, path, current.raw, retired, this.time);
     return retired;
   }
 
@@ -1542,7 +1716,7 @@ export class OrcaDriver implements ExecutorDriver {
    *  so it is only asked. */
   private async retireAndClose(slot: Slot): Promise<void> {
     await this.serial(async () => {
-      const retired = this.retireBoard("close", slot);
+      const retired = await this.retireBoard("close", slot);
       if (typeof retired.pid === "number" && pidLive(retired.pid)) await stopWatchBoard(retired, this.time);
       else requestWatchBoardStop(retired);
       await this.closeRecordedPane(slot.cwd, slot.name, slot.id, retired.runtimeId);

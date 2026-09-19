@@ -205,13 +205,13 @@ on the print side.
 `src/graph/schema.ts` declares **build test lint evidence scope acceptance review** in that
 order. The first five are mandatory; only acceptance and review may be omitted by task or
 disabled by supported shape policy. Declaration order is the Run matrix/returned-record
-order, not the execution timeline. The daemon selects `pipeline: "v185"` in
-`src/gates/run-gates.ts`: reject a dirty entry, screen evidence/scope before shell work,
+order, not the execution timeline. The single pipeline in `src/gates/run-gates.ts`
+rejects a dirty entry and screens evidence/scope before shell work,
 then run build, lint, evidence, scope and test, stopping at the first deterministic red.
 `src/gates/baseline.ts` compares tool failures against the recorded baseline. The cheap
 screen does not replace the later evidence/scope checks. Only after that battery passes
 do enabled acceptance and review start concurrently; both must pass, and each completion
-is journaled when it arrives. The legacy serial branch remains for compatibility fixtures.
+is journaled when it arrives. All callers and fixtures use this same execution path.
 If a non-final round selects covering tests, a green selection is held until the full
 suite runs on the same merge-candidate commit; no subset-only result authorizes merge.
 

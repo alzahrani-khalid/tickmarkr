@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { writeBashEnvFixture } from "../helpers/bash-env.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { Assignment, Invocation } from "../../src/adapters/types.js";
 import type { Task } from "../../src/graph/schema.js";
@@ -378,7 +379,7 @@ describe("a fast-kill death names the fast-kill (OBS-548)", () => {
   // unrelated row: the marker matches nothing, so the worker tree is empty and reads a flat zero.
   const flatCpuProbe = (): (() => void) => {
     const bashEnv = join(makeTestTempDir("tickmarkr-ps-flat-"), "bash-env");
-    writeFileSync(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+    writeBashEnvFixture(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
     const prior = process.env.BASH_ENV;
     process.env.BASH_ENV = bashEnv;
     return () => {

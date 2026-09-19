@@ -8,7 +8,7 @@ import { plan } from "../../src/cli/commands/plan.js";
 import { report } from "../../src/cli/commands/report.js";
 import { narrationSink, narrationLine as railLine, narrationRow as railRow, RAIL_ROWS, TTY_NOISE_EVENTS } from "../../src/cli/commands/run.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
-import { saveGraph } from "../../src/graph/graph.js";
+import { loadGraph, saveGraph, setStatus, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { HARVESTED_RESULT_SUMMARY } from "../../src/run/daemon.js";
 import { formatJournalNarration, Journal, type JournalEvent } from "../../src/run/journal.js";
@@ -80,6 +80,20 @@ const DOCTOR_FABLE_UNAUTHED = {
     },
   },
 };
+
+// OBS-1018: four leaves declared before a dependency-free root of a three-deep chain (R → A → B → C).
+// The golden is authored by hand from the depth/wave definition; this file never regenerates it.
+export function mkChainRepo(): string {
+  const repo = makeRepo({ "keep.txt": "x\n" });
+  const t = (id: string, deps: string[] = []) => ({ id, title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"], deps });
+  saveGraph(repo, validateGraph({
+    version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [t("L1"), t("L2"), t("L3"), t("L4"), t("R"), t("A", ["R"]), t("B", ["A"]), t("C", ["B"])],
+  }));
+  writeFileSync(join(tickmarkrDir(repo), "config.yaml"), "concurrency: 2\n");
+  writeDoctor(repo, DOCTOR5);
+  return repo;
+}
 
 function mkLintRepo(): string {
   const repo = makeRepo({ "keep.txt": "x\n" });
@@ -333,6 +347,42 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     setTTY(false);
     expect(await goldenPlan(mkBasicRepo())).toBe(golden("plan-basic.txt"));
     expect(await goldenPlan(mkLintRepo())).toBe(golden("plan-lints.txt"));
+  });
+
+  test("test: production plan rendering the chained fixture graph prints depth three counted by downstream edges and wave one for the chain root, wave one for the first declared leaf and later waves for the remaining leaves at concurrency two with depth zero on every leaf, its output equals the independently authored committed expected bytes under the brand-surfaces fixtures without the oracle regenerating them, and a graph with no chains prints depth zero on every row, so a plan whose depth or wave disagrees with readyTasks or an oracle that writes its own expected file fails", async () => {
+    setTTY(false);
+    const out = await goldenPlan(mkChainRepo());
+    const chainOf = (id: string) => new RegExp(`^  ${id} .*\\n(?:    .*\\n)*?    chain: (.*)$`, "m").exec(out)?.[1];
+    expect(chainOf("R")).toBe("depth 3 · wave 1 at concurrency 2");
+    expect(chainOf("L1")).toBe("depth 0 · wave 1 at concurrency 2");
+    expect(chainOf("L2")).toBe("depth 0 · wave 2 at concurrency 2");
+    expect(chainOf("L3")).toBe("depth 0 · wave 3 at concurrency 2");
+    expect(chainOf("L4")).toBe("depth 0 · wave 4 at concurrency 2");
+    expect(chainOf("A")).toBe("depth 2 · wave 2 at concurrency 2");
+    expect(chainOf("C")).toBe("depth 0 · wave 4 at concurrency 2");
+    // the committed bytes are the oracle; this test only reads them
+    const before = golden("plan-chain.txt");
+    expect(out).toBe(before);
+    expect(golden("plan-chain.txt")).toBe(before);
+    // no chains: every row is depth 0
+    const flat = await goldenPlan(mkBasicRepo());
+    expect(flat.match(/^    chain: depth (\d+)/gm)).toEqual(["    chain: depth 0"]);
+    expect(flat).toBe(golden("plan-basic.txt"));
+  });
+
+  test("plan renders the real status for wave-less tasks: a pending task behind a running dependency is blocked, not 'not pending' (OBS-1018 review)", async () => {
+    setTTY(false);
+    const repo = mkChainRepo();
+    const g = loadGraph(repo);
+    saveGraph(repo, setStatus(setStatus(g, "R", "running"), "L1", "done"));
+    const out = await goldenPlan(repo);
+    const chainOf = (id: string) => new RegExp(`^  ${id} .*\\n(?:    .*\\n)*?    chain: (.*)$`, "m").exec(out)?.[1];
+    expect(chainOf("A")).toBe("depth 2 · no wave (pending; blocked by R:running)");
+    expect(chainOf("B")).toBe("depth 1 · no wave (pending; blocked by A:pending)");
+    expect(chainOf("R")).toBe("depth 3 · no wave (running)");
+    expect(chainOf("L1")).toBe("depth 0 · no wave (done)");
+    expect(chainOf("L2")).toBe("depth 0 · wave 1 at concurrency 2");
+    expect(out).not.toContain("not pending");
   });
 
   test("a plan lint renders the attention glyph on a tty", async () => {

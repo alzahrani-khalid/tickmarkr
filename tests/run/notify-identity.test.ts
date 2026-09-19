@@ -75,6 +75,14 @@ function normJournal(events: JournalEvent[], repo: string, runId: string, baseRe
       expect(slot.name).toBe(`${taskId}-worker-fake-a${row.data.attempt}-${runId.replace(/^run-/, "")}`);
       row = { ...row, data: { ...row.data, slot: { ...slot, cwd: "<WORKTREE>", name: `<RUNID>-${taskId}-${row.data.attempt}` } } };
     }
+    if (row.event === "worker-process-reaped") {
+      // PGIDs and slot run IDs are host identities, not effects of the notification sink.
+      expect(row.data.slot).toBe(`${taskId}-worker-fake-a${row.data.attempt}-${runId.replace(/^run-/, "")}`);
+      expect(row.data).toHaveProperty("processGroup");
+      expect(row.data.survivors === null || Array.isArray(row.data.survivors)).toBe(true);
+      row = { ...row, data: { ...row.data, processGroup: typeof row.data.processGroup === "number" ? "<PGID>" : null,
+        slot: `<RUNID>-${taskId}-${row.data.attempt}` } };
+    }
     if (row.event === "gate-result") {
       // Mask values only after proving the row carried one. Two equally missing durationMs fields
       // must fail this identity oracle rather than normalize into a false equality.

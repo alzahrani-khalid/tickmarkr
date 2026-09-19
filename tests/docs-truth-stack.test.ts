@@ -116,8 +116,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
 
     // Verify Node version requirement is consistent
-    expect(stack).toContain("Node.js >=20");
-    expect(pkg.engines.node).toBe(">=20");
+    expect(stack).toContain(`Node.js ${pkg.engines.node}`);
 
     // Verify package is ESM
     expect(stack).toContain('Pure ESM');

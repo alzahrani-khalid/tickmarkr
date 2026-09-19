@@ -15,7 +15,7 @@
 ## Runtime
 
 **Environment:**
-- Node.js >=20 (`package.json:19` `engines.node`)
+- Node.js >=20.3 (`package.json:19` `engines.node`)
 - Pure ESM (`package.json:5` `"type": "module"`); `tsconfig.json` uses `module`/`moduleResolution: NodeNext`, so every internal import is a relative path with an explicit `.js` extension even though the source is `.ts`
 
 **Package Manager:**
@@ -68,7 +68,7 @@
 ## Platform Requirements
 
 **Development:**
-- Node.js >=20
+- Node.js >=20.3
 - git - required, not optional: task isolation (worktrees), integration branches, and diff-based gates all shell out to `git` directly (`src/run/git.ts`)
 - Optional, only for real (non-fake) runs: one or more agent CLIs on `PATH` — `claude`, `codex`, `cursor-agent`, `opencode`, `pi`, `grok`, `kimi` — verified with `tickmarkr doctor` (`src/cli/commands/doctor.ts`)
 - Optional: `herdr` CLI on `PATH` plus `HERDR_ENV=1` for the visible-pane driver; silently falls back to the invisible `SubprocessDriver` when absent

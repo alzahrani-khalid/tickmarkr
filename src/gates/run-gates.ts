@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { loadavg, tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { type Assignment, type BillingChannel, channelKey, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
@@ -6,19 +6,22 @@ import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate } from "./acceptance.js";
-import { type Baseline, compareToBaseline, effectiveCeilingMs } from "./baseline.js";
+import { type Baseline, type RetryOptions, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
 import { disallowedBy } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
-import { gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
+import { carriedAuthorVendors, gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
 import { evaluateManifestedTest, isVitestTestCommand } from "./test-manifest.js";
 import type { GateResult } from "./types.js";
-import { shGit, resolvedCapacity } from "../run/git.js";
+import { executionSignal } from "../run/execution-budget.js";
+import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
+import { preserveWorktree, shGit, resolvedCapacity, verificationProtocol } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 import {
   computeVerificationIdentity,
+  verificationIdentityKey,
   formatReusedRow,
   getVerdictStore,
   isInfraResult,
@@ -154,6 +157,7 @@ export type GateEvent =
   | { phase: "note"; gate: GateName; name: string; payload: Record<string, unknown>; result: GateResult };
 
 export interface GateContext {
+  authorizeInfraRetry?: (subject: string, cause?: VerificationRetryCause) => boolean;
   verificationScope?: VerificationScope;
   worktree: string;
   baseRef: string;
@@ -171,23 +175,55 @@ export interface GateContext {
   carriedFindings?: readonly StructuredFinding[];
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
   demotedReviewers?: Set<string>;
+  // OBS-1025 add.2: run-scoped no-verdict causes per reviewer seat; a seat at two leaves the rotation for the run.
+  reviewNoVerdicts?: Map<string, string[]>;
+  // OBS-1033: channel keys of the seats that authored the carried commits (the task's tried list) —
+  // a reviewer of that vendor is excluded for the round, never handed its own work to approve.
+  carriedAuthors?: readonly string[];
   reviewHistory?: string[]; // run-scoped LRU reviewer rotation; mutated synchronously when a seat is reserved
   priorReviewers?: PriorReviewer[]; // RF-1: seats THIS task's earlier review rows name, with their journaled dispatch tier — the floor a later round holds
   artifactDir?: string; // OBS-196: run dir for raw reviewer-output persistence on unparseable verdicts
-  // T4 (OBS-265): "v185" runs the pipeline mechanics this milestone buys — the cheap git checks as a
-  // pre-battery screen, a battery that stops at its first red, and judge ‖ review. The daemon always
-  // asks for it. The default is the frozen serial walk the gate fixtures outside this task's file
-  // scope still pin (tests/gates/judge-retry.test.ts, on-gate.test.ts) — the branch dies with them.
-  pipeline?: "v185" | "legacy";
-  // T4: this round may run only the tests covering its own diff. The daemon clears it once a test
-  // gate has failed for this task. Never a licence to merge on a subset: the merge-candidate round
+  // This round may select tests covering its diff; the caller applies recorded repair history
+  // and distrust before enabling it. Never a licence to merge on a subset: the merge-candidate round
   // re-runs the FULL suite on the same gated commit before this function reports green.
   selectTests?: boolean;
+  requiredRepairTests?: readonly string[];
+  selectionReason?: string;
   // OBS-547: this task's slice of the run's ONE full collateral map (uncapped, computed at run start
   // in the daemon). The gate classifies its red against it; absent ⇒ no classification.
   collateral?: ReadonlyArray<string>;
   onGate?: (e: GateEvent) => void | Promise<void>;
   stateDir?: string;
+}
+
+// A porcelain -z record: `status` is the 2-char XY code, `path` is that entry's current path.
+// -z suppresses git's octal-escape quoting entirely (the newline form c-quotes any non-ASCII byte,
+// which JSON.parse cannot decode — it uses a different escape grammar), so this is the only lossless
+// way to read a status line's path.
+interface DirtEntry {
+  status: string;
+  path: string;
+}
+
+interface DirtSnapshot {
+  text: string;
+  entries: DirtEntry[];
+}
+
+/** Parse `git status --porcelain --untracked-files=all -z` output. A rename/copy carries its
+ * ORIGINAL path in a second NUL field immediately after the current one; skip it — dirt only
+ * cares about paths that exist in the worktree now. */
+function parseStatusZ(stdout: string): DirtEntry[] {
+  const fields = stdout.split("\0");
+  const entries: DirtEntry[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const rec = fields[i]!;
+    if (!rec) continue;
+    const status = rec.slice(0, 2);
+    entries.push({ status, path: rec.slice(3) });
+    if (status.includes("R") || status.includes("C")) i++; // consume the paired original-path field
+  }
+  return entries;
 }
 
 const TEST_FILE_RE = /(?:^|\/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$/;
@@ -287,6 +323,8 @@ async function runVitestManifestGate(
   baseline: Baseline,
   selected: readonly string[] | undefined,
   artifactDir?: string,
+  retry: RetryOptions = {},
+  retried = false,
 ): Promise<GateResult> {
   const entry = baseline.commands.test;
   const outcome = await evaluateManifestedTest(cmd, worktree, {
@@ -296,6 +334,18 @@ async function runVitestManifestGate(
     artifactDir,
   });
   const reportPath = outcome.reportPath;
+  if (!retried && retry.authorizeRetry && failureDisposition(outcome) === "infrastructure"
+      && outcome.meta?.retryable !== false) {
+    const waitedMs = await waitForCalmWindow(executionSignal());
+    if (!calmWindowReady()) return { gate: "test", pass: false, details: outcome.details,
+      meta: { ...outcome.meta, reportPath, recoveryBlocked: "calm window unavailable within the existing wait ceiling" } };
+    if (!retry.authorizeRetry("infra")) {
+      return { gate: "test", pass: false, details: outcome.details,
+        meta: { ...outcome.meta, reportPath, recoveryBlocked: "infrastructure retry allowance exhausted or subject unavailable" } };
+    }
+    const result = await runVitestManifestGate(worktree, cmd, baseline, selected, artifactDir, retry, true);
+    return { ...result, meta: { ...result.meta, runnerInfraRerun: { count: 1, waitedMs, firstReportPath: reportPath } } };
+  }
   return {
     gate: "test",
     pass: outcome.pass,
@@ -322,9 +372,16 @@ export async function runGates(
   ctx: GateContext,
 ): Promise<{ results: GateResult[]; commits: string[] }> {
   const results: GateResult[] = [];
+  let selectionDecision: Record<string, unknown> | undefined;
   let commits: string[] = [];
   const stateDir = ctx.stateDir ?? resolveStateDir(ctx.worktree, ctx.artifactDir);
   const verdictStore = getVerdictStore(stateDir);
+  // R41: the verification protocol and the EFFECTIVE npm lifecycle policy measured for THIS
+  // checkout — the policy its runner children receive (an explicit process export, else npm's own
+  // resolved config for this worktree, project npmrc included). Every result leaves through
+  // withTelemetry carrying it, so the daemon's gate-result row records what the gate measured under
+  // rather than a session-wide value resolved somewhere else.
+  const verification = verificationProtocol(process.env, ctx.worktree);
   // VC-1: a reused verdict is journaled as its own row (the daemon appends every note by name) so
   // the ledger names the reuse and the identity even where the gate-result row's details must stay
   // the fresh verdict's (see formatReusedRow).
@@ -334,7 +391,6 @@ export async function runGates(
   const enabled = (g: GateName) =>
     task.gates.includes(g) && (g !== "acceptance" && g !== "review" || shapeGates?.[g] !== false);
   const failed = () => results.some((r) => !r.pass);
-  const v185 = ctx.pipeline === "v185";
   // T4 (OBS-265): a GREEN selected-test run is a screen, not the round's verdict — the merge-candidate
   // round re-runs the full suite on the same commit and THAT is what the round reports. Held here so
   // exactly one `test` gate-result ever leaves a round, always carrying which suite spoke for it.
@@ -385,12 +441,16 @@ export async function runGates(
   // path that forgets to measure is visibly missing its telemetry rather than carrying a fabricated
   // zero. The daemon lifts these off `meta` onto the gate-result row (src/run/daemon.ts).
   const withTelemetry = (result: GateResult): GateResult => {
+    if (result.gate === "test" && selectionDecision) {
+      result = { ...result, meta: { ...result.meta, selectionDecision } };
+    }
     const span = spans.get(result.gate);
-    if (!span) return result;
+    if (!span) return { ...result, meta: { ...result.meta, verification } };
     return {
       ...result,
       meta: {
         ...result.meta,
+        verification,
         ...span,
         ...(result.gate === "test" && selectedDurationMs !== undefined ? { selectedDurationMs } : {}),
         ...(result.gate === "test" && fullDurationMs !== undefined ? { fullDurationMs } : {}),
@@ -435,7 +495,7 @@ export async function runGates(
     if (last && sorted.every((r) => r.pass || r.meta?.skipped === true)) {
       const dirt = await dirtyWorktree();
       if (dirt) {
-        const refusal = withTelemetry(dirtyRoundRefusal(last.gate as GateName, dirt));
+        const refusal = withTelemetry(await dirtyRoundRefusal(last.gate as GateName, dirt));
         results[results.indexOf(last)] = refusal;
         sorted[sorted.length - 1] = refusal;
         await ctx.onGate?.({ phase: "end", gate: refusal.gate as GateName, result: refusal });
@@ -461,14 +521,12 @@ export async function runGates(
    * refusing a tree for the harness's own litter would fail every metered run. Nothing else is
    * exempt: an untracked source file is uncommitted work by every reading git offers.
    */
-  const dirtyWorktree = async (): Promise<string | undefined> => {
-    const r = await shGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain", ctx.worktree);
-    if (r.code !== 0) return `git status failed (exit ${r.code}) — the worktree cannot be proven clean`;
-    const entries = r.stdout
-      .split("\n")
-      .map((l) => l.trimEnd())
-      .filter((l) => l.trim() && !/^.. \.tickmarkr-[^/]*$/.test(l));
-    return entries.length ? entries.join("\n") : undefined;
+  const dirtyWorktree = async (): Promise<DirtSnapshot | undefined> => {
+    const r = await shGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=all -z", ctx.worktree);
+    if (r.code !== 0) return { text: `git status failed (exit ${r.code}) — the worktree cannot be proven clean`, entries: [] };
+    const entries = parseStatusZ(r.stdout).filter((e) => !/^\.tickmarkr-[^/]*$/.test(e.path));
+    if (!entries.length) return undefined;
+    return { text: entries.map((e) => `${e.status} ${e.path}`).join("\n"), entries };
   };
 
   const DIRTY_WHY = `refusing to gate a dirty worktree: the shell gates run against the working tree while `
@@ -476,53 +534,174 @@ export async function runGates(
     + `and never merged (and the committed diff would never be run)`;
 
   // `left` names the command that CREATED the dirt when one did; a round-entry refusal has no culprit.
-  const dirtyRefusal = (gate: GateName, dirt: string, left?: string): GateResult => ({
-    gate,
-    pass: false,
-    details: DIRTY_WHY
-      + (left ? `. The ${gate} command (${left}) left them behind, so every gate after it would judge a tree nobody will merge:\n` : `:\n`)
-      + dirt,
-    meta: { dirtyWorktree: true, ...(left ? { dirtiedBy: gate } : {}) },
-  });
+  const dirtyRefusal = async (gate: GateName, dirt: DirtSnapshot, left?: string): Promise<GateResult> => {
+    let preservedRef: string | undefined;
+    let preservationError: string | undefined;
+    try {
+      preservedRef = await preserveWorktree(ctx.worktree);
+    } catch (error) {
+      // Never masks the refusal, but never pretends a snapshot exists either — surfaced below.
+      preservationError = error instanceof Error ? error.message : String(error);
+    }
+
+    const dirtyPaths: string[] = [];
+    let allUntracked = true;
+    let totalBytes = 0;
+
+    for (const { status, path } of dirt.entries) {
+      dirtyPaths.push(path);
+      if (status !== "??") {
+        allUntracked = false;
+      }
+      try {
+        const st = statSync(join(ctx.worktree, path));
+        if (st.isFile()) {
+          totalBytes += st.size;
+        }
+      } catch {
+        // ignore deleted or unreadable
+      }
+    }
+
+    let allAbsentFromDiff = true;
+    if (ctx.baseRef) {
+      try {
+        const diffOut = await shGit(`git diff --name-only -z ${shq(ctx.baseRef)}..HEAD`, ctx.worktree);
+        if (diffOut.code === 0) {
+          // Paths in Git's newline output are C-quoted, which is not a lossless path encoding
+          // (and must never be parsed as JSON). `-z` lets this comparison retain arbitrary
+          // filenames exactly, including whitespace and non-ASCII bytes.
+          const touched = new Set(diffOut.stdout.split("\0").filter(Boolean));
+          for (const p of dirtyPaths) {
+            if (touched.has(p)) {
+              allAbsentFromDiff = false;
+              break;
+            }
+          }
+        } else {
+          // An unreadable committed diff cannot prove the litter is unrelated to the worker.
+          allAbsentFromDiff = false;
+        }
+      } catch {
+        allAbsentFromDiff = false;
+      }
+    }
+
+    const isInfra = Boolean(left && allUntracked && allAbsentFromDiff);
+    const primaryFile = dirtyPaths[0] ?? "";
+
+    const meta: Record<string, unknown> = {
+      dirtyWorktree: true,
+      ref: preservedRef,
+      preservedRef,
+      paths: dirtyPaths,
+      files: dirtyPaths,
+      path: primaryFile,
+      file: primaryFile,
+      bytes: totalBytes,
+      byteCount: totalBytes,
+    };
+
+    if (left) {
+      meta.dirtiedBy = gate;
+      meta.culprit = left;
+      meta.culpritCommand = left;
+      meta.command = left;
+    }
+
+    if (isInfra) {
+      meta.infra = true;
+      meta.classification = "infra";
+    }
+
+    if (preservationError) {
+      meta.preservationFailed = true;
+      meta.preservationError = preservationError;
+      // A refusal without a durable snapshot must never enter the ordinary repair/escalation
+      // path: the daemon recognizes infra rows as terminal parks for this attempt. This also
+      // overrides a chargeable entry/tracked-dirt classification, because retrying could lose
+      // the only remaining copy of the worktree state.
+      meta.infra = true;
+      meta.classification = "infra";
+      meta.retryable = false;
+      meta.recoveryBlocked = "dirty worktree preservation failed; no recovery ref exists";
+    }
+
+    return {
+      gate,
+      pass: false,
+      details: DIRTY_WHY
+        + (left ? `. The ${gate} command (${left}) left them behind, so every gate after it would judge a tree nobody will merge:\n` : `:\n`)
+        + dirt.text
+        + (preservationError ? `\npreservation failed — the litter could not be snapshotted onto a recovery ref: ${preservationError}` : ""),
+      meta,
+    };
+  };
 
   // The round-end withdrawal (see `done`). It blames no command: whatever dirtied the tree ran after
   // the last cleanliness check, and naming a culprit this function cannot identify would be a worse
   // record than naming the fact. `gate` is the verdict being withdrawn, not an accusation about who wrote.
-  const dirtyRoundRefusal = (gate: GateName, dirt: string): GateResult => ({
-    gate,
-    pass: false,
-    details: `${DIRTY_WHY}. Every gate of this round was satisfied and the round ended dirty — something after `
-      + `the last cleanliness check (the acceptance gate's command/test oracles, or a verdict gate's `
-      + `vendor CLI) wrote into the worktree — so this mergeable result is withdrawn rather than merged. `
-      + `Uncommitted at round end:\n${dirt}`,
-    meta: { dirtyWorktree: true, dirtyAtRoundEnd: true },
-  });
+  const dirtyRoundRefusal = async (gate: GateName, dirt: DirtSnapshot): Promise<GateResult> => {
+    let preservedRef: string | undefined;
+    let preservationError: string | undefined;
+    try {
+      preservedRef = await preserveWorktree(ctx.worktree);
+    } catch (error) {
+      preservationError = error instanceof Error ? error.message : String(error);
+    }
+
+    const dirtyPaths: string[] = [];
+    let totalBytes = 0;
+    for (const { path } of dirt.entries) {
+      dirtyPaths.push(path);
+      try {
+        const st = statSync(join(ctx.worktree, path));
+        if (st.isFile()) {
+          totalBytes += st.size;
+        }
+      } catch {}
+    }
+
+    const primaryFile = dirtyPaths[0] ?? "";
+    return {
+      gate,
+      pass: false,
+      details: `${DIRTY_WHY}. Every gate of this round was satisfied and the round ended dirty — something after `
+        + `the last cleanliness check (the acceptance gate's command/test oracles, or a verdict gate's `
+        + `vendor CLI) wrote into the worktree — so this mergeable result is withdrawn rather than merged. `
+        + `Uncommitted at round end:\n${dirt.text}`
+        + (preservationError ? `\npreservation failed — the litter could not be snapshotted onto a recovery ref: ${preservationError}` : ""),
+      meta: {
+        dirtyWorktree: true,
+        dirtyAtRoundEnd: true,
+        ref: preservedRef,
+        preservedRef,
+        paths: dirtyPaths,
+        files: dirtyPaths,
+        path: primaryFile,
+        file: primaryFile,
+        bytes: totalBytes,
+        byteCount: totalBytes,
+        ...(preservationError ? {
+          preservationFailed: true,
+          preservationError,
+          infra: true,
+          classification: "infra",
+          retryable: false,
+          recoveryBlocked: "dirty worktree preservation failed; no recovery ref exists",
+        } : {}),
+      },
+    };
+  };
 
   // shell tools vs the shared baseline
+  const retryOptions = (identity: VerificationIdentity | undefined): RetryOptions => ctx.authorizeInfraRetry
+    ? { authorizeRetry: (cause) => ctx.authorizeInfraRetry!(identity ? verificationIdentityKey(identity) : "",
+      cause === "infra" ? "infrastructure" : "host-starved") }
+    : {};
+
   const runBattery = async (commands: Record<string, string>, selected?: string[], gates: readonly GateName[] = toolGates): Promise<void> => {
     if (!gates.length) return;
-    if (!v185 && !(commands.test && isVitestTestCommand(commands.test, ctx.worktree))) {
-      // ponytail: compareToBaseline batches adjacent tools — their starts are emitted at iteration,
-      // not at true execution start. They are collectively sub-second (measured), so the debounce
-      // suppresses them anyway; split compareToBaseline only if a tool gate ever gets slow.
-      // ponytail: legacy runs adjacent tools in ONE compareToBaseline call, so there is one interval
-      // to measure and each of its gates carries it. Split it only if this branch ever stops batching.
-      const finish = startMeasurement();
-      const toolResults = await compareToBaseline(ctx.worktree, commands, ctx.baseline, [...gates], selected ? { selected } : {});
-      const batch = finish();
-      for (const g of gates) addMeasurement(g, batch);
-      // The same refusal AFTER the commands, because a green command can dirty the tree the check
-      // above just proved clean. Batched, legacy cannot say WHICH command did it, so the refusal
-      // lands on the last gate that had one — the round dies there either way. A red battery is
-      // reported as the red it is: the round already ends, and the command output is the better lead.
-      const dirt = toolResults.every((r) => r.pass) ? await dirtyWorktree() : undefined;
-      const blame = dirt ? [...gates].reverse().find((g) => commands[g]) : undefined;
-      for (const r of toolResults) {
-        await emitStart(r.gate as GateName);
-        await record(r.gate === blame ? dirtyRefusal(blame!, dirt!, commands[blame!]!) : r);
-      }
-      return;
-    }
     // T4 (OBS-265): one command at a time, stopping at the first red — a failed build no longer buys
     // any later tool before anyone reads its verdict.
     for (const g of gates) {
@@ -555,8 +734,8 @@ export async function runGates(
         // other scripted test command keeps today's exit-code contract byte-identically.
         const useManifest = g === "test" && commands.test !== undefined && isVitestTestCommand(commands.test, ctx.worktree);
         r = useManifest
-          ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir))
-          : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], g === "test" && selected ? { selected } : {})))[0];
+          ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir, retryOptions(identity)))
+          : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], { ...retryOptions(identity), ...(g === "test" && selected ? { selected } : {}) })))[0];
       }
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
       if (g === "test" && selected) selectedDurationMs = spans.get("test")?.durationMs ?? 0;
@@ -568,7 +747,7 @@ export async function runGates(
       if (!cached && r!.pass && commands[g]) {
         const dirt = await dirtyWorktree();
         if (dirt) {
-          await record(dirtyRefusal(g, dirt, commands[g]!));
+          await record(await dirtyRefusal(g, dirt, commands[g]!));
           return;
         }
       }
@@ -780,24 +959,45 @@ export async function runGates(
       const rv = captured.value;
       if (rv.meta?.noVerdict === true || rv.meta?.unparseable === true) {
         await ctx.onGate?.({ phase: "note", gate: "review", name: "review-no-verdict", payload: { ...rv.meta }, result: rv });
-        if (rv.meta.seatAuthoredBytes === 0 && typeof rv.meta.reviewer === "string"
-          && !ctx.demotedReviewers?.has(rv.meta.reviewer)) {
-          ctx.demotedReviewers?.add(rv.meta.reviewer);
-          await ctx.onGate?.({ phase: "note", gate: "review", name: "review-pool-demotion",
-            payload: { reviewer: rv.meta.reviewer, cause: rv.meta.cause, seatAuthoredBytes: 0 }, result: rv });
+        if (typeof rv.meta.reviewer === "string") {
+          const reviewer = rv.meta.reviewer;
+          const cause = String(rv.meta.cause);
+          // OBS-1025 add.2: the run-scoped tally; two no-verdicts retire the seat for the rest of the run.
+          const causes = rv.meta.noVerdict === true && ctx.reviewNoVerdicts
+            ? [...(ctx.reviewNoVerdicts.get(reviewer) ?? []), cause] : undefined;
+          if (causes) ctx.reviewNoVerdicts!.set(reviewer, causes);
+          // OBS-1039: a seat below the byte floor at the beat is silent — demoted like a zero-byte seat.
+          const silent = rv.meta.seatAuthoredBytes === 0 || cause === "silent" || cause === "launch-never-started";
+          const twice = (causes?.length ?? 0) >= 2;
+          if ((silent || twice) && !ctx.demotedReviewers?.has(reviewer)) {
+            ctx.demotedReviewers?.add(reviewer);
+            await ctx.onGate?.({ phase: "note", gate: "review", name: "review-pool-demotion",
+              payload: { reviewer, cause, seatAuthoredBytes: rv.meta.seatAuthoredBytes ?? 0, ...(twice ? { causes } : {}) }, result: rv });
+          }
         }
       }
       return rv;
     };
+    // OBS-1025 add.2: seats with two no-verdicts this run are out of the rotation for every pick below.
+    const retired = [...(ctx.reviewNoVerdicts ?? [])].filter(([, causes]) => causes.length >= 2).map(([seat]) => seat);
     // RF-1: THIS task's prior reviewers — earlier rounds' seats plus the seats that produced garbage for
     // it (excludeReviewers names only dispatched seats). Kept apart from the eligibility exclusions the
     // retry below adds for a flaked seat's whole adapter: those sibling channels never reviewed.
     const priorReviewers = [...(ctx.priorReviewers ?? []), ...(ctx.excludeReviewers ?? [])];
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, ctx.excludeReviewers, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers));
-    // OBS-193/574: an unparseable review verdict retries the REVIEW exactly once, preferring a
-    // different adapter. Only a single-adapter eligible pool may fall back to another channel on the
-    // flaked adapter. The flaked verdict never enters results; an exhausted pool preserves its cause.
-    if ((rv.meta?.unparseable === true || rv.meta?.noVerdict === true) && typeof rv.meta.reviewer === "string") {
+    const carriedAuthors = ctx.carriedAuthors ?? [];
+    let exclusions = [...(ctx.excludeReviewers ?? []), ...retired];
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors));
+    // OBS-193/574: an unparseable review verdict retries the REVIEW, preferring a different adapter. Only
+    // a single-adapter eligible pool may fall back to another channel on the flaked adapter. The flaked
+    // verdict never enters results; an exhausted pool preserves its cause.
+    // OBS-1013 add.3: the re-route LOOPS while seats return no verdict — a closure mismatch or a silent
+    // seat is re-routed to a third seat of another vendor, and only an exhausted pool ends the round,
+    // as a terminal infra result that keeps the carried materials. Never a worker.
+    let retryPrior = [...priorReviewers];
+    const routes: string[] = [];
+    let hop = 0;
+    while ((rv.meta?.unparseable === true || rv.meta?.noVerdict === true) && typeof rv.meta.reviewer === "string") {
+      hop++;
       const flaked = rv.meta.reviewer;
       const emptyOutput = rv.meta.cause === "empty-output";
       if (emptyOutput) {
@@ -808,35 +1008,36 @@ export async function runGates(
         });
       }
       const retryVia = ctx.via
-        ? { ...ctx.via, nameFor: (role: "judge" | "review", adapter: string) => ctx.via!.nameFor(role, adapter) + "-r1" }
+        ? { ...ctx.via, nameFor: (role: "judge" | "review", adapter: string) => ctx.via!.nameFor(role, adapter) + `-r${hop}` }
         : undefined;
-      const priorExclusions = ctx.excludeReviewers ?? [];
       const flakedAdapter = flaked.slice(0, flaked.indexOf(":"));
       const adapterExclusions = ctx.channels.filter((c) => c.adapter === flakedAdapter).map(channelKey);
       // RF-1: the retry filters by the floor reviewGate resolves — author tier, task floor, review.floor
       // and the prior reviewers' tiers, the flaked seat's own included, so a retry never drops a tier.
-      const retryPrior = [...priorReviewers, flaked];
+      retryPrior = [...retryPrior, flaked];
       const retryFloor = gateReviewerFloor(task, ctx.cfg, ctx.author, ctx.channels, retryPrior).floor;
       const crossAdapter = pickReviewer(
-        ctx.author, ctx.channels, [...priorExclusions, ...adapterExclusions],
-        ctx.cfg.review.prefer ?? [], retryFloor,
+        ctx.author, ctx.channels, [...exclusions, ...adapterExclusions],
+        ctx.cfg.review.prefer ?? [], retryFloor, undefined, undefined, undefined, carriedAuthorVendors(ctx.channels, carriedAuthors),
       );
       const exclusion = crossAdapter ? "adapter" : "channel";
-      const retryExclusions = [...priorExclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
+      exclusions = [...exclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, retryExclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior,
+        retryVia, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
         const route = exclusion === "adapter"
           ? `different-adapter retry; excluded flaked adapter ${flakedAdapter}`
           : `same-adapter fallback; excluded flaked channel ${flaked}`;
+        const produced = emptyOutput ? "EMPTY output" : rv.meta.cause === "closure-mismatch" ? "a verdict closing no carried fingerprint" : "no parseable verdict";
+        // `details` is lifted onto the journal's gate-result row; meta.reviewRetry is not. Keep every
+        // re-route visible in the result text a reader actually opens, including on a red retry.
+        routes.push(`review re-route (${route}): ${flaked} produced ${produced}; replaced by ${retried}`);
         rv = {
           ...second,
-          // `details` is lifted onto the journal's gate-result row; meta.reviewRetry is not. Keep the
-          // re-route visible in the result text a reader actually opens, including on a red retry.
-          details: `review re-route (${route}): ${flaked} produced ${emptyOutput ? "EMPTY output" : "no parseable verdict"}; replaced by ${retried}\n${second.details}`,
+          details: `${routes.join("\n")}\n${second.details}`,
           meta: { ...second.meta, reviewRetry: { flaked, retried, exclusion } },
         };
       } else {
@@ -844,7 +1045,14 @@ export async function runGates(
         // floor that correctly refused a lower-tier fallback — in details AND in the row's meta.
         const { reviewerFloor, reviewerFloorCause } = second.meta ?? {};
         rv = { ...rv, details: `${rv.details}\nreview re-route refused: ${second.details}`, meta: { ...rv.meta, reviewerFloor, reviewerFloorCause } };
+        break;
       }
+    }
+    if (rv.meta?.noVerdict === true) {
+      // Terminal: every eligible seat returned no verdict. The carried materials stay open — an infra
+      // row is not a passing review — and the sibling judge result is untouched beside it.
+      const carried = (ctx.carriedFindings ?? []).filter((f) => f.class === "review:material").map((f) => f.fingerprint);
+      rv = { ...rv, meta: { ...rv.meta, classification: "infra", infra: true, carriedFindings: carried } };
     }
     return invocations.length ? { ...rv, meta: { ...rv.meta, invocations } } : rv;
   };
@@ -865,11 +1073,11 @@ export async function runGates(
   if (entryDirt) {
     addMeasurement(sequence[0]!, entryMeasurement);
     await emitStart(sequence[0]!);
-    await record(dirtyRefusal(sequence[0]!, entryDirt));
+    await record(await dirtyRefusal(sequence[0]!, entryDirt));
     return done();
   }
 
-  if (v185 && await screenBlocks()) return done();
+  if (await screenBlocks()) return done();
 
   await runBattery(ctx.commands);
   if (failed()) return done();
@@ -883,14 +1091,31 @@ export async function runGates(
   }
   // A non-final round may run only the tests covering its own diff; the merge-candidate round below
   // pays the full suite anyway, so a selection that misses costs a round and can never merge.
-  const selected = v185 && ctx.selectTests && enabled("test") && ctx.commands.test
+  let selected = ctx.selectTests && enabled("test") && ctx.commands.test
     ? await coveringTests(ctx.worktree, ctx.baseRef)
     : undefined;
+  let selectionReason = ctx.selectionReason ?? (selected ? "affected-tests" : "full-suite-fallback");
+  if (selected && ctx.requiredRepairTests?.length) {
+    const required = ctx.requiredRepairTests;
+    const safe = required.every((path) => posix.normalize(path) === path && !path.startsWith("../")
+      && !path.startsWith("/") && TEST_FILE_RE.test(path) && existsSync(join(ctx.worktree, path)));
+    const listed = safe ? await shGit(`git ls-files -z -- ${required.map(shq).join(" ")}`, ctx.worktree) : undefined;
+    const tracked = new Set(listed?.stdout.split("\0").filter(Boolean));
+    if (!listed || listed.code !== 0 || required.some((path) => !tracked.has(path))) {
+      selected = undefined;
+      selectionReason = "required-repair-test-unavailable";
+    } else selected = [...new Set([...selected, ...required])].sort();
+  }
+  if (ctx.selectionReason) selectionDecision = {
+    scope: selected ? "selected" : "full", reason: selected ? selectionReason
+      : selectionReason === "known-failing-files" ? "unsupported-selection-full-suite" : selectionReason,
+    requiredFiles: [...(ctx.requiredRepairTests ?? [])],
+  };
   await runBattery(selected ? { ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, selected) } : ctx.commands,
     selected, enabled("test") ? ["test"] : []);
   if (failed()) return done();
 
-  if (v185 && (enabled("acceptance") || enabled("review"))) {
+  if (enabled("acceptance") || enabled("review")) {
     // Judge and review are launched TOGETHER (96m of serialization over 5 runs). Enforcement is
     // unchanged — it is still the AND of both, both still fail closed, and neither reads the other's
     // verdict: each gets the same commit and the same brief it always got, and neither promise is
@@ -910,21 +1135,14 @@ export async function runGates(
     const judged = judging?.then((outcome) =>
       withJudgeInvocationEvidence(outcome.invocations, () => record(outcome.result)));
     const reviewed = reviewing?.then((outcome) => record(outcome));
-    await Promise.all([judged, reviewed]);
+    if (executionSignal()) {
+      // A cancelled sibling still owns a process until it unwinds; do not settle the task early.
+      const settled = await Promise.allSettled([judged, reviewed]);
+      const rejected = settled.find((result) => result.status === "rejected");
+      if (rejected?.status === "rejected") throw rejected.reason;
+      executionSignal()?.throwIfAborted();
+    } else await Promise.all([judged, reviewed]);
     if (failed()) return done();
-  } else if (!v185) {
-    // Legacy serial walk — frozen, and reachable only from the fixtures that pin it.
-    if (enabled("acceptance")) {
-      await emitStart("acceptance");
-      const judged = await measure("acceptance", runAcceptance);
-      await withJudgeInvocationEvidence(judged.invocations, () => record(judged.result));
-      if (failed()) return done();
-    }
-    if (enabled("review")) {
-      await emitStart("review");
-      await record(await measure("review", runReview));
-    }
-    return done();
   }
 
   // The merge-candidate round: every other gate is green, so THIS round is the one that can merge —
@@ -963,8 +1181,8 @@ export async function runGates(
     if (!full) {
       const fullUsesManifest = ctx.commands.test !== undefined && isVitestTestCommand(ctx.commands.test, ctx.worktree);
       full = fullUsesManifest
-        ? await measure("test", () => runVitestManifestGate(ctx.worktree, ctx.commands.test!, ctx.baseline, undefined, ctx.artifactDir))
-        : (await measure("test", () => compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"])))[0];
+        ? await measure("test", () => runVitestManifestGate(ctx.worktree, ctx.commands.test!, ctx.baseline, undefined, ctx.artifactDir, retryOptions(identity)))
+        : (await measure("test", () => compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"], retryOptions(identity))))[0];
     }
     fullDurationMs = spans.get("test") ? spans.get("test")!.durationMs - (selectedDurationMs ?? 0) : 0;
     const dirt = (!cached && full!.pass) ? await dirtyWorktree() : undefined;
@@ -973,7 +1191,7 @@ export async function runGates(
       verdictStore.set(identity, { ...full, meta: { ...full.meta, source: "gate", runDir: ctx.artifactDir } });
     }
     const merged = withTelemetry(dirt
-      ? dirtyRefusal("test", dirt, ctx.commands.test!)
+      ? await dirtyRefusal("test", dirt, ctx.commands.test!)
       : { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } });
     results[results.findIndex((r) => r.gate === "test")] = merged;
     heldTest = undefined;

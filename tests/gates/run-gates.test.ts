@@ -59,7 +59,7 @@ function repoWithCommit(touch: Record<string, string> = { "a.txt": "after\n" }) 
   return { repo, baseRef };
 }
 
-async function gatesFor(t: ReturnType<typeof task>, cfg: typeof DEFAULT_CONFIG, adapter: FakeAdapter, pipeline?: "v185", touch?: Record<string, string>) {
+async function gatesFor(t: ReturnType<typeof task>, cfg: typeof DEFAULT_CONFIG, adapter: FakeAdapter, touch?: Record<string, string>) {
   const { repo, baseRef } = repoWithCommit(touch);
   return runGates(t, {
     worktree: repo,
@@ -71,7 +71,6 @@ async function gatesFor(t: ReturnType<typeof task>, cfg: typeof DEFAULT_CONFIG, 
     channels,
     adapters: [adapter],
     cfg,
-    ...(pipeline ? { pipeline } : {}),
   });
 }
 
@@ -83,7 +82,7 @@ describe("per-shape gate participation", () => {
     cfg.gates.byShape = { docs: { acceptance: false } };
 
     // build/test/lint have no detected command here (commands: {}) — they surface as explicit skips
-    const docs = await gatesFor(task("docs", 3, ["docs/**"]), cfg, adapter, undefined, { "docs/guide.md": "# guide\n" });
+    const docs = await gatesFor(task("docs", 3, ["docs/**"]), cfg, adapter, { "docs/guide.md": "# guide\n" });
     expect(docs.results.map((r) => r.gate)).toEqual(["build", "test", "lint", "evidence", "scope", "review"]);
     expect(docs.results.slice(0, 3).every((r) => r.pass && r.meta?.skipped === true)).toBe(true);
     // R3 (OBS-186): the review declines on PATHS — every declared path and every path this diff
@@ -97,19 +96,17 @@ describe("per-shape gate participation", () => {
     expect(implement.results.map((r) => r.gate)).toEqual(["build", "test", "lint", "evidence", "scope", "acceptance", "review"]);
   });
 
-  // T4 (OBS-265): the reordered pipeline changed WHEN gates run, not WHICH ones do. Same fixtures,
-  // same participation, same canonical record — the evidence array is order-stable across pipelines.
-  test("the v1.85 pipeline keeps per-shape participation and the canonical result order", async () => {
+  test("gate participation keeps the canonical result order", async () => {
     const adapter = fake();
     const cfg = structuredClone(DEFAULT_CONFIG) as typeof DEFAULT_CONFIG & { gates: { byShape?: Record<string, { acceptance?: boolean }> } };
     cfg.judge.adapter = "fake";
     cfg.gates.byShape = { docs: { acceptance: false } };
 
-    const docs = await gatesFor(task("docs", 3), cfg, adapter, "v185");
+    const docs = await gatesFor(task("docs", 3), cfg, adapter);
     expect(docs.results.map((r) => r.gate)).toEqual(["build", "test", "lint", "evidence", "scope", "review"]);
     expect(docs.results.slice(0, 3).every((r) => r.pass && r.meta?.skipped === true)).toBe(true);
 
-    const implement = await gatesFor(task("implement"), cfg, adapter, "v185");
+    const implement = await gatesFor(task("implement"), cfg, adapter);
     expect(implement.results.map((r) => r.gate)).toEqual(["build", "test", "lint", "evidence", "scope", "acceptance", "review"]);
     expect(implement.results.every((r) => r.pass)).toBe(true);
   });
@@ -122,11 +119,11 @@ describe("per-shape gate participation", () => {
     // Same shape, same complexity, two declarations: participation follows the PATHS, not the shape
     // and not the number (the assertion this replaces read `complexity 3 < threshold 7` — a switch
     // that made review unreachable while `required: true` claimed the opposite, OBS-186).
-    const leaf = await gatesFor(task("docs", 3, ["docs/**"]), cfg, adapter, undefined, { "docs/guide.md": "# guide\n" });
+    const leaf = await gatesFor(task("docs", 3, ["docs/**"]), cfg, adapter, { "docs/guide.md": "# guide\n" });
     expect(leaf.results.map((r) => r.gate)).toEqual(["build", "test", "lint", "evidence", "scope", "acceptance", "review"]);
     expect(leaf.results.at(-1)?.meta).toMatchObject({ verdict: "skipped", policy: "judge-only" });
 
-    const source = await gatesFor(task("docs", 3, ["src/run/daemon.ts"]), cfg, adapter, undefined, { "src/run/daemon.ts": "export const x = 1;\n" });
+    const source = await gatesFor(task("docs", 3, ["src/run/daemon.ts"]), cfg, adapter, { "src/run/daemon.ts": "export const x = 1;\n" });
     expect(source.results.at(-1)?.meta).toMatchObject({ policy: "full", reviewer: "fake:fake-2" });
     expect(source.results.at(-1)?.pass).toBe(true);
   });
@@ -173,7 +170,7 @@ async function gates(
     result: { ok: true, summary: "", deviations: [], raw: "" },
     commands, baseline, channels,
     adapters: opts.adapters ?? [fakeWith({}).adapter],
-    cfg, pipeline: "v185", selectTests: opts.selectTests,
+    cfg, selectTests: opts.selectTests,
     onGate: opts.onGate,
   });
 }
@@ -200,7 +197,6 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
       worktree: repo, baseRef, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg,
-      pipeline: "v185",
       onGate: (e) => {
         if (e.phase !== "end") return;
         journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`);
@@ -239,7 +235,7 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
     const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["src/**"] }), {
       worktree: repo, baseRef, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+      commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg,
       onGate: (e) => stream.push(`${e.gate}:${e.phase}`),
     });
 
@@ -262,7 +258,7 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
     const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
       worktree: repo, baseRef, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+      commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg,
     });
     expect(results.find((r) => r.gate === "lint")?.pass).toBe(false);
     expect(readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n")).toEqual(["build", "lint"]);
@@ -351,7 +347,7 @@ async function witnessRound(uncommitted: Record<string, string>): Promise<{
   const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
     worktree: repo, baseRef, author,
     result: { ok: true, summary: "", deviations: [], raw: "" },
-    commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+    commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg,
     onGate: (e) => {
       stream.push(`${e.gate}:${e.phase}`);
       if (e.phase === "end") journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`);
@@ -429,7 +425,7 @@ describe("v1.87 T5 — a dirty worktree is not gatable (the runtime refuses what
     const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
       worktree: repo, baseRef, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+      commands, baseline, channels, adapters: [fakeWith({}).adapter], cfg,
       onGate: (e) => { if (e.phase === "end") journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`); },
     });
 
@@ -465,7 +461,7 @@ describe("v1.87 T5 — a dirty worktree is not gatable (the runtime refuses what
       worktree: repo, baseRef, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands: {}, baseline: await captureBaseline(repo, {}),
-      channels, adapters: [fake], cfg, pipeline: "v185",
+      channels, adapters: [fake], cfg,
       onGate: (e) => { if (e.phase === "end") journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`); },
     });
 
@@ -501,7 +497,7 @@ describe("v1.87 T5 — a dirty worktree is not gatable (the runtime refuses what
       worktree: repo, baseRef, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands: {}, baseline: await captureBaseline(repo, {}),
-      channels, adapters: [fake], cfg, pipeline: "v185",
+      channels, adapters: [fake], cfg,
       onGate: (e) => {
         if (e.phase !== "end") return;
         journaled.push(`${e.gate}:${e.result.pass ? "pass" : "fail"}`);
@@ -549,7 +545,7 @@ describe("v1.87 T5 — scope.allowDeviations is bound for the round", () => {
       worktree: repo, baseRef, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands: {}, baseline: await captureBaseline(repo, {}),
-      channels, adapters: [fakeWith({}).adapter], cfg, pipeline: "v185",
+      channels, adapters: [fakeWith({}).adapter], cfg,
       onGate: (e) => {
         if (e.phase !== "end" || e.gate !== "build") return;
         cfg.scope!.allowDeviations!.push("**"); // the operator's live config, widened mid-round
@@ -714,18 +710,6 @@ describe("T4 — judge and review are one round, not two (OBS-265)", () => {
     expect(inverseEnds.findIndex((e) => e.gate === "review")).toBeLessThan(inverseEnds.findIndex((e) => e.gate === "acceptance"));
     expect(existsSync(join(inverse.sync, "judge-done"))).toBe(true); // the slow judge really did run
 
-    // the falsifier: the SAME fixture on the serial walk. The judge is dispatched first, waits out its
-    // bounded loop for a reviewer that cannot start yet, and leaves the marker the assertion above forbids.
-    const serial = rendezvous();
-    const cfg = structuredClone(DEFAULT_CONFIG);
-    cfg.judge.adapter = "fake";
-    await runGates(mkTask({ files: ["**"] }), {
-      worktree: repo, baseRef, author,
-      result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands: {}, baseline: await captureBaseline(repo, {}), channels, adapters: [serial.adapter], cfg,
-      pipeline: "legacy",
-    });
-    expect(existsSync(join(serial.sync, "judge-waited-out"))).toBe(true);
   }, 30_000);
 
   test("a failing judge no longer suppresses the review verdict — enforcement is the AND of both", async () => {
@@ -941,7 +925,7 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
         judge: { pass: false, criteria: [{ criterion: "a", met: false, reason: "no" }] },
         review: { approve: true, issues: [] },
       }).adapter],
-      cfg, pipeline: "v185", selectTests: true,
+      cfg, selectTests: true,
       onGate: (e) => { if (e.phase === "end") ends.push(e); },
     });
 
@@ -986,7 +970,7 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
         judge: { pass: false, criteria: [{ criterion: "a", met: false, reason: "screen-only" }] },
         review: { approve: true, issues: [] },
       }).adapter],
-      cfg, pipeline: "v185", selectTests: true,
+      cfg, selectTests: true,
     });
     const selectedGate = selectedRound.results.find((r) => r.gate === "test")!;
     expect(selectedGate.pass).toBe(true);
@@ -1006,7 +990,7 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands, baseline, channels,
       adapters: [fakeWith({}).adapter],
-      cfg, pipeline: "v185", selectTests: false,
+      cfg, selectTests: false,
     });
     const fullGate = fullRound.results.find((r) => r.gate === "test")!;
     expect(fullGate.pass).toBe(false);
@@ -1064,7 +1048,7 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
         judge: { pass: true, criteria: [] },
         review: { approve: true, issues: [] },
       }).adapter],
-      cfg, pipeline: "v185", selectTests: true,
+      cfg, selectTests: true,
       onGate: (e) => { if (e.phase === "end") ends.push(e); },
     });
 
@@ -1426,7 +1410,7 @@ describe("R3 participation is path-keyed and the nudge reaches the adapter allow
         worktree: repo, baseRef, author,
         result: { ok: true, summary: "", deviations: [], raw: "" },
         commands: {}, baseline: await captureBaseline(repo, {}),
-        channels: pool, adapters: [fake(), reviewer], cfg, pipeline: "v185",
+        channels: pool, adapters: [fake(), reviewer], cfg,
       });
     };
 
@@ -1558,7 +1542,6 @@ describe("review empty-output note", () => {
       channels: reviewChannels,
       adapters: [first, reviewerAdapter("good", '{"nonce":"__NONCE__","approve":true,"findings":[]}')],
       cfg,
-      pipeline: "v185",
       onGate: (e) => { events.push(e); },
     });
     return { out, events };

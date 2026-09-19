@@ -27,17 +27,25 @@ export default class TickmarkrReporter {
     const file = this.file(module);
     const failed = module.state() === 'failed';
     const failures = [];
-    if (failed) {
-      for (const test of module.children.allTests()) {
-        if (test.result().state === 'failed') {
+    // R41: count test bodies by their own state so a module whose every test was skipped (a
+    // describe.skipIf gate) is recorded as SKIPPED — present in the lifecycle, but never as
+    // executed test-body success. 'passed'/'failed' executed; anything else did not run.
+    const tests = { passed: 0, failed: 0, skipped: 0 };
+    for (const test of module.children.allTests()) {
+      const state = test.result().state;
+      if (state === 'failed') {
+        tests.failed++;
+        if (failed) {
           const errors = test.result().errors || [];
           failures.push(...(errors.length ? errors.map(e => 'FAIL ' + file + ' > ' + test.fullName + ': ' + e.message) : ['FAIL ' + file + ' > ' + test.fullName]));
         }
-      }
-      if (!failures.length) failures.push('FAIL ' + file);
+      } else if (state === 'passed') tests.passed++;
+      else tests.skipped++;
     }
+    if (failed && !failures.length) failures.push('FAIL ' + file);
+    const status = failed ? 'failed' : tests.passed + tests.failed === 0 ? 'skipped' : 'passed';
     if (file in this.report.completed) this.report.duplicateCompletions.push(file);
-    this.report.completed[file] = { at: Date.now(), status: failed ? 'failed' : 'passed', failures };
+    this.report.completed[file] = { at: Date.now(), status, failures, tests };
     this.save();
   }
   onTestRunEnd(modules, errors, reason) {

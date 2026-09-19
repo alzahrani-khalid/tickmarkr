@@ -58,7 +58,6 @@ test("test: a gate without a detected command produces a row whose meta outcome 
     channels: [],
     adapters: [],
     cfg: DEFAULT_CONFIG,
-    pipeline: "v185" as const,
     onGate: (e: { phase: string; gate: string }) => {
       if (e.phase === "end") events.push(e.gate);
     },

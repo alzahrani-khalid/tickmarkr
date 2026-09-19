@@ -744,7 +744,7 @@ describe("replayResumeState (Phase 46 derivation)", () => {
   // attempts zeroed; tried survives (consult bans / burned channels); lastAssignment cleared so the
   // daemon's nextChannel-over-tried path skips burned channels first. Pre-v1.24 task-approved (no
   // release key) is inert — status still pending, resume attempts unchanged.
-  test("v1.24: task-approved release:attempt-cap zeros attempts, keeps tried, clears lastAssignment", () => {
+  test("v1.24/v2.5.6: task-approved release:attempt-cap zeros attempts AND tried (a fresh budget on a cleared seat list), clears lastAssignment", () => {
     const j = Journal.create(mkdtempSync(join(tmpdir(), "tickmarkr-j-")), "run-1");
     const A = midA("fake", "fake-1");
     const B = midA("fake", "fake-2");
@@ -761,8 +761,8 @@ describe("replayResumeState (Phase 46 derivation)", () => {
     j.append("task-approved", "T1", { by: "op", release: ATTEMPT_CAP_RELEASE });
     const st = j.replayResumeState().get("T1")!;
     expect(st.attempts).toBe(0); // fresh budget — daemon will not re-park at the cap
-    expect(st.tried).toEqual([channelKey(A), channelKey(B)]); // burned channels remembered
-    expect(st.lastAssignment).toBeUndefined(); // force nextChannel over tried
+    expect(st.tried).toEqual([]); // v2.5.6 T5 (OBS-1028): a fresh-budget release resets BOTH halves of the ladder
+    expect(st.lastAssignment).toBeUndefined();
     // status replay still maps task-approved → pending (GATE-08, unchanged)
     expect(j.replayStatuses().get("T1")).toBe("pending");
   });

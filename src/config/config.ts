@@ -299,7 +299,15 @@ const ShapeGateParticipationSchema = z
     }
   });
 
+export const ExecutionPolicySchema = z.object({
+  boundedInfrastructure: z.boolean().default(false),
+  repairSelection: z.boolean().default(false),
+  taskExecutionLimitMs: z.number().int().positive(),
+}).strict();
+
 export const TickmarkrConfigSchema = z.object({
+  // Opt-in recovery experiment. The original run snapshot owns this across resumes.
+  executionPolicy: ExecutionPolicySchema.optional(),
   concurrency: z.number().int().positive(),
   driver: z.enum(["auto", "herdr", "subprocess", "orca"]),
   integrationBranchPrefix: z
@@ -948,6 +956,11 @@ export type FleetEditable = {
   // reader/writer in this task treats an absent array as empty.
   denyWorkersAdapters?: string[];
   denyWorkersModels?: string[];
+  // OBS-1046: the routing.allow complement over the discovered universe — adapter ids and
+  // adapter:model keys the allow form does NOT admit — kept DISTINCT from the authored deny lists
+  // above, so one Space press clears one reason and the writer keeps routing.allow while an
+  // authored deny is cleared. Present only when the reader was handed a universe.
+  allowOut?: string[];
   tiers: Record<string, Record<string, FleetTierAssignment | null>>;
   map: Record<string, MapEntry>;
   floors: Record<string, Tier>;
@@ -988,12 +1001,13 @@ export function universeCovers(
     entry === row.adapter || row.models.some((m) => entry === m || entry === `${row.adapter}:${m}`));
 }
 
-// v1.92 fleet membership: with a discovered `universe` (classified models only) the deny sets become
-// the EFFECTIVE out-of-fleet set — the routing.allow complement (fail-closed) as adapter ids and
-// adapter:model keys, UNION every authored routing.deny adapters/models entry VERBATIM in its own list
-// (never workers). LEG2-T3 round 2 finding 2: authored entries are never collapsed into a membership
-// key, so one Space press clears one reason; finding 3: allow admission honours recorded identity.
-// Absent universe ⇒ deny arrays verbatim, so non-UI callers stay byte-identical.
+// v1.92 fleet membership: with a discovered `universe` (classified models only) the routing.allow
+// complement (fail-closed) rides as `allowOut` — adapter ids and adapter:model keys — BESIDE the
+// authored routing.deny adapters/models entries, which ride VERBATIM in their own lists (never
+// workers). LEG2-T3 round 2 finding 2: authored entries are never collapsed into a membership key;
+// OBS-1046: nor is an allow exclusion folded into a deny list — the two reasons stay distinct so
+// one Space press clears one; finding 3: allow admission honours recorded identity.
+// Absent universe ⇒ deny arrays verbatim and no allowOut, so non-UI callers stay byte-identical.
 export function fleetEditableFromConfig(
   cfg: TickmarkrConfig,
   universe?: FleetUniverseRow[],
@@ -1005,8 +1019,9 @@ export function fleetEditableFromConfig(
       tiers[adapter][model] = { tier };
     }
   }
-  let denyAdapters = [...(cfg.routing.deny?.adapters ?? [])].sort();
-  let denyModels = [...(cfg.routing.deny?.models ?? [])].sort();
+  const denyAdapters = [...(cfg.routing.deny?.adapters ?? [])].sort();
+  const denyModels = [...(cfg.routing.deny?.models ?? [])].sort();
+  let allowOut: string[] | undefined;
   if (universe !== undefined) {
     const { allow } = cfg.routing;
     const allowEntries = allow ? [...(allow.adapters ?? []), ...(allow.models ?? [])] : null;
@@ -1022,14 +1037,14 @@ export function fleetEditableFromConfig(
         modelsOut.push(...out.map((m) => `${row.adapter}:${m}`));
       }
     }
-    // OBS-517: authored deny entries — covered by the probe universe or not — ride verbatim, so a
-    // transient probe failure can never un-deny one on the next write (fail-open on the ban list).
-    denyAdapters = [...new Set([...adaptersOut, ...denyAdapters])].sort();
-    denyModels = [...new Set([...modelsOut, ...denyModels])].sort();
+    // OBS-517: authored deny entries — covered by the probe universe or not — ride verbatim (above),
+    // so a transient probe failure can never un-deny one on the next write (fail-open on the ban list).
+    allowOut = [...new Set([...adaptersOut, ...modelsOut])].sort();
   }
   return {
     denyAdapters,
     denyModels,
+    ...(allowOut !== undefined ? { allowOut } : {}),
     // OBS-994: workers-only deny is never folded into the all-seats complement above — it is
     // returned verbatim beside the flat scopes so the fleet browser can show and toggle it.
     denyWorkersAdapters: [...(cfg.routing.deny?.workers?.adapters ?? [])].sort(),

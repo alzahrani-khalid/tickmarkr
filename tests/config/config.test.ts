@@ -608,6 +608,20 @@ describe("fleetRepoOverlayFromDelta branches", () => {
     expect((cleared.routing as { deny: { models: null } }).deny.models).toBeNull();
   });
 
+  test("an allow-only membership edit recomputes and removes the stale allow form", () => {
+    const out = fleetRepoOverlayFromDelta(
+      fe({ allowOut: ["fake:one"] }),
+      fe({ allowOut: [] }),
+      { routing: { allow: { models: ["fake:two"] }, futurePolicy: "keep" } },
+      {},
+      [{ adapter: "fake", models: ["one", "two"] }],
+    );
+    const routing = out.routing as Record<string, unknown>;
+    expect(routing.allow).toBeUndefined();
+    expect(routing.futurePolicy).toBe("keep");
+    expect(routing.deny).toEqual({ adapters: null, models: null });
+  });
+
   test("tier change and removal merge over an existing repo tiers entry", () => {
     const out = fleetRepoOverlayFromDelta(
       fe({ tiers: { pi: { "m-old": { tier: "mid" }, "m-gone": { tier: "cheap" } } } }),

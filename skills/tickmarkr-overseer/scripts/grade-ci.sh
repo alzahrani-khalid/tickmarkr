@@ -50,14 +50,21 @@ while IFS=$'\t' read -r id name status conclusion; do
   skipped=$(printf '%s\n' "$files" | grep -oE '[0-9]+ skipped' | awk '{s+=$1} END{print s+0}')
   failed=$(printf '%s\n' "$files" | grep -oE '[0-9]+ failed' | awk '{s+=$1} END{print s+0}')
   timedout=$(grep -cE 'Test timed out|Error: Hook timed out' "$log" || true)
+  # Vitest reports errors thrown outside any test (unhandled rejections, worker crashes) in an
+  # "Unhandled Errors" block that leaves the file summary green and the count oracle satisfied;
+  # its own tally line names how many. Any unhandled error is RED, never a green suite.
+  unhandled=$(grep -oE 'Vitest caught [0-9]+ unhandled error' "$log" | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
+  if [ "$unhandled" -eq 0 ]; then
+    unhandled=$(grep -cE 'Unhandled Errors' "$log" || true)
+  fi
   errors=$(grep -oE '##\[error\].*' "$log" | sort | uniq -c | sed 's/^ *//' | tr '\n' ';')
 
-  echo "$name: oracle=[${oracle:-MISSING}] files=[$(printf '%s' "$files" | tr '\n' '|')] passed=$passed skipped=$skipped failed=$failed timedout=$timedout errors=[$errors]"
+  echo "$name: oracle=[${oracle:-MISSING}] files=[$(printf '%s' "$files" | tr '\n' '|')] passed=$passed skipped=$skipped failed=$failed timedout=$timedout unhandled=$unhandled errors=[$errors]"
   if [ -z "$oracle" ] || [ -z "$files" ]; then
     echo "$name: UNREADABLE"
     mark_unreadable
   elif [ "$oracle" = "COUNT_ORACLE GREEN expected=$expected actual=$expected" ] \
-       && [ "$failed" -eq 0 ] && [ "$timedout" -eq 0 ] \
+       && [ "$failed" -eq 0 ] && [ "$timedout" -eq 0 ] && [ "$unhandled" -eq 0 ] \
        && [ $((passed + skipped)) -eq "$expected" ]; then
     echo "$name: GREEN"
   else

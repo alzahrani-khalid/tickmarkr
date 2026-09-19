@@ -99,7 +99,7 @@ describe("VIS-08 onGate — failing exit (D-05)", () => {
     const base = await gitHead(repo);
     const commands = { build: "bash fail.sh" };
     const baseline = await captureBaseline(repo, commands);
-    writeFileSync(join(repo, "fail.sh"), "exit 1\n");
+    commitFile(repo, "fail.sh", "exit 1\n");
     const fake = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: { approve: true, issues: [] } });
     const { trace, hook } = traceOf(() => {});
     await runGates(mkTask({ gates: [...GATE_NAMES] }), {
@@ -134,7 +134,7 @@ describe("VIS-08 onGate — failing exit (D-05)", () => {
     assertShortCircuit(trace, "scope");
   });
 
-  test("acceptance failure short-circuits with end event", async () => {
+  test("acceptance failure reports both semantic verdicts and keeps the round failed", async () => {
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ judge: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "nope" }] }, review: { approve: true, issues: [] } });
     const { trace, hook } = traceOf(() => {});
@@ -142,7 +142,8 @@ describe("VIS-08 onGate — failing exit (D-05)", () => {
       ...(await ctxFor(repo, base, mkTask(), fake)),
       onGate: hook,
     });
-    assertShortCircuit(trace, "acceptance");
+    expect(trace.find((e) => e.phase === "end" && e.gate === "acceptance")).toMatchObject({ result: { pass: false } });
+    expect(trace.find((e) => e.phase === "end" && e.gate === "review")).toMatchObject({ result: { pass: true } });
   });
 });
 

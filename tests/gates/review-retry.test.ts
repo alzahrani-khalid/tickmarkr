@@ -290,7 +290,7 @@ describe("review retry — unparseable verdict re-asks a different reviewer, nev
     const { repo, base } = repoWithCommit();
     const events: GateEvent[] = [];
     const ctx = await gateCtx(repo, base, [worker, garbage, good], [chAuthor, chGarbage, chSecond], events);
-    const { results } = await runGates(mkTask(), { ...ctx, pipeline: "v185" as const });
+    const { results } = await runGates(mkTask(), ctx);
     const reviews = results.filter((r) => r.gate === "review");
     expect(reviews).toHaveLength(1);
     expect(reviews[0]!.pass).toBe(true);

@@ -214,10 +214,10 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     const ev = Journal.open(repo, "run-cap-rel").read().find((e) => e.event === "task-approved")!;
     expect(ev.data.release).toBe("attempt-cap");
     expect(ev.data.by).toBe("op");
-    // resume state: fresh budget + tried preserved
+    // resume state: fresh budget resets both halves of the ladder (v2.5.6 T5, OBS-1028)
     const st = Journal.open(repo, "run-cap-rel").replayResumeState().get("T1")!;
     expect(st.attempts).toBe(0);
-    expect(st.tried).toEqual(["fake:fake-1"]);
+    expect(st.tried).toEqual([]);
   });
 
   test("approve resolves a park by its kind and not by prose matching", async () => {

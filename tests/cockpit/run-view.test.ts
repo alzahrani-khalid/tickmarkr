@@ -307,9 +307,11 @@ describe("C4 — Run and validated decisions", () => {
       { name: "scope gate-fail", kind: "gate-fail", failedGate: "scope", verbs: ["waive", "recheck"] },
       { name: "gate-fail without failed-gate evidence", kind: "gate-fail", verbs: [] },
       { name: "infra", kind: "infra", failedGate: "test", verbs: ["approve", "recheck"] },
+      // OBS-1007: a cap trip is re-gated under a raised cap, never re-bought — recheck is its ONLY verb
+      { name: "diff-cap", kind: "diff-cap", failedGate: "review", verbs: ["recheck"] },
       { name: "tombstone", kind: "human-gate", reason: "T1 — tombstone: retained only so the engagement resumes", verbs: [] },
       { name: "scope-request", kind: "scope-request", verbs: [] },
-      ...PARK_KINDS.filter((k) => k !== "gate-fail" && k !== "infra" && k !== "scope-request").map((kind) => ({ name: kind, kind, verbs: ["approve"] as const })),
+      ...PARK_KINDS.filter((k) => k !== "gate-fail" && k !== "infra" && k !== "scope-request" && k !== "diff-cap").map((kind) => ({ name: kind, kind, verbs: ["approve"] as const })),
     ];
     for (const c of cases) {
       const root = repo();

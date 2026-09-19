@@ -1,11 +1,11 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { TEST_REPORTER_SOURCE } from "./test-reporter.js";
 import { shq } from "../adapters/types.js";
 import type { BaselineFileDuration } from "./baseline.js";
-import { FORK_CAP_ENV, ROUTING_ENV_SEAMS, SUITE_PARENT_ENV, shell, resolvedCapacity } from "../run/git.js";
+import { FORK_CAP_ENV, ROUTING_ENV_SEAMS, SUITE_PARENT_ENV, shell, resolvedCapacity, verificationProtocol } from "../run/git.js";
 
 /**
  * VL-1 (OBS-985 lineage): a test gate's completion must be the runner's OWN report, never a stdout
@@ -32,7 +32,11 @@ function scriptInvocation(cmd: string, cwd: string): { body: string; trailing: s
   let manager = 0;
   while (/^[A-Za-z_][A-Za-z_0-9]*=/.test(argv[manager] ?? "")) manager++;
   if (!["npm", "pnpm", "yarn"].includes(argv[manager])) return undefined;
-  const offset = manager + (["run", "run-script"].includes(argv[manager + 1]) ? 2 : 1);
+  let offset = manager + (["run", "run-script"].includes(argv[manager + 1]) ? 2 : 1);
+  // OBS-1044: `npm run -s test` — the very spelling detectGateCommands synthesizes — carries the
+  // manager's own flags before the script name; a seam blind to them routed every default-configured
+  // npm repository past the manifest. Skip flags, never a `--` (which ends the manager's arguments).
+  while (offset > manager + 1 && /^-(?!-$)/.test(argv[offset] ?? "")) offset++;
   const name = ["t", "tst"].includes(argv[offset]) ? "test" : argv[offset];
   try {
     const body = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")).scripts?.[name];
@@ -64,8 +68,13 @@ function runnerInvocation(cmd: string, cwd: string): { listing: string; separato
   const forwarded = [...raw.slice(i + 1), ...(script?.trailing ?? [])];
   if (forwarded[0] === "run") forwarded.shift();
   const collection = forwarded.filter((a) => a !== "--run" && a !== "--watch" && a !== "--");
+  // R41: `--filesOnly` lists FILE SPECIFICATIONS — the unit the reporter certifies (module start/end) —
+  // instead of collected test cases, from which the ordinary listing omits every skipped test and so
+  // drops a module whose whole body is skipped (describe.skipIf): the runner then reported two files
+  // the manifest never expected (T4 236 vs 238, T8 288 vs 290 on run 91). Filters and the environment
+  // are forwarded exactly as before; only the unit enumerated changes.
   return {
-    listing: [...env, ...prefix.map(shq), shq(binary), "list", ...collection, "--json"].join(" "),
+    listing: [...env, ...prefix.map(shq), shq(binary), "list", ...collection, "--filesOnly", "--json"].join(" "),
     separator: script?.npm && !/(?:^|\s)--(?:\s|$)/.test(cmd) ? " --" : "",
   };
 }
@@ -85,9 +94,13 @@ export function toManifestPath(file: string, cwd: string): string {
 
 export interface TestReportCompletion {
   at: number;
-  status: "passed" | "failed";
+  /** R41: `skipped` = the module ran its lifecycle but executed NO test body (every test skipped);
+   * it is present in the manifest accounting and never counted as executed success. */
+  status: "passed" | "failed" | "skipped";
   /** Failure fingerprints for this file; absent/empty on a passed file. */
   failures?: string[];
+  /** Per-module test-body counts the reporter observed (absent on reports from older reporters). */
+  tests?: { passed: number; failed: number; skipped: number };
 }
 
 /** The runner's own machine report — requested/started/completed are the runner's claims about ITSELF. */
@@ -114,7 +127,12 @@ function isTestReportShape(v: unknown): v is TestReport {
   for (const c of Object.values(r.completed as Record<string, unknown>)) {
     if (typeof c !== "object" || c === null) return false;
     const cc = c as Record<string, unknown>;
-    if (typeof cc.at !== "number" || (cc.status !== "passed" && cc.status !== "failed")) return false;
+    if (typeof cc.at !== "number" || (cc.status !== "passed" && cc.status !== "failed" && cc.status !== "skipped")) return false;
+    if (cc.tests !== undefined) {
+      if (typeof cc.tests !== "object" || cc.tests === null) return false;
+      const t = cc.tests as Record<string, unknown>;
+      if (!["passed", "failed", "skipped"].every((k) => typeof t[k] === "number")) return false;
+    }
   }
   if (r.duplicateCompletions !== undefined) {
     if (!Array.isArray(r.duplicateCompletions) || !r.duplicateCompletions.every((f) => typeof f === "string")) return false;
@@ -234,11 +252,12 @@ export function verifyManifestReport(opts: {
     };
   }
 
-  const failures = Object.values(report.completed).filter((c) => c.status === "failed")
-    .flatMap((c) => c.failures?.length ? c.failures : ["<unnamed failure>"]);
+  const failedCompletions = Object.entries(report.completed).filter(([, c]) => c.status === "failed");
+  const failingFiles = failedCompletions.map(([file]) => file).sort();
+  const failures = failedCompletions.flatMap(([, c]) => c.failures?.length ? c.failures : ["<unnamed failure>"]);
   if (failures.length) return { kind: "work", pass: false,
     details: `test report names failing fingerprint(s):\n${failures.join("\n")}`,
-    meta: { classification: "regression", failingTests: failures, processExit: exitCode } };
+    meta: { classification: "regression", failingTests: failures, failingFiles, processExit: exitCode } };
 
   if (exitCode === undefined) {
     return {
@@ -295,11 +314,25 @@ export function verifyManifestReport(opts: {
     };
   }
 
+  // R41: a skipped whole module is PRESENT (the lifecycle certified it) but is not executed test-body
+  // success. The verdict says how many modules executed and names every one that did not; a report
+  // in which nothing executed proves nothing about the tree and is never a passing verdict.
+  const skippedModules = manifest.filter((f) => report.completed[f]?.status === "skipped").sort();
+  const executedModules = manifest.length - skippedModules.length;
+  if (executedModules === 0) {
+    return {
+      kind: "fail-closed",
+      pass: false,
+      details: `every manifest module was skipped whole (${skippedModules.join(", ")}) — no test body executed, so this report certifies nothing about the tree; failing closed`,
+      meta: { classification: "infra", infra: true, noExecutedModules: true, manifestFiles: manifest.length, executedModules, skippedModules },
+    };
+  }
   return {
     kind: "pass",
     pass: true,
-    details: `invocation-bound test report succeeded — ${manifest.length} manifest file(s) present exactly once`,
-    meta: { manifestFiles: manifest.length },
+    details: `invocation-bound test report succeeded — ${manifest.length} manifest file(s) present exactly once; ${executedModules} executed`
+      + (skippedModules.length ? `, ${skippedModules.length} skipped whole (${skippedModules.join(", ")})` : ""),
+    meta: { manifestFiles: manifest.length, executedModules, skippedModules },
   };
 }
 
@@ -395,6 +428,54 @@ export interface ManifestGateOutcome {
   reportPath: string;
 }
 
+/** The child environment every manifest invocation (listing and run) receives, and the lifecycle
+ * protocol it records. R41: the policy is whatever THIS process was launched with (npm reads
+ * `npm_config_ignore_scripts` from the environment over every npmrc); the verdict records it so a
+ * verdict measured with `pretest` hooks is never compared to one without. */
+function manifestEnvironment(cwd: string): { env: NodeJS.ProcessEnv; verification: ReturnType<typeof verificationProtocol> } {
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(cwd, "node_modules/.bin")}:${process.env.PATH ?? ""}`,
+    [FORK_CAP_ENV]: String(resolvedCapacity().forkCap), [SUITE_PARENT_ENV]: String(process.pid) };
+  const verification = verificationProtocol(env, cwd);
+  for (const key of ROUTING_ENV_SEAMS) delete env[key];
+  // A gate can itself be tested under Vitest. Do not give the child the outer worker identity.
+  for (const key of Object.keys(env)) if (["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"].includes(key)) delete (env as NodeJS.ProcessEnv)[key];
+  return { env, verification };
+}
+
+export interface DiscoveredManifest { files: string[]; listing: string; separator: string; listingExit: number | undefined; listingStdout: string }
+
+/** OBS-1044: THE discovery seam — the files the runner would collect under this exact invocation,
+ * from its own listing and never from a stdout summary. The gate and the baseline capture share it,
+ * so the count a capture records is the count the gate later asks the report to certify. Throws
+ * when the runner cannot list: a count that is not the runner's own is not a count. */
+export async function discoverTestManifest(cmd: string, cwd: string, opts: { dir: string; nonce: string; env: NodeJS.ProcessEnv; overallCeilingMs?: number }): Promise<DiscoveredManifest> {
+  const invocation = runnerInvocation(cmd, cwd);
+  const listed = await runManifestedTest(invocation.listing, cwd, {
+    manifest: [], nonce: opts.nonce, reportPath: join(opts.dir, `listing-${opts.nonce}.json`), env: opts.env,
+    overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
+  });
+  if (listed.exitCode !== 0) throw new Error(`vitest cannot list files (exit ${listed.exitCode ?? "signal"}): ${listed.stderr || listed.stdout}`);
+  let files: string[];
+  try {
+    const rows: unknown = JSON.parse(listed.stdout.slice(listed.stdout.indexOf("[")));
+    if (!Array.isArray(rows) || !rows.every((r) => typeof r?.file === "string")) throw new Error("invalid listing");
+    files = [...new Set(rows.map((r) => toManifestPath(r.file, cwd)))].sort();
+  } catch { throw new Error(`vitest cannot list files: invalid JSON listing: ${listed.stdout}`); }
+  if (!files.length) throw new Error("vitest cannot list files: empty manifest");
+  return { files, listing: invocation.listing, separator: invocation.separator, listingExit: listed.exitCode, listingStdout: listed.stdout };
+}
+
+/** The baseline capture's reading of the same seam: the manifest's file count, or null when the
+ * runner cannot list (a null compares nothing — it never manufactures a deficit). The suite is not
+ * run here; the capture already ran it once. */
+export async function manifestFileCount(cmd: string, cwd: string): Promise<number | null> {
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-test-manifest-"));
+  try {
+    const { files } = await discoverTestManifest(cmd, cwd, { dir, nonce: randomBytes(16).toString("hex"), env: manifestEnvironment(cwd).env });
+    return files.length;
+  } catch { return null; }
+}
+
 /** One configured runner execution, and its own collection under the same arguments and environment.
  * The installed runner is trusted (R28 add.1 option B); the nonce catches stale artifacts, not forgery. */
 export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
@@ -408,25 +489,20 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
   const reportPath = join(dir, `test-manifest-report-${nonce}.json`);
   const reporterPath = join(dir, `test-reporter-${nonce}.mjs`);
   let spawnedCommand = cmd;
-  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(cwd, "node_modules/.bin")}:${process.env.PATH ?? ""}`,
-    [FORK_CAP_ENV]: String(resolvedCapacity().forkCap), [SUITE_PARENT_ENV]: String(process.pid) };
-  for (const key of ROUTING_ENV_SEAMS) delete env[key];
-  // A gate can itself be tested under Vitest. Do not give the child the outer worker identity.
-  for (const key of Object.keys(env)) if (["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"].includes(key)) delete (env as NodeJS.ProcessEnv)[key];
+  let manifestPath: string | undefined;
+  const { env, verification } = manifestEnvironment(cwd);
   try {
-    const invocation = runnerInvocation(cmd, cwd);
-    const listed = await runManifestedTest(invocation.listing, cwd, {
-      manifest: [], nonce, reportPath: join(dir, `listing-${nonce}.json`), env,
-      overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
-    });
-    if (listed.exitCode !== 0) throw new Error(`vitest cannot list files (exit ${listed.exitCode ?? "signal"}): ${listed.stderr || listed.stdout}`);
-    let files: string[];
-    try {
-      const rows: unknown = JSON.parse(listed.stdout.slice(listed.stdout.indexOf("[")));
-      if (!Array.isArray(rows) || !rows.every((r) => typeof r?.file === "string")) throw new Error("invalid listing");
-      files = [...new Set(rows.map((r) => toManifestPath(r.file, cwd)))].sort();
-    } catch { throw new Error(`vitest cannot list files: invalid JSON listing: ${listed.stdout}`); }
-    if (!files.length) throw new Error("vitest cannot list files: empty manifest");
+    const invocation = await discoverTestManifest(cmd, cwd, { dir, nonce, env, overallCeilingMs: opts.overallCeilingMs });
+    const files = invocation.files;
+    // R41: the EXPECTED manifest is evidence in its own right — persisted beside the report with the
+    // exact discovery invocation, so a later reader can tell what this invocation was asked to prove
+    // without reconstructing it from the runner's own claims.
+    manifestPath = join(dir, `test-manifest-expected-${nonce}.json`);
+    writeFileSync(manifestPath, JSON.stringify({
+      nonce, verification, listingCommand: invocation.listing, listingExit: invocation.listingExit,
+      listingStdoutSha256: createHash("sha256").update(invocation.listingStdout).digest("hex"),
+      discoveredAt: Date.now(), files,
+    }, null, 2) + "\n");
     writeFileSync(reporterPath, TEST_REPORTER_SOURCE);
     spawnedCommand = `${cmd}${invocation.separator} --reporter=${shq(reporterPath)} --outputFile=${shq(reportPath)}`;
     const invoked = await runManifestedTest(spawnedCommand, cwd, {
@@ -441,11 +517,12 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
     return { pass: verdict.pass, kind: verdict.kind,
       details: verdict.details + (!invoked.report && invoked.stderr ? `\nvitest reporter: ${invoked.stderr}` : ""),
       classification: verdict.meta.classification as "infra" | "regression" | undefined,
-      meta: { ...verdict.meta, nonce, manifest: files, spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid },
+      meta: { ...verdict.meta, nonce, manifest: files, manifestPath, listingCommand: invocation.listing, verification,
+        spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid },
       exitCode: invoked.exitCode ?? -1, reportPath };
   } catch (error) {
     return { pass: false, kind: "infra", classification: "infra", exitCode: -1, reportPath,
       details: error instanceof Error ? error.message : String(error),
-      meta: { classification: "infra", infra: true, manifestDiscoveryFailed: true, spawnedCommand } };
+      meta: { classification: "infra", infra: true, manifestDiscoveryFailed: true, spawnedCommand, verification, ...(manifestPath ? { manifestPath } : {}) } };
   }
 }

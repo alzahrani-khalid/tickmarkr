@@ -187,9 +187,47 @@ export function addEvidence(
   };
 }
 
+// OBS-1018: chain depth = number of downstream edges on the longest dependency path from a task to
+// a leaf below it (a task nothing depends on is 0). Counted over the whole graph, status-blind: a
+// root's critical path does not shrink because part of it already ran.
+export function chainDepth(g: RunGraph): Map<string, number> {
+  const dependents = new Map<string, string[]>(g.tasks.map((t) => [t.id, []]));
+  for (const t of g.tasks) for (const d of t.deps) dependents.get(d)?.push(t.id);
+  const depth = new Map<string, number>();
+  const visit = (id: string): number => {
+    const known = depth.get(id);
+    if (known !== undefined) return known;
+    const below = dependents.get(id) ?? [];
+    const value = below.length ? 1 + Math.max(...below.map(visit)) : 0; // acyclic: validateGraph rejects cycles
+    depth.set(id, value);
+    return value;
+  };
+  for (const t of g.tasks) visit(t.id);
+  return depth;
+}
+
+// OBS-1018: admission is critical-path order — deepest chain root first, ties in declaration order.
+// The daemon's dispatch loop slices this list unchanged. Stated limit: resume-restore of previously
+// in-flight attempts keeps its own precedence (src/run/daemon.ts); only fresh admission is ordered here.
 export function readyTasks(g: RunGraph): Task[] {
   const done = new Set(g.tasks.filter((t) => t.status === "done").map((t) => t.id));
-  return g.tasks.filter((t) => t.status === "pending" && t.deps.every((d) => done.has(d)));
+  const depth = chainDepth(g);
+  return g.tasks
+    .filter((t) => t.status === "pending" && t.deps.every((d) => done.has(d)))
+    .sort((a, b) => depth.get(b.id)! - depth.get(a.id)!); // Array#sort is stable: equal depths keep declaration order
+}
+
+// OBS-1018: the dispatch wave each pending task would enter at `concurrency` slots if every wave
+// took one tick — computed by draining readyTasks, so plan and daemon can never disagree on order.
+// Tasks already past pending carry no wave.
+export function dispatchWaves(g: RunGraph, concurrency: number): Map<string, number> {
+  const waves = new Map<string, number>();
+  let sim = g;
+  for (let wave = 1; ; wave++) {
+    const batch = readyTasks(sim).slice(0, Math.max(1, concurrency));
+    if (!batch.length) return waves;
+    for (const t of batch) { waves.set(t.id, wave); sim = setStatus(sim, t.id, "done"); }
+  }
 }
 
 export function isComplete(g: RunGraph): boolean {

@@ -1,5 +1,8 @@
 import { graphDefinitionHash, loadGraph, saveGraph } from "../../graph/graph.js";
+import { execFileSync } from "node:child_process";
 import { userInfo } from "node:os";
+import { loadConfig } from "../../config/config.js";
+import { integrationBranch } from "../../run/merge.js";
 import { separabilityErrors } from "../../compile/collateral.js";
 import { GATE_NAMES } from "../../graph/schema.js";
 import { applyScopeAmendments, engagementComparable, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
@@ -106,6 +109,7 @@ export function permittedDecisionVerbs(park: Pick<NewestPark, "kind" | "failedGa
     return park.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
   }
   if (park.kind === "infra") return ["approve", "recheck"];
+  if (park.kind === "diff-cap") return ["recheck"]; // OBS-1007: a cap trip is re-gated under a raised cap, never re-bought
   return ["approve"];
 }
 
@@ -210,6 +214,21 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   if (status === undefined) {
     throw new Error(`task ${taskId} has no events in run ${runId} — unknown task or never dispatched`);
   }
+  // OBS-1022: a task-failed task whose preserved ref (or task branch) carries commits ahead of the
+  // integration base owns verified-able work; --recheck re-gates that tree with no worker. Any other
+  // verb on a failed task, or a recheck over nothing landed, is refused naming why.
+  if (status === "failed" && recheck) {
+    const ahead = failedTaskCommitsAhead(cwd, journal, runId, taskId);
+    if (ahead.count === 0) {
+      throw new Error(`task ${taskId} is failed and ${ahead.ref} carries no commits ahead of ${ahead.base} — nothing to re-gate; use resume --retry-failed to fund a worker`);
+    }
+    journal.append("task-approved", taskId, {
+      by, ...(reason ? { reason } : {}), via: "cli", release: RECHECK_RELEASE,
+      recheckedRef: ahead.ref, commitsAhead: ahead.count,
+      ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
+    });
+    return disposition(cwd, runId, "re-dispatch", `re-checking failed ${taskId} in ${runId} — by ${by}; ${ahead.count} commit(s) on ${ahead.ref} ahead of ${ahead.base}; no worker funded`, serialization.contended);
+  }
   if (status !== "human") {
     // a silent no-op would be worse than a loud refusal — name the actual status (D-05)
     throw new Error(`task ${taskId} is ${status}, not a parked human gate — refusing (a silent no-op would be worse)`);
@@ -222,7 +241,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   const lastHuman = park === undefined ? undefined : events[park.index];
   const capPark = park?.kind === ATTEMPT_CAP_RELEASE;
   const gateFailPark = park?.kind === "gate-fail";
-  const infraPark = park?.kind === "infra";
+  const infraPark = park?.kind === "infra" || park?.kind === "diff-cap";
   const failedGate = gateFailPark ? park?.failedGate : undefined;
   if ((park?.kind === "scope-request" && !decisions) || files !== undefined) {
     if (park?.kind !== "scope-request") throw new Error("--files requires a scope-request park");
@@ -273,7 +292,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   }
   if (recheck) {
     if ((!gateFailPark || !failedGate) && !infraPark) {
-      throw new Error(`--recheck applies to a gate-fail or infra park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
+      throw new Error(`--recheck applies to a gate-fail, infra or diff-cap park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
       by,
@@ -282,7 +301,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       release: RECHECK_RELEASE,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : "infra park"}; no gate marked satisfied`, serialization.contended);
+    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : `${park!.kind} park`}; no gate marked satisfied`, serialization.contended);
   }
   if (waive) {
     if (!gateFailPark || !failedGate) {
@@ -310,6 +329,11 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   if (park?.tombstone) {
     throw new Error(`task ${taskId}'s newest park is a tombstone (${park.reason ?? "no reason"}) — permanent by design; no verb releases it`);
   }
+  // OBS-1007: a cap trip is re-gated under a raised cap, never re-bought — plain approve would fund a
+  // worker the production oracle (permittedDecisionVerbs) says this park cannot buy.
+  if (park?.kind === "diff-cap") {
+    throw new Error(`task ${taskId} is parked on a diff cap; plain approve would fund another worker — raise gates.diffCap and pass --recheck (disposition re-dispatch)`);
+  }
 
   journal.append("task-approved", taskId, {
     by,
@@ -322,6 +346,40 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   return disposition(cwd, runId, token, `approved ${taskId} in ${runId} — by ${by}`, serialization.contended);
   } finally {
     serialization.release();
+  }
+}
+
+/**
+ * OBS-1022: what a failed task has landed. A preserved snapshot is authoritative only when it contains
+ * the current task-branch tip; an older preservation can remain in the journal after a later retry has
+ * advanced/rebuilt the branch. Missing task branches may still recover from a preserved ref. The selected
+ * ref is counted against the run's integration branch; unreadable refs count as zero and fail closed.
+ */
+function failedTaskCommitsAhead(cwd: string, journal: Journal, runId: string, taskId: string): { ref: string; base: string; count: number } {
+  const cfg = loadConfig(cwd);
+  const base = integrationBranch(cfg, runId);
+  const taskRef = `${base}--${taskId}`;
+  const preserved = [...journal.read()].reverse().find((e) => e.taskId === taskId && e.event === "worktree-preserved" && typeof e.data.ref === "string");
+  const preservedRef = preserved?.data.ref as string | undefined;
+  let ref = taskRef;
+  if (preservedRef) {
+    try {
+      execFileSync("git", ["rev-parse", "--verify", taskRef], { cwd, stdio: "ignore" });
+      execFileSync("git", ["merge-base", "--is-ancestor", taskRef, preservedRef], { cwd, stdio: "ignore" });
+      ref = preservedRef;
+    } catch {
+      try {
+        execFileSync("git", ["rev-parse", "--verify", taskRef], { cwd, stdio: "ignore" });
+      } catch {
+        ref = preservedRef;
+      }
+    }
+  }
+  try {
+    const out = execFileSync("git", ["rev-list", "--count", `${base}..${ref}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return { ref, base, count: Number.parseInt(out.trim(), 10) || 0 };
+  } catch {
+    return { ref, base, count: 0 };
   }
 }
 

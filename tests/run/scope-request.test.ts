@@ -1,10 +1,12 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { shq } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { graphDefinitionHash, loadGraph, saveGraph } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
+import * as stall from "../../src/run/stall.js";
 import { applyScopeAmendments, Journal, recordedGraphDefinitionHash } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -74,7 +76,33 @@ test(criterion, async () => {
   }, judge: { pass: true, criteria: [] }, review: { approve: true, issues: [] } }));
   const original = loadGraph(live.repo);
   const id = "run-scope-live";
-  const running = runDaemon(live.repo, { adapters: [new FakeAdapter(live.scriptPath)], runId: id, approvalWindowMs: 1000,
+  const driver = new SubprocessDriver();
+  const groups = new Map<string, number>();
+  let nextGroup = 40_000;
+  // Isolate the ownership oracle from host ps permissions. Actual children are
+  // still closed by SubprocessDriver, while each launch gets a distinct claim.
+  const readGroup = vi.spyOn(stall, "readOwnedProcessGroup").mockImplementation((path) => groups.get(path));
+  const reapGroup = vi.spyOn(stall, "reapOwnedProcessGroup").mockResolvedValue([]);
+  const launch = driver.run.bind(driver);
+  driver.run = async (slot, cmd) => {
+    if (slot.name.includes("-worker-")) {
+      const script = /^bash '(.+)'$/.exec(cmd)![1]!;
+      const groupFile = / > '([^']+\.pgid)'/.exec(readFileSync(script, "utf8"))![1]!;
+      groups.set(groupFile, ++nextGroup);
+    }
+    await launch(slot, cmd);
+  };
+  const waitOutput = driver.waitOutput.bind(driver);
+  driver.waitOutput = async (slot, pattern, timeoutMs, opts) => {
+    const hit = await waitOutput(slot, pattern, timeoutMs, opts);
+    // Make the exited-pane retention path deterministic: approval resets the attempt
+    // budget while the old pane is still retained until the run-end sweep.
+    if (hit && slot.name.includes("-worker-")) {
+      expect(await waitOutput(slot, "TICKMARKR_EXIT_[a-z0-9]+:[0-9]+", 5_000, { regex: true })).toBe(true);
+    }
+    return hit;
+  };
+  const running = runDaemon(live.repo, { driver, adapters: [new FakeAdapter(live.scriptPath)], runId: id, approvalWindowMs: 1000,
     narrate: (e) => {
       if (e.event === "task-dispatch" && e.taskId === "T1" && (e.data.files as string[] | undefined)?.includes("needed.txt")) {
         writeFileSync(release, "go");
@@ -107,9 +135,16 @@ test(criterion, async () => {
     const launches = rows.filter((e) => e.event === "worker-launch" && e.taskId === "T1");
     expect(launches.map((e) => e.data.retryMode)).toEqual(["fresh", "fresh"]);
     expect(launches[1]!.data.slot).not.toEqual(launches[0]!.data.slot);
+    // Reused attempt numbers must never overwrite an earlier pane's group claim.
+    expect(dispatches[1]!.data.attempt).toBe(dispatches[0]!.data.attempt);
+    expect([...groups.keys()].filter((path) => path.includes("/T1-"))).toHaveLength(2);
+    expect(reapGroup.mock.calls.map(([group]) => group).sort()).toEqual([...groups.values()].sort());
   } finally {
     writeFileSync(release, "go");
-    await running;
+    try { await running; } finally {
+      readGroup.mockRestore();
+      reapGroup.mockRestore();
+    }
   }
 
   const replay = setupRepo([T("T1", { files: ["owned.txt"], acceptance: [{ oracle: "command", command: "test -f needed.txt" }] }), T("T2", { humanGate: true })], { tasks: { T1: [refusal, success] } });

@@ -423,3 +423,59 @@ test("round 2 finding 3: an alias admitted by its resolved identity — bare or 
     expect(exclusionCollector({ adapter: "fake", model: "fake-2" }, cfg.routing, "judge"), spelling).not.toEqual([]);
   }
 });
+
+// ── OBS-1046: one Space press edits one reason; an untouched scope keeps its bytes ────────────
+
+const overlayOf = (repo: string) => readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+
+test("test: over a universe of two channels with allow models naming the second and deny models naming the first the browser shows two reasons for the first, one Space press clears the deny reason alone, the written overlay keeps routing.allow, and the loaded policy still excludes the first channel by allow in every role, so a press that removes both reasons fails", async () => {
+  const { repo, globalDir } = policyRepo(["one", "two"], ["  allow:", "    models: [fake:two]", "  deny:", "    models: [fake:one]"]);
+  const { out, frames } = await browse(repo, globalDir, KEYS.space + "w" + "y");
+  expect(out).toMatch(/^fleet: wrote /);
+  // two reasons on the row before the press: the allow exclusion and the authored deny
+  const line = rowLine(frames, "reach: out · all seats — ");
+  expect(line).toContain("routing.allow");
+  expect(line).toContain("routing.deny.models (fake:one)");
+  // one press clears the deny reason alone; routing.allow survives the write
+  expect(rowLine(frames, "space: cleared fake:one from routing.deny.models")).toBeDefined();
+  const written = overlayOf(repo);
+  expect(written).toContain("allow:");
+  expect(written).toContain("models: [fake:two]");
+  const cfg = loadConfig(repo, { globalDir });
+  expect(cfg.routing.allow?.models).toEqual(["fake:two"]);
+  expect(cfg.routing.deny?.models).toBeUndefined();
+  for (const role of ROLES) {
+    const scopes = exclusionCollector({ adapter: "fake", model: "one" }, cfg.routing, role);
+    expect(scopes.map((s) => s.by), role).toEqual(["allow"]);
+    expect(exclusionCollector({ adapter: "fake", model: "two" }, cfg.routing, role), role).toEqual([]);
+  }
+});
+
+test("test: through the production browser and writer, adding a channel to an initially empty deny models scope keeps the untouched empty adapters list and its trailing comment byte for byte, clearing the only entry of a populated deny adapters scope keeps the untouched empty models list and its comment byte for byte while the cleared scope becomes a null tombstone, the same two transitions hold with the scopes swapped, and the reloaded policy shows exactly the staged reach each time, so a writer that turns an untouched empty list into null or demands a tombstone for an addition fails", async () => {
+  const outFor = (cfg: ReturnType<typeof loadConfig>, model: string) =>
+    exclusionCollector({ adapter: "fake", model }, cfg.routing, "judge").length > 0;
+  for (const [added, cleared] of [["models", "adapters"], ["adapters", "models"]] as const) {
+    // addition: two presses take fake:one to out(all) — the exclusion rides the allow form and
+    // BOTH explicit empty lists keep their bytes (no tombstone for an addition)
+    const a = policyRepo(["one", "two"], ["  deny:", `    ${added}: []`, `    ${cleared}: [] # keep explicit empty list`]);
+    const one = await browse(a.repo, a.globalDir, KEYS.space + KEYS.space + "w" + "y");
+    expect(one.out, `add via ${added}`).toMatch(/^fleet: wrote /);
+    const addedBytes = overlayOf(a.repo);
+    expect(addedBytes).toContain(`    ${cleared}: [] # keep explicit empty list\n`);
+    expect(addedBytes).toContain(`    ${added}: []\n`);
+    expect(addedBytes).not.toContain("null");
+    const addedCfg = loadConfig(a.repo, { globalDir: a.globalDir });
+    expect([outFor(addedCfg, "one"), outFor(addedCfg, "two")], `add via ${added}`).toEqual([true, false]);
+
+    // clear: the only entry of the populated scope goes, that scope tombstones, the sibling empty
+    // list and its comment survive byte for byte
+    const b = policyRepo(["one", "two"], ["  deny:", `    ${cleared}: [fake:one]`, `    ${added}: [] # keep explicit empty list`]);
+    const two = await browse(b.repo, b.globalDir, KEYS.space + "w" + "y");
+    expect(two.out, `clear ${cleared}`).toMatch(/^fleet: wrote /);
+    const clearedBytes = overlayOf(b.repo);
+    expect(clearedBytes).toContain(`    ${added}: [] # keep explicit empty list\n`);
+    expect(clearedBytes).toContain(`    ${cleared}: null`);
+    const clearedCfg = loadConfig(b.repo, { globalDir: b.globalDir });
+    expect([outFor(clearedCfg, "one"), outFor(clearedCfg, "two")], `clear ${cleared}`).toEqual([false, false]);
+  }
+}, 90_000); // four production browser sessions

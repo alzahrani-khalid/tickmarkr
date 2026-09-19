@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, runWithCommandLease, withCommandLease } from "../../src/run/lease.js";
+import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, readHolder, reclaimDead, repositoryLeasePath, runWithCommandLease, tryReserve, withCommandLease, withRepositoryLease } from "../../src/run/lease.js";
 import { resetSpawnForTests, setSpawnForTests, sh } from "../../src/run/git.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
@@ -93,7 +93,7 @@ test.each([
   "pnpm test", "yarn test", "bun test", "pytest", "go test", "make test",
   "cd pkg && npm test", "bash -lc 'cd pkg && npm run -s test'", "python3 -m pytest",
   // D1: configured scripts and package-manager runner entry points must share the same lease.
-  "npm run test:unit", "npm run -s test:unit", "pnpm run test.integration", "yarn run test-e2e",
+  "npm run test:unit", "npm run -s test:unit", "pnpm run test.integration",
   "pnpm exec vitest run", "yarn vitest run", "pnpm vitest", "npx --yes vitest run", "npm exec vitest",
   "npm exec -- vitest run", "pnpm dlx vitest run", "bun x vitest run", "yarn exec jest", "pnpm exec mocha",
   "npx --no-install jest", "pnpm --silent exec -- vitest run", "env CI=1 sh -c 'npm run test:unit'",
@@ -119,7 +119,7 @@ test.each([
 
 test.each([
   "npm run lint vitest", "pnpm exec codex --prompt Run vitest tests", "npx --yes codex vitest",
-  "yarn run build --description test:unit", "npm run contest", "npm exec vitest-helper", "echo pnpm exec vitest",
+  "yarn run build --description test:unit", "npm run contest", "npm run test-lint", "npm exec vitest-helper", "echo pnpm exec vitest",
 ])("does not lease runner names in arguments to a non-runner command: %s", async command => {
   const lease = vi.fn((_command: string, run: () => Promise<void>) => run());
   const { withCommandLease } = await import("../../src/run/lease.js");
@@ -192,3 +192,116 @@ test("R87: a shell environment receives its active lease token even with an expl
   expect(commandLeaseEnvironment(supplied).TICKMARKR_LEASE_TOKEN).toBe(before || undefined);
   expect(supplied.TICKMARKR_LEASE_TOKEN).toBe("unrelated-token");
 });
+
+test("test: the runner classifier leases npm test, npm run test:unit and npx vitest run and leases neither a script named test-lint nor a prompt that mentions vitest, and a leased npm test whose child test spawns npx vitest through the production lease path completes without waiting on its parent and is censused once, so a classifier that over-matches or a nested runner that waits on its own parent fails", async () => {
+  for (const cmd of ["npm test", "npm run test:unit", "npx vitest run"]) expect(isRunnerCommand(cmd), cmd).toBe(true);
+  for (const cmd of ["npm run test-lint", "npm run -s test-lint", "codex --prompt 'run the vitest suite'"]) expect(isRunnerCommand(cmd), cmd).toBe(false);
+
+  const repo = makeRepo({ "base.txt": "base" });
+  vi.useFakeTimers();
+  const starts: Array<{ command: string; token: string | undefined }> = [];
+  const children = new Map<string, EventEmitter>();
+  let childRun: Promise<unknown> | undefined;
+  setSpawnForTests(((_binary: string, argv: string[], options: { env: NodeJS.ProcessEnv }) => {
+    const child = new EventEmitter() as EventEmitter & { pid: number; stdout: PassThrough; stderr: PassThrough; kill: () => boolean };
+    child.pid = 900000 + starts.length; child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    child.kill = () => true;
+    starts.push({ command: argv[1]!, token: options.env[COMMAND_LEASE_TOKEN_ENV] });
+    children.set(argv[1]!, child);
+    // The parent's test spawns a nested runner through the SAME production seam (sh → withCommandLease).
+    if (argv[1] === "npm test") childRun = sh("npx vitest run", repo);
+    return child;
+  }) as Parameters<typeof setSpawnForTests>[0]);
+  const leases = new CommandLeases();
+  const census: number[] = [];
+  const context = <T>(fn: () => Promise<T>) => runWithCommandLease((_cmd, run) => leases.run(run, count => census.push(count), 250), fn);
+  const parent = context(() => sh("npm test", repo));
+  const contender = context(() => sh("npm run test:unit", repo));
+  await vi.advanceTimersByTimeAsync(0);
+  // The nested runner started at once (no wait on its parent) carrying its parent's token.
+  expect(starts.map(s => s.command)).toEqual(["npm test", "npx vitest run"]);
+  expect(starts[0]!.token).toEqual(expect.any(String));
+  expect(starts[1]!.token).toBe(starts[0]!.token);
+  // The contender censused exactly one live reservation: the parent and its child are one suite.
+  expect(census).toEqual([1]);
+  children.get("npx vitest run")!.emit("close", 0);
+  await childRun;
+  children.get("npm test")!.emit("close", 0);
+  await parent;
+  await vi.advanceTimersByTimeAsync(250);
+  expect(starts.map(s => s.command)).toEqual(["npm test", "npx vitest run", "npm run test:unit"]);
+  children.get("npm run test:unit")!.emit("close", 0);
+  await contender;
+});
+
+test("R-T7: two waiters that both read one dead holder reclaim it once — the loser's reclamation never removes the winner's fresh reservation — and a reservation left empty or truncated by a process killed mid-acquisition is reclaimed rather than waited on forever", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { existsSync, readFileSync, statSync, writeFileSync } = await import("node:fs");
+  const repo = makeRepo({ "base.txt": "base" });
+  const path = await repositoryLeasePath(repo);
+  // A holder that really died: a child process that reserved and was then killed.
+  const deadPid = spawnSync("node", ["-e", "process.exit(0)"]).pid!;
+  const dead = { pid: deadPid, cwd: repo, at: 1, token: "dead-token" };
+  expect(tryReserve(path, dead)).toBe(true);
+  const deadStat = statSync(path);
+  const deadIdentity = `${deadStat.dev}-${deadStat.ino}`;
+  // The reviewer's interleaving: A and B both read the dead holder; A reclaims and acquires; B reclaims.
+  const a = { pid: process.pid, cwd: repo, at: 2, token: "a-token" };
+  expect(await reclaimDead(path, deadIdentity)).toBe(true);
+  expect(tryReserve(path, a)).toBe(true);
+  expect(await reclaimDead(path, deadIdentity)).toBe(false); // B's stale reclamation is a no-op
+  expect(readHolder(path)?.token).toBe("a-token"); // A's live reservation survived
+  expect(tryReserve(path, { ...a, token: "b-token" })).toBe(false);
+  expect(readHolder(path)?.token).toBe("a-token");
+
+  // Termination during reservation creation: the draft is private, so a kill before the link leaves nothing.
+  const draft = spawnSync("node", ["-e", `
+    const { writeFileSync } = require("node:fs");
+    writeFileSync(${JSON.stringify(path)} + ".x.draft", "{\\"pid\\":");
+    process.kill(process.pid, "SIGKILL");
+  `]);
+  expect(draft.signal).toBe("SIGKILL");
+  expect(readHolder(path)?.token).toBe("a-token");
+
+  // A partial record at the path itself is reclaimed on the next poll instead of being treated as a
+  // live holder. Its bytes and inode are read through one descriptor, so a stale corrupt observation
+  // cannot remove the complete replacement published by another process.
+  for (const bytes of ["", '{"pid":']) {
+    rmSyncOrIgnore(path);
+    writeFileSync(path, bytes);
+    const corruptStat = statSync(path);
+    const corruptIdentity = `${corruptStat.dev}-${corruptStat.ino}`;
+    rmSyncOrIgnore(path);
+    expect(tryReserve(path, a)).toBe(true);
+    const stale = spawnSync("node", ["--input-type=module", "-e", `
+      import { reclaimDead } from "./dist/run/lease.js";
+      void (async () => process.exit(await reclaimDead(process.argv[1], process.argv[2]) ? 42 : 0))();
+    `, path, corruptIdentity], { cwd: process.cwd() });
+    expect(stale.status, stale.stderr.toString()).toBe(0);
+    expect(readHolder(path)?.token).toBe("a-token");
+    rmSyncOrIgnore(path);
+    writeFileSync(path, bytes);
+    await expect(withRepositoryLease(repo, async () => `ran over ${JSON.stringify(bytes)}`, { pollMs: 10 })).resolves.toBe(`ran over ${JSON.stringify(bytes)}`);
+    expect(existsSync(path)).toBe(false);
+  }
+
+  // A reclaimer killed after linking the tombstone but before unlinking the canonical path leaves a
+  // dead mutation-lock generation. The next production acquisition supersedes it and finishes the
+  // exact inode's reclaim instead of spinning or deleting a replacement.
+  writeFileSync(path, '{"pid":');
+  const interruptedStat = statSync(path);
+  const interruptedIdentity = `${interruptedStat.dev}-${interruptedStat.ino}`;
+  const interrupted = spawnSync("node", ["-e", `
+    const { linkSync, mkdirSync, symlinkSync } = require("node:fs");
+    const path = process.argv[1], identity = process.argv[2], lock = path + ".lock";
+    mkdirSync(lock);
+    symlinkSync(process.pid + ":killed", lock + "/owner.0");
+    linkSync(path, path + ".dead-" + identity);
+    process.kill(process.pid, "SIGKILL");
+  `, path, interruptedIdentity]);
+  expect(interrupted.signal).toBe("SIGKILL");
+  await expect(withRepositoryLease(repo, async () => "recovered interrupted reclaim", { pollMs: 10 })).resolves.toBe("recovered interrupted reclaim");
+  expect(existsSync(path)).toBe(false);
+  expect(readFileSync(`${path}.dead-${deadIdentity}`, "utf8")).toContain("dead-token");
+});
+const rmSyncOrIgnore = (p: string) => { try { require("node:fs").rmSync(p, { force: true }); } catch { /* absent */ } };

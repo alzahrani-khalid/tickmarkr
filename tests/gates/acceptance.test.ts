@@ -324,7 +324,7 @@ describe("acceptanceGate", () => {
     expect(r.details).toMatch(/diff exceeds verifiable cap/i);
     expect(r.details).toMatch(/split the task/i);
     expect(r.details).toMatch(/raise gates\.diffCap/i);
-    expect(r.meta).toEqual({ park: "human" });
+    expect(r.meta).toMatchObject({ parkKind: "diff-cap", permittedBytes: 1 });
     expect(calls).toBe(0);
   });
 

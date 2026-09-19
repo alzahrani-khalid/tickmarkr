@@ -410,11 +410,13 @@ export async function assembleFleetEditor(
   // leaves the picker immediately and one toggled back in reappears without a relaunch (both
   // directions exact — the on-disk scopes would otherwise pre-filter the pool at startup and lie
   // until restart).
-  type StagedDeny = { adapters: string[]; models: string[]; workersAdapters: string[]; workersModels: string[] };
+  type StagedDeny = { adapters: string[]; models: string[]; workersAdapters: string[]; workersModels: string[]; allowOut?: string[] };
   const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny): FleetEditable => ({
     ...structuredClone(initial),
     denyAdapters: deny.adapters,
     denyModels: deny.models,
+    // OBS-1046: the allow complement is staged beside the deny lists, never folded into them
+    allowOut: deny.allowOut ?? initial.allowOut,
     denyWorkersAdapters: deny.workersAdapters,
     denyWorkersModels: deny.workersModels,
     map,
@@ -755,6 +757,7 @@ export async function assembleFleetEditor(
     const staged = structuredClone(initial) as FleetEditable;
     staged.denyAdapters = state.denyAdapters;
     staged.denyModels = state.denyModels;
+    staged.allowOut = state.allowOut ?? initial.allowOut;
     // OBS-994/FL-1: the workers-only deny scope rides the same review/write funnel as the flat one.
     staged.denyWorkersAdapters = state.denyWorkersAdapters;
     staged.denyWorkersModels = state.denyWorkersModels;
@@ -814,6 +817,7 @@ export async function assembleFleetEditor(
     health,
     initialDenyAdapters: editable.denyAdapters,
     initialDenyModels: editable.denyModels,
+    initialAllowOut: editable.allowOut,
     initialDenyWorkersAdapters: editable.denyWorkersAdapters,
     initialDenyWorkersModels: editable.denyWorkersModels,
     modelGroups,

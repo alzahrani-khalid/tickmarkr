@@ -48,7 +48,8 @@ function allowFormFromExclusions(
   }
   // LEG2-T3 round 2 finding 1: every staged entry excludes what it NAMES — a bare model id every
   // adapter serving it, an identity its alias — never only an adapter id or an adapter:model key.
-  const entries = [...edited.denyAdapters, ...edited.denyModels];
+  // OBS-1046: the staged allow complement is a reason of its own, beside the authored deny lists.
+  const entries = [...edited.denyAdapters, ...edited.denyModels, ...(edited.allowOut ?? [])];
   const adapters: string[] = [];
   const models: string[] = [];
   let excluded = false;
@@ -85,14 +86,18 @@ function residualDeny(
 // list keeps its node. A staged entry the allow form cannot express as a membership key (outside the
 // probe universe, or a bare-model/identity spelling) is written verbatim too; canonical keys the
 // session added ride the allow form alone.
+function authoredEntries(doc: OverlayDocument, path: OverlayPath): string[] {
+  const node = doc.getIn(path, true);
+  return isSeq(node) ? node.items.flatMap((item) => (isScalar(item) ? [String(item.value)] : [])) : [];
+}
+
 function flatDenyAfterWrite(
   doc: OverlayDocument,
   path: OverlayPath,
   after: string[],
   universe: FleetUniverseRow[],
 ): string[] {
-  const node = doc.getIn(path, true);
-  const authored = isSeq(node) ? node.items.flatMap((item) => (isScalar(item) ? [String(item.value)] : [])) : [];
+  const authored = authoredEntries(doc, path);
   const canonical = (entry: string) => universe.some((row) =>
     entry === row.adapter || row.models.some((m) => entry === `${row.adapter}:${m}`));
   const kept = authored.filter((entry) => after.includes(entry));
@@ -227,10 +232,13 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   if (doc.errors.length) throw doc.errors[0];
 
   const { initial, edited } = write;
-  const denyChanged =
-    sortedUnique(initial.denyAdapters).join() !== sortedUnique(edited.denyAdapters).join()
-    || sortedUnique(initial.denyModels).join() !== sortedUnique(edited.denyModels).join();
-  if (denyChanged) {
+  // OBS-1046: each flat scope (and the allow complement) is compared on its own — a scope the
+  // session never edited keeps its node byte for byte, whatever its sibling did.
+  const changed = (before: string[] = [], after: string[] = []) =>
+    sortedUnique(before).join() !== sortedUnique(after).join();
+  const adaptersChanged = changed(initial.denyAdapters, edited.denyAdapters);
+  const modelsChanged = changed(initial.denyModels, edited.denyModels);
+  if (adaptersChanged || modelsChanged || changed(initial.allowOut, edited.allowOut)) {
     if (write.universe) {
       // Membership write: the allow form IS the fleet; deny adapters/models scopes are tombstoned
       // so a lower layer can never re-exclude behind the operator's back (workers untouched).
@@ -256,25 +264,48 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
         // Whole fleet in: no restriction to express — the allow block goes away entirely.
         deleteAt(doc, ["routing", "allow"]);
       }
-      // Authored and non-canonical entries stay in deny (LEG2-T3 finding 4, round 2 finding 2); a
-      // list left with nothing is tombstoned so a lower layer can never re-exclude behind the
-      // operator's back (workers untouched).
-      for (const [scope, after] of [["adapters", edited.denyAdapters], ["models", edited.denyModels]] as const) {
+      // Authored and non-canonical entries stay in deny (LEG2-T3 finding 4, round 2 finding 2).
+      // OBS-1046: only an EDITED scope is rewritten, and only when its bytes must change — an
+      // addition the allow form carries leaves the list (an explicit `[]` included) untouched; a
+      // scope the press CLEARED down to nothing is tombstoned so a lower layer can never
+      // re-exclude behind the operator's back (workers untouched).
+      // LEG2-T3 finding 4: an authored entry the edit admits (staged nowhere any more) must go
+      // even from a scope whose own set did not change, or the admitted channel stays excluded
+      // behind the preserved bytes.
+      const stagedAfter = new Set([...edited.denyAdapters, ...edited.denyModels, ...(edited.allowOut ?? [])]);
+      const admitted = [...initial.denyAdapters, ...initial.denyModels, ...(initial.allowOut ?? [])]
+        .filter((entry) => !stagedAfter.has(entry));
+      const scopes = [
+        ["adapters", initial.denyAdapters, edited.denyAdapters, adaptersChanged],
+        ["models", initial.denyModels, edited.denyModels, modelsChanged],
+      ] as const;
+      for (const [scope, before, after, touched] of scopes) {
         const path = ["routing", "deny", scope];
+        const authored = authoredEntries(doc, path);
+        const stale = authored.some((entry) => admitted.includes(entry));
+        if (!touched && !stale) continue;
         const remaining = flatDenyAfterWrite(doc, path, after, write.universe);
-        setStringSequencePreservingComments(doc, path, remaining.length ? remaining : null);
+        if (remaining.length) {
+          if (remaining.join("\n") !== authored.join("\n")) setStringSequencePreservingComments(doc, path, remaining);
+        } else if (stale || before.some((entry) => !after.includes(entry))) {
+          setStringSequencePreservingComments(doc, path, null);
+        }
       }
     } else {
-      setStringSequencePreservingComments(
-        doc,
-        ["routing", "deny", "adapters"],
-        edited.denyAdapters.length ? sortedUnique(edited.denyAdapters) : null,
-      );
-      setStringSequencePreservingComments(
-        doc,
-        ["routing", "deny", "models"],
-        edited.denyModels.length ? sortedUnique(edited.denyModels) : null,
-      );
+      if (adaptersChanged) {
+        setStringSequencePreservingComments(
+          doc,
+          ["routing", "deny", "adapters"],
+          edited.denyAdapters.length ? sortedUnique(edited.denyAdapters) : null,
+        );
+      }
+      if (modelsChanged) {
+        setStringSequencePreservingComments(
+          doc,
+          ["routing", "deny", "models"],
+          edited.denyModels.length ? sortedUnique(edited.denyModels) : null,
+        );
+      }
     }
   }
 
@@ -412,15 +443,19 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   // operator reviews. commentString has no position context, but this writer owns the document:
   // scalar-trailing single-line comments (the only inline form fleet emits) are marked with a
   // private-use sentinel (the FIRST_TOUCH envelope precedent above), everything else renders
-  // byte-identical to yaml's own stringifyComment.
+  // byte-identical to yaml's own stringifyComment. OBS-1046: a scalar parsed from the prior bytes
+  // keeps the exact whitespace it had before its hash sign (yaml itself emits one space, so the
+  // sentinel carries the rest); only a comment fleet authored gets the two-space style.
   visit(doc, (_key, node) => {
     if (isScalar(node) && typeof node.comment === "string" && !node.comment.includes("\n")) {
-      node.comment = `${INLINE_COMMENT_SENTINEL}${node.comment}`;
+      const tail = node.range ? priorBytes.slice(node.range[1], node.range[2]) : "";
+      const gap = /^([ \t]+)#/.exec(tail)?.[1] ?? "  ";
+      node.comment = `${INLINE_COMMENT_SENTINEL}${gap.slice(1)}#${node.comment}`;
     }
   });
   return doc.toString({
     commentString: (comment) => comment.startsWith(INLINE_COMMENT_SENTINEL)
-      ? ` #${comment.slice(1)}`
+      ? comment.slice(1)
       : comment.replace(/^(?!$)(?: $)?/gm, "#"),
     // OBS-518: yaml's default pads flow collections (`[kimi]` → `[ kimi ]`), churning untouched
     // lines on the one confirmation surface an operator reviews. Hand-written overlays use the
@@ -443,7 +478,8 @@ export function fleetRepoOverlayFromDelta(
   let routingTouched = false;
   const denyChanged =
     sortedUnique(initial.denyAdapters).join() !== sortedUnique(edited.denyAdapters).join()
-    || sortedUnique(initial.denyModels).join() !== sortedUnique(edited.denyModels).join();
+    || sortedUnique(initial.denyModels).join() !== sortedUnique(edited.denyModels).join()
+    || sortedUnique(initial.allowOut ?? []).join() !== sortedUnique(edited.allowOut ?? []).join();
   if (denyChanged) {
     if (universe) {
       const form = allowFormFromExclusions(universe, edited);

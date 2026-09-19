@@ -344,7 +344,6 @@ describe("v2.0 calibrated gate inactivity policy", () => {
       adapters: [worker, primary, retry],
       cfg,
       via: gateVia(driver),
-      pipeline: "v185",
       onGate: (event) => { events.push(event); },
     });
 
@@ -403,7 +402,6 @@ describe("v2.0 calibrated gate inactivity policy", () => {
       adapters: [primary, retry],
       cfg,
       via: gateVia(driver),
-      pipeline: "v185",
       onGate: (event) => { events.push(event); },
     });
 

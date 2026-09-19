@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { execFileSync, execSync } from "node:child_process";
@@ -8,6 +8,7 @@ import {
   getWorktreeTree,
   getVerdictStore,
   computeVerificationIdentity,
+  environmentFingerprint,
   verificationIdentityKey,
   resetVerdictCacheBoundForTests,
   setVerdictCacheBoundForTests,
@@ -19,7 +20,7 @@ import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
-import { gitHead, resolvedCapacity, runWithVerificationBudget } from "../../src/run/git.js";
+import { gitHead, resolvedCapacity, runWithVerificationBudget, sameVerification, VERIFICATION_PROTOCOL, verificationProtocol } from "../../src/run/git.js";
 import { verify } from "../../src/cli/commands/verify.js";
 import { resetApprovalWindowForTests, runDaemon, setApprovalWindowForTests, verifyIntegrationTipCached } from "../../src/run/daemon.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
@@ -79,7 +80,7 @@ async function assertScopeRedPolicies(): Promise<void> {
     worktree: repo, baseRef, commands: { test: "sh check.sh" }, baseline: { commands: { test: { exitCode: 0, fingerprints: [] } } },
     author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" } as const,
     result: { ok: true, summary: "", deviations: [], raw: "" },
-    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), pipeline: "v185" as const, selectTests: true,
+    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), selectTests: true,
   };
   const first = await runGates(task, ctx);
   expect(first.results.find((r) => r.gate === "test")).toMatchObject({ pass: false, meta: { fullSuite: true } });
@@ -132,7 +133,7 @@ async function signalCacheFixture(selectTests: boolean, outcome = "exit 137") {
     baseline: { commands: { test: { exitCode: 0, fingerprints: [] } } },
     author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
     result: { ok: true, summary: "", deviations: [], raw: "" },
-    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), pipeline: "v185", selectTests,
+    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), selectTests,
     stateDir: makeTestTempDir("tickmarkr-signal-cache-"),
   };
   const store = getVerdictStore(ctx.stateDir!);
@@ -255,7 +256,7 @@ describe("VC-1 verdict cache", () => {
       worktree: repo, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline, channels: [], adapters: [adapter], cfg,
     });
 
     const b1 = round1.results.find((r) => r.gate === "build")!;
@@ -272,7 +273,7 @@ describe("VC-1 verdict cache", () => {
       worktree: repo, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline, channels: [], adapters: [adapter], cfg,
       onGate: (e) => { if (e.phase === "note" && e.name === "gate-reused-verdict") notes.push(e.payload); },
     });
 
@@ -309,7 +310,7 @@ describe("VC-1 verdict cache", () => {
       worktree: repo, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline, channels: [], adapters: [adapter], cfg,
     });
     const logTree = readFileSync(logPath, "utf8").trim().split("\n");
     expect(logTree.length).toBeGreaterThan(2);
@@ -323,7 +324,7 @@ describe("VC-1 verdict cache", () => {
       worktree: repo, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands: changedCommands, baseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands: changedCommands, baseline, channels: [], adapters: [adapter], cfg,
     });
     expect(readFileSync(logPath, "utf8")).toContain("build2");
 
@@ -337,7 +338,7 @@ describe("VC-1 verdict cache", () => {
       worktree: repo, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline: changedBaseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline: changedBaseline, channels: [], adapters: [adapter], cfg,
     });
     const logBase = readFileSync(logPath, "utf8").trim().split("\n");
     expect(logBase).toHaveLength(logTree.length + 4);
@@ -351,7 +352,7 @@ describe("VC-1 verdict cache", () => {
       worktree: repo, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline: changedBaseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline: changedBaseline, channels: [], adapters: [adapter], cfg,
     });
     const logLock = readFileSync(logPath, "utf8").trim().split("\n");
     expect(logLock).toHaveLength(logBase.length + 2);
@@ -364,7 +365,7 @@ describe("VC-1 verdict cache", () => {
         worktree: repo, baseRef,
         author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
         result: { ok: true, summary: "", deviations: [], raw: "" },
-        commands, baseline: changedBaseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+        commands, baseline: changedBaseline, channels: [], adapters: [adapter], cfg,
       });
     });
     const logCap = readFileSync(logPath, "utf8").trim().split("\n");
@@ -507,7 +508,7 @@ gates:
       worktree: taskWorktree, baseRef, artifactDir: tipJournal.dir,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline, channels: [], adapters: [adapter], cfg,
     });
     expect(runResult.results.every((r) => r.pass)).toBe(true);
     const countAfterRun = readFileSync(marker, "utf8").trim().split("\n").length;
@@ -549,14 +550,14 @@ gates:
       worktree: taskWorktree, baseRef, artifactDir: tipJournal.dir,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline, channels: [], adapters: [adapter], cfg,
     });
     // b) merge-candidate full suite reuses the run's verdict
     const selectScreen = await runGates(task, {
       worktree: taskWorktree, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels: [], adapters: [adapter], cfg, pipeline: "v185",
+      commands, baseline, channels: [], adapters: [adapter], cfg,
       selectTests: true,
     });
     const fullGate = selectScreen.results.find((r) => r.gate === "test")!;
@@ -690,4 +691,107 @@ test("tip verification reuses a manifested full-suite green recorded in tip scop
   expect(hit!.pass).toBe(true);
   expect(hit!.details).toContain("reused tip verdict (identity:");
   expect(hit!.reportPath).toBe("recorded-report.json");
+});
+
+// R41: run one battery under an explicit process-scoped npm lifecycle policy, restoring the fork's env after.
+async function underLifecycle<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env.npm_config_ignore_scripts;
+  if (value === undefined) delete process.env.npm_config_ignore_scripts; else process.env.npm_config_ignore_scripts = value;
+  try { return await fn(); } finally {
+    if (prior === undefined) delete process.env.npm_config_ignore_scripts; else process.env.npm_config_ignore_scripts = prior;
+  }
+}
+
+test("the verification identity binds the protocol and the effective runner lifecycle policy: through runGates a green test verdict recorded under an explicit lifecycle hooks is reused by the next battery under hooks with its row naming protocol, lifecycle and source and is re-run under ignore-scripts, a red work verdict recorded under hooks is likewise reused under hooks and re-run under ignore-scripts, with no explicit export the policy is measured from npm's resolved config so rewriting the user npmrc between batteries re-runs the command while an explicit export naming the same effective policy reuses it, an unmeasurable policy is never stored, answered or compatible with itself, the environment fingerprint differs between two protocols or two lifecycles over otherwise identical parts and names both in its parts, and a stored record whose environment predates the stamp never answers the stamped identity, so a cache that reuses a verdict across protocols or effective lifecycles, a reuse that hides them, an unknown policy treated as comparable, or a pre-stamp entry answering a stamped lookup fails", async () => {
+  for (const outcome of ["exit 0", "echo 'AssertionError: expected 1 to be 2'; exit 1"]) {
+    const { task, ctx, store, calls } = await signalCacheFixture(false, outcome);
+    const battery = () => runGates(task, ctx);
+    const first = await underLifecycle("false", battery);
+    const firstTest = first.results.find((r) => r.gate === "test")!;
+    expect(firstTest.pass).toBe(outcome === "exit 0");
+    expect(firstTest.meta?.reused).toBeUndefined();
+    expect(calls()).toEqual(["full"]);
+    expect(store.size()).toBe(1);
+
+    const second = await underLifecycle("false", battery);
+    const secondTest = second.results.find((r) => r.gate === "test")!;
+    expect(secondTest.meta?.reused).toBe(true);
+    expect(String(secondTest.meta?.reusedDetails)).toMatch(new RegExp(`protocol=${VERIFICATION_PROTOCOL}, lifecycle=hooks \\(explicit\\)\\]`));
+    expect((secondTest.meta!.verificationIdentity as Record<string, unknown>).environment)
+      .toBe((await computeVerificationIdentity({ worktree: ctx.worktree, gate: "test", command: ctx.commands.test!, baseline: ctx.baseline,
+        capacity: resolvedCapacity(), verification: { protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" } }))!.environment);
+    expect(calls()).toEqual(["full"]);
+
+    const third = await underLifecycle("true", battery);
+    const thirdTest = third.results.find((r) => r.gate === "test")!;
+    expect(thirdTest.meta?.reused).toBeUndefined();
+    expect(calls()).toEqual(["full", "full"]);
+    expect(store.size()).toBe(2);
+  }
+
+  // The EFFECTIVE policy, not the env: with no explicit export the identity is measured from npm's
+  // resolved config for the checkout, so rewriting the user npmrc between two batteries — no env
+  // change, no tree change — re-runs the command, and an unmeasurable policy never caches at all.
+  {
+    const { task, ctx, store, calls } = await signalCacheFixture(false, "exit 0");
+    const battery = () => runGates(task, ctx);
+    const userconfig = join(makeTestTempDir("tickmarkr-npmrc-"), "npmrc");
+    const setNpmrc = (body: string, mtimeSeconds: number) => { writeFileSync(userconfig, body); utimesSync(userconfig, mtimeSeconds, mtimeSeconds); };
+    const priorUser = process.env.NPM_CONFIG_USERCONFIG;
+    process.env.NPM_CONFIG_USERCONFIG = userconfig;
+    try {
+      setNpmrc("ignore-scripts=true\n", 1_700_000_000);
+      const measuredIgnore = await underLifecycle(undefined, battery);
+      const m1 = measuredIgnore.results.find((r) => r.gate === "test")!;
+      expect(m1.meta?.reused).toBeUndefined();
+      expect(await underLifecycle(undefined, async () => verificationProtocol(process.env, ctx.worktree))).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle: "ignore-scripts", source: "npm-config" });
+      const measuredAgain = await underLifecycle(undefined, battery);
+      expect(measuredAgain.results.find((r) => r.gate === "test")!.meta?.reused).toBe(true);
+      expect(String(measuredAgain.results.find((r) => r.gate === "test")!.meta?.reusedDetails)).toMatch(/lifecycle=ignore-scripts \(npm-config\)\]/);
+      expect(calls()).toEqual(["full"]);
+      setNpmrc("ignore-scripts=false\n", 1_700_000_100);
+      expect(await underLifecycle(undefined, async () => verificationProtocol(process.env, ctx.worktree))).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "npm-config" });
+      const measuredHooks = await underLifecycle(undefined, battery);
+      expect(measuredHooks.results.find((r) => r.gate === "test")!.meta?.reused).toBeUndefined();
+      expect(calls()).toEqual(["full", "full"]);
+      // An explicit export names the same effective policy as the npmrc: the two are one identity.
+      const explicitHooks = await underLifecycle("false", battery);
+      expect(explicitHooks.results.find((r) => r.gate === "test")!.meta?.reused).toBe(true);
+      expect(calls()).toEqual(["full", "full"]);
+      expect(store.size()).toBe(2);
+    } finally {
+      if (priorUser === undefined) delete process.env.NPM_CONFIG_USERCONFIG; else process.env.NPM_CONFIG_USERCONFIG = priorUser;
+    }
+    // Unknown is never compatible — not with a matching unknown, not with anything.
+    const unknown = { protocol: VERIFICATION_PROTOCOL, lifecycle: "unknown" as const, source: "unknown" as const };
+    expect(sameVerification(unknown, unknown)).toBe(false);
+    expect(sameVerification({ protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" }, unknown)).toBe(false);
+    expect(sameVerification({ protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "npm-config" }, { protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" })).toBe(true);
+    expect(sameVerification(undefined, { protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" })).toBe(false);
+    const unknownId = { ...(await computeVerificationIdentity({ worktree: ctx.worktree, gate: "test", command: ctx.commands.test!, baseline: ctx.baseline,
+      capacity: resolvedCapacity(), verification: unknown }))! };
+    expect(store.set(unknownId, { gate: "test", pass: true, details: "exit 0" })).toBe(false);
+    expect(store.get(unknownId)).toBeUndefined();
+  }
+
+  const parts = { nodeRuntime: "v1", lockfile: "l", capacity: { forkCap: 2, cores: 4 } };
+  const current = environmentFingerprint(parts);
+  expect(current.parts.verification).toEqual(verificationProtocol());
+  const otherProtocol = environmentFingerprint({ ...parts, verification: { ...verificationProtocol(), protocol: "vl1.1" } });
+  const otherLifecycle = environmentFingerprint({ ...parts, verification: { protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" } });
+  const sameAgain = environmentFingerprint({ ...parts, verification: verificationProtocol() });
+  expect(otherProtocol.fingerprint).not.toBe(current.fingerprint);
+  expect(otherLifecycle.fingerprint).not.toBe(environmentFingerprint({ ...parts, verification: { protocol: VERIFICATION_PROTOCOL, lifecycle: "ignore-scripts", source: "explicit" } }).fingerprint);
+  expect(sameAgain.fingerprint).toBe(current.fingerprint);
+
+  // A record written before the stamp keys on an environment fingerprint computed without it: the
+  // stamped identity never resolves to that file, green or red, and nothing has to be deleted.
+  const { ctx: legacyCtx, store: legacyStore, identity } = await signalCacheFixture(false, "exit 0");
+  const preStamp = { ...identity, environment: "0123456789abcdef", envParts: undefined };
+  expect(legacyStore.set(preStamp, { gate: "test", pass: true, details: "exit 0" })).toBe(true);
+  expect(legacyStore.set({ ...preStamp, gate: "lint" }, { gate: "lint", pass: false, details: "AssertionError: legacy red" })).toBe(true);
+  expect(legacyStore.get(identity)).toBeUndefined();
+  expect(legacyStore.get({ ...identity, gate: "lint" })).toBeUndefined();
+  expect(legacyStore.get(preStamp)?.pass).toBe(true);
+  expect(legacyCtx.stateDir).toBeTruthy();
 });

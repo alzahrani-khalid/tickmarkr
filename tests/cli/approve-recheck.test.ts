@@ -37,15 +37,15 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     expect(j.replayStatuses().get("T1")).toBe("pending");
   });
 
-  test("recheck zeros the attempt budget, so a cap-exhausted task can actually re-dispatch", async () => {
+  test("recheck preserves the attempt budget and the tried list — it funds no attempt (OBS-1028)", async () => {
     const { repo } = setupRepo([T("T1")], { tasks: {} });
-    const j = scopeParkedRun(repo, "run-recheck-budget", 14);
-    expect(j.replayResumeState().get("T1")?.attempts).toBe(14);
+    const j = scopeParkedRun(repo, "run-recheck-budget", 6);
+    expect(j.replayResumeState().get("T1")?.attempts).toBe(6);
 
     await approve(["run-recheck-budget", "T1", "--recheck"], repo);
 
     const rs = j.replayResumeState().get("T1");
-    expect(rs?.attempts).toBe(0);
+    expect(rs?.attempts).toBe(6); // the ladder is NOT reset by a verb that marks no gate satisfied
     expect(rs?.tried).toEqual(["fake:fake-1"]); // burned channels are NOT forgotten
   });
 
@@ -56,7 +56,7 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     j.append("task-human", "T1", { kind: "reroute-exhausted", reason: "every channel demoted" });
 
     await expect(approve(["run-recheck-refuse", "T1", "--recheck"], repo))
-      .rejects.toThrow(/--recheck applies to a gate-fail or infra park/);
+      .rejects.toThrow(/--recheck applies to a gate-fail, infra or diff-cap park/);
     expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
   });
 

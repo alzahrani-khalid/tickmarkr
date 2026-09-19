@@ -424,10 +424,10 @@ describe("tickmarkr fleet", () => {
     );
     expect(out).toMatch(/^fleet: wrote /);
     const routing = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).routing;
-    // whole fleet out: allow stays present but EMPTY (fail-closed, nothing admitted) and the
-    // legacy deny scopes are null-tombstoned so no lower layer re-excludes behind the operator
+    // whole fleet out: allow stays present but EMPTY (fail-closed, nothing admitted); OBS-1046:
+    // an addition the allow form carries writes no deny tombstone — the absent scopes stay absent
     expect(routing.allow).toEqual({});
-    expect(routing.deny).toEqual({ adapters: null, models: null });
+    expect(routing.deny).toBeUndefined();
   });
 
   test("the interactive loop renders through the declarative component runtime and no surface in this task hand-writes cursor-movement escape sequences", () => {
@@ -1621,7 +1621,8 @@ review:
     expect(aPicker).toContain("fake:fake-2");
     expect(aPicker).not.toContain("fake:fake-1");
     expect(parsedOverlay(a.repo).routing.allow).toEqual({ models: ["fake:fake-2"] });
-    expect(parsedOverlay(a.repo).routing.deny).toEqual({ adapters: null, models: null });
+    // OBS-1046: an addition rides the allow form alone — no deny tombstone for a scope never touched
+    expect(parsedOverlay(a.repo).routing.deny).toBeUndefined();
     // a DISK-excluded model (allow form, fail-closed complement) toggled back IN this session
     // reappears in the picker — the preview pool is discovered membership-blind, so the startup
     // scopes can't lie until restart — and the whole-fleet-in write removes the allow block
@@ -2338,13 +2339,14 @@ review:
   // ── OBS-524: the review diff scrolls — the operator can read everything they approve ──
   test("a review diff taller than the window scrolls with the arrow keys instead of hiding its tail forever", async () => {
     const { repo, adapter } = setup();
+    withOverlay(repo, TWO_CLASSIFIED);
     const io = makeIO();
     io.output.rows = 18; // viewRows = max(8, 18-12) = 8 → review window 9 rows
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
-    // OBS-994/FL-1: two presses reach out(all) — the all-seats membership toggle this test's
-    // allow-form + tombstones diff (> 9 lines) targets; one press alone only stages the much
-    // smaller workers-only scope.
-    io.input.write(KEYS.space + KEYS.space + KEYS.w);
+    // OBS-994/FL-1: a workers-only press on one classified row plus two presses (out all) on the
+    // next stage a workers deny block AND the allow form — a diff taller than the 9-row window
+    // (OBS-1046: an addition writes no deny tombstones, so one scope alone no longer overflows it).
+    io.input.write(KEYS.space + KEYS.down + KEYS.space + KEYS.space + KEYS.w);
     await settle(() => strip(io.writes.join("")).includes("review · "));
     const first = strip(io.writes.at(-1)!);
     expect(first).toMatch(/… \d+ below — ↓ scrolls/);

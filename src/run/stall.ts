@@ -68,6 +68,40 @@ function parsePsCpu(raw: string): { ms: number; frac: boolean } | undefined {
   return { ms, frac: m[4]!.includes(".") };
 }
 
+/** The dispatch shell records its foreground group in an attempt-unique artifact. */
+export function readOwnedProcessGroup(path: string): number | undefined {
+  try {
+    const raw = readFileSync(path, "utf8").trim();
+    const group = /^\d+$/.test(raw) ? Number(raw) : 0;
+    return Number.isSafeInteger(group) && group > 1 ? group : undefined;
+  } catch { return undefined; }
+}
+
+/** Never infer ownership from a task name or scan another attempt's marker when reaping. */
+export async function reapOwnedProcessGroup(group: number | undefined, cwd: string): Promise<number[] | null> {
+  if (group === undefined) return null;
+  const own = await shGit(`ps -o pgid= -p ${process.pid}`, cwd, 5_000);
+  // An in-process driver fixture (or a non-isolating host) can share the daemon's
+  // group. It is not an owned worker group: let the driver's close retire that slot.
+  if (own.code !== 0 || !/^\d+$/.test(own.stdout.trim()) || Number(own.stdout.trim()) === group) return null;
+  try { process.kill(-group, "SIGKILL"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+  let survivors: number[] = [];
+  // SIGKILL delivery and process retirement are asynchronous. Bound the confirmation
+  // grace, retaining names if a process is still present after it.
+  for (let probe = 0; probe < 5; probe++) {
+    const snapshot = await shGit("ps -Awwo pid=,pgid=,stat=", cwd, 5_000);
+    if (snapshot.code !== 0) return null;
+    survivors = snapshot.stdout.split("\n").flatMap((line) => {
+      const row = /^\s*(\d+)\s+(\d+)\s+(\S+)/.exec(line);
+      return row && Number(row[2]) === group && !row[3]!.startsWith("Z") ? [Number(row[1])] : [];
+    });
+    if (survivors.length === 0) break;
+    if (probe < 4) await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return survivors;
+}
+
 interface WorkerTreeCpuSnapshot {
   processes: Map<string, number>;
   resolutionMs: number;
@@ -100,7 +134,7 @@ function linuxProcessCpuMs(pid: string, cwd: string): Promise<{ ms: number; reso
 // Every non-seeded worker process descends from its attempt-unique dispatch script. One ps snapshot
 // finds that root and its descendants. An empty tree is measurable zero; a failed or unparseable
 // snapshot is undefined because missing evidence can never prove inactivity.
-async function workerTreeCpuSnapshot(marker: string, cwd: string): Promise<WorkerTreeCpuSnapshot | undefined> {
+async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number): Promise<WorkerTreeCpuSnapshot | undefined> {
   const snapshot = await shGit("ps -Awwo pid=,ppid=,time=,command=", cwd, 15_000);
   if (snapshot.code !== 0) return undefined;
   const rows: { pid: string; ppid: string; cpuMs: number; frac: boolean; cmd: string }[] = [];
@@ -112,6 +146,14 @@ async function workerTreeCpuSnapshot(marker: string, cwd: string): Promise<Worke
   }
   if (rows.length === 0) return undefined;
   const tree = new Set(rows.filter((p) => p.cmd.includes(marker)).map((p) => p.pid));
+  if (group !== undefined) {
+    const groups = await shGit("ps -Awwo pid=,pgid=", cwd, 15_000);
+    if (groups.code !== 0) return undefined;
+    for (const line of groups.stdout.split("\n")) {
+      const row = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (row && Number(row[2]) === group) tree.add(row[1]!);
+    }
+  }
   // ps output is not topologically ordered; relax the parent -> child closure until stable.
   for (let grew = true; grew;) {
     grew = false;
@@ -164,10 +206,10 @@ export class WorkerTreeCpuAccountant {
   private consecutiveGaps = 0;
   private latest: { ms: number; resolutionMs: number } | undefined;
 
-  constructor(private marker: string, private cwd: string) {}
+  constructor(private marker: string, private cwd: string, private group?: () => number | undefined) {}
 
   private async sample(): Promise<void> {
-    const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd);
+    const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd, this.group?.());
     if (snapshot === undefined) {
       this.gaps++;
       this.live.clear();

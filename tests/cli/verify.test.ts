@@ -160,6 +160,8 @@ describe("tickmarkr verify — standalone gate battery", () => {
       detectGateCommands: vi.fn(() => ({})),
       captureBaseline: vi.fn(async () => ({})),
     }));
+    // The fixture is a bare temp dir, not a repository: the lease keys on the common git dir.
+    vi.doMock("../../src/run/lease.js", () => ({ withRepositoryLease: vi.fn(async (_cwd: string, run: () => Promise<unknown>) => run()) }));
     vi.doMock("../../src/gates/run-gates.js", () => ({
       runGates: vi.fn(async (_task: unknown, ctx: { onGate?: (e: unknown) => void | Promise<void> }) => {
         await ctx.onGate?.({ phase: "note", gate: "review", name: "reviewer-empty-output", payload: { reviewer: "fake:m", bytes: 1 }, result: { gate: "review", pass: false, details: "note" } });
@@ -177,6 +179,7 @@ describe("tickmarkr verify — standalone gate battery", () => {
       vi.doUnmock("../../src/run/git.js");
       vi.doUnmock("../../src/gates/baseline.js");
       vi.doUnmock("../../src/gates/run-gates.js");
+      vi.doUnmock("../../src/run/lease.js");
       vi.resetModules();
     }
   });

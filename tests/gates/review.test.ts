@@ -785,7 +785,7 @@ describe("reviewGate", () => {
     expect(r.details).toMatch(/diff exceeds verifiable cap/i);
     expect(r.details).toMatch(/split the task/i);
     expect(r.details).toMatch(/raise gates\.diffCap/i);
-    expect(r.meta).toEqual({ park: "human" });
+    expect(r.meta).toMatchObject({ parkKind: "diff-cap", permittedBytes: 1 });
     expect(calls).toBe(0);
   });
 
@@ -1020,7 +1020,6 @@ test("test: an approval whose resolved list names every carried fingerprint pass
     [[], [], [carriedMaterials[0]]],
     [undefined, undefined, carriedMaterials],
     [ids, [ids[0]], carriedMaterials],
-    [[...ids, "unknown"], [], carriedMaterials],
     ["garbage", [], carriedMaterials],
   ] as const) {
     const invalid = await run(resolved, reraised, [...carried]);
@@ -1028,6 +1027,12 @@ test("test: an approval whose resolved list names every carried fingerprint pass
     expect(invalid.meta?.unparseable).toBe(true);
     expect(invalid.meta?.cause).toBe("malformed-verdict");
   }
+  // OBS-1013 add.3: an echoed id that matches no carried fingerprint is a closure mismatch — a
+  // no-verdict about the materials that re-routes, never a parse defect that buys a worker.
+  const mismatch = await run([...ids, "unknown"], [], [...carriedMaterials]);
+  expect(mismatch.pass).toBe(false);
+  expect(mismatch.meta).toMatchObject({ cause: "closure-mismatch", noVerdict: true, infra: true, classification: "infra" });
+  expect(mismatch.meta?.unparseable).toBeUndefined();
 });
 
 test("reviewer failover receives the same carried materials and must close them", async () => {
@@ -1175,8 +1180,9 @@ test("test: an approval whose resolved id equals a carried fingerprint with one 
   })).results[0]!;
 
   expect(failing.pass).toBe(false);
-  expect(failing.meta?.unparseable).toBe(true);
-  expect(failing.meta?.cause).toBe("malformed-verdict");
+  // OBS-1013 add.3: an id off by one letter is a closure MISMATCH (a no-verdict that re-routes), not unparseable.
+  expect(failing.meta?.unparseable).toBeUndefined();
+  expect(failing.meta).toMatchObject({ cause: "closure-mismatch", noVerdict: true, infra: true });
 
   // So a closure match that requires the verbatim string fails:
   const verbatimMatch = [dropped].every((id) => carried.map((f) => f.fingerprint).includes(id));

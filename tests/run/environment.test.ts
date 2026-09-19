@@ -31,6 +31,50 @@ async function runAndReadEnvironment(repo: string, adapters: WorkerAdapter[], ru
 }
 
 describe("run-start environment identity (fake adapter, zero tokens)", () => {
+  test("records resolved policy and CLI overrides on start and changed policy on resume without rewriting history", async () => {
+    const { repo, fake } = setupRepo([T("T1")], oneTask("T1"),
+      "concurrency: 3\ndriver: auto\nreview:\n  timeoutMs: 1234\n");
+    const runId = "run-policy-sessions";
+    await runDaemon(repo, { adapters: [fake], runId, concurrency: 2 });
+    const journal = Journal.open(repo, runId);
+    const original = journal.read().find((e) => e.event === "run-start")!;
+    expect(original.data.effectivePolicy).toMatchObject({
+      config: { concurrency: 3, driver: "auto", review: { timeoutMs: 1234 } },
+      concurrency: 2, driver: "subprocess", commands: original.data.commands,
+    });
+    expect(original.data.distFingerprint).toMatch(/^[0-9a-f]{64}$/);
+
+    const configPath = join(repo, ".tickmarkr/config.yaml");
+    writeFileSync(configPath, readFileSync(configPath, "utf8").replace("1234", "2345"));
+    await runDaemon(repo, { adapters: [fake], runId, resume: true, concurrency: 1 });
+    const events = journal.read();
+    const resumed = events.find((e) => e.event === "run-resume")!;
+    expect(resumed.data.effectivePolicy).toMatchObject({
+      config: { concurrency: 3, review: { timeoutMs: 2345 } },
+      concurrency: 1, driver: "subprocess", commands: original.data.commands,
+    });
+    expect((resumed.data.environment as RunEnvironment).configHash)
+      .not.toBe((original.data.environment as RunEnvironment).configHash);
+    expect(resumed.data.distFingerprint).toBe(original.data.distFingerprint);
+    expect(resumed.data.mode).toBe(original.data.mode);
+    expect(events.find((e) => e.event === "run-start")).toEqual(original);
+    expect(events.filter((e) => e.event === "task-dispatch")).toHaveLength(1);
+  });
+
+  test("policy snapshots use journal credential redaction without changing executable configuration", async () => {
+    const secret = "sk-proj-pilotfixture123456";
+    const { repo, fake } = setupRepo([T("T1")], oneTask("T1"),
+      `setup: 'API_KEY=${secret} true'\n`);
+    const runId = "run-policy-redaction";
+    await runDaemon(repo, { adapters: [fake], runId });
+    const journal = Journal.open(repo, runId);
+    const original = journal.read().find((e) => e.event === "run-start")!;
+    expect(JSON.stringify(original.data.effectivePolicy)).not.toContain(secret);
+    expect(JSON.stringify(original.data.effectivePolicy)).toContain("[REDACTED]");
+    expect(readFileSync(join(repo, ".tickmarkr/config.yaml"), "utf8")).toContain(secret);
+    expect(journal.read().find((e) => e.event === "run-end")!.data.done).toEqual(["T1"]);
+  });
+
   test("test: the run-start event records the running tickmarkr version", async () => {
     const { repo, fake } = setupRepo([T("T1")], oneTask("T1"));
     const env = await runAndReadEnvironment(repo, [fake], "run-env-tickmarkr-version");

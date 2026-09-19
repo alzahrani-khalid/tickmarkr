@@ -138,7 +138,7 @@ describe("diff cap — OBS-134 deletion facts", () => {
 describe("diff cap — shared implementation", () => {
   test("acceptance and review import the same checkDiffCap", () => {
     const fail = checkDiffCap("acceptance", 70_000, CAP);
-    expect(fail?.meta).toEqual({ park: "human" });
+    expect(fail?.meta).toMatchObject({ parkKind: "diff-cap", measuredBytes: 70_000, permittedBytes: CAP });
     expect(checkDiffCap("review", CAP, CAP)).toBeNull();
   });
 
@@ -167,7 +167,7 @@ describe("diff cap — shared implementation", () => {
 describe("diff cap — park('human') policy", () => {
   test("cap trip carries park meta and the remedy message", () => {
     const fail = checkDiffCap("acceptance", 80_728, 60_000)!;
-    expect(fail.meta).toEqual({ park: "human" });
+    expect(fail.meta).toMatchObject({ parkKind: "diff-cap", measuredBytes: 80_728, permittedBytes: 60_000 });
     expect(fail.details).toMatch(/split the task/i);
     expect(fail.details).toMatch(/raise gates\.diffCap/i);
   });
@@ -185,6 +185,15 @@ describe("diff cap — park('human') policy", () => {
     expect(stepsTaken).toEqual([]);
   });
 
+  test("an untyped human park is not accepted as a diff-cap park", () => {
+    expect(isDiffCapPark({
+      gate: "acceptance",
+      pass: false,
+      details: "diff exceeds verifiable cap (2 > 1)",
+      meta: { park: "human", measuredBytes: 2, permittedBytes: 1 },
+    })).toBe(false);
+  });
+
   test("the separate capture cap is finite and uses the same human-park lifecycle", () => {
     const captureCap = captureDiffCapFor(CAP);
     const fail = checkTaskDiffCaps(
@@ -196,6 +205,74 @@ describe("diff cap — park('human') policy", () => {
     expect(isDiffCapPark(fail)).toBe(true);
     expect(diffCapParkReason([fail])).toBe(fail.details);
   });
+});
+
+test("test: a diff one byte over the cap yields a review and an acceptance result whose meta names the park kind diff-cap with the measured and permitted bytes and no judge or reviewer is dispatched, while a diff at the cap dispatches both, so a cap trip that reaches a seat or carries an untyped park fails", async () => {
+  const repo = makeRepo({ "README.md": "# repo\n" });
+  const base = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+  writeFileSync(join(repo, "work.txt"), "hello world\n");
+  execSync("git add work.txt && git commit -m 'worker commit'", { cwd: repo });
+
+  const measured = await fetchTaskDiff(repo, base);
+  const logicBytes = measured.logicBytes;
+
+  let judgeDispatches = 0;
+  let reviewDispatches = 0;
+  const fakeJudge = fakeWith({
+    pass: true,
+    criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: { path: "work.txt", line: 1 } }],
+  });
+  const origJudgeHeadless = fakeJudge.headlessCommand.bind(fakeJudge);
+  fakeJudge.headlessCommand = async (...args) => {
+    judgeDispatches++;
+    return origJudgeHeadless(...args);
+  };
+
+  const fakeReview = fakeWith({
+    nonce: "test",
+    approve: true,
+    resolved: [],
+    reraised: [],
+    findings: [],
+    comments: [],
+  });
+  const origReviewHeadless = fakeReview.headlessCommand.bind(fakeReview);
+  fakeReview.headlessCommand = async (...args) => {
+    reviewDispatches++;
+    return origReviewHeadless(...args);
+  };
+
+  // Case 1: a diff one byte over the cap
+  const capOver = logicBytes - 1;
+  const accOver = await acceptanceGate(judgeTask, repo, base, { adapter: fakeJudge, model: "fake-1" }, undefined, { diffCap: capOver });
+  expect(accOver.pass).toBe(false);
+  expect(accOver.meta).toMatchObject({
+    parkKind: "diff-cap",
+    measuredBytes: logicBytes,
+    permittedBytes: capOver,
+  });
+  expect(judgeDispatches).toBe(0);
+
+  const revOver = await reviewGate(reviewTask, repo, base, AUTHOR, CHANNELS, [fakeReview], reviewCfg(capOver));
+  expect(revOver.pass).toBe(false);
+  expect(revOver.meta).toMatchObject({
+    parkKind: "diff-cap",
+    measuredBytes: logicBytes,
+    permittedBytes: capOver,
+  });
+  expect(reviewDispatches).toBe(0);
+
+  // Negative control: an untyped park (e.g. without parkKind: diff-cap) fails
+  expect(accOver.meta?.parkKind).toBe("diff-cap");
+  expect(revOver.meta?.parkKind).toBe("diff-cap");
+
+  // Case 2: a diff at the cap dispatches both
+  const capAt = logicBytes;
+  const _accAt = await acceptanceGate(judgeTask, repo, base, { adapter: fakeJudge, model: "fake-1" }, undefined, { diffCap: capAt });
+  expect(judgeDispatches).toBe(1);
+
+  const _revAt = await reviewGate(reviewTask, repo, base, AUTHOR, CHANNELS, [fakeReview], reviewCfg(capAt));
+  expect(reviewDispatches).toBe(1);
 });
 
 // ---------------------------------------------------------------------------

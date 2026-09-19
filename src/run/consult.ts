@@ -214,10 +214,11 @@ export async function consult(
       const r = await sh(adapter.headlessCommand(promptFile, seatModel), cwd, cfg.consult.stallMinutes * 60_000);
       out = r.stdout + r.stderr;
     } else {
-      // Preserve the adapter contract for CLIs that cannot seed their TUI: supported adapters use
-      // the interactive form, while a declared null keeps the existing visible print fallback.
-      const command = adapter.interactiveCommand(promptFile, seatModel)
-        ?? adapter.headlessCommand(promptFile, seatModel);
+      // OBS-1009: the pane runs the HEADLESS command. A seeded interactive session answers on screen
+      // but never exits, so the exit trailer after it never runs, the wait runs to the stall cap and
+      // the 300-line read is a TUI frame. The headless command exits, the trailer prints, and the
+      // pane is harvested through dewrap exactly like a judge or review seat.
+      const command = adapter.headlessCommand(promptFile, seatModel);
       // T8: role-first pane name for fleet visibility (consult · T2); consultSeq stays on the dossier artifact only
       const slot = await driver.slot(cwd, gatePaneName("consult", d.taskId), {
         label: `CONSULT ${d.taskId}`,

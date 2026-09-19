@@ -137,6 +137,11 @@ export interface FakeTerminalSpec {
   waitConditions?: string[];
   /** Result source for `read --screen`. Default "screen"; stream reads always report "stream". */
   screenSource?: "screen" | "screen-unavailable";
+  /** OBS-1011 add.1: the rendered frame can disagree with the cursor stream on a live terminal — the
+   *  stream answers `exited` with an empty tail while `--screen` still reports running and paints the
+   *  trailer. Absent: the screen reports the stream's status and lines. */
+  screenStatus?: string;
+  screenLines?: string[];
 }
 
 export interface FakeHookStatus {
@@ -187,6 +192,8 @@ export interface FakeOrcaOpts {
    *  Default: an `orca-worktrees` directory beside the repo. */
   worktreeRoot?: string;
   splitReceipt?: Record<string, unknown> | null;
+  /** Prompt stages `send --wait-submit` reports at `result.send.prompt.stages`; absent by default. */
+  sendStages?: string[];
 }
 
 interface FakeTerminal extends FakeTerminalSpec {
@@ -205,7 +212,7 @@ const ALLOWED_FLAGS: Record<string, Set<string>> = {
   create: new Set(["--worktree", "--title", "--command", "--json"]),
   list: new Set(["--worktree", "--include-visual-layouts", "--limit", "--json"]),
   read: new Set(["--terminal", "--cursor", "--screen", "--limit", "--json"]),
-  send: new Set(["--terminal", "--text", "--enter", "--interrupt", "--json"]),
+  send: new Set(["--terminal", "--text", "--enter", "--interrupt", "--wait-submit", "--json"]),
   wait: new Set(["--terminal", "--for", "--timeout-ms", "--json"]),
   show: new Set(["--terminal", "--json"]),
   close: new Set(["--terminal", "--json"]),
@@ -410,16 +417,16 @@ export class FakeOrca {
     });
   }
 
-  private page(t: FakeTerminal, cursor: string | undefined, lines: number): Record<string, unknown> {
-    const total = t.lines.length;
+  private page(all: string[], cursor: string | undefined, lines: number): Record<string, unknown> {
+    const total = all.length;
     const cap = Math.min(Number.isFinite(lines) && lines > 0 ? lines : this.pageSize, this.pageSize);
     if (cursor === undefined) {
       // unpaged tail read: the NEWEST lines, plus the cursor that says where the buffer starts
-      const tail = t.lines.slice(Math.max(0, total - cap));
+      const tail = all.slice(Math.max(0, total - cap));
       return { tail, truncated: tail.length < total, limited: false, oldestCursor: "0", nextCursor: String(total), latestCursor: String(total), returnedLineCount: tail.length };
     }
     const from = Math.max(0, Number(cursor) || 0);
-    const tail = t.lines.slice(from, from + cap);
+    const tail = all.slice(from, from + cap);
     const next = from + tail.length;
     return { tail, truncated: false, limited: next < total, oldestCursor: "0", nextCursor: String(next), latestCursor: String(total), returnedLineCount: tail.length };
   }
@@ -511,6 +518,7 @@ export class FakeOrca {
         return "send --interrupt does not accept text or enter";
       }
       if (!interrupt && flag(args, "--text") === undefined) return "send requires --text";
+      if (args.includes("--wait-submit") && flag(args, "--wait-submit") === undefined) return "send --wait-submit requires seconds";
     }
     if (family === "wait" && !["exit", "tui-idle"].includes(flag(args, "--for") ?? "")) {
       return "wait supports --for exit|tui-idle in this fixture";
@@ -687,13 +695,13 @@ export class FakeOrca {
     if (!t) return this.refusal("terminal_handle_stale", `no such terminal ${handle}`);
     if (family === "read") {
       this.reads.set(handle, (this.reads.get(handle) ?? 0) + 1);
-      const status = this.reportedStatus(t);
       // Recorded read record: handle, status, tail, cursors — no titles, no liveness fields.
       const screen = args.includes("--screen");
+      const status = screen ? (t.screenStatus ?? this.reportedStatus(t)) : this.reportedStatus(t);
       const source = screen ? (t.screenSource ?? "screen") : "stream";
       const page = source === "screen-unavailable"
         ? { tail: [], truncated: false, limited: false, returnedLineCount: 0 }
-        : this.page(t, flag(args, "--cursor"), Number(flag(args, "--limit")));
+        : this.page(screen ? (t.screenLines ?? t.lines) : t.lines, flag(args, "--cursor"), Number(flag(args, "--limit")));
       const rec: Record<string, unknown> = { handle, ...page, source };
       if (status !== "") rec.status = status;
       return this.ok({ terminal: rec });
@@ -717,7 +725,12 @@ export class FakeOrca {
         this.typed.set(handle, [...(this.typed.get(handle) ?? []), text]);
       }
       // Recorded send receipt: accepted + bytesWritten (the trailing newline of --enter included).
-      return this.ok({ send: { handle, accepted: true, bytesWritten: Buffer.byteLength(text, "utf8") + (enter ? 1 : 0) } });
+      return this.ok({ send: {
+        handle, accepted: true, bytesWritten: Buffer.byteLength(text, "utf8") + (enter ? 1 : 0),
+        ...(this.opts.sendStages && flag(args, "--wait-submit") !== undefined
+          ? { prompt: { stages: [...this.opts.sendStages] } }
+          : {}),
+      } });
     }
     if (family === "wait") {
       const condition = flag(args, "--for") ?? "";

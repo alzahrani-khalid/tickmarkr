@@ -6,14 +6,16 @@ import { parseArgs } from "node:util";
 import { allAdapters, probeAll, readDoctor, rolePools } from "../../adapters/registry.js";
 import { channelKey, type Assignment, type BillingChannel } from "../../adapters/types.js";
 import { loadConfig } from "../../config/config.js";
-import { captureBaseline, detectGateCommands, type Baseline } from "../../gates/baseline.js";
+import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline } from "../../gates/baseline.js";
 import { modelProvider } from "../../gates/review.js";
 import { runGates } from "../../gates/run-gates.js";
 import type { GateResult } from "../../gates/types.js";
 import { getTask, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../../graph/schema.js";
+import { executionSignal } from "../../run/execution-budget.js";
 import { linkNodeModules, removeWorktree, shGit, shGitOk } from "../../run/git.js";
 import { Journal } from "../../run/journal.js";
+import { withRepositoryLease } from "../../run/lease.js";
 
 /**
  * tickmarkr verify — the gate battery as a standalone command (OPERATING-MODEL-2026-08-11 item 3).
@@ -264,6 +266,18 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   // ponytail: tmpdir means the baseline cache dies on reboot/cleanup — worst case is one re-capture.
   const stateDir = verifyStateDir(cwd);
   mkdirSync(stateDir, { recursive: true });
+  const recordJournal = values.record ? Journal.open(stateRoot, values.record) : undefined;
+  // OBS-1042: one runner root per repository across every linked worktree — the capture and the
+  // battery below run under a reservation keyed on the common git dir, and a waiter says who holds it.
+  return withRepositoryLease(cwd, () => leasedVerify(), {
+    signal: executionSignal(),
+    onWait: (holder) => {
+      console.error(`verify: waiting for the repository's runner lease held by pid ${holder.pid} in ${holder.cwd}`);
+      recordJournal?.append("suite-wait", values.task ?? "VERIFY", { holderPid: holder.pid, holderCwd: holder.cwd });
+    },
+  });
+
+  async function leasedVerify(): Promise<{ out: string; code: number }> {
   let baseline: Baseline;
   const cachePath = baselineCachePath(cwd, mergeBase, commands);
   const verdictlessMarker = `${cachePath}.verdictless`;
@@ -277,6 +291,14 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
       const missing = verdictlessCommands(cached, commands);
       if (missing.length) {
         console.error(`verify: cached baseline recorded no verdict for ${missing.join(", ")}; it was not reusable and will be recaptured`);
+        rmSync(cachePath, { force: true });
+        cached = undefined;
+      }
+      // OBS-1044: a cached vitest count that is a stdout sum may be inflated by nested runner echo;
+      // applying it would manufacture a deficit. Only a manifest-derived count is a floor.
+      const stale = cached ? staleFileCountCommands(cached, commands, cwd) : [];
+      if (stale.length) {
+        console.error(`verify: cached baseline's file count for ${stale.join(", ")} is not manifest-derived; it will be recaptured`);
         rmSync(cachePath, { force: true });
         cached = undefined;
       }
@@ -310,7 +332,6 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     }
   }
 
-  const recordJournal = values.record ? Journal.open(stateRoot, values.record) : undefined;
   const artifactDir = join(stateDir, new Date().toISOString().replace(/[:.]/g, "-"));
   mkdirSync(artifactDir, { recursive: true });
 
@@ -318,7 +339,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     worktree: cwd, baseRef: mergeBase,
     result: { ok: true, summary: "standalone verify — no worker claims to trust", deviations: [], raw: "" },
     author, commands, baseline, channels, ...(judgeChannels ? { judgeChannels } : {}), adapters, cfg,
-    pipeline: "v185", verificationScope: "standalone", artifactDir, stateDir: join(stateRoot, ".tickmarkr"),
+    verificationScope: "standalone", artifactDir, stateDir: join(stateRoot, ".tickmarkr"),
     onGate: (e) => {
       if (e.phase === "start") console.error(`verify: → ${e.gate} (${e.index}/${e.total})`);
       else if (e.phase === "note") console.error(`verify: note ${e.gate} ${e.name} ${JSON.stringify(e.payload)}`);
@@ -351,4 +372,5 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     ? `verify GREEN — ${results.length} gate(s) passed on ${mergeBase.slice(0, 12)}..${head.slice(0, 12)} (merge is a human decision; artifacts: ${artifactPath})`
     : `verify RED — first failure decides; artifacts: ${artifactPath}`;
   return { out: [...lines, "", verdict].join("\n"), code: green ? 0 : 2 };
+  }
 }

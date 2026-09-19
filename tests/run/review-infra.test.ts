@@ -67,14 +67,17 @@ describe("review infrastructure recovery", () => {
     expect(rows.filter((row) => row.event === "task-dispatch")).toHaveLength(1);
     expect(rows.filter((row) => ["escalation", "consult", "consult-verdict", "repair-attempt"].includes(row.event))).toEqual([]);
     expect(rows.find((row) => row.event === "task-human")?.data.kind).toBe("infra");
-    const retried = rows.findIndex((row) => row.event === "review-infra-retry");
-    expect(retried).toBeGreaterThan(rows.findIndex((row) => row.event === "review-retry"));
-    expect(rows[retried]?.data.reviewer).toBe("seat-c:seat-c");
+    // v2.5.6 T4 (OBS-1013 add.3): the in-gate loop itself re-routes to the third seat, so the round
+    // reaches the daemon already exhausted — every seat named on a review-no-verdict row, one review row.
+    expect(rows.filter((row) => row.event === "review-no-verdict").map((row) => row.data.reviewer))
+      .toEqual(["seat-a:seat-a", "seat-b:seat-b", "seat-c:seat-c"]);
+    expect(rows.find((row) => row.event === "review-retry")?.data).toMatchObject({ flaked: "seat-b:seat-b", retried: "seat-c:seat-c" });
+    expect(rows.filter((row) => row.event === "review-infra-retry")).toEqual([]);
     const judge = rows.find((row) => row.event === "gate-result" && row.data.gate === "acceptance");
     expect(judge?.data.pass).toBe(false);
     expect(JSON.stringify(judge?.data.findings)).toContain("missing required behavior");
     const reviews = rows.filter((row) => row.event === "gate-result" && row.data.gate === "review");
-    expect(reviews).toHaveLength(2);
+    expect(reviews).toHaveLength(1);
     expect(reviews.every((row) => row.data.infra === true && row.data.skipped === true && row.data.pass === undefined && row.data.findings === undefined)).toBe(true);
     // An infra row is not a passing review: a prior round's open blocking finding survives it.
     const finding = { gate: "review", pass: false, details: "requested changes", commit: "c", attempt: 0,
@@ -88,7 +91,7 @@ describe("review infrastructure recovery", () => {
       .toMatchObject({ gateFails: 0, consults: 0 });
   });
 
-  test("test: a review seat whose capture holds only harness rows to the ceiling is recorded cause silent and journaled demoted at that round, and a later task's review in the same run never seats it, while a seat that emitted prose before the ceiling is recorded truncated and stays seatable, so a zero-authored seat recorded truncated or re-seated fails", async () => {
+  test("test: a review seat whose capture holds only harness rows to the ceiling is recorded cause silent and journaled demoted at that round, and a later task's review in the same run never seats it, while a seat that emitted prose before the ceiling is recorded truncated and stays seatable until its second strike, so a zero-authored seat recorded truncated or re-seated fails", async () => {
     const { repo, scriptPath } = setupRepo([
       T("T1", { acceptance: [{ oracle: "command", command: "true" }] }),
       T("T2", { deps: ["T1"], acceptance: [{ oracle: "command", command: "true" }] }),
@@ -104,8 +107,10 @@ describe("review infrastructure recovery", () => {
     expect(good.calls).toEqual(["T1", "T2"]);
     const rows = Journal.open(repo, "run-review-demotion").read();
     const demotions = rows.filter((row) => row.event === "review-pool-demotion");
-    expect(demotions).toHaveLength(1);
+    // Leg-2 (OBS-1052, R24): the two-strike law is live — the truncated seat's second no-verdict, on T2, demotes it.
+    expect(demotions).toHaveLength(2);
     expect(demotions[0]).toMatchObject({ taskId: "T1", data: { reviewer: "seat-a:seat-a", cause: "silent", seatAuthoredBytes: 0 } });
+    expect(demotions[1]).toMatchObject({ taskId: "T2", data: { reviewer: "seat-b:seat-b", cause: "truncated", causes: ["truncated", "truncated"] } });
     expect(rows.indexOf(demotions[0]!)).toBeLessThan(rows.findIndex((row) => row.event === "review-retry"));
     expect(rows.filter((row) => row.event === "review-no-verdict" && row.data.reviewer === "seat-b:seat-b")
       .map((row) => row.data.cause)).toEqual(["truncated", "truncated"]);

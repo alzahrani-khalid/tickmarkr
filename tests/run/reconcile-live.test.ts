@@ -1,3 +1,4 @@
+import { writeBashEnvFixture } from "../helpers/bash-env.js";
 // OBS-17 T2: live reconciliation — the daemon sweeps tickmarkr-owned panes to the journal-derived
 // desired set at every safe point, and the herdr driver closes owned-but-undesired panes plus the
 // tabs those closes emptied. Foreign panes, operator tabs, and other workspaces are never touched.
@@ -744,6 +745,7 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
     expect(outputArrivedAt.get("T2")! - dispatchReturnedAt.get("T2")!).toBeGreaterThanOrEqual(900);
     const w1 = owned("worker", "T1", 0, runId);
     const w2 = owned("worker", "T2", 0, runId);
+    await expect.poll(() => closedNames.includes(w1) && closedNames.includes(w2)).toBe(true);
     expect(live.has(w1)).toBe(false);
     expect(live.has(w2)).toBe(false);
     expect(closedNames).toContain(w1);
@@ -752,7 +754,7 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
 
   test("test: with the daemon's liveness ceilings compressed below that arrival the delayed worker is never concluded dead and the run completes both tasks; a ceiling treating an unmeasurable probe as death kills a worker that is merely slow and fails", async () => {
     const bashEnv = join(makeTestTempDir("tickmarkr-seed-sweep-ps-denied-"), "bash-env");
-    writeFileSync(bashEnv, "ps() { return 1; }\n");
+    writeBashEnvFixture(bashEnv, "ps() { return 1; }\n");
     const priorBashEnv = process.env.BASH_ENV;
     process.env.BASH_ENV = bashEnv;
     setDeadChannelFastKillMsForTests(1_500);
@@ -783,6 +785,7 @@ describe("seed-mode reconciliation parity (fake adapter, zero tokens)", () => {
     expect(s.done).toEqual(["T1", "T2"]);
     const w1 = owned("worker", "T1", 0, runId);
     const w2 = owned("worker", "T2", 0, runId);
+    await expect.poll(() => closedNames.includes(w1) && closedNames.includes(w2)).toBe(true);
     expect(live.has(w1)).toBe(false);
     expect(live.has(w2)).toBe(false);
     expect(closedNames).toContain(w1);

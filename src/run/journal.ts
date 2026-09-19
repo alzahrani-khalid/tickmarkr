@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
@@ -100,8 +101,8 @@ export const CHANNEL_EXCLUSION_KINDS = ["dead-channel"] as const;
 export type ChannelExclusionKind = (typeof CHANNEL_EXCLUSION_KINDS)[number];
 
 // v1.24 OBS-18: explicit data on task-approved when the operator releases an attempt-cap park.
-// Approve stamps this; replayResumeState zeros the attempt counter (fresh budget) while keeping
-// tried (consult bans / burned channels). Absent on pre-v1.24 events ⇒ inert (corpus outcome-identical).
+// Approve stamps this; replayResumeState resets both the attempt counter and tried seats for a fresh
+// budget. Absent on pre-v1.24 events ⇒ inert (corpus outcome-identical).
 export const ATTEMPT_CAP_RELEASE = "attempt-cap" as const;
 // OBS-130: task-approved carries the exact failed gate the operator satisfied. The release tag keeps
 // ordinary humanGate and attempt-cap approvals byte-compatible while making this authority explicit.
@@ -114,8 +115,8 @@ export const REVIEW_UPHELD_RELEASE = "review-upheld" as const;
 // gate before it — daemon.ts remainingGates), which is wrong when the gate failed against a stale task
 // DECLARATION rather than a bad diff: amend the spec's files[], recompile, and the gate now passes
 // honestly. This release runs the whole gate suite over the parked commit before any worker and
-// marks no gate satisfied: green merges directly, red returns to the ladder. Budget semantics match attempt-cap
-// (fresh attempts, tried survives) because the park cost the task its remaining budget.
+// marks no gate satisfied: green merges directly, red returns to the existing ladder with attempts
+// and tried seats intact.
 export const RECHECK_RELEASE = "recheck" as const;
 
 export interface PreservedRef {
@@ -282,9 +283,20 @@ function identifierIn(note: string): string {
 // code identity still has one stable identity of its own: its own words, with the volatile tokens
 // swept out so line/path churn cannot mint a new symbol for the same finding. It is the reviewer's
 // own bytes, never a guess, and it can never fuse two different findings into one.
+// OBS-1013 add.3: the words are BOUNDED — the first sentence, or a short hash when even that is long.
+// A whole-note symbol made a 600-byte fingerprint no reviewer could echo, so a real closure read as
+// malformed and bought a worker. A sentence a reviewer can copy is the identity; the hash is the fallback.
+const SYMBOL_SENTENCE_CAP = 160;
+export function boundedSymbol(note: string): string {
+  const words = normalizeGateFailure(note);
+  if (!words) return "";
+  const sentence = words.split(/(?<=[.!?])\s+|\n/)[0]!.trim();
+  return sentence.length <= SYMBOL_SENTENCE_CAP ? sentence : createHash("sha256").update(words).digest("hex").slice(0, 12);
+}
+
 function toFinding(cls: string, note: string, path: string, symbol: string, rationale?: string): StructuredFinding {
   const p = path || UNIDENTIFIED;
-  const s = symbol || normalizeGateFailure(note) || UNIDENTIFIED;
+  const s = symbol || boundedSymbol(note) || UNIDENTIFIED;
   return {
     class: cls, path: p, symbol: s, note,
     ...(rationale !== undefined ? { rationale } : {}),
@@ -868,7 +880,7 @@ const DispatchAssignmentSchema = z.object({
 // routing profile's QUALITY_FAIL_PARKS (route/profile.ts): the channel did nothing wrong.
 export const PARK_KINDS = ["human-gate", "ladder-exhausted", "attempt-cap", "gate-fail", "quota",
   "reroute-exhausted", "setup", "stall", "merge-conflict", "tip-moved", "infra", "dispatch",
-  "authoring", "scope-request"] as const;
+  "authoring", "scope-request", "diff-cap"] as const;
 export type ParkKind = (typeof PARK_KINDS)[number];
 // v1.85 T3: "repair" is a third dispatch mode beside the v1.29 session pair — a fix-only attempt that
 // carries the failing findings and the diff CONTENT of the work already landed, instead of re-buying
@@ -1615,23 +1627,29 @@ export class Journal {
       } else if (e.event === "consult-verdict" && e.data.action === "reroute") {
         // A reroute bans the in-force channel; retry/decompose/human verdicts ban nothing (D-03).
         pendingReroute.add(e.taskId);
-      } else if (e.event === "task-approved"
-                 && (e.data.release === ATTEMPT_CAP_RELEASE || e.data.release === RECHECK_RELEASE)) {
+      } else if (e.event === "task-approved" && e.data.release === ATTEMPT_CAP_RELEASE) {
         // v1.24 OBS-18: operator released an attempt-cap park. Pre-v1.24 task-approved events have no
         // `release` key ⇒ this branch never fires (corpus criterion: identical statuses + resume state).
-        // attempts reset to 0 so the daemon's attempt-cap check does not re-park in the same tick;
-        // tried survives (consult bans and burned channels are not forgotten); lastAssignment is
-        // cleared so the daemon's nextChannel-over-tried path skips burned channels on first dispatch
-        // (restoring the last burned assignment would re-try it first — the failure the tried-list exists to prevent).
+        // attempts and tried reset so the daemon's attempt-cap check does not re-park in the same tick
+        // and the newly funded engagement starts with a cleared seat list; lastAssignment clears too.
+        // OBS-1028: a RECHECK release is deliberately NOT here — it marks no gate satisfied and funds no
+        // attempt, so the ladder (attempts AND tried) survives it untouched. Only THIS fresh-budget
+        // release resets the ladder, and it resets both halves: a fresh budget on a cleared seat list.
         const st = m.get(e.taskId);
         if (st) {
           st.attempts = 0;
+          st.tried = [];
           st.lastAssignment = undefined;
         }
+      } else if (e.event === "task-approved" && e.data.release === RECHECK_RELEASE) {
+        // OBS-1028: the ladder survives a recheck (attempts AND tried); only the seat memory is cleared
+        // so a red battery's next dispatch is picked over the exclusions instead of restoring the parked seat.
+        const st = m.get(e.taskId);
+        if (st) st.lastAssignment = undefined;
       } else if (e.event === "task-approved" && e.data.release === REVIEW_UPHELD_RELEASE) {
-        // OBS-189: the operator upheld the reviewer. Same budget semantics as the attempt-cap release
-        // (fresh attempts, tried survives, no burned-channel restore) PLUS the findings carry: the
-        // newest failed review's details ride into the funded attempt as its retry brief.
+        // OBS-189: the operator upheld the reviewer. It funds fresh attempts without forgetting tried
+        // seats (unlike an attempt-cap fresh-budget release), and carries the newest failed review's
+        // details into the funded attempt as its retry brief.
         const st = m.get(e.taskId);
         if (st) {
           st.attempts = 0;
@@ -1735,7 +1753,9 @@ export class Journal {
   replayExcludedChannels(): Set<string> {
     const excluded = new Set<string>();
     for (const e of this.read()) {
-      if (e.event === "channel-exclusion" && typeof e.data.channel === "string") {
+      // OBS-1010: an in-run no-trailer demotion is a WORKER exclusion too; review-pool-demotion is
+      // the reviewer seat's own fold (daemon demotedReviewers) and never benches the worker channel.
+      if ((e.event === "channel-exclusion" || e.event === "channel-demotion") && typeof e.data.channel === "string") {
         excluded.add(e.data.channel);
       } else if (e.event === "dead-channel-failover" && typeof e.data.from === "string") {
         excluded.add(e.data.from);

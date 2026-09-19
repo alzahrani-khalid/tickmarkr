@@ -1,8 +1,9 @@
+import { executionSignal } from "./execution-budget.js";
 import { commandLeaseEnvironment, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { spawn } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { availableParallelism, tmpdir } from "node:os";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { availableParallelism, homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { shq } from "../adapters/types.js";
@@ -114,6 +115,93 @@ export function sameCapacity(recorded: unknown, current: RunCapacity | undefined
   return read.capacity.forkCap === current.forkCap && read.capacity.cores === current.cores;
 }
 
+/**
+ * R41: the verification PROTOCOL a verdict was produced under — which implementation of the manifest
+ * discovery/report contract judged it, and the npm lifecycle policy its runner children ran with.
+ * Two verdicts are comparable only when both match: a manifest built from module collection ("vl1.1",
+ * the pre-stamp implementation) and one built from file specifications ("vl1.2") certify different
+ * sets, and a suite whose `pretest` hook ran (ignore-scripts=false) is a different measurement from
+ * one where npm skipped it. Bump VERIFICATION_PROTOCOL whenever discovery or report semantics change.
+ */
+export const VERIFICATION_PROTOCOL = "vl1.2";
+export type RunnerLifecycle = "hooks" | "ignore-scripts" | "unknown";
+export interface VerificationProtocol {
+  protocol: string;
+  /** The EFFECTIVE npm lifecycle policy a runner child receives: `hooks` (pretest/prebuild run),
+   * `ignore-scripts` (npm skips them), or `unknown` (could not be measured — never comparable). */
+  lifecycle: RunnerLifecycle;
+  /** Provenance only, never part of compatibility: an explicit process-scoped env export, or npm's
+   * own resolved config for that checkout (user/project npmrc). */
+  source: "explicit" | "npm-config" | "unknown";
+}
+
+const lifecycleOf = (raw: string | undefined): Exclude<RunnerLifecycle, "unknown"> | undefined => {
+  const v = raw?.trim().toLowerCase();
+  return v === "false" ? "hooks" : v === "true" ? "ignore-scripts" : undefined;
+};
+
+// Measured effective policy, keyed on everything npm resolves it from that this process can see:
+// the checkout, its project npmrc and the user npmrc (path + mtime), and the explicit env. A
+// rewritten npmrc changes the key, so a later battery in the same process re-measures.
+const measuredLifecycle = new Map<string, RunnerLifecycle>();
+const mtimeOf = (p: string): string => { try { return String(statSync(p).mtimeMs); } catch { return "-"; } };
+
+/**
+ * R41: the lifecycle policy a runner child spawned from `env` in `cwd` receives. An explicit
+ * process-scoped `npm_config_ignore_scripts` export decides (npm reads env over every npmrc) and is
+ * recorded as such; otherwise the policy is MEASURED from npm's own resolved config for that checkout
+ * (`npm config get ignore-scripts` — user npmrc, project npmrc, env), so the identity binds what
+ * npm will actually do rather than a guess. A policy that cannot be measured is `unknown`, and an
+ * unknown policy is never compatible with anything, itself included. No env or npmrc is written here.
+ */
+export function runnerLifecycle(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): Pick<VerificationProtocol, "lifecycle" | "source"> {
+  const explicit = lifecycleOf(env.npm_config_ignore_scripts ?? env.NPM_CONFIG_IGNORE_SCRIPTS);
+  if (explicit) return { lifecycle: explicit, source: "explicit" };
+  const userconfig = env.NPM_CONFIG_USERCONFIG ?? env.npm_config_userconfig ?? join(homedir(), ".npmrc");
+  const key = [cwd, mtimeOf(join(cwd, ".npmrc")), userconfig, mtimeOf(userconfig),
+    env.npm_config_ignore_scripts ?? env.NPM_CONFIG_IGNORE_SCRIPTS ?? ""].join("\0");
+  let lifecycle = measuredLifecycle.get(key);
+  if (lifecycle === undefined) {
+    try {
+      const out = execFileSync("npm", ["config", "get", "ignore-scripts"], {
+        cwd: existsSync(cwd) ? cwd : process.cwd(), env, encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "ignore"],
+      });
+      lifecycle = lifecycleOf(out) ?? "unknown";
+    } catch {
+      lifecycle = "unknown";
+    }
+    measuredLifecycle.set(key, lifecycle);
+  }
+  return { lifecycle, source: lifecycle === "unknown" ? "unknown" : "npm-config" };
+}
+
+export function verificationProtocol(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): VerificationProtocol {
+  return { protocol: VERIFICATION_PROTOCOL, ...runnerLifecycle(env, cwd) };
+}
+
+/**
+ * May a verdict recorded under `recorded` be reused — cached, replayed — by a session running
+ * `current`? Unlike capacity, ABSENT is NOT compatible: a row with no protocol stamp was produced by
+ * the pre-stamp implementation (module-collection discovery, lifecycle unstated), which is exactly
+ * the evidence a changed protocol must not inherit — positive or negative. Malformed → no. An
+ * `unknown` lifecycle on either side → no: two unmeasured policies are not the same policy.
+ * `source` is provenance and never enters the comparison — an explicit `false` and an npmrc `false`
+ * are the same effective policy.
+ */
+export function sameVerification(recorded: unknown, current: VerificationProtocol): boolean {
+  if (recorded === null || typeof recorded !== "object") return false;
+  const { protocol, lifecycle } = recorded as Record<string, unknown>;
+  if (lifecycle === "unknown" || current.lifecycle === "unknown") return false;
+  return protocol === current.protocol && lifecycle === current.lifecycle;
+}
+
+export const describeVerification = (value: unknown): string => {
+  if (value === null || typeof value !== "object") return "an unrecorded verification protocol";
+  const { protocol, lifecycle, source } = value as Record<string, unknown>;
+  return typeof protocol === "string" && typeof lifecycle === "string"
+    ? `protocol ${protocol}, lifecycle ${lifecycle}${typeof source === "string" ? ` (${source})` : ""}` : "a malformed verification protocol";
+};
+
 export const describeCapacity = (value: unknown): string => {
   const read = readCapacity(value);
   return read.state === "present"
@@ -199,7 +287,10 @@ export interface ShellOptions {
 
 /** Shared command seam, including invocation-bound manifested runners. */
 export function shell(cmd: string, cwd: string, timeoutMs: number, login = false, options: ShellOptions = {}): Promise<ShResult> {
-  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, options));
+  const inherited = executionSignal();
+  const signal = inherited && options.signal ? AbortSignal.any([inherited, options.signal]) : inherited ?? options.signal;
+  signal?.throwIfAborted();
+  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, { ...options, signal }));
 }
 
 function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolean, options: ShellOptions): Promise<ShResult> {
@@ -341,6 +432,7 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   return (async () => {
     const startedAt = Date.now();
     for (let n = 1; ; n++) {
+      options.signal?.throwIfAborted();
       const r = await attempt();
       if (!("refused" in r)) return r;
       // Bounded, and the bound is what makes a persisting shortage a REPORTED failure rather than a

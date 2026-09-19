@@ -10,7 +10,6 @@ import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { buildDossierPrompt, consult, augmentRetryBrief, renderRetryGuidance, type Dossier } from "../../src/run/consult.js";
 import { extractPromptNonce, extractVerdictJson, gateExitTrailer, gatePaneName } from "../../src/gates/llm.js";
-import { bannerShell } from "../../src/brand.js";
 import { sh } from "../../src/run/git.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { nextChannel } from "../../src/route/router.js";
@@ -281,9 +280,14 @@ describe("consult", () => {
     expect(readFileSync(join(runDir, "consults", raw!), "utf8")).toContain("gibberish");
   });
 
-  test("test: with visibility llm pane the consult pane script invokes the adapter's interactive command with the prompt seeded and never its headless command and the verdict is still parsed from the nonce trailer whereas the shipped visible branch that writes the headless command into the pane fails", async () => {
+  test("test: through consult under pane visibility with the fake adapter and a fake driver the seat script runs the headless command followed by the exit trailer so the wait ends at the trailer, the verdict parsed from the pane names action reroute and the row carries the seat's adapter, model and vendor, while a pane whose verdict is absent fails safe to human naming unparseable, so a consult that seeds the interactive form and reads a TUI frame fails", async () => {
+    // OBS-1009: a seeded interactive session answers on screen but never exits, so the trailer the
+    // wait keys on never prints and the 300-line read is a TUI frame. The pane runs the HEADLESS
+    // command, which exits into the trailer, and is harvested through dewrap like a judge seat.
     const captured: string[] = [];
+    const waits: Array<{ pattern: string; regex?: boolean }> = [];
     let paneOutput = "";
+    let absentVerdict = false;
     const stubSlot: Slot = { id: "stub", name: gatePaneName("consult", "T1"), cwd: "/tmp" };
     const stub: ExecutorDriver = {
       id: "stub",
@@ -293,48 +297,48 @@ describe("consult", () => {
         captured.push(cmd);
         paneOutput = execSync(cmd, { cwd: "/tmp", encoding: "utf8" });
       },
-      waitOutput: async () => true,
+      waitOutput: async (_s, pattern, _t, o) => {
+        waits.push({ pattern, regex: o?.regex });
+        return new RegExp(pattern).test(paneOutput);
+      },
       waitAgentStatus: async () => false,
       status: async () => "unknown",
-      read: async () => paneOutput,
+      read: async () => (absentVerdict ? "│ ▌ thinking…\n│ status bar\n" : paneOutput),
       notify: async () => {},
       close: async () => {},
       worktree: async () => "/tmp/wt",
     };
-    const { cfg, fake, runDir } = setup({ action: "human", notes: "headless must not answer" });
-    let headlessCalls = 0;
-    const interactiveCalls: Array<{ promptFile: string; model: string }> = [];
-    fake.headlessCommand = () => {
-      headlessCalls++;
-      return "TICKMARKR_TEST_CONSULT_MODE=HEADLESS false";
+    const { cfg, fake, runDir } = setup({ action: "reroute", reason: "seat is blocked", guidance: "move it" });
+    const headlessCalls: Array<{ promptFile: string; model: string }> = [];
+    const headless = fake.headlessCommand.bind(fake);
+    fake.headlessCommand = (promptFile: string, model: string) => {
+      headlessCalls.push({ promptFile, model });
+      return headless(promptFile, model);
     };
-    fake.interactiveCommand = (promptFile: string, model: string) => {
-      interactiveCalls.push({ promptFile, model });
-      const js = `const fs=require("fs");const p=process.argv[1];const n=/VERDICT_NONCE: ([0-9a-f]+)/.exec(fs.readFileSync(p,"utf8"))[1];console.log(JSON.stringify({nonce:n,action:"retry",notes:"interactive pane"}))`;
-      return `TICKMARKR_TEST_CONSULT_MODE=INTERACTIVE node -e ${shq(js)} ${shq(promptFile)}`;
-    };
+    fake.interactiveCommand = () => { throw new Error("the seeded interactive form must never be built for a consult pane"); };
     cfg.visibility.llm = "pane";
     shMock.mockClear();
 
     const v = await consult(dossier, cfg, [fake], stub, "/tmp", runDir);
     const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!);
     const nonce = extractPromptNonce(readFileSync(promptFile, "utf8"))!;
-    expect(v).toMatchObject({ action: "retry", notes: "interactive pane" });
-    expect(extractVerdictJson(paneOutput, nonce)).toMatchObject({ action: "retry", notes: "interactive pane" });
-    expect(interactiveCalls).toEqual([{ promptFile, model: cfg.consult.model }]);
-    expect(headlessCalls).toBe(0);
+    expect(v).toMatchObject({ action: "reroute", reason: "seat is blocked", adapter: "fake", model: "fake-1", vendor: "fake-a" });
+    expect(headlessCalls).toEqual([{ promptFile, model: cfg.consult.model }]);
     expect(shMock).not.toHaveBeenCalled();
     expect(captured).toHaveLength(1);
-    expect(captured[0]).toMatch(/^bash ['"]/);
-    expect(captured[0]!.length).toBeLessThan(120);
-    const scriptPath = captured[0]!.slice(6, -1);
-    const script = readFileSync(scriptPath, "utf8");
-    expect(script).toContain("TICKMARKR_TEST_CONSULT_MODE=INTERACTIVE");
-    expect(script).not.toContain("TICKMARKR_TEST_CONSULT_MODE=HEADLESS");
-    expect(script).toContain(shq(promptFile));
-    expect(script).toContain(bannerShell());
+    const script = readFileSync(captured[0]!.slice(6, -1), "utf8");
+    expect(script).toContain(headless(promptFile, cfg.consult.model));
     expect(script.trimEnd().endsWith(gateExitTrailer(nonce))).toBe(true);
-    expect(script).toContain("export BASH_SILENCE_DEPRECATION_WARNING=1");
+    expect(script.indexOf(headless(promptFile, cfg.consult.model))).toBeLessThan(script.indexOf(gateExitTrailer(nonce)));
+    // the wait keys on the nonce-bound exit trailer, which the headless command's exit prints
+    expect(waits).toEqual([{ pattern: `TICKMARKR_EXIT_${nonce}:\\d`, regex: true }]);
+    expect(paneOutput).toMatch(new RegExp(`TICKMARKR_EXIT_${nonce}:0`));
+    expect(extractVerdictJson(paneOutput, nonce)).toMatchObject({ action: "reroute" });
+
+    absentVerdict = true;
+    const parked = await consult(dossier, cfg, [fake], stub, "/tmp", runDir);
+    expect(parked.action).toBe("human");
+    expect(parked.notes).toMatch(/unparseable/);
   });
 
   test("test: with visibility llm headless the consult invocation is byte-identical to the shipped headless command and its parse whereas a change that alters the headless argv or the trailer contract fails", async () => {

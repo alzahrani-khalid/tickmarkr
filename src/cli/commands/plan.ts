@@ -7,7 +7,7 @@ import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { classifyContextPath } from "../../compile/native.js";
 import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK, type TickmarkrConfig } from "../../config/config.js";
-import { graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
+import { chainDepth, dispatchWaves, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
 import { resolveRunMode } from "../../run/daemon.js";
 import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } from "../../route/preference.js";
@@ -368,11 +368,27 @@ export async function plan(
       : "";
     return { line: `${channelKey(reviewer)}${rotationNote} — reviewPolicy full`, cost: seatCost(reviewer) };
   };
+  // OBS-1018: depth and wave come from the same functions the daemon admits by, so the plan shows the
+  // critical path the run will actually follow at this concurrency.
+  const depths = chainDepth(g);
+  const waves = dispatchWaves(g, cfg.concurrency);
+  const byId = new Map(g.tasks.map((t) => [t.id, t]));
+  const chainLine = (t: Task) => {
+    const wave = waves.get(t.id);
+    // Map absence never implies status: a pending task stays wave-less when a dependency is
+    // running/gated/failed/human, so render the real status and name the blocking deps.
+    const tail = wave !== undefined
+      ? `wave ${wave} at concurrency ${cfg.concurrency}`
+      : t.status !== "pending"
+        ? `no wave (${t.status})`
+        : `no wave (pending; blocked by ${t.deps.filter((d) => byId.get(d)?.status !== "done").map((d) => `${d}:${byId.get(d)?.status ?? "missing"}`).join(", ")})`;
+    return `    chain: depth ${depths.get(t.id)} · ${tail}`;
+  };
   const routed: RoutedAssignment[] = [];
   for (const t of g.tasks) {
     const refusals = [...(oracleRefusals.get(t.id) ?? []), ...(inputRefusals.get(t.id) ?? [])];
     if (refusals.length) {
-      lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! pre-dispatch refusal — ${refusals.join("; ")}`);
+      lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! pre-dispatch refusal — ${refusals.join("; ")}`, chainLine(t));
       continue;
     }
     try {
@@ -390,6 +406,7 @@ export async function plan(
         `  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} c${String(t.complexity).padEnd(3)}→ ${r.assignment.adapter}:${r.assignment.model} [${r.assignment.channel}/${r.assignment.tier}]${t.timeoutMinutes !== undefined ? ` (timeout ${t.timeoutMinutes}m)` : ""}${t.humanGate ? " (human gate)" : ""}${est ? ` ~$${est.toFixed(2)}` : ""} — ${r.provenance}`,
         `    judge: ${judge.line}${judge.cost ? ` ~$${judge.cost.toFixed(2)}` : ""}`,
         `    review: ${review.line}${review.cost ? ` ~$${review.cost.toFixed(2)}` : ""}`,
+        chainLine(t),
       );
       const d = derivation(t.shape);
       if (d) lines.push(d);
@@ -410,7 +427,7 @@ export async function plan(
     } catch (e) {
       if (!(e instanceof RoutingError)) throw e;
       const msg = `${e.message}${exclusionReason(e.message)}`;
-      lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! ${msg}`);
+      lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! ${msg}`, chainLine(t));
       const d = derivation(t.shape);
       if (d) lines.push(d);
       lints.push(`${t.id}: unroutable — ${msg}`);

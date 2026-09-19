@@ -2,7 +2,10 @@
 // One latched nudge through the driver's verified-delivery surface; if the grace passes still idle
 // with no progress, the wait concludes as a stall immediately (the consult sees the un-answered
 // nudge) instead of burning the remainder of the window. Consult-ratified 3/3 (CONSULT-liveness).
-import { describe, expect, test, afterEach } from "vitest";
+import { describe, expect, test, afterEach, beforeEach } from "vitest";
+import { join } from "node:path";
+import { writeBashEnvFixture } from "../helpers/bash-env.js";
+import { resetHarvestCpuFlatMsForTests, setHarvestCpuFlatMsForTests } from "../../src/run/stall.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
@@ -10,7 +13,7 @@ import {
   NUDGEABLE_ADAPTERS, resetNudgeTimingForTests, runDaemon, setNudgeTimingForTests, WORKER_NUDGE_MESSAGE,
 } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
-import { setupRepo, T } from "../helpers/tmprepo.js";
+import { makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 function idriver(overrides: Record<string, unknown> = {}): ExecutorDriver {
   const inner = new SubprocessDriver();
@@ -36,7 +39,21 @@ const STALLED_SCRIPT = {
   tasks: { T1: [{ shell: "echo working-on-it" }] },
 };
 
+// Nudge policy is tested over a measured, resting worker. A host denying ps is
+// unknown CPU and must now hold to the hard ceiling instead of expiring the nudge.
+let priorBashEnv: string | undefined;
+beforeEach(() => {
+  priorBashEnv = process.env.BASH_ENV;
+  const path = join(makeTestTempDir("nudge-flat-cpu-"), "bash-env");
+  writeBashEnvFixture(path, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+  process.env.BASH_ENV = path;
+  setHarvestCpuFlatMsForTests(1);
+});
+
 afterEach(() => {
+  if (priorBashEnv === undefined) delete process.env.BASH_ENV;
+  else process.env.BASH_ENV = priorBashEnv;
+  resetHarvestCpuFlatMsForTests();
   NUDGEABLE_ADAPTERS.delete("fake");
   resetNudgeTimingForTests();
 });

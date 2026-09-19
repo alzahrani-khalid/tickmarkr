@@ -4,8 +4,10 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
 import { DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShResult } from "../run/git.js";
+import { executionSignal } from "../run/execution-budget.js";
 import type { GateOutcome } from "../run/outcome.js";
 import type { GateResult } from "./types.js";
+import { isVitestTestCommand, manifestFileCount } from "./test-manifest.js";
 
 /**
  * T7: the capacity a gate's own command ran under rides the RESULT, beside the verdict it explains,
@@ -37,8 +39,12 @@ export interface BaselineCommand {
   durationMs?: number;
   /** Sum of the per-file durations named by the runner; null when its output names none. */
   fileDurationSumMs?: number | null;
-  /** Total files reported by the runner summary; null when unavailable. */
+  /** Total files the runner would collect; null when unavailable. */
   fileCount?: number | null;
+  /** OBS-1044: `manifest` when `fileCount` came from the runner's own listing (test-manifest.ts's
+   * discovery seam) rather than a stdout summary sum. Absent on every pre-2.5.6 entry and on every
+   * scripted non-runner command, whose summary count keeps the stdout deficit rule byte-identically. */
+  fileCountSource?: "manifest";
   /** fileDurationSumMs / durationMs — average implied file concurrency, not a configured fork count. */
   impliedParallelism?: number | null;
   /** The slowest per-file entry named by the runner; null when per-file timing is unavailable. */
@@ -559,6 +565,28 @@ const invalidCaptureEntry = (
   ...(invalidatingLines.length ? { invalidatingLines } : {}),
 });
 
+// OBS-1044: a vitest command's count is the manifest discovery seam's (the same listing the gate
+// asks the report to certify), never a sum of every summary line in stdout — tests that spawn
+// nested runners echo their own summaries through the filter and inflated a baseline by two files,
+// so any diff that changed the nested echo read as a deficit. The listing is a collection, not a
+// run: the suite still runs exactly once here. Any other command keeps the stdout sum.
+const captureFileCount = async (cwd: string, cmd: string, raw: string): Promise<Pick<BaselineCommand, "fileCount" | "fileCountSource">> => {
+  if (!isVitestTestCommand(cmd, cwd)) return { fileCount: runnerFileCount(raw) };
+  const fileCount = await manifestFileCount(cmd, cwd);
+  return fileCount === null ? { fileCount } : { fileCount, fileCountSource: "manifest" };
+};
+
+/** OBS-1044: a cached vitest entry whose count is a stdout sum may be inflated; only a manifest-derived
+ * count is safe to apply as a deficit floor. A null count compares nothing and is safe as-is. */
+export function staleFileCountCommands(baseline: Baseline, commands: Record<string, string>, cwd: string): string[] {
+  return Object.entries(commands)
+    .filter(([name, cmd]) => {
+      const entry = baseline.commands[name];
+      return entry?.fileCount != null && entry.fileCountSource !== "manifest" && isVitestTestCommand(cmd, cwd);
+    })
+    .map(([name]) => name);
+}
+
 export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   for (const [name, cmd] of Object.entries(commands)) {
@@ -592,7 +620,7 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `it recorded NO fingerprints, so nothing is forgiven and every gate will treat a pre-existing `
         + `failure as a fresh one. Raise the ceiling or shorten the command.`,
       );
-      base.commands[name] = { ...invalidCaptureEntry(durationMs, "ceiling-kill"), fileCount: runnerFileCount(raw) };
+      base.commands[name] = { ...invalidCaptureEntry(durationMs, "ceiling-kill"), ...await captureFileCount(cwd, cmd, raw) };
       continue;
     }
     // Run 2137: the child exited and printed ordinary FAIL/AssertionError lines, so the gate-side
@@ -608,7 +636,7 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
         + `the measurement cannot distinguish a pre-existing failure from one caused by exhaustion. `
         + `First invalidating line: ${invalidatingLines[0]}`,
       );
-      base.commands[name] = { ...invalidCaptureEntry(durationMs, "resource-exhaustion", invalidatingLines), fileCount: runnerFileCount(raw) };
+      base.commands[name] = { ...invalidCaptureEntry(durationMs, "resource-exhaustion", invalidatingLines), ...await captureFileCount(cwd, cmd, raw) };
       continue;
     }
     // OBS-966: a worker RPC timeout is infra even beside an all-green summary.
@@ -616,7 +644,7 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
     const runnerVerdict = classifyRunnerOutput(raw, r.code);
     if (runnerVerdict === "infra") {
       console.error(`tickmarkr: baseline capture for "${name}" carries runner-infrastructure evidence — it recorded NO verdict; nothing is forgiven for this command`);
-      base.commands[name] = { ...invalidCaptureEntry(durationMs, "infra", withoutVitestEchoBlocks(combinedOutput).filter((line) => isInfraLine(line.replace(ANSI_RE, "")))), fileCount: runnerFileCount(raw) };
+      base.commands[name] = { ...invalidCaptureEntry(durationMs, "infra", withoutVitestEchoBlocks(combinedOutput).filter((line) => isInfraLine(line.replace(ANSI_RE, "")))), ...await captureFileCount(cwd, cmd, raw) };
       continue;
     }
     base.commands[name] = {
@@ -628,7 +656,7 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
       missingCommand: missingConfiguredCommand(cmd, r),
       durationMs,
       ...fileTiming(raw, durationMs),
-      fileCount: runnerFileCount(raw),
+      ...await captureFileCount(cwd, cmd, raw),
       ceilingMs: effectiveCeilingMs({ durationMs }),
       // T7: the world this measurement was taken in, so a later reader can ask whether its own world
       // is the same one. Recorded from THIS command's own shell result, never re-derived here.
@@ -700,12 +728,16 @@ function headlineDetails(raw: string, fresh: string[]): { details: string; meta?
   };
 }
 
+export interface RetryOptions {
+  authorizeRetry?: (cause: "infra" | "host-starved") => boolean;
+}
+
 export async function compareToBaseline(
   cwd: string,
   commands: Record<string, string>,
   baseline: Baseline,
   enabled: string[],
-  opts: { rerunOf?: HostStarvedRerun; infraRerun?: HostStarvedRerun; selected?: readonly string[] } = {},
+  opts: RetryOptions & { rerunOf?: HostStarvedRerun; infraRerun?: HostStarvedRerun; selected?: readonly string[] } = {},
 ): Promise<GateResult[]> {
   const results: GateResult[] = [];
   const rerunOf = opts.rerunOf;
@@ -730,7 +762,9 @@ export async function compareToBaseline(
     // T7: every verdict below carries the capacity ITS OWN command ran under, taken off the shell
     // result rather than re-derived after the fact. The skip row above ran no command and therefore
     // states no capacity — a row that never divided the machine must not claim that it did.
+    let recoveryBlocked: string | undefined;
     const record = (g: GateResult): void => {
+      if (recoveryBlocked) g = { ...g, meta: { ...g.meta, recoveryBlocked } };
       const withReap = r.reapedGroup ? { ...g, meta: { ...g.meta, reapedGroup: true } } : g;
       const withReapError = r.reapError ? { ...withReap, meta: { ...withReap.meta, reapError: r.reapError } } : withReap;
       const withRerun = rerunOf ? {
@@ -812,19 +846,33 @@ export async function compareToBaseline(
     // retain the whole-output read so a repeated infra abort can never be baseline-forgiven as green.
     const classification = classifyFreshRunnerOutput(entry, raw, r.code);
     if (name === "test" && classification === "infra" && !rerunOf && !opts.infraRerun) {
-      const waitedMs = await waitForCalmWindow();
-      const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
-      results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, infraRerun: provenance }));
-      continue;
+      const waitedMs = await waitForCalmWindow(executionSignal());
+      if (opts.authorizeRetry && !calmWindowReady()) {
+        recoveryBlocked = "calm window unavailable within the existing wait ceiling";
+      } else if (opts.authorizeRetry && !opts.authorizeRetry("infra")) {
+        recoveryBlocked = "infrastructure retry allowance exhausted or subject unavailable";
+      } else {
+        const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
+        results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, infraRerun: provenance }));
+        continue;
+      }
     }
     // OBS-896: every fresh failure must be timeout-class, and the suite must take at least twice its
     // own baseline measurement. The first read buys one calm rerun here, never a worker repair.
     if (name === "test" && classification !== "infra" && failing.length && !rerunOf && !opts.infraRerun
       && hostStarved(failing.join("\n"), r.durationMs ?? 0, entry?.durationMs)) {
-      const waitedMs = await waitForCalmWindow();
-      const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
-      results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, rerunOf: provenance }));
-      continue;
+      const waitedMs = await waitForCalmWindow(executionSignal());
+      if (opts.authorizeRetry && !calmWindowReady()) {
+        recoveryBlocked = "calm window unavailable within the existing wait ceiling";
+      } else if (opts.authorizeRetry && !opts.authorizeRetry("host-starved")) {
+        recoveryBlocked = "verification retry allowance exhausted or subject unavailable";
+      } else {
+        // Compatibility with OBS-896, not an infrastructure reclassification: a persistent
+        // timeout remains the ordinary conservative verdict after the single bounded remeasure.
+        const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
+        results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, rerunOf: provenance }));
+        continue;
+      }
     }
     if (classification === "infra") {
       const evidence = failing.length
@@ -945,11 +993,15 @@ const DEFAULT_CALM: CalmWindow = {
 let calm: CalmWindow = DEFAULT_CALM;
 export function setCalmWindowForTests(over: Partial<CalmWindow>): void { calm = { ...calm, ...over }; }
 export function resetCalmWindowForTests(): void { calm = DEFAULT_CALM; }
-export async function waitForCalmWindow(): Promise<number> {
+export function calmWindowReady(): boolean { return calm.loadProvider() <= calm.calmLoad(); }
+
+export async function waitForCalmWindow(signal?: AbortSignal): Promise<number> {
   const started = Date.now();
   while (calm.loadProvider() > calm.calmLoad() && Date.now() - started < calm.maxWaitMs) {
-    await new Promise((resolve) => setTimeout(resolve, calm.pollMs));
+    signal?.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, signal ? Math.min(calm.pollMs, 100) : calm.pollMs));
   }
+  signal?.throwIfAborted();
   return Date.now() - started;
 }
 

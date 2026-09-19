@@ -1,0 +1,56 @@
+tickmarkr plan — dry run (16 channels available)
+mode: risk-based (default) · explore on
+driver: auto → subprocess (HERDR_ENV unset)
+harness: /opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js (unresolved location)
+
+  L1     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 0 · wave 1 at concurrency 2
+    floor cheap ← mode risk-based
+  L2     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 0 · wave 2 at concurrency 2
+    floor cheap ← mode risk-based
+  L3     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 0 · wave 3 at concurrency 2
+    floor cheap ← mode risk-based
+  L4     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 0 · wave 4 at concurrency 2
+    floor cheap ← mode risk-based
+  R      chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 3 · wave 1 at concurrency 2
+    floor cheap ← mode risk-based
+  A      chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 2 · wave 2 at concurrency 2
+    floor cheap ← mode risk-based
+  B      chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 1 · wave 3 at concurrency 2
+    floor cheap ← mode risk-based
+  C      chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
+    judge: claude-code:fable
+    review: codex:gpt-5.6-sol (seat 1 of 11 — rotation applies at run time) — reviewPolicy full
+    chain: depth 0 · wave 4 at concurrency 2
+    floor cheap ← mode risk-based
+
+est. cost (API LLM seats, rough): ~$0.00 + consult calls
+
+routing lints:
+  ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
+  ! codex: no detection data — run tickmarkr doctor
+  ! cursor-agent: no detection data — run tickmarkr doctor
+  ! opencode: no detection data — run tickmarkr doctor
+  ! pi: no detection data — run tickmarkr doctor
+  ! qwen: no model-list surface — seeds stamped 2026-07-09; verify manually
+  ! agy: no model-list surface and no configured models — classify per benchmark policy to open channels

@@ -1,11 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
 import { runGates } from "../../src/gates/run-gates.js";
-import { fileHangBudgetMs, isVitestTestCommand, readTestReport } from "../../src/gates/test-manifest.js";
+import { fileHangBudgetMs, isVitestTestCommand, readTestReport, verifyManifestReport } from "../../src/gates/test-manifest.js";
+import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
@@ -39,7 +41,7 @@ async function round(f: Fixture, cmd = "vitest run --globals", over: Partial<Bas
   const out = await runGates(task, {
     worktree: f.repo, baseRef: f.base, author: { adapter: "fake", model: "fake", tier: "mid", channel: "sub" },
     result: { ok: true, summary: "done", deviations: [], raw: "" }, commands: { test: cmd }, baseline: baseline(cmd, over),
-    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), pipeline: "v185", artifactDir: f.artifacts, selectTests: selected,
+    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), artifactDir: f.artifacts, selectTests: selected,
   });
   expect(out.results.filter(r => r.gate === "test")).toHaveLength(1);
   return out.results.find(r => r.gate === "test")!;
@@ -114,6 +116,7 @@ test("through runGates the repository's installed vitest run with the gate's rep
   const red = await round(f);
   expect(red.pass).toBe(false); expect(red.meta?.classification).toBe("regression");
   expect(red.meta?.processExit).toBe(1); expect(red.details).toContain("real failure fingerprint");
+  expect(red.meta?.failingFiles).toEqual(["tests/b.test.ts"]);
   for (const [mode, reason] of [["missing", "tests/b.test.ts"], ["stale", "prior-invocation"], ["duplicate", "more than once"], ["terminal", "terminal"]]) {
     const broken = fixture(false); fault(broken, mode, mode);
     expect(existsSync(receipt(broken, mode))).toBe(false);
@@ -122,6 +125,21 @@ test("through runGates the repository's installed vitest run with the gate's rep
     expect(row.pass).toBe(false); expect(row.meta?.classification).toBe("infra"); expect(row.details).toContain(reason);
   }
 }, 90_000);
+
+test("failing file identities come from completed records, never failure prose or passed records", () => {
+  const manifest = ["tests/a.test.ts", "tests/b.test.ts", "tests/c.test.ts"];
+  const verdict = verifyManifestReport({ manifest, nonce: "this-run", exitCode: 1, report: {
+    nonce: "this-run", requested: manifest, started: Object.fromEntries(manifest.map(file => [file, 1])),
+    completed: {
+      "tests/a.test.ts": { at: 2, status: "passed", failures: ["misleading tests/a.test.ts"] },
+      "tests/c.test.ts": { at: 2, status: "failed" },
+      "tests/b.test.ts": { at: 2, status: "failed", failures: ["FAIL invented/path.test.ts > arbitrary message"] },
+    }, certificate: { at: 3, exitCode: 1 },
+  } });
+  expect(verdict.pass).toBe(false);
+  expect(verdict.meta.failingFiles).toEqual(["tests/b.test.ts", "tests/c.test.ts"]);
+  expect(verdict.meta.failingTests).toEqual(["<unnamed failure>", "FAIL invented/path.test.ts > arbitrary message"]);
+});
 
 test("verifyIntegrationTip and runGates each spawn the worktree's vitest with the gate's reporter, persist that invocation's report beside their artifacts at the path their result row names, and reach the report's verdict with the stdout deficit rule never consulted even when the runner prints fewer files than the baseline recorded, while a scripted test command that is not the runner produces the base's exact result row through both entry points, so a verify that counts files, a report left unpersisted, or a scripted command routed through the report fails", async () => {
   const f = fixture();
@@ -144,7 +162,8 @@ test("verifyIntegrationTip and runGates each spawn the worktree's vitest with th
     const actual = await round(f, scripted, {fileCount:null});
     // runGates adds the same volatile measurement fields to every base result row.
     const { meta: measurement, ...rowWithoutMeasurement } = actual;
-    expect(Object.keys(measurement!).sort()).toEqual(["durationMs","load1End","load1Max","load1Mean","load1Start"]);
+    // R41: `verification` (protocol + effective lifecycle) is the one non-volatile stamp every row carries.
+    expect(Object.keys(measurement!).sort()).toEqual(["durationMs","load1End","load1Max","load1Mean","load1Start","verification"]);
     expect(rowWithoutMeasurement).toEqual(expected);
     const [tipScript] = await verifyIntegrationTip(f.repo, {test:scripted}, f.artifacts, base);
     expect(tipScript).toEqual({gate:"test",cmd:scripted,pass:true,exitCode:0,fingerprints:[],details:"exit 0"});
@@ -237,3 +256,195 @@ test("through runGates a test command whose package script invokes vitest fails 
     if (mode === "list") expect(existsSync(receipt(f,mode)+".list.receipt")).toBe(true);
   }
 }, 90_000);
+
+// R41: run one battery with an explicit process-scoped npm lifecycle policy, restoring the fork's env after.
+async function underLifecycle<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env.npm_config_ignore_scripts;
+  if (value === undefined) delete process.env.npm_config_ignore_scripts; else process.env.npm_config_ignore_scripts = value;
+  try { return await fn(); } finally {
+    if (prior === undefined) delete process.env.npm_config_ignore_scripts; else process.env.npm_config_ignore_scripts = prior;
+  }
+}
+
+test("through runGates a vitest suite holding a module whose whole body is skipped by describe.skipIf lists that module in its file-specification manifest beside the two executed ones, its report completes it as skipped with zero executed test bodies, the passing row names two executed and one skipped module and persists the expected manifest with the exact filesOnly listing invocation beside the report, a selected screen over the changed source and the added skipped file lists exactly those two and passes on its one executed module while the merge-candidate full manifest keeps all three, a report whose only manifest module is skipped fails closed naming no executed module, a skipped record's failure prose is ignored as a passed record's is, and a completion with an unknown status or malformed counts is rejected before any verdict, so a discovery that omits skipped modules, a pass that counts a skipped module as executed, or a verdict with no executed test body fails", async () => {
+  const f = fixture();
+  writeFileSync(join(f.repo, "tests/c.test.ts"), 'describe.skipIf(true)("env-gated", () => { test("never runs here", () => expect(1).toBe(2)); });\n');
+  commit(f.repo);
+  const row = await underLifecycle("false", () => round(f));
+  expect(row.pass, row.details).toBe(true);
+  expect(row.meta?.manifest).toEqual(["tests/a.test.ts", "tests/b.test.ts", "tests/c.test.ts"]);
+  expect(row.meta?.executedModules).toBe(2);
+  expect(row.meta?.skippedModules).toEqual(["tests/c.test.ts"]);
+  expect(row.details).toMatch(/3 manifest file\(s\) present exactly once; 2 executed, 1 skipped whole \(tests\/c\.test\.ts\)/);
+  expect(String(row.meta?.listingCommand)).toMatch(/ list --globals --filesOnly --json$/);
+  expect(row.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" });
+  const report = readTestReport(String(row.meta?.reportPath))!;
+  expect(report.completed["tests/c.test.ts"]).toMatchObject({ status: "skipped", tests: { passed: 0, failed: 0, skipped: 1 } });
+  expect(report.completed["tests/a.test.ts"]).toMatchObject({ status: "passed", tests: { passed: 1, failed: 0, skipped: 0 } });
+  const manifestPath = String(row.meta?.manifestPath);
+  expect(existsSync(manifestPath)).toBe(true);
+  const persisted = JSON.parse(readFileSync(manifestPath, "utf8"));
+  expect(persisted).toMatchObject({ nonce: row.meta?.nonce, listingCommand: row.meta?.listingCommand, listingExit: 0, files: row.meta?.manifest });
+  expect(typeof persisted.listingStdoutSha256).toBe("string");
+
+  // Selected screen: the diff touches src/a.ts only, so the screen's own listing (filters forwarded
+  // to the same filesOnly discovery) is exactly its covering file; the merge-candidate full suite
+  // that supersedes it lists all three, the skipped module included.
+  const g = fixture();
+  writeFileSync(join(g.repo, "tests/c.test.ts"), 'describe.skipIf(true)("env-gated", () => { test("never runs here", () => expect(1).toBe(2)); });\n');
+  commit(g.repo);
+  const screened = await round(g, "vitest run --globals", {}, true);
+  expect(screened.pass, screened.details).toBe(true);
+  // The diff changed src/a.ts AND added tests/c.test.ts, so the screen selects both; its own
+  // manifest (a executed, c skipped whole) passes on the one executed module before the full suite.
+  expect(screened.meta?.selectedTests).toEqual(["tests/a.test.ts", "tests/c.test.ts"]);
+  expect(screened.meta?.fullSuite).toBe(true);
+  expect(screened.meta?.manifest).toEqual(["tests/a.test.ts", "tests/b.test.ts", "tests/c.test.ts"]);
+  expect(screened.meta?.skippedModules).toEqual(["tests/c.test.ts"]);
+
+  // Nothing executed is not a verdict.
+  const now = Date.now();
+  const onlySkipped = verifyManifestReport({ manifest: ["tests/c.test.ts"], nonce: "n", exitCode: 0, report: { nonce: "n",
+    requested: ["tests/c.test.ts"], started: { "tests/c.test.ts": now },
+    completed: { "tests/c.test.ts": { at: now, status: "skipped", tests: { passed: 0, failed: 0, skipped: 1 } } }, certificate: { at: now, exitCode: 0 } } });
+  expect(onlySkipped).toMatchObject({ kind: "fail-closed", pass: false, meta: { infra: true, noExecutedModules: true, skippedModules: ["tests/c.test.ts"] } });
+  expect(onlySkipped.details).toMatch(/no test body executed/);
+  // A skipped record's failure prose is ignored exactly as a passed record's is (the pinned contract
+  // above: failing identities come from FAILED completions only); an unknown status or malformed
+  // counts never parse into a report at all.
+  const skippedProse = verifyManifestReport({ manifest: ["tests/a.test.ts", "tests/b.test.ts"], nonce: "n", exitCode: 0, report: { nonce: "n",
+    requested: ["tests/a.test.ts", "tests/b.test.ts"], started: { "tests/a.test.ts": now, "tests/b.test.ts": now },
+    completed: { "tests/a.test.ts": { at: now, status: "skipped", failures: ["misleading tests/a.test.ts"] }, "tests/b.test.ts": { at: now, status: "passed" } },
+    certificate: { at: now, exitCode: 0 } } });
+  expect(skippedProse).toMatchObject({ kind: "pass", pass: true, meta: { executedModules: 1, skippedModules: ["tests/a.test.ts"] } });
+  const bogus = join(f.artifacts, "bogus-status.json");
+  writeFileSync(bogus, JSON.stringify({ nonce: "n", requested: ["tests/a.test.ts"], started: { "tests/a.test.ts": now },
+    completed: { "tests/a.test.ts": { at: now, status: "bogus" } }, certificate: { at: now, exitCode: 0 } }));
+  expect(readTestReport(bogus)).toBeUndefined();
+  const badCounts = join(f.artifacts, "bad-counts.json");
+  writeFileSync(badCounts, JSON.stringify({ nonce: "n", requested: ["tests/a.test.ts"], started: { "tests/a.test.ts": now },
+    completed: { "tests/a.test.ts": { at: now, status: "passed", tests: { passed: "1", failed: 0, skipped: 0 } } }, certificate: { at: now, exitCode: 0 } }));
+  expect(readTestReport(badCounts)).toBeUndefined();
+}, 120_000);
+
+test("through runGates a scratch checkout whose package declares pretest npm run build and whose only test imports the ignored dist that build writes passes its test gate under an explicit process-scoped npm_config_ignore_scripts=false with dist provisioned by the hook and the row recording lifecycle hooks, the same checkout with dist removed under npm_config_ignore_scripts=true fails closed as infra on a report whose lifecycle started no module beside exit one with dist still absent and the row recording lifecycle ignore-scripts, and with no explicit policy the row records the policy measured from npm's resolved config with the outcome agreeing with it, so a runner child that does not receive the process policy, a verdict that hides which lifecycle it ran under, or a provisioning claimed by anything but the hook fails", async () => {
+  const repo = makeRepo({
+    ".gitignore": "node_modules/\ndist/\n",
+    "build.mjs": 'import { mkdirSync, writeFileSync } from "node:fs"; mkdirSync("dist", { recursive: true }); writeFileSync("dist/a.js", "export const a = 1;\\n");\n',
+    "tests/a.test.ts": 'import { a } from "../dist/a.js"; test("built identity", () => expect(a).toBe(1));\n',
+    "package.json": JSON.stringify({ type: "module", scripts: { pretest: "npm run build", build: "node build.mjs", test: "vitest run --globals" } }),
+  });
+  symlinkSync(install, join(repo, "node_modules"), "dir");
+  const base = git(repo, "rev-parse", "HEAD");
+  writeFileSync(join(repo, "tests/a.test.ts"), 'import { a } from "../dist/a.js"; test("built identity", () => expect(a).toBe(1)); // touched\n'); commit(repo);
+  const f: Fixture = { repo, base, artifacts: makeTestTempDir("vl1-lifecycle-") };
+  const dist = join(repo, "dist/a.js");
+  expect(existsSync(dist)).toBe(false);
+
+  const hooks = await underLifecycle("false", () => round(f, "npm test"));
+  expect(hooks.pass, hooks.details).toBe(true);
+  expect(existsSync(dist)).toBe(true);
+  expect(hooks.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" });
+  expect(String(hooks.meta?.spawnedCommand).startsWith("npm test")).toBe(true);
+
+  rmSync(join(repo, "dist"), { recursive: true, force: true });
+  writeFileSync(join(repo, "tests/a.test.ts"), 'import { a } from "../dist/a.js"; test("built identity", () => expect(a).toBe(1)); // again\n'); commit(repo);
+  const ignored = await underLifecycle("true", () => round(f, "npm test"));
+  // Without the hook there is no dist, so the module cannot even load: vitest starts no module and
+  // exits 1, and the gate fails CLOSED on a certificate that names no failed test beside a nonzero
+  // exit — never a regression verdict, never a pass. The report itself shows the empty lifecycle.
+  expect(ignored.pass).toBe(false);
+  expect(ignored.meta?.classification).toBe("infra");
+  expect(ignored.meta?.processExit).toBe(1);
+  expect(ignored.details).toMatch(/report has no failed tests but the process exited 1/);
+  const unloaded = readTestReport(String(ignored.meta?.reportPath))!;
+  expect({ requested: unloaded.requested, started: unloaded.started, completed: unloaded.completed, exit: unloaded.certificate?.exitCode })
+    .toEqual({ requested: ["tests/a.test.ts"], started: {}, completed: {}, exit: 1 });
+  expect(existsSync(dist)).toBe(false);
+  expect(ignored.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle: "ignore-scripts", source: "explicit" });
+
+  writeFileSync(join(repo, "tests/a.test.ts"), 'import { a } from "../dist/a.js"; test("built identity", () => expect(a).toBe(1)); // third\n'); commit(repo);
+  const measured = await underLifecycle(undefined, () => round(f, "npm test"));
+  // With no explicit export the policy is MEASURED from npm's resolved config for this checkout —
+  // the host's npmrc, which this test does not own — and the outcome must agree with it.
+  const policy = measured.meta?.verification as { protocol: string; lifecycle: string; source: string };
+  expect(policy).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle: expect.stringMatching(/^(hooks|ignore-scripts)$/), source: "npm-config" });
+  expect({ pass: measured.pass, dist: existsSync(dist), classification: measured.meta?.classification })
+    .toEqual(policy.lifecycle === "hooks" ? { pass: true, dist: true, classification: undefined } : { pass: false, dist: false, classification: "infra" });
+}, 180_000);
+
+const SCRATCH_PRETEST_FILES = {
+  ".gitignore": "node_modules/\ndist/\n",
+  "build.mjs": 'import { mkdirSync, writeFileSync } from "node:fs"; mkdirSync("dist", { recursive: true }); writeFileSync("dist/a.js", "export const a = 1;\\n");\n',
+  "tests/a.test.ts": 'import { a } from "../dist/a.js"; test("built identity", () => expect(a).toBe(1));\n',
+  "package.json": JSON.stringify({ type: "module", scripts: { pretest: "npm run build", build: "node build.mjs", test: "vitest run --globals" } }),
+};
+
+test("through the production worktree recreation on one preserved clean commit, where the task checkout is preserved and re-added from its base with node_modules linked and nothing built and its carried commit is cherry-picked back so the gated tree is byte-identical, a battery whose build verdict is the compatible cached green of the prior checkout runs no build command so the recreated checkout still has no dist, and under an explicit lifecycle hooks its test gate actually runs with pretest provisioning dist inside the recreated checkout before the one module starts, completes and passes, while the same recreation under lifecycle ignore-scripts reuses the same build green, runs the test, starts no module and fails closed with dist still absent, so a recreation that inherits a build without its artifacts, a test gate that does not run, or a provisioning by anything but the hook fails", async () => {
+  for (const [value, lifecycle] of [["false", "hooks"], ["true", "ignore-scripts"]] as const) {
+    const repo = makeRepo(SCRATCH_PRETEST_FILES);
+    symlinkSync(install, join(repo, "node_modules"), "dir");
+    const base = git(repo, "rev-parse", "HEAD");
+    const driver = new SubprocessDriver();
+    const branch = "tickmarkr/r41-recreate--T1";
+    const wt = await driver.worktree(repo, branch, base);
+    writeFileSync(join(wt, "tests/a.test.ts"), 'import { a } from "../dist/a.js"; test("built identity", () => expect(a).toBe(1)); // carried\n'); commit(wt);
+    const tip = git(wt, "rev-parse", "HEAD");
+    const tipTree = git(wt, "rev-parse", "HEAD^{tree}");
+    const artifacts = makeTestTempDir("vl1-recreate-");
+    const stateDir = makeTestTempDir("vl1-recreate-state-");
+    const bl = { commands: {
+      build: { cmd: "npm run build", exitCode: 0, fingerprints: [] },
+      test: { cmd: "npm test", exitCode: 0, fingerprints: [], ceilingMs: 30_000, fileCount: 999 },
+    } } as unknown as Baseline;
+    const battery = (worktree: string, commands: Record<string, string>) => runGates(task, {
+      worktree, baseRef: base, author: { adapter: "fake", model: "fake", tier: "mid", channel: "sub" },
+      result: { ok: true, summary: "done", deviations: [], raw: "" }, commands, baseline: bl,
+      channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), artifactDir: artifacts, stateDir,
+    });
+
+    // The prior checkout: the build gate ran for real and left dist behind; its green is cached.
+    const prior = await underLifecycle(value, () => battery(wt, { build: "npm run build" }));
+    const priorBuild = prior.results.find((r) => r.gate === "build")!;
+    expect(priorBuild.pass, priorBuild.details).toBe(true);
+    expect(priorBuild.meta?.reused).toBeUndefined();
+    expect(existsSync(join(wt, "dist/a.js"))).toBe(true);
+    expect(priorBuild.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle, source: "explicit" });
+
+    // The production recreation the daemon performs: preserve (nothing to preserve on a clean
+    // checkout), re-add the worktree from its base, link node_modules only, carry the commit back.
+    expect(await preserveWorktree(wt)).toBeUndefined();
+    const recreated = await driver.worktree(repo, branch, base);
+    expect(recreated).toBe(wt);
+    expect(git(recreated, "rev-parse", "HEAD")).toBe(base);
+    expect(existsSync(join(recreated, "dist"))).toBe(false);
+    expect(lstatSync(join(recreated, "node_modules")).isSymbolicLink()).toBe(true);
+    await shGitOk(`git cherry-pick ${tip}`, recreated);
+    expect(git(recreated, "rev-parse", "HEAD^{tree}")).toBe(tipTree);
+    expect(existsSync(join(recreated, "dist"))).toBe(false);
+
+    const round2 = await underLifecycle(value, () => battery(recreated, { build: "npm run build", test: "npm test" }));
+    const build2 = round2.results.find((r) => r.gate === "build")!;
+    expect(build2.pass).toBe(true);
+    expect(build2.meta?.reused).toBe(true);
+    expect(String(build2.details)).toMatch(new RegExp(`reused verdict \\(identity: gate=build .*lifecycle=${lifecycle} \\(explicit\\)\\]`));
+    const test2 = round2.results.find((r) => r.gate === "test")!;
+    expect(String(test2.meta?.spawnedCommand).startsWith("npm test -- --reporter=")).toBe(true);
+    expect(test2.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle, source: "explicit" });
+    const report = readTestReport(String(test2.meta?.reportPath))!;
+    expect(report.requested).toEqual(["tests/a.test.ts"]);
+    if (lifecycle === "hooks") {
+      expect(test2.pass, test2.details).toBe(true);
+      expect(existsSync(join(recreated, "dist/a.js"))).toBe(true);
+      expect(report.started).toHaveProperty("tests/a.test.ts");
+      expect(report.completed["tests/a.test.ts"]).toMatchObject({ status: "passed", tests: { passed: 1, failed: 0, skipped: 0 } });
+      expect(report.certificate?.exitCode).toBe(0);
+      expect(test2.meta?.executedModules).toBe(1);
+    } else {
+      expect(test2.pass).toBe(false);
+      expect(test2.meta?.classification).toBe("infra");
+      expect(existsSync(join(recreated, "dist"))).toBe(false);
+      expect({ started: report.started, completed: report.completed, exit: report.certificate?.exitCode }).toEqual({ started: {}, completed: {}, exit: 1 });
+    }
+  }
+}, 240_000);

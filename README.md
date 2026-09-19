@@ -52,7 +52,7 @@ prefer, every example below works with either.
 
 - **macOS or Linux.** Every command shells out through `bash`, so native Windows is not
   supported — use WSL (untested).
-- Node ≥ 20 and `git` on PATH.
+- Node ≥ 20.3 and `git` on PATH.
 - At least one agent CLI on PATH (`claude`, `codex`, `cursor-agent`, `opencode`, `grok`, `pi`,
   or `kimi`), authenticated through its own login. tickmarkr never handles vendor API keys itself.
 
@@ -475,6 +475,8 @@ accepted contributions are credited via `Co-authored-by:` on the release commit.
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
+
+- [Experimental execution policy](docs/experimental-execution-policy.md) — bounded recovery, cumulative task time, and repair selection.
 
 - **[FLEET.md](https://github.com/alzahrani-khalid/tickmarkr/blob/main/FLEET.md)** — routing modes, steering syntax, tier provenance, and run flags (advanced reference)
 - **[LICENSE](LICENSE)** — MIT license

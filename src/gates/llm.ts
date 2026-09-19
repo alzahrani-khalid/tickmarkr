@@ -187,6 +187,8 @@ export interface LlmRunResult {
   exitCode?: number;
   timedOut: boolean;
   launchNeverStarted?: boolean;
+  /** OBS-1039: seat-authored bytes stayed under REVIEW_SILENT_BYTE_FLOOR at the first liveness beat. */
+  silentAtBeat?: boolean;
   seatAuthoredBytes?: number;
 }
 
@@ -338,6 +340,10 @@ export function reviewSeatOutput(raw: string, nonce: string, adapterBannerRows: 
 }
 
 export const REVIEW_FIRST_LIVENESS_MS = 30_000;
+// OBS-1039: a seat that wrote ten bytes and went quiet escaped the zero-byte beat and sat to the
+// ceiling. Below this many seat-authored bytes at the first beat the seat is `silent` — demoted and
+// re-routed then, not at the ceiling. Pane path only; a headless runner buffers and keeps its ceiling.
+export const REVIEW_SILENT_BYTE_FLOOR = 64;
 
 async function runHeadlessDetailed(
   adapter: WorkerAdapter,
@@ -414,6 +420,7 @@ async function runViaDriverDetailed(
     let out: string;
     let timedOut = false;
     let launchNeverStarted = false;
+    let silentAtBeat = false;
     let seatAuthoredBytes = 0;
     const gatePrompt = prompt.startsWith("TICKMARKR-JUDGE") || prompt.startsWith("TICKMARKR-REVIEW");
     if (!gatePrompt) {
@@ -468,6 +475,11 @@ async function runViaDriverDetailed(
             forceClose = true;
             break;
           }
+          if (seatAuthoredBytes < REVIEW_SILENT_BYTE_FLOOR) {
+            silentAtBeat = true;
+            forceClose = true;
+            break;
+          }
         }
         // Producing reviews own their full ceiling; inactivity is not a review verdict.
         if (reviewing) continue;
@@ -513,6 +525,7 @@ async function runViaDriverDetailed(
       ...(Number.isFinite(exitCode) ? { exitCode } : {}),
       timedOut,
       launchNeverStarted,
+      silentAtBeat,
       seatAuthoredBytes,
     };
   } finally {

@@ -957,7 +957,9 @@ describe("setup tab decisions surface", () => {
     journal.append("task-human", "tomb", { kind: "human-gate", reason: "tombstone, never dispatched" });
     // Scope amendments require files input in the production Run flow (run-view.test.ts);
     // this retained legacy setup fixture exercises only its flag-free decisions.
-    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "scope-request")) {
+    // OBS-1007 (v2.5.6 T5): diff-cap admits only --recheck (permittedDecisionVerbs); the legacy setup surface
+    // has no recheck key outside gate-fail, so the kind is exercised in run-view.test.ts, not here.
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "scope-request" && kind !== "diff-cap")) {
       journal.append("task-human", `park-${kind}`, { kind, reason: `park ${kind}` });
     }
     const decisions = deriveParkedDecisions(Journal.open(root, "run-cockpit-verbs"));
@@ -965,11 +967,11 @@ describe("setup tab decisions surface", () => {
     expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === "gate-scope")!)).toEqual(["waive", "recheck"]);
     expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === "gate-review")!)).toEqual(["waive", "uphold", "recheck"]);
     expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === "tomb")!)).toEqual([]);
-    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "scope-request")) {
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "scope-request" && kind !== "diff-cap")) {
       expect(setupDecisionVerbs(decisions.find((decision) => decision.taskId === `park-${kind}`)!)).toEqual(["approve"]);
     }
 
-    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "scope-request")) {
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "scope-request" && kind !== "diff-cap")) {
       const taskId = `park-${kind}`;
       const selection = decisions.filter((decision) => !decision.tombstone).findIndex((decision) => decision.taskId === taskId);
       const opened = applySetupDecisionsKey({ ...initialSetupDecisionsSession(), selection }, { input: "a", key: {} }, decisions);
@@ -1009,7 +1011,7 @@ describe("setup tab decisions surface", () => {
 
   test("test: every confirmable park-and-verb pair displays the exact disposition its confirmed command appends — approve on attempt-cap fresh-budget, approve on every other non-gate-fail kind dispatch, waive waive-gate, recheck re-dispatch and uphold fund-fixed-attempt — and executing that confirmation returns the same token, while an allowed but wrong token or a verb-only inset fails", async () => {
     const { root } = decisionsRepo("run-cockpit-dispositions");
-    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "attempt-cap" && kind !== "scope-request")) {
+    for (const kind of PARK_KINDS.filter((kind) => kind !== "gate-fail" && kind !== "attempt-cap" && kind !== "scope-request" && kind !== "diff-cap")) {
       const lines = setupDecisionConfirmLines({ verb: "approve", taskId: `x-${kind}` }, { taskId: `x-${kind}`, kind, parkedAt: "00:00:00", attempts: 0, tombstone: false }, "op", "journal", FINISHED_RUN);
       expect(lines.join("\n")).toContain("disposition dispatch");
     }

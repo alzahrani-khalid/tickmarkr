@@ -1,5 +1,5 @@
 import { existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { type Assignment, type BillingChannel, channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
 import {
   criticalPathHits, DEFAULT_DIFF_CAP, DEFAULT_REVIEW_CRITICAL_PATHS, declaredReviewPolicy,
@@ -14,6 +14,7 @@ import { structuredFindings, type StructuredFinding } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
 import { marginalCostRank } from "../route/router.js";
 import { modelProvider } from "../route/preference.js";
+import { resolveStateDir } from "./cache.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlmDetailed, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
@@ -185,8 +186,14 @@ export function checkDiffCap(gate: string, measured: number, cap: number, prefix
     gate,
     pass: false,
     details: prefix + `diff exceeds verifiable cap (${measured} > ${cap}) — ${DIFF_CAP_REMEDY}`,
-    // daemon/run-gates: park('human') immediately — the diff cannot shrink by retrying (OBS-48).
-    meta: { park: "human" },
+    meta: {
+      park: "diff-cap",
+      parkKind: "diff-cap",
+      measuredBytes: measured,
+      permittedBytes: cap,
+      measured,
+      permitted: cap,
+    },
   };
 }
 
@@ -206,13 +213,20 @@ export function checkTaskDiffCaps(
     pass: false,
     details: prefix
       + `captured artifact diff exceeds verifiable capture cap (${measured.captureBytes} > ${captureCap}) — ${DIFF_CAP_REMEDY}`,
-    meta: { park: "human" },
+    meta: {
+      park: "diff-cap",
+      parkKind: "diff-cap",
+      measuredBytes: measured.captureBytes,
+      permittedBytes: captureCap,
+      measured: measured.captureBytes,
+      permitted: captureCap,
+    },
   };
 }
 
 export function isDiffCapPark(result: GateResult): boolean {
   return result.pass === false
-    && result.meta?.park === "human"
+    && result.meta?.parkKind === "diff-cap"
     && /diff exceeds verifiable (?:capture )?cap/i.test(result.details);
 }
 
@@ -266,6 +280,23 @@ export function isReviewClosureInvalid(
     || new Set(allCandidateIds.map((id) => matchClosureId(id, priors) ?? id)).size !== allCandidateIds.length
     || [...priors].some((id) => !allCandidateIds.some((candidate) => matchClosureId(candidate, id)))
   );
+}
+
+/**
+ * OBS-1013 add.3: the reviewer ECHOED closure ids and at least one matches no carried fingerprint —
+ * it answered about the materials and missed the id (a retyped, truncated or paraphrased fingerprint).
+ * That is a no-verdict about the carried work (re-route), not a parse defect. A verdict that omits a
+ * list, carries a non-string or duplicates an id stays malformed: its shape, not its ids, is wrong.
+ */
+export function isReviewClosureMismatch(
+  v: Pick<ReviewVerdict, "resolved" | "reraised"> | null | undefined,
+  priorIds: ReadonlySet<string> | readonly string[],
+): boolean {
+  if (!v || !Array.isArray(v.resolved) || !Array.isArray(v.reraised)) return false;
+  const ids = [...v.resolved, ...v.reraised];
+  if (!ids.every((id) => typeof id === "string")) return false;
+  const priors = priorIds instanceof Set ? priorIds : new Set(priorIds);
+  return ids.some((id) => matchClosureId(id, priors) === undefined);
 }
 
 // v1.53 T2: same entry grammar as routing.map.prefer (router.ts preferIndex — router is out of this
@@ -345,6 +376,8 @@ export function pickReviewer(
   history: string[] = [], // run-scoped picks, oldest to newest; empty preserves the established ranking
   onSeat?: (seat: number, count: number) => void,
   demoted: ReadonlySet<string> = new Set(),
+  // OBS-1033: vendors that authored a carried commit inside the accumulated diff — excluded for the round.
+  excludeVendors: ReadonlySet<string> = new Set(),
 ): BillingChannel | null {
   // FLEET-05 success criterion 2: an author not resolvable in the channel list yields NO reviewer.
   // The old `?? author.adapter` fallback compared an adapter id to vendor names, matched nothing, and
@@ -364,6 +397,7 @@ export function pickReviewer(
       && modelProvider(c.model, c.vendor) !== authorProvider
       && modelId(c.model) !== modelId(author.model)
       && !exclude.includes(channelKey(c))
+      && !excludeVendors.has(c.vendor)
       && TIER_RANK[c.tier] >= TIER_RANK[effectiveFloor])
     .sort((a, b) => reviewPreferIndex(a, prefer) - reviewPreferIndex(b, prefer) || TIER_RANK[b.tier] - TIER_RANK[a.tier] || marginalCostRank(a) - marginalCostRank(b));
   const reviewer = [...ranked].sort((a, b) =>
@@ -377,7 +411,9 @@ export function pickReviewer(
 // OBS-196: the two observed unparseable causes are different defects — a cutoff/empty output is
 // reviewer infrastructure dying mid-flight; a malformed verdict is a parse defect. Neither is
 // evidence about the WORK, which is why run-gates retries the review, never the worker (OBS-193).
-export type ReviewUnparseableCause = VerdictUnparseableCause | "launch-never-started" | "truncated" | "silent";
+// OBS-1013 add.3: a parseable verdict whose closure ids match no carried fingerprint is a
+// `closure-mismatch` — a no-verdict about the carried materials (infra: re-route), never a parse defect.
+export type ReviewUnparseableCause = VerdictUnparseableCause | "launch-never-started" | "truncated" | "silent" | "closure-mismatch";
 
 /**
  * This shows the reviewer what the task DECLARED, never what the diff may actually reach. The diff
@@ -391,6 +427,59 @@ export function renderDeclaredWriteScope(files: ReadonlyArray<string>): string {
   return `## Declared write scope
 The task DECLARED these write-scope patterns:
 ${files.map((path) => `- ${path}`).join("\n")}`;
+}
+
+/**
+ * OBS-1033: the vendors of the seats that authored commits inside the accumulated diff. A seat is
+ * never handed its own earlier work to approve. A prior author not resolvable in the pool excludes
+ * its adapter's vendors instead (fail closed: the seat is known, its vendor is whatever it bills as).
+ */
+export function carriedAuthorVendors(channels: BillingChannel[], carriedAuthors: readonly string[] = []): Set<string> {
+  const vendors = new Set<string>();
+  for (const key of carriedAuthors) {
+    const adapter = key.split(":")[0]!;
+    const exact = channels.filter((c) => channelKey(c) === key);
+    for (const c of exact.length ? exact : channels.filter((c) => c.adapter === adapter)) vendors.add(c.vendor);
+  }
+  return vendors;
+}
+
+/**
+ * OBS-1020: the compiled goal is the contract. After `resume --graph-changed` the worktree's copy of
+ * the spec is the pre-change text on the integration branch, so a reviewer that reads it grades a
+ * superseded contract. The daemon's repository root is where specs and planning records are current.
+ */
+export function renderGoalSection(goal: string, repoRoot?: string): string {
+  return `## Goal (authoritative — compiled from the sealed graph; the worktree's spec file may be stale after resume --graph-changed)
+${goal}
+${repoRoot ? `Specs and planning records are read in the daemon's repository root ${repoRoot} (its specs/ and .planning/), never this worktree's copies.` : ""}`;
+}
+
+/**
+ * The daemon's repository root: the parent of the state dir the run's artifacts live under. Named
+ * only when that state dir exists — a guessed one would send the reviewer to a path that holds nothing.
+ */
+function daemonRepoRoot(worktree: string, artifactDir?: string): string | undefined {
+  try {
+    const stateDir = resolveStateDir(worktree, artifactDir);
+    return stateDir.endsWith("/.tickmarkr") && existsSync(stateDir) ? dirname(stateDir) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * OBS-1013 add.3: each carried id is printed ONCE, verbatim, inside a fenced block the reviewer can
+ * copy; the notes follow in the same order. A reviewer that retyped a 600-byte id from prose lost
+ * closure on a typo and that read as malformed — the block is what a closure list is copied from.
+ */
+export function renderPriorMaterials(priorMaterials: readonly StructuredFinding[]): string {
+  return `## Prior materials this attempt must close
+Copy each fingerprint below EXACTLY (they appear once, in this block) into resolved or reraised:
+\`\`\`text
+${priorMaterials.map((finding) => `Fingerprint: ${finding.fingerprint}`).join("\n")}
+\`\`\`
+${priorMaterials.map((finding, i) => `${i + 1}. ${finding.note}`).join("\n\n")}`;
 }
 
 export async function reviewGate(
@@ -412,6 +501,8 @@ export async function reviewGate(
   // RF-1: channel keys of THIS task's prior reviewers (earlier rounds, a flaked seat) — task-scoped,
   // never the run-wide rotation history nor excludeReviewers; the seat holds the highest of their tiers.
   priorReviewers: readonly PriorReviewer[] = [],
+  // OBS-1033: channel keys of the seats that authored the carried commits (the daemon's tried list).
+  carriedAuthors: readonly string[] = [],
 ): Promise<GateResult> {
   // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
   // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
@@ -495,6 +586,7 @@ export async function reviewGate(
   const reviewer = pickReviewer(
     author, channels, excludeReviewers ?? [], cfg.review.prefer ?? [], reviewerFloor,
     reviewHistory, reviewHistory ? (seat) => { rotationSeat = seat; } : undefined, demotedReviewers,
+    carriedAuthorVendors(channels, carriedAuthors),
   );
   if (!reviewer) {
     // meta.noEligibleReviewer lets run-gates' review-retry keep the ORIGINAL unparseable result when
@@ -514,6 +606,7 @@ export async function reviewGate(
   const capFail = checkTaskDiffCaps("review", measuredDiff, diffCap);
   if (capFail) return capFail;
   const nonce = generateVerdictNonce();
+  const repoRoot = daemonRepoRoot(worktree, artifactDir);
   const prompt = `TICKMARKR-REVIEW
 You are a skeptical cross-vendor code reviewer. Another agent (vendor: ${author.adapter}) authored this diff.
 Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
@@ -521,13 +614,13 @@ Look for correctness bugs, security issues, and acceptance-criteria gaps. Approv
 ${COMPLETION_FAKING_CHECKLIST}
 
 ## Task ${task.id}: ${task.title} (complexity ${task.complexity})
+${renderGoalSection(task.goal, repoRoot)}
 ## Acceptance criteria
 ${task.acceptance.map((a) => `- ${renderAcceptanceItem(a)}`).join("\n")}
 
 ${renderDeclaredWriteScope(task.files)}
 
-${priorMaterials.length ? `## Prior materials this attempt must close
-${priorMaterials.map((finding) => `Fingerprint: ${finding.fingerprint}\n${finding.note}`).join("\n\n")}
+${priorMaterials.length ? `${renderPriorMaterials(priorMaterials)}
 
 ` : ""}## Diff
 \`\`\`diff
@@ -610,17 +703,22 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
   const priorIds = new Set(priorMaterials.map((finding) => finding.fingerprint));
   const closureInvalid = isReviewClosureInvalid(v, priorIds);
+  const closureMismatch = closureInvalid && isReviewClosureMismatch(v, priorIds);
   // findings decides the verdict on its own; the legacy path still needs approve + issues to parse.
   if (!v || closureInvalid || (findings === null && (typeof v.approve !== "boolean" || !Array.isArray(v.issues)))) {
     // OBS-196: name the cause and persist the raw bytes — a ruled-on "unparseable" without its
     // evidence cannot be audited, and a cutoff must never be indistinguishable from a parse defect.
     const bytes = llm.seatAuthoredBytes ?? Buffer.byteLength(raw.trim(), "utf8");
-    const cause: ReviewUnparseableCause = closureInvalid ? "malformed-verdict" : llm.launchNeverStarted ? "launch-never-started"
+    const cause: ReviewUnparseableCause = closureMismatch ? "closure-mismatch" : closureInvalid ? "malformed-verdict"
+      : llm.launchNeverStarted ? "launch-never-started"
+      : llm.silentAtBeat ? "silent"
       : llm.timedOut ? (bytes > 0 ? "truncated" : "silent")
       : classifyVerdictCause(raw, nonce, "approve", llm);
     const failure = cause === "malformed-verdict"
       ? "review output unparseable"
-      : "review dispatch failed — no structurally valid nonce-bound response";
+      : cause === "closure-mismatch"
+        ? "review verdict closes no carried fingerprint — closure ids match none of the carried materials"
+        : "review dispatch failed — no structurally valid nonce-bound response";
     return {
       gate: "review",
       pass: false,
@@ -635,6 +733,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
         provider,
         ...(cause === "malformed-verdict" ? { unparseable: true } : { noVerdict: true, classification: "infra", infra: true }),
         cause,
+        ...(closureMismatch ? { resolved: v?.resolved, reraised: v?.reraised, carriedFingerprints: [...priorIds] } : {}),
         bytes, seatAuthoredBytes: bytes,
         ...(saved ? { rawPath: saved } : {}),
         ...(savedBrief ? { briefPath: savedBrief } : {}),

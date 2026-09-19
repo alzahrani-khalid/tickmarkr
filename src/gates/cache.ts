@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Baseline } from "./baseline.js";
 import type { GateResult } from "./types.js";
-import { describeCapacity, type RunCapacity, resolvedCapacity, shGit } from "../run/git.js";
+import { describeCapacity, type RunCapacity, resolvedCapacity, shGit, type VerificationProtocol, verificationProtocol } from "../run/git.js";
 import { shq } from "../adapters/types.js";
 
 export const DEFAULT_VERDICT_CACHE_BOUND = 128;
@@ -91,34 +91,42 @@ export interface GateEnvironmentInput {
   capacity?: RunCapacity;
   selectedSet?: readonly string[];
   scope?: VerificationScope;
+  /** R41: the verification protocol + runner lifecycle policy; defaults to this process's. */
+  verification?: VerificationProtocol;
 }
 
-export function environmentFingerprint(env: GateEnvironmentInput): {
-  fingerprint: string;
-  parts: {
-    nodeRuntime: string;
-    lockfile: string;
-    capacity: RunCapacity;
-    selectedSet?: readonly string[];
-  };
-} {
+export interface EnvironmentParts {
+  nodeRuntime: string;
+  lockfile: string;
+  capacity: RunCapacity;
+  selectedSet?: readonly string[];
+  verification: VerificationProtocol;
+}
+
+export function environmentFingerprint(env: GateEnvironmentInput): { fingerprint: string; parts: EnvironmentParts } {
   const nodeRuntime = env.nodeRuntime ?? process.version;
   const lockfile = env.lockfile ?? (env.worktree ? lockfileHash(env.worktree) : "no-lockfile");
   const cap = env.capacity ?? resolvedCapacity();
   const capacity: RunCapacity = { forkCap: cap.forkCap, cores: cap.cores };
   const selectedSet = env.selectedSet ? [...env.selectedSet].sort() : undefined;
+  const verification = env.verification ?? verificationProtocol(process.env, env.worktree ?? process.cwd());
 
+  // R41: the protocol and the EFFECTIVE lifecycle are IN the hashed payload, so every entry written
+  // before this stamp — green or red — keys differently and is never answered; no store surgery is
+  // needed. `source` is provenance (kept in parts, printed on the row) and never enters the key: an
+  // explicit `false` and an npmrc `false` are the same policy for the child that ran.
   const payload = canonicalJson({
     nodeRuntime,
     lockfile,
     capacity,
     selectedSet: selectedSet ?? null,
     scope: env.scope ?? "battery",
+    verification: { protocol: verification.protocol, lifecycle: verification.lifecycle },
   });
   const fingerprint = createHash("sha256").update(payload).digest("hex").slice(0, 16);
   return {
     fingerprint,
-    parts: { nodeRuntime, lockfile, capacity, selectedSet },
+    parts: { nodeRuntime, lockfile, capacity, selectedSet, verification },
   };
 }
 
@@ -135,12 +143,7 @@ export interface VerificationIdentity {
   command: string;
   baseline: string;
   environment: string;
-  envParts?: {
-    nodeRuntime: string;
-    lockfile: string;
-    capacity: RunCapacity;
-    selectedSet?: readonly string[];
-  };
+  envParts?: EnvironmentParts;
 }
 
 export async function computeVerificationIdentity(params: {
@@ -154,6 +157,7 @@ export async function computeVerificationIdentity(params: {
   tree?: string;
   lockfile?: string;
   nodeRuntime?: string;
+  verification?: VerificationProtocol;
 }): Promise<VerificationIdentity | undefined> {
   const tree = params.tree ?? (await getWorktreeTree(params.worktree));
   if (!tree) return undefined;
@@ -165,6 +169,7 @@ export async function computeVerificationIdentity(params: {
     lockfile: params.lockfile,
     nodeRuntime: params.nodeRuntime,
     scope: params.scope,
+    verification: params.verification,
   });
 
   return {
@@ -190,7 +195,7 @@ export function verificationIdentityKey(id: VerificationIdentity): string {
 export function formatReusedDetails(originalDetails: string, id: VerificationIdentity): string {
   const unadorned = originalDetails.replace(/^reused verdict \(identity: [^)]+\):\s*/, "");
   const envDesc = id.envParts
-    ? ` [node=${id.envParts.nodeRuntime}, lockfile=${id.envParts.lockfile}, capacity=${describeCapacity(id.envParts.capacity)}${id.envParts.selectedSet ? `, selected=${id.envParts.selectedSet.join(",")}` : ""}]`
+    ? ` [node=${id.envParts.nodeRuntime}, lockfile=${id.envParts.lockfile}, capacity=${describeCapacity(id.envParts.capacity)}${id.envParts.selectedSet ? `, selected=${id.envParts.selectedSet.join(",")}` : ""}, protocol=${id.envParts.verification.protocol}, lifecycle=${id.envParts.verification.lifecycle} (${id.envParts.verification.source})]`
     : "";
   const gate = id.gate ?? "gate";
   const prefix = `reused ${id.scope === "tip" ? "tip " : ""}verdict (identity: gate=${gate} tree=${id.tree}${id.worktree ? ` worktree=${id.worktree}` : ""} command=${id.command} baseline=${id.baseline} env=${id.environment}${envDesc})`;
@@ -338,8 +343,14 @@ export class VerdictStore {
     }
   }
 
+  // R41: an identity whose lifecycle policy could not be measured is never answered and never
+  // stored — an unknown policy is not comparable to anything, so the battery runs the command.
+  private static unknownPolicy(id: VerificationIdentity): boolean {
+    return id.envParts?.verification?.lifecycle === "unknown";
+  }
+
   get(id?: VerificationIdentity): CachedVerdict | undefined {
-    if (!id || !id.tree) return undefined;
+    if (!id || !id.tree || VerdictStore.unknownPolicy(id)) return undefined;
     const key = verificationIdentityKey(id);
     const p = join(this.dir, `verdict-${key}.json`);
     if (existsSync(p)) {
@@ -354,7 +365,7 @@ export class VerdictStore {
   }
 
   set(id: VerificationIdentity | undefined, verdict: GateResult | CachedVerdict): boolean {
-    if (!id || !id.tree) return false;
+    if (!id || !id.tree || VerdictStore.unknownPolicy(id)) return false;
     if (isInfraResult(verdict)) return false;
 
     mkdirSync(this.dir, { recursive: true });

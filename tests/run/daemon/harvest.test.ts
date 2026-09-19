@@ -1,3 +1,4 @@
+import { writeBashEnvFixture } from "../../helpers/bash-env.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +11,7 @@ import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
 import { tickmarkrDir } from "../../../src/graph/graph.js";
 import { NO_TRAILER_SUMMARY } from "../../../src/adapters/prompt.js";
-import { HARVESTED_RESULT_SUMMARY, harvestCpuFlatWindowMs, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, resetNudgeTimingForTests, runDaemon, setDeadChannelFastKillMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests, setNudgeTimingForTests, workerTreeCpuMs } from "../../../src/run/daemon.js";
+import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests, HARVESTED_RESULT_SUMMARY, harvestCpuFlatWindowMs, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, resetNudgeTimingForTests, runDaemon, setDeadChannelFastKillMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests, setNudgeTimingForTests, workerTreeCpuMs } from "../../../src/run/daemon.js";
 import { Journal, type JournalEvent } from "../../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
@@ -74,7 +75,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
   // here so the UNREADABLE reading is exercised everywhere rather than only where `ps` is denied.
   const denyPs = (): (() => void) => {
     const bashEnv = join(makeTestTempDir("tickmarkr-ps-denied-"), "bash-env");
-    writeFileSync(bashEnv, "ps() { return 1; }\n");
+    writeBashEnvFixture(bashEnv, "ps() { return 1; }\n");
     const prior = process.env.BASH_ENV;
     process.env.BASH_ENV = bashEnv;
     return () => {
@@ -114,7 +115,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         : "",
       'process.stdout.write(rows.join("\\n") + "\\n");',
     ].join("\n"));
-    writeFileSync(bashEnv, `ps() { node ${shq(script)}; }\n`);
+    writeBashEnvFixture(bashEnv, `ps() { node ${shq(script)}; }\n`);
     const prior = {
       bashEnv: process.env.BASH_ENV,
       marker: process.env.TICKMARKR_TEST_PS_MARKER,
@@ -506,26 +507,29 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     const daemonUrl = new URL("../../../src/run/daemon.ts", import.meta.url).href;
     const driverUrl = new URL("../../../src/drivers/subprocess.ts", import.meta.url).href;
     const helperUrl = new URL("../../helpers/tmprepo.ts", import.meta.url).href;
+    const journalUrl = new URL("../../../src/run/journal.ts", import.meta.url).href;
     writeFileSync(probe, [
-      `import { runDaemon, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests } from ${JSON.stringify(daemonUrl)};`,
+      `import { setAttemptHardTimeoutMsForTests, runDaemon, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests } from ${JSON.stringify(daemonUrl)};`,
       `import { SubprocessDriver } from ${JSON.stringify(driverUrl)};`,
-      `import { COMMIT, setupRepo, T } from ${JSON.stringify(helperUrl)};`,
+      `import { setupRepo, T } from ${JSON.stringify(helperUrl)};`,
+      `import { Journal } from ${JSON.stringify(journalUrl)};`,
       "async function main() {",
-      'const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], { tasks: { T1: [{ shell: `echo landed > landed.txt && ${COMMIT} landed` }] } });',
+      'const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 5 })], { tasks: { T1: [{ shell: "echo working" }] }, consult: { action: "human", notes: "unreadable worker" } });',
       "const inner = new SubprocessDriver();",
       "let reads = 0;",
       "const driver = {",
       '  id: "accountant-cleanup-probe", interactive: true,',
       "  slot: inner.slot.bind(inner), run: inner.run.bind(inner),",
       "  waitOutput: async () => { await new Promise((resolve) => setTimeout(resolve, 50)); return false; },",
-      '  read: async () => { if (++reads >= 3) throw new Error("probe read failure"); return "working-on-it"; },',
+      '  read: async () => { if (++reads >= 2) throw new Error("probe read failure"); return "working-on-it"; },',
       '  waitAgentStatus: inner.waitAgentStatus.bind(inner), status: async () => "working",',
       "  notify: inner.notify.bind(inner), close: inner.close.bind(inner), worktree: inner.worktree.bind(inner),",
       "};",
-      "setHarvestSilentMsForTests(0); setHarvestCpuFlatMsForTests(60_000);",
+      "setAttemptHardTimeoutMsForTests(600); setHarvestSilentMsForTests(0); setHarvestCpuFlatMsForTests(60_000);",
       "try {",
       '  const summary = await runDaemon(repo, { adapters: [fake], runId: "run-accountant-cleanup", driver });',
-      '  if (!summary.failed.includes("T1")) throw new Error(`unexpected summary: ${JSON.stringify(summary)}`);',
+      '  if (!Journal.open(repo, "run-accountant-cleanup").read().some((row) => row.event === "contact-unreadable" && row.data.source === "driver")) throw new Error("the wait loop never observed the injected failure");',
+      '  if (!summary.human.includes("T1")) throw new Error(`unexpected summary: ${JSON.stringify(summary)}`);',
       "} finally { resetHarvestSilentMsForTests(); resetHarvestCpuFlatMsForTests(); }",
       'process.stdout.write("accountant-cleanup-settled\\n");',
       "}",
@@ -560,7 +564,8 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
   test("test: a worker still burning CPU is not concluded however silent its tracker is", async () => {
     // Pin three seconds, not one sparse observation: the window crosses three complete burner/gap
     // cycles on both CPU-clock resolutions, so only retained exited-child CPU can hold it open.
-    await withSeams(300, 3_000, async () => {
+    setAttemptHardTimeoutMsForTests(7_200);
+    try { await withSeams(300, 3_000, async () => {
       // Commits ahead of base AND a frozen tracker: two of the three legs are satisfied from the
       // first slice. The worker then burns, so the CPU leg alone must hold the wait open.
       // The persistent worker launches CPU-heavy tool children for 120ms, then waits 800ms. Every
@@ -586,15 +591,16 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       // satisfied from the first slice
       expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
       expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0); // nor killed
-      expect(waited).toBeGreaterThanOrEqual(7_200); // it rode the whole 0.12m window out
+      expect(waited).toBeGreaterThanOrEqual(7_200);
+      expect(evs.filter((e) => e.event === "worker-hard-timeout")).toHaveLength(1);
       expect(evs.find((e) => e.event === "worker-result" && e.taskId === "T1")!.data.cause).toBe("stall-timeout");
       // The CPU leg governs WHEN a wait ends, never whether landed work is gated: once the window
-      // itself expired, the same carried worktree was still gated rather than redispatched — a busy
-      // worker buys the full window it is entitled to, and not one redundant attempt after it.
+      // itself expired at the fixture's hard ceiling, the same carried worktree was still gated
+      // rather than redispatched. The busy worker cannot be silently harvested before that ceiling.
       expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
       expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
       expect(s.done).toEqual(["T1"]);
-    });
+    }); } finally { resetAttemptHardTimeoutMsForTests(); }
   }, 120_000);
 
   // OBS-548: the dead-channel fast-kill concluded on three CHANNEL-side legs — no trailer, an
@@ -607,7 +613,8 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     // 3s flat window, the shipped value on a hundredths host: the burner below runs in short-lived
     // children with ~800ms gaps, so a shorter window would read one gap as rest and answer the
     // test's own question. 0.12m of stall window leaves the kill room to land long before expiry.
-    await withSeams(300, 3_000, async () => {
+    setAttemptHardTimeoutMsForTests(7_200);
+    try { await withSeams(300, 3_000, async () => {
       setDeadChannelFastKillMsForTests(100);
       const run = async (runId: string, shell: string, cpu: "flat" | "accruing" | "denied") => {
         const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.12 })], {
@@ -655,7 +662,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       expect(rows(denied, "worker-dead")).toHaveLength(0);
       expect(heldReasons(denied)).toEqual(["cpu-unmeasurable"]);
       expect(rows(denied, "worker-harvest-unmeasurable").length).toBeGreaterThan(0);
-    });
+    }); } finally { resetAttemptHardTimeoutMsForTests(); }
   }, 120_000);
 
   test("test: the synthesized no-trailer result is journaled as harvested, distinct from a worker-claimed ok", async () => {
@@ -888,7 +895,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     const counter = join(dir, "calls");
     const bashEnv = join(dir, "bash-env");
     writeFileSync(counter, "");
-    writeFileSync(bashEnv, 'ps() { printf x >> "$TICKMARKR_TEST_PS_CALLS"; return 1; }\n');
+    writeBashEnvFixture(bashEnv, 'ps() { printf x >> "$TICKMARKR_TEST_PS_CALLS"; return 1; }\n');
     const prior = { bashEnv: process.env.BASH_ENV, calls: process.env.TICKMARKR_TEST_PS_CALLS };
 
     await withSeams(200, 200, async () => {

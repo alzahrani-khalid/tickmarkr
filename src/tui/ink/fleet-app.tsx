@@ -35,6 +35,8 @@ const STEERING_KEYS: FleetSteeringKey[] = ["review", "consult"];
 export type FleetEditorState = {
   denyAdapters: string[];
   denyModels: string[];
+  /** OBS-1046: the staged routing.allow complement, distinct from the authored deny lists above */
+  allowOut?: string[];
   // OBS-994/FL-1: the worker-only deny scope, staged and written beside the flat scopes above.
   denyWorkersAdapters: string[];
   denyWorkersModels: string[];
@@ -87,7 +89,14 @@ export type FleetModelEvidence = {
 };
 
 /** The four staged deny sets every preview and the staged routing policy are computed from. */
-export type FleetStagedDeny = { adapters: string[]; models: string[]; workersAdapters: string[]; workersModels: string[] };
+export type FleetStagedDeny = {
+  adapters: string[];
+  models: string[];
+  workersAdapters: string[];
+  workersModels: string[];
+  /** OBS-1046: the staged routing.allow complement; absent ⇒ the session's initial one */
+  allowOut?: string[];
+};
 
 export type FleetModelGroup = {
   adapter: string;
@@ -250,6 +259,8 @@ type Ui = {
   lastEdit: { id: string; text: string } | null;
   deny: Set<string>;
   denyModels: Set<string>;
+  /** OBS-1046: channels routing.allow leaves out — a reason of its own, never merged into deny */
+  allowOut: Set<string>;
   /** OBS-994/FL-1: worker-only deny scope, staged in parallel with the flat sets above */
   denyWorkersAdapters: Set<string>;
   denyWorkersModels: Set<string>;
@@ -268,6 +279,7 @@ export function FleetApp({
   agents,
   initialDenyAdapters,
   initialDenyModels,
+  initialAllowOut = [],
   initialDenyWorkersAdapters = [],
   initialDenyWorkersModels = [],
   modelGroups,
@@ -294,6 +306,8 @@ export function FleetApp({
   agents: AgentCli[];
   initialDenyAdapters: string[];
   initialDenyModels: string[];
+  /** OBS-1046: adapter ids and adapter:model keys routing.allow leaves out of the fleet */
+  initialAllowOut?: string[];
   initialDenyWorkersAdapters?: string[];
   initialDenyWorkersModels?: string[];
   modelGroups: FleetModelGroup[];
@@ -350,6 +364,7 @@ export function FleetApp({
     lastEdit: null,
     deny: new Set(initialDenyAdapters),
     denyModels: new Set(initialDenyModels),
+    allowOut: new Set(initialAllowOut),
     denyWorkersAdapters: new Set(initialDenyWorkersAdapters),
     denyWorkersModels: new Set(initialDenyWorkersModels),
     classifications: [],
@@ -370,6 +385,7 @@ export function FleetApp({
   // chip, and the empty-`w` notice all read it. Counts staged EDITS, not diff hunks.
   const initialDenySet = new Set(initialDenyAdapters);
   const initialDenyModelSet = new Set(initialDenyModels);
+  const initialAllowOutSet = new Set(initialAllowOut);
   const initialDenyWorkersAdapterSet = new Set(initialDenyWorkersAdapters);
   const initialDenyWorkersModelSet = new Set(initialDenyWorkersModels);
   const stagedCount = (): number => {
@@ -380,6 +396,7 @@ export function FleetApp({
     for (const adapter of initialDenySet) if (!ui.deny.has(adapter)) n += 1;
     for (const model of ui.denyModels) if (!initialDenyModelSet.has(model)) n += 1;
     for (const model of initialDenyModelSet) if (!ui.denyModels.has(model)) n += 1;
+    for (const key of initialAllowOutSet) if (!ui.allowOut.has(key)) n += 1;
     for (const adapter of ui.denyWorkersAdapters) if (!initialDenyWorkersAdapterSet.has(adapter)) n += 1;
     for (const adapter of initialDenyWorkersAdapterSet) if (!ui.denyWorkersAdapters.has(adapter)) n += 1;
     for (const model of ui.denyWorkersModels) if (!initialDenyWorkersModelSet.has(model)) n += 1;
@@ -517,6 +534,7 @@ export function FleetApp({
     models: [...ui.denyModels].sort(),
     workersAdapters: [...ui.denyWorkersAdapters].sort(),
     workersModels: [...ui.denyWorkersModels].sort(),
+    allowOut: [...ui.allowOut].sort(),
   });
   const shapeList = () => shapeRows(ui.selectedMode, ui.map, stagedDeny());
   const steeringList = () => [
@@ -547,6 +565,7 @@ export function FleetApp({
   const editorState = (): FleetEditorState => ({
     denyAdapters: [...ui.deny].sort(),
     denyModels: [...ui.denyModels].sort(),
+    allowOut: [...ui.allowOut].sort(),
     denyWorkersAdapters: [...ui.denyWorkersAdapters].sort(),
     denyWorkersModels: [...ui.denyWorkersModels].sort(),
     classifications: ui.classifications.map((classification) =>
@@ -1266,10 +1285,15 @@ export function FleetApp({
         if (agents.find((agent) => agent.id === id)?.authed === false) {
           ui.notice = `${id} is not authed — Space only toggles fleet membership; re-auth the ${id} CLI, then run tickmarkr doctor`;
         }
-        const next = new Set(ui.deny);
-        if (next.has(id)) next.delete(id);
-        else next.add(id);
-        ui.deny = next;
+        // OBS-1046: an adapter routing.allow leaves out comes back in by clearing THAT reason
+        if (ui.allowOut.has(id)) {
+          ui.allowOut = new Set([...ui.allowOut].filter((key) => key !== id));
+        } else {
+          const next = new Set(ui.deny);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          ui.deny = next;
+        }
         clampList();
         bump();
         return;
@@ -1370,12 +1394,14 @@ export function FleetApp({
           ui.denyModels = new Set([...ui.denyModels, entry]);
           ui.lastEdit = { id, text: `space: moved ${entry} to routing.deny.models` };
         } else {
-          // round 2 finding 2: either flat list may carry this channel's own reason
+          // round 2 finding 2: either flat list may carry this channel's own reason; OBS-1046: an
+          // allow exclusion is the LAST reason cleared, and never together with an authored deny
           const fromModels = select(ui.denyModels, true);
           const fromAdapters = fromModels === undefined ? select(ui.deny, true) : undefined;
-          const entry = fromModels ?? fromAdapters;
+          const fromAllow = fromModels === undefined && fromAdapters === undefined ? select(ui.allowOut, true) : undefined;
+          const entry = fromModels ?? fromAdapters ?? fromAllow;
           if (entry === undefined) {
-            const shared = ui.deny.has(row.adapter)
+            const shared = ui.deny.has(row.adapter) || ui.allowOut.has(row.adapter)
               ? `every ${row.adapter} channel is out together — take the adapter back in on the rail`
               : "a shared entry covers other channels too";
             ui.notice = `${id} stays out — ${row.reasons.join("; ")} — Space edits only this channel's own entries; ${shared}`;
@@ -1383,8 +1409,10 @@ export function FleetApp({
             return;
           }
           if (fromModels !== undefined) ui.denyModels = new Set([...ui.denyModels].filter((staged) => staged !== entry));
-          else ui.deny = new Set([...ui.deny].filter((staged) => staged !== entry));
-          ui.lastEdit = { id, text: `space: cleared ${entry} from routing.deny.${fromModels !== undefined ? "models" : "adapters"}` };
+          else if (fromAdapters !== undefined) ui.deny = new Set([...ui.deny].filter((staged) => staged !== entry));
+          else ui.allowOut = new Set([...ui.allowOut].filter((staged) => staged !== entry));
+          const scope = fromModels !== undefined ? "routing.deny.models" : fromAdapters !== undefined ? "routing.deny.adapters" : "routing.allow";
+          ui.lastEdit = { id, text: `space: cleared ${entry} from ${scope}` };
         }
         bump();
         return;
@@ -1690,7 +1718,7 @@ export function FleetApp({
   const railAdapter = (index: number, railIndex: number) => {
     const group = modelGroups[index];
     const agent = agents.find((candidate) => candidate.id === group.adapter);
-    const denied = ui.deny.has(group.adapter);
+    const denied = ui.deny.has(group.adapter) || ui.allowOut.has(group.adapter);
     const active = ui.view === "models" && ui.adapterAt === index;
     const selected = ui.focus === "rail" && ui.railAt === railIndex;
     return (
@@ -2180,6 +2208,7 @@ export async function runFleetInkEditor({
   health,
   initialDenyAdapters,
   initialDenyModels,
+  initialAllowOut = [],
   initialDenyWorkersAdapters = [],
   initialDenyWorkersModels = [],
   modelGroups,
@@ -2208,6 +2237,8 @@ export async function runFleetInkEditor({
   health: Record<string, AuthHealth>;
   initialDenyAdapters: string[];
   initialDenyModels: string[];
+  /** OBS-1046: adapter ids and adapter:model keys routing.allow leaves out of the fleet */
+  initialAllowOut?: string[];
   initialDenyWorkersAdapters?: string[];
   initialDenyWorkersModels?: string[];
   modelGroups: FleetModelGroup[];
@@ -2267,6 +2298,7 @@ export async function runFleetInkEditor({
       agents={agents}
       initialDenyAdapters={initialDenyAdapters}
       initialDenyModels={initialDenyModels}
+      initialAllowOut={initialAllowOut}
       initialDenyWorkersAdapters={initialDenyWorkersAdapters}
       initialDenyWorkersModels={initialDenyWorkersModels}
       modelGroups={declaredModelGroups}

@@ -823,11 +823,13 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     await expect(
       driver.narrator(repo, `tickmarkr run --view run-board --run-id ${unclaimedRunId}`, unclaimedRunId)
     ).rejects.toThrow(/unclaimed board/i);
-    // A refused placement never deletes its record, even when the receipt's pane was closed.
-    expect(readWatchBoard(repo, unclaimedRunId)).toMatchObject({ driver: "orca", pane: "" });
+    // A refused placement never deletes its record: the reservation is tombstoned, still readable.
+    expect(readWatchBoard(repo, unclaimedRunId)).toMatchObject({ driver: "orca" });
+    expect(JSON.parse(readFileSync(join(repo, stateDirName(repo), "supervision", `watch-board.${unclaimedRunId}.json`), "utf8"))).toMatchObject({ retired: true });
 
-    // --- Part 2b: an unclaimed board whose close is refused keeps its reservation and reports
-    // indeterminate cleanup; the next call refuses rather than splitting beside the surviving pane.
+    // --- Part 2b: an unclaimed board whose close is refused tombstones its reservation naming the
+    // surviving pane; the next call closes exactly THAT recorded handle (never a guess) before it
+    // splits afresh — the tombstone is what lets a later narrator recover instead of refusing forever.
     const refusedRunId = "run-unclaimed-refused-124";
     refuseClose = true;
     const splitsBeforeRefused = fake.calls.filter((c) => c[1] === "split").length;
@@ -836,12 +838,20 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     ).rejects.toThrow(/unclaimed board.*indeterminate cleanup/i);
     refuseClose = false;
     const keptReservation = readWatchBoard(repo, refusedRunId);
-    expect(keptReservation).toMatchObject({ driver: "orca", pane: "" });
-    await expect(
-      driver.narrator(repo, `tickmarkr run --view run-board --run-id ${refusedRunId}`, refusedRunId)
-    ).rejects.toThrow(/placement remains unresolved.*indeterminate cleanup/i);
-    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitsBeforeRefused + 1);
-    expect(readWatchBoard(repo, refusedRunId)?.token).toBe(keptReservation?.token);
+    const survivingPane = fake.calls.filter((c) => c[1] === "split").length === splitsBeforeRefused + 1 ? fake.last()!.handle : "";
+    expect(keptReservation).toMatchObject({ driver: "orca", pane: survivingPane });
+    expect(fake.of(survivingPane)).toBeDefined();
+    simulateClaim = true;
+    const observerBeforeRecovery = activeObserver;
+    const closesBeforeRecovery = fake.calls.filter((c) => c[1] === "close").length;
+    const recovered = await driver.narrator(repo, `tickmarkr run --view run-board --run-id ${refusedRunId}`, refusedRunId);
+    activeObserver = observerBeforeRecovery; // the recovered board's observer is not this test's subject
+    expect(fake.calls.filter((c) => c[1] === "close").slice(closesBeforeRecovery).map((c) => c[3])).toEqual([survivingPane]);
+    expect(fake.of(survivingPane)).toBeUndefined();
+    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitsBeforeRefused + 2);
+    expect(readWatchBoard(repo, refusedRunId)).toMatchObject({ pane: recovered.id, pid: process.pid });
+    expect(readWatchBoard(repo, refusedRunId)?.token).not.toBe(keptReservation?.token);
+    simulateClaim = false;
 
     // --- Part 2c: a claim that lands AFTER the split returns. The narrator writes nothing before the
     // claim (the observer reads the untouched reservation), so the final record carries both the
@@ -965,14 +975,16 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 1);
     expect(fake.calls.filter((c) => c[1] === "close").length).toBe(closeCountBeforeMalformed);
     expect(fake.calls.filter((c) => c[1] === "close").map((c) => c[3])).not.toContain("term_forged_no_parent_tab");
-    // The durable reservation blocks a retry: an absent child handle is indeterminate, so a later
-    // call must not overwrite the reservation and create a second, unaccounted-for split.
+    // The reservation can never be bound, so it is tombstoned (still present, still readable): a
+    // later call splits afresh instead of refusing forever — and never closes the forged handle.
+    expect(JSON.parse(readFileSync(join(repo, stateDirName(repo), "supervision", `watch-board.${malformedRunId}.json`), "utf8"))).toMatchObject({ pane: "", retired: true });
     await expect(
       driver.narrator(repo, `tickmarkr run --view run-board --run-id ${malformedRunId}`, malformedRunId)
-    ).rejects.toThrow(/placement remains unresolved.*indeterminate cleanup/i);
-    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 1);
+    ).rejects.toThrow(/placement.*malformed or handle-less.*indeterminate cleanup/i);
+    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 2);
+    expect(fake.calls.filter((c) => c[1] === "close").length).toBe(closeCountBeforeMalformed);
 
-    // Unknown receipt: the verb was issued but its output is unparseable — same refusal, same record kept.
+    // Unknown receipt: the verb was issued but its output is unparseable — same refusal, same tombstone.
     malformedSplitReceipt = { code: 0, stdout: "split: connection reset" };
     const unknownRunId = "run-unknown-998";
     await expect(
@@ -981,8 +993,8 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     expect(readWatchBoard(repo, unknownRunId)?.pane).toBe("");
     await expect(
       driver.narrator(repo, `tickmarkr run --view run-board --run-id ${unknownRunId}`, unknownRunId)
-    ).rejects.toThrow(/placement remains unresolved.*indeterminate cleanup/i);
-    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 2);
+    ).rejects.toThrow(/placement failed .*receipt is unknown.*indeterminate cleanup/is);
+    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 4);
     expect(fake.calls.filter((c) => c[1] === "close").length).toBe(closeCountBeforeMalformed);
 
     // Handle present but parent tabId is not the launching terminal's — still malformed, no close.
@@ -1074,19 +1086,21 @@ function boardRig(runId: string) {
 }
 
 describe("Orca board owner record lifecycle, judged by a second OrcaDriver", () => {
-  test("reserve: the reservation exists before the split can read its token, a second OrcaDriver meeting it refuses without a split or a byte changed, and a record another driver holds under a live observer is never overwritten", async () => {
+  test("reserve: the reservation exists before the split can read its token, an unclaimed reservation is tombstoned so a second OrcaDriver splits afresh, and a record another driver holds under a live observer is never overwritten", async () => {
     const runId = "run-board-reserve";
     const rig = boardRig(runId);
     rig.claim = "never";
     await expect(rig.driver().narrator(rig.repo, rig.command, runId)).rejects.toThrow(/unclaimed board.*indeterminate cleanup refused/);
     expect(rig.atSplit).toMatchObject({ driver: "orca", pane: "", name: formatOwnedName({ role: "watch", taskId: "run", attempt: 0, runId }) });
     expect(rig.atSplit?.pid).toBeUndefined();
-    const reserved = rig.bytes();
-    expect(JSON.parse(reserved).token).toBe(rig.atSplit?.token);
+    const tombstoned = JSON.parse(rig.bytes()) as WatchBoardOwner & { retired?: true };
+    expect(tombstoned).toMatchObject({ token: rig.atSplit?.token, retired: true });
+    expect(tombstoned.pid).toBeUndefined();
 
-    await expect(rig.driver().narrator(rig.repo, rig.command, runId)).rejects.toThrow(/placement remains unresolved .*\(reserved, no bound pane\).*indeterminate cleanup refused/);
-    expect(rig.bytes()).toBe(reserved);
-    expect(rig.splits()).toBe(1);
+    rig.claim = "at-command-start";
+    const fresh = await rig.driver().narrator(rig.repo, rig.command, runId);
+    expect(rig.splits()).toBe(2);
+    expect(JSON.parse(rig.bytes())).toMatchObject({ pane: fresh.id, pid: process.pid, token: expect.not.stringMatching(tombstoned.token) });
 
     const foreignRun = "run-board-foreign";
     const foreign = JSON.stringify({
@@ -1096,7 +1110,7 @@ describe("Orca board owner record lifecycle, judged by a second OrcaDriver", () 
     writeFileSync(rig.boardFile(foreignRun), foreign);
     await expect(rig.driver().narrator(rig.repo, rig.command, foreignRun)).rejects.toThrow(/held by driver herdr/);
     expect(rig.bytes(foreignRun)).toBe(foreign);
-    expect(rig.splits()).toBe(1);
+    expect(rig.splits()).toBe(2);
   });
 
   test("claim: the observer's single claim lands on the untouched reservation after the split returns, and a second OrcaDriver reads the claimed record and answers the same pane with no split", async () => {
@@ -1358,14 +1372,15 @@ describe("Orca board CAS keeps the canonical record readable", () => {
 
       for (let i = 1; i <= 80; i++) {
         const next = sample(`p${i}`, `t${i}`);
-        expected = casBoard("split", path, expected, next);
+        expected = await casBoard("split", path, expected, next);
       }
       writeFileSync(`${path}.${randomUUID()}.tmp`, JSON.stringify(sample("orphan", "tmp")) + "\n");
-      expected = casBoard("split", path, expected, sample("after-tmp", "t-after"));
+      expected = await casBoard("split", path, expected, sample("after-tmp", "t-after"));
       expect(JSON.parse(readFileSync(path, "utf8")).pane).toBe("after-tmp");
 
       const lock = `${path}.lock`;
       mkdirSync(lock);
+      symlinkSync(`${process.pid}:fixture-live-holder`, join(lock, "owner.0"));
       const blocked = spawn(process.execPath, ["-e", `
         const { existsSync } = require("node:fs");
         const path = ${JSON.stringify(path)};
@@ -1382,11 +1397,11 @@ describe("Orca board CAS keeps the canonical record readable", () => {
         blocked.on("close", (code) => resolve({ code, out }));
       });
       const started = Date.now();
-      expect(() => casBoard("split", path, expected, sample("locked", "t-lock"))).toThrow(/lock not acquired; current record kept/);
+      await expect(casBoard("split", path, expected, sample("locked", "t-lock"))).rejects.toThrow(/lock not acquired; current record kept/);
       expect(Date.now() - started).toBeGreaterThanOrEqual(2000);
       expect(JSON.parse(readFileSync(path, "utf8")).pane).toBe("after-tmp");
       rmSync(lock, { recursive: true, force: true });
-      casBoard("split", path, expected, sample("unlocked", "t-unlock"));
+      await casBoard("split", path, expected, sample("unlocked", "t-unlock"));
       expect(JSON.parse(readFileSync(path, "utf8")).pane).toBe("unlocked");
 
       const readResult = await readerDone;
@@ -1417,7 +1432,7 @@ describe("Orca board CAS keeps the canonical record readable", () => {
     expect(JSON.parse(rig.bytes())).toMatchObject({ pane: won[0].value.id, pid: process.pid });
   });
 
-  test("interrupted-transition: a leftover tmp and lock beside the canonical record leave it readable, and after the lock is cleared a later swap recovers", () => {
+  test("interrupted-transition: a leftover tmp and lock beside the canonical record leave it readable, and after the lock is cleared a later swap recovers", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tkr-board-interrupt-"));
     const path = join(dir, "watch-board.json");
     try {
@@ -1425,10 +1440,11 @@ describe("Orca board CAS keeps the canonical record readable", () => {
       writeFileSync(path, previous);
       writeFileSync(`${path}.${randomUUID()}.tmp`, JSON.stringify(sample("uncommitted", "t-tmp")) + "\n");
       mkdirSync(`${path}.lock`);
-      expect(() => casBoard("split", path, previous, sample("stolen", "t-steal"))).toThrow(/lock not acquired; current record kept/);
+      symlinkSync(`${process.pid}:fixture-live-holder`, join(`${path}.lock`, "owner.0"));
+      await expect(casBoard("split", path, previous, sample("stolen", "t-steal"))).rejects.toThrow(/lock not acquired; current record kept/);
       expect(readFileSync(path, "utf8")).toBe(previous);
       rmSync(`${path}.lock`, { recursive: true, force: true });
-      casBoard("split", path, previous, sample("recovered", "t-rec"));
+      await casBoard("split", path, previous, sample("recovered", "t-rec"));
       expect(JSON.parse(readFileSync(path, "utf8")).pane).toBe("recovered");
     } finally {
       rmSync(dir, { recursive: true, force: true });

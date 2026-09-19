@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -133,7 +133,9 @@ describe("v1.23 context-sample (fake adapter, zero tokens)", () => {
         return inner.waitOutput(slot, pattern, timeoutMs, opts);
       },
       waitAgentStatus: inner.waitAgentStatus.bind(inner),
-      read: inner.read.bind(inner),
+      // Keep both transport and pane completion hidden until all context samples ran.
+      read: (slot: { id: string; name: string; cwd: string }, lines?: number) =>
+        polls < 3 && slot.name.includes("-worker-") ? Promise.resolve("working") : inner.read(slot, lines),
       async notify(msg: string, opts?: { sound?: string }) {
         notified.push(msg);
         return inner.notify(msg, opts);
@@ -463,7 +465,7 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
   // v1.24 T2 / OBS-18: approve of an attempt-cap park must grant a fresh attempt budget so resume
   // dispatches instead of re-parking in the same tick. Tried-list survives — a channel burned before
   // the park is not re-tried first. Journal is seeded (10 dispatches at cap) so the suite stays zero-token.
-  test("OBS-18: approve of attempt-cap park + resume dispatches with fresh budget, keeps tried", async () => {
+  test("OBS-18/v2.5.6 T5: approve of attempt-cap park + resume dispatches with a fresh budget on a cleared seat list", async () => {
     const fake1 = { adapter: "fake", model: "fake-1", channel: "sub" as const, tier: "frontier" as const };
     const fake2 = { adapter: "fake", model: "fake-2", channel: "api" as const, tier: "frontier" as const };
     const { repo, fake } = setupRepo(
@@ -489,10 +491,8 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     const approved = Journal.open(repo, "run-obs18-cap").read().find((e) => e.event === "task-approved")!;
     expect(approved.data.release).toBe("attempt-cap");
     expect(Journal.open(repo, "run-obs18-cap").replayResumeState().get("T1")!.attempts).toBe(0);
-    expect(Journal.open(repo, "run-obs18-cap").replayResumeState().get("T1")!.tried).toEqual([
-      "fake:fake-1",
-      "fake:fake-2",
-    ]);
+    // v2.5.6 T5 (OBS-1028): a fresh-budget release resets BOTH halves of the ladder — the seat list too
+    expect(Journal.open(repo, "run-obs18-cap").replayResumeState().get("T1")!.tried).toEqual([]);
 
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-obs18-cap", resume: true });
     expect(s.done).toEqual(["T1"]); // RED on HEAD: re-parks as human in the same tick
@@ -506,20 +506,17 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     const restores = post.filter((e) => e.event === "resume-restore" && e.taskId === "T1");
     expect(restores).toHaveLength(1);
     expect((restores[0]!.data as { attempts: number }).attempts).toBe(0); // fresh budget
-    expect((restores[0]!.data as { tried: string[] }).tried).toEqual(["fake:fake-1", "fake:fake-2"]);
+    // the cleared list holds only the seat the fresh engagement dispatches on (pre-kill invariant)
+    expect((restores[0]!.data as { tried: string[] }).tried).toEqual(["fake:fake-1"]);
 
     const dispatches = post.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
     expect(dispatches.length).toBeGreaterThanOrEqual(1);
     expect((dispatches[0]!.data as { attempt: number }).attempt).toBe(0);
-    // burned channels not re-tried first: both fake-1 and fake-2 are in tried ⇒ nextChannel null
-    // falls back to static route (fake-1). That is the ponytail ceiling when the ladder is fully
-    // burned — the invariant we pin is "tried survived" (above) and "dispatched" (done), not that
-    // a third channel exists. When only one of two is burned, nextChannel skips it:
-    // re-seed with only fake-1 burned for the skip oracle below.
   });
 
-  test("OBS-18: released task does not re-try a burned channel first", async () => {
-    // only fake-1 burned; fake-2 free — post-release nextChannel must skip fake-1
+  test("v2.5.6 T5: a fresh-budget release clears the burned list, so the released engagement starts on the static route", async () => {
+    // only fake-1 was burned; the fresh-budget release forgets it (OBS-1028: it resets BOTH counter and
+    // tried) — a recheck, by contrast, keeps the list (tests/run/daemon/recheck-counters.test.ts)
     const fake1 = { adapter: "fake", model: "fake-1", channel: "sub" as const, tier: "frontier" as const };
     const { repo, fake } = setupRepo(
       [T("T1")],
@@ -542,14 +539,10 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     const post = all.slice(resumeIdx + 1);
     const first = post.find((e) => e.event === "task-dispatch" && e.taskId === "T1")!;
     const a = first.data.assignment as { adapter: string; model: string };
-    // tried = [fake:fake-1]; lastAssignment cleared by release ⇒ nextChannel skips fake-1 ⇒ fake-2
-    expect(`${a.adapter}:${a.model}`).toBe("fake:fake-2");
-    // resume-restore seeds attempts:0 + the burned list; the chosen assignment is then appended
-    // (pre-kill invariant: tried always contains the current assignment)
+    expect(`${a.adapter}:${a.model}`).toBe("fake:fake-1"); // the static route: nothing is remembered as burned
     const rd = post.find((e) => e.event === "resume-restore")!.data as { tried: string[]; attempts: number };
     expect(rd.attempts).toBe(0);
-    expect(rd.tried[0]).toBe("fake:fake-1"); // burned channel remembered first — never forgotten
-    expect(rd.tried).toContain("fake:fake-2"); // current (post-release) assignment also present
+    expect(rd.tried).toEqual(["fake:fake-1"]); // only the current assignment (pre-kill invariant)
   });
 });
 
@@ -1558,7 +1551,8 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     // it forced a consult of its own, immediately, and that consult's retry verdict was refused:
     // escalation (the rung the cap spent) → consult-verdict → retry-same-banned, back to back.
     const capAt = evs.indexOf(cap[0]!);
-    expect(evs.slice(capAt + 1, capAt + 4).map((e) => e.event))
+    // Cleanup evidence may be interleaved; retry decisions retain their order.
+    expect(evs.slice(capAt + 1).filter((e) => e.event !== "worker-process-reaped").slice(0, 3).map((e) => e.event))
       .toEqual(["escalation", "consult-verdict", "retry-same-banned"]);
     expect(evs[capAt + 2]!.data.action).toBe("retry");   // the consult DID say retry …
 
@@ -1583,7 +1577,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     expect(rungs[2]!.data.fingerprintCap).toBe(true);    // the cap took rung 1 (escalate) and spent it
     expect(rungs[3]!.data.repair).toBe(2);               // the second and last funded repair
     // then the ladder's own end, on its own budget — the cap bought nothing extra
-    expect(evs.filter((e) => e.taskId === "T1").at(-1)!.event).toBe("task-human");
+    expect(evs.filter((e) => e.taskId === "T1" && e.event !== "worker-process-reaped").at(-1)!.event).toBe("task-human");
 
     // ── and the rerouted retry still knows WHY the last attempt failed ──
     // The consult's guidance is ADDED to the brief the journal already holds, never swapped for it:
@@ -2510,6 +2504,11 @@ describe("ES-2 daemon tier climb", () => {
       { adapter: "fake", vendor: "fake-d", model: "fake-4", channel: "api", tier: "frontier" },
     ];
     made.fake.probe = async () => ({ installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2", "fake-3", "fake-4"], modelAuth: authedModels(["fake-1", "fake-2", "fake-3", "fake-4"]) });
+    // v2.5.6 T5 (OBS-1007 add.4): the extractor accepts only paths present in the tree or the diff, so the
+    // unowned path this fixture's oracle names must be a REAL file — a bare token in prose is not a path.
+    mkdirSync(join(made.repo, "elsewhere"), { recursive: true });
+    writeFileSync(join(made.repo, "elsewhere/b.ts"), "export const b = 1;\n");
+    execSync("git add elsewhere && git commit --no-gpg-sign -qm elsewhere", { cwd: made.repo });
     return made;
   };
 

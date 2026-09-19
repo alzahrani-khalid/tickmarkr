@@ -9,7 +9,7 @@ import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
 import { PLAIN_BANNER } from "../../src/brand.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
-import { type GateVia, runLlmDetailed, REVIEW_FIRST_LIVENESS_MS, PROMPT_GLYPHS, reviewSeatOutput, setGateCpuAccountantFactoryForTests, resetGateCpuAccountantFactoryForTests, verdictNonceLine } from "../../src/gates/llm.js";
+import { type GateVia, runLlmDetailed, REVIEW_FIRST_LIVENESS_MS, REVIEW_SILENT_BYTE_FLOOR, PROMPT_GLYPHS, reviewSeatOutput, setGateCpuAccountantFactoryForTests, resetGateCpuAccountantFactoryForTests, verdictNonceLine } from "../../src/gates/llm.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { runGates, type GateEvent } from "../../src/gates/run-gates.js";
 import { reviewGate } from "../../src/gates/review.js";
@@ -457,7 +457,7 @@ test("a silent review whose ceiling coincides with first liveness is a silent ce
   expect(pane.closed).toBe(1);
 });
 
-test("test: a pane review seat whose capture holds only the harness preamble through the pane-identity line is re-routed at the first-liveness beat with cause launch-never-started and seat-authored bytes 0 while a seat that has emitted one byte of its own by that beat runs on to its ceiling, so a seat whose preamble bytes are counted as output and runs 900 s before re-routing fails", async () => {
+test("test: a pane review seat whose capture holds only the harness preamble through the pane-identity line is re-routed at the first-liveness beat with cause launch-never-started and seat-authored bytes 0 while a seat that has emitted its own bytes at the silence floor by that beat runs on to its ceiling, so a seat whose preamble bytes are counted as output and runs 900 s before re-routing fails", async () => {
   const silent = await clockedReview(PREAMBLE, 900_000);
   expect(silent.row.meta).toMatchObject({ cause: "launch-never-started", seatAuthoredBytes: 0, infra: true });
   expect(silent.row.meta?.unparseable).toBeUndefined();
@@ -511,15 +511,22 @@ test("test: a pane review seat whose capture holds only the harness preamble thr
     expect(partial.row.meta).toMatchObject({ cause: "launch-never-started", seatAuthoredBytes: 0, infra: true });
     expect(partial.pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
   }
-  for (const byte of ["x", " "]) {
-    const producing = await clockedReview(PREAMBLE + byte, 900_000);
-    expect(producing.row.meta).toMatchObject({ cause: "truncated", seatAuthoredBytes: 1 });
+  // OBS-1039 (v2.5.6 T4): the beat now demands REVIEW_SILENT_BYTE_FLOOR seat-authored bytes, not one —
+  // a seat at the floor keeps its ceiling; one byte (or ten) is `silent` and re-routed at the beat.
+  for (const own of ["x".repeat(REVIEW_SILENT_BYTE_FLOOR), " " + "x".repeat(REVIEW_SILENT_BYTE_FLOOR)]) {
+    const producing = await clockedReview(PREAMBLE + own, 900_000);
+    expect(producing.row.meta).toMatchObject({ cause: "truncated", seatAuthoredBytes: own.length });
     expect(producing.pane.elapsed).toBe(900_000);
     expect(producing.pane.closed).toBe(1);
   }
+  for (const byte of ["x", " "]) {
+    const silent = await clockedReview(PREAMBLE + byte, 900_000);
+    expect(silent.row.meta).toMatchObject({ cause: "silent", seatAuthoredBytes: 1, infra: true });
+    expect(silent.pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
+  }
   // A seat whose own first byte lands mid-paint still owns its ceiling: the boundary excludes the
   // preamble, it does not swallow the response that follows it.
-  const early = await clockedReview(PREAMBLE + "I am inspecting the diff", 900_000, undefined, MID_PAINT[1]);
+  const early = await clockedReview(PREAMBLE + "I am inspecting the diff for correctness, security and acceptance gaps before I write a verdict", 900_000, undefined, MID_PAINT[1]);
   expect(early.row.meta).toMatchObject({ cause: "truncated" });
   expect(early.pane.elapsed).toBe(900_000);
 });

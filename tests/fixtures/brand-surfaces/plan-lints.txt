@@ -6,6 +6,7 @@ harness: /opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js (unresolved
 model auth: 2 channel(s) unauthed — claude-code:fable (HTTP 403: forbidden — probed 2026-07-13), claude-code:opus (insufficient credit — probed 2026-07-13)
 
   T1     migration  !! T1: no channel at tier>=frontier; available: claude-code:sonnet, claude-code:haiku
+    chain: depth 0 · wave 1 at concurrency 3
     floor frontier ← mode risk-based
 
 est. cost (API LLM seats, rough): ~$0.00 + consult calls
