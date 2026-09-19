@@ -127,7 +127,9 @@ test("external-suite admission waiting consumes task budget and launches no veri
   const runnerDir = makeTestTempDir("tkr-budget-admission-");
   const marker = join(runnerDir, "verifier-ran");
   const rows = journal.read();
-  rows[0].data.effectivePolicy = { config: { executionPolicy: { boundedInfrastructure: true, taskExecutionLimitMs: 700 } } };
+  // OBS-1059: the budget must outlast daemon start-up on a starved CI runner or the admission wait is
+  // never reached and no suite-wait row exists to assert; the wait itself still exhausts it.
+  rows[0].data.effectivePolicy = { config: { executionPolicy: { boundedInfrastructure: true, taskExecutionLimitMs: 2500 } } };
   writeFileSync(join(runnerDir, "package.json"), JSON.stringify({ scripts: { test: "node test.cjs" } }));
   writeFileSync(join(runnerDir, "test.cjs"), `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`);
   const command = `cd ${runnerDir} && npm run -s test`;
@@ -139,12 +141,12 @@ test("external-suite admission waiting consumes task budget and launches no veri
   setLiveSuiteCountForTests(async () => 1);
   const started = Date.now();
   const summary = await runDaemon(repo, { runId: journal.runId, resume: true, adapters: [fake], driver: new SubprocessDriver() });
-  expect(Date.now() - started).toBeLessThan(5000);
+  expect(Date.now() - started).toBeLessThan(8000);
   expect(summary.human).toEqual(["T1"]);
   expect(journal.read().some((e) => e.event === "suite-wait" && e.taskId === "T1")).toBe(true);
   expect(journal.read().find((e) => e.event === "task-human")?.data.disposition).toBe("execution-budget-exhausted");
   expect(existsSync(marker)).toBe(false);
-}, 7000);
+}, 12000);
 
 test("an exhausted task cannot close a concurrently executing sibling's owned worker", async () => {
   setApprovalWindowForTests(1);

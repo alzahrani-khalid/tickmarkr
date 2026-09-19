@@ -108,8 +108,10 @@ async function assertScopeRedPolicies(): Promise<void> {
 
   // Infra must execute again through the actual battery, even at an unchanged identity.
   const buildTask = { ...task, gates: ["build" as const] };
-  const infraCtx = { ...ctx, commands: { build: "echo infra >> calls.log; sleep 1" },
-    baseline: { commands: { build: { ceilingMs: 100, fingerprints: [] } } } };
+  // OBS-1059: the echo must land before the ceiling kills the shell even on a starved CI runner, where
+  // spawning sh alone can exceed 100 ms — the sleep guarantees the timeout, the ceiling stays far above spawn.
+  const infraCtx = { ...ctx, commands: { build: "echo infra >> calls.log; sleep 5" },
+    baseline: { commands: { build: { ceilingMs: 1000, fingerprints: [] } } } };
   for (let i = 0; i < 2; i++) {
     const result = await runGates(buildTask, infraCtx);
     expect(result.results[0]?.meta?.classification).toBe("infra");
