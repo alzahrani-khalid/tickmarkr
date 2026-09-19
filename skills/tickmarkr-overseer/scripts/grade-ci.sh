@@ -57,9 +57,29 @@ while IFS=$'\t' read -r id name status conclusion; do
   if [ "$unhandled" -eq 0 ]; then
     unhandled=$(grep -cE 'Unhandled Errors' "$log" || true)
   fi
+  # OBS-1058 (RULING-231-17 precedent, v2.5.5 close R115 add.7): a vitest-worker RPC timeout
+  # ("Timeout calling \"onTaskUpdate\"") is the starved runner talking, not a test — every green
+  # release run has carried one. Only a timeout that is ITSELF an unhandled entry counts: the first
+  # payload line under a per-error header, nothing later. The header is Vitest's own structural line —
+  # a run of ⎯ on each side of "Unhandled Error", ANSI stripped (both the raw ESC byte and gh's `^[` rendering of it), nothing else on the line — so prose that
+  # merely contains the words never opens a window — and the payload must be Vitest's whole line
+  # (`Error: [vitest-worker]: Timeout calling "<method>"`), so an assertion quoting it stays RED. Per-error headers are honoured only inside Vitest's own block —
+  # after its structural "Unhandled Errors" line and "Vitest caught N" tally, until the file summary — and
+  # the count never exceeds N, so a test that prints a header and a timeout to stdout forges nothing. A stray diagnostic elsewhere in the log never
+  # offsets a real unhandled error; anything else under a header stays RED.
+  esc=$(printf '\033')
+  rpc=$(awk -v esc="$esc" '{ line = $0; gsub(/\^\[\[[0-9;]*m/, "", line); gsub(esc "\\[[0-9;]*m", "", line); sub(/^[^\t]*\t[^\t]*\t[0-9T:.-]+Z[ ]?/, "", line) }
+             line ~ /^(⎯)+ Unhandled Errors (⎯)+[ \t]*$/ { opening = 1; next }
+             opening && line !~ /[^ \t]/ { next }
+             opening { opening = 0; if (line ~ /^Vitest caught [0-9]+ unhandled error/) { armed = 1; cap = line; sub(/^Vitest caught /, "", cap); sub(/ .*$/, "", cap) } }
+             armed && line ~ /^[ \t]*Test Files / { armed = 0 }
+             armed && line ~ /^(⎯)+ Unhandled Error (⎯)+[ \t]*$/ { pending = 1; next }
+             pending && line ~ /[^ \t]/ { pending = 0; if (line ~ /^Error: \[vitest-worker\]: Timeout calling "[A-Za-z]+"[ \t]*$/) n++ }
+             END { if (n > cap + 0) n = cap + 0; print n + 0 }' "$log")
+  if [ "$rpc" -gt 0 ] && [ "$unhandled" -ge "$rpc" ]; then unhandled=$((unhandled - rpc)); fi
   errors=$(grep -oE '##\[error\].*' "$log" | sort | uniq -c | sed 's/^ *//' | tr '\n' ';')
 
-  echo "$name: oracle=[${oracle:-MISSING}] files=[$(printf '%s' "$files" | tr '\n' '|')] passed=$passed skipped=$skipped failed=$failed timedout=$timedout unhandled=$unhandled errors=[$errors]"
+  echo "$name: oracle=[${oracle:-MISSING}] files=[$(printf '%s' "$files" | tr '\n' '|')] passed=$passed skipped=$skipped failed=$failed timedout=$timedout unhandled=$unhandled runner_rpc_timeouts=${rpc:-0} errors=[$errors]"
   if [ -z "$oracle" ] || [ -z "$files" ]; then
     echo "$name: UNREADABLE"
     mark_unreadable

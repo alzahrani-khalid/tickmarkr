@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 
 // The process census and command admission deliberately use the same command-head classifier.
@@ -118,6 +119,18 @@ const alive = (pid: number): boolean => {
 };
 const isCode = (error: unknown, code: string) => (error as NodeJS.ErrnoException).code === code;
 
+/** OBS-1057: dev+ino alone is not an identity across unlink/recreate — Linux hands the freed inode
+ * number straight to the next file, so a stale observation of a dead or corrupt reservation matched
+ * the fresh reservation that replaced it and reclaimDead removed the live winner (public CI, ubuntu).
+ * The bytes are the generation: a fragment never hashes like a complete record, and two complete
+ * records differ by token. Size and mtime are not enough (a same-length reservation written within
+ * the filesystem's timestamp resolution — Leg-2 review of the first cut). */
+export const inodeIdentity = (st: { dev: number | bigint; ino: number | bigint }, bytes: string | Buffer): string =>
+  `${st.dev}-${st.ino}-${createHash("sha256").update(bytes).digest("hex").slice(0, 16)}`;
+
+/** The identity a reclaimer would observe at a path right now, or undefined when nothing is there. */
+export const observeIdentity = (path: string): string | undefined => readOccupant(path)?.identity;
+
 /** What sits at the lease path, read through one descriptor so bytes and identity always describe
  * the same inode even when another process replaces the pathname. */
 type Occupant = { holder: RepositoryLeaseHolder | undefined; identity: string } | undefined;
@@ -126,9 +139,10 @@ const readOccupant = (path: string): Occupant => {
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const st = fstatSync(fd);
-    const identity = `${st.dev}-${st.ino}`;
+    const bytes = readFileSync(fd, "utf8");
+    const identity = inodeIdentity(st, bytes);
     try {
-      const holder = JSON.parse(readFileSync(fd, "utf8")) as RepositoryLeaseHolder;
+      const holder = JSON.parse(bytes) as RepositoryLeaseHolder;
       if (typeof holder.pid === "number" && typeof holder.cwd === "string" && typeof holder.token === "string") return { holder, identity };
     } catch { /* incomplete/foreign bytes are reclaimable under the mutation lock */ }
     return { holder: undefined, identity };

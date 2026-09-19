@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, readHolder, reclaimDead, repositoryLeasePath, runWithCommandLease, tryReserve, withCommandLease, withRepositoryLease } from "../../src/run/lease.js";
+import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, readHolder, reclaimDead, repositoryLeasePath, runWithCommandLease, tryReserve, withCommandLease, withRepositoryLease, observeIdentity } from "../../src/run/lease.js";
 import { resetSpawnForTests, setSpawnForTests, sh } from "../../src/run/git.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
@@ -236,15 +236,14 @@ test("test: the runner classifier leases npm test, npm run test:unit and npx vit
 
 test("R-T7: two waiters that both read one dead holder reclaim it once — the loser's reclamation never removes the winner's fresh reservation — and a reservation left empty or truncated by a process killed mid-acquisition is reclaimed rather than waited on forever", async () => {
   const { spawnSync } = await import("node:child_process");
-  const { existsSync, readFileSync, statSync, writeFileSync } = await import("node:fs");
+  const { existsSync, readFileSync, writeFileSync } = await import("node:fs");
   const repo = makeRepo({ "base.txt": "base" });
   const path = await repositoryLeasePath(repo);
   // A holder that really died: a child process that reserved and was then killed.
   const deadPid = spawnSync("node", ["-e", "process.exit(0)"]).pid!;
   const dead = { pid: deadPid, cwd: repo, at: 1, token: "dead-token" };
   expect(tryReserve(path, dead)).toBe(true);
-  const deadStat = statSync(path);
-  const deadIdentity = `${deadStat.dev}-${deadStat.ino}`;
+  const deadIdentity = observeIdentity(path)!;
   // The reviewer's interleaving: A and B both read the dead holder; A reclaims and acquires; B reclaims.
   const a = { pid: process.pid, cwd: repo, at: 2, token: "a-token" };
   expect(await reclaimDead(path, deadIdentity)).toBe(true);
@@ -269,8 +268,7 @@ test("R-T7: two waiters that both read one dead holder reclaim it once — the l
   for (const bytes of ["", '{"pid":']) {
     rmSyncOrIgnore(path);
     writeFileSync(path, bytes);
-    const corruptStat = statSync(path);
-    const corruptIdentity = `${corruptStat.dev}-${corruptStat.ino}`;
+    const corruptIdentity = observeIdentity(path)!;
     rmSyncOrIgnore(path);
     expect(tryReserve(path, a)).toBe(true);
     const stale = spawnSync("node", ["--input-type=module", "-e", `
@@ -289,8 +287,7 @@ test("R-T7: two waiters that both read one dead holder reclaim it once — the l
   // dead mutation-lock generation. The next production acquisition supersedes it and finishes the
   // exact inode's reclaim instead of spinning or deleting a replacement.
   writeFileSync(path, '{"pid":');
-  const interruptedStat = statSync(path);
-  const interruptedIdentity = `${interruptedStat.dev}-${interruptedStat.ino}`;
+  const interruptedIdentity = observeIdentity(path)!;
   const interrupted = spawnSync("node", ["-e", `
     const { linkSync, mkdirSync, symlinkSync } = require("node:fs");
     const path = process.argv[1], identity = process.argv[2], lock = path + ".lock";
