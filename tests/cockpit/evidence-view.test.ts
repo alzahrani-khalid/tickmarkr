@@ -387,11 +387,33 @@ test("test: the Evidence view shows each operator-page group with its first and 
     for (let i = 0; i < pages.length; i++) expect(rawSection).toContain(`flood-row-${i}`);
     // Traverse every historical row using the production input handler, including those coalesced.
     for (const page of [...pages].reverse()) {
+      // Wait for the DRAWN selection, not for a fixed sleep: a 20 ms wait is host-speed-bound and
+      // reddened both public CI jobs of v2.5.7 (run 35577514076).
+      for (let i = 0; i < 100 && !frame.frame().includes(`selected journal.jsonl#L${page.line}`); i++) await wait();
       expect(frame.frame()).toContain(`selected journal.jsonl#L${page.line}`);
       expect(frame.frame()).toContain(`"summary": "${page.event.data.summary}"`);
       frame.input.write("\r"); await wait();
       frame.input.write("\x1B[A"); await wait();
     }
     expect(selected).toEqual([...pages].reverse().map(p => `journal.jsonl#L${p.line}`));
+  } finally { frame.unmount(); }
+});
+
+
+test("Enter opens the row the operator navigated to even when no frame was drawn between the arrow and the Enter, so a handler acting on the previous render's selection fails", async () => {
+  const rows = Array.from({ length: 6 }, (_, i) => ({
+    line: i + 3,
+    event: ev("operator-page", "T1", { park: "gate-fail#0", status: "blocked", owner: "operator", summary: `row-${i}` },
+      `2026-09-21T00:00:${String(i).padStart(2, "0")}.000Z`),
+  }));
+  const model = deriveEvidenceView({ rows });
+  const selected: string[] = [];
+  const frame = await drawFrame(createElement(EvidenceView, { model, onSelect: e => selected.push(e.id) }));
+  try {
+    // Two arrows and an Enter in one tick: no render, and no re-subscribed handler, in between.
+    frame.input.write("\x1B[A"); frame.input.write("\x1B[A"); frame.input.write("\r");
+    await wait(50);
+    expect(selected).toEqual(["journal.jsonl#L6"]);
+    expect(frame.frame()).toContain("selected journal.jsonl#L6");
   } finally { frame.unmount(); }
 });

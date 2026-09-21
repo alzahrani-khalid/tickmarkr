@@ -1,7 +1,7 @@
 import { existsSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { Box, useInput } from "ink";
-import { useEffect, useState, type ReactElement } from "react";
+import { useEffect, useRef, useState, type ReactElement } from "react";
 import type { ChannelCost } from "../../report/cost.js";
 import { buildOperatorRecord, formatOperatorRecordRow, type OperatorRecordRow } from "../../report/operator-record.js";
 import { EMPTY_OPERATOR_PAGE_SUMMARY, foldOperatorPages, operatorPageRow, type OperatorPageGroup } from "../../run/operator-page-summary.js";
@@ -285,6 +285,19 @@ export function EvidenceView({ model, width, focused = true, focusEvidence, onSe
   const selectedIndex = model.journal.findIndex((row) => row.evidence.line === selectedLine);
   const selectedRow = selectedIndex >= 0 ? model.journal[selectedIndex] : undefined;
 
+  // The key handler reads the selection from this ref, never from the render it closed over: ink
+  // re-subscribes the handler in an effect AFTER the frame is drawn, so a key arriving in that
+  // window would act on the previous row while the screen shows the new one (Enter opened the row
+  // above the highlighted one; a second fast arrow lost its step). Render resyncs it; a move
+  // writes it before the state update, so the next key sees the move even with no render between.
+  const lineRef = useRef(selectedLine);
+  lineRef.current = selectedLine;
+  const moveTo = (index: number): void => {
+    const line = model.journal[index]!.evidence.line;
+    lineRef.current = line;
+    setSelectedLine(line);
+  };
+
   useInput(
     (input, key) => {
       if (key.leftArrow) setTab((t) => TABS[(TABS.indexOf(t) - 1 + TABS.length) % TABS.length]!);
@@ -292,17 +305,16 @@ export function EvidenceView({ model, width, focused = true, focusEvidence, onSe
       if (input === "e" && onExport) onExport();
       if (tab !== "journal" || model.journal.length === 0) return;
       if (input === "f") setFollow((f) => !f);
+      const current = model.journal.findIndex((row) => row.evidence.line === lineRef.current);
       if (key.upArrow) {
         setFollow(false);
-        const i = Math.max(0, (selectedIndex < 0 ? model.journal.length - 1 : selectedIndex) - 1);
-        setSelectedLine(model.journal[i]!.evidence.line);
+        moveTo(Math.max(0, (current < 0 ? model.journal.length - 1 : current) - 1));
       }
       if (key.downArrow) {
         setFollow(false);
-        const i = Math.min(model.journal.length - 1, (selectedIndex < 0 ? 0 : selectedIndex) + 1);
-        setSelectedLine(model.journal[i]!.evidence.line);
+        moveTo(Math.min(model.journal.length - 1, (current < 0 ? 0 : current) + 1));
       }
-      if (key.return && selectedRow && onSelect) onSelect(selectedRow.evidence);
+      if (key.return && current >= 0 && onSelect) onSelect(model.journal[current]!.evidence);
     },
     { isActive: focused },
   );
