@@ -412,7 +412,7 @@ describe("v1.65 activity cells on the status surface", () => {
     const out = await status([], repo);
     expect(row(out, "T2")).toContain("dep-waiting on T1"); // the unmet dep is named
     expect(out.match(/dep-waiting/g)).toHaveLength(1); // no other pending task shows dep-waiting
-    expect(row(out, "T1")).toContain("attempt 1 in flight on fake:fake-1 since 08:00:00"); // live attempt, not dep-waiting
+    expect(row(out, "T1")).toContain("preparing · attempt 1 since 08:00:00"); // live attempt, not dep-waiting
     expect(row(out, "T3")).not.toContain("dep-waiting"); // pending with no deps stays unlabeled
   });
 
@@ -811,4 +811,87 @@ describe("status <runId> reports the run you named", () => {
     expect(journalless.code).not.toBe(0);
     expect(journalless.out).toContain("run-20260101-000100");
   });
+});
+
+const projectionFixture = () => {
+  const repo = mkRepo();
+  const g = boardGraph([
+    { id: "T1", title: "Preparing task", goal: "Prepare", status: "pending" },
+    { id: "T2", title: "Green task", goal: "Verify", status: "pending" },
+    { id: "T3", title: "Parked task", goal: "Decide", status: "pending" },
+  ]);
+  saveGraph(repo, g);
+  const ts = "2026-09-20T08:00:00.000Z";
+  seedJournal(repo, "run-projection", [
+    { ...startFor(g), ts },
+    { ts, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0, role: "implementer", agent: "agent-one" } },
+    { ts, event: "task-dispatch", taskId: "T2", data: { assignment: { adapter: "fake", model: "fake-2" }, attempt: 0 } },
+    { ts, event: "worker-result", taskId: "T2", data: { ok: true, finished: true } },
+    ...g.tasks[1]!.gates.map(gate => ({ ts, event: "gate-result", taskId: "T2", data: { gate, pass: true } })),
+    { ts, event: "task-human", taskId: "T3", data: { kind: "human-gate", reason: "Please decide", role: "reviewer" } },
+  ]);
+  return repo;
+};
+
+test("test: status renders for each current task its recorded phase last evidence time responsible role or agent when recorded blocker kind next action and human-decision flag from the shared projection, and a dispatched-not-launched task reads preparing while an all-green task reads awaiting merge phase, so a cell that predicts a gate running or infers merging fails", async () => {
+  const repo = projectionFixture();
+  const out = await withStatusSurface(false, 120, () => status([], repo));
+  const lines = out.split("\n");
+  const evidence = (id: string) => lines[lines.indexOf(row(out, id)) + 1]!;
+  expect(evidence("T1")).toBe("    phase preparing · last evidence 2026-09-20T08:00:00.000Z · responsible implementer / agent-one · blocker none · next action unrecorded · human-decision no");
+  expect(evidence("T2")).toContain("phase awaiting merge phase");
+  expect(evidence("T3")).toBe("    phase terminal · last evidence 2026-09-20T08:00:00.000Z · responsible reviewer · blocker human-decision · next action Choose a decision: approve · human-decision yes");
+  expect(out).not.toMatch(/gate \w+ running|\bmerging\b|in flight/);
+  const watch = await withStatusSurface(false, 120, () => status(["--watch"], repo, { iterations: 1 }));
+  for (const id of ["T1", "T2", "T3"]) expect(watch).toContain(evidence(id));
+});
+
+test("test: the compact one-line form keeps its byte-pinned presentation while reading the same projection and the non-tty output stays byte-pinned around the task-title column, so a one-line drift or a changed pinned column fails", async () => {
+  const repo = projectionFixture();
+  expect(await status(["--oneline"], repo)).toBe("run-projection · 0/3 done · verify unrecorded");
+  const out = await withStatusSurface(false, 120, () => status([], repo));
+  expect(row(out, "T1").split("  B[")[0]).toBe("  [ ] T1 Preparing task");
+  expect(row(out, "T2").split("  B[")[0]).toBe("  [ ] T2 Green task");
+  expect(row(out, "T3").split("  B[")[0]).toBe("  [!] T3 Parked task");
+});
+
+test("test: at 80 columns and at 120 columns the blocker kind and next action of a parked task are present in the frame, so a narrow layout that drops the blocker fails", async () => {
+  const repo = projectionFixture();
+  for (const columns of [80, 120]) {
+    const frame = stripAnsi(await withStatusSurface(true, columns, () => status([], repo)));
+    const parked = taskBlock(frame, "T3").replace(/\s+/g, " ");
+    expect(parked, `${columns} columns`).toContain("blocker human-decision");
+    expect(parked, `${columns} columns`).toContain("next action Choose a decision: approve");
+    expect(parked, `${columns} columns`).toContain("human-decision yes");
+    for (const line of frame.split("\n")) expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+  }
+});
+
+
+test("only an explicit merge phase starts merging and a new verification round retires the prior ready phase", async () => {
+  const repo = projectionFixture();
+  const journal = Journal.open(repo, "run-projection");
+  journal.append("phase-start", "T2", { phase: "merge" });
+  expect(await status([], repo)).toContain("phase merging");
+  journal.append("run-resume", undefined, {});
+  expect(await status([], repo)).not.toContain("awaiting merge phase");
+  journal.append("phase-start", "T2", { phase: "gates" });
+  journal.append("gate-result", "T2", { gate: "build", pass: true });
+  expect(await status([], repo)).not.toContain("awaiting merge phase");
+});
+
+test("a newer gate non-verdict retires awaiting merge until a full passing verdict is recorded", async () => {
+  const repo = projectionFixture();
+  const journal = Journal.open(repo, "run-projection");
+  for (const data of [
+    { pass: true, selectedTests: ["tests/cli/status.test.ts"] },
+    { outcome: { kind: "infra", reason: "runner unavailable", retryable: true } },
+    { outcome: { kind: "unavailable", reason: "receipt unreadable" } },
+  ]) {
+    expect(await status([], repo)).toContain("phase awaiting merge phase");
+    journal.append("gate-result", "T2", { gate: "test", ...data });
+    expect(await status([], repo)).not.toContain("awaiting merge phase");
+    journal.append("gate-result", "T2", { gate: "test", pass: true, fullSuite: true });
+  }
+  expect(await status([], repo)).toContain("phase awaiting merge phase");
 });

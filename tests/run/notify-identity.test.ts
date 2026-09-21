@@ -65,8 +65,19 @@ function maskMeasured<T>(obj: T): T {
 }
 
 function normJournal(events: JournalEvent[], repo: string, runId: string, baseRef: string, taskId = "T1") {
+  const invocations = new Map<string, number>();
   return events.map((e, i) => {
     let row = { ...e, ts: String(i) };
+    if (row.event === "build-receipt") {
+      // Canonicalize random identities, retaining start/terminal correlation and distinct rounds.
+      const attribution = row.data.attribution as { invocation: string };
+      expect(attribution).toMatchObject({ runId, taskId });
+      expect(attribution.invocation).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+      if (!invocations.has(attribution.invocation)) invocations.set(attribution.invocation, invocations.size);
+      row = { ...row, data: { ...row.data, attribution: {
+        ...attribution, invocation: `INVOCATION-${invocations.get(attribution.invocation)}`,
+      } } };
+    }
     if (row.event === "worker-launch") {
       // Focus needs the recorded ownership. Prove the actual launch identity
       // before normalizing the two fixtures' different repositories/runs.

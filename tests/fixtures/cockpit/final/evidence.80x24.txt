@@ -1,23 +1,23 @@
 tickmarkr capture | EVIDENCE | run-20260905-000000
-1 Home  4 Run  5 Evidence | content | 1–17/17 | 0 hidden
+1 Home  4 Run  5 Evidence | content | 1–17/25 | 8 hidden
 ────────────────────────────────────────────────────────────────────────────────
 │EVIDENCE [JOURNAL]  REPORT  STATS  CHANNELS  LEARNING PREVIEW  | Follow on  |…│
-│JOURNAL                                                                       │
-│2026-09-05T00:00:00.000Z ● running run-start — fixture                        │
-│2026-09-05T00:00:00.000Z ● running task-dispatch — T1                         │
-│2026-09-05T00:00:00.000Z ✓ passed gate-result — T1 — review passed            │
-│2026-09-05T00:00:00.000Z ✗ terminal failure gate-result — T1 — review failed  │
-│2026-09-05T00:0 - disabled build — gate-result — Txxxxxxxxxxxxxxxxxxxxxxxxxxx…│
-│2026-09-05T00:00:00.000Z ✓ passed merge — T1                                  │
-│2026-09-05T00:00:00.000Z ! human park task-human — T2                         │
-│2026-09-05T00:00:00.000Z ? unknown tip-verify                                 │
-│2026-09-05T00:00:00.000Z ✓ passed run-end — done 1, failed 0                  │
-│2026-09-05T00:00:00.000Z ? unknown task-approved — T2                         │
-│2026-09-05T00:00:00.000Z ● running run-resume                                 │
-│2026-09-05T00:00:00.000Z ● running ❯ task-dispatch — T2                       │
+│RAW JOURNAL                                                                   │
+│00:00:00 ● running #L1 run-start — fixture                                    │
+│00:00:00 ● running #L2 task-dispatch — T1                                     │
+│00:00:00 ✓ passed #L3 gate-result — T1 — review passed                        │
+│00:00:00 ✗ terminal failure #L4 gate-result — T1 — review failed              │
+│00:00:00 - disabled #L5 build — gate-result — Txxxxxxxxxxxxxxxxxxxx…          │
+│00:00:00 ✓ passed #L6 merge — T1                                              │
+│00:00:00 ! human park #L7 task-human — T2                                     │
+│00:00:00 ? unknown #L8 tip-verify                                             │
+│00:00:00 ✓ passed #L9 run-end — done 1, failed 0                              │
+│00:00:00 ? unknown #L10 task-approved — T2                                    │
+│00:00:00 ● running #L11 run-resume                                            │
+│00:00:00 ● running ❯ #L12 task-dispatch — T2                                  │
+│OPERATOR PAGE GROUPS                                                          │
+│no operator pages                                                             │
 │SELECTED EVIDENCE                                                             │
-│Original journal <engagement>/journal.jsonl                                   │
-│Artifacts: missing                                                            │
 ────────────────────────────────────────────────────────────────────────────────
 RUNNING | MERGED 1/4 | CURRENT TIP PENDING | fresh
 Tab Focus | Enter Open | a Actions | ? Keys | q Quit

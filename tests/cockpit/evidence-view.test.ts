@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { ttyInput } from "../helpers/tty-input.js";
@@ -16,6 +17,17 @@ import {
   writeEvidenceExport,
 } from "../../src/tui/cockpit/evidence-view.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
+
+// every file outside tickmarkr's own state directory, keyed by path, valued by content hash
+function snapshotRepo(repo: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rel of readdirSync(repo, { recursive: true }).map(String).sort()) {
+    if (rel === ".tickmarkr" || rel.startsWith(".tickmarkr/")) continue;
+    const full = join(repo, rel);
+    if (statSync(full).isFile()) out[rel] = createHash("sha256").update(readFileSync(full)).digest("hex");
+  }
+  return out;
+}
 
 const stripAnsi = (value: string) => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 
@@ -208,14 +220,9 @@ describe("evidence-view", () => {
     baseline.append("run-start", undefined, { baseRef: "abc" });
     baseline.append("run-end", undefined, { done: [], failed: [], human: [], blocked: [], pending: [] });
 
-    // A real guard against a silent write: snapshot the ENTIRE repo tree report ran against (not an
-    // unrelated temp dir) before and after — --md returning text must leave every file in it
-    // untouched, not merely fail to produce one specific unrelated filename.
-    const beforeMd = readdirSync(repo, { recursive: true }).sort();
+    // --md stays stdout-only; its byte-identity oracle is the dedicated test below (OBS-1056 (1))
     const md = await report(["run-evidence-export", "--md"], repo);
-    expect(md).toContain("# tickmarkr engagement"); // stdout text, not a side-effect file
-    expect(readdirSync(repo, { recursive: true }).sort()).toEqual(beforeMd);
-    expect(existsSync(join(dir, "run-evidence-export.report.md"))).toBe(false);
+    expect(md).toContain("# tickmarkr engagement");
 
     const bundlePath = join(dir, "proof-bundle.json");
     expect(existsSync(bundlePath)).toBe(false);
@@ -224,6 +231,36 @@ describe("evidence-view", () => {
 
     const compared = await report(["run-evidence-export", "--compare", "run-evidence-baseline"], repo);
     expect(compared).toMatch(/comparability caveat.*not apples-to-apples/s);
+  });
+
+  test("test: report --md returns Markdown containing the engagement heading and the selected run evidence while leaving every file that existed before it byte-identical and creates no report file anywhere in the repository, checked over a snapshot that excludes tickmarkr's own state directory, so an empty report fails and a run-state write under .tickmarkr no longer reds the oracle while a report file written beside the spec still does", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n", "specs/v1-thing.spec.md": "# spec\n" });
+    const j = Journal.create(repo, "run-md-oracle");
+    j.append("run-start", undefined, { baseRef: "abc" });
+    j.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0 });
+    j.append("gate-result", "T1", { gate: "test", pass: true, details: "exit 0" });
+    j.append("merge", "T1", { commit: "deadbeef" });
+    j.append("run-end", undefined, { done: ["T1"], failed: [], human: [], blocked: [], pending: [] });
+
+    const reportFiles = () => readdirSync(repo, { recursive: true }).map(String).filter((p) => /report\.md$/.test(p));
+    const before = snapshotRepo(repo);
+    const md = await report(["run-md-oracle", "--md"], repo);
+    expect(md).toContain("# tickmarkr engagement"); // stdout text, not a side-effect file
+    expect(md).toContain("run-md-oracle");
+    expect(md).toContain("deadbeef"); // the selected run's own evidence — an empty report fails here
+    expect(snapshotRepo(repo)).toEqual(before); // every pre-existing file byte-identical
+    expect(reportFiles()).toEqual([]); // no report file anywhere, .tickmarkr included
+
+    // positive controls for the oracle itself: run-state under .tickmarkr is invisible to it ...
+    writeFileSync(join(repo, ".tickmarkr", "run-state.json"), "{}\n");
+    expect(snapshotRepo(repo)).toEqual(before);
+    // ... a report file beside the spec, or a rewritten pre-existing file, still reds it
+    writeFileSync(join(repo, "specs", "run-md-oracle.report.md"), md);
+    expect(snapshotRepo(repo)).not.toEqual(before);
+    expect(reportFiles()).toEqual(["specs/run-md-oracle.report.md"]);
+    rmSync(join(repo, "specs", "run-md-oracle.report.md"));
+    writeFileSync(join(repo, "keep.txt"), "y\n");
+    expect(snapshotRepo(repo)).not.toEqual(before);
   });
 
   test("Evidence rows carry the tracked journal rows' own line identities so a blank line and a malformed complete line before a review leave its #L equal to its physical position, and a review-leg2 row's recorded artifact path is listed as its durable artifact", () => {
@@ -305,4 +342,56 @@ describe("evidence-view", () => {
     });
     expect(readFileSync(destination, "utf8")).toBe(fullRecord);
   });
+});
+
+
+test("test: the Evidence view shows each operator-page group with its first and last evidence its visible and suppressed counts and every raw source line reachable while the raw journal section still lists every historical flood row, so a group that hides a raw row fails", async () => {
+  const pages = Array.from({ length: 12 }, (_, i) => ({
+    line: i + 4,
+    event: ev("operator-page", "T1", {
+      park: "gate-fail#0", status: i < 10 ? "blocked" : "resolved",
+      owner: i < 11 ? "operator" : "reviewer",
+      ...(i === 0 ? {} : { suppressed: 2 }), summary: `flood-row-${i}`,
+    }, `2026-09-21T00:00:${String(i).padStart(2, "0")}.000Z`),
+  }));
+  // Physical gaps must not turn references into filtered display ordinals.
+  const model = deriveEvidenceView({ rows: [{ line: 2, error: "malformed", raw: "{" }, ...pages] });
+  expect(model.operatorPages.map(g => [g.lines, g.observedCount, g.suppressedCount, g.rawOnly])).toEqual([
+    [pages.slice(0, 10).map(r => r.line), 10, 18, true],
+    [[pages[10]!.line], 1, 2, false],
+    [[pages[11]!.line], 1, 2, false],
+  ]);
+  expect(model.journal.map(r => r.evidence.line)).toEqual(pages.map(r => r.line));
+  const selected: string[] = [];
+  const frame = await drawFrame(createElement(EvidenceView, { model, onSelect: e => selected.push(e.id) }));
+  try {
+    const body = frame.frame();
+    expect(body).toContain("RAW JOURNAL");
+    expect(body).toContain("OPERATOR PAGE GROUPS");
+    // Inspect each rendered group independently: the raw journal must not satisfy a
+    // missing group reference, nor may another group's timestamps/counts stand in for it.
+    const groupsSection = body.split("OPERATOR PAGE GROUPS")[1]!.split("SELECTED EVIDENCE")[0]!;
+    const groups = groupsSection.split(/T1 · gate-fail#0 · (?:blocked|resolved)/).slice(1);
+    expect(groups).toHaveLength(3);
+    const expectedGroups = [pages.slice(0, 10), [pages[10]!], [pages[11]!]];
+    for (const [index, rows] of expectedGroups.entries()) {
+      const group = groups[index]!;
+      expect(group).toContain(`first ${rows[0]!.event.ts}`);
+      expect(group).toContain(`last ${rows.at(-1)!.event.ts}`);
+      expect(group).toContain(`visible ${rows.length} · suppressed ${index === 0 ? 18 : 2}`);
+      expect(group.includes("raw-only (suppression unrecorded)")).toBe(index === 0);
+      expect([...group.matchAll(/#L(\d+)\b/g)].map(match => Number(match[1])))
+        .toEqual(rows.map(row => row.line));
+    }
+    const rawSection = body.split("RAW JOURNAL")[1]!.split("OPERATOR PAGE GROUPS")[0]!;
+    for (let i = 0; i < pages.length; i++) expect(rawSection).toContain(`flood-row-${i}`);
+    // Traverse every historical row using the production input handler, including those coalesced.
+    for (const page of [...pages].reverse()) {
+      expect(frame.frame()).toContain(`selected journal.jsonl#L${page.line}`);
+      expect(frame.frame()).toContain(`"summary": "${page.event.data.summary}"`);
+      frame.input.write("\r"); await wait();
+      frame.input.write("\x1B[A"); await wait();
+    }
+    expect(selected).toEqual([...pages].reverse().map(p => `journal.jsonl#L${p.line}`));
+  } finally { frame.unmount(); }
 });

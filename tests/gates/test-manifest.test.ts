@@ -77,13 +77,19 @@ const now = Date.now();
 const report = { nonce: mode === 'stale' ? 'prior-invocation' : process.env.TICKMARKR_TEST_NONCE,
   requested: [...present], started: Object.fromEntries(present.map(f => [f, now])),
   completed: Object.fromEntries(present.map(f => [f, {at: now, status: 'passed'}])), certificate: {at: now, exitCode: 0} };
+if (mode === 'runner-red') {
+  report.started = {}; report.completed = {};
+  report.certificate.exitCode = 1; report.certificate.errors = 1;
+  process.stdout.write('x'.repeat(20000) + 'runner stdout tail');
+  process.stderr.write('y'.repeat(20000) + '\\nError EAGAIN\\n');
+}
 if (mode === 'duplicate') report.requested.push(present[0]);
 if (mode === 'terminal') delete report.certificate;
 if (mode === 'hang') { report.started = {[files[0]]: now}; report.completed = {}; delete report.certificate; }
 if (mode === 'failed' || mode === 'failed-zero') { report.completed[files[0]] = {at: now, status: 'failed', failures: ['FAIL tests/a.test.ts > injected assertion']}; report.certificate.exitCode = 1; }
 fs.writeFileSync(process.env.TICKMARKR_TEST_REPORT, JSON.stringify(report));
 if (mode === 'hang') setInterval(() => {}, 1000);
-else process.exit(mode === 'contradiction' || mode === 'failed' ? 1 : 0);
+else process.exit(mode === 'contradiction' || mode === 'runner-red' || mode === 'failed' ? 1 : 0);
 `, { mode: 0o755 });
 }
 function executed(f: Fixture, name: string, row: Awaited<ReturnType<typeof round>>, cmd: string) {
@@ -448,3 +454,50 @@ test("through the production worktree recreation on one preserved clean commit, 
     }
   }
 }, 240_000);
+
+test("test: a manifested vitest run whose report is green but whose runner prints Error EAGAIN and exits 1 yields a failed test gate row retaining classification infra with a runner-level diagnostic, the available never-started and reporter error counts and the EAGAIN line, and persists the runner's stdout and stderr tail beside the manifest report while unavailable counts read unknown, so a red that records only the certificate or changes the existing verdict or classification fails", async () => {
+  const f = fixture(false);
+  fault(f, "runner-red", "runner-red");
+  const row = await round(f);
+  expect(row.pass).toBe(false);
+  expect(row.meta?.classification).toBe("infra");
+  expect(row.details).toContain("report has no failed tests but the process exited 1");
+  expect(row.details).toContain("classification: infra; runner-level diagnostic: never-started 2; reporter errors 1");
+  expect(row.details).toContain("Error EAGAIN");
+  for (const [key, ending] of [["stdoutPath", "runner stdout tail"], ["stderrPath", "Error EAGAIN\n"]]) {
+    const path = String(row.meta?.[key]);
+    expect(dirname(path)).toBe(dirname(String(row.meta?.reportPath)));
+    const bytes = readFileSync(path);
+    expect(bytes.length).toBe(16 * 1024);
+    expect(bytes.toString().endsWith(ending)).toBe(true);
+  }
+  const old = fixture(false);
+  fault(old, "contradiction", "contradiction");
+  const oldRow = await round(old);
+  expect(oldRow.pass).toBe(false);
+  expect(oldRow.meta?.classification).toBe("infra");
+  expect(oldRow.details).toContain("never-started 0; reporter errors unknown");
+  const absent = fixture(false);
+  fault(absent, "absent", "absent");
+  expect((await round(absent)).details).toContain("never-started unknown; reporter errors unknown");
+}, 60_000);
+
+test("test: a manifested run with one module that fails to load yields a certificate carrying errors 1 and a gate row whose details name that module's load error while its classification and pass verdict are exactly what the same report produced before this change, so a load error recorded without its module name or a row whose verdict moved fails", async () => {
+  const f = fixture();
+  rmSync(join(f.repo, "tests/b.test.ts"));
+  writeFileSync(join(f.repo, "tests/a.test.ts"), 'import "../missing-module.js"; test("unreachable", () => {});\n');
+  commit(f.repo);
+  const row = await round(f);
+  const report = readTestReport(String(row.meta?.reportPath))!;
+  expect(report.certificate?.errors).toBe(1);
+  expect(row.details).toContain("tests/a.test.ts");
+  expect(row.details).toContain("missing-module");
+  const before = structuredClone(report);
+  delete before.certificate!.errors;
+  delete before.certificate!.diagnostics;
+  const verdict = verifyManifestReport({ manifest: row.meta!.manifest as string[], nonce: report.nonce, report: before, exitCode: 1 });
+  expect(row.pass).toBe(verdict.pass);
+  expect(row.meta?.classification).toBe(verdict.meta.classification);
+  expect(row.pass).toBe(false);
+  expect(row.meta?.classification).toBe("infra");
+}, 60_000);

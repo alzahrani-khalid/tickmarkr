@@ -13,7 +13,7 @@ import { compileSource } from "../../src/compile/index.js";
 import { compileNative } from "../../src/compile/native.js";
 import { criticalPathHits, declaredReviewPolicy, DEFAULT_CONFIG, effectiveReviewPolicy, isReviewLeafPath, repoOverlayPath } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
-import { fetchTaskDiff, matchClosureId, modelProvider, pickReviewer, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
+import { fetchTaskDiff, isReviewClosureMismatch, matchClosureId, modelProvider, pickReviewer, renderPriorMaterials, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
 import { extractJson } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
@@ -69,6 +69,101 @@ function promptSection(prompt: string, heading: string): string {
   const end = prompt.indexOf("\n\n## ", body);
   return prompt.slice(body, end < 0 ? undefined : end).trim();
 }
+
+test("test: a task whose files[] names no test file receives a brief that says no suite may be run and every other brief section is byte-identical to the brief built before this change, so a budget that lists a suite the task does not own or a brief section that moved fails", async () => {
+  const prompt = await captureReviewPrompt(mkTask({ files: ["a.txt", "src/tool.ts", "tests/helper.ts", "tests/*.test.ts"] }));
+  const budget = "## Reviewer suite budget\nNo suite may be run: files[] names no explicit test file owned by this task. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.\n\n";
+  expect(prompt).toContain(budget);
+  expect(promptSection(await captureReviewPrompt(mkTask({ files: [] })), "Reviewer suite budget"))
+    .toBe(budget.slice("## Reviewer suite budget\n".length).trim());
+  const nonce = /VERDICT_NONCE: ([0-9a-f]+)/.exec(prompt)![1]!;
+  // Captured from the production gate before adding the suite budget; normalize only its random nonce.
+  expect(prompt.replace(budget, "").replaceAll(nonce, "<nonce>")).toMatchInlineSnapshot(`
+    "TICKMARKR-REVIEW
+    You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
+    Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
+
+    ## Completion-faking checklist
+    Hunt for these concrete completion-faking shortcuts before ruling on any criterion:
+    - hardcoded-result: output or fixture hardcoded to satisfy the stated criterion instead of real logic
+    - test-weakening: tests skipped, deleted, or assertions loosened until failing behavior looks green
+    - vacuous-assertion: a test that cannot fail (asserts a constant, asserts its own setup, no assertion)
+    - fixture-overfit: implementation narrowed to the exact test inputs rather than the described behavior
+    - echo-not-implement: criterion text echoed in names, comments, or strings without the behavior itself
+    - stub-left-behind: TODO, throw, or no-op stub where the real implementation should be
+    - error-swallowing: catch or fallback that hides failures instead of handling them
+    - self-mocking: the code under test mocked or faked so the test exercises the mock
+    - check-bypass: lint, type, or CI checks disabled, relaxed, or excluded to get green
+    - rename-as-work: code moved or renamed and presented as the requested change
+    - scope-padding: unrelated edits padding the diff while the criterion's behavior is untouched
+    When a criterion fails, the verdict MUST name which shortcut above it matches, or state that none does.
+
+    ## Task T1: t (complexity 8)
+    ## Goal (authoritative — compiled from the sealed graph; the worktree's spec file may be stale after resume --graph-changed)
+    g
+
+    ## Acceptance criteria
+    - a
+
+    ## Declared write scope
+    The task DECLARED these write-scope patterns:
+    - a.txt
+    - src/tool.ts
+    - tests/helper.ts
+    - tests/*.test.ts
+
+    ## Diff
+    \`\`\`diff
+    diff --git a/a.txt b/a.txt
+    index 587be6b4c3f93f93c489c0111bba5596147a26cb..975fbec8256d3e8a3797e7a3611380f27c49f4ac 100644
+    --- a/a.txt
+    +++ b/a.txt
+    @@ -1 +1 @@
+    -x
+    +y
+
+    \`\`\`
+
+    VERDICT_NONCE: <nonce>
+
+    Classify every concern as "material" (a correctness, security, or acceptance-criteria defect that must
+    block the merge) or "minor" (style, naming, or preference that should not block). ONLY material findings
+    block approval. For a minor concern you have decided not to block on, set "defer": true and give a
+    one-line "rationale" — it is recorded in the review, never dropped.
+    A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+
+    Respond with ONLY this JSON:
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
+    (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
+    Approve iff no material finding remains and every prior material is resolved.
+    The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    "
+  `);
+});
+
+test("test: the brief the production review gate delivers to a fake reviewer adapter names the task's own test files as the only suites the reviewer may run and states that a full suite starves the gate, and the brief written beside the artifact carries the same paragraph, so a brief delivered without the suite budget or an artifact brief that differs from the delivered one fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const artifacts = mkdtempSync(join(tmpdir(), "tickmarkr-suite-budget-"));
+  writeFileSync(join(repo, "unowned.test.ts"), "// Another task's test must not be offered.\n");
+  const fake = fakeWith({ review: { approve: true, findings: [] } });
+  const command = fake.headlessCommand.bind(fake);
+  let delivered = "";
+  fake.headlessCommand = (file, model) => {
+    delivered = readFileSync(file, "utf8");
+    return command(file, model);
+  };
+  const task = mkTask({ files: ["a.txt", "src/tool.ts", "tests/own.test.ts", "tests/view.spec.tsx", "tests/node.test.mjs", "tests/helper.ts", "tests/*.test.ts"] });
+  const result = await reviewGate(task, repo, base, author, CH, [fake], DEFAULT_CONFIG, undefined, undefined, artifacts);
+  expect(result.pass).toBe(true);
+  expect(promptSection(delivered, "Reviewer suite budget")).toBe(
+    "You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: `tests/own.test.ts`, `tests/view.spec.tsx`, `tests/node.test.mjs`. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.",
+  );
+  expect(result.meta?.briefPath).toBeDefined();
+  expect(readFileSync(String(result.meta?.briefPath), "utf8")).toBe(delivered);
+  expect(dirname(String(result.meta?.briefPath))).toBe(dirname(String(result.meta?.rawPath)));
+  expect(existsSync(String(result.meta?.rawPath))).toBe(true);
+});
 
 describe("pickReviewer", () => {
   test("picks a different vendor; null when none exists", () => {
@@ -1236,4 +1331,22 @@ test("test: a repair round that re-picks the reviewer of an earlier round writes
 
   // So a re-picked seat that overwrites an earlier round's raw fails:
   expect(round2.meta?.rawPath === round1.meta?.rawPath).toBe(false);
+});
+
+// OBS-1068 (v2.5.7 run …152220: T6 fable, T10 sol, T10 astra — three approvals discarded): the copy
+// block labelled every id `Fingerprint: …`; a seat that copied it EXACTLY missed closure.
+describe("review closure ids and the brief's copy block (OBS-1068)", () => {
+  test("a resolved id copied with the brief's Fingerprint label closes the carried fingerprint, and every line of the copy block closes its own fingerprint when copied verbatim, so a faithful copy of the brief that is discarded as closure-mismatch fails", () => {
+    const fp = "review:material|src/run/operator-summary.ts|[\"done\", \"completed\", \"merged\", \"failed\"]";
+    expect(matchClosureId(`Fingerprint: ${fp}`, fp)).toBe(true);
+    expect(matchClosureId(`fingerprint:${fp}`, [fp])).toBe(fp);
+    expect(isReviewClosureMismatch({ resolved: [`Fingerprint: ${fp}`], reraised: [] }, [fp])).toBe(false);
+    // a retyped id is still a mismatch — the label strip is not a fuzzy match
+    expect(isReviewClosureMismatch({ resolved: ["Fingerprint: review:material|x|y"], reraised: [] }, [fp])).toBe(true);
+    const brief = renderPriorMaterials([{ fingerprint: fp, note: "n", severity: "material" } as never]);
+    // the block keeps its `Fingerprint: ` label (three fixture reviewers parse it); a verbatim copy of the line closes
+    const line = brief.split("\n").find((l) => l.includes(fp))!;
+    expect(line).toBe(`Fingerprint: ${fp}`);
+    expect(matchClosureId(line, [fp])).toBe(fp);
+  });
 });

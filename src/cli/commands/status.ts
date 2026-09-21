@@ -12,9 +12,13 @@ import {
 } from "../../drivers/types.js";
 import { blockedTasks, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { GATE_NAMES, type GateName, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
-import { foldActivity } from "../../run/activity.js";
+import { projectActivity } from "../../run/activity.js";
+import { projectOperatorSummary, type OperatorTaskSummary } from "../../run/operator-summary.js";
+import { trackJournalRows } from "../../run/protocol.js";
+import { newestPark, permittedDecisionVerbs } from "./approve.js";
 import {
   Journal,
+  formatJournalNarration,
   type JournalEvent,
   engagementComparable,
   isQualityFailureParkKind,
@@ -130,8 +134,8 @@ const taskClockReference = (
   return fallback;
 };
 
-// Every attempt number a cell phrase carries is the engagement's own ladder (foldActivity counts
-// dispatch labels from 1). Name that ruler wherever a bare one appears, not only in the one phrase
+// Every attempt number a cell phrase carries is the engagement's own ladder (journal dispatch
+// labels are displayed from 1). Name that ruler wherever a bare one appears, not only in the one phrase
 // shipping today — a phrase added upstream must not reach the operator unruled.
 const labelAttemptRuler = (text: string): string =>
   text.replace(/(?<!engagement |run )\battempt (?=\d)/gu, "engagement attempt ");
@@ -1077,14 +1081,69 @@ const readRunRecord = (cwd: string, graph: RunGraph, namedRunId?: string): RunRe
  * catch an empty or torn first write. Those snapshots own no task fold yet; once run-start exists,
  * however, a fold failure is unexpected and must surface instead of becoming a false empty run.
  */
-const recordTaskRows = (record: RunRecord, graph: RunGraph): Map<string, TaskRow> =>
+const recordTaskRows = (record: RunRecord, graph: RunGraph, isDaemonAlive?: (pid: number) => boolean): Map<string, TaskRow> =>
   record.comparable && record.events.some((event) => event.event === "run-start")
     ? new Map(deriveRunCockpitData(
       { fileName: `${record.runId}.journal.jsonl`, raw: record.raw },
       "status",
-      { graph },
+      { graph, isDaemonAlive },
     ).taskRows.map((row) => [row.taskId, row]))
     : new Map();
+
+/** Adapt the single journal snapshot to the shared, evidence-only projections. */
+const recordProjection = (record: RunRecord | undefined, graph: RunGraph, isDaemonAlive?: (pid: number) => boolean) => {
+  const rows = record ? recordTaskRows(record, graph, isDaemonAlive) : new Map<string, TaskRow>();
+  const events = record?.comparable ? record.events : [];
+  const activity = projectActivity(record?.runId ?? "", trackJournalRows(record?.runId ?? "",
+    events.map((raw, sourceIndex) => ({ raw, sourceIndex }))), graph.tasks);
+  const tasks = graph.tasks.map(task => {
+    const row = rows.get(task.id);
+    const evidence = events.filter(event => event.taskId === task.id);
+    const last = evidence.at(-1);
+    const recorded = activity.get(task.id)!;
+    let phase: string | undefined = last ? recorded.state : undefined;
+    // A completed battery is evidence of readiness, never evidence that merge started.
+    const gates = gateSnapshot(task, events, record?.rehashAt);
+    const boundary = events.reduce((index, event, at) =>
+      ["run-start", "run-resume", "run-end"].includes(event.event)
+        || (event.taskId === task.id && (event.event === "task-dispatch"
+          || (event.event === "phase-start" && event.data.phase === "gates"))) ? at : index, -1);
+    // Read the latest outcome, including non-verdicts. The gate rail retains earlier
+    // verdicts while a screen or infrastructure retry is pending; that historical
+    // pass must not make the current battery look ready to merge.
+    const currentResults = new Map(events.slice(boundary + 1).filter(event =>
+      event.taskId === task.id && event.event === "gate-result")
+      .map(event => [event.data.gate, normalizeGateOutcome(event.data).kind]));
+    if (recorded.state === "unconfirmed" && task.gates.length > 0 && !gates.priorGraph
+        && task.gates.every(gate => currentResults.get(gate) === "passed")) {
+      phase = "awaiting merge phase";
+    }
+    const responsibility = [...evidence].reverse().find(event =>
+      typeof event.data.role === "string" || typeof event.data.agent === "string");
+    return {
+      id: task.id, deps: task.deps, status: row?.state ?? task.status,
+      phase, lastEvidenceAt: last?.ts,
+      responsible: responsibility ? {
+        role: typeof responsibility.data.role === "string" ? responsibility.data.role : undefined,
+        agent: typeof responsibility.data.agent === "string" ? responsibility.data.agent : undefined,
+      } : undefined,
+    };
+  });
+  const decisions = tasks.flatMap(task => {
+    const park = task.status === "human" ? newestPark(events, task.id) : undefined;
+    return park ? [{ taskId: task.id, park, verbs: permittedDecisionVerbs(park) }] : [];
+  });
+  return { rows, activity, summaries: new Map(projectOperatorSummary(tasks, decisions).map(task => [task.taskId, task])) };
+};
+
+const summaryText = (summary: OperatorTaskSummary): string => sanitizeTaskText([
+  `phase ${summary.phase ?? "unrecorded"}`,
+  `last evidence ${summary.lastEvidenceAt ?? "unrecorded"}`,
+  `responsible ${[summary.responsible?.role, summary.responsible?.agent].filter(Boolean).join(" / ") || "unrecorded"}`,
+  `blocker ${summary.blocker?.kind ?? "none"}`,
+  `next action ${summary.blocker?.nextAction ?? "unrecorded"}`,
+  `human-decision ${summary.blocker?.decisionRequired ? "yes" : "no"}`,
+].join(" · "));
 
 /** The graph tasks this run's record actually speaks about — a row with no recorded fact is silence. */
 const recordedTasks = (graph: RunGraph, rows: Map<string, TaskRow>): Task[] =>
@@ -1125,13 +1184,11 @@ const renderFrame = (
   const comparable = record?.comparable ?? false;
   const rehashAt = record?.rehashAt;
   const assignments = new Map<string, string>();
-  let replayed: Map<string, TaskStatus> | null = null;
   const contexts = new Map<string, number>();
   // v1.53 T5: this run is dead — a newer run replaced it
   const supersededBy = [...events].reverse()
     .find((e) => e.event === "superseded" && typeof e.data.by === "string")?.data.by as string | undefined;
   if (record && comparable) {
-    if (!journalRowsOnly) replayed = Journal.open(cwd, record.runId).replayStatuses();
     for (const e of events) {
       if (!journalRowsOnly && e.event === "task-dispatch" && e.taskId) {
         const a = e.data.assignment as { adapter?: string; model?: string };
@@ -1144,7 +1201,12 @@ const renderFrame = (
       }
     }
   }
-  const taskRows = record && journalRowsOnly ? recordTaskRows(record, g) : new Map<string, TaskRow>();
+  const projection = recordProjection(record, g, () => daemon.state !== "dead");
+  const taskRows = projection.rows;
+  // Preserve the plain table's compact status vocabulary using the same snapshot as its evidence.
+  const replayed = new Map([...taskRows].flatMap(([id, row]) => row.state === undefined ? [] : [[id,
+    row.state === "running" || row.state === "interrupted" ? "pending" : graphTaskStatus(row.state, "pending"),
+  ] as const]));
   const clockFallback = new Date(now);
   const recordedClock = new Date(events.at(-1)?.ts ?? now);
   const zoneReference = Number.isFinite(recordedClock.getTime()) ? recordedClock : clockFallback;
@@ -1161,14 +1223,7 @@ const renderFrame = (
   };
   const renderedTasks = journalRowsOnly ? recordedTasks(g, taskRows) : g.tasks;
   const starved = new Set(blockedTasks(effective).map((t) => t.id));
-  // OBS-104: ONE activity fold feeds both surfaces — never re-derived here. Comparable events only
-  // (a recompiled graph's journal must not animate the wrong tasks); with no or stale journal the
-  // dep-waiting cells still derive from the effective graph statuses.
-  const activity = foldActivity(comparable ? events : [], effective.tasks);
-  // RULING-v189-scope §14c: a card answers BOTH supervisor questions. `foldActivity` names what a
-  // task waits FOR; this names what waits ON it. Read from `effective.tasks` — whose statuses are
-  // the journal's replay, never the compiled graph's — so a dependent the record says is done stops
-  // being named, and a task all of whose dependents are done acquires no entry at all.
+  // Reverse dependencies share the effective task statuses with the projection.
   const dependents = new Map<string, string[]>();
   for (const task of effective.tasks) {
     if (task.status === "done") continue;
@@ -1228,7 +1283,18 @@ const renderFrame = (
     );
     const livePhase = phases.get(t.id);
     const isStarved = !livePhase && starved.has(t.id);
-    const rawPhrase = livePhase ? phaseDetail(livePhase, now, workerLiveness.get(t.id)) : isStarved ? undefined : activity.cells.get(t.id);
+    const summary = projection.summaries.get(t.id)!;
+    // Attempt labels can restart at zero in legacy engagements. Pair the preparing caption's
+    // counter and timestamp from the same dispatch, rather than retaining a prior higher label.
+    const dispatch = [...events].reverse().find(event => event.taskId === t.id && event.event === "task-dispatch");
+    const projectedPhrase = summary.blocker?.kind === "dependency-wait"
+      ? `dep-waiting on ${summary.blocker.prerequisites!.join(", ")}`
+      : summary.phase === "terminal"
+        ? st === "human" ? `parked${failureKind ? ` (${failureKind})` : ""}` : undefined
+        : summary.phase === "preparing" && dispatch
+          ? `preparing · attempt ${(Number.isInteger(dispatch.data.attempt) ? dispatch.data.attempt as number : 0) + 1} since ${dispatch.ts.slice(11, 19)}`
+          : summary.phase ?? undefined;
+    const rawPhrase = livePhase ? phaseDetail(livePhase, now, workerLiveness.get(t.id)) : projectedPhrase;
     const phrase = rawPhrase === undefined
       ? undefined
       : journalRowsOnly
@@ -1245,13 +1311,13 @@ const renderFrame = (
       ? gateSnapshot(t, events, rehashAt)
       : { states: defaultGateStates(t), priorGraph: false };
     const pane = panes.get(t.id);
-    return { t, st, merged, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, pane, ...gates };
+    return { t, st, merged, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, pane, summary, ...gates };
   });
 
   if (!unicode) {
-    // machine/CI surface — journals without phase-start stay byte-identical; new phase-aware frames
-    // use an ASCII spinner so pipes never receive terminal-only braille/ANSI.
-    const rows = cells.flatMap(({ t, st, merged, label, assignCol, livePhase, states, priorGraph, pane }) => {
+    // Keep the machine task-title columns intact; projection details occupy their own line.
+    // Phase-aware frames use ASCII spinners so pipes never receive terminal-only braille/ANSI.
+    const rows = cells.flatMap(({ t, st, merged, label, assignCol, livePhase, states, priorGraph, pane, summary }) => {
       const chain = gateChain(states, false);
       const prefix = livePhase ? `  ${ASCII_SPINNER[animationFrame % ASCII_SPINNER.length]} ${t.id} ` : `  ${surfaceTaskBox(st, merged)} ${t.id} `;
       const suffix = `  ${chain}${priorGraph ? ` ${PRIOR_GRAPH_MARKER}` : ""}  ${livePhase ? "running" : surfaceStatusWord(st)}${label}  ${assignCol}${pane ? `  pane ${pane}` : ""}`;
@@ -1262,6 +1328,7 @@ const renderFrame = (
       // (a pane name is 60 columns on its own), so the floor costs wrapping, never the graph.
       return [
         `${prefix}${shortGoal(t.title, Math.max(MACHINE_TITLE_FLOOR, width - prefix.length - suffix.length))}${suffix}`,
+        `    ${summaryText(summary)}`,
         ...recoveryLinesForTask(t.id).map((line) => `    ${line}`),
       ];
     });
@@ -1338,7 +1405,8 @@ const renderFrame = (
     besideLockup(fillLockup(dim(versionText), versionCells), factLines[1]),
     ...factLines.slice(2).map((line) => `${" ".repeat(lockupCells + lockupGapCells)}${line}`),
   ];
-  const nowLine = activity.now ? [legend(`   now: ${activity.now}`)] : [];
+  const lastEvent = comparable ? events.at(-1) : undefined;
+  const nowLine = lastEvent ? [legend(`   now: ${formatJournalNarration(lastEvent)}`)] : [];
   const supervisionLegend = legend(`   ${supervisionText(supervision)}`);
   const taskSectionSummary = `${done} of ${total} merged · rows in graph order · gates left→right in pipeline order`;
   const taskSection = `  ${ok("▌")} ${title("TASKS")}   ${dim(taskSectionSummary)}`;
@@ -1421,6 +1489,7 @@ const renderFrame = (
           `    ${tone(cell.t.id)}  ${dim(taskArea(cell.t))}  ${sanitizeTaskText(cell.t.title)}`,
           ...wrapCells(`    ${dim(machinery)}`, boardColumns, { continuationPrefix: "      " }),
           ...wrapCells(`    ${dim(noteFor(cell))}`, boardColumns, { continuationPrefix: "      " }).filter((line) => line.trim()),
+          ...wrapCells(`    ${dim(summaryText(cell.summary))}`, boardColumns, { continuationPrefix: "      " }),
           "",
         ];
       });
@@ -1451,7 +1520,7 @@ const renderFrame = (
               ? running
               : dim;
       const titleTone = cell.redTier || cell.livePhase || (effort?.parks ?? 0) >= 3 ? title : dim;
-      return Array.from({ length: height }, (_, index) =>
+      return [...Array.from({ length: height }, (_, index) =>
         `    ${idTone(fitColumn(columns[0]![index] ?? "", idWidth, 1))}`
         + dim(fitColumn(columns[1]![index] ?? "", areaWidth))
         + dim(fitColumn(columns[2]![index] ?? "", depsWidth))
@@ -1461,7 +1530,7 @@ const renderFrame = (
         + dim(fitColumn(columns[5]![index] ?? "", channelWidth))
         + dim(fitColumn(columns[6]![index] ?? "", attemptWidth, 1))
         + dim(fitCells(columns[7]![index] ?? "", noteWidth))
-      );
+      ), ...wrapCells(`    ${dim(summaryText(cell.summary))}`, boardColumns, { continuationPrefix: "      " })];
     });
     return [legend(headerRow), dim(ruleRow), ...rows];
   };
@@ -1513,7 +1582,7 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
   const graph = loadGraph(cwd);
   const record = readRunRecord(cwd, graph, namedRunId);
   if (!record) return sanitizeTaskText(`tickmarkr · no runs yet · 0/${graph.tasks.length} done`);
-  const rows = recordTaskRows(record, graph);
+  const { rows } = recordProjection(record, graph);
   const claims = record.comparable
     ? [
       `${recordedDone(recordedTasks(graph, rows), rows)}/${graph.tasks.length} done`,

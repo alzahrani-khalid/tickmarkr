@@ -126,7 +126,7 @@ describe("status board dependents", () => {
     // by evicting the machinery below it, and the phrase above it is untouched.
     const wideCard = taskText(wide, "t1");
     expect(wideCard).toContain("ctx 42000");
-    expect(wideCard).toContain("gate build running");
+    expect(wideCard).toContain("phase returned-for-verification");
   });
 
   test("test: a dependent recorded done in the journal leaves the blocker's dependents element and a task all of whose dependents are done carries none, so a fold reading graph deps without the journal done set fails", async () => {

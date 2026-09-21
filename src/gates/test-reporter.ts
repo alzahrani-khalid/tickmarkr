@@ -50,7 +50,12 @@ export default class TickmarkrReporter {
   }
   onTestRunEnd(modules, errors, reason) {
     const failed = reason === 'failed' || errors.length > 0 || Object.values(this.report.completed).some(c => c.status === 'failed');
-    this.report.certificate = { at: Date.now(), exitCode: failed ? 1 : 0 };
+    // Collection failures can reach run end without a module start/end event. Keep their
+    // identity as diagnostics, without inventing lifecycle records or changing the verdict.
+    const loadErrors = modules.flatMap(module => module.errors().map(e => this.file(module) + ': ' + e.message));
+    this.report.certificate = { at: Date.now(), exitCode: failed ? 1 : 0,
+      errors: errors.length + loadErrors.length,
+      diagnostics: [...loadErrors, ...errors.map(e => [e.testPath, e.name, e.message].filter(Boolean).join(': '))] };
     this.save();
   }
 }

@@ -1,7 +1,13 @@
 // Consolidated C1/C6 readers use the incremental lifecycle contract; legacy captures keep their API.
 export { readOperatorState as deriveOperatorState } from "../../run/operator-state.js";
 import { channelKey } from "../../adapters/types.js";
+import { newestPark, permittedDecisionVerbs } from "../../cli/commands/approve.js";
+import { parseOwnedName } from "../../drivers/types.js";
+import { projectActivity, type TaskActivityProjection } from "../../run/activity.js";
 import { isPidLive } from "../../run/lock.js";
+import { normalizeGateOutcome } from "../../run/outcome.js";
+import { projectOperatorSummary, type OperatorTaskSummary } from "../../run/operator-summary.js";
+import { trackJournalRows } from "../../run/protocol.js";
 import type {
   ComponentState,
   JournalRow,
@@ -98,7 +104,35 @@ export type CockpitGraph = {
     readonly id: string;
     readonly title?: string;
     readonly status?: string;
+    /** Prerequisites and declared gates: read only by the shared projection (blocker, readiness). */
+    readonly deps?: readonly string[];
+    readonly gates?: readonly string[];
   }[];
+};
+
+/** One recorded seat: a task attempt in a role. Keyed by all three, never by provider alone. */
+export type RecordedIdentity = {
+  readonly key: string;
+  readonly role: string;
+  readonly attempt: number;
+  /** The slot name the driver recorded, verbatim; absent when the row named none. */
+  readonly name?: string;
+};
+
+/**
+ * OBS-1048: what the journal recorded about one in-flight attempt's harvest. `trailerFirstSeenAt`
+ * is always absent — no producer journals it (daemon.ts samples the trailer without recording;
+ * OBS-1048 add.1, 2.5.8) — and is never synthesized from any other timestamp.
+ */
+export type AttemptHarvest = {
+  readonly attempt: number;
+  readonly lastWorkerStatus?: string;
+  readonly nudgeFailures: number;
+  readonly lastNudgeFailureAt?: string;
+  readonly pageCount: number;
+  readonly trailerFirstSeenAt?: undefined;
+  /** SUSPECTED: nudges failed and pages fired, and no worker-result of THIS attempt followed the launch. */
+  readonly suspectedStalledHarvest: boolean;
 };
 
 /** How an unrecorded field draws: the engagement said nothing, so the row says nothing. */
@@ -148,6 +182,13 @@ export type TaskRow = {
    * that earns one rather than having to read `done` as if it were the same.
    */
   readonly merged?: true;
+  /** Evidence-only activity projection (run/activity.ts), the one status renders. */
+  readonly activity?: TaskActivityProjection;
+  /** Operator summary (phase, blocker, next action) — the same projection status renders. */
+  readonly summary?: OperatorTaskSummary;
+  readonly identities?: readonly RecordedIdentity[];
+  /** Per recorded attempt, newest last (OBS-1048). */
+  readonly harvests?: readonly AttemptHarvest[];
 };
 
 /** One recorded gate result. `details` is the record's own text, verbatim. */
@@ -706,10 +747,136 @@ function journalRows(
  * graph's own `status` is never consulted, which is what keeps a recompiled
  * graph from repainting a parked task green.
  */
+const stringField = (data: Record<string, unknown>, key: string): string | undefined =>
+  typeof data[key] === "string" ? data[key] as string : undefined;
+const attemptField = (data: Record<string, unknown>): number | undefined =>
+  typeof data.attempt === "number" && Number.isInteger(data.attempt) && data.attempt >= 0 ? data.attempt : undefined;
+
+/** Recorded seats for one task: role and attempt from the row, or from an owned slot name it carries. */
+function recordedIdentities(events: readonly CaptureEvent[], taskId: string): RecordedIdentity[] {
+  const seen = new Map<string, RecordedIdentity>();
+  for (const event of events) {
+    if (event.taskId !== taskId) continue;
+    const slot = recordValue(event.data.slot);
+    const name = stringField(event.data, "slotName") ?? (slot ? stringField(slot, "name") : stringField(event.data, "slot"));
+    const owned = name === undefined ? null : parseOwnedName(name);
+    const role = stringField(event.data, "role") ?? owned?.role ?? (event.event === "worker-launch" ? "worker" : undefined);
+    if (role === undefined) continue;
+    const attempt = attemptField(event.data) ?? owned?.attempt;
+    if (attempt === undefined) continue;
+    const key = `${taskId}:${attempt}:${role}`;
+    if (!seen.has(key)) seen.set(key, { key, role, attempt, ...(name === undefined ? {} : { name }) });
+  }
+  return [...seen.values()];
+}
+
+/**
+ * OBS-1048 fold, chronological: each worker-launch opens a fresh occurrence of its attempt label
+ * (labels reset on resume), and only a worker-result recorded AFTER that launch retires it — an
+ * unnumbered result binds to the newest launch so far, a numbered one to its own attempt's launch.
+ */
+function attemptHarvests(events: readonly CaptureEvent[], taskId: string): AttemptHarvest[] {
+  type Harvest = { launched: boolean; returned: boolean; status?: string; nudges: number; nudgeAt?: string; pages: number; order: number };
+  const byAttempt = new Map<number, Harvest>();
+  let newest: number | undefined;
+  for (const [order, event] of events.entries()) {
+    if (event.taskId !== taskId) continue;
+    const attempt = attemptField(event.data) ?? (event.event === "worker-result" ? newest : undefined);
+    if (attempt === undefined) continue;
+    const existing = byAttempt.get(attempt);
+    if (event.event === "worker-launch") {
+      // A launch resets its label's evidence: an earlier occurrence's status, nudges, pages and result are history.
+      byAttempt.set(attempt, { launched: true, returned: false, nudges: 0, pages: 0, order });
+      newest = attempt;
+      continue;
+    }
+    const h = existing ?? { launched: false, returned: false, nudges: 0, pages: 0, order };
+    if (!existing) byAttempt.set(attempt, h);
+    switch (event.event) {
+      case "worker-status": h.status = stringField(event.data, "status"); break;
+      case "worker-nudge-failed": h.nudges += 1; h.nudgeAt = event.ts; break;
+      case "operator-page": h.pages += 1; break;
+      case "worker-result": h.returned = true; break;
+    }
+  }
+  // Attempt labels reset on resume, so numeric order is not chronology. The board reads the
+  // last harvest as newest; retain the order of each label's latest worker-launch occurrence.
+  return [...byAttempt].sort(([, a], [, b]) => a.order - b.order).map(([attempt, h]) => ({
+    attempt,
+    ...(h.status === undefined ? {} : { lastWorkerStatus: h.status }),
+    nudgeFailures: h.nudges,
+    ...(h.nudgeAt === undefined ? {} : { lastNudgeFailureAt: h.nudgeAt }),
+    pageCount: h.pages,
+    suspectedStalledHarvest: h.launched && !h.returned && h.nudges > 0 && h.pages > 0,
+  }));
+}
+
+/**
+ * The shared, evidence-only projection status renders (status.ts recordProjection), folded here
+ * so both surfaces read one fact. Phase/blocker/next-action come from run/activity.ts and
+ * run/operator-summary.ts; decisions from the production park oracle.
+ */
+function projectSummaries(
+  events: readonly CaptureEvent[],
+  runId: string,
+  identities: readonly { id: string; title?: string }[],
+  graph: CockpitGraph | undefined,
+  rowState: (id: string) => TaskState | undefined,
+): { activity: Map<string, TaskActivityProjection>; summaries: Map<string, OperatorTaskSummary> } {
+  const journal = events.map((event) => ({
+    ts: event.ts, event: event.event, ...(event.taskId === undefined ? {} : { taskId: event.taskId }), data: event.data,
+  }));
+  const graphTask = (id: string) => graph?.tasks.find((task) => task.id === id);
+  const tasks = identities.map(({ id }) => ({
+    id, gates: graphTask(id)?.gates ?? [], deps: graphTask(id)?.deps ?? [], status: rowState(id) ?? graphTask(id)?.status ?? "unknown",
+  }));
+  const activity = projectActivity(runId, trackJournalRows(runId, journal.map((raw, sourceIndex) => ({ raw, sourceIndex }))), tasks);
+  const rehashAt = journal.reduce((at, event, index) => event.event === "graph-rehash" ? index : at, -1);
+  const summaryTasks = tasks.map((task) => {
+    const evidence = journal.filter((event) => event.taskId === task.id);
+    const last = evidence.at(-1);
+    const recorded = activity.get(task.id)!;
+    let phase: string | undefined = last ? recorded.state : undefined;
+    // A completed battery is evidence of readiness, never evidence that merge started (status.ts).
+    const boundary = journal.reduce((index, event, at) =>
+      ["run-start", "run-resume", "run-end"].includes(event.event)
+        || (event.taskId === task.id && (event.event === "task-dispatch"
+          || (event.event === "phase-start" && event.data.phase === "gates"))) ? at : index, -1);
+    const latest = new Map<string, number>();
+    journal.forEach((event, index) => {
+      if (event.taskId === task.id && event.event === "gate-result" && typeof event.data.gate === "string") latest.set(event.data.gate, index);
+    });
+    const priorGraph = rehashAt >= 0 && [...latest.values()].some((index) => index < rehashAt);
+    // Latest outcome including non-verdicts (status.ts): a held screen or skipped gate is not a pass.
+    const passedNow = (gate: string) => {
+      const latestResult = journal.slice(boundary + 1).filter((event) =>
+        event.taskId === task.id && event.event === "gate-result" && event.data.gate === gate).at(-1);
+      return latestResult !== undefined && normalizeGateOutcome(latestResult.data).kind === "passed";
+    };
+    if (recorded.state === "unconfirmed" && task.gates.length > 0 && !priorGraph && task.gates.every(passedNow)) {
+      phase = "awaiting merge phase";
+    }
+    const responsibility = [...evidence].reverse().find((event) =>
+      typeof event.data.role === "string" || typeof event.data.agent === "string");
+    return {
+      id: task.id, deps: task.deps, status: task.status, phase, lastEvidenceAt: last?.ts,
+      responsible: responsibility ? {
+        role: stringField(responsibility.data, "role"), agent: stringField(responsibility.data, "agent"),
+      } : undefined,
+    };
+  });
+  const decisions = summaryTasks.flatMap((task) => {
+    const park = task.status === "human" ? newestPark(journal, task.id) : undefined;
+    return park ? [{ taskId: task.id, park, verbs: permittedDecisionVerbs(park) }] : [];
+  });
+  return { activity, summaries: new Map(projectOperatorSummary(summaryTasks, decisions).map((task) => [task.taskId, task])) };
+}
+
 function taskRows(
   events: readonly CaptureEvent[],
   tasks: ReadonlyMap<string, TaskFact>,
   graph: CockpitGraph | undefined,
+  runId: string,
 ): TaskRow[] {
   const lastSeen = new Map<string, string>();
   for (const event of events) {
@@ -722,6 +889,15 @@ function taskRows(
       id,
       title: undefined as string | undefined,
     }));
+  // `task-done` records completion; only `merge` records landing. The fixed
+  // Tasks-view consumer maps `done` to a check, so the derived row must keep
+  // an unmerged completion in the neutral `completed` state and reserve
+  // `done` for a fact whose merge the journal actually carries.
+  const rowState = (id: string): TaskState | undefined => {
+    const fact = tasks.get(id);
+    return fact?.state === "done" && fact.merged !== true ? "completed" : fact?.state;
+  };
+  const projection = projectSummaries(events, runId, identities, graph, rowState);
 
   return identities.map(({ id, title }) => {
     const fact = tasks.get(id);
@@ -731,13 +907,9 @@ function taskRows(
     // zero when a run resumes, so a task dispatched 0,1,0 was tried three times
     // and reporting its last label would say one.
     const attempts = fact?.dispatches.length ?? 0;
-    // `task-done` records completion; only `merge` records landing. The fixed
-    // Tasks-view consumer maps `done` to a check, so the derived row must keep
-    // an unmerged completion in the neutral `completed` state and reserve
-    // `done` for a fact whose merge the journal actually carries.
-    const state = fact?.state === "done" && fact.merged !== true
-      ? "completed" as const
-      : fact?.state;
+    const state = rowState(id);
+    const recorded = recordedIdentities(events, id);
+    const harvests = attemptHarvests(events, id);
     return {
       id: `task:${id}`,
       taskId: id,
@@ -753,6 +925,10 @@ function taskRows(
       // Landing is its own fact. `done` is work finished; only a recorded merge
       // is work landed, and only that earns a check-mark.
       ...(fact?.merged === true ? { merged: true as const } : {}),
+      activity: projection.activity.get(id)!,
+      summary: projection.summaries.get(id)!,
+      ...(recorded.length === 0 ? {} : { identities: recorded }),
+      ...(harvests.length === 0 ? {} : { harvests }),
     };
   });
 }
@@ -1031,9 +1207,10 @@ export function deriveRunCockpitData(
               ? "interrupted"
               : "running";
 
+  const runId = source.fileName.replace(/(?:\.interrupted)?\.journal\.jsonl$/, "");
   return {
     binaryVersion,
-    runId: source.fileName.replace(/(?:\.interrupted)?\.journal\.jsonl$/, ""),
+    runId,
     branch: typeof start.data.branch === "string" ? start.data.branch : "unknown",
     status: runStatus,
     elapsed: elapsedReading(events[0]!.ts, events.at(-1)!.ts),
@@ -1056,7 +1233,7 @@ export function deriveRunCockpitData(
       ? `${spotlight.id} · ${spotlight.phase} · attempt ${taskAttempt(spotlight)} · ${taskActor(spotlight)}`
       : "- · pending · attempt 1 · unassigned",
     journalRows: journalRows(events, tasks, defects, runStatus),
-    taskRows: taskRows(events, tasks, options.graph),
+    taskRows: taskRows(events, tasks, options.graph, runId),
     gateRows: gateRows(events),
     fleetRows: fleetRows(events),
     statusItems: [

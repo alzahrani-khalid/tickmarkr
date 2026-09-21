@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
@@ -189,3 +189,41 @@ describe("verify worktree truth", () => {
     expect(rawBytes).toContain('"approve": true');
   }, 60_000);
 });
+
+test("test: verify run from a linked worktree whose state directory holds config.yaml but not graph.json or doctor.json reads config.yaml locally and only the two absent files from the common root and prints a caveat naming each file's origin, while a worktree lacking all three still reads all three from the common root, so a partial local state directory silently overridden by the common root fails", async () => {
+  const repo = makeRepo({ ".gitignore": ".tickmarkr/\n", "src.txt": "base\n" });
+  branch(repo);
+  saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [T("T1", { files: ["src.txt"] })] }));
+  writeDoctor(repo, { fake: { installed: true, authed: true, models: [], modelAuth: authedModels(["fake-1", "fake-2"]) } });
+  const scratch = makeTestTempDir("verify-file-origins-");
+  const counter = join(scratch, "commands");
+  const config = (origin: string) => `gates:\n  test: "printf ${origin} >> '${counter}'"\n`;
+  writeFileSync(join(repo, ".tickmarkr/config.yaml"), config("common"));
+  const script = join(scratch, "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {}, review: { approve: true, issues: [] } }));
+  process.env.TICKMARKR_FAKE_SCRIPT = script;
+  const linked = join(scratch, "linked");
+  git(repo, `worktree add --detach '${linked}' HEAD`);
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    mkdirSync(join(linked, ".tickmarkr"));
+    writeFileSync(join(linked, ".tickmarkr/config.yaml"), config("local"));
+    for (const local of [true, false]) {
+      if (!local) rmSync(join(linked, ".tickmarkr/config.yaml"));
+      errors.mockClear();
+      const result = await verify(["--task", "T1", "--no-acceptance"], linked);
+      expect(result.code, result.out).toBe(0);
+      expect(result.out).toContain("PASS review"); // doctor was read from common root
+      expect(result.out).toContain("PASS scope"); // task graph was read from common root
+      const caveat = String(errors.mock.calls[0]?.[0]);
+      for (const file of ["config.yaml", "graph.json", "doctor.json"]) {
+        const isLocal = local && file === "config.yaml";
+        expect(caveat).toContain(`${file}: ${join(isLocal ? linked : realpathSync(repo), ".tickmarkr", file)} (${isLocal ? "local" : "common root"})`);
+      }
+      expect(readFileSync(counter, "utf8")).toBe(local ? "locallocal" : "locallocalcommoncommon");
+    }
+  } finally {
+    git(repo, `worktree remove --force '${linked}'`);
+  }
+}, 60_000);

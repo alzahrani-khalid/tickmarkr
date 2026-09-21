@@ -78,10 +78,30 @@ export const UNPARSEABLE_TRAILER_SUMMARY = "unparseable TICKMARKR_RESULT trailer
 
 export type ClassifiedWorkerResult = WorkerResult & { cause?: VerdictUnparseableCause };
 
+// OBS-1062: every interactive TUI echoes the brief into the pane, and the brief carries the trailer
+// TEMPLATE above — so the nonce token is on screen before the worker has said anything. A token
+// whose object opens with the template's literal `"ok":true|false` (not a bool) is the brief being
+// displayed, never the worker speaking; it must not count as trailer participation, or the daemon
+// reaps the attempt as malformed at its first poll (v2.5.7 run …115246, both workers at 34 s).
+const TEMPLATE_BODY = '{"ok":true|false';
+// Bounded to THIS occurrence (review finding, Leg 0a R2): the `{` must sit before the next nonce
+// token, or a malformed worker token followed by a later template redraw would be erased as echo.
+function isTemplateEcho(raw: string, at: number, end: number): boolean {
+  const open = raw.indexOf("{", at);
+  if (open === -1 || open >= end) return false;
+  const joined = raw
+    .slice(open, open + 64)
+    .split("\n")
+    .map((l) => l.replace(/^[\s│|]+/, "").replace(/[\s│|]+$/, ""))
+    .join("");
+  return joined.startsWith(TEMPLATE_BODY);
+}
+
 export function parseWorkerResult(raw: string, nonce: string): ClassifiedWorkerResult {
   const fail = (summary: string, cause: VerdictUnparseableCause): ClassifiedWorkerResult =>
     ({ ok: false, summary, deviations: [], raw, cause });
-  const positions = trailerTokenPositions(raw, nonce);
+  const all = trailerTokenPositions(raw, nonce);
+  const positions = all.filter((at, i) => !isTemplateEcho(raw, at, all[i + 1] ?? raw.length));
   // TUIs echo the prompt template, redraw lines, and HARD-wrap the JSON with per-line margins
   // (cursor does; recent-unwrapped can't rejoin hard newlines). Scan occurrences backward — last
   // parseable wins — joining wrapped lines, stripping margin/box chrome, and growing the candidate

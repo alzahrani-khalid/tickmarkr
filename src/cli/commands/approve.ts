@@ -1,11 +1,11 @@
-import { graphDefinitionHash, loadGraph, saveGraph } from "../../graph/graph.js";
+import { graphDefinitionHash, loadGraph, saveGraph, taskDefinitionFingerprint } from "../../graph/graph.js";
 import { execFileSync } from "node:child_process";
 import { userInfo } from "node:os";
 import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
 import { separabilityErrors } from "../../compile/collateral.js";
 import { GATE_NAMES } from "../../graph/schema.js";
-import { applyScopeAmendments, engagementComparable, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
+import { applyScopeAmendments, engagementComparable, engagementReleased, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
 
 export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
 export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
@@ -247,7 +247,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     if (park?.kind !== "scope-request") throw new Error("--files requires a scope-request park");
     if (!files?.length) throw new Error(`scope-request for ${taskId} requires --files <glob,…>`);
     if (decisions) throw new Error("--files cannot be combined with --waive, --uphold or --recheck");
-    const graph = applyScopeAmendments(loadGraph(cwd), journal);
+    const graph = applyScopeAmendments(loadGraph(cwd), journal, false, engagementReleased(events));
     const from = graphDefinitionHash(graph);
     if (!engagementComparable(journal.read(), from).comparable
         || (lastHuman?.data.graphDefinitionHash !== undefined && lastHuman.data.graphDefinitionHash !== from)) {
@@ -262,11 +262,11 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     if (conflicts.length) throw new Error(`refusing scope-request approval for ${taskId}: ${conflicts.join("\n")}`);
     journal.append("task-approved", taskId, {
       by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request",
-      amendment: { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park.line },
+      amendment: { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park.line, definition: taskDefinitionFingerprint(task) },
     });
     // Do not write graph.json from this process while the daemon owns it: its sweep materializes
     // the amendment without replacing a sibling's running state with this command's snapshot.
-    const projected = applyScopeAmendments(graph, journal);
+    const projected = applyScopeAmendments(graph, journal, false, engagementReleased(events));
     const owner = approvalRunOwner(cwd, runId);
     if (!owner.live && !owner.blockingRunId) saveGraph(cwd, projected);
     return disposition(cwd, runId, "dispatch", `approved files[] for ${taskId} in ${runId} — by ${by}`, serialization.contended);

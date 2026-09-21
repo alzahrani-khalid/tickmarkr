@@ -240,7 +240,8 @@ describe("T4 — the deterministic gates run before the battery (OBS-265)", () =
     });
 
     expect(results.every((r) => r.pass)).toBe(true);
-    expect(stream).toEqual(["build", "lint", "evidence", "scope", "test"].flatMap((g) => [`${g}:start`, `${g}:end`]));
+    expect(stream).toEqual(["build:start", "build:note", "build:note", "build:end",
+      ...["lint", "evidence", "scope", "test"].flatMap((g) => [`${g}:start`, `${g}:end`])]);
     expect(readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n")).toEqual(["build", "lint", "test"]);
   });
 
@@ -398,7 +399,8 @@ describe("v1.87 T5 — a dirty worktree is not gatable (the runtime refuses what
 
     expect(battery).toEqual(["build", "lint", "test"]); // every command really ran, in order
     expect(journaled).toEqual(["build", "lint", "evidence", "scope", "test"].map((g) => `${g}:pass`));
-    expect(stream).toEqual(["build", "lint", "evidence", "scope", "test"].flatMap((g) => [`${g}:start`, `${g}:end`]));
+    expect(stream).toEqual(["build:start", "build:note", "build:note", "build:end",
+      ...["lint", "evidence", "scope", "test"].flatMap((g) => [`${g}:start`, `${g}:end`])]);
     expect(results.map((r) => r.gate)).toEqual(DETERMINISTIC);
     expect(results.every((r) => r.pass)).toBe(true);
     expect(results.some((r) => r.meta?.dirtyWorktree === true)).toBe(false);

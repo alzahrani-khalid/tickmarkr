@@ -70,12 +70,14 @@ async function seedResume(
   failingShell?: (typeof SHELL_GATES)[number],
   scriptOverride: Record<string, unknown> = {},
   repoFiles: Record<string, string> = {},
+  /** OBS-1049: extra shell a gate runs inside the T1 worktree, after its marker line. */
+  gateExtras: Partial<Record<(typeof SHELL_GATES)[number], string>> = {},
 ): Promise<SeededResume> {
   const marker = join(makeTestTempDir("tickmarkr-resume-gates-"), "shells.log");
   const commands = Object.fromEntries(SHELL_GATES.map((gate) => [
     gate,
     `if [[ "$PWD" == *--T1 ]]; then printf '%s\\n' ${shq(gate)} >> ${shq(marker)};`
-      + `${gate === failingShell ? " exit 1;" : ""} fi`,
+      + `${gateExtras[gate] ? ` ${gateExtras[gate]}` : ""}${gate === failingShell ? " exit 1;" : ""} fi`,
   ]));
   const { repo, fake } = setupRepo(
     [T("T1", { files: ["work.txt", "changed.txt"] })],
@@ -141,7 +143,8 @@ test("resuming five green current-attempt/current-commit results emits five gate
     const greenEvents = await resume(green);
     expect(greenEvents.filter((event) => event.event === "gate-reused").map((event) => event.data.gate))
       .toEqual(["build", "test", "lint", "evidence", "scope"]);
-    expect(markerLines(green.marker)).toEqual([]);
+    // OBS-1049: the replayed build is provisioned (its command runs once in the recreated tree); no gate runs
+    expect(markerLines(green.marker)).toEqual(["build"]);
     expect(greenEvents.some((event) => event.event === "phase-start" && event.data.gate === "acceptance")).toBe(true);
 
     const failed = await seedResume("run-green-until-lint", [[
@@ -150,7 +153,7 @@ test("resuming five green current-attempt/current-commit results emits five gate
     const failedEvents = await resume(failed);
     expect(failedEvents.filter((event) => event.event === "gate-reused").map((event) => event.data.gate))
       .toEqual(["build", "test"]);
-    expect(markerLines(failed.marker)[0]).toBe("lint");
+    expect(markerLines(failed.marker).slice(0, 2)).toEqual(["build", "lint"]); // provisioned build, then the first re-run gate
     expect(failedEvents.some((event) => event.event === "task-dispatch")).toBe(true);
     expect(failedEvents.find((event) =>
       event.event === "gate-result" && event.data.gate === "lint" && event.data.pass === false,
@@ -206,7 +209,7 @@ test("a gate result recorded against a commit the task no longer carries is re-r
     const unchangedEvents = await resume(unchanged);
     expect(unchangedEvents.filter((event) => event.event === "gate-reused").map((event) => event.data.gate))
       .toEqual(["build"]);
-    expect(markerLines(unchanged.marker)[0]).toBe("lint");
+    expect(markerLines(unchanged.marker).slice(0, 2)).toEqual(["build", "lint"]); // OBS-1049: provisioned, then lint
 
     const changed = await seedResume("run-commit-changed", [[{ gate: "build", pass: true }]]);
     writeFileSync(join(changed.taskWorktree, "changed.txt"), "a different task tip\n");
@@ -227,6 +230,32 @@ test("a gate result recorded against a commit the task no longer carries is re-r
     expect(rebasedEvents.filter((event) => event.event === "gate-reused")).toEqual([]);
     expect(markerLines(rebased.marker)[0]).toBe("build");
   }, 120_000);
+
+test("a replayed green build onto the recreated worktree runs the build command exactly once before the test gate, journals gate-reused build then gate-provisioned build with exit 0, and the test gate finds the dist that provisioning wrote; a provisioning that exits 1 journals its exit, reuses no gate, and re-runs build as a gate, so a replayed build that leaves the recreated tree dist-less or a red provisioning that is still reused fails", async () => {
+  const provisions = { build: "mkdir -p dist && echo built > dist/marker;", test: "[ -f dist/marker ] || exit 1;" };
+  const green = await seedResume("run-replay-build-provisions", [[{ gate: "build", pass: true }]],
+    undefined, undefined, {}, { ".gitignore": "dist/\n" }, provisions);
+  const greenEvents = await resume(green);
+  const shells = markerLines(green.marker);
+  expect(shells.filter((s) => s === "build")).toEqual(["build"]);
+  expect(shells.indexOf("build")).toBeLessThan(shells.indexOf("test"));
+  expect(greenEvents.filter((e) => e.event === "gate-reused").map((e) => e.data.gate)).toEqual(["build"]);
+  // Relative order, not two independent filters: reuse row first, then the provisioning it belongs to.
+  expect(greenEvents.filter((e) => e.event === "gate-reused" || e.event === "gate-provisioned").map((e) => `${e.event}:${e.data.gate}`))
+    .toEqual(["gate-reused:build", "gate-provisioned:build"]);
+  expect(greenEvents.filter((e) => e.event === "gate-provisioned").map((e) => e.data))
+    .toEqual([expect.objectContaining({ gate: "build", commit: green.commit, exitCode: 0 })]);
+  expect(greenEvents.find((e) => e.event === "gate-result" && e.data.gate === "test")?.data.pass).toBe(true);
+  expect(greenEvents.some((e) => e.event === "task-done")).toBe(true);
+
+  const red = await seedResume("run-replay-build-provision-red", [[{ gate: "build", pass: true }]],
+    undefined, "build", {}, { ".gitignore": "dist/\n" }, provisions);
+  const redEvents = await resume(red);
+  expect(redEvents.filter((e) => e.event === "gate-provisioned").map((e) => e.data.exitCode)).toEqual([1]);
+  expect(redEvents.filter((e) => e.event === "gate-reused")).toEqual([]);
+  expect(markerLines(red.marker).slice(0, 2)).toEqual(["build", "build"]); // provisioning, then build as a gate
+  expect(redEvents.find((e) => e.event === "gate-result" && e.data.gate === "build")?.data.pass).toBe(false);
+}, 120_000);
 
 test("replaySatisfiedGates receives current-attempt failed-gate journals with no approval, an untyped approval and a typed gate-satisfied release; resume re-runs the gate in the first two and advances only in the third, so blanket survival or marker-blind approval fails", async () => {
     const none = await seedResume("run-failed-no-approval", [[{ gate: "build", pass: false }]]);
@@ -401,7 +430,7 @@ test("a prior-attempt pass plus current-attempt failure resumes at the failed ga
     const passedEvents = await resume(passed);
     expect(passedEvents.filter((event) => event.event === "gate-reused").map((event) => event.data.gate))
       .toEqual(["build"]);
-    expect(markerLines(passed.marker)[0]).toBe("lint");
+    expect(markerLines(passed.marker).slice(0, 2)).toEqual(["build", "lint"]); // OBS-1049: provisioned, then lint
 
     const released = await seedResume(
       "run-attempt-current-released",
@@ -430,7 +459,7 @@ test("resuming a green current-commit prefix whose rows carry no verification st
     const changed = events.filter((e) => e.event === "gate-replay-verification-changed");
     if (c.replayed) {
       expect({ label: c.label, reused, changed: changed.length, shells: markerLines(seed.marker) })
-        .toEqual({ label: c.label, reused: [...SHELL_GATES], changed: 0, shells: [] });
+        .toEqual({ label: c.label, reused: [...SHELL_GATES], changed: 0, shells: ["build"] }); // OBS-1049: the provisioning shell only
     } else {
       // Every shell gate re-runs (the full test suite runs last, as the merge candidate).
       expect({ label: c.label, reused, changed: changed.length, shells: [...markerLines(seed.marker)].sort() })
@@ -457,7 +486,7 @@ test("with no explicit lifecycle export the replay guard measures the effective 
     const sameEvents = await resume(replayed);
     expect({ reused: sameEvents.filter((e) => e.event === "gate-reused").map((e) => e.data.gate), shells: markerLines(replayed.marker),
       changed: sameEvents.filter((e) => e.event === "gate-replay-verification-changed").length })
-      .toEqual({ reused: [...SHELL_GATES], shells: [], changed: 0 });
+      .toEqual({ reused: [...SHELL_GATES], shells: ["build"], changed: 0 }); // OBS-1049: the provisioning shell only
 
     const stale = { protocol: VERIFICATION_PROTOCOL, lifecycle: "ignore-scripts", source: "npm-config" };
     const rerun = await seedResume("run-replay-project-npmrc-other",

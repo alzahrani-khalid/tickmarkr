@@ -4,9 +4,11 @@ import { Box, useInput } from "ink";
 import { useEffect, useState, type ReactElement } from "react";
 import type { ChannelCost } from "../../report/cost.js";
 import { buildOperatorRecord, formatOperatorRecordRow, type OperatorRecordRow } from "../../report/operator-record.js";
+import { EMPTY_OPERATOR_PAGE_SUMMARY, foldOperatorPages, operatorPageRow, type OperatorPageGroup } from "../../run/operator-page-summary.js";
 import type { EvidenceIdentity } from "../../run/operator-state.js";
 import { formatJournalNarration, type JournalEvent } from "../../run/journal.js";
 import { BodyText, JournalRowPanel, Panel, type ComponentState, type JournalRow } from "./components.js";
+import { cellWidth, sliceCells } from "./width.js";
 
 /** A journal row the shell/store tracks — physical line identity travels with the row. */
 export interface TrackedJournalRow {
@@ -90,7 +92,7 @@ export function deriveEvidenceJournal(
       time: e.ts,
       state: stateFor(e),
       text: formatJournalNarration(e),
-      fullText: details,
+      fullText: details || JSON.stringify(e.data, null, 2),
       artifacts,
       ...(e.taskId ? { taskId: e.taskId } : {}),
       ...(gate ? { gate } : {}),
@@ -122,6 +124,7 @@ export interface EvidenceViewInput {
 }
 
 export interface EvidenceViewModel {
+  readonly operatorPages: readonly OperatorPageGroup[];
   readonly journal: readonly EvidenceRow[];
   readonly channels: readonly OperatorRecordRow[];
   readonly reportLines: readonly string[];
@@ -136,6 +139,14 @@ export function deriveEvidenceView(input: EvidenceViewInput): EvidenceViewModel 
     ? input.rows.flatMap((r) => (r.event ? [r.event] : []))
     : (input.events ?? []);
   return {
+    operatorPages: foldOperatorPages(EMPTY_OPERATOR_PAGE_SUMMARY, items.flatMap((item, index) => {
+      const tracked = "line" in item;
+      const event = tracked ? item.event : item;
+      if (!event) return [];
+      // The source identifies the owning run; preserve physical lines across malformed rows.
+      const row = operatorPageRow(event, tracked ? item.line : index + 1, tracked ? item.source ?? source : source);
+      return row ? [row] : [];
+    })).groups,
     journal: deriveEvidenceJournal(items, source),
     channels: buildOperatorRecord(events, input.costs ?? []),
     reportLines: input.reportLines ?? [],
@@ -296,9 +307,17 @@ export function EvidenceView({ model, width, focused = true, focusEvidence, onSe
     { isActive: focused },
   );
 
-  const journalRows: JournalRow[] = model.journal.map((row) => ({
-    id: row.evidence.id, time: row.time, state: row.state, text: row.text,
-  }));
+  const journalRows: JournalRow[] = model.journal.map((row) => {
+    // Leave room for physical source references and complete state labels in the narrow body.
+    // The raw row opened with Enter retains the full recorded timestamp.
+    const time = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(row.time) ? row.time.slice(11, 19) : row.time;
+    const text = `#L${row.evidence.line} ${row.text}`;
+    // Reserve the widest state label (18 cells), two separators and the selection pointer.
+    // Bound narration before Yoga lays out the row so long task IDs cannot squeeze state words.
+    const budget = typeof width === "number" ? Math.max(1, width - cellWidth(time) - 22) : undefined;
+    const clipped = budget === undefined || cellWidth(text) <= budget ? text : `${sliceCells(text, budget - 1).head}…`;
+    return { id: row.evidence.id, time, state: row.state, text: clipped };
+  });
 
   return (
     <Box flexDirection="column" width={width}>
@@ -309,7 +328,19 @@ export function EvidenceView({ model, width, focused = true, focusEvidence, onSe
       </BodyText>
       {tab === "journal" && (
         <>
-          <JournalRowPanel rows={journalRows} selection={selectedIndex >= 0 ? selectedIndex : undefined} />
+          <JournalRowPanel title="RAW JOURNAL" rows={journalRows} selection={selectedIndex >= 0 ? selectedIndex : undefined} />
+          <Panel title="OPERATOR PAGE GROUPS">
+            {model.operatorPages.length ? model.operatorPages.map((group, index) => (
+              <Box key={`${group.key}:${index}`} flexDirection="column">
+                <BodyText emphasis="strong">{group.taskId} · {group.park} · {group.status}</BodyText>
+                <BodyText>first {group.firstEvidenceAt}</BodyText>
+                <BodyText>last {group.lastEvidenceAt}</BodyText>
+                <BodyText>visible {group.observedCount} · suppressed {group.suppressedCount}{group.rawOnly ? " · raw-only (suppression unrecorded)" : ""}</BodyText>
+                <BodyText>Raw source lines (↑↓ select, Enter open):</BodyText>
+                {group.lines.map(line => <BodyText key={line}>#L{line}</BodyText>)}
+              </Box>
+            )) : <BodyText emphasis="dim">no operator pages</BodyText>}
+          </Panel>
           <Panel title="SELECTED EVIDENCE">
             {selectedRow
               ? (

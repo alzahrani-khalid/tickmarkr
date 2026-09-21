@@ -1,10 +1,11 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
+import { setTimeout as wait } from "node:timers/promises";
 import { render } from "ink";
 import { createElement, type ReactNode } from "react";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   approvalEnactment,
   approvalRunOwner,
@@ -14,6 +15,7 @@ import {
   releaseForDecision,
   type DecisionVerb,
 } from "../../src/cli/commands/approve.js";
+import { formatOwnedName } from "../../src/drivers/types.js";
 import { graphDefinitionHash, tickmarkrDir } from "../../src/graph/graph.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import { Journal, PARK_KINDS, type JournalEvent } from "../../src/run/journal.js";
@@ -31,17 +33,26 @@ import {
   withDecisionReceipt,
   type DecisionPreview,
 } from "../../src/tui/cockpit/decision-actions.js";
+import { deriveRunCockpitData } from "../../src/tui/cockpit/derive.js";
+import { runLiveCockpit } from "../../src/tui/cockpit/live.js";
+import { deriveRunViewRows, taskProjectionText } from "../../src/tui/cockpit/run-cockpit.js";
+import type { ShellDelivery } from "../../src/tui/cockpit/live-runtime.js";
 import {
   applyRunViewKey,
   evidenceLookup,
   initialRunViewSession,
+  paneLocator,
+  projectionLine,
+  projectRunTasks,
   runGateCells,
   RunView,
+  STALL_MARKER,
   VERDICT_WINDOW,
   type RunEvidenceRow,
   type RunViewSession,
 } from "../../src/tui/cockpit/run-view.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
+import { ttyInput } from "../helpers/tty-input.js";
 
 /* ------------------------------------------------------------------------ */
 /* Harness: a temp repo per journal, C2's reader over the file, an Ink frame. */
@@ -634,5 +645,322 @@ describe("C4 — Run and validated decisions", () => {
     expect(applyDecisionKey(armed, key("", { escape: true }), undefined).session.confirming).toBeNull();
     expect(applyDecisionKey(armed, key("n"), undefined).confirm).toBeUndefined();
     expect(readFileSync(join(tickmarkrDir(cancelRoot), "runs", "run-cancel", "journal.jsonl"), "utf8")).toBe(bytes);
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* T9 — the projection per task with source references; honest locators.    */
+/* ------------------------------------------------------------------------ */
+
+const T9_RUN = "run-20260921-090000";
+const ownedWorker = (taskId: string, attempt: number, runId = T9_RUN) => formatOwnedName({ role: "worker", taskId, attempt, runId });
+const launch = (j: Journal, taskId: string, attempt: number, slot: { id: string; name: string; cwd?: string }, driver = "herdr") =>
+  j.append("worker-launch", taskId, { attempt, driver, slot: { cwd: "/wt", ...slot }, workspace: "ws-1" });
+
+/** T1 stalls after launch; T2 builds, fails review and parks; T3 waits on T2. */
+function t9Journal(root: string): { j: Journal; graph: ReturnType<typeof graphOf> } {
+  const graph = graphOf(["T1", "T2", "T3"], { T3: ["T2"] });
+  const j = Journal.create(root, T9_RUN);
+  j.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+  j.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+  launch(j, "T1", 0, { id: "p-11", name: ownedWorker("T1", 0) });
+  j.append("worker-nudge-failed", "T1", { attempt: 0, reason: "no composer" });
+  j.append("operator-page", "T1", { attempt: 0, reason: "idle" });
+  j.append("task-dispatch", "T2", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T2", pane: "pane-T2", alarmMs: 600000 });
+  launch(j, "T2", 0, { id: "p-22", name: ownedWorker("T2", 0) });
+  j.append("worker-result", "T2", { attempt: 0, ok: true, finished: true, role: "worker", agent: "fake:fake-1" });
+  j.append("phase-start", "T2", { phase: "gates", attempt: 0 });
+  j.append("build-receipt", "T2", { gate: "build", outcome: "completed", confirmedStart: true, exitCode: 0, durationMs: 12, attribution: { runId: T9_RUN, taskId: "T2", attempt: 0, gateRound: 1, invocation: "build#1" } });
+  j.append("gate-result", "T2", { gate: "build", pass: true, attempt: 0, details: "ok" });
+  j.append("gate-result", "T2", { gate: "review", pass: false, attempt: 0, details: "review red" });
+  j.append("task-human", "T2", { kind: "gate-fail", reason: "review round cap reached — the reviewer upheld two findings about the retry path and the operator must decide" });
+  return { j, graph };
+}
+
+const lineOfEvent = (root: string, pred: (e: JournalEvent) => boolean): number => journalEvents(root, T9_RUN).findIndex(pred) + 1;
+
+describe("T9 — projection per agent with source references and honest locators", () => {
+  test("the Run body shows for every task its role or agent identity phase build execution evidence blocker and next action each with the journal line it came from, and draws the stall marker on a stalled attempt, so a row without source references or a stalled attempt drawn as in flight fails", async () => {
+    const root = repo();
+    const { graph } = t9Journal(root);
+    const { rows, snapshot } = readRun(root, T9_RUN, graph);
+    const decisions = deriveRunDecisions(Journal.open(root, T9_RUN), graph);
+    const projections = projectRunTasks(snapshot, rows, graph, decisions, T9_RUN);
+    expect(projections.map((p) => p.taskId)).toEqual(["T1", "T2", "T3"]);
+    const by = Object.fromEntries(projections.map((p) => [p.taskId, p]));
+
+    // T1: identity from its launch row, phase implementing, no build row, stalled — never "in flight".
+    const t1Launch = lineOfEvent(root, (e) => e.event === "worker-launch" && e.taskId === "T1");
+    expect(by.T1).toMatchObject({ identity: { label: `worker ${ownedWorker("T1", 0)}`, line: t1Launch }, phase: { label: "phase implementing" }, build: { label: "build start-unrecorded" } });
+    expect(by.T1!.build.line).toBeUndefined();
+    expect(by.T1!.stalled).toMatchObject({ line: t1Launch });
+    expect(by.T1!.stalled!.label).toContain(STALL_MARKER);
+    expect(by.T1!.stalled!.label).toContain(`nudge failed #L${lineOfEvent(root, (e) => e.event === "worker-nudge-failed")}`);
+    expect(by.T1!.stalled!.label).toContain(`paged #L${lineOfEvent(root, (e) => e.event === "operator-page")}`);
+
+    // T2: identity from the worker-result's recorded role/agent, build receipt with its row, park as the blocker.
+    const t2Result = lineOfEvent(root, (e) => e.event === "worker-result" && e.taskId === "T2");
+    const t2Build = lineOfEvent(root, (e) => e.event === "build-receipt");
+    const t2Park = lineOfEvent(root, (e) => e.event === "task-human" && e.taskId === "T2");
+    expect(by.T2).toMatchObject({ identity: { label: "worker fake:fake-1", line: t2Result }, build: { label: "build completed exit 0", line: t2Build }, blocker: { line: t2Park }, nextAction: { line: t2Park } });
+    expect(by.T2!.blocker.label).toContain("blocker human-decision");
+    expect(by.T2!.nextAction.label).toMatch(/^next Choose a decision: /u);
+    expect(by.T2!.phase).toMatchObject({ label: "phase terminal", line: t2Park });
+    expect(by.T2!.stalled).toBeUndefined();
+
+    // T3: never dispatched — every field says so rather than inventing a row.
+    expect(by.T3).toMatchObject({ identity: { label: "identity unrecorded" }, blocker: { label: "blocker dependency-wait" }, nextAction: { label: "next Wait for prerequisites: T2" } });
+    expect(by.T3!.identity.line).toBeUndefined();
+    expect(by.T3!.stalled).toBeUndefined();
+
+    // Every recorded reading carries the line it came from — a row without source references fails.
+    for (const p of [by.T1!, by.T2!]) for (const f of [p.identity, p.phase]) expect(f.line, `${p.taskId} ${f.label}`).toBeGreaterThan(0);
+
+    const frame = await drawRun(root, T9_RUN, initialRunViewSession(), 220, graph);
+    expect(frame).toContain("PROJECTION / every task");
+    for (const p of projections) expect(frame).toContain(projectionLine(p).slice(0, 120));
+    expect(frame).toContain(`T1 · worker ${ownedWorker("T1", 0)} #L${t1Launch} · phase implementing #L${t1Launch} · build start-unrecorded (no journal row)`);
+    expect(frame).toContain(`build completed exit 0 #L${t2Build} · blocker human-decision`);
+    const t1Row = frame.split("\n").find((l) => l.includes(`T1 · worker ${ownedWorker("T1", 0)}`))!;
+    expect(t1Row).toContain(STALL_MARKER);
+    expect(t1Row).not.toContain("in flight");
+
+    // Cross-attempt (finding 1): a delayed worker-result of attempt 0 never retires attempt 1's stall,
+    // and attempt 0's nudge and page never mark attempt 1 stalled.
+    const { j } = { j: Journal.open(root, T9_RUN) };
+    j.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 1, worktree: "/wt/T1", pane: "pane-T1b", alarmMs: 600000 });
+    launch(j, "T1", 1, { id: "p-12", name: ownedWorker("T1", 1) });
+    j.append("worker-nudge-failed", "T1", { attempt: 0, reason: "late" });
+    j.append("operator-page", "T1", { attempt: 0, reason: "late" });
+    let again = readRun(root, T9_RUN, graph);
+    let p1 = projectRunTasks(again.snapshot, again.rows, graph, [], T9_RUN).find((p) => p.taskId === "T1")!;
+    expect(p1.stalled, "old-attempt nudge/page do not stall attempt 1").toBeUndefined();
+    j.append("worker-nudge-failed", "T1", { attempt: 1, reason: "no composer" });
+    j.append("operator-page", "T1", { attempt: 1, reason: "idle" });
+    j.append("worker-result", "T1", { attempt: 0, ok: false, finished: true });
+    again = readRun(root, T9_RUN, graph);
+    p1 = projectRunTasks(again.snapshot, again.rows, graph, [], T9_RUN).find((p) => p.taskId === "T1")!;
+    const t1Launch1 = lineOfEvent(root, (e) => e.event === "worker-launch" && e.taskId === "T1" && e.data.attempt === 1);
+    expect(p1.stalled, "a delayed attempt-0 result never retires attempt 1's stall").toMatchObject({ line: t1Launch1 });
+    expect(p1.identity, "identity follows the current attempt").toMatchObject({ label: `worker ${ownedWorker("T1", 1)}`, line: t1Launch1 });
+    expect(p1.phase, "a delayed old-attempt result is not the phase's source").toMatchObject({ label: "phase implementing", line: t1Launch1 });
+
+    // Accepted evidence (finding 2): a rejected attempt-0 receipt after the valid one is never the build's source.
+    j.append("task-dispatch", "T2", { assignment: ASSIGNMENT, attempt: 1, worktree: "/wt/T2", pane: "pane-T2b", alarmMs: 600000 });
+    launch(j, "T2", 1, { id: "p-23", name: ownedWorker("T2", 1) });
+    j.append("worker-result", "T2", { attempt: 1, ok: true, finished: true });
+    j.append("phase-start", "T2", { phase: "gates", attempt: 1 });
+    j.append("build-receipt", "T2", { gate: "build", outcome: "completed", confirmedStart: true, exitCode: 0, durationMs: 9, attribution: { runId: T9_RUN, taskId: "T2", attempt: 1, gateRound: 2, invocation: "build#2" } });
+    j.append("build-receipt", "T2", { gate: "build", outcome: "failed", confirmedStart: true, exitCode: 1, durationMs: 9, attribution: { runId: T9_RUN, taskId: "T2", attempt: 0, gateRound: 2, invocation: "build#stale" } });
+    again = readRun(root, T9_RUN, graph);
+    const p2 = projectRunTasks(again.snapshot, again.rows, graph, [], T9_RUN).find((p) => p.taskId === "T2")!;
+    const validReceipt = lineOfEvent(root, (e) => e.event === "build-receipt" && (e.data as { attribution: { invocation: string } }).attribution.invocation === "build#2");
+    expect(p2.build).toEqual({ label: "build completed exit 0", line: validReceipt });
+    const gatesStart = lineOfEvent(root, (e) => e.event === "phase-start" && e.taskId === "T2" && e.data.attempt === 1);
+    const t2Result1 = lineOfEvent(root, (e) => e.event === "worker-result" && e.taskId === "T2" && e.data.attempt === 1);
+    expect(p2.phase, "the row that moved the phase, not the newest lifecycle row, is its source").toEqual({ label: "phase returned-for-verification", line: t2Result1 });
+    expect(gatesStart).toBeGreaterThan(t2Result1);
+
+    // The cockpit's tasks-view row (finding 4): exact sources carry their own line; presentation-only
+    // ambiguity fails closed instead of attaching a stale attempt's row to the accepted value.
+    const data = deriveRunCockpitData({ fileName: `${T9_RUN}.journal.jsonl`, raw: readFileSync(join(tickmarkrDir(root), "runs", T9_RUN, "journal.jsonl"), "utf8") }, "t9", { graph: { tasks: graph.tasks.map((t) => ({ id: t.id, title: t.title })) } });
+    const taskRows = deriveRunViewRows(data, "tasks");
+    const t2Text = taskRows.find((r) => r.text.startsWith("T2 "))!.text;
+    // The cockpit cites the row that supplied each field: the owned identity came from this
+    // attempt's launch, not the later worker-result that carried no identity payload.
+    const newestT2Launch = lineOfEvent(root, (e) => e.event === "worker-launch" && e.taskId === "T2" && e.data.attempt === 1);
+    expect(t2Text).toContain(`identity worker ${ownedWorker("T2", 1)} #L${newestT2Launch}`);
+    expect(t2Text).toContain("phase returned-for-verification (no journal row)");
+    expect(t2Text).toContain("build completed (no journal row)");
+    expect(t2Text).not.toContain(`build completed #L${validReceipt}`);
+    const t1Text = taskRows.find((r) => r.text.startsWith("T1 "))!.text;
+    expect(t1Text).toContain(`${STALL_MARKER} · launch #L${t1Launch1} · 1 nudge failed (no journal row) · 1 paged (no journal row)`);
+    expect(t1Text).not.toContain("source");
+    expect(taskProjectionText(data.taskRows.find((r) => r.taskId === "T3")!, data.journalRows)).toBe("identity - · phase unconfirmed (no journal row) · build start-unrecorded · blocker unknown (no journal row) · next -");
+
+    // Presentation rows omit attempts, so the cockpit must fail closed in the opposite ordering
+    // too: stale attempt-0 evidence before accepted attempt-1 evidence is still ambiguous here.
+    const probeRoot = repo();
+    const probeGraph = graphOf(["T1"]);
+    const probe = Journal.create(probeRoot, T9_RUN);
+    probe.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(probeGraph), branch: "fixture" });
+    probe.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 1, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+    launch(probe, "T1", 1, { id: "p-probe", name: ownedWorker("T1", 1) });
+    probe.append("worker-result", "T1", { attempt: 0, ok: true, finished: true });
+    probe.append("worker-result", "T1", { attempt: 1, ok: true, finished: true });
+    probe.append("phase-start", "T1", { phase: "gates", attempt: 1 });
+    probe.append("build-receipt", "T1", { gate: "build", outcome: "failed", confirmedStart: true, exitCode: 1, durationMs: 9, attribution: { runId: T9_RUN, taskId: "T1", attempt: 0, gateRound: 1, invocation: "build#stale-first" } });
+    probe.append("build-receipt", "T1", { gate: "build", outcome: "completed", confirmedStart: true, exitCode: 0, durationMs: 9, attribution: { runId: T9_RUN, taskId: "T1", attempt: 1, gateRound: 1, invocation: "build#accepted-second" } });
+    const probeData = deriveRunCockpitData({ fileName: `${T9_RUN}.journal.jsonl`, raw: readFileSync(join(tickmarkrDir(probeRoot), "runs", T9_RUN, "journal.jsonl"), "utf8") }, "t9", { graph: { tasks: probeGraph.tasks.map((t) => ({ id: t.id, title: t.title })) } });
+    const probeText = deriveRunViewRows(probeData, "tasks")[0]!.text;
+    expect(probeText).toContain("phase returned-for-verification (no journal row)");
+    expect(probeText).toContain("build completed (no journal row)");
+  });
+
+  test("a pane locator the driver cannot verify a stale one and an ambiguous one render as unavailable with the recorded evidence reachable and no other terminal is selected by title provider or task id, so a guessed replacement tab fails", async () => {
+    const root = repo();
+    const graph = graphOf(["T1", "T2"]);
+    const j = Journal.create(root, T9_RUN);
+    j.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+    j.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+    // Look-alikes that a guess would pick: same task id in the title, same provider, another run's owned name.
+    launch(j, "T2", 0, { id: "p-decoy-title", name: "T1 — Task T1 (claude)" });
+    launch(j, "T2", 0, { id: "p-decoy-other-run", name: ownedWorker("T1", 0, "run-20260101-000000") });
+    const read = (runId = T9_RUN) => { const { rows, snapshot } = readRun(root, runId, graph); return { rows, task: snapshot.tasks.find((t) => t.id === "T1")! }; };
+    const dispatchLine = lineOfEvent(root, (e) => e.event === "task-dispatch" && e.taskId === "T1");
+
+    // No launch for this attempt: unavailable, the dispatch-recorded pane field reachable with its evidence row.
+    let r = read();
+    expect(paneLocator(r.task, r.rows, T9_RUN)).toEqual({ status: "unavailable", reason: `no worker-launch for attempt 0 · recorded pane pane-T1 · evidence #L${dispatchLine}` });
+
+    // A launch that names a title, not this attempt's owned pane: unverifiable, its row cited, never adopted.
+    launch(j, "T1", 0, { id: "p-title", name: "Task T1 · claude" });
+    r = read();
+    const titled = paneLocator(r.task, r.rows, T9_RUN);
+    expect(titled.status).toBe("unavailable");
+    expect(titled.reason).toContain(`launch #L${titled.line} names Task T1 · claude, not this attempt's owned pane`);
+    expect(titled.reason).toContain(`recorded pane pane-T1 · evidence #L${r.task.evidence!.line}`);
+
+    // Ambiguous: two launches of the attempt with different pane ids.
+    launch(j, "T1", 0, { id: "p-a", name: ownedWorker("T1", 0) });
+    launch(j, "T1", 0, { id: "p-b", name: ownedWorker("T1", 0) });
+    r = read();
+    const ambiguous = paneLocator(r.task, r.rows, T9_RUN);
+    expect(ambiguous.status).toBe("unavailable");
+    expect(ambiguous.reason).toMatch(/^ambiguous: 3 launches #L\d+,#L\d+,#L\d+/u);
+
+    // A single owned launch remains unavailable: this read does not ask the host, so it cannot
+    // distinguish a live pane from one closed outside the journal. A resume still proves staleness.
+    const root2 = repo();
+    const j2 = Journal.create(root2, T9_RUN);
+    j2.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+    j2.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+    launch(j2, "T1", 0, { id: "p-live", name: ownedWorker("T1", 0) });
+    const live = readRun(root2, T9_RUN, graph);
+    const launchLine = live.rows.length;
+    expect(paneLocator(live.snapshot.tasks[0]!, live.rows, T9_RUN)).toMatchObject({ status: "unavailable", line: launchLine, reason: expect.stringContaining(`launch #L${launchLine} records herdr p-live, but live host verification is required`) });
+    // A different run id makes the same name foreign: the locator is keyed by run, task and attempt.
+    expect(paneLocator(live.snapshot.tasks[0]!, live.rows, "run-20260101-000000").status).toBe("unavailable");
+    j2.append("run-resume", undefined, {});
+    const stale = readRun(root2, T9_RUN, graph);
+    const staleRead = paneLocator(stale.snapshot.tasks[0]!, stale.rows, T9_RUN);
+    expect(staleRead).toMatchObject({ status: "unavailable", line: launchLine });
+    expect(staleRead.reason).toContain(`launch #L${launchLine} is stale: run-resume #L${launchLine + 1} followed it`);
+
+    // Staleness belongs to this attempt and exact pane. Delayed old-attempt results and closes of
+    // another pane cannot retire the current locator.
+    const root5 = repo();
+    const j5 = Journal.create(root5, T9_RUN);
+    j5.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+    j5.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 1, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+    launch(j5, "T1", 1, { id: "p-current", name: ownedWorker("T1", 1) });
+    j5.append("worker-result", "T1", { attempt: 0, ok: true, finished: true });
+    j5.append("pane-close", "T1", { paneId: "p-other" });
+    const unrelated = readRun(root5, T9_RUN, graph);
+    const unrelatedRead = paneLocator(unrelated.snapshot.tasks[0]!, unrelated.rows, T9_RUN);
+    expect(unrelatedRead).toMatchObject({ status: "unavailable", reason: expect.stringContaining("live host verification is required") });
+    expect(unrelatedRead.reason).not.toContain("is stale");
+
+    // Capability limitations, not malformed names: a herdr launch without a workspace (HerdrDriver.focus
+    // rejects it), a subprocess launch (no pane to verify), and a pane the journal recorded closed.
+    for (const [label, extra, expected] of [
+      ["herdr without workspace", { driver: "herdr", workspace: undefined }, "records no workspace; herdr cannot verify the pane"],
+      ["subprocess", { driver: "subprocess" }, "driver subprocess cannot verify a pane"],
+    ] as const) {
+      const root3 = repo();
+      const j3 = Journal.create(root3, T9_RUN);
+      j3.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+      j3.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+      j3.append("worker-launch", "T1", { attempt: 0, slot: { id: "p-cap", cwd: "/wt", name: ownedWorker("T1", 0) }, ...extra });
+      const cap = readRun(root3, T9_RUN, graph);
+      const reading = paneLocator(cap.snapshot.tasks[0]!, cap.rows, T9_RUN);
+      expect(reading.status, label).toBe("unavailable");
+      expect(reading.reason, label).toContain(expected);
+      expect(reading.reason, label).toContain("recorded pane pane-T1 · evidence #L");
+      expect(reading.line, label).toBe(cap.rows.length);
+    }
+    const root4 = repo();
+    const j4 = Journal.create(root4, T9_RUN);
+    j4.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+    j4.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+    launch(j4, "T1", 0, { id: "p-closed", name: ownedWorker("T1", 0) });
+    j4.append("pane-close", "T1", { paneId: "p-closed" });
+    const closed = readRun(root4, T9_RUN, graph);
+    const closedRead = paneLocator(closed.snapshot.tasks[0]!, closed.rows, T9_RUN);
+    expect(closedRead.status).toBe("unavailable");
+    expect(closedRead.reason).toContain(`is stale: pane-close #L${closed.rows.length} followed it`);
+
+    // Rendered: the unavailable reading and its evidence are on the selected task's detail line; no decoy pane id is.
+    const frame = await drawRun(root, T9_RUN, initialRunViewSession(), 220, graph);
+    const detail = frame.split("\n").filter((l) => l.includes("locator unavailable — ambiguous")).join("\n");
+    expect(detail).toContain(`recorded pane pane-T1 · evidence #L${r.task.evidence!.line}`);
+    for (const decoy of ["p-decoy-title", "p-decoy-other-run", "p-title", "p-a", "p-b"]) expect(detail).not.toContain(decoy);
+    const staleFrame = await drawRun(root2, T9_RUN, initialRunViewSession(), 220, graph);
+    expect(staleFrame).toContain(`locator unavailable — launch #L${launchLine} is stale`);
+  });
+
+  test("refresh and navigation of the Run view issue zero terminal lifecycle or input operations and the existing decision confirmation and receipt read-back flow is unchanged, so a read that mutates a terminal or a broken confirmation fails", async () => {
+    // Static: the view reads owned-name helpers only; no driver, host or process module can be reached from it.
+    const source = readFileSync(join(import.meta.dirname, "../../src/tui/cockpit/run-view.tsx"), "utf8");
+    const imports = [...source.matchAll(/from "([^"]+)"/gu)].map((m) => m[1]!);
+    expect(imports.filter((i) => i.includes("drivers/"))).toEqual(["../../drivers/types.js"]);
+    expect(imports.some((i) => /child_process|drivers\/index|herdr|orca|subprocess/u.test(i))).toBe(false);
+
+    // Mounted: every navigation key and a refresh, with the focus capability spied — it is never reached.
+    const root = repo();
+    const { graph } = t9Journal(root);
+    void graph;
+    const focusDriver = vi.fn(async () => ({ status: "focused" as const, reason: "never" }));
+    const input = ttyInput();
+    let lastFrame = "";
+    const output = new Writable({ write(chunk, _enc, next) { const t = String(chunk); if (t.includes("q Quit")) lastFrame = t.slice(-20000); next(); } }) as NodeJS.WriteStream;
+    Object.assign(output, { isTTY: true, columns: 120, rows: 40 });
+    let delivery!: ShellDelivery;
+    const mounted = runLiveCockpit({ cwd: root, runId: T9_RUN, input, output, binaryVersion: "t9", debug: true, refreshMs: 2 ** 30, focusDriver, onShellDelivery: (d) => { delivery = d; } });
+    const settled = mounted.then(() => undefined, (e) => e as Error);
+    await wait(30);
+    try {
+      delivery.key({ input: "4", key: {} });
+      for (const k of [{ downArrow: true }, { downArrow: true }, { upArrow: true }, { rightArrow: true }, { leftArrow: true }, { pageDown: true }, { pageUp: true }]) delivery.key({ input: "", key: k });
+      delivery.key({ input: "x", key: {} });
+      delivery.refresh();
+      await wait(30);
+      expect(stripAnsi(lastFrame)).toContain("RUN /");
+      expect(focusDriver).not.toHaveBeenCalled();
+    } finally {
+      delivery.key({ input: "q", key: {} }); delivery.key({ input: "c", key: { ctrl: true } });
+      expect(await settled).toBeUndefined();
+      input.destroy(); output.destroy();
+    }
+
+    // The confirmation and receipt read-back flow: a → Enter previews, y confirms, one append read back.
+    const decisions = () => deriveRunDecisions(Journal.open(root, T9_RUN), graph);
+    const { snapshot } = readRun(root, T9_RUN, graph);
+    const ctx = { tasks: snapshot.tasks, decisions: decisions(), verdictLines: 0 };
+    let session: RunViewSession = { ...initialRunViewSession(), selection: 1 };
+    session = applyRunViewKey(session, key("a"), ctx).session;
+    expect(session.decisions.menu).toEqual({ taskId: "T2", verbs: ["waive", "uphold", "recheck"], selection: 0 });
+    const picked = applyRunViewKey(session, ENTER, ctx);
+    expect(picked.open).toEqual({ verb: "waive", taskId: "T2" });
+    const preview = previewDecision({ ...picked.open!, reason: "accepted risk" }, { cwd: root, runId: T9_RUN, by: "operator" });
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    session = { ...picked.session, decisions: withDecisionPreview(picked.session.decisions, preview) };
+    const confirmFrame = await drawRun(root, T9_RUN, session, 220, graph);
+    expect(confirmFrame).toContain("CONFIRM WAIVE");
+    expect(confirmFrame).toContain(`tickmarkr approve ${T9_RUN} T2 --waive`);
+    expect(applyRunViewKey(session, ENTER, ctx).confirm).toBeUndefined();
+    expect(approvals(root, T9_RUN, "T2")).toEqual([]);
+    const confirmed = applyRunViewKey(session, key("y"), ctx);
+    expect(confirmed.confirm).toEqual(preview.preview);
+    const receipt = await executeDecision(confirmed.confirm!, { cwd: root });
+    expect(receipt.ok).toBe(true);
+    if (!receipt.ok) return;
+    expect(approvals(root, T9_RUN, "T2")).toHaveLength(1);
+    expect(receipt.appended.line).toBe(journalEvents(root, T9_RUN).length);
+    const receiptFrame = await drawRun(root, T9_RUN, { ...session, decisions: withDecisionReceipt(session.decisions, receipt) }, 220, graph);
+    expect(receiptFrame).toContain("RECEIPT · appended");
+    expect(receiptFrame).toContain(`#L${receipt.appended.line} task-approved T2 · release ${receipt.release ?? "none"}`);
+    expect(focusDriver).not.toHaveBeenCalled();
   });
 });

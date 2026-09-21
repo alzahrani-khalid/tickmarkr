@@ -1322,7 +1322,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     ]);
     expect(journaledFailureBrief(gated, "T2")).toEqual([]);                       // task-scoped
     expect(journaledFailureBrief([...gated, ev("worker-launch")], "T1")).toEqual([]); // spent at launch
-    expect(journaledFailureBrief([...gated, ev("task-approved")], "T1")).toEqual([]); // and by an approval
+    expect(journaledFailureBrief([...gated, ev("task-approved", { release: "gate-satisfied" })], "T1")).toEqual([]); // and by a WAIVE (OBS-1074: only a waive settles)
 
     // The ONE pre-launch invariant covers the terminal exception path too: task-dispatch does not
     // spend information, task-failed contributes its exact dispatch error, and only an actual launch
@@ -2468,6 +2468,10 @@ describe("RT-2 red replay", () => {
           ] },
         },
       );
+      // A refusal hint must resolve in the repository before the daemon offers approval.
+      mkdirSync(join(repo, "tests/cli"), { recursive: true });
+      writeFileSync(join(repo, "tests/cli/brand-surfaces.test.ts"), "// tracked test\n");
+      execSync("git add tests && git commit --no-gpg-sign -qm fixture", { cwd: repo });
       await runDaemon(repo, { adapters: [fake], runId: "run-refusal-hint" });
       const park = Journal.open(repo, "run-refusal-hint").read().find((e) => e.event === "task-human")!;
       expect(park, JSON.stringify(Journal.open(repo, "run-refusal-hint").read().slice(-5))).toBeDefined();
@@ -2630,4 +2634,20 @@ describe("ES-2 daemon tier climb", () => {
       else expect(park.data.reason).toContain("pin fake:fake-1 held: gate-fingerprint-cap");
     }
   }, 180_000);
+});
+
+// OBS-1074 (v2.5.7 run …152220: T11 parked four times on one hygiene oracle — every plain approval erased the
+// gate row the fresh attempt was funded to fix, and the operator's reason never reached the worker).
+test("test: a plain approval, a scope grant or a recheck after a park keeps the parked attempt's failed gate rows in the brief and appends the operator's reason, a waive still clears them, and a worker-launch spends them, so a fresh attempt that starts without the finding it was funded to fix fails", () => {
+  const ev = (event: string, data: Record<string, unknown> = {}, taskId = "T1") => ({ ts: "t", event, taskId, data }) as never;
+  const parked = [ev("gate-result", { gate: "test", pass: false, details: "FAIL tests/repo/oracle.test.ts > reads an excluded path" })];
+  for (const approval of [{ reason: "guard the read with a named skip" }, { release: "scope-request", reason: "files[] += docs/x.md" }, { release: "recheck", reason: "same tree, re-gate" }]) {
+    expect(journaledFailureBrief([...parked, ev("task-approved", approval)], "T1")).toEqual([
+      "test: FAIL tests/repo/oracle.test.ts > reads an excluded path",
+      `approval: ${approval.reason}`,
+    ]);
+  }
+  expect(journaledFailureBrief([...parked, ev("task-approved", {})], "T1")).toEqual(["test: FAIL tests/repo/oracle.test.ts > reads an excluded path"]);
+  expect(journaledFailureBrief([...parked, ev("task-approved", { release: "gate-satisfied", reason: "waived" })], "T1")).toEqual([]);
+  expect(journaledFailureBrief([...parked, ev("task-approved", { reason: "r" }), ev("worker-launch")], "T1")).toEqual([]);
 });

@@ -1,3 +1,4 @@
+import type { CommandReceiptAttribution, ShellReceipt } from "./protocol.js";
 import { executionSignal } from "./execution-budget.js";
 import { commandLeaseEnvironment, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -283,18 +284,53 @@ export interface ShellOptions {
   signal?: AbortSignal;
   onSpawn?: (pid: number | undefined) => void;
   onTimeout?: () => void;
+  /** Independent of the legacy pid callback; started means the child emitted spawn. */
+  onReceipt?: (receipt: ShellReceipt) => void;
+  /** Called once per invocation (1-based), including each pre-spawn retry. */
+  receiptAttribution?: (invocation: number) => CommandReceiptAttribution;
 }
 
 /** Shared command seam, including invocation-bound manifested runners. */
 export function shell(cmd: string, cwd: string, timeoutMs: number, login = false, options: ShellOptions = {}): Promise<ShResult> {
   const inherited = executionSignal();
   const signal = inherited && options.signal ? AbortSignal.any([inherited, options.signal]) : inherited ?? options.signal;
-  signal?.throwIfAborted();
-  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, { ...options, signal }));
+  let attribution: CommandReceiptAttribution | undefined;
+  let confirmedStart = false;
+  let terminal = false;
+  const begin = (invocation: number) => {
+    attribution = options.receiptAttribution?.(invocation);
+    confirmedStart = false;
+    terminal = false;
+  };
+  const emit = (receipt: Omit<ShellReceipt, "attribution" | "confirmedStart">) => {
+    if (terminal) return;
+    if (receipt.outcome === "started") confirmedStart = true;
+    else terminal = true;
+    // Observational callbacks must not change process cleanup, retries or cancellation.
+    try { options.onReceipt?.({ ...receipt, confirmedStart, ...(attribution ? { attribution: { ...attribution } } : {}) }); }
+    catch { /* receipt sinks are observational */ }
+  };
+  const checkAbort = () => {
+    if (signal?.aborted) emit({ outcome: "cancelled", exitCode: null, signal: null });
+    signal?.throwIfAborted();
+  };
+  begin(1);
+  checkAbort();
+  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, { ...options, signal }, { begin, emit, checkAbort }))
+    .catch((error: unknown) => {
+      if (signal?.aborted) emit({ outcome: "cancelled", exitCode: null, signal: null });
+      throw error;
+    });
 }
 
-function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolean, options: ShellOptions): Promise<ShResult> {
-  options.signal?.throwIfAborted();
+interface ShellObservation {
+  begin: (invocation: number) => void;
+  emit: (receipt: Omit<ShellReceipt, "attribution" | "confirmedStart">) => void;
+  checkAbort: () => void;
+}
+
+function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolean, options: ShellOptions, observation: ShellObservation): Promise<ShResult> {
+  observation.checkAbort();
   // OBS-74: scrub tickmarkr's own routing env seams from every child — a daemon carrying
   // TICKMARKR_QUALITY leaked it into baseline/gate/tip-verify children, turning a dogfood
   // repo's route() tests red inside the gates. Scrub a copy at this one choke point so
@@ -320,13 +356,21 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
     // detached: bash gets its own process group so a timeout can kill the whole tree —
     // SIGKILLing bash alone orphans grandchildren (codex/pi) that hold the stdio pipes
     // open, so "close" never fires and the promise wedges forever (v1.33.1 init hang).
-    const p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    let p: ReturnType<typeof spawn>;
+    try {
+      p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    } catch (error) {
+      observation.emit({ outcome: "spawn-failed", exitCode: null, signal: null, error: String(error) });
+      throw error;
+    }
     let stdout = "", stderr = "";
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
     let timedOut = false, reapedGroup = false, done = false, started = false, outputSeen = false;
     let reapError: string | undefined, exitedCode: number | undefined;
     let signalExit = false;
+    let exitSignal: NodeJS.Signals | null = null;
+    let spawnError: string | undefined;
     let reapTimer: NodeJS.Timeout | undefined;
     let drainTimer: NodeJS.Timeout | undefined;
     const finish = (code: number, err?: string) => {
@@ -338,6 +382,12 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
       options.signal?.removeEventListener("abort", abort);
       stdout += stdoutDecoder.end();
       stderr += stderrDecoder.end();
+      observation.emit({
+        outcome: options.signal?.aborted ? "cancelled" : timedOut ? "timed-out" : spawnError ? "spawn-failed" : "completed",
+        pid: p.pid, exitCode: signalExit || spawnError ? null : code,
+        signal: exitSignal, ...(spawnError ? { error: spawnError } : {}),
+        durationMs: Date.now() - startedAt,
+      });
       resolve({
         code,
         ...(signalExit ? { signalExit: true } : {}),
@@ -381,7 +431,7 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
     options.signal?.addEventListener("abort", abort, { once: true });
     options.onSpawn?.(p.pid);
     if (options.signal?.aborted) abort();
-    p.on("spawn", () => { started = true; }); // the command exists from here on — never retryable past it
+    p.on("spawn", () => { started = true; observation.emit({ outcome: "started", pid: p.pid }); }); // the command exists from here on — never retryable past it
     // OBS-716: one stateful decoder per stream carries an incomplete UTF-8 sequence into that
     // stream's next pipe chunk; decoding each chunk through string concatenation corrupts bytes at
     // kernel-chosen boundaries. A deterministic fixture proves this decoder correct rather than
@@ -396,21 +446,24 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
       stderr += stderrDecoder.write(d);
     });
     p.on("error", (e: NodeJS.ErrnoException) => {
+      spawnError = String(e);
       if (!done && !started && !outputSeen && e.code === RETRYABLE_SPAWN_CODE) {
         done = true;
         clearTimeout(timer);
         options.signal?.removeEventListener("abort", abort);
+        observation.emit({ outcome: "spawn-failed", exitCode: null, signal: null, error: String(e), durationMs: Date.now() - startedAt });
         resolve({ refused: e });
         return;
       }
       finish(127, String(e));
     });
-    p.on("close", (code) => { signalExit = code === null; finish(code ?? 1); });
+    p.on("close", (code, signal) => { signalExit = code === null; exitSignal = signal; finish(code ?? 1); });
     // "close" waits for stdio to drain. Once bash exits normally, give descendants a bounded grace
     // to exit with it; a survivor still in bash's detached group is then reaped so its inherited pipe
     // cannot hold this promise until the command ceiling. A real timeout wins first and is never
     // reclassified as a grace reap.
-    p.on("exit", (code) => {
+    p.on("exit", (code, signal) => {
+      exitSignal = signal;
       signalExit = code === null;
       exitedCode = code ?? 1;
       // Allow a short pipe drain after killing, bounded even for an escaped descendant.
@@ -432,7 +485,8 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   return (async () => {
     const startedAt = Date.now();
     for (let n = 1; ; n++) {
-      options.signal?.throwIfAborted();
+      if (n > 1) observation.begin(n);
+      observation.checkAbort();
       const r = await attempt();
       if (!("refused" in r)) return r;
       // Bounded, and the bound is what makes a persisting shortage a REPORTED failure rather than a
@@ -445,8 +499,8 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   })();
 }
 
-export function sh(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<ShResult> {
-  return shell(cmd, cwd, timeoutMs, true);
+export function sh(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, options: ShellOptions = {}): Promise<ShResult> {
+  return shell(cmd, cwd, timeoutMs, true, options);
 }
 
 // Git plumbing never needs an operator profile; skip login-shell startup and its side effects.

@@ -99,3 +99,33 @@ test("pair-integrity fold ranges over gate phases and worker, judge, review and 
     "terminal-without-start",
   ]);
 });
+
+test("test: a receipt row validates against the typed receipt schema with run task attempt gate round invocation and an outcome from the closed set started completed spawn-failed timed-out cancelled reused-result skipped refused, an abort before spawn validates as cancelled with no confirmed start, and a row missing its invocation or naming an outcome outside the set is a protocol issue, so a receipt that validates without its correlation or an outcome the set does not name fails", async () => {
+  const { COMMAND_RECEIPT_OUTCOMES, CommandReceiptSchema, readCommandReceipt } = await import("../../src/run/protocol.js");
+  const { shell } = await import("../../src/run/git.js");
+  const attribution = { runId: "run-protocol", taskId: "T3", attempt: 0, gateRound: 1, invocation: "invocation-owned-by-caller" };
+  const outcomes = ["started", "completed", "spawn-failed", "timed-out", "cancelled", "reused-result", "skipped", "refused"];
+  expect(COMMAND_RECEIPT_OUTCOMES).toEqual(outcomes);
+  for (const outcome of outcomes) {
+    const row = { attribution, outcome, confirmedStart: outcome === "started" || outcome === "completed" };
+    expect(CommandReceiptSchema.safeParse(row).success).toBe(true);
+    expect(readCommandReceipt(row)).toEqual({ kind: "receipt", receipt: row });
+  }
+  for (const field of ["runId", "taskId", "attempt", "gateRound", "invocation"]) {
+    const incomplete: Record<string, unknown> = { ...attribution };
+    delete incomplete[field];
+    const row = { attribution: incomplete, outcome: "completed", confirmedStart: true };
+    expect(CommandReceiptSchema.safeParse(row).success).toBe(false);
+    expect(readCommandReceipt(row)).toMatchObject({ kind: "protocol-issue", issues: [expect.stringContaining(field)] });
+  }
+  expect(readCommandReceipt({ attribution, outcome: "failed", confirmedStart: false })).toMatchObject({ kind: "protocol-issue" });
+  expect(readCommandReceipt({ outcome: "completed", confirmedStart: true })).toMatchObject({ kind: "protocol-issue" });
+  const controller = new AbortController();
+  controller.abort(new Error("protocol abort"));
+  const rows: unknown[] = [];
+  expect(() => shell("exit 0", "/tmp", 1000, false, {
+    signal: controller.signal, receiptAttribution: () => attribution, onReceipt: (r) => rows.push(r),
+  })).toThrow("protocol abort");
+  expect(rows).toEqual([{ attribution, outcome: "cancelled", confirmedStart: false, exitCode: null, signal: null }]);
+  expect(readCommandReceipt(rows[0])).toMatchObject({ kind: "receipt" });
+});

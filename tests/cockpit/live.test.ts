@@ -331,7 +331,8 @@ describe("live cockpit", () => {
     );
     // Watch reads the engagement's own label; the caption reads the run's dispatch count. Neither
     // borrows the other's ruler, so 1 and 3 can stand side by side without contradicting.
-    expect(resumedWatch).toContain("engagement attempt 1 in flight on fake:current");
+    expect(resumedWatch).toContain("preparing · engagement attempt 1 since");
+    expect(resumedWatch).not.toContain("in flight");
     expect(resumedFrame).toContain("T2 · worker · engagement attempt 1 · fake:current");
     expect(resumedFrame).not.toContain("engagement attempt 3");
     expect(deriveRunViewRows(resumedData, "tasks").find((row) => row.id === "task:T2")?.text)
@@ -3522,7 +3523,7 @@ test(C1_CRITERIA[3], async () => {
       // not a footer legend or another unrelated disabled component.
       const gateRow = mounted.split("\n").find(line => stripAnsi(line).includes("- disabled"));
       expect(gateRow).toBeDefined();
-      expect(stripAnsi(gateRow!)).toContain("- disabled build — gate-result");
+      expect(stripAnsi(gateRow!)).toContain("- disabled #L5 build — gate-result");
       expect(stripAnsi(gateRow!)).toContain(LONG_TASK_ID.slice(0, 20));
       expect(mounted).not.toContain("uninstalled disabled");
       expect(mounted.split("\n").slice(-4).join("\n")).not.toContain("disabled");
@@ -3690,7 +3691,7 @@ test("mounted pointer selects the painted Run task and Evidence row after resize
     expect(m.delivery.snapshot().state.view).toBe("evidence");
     await m.resize(120, 40);
     const geometry = m.delivery.geometry()!;
-    const target = geometry.paintedRows.find(row => row.text === "gate-result — T1 — review passed")!;
+    const target = geometry.paintedRows.find(row => row.text === "#L3 gate-result — T1 — review passed")!;
     expect(target).toBeDefined();
     m.delivery.pointer({ action: "press", column: target.column + 1, row: target.row });
     await m.send(""); await m.send("\r");
@@ -3704,7 +3705,7 @@ test("mounted Evidence reselects a previously clicked row after keyboard navigat
   try {
     await m.send("5");
     const clickReview = async () => {
-      const target = m.delivery.geometry()!.paintedRows.find(row => row.text === "gate-result — T1 — review passed")!;
+      const target = m.delivery.geometry()!.paintedRows.find(row => row.text === "#L3 gate-result — T1 — review passed")!;
       expect(target).toBeDefined();
       await m.send(`\x1b[<0;${target.column + 2};${target.row + 1}M`);
       await m.send(`\x1b[<0;${target.column + 2};${target.row + 1}m`);
@@ -3851,6 +3852,49 @@ test("mounted Open disappears when an unfollowed Evidence selection is removed o
   } finally { await m.close(); f.close(); }
 });
 
+
+test("mounted Evidence at 80x24 and 120x40 pages through operator groups and opens every historical flood row", async () => {
+  const f = shellFixture();
+  const pages = Array.from({ length: 12 }, (_, index) => ({
+    ts: `2026-09-05T00:03:${String(index).padStart(2, "0")}.000Z`,
+    event: "operator-page", taskId: "T2",
+    data: { park: "gate-fail#0", status: "blocked", suppressed: 2, summary: `flood-row-${index}` },
+  }));
+  appendFileSync(join(f.cwd, ".tickmarkr", "runs", f.runId, "journal.jsonl"),
+    pages.map(page => JSON.stringify(page) + "\n").join(""));
+  try {
+    for (const [columns, rows] of [[80, 24], [120, 40]]) {
+      const m = await mountShell(f.cwd, f.runId, columns, rows, { NO_COLOR: "1" });
+      try {
+        await m.send("5");
+        const history = m.delivery.snapshot().store.journal.history.slice(-pages.length);
+        const frames: string[] = [];
+        // Scroll the bounded shell, rather than inspecting an unbounded leaf render.
+        for (let page = 0; page < 8; page++) {
+          frames.push(stripAnsi(m.frame()));
+          await m.send("\x1b[6~");
+        }
+        const painted = frames.join("\n");
+        expect(painted).toContain("RAW JOURNAL");
+        expect(painted).toContain("OPERATOR PAGE GROUPS");
+        expect(painted).toContain(`first ${pages[0]!.ts}`);
+        expect(painted).toContain(`last ${pages.at(-1)!.ts}`);
+        expect(painted).toContain("visible 12 · suppressed 24");
+        for (const row of history) expect(painted).toContain(`#L${row.line}`);
+        for (const page of pages) expect(painted).toContain(page.data.summary);
+        for (const row of [...history].reverse()) {
+          await m.send("\r");
+          const overlay = m.delivery.snapshot().state.overlay!;
+          expect(overlay[0]).toBe(row.id);
+          expect(overlay.join("\n")).toContain(row.event!.data.summary);
+          expect(overlay.join("\n")).toContain(row.event!.ts);
+          await m.send("\x1b");
+          await m.send("\x1b[A");
+        }
+      } finally { await m.close(); }
+    }
+  } finally { f.close(); }
+});
 
 test("mounted pointer keeps original identities for repeated journal narrations", async () => {
   const f = shellFixture();

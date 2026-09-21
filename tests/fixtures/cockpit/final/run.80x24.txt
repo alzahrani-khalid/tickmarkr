@@ -1,5 +1,5 @@
 tickmarkr capture | RUN | run-20260905-000000
-1 Home  4 Run  5 Evidence | content | 1–17/59 | 42 hidden
+1 Home  4 Run  5 Evidence | content | 1–17/75 | 58 hidden
 ────────────────────────────────────────────────────────────────────────────────
 │RUN / RUNNING · 1/4 merged | blocked T3 | current-cycle tip PENDING | RUNNING │
 │ tickmarkr  run-20260905-000000  │  1/4 done  │  0 esc  │  0h00m              │

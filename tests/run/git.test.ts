@@ -780,3 +780,106 @@ describe("refs probe (OBS-983/984)", () => {
     }
   });
 });
+
+const receiptIdentity = (invocation: number) => ({
+  runId: "run-receipts", taskId: "T3", attempt: 2, gateRound: 4, invocation: `caller-invocation-${invocation}`,
+});
+
+test("test: the shell seam emits a confirmed-start receipt only from the child's spawn event and a terminal receipt naming exit code, signal, timeout or spawn failure, a pre-spawn EAGAIN exhaustion emits terminal spawn-failed with no confirmed start, and invoking the actual shell with an already aborted signal emits cancelled terminal evidence with no confirmed start while preserving cancellation behavior, so a receipt taken from child creation or from the pid callback alone or a lost pre-abort terminal fails", async () => {
+  const { shell } = await import("../../src/run/git.js");
+  const { CommandReceiptSchema } = await import("../../src/run/protocol.js");
+  type Receipt = import("../../src/run/protocol.js").ShellReceipt;
+  vi.useFakeTimers();
+  const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+  try {
+    for (const mode of ["exit", "signal", "timeout", "spawn-failure", "cancel"] as const) {
+      const receipts: Receipt[] = [];
+      const child = Object.assign(new EventEmitter(), {
+        pid: 812345, stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+      });
+      setSpawnForTests((() => child) as unknown as typeof spawn);
+      const controller = new AbortController();
+      const onSpawn = vi.fn(() => expect(receipts).toEqual([]));
+      const result = shell("unused", "/tmp", 1000, false, {
+        onSpawn, signal: controller.signal, receiptAttribution: receiptIdentity,
+        onReceipt: (receipt) => receipts.push(receipt),
+      });
+      expect(onSpawn).toHaveBeenCalledWith(child.pid);
+      expect(receipts).toEqual([]); // Child creation and the pid callback prove no start.
+      if (mode === "spawn-failure") {
+        child.emit("error", Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }));
+        child.emit("close", -2, null);
+        expect(await result).toMatchObject({ code: 127 });
+        expect(receipts).toEqual([expect.objectContaining({ outcome: "spawn-failed", confirmedStart: false, error: "Error: spawn ENOENT", exitCode: null })]);
+      } else {
+        child.emit("spawn");
+        expect(receipts).toEqual([{ outcome: "started", confirmedStart: true, pid: child.pid, attribution: receiptIdentity(1) }]);
+        if (mode === "timeout") await vi.advanceTimersByTimeAsync(1000);
+        if (mode === "cancel") controller.abort();
+        const code = mode === "exit" ? 7 : null;
+        const signal = mode === "exit" ? null : mode === "signal" ? "SIGTERM" : "SIGKILL";
+        child.emit("exit", code, signal);
+        child.emit("close", code, signal);
+        expect(await result).toMatchObject({ code: code ?? 1, timedOut: mode === "timeout" });
+        expect(receipts[1]).toMatchObject({
+          outcome: mode === "timeout" ? "timed-out" : mode === "cancel" ? "cancelled" : "completed",
+          confirmedStart: true, exitCode: code, signal,
+        });
+        expect(receipts).toHaveLength(2);
+      }
+      expect(receipts.every((r) => CommandReceiptSchema.safeParse(r).success)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    }
+
+    const receipts: Receipt[] = [];
+    setSpawnForTests((() => refusedSpawn("EAGAIN")) as typeof spawn);
+    const exhausted = shell("unused", "/tmp", 1000, false, { receiptAttribution: receiptIdentity, onReceipt: (r) => receipts.push(r) });
+    await vi.runAllTimersAsync();
+    expect(await exhausted).toMatchObject({ code: 127, stderr: expect.stringContaining("EAGAIN") });
+    expect(receipts).toHaveLength(SPAWN_ATTEMPT_LIMIT);
+    expect(receipts.every((r) => r.outcome === "spawn-failed" && !r.confirmedStart)).toBe(true);
+    expect(receipts.map((r) => r.attribution)).toEqual(Array.from({ length: SPAWN_ATTEMPT_LIMIT }, (_, n) => receiptIdentity(n + 1)));
+  } finally {
+    resetSpawnForTests(); kill.mockRestore(); vi.useRealTimers();
+  }
+  // Exercise the public, actual shell seam: this used to throw before any evidence could land.
+  const controller = new AbortController();
+  const reason = new Error("already cancelled");
+  controller.abort(reason);
+  const receipts: Receipt[] = [];
+  const pid = vi.fn();
+  expect(() => shell("exit 0", "/tmp", 1000, false, {
+    signal: controller.signal, onSpawn: pid, receiptAttribution: receiptIdentity, onReceipt: (r) => receipts.push(r),
+  })).toThrow(reason);
+  expect(pid).not.toHaveBeenCalled();
+  expect(receipts).toEqual([{ outcome: "cancelled", confirmedStart: false, attribution: receiptIdentity(1), exitCode: null, signal: null }]);
+  expect(CommandReceiptSchema.safeParse(receipts[0]).success).toBe(true);
+});
+
+test("test: every existing pid-callback consumer still receives the pid it received before and each receipt carries the invocation identity the caller supplied, with a retry inside one attempt reported as a new invocation of the same attempt, so an observer that replaces the pid callback or merges two invocations fails", async () => {
+  const { shell } = await import("../../src/run/git.js");
+  type Receipt = import("../../src/run/protocol.js").ShellReceipt;
+  const receipts: Receipt[] = [];
+  const pids: Array<number | undefined> = [];
+  const suppliedPids: Array<number | undefined> = [];
+  const attribution = vi.fn(receiptIdentity);
+  let calls = 0;
+  setSpawnForTests(((file, args, opts) => {
+    const child = ++calls === 1 ? refusedSpawn("EAGAIN") : spawn(file, args as string[], opts as object);
+    suppliedPids.push(child.pid);
+    return child;
+  }) as typeof spawn);
+  try {
+    expect(await shell("printf receipt", "/tmp", 5000, false, {
+      onSpawn: (pid) => pids.push(pid), receiptAttribution: attribution, onReceipt: (r) => receipts.push(r),
+    })).toMatchObject({ code: 0, stdout: "receipt" });
+    expect(pids).toEqual(suppliedPids);
+    expect(pids[0]).toBeUndefined();
+    expect(pids[1]).toBeGreaterThan(0);
+    expect(attribution.mock.calls).toEqual([[1], [2]]);
+    expect(receipts.map((r) => [r.outcome, r.attribution])).toEqual([
+      ["spawn-failed", receiptIdentity(1)], ["started", receiptIdentity(2)], ["completed", receiptIdentity(2)],
+    ]);
+    expect(receipts.slice(1).every((r) => r.pid === pids[1])).toBe(true);
+  } finally { resetSpawnForTests(); }
+});

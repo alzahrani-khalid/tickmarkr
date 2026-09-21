@@ -18,6 +18,46 @@ const TaskIdsSchema = z.array(TaskIdSchema);
 const AttemptSchema = z.number().int().nonnegative();
 const EvidenceSchema = z.record(z.string(), z.unknown());
 
+/** Shared lifecycle vocabulary for shell evidence and later build-result emitters. */
+export const COMMAND_RECEIPT_OUTCOMES = [
+  "started", "completed", "spawn-failed", "timed-out", "cancelled", "reused-result", "skipped", "refused",
+] as const;
+export const CommandReceiptAttributionSchema = z.object({
+  runId: NonEmptyStringSchema,
+  taskId: TaskIdSchema,
+  attempt: AttemptSchema,
+  gateRound: z.number().int().nonnegative(),
+  invocation: NonEmptyStringSchema,
+}).strict();
+export type CommandReceiptAttribution = z.infer<typeof CommandReceiptAttributionSchema>;
+
+export const ShellReceiptSchema = z.object({
+  outcome: z.enum(COMMAND_RECEIPT_OUTCOMES),
+  confirmedStart: z.boolean(),
+  attribution: CommandReceiptAttributionSchema.optional(),
+  pid: z.number().int().positive().optional(),
+  exitCode: z.number().int().nullable().optional(),
+  signal: NonEmptyStringSchema.nullable().optional(),
+  error: z.string().optional(),
+  durationMs: z.number().nonnegative().optional(),
+}).strict();
+export type ShellReceipt = z.infer<typeof ShellReceiptSchema>;
+/** A task-build row must carry the entire caller-owned correlation, even before spawn. */
+export const CommandReceiptSchema = ShellReceiptSchema.extend({
+  attribution: CommandReceiptAttributionSchema,
+});
+export type CommandReceipt = z.infer<typeof CommandReceiptSchema>;
+
+export function readCommandReceipt(raw: unknown):
+  | { kind: "receipt"; receipt: CommandReceipt }
+  | { kind: "protocol-issue"; issues: string[]; raw: unknown } {
+  const parsed = CommandReceiptSchema.safeParse(raw);
+  return parsed.success ? { kind: "receipt", receipt: parsed.data } : {
+    kind: "protocol-issue", raw,
+    issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
+  };
+}
+
 /** The T31 outcome vocabulary, made executable and strict at the persistence boundary. */
 export const GateOutcomeSchema: z.ZodType<GateOutcome> = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("passed") }).strict(),

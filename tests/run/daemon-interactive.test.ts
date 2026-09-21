@@ -496,6 +496,35 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
     // whose staged ladder flips the outcome to done the moment the loop over-reads.
   }, 30_000);
 
+  // OBS-1062 (v2.5.7 run …115246): the TUI echoes the brief — trailer TEMPLATE included — into the
+  // pane before the worker says anything. The poll loop must keep waiting through that echo and
+  // harvest the real trailer later; under the defect it broke at the first poll, settled twice on
+  // the same echo, and reaped both workers as malformed at 34 s.
+  test("an interactive pane showing only the echoed brief (trailer template, no worker trailer) is not reaped as malformed; the real trailer is harvested when it lands", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1")],
+      { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "echo survived" } }] }, consult: { action: "human", notes: "reaped on the echo" } },
+      "taskTimeoutMinutes: 0.05\n",
+    );
+    const echo = `ctly one line (no code fence):\n  TICKMARKR_RESULT_<NONCE> {"ok":true|false,"summary":"<one sentence>","deviations":["<path or reason>"]}\n⏺ I'll read the helper first.\n`;
+    const driver = stagedInteractiveDriver(repo, "run-template-echo", "T1", [
+      "",
+      echo,
+      echo,
+      echo,
+      `${echo}TICKMARKR_RESULT_<NONCE> {"ok":true,"summary":"echo survived","deviations":[]}`,
+    ]);
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-template-echo", driver });
+    expect(s.human).toEqual([]);
+    expect(s.done).toEqual(["T1"]);
+    const evs = Journal.open(repo, "run-template-echo").read();
+    expect(evs.some((e) => e.event === "worker-reaped-before-harvest")).toBe(false);
+    const wr = evs.find((e) => e.event === "worker-result");
+    expect(wr?.data.ok).toBe(true);
+    expect(wr?.data.summary).toBe("echo survived");
+    expect(wr?.data.cause).toBeUndefined();
+  }, 30_000);
+
   test("the settle re-read is bounded to at most two attempts and never runs out the attempt's own stall window", async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],

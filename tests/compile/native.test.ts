@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { quietGitInit } from "../helpers/tmprepo.js";
 import { CompileError } from "../../src/compile/common.js";
 import { compileSource } from "../../src/compile/index.js";
 import { classifyContextPath, compileNative, TICKMARKR_NATIVE_MARKER, specTemplate } from "../../src/compile/native.js";
@@ -449,7 +450,7 @@ test("criterion-scope lint errors when a criterion names a file or a `52/64`-for
     join(repo, "tests", "render.test.ts"),
     'test("rendered numerator", () => expect("52/64").toBe("52/64"));\n',
   );
-  execSync("git init -q", { cwd: repo });
+  quietGitInit(repo);
   execSync("git config user.email t@t.t", { cwd: repo });
   execSync("git config user.name t", { cwd: repo });
   execSync("git add tests/render.test.ts", { cwd: repo });

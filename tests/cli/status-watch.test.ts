@@ -483,7 +483,7 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       const out = await status([], repo);
       expect(strip(card(out, "T2"))).toMatch(/✓ ✗ ○ ○ ○ - -/);
-      expect(card(out, "T2")).toContain("gate lint running");
+      expect(card(out, "T2")).toContain("phase unconfirmed");
       expect(card(out, "T2")).not.toContain("\x1b[36m");
       expect(card(out, "T2").match(/fake:fake-/g)).toHaveLength(1); // clipped channel column, still rendered once
     });
@@ -534,7 +534,7 @@ describe("status checklist rendering", () => {
         expect(strip(row(out, "T1"))).toContain("done");
         expect(strip(row(out, "T2"))).toContain("T2");
         expect(strip(row(out, "T2"))).toContain("mixed");
-        expect(card(out, "T2")).toContain("attempt 1 in flight on fake:fake-2 since 08:00:00");
+        expect(card(out, "T2")).toContain("preparing · attempt 1 since 08:00:00");
         expect(strip(row(out, "T3"))).toContain("T3");
         expect(card(out, "T3")).toContain("dep-waiting on T2");
       });
@@ -1014,7 +1014,7 @@ describe("status checklist rendering", () => {
     await withTty(async () => {
       const out = await status([], repo);
       expect(strip(out)).toContain("now: gate-result — T2 — build passed");
-      expect(strip(card(out, "T2"))).toContain("gate test running"); // and the watched task names its running gate
+      expect(strip(card(out, "T2"))).toContain("phase unconfirmed"); // no next gate is predicted without a start record
     });
   });
 
@@ -1246,8 +1246,11 @@ describe("status checklist rendering", () => {
           "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
           "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +
           "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
+          `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
           "  [!] T2 mixed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
-          "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -";
+          `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
+          "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -\n" +
+          "    phase unrecorded · last evidence unrecorded · responsible unrecorded · blocker dependency-wait · next action Wait for prerequisites: T2 · human-decision no";
         expect(out).toBe(golden);
       },
     );

@@ -270,8 +270,11 @@ describe("T3 watch cockpit brand restyle", () => {
         // no watcher has ever beaten in this fixture, and every tier says so rather than being omitted
         "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +
         "  [x] T1 done  B[x] T[x] L[ ] E[ ] S[ ] A. R.  done  fake:fake-1\n" +
+        `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
         "  [!] T2 failed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2 / ctx 1234\n" +
-        "  [ ] T3 starved  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -",
+        `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
+        "  [ ] T3 starved  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -\n" +
+        "    phase unrecorded · last evidence unrecorded · responsible unrecorded · blocker dependency-wait · next action Wait for prerequisites: T2 · human-decision no",
       );
     });
   });

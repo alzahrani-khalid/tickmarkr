@@ -280,11 +280,12 @@ test("test: a resumed run re-runs a green gate whose recorded capacity differs f
   const here: RunCapacity = { forkCap: 3, cores: CORES };
 
   // CONTROL: the same world. The commit is unchanged and the capacity matches, so the green prefix
-  // is replayed and not one gate shell runs — exactly today's behaviour.
+  // is replayed and not one gate runs — the single shell is the replayed build's provisioning of
+  // the recreated worktree, never a gate (OBS-1049).
   const same = await seedGreenAttempt("run-capacity-resume-same", here);
   await runDaemon(same.repo, { adapters: [same.fake], runId: "run-capacity-resume-same", resume: true });
   expect(reusedGates(same.repo, "run-capacity-resume-same")).toEqual([...SHELL_GATES]);
-  expect(lines(same.marker)).toEqual([]);
+  expect(lines(same.marker)).toEqual(["build"]); // OBS-1049: the provisioning shell only
 
   // The same commit measured under a different fork cap. The tree is identical; the machine it was
   // measured on was divided by a different number, so those greens are re-run.

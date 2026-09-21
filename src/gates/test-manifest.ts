@@ -115,7 +115,13 @@ export interface TestReport {
   duplicateCompletions?: string[];
   /** Written last, once, when the runner reaches its own terminal state. Its absence means the run
    * never certified completion — killed, crashed, or still in flight — and is never a verdict. */
-  certificate?: { at: number; exitCode: number };
+  certificate?: {
+    at: number;
+    exitCode: number;
+    /** Unhandled and module collection errors observed by the reporter; absent on older reports. */
+    errors?: number;
+    diagnostics?: string[];
+  };
 }
 
 function isTestReportShape(v: unknown): v is TestReport {
@@ -514,11 +520,29 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
     });
     const verdict = verifyManifestReport({ manifest: files, nonce, exitCode: invoked.exitCode,
       report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs });
+    // Preserve the validator's verdict and classification; runner evidence only explains it.
+    const stdoutPath = join(dir, `test-runner-stdout-${nonce}.log`);
+    const stderrPath = join(dir, `test-runner-stderr-${nonce}.log`);
+    const stdoutTail = Buffer.from(invoked.stdout).subarray(-16 * 1024);
+    const stderrTail = Buffer.from(invoked.stderr).subarray(-16 * 1024);
+    writeFileSync(stdoutPath, stdoutTail);
+    writeFileSync(stderrPath, stderrTail);
+    const report = invoked.report?.nonce === nonce ? invoked.report : undefined;
+    const neverStarted = report ? files.filter(file => !(file in report.started)).length : "unknown";
+    const errors = report?.certificate?.errors;
+    const reporterErrors = typeof errors === "number" && Number.isInteger(errors) && errors >= 0 ? errors : "unknown";
+    const reportedDiagnostics = report?.certificate?.diagnostics;
+    const runnerErrors = Array.isArray(reportedDiagnostics) ? reportedDiagnostics.filter(error => typeof error === "string") : [];
+    const diagnostics = !verdict.pass
+      ? `\nclassification: ${verdict.meta.classification ?? "unknown"}; runner-level diagnostic: never-started ${neverStarted}; reporter errors ${reporterErrors}`
+        + [...runnerErrors,
+          stdoutTail.toString(), stderrTail.toString()].filter(Boolean).map(text => `\n${text}`).join("")
+      : "";
     return { pass: verdict.pass, kind: verdict.kind,
-      details: verdict.details + (!invoked.report && invoked.stderr ? `\nvitest reporter: ${invoked.stderr}` : ""),
+      details: verdict.details + diagnostics,
       classification: verdict.meta.classification as "infra" | "regression" | undefined,
       meta: { ...verdict.meta, nonce, manifest: files, manifestPath, listingCommand: invocation.listing, verification,
-        spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid },
+        spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid, stdoutPath, stderrPath },
       exitCode: invoked.exitCode ?? -1, reportPath };
   } catch (error) {
     return { pass: false, kind: "infra", classification: "infra", exitCode: -1, reportPath,

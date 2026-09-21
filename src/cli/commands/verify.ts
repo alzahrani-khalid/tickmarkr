@@ -162,10 +162,13 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   });
 
   const stateRoot = await verifyStateRoot(cwd);
+  const fileRoot = (file: typeof STATE_FILES[number]) =>
+    existsSync(join(cwd, ".tickmarkr", file)) ? cwd : stateRoot;
   if (resolve(stateRoot) !== resolve(cwd)) {
-    console.error(`verify: state files graph.json, doctor.json and config.yaml resolved read-only from ${join(stateRoot, ".tickmarkr")} (linked worktree)`);
+    console.error(`verify: state files resolved read-only from ${join(stateRoot, ".tickmarkr")} (linked worktree; per-file origins: `
+      + STATE_FILES.map(file => `${file}: ${join(fileRoot(file), ".tickmarkr", file)} (${fileRoot(file) === cwd ? "local" : "common root"})`).join("; ") + ")");
   }
-  const cfg = loadConfig(stateRoot);
+  const cfg = loadConfig(fileRoot("config.yaml"));
   const head = (await shGitOk("git rev-parse HEAD", cwd)).trim();
   const baseTip = (await shGitOk(`git rev-parse '${values.base}'`, cwd).catch(() => {
     throw new Error(`--base ${values.base} is not a resolvable ref — pass --base <ref> naming the branch this diff targets`);
@@ -180,7 +183,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   let files = values.files ?? [];
   let goal = `independent verification of the ${values.base}..HEAD diff`;
   if (values.task) {
-    const t = getTask(loadGraph(stateRoot), values.task);
+    const t = getTask(loadGraph(fileRoot("graph.json")), values.task);
     acceptance = t.acceptance;
     if (!files.length) files = t.files;
     goal = t.goal;
@@ -238,7 +241,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
   let author: Assignment = HUMAN_AUTHOR;
   const adapters = allAdapters();
   if (wantAcceptance || wantReview) {
-    const health = readDoctor(stateRoot) ?? (await probeAll(adapters));
+    const health = readDoctor(fileRoot("doctor.json")) ?? (await probeAll(adapters));
     const pools = rolePools(cfg, adapters, health);
     judgeChannels = pools.judge;
     channels = pools.review;

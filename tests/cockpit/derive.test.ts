@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { gunzipSync } from "node:zlib";
 import { render } from "ink";
 import { createElement } from "react";
 import { describe, expect, test } from "vitest";
+import { DECISION_VERBS } from "../../src/cli/commands/approve.js";
+import { status } from "../../src/cli/commands/status.js";
+import { graphDefinitionHash, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { validateGraph, type RunGraph } from "../../src/graph/schema.js";
+import { Journal, PARK_KINDS, type JournalEvent } from "../../src/run/journal.js";
+import { applyDecisionKey, deriveRunDecisions, initialDecisionSession } from "../../src/tui/cockpit/decision-actions.js";
 import type { CaptureEvent, DemoJournalCapture } from "../../src/tui/cockpit/demo.js";
 import {
   ABSENT_FIELD,
@@ -2831,5 +2838,240 @@ describe("the folds tell the truth", () => {
       id: "event:2",
       state: "fail",
     });
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* T8 (draft T3 part 2, OBS-1048): the cockpit rows carry the shared         */
+/* projection, recorded identities per attempt and role, and the per-attempt */
+/* harvest marker — additive, so every frame above is untouched.             */
+/* ------------------------------------------------------------------------ */
+
+describe("cockpit rows read the shared projection", () => {
+  const PROJECTION_TS = "2026-09-20T08:00:00.000Z";
+  const projectionGraph = () => validateGraph({
+    version: 1,
+    spec: { source: "prd", paths: ["status-title-fixture"], hash: "status-title-fixture" },
+    tasks: [
+      { id: "T1", title: "Preparing task", goal: "Prepare", status: "pending" },
+      { id: "T2", title: "Green task", goal: "Verify", status: "pending" },
+      { id: "T3", title: "Parked task", goal: "Decide", status: "pending" },
+      { id: "T4", title: "Held task", goal: "Screen", status: "pending" },
+    ].map((task) => ({ shape: "implement", complexity: 3, acceptance: ["status title fixture"], ...task })),
+  });
+  const projectionEvents = (g: RunGraph): JournalEvent[] => [
+    { ts: PROJECTION_TS, event: "run-start", data: { pid: process.pid, graphDefinitionHash: graphDefinitionHash(g) } },
+    { ts: PROJECTION_TS, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0, role: "implementer", agent: "agent-one" } },
+    { ts: PROJECTION_TS, event: "task-dispatch", taskId: "T2", data: { assignment: { adapter: "fake", model: "fake-2" }, attempt: 0 } },
+    { ts: PROJECTION_TS, event: "worker-result", taskId: "T2", data: { ok: true, finished: true } },
+    ...g.tasks[1]!.gates.map((gate) => ({ ts: PROJECTION_TS, event: "gate-result", taskId: "T2", data: { gate, pass: true } })),
+    { ts: PROJECTION_TS, event: "task-human", taskId: "T3", data: { kind: "human-gate", reason: "Please decide", role: "reviewer" } },
+    // Non-verdict: pass:true with a selected-test screen and no full suite is HELD, never readiness.
+    { ts: PROJECTION_TS, event: "task-dispatch", taskId: "T4", data: { assignment: { adapter: "fake", model: "fake-2" }, attempt: 0 } },
+    { ts: PROJECTION_TS, event: "worker-result", taskId: "T4", data: { ok: true, finished: true } },
+    ...g.tasks[3]!.gates.map((gate) => ({ ts: PROJECTION_TS, event: "gate-result", taskId: "T4", data: gate === "test"
+      ? { gate, pass: true, selectedTests: ["tests/x.test.ts"] }
+      : { gate, pass: true } })),
+  ];
+  const cockpitGraph = (g: RunGraph): CockpitGraph => ({
+    tasks: g.tasks.map((t) => ({ id: t.id, title: t.title, status: t.status, deps: t.deps, gates: t.gates })),
+  });
+  const rowsOf = (runId: string, events: readonly JournalEvent[], graph?: CockpitGraph) => deriveRunCockpitData(
+    { fileName: `${runId}.journal.jsonl`, raw: events.map((e) => JSON.stringify(e)).join("\n") + "\n" },
+    "9.8.7",
+    graph ? { graph, isDaemonAlive: () => true } : { isDaemonAlive: () => true },
+  ).taskRows;
+
+  test("test: for one journal fixture the cockpit's derived task rows carry activity blocker and next-action fields equal to the fields status renders for the same tasks, so a field the two surfaces disagree on fails", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-derive-projection-"));
+    const g = projectionGraph();
+    saveGraph(repo, g);
+    const events = projectionEvents(g);
+    const dir = join(tickmarkrDir(repo), "runs", "run-projection");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const isTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: false });
+    Object.defineProperty(process.stdout, "columns", { configurable: true, value: 120 });
+    let out: string;
+    try {
+      out = await status([], repo);
+    } finally {
+      if (isTTY) Object.defineProperty(process.stdout, "isTTY", isTTY); else delete (process.stdout as { isTTY?: boolean }).isTTY;
+      if (columns) Object.defineProperty(process.stdout, "columns", columns); else delete (process.stdout as { columns?: number }).columns;
+    }
+    const lines = out.split("\n");
+    const rendered = (id: string) => {
+      const at = lines.findIndex((line) => new RegExp(`^\\s+\\[.\\]\\s+${id}\\b`).test(line));
+      expect(at, `status row for ${id}`).toBeGreaterThanOrEqual(0);
+      const fields = Object.fromEntries(lines[at + 1]!.trim().split(" · ").map((cell) => {
+        const [key, ...rest] = cell.split(" ");
+        return [key === "next" || key === "last" ? `${key} ${rest.shift()}` : key, rest.join(" ")];
+      }));
+      return fields as Record<string, string>;
+    };
+    const rows = rowsOf("run-projection", events, cockpitGraph(g));
+    for (const id of ["T1", "T2", "T3", "T4"]) {
+      const row = rows.find((r) => r.taskId === id)!;
+      const shown = rendered(id);
+      expect(row.summary, id).toBeDefined();
+      expect(row.activity, id).toBeDefined();
+      expect(shown.phase, id).toBe(row.summary!.phase ?? "unrecorded");
+      expect(shown.blocker, id).toBe(row.summary!.blocker?.kind ?? "none");
+      expect(shown["next action"], id).toBe(row.summary!.blocker?.nextAction ?? "unrecorded");
+      expect(shown["human-decision"], id).toBe(row.summary!.blocker?.decisionRequired ? "yes" : "no");
+      expect(shown["last evidence"], id).toBe(row.summary!.lastEvidenceAt ?? "unrecorded");
+    }
+    // The activity projection itself is what status names as the phase where no readiness override applies.
+    expect(rows.find((r) => r.taskId === "T1")!.activity!.state).toBe(rendered("T1").phase);
+    expect(rows.find((r) => r.taskId === "T3")!.activity!.state).toBe(rendered("T3").phase);
+    expect(rendered("T2").phase).toBe("awaiting merge phase");
+    expect(rendered("T4").phase).not.toBe("awaiting merge phase");
+    expect(rows.find((r) => r.taskId === "T4")!.summary!.phase).not.toBe("awaiting merge phase");
+    // A disagreement fails: perturb one field and the comparison above would have caught it.
+    expect(rendered("T3")["next action"]).toBe("Choose a decision: approve");
+    expect(rows.find((r) => r.taskId === "T3")!.summary!.blocker!.permittedActions).toEqual(["approve"]);
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test("test: recorded identities distinguish two attempts of one task and two concurrent roles on one provider by task attempt and role, so an identity keyed by provider name alone fails", () => {
+    const runId = "run-identity";
+    const ts = PROJECTION_TS;
+    const slot = (role: string, attempt: number) => ({ name: `tickmarkr:${role}:T1:${attempt}:${runId}` });
+    const events: JournalEvent[] = [
+      { ts, event: "run-start", data: { pid: process.pid } },
+      { ts, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "claude-code", model: "opus" }, attempt: 0 } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 0, driver: "herdr", slot: slot("worker", 0) } },
+      { ts, event: "worker-result", taskId: "T1", data: { ok: true, finished: true } },
+      { ts, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "claude-code", model: "opus" }, attempt: 1 } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 1, driver: "herdr", slot: slot("worker", 1) } },
+      { ts, event: "worker-result", taskId: "T1", data: { ok: true, finished: true } },
+      // judge ‖ review, both on the same provider, both attempt 1
+      { ts, event: "gate-phase-start", taskId: "T1", data: { gate: "acceptance", role: "judge", agent: "claude-code", attempt: 1, slot: slot("judge", 1) } },
+      { ts, event: "gate-phase-start", taskId: "T1", data: { gate: "review", role: "review", agent: "claude-code", attempt: 1, slot: slot("review", 1) } },
+    ];
+    const row = rowsOf(runId, events).find((r) => r.taskId === "T1")!;
+    const identities = row.identities!;
+    expect(identities.map((i) => i.key)).toEqual(["T1:0:worker", "T1:1:worker", "T1:1:judge", "T1:1:review"]);
+    expect(new Set(identities.map((i) => i.key)).size).toBe(4);
+    expect(identities.map((i) => i.name)).toEqual([slot("worker", 0).name, slot("worker", 1).name, slot("judge", 1).name, slot("review", 1).name]);
+    // Keyed by provider alone, the four seats collapse into one — that key cannot tell them apart.
+    const byProvider = new Set(events.flatMap((e) => typeof e.data.agent === "string" ? [e.data.agent] : []));
+    expect(byProvider.size).toBe(1);
+    expect(identities.filter((i) => i.attempt === 1 && i.role === "judge")).toHaveLength(1);
+    expect(identities.filter((i) => i.attempt === 1 && i.role === "review")).toHaveLength(1);
+    expect(identities.filter((i) => i.role === "worker").map((i) => i.attempt)).toEqual([0, 1]);
+  });
+
+  test("test: a fixture journal with worker-launch worker-nudge-failed and two hundred operator-page rows and no worker-result derives a suspected-stalled-harvest marker for that attempt carrying the last worker-status the nudge failure time the page count and an unrecorded trailer time, the same journal with a worker-result row of the same attempt derives no marker, and a worker-result of an older attempt retires nothing, so a stalled harvest derived as a healthy worker, a synthesized trailer time, or a marker retired by another attempt's result fails", () => {
+    const runId = "run-stalled";
+    const ts = PROJECTION_TS;
+    const nudgeAt = "2026-09-20T09:00:00.000Z";
+    const slot = "tickmarkr:worker:T1:1:run-stalled";
+    const base: JournalEvent[] = [
+      { ts, event: "run-start", data: { pid: process.pid } },
+      { ts, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "claude-code", model: "opus" }, attempt: 0 } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 0, driver: "herdr", slot: { name: "tickmarkr:worker:T1:0:run-stalled" } } },
+      { ts, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "claude-code", model: "opus" }, attempt: 1 } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 1, driver: "herdr", slot: { name: slot } } },
+      { ts, event: "worker-status", taskId: "T1", data: { slot, status: "working", attempt: 1 } },
+      { ts, event: "worker-status", taskId: "T1", data: { slot, status: "idle", attempt: 1 } },
+      { ts: nudgeAt, event: "worker-nudge-failed", taskId: "T1", data: { slot, attempt: 1, cause: "delivery-refused-or-unconfirmed" } },
+      ...Array.from({ length: 200 }, (_, i) => ({
+        ts: `2026-09-20T09:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}.000Z`,
+        event: "operator-page", taskId: "T1", data: { slot, attempt: 1, status: "idle", suppressed: i >= 3 },
+      })),
+    ];
+    const harvest = (events: readonly JournalEvent[], attempt: number) =>
+      rowsOf(runId, events).find((r) => r.taskId === "T1")!.harvests!.find((h) => h.attempt === attempt)!;
+
+    const stalled = harvest(base, 1);
+    expect(stalled).toEqual({
+      attempt: 1, lastWorkerStatus: "idle", nudgeFailures: 1, lastNudgeFailureAt: nudgeAt, pageCount: 200,
+      suspectedStalledHarvest: true,
+    });
+    expect(stalled.trailerFirstSeenAt).toBeUndefined();
+    expect("trailerFirstSeenAt" in stalled).toBe(false);
+    // The older attempt's own row stays healthy: no nudge failures, no pages, no marker.
+    expect(harvest(base, 0).suspectedStalledHarvest).toBe(false);
+
+    const returned = harvest([...base, { ts, event: "worker-result", taskId: "T1", data: { ok: false, finished: false, attempt: 1 } }], 1);
+    expect(returned.suspectedStalledHarvest).toBe(false);
+    expect(returned.pageCount).toBe(200);
+
+    const olderResult = harvest([...base, { ts, event: "worker-result", taskId: "T1", data: { ok: true, finished: true, attempt: 0 } }], 1);
+    expect(olderResult.suspectedStalledHarvest).toBe(true);
+    expect(olderResult.lastNudgeFailureAt).toBe(nudgeAt);
+
+    // Resume regression: labels reset on resume, so launch(0) → unnumbered result → resume → launch(0)
+    // → nudge failure → page is a stalled SECOND occurrence; the first occurrence's result retires nothing.
+    const resumedSlot = "tickmarkr:worker:T1:0:run-stalled";
+    const resumed = harvest([
+      { ts, event: "run-start", data: { pid: process.pid } },
+      { ts, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "claude-code", model: "opus" }, attempt: 0 } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 0, driver: "herdr", slot: { name: resumedSlot } } },
+      { ts, event: "worker-status", taskId: "T1", data: { slot: resumedSlot, status: "working", attempt: 0 } },
+      { ts, event: "worker-result", taskId: "T1", data: { ok: false, finished: false } },
+      { ts, event: "run-resume", data: { pid: process.pid } },
+      { ts, event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "claude-code", model: "opus" }, attempt: 0 } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 0, driver: "herdr", slot: { name: resumedSlot } } },
+      { ts: nudgeAt, event: "worker-nudge-failed", taskId: "T1", data: { slot: resumedSlot, attempt: 0, cause: "delivery-refused-or-unconfirmed" } },
+      { ts: nudgeAt, event: "operator-page", taskId: "T1", data: { slot: resumedSlot, attempt: 0, status: "idle", suppressed: false } },
+    ], 0);
+    expect(resumed).toEqual({ attempt: 0, nudgeFailures: 1, lastNudgeFailureAt: nudgeAt, pageCount: 1, suspectedStalledHarvest: true });
+
+    // Attempt labels are not chronological across resumes. The board reads the final harvest as
+    // newest, so a resumed attempt 0 must follow an older pre-resume attempt 1 in the projection.
+    const resetEvents: JournalEvent[] = [
+      { ts, event: "run-start", data: { pid: process.pid } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 1, driver: "herdr", slot: { name: slot } } },
+      { ts, event: "worker-result", taskId: "T1", data: { ok: true, finished: true, attempt: 1 } },
+      { ts, event: "run-resume", data: { pid: process.pid } },
+      { ts, event: "worker-launch", taskId: "T1", data: { attempt: 0, driver: "herdr", slot: { name: resumedSlot } } },
+      { ts: nudgeAt, event: "worker-nudge-failed", taskId: "T1", data: { slot: resumedSlot, attempt: 0, cause: "delivery-refused-or-unconfirmed" } },
+      { ts: nudgeAt, event: "operator-page", taskId: "T1", data: { slot: resumedSlot, attempt: 0, status: "idle", suppressed: false } },
+    ];
+    const resetHarvests = rowsOf(runId, resetEvents).find((r) => r.taskId === "T1")!.harvests!;
+    expect(resetHarvests.map((h) => h.attempt)).toEqual([1, 0]);
+    expect(resetHarvests.at(-1)).toMatchObject({ attempt: 0, suspectedStalledHarvest: true });
+  });
+
+  test("test: the decision menu the cockpit offers for every park kind equals the shared projection's permitted actions, so a menu verb the projection refuses fails", () => {
+    const root = mkdtempSync(join(tmpdir(), "tickmarkr-derive-menu-"));
+    const graph = validateGraph({
+      version: 1, spec: { paths: ["fixture.md"], hash: "fixture-menu", source: "native" },
+      tasks: [{ id: "T1", title: "Task T1", goal: "Synthetic", shape: "implement", complexity: 1, deps: [], files: [], acceptance: ["fixture"] }],
+    });
+    const cases: { kind: string; failedGate?: string; reason?: string }[] = [
+      ...PARK_KINDS.map((kind) => ({ kind })),
+      { kind: "gate-fail", failedGate: "review" },
+      { kind: "gate-fail", failedGate: "test" },
+      { kind: "human-gate", reason: "Task T1 — tombstone" },
+    ];
+    let seen = 0;
+    for (const [index, c] of cases.entries()) {
+      const runId = `run-menu-${index}`;
+      const journal = Journal.create(root, runId);
+      journal.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph) });
+      journal.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0 });
+      if (c.failedGate) journal.append("gate-result", "T1", { gate: c.failedGate, pass: false, details: `${c.failedGate} red` });
+      journal.append("task-human", "T1", { kind: c.kind, reason: c.reason ?? `${c.kind} park` });
+      const [decision] = deriveRunDecisions(journal, graph);
+      expect(decision, c.kind).toBeDefined();
+      const raw = readFileSync(join(tickmarkrDir(root), "runs", runId, "journal.jsonl"), "utf8");
+      const row = deriveRunCockpitData({ fileName: `${runId}.journal.jsonl`, raw }, "9.8.7", { isDaemonAlive: () => true }).taskRows.find((r) => r.taskId === "T1")!;
+      const permitted = row.summary!.blocker!.permittedActions;
+      const label = `${c.kind}${c.failedGate ? `/${c.failedGate}` : ""}${c.reason ? " tombstone" : ""}`;
+      expect(decision!.verbs, label).toEqual(permitted);
+      const opened = applyDecisionKey(initialDecisionSession(), { input: "a", key: {} }, decision);
+      expect(opened.session.menu!.verbs, label).toEqual(permitted);
+      for (const verb of DECISION_VERBS) {
+        if (!permitted.includes(verb)) expect(opened.session.menu!.verbs, `${label} refuses ${verb}`).not.toContain(verb);
+      }
+      seen += 1;
+    }
+    expect(seen).toBe(cases.length);
+    rmSync(root, { recursive: true, force: true });
   });
 });

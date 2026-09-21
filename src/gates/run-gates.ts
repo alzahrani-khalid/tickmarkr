@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { CommandReceiptAttribution, ShellReceipt } from "../run/protocol.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { loadavg, tmpdir } from "node:os";
 import { join, posix } from "node:path";
@@ -154,9 +156,10 @@ export type GateEvent =
   // without inferring it from wall-clock. Deterministic gates carry no parent: they are the sequence.
   | { phase: "start"; gate: GateName; index: number; total: number; parentAt?: number }
   | { phase: "end"; gate: GateName; result: GateResult }
-  | { phase: "note"; gate: GateName; name: string; payload: Record<string, unknown>; result: GateResult };
+  | { phase: "note"; gate: GateName; name: string; payload: Record<string, unknown>; result?: GateResult };
 
 export interface GateContext {
+  buildReceiptIdentity?: Omit<CommandReceiptAttribution, "invocation">;
   authorizeInfraRetry?: (subject: string, cause?: VerificationRetryCause) => boolean;
   verificationScope?: VerificationScope;
   worktree: string;
@@ -177,6 +180,9 @@ export interface GateContext {
   demotedReviewers?: Set<string>;
   // OBS-1025 add.2: run-scoped no-verdict causes per reviewer seat; a seat at two leaves the rotation for the run.
   reviewNoVerdicts?: Map<string, string[]>;
+  // OBS-1055: this round is an operator recheck — it re-MEASURES, so a cached RED verdict is discarded
+  // and the gate re-runs (a cached green is not what the recheck questions and may replay).
+  recheck?: boolean;
   // OBS-1033: channel keys of the seats that authored the carried commits (the task's tried list) —
   // a reviewer of that vendor is excluded for the round, never handed its own work to approve.
   carriedAuthors?: readonly string[];
@@ -372,6 +378,39 @@ export async function runGates(
   ctx: GateContext,
 ): Promise<{ results: GateResult[]; commits: string[] }> {
   const results: GateResult[] = [];
+  // Receipt identity belongs to this round, never to a cached verdict. Each call from the shell
+  // allocates a new invocation, including retries whose local spawn counter starts at one again.
+  let currentBuild: CommandReceiptAttribution | undefined;
+  let buildStarted = false;
+  let receiptNotes = Promise.resolve();
+  const beginBuild = (): CommandReceiptAttribution => {
+    buildStarted = false;
+    currentBuild = { ...(ctx.buildReceiptIdentity ?? {
+      runId: ctx.artifactDir ?? "standalone", taskId: task.id, attempt: 0, gateRound: 0,
+    }), invocation: randomUUID() };
+    return { ...currentBuild };
+  };
+  const buildReceipt = (receipt: ShellReceipt, reason?: string): void => {
+    const matches = currentBuild !== undefined && receipt.attribution !== undefined
+      && (Object.keys(currentBuild) as Array<keyof CommandReceiptAttribution>)
+        .every((key) => receipt.attribution![key] === currentBuild![key]);
+    const attributed = matches && (receipt.outcome === "started" || !receipt.confirmedStart || buildStarted);
+    if (attributed) buildStarted = receipt.outcome === "started";
+    const { attribution, ...observation } = receipt;
+    const payload = attributed ? { ...receipt, gate: "build", ...(reason ? { reason, freshBuildRan: false } : {}) } : {
+      ...observation, gate: "build", attributionStatus: "unattributed",
+      reportedAttribution: attribution,
+    };
+    // Shell observers are synchronous. Serialize asynchronous note sinks and drain before the
+    // verdict (also on cancellation), without letting an observer change execution or retry policy.
+    receiptNotes = receiptNotes.then(async () => {
+      await ctx.onGate?.({ phase: "note", gate: "build", name: "build-receipt", payload });
+    }).catch(() => {});
+  };
+  const noBuild = async (outcome: "reused-result" | "skipped" | "refused", reason: string) => {
+    buildReceipt({ outcome, confirmedStart: false, attribution: beginBuild() }, reason);
+    await receiptNotes;
+  };
   let selectionDecision: Record<string, unknown> | undefined;
   let commits: string[] = [];
   const stateDir = ctx.stateDir ?? resolveStateDir(ctx.worktree, ctx.artifactDir);
@@ -387,6 +426,13 @@ export async function runGates(
   // the fresh verdict's (see formatReusedRow).
   const noteReuse = (gate: GateName, r: GateResult, id: VerificationIdentity) =>
     ctx.onGate?.({ phase: "note", gate, name: "gate-reused-verdict", payload: { gate, pass: r.pass, details: r.meta?.reusedDetails, ...reusedIdentity(id) }, result: r });
+  // OBS-1055: on a recheck a cached red is the answer the operator just said was wrongly given; it is
+  // journaled as discarded and the gate runs. Returns true when the hit must NOT be reused.
+  const discardCachedRed = async (gate: GateName, hit: GateResult): Promise<boolean> => {
+    if (!ctx.recheck || hit.pass) return false;
+    await ctx.onGate?.({ phase: "note", gate, name: "recheck-rerun", payload: { gate, reason: "cached-red-discarded" }, result: hit });
+    return true;
+  };
   const shapeGates = ctx.cfg.gates.byShape?.[task.shape];
   const enabled = (g: GateName) =>
     task.gates.includes(g) && (g !== "acceptance" && g !== "review" || shapeGates?.[g] !== false);
@@ -722,20 +768,25 @@ export async function runGates(
         });
         const hit = verdictStore.get(identity);
         if (hit) classifySignalOnlyTest(hit); // Older entries predate classification at the write seam.
-        if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")) {
+        if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
+            && !(await discardCachedRed(g, hit))) {
           r = formatReusedRow(hit, identity);
           cached = true;
+          if (g === "build") await noBuild("reused-result", "verdict reused; no fresh build ran in this invocation");
           await noteReuse(g, r, identity);
         }
       }
       if (!r) {
-        // VL-1: a detected vitest test command is judged by its own invocation-bound report — the
-        // stdout-count/file-count path (compareToBaseline's fileCountDeficit) never runs for it. Any
-        // other scripted test command keeps today's exit-code contract byte-identically.
-        const useManifest = g === "test" && commands.test !== undefined && isVitestTestCommand(commands.test, ctx.worktree);
-        r = useManifest
-          ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir, retryOptions(identity)))
-          : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], { ...retryOptions(identity), ...(g === "test" && selected ? { selected } : {}) })))[0];
+        if (g === "build" && !cmd) await noBuild("skipped", "no build command detected");
+        try {
+          // VL-1: a detected vitest test command is judged by its own invocation-bound report — the
+          // stdout-count/file-count path (compareToBaseline's fileCountDeficit) never runs for it. Any
+          // other scripted test command keeps today's exit-code contract byte-identically.
+          const useManifest = g === "test" && commands.test !== undefined && isVitestTestCommand(commands.test, ctx.worktree);
+          r = useManifest
+            ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir, retryOptions(identity)))
+            : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], { ...retryOptions(identity), ...(g === "build" ? { onReceipt: buildReceipt, taskBuildAttribution: beginBuild } : {}), ...(g === "test" && selected ? { selected } : {}) })))[0];
+        } finally { await receiptNotes; }
       }
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
       if (g === "test" && selected) selectedDurationMs = spans.get("test")?.durationMs ?? 0;
@@ -1073,6 +1124,7 @@ export async function runGates(
   if (entryDirt) {
     addMeasurement(sequence[0]!, entryMeasurement);
     await emitStart(sequence[0]!);
+    if (enabled("build")) await noBuild("refused", "dirty worktree; no build start confirmed");
     await record(await dirtyRefusal(sequence[0]!, entryDirt));
     return done();
   }
@@ -1172,7 +1224,8 @@ export async function runGates(
       });
       const hit = verdictStore.get(identity);
       if (hit) classifySignalOnlyTest(hit);
-      if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")) {
+      if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
+          && !(await discardCachedRed("test", hit))) {
         full = formatReusedRow(hit, identity);
         cached = true;
         await noteReuse("test", full, identity);

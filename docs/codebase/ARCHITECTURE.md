@@ -378,3 +378,11 @@ instead of introducing another help skill or independent instructions.
 ---
 
 *Cockpit and gate execution checked against source: 2026-09-07; other subsystem analysis retains its earlier scope.*
+
+## Operator evidence projections
+
+Tracking is limited to **registered run evidence**, not arbitrary agents or machine-wide process discovery. `src/run/protocol.ts` defines command receipt attribution and outcomes; `src/run/journal.ts` preserves physical source identities. `src/run/activity.ts` (`projectActivity`) folds recorded phases and build receipts without predicting the next phase or inferring liveness from silence. `src/run/operator-summary.ts` (`projectOperatorSummary`) derives blockers, recorded responsibility and next actions using a caller-supplied production decision snapshot. `src/run/operator-page-summary.ts` (`foldOperatorPages`) groups equivalent notification rows while retaining every source line, first/last evidence and distinct observed/suppressed counts.
+
+`src/tui/cockpit/run-view.tsx` renders each task's recorded role/agent, phase, build evidence, blocker and next action with journal references. Recorded agent evidence is reached through Run (`4`) source `#L` references and Evidence (`5`), where ↑/↓ select raw rows and Enter opens the evidence. `src/tui/cockpit/evidence-view.tsx` keeps RAW JOURNAL alongside OPERATOR PAGE GROUPS and complete selected details/artifact locations. Missing identity stays unknown; a recorded pane is unavailable for navigation until host verification exists. Reading these views does not operate terminals.
+
+[Operator progress](../operator-progress.md) walks through the phase, build and decision contracts. Both documents are repo-only **HYGIENE** (`docs/` is not shipped in `package.json` files[]). The **SHIP condition** is a consumer request, at which point the walkthrough moves into the `tickmarkr init` guidance block. Deferred work includes global agent discovery, verified host pane navigation and terminal control, Fleet/Bootstrap and Plan/Health follow-ons, and the TypeSafe prescreen ledger deferral; this projection work does not implement them.

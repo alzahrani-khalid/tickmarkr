@@ -99,6 +99,12 @@ export function onDiskSpecHash(_repoRoot: string, graph: RunGraph): OnDiskSpecHa
 // single comparator in journal.ts (engagementComparable) so the journal↔graph join is decided once.
 // ponytail: sha256 truncated to 16 hex — stable, grep-friendly; promote to full digest only if a
 // collision ever bites (engagement ids are not a trust boundary, collisions just force a re-run).
+/** A task's definition minus its files[] (and run state): what a scope amendment must NOT move (OBS-1073). */
+export function taskDefinitionFingerprint(task: Task): string {
+  const { status: _status, evidence: _evidence, files: _files, ...def } = task;
+  return createHash("sha256").update(JSON.stringify(def)).digest("hex").slice(0, 16);
+}
+
 export function graphDefinitionHash(g: RunGraph): string {
   const definitions = g.tasks.map(({ status: _status, evidence: _evidence, ...def }) => def);
   return createHash("sha256").update(JSON.stringify({ version: g.version, spec: g.spec, tasks: definitions })).digest("hex").slice(0, 16);

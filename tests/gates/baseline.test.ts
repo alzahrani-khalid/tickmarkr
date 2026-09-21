@@ -4,7 +4,7 @@ import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, classifyFailureOutput, compareToBaseline, detectGateCommands, detectPackageManager, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../../src/route/router.js";
-import { DEFAULT_SHELL_TIMEOUT_MS, sh, type ShResult } from "../../src/run/git.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, sh, type ShellOptions, type ShResult } from "../../src/run/git.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 // The ceiling a battery runs under is an ARGUMENT to the shell, and an argument is only observable at
@@ -21,10 +21,10 @@ vi.mock("../../src/run/git.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/run/git.js")>();
   return {
     ...actual,
-    sh: (cmd: string, cwd: string, timeoutMs?: number) => {
+    sh: (cmd: string, cwd: string, timeoutMs?: number, options?: ShellOptions) => {
       shSpy.calls.push({ cmd, timeoutMs });
       const stubbed = shSpy.stub?.(cmd);
-      return stubbed ? Promise.resolve(stubbed) : actual.sh(cmd, cwd, timeoutMs);
+      return stubbed ? Promise.resolve(stubbed) : actual.sh(cmd, cwd, timeoutMs, options);
     },
   };
 });
@@ -904,3 +904,24 @@ test("baseline capture stores the measured suite duration and a later battery us
   expect(effectiveCeilingMs({ durationMs: 1_000 })).toBe(600_000);
   expect(effectiveCeilingMs(undefined)).toBe(600_000);
 }, 30_000);
+
+test("test: the baseline comparison attaches the caller's task-build attribution to the build command's receipts only, while the baseline capture and the lint and test commands of the same round emit receipts with no task-build attribution, so a capture or a non-build command that masquerades as the task's build fails", async () => {
+  type Receipt = import("../../src/run/protocol.js").ShellReceipt;
+  const receipts: Receipt[] = [];
+  const attribution = { runId: "run-build", taskId: "T3", attempt: 1, gateRound: 2, invocation: "build-invocation" };
+  const taskBuildAttribution = vi.fn(() => attribution);
+  const options = { taskBuildAttribution, onReceipt: (r: Receipt) => receipts.push(r) };
+  // Identical command strings cannot be used to infer task-build attribution.
+  const commands = { build: "exit 0", lint: "exit 0", test: "exit 0" };
+  shSpy.stub = undefined;
+  const baseline = await captureBaseline("/tmp", commands, options);
+  expect(receipts.map((r) => r.outcome)).toEqual(["started", "completed", "started", "completed", "started", "completed"]);
+  expect(receipts.every((r) => r.attribution === undefined)).toBe(true);
+  expect(taskBuildAttribution).not.toHaveBeenCalled();
+  receipts.length = 0;
+  const results = await compareToBaseline("/tmp", commands, baseline, ["lint", "build", "test"], options);
+  expect(results.every((r) => r.pass)).toBe(true);
+  expect(receipts.map((r) => r.outcome)).toEqual(["started", "completed", "started", "completed", "started", "completed"]);
+  expect(receipts.map((r) => r.attribution)).toEqual([undefined, undefined, attribution, attribution, undefined, undefined]);
+  expect(taskBuildAttribution.mock.calls).toEqual([[1]]);
+});

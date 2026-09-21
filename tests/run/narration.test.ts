@@ -74,10 +74,20 @@ describe("narration side-channel (fake adapter, zero tokens)", () => {
       // reason the ts mask exists. Presence and shape of that measurement are pinned over all seven
       // gates in tests/run/gate-telemetry.test.ts; what THIS oracle asserts is that narration does
       // not add, drop, reorder, or alter events, and a number the host clock chose cannot answer that.
-      const maskTs = (s: string) => s
+      const maskTs = (s: string) => {
+        // UUIDs differ between runs. Preserve their equality relationships so a mismatched
+        // terminal or an invocation reused across rounds still changes the comparison.
+        const invocations = new Map<string, number>();
+        return s
+        .replace(/"invocation":"([^"]*)"/g, (_match, invocation: string) => {
+          expect(invocation).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+          if (!invocations.has(invocation)) invocations.set(invocation, invocations.size);
+          return `"invocation":"INVOCATION-${invocations.get(invocation)}"`;
+        })
         .replace(/"ts":"[^"]*"/g, '"ts":"X"')
         .replace(/"processGroup":\d+/g, '"processGroup":"PGID"')
         .replace(/"(durationMs|selectedDurationMs|fullDurationMs|load1Start|load1End|load1Max|load1Mean)":-?[\d.e+-]+/g, '"$1":"X"');
+      };
       const onFile = maskTs(readFileSync(join(tickmarkrDir(on.repo), "runs", "run-byte", "journal.jsonl"), "utf8").split(on.repo).join("<repo>"));
       const offFile = maskTs(readFileSync(join(tickmarkrDir(off.repo), "runs", "run-byte", "journal.jsonl"), "utf8").split(off.repo).join("<repo>"));
       expect(onFile).toBe(offFile); // byte-identical except the unavoidable clock

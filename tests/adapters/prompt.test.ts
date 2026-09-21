@@ -128,10 +128,21 @@ describe("parseWorkerResult v1.2 hardening (interactive transcripts)", () => {
     expect(r.summary).toBe("final");
   });
 
-  test("template echo alone fails closed", () => {
+  // OBS-1062: the echoed template is the brief on screen, not the worker speaking — it fails
+  // closed as NO trailer (the daemon's poll loop breaks on the unparseable sentinel and would
+  // otherwise reap every interactive worker at its first poll).
+  test("template echo alone fails closed as no trailer, never as an unparseable one", () => {
     const r = parseWorkerResult(`prompt says:\n${TEMPLATE}\n`, N);
     expect(r.ok).toBe(false);
-    expect(r.summary).toBe("unparseable TICKMARKR_RESULT trailer");
+    expect(r.summary).toBe("worker produced no TICKMARKR_RESULT trailer");
+    expect(r.cause).toBe("no-verdict");
+    // a real token followed by garbage is still the worker speaking badly
+    expect(parseWorkerResult(`${TEMPLATE}\nTICKMARKR_RESULT_${N} {"ok":fals`, N).summary).toBe("unparseable TICKMARKR_RESULT trailer");
+    // reversed order (review finding): a malformed worker token BEFORE a later template redraw is
+    // still the worker speaking badly — the echo filter is bounded to its own occurrence
+    const reversed = parseWorkerResult(`TICKMARKR_RESULT_${N} garbage\n${TEMPLATE}`, N);
+    expect(reversed.summary).toBe("unparseable TICKMARKR_RESULT trailer");
+    expect(reversed.cause).not.toBe("no-verdict");
   });
 
   // v1.5 pi live check (2026-07-10, pi 0.80.3): pi renders NON-BLOCKING update banners in its
@@ -161,6 +172,7 @@ describe("parseWorkerResult v1.2 hardening (interactive transcripts)", () => {
   test("hard-wrapped template echo still fails closed; later wrapped real trailer wins", () => {
     const wrappedTemplate = `  TICKMARKR_RESULT_${N} {"ok":true|false,"su\n  mmary":"<one sentence>","deviation\n  s":["<path or reason>"]}`;
     expect(parseWorkerResult(`${wrappedTemplate}\n`, N).ok).toBe(false);
+    expect(parseWorkerResult(`${wrappedTemplate}\n`, N).summary).toBe("worker produced no TICKMARKR_RESULT trailer");
     const r = parseWorkerResult(`${wrappedTemplate}\nwork\n  TICKMARKR_RESULT_${N} {"ok":false,"summary\n  ":"tests failing"}\n`, N);
     expect(r.ok).toBe(false);
     expect(r.summary).toContain("tests failing");

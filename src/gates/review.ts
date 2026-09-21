@@ -254,7 +254,10 @@ export function matchClosureId(candidate: unknown, fingerprint: string): boolean
 export function matchClosureId(candidate: unknown, fingerprints: Iterable<string>): string | undefined;
 export function matchClosureId(candidate: unknown, target: string | Iterable<string>): boolean | string | undefined {
   if (typeof candidate !== "string") return typeof target === "string" ? false : undefined;
-  const normCandidate = candidate.replace(/\s+/g, "");
+  // OBS-1068: the brief's copy block printed each id as `Fingerprint: <id>` and told the seat to copy
+  // it EXACTLY — three faithful approvals in one run were discarded as closure-mismatch. A leading
+  // `Fingerprint:` label is the brief's own wording, never the reviewer's id; strip it before comparing.
+  const normCandidate = candidate.replace(/^\s*fingerprint\s*:\s*/i, "").replace(/\s+/g, "");
   if (typeof target === "string") {
     return normCandidate === target.replace(/\s+/g, "");
   }
@@ -607,6 +610,13 @@ export async function reviewGate(
   if (capFail) return capFail;
   const nonce = generateVerdictNonce();
   const repoRoot = daemonRepoRoot(worktree, artifactDir);
+  // OBS-880 add.1: guidance only. Do not expand scope globs into permission to run suites.
+  const ownTestFiles = [...new Set(task.files.filter((file) =>
+    !/[*?[\]{}()!]/.test(file) && /(?:^|\/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file),
+  ))];
+  const suiteBudget = ownTestFiles.length
+    ? `You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: ${ownTestFiles.map((file) => `\`${file}\``).join(", ")}.`
+    : "No suite may be run: files[] names no explicit test file owned by this task.";
   const prompt = `TICKMARKR-REVIEW
 You are a skeptical cross-vendor code reviewer. Another agent (vendor: ${author.adapter}) authored this diff.
 Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
@@ -619,6 +629,9 @@ ${renderGoalSection(task.goal, repoRoot)}
 ${task.acceptance.map((a) => `- ${renderAcceptanceItem(a)}`).join("\n")}
 
 ${renderDeclaredWriteScope(task.files)}
+
+## Reviewer suite budget
+${suiteBudget} Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.
 
 ${priorMaterials.length ? `${renderPriorMaterials(priorMaterials)}
 

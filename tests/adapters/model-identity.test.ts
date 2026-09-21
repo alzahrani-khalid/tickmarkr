@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
+import { quietGitInit } from "../helpers/tmprepo.js";
 import {
   type Assignment,
   type AuthHealth,
@@ -21,7 +22,7 @@ import { tickmarkrDir } from "../../src/graph/graph.js";
 function repoWithOverlay(yaml: string): { repo: string; globalDir: string } {
   const repo = mkdtempSync(join(tmpdir(), "tickmarkr-id-repo-"));
   const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-id-global-"));
-  execSync("git init -b main -q", { cwd: repo, stdio: "ignore" });
+  quietGitInit(repo);
   execSync("git config user.name test", { cwd: repo, stdio: "ignore" });
   execSync("git config user.email test@example.com", { cwd: repo, stdio: "ignore" });
   writeFileSync(join(repo, "keep.txt"), "x\n");

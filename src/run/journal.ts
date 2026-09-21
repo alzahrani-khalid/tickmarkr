@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { channelKey, shq, TokenUsageSchema, type Assignment } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
-import { graphDefinitionHash, stateDirName, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
+import { graphDefinitionHash, stateDirName, taskContentDigest, taskDefinitionFingerprint, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, TIERS, type GateName, type RunGraph, type Task, type TaskStatus } from "../graph/schema.js";
 import { channelRouteIdentity } from "../route/preference.js";
 import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
@@ -762,14 +762,21 @@ function decisionForNextDispatch(events: JournalEvent[], taskId: string, event: 
  * `task-dispatch`: everything between the two — worktree recreation, setup, prompt write, slot
  * allocation, the launch itself — can still die with no worker having read a word, and clearing at
  * task-dispatch meant `--retry-failed` after exactly that death rebuilt the prompt without the gate
- * failures OR the delivery failure that preceded it. `task-approved` also clears (an operator approval
- * retires the findings it settled — the uphold case re-derives its own brief separately).
+ * failures OR the delivery failure that preceded it. Of the approvals, only a WAIVE clears (the operator
+ * retired the findings by fiat — the uphold case re-derives its own brief separately). OBS-1074: a
+ * plain approve, a scope grant or a recheck re-funds an attempt that must still see why the last one
+ * parked, plus the operator's stated reason — v2.5.7's T11 looped four times on one hygiene oracle
+ * because every approval erased exactly the finding the fresh attempt was funded to fix.
  */
 export function journaledFailureBrief(events: JournalEvent[], taskId: string): string[] {
   let rows: string[] = [];
   for (const e of events) {
     if (e.taskId !== taskId) continue;
-    if (e.event === "worker-launch" || e.event === "task-approved") rows = [];
+    if (e.event === "worker-launch") rows = [];
+    else if (e.event === "task-approved") {
+      if (e.data.release === GATE_SATISFIED_RELEASE) rows = [];
+      else if (typeof e.data.reason === "string" && e.data.reason.trim()) rows.push(`approval: ${e.data.reason.trim()}`);
+    }
     else if (e.event === "gate-result" && e.data.pass === false && e.data.skipped !== true
              && typeof e.data.details === "string") rows.push(`${e.data.gate}: ${e.data.details}`);
     else if (e.event === "delivery-readiness-failed" && typeof e.data.transcript === "string") {
@@ -1108,13 +1115,39 @@ export function recordedGraphDefinitionHash(events: JournalEvent[]): string | un
   return recorded ?? undefined;
 }
 
+/**
+ * OBS-1073 residual: the `--graph-changed` release belongs to the ENGAGEMENT, not to the launch call. The
+ * daemon writes it on the run-resume row; every replay that runs inside that engagement from another
+ * process (the approve CLI) reads it back here. Without it the first in-run approval after a released
+ * launch re-ran the whole-graph asserts the launch had waived and killed the daemon (v2.5.7 run …152220).
+ */
+export function engagementReleased(events: JournalEvent[]): boolean {
+  const engagement = events.filter((e) => e.event === "run-start" || e.event === "run-resume").at(-1);
+  return engagement?.data.graphChanged === true;
+}
+
+/** The run's own graph.json (copied by the daemon at every start/resume) — the definitions the last engagement ran on. */
+function snapshotDefinitions(journal: Journal): Map<string, string> {
+  const path = join(journal.dir, "graph.json");
+  if (!existsSync(path)) return new Map();
+  const snapshot = JSON.parse(readFileSync(path, "utf8")) as { tasks?: Task[] };
+  return new Map((snapshot.tasks ?? []).map((t) => [t.id, taskDefinitionFingerprint(t)]));
+}
+
 /** An approval is the durable authority; graph.json is only its materialized projection. */
 export const ScopeAmendmentSchema = z.object({
   from: z.string(), to: z.string(), beforeFiles: z.array(z.string()), files: z.array(z.string()),
   parkLine: z.number().int().positive(),
+  /** OBS-1073: the amended task's definition minus files[] at approval; absent on rows older than v2.5.7. */
+  definition: z.string().optional(),
 });
 
-export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[]): RunGraph {
+/**
+ * `release` is the operator's audited `--graph-changed`. `approvedDefinitions` supplies, per amended task,
+ * the definition fingerprint the amendment was granted against when the row itself carries none (rows
+ * older than v2.5.7): the caller reads it from the run's materialized graph snapshot.
+ */
+export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], release = false, approvedDefinitions: ReadonlyMap<string, string> = new Map()): RunGraph {
   const amendments = events.filter((e) => e.event === "task-approved" && e.data.release === "scope-request")
     .map((event) => ({ event, amendment: ScopeAmendmentSchema.parse(event.data.amendment) }));
   if (!amendments.length) return graph;
@@ -1132,20 +1165,37 @@ export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[]): 
     }
     result = { ...result, tasks: result.tasks.map((t) => t.id === id ? { ...t, files: original } : t) };
   }
+  // OBS-1073: `from`/`to` bind the WHOLE graph, so a later spec repair of ANOTHER task (a pin-sweep miss
+  // found mid-run, D-57) makes them unmatchable forever and `--graph-changed` — applied only after this
+  // replay — never reaches its own release. Under that audited release the amended task's files[]
+  // recognition above still holds and the caller journals the rehash; only the whole-graph identity
+  // asserts are waived. Without the release nothing changes: fail closed.
   for (const { event, amendment } of amendments) {
-    if (graphDefinitionHash(result) !== amendment.from) {
+    if (release) {
+      // The release waives the WHOLE-GRAPH identity (another task may lawfully have moved), never the
+      // amended task's own definition: goal, acceptance, deps, floor must still be what was approved.
+      const approved = amendment.definition ?? approvedDefinitions.get(event.taskId ?? "");
+      const current = result.tasks.find((t) => t.id === event.taskId);
+      if (approved === undefined || current === undefined) {
+        throw new Error(`refusing scope amendment replay under --graph-changed: no approved definition fingerprint for ${event.taskId}`);
+      }
+      if (taskDefinitionFingerprint(current) !== approved) {
+        throw new Error(`refusing scope amendment replay: ${event.taskId} definition changed beyond the approved amendment (goal, acceptance, deps or routing)`);
+      }
+    }
+    if (!release && graphDefinitionHash(result) !== amendment.from) {
       throw new Error(`refusing scope amendment replay: graph task definition changed beyond approval for ${event.taskId}`);
     }
     result = { ...result, tasks: result.tasks.map((t) => t.id === event.taskId ? { ...t, files: amendment.files } : t) };
-    if (graphDefinitionHash(result) !== amendment.to) throw new Error("refusing invalid scope amendment hash");
+    if (!release && graphDefinitionHash(result) !== amendment.to) throw new Error("refusing invalid scope amendment hash");
   }
   return result;
 }
 
 /** Publish/recover the audit before dispatch, even after a crash between approval and rehash. */
-export function applyScopeAmendments(graph: RunGraph, journal: Journal, auditReplay = false): RunGraph {
+export function applyScopeAmendments(graph: RunGraph, journal: Journal, auditReplay = false, release = false): RunGraph {
   const events = journal.read();
-  const result = replayScopeAmendments(graph, events); // validate all before moving any identity
+  const result = replayScopeAmendments(graph, events, release, release ? snapshotDefinitions(journal) : new Map()); // validate all before moving any identity
   const approvals = events.filter((e) => e.event === "task-approved" && e.data.release === "scope-request");
   for (const approval of approvals) {
     const amendment = ScopeAmendmentSchema.parse(approval.data.amendment);

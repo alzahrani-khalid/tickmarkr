@@ -139,7 +139,7 @@ through brief lineage. **An executor choice nobody made is still an executor cho
      fraction (`ORCH · v1.19 4/5`, updated on every task-done); tickmarkr opens ONE TAB PER TASK, labelled
      with the task id and holding that task's worker plus its judge/review/consult panes (tickmarkr
      updates it). Never long context strings or ✓-chains.
-   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill and do not map a Herdr workspace. Work from the current Orca terminal context. Keep the overseer in the launching terminal and inspect terminals with `orca terminal list --json`. The daemon self-places the watch board as a horizontal split of the launching terminal (`ORCA_TERMINAL_HANDLE`).
+   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill and do not map a Herdr workspace. Work from the current Orca terminal context. Keep the overseer in the launching terminal, name it in the same act — `orca terminal rename --terminal "$ORCA_TERMINAL_HANDLE" --title "OVERSEER · <version>"` (tab title; see the seat-name law under Seat-spawn recipes) — and inspect terminals with `orca terminal list --json`. The daemon self-places the watch board as a horizontal split of the launching terminal (`ORCA_TERMINAL_HANDLE`).
 2. **Orchestrator**: Launch the orchestrator with your agent host.
    - **On herdr (`HERDR_ENV=1`)**: Spawning on current herdr is two-step — the one-shot `agent start --cwd` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138): first create the pane with `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <version>"` and parse `result.root_pane.pane_id` from its JSON, then start the agent in it. For Claude Code, use `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions` (append `--model <m>` after the `--` if the operator has a policy). For Codex, use `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` (add `--model <m>` to specify a model). The unsandboxed flag is REQUIRED: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation — do not downgrade it. Workers you never spawn — tickmarkr spawns its own visible worker panes. Auxiliary agents you do spawn (consultants, reviewers, scouts) follow the same forms: never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions --settings '{"promptSuggestionEnabled":false}'`. **For a codex consultant, use `-a never --sandbox workspace-write` — NOT `--sandbox read-only`.** ⚠ **`--sandbox read-only` CONTRADICTS this skill's own completion protocol and will hang the seat.** Every seat you spawn is told to deliver an ARTIFACT ending in a terminal MARKER, because that is the only completion signal the artifact watcher can key on (`done` is turn end). A read-only sandbox cannot write that artifact, so codex blocks on `Would you like to make the following edits?` for its OWN report — and the report exists ONLY in the pending edit, so abandoning the prompt destroys the work rather than merely delaying it. Measured 2026-08-28: a consultant spawned `--sandbox read-only` finished a 14,604-byte verdict, sat blocked on the write, and the operator saw the prompt before the supervising tier did. `read-only` is correct ONLY for a seat that writes nothing at all — which, under the artifact+marker rule, is no seat this skill tells you to spawn. When the prompt does appear, answer **"Yes, and don't ask again for these files"** rather than plain yes: plain yes re-blocks on the next write of the same file. **That `--settings` pair is not cosmetic and it is not optional:** claude-code's AUTOSUGGEST renders context-plausible ghost text into an idle seat's prompt line that is BYTE-IDENTICAL to a typed draft in text-format reads (OBS-482), so a supervising tier cannot tell a seat's own unsent work from a rendering artifact without `agent read --format ansi`. Turning the suggester off at spawn removes the ambiguity at its source instead of paying for the discrimination at every read. Verified against the shipped binary: `claude --settings '{"promptSuggestionEnabled":false}' -p …` exits 0 with a real response, and the key appears in the binary's own settings schema. **For kimi, pass `-y`** (`herdr agent start <name> --kind kimi --pane <id> -- -y`) — the adapter already launches its own workers that way (`src/adapters/kimi.ts:204`), and a kimi seat spawned without it sits on an approval prompt having done nothing. **Herdr cannot see that state**: it reports a kimi pane as `agent_status: working` with `screen_detection_skipped: true` while the prompt is up, so the BLOCKED-STATE watcher below is blind on this vendor and the spawn flag is the ONLY control. Every vendor you spawn needs its auto-approve form named here; a vendor absent from this list is a seat that will hang.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Seats spawn with `orca terminal create` on a path worktree selector with a command:
@@ -176,6 +176,12 @@ through brief lineage. **An executor choice nobody made is still an executor cho
 - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Re-list terminals, re-read the
   recorded terminal handles and evidence files, and re-arm only file/journal watchers. Do not use a Herdr
   pane id, `agent start`, `pane run`, tab canon, or a name-keyed Herdr watcher on an Orca launch.
+  **Handles do not survive an Orca restart (OBS-1050, three gates lost to it in v2.5.6).** The restart
+  re-issues every terminal handle; a recorded one answers `terminal_handle_stale` and any watcher or gate
+  keyed to it is already dead. So: record every seat's handle in `pids/<seat>.handle` beside its title at
+  spawn; on `terminal_handle_stale`, re-list terminals and re-resolve the seat by TITLE, then rewrite the
+  handle file; and treat a stale handle as a dead seat until the read-back of the new handle proves
+  otherwise — a gate that was running in that seat has to be re-launched, never assumed to continue.
   When briefing a seat on either host, take its current address from the handoff file; never hardcode a pane id
   or terminal handle in a brief or command template.
 
@@ -199,7 +205,45 @@ Inventories retain the **full suite log**, not a tail or summary, and no one run
 - **On herdr (`HERDR_ENV=1`)**: Every mission to a Claude or Grok seat is delivered only with `herdr pane run <pane> "<message>"` and
   verified by reading the pane back; never use `agent prompt` for mission delivery. Launch a Grok seat with
   `herdr agent start <seat> --kind grok --pane <pane> -- -m grok-4.6`.
-- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Seats spawn with `orca terminal create --worktree path:<repo> --command "<cmd>" --json`. Brief delivery travels as a file announced by `orca terminal send --terminal <handle> --text "<announcement>" --enter --wait-submit 15 --json`. Read `result.send.prompt.stages` and treat the brief as delivered only when a `turn_started` stage is present; `accepted: true` proves input acceptance, not a started turn; never resend on `accepted` alone.
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Seats spawn with `orca terminal create --worktree path:<repo> --command "<cmd>" --json`.
+  **`--worktree path:` resolves only an Orca-MANAGED worktree** (`orca worktree list`); on any other checkout —
+  a `git worktree add` the overseer made for a spec branch, a throwaway clone — `terminal create` hangs and
+  returns "Timed out waiting for terminal handle after creation". The lawful form for such a checkout is a
+  terminal in a managed worktree with a cwd change in the command:
+  `orca terminal create --worktree path:<managed-repo> --title "ORCH · <version>" --command "cd <checkout> && <agent-cmd>" --json`.
+  **An Orca-hosted run's checkout is created by Orca** (`orca worktree create --repo id:<repo> --base-branch <spec-branch>`),
+  never by `git worktree add`: the orca driver asks `orca worktree current` from inside every task worktree and refuses
+  (`selector_not_found`) on an unmanaged checkout — every task fails pre-launch and the board cannot place (OBS-1061,
+  one abandoned run). **The overseer sits in the RUN's workspace**, in its own tab beside the orchestrator's, so the
+  run's card shows its supervision; records may live on another branch and are committed there by path.
+  **The orchestrator NEVER shares the overseer's tab.** Never spawn it with `orca terminal split` off the
+  overseer's own handle, even as a fallback: the daemon self-places its live board as a split of the
+  LAUNCHING terminal, so an orchestrator in the overseer's tab drags the board and every worker pane
+  into it (measured 2026-09-20: `terminal create` timed out on an unmanaged spec worktree, the overseer
+  split instead, and the run had to be re-seated before GO). Before delivering the brief, prove the seat
+  is in its own tab: `orca terminal list --json`, the new handle's `tabId` must differ from the
+  overseer's; if it does not, close the seat and create it again the lawful way. `split` is for seats
+  that BELONG beside another seat (consultant pairs, a reviewer beside its surgeon), never for the
+  orchestrator or a gate seat.
+  **Seat names on Orca are TAB titles, and a tab title HOLDS; the pane title is the agent's and drifts.**
+  Orca keeps two titles per seat. The TAB title is owned: `orca terminal create --title` and
+  `orca terminal rename --terminal <handle> --title "<seat>"` set it, and nothing a process writes to
+  its pty changes it — measured 2026-09-20 (OBS-1063) on a scratch terminal writing an OSC title every
+  2 s: the PANE title flipped to the OSC text within 8 s, the TAB title stayed, and the operator's tab
+  strip renders the TAB title. The pane title is whatever the process last wrote (oh-my-zsh, Claude
+  Code's turn summary, Codex's last prompt) and is NOT the seat's name. This is vendor-neutral by
+  construction — no per-vendor env var, no agent command, no launch-form ritual — which is what makes
+  it the same law as Herdr's tab label. So: **the overseer names its OWN seat at Setup 1** with
+  `orca terminal rename --terminal "$ORCA_TERMINAL_HANDLE" --title "OVERSEER · <version>"` (the seat
+  it was invoked in is the one seat nobody else launches), every seat it spawns is named by
+  `create --title`, and a live-label change (progress fraction, hot-state token) is `rename` again.
+  **Prove a name by the field that holds:** `tabs[].title` in
+  `orca terminal list --include-visual-layouts --json`, never the plain `list`'s `title` — that one is
+  the pane title and reads as drift on every agent seat, which is how three sessions "proved" a
+  failure that was a misread (`src/drivers/orca.ts:27-42` keys worker identity on the owned tab title
+  for the same reason). The earlier three-part launch form (`DISABLE_AUTO_TITLE` + `printf` +
+  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`) is withdrawn: it silenced one vendor's pane title and named
+  nothing the tab did not already hold. Brief delivery travels as a file announced by `orca terminal send --terminal <handle> --text "<announcement>" --enter --wait-submit 15 --json`. Read `result.send.prompt.stages` and treat the brief as delivered only when a `turn_started` stage is present; `accepted: true` proves input acceptance, not a started turn; never resend on `accepted` alone.
 For Leg-2 (both hosts), a Codex reviewer under `workspace-write` must be briefed with an in-worktree verdict path such as
 `<repo>/.tickmarkr/overseer/verdicts/<task>.md`, and its verdict must be written there before it is read.
 ## Supervising tickmarkr as the executor — WHO DOES WHAT
@@ -656,6 +700,14 @@ they are left implicit:
    fail-closed verdict, no daemon, no retries. A per-lane grep gate re-implements a weaker version of
    this and passes on source text the screen never renders, which is exactly the class the acceptance
    judge exists to reject. One command per lane, named in the lane's own brief.
+   Fix-leg laws learned the hard way (v2.5.6 R25/R26/R34):
+   - A `test:` criterion for a fix leg is written FROM the landed test's title, verbatim, never before the
+     test exists — the acceptance oracle runs the sentence as vitest `-t` and a paraphrase matches zero tests.
+   - Every fix-leg verify carries `--author <the seat that wrote it>`; without it the author is HUMAN, every
+     vendor stays eligible, and a same-vendor approval is not the cross-vendor review the criterion names.
+   - A grader change is proved on a captured REAL job log, never on a synthetic one.
+   - A public-CI red is classified in a throttled Linux container first (`docker run --cpus=2 node:22`),
+     by measurement: starvation on the base tree is not a defect on the branch.
 
 ## Pane mechanics that bite
 
@@ -1029,7 +1081,7 @@ orchestrator turn boundary.
 
 ### On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`) — supervision instruments
 
-At seat spawn, arm file/journal watchers for artifact completion, run events, missing progress and context evidence. Record each watcher owner and bounded expiry; renew on every wake and stop on stand-down. Read `orca terminal read --terminal <handle> --screen --json` on each wake to detect blocked or pending input. For a human gate, write a checkpoint evidence file and announce it through verified terminal send. Use Orca notifications only when the installed host advertises a notification capability; the current CLI has no `notification` command, so the file and terminal receipt remain the delivery path. A notification or accepted input alone never proves delivery or completion.
+At seat spawn, arm file/journal watchers for artifact completion, run events, missing progress and context evidence. Record each watcher owner and bounded expiry; renew on every wake and stop on stand-down. Read `orca terminal read --terminal <handle> --screen --json` on each wake to detect blocked or pending input. For a human gate, write a checkpoint evidence file and announce it through verified terminal send. Use Orca notifications only when the installed host advertises a notification capability; the current CLI has no `notification` command, so the file and terminal receipt remain the delivery path. A notification or accepted input alone never proves delivery or completion. A seat-liveness watcher on the ORCHESTRATOR handle is mandatory, not optional: poll `orca terminal read --terminal <handle> --screen --json` on a bounded interval, treat `terminal_handle_stale` or a missing terminal as seat death, and re-resolve by title before re-arming (OBS-1050 — the orchestrator seat exited silently and the daemon ran unsupervised to a PARTIAL run-end).
 
 ## Specialist pipeline rules
 

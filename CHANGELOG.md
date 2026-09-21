@@ -2,6 +2,22 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.5.7 — a battery you can trust, then truthful progress
+
+**v2.5.7** — the test battery reports what actually ran, the daemon journals build receipts it can prove, and every operator surface (status, cockpit board, run view, evidence view) reads one shared projection of recorded evidence instead of predicting what a gate is doing.
+
+- **T1 — battery hygiene.** Temp fixtures are namespaced per runner and reaped by record; the evidence export oracle stops counting the tree.
+- **T2 — verify truth.** A green-report exit-1 red is classifiable from the record; a partial local state directory is reported and its present files preferred.
+- **T3/T4 — build-command receipts.** The shell seam emits confirmed-start and terminal receipts with invocation identity; run-gates journals them, ordinary and resumed, so a build gate-result without its receipt pair is a protocol issue.
+- **T5/T6 — truthful activity and blocker projection.** Task activity is projected from recorded receipts only; the blocker projection takes the production decision table from the caller, so every park kind shows exactly the verbs it admits and never invents a next action.
+- **T7 — status.** `tickmarkr status` renders the shared projection and retires the predictive cells (no "gate running" or "merging" inferred from all-green).
+- **T8/T9 — cockpit.** Derive, board and decisions read the shared projection; a stalled harvest is marked; the Run view shows the projection per agent with source references and honest pane locators.
+- **T10/T11 — evidence.** Operator-page groups consume the suppressed counts and the Evidence view shows them beside the complete raw journal; `docs/operator-progress.md` walks the phases and build states and distinguishes a human decision from an automatic wait.
+- **T12 — daemon riders.** An Orca transport timeout is a held probe, an ambiguous dispatch is reconciled not repeated, exhaustion parks with the commits kept.
+- **T13 — review brief.** The review brief forbids running suites in the task worktree and names the task's own test files as the only suites the reviewer may run.
+- **Fix legs landed mid-run, each gated standalone and cross-vendor reviewed.** OBS-1068: `matchClosureId` strips the brief's `Fingerprint:` label so a faithful copy of the brief closes its finding. OBS-1067: fixture repos switch off git auto-maintenance at init (one seam for every fixture) — the ENOENT-under-`.git` "authoring" parks are gone. OBS-1073: `--graph-changed` releases the scope-amendment replay's whole-graph identity while a per-task definition fingerprint keeps the amended task pinned; the release belongs to the engagement (journaled on `run-resume`) and is honoured by the in-run approval sweep and the approve CLI. OBS-1074: a plain approval, scope grant or recheck keeps the parked attempt's failed gate rows in the fresh attempt's brief and carries the operator's reason; only a waive clears.
+- **Known gaps (queued, not shipped).** OBS-1070: judge ‖ review may start while the test gate is still in suite-wait (spend order, fail-closed intact). OBS-1071: a worker's own full suite runs beside the daemon's gate suite. OBS-1072: the scope-request path extractor prints prose-mangled paths in `approveCommand`. OBS-1075: an approval journaled in an engagement that died without run-end is not honoured as a fresh dispatch on resume. OBS-1069: the restore/release path re-gates an unprovisioned worktree.
+
 ## v2.5.6 — no wasted turn
 
 **v2.5.6** — a run spends no turn it cannot use: ready tasks are admitted by critical path, a live worker is never reaped, a review round that produced nothing buys no worker, rechecks re-gate committed work without a dispatch, dirt and cap trips are typed at the gate, the standalone battery reads the runner's manifest under one repository lease, the harvest reads a live Orca terminal's screen when its stream looks exited, and one Space press edits one deny reason. Eight tasks from `specs/v2.5.6-no-wasted-turn.spec.md`, delivered by run 20260918-091659-…0001 (8/8, tip 4f1543cd, 17.1 h across four boundary halts) plus one Leg-2 fix leg, assembled as 4238994e.

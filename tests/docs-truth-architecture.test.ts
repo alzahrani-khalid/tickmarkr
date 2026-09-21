@@ -3,11 +3,76 @@ import { dirname, join, resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parseWorkerResult } from "../src/adapters/prompt.js";
 import { GATE_NAMES, validateGraph } from "../src/graph/schema.js";
+import type { TaskActivityProjection } from "../src/run/activity.js";
+import { BLOCKER_KINDS, projectOperatorSummary } from "../src/run/operator-summary.js";
+import { COMMAND_RECEIPT_OUTCOMES } from "../src/run/protocol.js";
 import { readOperatorState } from "../src/run/operator-state.js";
 import { ev, graph, partial } from "./fixtures/operator-state/fixture.js";
 
 const repoRoot = join(import.meta.dirname, "..");
 const codebaseDocs = join(repoRoot, "docs", "codebase");
+
+const walkthroughPath = join(repoRoot, "docs/operator-progress.md");
+
+// Skip this suite when the repo-only walkthrough is absent from the exported tree.
+describe.skipIf(!existsSync(walkthroughPath))("docs-truth: operator progress walkthrough", () => {
+  test("docs/operator-progress.md walks through every phase and build state the evidence contract defines and distinguishes a human decision from an automatic wait, citing the changed lines", () => {
+    const prose = readFileSync(walkthroughPath, "utf8");
+    const phases = {
+      unconfirmed: true, preparing: true, implementing: true,
+      "returned-for-verification": true, validating: true, reviewing: true,
+      merging: true, terminal: true,
+    } satisfies Record<TaskActivityProjection["state"], true>;
+    for (const state of [...Object.keys(phases), ...COMMAND_RECEIPT_OUTCOMES,
+      "start-unrecorded", "awaiting-command", "unresolved", ...BLOCKER_KINDS]) {
+      expect(prose, state).toContain(`\`${state}\``);
+    }
+    expect(prose).toContain("Enter opens the preview; only `y` confirms the write");
+    expect(prose).toContain("For retry/cooldown/dependency wait, no human decision is implied");
+    expect(prose).toContain("Completion alone does not mean success");
+    // Replay the distinction the walkthrough asks the operator to make.
+    const summaries = projectOperatorSummary([
+      { id: "park", status: "human", deps: [] },
+      { id: "retry", status: "pending", deps: [], wait: { kind: "retry" } },
+      { id: "cooldown", status: "pending", deps: [], wait: { kind: "cooldown" } },
+      { id: "dependent", status: "pending", deps: ["park"] },
+    ], [{ taskId: "park", park: { kind: "gate-fail", tombstone: false }, verbs: ["approve"] }]);
+    expect(summaries.map(s => [s.blocker?.kind, s.blocker?.decisionRequired])).toEqual([
+      ["human-decision", true], ["retry", false], ["cooldown", false], ["dependency-wait", false],
+    ]);
+    // A citation must land on the named declaration, not merely on an existing file.
+    for (const [file, declaration] of [
+      ["src/run/activity.ts", "export function projectActivity("],
+      ["src/tui/cockpit/run-view.tsx", "export function projectRunTasks("],
+      ["src/tui/cockpit/evidence-view.tsx", "export function deriveEvidenceView("],
+      ["src/run/operator-page-summary.ts", "export function foldOperatorPages("],
+      ["src/tui/cockpit/decision-actions.ts", "export function applyDecisionKey("],
+    ]) {
+      const source = readFileSync(join(repoRoot, file!), "utf8").split("\n");
+      const line = source.findIndex(text => text.startsWith(declaration!)) + 1;
+      expect(line, declaration).toBeGreaterThan(0);
+      expect(prose).toContain(`../${file}#L${line}`);
+    }
+  });
+
+  test("docs/operator-progress.md and docs/codebase/ARCHITECTURE.md limit tracking claims to registered run evidence, name how recorded agent evidence is reached, and state the deferred work", () => {
+    for (const path of [walkthroughPath, join(codebaseDocs, "ARCHITECTURE.md")]) {
+      const prose = readFileSync(path, "utf8");
+      for (const phrase of ["registered run evidence", "Run (`4`)", "Evidence (`5`)", "#L",
+        "RAW JOURNAL", "OPERATOR PAGE GROUPS", "HYGIENE", "SHIP condition", "consumer request",
+        "`tickmarkr init` guidance block", "global agent discovery", "verified host pane navigation",
+        "terminal control", "Fleet/Bootstrap and Plan/Health", "TypeSafe prescreen ledger deferral"]) {
+        expect(prose, `${path}: ${phrase}`).toContain(phrase);
+      }
+    }
+    const architecture = readFileSync(join(codebaseDocs, "ARCHITECTURE.md"), "utf8");
+    for (const module of ["activity", "operator-summary", "operator-page-summary"]) {
+      expect(architecture).toContain(`src/run/${module}.ts`);
+    }
+    const manifest = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+    expect(manifest.files).not.toContain("docs");
+  });
+});
 
 const srcFilePattern = /\bsrc\/[a-zA-Z0-9/_-]+\.tsx?\b/g;
 

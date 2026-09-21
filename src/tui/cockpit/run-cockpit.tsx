@@ -33,6 +33,7 @@ import {
   type JournalRow,
 } from "./components.js";
 import { fieldReading, type RunCockpitData, type TaskRow } from "./derive.js";
+import { STALL_MARKER } from "./run-view.js";
 import {
   initialRunInteractionState,
   projectRunKeyEntries,
@@ -564,7 +565,7 @@ function promotedViewRows(
       state: taskRowState(row),
       text: `${row.taskId} · ${fieldReading(row.state)} · ${runAttemptLabel(row.attempts)} · ${
         fieldReading(row.actor)
-      }${row.title === undefined ? "" : ` · ${row.title}`}`,
+      }${row.title === undefined ? "" : ` · ${row.title}`} · ${taskProjectionText(row, data.journalRows)}`,
     }));
   }
   if (viewId === "gates") {
@@ -590,6 +591,102 @@ function promotedViewRows(
     }));
   }
   return [];
+}
+
+/**
+ * T9: the shared projection (derive.ts TaskRow.summary/activity/identities/harvests) read onto the
+ * task row — identity, phase, build evidence, blocker, next action — each unrecorded field saying so,
+ * each recorded one citing the journal line it was read from, and the OBS-1048 stall marker when the
+ * newest attempt's harvest is suspect. No attempt label is printed here: the ruler is the row's own.
+ */
+export function taskProjectionText(row: TaskRow, journal: readonly JournalRow[] = []): string {
+  const identity = row.identities?.at(-1);
+  const blocker = row.summary?.blocker;
+  const harvest = row.harvests?.at(-1);
+  const evidence = projectionEvidence(row, journal);
+  const at = (line: number | undefined) => line === undefined ? "(no journal row)" : `#L${line}`;
+  const responsible = row.summary?.responsible;
+  const identityLabel = identity
+    ? `${identity.role} ${fieldReading(identity.name ?? responsible?.agent)}`
+    : responsible?.role !== undefined || responsible?.agent !== undefined
+      ? `${fieldReading(responsible.role)} ${fieldReading(responsible.agent)}`
+      : fieldReading(undefined);
+  return [
+    `identity ${identityLabel}${evidence.identity === undefined ? identityLabel === fieldReading(undefined) ? "" : ` ${at(undefined)}` : ` ${at(evidence.identity)}`}`,
+    `phase ${fieldReading(row.summary?.phase ?? row.activity?.state)}${row.summary?.phase === undefined && row.activity === undefined ? "" : ` ${at(evidence.phase)}`}`,
+    `build ${fieldReading(row.activity?.build.state)}${row.activity !== undefined && "receipt" in row.activity.build ? ` ${at(evidence.build)}` : ""}`,
+    `blocker ${blocker ? `${blocker.kind} ${at(evidence.blocker)}` : "none"}`,
+    `next ${blocker?.nextAction == null ? fieldReading(undefined) : `${blocker.nextAction} ${at(evidence.nextAction)}`}`,
+    ...(harvest?.suspectedStalledHarvest ? [`${STALL_MARKER} · launch ${at(evidence.launch)} · ${harvest.nudgeFailures} nudge failed ${at(evidence.nudge)} · ${harvest.pageCount} paged ${at(evidence.page)} · no worker-result`] : []),
+  ].reduce((text, part) => `${text} · ${part}`);
+}
+
+type ProjectionEvidence = {
+  readonly identity?: number; readonly phase?: number; readonly build?: number;
+  readonly blocker?: number; readonly nextAction?: number;
+  readonly launch?: number; readonly nudge?: number; readonly page?: number;
+};
+
+/**
+ * Correlate each already-derived field with the row that can have produced that value. This is
+ * intentionally not a "newest row with a plausible name" lookup: launch identity is paired by
+ * recorded seat, phase starts at the current launch boundary, a receipt is taken from the current
+ * verification battery, and harvest counts select only the number of rows retained by that fold.
+ * The newest presentation row omits its event name; it is used only for a terminal field whose
+ * derived last-evidence timestamp proves that exact row is the transition.
+ */
+function projectionEvidence(row: TaskRow, journal: readonly JournalRow[]): ProjectionEvidence {
+  const facts = journal.flatMap((entry) => {
+    const match = /^event:(\d+)$/u.exec(entry.id);
+    if (!match || !entry.text.startsWith(`${row.taskId} `)) return [];
+    const separator = entry.text.lastIndexOf(" · ");
+    return [{ line: Number(match[1]), timestamp: entry.timestamp, event: separator < 0 ? undefined : entry.text.slice(separator + 3) }];
+  }).sort((a, b) => a.line - b.line);
+  const lines = (event: string) => facts.filter((fact) => fact.event === event).map((fact) => fact.line);
+  // JournalRow is deliberately presentation-only: it carries neither the raw payload nor its
+  // attempt. Consequently two plausible rows cannot be correlated to the accepted projection
+  // without guessing. Fail closed in that case; the evidence remains reachable in the journal.
+  const only = (candidates: readonly number[]): number | undefined => candidates.length === 1 ? candidates[0] : undefined;
+  const unknownAfter = (line: number | undefined): number[] => facts
+    .filter((fact) => fact.event === undefined && (line === undefined || fact.line > line))
+    .map((fact) => fact.line);
+  const newestTaskLine = [...facts].reverse().find((fact) => fact.timestamp === row.lastEventTimestamp)?.line;
+
+  const namedIdentities = row.identities?.filter((seat) => seat.name !== undefined) ?? [];
+  const currentIdentity = row.identities?.at(-1);
+  const launches = lines("worker-launch");
+  const identityIndex = currentIdentity === undefined ? -1 : namedIdentities.findIndex((seat) => seat.key === currentIdentity.key);
+  // A newest worker-launch has no printed event suffix. It is nevertheless the only missing launch
+  // when the identity fold gained one more named seat on the row carrying lastEventTimestamp.
+  if (launches.length < namedIdentities.length && newestTaskLine !== undefined && !launches.includes(newestTaskLine)) launches.push(newestTaskLine);
+  const identity = identityIndex >= 0 && launches.length === namedIdentities.length
+    ? launches[identityIndex]
+    : currentIdentity === undefined ? only(lines("worker-result")) : undefined;
+  const launch = identityIndex >= 0 && launches.length === namedIdentities.length ? launches[identityIndex] : undefined;
+  const afterLaunch = (candidates: readonly number[]) => candidates.filter((line) => launch === undefined || line > launch);
+
+  const state = row.summary?.phase ?? row.activity?.state;
+  let phase: number | undefined;
+  if (state === "terminal") {
+    phase = only([...lines("task-human"), ...lines("task-failed"), ...lines("task-done"), ...lines("task-approved"), ...lines("merge")].sort((a, b) => a - b));
+  } else if (state === "implementing") phase = launch;
+  else if (state === "preparing") phase = only([...lines("task-dispatch"), ...unknownAfter(undefined)]);
+  else if (state === "returned-for-verification") phase = only([...afterLaunch(lines("worker-result")), ...unknownAfter(launch)]);
+  else if (state === "validating" || state === "reviewing") phase = only([...afterLaunch([...lines("phase-start"), ...lines("gate-phase-start")].sort((a, b) => a - b)), ...unknownAfter(launch)]);
+  else phase = only([...afterLaunch([...lines("gate-result"), ...lines("phase-start"), ...lines("gate-phase-start")].sort((a, b) => a - b)), ...unknownAfter(launch)]);
+
+  const battery = lines("phase-start").at(-1) ?? launch;
+  const receiptLines = [...lines("build-receipt"), ...lines("build-result")].sort((a, b) => a - b).filter((line) => battery === undefined || line > battery);
+  const build = row.activity !== undefined && "receipt" in row.activity.build ? only([...receiptLines, ...unknownAfter(battery)]) : undefined;
+  const parkCandidates = [...lines("task-human"), ...lines("task-failed")].sort((a, b) => a - b);
+  const park = only(parkCandidates) ?? (parkCandidates.length === 0 && row.state === "human" ? newestTaskLine : undefined);
+  const nudgeCandidates = afterLaunch(lines("worker-nudge-failed"));
+  const pageCandidates = afterLaunch(lines("operator-page"));
+  const nudgeCount = row.harvests?.at(-1)?.nudgeFailures ?? 0;
+  const pageCount = row.harvests?.at(-1)?.pageCount ?? 0;
+  const nudge = nudgeCount > 0 && nudgeCandidates.length === nudgeCount ? nudgeCandidates.at(-1) : undefined;
+  const page = pageCount > 0 && pageCandidates.length === pageCount ? pageCandidates.at(-1) : undefined;
+  return { identity, phase, build, ...(row.summary?.blocker ? { blocker: park, nextAction: park } : {}), launch, nudge, page };
 }
 
 /** A task row exists on an operator surface only when the journal fold recorded a task fact. */

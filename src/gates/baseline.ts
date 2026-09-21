@@ -3,7 +3,7 @@ import { availableParallelism, loadavg } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
-import { DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShResult } from "../run/git.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShellOptions, type ShResult } from "../run/git.js";
 import { executionSignal } from "../run/execution-budget.js";
 import type { GateOutcome } from "../run/outcome.js";
 import type { GateResult } from "./types.js";
@@ -587,13 +587,19 @@ export function staleFileCountCommands(baseline: Baseline, commands: Record<stri
     .map(([name]) => name);
 }
 
-export async function captureBaseline(cwd: string, commands: Record<string, string>): Promise<Baseline> {
+export interface BaselineReceiptOptions {
+  onReceipt?: ShellOptions["onReceipt"];
+  /** Only comparison's build command may carry task-build identity; capture never does. */
+  taskBuildAttribution?: ShellOptions["receiptAttribution"];
+}
+
+export async function captureBaseline(cwd: string, commands: Record<string, string>, opts: BaselineReceiptOptions = {}): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   for (const [name, cmd] of Object.entries(commands)) {
     if (name === "tipTest" && commands.test !== undefined && cmd === commands.test) {
       continue;
     }
-    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS);
+    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS, { onReceipt: opts.onReceipt });
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
     // ponytail: a capture that was itself killed records the ceiling as its "measurement", which
     // scales the next ceiling up — the right direction for a suite that never finished once.
@@ -737,7 +743,7 @@ export async function compareToBaseline(
   commands: Record<string, string>,
   baseline: Baseline,
   enabled: string[],
-  opts: RetryOptions & { rerunOf?: HostStarvedRerun; infraRerun?: HostStarvedRerun; selected?: readonly string[] } = {},
+  opts: RetryOptions & BaselineReceiptOptions & { rerunOf?: HostStarvedRerun; infraRerun?: HostStarvedRerun; selected?: readonly string[] } = {},
 ): Promise<GateResult[]> {
   const results: GateResult[] = [];
   const rerunOf = opts.rerunOf;
@@ -758,7 +764,10 @@ export async function compareToBaseline(
     }
     const entry = baseline.commands[name];
     const ceilingMs = effectiveCeilingMs(entry);
-    const r = await sh(cmd, cwd, ceilingMs);
+    const r = await sh(cmd, cwd, ceilingMs, {
+      onReceipt: opts.onReceipt,
+      ...(name === "build" ? { receiptAttribution: opts.taskBuildAttribution } : {}),
+    });
     // T7: every verdict below carries the capacity ITS OWN command ran under, taken off the shell
     // result rather than re-derived after the fact. The skip row above ran no command and therefore
     // states no capacity — a row that never divided the machine must not claim that it did.

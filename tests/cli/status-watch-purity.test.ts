@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test, vi } from "vitest";
+import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, saveGraph, stateDirName } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -192,4 +193,25 @@ describe("VIS-07 status --watch purity (D-02)", () => {
     expect(readFileSync(journal, "utf8")).toBe(bytesBefore);
     expect(snapshot(repo)).toEqual(before);
   });
+});
+
+
+test("test: a status refresh and a watch frame issue zero terminal create close relaunch or send-input operations against the host driver, so a status read that touches a terminal fails", async () => {
+  const repo = mkRepo();
+  seed(repo, true);
+  const available = vi.spyOn(HerdrDriver, "available").mockReturnValue(true);
+  const read = vi.spyOn(HerdrDriver.prototype, "read").mockResolvedValue("");
+  const mutations = ["slot", "run", "close", "nudge", "sendKey", "reconcile", "narrator", "retireLostWatch"] as const;
+  const spies = mutations.map(method => vi.spyOn(HerdrDriver.prototype, method).mockImplementation(() => {
+    throw new Error(`status attempted terminal mutation: ${method}`);
+  }));
+  try {
+    await status([], repo);
+    await status(["--watch"], repo, { iterations: 2, sleep: async () => {} });
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+    read.mockRestore();
+    available.mockRestore();
+  }
 });

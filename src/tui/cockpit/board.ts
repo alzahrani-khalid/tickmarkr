@@ -1,5 +1,6 @@
 import { GATE_NAMES, type RunGraph } from "../../graph/schema.js";
 import type { OperatorSnapshot, OperatorTask } from "../../run/operator-state.js";
+import type { AttemptHarvest, TaskRow } from "./derive.js";
 import { cellWidth, sliceCells } from "./width.js";
 
 /* ------------------------------------------------------------------------ */
@@ -103,6 +104,8 @@ export interface BoardInput {
   /** Footer key hints, joined the prototype's way; `false` leaves the footer to the caller (see boardFooter). */
   readonly keys?: readonly string[] | false;
   readonly colour?: boolean;
+  /** The cockpit's derived rows: the shared projection (blocker, next action, harvest) rides on each board row, unrendered. */
+  readonly rows?: readonly TaskRow[];
 }
 
 /** One task row, in the parts the Run view recomposes per width band. */
@@ -118,6 +121,12 @@ export interface BoardRow {
   readonly note: string;
   /** The note's segments, so a band can wrap it across continuation rows without cutting one. */
   readonly noteParts: readonly string[];
+  /** From the shared projection (derive.ts TaskRow.summary), when the caller supplied rows. */
+  readonly blocker?: string;
+  readonly nextAction?: string;
+  readonly permittedActions?: readonly string[];
+  /** OBS-1048: the newest recorded attempt's harvest evidence, when the caller supplied rows. */
+  readonly harvest?: AttemptHarvest;
 }
 
 export interface BoardFrame {
@@ -134,6 +143,16 @@ export interface BoardFrame {
 }
 
 const isDone = (t: OperatorTask | undefined): boolean => t !== undefined && (t.merged || t.state === "completed");
+
+const projected = (row: TaskRow | undefined): Pick<BoardRow, "blocker" | "nextAction" | "permittedActions" | "harvest"> => {
+  const blocker = row?.summary?.blocker;
+  const harvest = row?.harvests?.at(-1);
+  return {
+    ...(blocker ? { blocker: blocker.kind, permittedActions: blocker.permittedActions } : {}),
+    ...(blocker?.nextAction ? { nextAction: blocker.nextAction } : {}),
+    ...(harvest ? { harvest } : {}),
+  };
+};
 
 /** The prototype's frame, sectioned. `renderBoard` joins it row for row. */
 export function boardFrame(input: BoardInput, width: number): BoardFrame {
@@ -262,6 +281,7 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
       tail: `  ${pad(mute(sliceCells(t?.channel ?? "—", CHAN - 2).head), CHAN)}${pad(mute(String(attempts)), 5)}`,
       note: note.join(mute(" · ")),
       noteParts: note,
+      ...projected(input.rows?.find((row) => row.taskId === g.id)),
     });
   }
 
