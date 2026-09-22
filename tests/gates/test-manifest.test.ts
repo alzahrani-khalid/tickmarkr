@@ -501,3 +501,18 @@ test("test: a manifested run with one module that fails to load yields a certifi
   expect(row.pass).toBe(false);
   expect(row.meta?.classification).toBe("infra");
 }, 60_000);
+
+test("test: through the test gate a vitest run holding one failing assertion yields a failed row whose meta carries that failure's evidence beside an unchanged regression classification, so a verdict that drops the evidence fails", async () => {
+  const f = fixture();
+  writeFileSync(join(f.repo, "tests/b.test.ts"), 'test("scope list", () => expect({ files: ["src/nested/in-scope.ts"] }).toEqual({ files: ["src/nested/other.ts"] }));'); commit(f.repo);
+  const red = await round(f);
+  expect(red.pass).toBe(false);
+  expect(red.meta?.classification).toBe("regression");
+  expect(red.meta?.failingFiles).toEqual(["tests/b.test.ts"]);
+  expect(red.meta?.failingTests).toHaveLength(1);
+  const evidence = red.meta?.failureEvidence as Array<{ test: string; text: string }>;
+  expect(evidence).toHaveLength(1);
+  expect(evidence[0]!.test).toBe("tests/b.test.ts > scope list");
+  expect(evidence[0]!.text).toContain("src/nested/in-scope.ts");
+  expect(Buffer.byteLength(evidence[0]!.text)).toBeLessThanOrEqual(4096);
+}, 60_000);

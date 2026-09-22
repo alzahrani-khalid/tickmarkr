@@ -321,7 +321,7 @@ export async function runOrcaSmoke(opts: {
   let slot: Slot | undefined;
   try {
     slot = await driver.slot(worktree, branch, {
-      owned: { role: "watch", taskId: "ORCASMOKE", attempt: 0, runId: SMOKE_RUN_ID },
+      owned: { role: "worker", taskId: "ORCASMOKE", attempt: 0, runId: SMOKE_RUN_ID },
     });
     observations.smokeWorktree = slot.cwd;
     // The whole payload: two printfs emitting the split trailer, then an idle sleep the close will

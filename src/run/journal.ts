@@ -727,6 +727,59 @@ export function pendingRechecks(events: JournalEvent[]): Set<string> {
   return pending;
 }
 
+/**
+ * OBS-1075: what an accepted approval still authorises, typed by its release. `worker` funds one
+ * dispatch (plain, attempt-cap, review-upheld, scope-request); `battery` funds the recheck battery
+ * and no worker; `waiver` satisfies exactly its named gate; `inert` authorises nothing.
+ */
+export type PendingApprovalAction =
+  | { taskId: string; ts: string; authority: "worker"; release: "plain" | typeof ATTEMPT_CAP_RELEASE | typeof REVIEW_UPHELD_RELEASE | "scope-request" }
+  | { taskId: string; ts: string; authority: "battery"; release: typeof RECHECK_RELEASE }
+  | { taskId: string; ts: string; authority: "waiver"; release: typeof GATE_SATISFIED_RELEASE; gate: GateName }
+  | { taskId: string; ts: string; authority: "inert"; release: unknown };
+
+const ENACTED_BY: Record<Exclude<PendingApprovalAction["authority"], "inert">, readonly string[]> = {
+  worker: ["task-dispatch", "worker-launch"],
+  battery: ["recheck-battery"],
+  waiver: ["worktree-recreation"],
+};
+
+/**
+ * Per task, the newest task-approved row no later enactment has consumed. Pure: events in, typed
+ * actions out. Acceptance is not enactment and a run boundary is not enactment — only the row the
+ * release causes consumes it (ENACTED_BY), so an approval accepted just before an abnormal exit
+ * survives every restart until it is enacted. A later approval supersedes an earlier one. An unknown
+ * release, or a waiver without a known gate, is inert: it supersedes, authorises nothing, and no row
+ * enacts it.
+ */
+export function pendingApprovalActions(events: JournalEvent[]): Map<string, PendingApprovalAction> {
+  const pending = new Map<string, PendingApprovalAction>();
+  for (const e of events) {
+    if (!e.taskId) continue;
+    if (e.event === "task-approved") {
+      pending.set(e.taskId, approvalAction(e.taskId, e));
+      continue;
+    }
+    const action = pending.get(e.taskId);
+    if (action && action.authority !== "inert" && ENACTED_BY[action.authority].includes(e.event)) pending.delete(e.taskId);
+  }
+  return pending;
+}
+
+function approvalAction(taskId: string, e: JournalEvent): PendingApprovalAction {
+  const { release, gate } = e.data;
+  const base = { taskId, ts: e.ts };
+  if (release === undefined) return { ...base, authority: "worker", release: "plain" };
+  if (release === ATTEMPT_CAP_RELEASE || release === REVIEW_UPHELD_RELEASE || release === "scope-request") {
+    return { ...base, authority: "worker", release };
+  }
+  if (release === RECHECK_RELEASE) return { ...base, authority: "battery", release };
+  if (release === GATE_SATISFIED_RELEASE && typeof gate === "string" && (GATE_NAMES as readonly string[]).includes(gate)) {
+    return { ...base, authority: "waiver", release, gate: gate as GateName };
+  }
+  return { ...base, authority: "inert", release };
+}
+
 // Both retry decisions below govern exactly ONE dispatch: the next one. So both are read back from the
 // journal at the moment that dispatch is built, never carried in a process variable — a stop between
 // the decision and the dispatch (OBS-254's shape, one layer up) would otherwise send a normal prompt

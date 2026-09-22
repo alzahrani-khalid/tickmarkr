@@ -288,6 +288,58 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
 3. **Gate a mid-run fix at the base, not at a summary (law 47 / OBS-909).** A fix landed on main while a
    run is live is proved with `tickmarkr verify --base <main>`, never with a suite summary copied from a
    different tree. A release proof runs every CI-ordered step — including lint — before its suite.
+4. **Rescue a broken harness from OUTSIDE the run it broke — the daemon is NEVER asked to repair itself
+   as a task (v2.5.7 ledger D-59, D-64; OBS-1078).** When the harness is the defect — resume cannot be
+   relied on, a gate cannot be relied on, the binary every gate runs on is the thing that is wrong — no
+   task inside the run can fix it: the gates that would judge the repair are executed BY the suspect
+   binary, and the worktree the repair would run in is created by the same code. Dispatching
+   *"fix the daemon"* as a task of the run it broke buys a green gate from the defect and a repair nobody
+   can trust. The rescue route has three legs, each with its own record, and there is no fourth:
+   - **AN INDEPENDENTLY GATED EXTERNAL FIX LEG.** Its own checkout and branch off the run's base, its own
+     brief, its own `files[]`, its own battery — `tickmarkr verify --base <ref> --criteria <file>
+     --author <the seat that wrote it>` — plus the cross-vendor review its criterion names, all recorded
+     BEFORE the run consumes any of it. The leg's battery is scheduled at a boundary item 2 permits (the
+     run parked or ended, or the operator's recorded exception), and its reds are declared to the
+     contamination watcher in advance so they are classified instead of assumed.
+   - **AN EXPLICITLY RECORDED REBUILT BINARY AND RESTART — the provenance is written down in the same act,
+     or the rebuild did not happen.** Record: the fix leg's commit sha; the build command; the install
+     form (never `npm i -g .` on the repository directory — npm SYMLINKS a directory install and every
+     later build hot-swaps the machine-wide binary with no version change to notice it by); the
+     global-versus-repo **inode** comparison that proves a real install, which `tickmarkr version` cannot
+     do because it cannot go red when nothing is bumped; the version read-back; and the restart itself —
+     `tickmarkr resume <runId>`, the ORCHESTRATOR's command, never yours. An unrecorded rebuild leaves the
+     next seat arguing about which binary produced which journal rows, with nothing to read.
+   - **A SEPARATELY GATED UNION.** The rebuilt harness and the run's existing work are then gated
+     TOGETHER, on their own, at the one commit that carries both. A green fix leg beside a green run is
+     no proof of their union — see *a green leg beside a green parent*, under the release criterion
+     below — because the union's own conflict resolutions, ordering and collected-count changes are
+     exactly what neither green ever saw.
+   **NO BRANCH SURGERY: the run keeps its ORIGINAL base and its recorded baseline.** No rebase of the
+   integration branch, no re-cut `baseRef`, no re-baselining to make the rescue leg's diff read small.
+   Resume REPLAYS the journal's `baseRef`, so a rewritten one is a different run wearing the same id —
+   and a baseline re-recorded to suit the rescue launders every red the original baseline was there to
+   compare against.
+5. **A rebuilt binary is NOT a rebuilt tree: a claimed fix arrival needs ANCESTRY EVIDENCE naming the
+   actual task subject (v2.5.7 ledger D-80; OBS-1078).** Rebuilding and reinstalling `dist` changes the
+   daemon the orchestrator launches and nothing else. It puts no test, fixture, schema or skill byte into
+   any task worktree or into the integration branch: those trees were checked out from the integration tip
+   BEFORE the fix leg landed, and git does not retro-fill a checkout that already exists. So *"the fix has
+   reached the task checkouts"* is never accepted on a version read-back, a rebuild log, or the fixer's
+   say-so — require ancestry evidence naming the ACTUAL subjects, and read it before the claim, not after:
+   - **the TASK subject** — that task worktree's own branch and HEAD sha (`git -C <task-worktree> rev-parse
+     --abbrev-ref HEAD` and `git -C <task-worktree> rev-parse HEAD`), with the fix proven an ancestor of
+     THAT commit: `git -C <task-worktree> merge-base --is-ancestor <fix-sha> HEAD`, whose exit code is the
+     evidence, recorded beside all three shas;
+   - **the INTEGRATION subject** — the integration-branch commit that worktree was created from, named by
+     sha from the journal's `task-dispatch` row or `tickmarkr status`; never "the run", and never the
+     branch name alone, which moves while you are reading it;
+   - **and, where the fix is a FILE the tree must hold** — a new test, a fixture, a schema — its presence
+     at that commit: `git -C <task-worktree> cat-file -e <task-head>:<path>`. A fix that lives only in the
+     daemon's `dist` cannot make a worker's missing oracle appear, and a worker red on that missing file is
+     still a plan defect, not a retry.
+   A fix present in the daemon and absent from the task trees has been INSTALLED, not ARRIVED: say which
+   of the two you mean, and name the commit each half was read against. Evidence rule 13's baseRef trap is
+   the same defect wearing a diff instead of a claim.
 
 ### What the ORCHESTRATOR does, and what you require of it
 
@@ -383,11 +435,66 @@ its own — **not because any instrument detected it.**
 > covers — and a re-scope of any named subject voids it AUTOMATICALLY, with no ruling required.**
 > A void condition that needs a ruling to fire is not a void condition; it is a second thing to forget.
 
+**⚡ ONE QUALIFICATION, PROSPECTIVE ONLY: A FUTURE SEAL MAY DECLARE THAT AN AUDITED FILES-ONLY AMENDMENT
+DOES NOT VOID IT — AND THAT DECLARATION HAS TO BE IN THE SEAL, WRITTEN AT ISSUE (v2.5.7 ledger D-80, D-83;
+OBS-1078).** The automatic-void rule above is QUALIFIED for seals issued after this clause, never deleted:
+it still fires on its own terms for every seal that does not carry the declaration. A requirements seal may
+declare, prospectively, that exactly one narrow class of change does not void it — an **AUDITED FILES-ONLY
+AMENDMENT**: a recorded amendment to a task's `files[]` and nothing else, which leaves all four of these
+UNTOUCHED.
+
+1. **the ACCEPTANCE TEXT** — every criterion's own words, byte for byte, a `test:` leaf title included;
+2. **the TASK IDENTITY** — which task is which: its id, its shape, its deps, the suites it owns;
+3. **the RUN IDENTITY** — the run, its base and its `baseRef`, the integration branch and its tip commit;
+4. **the SAFETY REQUIREMENTS** — the gates, bounds, refusals and contamination rules the run is held to.
+
+**Replay it both ways, because the clause is a procedure and not a mood:**
+- *A seal carrying that declaration, then an audited amendment adding one owned path to a task's `files[]`,
+  with all four invariants read and found unchanged* → **THE SEAL IS KEPT.** No successor seal and no
+  re-grade of what it already sealed: the declaration was the seal's own pre-commitment about this exact
+  change, made before the change existed — the only moment such a commitment can honestly be made. Read the
+  four invariants BEFORE ruling, and record the read beside the amendment.
+- *The same seal, then an amendment that changes the RUN IDENTITY — a new run id, a re-cut `baseRef`, a
+  different integration tip* → **THE SEAL IS VOID, on its own declaration's terms.** Run identity is one of
+  the four, so *"files-only"* does not describe that amendment; moving any one of the four puts the change
+  outside the declared class, and **any other change of any kind needs a SUCCESSOR SEAL** — a new document,
+  sealed before the work it grades, naming the subject as it now stands.
+
+**Three limits, and each one has been argued around:**
+- **The declaration is never retroactive and never inferred.** A seal issued BEFORE this change — one whose
+  own text does not carry the declaration — **stays governed by the existing void conditions above,
+  unmodified: any re-scope, narrowing, widening, split, merge or re-ownership of a named subject voids it
+  AUTOMATICALLY, with no ruling required.** So *"the acceptance text never changed, therefore the seal
+  still holds"* is **REFUSED** for such a seal once its SUBJECT has moved: unchanged acceptance text alone
+  preserves nothing over a changed subject, because a seal grades the subject it named, not the sentences
+  it happened to be written in. Retrofitting the declaration onto an already-sealed document is itself an
+  amendment to a sealed subject — write the successor seal instead.
+- **A files-only clause confers no amendment authority.** It says nothing about whether the amendment is
+  LAWFUL: compile's unit bounds still refuse an over-bound `files[]`, and no seal can widen what compile
+  will certify.
+- **AUDITED means recorded, or it did not happen.** The approval row carrying the amended files, the
+  before-and-after `files[]`, and the four-invariant read are what let the next seat replay your ruling
+  instead of trusting it. An unrecorded *"files-only"* amendment is indistinguishable from a re-scope, and
+  is voided as one.
+
 **⚡ IDENTIFY THE SUBJECT BY WHAT THE CLAIM IS ABOUT. Half of the failure above was a category error, and
 it is the cheap half to fix:** a graph hash identifies a **PLAN**, and a plan is recompiled, re-cut and
 re-owned as a matter of course. **A criterion about a SHIPPED TREE names the COMMIT** — or the tag, or the
 export tree hash — **never a graph hash, never a run id, never a task list.** Ask what a reader would have
 to hold in their hand to check the clause: if it is bytes, name the bytes.
+
+**⚡ A GREEN LEG BESIDE A GREEN PARENT IS NO PROOF OF THEIR UNION: THE RELEASE PROOF BINDS TO THE MERGED
+CANDIDATE'S COMMIT, AND IS VOID THE MOMENT THAT SUBJECT MOVES (v2.5.7 ledger D-80, D-83; OBS-1078).** The
+subject of a release proof is never *"the run"* and never *"the fix leg"* — it is the **MERGED candidate**:
+the one commit that carries the run's work AND every leg merged into it. Name that commit's sha in the
+proof, in the same act as the grade, and the proof is bound to that sha alone. **When the subject moves — a
+later merge, a new integration tip, an amended or re-cut commit, a fresh export, a re-tag — the proof is
+VOID, and the new subject is graded from scratch**, count oracle included, since the oracle is derived from
+the merged tree and not from either parent. Two greens assembled into one verdict are two claims about two
+trees that never contained each other: the union's own conflict resolutions, its ordering and its
+collected-test total are exactly what neither green observed — which is why `RELEASING.md` step 4 matches
+the run's head SHA to the mirror's `HEAD` before a single job log is graded. This is the void-condition duty
+pointed at bytes: **a proof that names no commit cannot notice its subject leaving.**
 
 **THE RECIPROCAL DUTY, and it is yours because you write both documents:** when you issue a ruling that
 re-scopes, narrows, splits or re-owns anything, **the ruling must name every sealed document its subject

@@ -2651,3 +2651,94 @@ test("test: a plain approval, a scope grant or a recheck after a park keeps the 
   expect(journaledFailureBrief([...parked, ev("task-approved", { release: "gate-satisfied", reason: "waived" })], "T1")).toEqual([]);
   expect(journaledFailureBrief([...parked, ev("task-approved", { reason: "r" }), ev("worker-launch")], "T1")).toEqual([]);
 });
+
+// Wiring proofs share the existing fake-adapter repository and real gate battery. Only the
+// reporter metadata is injected: its extraction is owned by the manifest/reporter tests.
+describe("unowned test detection site repair wiring", () => {
+  const evidence = [{ test: "unowned.test.ts > renders the expected label", text: "- Expected: ready\n+ Received: waiting\n at unowned.test.ts:12:3" }];
+  let events: JournalEvent[];
+  let prompt: string;
+  let repeated: JournalEvent[];
+  beforeAll(async () => {
+    const original = gateRunner.runGates;
+    let measurement = 0;
+    const spy = vi.spyOn(gateRunner, "runGates").mockImplementation((task, ctx, ...rest) => original(task, {
+      ...ctx,
+      onGate: async (event) => {
+        if (event.phase === "end" && event.result.gate === "test" && !event.result.pass) {
+          event.result.meta = { ...event.result.meta, failureEvidence: evidence.map((e) => ({ ...e, text: `${e.text}\nmeasurement ${++measurement}` })) };
+        }
+        await ctx.onGate?.(event);
+      },
+    }, ...rest));
+    try {
+      for (const repeat of [false, true]) {
+        const runId = repeat ? "run-unowned-repeat" : "run-unowned-repair";
+        const { repo, fake } = setupRepo(
+          [T("T1", { files: ["broken.txt", "fixed.txt"] })],
+          {
+            consult: { action: "human", notes: "identical failure needs an operator" },
+            tasks: { T1: [
+              { shell: `echo boom > broken.txt && ${COMMIT} broken`, result: { ok: true, summary: "implemented" } },
+              { shell: repeat ? `echo changed > fixed.txt && ${COMMIT} still-broken` : `git rm broken.txt && echo fixed > fixed.txt && ${COMMIT} fixed`, result: { ok: true, summary: "fixed everything" } },
+            ] },
+          },
+          `routing: { escalateTier: off }\ngates: { build: 'true', lint: 'true', test: 'if test -f broken.txt; then echo "FAIL unowned.test.ts"; exit 1; fi' }\n`,
+        );
+        writeFileSync(join(repo, "unowned.test.ts"), "// tracked detection site\n");
+        execSync(`${COMMIT} suite`, { cwd: repo, stdio: "pipe" });
+        const summary = await runDaemon(repo, { adapters: [fake], runId });
+        const rows = Journal.open(repo, runId).read();
+        if (repeat) {
+          expect(summary.human).toEqual(["T1"]);
+          repeated = rows;
+        } else {
+          expect(summary.done).toEqual(["T1"]);
+          events = rows;
+          prompt = readFileSync(join(tickmarkrDir(repo), "runs", runId, "prompts", "T1-a1.md"), "utf8");
+        }
+      }
+    } finally { spy.mockRestore(); }
+  }, 90_000);
+
+  test("test: an eligible test red in an unowned suite over fully carried landed work with repair budget remaining funds a chargeable repair carrying the finding, so a diagnostic only authoring park fails", () => {
+    const funding = events.filter((e) => e.event === "repair-attempt");
+    expect(funding).toHaveLength(1);
+    expect(funding[0]!.data).toMatchObject({ charge: 1, of: 2, commits: 1, gates: ["test"] });
+    expect(funding[0]!.data.findings).toContain("FAIL unowned.test.ts");
+    expect(events.some((e) => e.event === "scope-authoring" || e.event === "task-approved")).toBe(false);
+    expect(events.filter((e) => e.event === "task-dispatch").map((e) => e.data.retryMode)).toEqual(["fresh", "repair"]);
+  });
+
+  test("test: the funded repair brief delivered to the worker contains the assertion evidence journaled on the failed test row, so a brief carrying only the failing suite path fails", () => {
+    const red = events.find((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false)!;
+    const saved = red.data.failureEvidence as typeof evidence;
+    expect(saved).toHaveLength(1);
+    expect(saved[0]!.text).toContain(evidence[0]!.text);
+    const encoded = JSON.stringify(saved, null, 2);
+    expect(events.find((e) => e.event === "repair-attempt")!.data.findings).toContain(encoded);
+    expect(prompt).toContain(encoded);
+    expect(prompt).toContain("## Repair attempt");
+    expect(prompt).toContain("+boom");
+    expect(red.data.details).not.toContain("Received");
+  });
+
+  test("test: a funded repair that reproduces the identical normalized failure reaches the existing fingerprint cap at its second occurrence, so richer evidence that resets the repeat count fails", () => {
+    const reds = repeated.filter((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false);
+    expect(reds).toHaveLength(2);
+    expect(reds[0]!.data.failureEvidence).not.toEqual(reds[1]!.data.failureEvidence);
+    expect(normalizeGateFailure(String(reds[0]!.data.details))).toBe(normalizeGateFailure(String(reds[1]!.data.details)));
+    expect(repeated.filter((e) => e.event === "repair-attempt")).toHaveLength(1);
+    expect(repeated.find((e) => e.event === "gate-fingerprint-cap")!.data).toMatchObject({ gate: "test", occurrences: 2, retrySameBanned: true });
+    expect(repeated.some((e) => e.event === "merge")).toBe(false);
+  });
+
+  test("test: a repair whose worker reports success still runs the full gate battery before any merge, so a repair merged on the worker's claim fails", () => {
+    const launch = events.findLastIndex((e) => e.event === "worker-launch");
+    const merge = events.findIndex((e) => e.event === "merge");
+    expect(merge).toBeGreaterThan(launch);
+    const battery = events.slice(launch, merge).filter((e) => e.event === "gate-result");
+    expect(battery.map((e) => e.data.gate).sort()).toEqual(["acceptance", "build", "evidence", "lint", "review", "scope", "test"]);
+    expect(battery.every((e) => e.data.pass === true || e.data.skipped === true)).toBe(true);
+  });
+});

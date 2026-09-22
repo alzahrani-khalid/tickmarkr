@@ -9,11 +9,11 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq, type Assignment } from "../../src/adapters/types.js";
 import { loadConfig } from "../../src/config/config.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
-import { graphDefinitionHash, loadGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import type { GateName } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead, shGitOk, VERIFICATION_PROTOCOL, verificationProtocol } from "../../src/run/git.js";
-import { Journal, reviewRoundsSinceApproval, type JournalEvent } from "../../src/run/journal.js";
+import { Journal, pendingRepairFindings, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, type JournalEvent } from "../../src/run/journal.js";
 import { ensureIntegration, integrationBranch } from "../../src/run/merge.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -503,3 +503,203 @@ test("with no explicit lifecycle export the replay guard measures the effective 
     if (prior === undefined) delete process.env.npm_config_ignore_scripts; else process.env.npm_config_ignore_scripts = prior;
   }
 }, 300_000);
+
+async function fundedPlainResume(live: boolean, closed: boolean) {
+  const seed = await seedResume(`run-plain-funding-${live}-${closed}`, [[{ gate: "test", pass: false }]], undefined, undefined, {
+    tasks: { T1: [{ shell: `echo fixed > changed.txt && ${COMMIT} fixed`, result: { ok: true, summary: "fixed" } }] },
+  });
+  seed.journal.append("task-human", "T1", { kind: "gate-fail", reason: "old red" });
+  const graph = loadGraph(seed.repo);
+  saveGraph(seed.repo, { ...graph, tasks: graph.tasks.map((t) => ({ ...t, status: "human" })) });
+  if (closed) seed.journal.append("run-end", undefined, { branch: `tickmarkr/${seed.runId}` });
+  if (!live) seed.journal.append("task-approved", "T1", { by: "operator" });
+  let appended = false;
+  const summary = await runDaemon(seed.repo, { adapters: [seed.fake], runId: seed.runId, resume: true, approvalWindowMs: 1,
+    narrate: (e) => {
+      if (live && !appended && e.event === "approval-window-start") {
+        appended = true;
+        seed.journal.append("task-approved", "T1", { by: "operator" });
+      }
+    },
+  });
+  const events = seed.journal.read();
+  const approvalAt = events.findIndex((e) => e.event === "task-approved");
+  const post = events.slice(approvalAt + 1).filter((e) => e.taskId === "T1");
+  const dispatchAt = post.findIndex((e) => e.event === "task-dispatch");
+  const gatesAt = post.findIndex((e) => e.event === "gate-result");
+  expect(summary.done).toEqual(["T1"]);
+  expect(dispatchAt).toBeGreaterThanOrEqual(0);
+  expect(gatesAt).toBeGreaterThan(dispatchAt);
+  expect(post.some((e) => e.event === "worker-launch")).toBe(true);
+  expect(post.filter((e) => e.event === "gate-result").every((e) => e.data.replayMeasurement !== true)).toBe(true);
+  expect(post.some((e) => e.event === "gate-replayed")).toBe(false);
+  expect(post.find((e) => e.event === "task-dispatch")?.data.attempt).toBe(1);
+}
+
+test("resume preserves a completed legacy plain approval followed by gate replay and merge without a new dispatch", async () => {
+  const seed = await seedResume("run-legacy-approved-done", [[{ gate: "test", pass: false }]], { reason: "re-gate" });
+  // 2.5.x enacted plain approvals through gates alone, leaving no dispatch to consume funding.
+  for (const gate of ["build", "test", "lint", "evidence", "scope", "acceptance", "review"]) {
+    seed.journal.append("gate-result", "T1", { gate, pass: true, commit: seed.commit, attempt: 0, replayMeasurement: true });
+  }
+  const branch = integrationBranch(loadConfig(seed.repo), seed.runId);
+  const intWt = await ensureIntegration(seed.repo, branch, seed.commit);
+  await shGitOk(`git merge --ff-only ${shq(seed.commit)}`, intWt);
+  seed.journal.append("task-done", "T1", { attempts: 1, assignment: ASSIGNMENT });
+  seed.journal.append("merge", "T1", { branch: `${branch}--T1`, commit: await gitHead(intWt) });
+  const graph = loadGraph(seed.repo);
+  saveGraph(seed.repo, { ...graph, tasks: graph.tasks.map((t) => ({ ...t, status: "done" })) });
+  const before = seed.journal.replayResumeState().get("T1");
+
+  const summary = await runDaemon(seed.repo, { adapters: [seed.fake], runId: seed.runId, resume: true, approvalWindowMs: 1 });
+
+  expect(summary.done).toEqual(["T1"]);
+  expect(summary.human).toEqual([]);
+  expect(loadGraph(seed.repo).tasks[0]!.status).toBe("done");
+  expect(afterLastResume(seed.journal.read()).filter((e) => e.taskId === "T1" &&
+    ["task-dispatch", "worker-launch", "task-human", "gate-result", "task-done", "merge"].includes(e.event))).toEqual([]);
+  expect(seed.journal.replayResumeState().get("T1")).toEqual(before);
+  expect((await shGitOk(`git rev-parse ${shq(branch)}`, seed.repo)).trim()).toBe(seed.commit);
+}, 120_000);
+
+test("test: a resume over a journal holding an unenacted plain approval newer than the last dispatch starts a fresh attempt, so a resume that restores the superseded attempt from its cached reds fails", async () => {
+  for (const closed of [false, true]) await fundedPlainResume(false, closed);
+}, 120_000);
+
+test("test: the same approval appended while the daemon is live is enacted by the live sweep as a fresh attempt, so a live sweep that replays the parked attempt's red verdicts fails", async () => {
+  for (const closed of [false, true]) await fundedPlainResume(true, closed);
+}, 120_000);
+
+test("test: a restart or a live sweep holding no pending funding leaves human gate permission, replayed verdicts and attempt budget unchanged across consumed approvals or inert releases, so another approval demand or fresh funding inferred from those rows fails", async () => {
+  const greens: SeedGate[] = ["build", "test", "lint", "evidence", "scope"].map((gate) => ({ gate: gate as GateName, pass: true }));
+  for (const live of [false, true]) {
+    for (const release of [undefined, { release: "unknown-release" }, { release: "gate-satisfied", gate: "unknown-gate" }]) {
+      const seed = await seedResume(`run-no-funding-${live}-${release?.release ?? "consumed"}`, [greens]);
+      // An approval that already paid for this dispatch still grants human-gate permission.
+      const events = seed.journal.read();
+      events.splice(1, 0, { ts: events[0]!.ts, event: "task-approved", taskId: "T1", data: { by: "operator" } });
+      writeFileSync(seed.journal.journalPath, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+      const graph = loadGraph(seed.repo);
+      const gated = { ...graph, tasks: graph.tasks.map((t) => ({ ...t, humanGate: true })) };
+      saveGraph(seed.repo, gated);
+      seed.journal.append("graph-rehash", undefined, { from: graphDefinitionHash(graph), to: graphDefinitionHash(gated) });
+      if (release && !live) seed.journal.append("task-approved", "T1", release);
+      const before = seed.journal.replayResumeState().get("T1");
+      const summary = await runDaemon(seed.repo, { adapters: [seed.fake], runId: seed.runId, resume: true, approvalWindowMs: 1,
+        narrate: (e) => {
+          if (release && live && e.event === "run-resume") seed.journal.append("task-approved", "T1", release);
+        },
+      });
+      const post = afterLastResume(seed.journal.read());
+      expect(summary.done).toEqual(["T1"]);
+      expect(post.filter((e) => e.event === "gate-reused").map((e) => e.data.gate)).toEqual(greens.map((g) => g.gate));
+      expect(post.some((e) => ["task-dispatch", "worker-launch", "task-human", "gate-rerun"].includes(e.event))).toBe(false);
+      expect(seed.journal.replayResumeState().get("T1")).toEqual(before);
+    }
+    for (const release of [{ release: "unknown-release" }, { release: "gate-satisfied", gate: "unknown-gate" }]) {
+      const seed = await seedResume(`run-inert-park-${live}-${release.release}`, [[{ gate: "test", pass: false }]]);
+      const graph = loadGraph(seed.repo);
+      saveGraph(seed.repo, { ...graph, tasks: graph.tasks.map((t) => ({ ...t, status: "human" })) });
+      seed.journal.append("task-human", "T1", { kind: "gate-fail", reason: "parked red" });
+      const before = seed.journal.replayResumeState().get("T1");
+      if (!live) seed.journal.append("task-approved", "T1", release);
+      let appended = false;
+      const summary = await runDaemon(seed.repo, { adapters: [seed.fake], runId: seed.runId, resume: true, approvalWindowMs: 1,
+        narrate: (e) => {
+          if (live && !appended && e.event === "approval-window-start") {
+            appended = true;
+            seed.journal.append("task-approved", "T1", release);
+          }
+        },
+      });
+      expect(summary.human).toEqual(["T1"]);
+      expect(afterLastResume(seed.journal.read()).some((e) => ["task-dispatch", "worker-launch", "gate-result"].includes(e.event))).toBe(false);
+      expect(seed.journal.replayResumeState().get("T1")).toEqual(before);
+    }
+  }
+}, 120_000);
+
+
+test("legacy worker launch consumes a recheck approval at restart and in the live sweep without reopening a human park", async () => {
+  for (const live of [false, true]) {
+    for (const missingWorktree of [false, true]) {
+      const seed = await seedResume(`run-legacy-recheck-${live}-${missingWorktree}`, [[{ gate: "test", pass: false }]]);
+      const park = () => seed.journal.append("task-human", "T1", { kind: "ladder-exhausted", reason: "exhausted" });
+      const legacyEnactment = () => {
+        seed.journal.append("task-approved", "T1", { release: "recheck" });
+        seed.journal.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 1, retryMode: "fresh" });
+        seed.journal.append("worker-launch", "T1", { attempt: 1 });
+        park();
+      };
+      park();
+      const graph = loadGraph(seed.repo);
+      saveGraph(seed.repo, { ...graph, tasks: graph.tasks.map((t) => ({ ...t, status: "human" })) });
+      if (!live) legacyEnactment();
+      if (missingWorktree) await shGitOk(`git worktree remove --force ${shq(seed.taskWorktree)}`, seed.repo);
+      let swept = false;
+      // Repeated resumes must leave the consumed release consumed.
+      for (let restart = 0; restart < 2; restart++) {
+        let boundary = seed.journal.read().length;
+        let before = seed.journal.replayResumeState().get("T1");
+        const summary = await runDaemon(seed.repo, {
+          adapters: [seed.fake], runId: seed.runId, resume: true, approvalWindowMs: 1,
+          narrate: (e) => {
+            if (live && !swept && e.event === "approval-window-start") {
+              swept = true;
+              legacyEnactment();
+              boundary = seed.journal.read().length;
+              before = seed.journal.replayResumeState().get("T1");
+            }
+          },
+        });
+        expect(summary.human).toEqual(["T1"]);
+        expect(summary.failed).toEqual([]);
+        expect(loadGraph(seed.repo).tasks[0]!.status).toBe("human");
+        expect(seed.journal.read().slice(boundary).filter((e) => e.taskId === "T1" &&
+          ["task-dispatch", "worker-launch", "worktree-recreation", "gate-result", "recheck-battery", "task-done"].includes(e.event))).toEqual([]);
+        expect(seed.journal.replayResumeState().get("T1")).toEqual(before);
+      }
+      if (live) expect(swept).toBe(true);
+    }
+  }
+}, 120_000);
+
+test("test: the same eligible red observed by a resumed gate replay receives the same funded repair disposition, so a restored path that parks where the ordinary path repairs fails", async () => {
+  const seed = await seedResume("run-unowned-replay", [[{ gate: "build", pass: true }]], undefined, undefined, {
+    tasks: { T1: [{ shell: `echo fixed > changed.txt && ${COMMIT} repaired`, result: { ok: true, summary: "fixed" } }] },
+  }, { "unowned.test.ts": "// detection site\n" }, {
+    test: ' if test ! -f changed.txt; then echo "FAIL unowned.test.ts"; exit 1; fi;',
+  });
+  const events = await resume(seed);
+  const funding = events.filter((e) => e.event === "repair-attempt");
+  expect(funding).toHaveLength(1);
+  expect(funding[0]!.data).toMatchObject({ charge: 1, commits: 1, gates: ["test"] });
+  expect(funding[0]!.data.findings).toContain("FAIL unowned.test.ts");
+  expect(events.find((e) => e.event === "task-dispatch")!.data.retryMode).toBe("repair");
+  expect(events.some((e) => e.event === "scope-authoring" || e.event === "task-approved")).toBe(false);
+  expect(events.some((e) => e.event === "merge")).toBe(true);
+  expect(repairsSinceApproval(seed.journal.read(), "T1")).toBe(1);
+}, 60_000);
+
+test("test: a resume over a journal ending at repair funding before any launch holds that allowance unspent whereas one ending after the funded gate was reached keeps its charge, so refunding a spent repair or forfeiting an unspent one fails", async () => {
+  const seed = await seedResume("run-repair-charge-replay", [[{ gate: "build", pass: true }]]);
+  const finding = "test: FAIL unowned.test.ts\nAssertion evidence: expected ready, received waiting";
+  seed.journal.append("repair-attempt", "T1", { repair: 1, gates: ["test"], findings: finding });
+  const replay = () => Journal.open(seed.repo, seed.runId).read();
+  seed.journal.append("run-resume", undefined, {});
+  expect(repairsSinceApproval(replay(), "T1")).toBe(0);
+  expect(pendingRepairFindings(replay(), "T1")).toBe(finding);
+  seed.journal.append("task-dispatch", "T1", { attempt: 1, assignment: ASSIGNMENT, retryMode: "repair" });
+  expect(repairsSinceApproval(replay(), "T1")).toBe(0);
+  expect(pendingRepairFindings(replay(), "T1")).toBe(finding);
+  seed.journal.append("worker-launch", "T1", {});
+  seed.journal.append("gate-result", "T1", { gate: "build", pass: true });
+  expect(repairsSinceApproval(replay(), "T1")).toBe(0);
+  seed.journal.append("gate-result", "T1", { gate: "test", pass: false, details: "FAIL unowned.test.ts" });
+  seed.journal.append("run-resume", undefined, {});
+  expect(repairsSinceApproval(replay(), "T1")).toBe(1);
+  expect(pendingRepairFindings(replay(), "T1")).toBeUndefined();
+  expect(repairReachSinceApproval(replay(), "T1")).toEqual([
+    { repair: 1, funded: ["test"], reached: ["build", "test"], diedAt: "test", charged: true },
+  ]);
+});

@@ -336,3 +336,38 @@ test('test: a review rejection reading "pins the tracked twin at .claude/skills/
     }
   }
 }, 60_000);
+
+test("test: a worker refusal naming one path present in the task tree plus one present only in the main checkout yields a repair hint for the first alone, so a fallback resolved against the repository root fails", async () => {
+  const mainOnly = ".tickmarkr/main-only.txt";
+  const blocked = { shell: "true", result: { ok: false, summary: `Blocked until needed.txt and ${mainOnly} are repaired first` } };
+  const { repo, fake } = setupRepo([T("T1", { files: ["owned.txt"] })],
+    { consult: { action: "human", notes: "operator decides" }, tasks: { T1: Array.from({ length: 6 }, () => blocked) } });
+  seedNeeded(repo);
+  // Present in the main checkout only: no task worktree ever carries it.
+  writeFileSync(join(repo, mainOnly), "main checkout only\n");
+  const id = "run-scope-fallback";
+  await runDaemon(repo, { adapters: [fake], runId: id, approvalWindowMs: 0 });
+  expect(existsSync(join(repo, mainOnly))).toBe(true);
+  const park = Journal.open(repo, id).read().findLast((e) => e.taskId === "T1" && e.event === "task-human")!;
+  expect(park.data.approveCommand).toBeUndefined();
+  expect(park.data.reason).toMatch(/files\[\] repair hint: needed\.txt$/);
+  expect(park.data.reason).not.toContain(mainOnly);
+}, 60_000);
+
+test("test: the approve command printed on a scope request park lists exactly the validated paths, so a command carrying an unresolved token fails", async () => {
+  const mixed = { shell: "true", result: { ok: false, summary: "Cannot edit needed.txt or ghost/missing.txt outside files[] allowlist" } };
+  const { repo, fake } = setupRepo([T("T1", { files: ["owned.txt"] })], { tasks: { T1: [mixed] } });
+  seedNeeded(repo);
+  const notifications: string[] = [];
+  const driver = new SubprocessDriver();
+  driver.notify = async (message) => { notifications.push(message); };
+  const id = "run-scope-validated";
+  await runDaemon(repo, { adapters: [fake], driver, runId: id, approvalWindowMs: 0 });
+  const events = Journal.open(repo, id).read().filter((e) => e.taskId === "T1");
+  const park = events.findLast((e) => e.event === "task-human")!;
+  const command = `tickmarkr approve ${id} T1 --files needed.txt`;
+  expect(park.data).toMatchObject({ kind: "scope-request", paths: ["needed.txt"], approveCommand: command });
+  expect(notifications.flatMap((message) => message.split("\n")).filter((line) => line.includes("--files"))).toEqual([command]);
+  expect(notifications.join("\n")).not.toMatch(/--files[^\n]*ghost/);
+  expect(events.some((e) => e.event === "scope-hint-unresolved" && (e.data.paths as string[]).includes("ghost/missing.txt"))).toBe(true);
+}, 60_000);

@@ -797,3 +797,33 @@ test("the verification identity binds the protocol and the effective runner life
   expect(legacyStore.get(preStamp)?.pass).toBe(true);
   expect(legacyCtx.stateDir).toBeTruthy();
 });
+
+test("test: an explicitly funded rerun discards a cached red at the battery read plus the full suite read journaling each discard, whereas a cached green is still reused, so a red replayed from either cache fails", async () => {
+  for (const outcome of ["exit 0", "echo 'AssertionError: still broken'; exit 1"]) {
+    const { task, ctx, store, identity, calls } = await signalCacheFixture(true, outcome);
+    ctx.commands.build = "true";
+    ctx.cachedRedBypass = "operator-rerun";
+    const journal = Journal.create(makeTestTempDir("tickmarkr-cache-journal-"), `run-funded-cache-${outcome === "exit 0" ? "green" : "red"}`);
+    ctx.onGate = (e) => { if (e.phase === "note") journal.append(e.name, task.id, e.payload); };
+    const buildId = await computeVerificationIdentity({ worktree: ctx.worktree, gate: "build", command: "true",
+      baseline: ctx.baseline, capacity: resolvedCapacity() });
+    store.set(buildId, { gate: "build", pass: false, details: "old build red" });
+    store.set(identity, { gate: "test", pass: false, details: "old full suite red" });
+    const first = await runGates(task, ctx);
+    expect(first.results.find((r) => r.gate === "build")?.pass).toBe(true);
+    expect(first.results.find((r) => r.gate === "test")?.pass).toBe(outcome === "exit 0");
+    expect(calls()).toEqual(["selected", "full"]);
+    expect(journal.read().filter((e) => e.event === "gate-rerun").map((e) => e.data)).toEqual([
+      { gate: "build", reason: "cached-red-discarded", bypass: "operator-rerun" },
+      { gate: "test", reason: "cached-red-discarded", bypass: "operator-rerun" },
+    ]);
+    if (outcome === "exit 0") {
+      const second = await runGates(task, ctx);
+      expect(second.results.find((r) => r.gate === "test")?.meta?.reused).toBe(true);
+      expect(calls()).toEqual(["selected", "full"]);
+      expect(journal.read().filter((e) => e.event === "gate-rerun")).toHaveLength(2);
+      expect(journal.read().filter((e) => e.event === "gate-reused-verdict").map((e) => e.data.gate))
+        .toEqual(expect.arrayContaining(["build", "test"]));
+    }
+  }
+});

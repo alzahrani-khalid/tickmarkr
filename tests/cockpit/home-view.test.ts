@@ -497,3 +497,64 @@ test("Activity selection reconciles by stable evidence identity when new activit
 
   h.unmount();
 });
+
+
+test("test: a down arrow followed at once by Enter on the needs you section opens the second park when no frame was drawn between the keys, so a handler acting on the previous render's selection fails", async () => {
+  const model = deriveHomeView({ operator: partialSnapshot, seats });
+  const opened: string[] = [];
+  const h = await mountHome(model, { onOpenPark: id => opened.push(id) });
+  try {
+    expect(h.frame()).toContain("T2 human");
+    // No wait or render between the navigation and activation.
+    h.input.write("\x1B[B"); h.input.write("\r");
+    await wait(50);
+    expect(opened).toEqual(["T3"]);
+    expect(h.frame()).toContain("T3 blocked");
+    expect(h.frame()).not.toContain("T2 human");
+  } finally { h.unmount(); }
+});
+
+test("test: a right arrow then a down arrow then Enter written in one tick opens the second activity row's evidence, so a handler that still targets the needs you section fails", async () => {
+  const activity: HomeActivityRow[] = [100, 97].map(line => ({
+    evidence: { source: "journal.jsonl", line, id: `journal.jsonl#L${line}` },
+    time: "08:00:00", state: "neutral", text: `event ${line}`,
+  }));
+  const model = deriveHomeView({ operator: partialSnapshot, seats, activity });
+  const opened: EvidenceIdentity[] = [];
+  const parks: string[] = [];
+  const h = await mountHome(model, {
+    onOpenPark: id => parks.push(id),
+    onOpenEvidence: evidence => opened.push(evidence),
+  });
+  try {
+    expect(h.frame()).toContain("T2 human");
+    h.input.write("\x1B[C"); h.input.write("\x1B[B"); h.input.write("\r");
+    await wait(50);
+    expect(opened).toEqual([activity[1]!.evidence]);
+    expect(parks).toEqual([]);
+    expect(h.frame()).toContain(`${GLYPHS.pointer} event 97`);
+    expect(h.frame()).not.toContain(`${GLYPHS.pointer} event 100`);
+    expect(h.frame()).toContain("T2 human");
+  } finally { h.unmount(); }
+});
+
+test("test: two down arrows written in one tick across three parks select the third park, so a handler that steps once from a stale index fails", async () => {
+  const model = deriveHomeView({
+    operator: {
+      ...partialSnapshot,
+      tasks: partialSnapshot.tasks.map(task => ({ ...task, state: "human" as const })),
+    },
+    seats,
+  });
+  expect(model.needsYou.map(target => target.id)).toEqual(["T1", "T2", "T3"]);
+  const opened: string[] = [];
+  const h = await mountHome(model, { onOpenPark: id => opened.push(id) });
+  try {
+    expect(h.frame()).toContain(model.needsYou[0]!.label);
+    h.input.write("\x1B[B"); h.input.write("\x1B[B"); h.input.write("\r");
+    await wait(50);
+    expect(opened).toEqual(["T3"]);
+    expect(h.frame()).toContain(model.needsYou[2]!.label);
+    expect(h.frame()).not.toContain(model.needsYou[1]!.label);
+  } finally { h.unmount(); }
+});

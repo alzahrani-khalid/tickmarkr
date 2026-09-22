@@ -41,7 +41,7 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
   }
   await assertRefsWritable(cwd, "resume");
   const host = classifyHost();
-  preflightHostDriver(cfg, driverOverride, host);
+  await preflightHostDriver(cfg, driverOverride, host, cwd);
   const narrate = narrationSink(runId);
   const s = await runDaemon(cwd, {
     runId,

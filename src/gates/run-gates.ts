@@ -183,6 +183,8 @@ export interface GateContext {
   // OBS-1055: this round is an operator recheck — it re-MEASURES, so a cached RED verdict is discarded
   // and the gate re-runs (a cached green is not what the recheck questions and may replay).
   recheck?: boolean;
+  /** Explicit worker funding requires fresh red measurements, never a gate waiver. */
+  cachedRedBypass?: "operator-rerun";
   // OBS-1033: channel keys of the seats that authored the carried commits (the task's tried list) —
   // a reviewer of that vendor is excluded for the round, never handed its own work to approve.
   carriedAuthors?: readonly string[];
@@ -429,8 +431,10 @@ export async function runGates(
   // OBS-1055: on a recheck a cached red is the answer the operator just said was wrongly given; it is
   // journaled as discarded and the gate runs. Returns true when the hit must NOT be reused.
   const discardCachedRed = async (gate: GateName, hit: GateResult): Promise<boolean> => {
-    if (!ctx.recheck || hit.pass) return false;
-    await ctx.onGate?.({ phase: "note", gate, name: "recheck-rerun", payload: { gate, reason: "cached-red-discarded" }, result: hit });
+    const reason = ctx.recheck ? "recheck" : ctx.cachedRedBypass;
+    if (!reason || hit.pass) return false;
+    await ctx.onGate?.({ phase: "note", gate, name: reason === "recheck" ? "recheck-rerun" : "gate-rerun",
+      payload: { gate, reason: "cached-red-discarded", ...(reason === "recheck" ? {} : { bypass: reason }) }, result: hit });
     return true;
   };
   const shapeGates = ctx.cfg.gates.byShape?.[task.shape];

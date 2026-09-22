@@ -2,6 +2,22 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.5.8 — a run that does not lap
+
+**v2.5.8** — the laps v2.5.7 bought (park → close → resume, a full suite each) are removed where a harness or plan defect caused them: pending approvals fold once, a repair disposition is pure and bounded, declared pins and landing suites survive compile, and a run refuses the checkouts and hosts it cannot supervise. Run `run-20260921-164444-0000000000000044`: 15/15 merged, every review cross-vendor, tip verify uncached on the shipped commit.
+
+- **T1 — manifest evidence.** The manifest reporter carries bounded assertion evidence without minting a new failure identity.
+- **T2/T3 — one fold of pending approvals (OBS-1075, OBS-1069).** Startup and the live sweep consume a single typed fold; an explicit rerun bypasses a cached red at both cache reads.
+- **T4/T5/T6 — repair disposition (OBS-1077, OBS-1074, OBS-1072).** A pure disposition and scope-hint resolver, wired into the ordinary and restored outcome paths with bounded repair; the hint fallback resolves against the task inventory, and run-end names a fresh, reused or failed verification cycle.
+- **T7/T14 — pin sweep (agreement C2).** A typed declaration of retired-literal and fixture pins survives compile, validation and reload; a declared pin is scanned completely and an uncovered obligation refuses the seal.
+- **T8/T15 — declared landing suites (OBS-1064).** A test criterion's declared landing suite survives native compile, validation and reload; a declared landing in an owned suite plans as pending authorship, every other unmatched oracle stays a refusal.
+- **T9 — overseer skill (OBS-1078).** Names the broken-harness rescue, ancestry evidence, the merged release subject and scope-only seals.
+- **T10 — resumed sweep failures (the D-64 class).** A resumed engagement's sweep failure records its own fatal outcome.
+- **T11 — `approve --files` (agreement C4).** Refuses an over-bound amendment before the authority append.
+- **T12 — Orca checkouts (OBS-1061).** A run whose resolved driver is orca refuses an unmanaged checkout before any dispatch.
+- **T13 — Home view (OBS-1081).** Keys act on the selection the operator made, not on the render the handler captured.
+- **Known gaps (queued, not shipped).** A restored attempt replays a green build verdict onto a recreated worktree that was never built, so dist-dependent suites red until a fresh attempt (the green-side sibling of OBS-1069; 2.5.9 P1). `--review-rounds` is dropped on a scope-request decision.
+
 ## v2.5.7 — a battery you can trust, then truthful progress
 
 **v2.5.7** — the test battery reports what actually ran, the daemon journals build receipts it can prove, and every operator surface (status, cockpit board, run view, evidence view) reads one shared projection of recorded evidence instead of predicting what a gate is doing.

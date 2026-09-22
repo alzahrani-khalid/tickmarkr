@@ -8,6 +8,7 @@ import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { classifyContextPath } from "../../compile/native.js";
 import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK, type TickmarkrConfig } from "../../config/config.js";
 import { chainDepth, dispatchWaves, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
+import { filesGlob } from "../../graph/files-glob.js";
 import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
 import { resolveRunMode } from "../../run/daemon.js";
 import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } from "../../route/preference.js";
@@ -51,6 +52,33 @@ const fleetCanCrossVendorReview = (channels: BillingChannel[]) => {
 export type PlanOpts = {
   listTests?: (cwd: string) => Promise<VitestListResult>;
 };
+
+// Planning can defer authorship only to this criterion's explicitly owned landing.
+// This advisory does not change runtime oracle execution or name resolution.
+export function plannedOracleDisposition(
+  task: Pick<Task, "files" | "acceptance">,
+  listing: VitestListResult,
+): { refusals: string[]; advisories: string[] } {
+  const refusals: string[] = [];
+  const advisories: string[] = [];
+  const items = task.acceptance.filter((item) => typeof item === "object" && item.oracle === "test");
+  if (listing.status === "failed") {
+    if (items.length) refusals.push(`acceptance oracle unresolved — runner listing failed: ${listing.error.split("\n")[0]}`);
+    return { refusals, advisories };
+  }
+  const owns = filesGlob(task.files.map((path) => path.replace(/^\.\//, "")));
+  for (const item of items) {
+    const audit = auditNamedTestOracles([item], listing.tests)[0]!;
+    if (audit.matches.length === 0 && item.landing && owns(item.landing)) {
+      advisories.push(`acceptance oracle ${JSON.stringify(audit.criterion)} not yet written (worker authors ${item.landing})`);
+    } else if (audit.matches.length === 0) {
+      refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches zero runner-listed test names`);
+    } else if (audit.matches.length > 1) {
+      refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches ${audit.matches.length} runner-listed test names`);
+    }
+  }
+  return { refusals, advisories };
+}
 
 type TaskInputFinding = {
   taskId: string;
@@ -183,26 +211,7 @@ export async function plan(
   if (g.tasks.some((task) => task.acceptance.some((item) => typeof item === "object" && item.oracle === "test"))) {
     const listing = await (opts.listTests ?? listVitestTests)(cwd);
     for (const task of g.tasks) {
-      const refusals: string[] = [];
-      const advisories: string[] = [];
-      const authoredTest = task.files
-        .map((path) => path.replace(/^\.\//, ""))
-        .find((path) => /^tests\/.+\.test\.ts$/.test(path) && !/[?*{[]/.test(path) && !existsSync(join(cwd, path)));
-      if (listing.status === "failed") {
-        if (task.acceptance.some((item) => typeof item === "object" && item.oracle === "test")) {
-          refusals.push(`acceptance oracle unresolved — runner listing failed: ${listing.error.split("\n")[0]}`);
-        }
-      } else {
-        for (const audit of auditNamedTestOracles(task.acceptance, listing.tests)) {
-          if (audit.matches.length === 0 && authoredTest) {
-            advisories.push(`acceptance oracle ${JSON.stringify(audit.criterion)} not yet written (worker authors ${authoredTest})`);
-          } else if (audit.matches.length === 0) {
-            refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches zero runner-listed test names`);
-          } else if (audit.matches.length > 1) {
-            refusals.push(`acceptance oracle ${JSON.stringify(audit.criterion)} matches ${audit.matches.length} runner-listed test names`);
-          }
-        }
-      }
+      const { refusals, advisories } = plannedOracleDisposition(task, listing);
       if (refusals.length) oracleRefusals.set(task.id, refusals);
       if (advisories.length) oracleAdvisories.set(task.id, advisories);
     }

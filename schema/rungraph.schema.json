@@ -149,6 +149,10 @@
                     "text": {
                       "type": "string",
                       "minLength": 1
+                    },
+                    "landing": {
+                      "type": "string",
+                      "minLength": 1
                     }
                   },
                   "required": [
@@ -198,6 +202,56 @@
               },
               "required": [
                 "paths"
+              ]
+            }
+          },
+          "pins": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "literal"
+                    },
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "glob": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "text",
+                    "glob"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "fixture"
+                    },
+                    "paths": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "paths"
+                  ]
+                }
               ]
             }
           },

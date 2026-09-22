@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
 import picomatch from "picomatch";
 import {
-  type AcceptanceItem, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, renderAcceptanceItem, SHAPES, TIERS,
+  type AcceptanceItem, type Pin, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, renderAcceptanceItem, SHAPES, TIERS,
   type RunGraph, type Task, validateGraph,
 } from "../graph/schema.js";
 import { criterionReadsOnly } from "./collateral.js";
@@ -72,7 +72,7 @@ const NESTED_RE = /^\s+- (.+)$/;
 // v1.19: a typed acceptance oracle line — "command: ...", "test: ...", or "judge: ...". Anything
 // without one of these prefixes is a plain-string judge criterion (compat path, emits a warning).
 const ORACLE_RE = new RegExp(`^(${ORACLES.join("|")}):\\s*(.*)$`);
-const FIELDS = new Set(["goal", "shape", "deps", "files", "context", "complexity", "humangate", "pin", "floor", "gates", "acceptance", "timeout"]);
+const FIELDS = new Set(["goal", "shape", "deps", "files", "context", "complexity", "humangate", "pin", "floor", "gates", "acceptance", "timeout", "pins"]);
 
 interface Draft {
   id: string;
@@ -84,11 +84,53 @@ interface Draft {
   acceptance: AcceptanceItem[];
   gates: string[];
   hasGates: boolean;
-  list: "acceptance" | "gates" | null;
+  pinsRaw: string[];
+  list: "acceptance" | "gates" | "pins" | null;
   // true while the last item of `list` may still absorb wrapped continuation lines; cleared by
   // any field bullet or blank line, so a dangling indented line elsewhere fails closed below.
   itemOpen: boolean;
   continuationField: "goal" | "deps" | "files" | "context" | null;
+}
+
+const listItems = (draft: Draft) =>
+  draft.list === "acceptance" ? draft.acceptanceRaw : draft.list === "pins" ? draft.pinsRaw : draft.gates;
+
+// v2.5.8 T7: one declared pin item — "literal: <exact text> | glob: <search glob>" (split at the LAST
+// " | glob: " so the text may itself hold a bar) or "fixture: <path set>". A declaration missing the
+// payload its own kind requires refuses the compile naming the task and the item.
+const PIN_GLOB_SEP = "| glob:";
+// v2.5.8 T8 (OBS-1064): "test: <title> | suite: <path>" — split at the LAST " | suite: " so the title
+// stays the verbatim leaf the gate matches and the landing path never enters it.
+const LANDING_SEP = "| suite:";
+function parsePin(task: string, raw: string, index: number, pathSet: (value: string) => string[]): Pin {
+  const bad = (detail: string): never => invalid(task, "pins", `item ${index + 1} (${JSON.stringify(raw)}) ${detail}`);
+  const typed = raw.match(/^(\w+):\s*(.*)$/);
+  if (typed?.[1] === "fixture") {
+    const paths = pathSet(typed[2]);
+    if (!paths.length) bad("is a fixture pin missing its path set");
+    return { kind: "fixture", paths };
+  }
+  if (typed?.[1] === "literal") {
+    const at = typed[2].lastIndexOf(PIN_GLOB_SEP);
+    const text = (at < 0 ? typed[2] : typed[2].slice(0, at)).trim();
+    const glob = at < 0 ? "" : typed[2].slice(at + PIN_GLOB_SEP.length).trim();
+    if (!text) bad("is a literal pin missing its text");
+    if (!glob) bad(`is a literal pin missing its search glob — write "literal: <text> ${PIN_GLOB_SEP} <glob>"`);
+    return { kind: "literal", text, glob };
+  }
+  return bad('must be "literal: <text> | glob: <glob>" or "fixture: <path set>"');
+}
+
+function parseTestOracle(task: string, body: string, index: number): AcceptanceItem {
+  const at = body.lastIndexOf(LANDING_SEP);
+  if (at < 0) return { oracle: "test", test: body.trim() };
+  const test = body.slice(0, at).trim();
+  const landing = body.slice(at + LANDING_SEP.length).trim();
+  const bad = (detail: string): never => invalid(task, "acceptance", `item ${index + 1} (${JSON.stringify(body)}) ${detail}`);
+  if (!test) bad("is a test oracle missing its title before the landing");
+  if (!landing) bad(`is a test oracle missing its landing path — write "test: <title> ${LANDING_SEP} <path>"`);
+  if (!picomatch(COLLECTABLE_TESTS, { dot: true })(landing)) bad(`declares landing ${JSON.stringify(landing)} which no runner collects (${COLLECTABLE_TESTS})`);
+  return { oracle: "test", test, landing };
 }
 
 function invalid(task: string, field: string, detail: string): never {
@@ -427,7 +469,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
   for (const [index, line] of content.split("\n").entries()) {
     const heading = line.match(HEAD_RE);
     if (heading) {
-      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptanceRaw: [], acceptance: [], gates: [], hasGates: false, list: null, itemOpen: false, continuationField: null });
+      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptanceRaw: [], acceptance: [], gates: [], hasGates: false, pinsRaw: [], list: null, itemOpen: false, continuationField: null });
       continue;
     }
     const draft = drafts.at(-1);
@@ -462,7 +504,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
       if (!FIELDS.has(name)) invalid(draft.id, field[1], "is unknown");
       const value = field[2].trim();
       draft.itemOpen = false;
-      if (name === "acceptance" || name === "gates") {
+      if (name === "acceptance" || name === "gates" || name === "pins") {
         if (value) invalid(draft.id, field[1], "must be a nested list");
         draft.list = name;
         if (name === "gates") draft.hasGates = true;
@@ -507,7 +549,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
     if (nested && draft.list) {
       const value = nested[1].trim();
       if (!value) invalid(draft.id, draft.list, "must not contain empty entries");
-      (draft.list === "acceptance" ? draft.acceptanceRaw : draft.gates).push(value);
+      listItems(draft).push(value);
       draft.itemOpen = true;
       continue;
     }
@@ -516,7 +558,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
     // 1.87.0 dropped these lines silently: 53/78 of run-551's criteria compiled to first-line
     // stubs and every falsifier tail was invisible to the judge.
     if (draft.list && draft.itemOpen && (line.startsWith(" ") || line.startsWith("\t")) && line.trim()) {
-      const items = draft.list === "acceptance" ? draft.acceptanceRaw : draft.gates;
+      const items = listItems(draft);
       items[items.length - 1] += ` ${line.trim()}`;
       continue;
     }
@@ -539,14 +581,14 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
   // OBS-488: typed-oracle prefixes parse on the COMPLETE joined item text, never its first
   // physical line — a wrapped `command:` body or falsifier tail is part of the criterion.
   for (const draft of drafts) {
-    for (const raw of draft.acceptanceRaw) {
+    for (const [index, raw] of draft.acceptanceRaw.entries()) {
       const typed = raw.match(ORACLE_RE);
       if (typed) {
         const [, kind, body] = typed;
         if (!body.trim()) invalid(draft.id, "acceptance", `${kind} oracle must carry a value`);
         draft.acceptance.push(
           kind === "command" ? { oracle: "command", command: body.trim() }
-            : kind === "test" ? { oracle: "test", test: body.trim() }
+            : kind === "test" ? parseTestOracle(draft.id, body, index)
             : { oracle: "judge", text: body.trim() },
         );
       } else {
@@ -609,6 +651,10 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
   };
   const csv = (value?: string) =>
     value && value.toLowerCase() !== "none" ? splitTop(value).map((item) => stripAnnotation(item.trim())).filter(Boolean) : [];
+
+  // A fixture pin's path set is split only — never annotation-stripped: "fixtures/output (old)" is a
+  // filename, and csv() would silently retarget the declared obligation to "fixtures/output".
+  const pinPaths = (value: string) => splitTop(value).map((item) => item.trim()).filter(Boolean);
 
   // OBS-97: a typed test: oracle needs a collectable home. vitest only collects COLLECTABLE_TESTS
   // paths, so a task whose non-empty files[] cannot host one makes scope-green and acceptance-green
@@ -728,6 +774,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
       ...(timeoutMinutes !== undefined ? { timeoutMinutes } : {}),
       ...(routingHints ? { routingHints } : {}),
       ...(draft.hasGates ? { gates: draft.gates } : {}),
+      ...(draft.pinsRaw.length ? { pins: draft.pinsRaw.map((raw, i) => parsePin(draft.id, raw, i, pinPaths)) } : {}),
     };
   });
 
@@ -844,9 +891,19 @@ acceptance is required on every task (a nested list of observable outcomes).
     acceptance:  nested list (REQUIRED, non-empty). Each item is either a typed oracle or plain text:
                  - command: <shell>   (oracle: command — exit code)
                  - test: <name>       (oracle: test — named test)
+                 - test: <name> | suite: <path>   (same, plus the tests/**/*.test.ts file it lands in;
+                                       the path lives in the item's landing field, never in the title)
                  - judge: <rubric>    (oracle: judge — LLM-judged, free text)
                  A judge criterion carries ONE claim; a semicolon-joined criterion warns — split its clauses.
                  - <plain text>       (compat: compiles as judge oracle, warns)
+    pins:        nested list (optional) of retired-literal and fixture pin obligations:
+                 - literal: <exact text> | glob: <search glob>   (every file matching the glob that holds
+                                                                  the text is an obligated file)
+                 - fixture: <comma-separated path set>           (every matching file is itself obligated:
+                                                                  byte-pinned output the change will move;
+                                                                  it carries no literal text)
+                 LAW: a pins declaration is a LIMITED AUTHORING CONTRACT, not an assertion analyzer —
+                 tickmarkr holds you to the obligations you DECLARE; it does not discover the pins you forgot.
 
   HARD BOUNDS — these FAIL the compile, they do not warn:
     - at most 6 acceptance items per task (no exception path)
@@ -863,6 +920,9 @@ acceptance is required on every task (a nested list of observable outcomes).
       describe() is allowed (OBS-511: the gate matches the criterion as the trailing segment of the
       runner-visible full name), but the leaf title itself must equal the criterion: a shortened,
       decorated, or paraphrased leaf selects ZERO tests and the gate parks even though the suite is green.
+      To say WHICH suite the test lands in, append " | suite: <tests/**/*.test.ts path>" — the path is
+      parsed off into the item's landing field and the title stays the bare leaf; a landing outside the
+      collectable glob refuses the compile.
       Measured before the widening: two parks across two runs, one full attempt lost in each.
     - NO criterion may be satisfiable by an absence, a rename, a source-text grep, or an empty collection.
       "no file references X" is not a criterion — it passes in a repo where the feature was never built.

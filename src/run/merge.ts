@@ -39,6 +39,8 @@ export interface TipVerifyResult {
   spawnedCommand?: string;
   /** Q121s: nonzero exit whose failures are ALL baseline-recorded — forgiven exactly as the battery forgives. */
   forgiven?: boolean;
+  /** D-131: carried from a persisted per-gate verdict — this cycle did NOT execute the command. */
+  reused?: true;
   /**
    * OBS-534: what a nonzero exit is evidence OF, taken from the battery's own readers — `ceilingKillResult`
    * for a kill, the shared runner classifier for everything else. `infra` means nothing was verified.
@@ -232,6 +234,7 @@ export async function verifyIntegrationTip(
         gate,
         cmd,
         pass: hit.pass,
+        reused: true,
         exitCode: hit.exitCode ?? 0,
         fingerprints: (hit.meta?.fingerprints as string[] | undefined) ?? [],
         ...(hit.meta?.forgiven ? { forgiven: true } : {}),

@@ -544,7 +544,7 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     }
     await assertRefsWritable(cwd, "run");
     const host = classifyHost();
-    preflightHostDriver(cfg, driverOverride, host);
+    await preflightHostDriver(cfg, driverOverride, host, cwd);
     // The run id is minted HERE rather than inside the daemon, because the narration sink has to know
     // which run it is narrating before the first event arrives (the daemon's `narrate` callback is
     // handed an event and nothing else, and `run-start` carries no run id). `runDaemon` uses the id

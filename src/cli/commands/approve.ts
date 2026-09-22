@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { userInfo } from "node:os";
 import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
-import { separabilityErrors } from "../../compile/collateral.js";
+import { separabilityErrors, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
 import { GATE_NAMES } from "../../graph/schema.js";
 import { applyScopeAmendments, engagementComparable, engagementReleased, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
 
@@ -260,6 +260,13 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     const amended = { ...graph, tasks: graph.tasks.map((t) => t.id === taskId ? { ...t, files: amendedFiles } : t) };
     const conflicts = separabilityErrors(amended.tasks);
     if (conflicts.length) throw new Error(`refusing scope-request approval for ${taskId}: ${conflicts.join("\n")}`);
+    // C4: a live grant may not take a task past the bounds that fail every compile. The exception
+    // list is EMPTY on purpose — a recorded historical compile exception confers no live authority.
+    const overBound = [...taskBudgetErrors([{ ...task, files: amendedFiles }]), ...surfaceErrors([{ ...task, files: amendedFiles }], [])];
+    if (overBound.length) {
+      throw new Error(`refusing scope-request approval for ${taskId}: ${overBound.join("\n")}\n`
+        + `remedy: close the run, split the task in its spec, recompile, then \`tickmarkr resume ${runId} --graph-changed\``);
+    }
     journal.append("task-approved", taskId, {
       by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request",
       amendment: { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park.line, definition: taskDefinitionFingerprint(task) },

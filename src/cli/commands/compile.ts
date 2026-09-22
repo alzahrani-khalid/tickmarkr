@@ -5,6 +5,7 @@ import {
 } from "../../compile/collateral.js";
 import { CompileError } from "../../compile/common.js";
 import { compileSource } from "../../compile/index.js";
+import { retiredLiteralErrors } from "../../compile/retired-literals.js";
 import { clearCompileRefusal, saveCompileRefusal, saveGraph, stateDirName } from "../../graph/graph.js";
 import { formatPriorFindingEvidence, readPriorRunEvidence, type PriorMergeEvidence } from "../../run/journal.js";
 import { shGit } from "../../run/git.js";
@@ -86,6 +87,12 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
     const unwaived = g.spec.source === "native" ? nativeSourceScopeErrors(g, sourceFindings) : [];
     if (unwaived.length > 0) {
       throw new CompileError(`${src} has unwaived native source-scope authoring errors:\n${unwaived.map((line) => `  - ${line}`).join("\n")}${diagnostics}`);
+    }
+    // v2.5.8 T14: a declared pin whose obligated file the declaring task does not own refuses the seal
+    // here, before any state write, so a dry run reaches the same refusal. Diagnostic only: never widens scope.
+    const uncovered = retiredLiteralErrors(g.tasks, cwd);
+    if (uncovered.length > 0) {
+      throw new CompileError(`${src} has uncovered declared pin obligations:\n${uncovered.map((line) => `  - ${line}`).join("\n")}${diagnostics}`);
     }
     // One bounded read supplies both cross-run surfaces: unresolved findings below and merge facts for
     // the ancestry check. Neither fact mutates the compiled graph; status and every readiness predicate

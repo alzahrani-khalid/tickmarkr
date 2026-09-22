@@ -1,6 +1,8 @@
 import type { TickmarkrConfig } from "../config/config.js";
 import { HerdrDriver } from "./herdr.js";
-import { OrcaDriver } from "./orca.js";
+import { shq } from "../adapters/types.js";
+import { sh } from "../run/git.js";
+import { canonicalWorktreePath, OrcaDriver, OrcaError, parseEnvelope, resolveOrcaCliBinary, terminalWorktree } from "./orca.js";
 import { SubprocessDriver } from "./subprocess.js";
 import type { ExecutorDriver } from "./types.js";
 
@@ -26,19 +28,68 @@ export function classifyHost(env: NodeJS.ProcessEnv = process.env): ClassifiedHo
   return "none";
 }
 
+const UNMANAGED_CHECKOUT = "checkout is not Orca-managed; run from an orca worktree create checkout or pass --driver subprocess";
+
+/**
+ * OBS-1061: the ONE admission probe — `worktree current` asked from the run root. Like the driver's
+ * own per-checkout query it accepts an enclosing tracked checkout after path canonicalisation. An
+ * untracked checkout refuses with both remedies; any other failure refuses naming its reason, never
+ * read as managed.
+ */
+async function admitOrcaCheckout(runRoot: string, env: NodeJS.ProcessEnv): Promise<void> {
+  const bin = resolveOrcaCliBinary(runRoot, { env }) ?? "orca";
+  const refuse = (reason: string) => new Error(`refusing driver 'orca': Orca admission probe of ${runRoot} failed — ${reason}`);
+  let reported: string | undefined;
+  // The transport's own diagnostics (timeout, exit, stderr): a stderr-only failure such as a missing
+  // executable parses as 'empty response', which alone names no cause.
+  let transport = "";
+  try {
+    // Config values flow into a shell here: every argv element is quoted, always.
+    const r = await sh([bin, "worktree", "current", "--json"].map(shq).join(" "), runRoot);
+    const raw = [r.stdout, r.stderr ? `STDERR: ${r.stderr}` : ""].filter(Boolean).join("\n");
+    transport = [r.timedOut ? "probe timed out" : r.code !== 0 ? `orca exited ${r.code}` : "", r.stderr.trim() ? `stderr: ${r.stderr.trim()}` : ""]
+      .filter(Boolean).join("; ");
+    const envelope = parseEnvelope("worktree-current", r.stdout, raw);
+    // An ok:true body on a nonzero exit is a transport failure (stale stdout), as in the driver.
+    if (r.code !== 0) throw new OrcaError("worktree-current", `orca exited ${r.code}`, raw);
+    const worktree = envelope.result.worktree;
+    reported = typeof worktree === "object" && worktree !== null && !Array.isArray(worktree)
+      ? terminalWorktree(worktree as Record<string, unknown>)
+      : undefined;
+    if (!reported) throw new OrcaError("worktree-current", "response carries no worktree path", raw);
+  } catch (e) {
+    if (e instanceof OrcaError && e.code === "selector_not_found") throw new Error(`refusing driver 'orca': ${UNMANAGED_CHECKOUT}`);
+    const reason = e instanceof OrcaError ? e.reason : (e as Error).message;
+    throw refuse(transport.startsWith(reason) ? transport : [reason, transport].filter(Boolean).join("; "));
+  }
+  const tracked = canonicalWorktreePath(reported);
+  const root = canonicalWorktreePath(runRoot);
+  if (tracked !== root && !root.startsWith(`${tracked}/`)) throw new Error(`refusing driver 'orca': ${UNMANAGED_CHECKOUT}`);
+}
+
 /**
  * A config driver of herdr or orca whose host is not the classified one is refused naming the
  * detected host, the config line and the --driver remedy. Any explicit --driver value bypasses
- * this; auto and subprocess are never refused.
+ * that; auto and subprocess are never refused. Then, when the RESOLVED driver is orca (config,
+ * auto on an Orca host, or an explicit flag), the run root is admitted by one probe before any run
+ * directory, journal row or dispatch exists. Subprocess and herdr selections probe nothing.
  */
-export function preflightHostDriver(cfg: TickmarkrConfig, driverOverride: string | undefined, host: ClassifiedHost): void {
-  if (driverOverride !== undefined) return;
-  if ((cfg.driver === "herdr" || cfg.driver === "orca") && cfg.driver !== host) {
+export async function preflightHostDriver(
+  cfg: TickmarkrConfig,
+  driverOverride: string | undefined,
+  host: ClassifiedHost,
+  runRoot: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  if (driverOverride === undefined && (cfg.driver === "herdr" || cfg.driver === "orca") && cfg.driver !== host) {
     const remedy = host === "none" ? "subprocess" : host;
     throw new Error(
       `refusing driver '${cfg.driver}' (config line 'driver: ${cfg.driver}'): detected host is ${host}; use --driver ${remedy} to override`,
     );
   }
+  const want = parseDriverOverride(driverOverride) ?? cfg.driver;
+  const resolved = want === "auto" ? (host === "none" ? "subprocess" : host) : want;
+  if (resolved === "orca") await admitOrcaCheckout(runRoot, env);
 }
 
 /**

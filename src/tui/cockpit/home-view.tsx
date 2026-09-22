@@ -1,5 +1,5 @@
 import { Box, useInput } from "ink";
-import { useLayoutEffect, useState, type ReactElement, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import { GLYPHS } from "../../brand.js";
 import type {
   EvidenceIdentity,
@@ -260,70 +260,86 @@ export function HomeView({
   const maxSelection = Math.max(0, model.activity.length - 1);
   const safeOffset = Math.min(offset, maxOffset);
 
+  // Keep input ahead of the next render/effect subscription, as in EvidenceView.
+  // Render reconciles the refs with model updates; each move writes before setting state.
+  const sectionRef = useRef(effectiveSection);
+  const needsYouIndexRef = useRef(effectiveNeedsYouIndex);
+  const activityIndexRef = useRef(effectiveActivityIndex);
+  sectionRef.current = effectiveSection;
+  needsYouIndexRef.current = effectiveNeedsYouIndex;
+  activityIndexRef.current = effectiveActivityIndex;
+  const moveSection = (next: "needsYou" | "activity"): void => {
+    sectionRef.current = next;
+    setSection(next);
+  };
+  const moveNeedsYou = (index: number): void => {
+    needsYouIndexRef.current = index;
+    setNeedsYouIndex(index);
+    setSelectedNeedsYouId(model.needsYou[index]?.id);
+  };
+  const moveActivity = (index: number): void => {
+    activityIndexRef.current = index;
+    setActivityIndex(index);
+    setSelectedEvidenceId(model.activity[index]?.evidence.id);
+  };
+
   useInput(
     (_input, key) => {
       if (key.leftArrow && model.needsYou.length > 0) {
-        if (effectiveSection === "needsYou") {
-          const nextIndex = (effectiveNeedsYouIndex + 1) % model.needsYou.length;
-          setNeedsYouIndex(nextIndex);
-          setSelectedNeedsYouId(model.needsYou[nextIndex]?.id);
+        if (sectionRef.current === "needsYou") {
+          const nextIndex = (needsYouIndexRef.current + 1) % model.needsYou.length;
+          moveNeedsYou(nextIndex);
         } else {
-          setSection("needsYou");
+          moveSection("needsYou");
         }
       }
-      if (key.rightArrow) setSection("activity");
+      if (key.rightArrow) moveSection("activity");
       if (key.upArrow) {
-        if (effectiveSection === "needsYou") {
+        if (sectionRef.current === "needsYou") {
           if (model.needsYou.length > 0) {
-            const nextIndex = (effectiveNeedsYouIndex - 1 + model.needsYou.length) % model.needsYou.length;
-            setNeedsYouIndex(nextIndex);
-            setSelectedNeedsYouId(model.needsYou[nextIndex]?.id);
+            const nextIndex = (needsYouIndexRef.current - 1 + model.needsYou.length) % model.needsYou.length;
+            moveNeedsYou(nextIndex);
           }
         } else {
           if (model.activity.length > 0) {
-            const nextIndex = Math.max(0, effectiveActivityIndex - 1);
-            setActivityIndex(nextIndex);
-            setSelectedEvidenceId(model.activity[nextIndex]?.evidence.id);
+            const nextIndex = Math.max(0, activityIndexRef.current - 1);
+            moveActivity(nextIndex);
           }
         }
       }
       if (key.downArrow) {
-        if (effectiveSection === "needsYou") {
+        if (sectionRef.current === "needsYou") {
           if (model.needsYou.length > 0) {
-            const nextIndex = (effectiveNeedsYouIndex + 1) % model.needsYou.length;
-            setNeedsYouIndex(nextIndex);
-            setSelectedNeedsYouId(model.needsYou[nextIndex]?.id);
+            const nextIndex = (needsYouIndexRef.current + 1) % model.needsYou.length;
+            moveNeedsYou(nextIndex);
           }
         } else {
           if (model.activity.length > 0) {
-            const nextIndex = Math.min(maxSelection, effectiveActivityIndex + 1);
-            setActivityIndex(nextIndex);
-            setSelectedEvidenceId(model.activity[nextIndex]?.evidence.id);
+            const nextIndex = Math.min(maxSelection, activityIndexRef.current + 1);
+            moveActivity(nextIndex);
           }
         }
       }
       if (key.pageDown) {
         setOffset((o) => Math.max(0, o - HOME_ACTIVITY_VISIBLE_ROWS));
         if (model.activity.length > 0) {
-          const nextIndex = Math.max(0, effectiveActivityIndex - HOME_ACTIVITY_VISIBLE_ROWS);
-          setActivityIndex(nextIndex);
-          setSelectedEvidenceId(model.activity[nextIndex]?.evidence.id);
+          const nextIndex = Math.max(0, activityIndexRef.current - HOME_ACTIVITY_VISIBLE_ROWS);
+          moveActivity(nextIndex);
         }
       }
       if (key.pageUp) {
         setOffset((o) => Math.min(maxOffset, o + HOME_ACTIVITY_VISIBLE_ROWS));
         if (model.activity.length > 0) {
-          const nextIndex = Math.min(maxSelection, effectiveActivityIndex + HOME_ACTIVITY_VISIBLE_ROWS);
-          setActivityIndex(nextIndex);
-          setSelectedEvidenceId(model.activity[nextIndex]?.evidence.id);
+          const nextIndex = Math.min(maxSelection, activityIndexRef.current + HOME_ACTIVITY_VISIBLE_ROWS);
+          moveActivity(nextIndex);
         }
       }
       if (key.return) {
-        if (effectiveSection === "needsYou") {
-          const target = selectedNeedsYou;
+        if (sectionRef.current === "needsYou") {
+          const target = selectNeedsYouTarget(model, needsYouIndexRef.current);
           if (target) (target.kind === "park" ? onOpenPark : onOpenDiagnostic)(target.id);
         } else {
-          const row = model.activity[effectiveActivityIndex];
+          const row = model.activity[activityIndexRef.current];
           if (row) onOpenEvidence(row.evidence);
         }
       }

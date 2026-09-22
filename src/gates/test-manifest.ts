@@ -101,6 +101,17 @@ export interface TestReportCompletion {
   failures?: string[];
   /** Per-module test-body counts the reporter observed (absent on reports from older reporters). */
   tests?: { passed: number; failed: number; skipped: number };
+  /** Bounded (4096 bytes) runner evidence per failed test — diff, actual/expected or stack head.
+   * Never part of the failure's identity: `failures` alone feeds details and fingerprints. */
+  evidence?: FailureEvidence[];
+}
+
+export interface FailureEvidence { test: string; text: string; truncated?: true; unavailable?: true }
+
+function isFailureEvidence(v: unknown): v is FailureEvidence {
+  if (typeof v !== "object" || v === null) return false;
+  const e = v as Record<string, unknown>;
+  return typeof e.test === "string" && typeof e.text === "string";
 }
 
 /** The runner's own machine report — requested/started/completed are the runner's claims about ITSELF. */
@@ -261,9 +272,11 @@ export function verifyManifestReport(opts: {
   const failedCompletions = Object.entries(report.completed).filter(([, c]) => c.status === "failed");
   const failingFiles = failedCompletions.map(([file]) => file).sort();
   const failures = failedCompletions.flatMap(([, c]) => c.failures?.length ? c.failures : ["<unnamed failure>"]);
+  // Parsed defensively: a malformed entry is dropped, never a verdict change — evidence is diagnostics only.
+  const failureEvidence = failedCompletions.flatMap(([, c]) => Array.isArray(c.evidence) ? c.evidence.filter(isFailureEvidence) : []);
   if (failures.length) return { kind: "work", pass: false,
     details: `test report names failing fingerprint(s):\n${failures.join("\n")}`,
-    meta: { classification: "regression", failingTests: failures, failingFiles, processExit: exitCode } };
+    meta: { classification: "regression", failingTests: failures, failingFiles, processExit: exitCode, failureEvidence } };
 
   if (exitCode === undefined) {
     return {

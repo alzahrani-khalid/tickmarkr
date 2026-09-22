@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
@@ -64,6 +65,28 @@ async function createRecordedRun(repo: string, runId = "run-recorded-1", recorde
   return { runId, journal: j };
 }
 
+/**
+ * OBS-1061 probe fixture: a fake Orca CLI reached through the resolver's environment override, so
+ * preflight and envelope parsing stay real. It logs every invocation (the admission-probe count)
+ * and answers `worktree current` as a managed checkout, an untracked one, or a broken runtime.
+ */
+function fakeOrcaCli(mode: "managed" | "unmanaged" | "broken" | "stderr-only") {
+  const dir = mkdtempSync(join(tmpdir(), "tkr-fake-orca-"));
+  const log = join(dir, "calls.log");
+  const bin = join(dir, "orca");
+  const refusal = (code: string, message: string) =>
+    `printf '%s' '{"ok":false,"error":{"code":"${code}","message":"${message}"},"_meta":{"runtimeId":"rt_fake"}}'\nexit 1`;
+  const body = mode === "managed"
+    ? `printf '{"ok":true,"result":{"worktree":{"path":"%s"}},"_meta":{"runtimeId":"rt_fake"}}' "$(pwd -P)"`
+    : mode === "unmanaged" ? refusal("selector_not_found", "no worktree matches the current directory")
+      : mode === "stderr-only" ? `echo 'orca: cannot reach the runtime socket' >&2\nexit 7`
+        : refusal("runtime_unavailable", "the Orca runtime is not reachable");
+  writeFileSync(bin, `#!/bin/sh\necho "$*" >> '${log}'\n${body}\n`);
+  chmodSync(bin, 0o755);
+  process.env.ORCA_CLI_COMMAND = bin;
+  return { calls: () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []) };
+}
+
 async function runCli(argv: string[], repo: string) {
   const prior = resolve(".");
   try {
@@ -91,6 +114,7 @@ describe("HD-1 host-driver truth (OBS-1003 / RULING-232-01 add.3)", () => {
     delete process.env.HERDR_ENV;
     delete process.env.TERM_PROGRAM;
     delete process.env.ORCA_TERMINAL_HANDLE;
+    fakeOrcaCli("managed");
   });
 
   afterEach(() => {
@@ -348,4 +372,102 @@ describe("HD-1 host-driver truth (OBS-1003 / RULING-232-01 add.3)", () => {
       expect(dispatched).toEqual(["orca"]);
     }
   }, 600_000);
+
+  const orcaHost = () => {
+    process.env.TERM_PROGRAM = "Orca";
+    process.env.ORCA_TERMINAL_HANDLE = "term_admission";
+  };
+  const spyDispatch = () => {
+    const dispatched: string[] = [];
+    const realPick = DriversModule.pickDriver;
+    vi.spyOn(DriversModule, "pickDriver").mockImplementation((cfg, override, host) => hollowOut(realPick(cfg, override, host), dispatched));
+    return dispatched;
+  };
+  const REMEDIES = "checkout is not Orca-managed; run from an orca worktree create checkout or pass --driver subprocess";
+
+  test("test: tickmarkr run from a checkout Orca does not track under a resolved orca driver exits nonzero naming both remedies before any run directory exists, so a run that fails each task at launch instead fails", async () => {
+    const dispatched = spyDispatch();
+    // every way the driver resolves to orca: config, auto on an Orca host, an explicit flag off-host
+    for (const [cfgDriver, argv, host] of [["orca", [], true], ["auto", [], true], ["subprocess", ["--driver", "orca"], false]] as const) {
+      const { repo, scriptPath } = setupTestRepo(cfgDriver);
+      process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+      delete process.env.TERM_PROGRAM;
+      delete process.env.ORCA_TERMINAL_HANDLE;
+      if (host) orcaHost();
+      fakeOrcaCli("unmanaged");
+
+      const res = await runCli([...argv], repo);
+      expect(res.code).not.toBe(0);
+      expect(res.out).toContain(REMEDIES);
+      expect(existsSync(join(tickmarkrDir(repo), "runs"))).toBe(false);
+      expect(dispatched).toEqual([]);
+    }
+  }, 120_000);
+
+  test("test: tickmarkr resume from the same unmanaged checkout is refused before its journal gains a row, so a resume that reaches dispatch first fails", async () => {
+    const dispatched = spyDispatch();
+    const { repo, scriptPath } = setupTestRepo("auto");
+    process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+    const { runId, journal } = await createRecordedRun(repo, "run-unmanaged-resume", "orca");
+    const journalFile = join(journal.dir, "journal.jsonl");
+    const bytesBefore = readFileSync(journalFile);
+    orcaHost();
+    fakeOrcaCli("unmanaged");
+
+    const res = await resumeCli([runId, "--retry-failed"], repo);
+    expect(res.code).not.toBe(0);
+    expect(res.out).toContain(REMEDIES);
+    expect(readFileSync(journalFile).equals(bytesBefore)).toBe(true);
+    expect(dispatched).toEqual([]);
+  }, 120_000);
+
+  test("test: a managed checkout reaches dispatch after one run root admission probe whereas an explicit subprocess run performs none, so repeated admission probes or refusing a managed checkout fails", async () => {
+    const dispatched = spyDispatch();
+    orcaHost();
+    {
+      const { repo, scriptPath } = setupTestRepo("auto");
+      process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+      const orca = fakeOrcaCli("managed");
+      const res = await runCli([], repo);
+      expect(res.code).toBe(0);
+      expect(dispatched).toEqual(["orca"]);
+      expect(orca.calls()).toEqual(["worktree current --json"]);
+    }
+    {
+      dispatched.length = 0;
+      const { repo, scriptPath } = setupTestRepo("auto");
+      process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+      const orca = fakeOrcaCli("unmanaged"); // would refuse if probed
+      const res = await runCli(["--driver", "subprocess"], repo);
+      expect(res.code).toBe(0);
+      expect(dispatched).toEqual(["subprocess"]);
+      expect(orca.calls()).toEqual([]);
+    }
+  }, 120_000);
+
+  test("test: a probe that fails for a reason other than an untracked checkout refuses the run naming that reason, so a probe error read as a managed checkout fails", async () => {
+    const dispatched = spyDispatch();
+    const { repo, scriptPath } = setupTestRepo("orca");
+    process.env.TICKMARKR_FAKE_SCRIPT = scriptPath;
+    orcaHost();
+    fakeOrcaCli("broken");
+
+    const res = await runCli([], repo);
+    expect(res.code).not.toBe(0);
+    expect(res.out).toContain("runtime_unavailable");
+    expect(res.out).toContain("the Orca runtime is not reachable");
+    expect(res.out).not.toContain("not Orca-managed");
+    expect(existsSync(join(tickmarkrDir(repo), "runs"))).toBe(false);
+    expect(dispatched).toEqual([]);
+
+    // a stderr-only failure (no envelope at all) still names its cause: the exit and the diagnostic
+    fakeOrcaCli("stderr-only");
+    const silent = await runCli([], repo);
+    expect(silent.code).not.toBe(0);
+    expect(silent.out).toContain("orca exited 7");
+    expect(silent.out).toContain("orca: cannot reach the runtime socket");
+    expect(silent.out).not.toContain("not Orca-managed");
+    expect(existsSync(join(tickmarkrDir(repo), "runs"))).toBe(false);
+    expect(dispatched).toEqual([]);
+  }, 120_000);
 });

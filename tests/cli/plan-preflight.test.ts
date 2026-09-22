@@ -6,7 +6,8 @@ import type { BillingChannel, WorkerAdapter } from "../../src/adapters/types.js"
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
 import type { VitestListResult } from "../../src/gates/acceptance.js";
-import { saveGraph } from "../../src/graph/graph.js";
+import { compileNative } from "../../src/compile/native.js";
+import { loadGraph, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph, type AcceptanceItem } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -79,42 +80,85 @@ test("test: plan refuses a graph whose acceptance item matches zero of the runne
   expect(many).toContain(`acceptance oracle ${JSON.stringify(criterion)} matches 2 runner-listed test names`);
 });
 
-test("plan on a spec whose test criterion names a title with no match and whose owning task lists a test file absent from the tree prints an advisory not yet written line naming that path and keeps the task's routing column while a criterion whose test file exists with a different title still prints the pre-dispatch refusal whereas a plan that refuses both or advises both fails", async () => {
-  const repo = preflightRepo(
-    [{ oracle: "test", test: "placeholder" }],
-    [],
-    { "tests/existing.test.ts": 'test("a different title", () => {});\n' },
-  );
-  saveGraph(repo, validateGraph({
-    version: 1,
-    spec: { source: "prd", paths: ["fixture"], hash: "fixture" },
-    tasks: [
-      {
-        id: "T1", title: "fresh test", goal: "fresh test", shape: "chore", complexity: 2,
-        files: ["tests/fresh.test.ts"], acceptance: [{ oracle: "test", test: "fresh criterion" }],
-      },
-      {
-        id: "T2", title: "wrong title", goal: "wrong title", shape: "chore", complexity: 2,
-        files: ["tests/existing.test.ts"], acceptance: [{ oracle: "test", test: "expected criterion" }],
-      },
-    ],
-  }));
+function nativePreflightRepo(acceptance: string[], files: string[], repoFiles: Record<string, string> = {}): string {
+  const spec = `<!-- tickmarkr:spec -->
+# Oracle landing fixture
+## T1: preflight
+- goal: Check oracle landings
+- shape: chore
+- complexity: 2
+- files: ${files.join(", ")}
+- acceptance:
+${acceptance.map((item) => `  - ${item}`).join("\n")}
+`;
+  const repo = preflightRepo(["placeholder"], [], { ...repoFiles, "spec.md": spec });
+  const compiled = compileNative(join(repo, "spec.md"));
+  saveGraph(repo, compiled);
+  expect(loadGraph(repo)).toEqual(compiled);
+  return repo;
+}
 
-  const output = await plan([], repo, [adapter], undefined, {
-    listTests: async () => ({
-      status: "listed",
-      tests: [{ name: "test: a different title", file: join(repo, "tests/existing.test.ts"), projectName: "suite" }],
-    }),
-  });
-  const freshRow = output.split("\n").find((line) => /^\s+T1\s/.test(line));
-  const existingRow = output.split("\n").find((line) => /^\s+T2\s/.test(line));
+test("test: plan over a compiled native spec reports a zero match criterion whose declared landing is a suite the task owns by exact path or by glob as pending authorship naming that suite, so an owned landing printed as a refusal fails", async () => {
+  for (const ownership of ["tests/landing.test.ts", "tests/**/*.test.ts", "tests/{landing,other}.test.ts"]) {
+    for (const exists of [false, true]) {
+      const landing = "tests/landing.test.ts";
+      const criterion = "new criterion";
+      const repo = nativePreflightRepo(
+        [`test: ${criterion} | suite: ${landing}`],
+        [ownership],
+        exists ? { [landing]: 'test("a different title", () => {});\n' } : {},
+      );
+      expect(loadGraph(repo).tasks[0]!.acceptance).toEqual([{ oracle: "test", test: criterion, landing }]);
+      const output = await planned(repo, exists ? ["test: a different title"] : []);
+      expect(output).toContain(`acceptance oracle "${criterion}" not yet written (worker authors ${landing})`);
+      expect(output).not.toContain("pre-dispatch refusal");
+      expect(output).not.toContain("matches zero runner-listed test names");
+      expect(output).toMatch(/T1.*→ fake:fake-1/);
+      // An already resolved title needs neither a refusal nor an authorship advisory.
+      const resolved = await planned(repo, [`test: ${criterion}`]);
+      expect(resolved).not.toContain("pre-dispatch refusal");
+      expect(resolved).not.toContain("not yet written");
+    }
+  }
+});
 
-  expect(freshRow).toContain("→ fake:fake-1");
-  expect(output).toContain('acceptance oracle "fresh criterion" not yet written (worker authors tests/fresh.test.ts)');
-  expect(existingRow).toContain("pre-dispatch refusal");
-  expect(existingRow).toContain('acceptance oracle "expected criterion" matches zero runner-listed test names');
-  expect(output.match(/not yet written/g)).toHaveLength(1);
-  expect(output.match(/pre-dispatch refusal/g)).toHaveLength(1);
+test("test: an unmatched criterion declaring no landing or an unowned landing stays refused despite an unrelated owned absent suite, so unrelated ownership that grants pending authorship fails", async () => {
+  for (const ownership of ["tests/owned.test.ts", "tests/owned/**/*.test.ts"]) {
+    const owned = ownership.includes("**") ? "tests/owned/new.test.ts" : ownership;
+    const repo = nativePreflightRepo([
+      `test: owned criterion | suite: ${owned}`,
+      "test: no landing criterion",
+      "test: unowned criterion | suite: tests/unowned.test.ts",
+    ], [ownership]);
+    const output = await planned(repo, []);
+    const row = output.split("\n").find((line) => /^\s+T1\s/.test(line));
+    expect(row).toContain("pre-dispatch refusal");
+    for (const criterion of ["no landing criterion", "unowned criterion"]) {
+      expect(output).toContain(`acceptance oracle "${criterion}" matches zero runner-listed test names`);
+      expect(output).not.toContain(`acceptance oracle "${criterion}" not yet written`);
+    }
+  }
+});
+
+test("test: a failed runner listing or a title matching two listed tests stays a refusal whatever landing the criterion declares, so a landing that hides an unresolved listing or an ambiguous title fails", async () => {
+  for (const landing of [undefined, "tests/owned.test.ts", "tests/unowned.test.ts"]) {
+    const criterion = "unresolved criterion";
+    const repo = nativePreflightRepo(
+      [`test: ${criterion}${landing ? ` | suite: ${landing}` : ""}`],
+      ["tests/owned.test.ts"],
+    );
+    const failed = await plan([], repo, [adapter], undefined, {
+      listTests: async () => ({ status: "failed", error: "runner unavailable\nsecondary detail" }),
+    });
+    expect(failed).toContain("pre-dispatch refusal");
+    expect(failed).toContain("acceptance oracle unresolved — runner listing failed: runner unavailable");
+    expect(failed).not.toContain("secondary detail");
+    expect(failed).not.toContain("not yet written");
+    const ambiguous = await planned(repo, [`test: ${criterion}`, `nested > test: ${criterion}`]);
+    expect(ambiguous).toContain("pre-dispatch refusal");
+    expect(ambiguous).toContain(`acceptance oracle "${criterion}" matches 2 runner-listed test names`);
+    expect(ambiguous).not.toContain("not yet written");
+  }
 });
 
 test("test: a criterion matching exactly one runner listed test name plans without refusal and reports a passing oracle row in doctor, so a resolved oracle is distinguishable from an unresolved one", async () => {

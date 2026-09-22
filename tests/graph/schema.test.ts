@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { finalizePlan, type PlanIR } from "../../src/compile/index.js";
 import { graphPath, loadGraph, saveGraph } from "../../src/graph/graph.js";
-import { GATE_NAMES, GRAPH_ROUTING_MODES, GraphValidationError, SPEC_SOURCES, renderAcceptanceItem, validateGraph } from "../../src/graph/schema.js";
+import { z } from "zod";
+import { GATE_NAMES, GRAPH_ROUTING_MODES, GraphValidationError, RunGraphSchema, SPEC_SOURCES, renderAcceptanceItem, validateGraph } from "../../src/graph/schema.js";
 
 const task = (over: Record<string, unknown> = {}) => ({
   id: "T1",
@@ -262,4 +263,22 @@ test("schema parity serializes a canonical plan containing source, paths, hash, 
       expect(() => loadGraph(repo), contract.field).toThrow(GraphValidationError);
     }
   }
+});
+
+// v2.5.8 T8 (OBS-1064): the shipped schema/rungraph.schema.json admits a test item's landing field
+// exactly as the validator does — the package ships the file, so a stale emit rejects valid graphs.
+test("the generated graph schema file admits the landing field on a test item exactly as the validator does, so a shipped schema that rejects a graph the validator accepts fails", () => {
+  type Member = { properties?: Record<string, unknown> & { oracle?: { const?: string } } };
+  type Root = { properties: { tasks: { items: { properties: { acceptance: { items: { anyOf: Member[] } } } } } } };
+  const testMember = (root: Root) =>
+    root.properties.tasks.items.properties.acceptance.items.anyOf.find((m) => m.properties?.oracle?.const === "test");
+  const generated = JSON.parse(readFileSync("schema/rungraph.schema.json", "utf8")) as Root;
+  const emitted = z.toJSONSchema(RunGraphSchema, { io: "input", unrepresentable: "any" }) as unknown as Root;
+  expect(testMember(generated)).toEqual(testMember(emitted));
+  expect(testMember(generated)?.properties?.landing).toEqual({ type: "string", minLength: 1 });
+  expect(validateGraph({
+    version: 1,
+    spec: { source: "native", paths: ["p.md"], hash: "h" },
+    tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 1, acceptance: [{ oracle: "test", test: "leaf", landing: "tests/x.test.ts" }] }],
+  }).tasks[0].acceptance[0]).toEqual({ oracle: "test", test: "leaf", landing: "tests/x.test.ts" });
 });

@@ -27,7 +27,9 @@ export type SpecSource = (typeof SPEC_SOURCES)[number];
 export const AcceptanceItemSchema = z.union([
   z.string().min(1),
   z.object({ oracle: z.literal("command"), command: z.string().min(1), text: z.string().min(1).optional() }),
-  z.object({ oracle: z.literal("test"), test: z.string().min(1), text: z.string().min(1).optional() }),
+  // v2.5.8 T8 (OBS-1064): landing = the collectable suite path a test criterion lands in, declared
+  // beside the verbatim title (never inside it). Optional; compile enforces the collectable glob.
+  z.object({ oracle: z.literal("test"), test: z.string().min(1), text: z.string().min(1).optional(), landing: z.string().min(1).optional() }),
   z.object({ oracle: z.literal("judge"), text: z.string().min(1) }),
 ]);
 export type AcceptanceItem = z.infer<typeof AcceptanceItemSchema>;
@@ -40,6 +42,17 @@ export function renderAcceptanceItem(item: AcceptanceItem): string {
   if (item.oracle === "test") return item.text ?? `test: ${item.test}`;
   return item.text; // judge — bare text, byte-identical to a plain-string judge criterion
 }
+
+// v2.5.8 T7 (agreement C2): declared pin obligations — a LIMITED AUTHORING CONTRACT, not an assertion
+// analyzer. literal = an exact text plus the glob it is pinned in (every matching file holding the text
+// is obligated); fixture = a path set whose every matching file is itself obligated (byte-pinned output
+// the change will move) and which carries no literal text. Declared here because z.object strips
+// undeclared keys on every load.
+export const PinSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("literal"), text: z.string().min(1), glob: z.string().min(1) }),
+  z.object({ kind: z.literal("fixture"), paths: z.array(z.string().min(1)).min(1) }),
+]);
+export type Pin = z.infer<typeof PinSchema>;
 
 export const TaskSchema = z.object({
   // ids land in git branch names and herdr pane names — branch-safe characters only, bounded
@@ -69,6 +82,7 @@ export const TaskSchema = z.object({
       }),
     )
     .optional(),
+  pins: z.array(PinSchema).optional(),
   gates: z
     .array(z.enum(GATE_NAMES))
     .default(["build", "test", "lint", "evidence", "scope", "acceptance", "review"])
