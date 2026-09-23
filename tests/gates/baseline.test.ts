@@ -925,3 +925,114 @@ test("test: the baseline comparison attaches the caller's task-build attribution
   expect(receipts.map((r) => r.attribution)).toEqual([undefined, undefined, attribution, attribution, undefined, undefined]);
   expect(taskBuildAttribution.mock.calls).toEqual([[1]]);
 });
+
+test("test: an executed build or lint command whose output exceeds the tail cap yields a receipt whose run relative artifact references carry the sha256 of the persisted bytes beside retained dropped byte counts marked truncated, so a receipt claiming complete for a cut tail fails", async () => {
+  const { createHash } = await import("node:crypto");
+  const { GateEvidenceReceiptSchema } = await import("../../src/run/protocol.js");
+  const { makeTestTempDir } = await import("../helpers/tmprepo.js");
+  const repo = makeRepo({ "a.txt": "a" });
+  const artifactDir = makeTestTempDir("evidence-cap-");
+  const cmd = `node -e 'process.stdout.write("Ω".repeat(20000)); process.stderr.write("Ж".repeat(20000))'`;
+  const rows = await compareToBaseline(repo, { build: cmd, lint: cmd }, { commands: {} }, ["build", "lint"], { evidence: { artifactDir } });
+  expect(new Set(rows.map(row => row.evidenceReceipt!.invocationId)).size).toBe(2);
+  for (const row of rows) {
+    expect(row.pass).toBe(true);
+    const receipt = row.evidenceReceipt!;
+    expect(GateEvidenceReceiptSchema.safeParse(receipt).success).toBe(true);
+    expect(receipt.termination).toEqual({ kind: "exit", exitCode: 0, signal: null, timedOut: false });
+    for (const ref of [receipt.stdout, receipt.stderr]) {
+      const bytes = readFileSync(join(artifactDir, ref.path));
+      expect(ref.path).not.toMatch(/^\//);
+      expect(ref).toMatchObject({ availability: "available", retainedBytes: 16384, droppedBytes: 23616, truncated: true,
+        sha256: createHash("sha256").update(bytes).digest("hex") });
+    }
+    expect(GateEvidenceReceiptSchema.safeParse({ ...receipt, stdout: { ...receipt.stdout, truncated: false } }).success).toBe(false);
+  }
+});
+
+test("test: an output line carrying a value from the command environment or a token shaped secret is redacted before persistence and the receipt records material redaction with its hash taken over the redacted bytes, so a hash of the unredacted bytes fails", async () => {
+  const { createHash } = await import("node:crypto");
+  const { makeTestTempDir } = await import("../helpers/tmprepo.js");
+  const artifactDir = makeTestTempDir("evidence-redact-");
+  const repo = makeRepo({ "a.txt": "a" });
+  const secret = "unique-environment-credential";
+  const token = "ghp_Abcdefghijklmnopqrstuvwxyz123456789";
+  const [row] = await compareToBaseline(repo, { build: `node -e 'process.stdout.write(process.env.RECEIPT_SECRET + " ${token}")'` }, { commands: {} }, ["build"], {
+    evidence: { artifactDir, env: { ...process.env, RECEIPT_SECRET: secret } },
+  });
+  const receipt = row.evidenceReceipt!;
+  const bytes = readFileSync(join(artifactDir, receipt.stdout.path));
+  expect(bytes.toString()).not.toContain(secret); expect(bytes.toString()).not.toContain(token);
+  expect(bytes.toString()).toContain("[REDACTED]");
+  expect(receipt.redaction.material).toBe(true);
+  expect(receipt.stdout.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+  expect(receipt.stdout.sha256).not.toBe(createHash("sha256").update(`${secret} ${token}`).digest("hex"));
+});
+
+test("evidence redaction preserves ordinary diagnostics and still redacts short secrets and long environment values", async () => {
+  const { createHash } = await import("node:crypto");
+  const { makeTestTempDir } = await import("../helpers/tmprepo.js");
+  const artifactDir = makeTestTempDir("evidence-readable-");
+  const repo = makeRepo({ "a.txt": "a" });
+  const diagnostic = "FAIL tests/unit/math.test.ts: expected 3 to be 1; 10 passed; 4 failed; true; vi; -R; pid 12345";
+  const env = {
+    ...process.env,
+    XPC_SERVICE_NAME: "0", SHLVL: "1", COLOR: "0", GIT_EDITOR: "true", EDITOR: "vi", LESS: "-R",
+    NODE_ENV: "test", VITEST_MAX_FORKS: "4", DAEMON_PID: "12345", RECEIPT_SECRET: "s3!", RECEIPT_VALUE: "abcdefgh",
+  };
+  for (const includeSecrets of [false, true]) {
+    const output = diagnostic + (includeSecrets ? " s3! abcdefgh" : "");
+    const [row] = await compareToBaseline(repo, { build: `node -e 'process.stdout.write(${JSON.stringify(output)})'` }, { commands: {} }, ["build"], {
+      evidence: { artifactDir, env },
+    });
+    const receipt = row.evidenceReceipt!;
+    expect(receipt.termination.exitCode).toBe(0);
+    const bytes = readFileSync(join(artifactDir, receipt.stdout.path));
+    expect(bytes.toString()).toBe(diagnostic + (includeSecrets ? " [REDACTED] [REDACTED]" : ""));
+    expect(receipt.redaction.material).toBe(includeSecrets);
+    expect(receipt.stdout.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+  }
+});
+
+test("test: a receipt validates against the protocol schema with available as its success state while a per run byte quota exhausted through production writes leaves the evicted reference detectably unavailable, so unbounded retention or a fabricated expired file fails", async () => {
+  const { makeTestTempDir } = await import("../helpers/tmprepo.js");
+  const { GateEvidenceReceiptSchema } = await import("../../src/run/protocol.js");
+  const { resolveEvidenceArtifact } = await import("../../src/gates/baseline.js");
+  const { readdirSync, statSync } = await import("node:fs");
+  const artifactDir = makeTestTempDir("evidence-quota-");
+  const repo = makeRepo({ "a.txt": "a" });
+  const options = { evidence: { artifactDir, quotaBytes: 16384 } };
+  const execute = () => compareToBaseline(repo, { lint: `node -e 'process.stdout.write("Ω".repeat(8192))'` }, { commands: {} }, ["lint"], options);
+  const [first] = await execute();
+  const receipt = first.evidenceReceipt!;
+  expect(GateEvidenceReceiptSchema.parse(receipt).availability).toBe("available");
+  const [second] = await execute();
+  expect(resolveEvidenceArtifact(artifactDir, receipt.stdout).availability).toBe("missing");
+  expect(existsSync(join(artifactDir, receipt.stdout.path))).toBe(false);
+  expect(resolveEvidenceArtifact(artifactDir, second.evidenceReceipt!.stdout).availability).toBe("available");
+  const size = readdirSync(join(artifactDir, "gate-evidence")).reduce((sum, path) => sum + statSync(join(artifactDir, "gate-evidence", path)).size, 0);
+  expect(size).toBeLessThanOrEqual(16384);
+  const capture = await captureBaseline(repo, { build: "echo fine" }, options);
+  expect(GateEvidenceReceiptSchema.safeParse(capture.evidenceReceipts?.build).success).toBe(true);
+});
+
+
+test("baseline recaptures retain distinct evidence without changing forgiveness identity", async () => {
+  const { baselineIdentity } = await import("../../src/gates/cache.js");
+  const { makeTestTempDir } = await import("../helpers/tmprepo.js");
+  const repo = makeRepo({ "a.txt": "a" });
+  const evidence = { artifactDir: makeTestTempDir("capture-identity-") };
+  const commands = { build: "echo fine", lint: "echo 'Error: broken'; exit 1" };
+  const first = await captureBaseline(repo, commands, { evidence });
+  const second = await captureBaseline(repo, commands, { evidence });
+  const lost = await captureBaseline(repo, commands, { evidence: { ...evidence, write: () => { throw new Error("disk failure"); } } });
+  for (const gate of Object.keys(commands)) {
+    expect(first.commands[gate]).not.toHaveProperty("evidenceReceipt");
+    expect(first.evidenceReceipts?.[gate].availability).toBe("available");
+    expect(second.evidenceReceipts?.[gate].invocationId).not.toBe(first.evidenceReceipts?.[gate].invocationId);
+    expect(lost.evidenceReceipts?.[gate].availability).toBe("capture-failed");
+  }
+  expect(baselineIdentity(first)).toBe(baselineIdentity({ commands: first.commands }));
+  expect(baselineIdentity(second)).toBe(baselineIdentity(first));
+  expect(baselineIdentity(lost)).toBe(baselineIdentity(first));
+});

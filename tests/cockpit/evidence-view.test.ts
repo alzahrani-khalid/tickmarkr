@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { ttyInput } from "../helpers/tty-input.js";
@@ -15,6 +15,7 @@ import {
   planEvidenceExport,
   selectTaskReview,
   writeEvidenceExport,
+  runRootOf,
 } from "../../src/tui/cockpit/evidence-view.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
@@ -415,5 +416,105 @@ test("Enter opens the row the operator navigated to even when no frame was drawn
     await wait(50);
     expect(selected).toEqual(["journal.jsonl#L6"]);
     expect(frame.frame()).toContain("selected journal.jsonl#L6");
+  } finally { frame.unmount(); }
+});
+
+test("test: the Evidence view resolves a gate row's receipt through the shared resolver and shows the artifact's availability beside its verified hash, so a view that prints the reference string alone fails", async () => {
+  const runRoot = makeTestTempDir("tickmarkr-evidence-receipt-");
+  const foreignRoot = makeTestTempDir("tickmarkr-evidence-foreign-");
+  const out = Buffer.from("build ok\n"), err = Buffer.from("");
+  const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+  for (const root of [runRoot, foreignRoot]) {
+    mkdirSync(join(root, "gate-evidence"), { recursive: true });
+    writeFileSync(join(root, "gate-evidence", "inv-1-stdout.log"), out);
+    writeFileSync(join(root, "gate-evidence", "inv-1-stderr.log"), err);
+  }
+  const artifact = (name: string, bytes: Buffer) => ({ path: `gate-evidence/${name}`, availability: "available", sha256: sha(bytes), retainedBytes: bytes.length, droppedBytes: 0, truncated: false });
+  const receipt = {
+    invocationId: "inv-1",
+    subject: { runId: "run-1", taskId: "T1", attempt: 0, gate: "build", subjectCommit: null },
+    termination: { kind: "exit", exitCode: 0, signal: null, timedOut: false },
+    availability: "available", redaction: { material: false },
+    stdout: artifact("inv-1-stdout.log", out), stderr: artifact("inv-1-stderr.log", err),
+  };
+  // Tamper with this run's stderr so a resolver that trusts the reference alone is caught.
+  writeFileSync(join(runRoot, "gate-evidence", "inv-1-stderr.log"), "extra\n");
+
+  const model = deriveEvidenceView({
+    runRoot,
+    events: [
+      ev("gate-result", "T1", { gate: "build", pass: true, details: "build passed", evidenceReceipt: receipt }),
+      // A reused verdict resolves under its ORIGIN run root, whose bytes are intact, never the current one.
+      ev("tip-verify", undefined, { gate: "build", pass: true, cached: true, reused: true, originRunRoot: foreignRoot, evidenceReceipt: receipt }),
+      ev("gate-result", "T1", { gate: "lint", pass: true, details: "no receipt on this row" }),
+    ],
+  });
+  const [fresh, reused, bare] = model.journal;
+  expect(fresh!.receipts).toEqual([
+    `gate-evidence/inv-1-stdout.log available sha256=${sha(out)}`,
+    "gate-evidence/inv-1-stderr.log unavailable (hash-mismatch)",
+  ]);
+  expect(reused!.receipts).toEqual([
+    `gate-evidence/inv-1-stdout.log available sha256=${sha(out)}`,
+    `gate-evidence/inv-1-stderr.log available sha256=${sha(err)}`,
+  ]);
+  expect(bare!.receipts).toEqual([]);
+  // Without any run root, the reference is still shown and nothing is claimed verified.
+  expect(deriveEvidenceView({ events: [ev("gate-result", "T1", { gate: "build", pass: true, evidenceReceipt: receipt })] }).journal[0]!.receipts)
+    .toEqual(["gate-evidence/inv-1-stdout.log unavailable (missing)", "gate-evidence/inv-1-stderr.log unavailable (missing)"]);
+  // The production cockpit passes only tracked rows and the journal's ABSOLUTE path (live-runtime.tsx:
+  // `{ rows, source: snap.journal.source }`); the run root is that journal's directory, so current-run
+  // receipts verify without any caller wiring, and a per-row source is honoured over the input's.
+  const liveSource = join(runRoot, "journal.jsonl");
+  const live = deriveEvidenceView({
+    rows: [
+      { line: 1, event: ev("gate-result", "T1", { gate: "build", pass: true, evidenceReceipt: receipt }) },
+      { line: 2, source: join(foreignRoot, "journal.jsonl"), event: ev("gate-result", "T1", { gate: "build", pass: true, evidenceReceipt: receipt }) },
+    ],
+    source: liveSource,
+  });
+  expect(live.journal[0]!.receipts).toEqual([
+    `gate-evidence/inv-1-stdout.log available sha256=${sha(out)}`,
+    "gate-evidence/inv-1-stderr.log unavailable (hash-mismatch)",
+  ]);
+  expect(live.journal[1]!.receipts).toEqual([
+    `gate-evidence/inv-1-stdout.log available sha256=${sha(out)}`,
+    `gate-evidence/inv-1-stderr.log available sha256=${sha(err)}`,
+  ]);
+  // A receipt the schema rejects is still shown reference by reference with the resolver's reason —
+  // never dropped as if the row carried no receipt (an escaping path must read `outside-root`).
+  const rejected = deriveEvidenceView({
+    runRoot,
+    events: [ev("gate-result", "T1", { gate: "build", pass: true, evidenceReceipt: { ...receipt, stdout: { ...receipt.stdout, path: "../outside.log" } } })],
+  });
+  expect(rejected.journal[0]!.receipts).toEqual([
+    "../outside.log unavailable (outside-root)",
+    "gate-evidence/inv-1-stderr.log unavailable (hash-mismatch)",
+  ]);
+  // A recorded origin root that IS a symlink (or sits under one) is passed to the resolver as recorded,
+  // never canonicalised away: the view shows `unavailable (symlink)` even though the bytes behind it match.
+  const linkBase = makeTestTempDir("tickmarkr-evidence-linkroot-");
+  symlinkSync(foreignRoot, join(linkBase, "run"));
+  mkdirSync(join(linkBase, "real"));
+  symlinkSync(join(linkBase, "real"), join(linkBase, "link"));
+  symlinkSync(foreignRoot, join(linkBase, "real", "run"));
+  for (const originRunRoot of [join(linkBase, "run"), join(linkBase, "link", "run")]) {
+    const linked = deriveEvidenceView({ runRoot, events: [ev("tip-verify", undefined, { gate: "build", pass: true, reused: true, originRunRoot, evidenceReceipt: receipt })] });
+    expect(linked.journal[0]!.receipts).toEqual([
+      "gate-evidence/inv-1-stdout.log unavailable (symlink)",
+      "gate-evidence/inv-1-stderr.log unavailable (symlink)",
+    ]);
+  }
+  // A relative or non-journal source names no root; the default "journal.jsonl" never resolves against cwd.
+  expect(runRootOf("journal.jsonl")).toBeUndefined();
+  expect(runRootOf(join(runRoot, "graph.json"))).toBeUndefined();
+  expect(runRootOf(liveSource)).toBe(runRoot);
+
+  const frame = await drawFrame(createElement(EvidenceView, { model, focusEvidence: fresh!.evidence }));
+  try {
+    const text = frame.frame(); // the hash may wrap in a 120-column frame; both halves must be on screen
+    expect(text).toContain("Receipt: gate-evidence/inv-1-stdout.log available");
+    expect(text).toContain(`sha256=${sha(out)}`);
+    expect(text).toContain("Receipt: gate-evidence/inv-1-stderr.log unavailable (hash-mismatch)");
   } finally { frame.unmount(); }
 });

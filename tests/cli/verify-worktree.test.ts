@@ -1,12 +1,14 @@
+import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
 import type { BillingChannel } from "../../src/adapters/types.js";
 import {
   baselineCachePath, excludeAuthorProvider, verify, verifyStateRoot,
 } from "../../src/cli/commands/verify.js";
+import { getVerdictStore } from "../../src/gates/cache.js";
 import { pickReviewer } from "../../src/gates/review.js";
 import { saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -225,5 +227,83 @@ test("test: verify run from a linked worktree whose state directory holds config
     }
   } finally {
     git(repo, `worktree remove --force '${linked}'`);
+  }
+}, 60_000);
+
+test("test: standalone verify persists each executed tool gate's receipt in verify results and when review recording is enabled its review leg2 row references that exact results artifact by hash, so dropping tool receipts or fabricating a review row fails", async () => {
+  const repo = makeRepo({
+    "src.txt": "base\n",
+    "package.json": JSON.stringify({ scripts: { build: "printf build", test: "printf test", lint: "printf lint" } }),
+  });
+  branch(repo);
+  writeDoctor(repo, { fake: { installed: true, authed: true, models: [], modelAuth: authedModels(["fake-1", "fake-2"]) } });
+  const script = join(makeTestTempDir("receipt-review-"), "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {}, review: { approve: true, issues: [] } }));
+  process.env.TICKMARKR_FAKE_SCRIPT = script;
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  for (const review of [true, false]) {
+    getVerdictStore(join(repo, ".tickmarkr")).clear(); // this oracle covers fresh writers, not reuse
+    const journal = Journal.create(repo, `run-receipt-review-${review}`);
+    journal.append("run-start", undefined, {});
+    const result = await verify(["--json", "--record", `run-receipt-review-${review}`, ...(!review ? ["--no-review"] : [])], repo);
+    expect(result.code).toBe(0);
+    const report = JSON.parse(result.out);
+    const bytes = readFileSync(report.artifactPath);
+    const artifact = JSON.parse(bytes.toString());
+    for (const gate of ["build", "test", "lint"]) {
+      const row = artifact.gateRows.find((row: { gate: string }) => row.gate === gate);
+      expect(row.evidenceReceipt).toEqual(report.results.find((row: { gate: string }) => row.gate === gate).evidenceReceipt);
+      expect(row.evidenceReceipt).toMatchObject({ invocationId: expect.any(String), availability: "available" });
+      for (const stream of ["stdout", "stderr"]) {
+        const ref = row.evidenceReceipt[stream];
+        expect(createHash("sha256").update(readFileSync(join(report.artifactPath, "..", ref.path))).digest("hex")).toBe(ref.sha256);
+      }
+    }
+    const rows = journal.read().filter(row => row.event === "review-leg2");
+    expect(rows).toHaveLength(review ? 1 : 0);
+    if (review) expect(rows[0]!.data).toMatchObject({
+      artifactPath: report.artifactPath, artifactAvailability: "available",
+      artifactSha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+  }
+}, 60_000);
+
+test("test: one successful plus one failed executed command under healthy or injected failing evidence persistence on the tip verify path or the standalone path keep pass classification plus recovery decision unchanged under capture-failed evidence, so an evidence failure that alters recovery authority fails", async () => {
+  const { verifyIntegrationTip } = await import("../../src/run/merge.js");
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  for (const code of [0, 1]) {
+    const command = `printf 'FAIL new assertion'; printf diagnostic >&2; exit ${code}`;
+    const repo = makeRepo({ "src.txt": "base\n", "package.json": JSON.stringify({ scripts: { build: command } }) });
+    branch(repo);
+    const baseline = join(makeTestTempDir("receipt-baseline-"), "baseline.json");
+    writeFileSync(baseline, JSON.stringify({ commands: { build: { exitCode: 0, fingerprints: [] } } }));
+    const verdicts = [];
+    for (const fail of [false, true]) {
+      getVerdictStore(join(repo, ".tickmarkr")).clear();
+      const evidence = fail ? { write: (path: string) => {
+        // Block both the raw stream persistence and the standalone summary write.
+        mkdirSync(join(dirname(dirname(path)), "verify-results.json"), { recursive: true });
+        throw new Error("injected disk failure");
+      } } : {};
+      const tipDir = makeTestTempDir("tip-capture-");
+      if (fail) mkdirSync(join(tipDir, "tip-verify-build.log"));
+      const [tip] = await verifyIntegrationTip(repo, { build: command }, tipDir, undefined, evidence);
+      const standalone = await verify(["--json", "--no-review", "--baseline", baseline], repo, { evidence });
+      const report = JSON.parse(standalone.out);
+      expect(report.artifactAvailability).toBe(fail ? "capture-failed" : "available");
+      expect(report.artifactSha256 === null).toBe(fail);
+      const build = report.results.find((row: { gate: string }) => row.gate === "build");
+      for (const row of [tip, build]) {
+        expect(row.evidenceReceipt.availability).toBe(fail ? "capture-failed" : "available");
+        expect(row.pass).toBe(code === 0);
+        expect(row.evidenceReceipts).toHaveLength(1);
+      }
+      verdicts.push({
+        tip: { pass: tip!.pass, cause: tip!.cause, details: tip!.details },
+        standalone: { code: standalone.code, pass: build.pass, classification: build.meta?.classification,
+          recoveryBlocked: build.meta?.recoveryBlocked, disposition: build.meta?.disposition, details: build.details },
+      });
+    }
+    expect(verdicts[1]).toEqual(verdicts[0]);
   }
 }, 60_000);

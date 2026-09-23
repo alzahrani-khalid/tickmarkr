@@ -144,14 +144,16 @@ export const COMMAND_HELP = {
   },
   beat: {
     usage: "beat <orchestrator|orchestrator-context|overseer|overseer-context|watch> --seat <identity> [options]",
-    description: "Write one supervision beat. The supervising seat's watcher loop repeats it; stopped beats become STALE.",
+    description: "Write one supervision beat using the recorded arm. Stood-down arms stay DISARMED until explicitly re-armed; stopped beats become STALE.",
     options: {
       "--seat <identity>": "Required: identify the supervising pane or agent.",
-      "--arm-id <identity>": "Identify this supervision arm.",
+      "--new-arm": "Create a new durable arm, allowing beats to resume after stand-down; the hand-off step for a seat taking over a stood-down tier (combine with --arm-id and --pct on a context tier).",
+      "--loop": "Create a new durable arm and beat in this process every 10 seconds; exit within one interval after stand-down.",
+      "--arm-id <identity>": "Name a newly created arm; with --pct, identify the context observation arm. Never refuses a tick.",
       "--pct <0..100>": "Report current context consumption percentage.",
       "--threshold-pct <0..100>": "Set the context warning threshold (default 75).",
-      "--stand-down": "Record an explicit handoff and stand down this tier.",
-    }, examples: ["beat overseer --seat supervisor", "beat overseer --seat supervisor --stand-down"],
+      "--stand-down": "Record an explicit handoff and stand down this tier. A later one-shot tick on the old arm exits non-zero; context observations still raise and discharge the clear duty.",
+    }, examples: ["beat overseer --seat supervisor", "beat overseer --seat supervisor --loop", "beat overseer --seat supervisor --stand-down", "beat overseer --seat supervisor --new-arm"],
   },
   version: {
     usage: "version [--dist]", description: "Print the installed package version. Top-level aliases: --version and -v.",

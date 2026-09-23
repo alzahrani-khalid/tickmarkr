@@ -1,6 +1,15 @@
 // Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
 import { isMap, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
-import { type FleetEditable, type FleetUniverseRow, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
+import { DENY_SCOPES, type DenyScope, type FleetEditable, type FleetUniverseRow, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
+
+// OBS-1099 add.1: the writer ranges over the schema-derived scopes. The flat (all-seats) scopes
+// take part in the membership/allow-form write; every nested scope (routing.deny.workers.*) is a
+// literal deny list written on its own. ponytail: "flat" = directly under routing.deny. Read
+// lazily: config.ts imports this module, so the enumeration is not initialized at load time.
+const flatDenyScopes = () => DENY_SCOPES.filter((scope) => scope.path.length === 3);
+const nestedDenyScopes = () => DENY_SCOPES.filter((scope) => scope.path.length > 3);
+const listsOf = (write: FleetOverlayWrite, scope: DenyScope): [string[], string[]] =>
+  [write.initial[scope.key] ?? [], write.edited[scope.key] ?? []];
 
 /** Fleet-owned overlay keys — the only config surface `tickmarkr fleet` may write. */
 export const FLEET_OVERLAY_KEYS = ["routing", "tiers"] as const;
@@ -49,7 +58,7 @@ function allowFormFromExclusions(
   // LEG2-T3 round 2 finding 1: every staged entry excludes what it NAMES — a bare model id every
   // adapter serving it, an identity its alias — never only an adapter id or an adapter:model key.
   // OBS-1046: the staged allow complement is a reason of its own, beside the authored deny lists.
-  const entries = [...edited.denyAdapters, ...edited.denyModels, ...(edited.allowOut ?? [])];
+  const entries = [...flatDenyScopes().flatMap((scope) => edited[scope.key] ?? []), ...(edited.allowOut ?? [])];
   const adapters: string[] = [];
   const models: string[] = [];
   let excluded = false;
@@ -236,9 +245,9 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   // session never edited keeps its node byte for byte, whatever its sibling did.
   const changed = (before: string[] = [], after: string[] = []) =>
     sortedUnique(before).join() !== sortedUnique(after).join();
-  const adaptersChanged = changed(initial.denyAdapters, edited.denyAdapters);
-  const modelsChanged = changed(initial.denyModels, edited.denyModels);
-  if (adaptersChanged || modelsChanged || changed(initial.allowOut, edited.allowOut)) {
+  const FLAT_DENY_SCOPES = flatDenyScopes();
+  const flatChanged = new Map(FLAT_DENY_SCOPES.map((scope) => [scope.key, changed(...listsOf(write, scope))]));
+  if ([...flatChanged.values()].some(Boolean) || changed(initial.allowOut, edited.allowOut)) {
     if (write.universe) {
       // Membership write: the allow form IS the fleet; deny adapters/models scopes are tombstoned
       // so a lower layer can never re-exclude behind the operator's back (workers untouched).
@@ -272,15 +281,13 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
       // LEG2-T3 finding 4: an authored entry the edit admits (staged nowhere any more) must go
       // even from a scope whose own set did not change, or the admitted channel stays excluded
       // behind the preserved bytes.
-      const stagedAfter = new Set([...edited.denyAdapters, ...edited.denyModels, ...(edited.allowOut ?? [])]);
-      const admitted = [...initial.denyAdapters, ...initial.denyModels, ...(initial.allowOut ?? [])]
+      const stagedAfter = new Set([...FLAT_DENY_SCOPES.flatMap((scope) => edited[scope.key] ?? []), ...(edited.allowOut ?? [])]);
+      const admitted = [...FLAT_DENY_SCOPES.flatMap((scope) => initial[scope.key] ?? []), ...(initial.allowOut ?? [])]
         .filter((entry) => !stagedAfter.has(entry));
-      const scopes = [
-        ["adapters", initial.denyAdapters, edited.denyAdapters, adaptersChanged],
-        ["models", initial.denyModels, edited.denyModels, modelsChanged],
-      ] as const;
-      for (const [scope, before, after, touched] of scopes) {
-        const path = ["routing", "deny", scope];
+      for (const scope of FLAT_DENY_SCOPES) {
+        const [before, after] = listsOf(write, scope);
+        const touched = flatChanged.get(scope.key);
+        const path = scope.path;
         const authored = authoredEntries(doc, path);
         const stale = authored.some((entry) => admitted.includes(entry));
         if (!touched && !stale) continue;
@@ -292,45 +299,23 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
         }
       }
     } else {
-      if (adaptersChanged) {
-        setStringSequencePreservingComments(
-          doc,
-          ["routing", "deny", "adapters"],
-          edited.denyAdapters.length ? sortedUnique(edited.denyAdapters) : null,
-        );
-      }
-      if (modelsChanged) {
-        setStringSequencePreservingComments(
-          doc,
-          ["routing", "deny", "models"],
-          edited.denyModels.length ? sortedUnique(edited.denyModels) : null,
-        );
+      for (const scope of FLAT_DENY_SCOPES) {
+        if (!flatChanged.get(scope.key)) continue;
+        const after = edited[scope.key] ?? [];
+        setStringSequencePreservingComments(doc, scope.path, after.length ? sortedUnique(after) : null);
       }
     }
   }
 
   // OBS-994/FL-1: routing.deny.workers is a literal deny list, never a universe-derived
   // membership scope — it never routes through the allow-complement dance above, in either
-  // branch. Same tombstone/comment-preserving rules as the flat scopes.
-  const initialWorkersAdapters = initial.denyWorkersAdapters ?? [];
-  const editedWorkersAdapters = edited.denyWorkersAdapters ?? [];
-  const initialWorkersModels = initial.denyWorkersModels ?? [];
-  const editedWorkersModels = edited.denyWorkersModels ?? [];
-  // Each sub-path mutates independently — an untouched sibling must not be rewritten (a `null`
-  // tombstone over an absent/untouched sibling would mask a lower layer's own workers scope).
-  if (sortedUnique(initialWorkersAdapters).join() !== sortedUnique(editedWorkersAdapters).join()) {
-    setStringSequencePreservingComments(
-      doc,
-      ["routing", "deny", "workers", "adapters"],
-      editedWorkersAdapters.length ? sortedUnique(editedWorkersAdapters) : null,
-    );
-  }
-  if (sortedUnique(initialWorkersModels).join() !== sortedUnique(editedWorkersModels).join()) {
-    setStringSequencePreservingComments(
-      doc,
-      ["routing", "deny", "workers", "models"],
-      editedWorkersModels.length ? sortedUnique(editedWorkersModels) : null,
-    );
+  // branch. Same tombstone/comment-preserving rules as the flat scopes. Each nested scope
+  // mutates independently — an untouched sibling must not be rewritten (a `null` tombstone over
+  // an absent/untouched sibling would mask a lower layer's own workers scope).
+  for (const scope of nestedDenyScopes()) {
+    const [before, after] = listsOf(write, scope);
+    if (!changed(before, after)) continue;
+    setStringSequencePreservingComments(doc, scope.path, after.length ? sortedUnique(after) : null);
   }
 
   for (const shape of new Set([...Object.keys(initial.map), ...Object.keys(edited.map)])) {
@@ -476,9 +461,12 @@ export function fleetRepoOverlayFromDelta(
   const out = structuredClone(existingRepo) as Record<string, unknown>;
   const routing = { ...(out.routing as Record<string, unknown> | undefined) };
   let routingTouched = false;
-  const denyChanged =
-    sortedUnique(initial.denyAdapters).join() !== sortedUnique(edited.denyAdapters).join()
-    || sortedUnique(initial.denyModels).join() !== sortedUnique(edited.denyModels).join()
+  // OBS-1099 add.1: the flat scopes (routing.deny.<leaf>) and the allow complement are one
+  // membership write; a list or its tombstone lands at every flat scope the enumeration names
+  const changedAt = (scope: DenyScope) =>
+    sortedUnique(initial[scope.key] ?? []).join() !== sortedUnique(edited[scope.key] ?? []).join();
+  const listOrTombstone = (entries: string[]) => entries.length ? entries : null;
+  const denyChanged = flatDenyScopes().some(changedAt)
     || sortedUnique(initial.allowOut ?? []).join() !== sortedUnique(edited.allowOut ?? []).join();
   if (denyChanged) {
     if (universe) {
@@ -489,46 +477,26 @@ export function fleetRepoOverlayFromDelta(
           ...(form.models.length ? { models: form.models } : {}),
         };
       } else delete routing.allow;
-      const residualAdapters = residualDeny(universe, edited.denyAdapters);
-      const residualModels = residualDeny(universe, edited.denyModels);
       routing.deny = {
         ...(routing.deny as Record<string, unknown> | undefined),
-        adapters: residualAdapters.length ? residualAdapters : null,
-        models: residualModels.length ? residualModels : null,
+        ...Object.fromEntries(flatDenyScopes().map((scope) =>
+          [scope.path[scope.path.length - 1], listOrTombstone(residualDeny(universe, edited[scope.key] ?? []))])),
       };
     } else {
-      routing.deny = {
-        adapters: edited.denyAdapters.length ? edited.denyAdapters : null,
-        models: edited.denyModels.length ? edited.denyModels : null,
-      };
+      routing.deny = Object.fromEntries(flatDenyScopes().map((scope) =>
+        [scope.path[scope.path.length - 1], listOrTombstone(edited[scope.key] ?? [])]));
     }
     routingTouched = true;
   }
 
-  // OBS-994/FL-1: workers deny is a literal list, independent of the universe/allow dance above.
-  // Each sub-path is included only when it actually changed — an untouched sibling must not be
-  // rewritten as a `null` tombstone over whatever the existing repo overlay already held.
-  const initialWorkersAdapters = initial.denyWorkersAdapters ?? [];
-  const editedWorkersAdapters = edited.denyWorkersAdapters ?? [];
-  const initialWorkersModels = initial.denyWorkersModels ?? [];
-  const editedWorkersModels = edited.denyWorkersModels ?? [];
-  const workersAdaptersChanged =
-    sortedUnique(initialWorkersAdapters).join() !== sortedUnique(editedWorkersAdapters).join();
-  const workersModelsChanged =
-    sortedUnique(initialWorkersModels).join() !== sortedUnique(editedWorkersModels).join();
-  if (workersAdaptersChanged || workersModelsChanged) {
-    routing.deny = {
-      ...(routing.deny as Record<string, unknown> | undefined),
-      workers: {
-        ...((routing.deny as { workers?: Record<string, unknown> } | undefined)?.workers),
-        ...(workersAdaptersChanged
-          ? { adapters: editedWorkersAdapters.length ? editedWorkersAdapters : null }
-          : {}),
-        ...(workersModelsChanged
-          ? { models: editedWorkersModels.length ? editedWorkersModels : null }
-          : {}),
-      },
-    };
+  // OBS-994/FL-1: a nested scope (routing.deny.workers.*) is a literal list, independent of the
+  // universe/allow dance above. Each sub-path is included only when it actually changed — an
+  // untouched sibling must not be rewritten as a `null` tombstone over whatever the existing repo
+  // overlay already held.
+  for (const scope of nestedDenyScopes().filter(changedAt)) {
+    let cur = (routing.deny = { ...(routing.deny as Record<string, unknown> | undefined) });
+    for (const segment of scope.path.slice(2, -1)) cur = (cur[segment] = { ...(cur[segment] as Record<string, unknown> | undefined) });
+    cur[scope.path[scope.path.length - 1]] = listOrTombstone(edited[scope.key] ?? []);
     routingTouched = true;
   }
   // pool widened to accept the null tombstone; MapEntry itself never carries null in memory.

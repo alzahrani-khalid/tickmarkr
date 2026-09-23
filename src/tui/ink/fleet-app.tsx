@@ -2,10 +2,10 @@ import { Box, render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
 import { retiredModelReason } from "../../adapters/model-lints.js";
-import type { MapEntry, RoutingMode, Tier, TickmarkrConfig } from "../../config/config.js";
+import { DENY_SCOPES, denyBlockFrom, denyEntriesAt, initialDenyPropOf, stagedDenyKeyOf, type DenyScope, type DenyScopeKey, type InitialDenyProps, type MapEntry, type RoutingMode, type StagedDenyKey, type Tier, type TickmarkrConfig } from "../../config/config.js";
 import { fleetFirstTouchProvenance } from "../../config/fleet-overlay.js";
 import { exclusionReason } from "../../config/fleet-why.js";
-import { entryMatchesChannel, exclusionCollector } from "../../route/preference.js";
+import { entryMatchesChannel, exclusionCollector, type ExclusionScope, type PreferenceRole } from "../../route/preference.js";
 import { TIERS, type Shape } from "../../graph/schema.js";
 import { windowRows } from "./components.js";
 import {
@@ -32,14 +32,11 @@ import {
 export type FleetSteeringKey = "review" | "consult";
 const STEERING_KEYS: FleetSteeringKey[] = ["review", "consult"];
 
-export type FleetEditorState = {
-  denyAdapters: string[];
-  denyModels: string[];
+// OBS-1099 add.1: one staged list per schema-enumerated deny scope, keyed as FleetEditable — a
+// scope the schema gains is carried here without a hand field (the command bridge copies it over).
+export type FleetEditorState = Record<DenyScopeKey, string[]> & {
   /** OBS-1046: the staged routing.allow complement, distinct from the authored deny lists above */
   allowOut?: string[];
-  // OBS-994/FL-1: the worker-only deny scope, staged and written beside the flat scopes above.
-  denyWorkersAdapters: string[];
-  denyWorkersModels: string[];
   classifications: FleetClassification[];
   selectedMode: RoutingMode;
   map: Record<string, MapEntry>;
@@ -88,15 +85,18 @@ export type FleetModelEvidence = {
   identity?: string;
 };
 
-/** The four staged deny sets every preview and the staged routing policy are computed from. */
-export type FleetStagedDeny = {
-  adapters: string[];
-  models: string[];
-  workersAdapters: string[];
-  workersModels: string[];
+/** OBS-1099 add.1: the staged deny list of every schema-enumerated scope — keyed by the scope
+ * key minus its `deny` prefix (denyWorkersAdapters → workersAdapters) — every preview and the
+ * staged routing policy are computed from; a scope the schema gains is a key here, not a hand field. */
+export type FleetStagedDeny = Record<StagedDenyKey, string[]> & {
   /** OBS-1046: the staged routing.allow complement; absent ⇒ the session's initial one */
   allowOut?: string[];
 };
+/** every scope's staged list, empty — the "every policy scope open" probe the picker lifts against */
+export const openStagedDeny = (): FleetStagedDeny => ({
+  ...(Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), [] as string[]])) as Record<StagedDenyKey, string[]>),
+  allowOut: [],
+});
 
 export type FleetModelGroup = {
   adapter: string;
@@ -141,6 +141,8 @@ export type FleetCandidateOption = {
   id: string;
   label: string;
   pin: { via: string; model: string };
+  /** ranked only after the shape's advisory floor was dropped (candidates.ts) — never lift-eligible */
+  belowFloor?: boolean;
 };
 
 const CHANNELS = ["sub", "api"] as const;
@@ -202,7 +204,28 @@ type Overlay =
   | { kind: "poolmode"; picker: CandidatesOverlay; at: number }
   | { kind: "prefer"; target: { shape: Shape } | { steering: FleetSteeringKey }; rows: string[]; chain: string[]; at: number }
   | { kind: "judge"; at: number }
+  // OBS-1099 items 1 and 4: the reach picker — one selected reason changes per act, never a cycle
+  | { kind: "reach"; target: { adapter: string; model?: string }; at: number }
+  // OBS-1099 items 2/3, OBS-1065: the ONE entry-level owning control — lists every identity the
+  // covering entry reaches, then Enter lifts that one logical entry
+  | { kind: "lift"; id: string; covering: Covering }
   | { kind: "review"; review: DiffReview; scroll: number };
+
+type SeatChannel = { adapter: string; model: string; identity?: string };
+/** a deny entry that reaches this row other than by its own adapter:model key, with every
+ * displayed channel it covers; `shared` ⇒ never a row edit, only the lift control */
+type Owned = { entry: string; scope: string };
+/** review round 12: the ONE entry each reach choice edits on this row, from the same ordered
+ * selector the mutation reads — the detail line names them per choice, never a merged promise */
+type ReachEdits = { clear?: Owned; demote?: Owned; promote?: Owned };
+type Covering = { entry: string; scope: string; covers: string[]; shared: boolean; edits: ReachEdits };
+
+type ReachChoice = "in" | "out-workers" | "out-all";
+const REACH_CHOICES: Array<{ id: ReachChoice; label: string; gloss: string }> = [
+  { id: "in", label: "in", gloss: "every seat may route here" },
+  { id: "out-workers", label: "out · workers", gloss: "workers skip it; judge/review/consult unaffected" },
+  { id: "out-all", label: "out · all seats", gloss: "no seat routes here" },
+];
 
 type RailRow =
   | { kind: "view"; view: View; label: string; count: number }
@@ -235,6 +258,7 @@ type ModelRow = {
   reasons: string[];
   /** a resolved alias no deny scope of the staged policy covers */
   uncoveredAlias: boolean;
+  covering?: Covering;
 };
 
 type Ui = {
@@ -257,13 +281,8 @@ type Ui = {
   notice: string;
   /** judge c3: the one entry the last Space press edited, named on that channel's detail line */
   lastEdit: { id: string; text: string } | null;
-  deny: Set<string>;
-  denyModels: Set<string>;
   /** OBS-1046: channels routing.allow leaves out — a reason of its own, never merged into deny */
   allowOut: Set<string>;
-  /** OBS-994/FL-1: worker-only deny scope, staged in parallel with the flat sets above */
-  denyWorkersAdapters: Set<string>;
-  denyWorkersModels: Set<string>;
   classifications: FleetClassification[];
   selectedMode: RoutingMode;
   map: Record<string, MapEntry>;
@@ -272,16 +291,15 @@ type Ui = {
   channelByAdapter: Record<string, "sub" | "api">;
   overlay: Overlay | null;
   done: boolean;
-};
+  // OBS-1099 add.1: one staged set per schema-enumerated deny scope (denyAdapters, denyModels,
+  // denyWorkersAdapters, denyWorkersModels, …), keyed exactly as FleetEditable — every scope loop
+  // below ranges over DENY_SCOPES, so a scope the schema gains is staged and edited without a hand list.
+} & Record<DenyScopeKey, Set<string>>;
 
 export function FleetApp({
   ageMs,
   agents,
-  initialDenyAdapters,
-  initialDenyModels,
   initialAllowOut = [],
-  initialDenyWorkersAdapters = [],
-  initialDenyWorkersModels = [],
   modelGroups,
   initialMode,
   modeOptions,
@@ -301,15 +319,12 @@ export function FleetApp({
   viewRows = Number.POSITIVE_INFINITY,
   frameColumns = 100,
   frameRows,
-}: {
+  ...initialDenyProps
+}: InitialDenyProps & {
   ageMs: number | null;
   agents: AgentCli[];
-  initialDenyAdapters: string[];
-  initialDenyModels: string[];
   /** OBS-1046: adapter ids and adapter:model keys routing.allow leaves out of the fleet */
   initialAllowOut?: string[];
-  initialDenyWorkersAdapters?: string[];
-  initialDenyWorkersModels?: string[];
   modelGroups: FleetModelGroup[];
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
@@ -347,6 +362,11 @@ export function FleetApp({
 }) {
   const { exit } = useApp();
   const [, setRevision] = useState(0);
+  // the props are the fleet command's contract, one per schema-enumerated scope (initialDeny…),
+  // read by a loop so a scope the schema gains seeds its set without a hand field (OBS-1099 add.1)
+  const initialDeny = Object.fromEntries(
+    DENY_SCOPES.map((scope) => [scope.key, initialDenyProps[initialDenyPropOf(scope)] ?? []]),
+  ) as Record<DenyScopeKey, string[]>;
   const uiRef = useRef<Ui | null>(null);
   uiRef.current ??= {
     focus: "list",
@@ -362,11 +382,8 @@ export function FleetApp({
     presetsSeen: false,
     notice: "",
     lastEdit: null,
-    deny: new Set(initialDenyAdapters),
-    denyModels: new Set(initialDenyModels),
     allowOut: new Set(initialAllowOut),
-    denyWorkersAdapters: new Set(initialDenyWorkersAdapters),
-    denyWorkersModels: new Set(initialDenyWorkersModels),
+    ...(Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, new Set(initialDeny[scope.key])])) as Record<DenyScopeKey, Set<string>>),
     classifications: [],
     selectedMode: initialMode,
     map: structuredClone(initialMap),
@@ -383,24 +400,17 @@ export function FleetApp({
 
   // OBS-521/OBS-522: one truth for "is there staged work" — the Esc/q loss guard, the header
   // chip, and the empty-`w` notice all read it. Counts staged EDITS, not diff hunks.
-  const initialDenySet = new Set(initialDenyAdapters);
-  const initialDenyModelSet = new Set(initialDenyModels);
   const initialAllowOutSet = new Set(initialAllowOut);
-  const initialDenyWorkersAdapterSet = new Set(initialDenyWorkersAdapters);
-  const initialDenyWorkersModelSet = new Set(initialDenyWorkersModels);
   const stagedCount = (): number => {
     let n = ui.classifications.length
       + (ui.selectedMode !== initialMode ? 1 : 0)
       + (ui.judgeSeat !== null ? 1 : 0);
-    for (const adapter of ui.deny) if (!initialDenySet.has(adapter)) n += 1;
-    for (const adapter of initialDenySet) if (!ui.deny.has(adapter)) n += 1;
-    for (const model of ui.denyModels) if (!initialDenyModelSet.has(model)) n += 1;
-    for (const model of initialDenyModelSet) if (!ui.denyModels.has(model)) n += 1;
+    for (const scope of DENY_SCOPES) {
+      const before = new Set(initialDeny[scope.key]);
+      for (const entry of ui[scope.key]) if (!before.has(entry)) n += 1;
+      for (const entry of before) if (!ui[scope.key].has(entry)) n += 1;
+    }
     for (const key of initialAllowOutSet) if (!ui.allowOut.has(key)) n += 1;
-    for (const adapter of ui.denyWorkersAdapters) if (!initialDenyWorkersAdapterSet.has(adapter)) n += 1;
-    for (const adapter of initialDenyWorkersAdapterSet) if (!ui.denyWorkersAdapters.has(adapter)) n += 1;
-    for (const model of ui.denyWorkersModels) if (!initialDenyWorkersModelSet.has(model)) n += 1;
-    for (const model of initialDenyWorkersModelSet) if (!ui.denyWorkersModels.has(model)) n += 1;
     for (const shape of new Set([...Object.keys(initialMap), ...Object.keys(ui.map)])) {
       // {} ≡ absent: pin-then-auto leaves an empty entry that writes nothing — not staged work
       if (JSON.stringify(initialMap[shape] ?? {}) !== JSON.stringify(ui.map[shape] ?? {})) n += 1;
@@ -435,17 +445,28 @@ export function FleetApp({
         key,
         policy: stagedRouting
           ? stagedRouting(deny)
-          : { ok: true, routing: { deny: { adapters: deny.adapters, models: deny.models, workers: { adapters: deny.workersAdapters, models: deny.workersModels } } } as TickmarkrConfig["routing"] },
+          : { ok: true, routing: { deny: denyBlockFrom(denyLists()) } as TickmarkrConfig["routing"] },
       };
     }
     return routingMemo.policy;
   };
+  // OBS-1099 add.1: the browser's deny discovery ranges over the schema-enumerated scopes (the
+  // route collector names its four paths by hand, so a scope the schema gains would never render
+  // or lift here). A flat scope reaches every seat; a nested one only the seat its block names
+  // (workers → worker). The allow exclusion (by absence, never lifted) stays the collector's.
+  const scopeReaches = (scope: DenyScope, role: PreferenceRole) => scope.path.length === 3 || scope.path[2] === `${role}s`;
+  const exclusionsOf = (channel: SeatChannel, routing: TickmarkrConfig["routing"], role: PreferenceRole): ExclusionScope[] => [
+    ...DENY_SCOPES.filter((scope) => scopeReaches(scope, role)).flatMap((scope) =>
+      (denyEntriesAt(routing, scope) ?? []).filter((entry) => entryMatchesChannel(entry, channel, true))
+        .map((entry) => ({ scope: scope.dotted, path: scope.dotted, configPath: scope.dotted, entry, by: "deny" as const }))),
+    ...exclusionCollector(channel, routing, role).filter((found) => found.by === "allow"),
+  ];
   const reachFor = (adapter: string, model: string, identity?: string): Pick<ModelRow, "reach" | "reasons" | "uncoveredAlias"> => {
     const policy = stagedPolicy();
     if (!policy.ok) return { reach: "unknown", reasons: [`preview unavailable (${policy.error})`], uncoveredAlias: false };
     const channel = { adapter, model, ...(identity !== undefined ? { identity } : {}) };
-    const worker = exclusionCollector(channel, policy.routing, "worker");
-    const allSeats = exclusionCollector(channel, policy.routing, "judge");
+    const worker = exclusionsOf(channel, policy.routing, "worker");
+    const allSeats = exclusionsOf(channel, policy.routing, "judge");
     const reach: FleetReach = allSeats.some((scope) => scope.by === "deny") ? "out-all"
       : allSeats.length ? "out-allow"
       : worker.length ? "out-workers"
@@ -455,6 +476,106 @@ export function FleetApp({
       reasons: worker.map(exclusionReason),
       uncoveredAlias: identity !== undefined && !worker.some((scope) => scope.by === "deny"),
     };
+  };
+
+  // OBS-1099 review: a displayed row may fold several discovered gateway ids (foldedModels);
+  // each folded id is a real channel the policy matches on its own, so every one but a row's
+  // own id counts as a sibling — an entry covering a folded id is shared, never row-owned
+  const displayedChannels = (): SeatChannel[] => modelGroups.flatMap((group) => group.rows
+    .flatMap((other) => (other.foldedModels?.length ? other.foldedModels : [other.model])
+      .map((model) => ({ adapter: group.adapter, model, identity: other.evidence?.identity }))));
+  const siblingsOf = (self: SeatChannel) => displayedChannels()
+    .filter((other) => other.adapter !== self.adapter || other.model !== self.model);
+  // Judge c3 (R107): exactly ONE selected entry per act — the channel's adapter:model key when it
+  // is a candidate, else the first candidate in sorted order; only an entry no sibling matches
+  const selectOwn = (entries: Set<string>, self: SeatChannel): string | undefined => {
+    const others = siblingsOf(self);
+    const candidates = [...entries].filter((entry) => entryMatchesChannel(entry, self, true)
+      && !others.some((other) => entryMatchesChannel(entry, other, true)));
+    const id = `${self.adapter}:${self.model}`;
+    return candidates.includes(id) ? id : candidates.sort()[0];
+  };
+  // OBS-1099 add.1: the scope order every row edit ranks by — shallow scopes first, the models
+  // list before its adapters sibling (the row-edit order every prior round used) — derived from
+  // the schema enumeration, never listed by hand
+  const SCOPED = [...DENY_SCOPES].sort((a, b) => a.path.length - b.path.length
+    || Number(b.path[b.path.length - 1] === "models") - Number(a.path[a.path.length - 1] === "models"));
+  const scopeOf = (dotted: string): DenyScope | undefined => DENY_SCOPES.find((scope) => scope.dotted === dotted);
+  const denySets = () => SCOPED.map((scope) => [ui[scope.key], scope.dotted] as const);
+  // D-233: adapter-wideness is a property of the ENTRY's grammar (a bare adapter id), never of
+  // the config PATH — both .adapters lists accept adapter, model and adapter:model entries alike
+  const isAdapterWide = (entry: string, self: SeatChannel) => !entry.includes(":") && entry === self.adapter;
+  /** the one row-owned deny entry a picker lift may take — never an allow exclusion, and never an
+   * adapter-wide entry (review round 2: an adapter with one displayed channel would otherwise
+   * count as owning its whole adapter entry) */
+  const ownDeny = (self: SeatChannel): { entry: string; scope: string } | undefined => {
+    for (const [set, scope] of denySets()) {
+      const entry = selectOwn(new Set([...set].filter((e) => !isAdapterWide(e, self))), self);
+      if (entry !== undefined) return { entry, scope };
+    }
+    return undefined;
+  };
+  const liftEntry = ({ entry, scope }: { entry: string; scope: string }) => {
+    const found = scopeOf(scope);
+    if (found) ui[found.key] = new Set([...ui[found.key]].filter((staged) => staged !== entry));
+  };
+  // Review round 10: the ONE ordered selector both the detail line and the reach edit read — every
+  // deny entry this row owns alone (never adapter-wide, never one a displayed sibling matches),
+  // the row's own key first (judge c3), then scope order models → adapters → workers.models →
+  // workers.adapters, alphabetical within a scope (the row-edit order every prior round used).
+  const SCOPE_ORDER = SCOPED.map((scope) => scope.dotted);
+  // Read over the RAW staged sets, never the validated policy: the writer restates a flat deny
+  // in the allow form, and a row must still find the entry it authored a press ago.
+  const ownedDenies = (self: SeatChannel): Array<{ entry: string; scope: string }> => {
+    const own = `${self.adapter}:${self.model}`;
+    const others = siblingsOf(self);
+    const routing = { deny: denyBlockFrom(denyLists()) } as TickmarkrConfig["routing"];
+    return exclusionsOf(self, routing, "worker")
+      .filter((found) => found.by === "deny" && !isAdapterWide(found.entry, self)
+        && !others.some((other) => entryMatchesChannel(found.entry, other, true)))
+      .map((found) => ({ entry: found.entry, scope: found.configPath }))
+      .sort((a, b) => Number(b.entry === own) - Number(a.entry === own)
+        || SCOPE_ORDER.indexOf(a.scope) - SCOPE_ORDER.indexOf(b.scope) || a.entry.localeCompare(b.entry));
+  };
+  // a nested scope (routing.deny.workers.*) denies workers only; a flat one denies every seat
+  const WORKERS_SCOPES = SCOPED.filter((scope) => scope.path.length > 3).map((scope) => scope.dotted);
+  const FLAT_SCOPES = SCOPED.filter((scope) => scope.path.length === 3).map((scope) => scope.dotted);
+  // the adapter rail edits only the `adapters` leaves — its own adapter-id entries (D-233 grammar)
+  const FLAT_ADAPTER_SCOPES = SCOPED.filter((scope) => scope.path.length === 3 && scope.path[scope.path.length - 1] === "adapters");
+  const NESTED_ADAPTER_SCOPES = SCOPED.filter((scope) => scope.path.length > 3 && scope.path[scope.path.length - 1] === "adapters");
+  // review round 12: per reach choice, the entry the Space handler edits — in clears the head,
+  // out · workers demotes the first flat entry, out · all promotes the first workers entry
+  const reachEdits = (owned: Owned[]): ReachEdits => ({
+    clear: owned[0],
+    demote: owned.find((f) => FLAT_SCOPES.includes(f.scope)),
+    promote: owned.find((f) => WORKERS_SCOPES.includes(f.scope)),
+  });
+  // OBS-1099 item 2: the entry that covers a row OTHER than its own key (an explicit id reached
+  // through the doctor-recorded identity, a bare model, an adapter-wide entry) — named, with every
+  // displayed channel it covers. ponytail: O(rows²) over a fleet of dozens; index if it grows.
+  const coveringFor = (self: SeatChannel): Covering | undefined => {
+    const policy = stagedPolicy();
+    if (!policy.ok) return undefined;
+    // review round 3: the row's own key is dropped only when it covers no displayed sibling —
+    // an explicit id whose alias folds into this row is one shared entry, so it stays here
+    // (Space already refuses it as shared) and the l control owns it
+    const own = `${self.adapter}:${self.model}`;
+    const ownShared = siblingsOf(self).some((other) => entryMatchesChannel(own, other, true));
+    // D-245 (review round 11): the named entry is the FIRST ownedDenies record other than the own
+    // key (or the own key itself when shared) — the very record Space edits, scope included, never
+    // re-ranked through the collector; only a row that owns nothing falls back to the collector's
+    // shared entries, adapter-wide last
+    const owned = ownedDenies(self);
+    const ownedPick = owned.find((f) => f.entry !== own || ownShared);
+    const scope = ownedPick ? { entry: ownedPick.entry, configPath: ownedPick.scope }
+      : exclusionsOf(self, policy.routing, "worker")
+        .filter((found) => found.by === "deny" && (found.entry !== own || ownShared))
+        .sort((a, b) => Number(isAdapterWide(a.entry, self)) - Number(isAdapterWide(b.entry, self)))[0];
+    if (!scope) return undefined;
+    const covers = displayedChannels().filter((channel) => entryMatchesChannel(scope.entry, channel, true))
+      .map((channel) => `${channel.adapter}:${channel.model}${channel.identity ? ` (${channel.identity})` : ""}`);
+    const shared = isAdapterWide(scope.entry, self) || covers.length > 1;
+    return { entry: scope.entry, scope: scope.configPath, covers, shared, edits: reachEdits(owned) };
   };
 
   const groupRows = (group: FleetModelGroup): ModelRow[] => {
@@ -478,6 +599,10 @@ export function FleetApp({
         score: row.score,
         denied: reach.reach !== "in",
         ...reach,
+        // OBS-1099 item 2 (review round 2): every row is covered the same way — an alias through
+        // its identity, a plain row by a bare-model or adapter entry — so a shared bare-model
+        // entry across adapters has the one owning control too
+        covering: coveringFor({ adapter: group.adapter, model: row.model, identity: row.evidence?.identity }),
       };
     });
     const known = new Set(rows.flatMap((row) => row.classifyModel ? [row.model, row.classifyModel] : [row.model]));
@@ -529,11 +654,10 @@ export function FleetApp({
 
   // three preview callbacks share it in lockstep — the staged deny truth every preview ranks under.
   // LEG2-T3 finding 2: all four scopes travel distinct; the preview loads them as written.
+  const denyLists = (): Record<DenyScopeKey, string[]> =>
+    Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, [...ui[scope.key]].sort()])) as Record<DenyScopeKey, string[]>;
   const stagedDeny = (): FleetStagedDeny => ({
-    adapters: [...ui.deny].sort(),
-    models: [...ui.denyModels].sort(),
-    workersAdapters: [...ui.denyWorkersAdapters].sort(),
-    workersModels: [...ui.denyWorkersModels].sort(),
+    ...(Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), [...ui[scope.key]].sort()])) as Record<StagedDenyKey, string[]>),
     allowOut: [...ui.allowOut].sort(),
   });
   const shapeList = () => shapeRows(ui.selectedMode, ui.map, stagedDeny());
@@ -563,11 +687,8 @@ export function FleetApp({
   // ── state transitions ──────────────────────────────────────────────────────
 
   const editorState = (): FleetEditorState => ({
-    denyAdapters: [...ui.deny].sort(),
-    denyModels: [...ui.denyModels].sort(),
+    ...denyLists(),
     allowOut: [...ui.allowOut].sort(),
-    denyWorkersAdapters: [...ui.denyWorkersAdapters].sort(),
-    denyWorkersModels: [...ui.denyWorkersModels].sort(),
     classifications: ui.classifications.map((classification) =>
       classification.vendor && classification.channel
         ? {
@@ -707,6 +828,253 @@ export function FleetApp({
   const capacity = Number.isFinite(viewRows) ? Math.max(4, viewRows as number) : Number.POSITIVE_INFINITY;
   /** review diff rows: overlay chrome is one row shorter than the browser's (no scope header) */
   const reviewCapacity = () => Number.isFinite(capacity) ? Math.min(Math.max(capacity + 1, 4), 400) : 400;
+  // OBS-1099 item 4 (D-199, D-205): an adapter row's reach and remaining reasons come from the
+  // exclusion collector over the STAGED policy for EVERY channel it serves — displayed rows and the
+  // gateway ids folded into them — never literal set membership, which misses model-scope entries
+  // that cover the whole adapter (a bare adapter id in routing.deny.models: preference.ts).
+  // D-205: reach is the MOST-excluded channel's reach — in only when every channel is in, out-all
+  // when any channel is out for all seats, else out-workers — and `partial` says the channels
+  // disagree, so a mixed rail is never shown or guarded as an adapter-wide selected state.
+  // Reasons are the UNION over the channels: one every channel shares is named once, a
+  // channel-specific one carries its channel, so a partial exclusion is never intersected away.
+  const adapterReach = (id: string): { reach: FleetReach; reasons: string[]; partial: boolean } => {
+    const group = modelGroups.find((candidate) => candidate.adapter === id);
+    const channels = (group?.rows ?? []).flatMap((row) => (row.foldedModels?.length ? row.foldedModels : [row.model])
+      .map((model) => ({ model, ...reachFor(id, model, row.evidence?.identity) })));
+    if (channels.length === 0) {
+      // ponytail: a rail entry with no probed channels has only its own literal entries to show
+      const reasons = [
+        ...FLAT_ADAPTER_SCOPES.filter((scope) => ui[scope.key].has(id)).map((scope) => `${scope.dotted} (${id})`),
+        ui.allowOut.has(id) ? "routing.allow (not admitted)" : "",
+        ...NESTED_ADAPTER_SCOPES.filter((scope) => ui[scope.key].has(id)).map((scope) => `${scope.dotted} (${id})`),
+      ].filter(Boolean);
+      const reach: FleetReach = FLAT_ADAPTER_SCOPES.some((scope) => ui[scope.key].has(id)) ? "out-all"
+        : ui.allowOut.has(id) ? "out-allow"
+        : NESTED_ADAPTER_SCOPES.some((scope) => ui[scope.key].has(id)) ? "out-workers" : "in";
+      return { reach, reasons, partial: false };
+    }
+    const unknown = channels.find((channel) => channel.reach === "unknown");
+    if (unknown) return { reach: "unknown", reasons: unknown.reasons, partial: false };
+    // OBS-1099 review round 5: out-allow and out-all are ONE picker choice (out · all seats), so a
+    // deny-excluded channel beside an allow-excluded one is uniformly out-all, never partial
+    const picked = (reach: FleetReach): FleetReach => reach === "out-allow" ? "out-all" : reach;
+    const rank: Record<FleetReach, number> = { unknown: -1, in: 0, "out-workers": 1, "out-allow": 2, "out-all": 2 };
+    const reach = channels.reduce<FleetReach>((most, channel) => rank[channel.reach] > rank[most] ? picked(channel.reach) : most, picked(channels[0].reach));
+    const partial = channels.some((channel) => picked(channel.reach) !== reach);
+    const shared = channels[0].reasons.filter((reason) => channels.every((channel) => channel.reasons.includes(reason)));
+    const own = channels.flatMap((channel) => channel.reasons
+      .filter((reason) => !shared.includes(reason))
+      .map((reason) => `${channel.model}: ${reason}`));
+    return { reach, reasons: [...shared, ...own], partial };
+  };
+  const describeReach = (state: { reach: FleetReach; partial: boolean }) => state.partial ? `${state.reach} (partial: not every channel)` : state.reach;
+
+  // OBS-1099 items 1 and 4: one picker choice changes exactly ONE selected entry in ONE scope —
+  // added, cleared, or re-scoped between the workers list and the flat list — then the row's
+  // ACTUAL reach is recomputed and the remaining reasons named. The one-entry-per-press law
+  // (R107, LEG2-T3) stays: a shared or adapter-wide entry covering sibling channels is never
+  // edited from a channel row; the refusal names it. A row holding two reasons is never promised
+  // in after one act.
+  const applyReach = (target: { adapter: string; model?: string }, choice: ReachChoice) => {
+    const without = (set: Set<string>, entry: string) => new Set([...set].filter((staged) => staged !== entry));
+    const withEntry = (set: Set<string>, entry: string) => new Set([...set, entry]);
+    const label = REACH_CHOICES.find((option) => option.id === choice)!.label;
+    // the allow form is how the writer spells an all-seats exclusion — it IS out · all seats
+    const reached = (reach: FleetReach, wanted: ReachChoice) => reach === wanted || (wanted === "out-all" && reach === "out-allow");
+
+    if (target.model === undefined) {
+      const id = target.adapter;
+      const { reach, reasons, partial } = adapterReach(id);
+      // the rail edits exactly ONE adapter-id entry: the authored deny before the allow complement
+      // before the workers deny (OBS-1046). Reach that comes only from channel-scope entries is not
+      // the rail's to clear — the refusal names those reasons.
+      // OBS-1099 add.1: the held entry is looked up over the schema-enumerated adapter scopes,
+      // flat before the allow complement before nested
+      const heldScope = FLAT_ADAPTER_SCOPES.find((scope) => ui[scope.key].has(id))
+        ?? (ui.allowOut.has(id) ? undefined : NESTED_ADAPTER_SCOPES.find((scope) => ui[scope.key].has(id)));
+      const held = heldScope?.dotted ?? (ui.allowOut.has(id) ? "routing.allow" : null);
+      const take = () => {
+        if (heldScope) ui[heldScope.key] = without(ui[heldScope.key], id);
+        else ui.allowOut = without(ui.allowOut, id);
+      };
+      let edit = "";
+      // OBS-1099 review: transitions are judged on ACTUAL reach, not only on the held entry — an
+      // adapter that is out only through channel-scope entries (a bare adapter id in
+      // routing.deny.models) has nothing the rail may move: a choice it already reaches says so,
+      // and a choice that would leave it out-all while staging a second reason is refused by name.
+      // D-205: a PARTIAL rail (channels disagree) is never "already" anything — the choice that
+      // widens every channel to the picked reach is one act, the others are refused by name
+      if (held === null && !partial && reached(reach, choice)) {
+        ui.notice = `${id} is already ${label}${reasons.length ? ` — ${reasons.join("; ")}` : ""}`;
+        return;
+      }
+      if (held === null && (choice === "in" || (choice === "out-workers" && reached(reach, "out-all")))) {
+        ui.notice = `${id} stays ${describeReach({ reach, partial })} — ${reasons.join("; ")} — the rail edits only ${id}'s own adapter entries; set reach on the channel rows`;
+        return;
+      }
+      if (choice === "in") {
+        take();
+        edit = `cleared ${id} from ${held}`;
+      } else if (choice === "out-workers") {
+        if (held === "routing.deny.workers.adapters") {
+          // OBS-1099 review round 3: the held workers entry is already the rail's whole say —
+          // when actual reach is still out-all, the remaining all-seat reasons live on the
+          // channel rows, and this choice cannot reach workers-only until they clear
+          if (!partial && reached(reach, choice)) {
+            ui.notice = `${id} is already ${label}`;
+          } else {
+            const remaining = reasons.filter((reason) => reason !== `routing.deny.workers.adapters (${id})`);
+            ui.notice = `${id} stays ${describeReach({ reach, partial })} — ${remaining.join("; ")} — ${id} is already in routing.deny.workers.adapters; workers-only reach needs those all-seat reasons cleared on the channel rows`;
+          }
+          return;
+        }
+        if (held !== null) take();
+        ui.denyWorkersAdapters = withEntry(ui.denyWorkersAdapters, id);
+        edit = `${held === null ? "added" : "moved"} ${id} to routing.deny.workers.adapters`;
+      } else {
+        if (held === "routing.deny.adapters" || held === "routing.allow") {
+          ui.notice = `${id} is already ${label}`;
+          return;
+        }
+        if (held !== null) take();
+        ui.denyAdapters = withEntry(ui.denyAdapters, id);
+        edit = `${held === null ? "added" : "moved"} ${id} to routing.deny.adapters`;
+      }
+      const after = adapterReach(id);
+      // a partially excluded adapter (one channel still out by its own entry) names what remains
+      const still = choice === "in" ? after.reasons.length > 0 : after.partial || !reached(after.reach, choice);
+      ui.notice = `space: ${edit}${still ? ` — still out: ${after.reasons.join("; ")}` : ""}`;
+      clampList();
+      return;
+    }
+
+    const row = modelRows().find((candidate) => candidate.adapter === target.adapter && candidate.model === target.model);
+    if (!row) return;
+    const id = `${row.adapter}:${row.model}`;
+    const self = { adapter: row.adapter, model: row.model, identity: row.evidence?.identity };
+    // LEG2-T3 round 2 finding 1 / D-233 / D-235 (review round 10): ONE ordered selector —
+    // ownedDenies — feeds the detail line AND every Space edit, so the entry named is the entry
+    // edited: a clear takes its head (own key first, then collector order); a demotion takes its
+    // first flat entry, a promotion its first workers entry; a bare adapter id or a sibling's
+    // entry is never in it. OBS-1046: an allow exclusion is the LAST reason taken, never together
+    // with an authored deny.
+    const edits = reachEdits(ownedDenies(self));
+    const ownAllow = (): Owned | undefined => {
+      const fromAllow = selectOwn(ui.allowOut, self);
+      return fromAllow === undefined ? undefined : { entry: fromAllow, scope: "routing.allow" };
+    };
+    const ownFlat = () => edits.demote ?? ownAllow();
+    const ownWorkers = () => edits.promote;
+    const takeFlat = (found: { entry: string; scope: string }) => {
+      const scope = scopeOf(found.scope);
+      if (scope) ui[scope.key] = without(ui[scope.key], found.entry);
+      else ui.allowOut = without(ui.allowOut, found.entry);
+    };
+    const refuse = (reachLabel: string) => {
+      // OBS-1099 item 2: a covered row names the covering entry, every identity it covers, and
+      // the ONE control that lifts it — the T1 refusal wording stays in front of it
+      if (row.covering?.shared) {
+        // the notice clips at the browser width; the detail line and the l overlay list every identity
+        ui.notice = `${id} stays ${reachLabel} — ${row.covering.scope} (${row.covering.entry}) covers ${row.covering.covers.length} channels — Space edits only this channel's own entries; l lists and lifts it`;
+        return;
+      }
+      const shared = ui.denyAdapters.has(row.adapter) || ui.allowOut.has(row.adapter) || ui.denyWorkersAdapters.has(row.adapter)
+        ? `every ${row.adapter} channel is out together — set the adapter's reach on the rail`
+        : "a shared entry covers other channels too";
+      ui.notice = `${id} stays ${reachLabel} — ${row.reasons.join("; ")} — Space edits only this channel's own entries; ${shared}`;
+    };
+
+    const reach = row.reach;
+    const outAll = reach === "out-all" || reach === "out-allow";
+    let edit = "";
+    if (choice === "out-workers" && reach === "in") {
+      ui.denyWorkersModels = withEntry(ui.denyWorkersModels, id);
+      edit = `added ${id} to routing.deny.workers.models`;
+    } else if (choice === "out-workers" && outAll) {
+      const found = ownFlat();
+      if (found === undefined) return refuse("out");
+      takeFlat(found);
+      ui.denyWorkersModels = withEntry(ui.denyWorkersModels, found.entry);
+      edit = `moved ${found.entry} to routing.deny.workers.models`;
+    } else if (choice === "out-all" && reach === "in") {
+      ui.denyModels = withEntry(ui.denyModels, id);
+      edit = `added ${id} to routing.deny.models`;
+    } else if (choice === "out-all" && reach === "out-workers") {
+      // OBS-1099 review: a promotion, like a clear, takes only an entry no sibling row matches —
+      // a shared workers entry (adapter-wide or a bare id another row serves) is refused by name,
+      // never moved for its siblings and never doubled by a fresh flat deny
+      const found = ownWorkers();
+      if (found === undefined) return refuse("out · workers");
+      takeFlat(found);
+      ui.denyModels = withEntry(ui.denyModels, found.entry);
+      edit = `moved ${found.entry} to routing.deny.models`;
+    } else if (choice === "in" && reach !== "in") {
+      // D-205: in clears ONE row-owned reason from either the flat scopes or the workers scope —
+      // a shared flat reason (routing.deny.adapters covering every channel) never blocks clearing
+      // this row's own workers entry; the recomputed reach then names the shared reason that remains
+      const found = edits.clear ?? (outAll ? ownAllow() : undefined);
+      if (found !== undefined) {
+        takeFlat(found);
+        edit = `cleared ${found.entry} from ${found.scope}`;
+      } else {
+        return refuse(outAll ? "out" : "out · workers");
+      }
+    } else {
+      ui.notice = `${id} is already ${label}`;
+      return;
+    }
+    const after = reachFor(row.adapter, row.model, row.evidence?.identity);
+    const still = reached(after.reach, choice) ? "" : ` — still out: ${after.reasons.join("; ")}`;
+    ui.lastEdit = { id, text: `space: ${edit}${still}` };
+  };
+
+  // OBS-1065: Enter on a greyed picker row lifts exactly its row-owned covering entry, then the
+  // same picker reopens over the recomputed policy — a shared or adapter-wide entry is refused by
+  // name and the row stays greyed
+  const liftFromPicker = (overlay: CandidatesOverlay, line: string) => {
+    const head = line.split(" — ")[0];
+    const slash = head.indexOf("/");
+    const self = slash === -1 ? undefined
+      : displayedChannels().find((channel) => channel.adapter === head.slice(0, slash) && channel.model === head.slice(slash + 1));
+    if (!self) {
+      ui.notice = `nothing to lift on this row — ${line}`;
+      bump();
+      return;
+    }
+    const id = `${self.adapter}:${self.model}`;
+    // review round 2/4: only a channel that is otherwise eligible (tier floor, auth, pin/pool) may
+    // be lifted. Eligibility is read from the picker source itself, never the ledger strings: the
+    // channel must be OFFERED at or above the floor once every policy scope is open — a failed
+    // model probe (dropped by discovery), a pin or a pool keep it out of that list and a floor
+    // marks it belowFloor, so nothing here lifts it.
+    const eligible = candidatesForShape(overlay.shape, ui.selectedMode, ui.map, openStagedDeny()).rows
+      .some((row) => row.id === id && !row.belowFloor);
+    if (!eligible) {
+      // the ledger line spells its reasons; drop the row label and the reach segment for the notice
+      const reasons = line.split(" — ").slice(1).filter((segment) => !segment.startsWith("reach: "));
+      ui.notice = `${id} stays out — ${reasons.join(" — ")} — nothing here to lift`;
+      bump();
+      return;
+    }
+    const found = ownDeny(self);
+    if (found === undefined) {
+      const covering = coveringFor(self);
+      ui.notice = covering
+        ? `${id} stays out — ${covering.scope} (${covering.entry}) covers ${covering.covers.join(", ")} — l on its models row lifts that one entry`
+        : `${id} stays out — ${reachFor(self.adapter, self.model, self.identity).reasons.join("; ") || "not a deny entry"} — nothing here to lift`;
+      bump();
+      return;
+    }
+    liftEntry(found);
+    const after = reachFor(self.adapter, self.model, self.identity);
+    const text = `lift: cleared ${found.entry} from ${found.scope}${after.reach === "in" ? "" : ` — still out: ${after.reasons.join("; ")}`}`;
+    ui.lastEdit = { id, text };
+    ui.notice = text;
+    const picked = candidatesForShape(overlay.shape, ui.selectedMode, ui.map, stagedDeny());
+    ui.overlay = { ...overlay, rows: picked.rows, excludedNote: picked.excludedNote, ledger: picked.ledger ?? [], at: 0 };
+    bump();
+  };
+
   const reviewWindow = (overlay: Extract<Overlay, { kind: "review" }>) => {
     const lines = overlay.review.diff.split("\n");
     const cap = reviewCapacity();
@@ -1034,6 +1402,11 @@ export function FleetApp({
           return;
         }
         if (key.return) {
+          const greyed = ledger[overlay.at - rows.length];
+          if (!rows[overlay.at] && greyed !== undefined) {
+            liftFromPicker(overlay, greyed);
+            return;
+          }
           if (overlay.chain.length) {
             // a selection is a POOL, and its mode is a decision, not a default — the tiny
             // poolmode overlay asks it; Esc there restores this picker with the chain intact
@@ -1133,6 +1506,44 @@ export function FleetApp({
             overlay.at = Math.min(overlay.at, max);
           },
         );
+        return;
+      }
+
+      if (overlay.kind === "reach") {
+        if (key.escape) {
+          setOverlay(null);
+          return;
+        }
+        if (key.downArrow || input === "j") {
+          overlay.at = Math.min(overlay.at + 1, REACH_CHOICES.length - 1);
+          bump();
+          return;
+        }
+        if (key.upArrow || input === "k") {
+          overlay.at = Math.max(overlay.at - 1, 0);
+          bump();
+          return;
+        }
+        if (key.return) {
+          const choice = REACH_CHOICES[overlay.at].id;
+          setOverlay(null);
+          applyReach(overlay.target, choice);
+          bump();
+        }
+        return;
+      }
+
+      if (overlay.kind === "lift") {
+        if (key.escape) {
+          setOverlay(null);
+          return;
+        }
+        if (key.return) {
+          liftEntry(overlay.covering);
+          ui.lastEdit = { id: overlay.id, text: `lift: cleared ${overlay.covering.entry} from ${overlay.covering.scope} (covered ${overlay.covering.covers.join(", ")})` };
+          setOverlay(null);
+          bump();
+        }
         return;
       }
 
@@ -1282,19 +1693,12 @@ export function FleetApp({
         const id = modelGroups[row.index].adapter;
         // membership can't fix auth — say so, or the ✗ reads as a toggle that refuses to move
         // (operator field report, 2026-08-16: expired kimi token)
-        if (agents.find((agent) => agent.id === id)?.authed === false) {
-          ui.notice = `${id} is not authed — Space only toggles fleet membership; re-auth the ${id} CLI, then run tickmarkr doctor`;
-        }
-        // OBS-1046: an adapter routing.allow leaves out comes back in by clearing THAT reason
-        if (ui.allowOut.has(id)) {
-          ui.allowOut = new Set([...ui.allowOut].filter((key) => key !== id));
-        } else {
-          const next = new Set(ui.deny);
-          if (next.has(id)) next.delete(id);
-          else next.add(id);
-          ui.deny = next;
-        }
-        clampList();
+        const unauthed = agents.find((agent) => agent.id === id)?.authed === false
+          ? `${id} is not authed — Space only sets fleet reach; re-auth the ${id} CLI, then run tickmarkr doctor`
+          : "";
+        // OBS-1099 item 4: an adapter row gets the same three-way reach picker as a model row
+        setOverlay({ kind: "reach", target: { adapter: id }, at: 0 });
+        ui.notice = unauthed;
         bump();
         return;
       }
@@ -1356,65 +1760,13 @@ export function FleetApp({
           bump();
           return;
         }
-        const id = `${row.adapter}:${row.model}`;
-        // OBS-994/FL-1, LEG2-T3 finding 3: Space cycles in → out(workers) → out(all) → in by editing
-        // only THIS channel's own entries in the per-model scopes — its adapter:model key, or an
-        // identity/bare-model entry no other browser row matches. An adapter-wide or shared entry
-        // is never promoted or cleared from a channel row: that would move sibling channels and
-        // wipe reasons that are not this row's to clear. The row's detail line names the entry each
-        // press edited; a refused press names the shared entry in the notice instead.
-        const self = { adapter: row.adapter, model: row.model, identity: row.evidence?.identity };
-        const others = modelGroups.flatMap((group) => group.rows
-          .filter((other) => group.adapter !== row.adapter || other.model !== row.model)
-          .map((other) => ({ adapter: group.adapter, model: other.model, identity: other.evidence?.identity })));
-        // Judge c3 (R107): exactly ONE selected entry per press — the channel's adapter:model key when
-        // it is a candidate, else the first candidate in sorted order. The cycle is three states over
-        // two scopes, so the out-workers → out-all press re-scopes that one entry from
-        // routing.deny.workers.models to routing.deny.models; every other press adds or clears one
-        // entry in one scope. The channel's other entries keep their reasons for later presses.
-        // LEG2-T3 round 2 finding 1: promotion widens the selected ban as spelled — a bare model id
-        // then excludes every seat serving that model — while a CLEAR only takes an entry no other
-        // row matches, so no sibling is ever admitted by a channel toggle.
-        const select = (entries: Set<string>, ownOnly: boolean): string | undefined => {
-          const candidates = [...entries].filter((entry) => entryMatchesChannel(entry, self, true)
-            && (!ownOnly || !others.some((other) => entryMatchesChannel(entry, other, true))));
-          return candidates.includes(id) ? id : candidates.sort()[0];
-        };
         if (row.reach === "unknown") {
-          ui.notice = `${id} reach is unknown — Space does not toggle it until the staged overlay loads: ${row.reasons.join("; ")}`;
+          ui.notice = `${row.adapter}:${row.model} reach is unknown — Space does not toggle it until the staged overlay loads: ${row.reasons.join("; ")}`;
           bump();
           return;
         }
-        if (row.reach === "in") {
-          ui.denyWorkersModels = new Set([...ui.denyWorkersModels, id]);
-          ui.lastEdit = { id, text: `space: added ${id} to routing.deny.workers.models` };
-        } else if (row.reach === "out-workers") {
-          const entry = select(ui.denyWorkersModels, false) ?? id;
-          ui.denyWorkersModels = new Set([...ui.denyWorkersModels].filter((staged) => staged !== entry));
-          ui.denyModels = new Set([...ui.denyModels, entry]);
-          ui.lastEdit = { id, text: `space: moved ${entry} to routing.deny.models` };
-        } else {
-          // round 2 finding 2: either flat list may carry this channel's own reason; OBS-1046: an
-          // allow exclusion is the LAST reason cleared, and never together with an authored deny
-          const fromModels = select(ui.denyModels, true);
-          const fromAdapters = fromModels === undefined ? select(ui.deny, true) : undefined;
-          const fromAllow = fromModels === undefined && fromAdapters === undefined ? select(ui.allowOut, true) : undefined;
-          const entry = fromModels ?? fromAdapters ?? fromAllow;
-          if (entry === undefined) {
-            const shared = ui.deny.has(row.adapter) || ui.allowOut.has(row.adapter)
-              ? `every ${row.adapter} channel is out together — take the adapter back in on the rail`
-              : "a shared entry covers other channels too";
-            ui.notice = `${id} stays out — ${row.reasons.join("; ")} — Space edits only this channel's own entries; ${shared}`;
-            bump();
-            return;
-          }
-          if (fromModels !== undefined) ui.denyModels = new Set([...ui.denyModels].filter((staged) => staged !== entry));
-          else if (fromAdapters !== undefined) ui.deny = new Set([...ui.deny].filter((staged) => staged !== entry));
-          else ui.allowOut = new Set([...ui.allowOut].filter((staged) => staged !== entry));
-          const scope = fromModels !== undefined ? "routing.deny.models" : fromAdapters !== undefined ? "routing.deny.adapters" : "routing.allow";
-          ui.lastEdit = { id, text: `space: cleared ${entry} from ${scope}` };
-        }
-        bump();
+        // OBS-1099 item 1: Space opens the reach picker; applyReach changes ONE selected reason
+        setOverlay({ kind: "reach", target: { adapter: row.adapter, model: row.model }, at: 0 });
         return;
       }
       if (key.return && row) {
@@ -1422,13 +1774,22 @@ export function FleetApp({
           beginClassification(row.adapter, row.model);
           return;
         }
-        if (row.denied || ui.deny.has(row.adapter)) {
+        if (row.denied || ui.denyAdapters.has(row.adapter)) {
           ui.notice = `${row.adapter}:${row.model} is out of the fleet — Space adds it before assigning`;
           bump();
           return;
         }
         // model-centric assignment: Enter pins the model to a shape (omp: Enter assigns roles)
         setOverlay({ kind: "assign", adapter: row.adapter, model: row.model, at: 0 });
+        return;
+      }
+      if (hotkey === "l" && row) {
+        if (!row.covering) {
+          ui.notice = `${row.adapter}:${row.model} — no covering entry to lift${row.reasons.length ? ` — ${row.reasons.join("; ")} — Space edits this row's own entries` : ""}`;
+          bump();
+          return;
+        }
+        setOverlay({ kind: "lift", id: `${row.adapter}:${row.model}`, covering: row.covering });
         return;
       }
       if (hotkey === "t" && row) {
@@ -1599,11 +1960,11 @@ export function FleetApp({
   const reachDetail = (row: ModelRow): string => {
     if (row.evidence?.unauthed !== undefined) return "unauthed — re-probe with tickmarkr doctor (Space does not toggle reach)";
     const reasons = row.reasons.join("; ");
-    if (row.reach === "out-all") return `reach: out · all seats — ${reasons}`;
-    if (row.reach === "out-allow") return `reach: out · all seats · allow — ${reasons}`;
-    if (row.reach === "out-workers") return `reach: out · workers only (judge/review/consult unaffected) — ${reasons}`;
+    if (row.reach === "out-all") return `reach: out · all seats — ${reasons} — Space picks in or out · workers`;
+    if (row.reach === "out-allow") return `reach: out · all seats · allow — ${reasons} — Space picks in or out · workers`;
+    if (row.reach === "out-workers") return `reach: out · workers only (judge/review/consult unaffected) — ${reasons} — Space picks in or out · all seats`;
     if (row.reach === "unknown") return `reach: unknown — ${reasons}`;
-    return "reach: in — Space cycles to out · workers";
+    return "reach: in — Space picks out · workers or out · all seats";
   };
 
   const reachCell = (row: ModelRow): string =>
@@ -1614,6 +1975,25 @@ export function FleetApp({
     return row.uncoveredAlias
       ? `resolved identity ${row.evidence.identity} — no deny entry covers it`
       : `resolved identity ${row.evidence.identity}`;
+  };
+
+  // OBS-1099 item 2: a second detail line names the entry that covers this row other than by its
+  // own key, its scope, and which control edits it — the ONE lift control when it is shared
+  const coveringDetail = (row: ModelRow): string => {
+    const covering = row.covering!;
+    if (covering.shared) return `covered by ${covering.scope} (${covering.entry}) — shared: covers ${covering.covers.join(", ")} — l lifts that one entry`;
+    // review round 12: name the entry each APPLICABLE reach choice edits, from the selector the
+    // handler reads; when every one is the covering entry itself the short form stands
+    const outAll = row.reach === "out-all" || row.reach === "out-allow";
+    const applicable: Array<[string, Owned | undefined]> = [
+      ["in clears", covering.edits.clear],
+      ...(outAll ? [["out · workers demotes", covering.edits.demote] as [string, Owned | undefined]] : []),
+      ...(row.reach === "out-workers" ? [["out · all promotes", covering.edits.promote] as [string, Owned | undefined]] : []),
+    ];
+    const named = applicable.filter((pair): pair is [string, Owned] => pair[1] !== undefined);
+    const same = named.every(([, o]) => o.entry === covering.entry && o.scope === covering.scope);
+    return `covered by ${covering.scope} (${covering.entry}) — ${same ? "Space edits that entry"
+      : `Space: ${named.map(([verb, o]) => `${verb} ${o.entry} (${o.scope})`).join("; ")}`}`;
   };
 
   const modelDetail = (row: ModelRow): string => {
@@ -1718,7 +2098,7 @@ export function FleetApp({
   const railAdapter = (index: number, railIndex: number) => {
     const group = modelGroups[index];
     const agent = agents.find((candidate) => candidate.id === group.adapter);
-    const denied = ui.deny.has(group.adapter) || ui.allowOut.has(group.adapter);
+    const denied = ui.denyAdapters.has(group.adapter) || ui.allowOut.has(group.adapter);
     const active = ui.view === "models" && ui.adapterAt === index;
     const selected = ui.focus === "rail" && ui.railAt === railIndex;
     return (
@@ -1959,6 +2339,44 @@ export function FleetApp({
       );
     }
 
+    if (overlay.kind === "lift") {
+      return (
+        <OverlayPanel title={`lift · ${overlay.covering.scope} (${overlay.covering.entry})`} width={bodyW}>
+          <Text dimColor>{clip(`from ${overlay.id} — Enter lifts this ONE entry for every channel it covers · Esc keeps it`, bodyW - 4)}</Text>
+          <Text> </Text>
+          {overlay.covering.covers.map((covered) => (
+            <Text key={covered} wrap="truncate">{clip(`  ${covered}`, bodyW - 4)}</Text>
+          ))}
+        </OverlayPanel>
+      );
+    }
+
+    if (overlay.kind === "reach") {
+      const id = overlay.target.model === undefined ? overlay.target.adapter : `${overlay.target.adapter}:${overlay.target.model}`;
+      const current = overlay.target.model === undefined
+        ? adapterReach(overlay.target.adapter)
+        : modelRows().find((row) => row.adapter === overlay.target.adapter && row.model === overlay.target.model) ?? { reach: "unknown", reasons: [] };
+      const partial = "partial" in current && current.partial;
+      // D-205: a partial rail marks no choice as selected — its channels disagree
+      const on: ReachChoice | null = partial || current.reach === "unknown" ? null
+        : current.reach === "out-all" || current.reach === "out-allow" ? "out-all" : current.reach;
+      return (
+        <OverlayPanel title={`reach · ${id}`} width={bodyW}>
+          <Text dimColor>{clip(`now: ${describeReach({ reach: current.reach, partial })}${current.reasons.length ? ` — ${current.reasons.join("; ")}` : ""}`, bodyW - 4)}</Text>
+          <Text dimColor>one choice edits one reason; a row with more reasons keeps the rest</Text>
+          <Text> </Text>
+          {REACH_CHOICES.map((choice, index) => (
+            <Text key={choice.id}>
+              <Pointer on={overlay.at === index} />
+              {choice.id === on ? <Glyph kind="on" /> : <Text> </Text>}
+              <Text bold={overlay.at === index}>{` ${padCell(choice.label, 16)}`}</Text>
+              <Text dimColor>{clip(`— ${choice.gloss}`, bodyW - 24)}</Text>
+            </Text>
+          ))}
+        </OverlayPanel>
+      );
+    }
+
     // judge
     const rows = [judgeKeepRow, ...judgeSeats].filter((row) => matches(row, ui.filter));
     const { visible, start, above, below } = windowRows(rows, overlay.at, capacity);
@@ -2064,6 +2482,7 @@ export function FleetApp({
       const lines: string[] = [];
       if (row) {
         lines.push(modelDetail(row));
+        if (row.covering) lines.push(coveringDetail(row));
         if (!row.tier) {
           lines.push(row.suggestion
             ? `catalog suggests ${row.suggestion.tier} — Space/Enter classifies with the note pre-typed · s stages every visible suggestion`
@@ -2108,11 +2527,17 @@ export function FleetApp({
       }
       if (overlay.kind === "candidates") {
         return [
-          { key: "Enter", label: overlay.chain.length ? "apply pool" : "pin" },
+          { key: "Enter", label: overlay.chain.length ? "apply pool" : "pin · lift greyed" },
           { key: "Space", label: "pool in order" },
           { key: "type", label: "search" },
           { key: "Esc", label: "cancel" },
         ];
+      }
+      if (overlay.kind === "reach") {
+        return [{ key: "Enter", label: "set reach" }, { key: "↑↓", label: "move" }, { key: "Esc", label: "cancel" }];
+      }
+      if (overlay.kind === "lift") {
+        return [{ key: "Enter", label: "lift entry" }, { key: "Esc", label: "keep" }];
       }
       if (overlay.kind === "poolmode") {
         return [
@@ -2136,7 +2561,7 @@ export function FleetApp({
       return [
         { key: "Enter", label: "open" },
         { key: "↑↓", label: "move" },
-        { key: "Space", label: "fleet in/out CLI" },
+        { key: "Space", label: "reach picker (CLI)" },
         { key: "→", label: "list" },
         { key: "w", label: "review + write" },
         { key: "Esc", label: escLabel },
@@ -2145,7 +2570,8 @@ export function FleetApp({
     if (ui.view === "models") {
       return [
         { key: "Enter", label: "assign/classify" },
-        { key: "Space", label: "fleet in/out" },
+        { key: "Space", label: "reach picker" },
+        { key: "l", label: "lift entry" },
         { key: "m", label: "presets" },
         { key: "w", label: "review + write" },
         { key: "←", label: "rail" },
@@ -2206,11 +2632,7 @@ export async function runFleetInkEditor({
   ageMs,
   adapters,
   health,
-  initialDenyAdapters,
-  initialDenyModels,
   initialAllowOut = [],
-  initialDenyWorkersAdapters = [],
-  initialDenyWorkersModels = [],
   modelGroups,
   initialMode,
   modeOptions,
@@ -2231,16 +2653,13 @@ export async function runFleetInkEditor({
   input,
   output,
   debug = false,
-}: {
+  ...initialDenyProps
+}: InitialDenyProps & {
   ageMs: number | null;
   adapters: WorkerAdapter[];
   health: Record<string, AuthHealth>;
-  initialDenyAdapters: string[];
-  initialDenyModels: string[];
   /** OBS-1046: adapter ids and adapter:model keys routing.allow leaves out of the fleet */
   initialAllowOut?: string[];
-  initialDenyWorkersAdapters?: string[];
-  initialDenyWorkersModels?: string[];
   modelGroups: FleetModelGroup[];
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
@@ -2296,11 +2715,8 @@ export async function runFleetInkEditor({
     <FleetApp
       ageMs={ageMs}
       agents={agents}
-      initialDenyAdapters={initialDenyAdapters}
-      initialDenyModels={initialDenyModels}
+      {...initialDenyProps}
       initialAllowOut={initialAllowOut}
-      initialDenyWorkersAdapters={initialDenyWorkersAdapters}
-      initialDenyWorkersModels={initialDenyWorkersModels}
       modelGroups={declaredModelGroups}
       initialMode={initialMode}
       modeOptions={modeOptions}

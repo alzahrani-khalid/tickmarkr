@@ -506,7 +506,7 @@ test("test: after a workers-scope toggle is written the four role pools discover
     { input: io.input, output: io.output } as unknown as FleetIO,
   );
   // one Space on the first model row (fake-1): in → out(workers) — the reach the browser showed
-  io.input.write(KEYS.space + KEYS.w + KEYS.y);
+  io.input.write(KEYS.space + KEYS.down + KEYS.enter + KEYS.w + KEYS.y);
   const out = await done;
   expect(out).toMatch(/^fleet: wrote /);
 
@@ -549,4 +549,25 @@ test("judge c2: a staged policy the loader refuses shows the row's reach as unkn
   expect(all).toContain("reach: unknown — preview unavailable (routing.map.docs: pin and pool are one declaration)");
   expect(all).toContain("unknown");
   expect(all).toContain("nova:nova-1 reach is unknown — Space does not toggle");
+});
+
+test("OBS-1099 review: a workers-model entry naming a gateway id folded into another displayed row is a shared entry — choosing in from the fold head is refused by name, whereas the head's own adapter:model key clears in one act, so a picker that treats folded siblings as invisible fails", async () => {
+  // the head row `gw` folds the gateway id `gw-fast`; the family grammar makes omp:gw-fast cover the
+  // head too, so the row is out · workers by an entry that names its folded sibling exactly
+  const folded = [
+    { adapter: "omp", rows: [
+      { model: "gw", tier: "mid" as const, foldedModels: ["gw", "gw-fast"] },
+      { model: "other", tier: "mid" as const },
+    ] },
+  ];
+  // Space → reach picker on the head row; Enter picks "in"; nothing staged, so one q quits
+  const refused = await driveInk(folded, " \r" + KEYS.q, { initialDenyWorkersModels: ["omp:gw-fast"] });
+  expect(refused.result).toEqual({ kind: "quit" });
+  const all = stripAnsi(refused.writes.join("\n"));
+  expect(all).toContain("omp:gw stays out · workers — routing.deny.workers.models (omp:gw-fast)");
+  expect(all).not.toContain("cleared omp:gw-fast");
+
+  const own = await driveInk(folded, " \r" + KEYS.w, { initialDenyWorkersModels: ["omp:gw"] });
+  expect(stripAnsi(own.writes.join("\n"))).toContain("space: cleared omp:gw from routing.deny.workers.models");
+  expect(own.reviewed?.denyWorkersModels).toEqual([]);
 });

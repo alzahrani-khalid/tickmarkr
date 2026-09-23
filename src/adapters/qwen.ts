@@ -39,7 +39,7 @@ function decodeQwenEvents(events: readonly unknown[]): DecodedQwenEvents {
     if (!event || typeof event !== "object") continue;
     if ("type" in event && event.type === "assistant" && "message" in event) {
       const message = event.message;
-      if (message && typeof message === "object" && "content" in message && Array.isArray(message.content)) {
+      if (message && typeof message === "object" && (!("role" in message) || message.role === "assistant") && "content" in message && Array.isArray(message.content)) {
         for (const content of message.content) {
           if (!content || typeof content !== "object" || !(("type" in content) && content.type === "text")) continue;
           if ("text" in content && typeof content.text === "string") text.push(content.text);
@@ -77,7 +77,7 @@ function decodeQwenEvents(events: readonly unknown[]): DecodedQwenEvents {
     }
   }
 
-  const assistantText = text.join("\n");
+  const assistantText = text.join("");
   const apiError = assistantText.match(/\[API Error:[^\n]*/)?.[0];
   if (apiError) failed = true;
   if (!failed) return { assistantText };
@@ -105,6 +105,31 @@ function eventArray(raw: string): unknown[] | undefined {
   return undefined;
 }
 
+// OBS-1085: a pane capture can begin inside an event's string. Do not repair that
+// event or scan its prose for trailers. A candidate must decode all the way to
+// the surviving array close: this prevents a nested object or an escaped tool
+// echo from masquerading as a top-level event. Keep terminal failures, but only
+// assistant events can contribute completion text. No partial tail is accepted.
+function eventSuffix(raw: string): unknown[] | undefined {
+  // Shell prompts and stderr after the stream may contain `]`; use the event
+  // array's object-plus-close boundary, just as eventArray does.
+  const close = raw.lastIndexOf("}]");
+  if (close === -1) return undefined;
+  const end = close + 1;
+  const boundaries = /,\s*(?=\{)/g;
+  for (const boundary of raw.matchAll(boundaries)) {
+    const start = boundary.index + boundary[0].length;
+    if (start >= end) break;
+    try {
+      const events: unknown = JSON.parse(`[${raw.slice(start, end + 1)}`);
+      if (!Array.isArray(events) || !events.every((event: unknown) =>
+        event !== null && typeof event === "object" && "type" in event && typeof event.type === "string")) continue;
+      return events;
+    } catch { /* still inside the clipped event; try the next boundary */ }
+  }
+  return undefined;
+}
+
 // Decode qwen's JSON envelope before scanning only decoded assistant text for the worker trailer.
 export function parseQwenResult(raw: string, nonce: string): ClassifiedWorkerResult {
   const malformed: ClassifiedWorkerResult = {
@@ -114,7 +139,7 @@ export function parseQwenResult(raw: string, nonce: string): ClassifiedWorkerRes
     raw,
     cause: raw.trim() ? "malformed-verdict" : "empty-output",
   };
-  const parsed = eventArray(raw);
+  const parsed = eventArray(raw) ?? eventSuffix(raw);
   if (!parsed) return malformed;
 
   const decoded = decodeQwenEvents(parsed);

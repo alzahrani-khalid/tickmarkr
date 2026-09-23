@@ -614,6 +614,11 @@ run the Herdr pane commands or Herdr context watcher below.
    verify every new pid twice, preserve the partner-owned watchers the stand-down lists, then confirm."
    ```
 
+   **Log every open per CITE-IS-NOT-READ:** the moment the returning seat opens `<handoff>` or
+   `<brief>`, append `opened <path>` to the append-only log `.tickmarkr/overseer/opened-files.log`
+   (create it if absent; never truncate or rewrite an existing line). On both hosts this log — not the
+   transcript — is the record a later handoff is measured against (OBS-1102).
+
    ⚠ **Steps 3 and 4 are two sends, never one.** A pointer batched with the clear lands *during* it and is
    lost with the context it was meant to survive. Verify the clear landed by reading the prompt line
    and re-reading the banner percentage below its pre-clear value before sending the pointer — the same
@@ -997,49 +1002,63 @@ tier's state from a beat file the tier itself writes, so a seat that never beats
 run: `orchestrator ARMED / overseer ABSENT / watch ABSENT` for the whole milestone, with a live overseer
 watching it. Two thirds of that line were constants, not measurements.
 
-The beat is one shipped command and the loop is yours, run from the repo root as its own
-`run_in_background` Bash call:
+The beat is one shipped command and it arms through two explicit verbs, `--new-arm` and `--loop` —
+never a bare invocation. `--loop` already implies `--new-arm`: it creates a durable arm and beats in
+this process every 10 seconds, exiting on its own within one interval after a stand-down. Run it from
+the repo root as its own `run_in_background` Bash call:
 
 ```bash
-cd <repo> && while :; do tickmarkr beat overseer --seat <overseer-agent-or-pane>; sleep 10; done
-tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down  # after stopping that loop
+cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop
+tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down  # deliberately hand off; --loop exits
 ```
 
-The pre-2.1.3 forms `while :; do tickmarkr beat overseer; sleep 10; done` and
-`tickmarkr beat overseer --stand-down` are preserved here only as migration warnings: both are now
-rejected because neither declares which seat the tier speaks for. Do not copy or run them.
+**The legacy wrapper loop, `while :; do tickmarkr beat overseer --seat <pane>; sleep 10; done`, is the
+UNSAFE form and must not be used.** It is a bare one-shot call repeated by a shell loop the product
+cannot see, and it is the shape that re-armed a recorded stand-down (OBS-583, OBS-1088): a bare beat
+reuses whatever durable arm is already on disk instead of acknowledging the marker a stand-down just
+wrote, so a stray shell loop left running by a predecessor seat kept a stood-down tier reading ARMED.
+`--new-arm` and `--loop` are the only verbs that acknowledge a stand-down; a bare beat, wrapped in
+shell or not, never does. The pre-2.1.3 forms `while :; do tickmarkr beat overseer; sleep 10; done`
+and `tickmarkr beat overseer --stand-down` are preserved here only as older migration warnings: both
+are now rejected outright because neither declares which seat the tier speaks for. Do not copy or
+run either legacy form.
 
-One beat per invocation, deliberately: the loop is what proves the seat is alive, so a command that
-kept beating on its own would keep reporting a dead seat as healthy. Stop the loop — or die — and the
+One beat per LIVE PROCESS, deliberately: `--loop`'s recorded pid is that process's own, so the tier's
+liveness is exactly as verifiable as the process table — stop the loop, or let it die, and the
 tier ages to `STALE` (never `ABSENT`) within six beats, which is the state that says *armed, then lost*.
 Stand down explicitly when you hand off, or a deliberate exit reads as a death. Same rule as rule 29
 below, now with a conventional path the other tier already reads: `tickmarkr status` shows it.
 
-⚠ **THE LOOP ABOVE NAMES A SEAT BUT STILL BINDS ITS LIFETIME TO A PROCESS — and that distinction is
+⚠ **`--loop` NAMES A SEAT BUT STILL BINDS ITS LIFETIME TO A PROCESS — and that distinction is
 load-bearing.** The command refuses an anonymous beat, and `status` renders the declared seat beside
 the tier state; a legacy tier+pid+instant record cannot be attributed and reads `UNREADABLE`, never
-`ARMED`. Naming the seat does not make the shell loop stop when that seat leaves.
-The beat keeps running while its *session* lives, so a loop started by a seat that has since been
-cleared, re-briefed, or replaced keeps beating that tier's file forever. Measured 2026-08-24
-(OBS-583): a **2d20h** orphan loop from a predecessor seat held `orchestrator ARMED` through a
-**three-hour window in which no orchestrator was alive**, and it would have silently re-armed a
-recorded stand-down within 10 seconds. On the same sweep the overseer tier had **three** beat loops,
-one owned by an unrelated session. So:
+`ARMED`. Naming the seat does not prove that the named seat is still alive: its `--loop` process can
+outlive the seat's clear, re-brief, or replacement while that process remains alive. The current loop
+does not re-arm after stand-down: it observes the recorded marker and exits within one interval.
+
+Measured 2026-08-24 (OBS-583), the now-unsafe legacy wrapper loop left a **2d20h** orphan from a
+predecessor seat holding `orchestrator ARMED` through a **three-hour window in which no orchestrator
+was alive**; that wrapper could also re-arm a recorded stand-down. On the same sweep the overseer tier
+had three beat writers, one owned by an unrelated session. The shipped `--loop` supersedes that wrapper,
+but its process ownership still needs a live check. So:
+
 - **Split the liveness reads.** A tier's liveness is read from beat freshness in the repository status
-  path; a loop's liveness is read from the live process payload that is emitting that beat (`tickmarkr
-  beat <tier> --seat <seat>` in this repo). Neither liveness claim is read from a recorded pid: a pid
+  path; the loop's liveness is read from the live process payload (`tickmarkr beat <tier> --seat <seat>
+  --loop` in this repo). Neither liveness claim is read from a recorded pid: a pid
   recorded earlier can be stale, reused, or detached from the beat now holding the tier green.
-- **At every adopt, clear, or re-brief, sweep for pre-existing loops on YOUR tier before arming one**
-  (`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected** — this exact probe returned its own
-  shell as pid 14680 on 2026-08-31), trace each survivor to its parent session, and kill the **loop only**
-  — never the parent — then verify the parent survived.
+- **At every adopt, clear, or re-brief, sweep for pre-existing beat writers on YOUR tier before
+  arming one** (`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected** — this exact probe
+  returned its own shell as pid 14680 on 2026-08-31). **The PRIMARY target is the legacy
+  `while … tickmarkr beat <tier>` wrapper**, which is why the pattern carries no `--loop` qualifier:
+  a `--loop` exits by itself once your new arm replaces its own, but the wrapper's bare tick beats
+  whatever arm is on disk, so it survives your re-arm and never exits on its own. Trace each survivor
+  to its parent session. Stop an unowned writer only — never its parent — then verify the parent survived.
 - **`ARMED (<seat>)` is an attributable claim, not proof that the named seat is still alive.** Before
-  trusting it, ask whose session owns the beater; an orphan loop can keep naming a departed seat
-  (rule 11's outliving-its-trigger failure, in beat form).
-- Stand-down must kill the loop **and** run `--stand-down`; the second without the first is undone
-  by the next tick.
-The remaining product fix (a sentinel-terminated beat, armed and stood down in one act) is queued;
-until it ships, this sweep is the guard.
+  trusting it, ask whose session owns the beater; a still-running `--loop` can keep naming a departed
+  seat (rule 11's outliving-its-trigger failure, in beat form).
+- **Stand down with `--stand-down` and verify the `--loop` exits within one interval.** Do not use the
+  legacy bare shell wrapper: unlike `--loop`, it cannot observe the marker and was the form that
+  re-armed a stand-down.
 
 Arm the bundled watcher as its OWN Bash call with `run_in_background` — chaining it after other commands
 with `&` orphans it from the wake chain. It prints one wake reason and exits; re-arm after every wake.
@@ -1188,7 +1207,7 @@ orchestrator turn boundary.
 
 ### On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`) — supervision instruments
 
-At seat spawn, arm file/journal watchers for artifact completion, run events, missing progress and context evidence. Record each watcher owner and bounded expiry; renew on every wake and stop on stand-down. Read `orca terminal read --terminal <handle> --screen --json` on each wake to detect blocked or pending input. For a human gate, write a checkpoint evidence file and announce it through verified terminal send. Use Orca notifications only when the installed host advertises a notification capability; the current CLI has no `notification` command, so the file and terminal receipt remain the delivery path. A notification or accepted input alone never proves delivery or completion. A seat-liveness watcher on the ORCHESTRATOR handle is mandatory, not optional: poll `orca terminal read --terminal <handle> --screen --json` on a bounded interval, treat `terminal_handle_stale` or a missing terminal as seat death, and re-resolve by title before re-arming (OBS-1050 — the orchestrator seat exited silently and the daemon ran unsupervised to a PARTIAL run-end).
+At seat spawn, arm file/journal watchers for artifact completion, run events, missing progress and context evidence. Record each watcher owner and bounded expiry; renew on every wake and stop on stand-down. Read `orca terminal read --terminal <handle> --screen --json` on each wake to detect blocked or pending input. For a human gate, write a checkpoint evidence file and announce it through verified terminal send; the moment a successor opens that file (or any other cited file) back, log the open per CITE-IS-NOT-READ (`opened <path>` appended to `.tickmarkr/overseer/opened-files.log`). Use Orca notifications only when the installed host advertises a notification capability; the current CLI has no `notification` command, so the file and terminal receipt remain the delivery path. A notification or accepted input alone never proves delivery or completion. A seat-liveness watcher on the ORCHESTRATOR handle is mandatory, not optional: poll `orca terminal read --terminal <handle> --screen --json` on a bounded interval and key liveness on `result.terminal.status === "running"` — never on the envelope's own `ok`. `ok: true` proves only that the READ command executed; a closed seat's read still returns that same `ok: true` with `result.terminal.status: "exited"`, and a matcher keyed on `ok` reads that exited seat as alive and never fires (OBS-1087). Treat `result.terminal.status !== "running"`, `terminal_handle_stale`, or a missing terminal as seat death, and re-resolve by title before re-arming (OBS-1050 — the orchestrator seat exited silently and the daemon ran unsupervised to a PARTIAL run-end).
 
 ## Specialist pipeline rules
 
@@ -1353,10 +1372,11 @@ Create specialist seats using `orca terminal create --worktree path:<repo> --com
      — the entry survived, but nothing had checked. `grep -c '^## OBS-<id>'` for each id the diff
      introduced. A citation pointing at nothing is the defect the ledger itself files (OBS-604), shipped
      into `src/`.
-   - **KILL THE BEAT LOOP *AND* RUN `--stand-down`.** Either alone is worse than neither: the loop
-     without the stand-down re-arms a tier you retired within 10s, and the stand-down without the loop
-     is undone by the next tick. Verify `status` reads `DISARMED` — which means *handed off*, distinct
-     from `STALE` (armed then died) and `ABSENT` (never armed).
+   - **STAND DOWN THE BEAT THROUGH `--stand-down`, THEN VERIFY THE `--loop` EXITS.** The shipped loop
+     observes the recorded marker and exits within one interval; it does not re-arm after the stand-down.
+     Verify `status` reads `DISARMED` — which means *handed off*, distinct from `STALE` (armed then died)
+     and `ABSENT` (never armed). A bare legacy shell wrapper is unsafe because it cannot observe that
+     marker; do not substitute one for `--loop`.
    - **RECORD YOUR WATCHERS AS DYING WITH THIS SESSION — never as "armed".** A written stand-down or
      handoff may NOT carry the bare wording *"watcher armed"* for anything this seat owns: that form
      states an act and lets the successor read a fact, and it survived into a handoff exactly once before
@@ -1411,7 +1431,12 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
 
 1. **CITE-IS-NOT-READ.** A queue, handoff, finding, or brief that cites an observation does not prove its
    author opened it. Before acting on a cited premise, open the primary record, quote the operative bytes,
-   and state the qualifier or falsifier the citation would otherwise hide.
+   and state the qualifier or falsifier the citation would otherwise hide. **On BOTH hosts, log the open:**
+   append one line, `opened <path>`, to the append-only log `.tickmarkr/overseer/opened-files.log` (create
+   it if absent; never truncate or rewrite an existing line) for every cited file this rule makes you open.
+   Nothing else records which cited files a successor actually opened after a clear (OBS-1102) — this log
+   is the record a later handoff is measured against: a claimed read with no matching line here did not
+   happen.
 2. **EXECUTING-FORM PROBE.** Process ownership starts from the watcher pid file. Where legacy discovery is
    unavoidable, match the executing form — interpreter plus exact script path and arguments — not a journal
    path or name substring, resolve the candidate's cwd/parent, read the arm log for startup failure, then

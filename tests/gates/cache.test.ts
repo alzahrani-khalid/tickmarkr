@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { execFileSync, execSync } from "node:child_process";
@@ -22,9 +22,10 @@ import { validateGraph } from "../../src/graph/schema.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { gitHead, resolvedCapacity, runWithVerificationBudget, sameVerification, VERIFICATION_PROTOCOL, verificationProtocol } from "../../src/run/git.js";
 import { verify } from "../../src/cli/commands/verify.js";
-import { resetApprovalWindowForTests, runDaemon, setApprovalWindowForTests, verifyIntegrationTipCached } from "../../src/run/daemon.js";
-import { verifyIntegrationTip } from "../../src/run/merge.js";
+import { commandsHash, resetApprovalWindowForTests, runDaemon, setApprovalWindowForTests, verifyIntegrationTipCached } from "../../src/run/daemon.js";
+import { type TipVerifyResult, verifyIntegrationTip } from "../../src/run/merge.js";
 import { Journal } from "../../src/run/journal.js";
+import { resolveReceiptArtifacts } from "../../src/run/receipt-resolver.js";
 import { makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 function commitAll(repo: string, msg: string): void {
@@ -826,4 +827,148 @@ test("test: an explicitly funded rerun discards a cached red at the battery read
         .toEqual(expect.arrayContaining(["build", "test"]));
     }
   }
+});
+
+
+// Snapshot bytes as well as filenames: reuse must not rewrite a receipt or mint an artifact.
+function cacheEvidenceBytes(dir: string): Record<string, string> {
+  if (!existsSync(dir)) return {};
+  return Object.fromEntries(readdirSync(dir).sort().map(file => [file, readFileSync(join(dir, file)).toString("base64")]));
+}
+
+test("test: a per gate persisted hit reused in a fresh process carries the original receipt invocation id plus origin run root under a reused marker, so a reuse that mints a new invocation or drops the receipt fails", async () => {
+  const repo = makeRepo({ ".gitignore": "calls.log\n" });
+  const commands = { build: "echo build >> calls.log; echo original-output" };
+  const original = Journal.create(repo, "run-original-receipt");
+  original.append("run-start", undefined, { commands });
+  const [fresh] = await verifyIntegrationTip(repo, commands, original.dir);
+  expect(fresh!.evidenceReceipt?.invocationId).toBeTruthy();
+  expect(fresh!.originRunRoot).toBe(original.dir);
+  const store = getVerdictStore(join(repo, ".tickmarkr"));
+  const beforeStore = cacheEvidenceBytes(store.dir);
+  const beforeEvidence = cacheEvidenceBytes(join(original.dir, "gate-evidence"));
+  const next = Journal.create(repo, "run-reusing-receipt");
+  next.append("run-start", undefined, { commands });
+  const reused = freshProcess(`
+    import { verifyIntegrationTip } from ${JSON.stringify(new URL("../../src/run/merge.ts", import.meta.url).href)};
+    import { runWithVerificationBudget } from ${JSON.stringify(new URL("../../src/run/git.ts", import.meta.url).href)};
+    console.log(JSON.stringify(await runWithVerificationBudget(${JSON.stringify(resolvedCapacity())}, () =>
+      verifyIntegrationTip(${JSON.stringify(repo)}, ${JSON.stringify(commands)}, ${JSON.stringify(next.dir)}))));
+  `) as TipVerifyResult[];
+  expect(reused).toHaveLength(1);
+  expect(reused[0]).toMatchObject({ reused: true, originRunRoot: original.dir,
+    evidenceReceipt: fresh!.evidenceReceipt, evidenceReceipts: fresh!.evidenceReceipts });
+  expect(reused[0]!.evidenceReceipt).toEqual(fresh!.evidenceReceipt);
+  expect(readFileSync(join(repo, "calls.log"), "utf8")).toBe("build\n");
+  expect(cacheEvidenceBytes(store.dir)).toEqual(beforeStore);
+  expect(cacheEvidenceBytes(join(original.dir, "gate-evidence"))).toEqual(beforeEvidence);
+  expect(existsSync(join(next.dir, "gate-evidence"))).toBe(false);
+
+  // A daemon cycle populated from the persisted hit must carry the same evidence too.
+  for (let cycle = 0; cycle < 2; cycle++) {
+    expect(await verifyIntegrationTipCached(repo, commands, next)).toBe(false);
+    expect(next.read().filter(e => e.event === "tip-verify").at(-1)!.data).toMatchObject({
+      cached: true, reused: true, originRunRoot: original.dir, evidenceReceipt: fresh!.evidenceReceipt,
+    });
+  }
+  expect(cacheEvidenceBytes(store.dir)).toEqual(beforeStore);
+  expect(cacheEvidenceBytes(join(original.dir, "gate-evidence"))).toEqual(beforeEvidence);
+  expect(existsSync(join(next.dir, "gate-evidence"))).toBe(false);
+  expect(readFileSync(join(repo, "calls.log"), "utf8")).toBe("build\n");
+});
+
+test("test: whole cycle cached rows carry their original receipts unchanged while the store's no re-execution contract holds byte for byte, so a reuse projection that re-executes or rewrites evidence fails", async () => {
+  const repo = makeRepo({ ".gitignore": "calls.log\n" });
+  const commands = { build: "echo build >> calls.log; echo build-output", lint: "echo lint >> calls.log; echo lint-output >&2" };
+  const journal = Journal.create(repo, "run-cycle-receipts");
+  journal.append("run-start", undefined, { commands });
+  expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
+  const originals = journal.read().filter(e => e.event === "tip-verify");
+  expect(originals).toHaveLength(2);
+  for (const row of originals) expect(row.data.evidenceReceipt).toBeDefined();
+  const store = getVerdictStore(join(repo, ".tickmarkr"));
+  const beforeStore = cacheEvidenceBytes(store.dir);
+  const beforeEvidence = cacheEvidenceBytes(join(journal.dir, "gate-evidence"));
+  for (let cycle = 0; cycle < 2; cycle++) {
+    expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
+    const rows = journal.read().filter(e => e.event === "tip-verify").slice(-2);
+    for (const [index, row] of rows.entries()) {
+      expect(row.data).toMatchObject({ cached: true, reused: true, originRunRoot: journal.dir });
+      expect(row.data.evidenceReceipt).toEqual(originals[index]!.data.evidenceReceipt);
+      expect(row.data.evidenceReceipts).toEqual(originals[index]!.data.evidenceReceipts);
+    }
+    expect(readFileSync(join(repo, "calls.log"), "utf8")).toBe("build\nlint\n");
+    expect(cacheEvidenceBytes(store.dir)).toEqual(beforeStore);
+    expect(cacheEvidenceBytes(join(journal.dir, "gate-evidence"))).toEqual(beforeEvidence);
+  }
+});
+
+test("test: a historical cached result without a receipt reuses as absent evidence fabricating none, so a backfilled or invented receipt on reuse fails", async () => {
+  const repo = makeRepo({ ".gitignore": "calls.log\n" });
+  const commands = { build: "echo unexpected >> calls.log" };
+  const journal = Journal.create(repo, "run-historical-receipt");
+  journal.append("run-start", undefined, { commands });
+  const store = getVerdictStore(join(repo, ".tickmarkr"));
+  const id = await computeVerificationIdentity({ worktree: repo, gate: "build", scope: "tip", command: commands.build });
+  store.set(id, { gate: "build", pass: true, details: "historical green" });
+  const beforeStore = cacheEvidenceBytes(store.dir);
+  const [hit] = await verifyIntegrationTip(repo, commands, journal.dir);
+  expect(hit).toMatchObject({ pass: true, reused: true, evidenceAbsence: "historical-cache" });
+  expect(hit!.evidenceReceipt).toBeUndefined();
+  expect(hit!.evidenceReceipts).toBeUndefined();
+  expect(hit!.originRunRoot).toBeUndefined();
+
+  // Seed an actual pre-receipt cycle; both repeated cycle reuse and persisted reuse are covered.
+  const tip = await gitHead(repo);
+  const cmdHash = commandsHash(commands);
+  journal.append("tip-verify", undefined, { gate: "build", cmd: commands.build, pass: true, exitCode: 0, tip, cmdHash });
+  expect(cacheEvidenceBytes(store.dir)).toEqual(beforeStore);
+  store.clear(); // Only the historical cycle can answer now; executing would create calls.log.
+  for (let cycle = 0; cycle < 2; cycle++) {
+    expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(false);
+    const row = journal.read().filter(e => e.event === "tip-verify").at(-1)!;
+    expect(row.data).toMatchObject({ cached: true, reused: true, evidenceAbsence: "historical-cache" });
+    for (const key of ["evidenceReceipt", "evidenceReceipts", "originRunRoot", "nonce"]) expect(row.data[key]).toBeUndefined();
+  }
+  expect(Object.keys(beforeStore)).toHaveLength(1);
+  expect(cacheEvidenceBytes(store.dir)).toEqual({});
+  expect(existsSync(join(repo, "calls.log"))).toBe(false);
+  expect(existsSync(join(journal.dir, "gate-evidence"))).toBe(false);
+});
+
+test("test: a reused verdict retains its original receipt bound to its origin run root and the cache's no re-execution contract holds byte for byte, so a reuse that mints a fresh execution or resolves a foreign reference against the current run fails", async () => {
+  const repo = makeRepo({ ".gitignore": "calls.log\n" });
+  const commands = { build: "echo build >> calls.log; echo bound-output" };
+  const original = Journal.create(repo, "run-bound-origin");
+  original.append("run-start", undefined, { commands });
+  const [fresh] = await verifyIntegrationTip(repo, commands, original.dir);
+  expect(fresh).toMatchObject({ pass: true, originRunRoot: original.dir });
+  const freshReceipt = fresh!.evidenceReceipt!;
+  const store = getVerdictStore(join(repo, ".tickmarkr"));
+  const beforeStore = cacheEvidenceBytes(store.dir);
+  const beforeEvidence = cacheEvidenceBytes(join(original.dir, "gate-evidence"));
+  expect(Object.keys(beforeEvidence)).toHaveLength(2);
+
+  const next = Journal.create(repo, "run-bound-reuser");
+  next.append("run-start", undefined, { commands });
+  for (let cycle = 0; cycle < 2; cycle++) {
+    expect(await verifyIntegrationTipCached(repo, commands, next)).toBe(false);
+    const row = next.read().filter(e => e.event === "tip-verify").at(-1)!;
+    expect(row.data).toMatchObject({ cached: true, reused: true, originRunRoot: original.dir });
+    expect(row.data.evidenceReceipt).toEqual(freshReceipt);
+    // The retained receipt resolves against the run root that minted it — verified bytes, hash and all…
+    // The root is the caller's trust anchor and is handed in canonical form; the resolver itself follows no link.
+    const resolved = resolveReceiptArtifacts(row.data.evidenceReceipt as typeof freshReceipt, realpathSync(row.data.originRunRoot as string));
+    expect(resolved).toEqual([
+      { ok: true, path: freshReceipt.stdout.path, sha256: freshReceipt.stdout.sha256 },
+      { ok: true, path: freshReceipt.stderr.path, sha256: freshReceipt.stderr.sha256 },
+    ]);
+    // …and the same reference is a FOREIGN one under the reusing run, which owns no such bytes.
+    expect(resolveReceiptArtifacts(freshReceipt, realpathSync(next.dir)).map(r => r.ok ? "available" : r.reason)).toEqual(["missing", "missing"]);
+  }
+  // No fresh execution was minted: the command ran once, nothing under either run root changed.
+  expect(readFileSync(join(repo, "calls.log"), "utf8")).toBe("build\n");
+  expect(cacheEvidenceBytes(store.dir)).toEqual(beforeStore);
+  expect(cacheEvidenceBytes(join(original.dir, "gate-evidence"))).toEqual(beforeEvidence);
+  expect(existsSync(join(next.dir, "gate-evidence"))).toBe(false);
 });

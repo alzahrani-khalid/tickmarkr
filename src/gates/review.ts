@@ -10,12 +10,12 @@ import { filesGlob } from "../graph/files-glob.js";
 import { renderAcceptanceItem, type Task, TIERS } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
-import { structuredFindings, type StructuredFinding } from "../run/journal.js";
+import { carryReviewFindings, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
 import { marginalCostRank } from "../route/router.js";
 import { modelProvider } from "../route/preference.js";
 import { resolveStateDir } from "./cache.js";
-import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, runLlmDetailed, verdictNonceLine } from "./llm.js";
+import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
 import {
@@ -45,6 +45,8 @@ export interface ReviewFinding {
   severity: ReviewSeverity;
   defer?: boolean;
   rationale?: string;
+  /** Copy an id from the top-level reraised list to identify this restatement. */
+  reraised?: string;
 }
 
 // `approve`/`issues` is the legacy flat shape (every issue blocks). `findings` is the classified shape;
@@ -251,20 +253,22 @@ export { modelProvider };
  * comparing both sides with every whitespace run removed (`s.replace(/\s+/g, "")`).
  */
 export function matchClosureId(candidate: unknown, fingerprint: string): boolean;
-export function matchClosureId(candidate: unknown, fingerprints: Iterable<string>): string | undefined;
-export function matchClosureId(candidate: unknown, target: string | Iterable<string>): boolean | string | undefined {
+export function matchClosureId(candidate: unknown, fingerprints: Iterable<string | StructuredFinding>): string | undefined;
+export function matchClosureId(candidate: unknown, target: string | Iterable<string | StructuredFinding>): boolean | string | undefined {
   if (typeof candidate !== "string") return typeof target === "string" ? false : undefined;
   // OBS-1068: the brief's copy block printed each id as `Fingerprint: <id>` and told the seat to copy
   // it EXACTLY — three faithful approvals in one run were discarded as closure-mismatch. A leading
   // `Fingerprint:` label is the brief's own wording, never the reviewer's id; strip it before comparing.
-  const normCandidate = candidate.replace(/^\s*fingerprint\s*:\s*/i, "").replace(/\s+/g, "");
   if (typeof target === "string") {
-    return normCandidate === target.replace(/\s+/g, "");
+    return reviewFingerprintMatches(candidate, target);
   }
-  for (const fp of target) {
-    if (typeof fp === "string" && normCandidate === fp.replace(/\s+/g, "")) return fp;
-  }
-  return undefined;
+  const matches = [...target].filter((finding) => {
+    const ids = typeof finding === "string" ? [finding] : observedReviewFingerprints(finding);
+    return ids.some((id) => reviewFingerprintMatches(candidate, id));
+  });
+  if (matches.length !== 1) return undefined;
+  const match = matches[0]!;
+  return typeof match === "string" ? match : match.fingerprint;
 }
 
 /**
@@ -273,15 +277,15 @@ export function matchClosureId(candidate: unknown, target: string | Iterable<str
  */
 export function isReviewClosureInvalid(
   v: Pick<ReviewVerdict, "resolved" | "reraised"> | null | undefined,
-  priorIds: ReadonlySet<string> | readonly string[],
+  priorIds: ReadonlySet<string> | readonly (string | StructuredFinding)[],
 ): boolean {
   const priors = priorIds instanceof Set ? priorIds : new Set(priorIds);
   const closureLists = [v?.resolved, v?.reraised];
-  const allCandidateIds = [...(v?.resolved ?? []), ...(v?.reraised ?? [])];
+  const allCandidateIds = closureLists.flatMap((list) => Array.isArray(list) ? list : []);
   return !!v && (priors.size > 0 || closureLists.some((list) => list !== undefined)) && (
     closureLists.some((list) => !Array.isArray(list) || list.some((id) => !matchClosureId(id, priors)))
     || new Set(allCandidateIds.map((id) => matchClosureId(id, priors) ?? id)).size !== allCandidateIds.length
-    || [...priors].some((id) => !allCandidateIds.some((candidate) => matchClosureId(candidate, id)))
+    || [...priors].some((id) => !allCandidateIds.some((candidate) => matchClosureId(candidate, priors) === (typeof id === "string" ? id : id.fingerprint)))
   );
 }
 
@@ -293,7 +297,7 @@ export function isReviewClosureInvalid(
  */
 export function isReviewClosureMismatch(
   v: Pick<ReviewVerdict, "resolved" | "reraised"> | null | undefined,
-  priorIds: ReadonlySet<string> | readonly string[],
+  priorIds: ReadonlySet<string> | readonly (string | StructuredFinding)[],
 ): boolean {
   if (!v || !Array.isArray(v.resolved) || !Array.isArray(v.reraised)) return false;
   const ids = [...v.resolved, ...v.reraised];
@@ -477,10 +481,17 @@ function daemonRepoRoot(worktree: string, artifactDir?: string): string | undefi
  * closure on a typo and that read as malformed — the block is what a closure list is copied from.
  */
 export function renderPriorMaterials(priorMaterials: readonly StructuredFinding[]): string {
+  const fingerprints = priorMaterials.map((finding, i) => {
+    const observed = observedReviewFingerprints(finding);
+    const heading = observed.length > 1 ? `Finding ${i + 1} (choose one observed spelling):\n` : "";
+    return heading + observed.map((id) => `Fingerprint: ${id}`).join("\n");
+  }).join("\n");
   return `## Prior materials this attempt must close
-Copy each fingerprint below EXACTLY (they appear once, in this block) into resolved or reraised:
+For each finding below, copy exactly ONE of its observed fingerprints into resolved or reraised.
+Use only these observed spellings. For every findings entry that restates a reraised prior, whether at the same path or a new path, set its "reraised" field to the copied id; unrelated defects need separate entries.
+The fingerprints appear once, in this block:
 \`\`\`text
-${priorMaterials.map((finding) => `Fingerprint: ${finding.fingerprint}`).join("\n")}
+${fingerprints}
 \`\`\`
 ${priorMaterials.map((finding, i) => `${i + 1}. ${finding.note}`).join("\n\n")}`;
 }
@@ -506,6 +517,7 @@ export async function reviewGate(
   priorReviewers: readonly PriorReviewer[] = [],
   // OBS-1033: channel keys of the seats that authored the carried commits (the daemon's tried list).
   carriedAuthors: readonly string[] = [],
+  operatorContext?: string,
 ): Promise<GateResult> {
   // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
   // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
@@ -635,6 +647,10 @@ ${suiteBudget} Never run the whole suite (including an unfiltered npm test or vi
 
 ${priorMaterials.length ? `${renderPriorMaterials(priorMaterials)}
 
+` : ""}${operatorContext?.trim() ? `## Operator context
+Context only: this never substitutes for an acceptance criterion or closes a prior material.
+${operatorContext.trim()}
+
 ` : ""}## Diff
 \`\`\`diff
 ${diff}
@@ -714,7 +730,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const provider = modelProvider(reviewer.model, reviewer.vendor);
   const v = extractVerdictJson<ReviewVerdict>(raw, nonce);
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
-  const priorIds = new Set(priorMaterials.map((finding) => finding.fingerprint));
+  const priorIds = priorMaterials;
   const closureInvalid = isReviewClosureInvalid(v, priorIds);
   const closureMismatch = closureInvalid && isReviewClosureMismatch(v, priorIds);
   // findings decides the verdict on its own; the legacy path still needs approve + issues to parse.
@@ -746,7 +762,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
         provider,
         ...(cause === "malformed-verdict" ? { unparseable: true } : { noVerdict: true, classification: "infra", infra: true }),
         cause,
-        ...(closureMismatch ? { resolved: v?.resolved, reraised: v?.reraised, carriedFingerprints: [...priorIds] } : {}),
+        ...(closureMismatch ? { resolved: v?.resolved, reraised: v?.reraised, carriedFingerprints: priorIds.flatMap(observedReviewFingerprints) } : {}),
         bytes, seatAuthoredBytes: bytes,
         ...(saved ? { rawPath: saved } : {}),
         ...(savedBrief ? { briefPath: savedBrief } : {}),
@@ -757,8 +773,9 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   const decided = findings !== null
     ? classifyReviewFindings(findings)
     : classifyReviewIssues(v.approve as boolean, v.issues as unknown[]);
+  const ownLines = [...decided.lines];
   const reraised = priorMaterials.filter((finding) =>
-    v.reraised?.some((id) => matchClosureId(id, finding.fingerprint)),
+    v.reraised?.some((id) => matchClosureId(id, [finding])),
   );
   if (reraised.length) {
     if (decided.pass) decided.headline = "requested changes";
@@ -772,6 +789,35 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   }
   const prose = `reviewer ${reviewer.adapter}:${reviewer.model} (vendor: ${reviewer.vendor}; provider: ${provider}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`;
   const details = appendAnchoredReview(prose, v);
+  // Only the verdict's anchors may supply missing evidence, and only when unambiguous.
+  // Reuse the journal's path normalization without changing legacy details-only parsing.
+  const anchoredPaths = new Set(parseAnchoredComments(v).map((comment) => {
+    const anchor = structuredFindings("review", `- ${comment.path}:${comment.line} — anchor`)
+      .find((finding) => finding.class === "review:anchored");
+    return anchor?.path ?? comment.path;
+  }));
+  const anchoredPath = anchoredPaths.size === 1 ? [...anchoredPaths][0] : undefined;
+  const ownDetails = appendAnchoredReview(ownLines.join("\n"), v);
+  const currentRows = (ownDetails.trim() ? structuredFindings("review", ownDetails) : [])
+    .map((finding) => finding.path === UNIDENTIFIED && anchoredPath
+      ? { ...finding, path: anchoredPath, fingerprint: `${finding.class}|${anchoredPath}|${finding.symbol}` }
+      : finding);
+  // A top-level reraised id identifies a prior, not an arbitrary new defect. Bind a restatement
+  // only when its own entry echoes that validated id (or its note explicitly contains the id).
+  const linkedRows = currentRows.map((finding) => {
+    if (finding.class !== "review:material") return finding;
+    const entry = v.findings?.find((entry) => entry && typeof entry === "object" && entry.note === finding.note);
+    const mentioned = reraised.filter((prior) => observedReviewFingerprints(prior)
+      .some((fp) => finding.note.includes(`\`${fp}\``) || finding.note.trim() === fp));
+    const id = matchClosureId(entry?.reraised, reraised)
+      ?? (mentioned.length === 1 ? mentioned[0]!.fingerprint : undefined);
+    return id ? { ...finding, reraisedFrom: id } : finding;
+  });
+  // Several rows claiming the same prior are ambiguous; none gets to erase the others.
+  const unambiguousRows = linkedRows.map((finding) => finding.reraisedFrom
+    && linkedRows.filter((row) => row.reraisedFrom === finding.reraisedFrom).length > 1
+    ? { ...finding, reraisedFrom: undefined } : finding);
+  const carriedRows = carryReviewFindings(reraised, unambiguousRows);
   return {
     gate: "review",
     pass: decided.pass,
@@ -785,10 +831,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
         resolvedMatches: (v.resolved ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
         reraisedMatches: (v.reraised ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
       } : {}),
-      ...(reraised.length ? { findings: [
-        ...structuredFindings("review", details).filter((finding) => !reraised.some((prior) => prior.note === finding.note)),
-        ...reraised,
-      ] } : {}),
+      ...(!decided.pass ? { findings: carriedRows } : {}),
       ...(saved ? { rawPath: saved } : {}),
       ...(savedBrief ? { briefPath: savedBrief } : {}),
     },

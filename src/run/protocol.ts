@@ -42,6 +42,42 @@ export const ShellReceiptSchema = z.object({
   durationMs: z.number().nonnegative().optional(),
 }).strict();
 export type ShellReceipt = z.infer<typeof ShellReceiptSchema>;
+
+export const EVIDENCE_AVAILABILITIES = ["available", "not-started", "capture-failed", "killed", "expired", "missing"] as const;
+export const EvidenceArtifactSchema = z.object({
+  path: z.string().refine(p => p.length > 0 && !p.startsWith("/") && !p.includes("\\") && !p.split("/").includes("..")),
+  availability: z.enum(EVIDENCE_AVAILABILITIES),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+  retainedBytes: z.number().int().min(0).max(16 * 1024),
+  droppedBytes: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+}).strict().superRefine((ref, ctx) => {
+  if (ref.truncated !== (ref.droppedBytes > 0)) ctx.addIssue({ code: "custom", message: "truncation must agree with dropped bytes" });
+  if (ref.availability === "available" && ref.sha256 === null) ctx.addIssue({ code: "custom", message: "available bytes require a hash" });
+});
+export const GateEvidenceReceiptSchema = z.object({
+  invocationId: NonEmptyStringSchema,
+  nonce: NonEmptyStringSchema.optional(),
+  subject: z.object({
+    runId: NonEmptyStringSchema,
+    taskId: NonEmptyStringSchema.nullable(),
+    attempt: AttemptSchema.nullable(),
+    gate: NonEmptyStringSchema,
+    subjectCommit: NonEmptyStringSchema.nullable(),
+  }).strict(),
+  termination: z.object({
+    kind: z.enum(["exit", "signal", "timeout", "not-started", "unknown"]),
+    exitCode: z.number().int().nullable(),
+    signal: NonEmptyStringSchema.nullable(),
+    timedOut: z.boolean().nullable(),
+  }).strict(),
+  availability: z.enum(EVIDENCE_AVAILABILITIES),
+  redaction: z.object({ material: z.boolean() }).strict(),
+  stdout: EvidenceArtifactSchema,
+  stderr: EvidenceArtifactSchema,
+}).strict();
+export type GateEvidenceReceipt = z.infer<typeof GateEvidenceReceiptSchema>;
+export type EvidenceArtifact = z.infer<typeof EvidenceArtifactSchema>;
 /** A task-build row must carry the entire caller-owned correlation, even before spawn. */
 export const CommandReceiptSchema = ShellReceiptSchema.extend({
   attribution: CommandReceiptAttributionSchema,

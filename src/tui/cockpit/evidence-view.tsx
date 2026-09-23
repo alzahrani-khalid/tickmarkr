@@ -1,5 +1,5 @@
-import { existsSync, renameSync, statSync, unlinkSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, realpathSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { Box, useInput } from "ink";
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import type { ChannelCost } from "../../report/cost.js";
@@ -7,6 +7,7 @@ import { buildOperatorRecord, formatOperatorRecordRow, type OperatorRecordRow } 
 import { EMPTY_OPERATOR_PAGE_SUMMARY, foldOperatorPages, operatorPageRow, type OperatorPageGroup } from "../../run/operator-page-summary.js";
 import type { EvidenceIdentity } from "../../run/operator-state.js";
 import { formatJournalNarration, type JournalEvent } from "../../run/journal.js";
+import { formatReceiptResolution, resolveReceipt } from "../../run/receipt-resolver.js";
 import { BodyText, JournalRowPanel, Panel, type ComponentState, type JournalRow } from "./components.js";
 import { cellWidth, sliceCells } from "./width.js";
 
@@ -33,6 +34,10 @@ export interface EvidenceRow {
   /** Durable artifact locations this row's detail names (e.g. a saved raw-review capture); empty
    *  when none were recorded — rendered as "missing", never silently omitted. */
   readonly artifacts: readonly string[];
+  /** The row's execution-evidence receipt, each artifact resolved through the shared resolver against
+   *  the run root it was minted in (`originRunRoot` for a reused verdict) — reference then verified
+   *  availability; empty when the row carries no receipt. */
+  readonly receipts: readonly string[];
   readonly taskId?: string;
   readonly gate?: string;
 }
@@ -60,6 +65,7 @@ function stateFor(e: JournalEvent): ComponentState {
 export function deriveEvidenceJournal(
   eventsOrRows: readonly (JournalEvent | TrackedJournalRow)[],
   source = "journal.jsonl",
+  runRoot?: string,
 ): EvidenceRow[] {
   const result: EvidenceRow[] = [];
   for (let i = 0; i < eventsOrRows.length; i++) {
@@ -87,6 +93,7 @@ export function deriveEvidenceJournal(
       if (!artifacts.includes(p)) artifacts.push(p);
     }
     const gate = typeof e.data?.gate === "string" ? e.data.gate : (e.event === "review-leg2" ? "review" : undefined);
+    const receipts = resolveRowReceipt(e.data, runRoot ?? runRootOf(rowSource));
     result.push({
       evidence: { source: rowSource, line, id },
       time: e.ts,
@@ -94,11 +101,37 @@ export function deriveEvidenceJournal(
       text: formatJournalNarration(e),
       fullText: details || JSON.stringify(e.data, null, 2),
       artifacts,
+      receipts,
       ...(e.taskId ? { taskId: e.taskId } : {}),
       ...(gate ? { gate } : {}),
     });
   }
   return result;
+}
+
+/** The live cockpit names its journal by absolute path (`<state>/runs/<runId>/journal.jsonl`); that
+ *  directory IS the run root. A relative or foreign source names no root — nothing is guessed. */
+export function runRootOf(source: string | undefined): string | undefined {
+  return source && isAbsolute(source) && basename(source) === "journal.jsonl" ? dirname(source) : undefined;
+}
+
+// A reused verdict's receipt stays bound to the run root that minted it; the current run's root
+// answers only for evidence this run produced. No root known → nothing can be verified. A receipt
+// the schema rejects is still a receipt the row carries: each reference it names goes through the
+// resolver and is shown with its reason, never dropped. D-279: the boundary is the run root — the
+// host's ancestors are canonicalised (macOS `/var` → `/private/var`) but the root's own name is
+// passed as recorded, so a root that IS a symlink stays visible and the resolver refuses it.
+function resolveRowReceipt(data: Record<string, unknown> | undefined, runRoot: string | undefined): string[] {
+  const receipt = data?.evidenceReceipt;
+  if (!receipt || typeof receipt !== "object") return [];
+  const refs = [(receipt as { stdout?: unknown }).stdout, (receipt as { stderr?: unknown }).stderr];
+  const recorded = typeof data?.originRunRoot === "string" && data.originRunRoot ? data.originRunRoot : runRoot;
+  let root: string | undefined;
+  try { root = recorded ? join(realpathSync(dirname(recorded)), basename(recorded)) : undefined; } catch { root = undefined; }
+  return refs.map(ref => {
+    const path = typeof (ref as { path?: unknown })?.path === "string" ? (ref as { path: string }).path : "";
+    return formatReceiptResolution(root ? resolveReceipt(ref, root) : { ok: false, path, reason: "missing" });
+  });
 }
 
 /** The most recent review verdict recorded for a task — by original journal position, so a merged
@@ -115,6 +148,8 @@ export interface EvidenceViewInput {
   readonly events?: readonly JournalEvent[];
   readonly rows?: readonly TrackedJournalRow[];
   readonly source?: string;
+  /** The displayed run's root (its journal directory); receipts minted by this run resolve under it. */
+  readonly runRoot?: string;
   readonly costs?: readonly ChannelCost[];
   /** Caller-supplied Report-tab text (e.g. from `renderMarkdownRecord`/`textReport`) — kept as a pure
    *  input so this leaf never reads config/telemetry itself. */
@@ -147,7 +182,7 @@ export function deriveEvidenceView(input: EvidenceViewInput): EvidenceViewModel 
       const row = operatorPageRow(event, tracked ? item.line : index + 1, tracked ? item.source ?? source : source);
       return row ? [row] : [];
     })).groups,
-    journal: deriveEvidenceJournal(items, source),
+    journal: deriveEvidenceJournal(items, source, input.runRoot),
     channels: buildOperatorRecord(events, input.costs ?? []),
     reportLines: input.reportLines ?? [],
     statsLines: input.statsLines ?? [],
@@ -362,6 +397,7 @@ export function EvidenceView({ model, width, focused = true, focusEvidence, onSe
                   <BodyText emphasis="dim">
                     Artifacts: {selectedRow.artifacts.length ? selectedRow.artifacts.join(", ") : "missing"}
                   </BodyText>
+                  {selectedRow.receipts.map((line, i) => <BodyText key={`r${i}`} emphasis="dim">Receipt: {line}</BodyText>)}
                 </>
               )
               : <BodyText emphasis="dim">no history</BodyText>}

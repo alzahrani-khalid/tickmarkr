@@ -275,8 +275,11 @@ test("replaySatisfiedGates receives current-attempt failed-gate journals with no
       { by: "operator", release: "gate-satisfied", gate: "build" },
     );
     expect(typed.journal.replaySatisfiedGates().get("T1")).toBe("build");
-    await resume(typed);
-    expect(markerLines(typed.marker)[0]).toBe("lint");
+    const typedEvents = await resume(typed);
+    expect(markerLines(typed.marker).slice(0, 2)).toEqual(["build", "lint"]);
+    expect(typedEvents.filter((e) => e.event === "gate-provisioned" && e.data.gate === "build"))
+      .toHaveLength(1);
+    expect(typedEvents.filter((e) => e.event === "gate-result" && e.data.gate === "build")).toEqual([]);
   }, 120_000);
 
 test("test: a waiver is consumed by the worktree-recreation row journaled as its enactment so a run killed after that row and before any later approval or park resumes with the formerly waived gate running while a fold that clears the waiver only on a later task-approved or task-human row replays the dead waiver and fails", () => {
@@ -437,8 +440,11 @@ test("a prior-attempt pass plus current-attempt failure resumes at the failed ga
       [[{ gate: "build", pass: true }], [{ gate: "build", pass: false }]],
       { by: "operator", release: "gate-satisfied", gate: "build" },
     );
-    await resume(released);
-    expect(markerLines(released.marker)[0]).toBe("lint");
+    const releasedEvents = await resume(released);
+    expect(markerLines(released.marker).slice(0, 2)).toEqual(["build", "lint"]);
+    expect(releasedEvents.filter((e) => e.event === "gate-provisioned" && e.data.gate === "build"))
+      .toHaveLength(1);
+    expect(releasedEvents.filter((e) => e.event === "gate-result" && e.data.gate === "build")).toEqual([]);
   }, 120_000);
 
 test("resuming a green current-commit prefix whose rows carry no verification stamp re-runs every gate and journals gate-replay-verification-changed naming the unrecorded rows and this session's protocol, the same prefix stamped with another protocol, another lifecycle or an unknown lifecycle is likewise re-run and named, and the prefix stamped with this session's protocol and effective lifecycle is replayed with zero gate-shell invocations, so a replay that inherits a green measured by an older discovery implementation, under another npm lifecycle policy, or under a policy nobody measured fails", async () => {
@@ -703,3 +709,93 @@ test("test: a resume over a journal ending at repair funding before any launch h
     { repair: 1, funded: ["test"], reached: ["build", "test"], diedAt: "test", charged: true },
   ]);
 });
+
+test("a waived build whose provisioning exits 1 records the failure and continues through the remaining gates without re-gating build or re-parking", async () => {
+  const seed = await seedResume("run-waived-build-provision-red", [[{ gate: "build", pass: false }]],
+    { by: "operator", release: "gate-satisfied", gate: "build" }, "build");
+  const events = await resume(seed);
+  expect(markerLines(seed.marker)).toEqual(["build", "lint", "test"]);
+  expect(events.filter((e) => e.event === "gate-provisioned").map((e) => e.data))
+    .toEqual([expect.objectContaining({ gate: "build", exitCode: 1 })]);
+  expect(events.filter((e) => e.event === "gate-result" && e.data.gate === "build")).toEqual([]);
+  expect(events.filter((e) => e.event === "gate-reused")).toEqual([]);
+  expect(events.filter((e) => e.event === "gate-result").map((e) => [e.data.gate, e.data.pass]))
+    .toEqual(expect.arrayContaining(["lint", "test", "evidence", "scope", "acceptance", "review"]
+      .map((gate) => [gate, true])));
+  expect(events.some((e) => e.event === "worktree-recreation")).toBe(true);
+  expect(events.some((e) => e.event === "task-done")).toBe(true);
+  expect(events.some((e) => e.event === "task-dispatch" || e.event === "task-human")).toBe(false);
+}, 60_000);
+
+const restoreProvisions = {
+  build: "mkdir -p dist && echo built > dist/marker;",
+  test: "[ -f dist/marker ] || exit 1;",
+};
+const waiverResults: SeedGate[] = [
+  { gate: "build", pass: true }, { gate: "lint", pass: true },
+  { gate: "evidence", pass: true }, { gate: "scope", pass: true },
+  { gate: "acceptance", pass: true }, { gate: "review", pass: false },
+];
+
+test("test: a resume releasing a waived review gate onto a recreated worktree whose journal holds a green build runs the build command once as provisioning before the test gate and journals gate-provisioned build, so a restore that reaches the suite with no dist fails", async () => {
+  const seed = await seedResume("run-waiver-provision", [waiverResults],
+    { by: "operator", release: "gate-satisfied", gate: "review" }, undefined, {},
+    { ".gitignore": "dist/\n" }, restoreProvisions);
+  expect(existsSync(join(seed.taskWorktree, "dist"))).toBe(false);
+  const events = await resume(seed);
+  expect(markerLines(seed.marker)).toEqual(["build", "test"]);
+  expect(events.filter((e) => e.event === "gate-provisioned").map((e) => e.data))
+    .toEqual([expect.objectContaining({ gate: "build", exitCode: 0 })]);
+  expect(events.findIndex((e) => e.event === "gate-provisioned"))
+    .toBeLessThan(events.findIndex((e) => e.event === "phase-start" && e.data.gate === "test"));
+  expect(events.filter((e) => e.event === "gate-result").map((e) => [e.data.gate, e.data.pass]))
+    .toEqual([["test", true]]);
+  expect(events.some((e) => e.event === "worktree-recreation")).toBe(true);
+  expect(events.some((e) => e.event === "task-done")).toBe(true);
+  expect(events.some((e) => e.event === "task-dispatch")).toBe(false);
+}, 60_000);
+
+test("test: the same waiver restore whose provisioning exits nonzero re-enters build and every declared gate behind it as gates and journals no reuse, so a red provisioning that is skipped fails", async () => {
+  const seed = await seedResume("run-waiver-provision-red", [waiverResults],
+    { by: "operator", release: "gate-satisfied", gate: "review" }, undefined, {},
+    { ".gitignore": "dist/\n" }, {
+      ...restoreProvisions,
+      build: "if [ ! -f dist/marker ]; then mkdir -p dist && echo built > dist/marker; exit 1; fi;",
+    });
+  const events = await resume(seed);
+  expect(events.filter((e) => e.event === "gate-provisioned").map((e) => e.data.exitCode)).toEqual([1]);
+  expect(events.filter((e) => e.event === "gate-reused")).toEqual([]);
+  expect(markerLines(seed.marker)).toEqual(["build", "build", "lint", "test"]);
+  const results = events.filter((e) => e.event === "gate-result");
+  expect(results.map((e) => e.data.gate).sort()).toEqual([
+    "acceptance", "build", "evidence", "lint", "review", "scope", "test",
+  ]);
+  expect(results.every((e) => e.data.pass === true)).toBe(true);
+  expect(events.some((e) => e.event === "task-done")).toBe(true);
+  expect(events.some((e) => e.event === "task-dispatch")).toBe(false);
+}, 60_000);
+
+test("test: a recheck restore runs build as a gate and journals no gate-provisioned row, so provisioning that runs a second build beside the build gate fails", async () => {
+  const seed = await seedResume("run-recheck-provision", [waiverResults], undefined, undefined, {},
+    { ".gitignore": "dist/\n" }, restoreProvisions);
+  seed.journal.append("task-approved", "T1", { by: "operator", release: "recheck", recheckedRef: seed.commit });
+  const events = await resume(seed);
+  expect(markerLines(seed.marker)).toEqual(["build", "lint", "test"]);
+  expect(events.filter((e) => e.event === "gate-provisioned" || e.event === "gate-reused")).toEqual([]);
+  expect(events.filter((e) => e.event === "gate-result" && e.data.gate === "build").map((e) => e.data.pass)).toEqual([true]);
+  expect(events.find((e) => e.event === "gate-result" && e.data.gate === "test")?.data.pass).toBe(true);
+  expect(events.some((e) => e.event === "worktree-recreation")).toBe(true);
+  expect(events.some((e) => e.event === "task-done")).toBe(true);
+}, 60_000);
+
+test("test: a contiguous prefix restore keeps its gate-reused rows followed by one gate-provisioned build row in that order, so a hoist that reorders or duplicates the prefix branch's rows fails", async () => {
+  const gates: GateName[] = ["build", "test", "lint", "evidence", "scope"];
+  const seed = await seedResume("run-prefix-provision-order", [gates.map((gate) => ({ gate, pass: true }))],
+    undefined, undefined, {}, { ".gitignore": "dist/\n" }, restoreProvisions);
+  const events = await resume(seed);
+  expect(events.filter((e) => e.event === "gate-reused" || e.event === "gate-provisioned").map((e) => [e.event, e.data.gate, e.data.commit]))
+    .toEqual([...gates.map((gate) => ["gate-reused", gate, seed.commit]), ["gate-provisioned", "build", seed.commit]]);
+  expect(markerLines(seed.marker)).toEqual(["build"]);
+  expect(events.find((e) => e.event === "gate-provisioned")?.data.exitCode).toBe(0);
+  expect(events.some((e) => e.event === "task-done")).toBe(true);
+}, 60_000);

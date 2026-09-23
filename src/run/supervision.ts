@@ -1,7 +1,7 @@
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type Stats,
+  existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type Stats,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { parseRunId } from "./journal.js";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
@@ -131,6 +131,61 @@ export const supervisionBeatPath = (repoRoot: string, tier: SupervisionTier): st
 export const supervisionStandDownPath = (repoRoot: string, tier: SupervisionTier): string =>
   join(supervisionDir(repoRoot), `${tier}.standdown`);
 
+/** Durable CLI arm; ticks never advance its epoch or its stand-down fence. */
+export interface SupervisionArm {
+  armId: string;
+  armEpoch: string;
+  markerFence: string;
+}
+export const supervisionArmPath = (repoRoot: string, tier: SupervisionTier): string =>
+  join(supervisionDir(repoRoot), `${tier}.arm`);
+
+function readArm(repoRoot: string, tier: SupervisionTier): SupervisionArm | undefined {
+  try {
+    const arm = JSON.parse(readFileSync(supervisionArmPath(repoRoot, tier), "utf8"));
+    if (typeof arm.armId !== "string" || !arm.armId.trim() ||
+        typeof arm.armEpoch !== "string" || Number.isNaN(Date.parse(arm.armEpoch)) ||
+        typeof arm.markerFence !== "string") throw new Error("invalid arm");
+    return arm;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`${tier} arm is unreadable`, { cause: error });
+  }
+}
+
+function markerFence(repoRoot: string, tier: SupervisionTier): string {
+  const marker = readStandDown(repoRoot, tier);
+  if (marker === "UNREADABLE") throw new Error(`${tier} stand-down is unreadable`);
+  return marker === "NONE" ? "NONE" : marker.fence;
+}
+
+/** Explicit arming acknowledges the current marker without deleting it. */
+export function newSupervisionArm(
+  repoRoot: string, tier: SupervisionTier, armId: string = randomUUID(), initial = false,
+): SupervisionArm {
+  // Acknowledge only the marker observed when arming begins. In particular, do not
+  // sample it after stamping the epoch: a stand-down published in that gap is a
+  // later act, and must fence this arm rather than be silently acknowledged by it.
+  const fence = initial ? "NONE" : markerFence(repoRoot, tier);
+  const previous = readArm(repoRoot, tier);
+  const arm = {
+    armId, armEpoch: new Date(Math.max(Date.now(), previous ? Date.parse(previous.armEpoch) + 1 : 0)).toISOString(),
+    markerFence: fence,
+  };
+  tickmarkrDir(repoRoot);
+  const path = supervisionArmPath(repoRoot, tier);
+  if (!initial) { atomicRecord(path, arm); return arm; }
+  // Only one legacy first tick may install the initial arm. A losing process reuses the winner.
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(arm) + "\n");
+    try { linkSync(tmp, path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  } finally { rmSync(tmp, { force: true }); }
+  return readArm(repoRoot, tier)!;
+}
+
 /** The independent latch a stand-down cannot overwrite or remove. */
 const supervisionObligationPath = (repoRoot: string, tier: SupervisionTier): string =>
   join(supervisionDir(repoRoot), `${tier}.clear-owed`);
@@ -241,6 +296,24 @@ function dischargeClearObligation(
   }
 }
 
+function raiseIfCrossed(repoRoot: string, tier: SupervisionTier, observation: SupervisionBeatObservation): void {
+  if (observation.pct >= observation.thresholdPct) {
+    raiseClearObligation(repoRoot, tier, observation.armId, observation.thresholdPct);
+  }
+}
+
+// The latch is orthogonal to liveness: a stood-down tier still raises a crossing and still lets a
+// different arm below threshold discharge it. Otherwise the context instrument goes silent after the
+// first hand-off — the watcher script stands its tier down on every exit.
+function observeWithoutBeat(repoRoot: string, tier: SupervisionTier, observation?: SupervisionBeatObservation): false {
+  if (observation !== undefined) {
+    tickmarkrDir(repoRoot);
+    raiseIfCrossed(repoRoot, tier, observation);
+    dischargeClearObligation(repoRoot, tier, observation);
+  }
+  return false;
+}
+
 function validateObservation(observation: SupervisionBeatObservation): void {
   if (!observation.armId.trim()) throw new Error("a supervision observation needs a non-empty arm identity");
   for (const [name, value] of [["pct", observation.pct], ["threshold-pct", observation.thresholdPct]] as const) {
@@ -259,6 +332,8 @@ function writeSupervisionBeat(
   seat?: string,
   armId?: string,
   observation?: SupervisionBeatObservation,
+  arm?: SupervisionArm,
+  loop = false,
 ): void {
   // A seat tier may not be armed anonymously, and the refusal belongs HERE rather than only in the
   // verb: any caller that could write a seatless record could arm a tier nobody occupies.
@@ -271,17 +346,14 @@ function writeSupervisionBeat(
   mkdirSync(dirname(p), { recursive: true });
   // Raise before the beat so a later beat failure cannot hide a duty; discharge only after the
   // below-threshold observation exists on disk.
-  if (observation !== undefined && observation.pct >= observation.thresholdPct) {
-    raiseClearObligation(repoRoot, tier, observation.armId, observation.thresholdPct);
-  }
-  writeFileSync(
-    p,
-    JSON.stringify({
-      tier, ...(seat ? { seat } : {}), ...(armId ? { armId } : {}),
-      ...(observation !== undefined ? { pct: observation.pct, thresholdPct: observation.thresholdPct } : {}),
-      exitedWriterPid: process.pid, beatAt: new Date().toISOString(),
-    }) + "\n",
-  );
+  if (observation !== undefined) raiseIfCrossed(repoRoot, tier, observation);
+  atomicRecord(p, {
+    tier, ...(seat ? { seat } : {}), ...(armId ? { armId } : {}),
+    ...(observation !== undefined ? { pct: observation.pct, thresholdPct: observation.thresholdPct } : {}),
+    ...arm,
+    ...(loop ? { pid: process.pid } : { exitedWriterPid: process.pid }),
+    beatAt: new Date().toISOString(),
+  });
   if (observation !== undefined) dischargeClearObligation(repoRoot, tier, observation);
 }
 
@@ -290,8 +362,27 @@ export function beatSupervision(
   tier: SupervisionTier,
   seat?: string,
   observation?: SupervisionBeatObservation,
-): void {
-  writeSupervisionBeat(repoRoot, tier, seat, undefined, observation);
+  options: { arm?: SupervisionArm; armId?: string; loop?: boolean } = {},
+): boolean {
+  // `armId` only NAMES a first legacy arm; an existing arm is never refused for a name mismatch —
+  // the recorded id is a UUID no operator can know, and a mismatch is not a stand-down.
+  if (isSeatTier(tier) && !seat?.trim()) {
+    throw new Error(`${tier} is a per-seat tier — a beat must declare the seat identity it speaks for`);
+  }
+  if (observation !== undefined) validateObservation(observation);
+  let arm = options.arm ?? readArm(repoRoot, tier);
+  if (!arm) {
+    if (markerFence(repoRoot, tier) !== "NONE") return observeWithoutBeat(repoRoot, tier, observation);
+    arm = newSupervisionArm(repoRoot, tier, options.armId ?? observation?.armId, true);
+    // A marker published during initial creation must not be acknowledged implicitly.
+    if (arm.markerFence !== "NONE") return observeWithoutBeat(repoRoot, tier, observation);
+  }
+  const current = readArm(repoRoot, tier);
+  if (current?.armId !== arm.armId || current.armEpoch !== arm.armEpoch ||
+      markerFence(repoRoot, tier) !== arm.markerFence) return observeWithoutBeat(repoRoot, tier, observation);
+  writeSupervisionBeat(repoRoot, tier, seat, arm.armId, observation, arm, options.loop);
+  // The immutable fence travels WITH the beat, so a rename racing stand-down cannot outrank it.
+  return markerFence(repoRoot, tier) === arm.markerFence;
 }
 
 /** Handle a watcher holds for as long as it is supervising; disarm stands it down and is idempotent. */
@@ -400,7 +491,7 @@ export function readTierLiveness(repoRoot: string, tier: SupervisionTier, now = 
 }
 
 /** What a beat record yields: when it was written, its seat, and its armed-watcher fence when named. */
-type BeatRecord = { mtimeMs: number; seat?: string; armId?: string } | "ABSENT" | "UNREADABLE";
+type BeatRecord = { mtimeMs: number; seat?: string; armId?: string; markerFence?: string } | "ABSENT" | "UNREADABLE";
 
 // The beat's inode, or why there is no age to derive from it. Split out so the stand-down ranking below
 // reads the SAME mtime this derivation does rather than a second, later stat of a moving record.
@@ -420,22 +511,24 @@ function readBeat(repoRoot: string, tier: SupervisionTier): BeatRecord {
   // is not evidence that nobody armed the tier). On a SEAT tier it is the opposite: a record naming no
   // seat leaves the tier armed and unattributable, which reads as coverage no seat is providing, so
   // it is UNREADABLE — something is there and no beat any reader can attribute comes out of it.
-  const { seat, armId } = beatMetadata(p);
+  const { seat, armId, markerFence } = beatMetadata(p);
   if (isSeatTier(tier) && seat === undefined) return "UNREADABLE";
   return {
     mtimeMs: st.mtimeMs,
+    ...(markerFence !== undefined ? { markerFence } : {}),
     ...(seat !== undefined ? { seat } : {}),
     ...(armId !== undefined ? { armId } : {}),
   };
 }
 
 /** Optional metadata declared by a beat; its mtime remains the only source of age. */
-function beatMetadata(path: string): { seat?: string; armId?: string } {
+function beatMetadata(path: string): { seat?: string; armId?: string; markerFence?: string } {
   try {
-    const rec = JSON.parse(readFileSync(path, "utf8")) as { seat?: unknown; armId?: unknown };
+    const rec = JSON.parse(readFileSync(path, "utf8")) as { seat?: unknown; armId?: unknown; markerFence?: unknown };
     const seat = typeof rec?.seat === "string" && rec.seat.trim() ? rec.seat : undefined;
     const armId = typeof rec?.armId === "string" && rec.armId.trim() ? rec.armId : undefined;
-    return { ...(seat !== undefined ? { seat } : {}), ...(armId !== undefined ? { armId } : {}) };
+    const markerFence = typeof rec?.markerFence === "string" ? rec.markerFence : undefined;
+    return { ...(markerFence !== undefined ? { markerFence } : {}), ...(seat !== undefined ? { seat } : {}), ...(armId !== undefined ? { armId } : {}) };
   } catch { return {}; } // unparseable bytes name no seat or arm — the caller decides what that means
 }
 
@@ -476,7 +569,7 @@ function withClearObligation(
 function readStandDown(
   repoRoot: string,
   tier: SupervisionTier,
-): { mtimeMs: number; seat?: string; armId?: string } | "NONE" | "UNREADABLE" {
+): { mtimeMs: number; seat?: string; armId?: string; fence: string } | "NONE" | "UNREADABLE" {
   const p = supervisionStandDownPath(repoRoot, tier);
   let st: Stats;
   try {
@@ -488,8 +581,11 @@ function readStandDown(
   if (!st.isFile()) return "UNREADABLE";
   let seat: string | undefined;
   let armId: string | undefined;
+  let fence: string;
   try {
-    const rec = JSON.parse(readFileSync(p, "utf8")) as {
+    const bytes = readFileSync(p, "utf8");
+    fence = createHash("sha256").update(bytes).digest("hex");
+    const rec = JSON.parse(bytes) as {
       tier?: unknown; disarmedAt?: unknown; seat?: unknown; armId?: unknown;
     };
     if (rec?.tier !== tier) return "UNREADABLE";
@@ -501,27 +597,26 @@ function readStandDown(
     if (isSeatTier(tier) && seat === undefined) return "UNREADABLE";
   } catch { return "UNREADABLE"; } // unparseable or unreadable bytes — not a stand-down anyone can read
   return {
-    mtimeMs: st.mtimeMs,
+    mtimeMs: st.mtimeMs, fence,
     ...(seat !== undefined ? { seat } : {}),
     ...(armId !== undefined ? { armId } : {}),
   };
 }
 
-// THE TIER'S STATE — what every surface and every operator reads. A valid stand-down outranks the beat:
-// the watcher that wrote it is gone ON PURPOSE, and its last beat ages out exactly like a dead one's
-// would. It outranks the beat it FOLLOWED and no other — a later timestamp OR a FRESH different
-// armed-watcher identity is another arm, so a marker whose rename lost that race cannot mask a live
-// watcher. Once that foreign beat is stale, a newer clean hand-off must win: otherwise overlapping
-// boards closed in last-beater-first order would leave the tier reporting a death forever.
+// CLI beats carry the marker generation acknowledged at arm time, never at tick time. A new
+// marker dominates every tick of that arm regardless of rename order or beat mtime. The separate
+// presence-based lifecycle retains overlapping watch owners and their last-owner stand-down.
 export function supervisionStatus(repoRoot: string, tier: SupervisionTier, now = Date.now()): TierLiveness {
   const beat = readBeat(repoRoot, tier);
   const standDown = readStandDown(repoRoot, tier);
   if (standDown === "UNREADABLE") return withClearObligation(repoRoot, tier, { tier, state: "UNREADABLE" });
   const beatOutranksStandDown = standDown !== "NONE" && typeof beat === "object" && (
-    beat.mtimeMs > standDown.mtimeMs || (
-      now - beat.mtimeMs <= SUPERVISION_STALE_MS &&
-      beat.armId !== undefined && standDown.armId !== undefined && beat.armId !== standDown.armId &&
-      existsSync(supervisionPresencePath(repoRoot, tier, beat.armId))
+    beat.markerFence !== undefined ? beat.markerFence === standDown.fence :
+    beat.armId !== undefined && existsSync(supervisionPresencePath(repoRoot, tier, beat.armId)) && (
+      beat.mtimeMs > standDown.mtimeMs || (
+        now - beat.mtimeMs <= SUPERVISION_STALE_MS &&
+        standDown.armId !== undefined && beat.armId !== standDown.armId
+      )
     )
   );
   if (standDown !== "NONE" && !beatOutranksStandDown) {

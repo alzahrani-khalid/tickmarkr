@@ -15,6 +15,7 @@ import { GLYPHS } from "../../src/brand.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
 import { formatFleetPrint, loadConfig, overlayBytesLoadError } from "../../src/config/config.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
+import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const FAKE_TIERS = `tiers:
@@ -49,6 +50,11 @@ const KEYS = {
   n: "n",
   backspace: "\x7f",
 } as const;
+
+// OBS-1099: Space opens the reach picker (cursor on in · out workers · out all seats); Enter sets it
+const REACH_IN = KEYS.space + KEYS.enter;
+const REACH_WORKERS = KEYS.space + KEYS.down + KEYS.enter;
+const REACH_ALL = KEYS.space + KEYS.down.repeat(2) + KEYS.enter;
 
 const withOverlay = (repo: string, yaml: string) => {
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
@@ -419,7 +425,7 @@ describe("tickmarkr fleet", () => {
       repo,
       adapter,
       makeIO().io,
-      RAIL + KEYS.down.repeat(3) + KEYS.space + KEYS.w,
+      RAIL + KEYS.down.repeat(3) + REACH_ALL + KEYS.w,
       ["--global-dir", isolatedGlobal()],
     );
     expect(out).toMatch(/^fleet: wrote /);
@@ -458,7 +464,7 @@ describe("tickmarkr fleet", () => {
     PassThrough.prototype.write.call(
       io.input,
       // the staged toggle arms the quit guard — the second q in the same chunk confirms it
-      RAIL + KEYS.down.repeat(3) + KEYS.space + KEYS.q + KEYS.q,
+      RAIL + KEYS.down.repeat(3) + REACH_ALL + KEYS.q + KEYS.q,
     );
     const early = await Promise.race([
       done.then((value) => ({ value })),
@@ -507,7 +513,7 @@ describe("tickmarkr fleet", () => {
   test("the space key toggles the highlighted rail adapter between active and inactive", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, RAIL + KEYS.down.repeat(3) + KEYS.space + KEYS.space + KEYS.q);
+    const out = await drive(repo, adapter, io, RAIL + KEYS.down.repeat(3) + REACH_ALL + REACH_IN + KEYS.q);
     expect(out).toBe("fleet: quit without writing");
     const frames = writes.map(strip);
     const denied = frames.findIndex((f) => f.includes(`${GLYPHS.toggleInactive} fake`));
@@ -518,7 +524,7 @@ describe("tickmarkr fleet", () => {
   test("the space key cycles a model's reach through in, out workers, out all seats and back to in", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.space + KEYS.space + KEYS.space + KEYS.q);
+    const out = await drive(repo, adapter, io, REACH_WORKERS + REACH_ALL + REACH_IN + KEYS.q);
     expect(out).toBe("fleet: quit without writing");
     const frames = writes.map(strip);
     expect(frames[0]).toContain(`${GLYPHS.toggleActive} fake/fake-1`);
@@ -551,7 +557,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     const before = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.space + KEYS.escape + KEYS.escape);
+    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.escape + KEYS.escape);
     expect(out).toBe("fleet: quit without writing");
     // OBS-521: the first Esc warns instead of silently discarding the staged toggle
     expect(strip(writes.join(""))).toContain("staged edit(s) not written");
@@ -562,7 +568,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     const before = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
     const { io } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.space + KEYS.q + KEYS.q);
+    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.q + KEYS.q);
     expect(out).toBe("fleet: quit without writing");
     expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(before);
   });
@@ -589,7 +595,7 @@ describe("tickmarkr fleet", () => {
     const overlayPath = join(repo, ".tickmarkr", "config.yaml");
     const before = readFileSync(overlayPath, "utf8");
     // OBS-994/FL-1: two presses reach out(all) — the allow-form write this test targets.
-    const bytes = KEYS.space + KEYS.space + KEYS.w;
+    const bytes = REACH_ALL + KEYS.w;
 
     queueAnswers("n");
     const declined = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
@@ -769,7 +775,7 @@ describe("tickmarkr fleet", () => {
     // the extra trailing Esc pair: the first Esc dismisses the auto-raised presets overlay on the
     // Shapes entry (v1.92); the staged toggle arms the quit guard so TWO more Esc quit the browser
     // OBS-994/FL-1: two spaces cycle in → out(workers) → out(all), the state this test asserts.
-    const out = await drive(repo, adapter, io, "  \x1b[D\x1b[B\r\x1b\x1b\x1b", ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, " \x1b[B\x1b[B\r\x1b[D\x1b[B\r\x1b\x1b\x1b", ["--global-dir", isolatedGlobal()]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain(`${GLYPHS.toggleInactive} fake/fake-1`);
@@ -801,7 +807,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     queueAnswers("y");
     const { io, input } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.space + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.w, ["--global-dir", isolatedGlobal()]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(input.isPaused()).toBe(true);
     expect(input.listenerCount("keypress")).toBe(0);
@@ -888,7 +894,7 @@ describe("tickmarkr fleet", () => {
     const before = readFileSync(doctorPath, "utf8");
     const mtimeBefore = statSync(doctorPath).mtimeMs;
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, KEYS.space + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, REACH_WORKERS + KEYS.w, ["--global-dir", isolatedGlobal()]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(readFileSync(doctorPath, "utf8")).toBe(before);
     expect(statSync(doctorPath).mtimeMs).toBe(mtimeBefore);
@@ -932,7 +938,7 @@ describe("tickmarkr fleet", () => {
   test("OBS-994/FL-1: a workers-only reach row renders the warn glyph on a tty", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    await drive(repo, adapter, io, KEYS.space + KEYS.q + KEYS.q);
+    await drive(repo, adapter, io, REACH_WORKERS + KEYS.q + KEYS.q);
     const outWorkers = writes.find((f) => strip(f).includes(`${GLYPHS.attention} fake/fake-1`));
     expect(outWorkers).toBeDefined();
   });
@@ -941,7 +947,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
     // OBS-994/FL-1: two presses reach out(all) — the dim-circle state this test targets.
-    await drive(repo, adapter, io, KEYS.space + KEYS.space + KEYS.q + KEYS.q);
+    await drive(repo, adapter, io, REACH_ALL + KEYS.q + KEYS.q);
     const denied = writes.find((f) => strip(f).includes("○ fake/fake-1"));
     expect(denied).toBeDefined();
     expect(denied).toMatch(/\x1b\[2m○\x1b\[22m/);
@@ -1054,7 +1060,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     const gdir = isolatedGlobal();
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, KEYS.space + KEYS.w, ["--global-dir", gdir]);
+    const out = await drive(repo, adapter, makeIO().io, REACH_WORKERS + KEYS.w, ["--global-dir", gdir]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(() => loadConfig(repo, { globalDir: gdir })).not.toThrow();
   });
@@ -1063,7 +1069,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     const gdir = isolatedGlobal();
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, KEYS.space + KEYS.w, ["--global-dir", gdir]);
+    const out = await drive(repo, adapter, makeIO().io, REACH_WORKERS + KEYS.w, ["--global-dir", gdir]);
     expect(out).toMatch(/^fleet: wrote /);
     // and what it wrote reloads through the same loader the guard used
     expect(() => loadConfig(repo, { globalDir: gdir })).not.toThrow();
@@ -1297,7 +1303,7 @@ describe("tickmarkr fleet", () => {
       OPEN_STEER + KEYS.f + "\x03",
       KEYS.m + KEYS.escape + KEYS.q,
       // q on the review overlay itself quits without writing
-      KEYS.space + KEYS.w + KEYS.q,
+      REACH_WORKERS + KEYS.w + KEYS.q,
     ];
     for (const bytes of cases) {
       const { repo, adapter } = setup();
@@ -1612,7 +1618,7 @@ review:
     const aDone = fleet(["--global-dir", isolatedGlobal()], a.repo, [a.adapter], aIO.io);
     // OBS-994/FL-1: Space now cycles in → out(workers) → out(all) → in — two presses reach the
     // all-seats exclusion this test's allow-form assertions target.
-    aIO.input.write(KEYS.space + KEYS.space + TO_DOCS + KEYS.p);
+    aIO.input.write(REACH_ALL + TO_DOCS + KEYS.p);
     await settle(() => strip(aIO.writes.join("")).includes("pin · docs"));
     aIO.input.write(KEYS.escape + KEYS.w + KEYS.y);
     expect(await aDone).toMatch(/^fleet: wrote /);
@@ -1633,7 +1639,7 @@ review:
 `);
     const bIO = makeIO();
     const bDone = fleet(["--global-dir", isolatedGlobal()], b.repo, [b.adapter], bIO.io);
-    bIO.input.write(KEYS.space + TO_DOCS + KEYS.p);
+    bIO.input.write(REACH_IN + TO_DOCS + KEYS.p);
     await settle(() => strip(bIO.writes.join("")).includes("pin · docs"));
     bIO.input.write(KEYS.escape + KEYS.w + KEYS.y);
     expect(await bDone).toMatch(/^fleet: wrote /);
@@ -1645,7 +1651,7 @@ review:
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
     // Space toggles fake-1 out of the fleet; Enter on the same row must coach, not assign
-    const out = await drive(repo, adapter, io, KEYS.space + KEYS.enter + KEYS.q + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.enter + KEYS.q + KEYS.q, ["--global-dir", isolatedGlobal()]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain("fake:fake-1 is out of the fleet — Space adds it before assigning");
@@ -1718,10 +1724,10 @@ review:
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [fakeAdapter(repo)], io);
     input.write(RAIL + KEYS.down.repeat(3) + KEYS.space);
     await settle(() => strip(writes.join("")).includes("is not authed"));
-    input.write(KEYS.q + KEYS.q);
+    input.write(KEYS.escape + KEYS.q); // Esc leaves the picker with nothing staged — one q quits
     expect(await done).toBe("fleet: quit without writing");
     expect(strip(writes.join(""))).toContain(
-      "fake is not authed — Space only toggles fleet membership; re-auth the fake CLI, then run tickmarkr doctor",
+      "fake is not authed — Space only sets fleet reach; re-auth the fake CLI, then run tickmarkr doctor",
     );
   });
 
@@ -2021,7 +2027,7 @@ review:
     const io = makeIO();
     queueAnswers("y");
     // OBS-994/FL-1: two presses reach out(all) — this test targets the all-seats allow form.
-    const bytes = KEYS.space + KEYS.space + KEYS.down + KEYS.t + KEYS.down + KEYS.enter + KEYS.enter
+    const bytes = REACH_ALL + KEYS.down + KEYS.t + KEYS.down + KEYS.enter + KEYS.enter
       + "AA Index 54" + KEYS.enter + KEYS.w;
     const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", isolatedGlobal()]);
     expect(out).toMatch(/^fleet: wrote /);
@@ -2094,7 +2100,7 @@ review:
     const out = await drive(
       repo, adapter, io.io,
       // OBS-994/FL-1: two presses reach out(all) — this test targets the all-seats allow form.
-      KEYS.space + KEYS.space + KEYS.t + KEYS.down + KEYS.t
+      REACH_ALL + KEYS.t + KEYS.down + KEYS.t
         + KEYS.down + KEYS.down + KEYS.enter + KEYS.enter
         + "AA Index 54" + KEYS.enter + KEYS.w,
       ["--global-dir", isolatedGlobal()],
@@ -2346,7 +2352,7 @@ review:
     // OBS-994/FL-1: a workers-only press on one classified row plus two presses (out all) on the
     // next stage a workers deny block AND the allow form — a diff taller than the 9-row window
     // (OBS-1046: an addition writes no deny tombstones, so one scope alone no longer overflows it).
-    io.input.write(KEYS.space + KEYS.down + KEYS.space + KEYS.space + KEYS.w);
+    io.input.write(REACH_WORKERS + KEYS.down + REACH_ALL + KEYS.w);
     await settle(() => strip(io.writes.join("")).includes("review · "));
     const first = strip(io.writes.at(-1)!);
     expect(first).toMatch(/… \d+ below — ↓ scrolls/);
@@ -2432,13 +2438,13 @@ review:
     const { repo, adapter } = setup();
     const io = makeIO();
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
-    io.input.write(KEYS.space);
+    io.input.write(REACH_WORKERS);
     await settle(() => io.writes.map(strip).some((f) => f.includes("· 1 staged")));
     expect(io.writes.map(strip).some((f) => f.includes("· 1 staged"))).toBe(true);
     const mark = io.writes.length;
     // OBS-994/FL-1: Space now cycles in → out(workers) → out(all) → in — a third press is the
     // one that returns to zero staged.
-    io.input.write(KEYS.space + KEYS.space); // cycle through out(all) — back to zero staged
+    io.input.write(REACH_IN); // one act back to in — zero staged
     await settle(() => io.writes.slice(mark).map(strip).some((f) => !f.includes("staged") && f.includes("tickmarkr fleet")));
     expect(strip(io.writes.at(-1)!)).not.toContain("· 1 staged");
     io.input.write(KEYS.q); // zero staged ⇒ one q suffices
@@ -2464,7 +2470,7 @@ review:
     });
     const io: FleetIO = { input: base.input as unknown as NodeJS.ReadStream, output: output as unknown as NodeJS.WriteStream, debug: true };
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
-    base.input.write(KEYS.space); // stage a toggle so state survival across the resize is observable
+    base.input.write(REACH_WORKERS); // stage a toggle so state survival across the resize is observable
     await settle(() => writes.map(strip).some((f) => f.includes("· 1 staged")));
     const frameWidth = (frame: string) =>
       frame.split("\n").find((line) => line.startsWith("╭"))?.length ?? Number.NaN;
@@ -2503,7 +2509,7 @@ review:
     const { repo, adapter } = setup();
     const io = makeIO();
     const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
-    io.input.write(KEYS.space); // stage fake-1 out — the picker must attribute its absence
+    io.input.write(REACH_WORKERS); // stage fake-1 out — the picker must attribute its absence
     await settle(() => io.writes.map(strip).some((f) => f.includes("· 1 staged")));
     io.input.write(OPEN_SHAPES + KEYS.p);
     await settle(() => io.writes.map(strip).some((f) => f.includes("not offered:")));
@@ -2536,5 +2542,86 @@ review:
     expect(clipped.endsWith("/claude-fable-5")).toBe(true); // the tail survives
     expect(clipPathTail("no-slashes-here-at-all", 10)).toBe("no-slashe…"); // fallback end-clip
     expect(clipPathTail("a/very-long-tail-segment-wider-than-width", 10)).toHaveLength(10); // tail too wide — fallback
+  });
+});
+
+// ── D-225 (T2 review round 2): the shape picker is a closed offered-or-greyed partition ──────
+describe("D-225: greyed ledger rows", () => {
+  const TWO_MODELS = `tiers:
+  fake:
+    vendor: fake
+    channel: sub
+    models:
+      fake-1: mid
+      fake-2: cheap
+`;
+  // FakeAdapter hardcodes frontier tiers; this adapter reads cfg.tiers so a floor can sit above it
+  const tierAdapter: WorkerAdapter = {
+    id: "fake",
+    vendor: "fake",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (cfg) => channelsFromConfig("fake", cfg),
+    headlessCommand: () => "fake",
+    interactiveCommand: () => null,
+    invoke: () => ({ command: "fake" }),
+    parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+    listModels: async () => [],
+  };
+  const pickImplement = async (repo: string, adapter: WorkerAdapter) => {
+    const assembled = await assembleFleetEditor(repo, [adapter], makeIO().io, { globalDir: isolatedGlobal() });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    const { candidatesForShape, initialMap, props } = { ...assembled, ...assembled.props };
+    const deny = {
+      adapters: props.initialDenyAdapters,
+      models: props.initialDenyModels,
+      workersAdapters: props.initialDenyWorkersAdapters ?? [],
+      workersModels: props.initialDenyWorkersModels ?? [],
+    };
+    return candidatesForShape("implement", "risk-based", initialMap, deny);
+  };
+
+  test("a channel both worker-denied and failed-probe greys with its reach and deny scope before the auth reason", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, TWO_MODELS + "routing:\n  deny:\n    workers:\n      models: [fake:fake-2]\n");
+    registry.writeDoctor(repo, {
+      fake: {
+        installed: true,
+        authed: true,
+        version: "fake",
+        models: ["fake-1", "fake-2"],
+        modelAuth: {
+          "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+          "fake-2": { authed: false, reason: "quota exceeded", probedAt: "2026-09-12T00:00:00.000Z" },
+        },
+      },
+    });
+    const picked = await pickImplement(repo, fakeAdapter(repo));
+    expect(picked.rows.map((row) => row.id)).toEqual(["fake:fake-1"]);
+    expect(picked.ledger).toContain("fake/fake-2 — reach: out workers — routing.deny.workers.models (fake:fake-2); unauthed (quota exceeded) — re-probe with tickmarkr doctor");
+  });
+
+  test("a below-floor fallback candidate that is offered appears once, as offered, never in the greyed ledger", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    // every channel is below the frontier floor, so the ranker falls back to offering them
+    withOverlay(repo, TWO_MODELS + "routing:\n  floors:\n    implement: frontier\n");
+    registry.writeDoctor(repo, {
+      fake: {
+        installed: true,
+        authed: true,
+        version: "fake",
+        models: ["fake-1", "fake-2"],
+        modelAuth: {
+          "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+          "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        },
+      },
+    });
+    const picked = await pickImplement(repo, tierAdapter);
+    const offered = picked.rows.map((row) => row.id);
+    expect(offered).toContain("fake:fake-1");
+    expect(offered).toContain("fake:fake-2");
+    expect(picked.rows.every((row) => row.belowFloor)).toBe(true);
+    expect(picked.ledger ?? []).toEqual([]);
+    expect(picked.excludedNote).toContain("below routing.floors.implement (frontier) — not manageable here");
   });
 });

@@ -9,8 +9,9 @@ import { Journal, structuredFindings } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 test("daemon carries repair materials into re-review and journals their certified closure", async () => {
-  const note = "src/mark.ts `select` loses the selected identity after prepend.";
-  const [finding] = structuredFindings("review", `- [material] ${note}`);
+  const note = "`select` loses the selected identity after prepend.";
+  const [identified] = structuredFindings("review", `- [material] src/mark.ts ${note}`);
+  const finding = { ...identified, note };
   const fixture = setupRepo([T("T1")], {
     tasks: { T1: [
       { shell: `mkdir -p src && echo one > src/mark.ts && ${COMMIT} initial`, result: { ok: true, summary: "initial" } },
@@ -27,6 +28,7 @@ test("daemon carries repair materials into re-review and journals their certifie
       const verdict = {
         nonce: extractPromptNonce(prompt), approve: !initial,
         findings: initial ? [{ note, severity: "material" }] : [],
+        comments: initial ? [{ path: "src/mark.ts", line: 1, body: "Repair selection here." }] : [],
         resolved: prompt.includes("## Prior materials this attempt must close") ? [finding.fingerprint] : [],
         reraised: [],
       };
@@ -36,6 +38,9 @@ test("daemon carries repair materials into re-review and journals their certifie
   const runId = "run-material-closure";
   await runDaemon(fixture.repo, { adapters: [new ClosingReviewer(fixture.scriptPath)], runId });
   const events = Journal.open(fixture.repo, runId).read();
+  const initialReview = events.find((event) => event.event === "gate-result"
+    && event.data.gate === "review" && event.data.pass === false);
+  expect(initialReview?.data.findings).toContainEqual(finding);
   const repair = events.find((event) => event.event === "task-dispatch" && event.data.retryMode === "repair");
   expect(repair?.data.carriedFindings).toContainEqual(finding);
   expect(prompts[0]).not.toContain("## Prior materials this attempt must close");

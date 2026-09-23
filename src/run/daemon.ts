@@ -39,7 +39,7 @@ import { classifyRepairDisposition, resolveScopeHints } from "./repair-dispositi
 import { applyScopeAmendments, activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { isDiffCapPark, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
-import { ensureIntegration, integrationBranch, integrationHead, mergeTask, verifyIntegrationTip } from "./merge.js";
+import { ensureIntegration, integrationBranch, integrationHead, mergeTask, reusedTipEvidence, verifyIntegrationTip } from "./merge.js";
 import { climbChannel, marginalCostRank, nextChannel, route } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
 import { readTierLiveness, readWatchBoard, supervisionBeatPath } from "./supervision.js";
@@ -248,6 +248,26 @@ export interface RunSummary {
   approvalDisposition?: "complete" | "outstanding";
   /** the accepted approvals that never reached a dispatch — named, never left to the park buckets */
   outstandingApprovals?: string[];
+}
+
+// Bind approval context before dispatch consumes the release. Restore reconstructs the same
+// binding from journal order; a newer approval, including one without a reason, supersedes it.
+function approvalReviewContext(events: JournalEvent[], taskId: string, restore = false): string | undefined {
+  let pending: string | undefined;
+  let bound: string | undefined;
+  let approved = false;
+  for (const row of events) {
+    if (row.taskId !== taskId) continue;
+    if (row.event === "task-approved") {
+      pending = typeof row.data.reason === "string" ? row.data.reason.trim() || undefined : undefined;
+      approved = true;
+    } else if (row.event === "task-dispatch" || (row.event === "recheck-battery" && approved)) {
+      bound = pending;
+      pending = undefined;
+      approved = false;
+    }
+  }
+  return restore && !approved ? bound : pending;
 }
 
 // T14: the events that prove an approval was ENACTED — narrowly causal, never merely subsequent.
@@ -766,6 +786,7 @@ interface VerifyCycle {
   failed: boolean;
   forgiven: boolean;
   capacities: unknown[];
+  evidenceByGate: Map<string, JournalEvent["data"]>;
 }
 
 /**
@@ -789,7 +810,7 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
     if (e.event === "tip-verify-start") {
       const { tip, cmdHash } = e.data;
       cur = typeof tip === "string" && typeof cmdHash === "string"
-        ? { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [e.data.capacity] }
+        ? { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [e.data.capacity], evidenceByGate: new Map() }
         : undefined;
       afterRunEnd = false;
       continue;
@@ -810,7 +831,7 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
       continue;
     }
     if (!cur || afterRunEnd || cur.tip !== tip || cur.cmdHash !== cmdHash) {
-      cur = { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [] };
+      cur = { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [], evidenceByGate: new Map() };
     }
     afterRunEnd = false;
     // T7: EVERY verdict row's own capacity, not just the start row's. The start row is a statement of
@@ -821,6 +842,7 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
     if (e.event === "tip-verify-failed") cur.failed = true;
     else {
       cur.gates.add(gate);
+      cur.evidenceByGate.set(gate, e.data);
       // Q121s review M1: a forgiven green depends on the baseline that forgave it. Baselines are not
       // part of the cache key, so a forgiven cycle is NEVER cache-eligible — an unchanged tip whose
       // baseline later vanishes or changes must re-run the full verify, not inherit the green.
@@ -1031,7 +1053,7 @@ export async function verifyIntegrationTipCached(
     // pass — `cached: true` keeps it honest about not having re-run the command.
     for (const gate of gates) {
       const cmd = gate === "test" && commands.tipTest ? commands.tipTest : commands[gate]!;
-      journal.append("tip-verify", undefined, { gate, cmd, pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity });
+      journal.append("tip-verify", undefined, { ...reusedTipEvidence(last.evidenceByGate.get(gate) ?? {}), gate, cmd, pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity });
     }
     return false;
   }
@@ -1040,11 +1062,21 @@ export async function verifyIntegrationTipCached(
     ? cancellableTipBattery(intWt, commands, journal.dir, opts.baseline, opts.signal)
     : verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline))) {
     const measuredCapacity = (r as typeof r & { capacity?: RunCapacity }).capacity ?? capacity;
+    const evidence = r.reused ? reusedTipEvidence(r) : {
+      ...(r.originRunRoot ? { originRunRoot: r.originRunRoot } : {}),
+      ...(r.cause ? { cause: r.cause } : {}),
+      ...(r.evidenceReceipt ? { evidenceReceipt: r.evidenceReceipt } : {}),
+      ...(r.evidenceReceipts ? { evidenceReceipts: r.evidenceReceipts } : {}),
+      ...(r.evidenceAbsence ? { evidenceAbsence: r.evidenceAbsence } : {}),
+      ...Object.fromEntries(["nonce", "stdoutPath", "stderrPath"]
+        .filter(key => r[key as keyof typeof r] !== undefined).map(key => [key, r[key as keyof typeof r]])),
+    };
     if (r.pass) {
       // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
-      journal.append("tip-verify", undefined, { gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.reused ? { cached: true } : {}), ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash, capacity: measuredCapacity });
+      journal.append("tip-verify", undefined, { ...evidence, gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.reused ? { cached: true } : {}), ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints } : {}), tip, cmdHash, capacity: measuredCapacity });
     } else {
       journal.append("tip-verify-failed", undefined, {
+        ...evidence,
         gate: r.gate,
         cmd: r.cmd,
         exitCode: r.exitCode,
@@ -2638,6 +2670,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // run; a park-instead policy can come later if it ever bites.
     }
     const taskHistory = journal.read().filter((e) => e.taskId === t.id);
+    // Lifetime identity counts every dispatch, including legacy and unchargeable rows. Releases
+    // reset the budget below, never this counter; observational annotations do not consume it.
+    let nextWorkerDispatchOrdinal = taskHistory.filter((e) => e.event === "task-dispatch").length;
     const lastApproval = taskHistory.map((e) => e.event).lastIndexOf("task-approved");
     const priorClimb = taskHistory.slice(lastApproval + 1).reverse().find((e) => e.event === "tier-escalated");
     if (!hintsChanged && priorClimb && taskHistory.indexOf(priorClimb) > taskHistory.map((e) => e.event).lastIndexOf("task-dispatch")) {
@@ -2651,7 +2686,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // VIS-02 convention: absence = no seeding happened. The observable surface for criterion 2's
     // exclusion-list-equality oracle. Daemon-side append only — no journal.ts write-path change (Phase 48
     // stays unblocked); inert to replayStatuses (unknown events ignored, pinned at journal.test.ts:70-80).
-    if (rs) journal.append("resume-restore", t.id, { attempts: rs.attempts, tried: [...tried], assignment });
+    if (rs) journal.append("resume-restore", t.id, {
+      attempts: rs.attempts, tried: [...tried], assignment,
+      workerDispatchOrdinal: previousDispatch?.data.workerDispatchOrdinal ?? null,
+    });
     // Keep one live list: recovery retries must see exclusions added by onGate during the round.
     const badReviewers: string[] = [...replayedReviewerExclusions];
     const noteReviewEvent = (e: Extract<GateEvent, { phase: "note" }>) => {
@@ -2817,6 +2855,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // every recalibration this telemetry funds, a gap is honest and a zero is a lie. The
         // seven-gate closed set is asserted end-to-end in tests/run/gate-telemetry.test.ts.
         ...gateMeasurement(g.meta),
+        // Fresh producer evidence is copied verbatim; absent/historical evidence is never minted here.
+        ...(g.meta?.reused ? {} : {
+          ...(g.evidenceReceipt ? { evidenceReceipt: g.evidenceReceipt } : {}),
+          ...(g.evidenceReceipts ? { evidenceReceipts: g.evidenceReceipts } : {}),
+          ...Object.fromEntries(["nonce", "stdoutPath", "stderrPath", "classification"]
+            .filter(key => g.meta?.[key] !== undefined).map(key => [key, g.meta![key]])),
+        }),
         // T7: the capacity the gate's own command child ran under, lifted verbatim from the result
         // the battery produced — read where the shell built that child's environment, never
         // re-derived from the run's own budget, which would answer a different number than the
@@ -3150,6 +3195,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             || !(GATE_NAMES as readonly string[]).includes(e.data.gate)) continue;
         priorResults.set(e.data.gate as GateName, e);
       }
+      const declaredGates = GATE_NAMES.filter((gate) => t.gates.includes(gate));
+      const reused: GateName[] = [];
       let remainingGates: GateName[];
       if (recheck) {
         remainingGates = GATE_NAMES.filter((gate) => t.gates.includes(gate));
@@ -3200,45 +3247,37 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           });
         }
         let reusable = sameWorld && sameProtocol && (exactCurrentCommit || canonicalCurrentCommit || recreatedLegacyCommit);
-        const reused: GateName[] = [];
-        const declaredGates = GATE_NAMES.filter((gate) => t.gates.includes(gate));
         for (const gate of declaredGates) {
           if (!reusable || replayedGates!.results.get(gate) !== true) reusable = false;
           else reused.push(gate);
         }
-        // OBS-1049: build outputs are not commits. A replayed build verdict says the tree WAS green;
-        // it says nothing about whether the RECREATED checkout holds what that build produced (dist),
-        // and the host's npm lifecycle (ignore-scripts) may never rebuild it before the suite runs.
-        // So a replayed build re-runs its own command here as provisioning, journaled by name; a red
-        // provisioning is not reused — build (and everything behind it) re-enters the battery as a gate.
-        // Every resume on this path recreates the checkout (recreateTaskWorktree above), so "reused
-        // build" is exactly "build replayed onto a recreated tree".
-        // Journal order is the criterion's order: a GREEN provisioning is recorded AFTER the reuse
-        // rows it belongs to (gate-reused build, then gate-provisioned build); a RED provisioning is
-        // recorded alone, and no reuse row follows it.
-        let provisionedRow: Record<string, unknown> | undefined;
-        if (reused.includes("build") && commands.build !== undefined) {
-          // Provisioning is a verification command like any gate: it waits for the run's baseline and
-          // takes the command lease (suite admission), never a bare shell beside sibling gates.
-          await waitForBaseline(t.id);
-          const startedAt = Date.now();
-          const provisioned = await withCommandContext(t.id, () => sh(commands.build, wt));
-          provisionedRow = {
-            gate: "build", commit: replayedGates!.commit, exitCode: provisioned.code, durationMs: Date.now() - startedAt,
-          };
-          if (provisioned.code !== 0) {
-            reused.splice(reused.indexOf("build"));
-            journal.append("gate-provisioned", t.id, provisionedRow);
-            provisionedRow = undefined;
-          }
-        }
-        for (const gate of reused) {
-          journal.append("gate-reused", t.id, { gate, commit: replayedGates!.commit });
-        }
-        if (provisionedRow !== undefined) journal.append("gate-provisioned", t.id, provisionedRow);
         remainingGates = declaredGates.slice(reused.length);
       }
+      // OBS-1094/1049: every replay recreates the checkout, but build outputs are not commits.
+      // Provision whenever build will not run as a gate, including an operator waiver restore.
+      // Defer reuse rows until provisioning succeeds: green keeps reuse-then-provision order;
+      // red records only provisioning and puts build and every declared successor back in gates,
+      // unless build itself was waived: provisioning must not undo the operator's release.
+      let provisionedRow: Record<string, unknown> | undefined;
+      if (!remainingGates.includes("build") && commands.build !== undefined) {
+        await waitForBaseline(t.id);
+        const startedAt = Date.now();
+        const provisioned = await withCommandContext(t.id, () => sh(commands.build, wt));
+        provisionedRow = {
+          gate: "build", commit: !satisfiedGate && !recheck ? replayedGates!.commit : currentTaskSubject,
+          exitCode: provisioned.code, durationMs: Date.now() - startedAt,
+        };
+        if (provisioned.code !== 0 && satisfiedGate !== "build") {
+          reused.length = 0;
+          remainingGates = ["build", ...declaredGates.filter((gate) => gate !== "build")];
+        }
+      }
+      for (const gate of reused) {
+        journal.append("gate-reused", t.id, { gate, commit: replayedGates!.commit });
+      }
+      if (provisionedRow !== undefined) journal.append("gate-provisioned", t.id, provisionedRow);
       const resumedTask = { ...t, gates: remainingGates };
+      const operatorContext = approvalReviewContext(journal.read(), t.id, true);
 
       gateLoop: while (true) {
         fatalStop.signal.throwIfAborted();
@@ -3258,6 +3297,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const { results } = await withCommandContext(t.id,
           () => runReviewRecovery(resumedTask, {
           carriedFindings: outstandingReviewFindings(journal.read(), t.id),
+          operatorContext,
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
           commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
           collateral: collateral.get(t.id) ?? [],
@@ -3515,6 +3555,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // fresh re-dispatches. Read from the JOURNAL, before this dispatch's own event lands: a run that
       // stopped between funding the repair and sending it resumes still carrying the findings.
       const journaledSoFar = journal.read(); // read BEFORE this dispatch's own event lands
+      const operatorContext = approvalReviewContext(journaledSoFar, t.id);
       let repairFindings = pendingRepairFindings(journaledSoFar, t.id);
       // OBS-254, one layer below the upheld brief: the ordinary gate-fail brief was loop-local, so any
       // path that rebuilt this task's state (a resume, `--retry-failed`, a fresh daemon) dispatched a
@@ -3606,9 +3647,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // ledger cannot tell a carried dispatch from an amnesiac one — the exact question a run that
       // spends two frontier attempts re-deriving a known defect has to be able to answer afterwards.
       fatalStop.signal.throwIfAborted();
+      const workerDispatchOrdinal = nextWorkerDispatchOrdinal++;
       journal.append("task-dispatch", t.id, {
         ...(scopeApproval?.data.release === "scope-request" ? { files: t.files, graphDefinitionHash: graphDefinitionHash(graph) } : {}),
-        assignment, attempt, provenance: dispatchProvenance([
+        assignment, attempt, workerDispatchOrdinal, provenance: dispatchProvenance([
           channelKey(assignment) === channelKey(r.assignment) ? r.provenance
             : t.routingHints?.pin ? `pin ${t.routingHints.pin.via}:${t.routingHints.pin.model} not re-tried` : "ladder assignment",
           `dispatch ${channelKey(assignment)}`, climbProvenance,
@@ -3717,7 +3759,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // anything the live brief holds beyond the journaled findings (a consult's guidance) is kept:
         // a repair adds the diff and the fix-only contract, it never subtracts what was already known.
         feedback = feedback && !brief.includes(feedback) ? `${brief}\n\n${feedback}` : brief;
-        journal.append("repair-dispatch", t.id, { diffBytes: Buffer.byteLength(diff, "utf8"), capped, ...(capped ? { droppedFiles } : {}) });
+        journal.append("repair-dispatch", t.id, { workerDispatchOrdinal, diffBytes: Buffer.byteLength(diff, "utf8"), capped, ...(capped ? { droppedFiles } : {}) });
       }
       if (feedback || priorNamed.length > 0) {
         feedback = augmentRetryBrief(feedback, { attempted: commitsToCarry, carried: carriedCommits, present: presentCommits });
@@ -5137,6 +5179,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ({ results, commits } = await withCommandContext(t.id,
             () => runReviewRecovery(t, {
             carriedFindings: outstandingFindings,
+            operatorContext,
             worktree: wt, baseRef: taskBase, result, author: assignment,
             commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
             collateral: collateral.get(t.id) ?? [],

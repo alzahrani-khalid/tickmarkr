@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -302,4 +303,95 @@ describe("qwen native drive", () => {
       }
     }
   });
+
+  test("test: parseQwenResult recovers the nonce bound assistant completion in the prefix clipped a1 capture through the daemon wrapper while the banner only a0 capture stays non ok, so inventing a trailer or requiring an intact outer event array fails", () => {
+    const clipped = fixture("run-0044-T9-a1.out");
+    const bannerOnly = fixture("run-0044-T9-a0.out");
+    expect(clipped.startsWith("ertions on the skill")).toBe(true);
+    expect(() => JSON.parse(clipped)).toThrow();
+    expect(clipped).toContain("TICKMARKR_EXIT_f6da4b83:0");
+    const captures = [
+      clipped,
+      `${clipped}\n[user@host dir]$ `,
+      clipped.replace("TICKMARKR_EXIT_f6da4b83:0", "[warn] something\nTICKMARKR_EXIT_f6da4b83:0"),
+    ];
+    for (const raw of captures.flatMap((capture) => [capture, wrapAsDaemonStream(capture, 0)])) {
+      expect(parseQwenResult(raw, "f6da4b83")).toMatchObject({
+        ok: true,
+        summary: "Committed the missing seal half (criteria 4-5) to skills/tickmarkr-overseer/SKILL.md as 42d99b52, leaving a clean worktree with all five judge criteria present at cited lines and the existing void conditions retained.",
+        deviations: [],
+        raw,
+      });
+      expect(qwen.parse(raw, "f6da4b83").ok).toBe(true);
+      expect(parseQwenResult(raw, NONCE).ok).toBe(false);
+    }
+    expect(bannerOnly).not.toContain("TICKMARKR_RESULT_");
+    for (const raw of [bannerOnly, wrapAsDaemonStream(bannerOnly, 0)]) {
+      expect(parseQwenResult(raw, "20397786")).toMatchObject({ ok: false, cause: "malformed-verdict" });
+    }
+  });
+
+  test("test: a trailer split inside a string at an interior byte or exactly at a token boundary across two assistant text events still parses whereas a tool echo a template echo or a wrong nonce stays unparseable, so a parser that joins with a newline or accepts an echo fails", () => {
+    const trailer = `TICKMARKR_RESULT_${NONCE} {"ok":true,"summary":"split completion","deviations":[]}`;
+    const assistant = (text: string) => ({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+    const terminal = { type: "result", subtype: "success", is_error: false };
+    const stream = (events: unknown[], clipped: boolean) => wrapAsDaemonStream(
+      clipped ? `clipped string tail"},${JSON.stringify(events).slice(1)}` : JSON.stringify(events), 0,
+    );
+    for (const clipped of [false, true]) {
+      // Every split includes marker/token boundaries, JSON punctuation, and string interiors.
+      for (let split = 1; split < trailer.length; split++) {
+        const raw = stream([assistant(trailer.slice(0, split)), assistant(trailer.slice(split)), terminal], clipped);
+        expect(parseQwenResult(raw, NONCE), `split ${split}, clipped ${clipped}`).toMatchObject({ ok: true, summary: "split completion" });
+        expect(parseQwenResult(raw, "wrong-nonce").ok).toBe(false);
+      }
+      const echoes = [
+        { type: "tool", message: { content: [{ type: "text", text: trailer }] } },
+        { type: "user", message: { role: "user", content: [{ type: "text", text: trailer }] } },
+        { type: "assistant", message: { role: "user", content: [{ type: "text", text: trailer }] } },
+        { type: "assistant", message: { content: [{ type: "tool_use", input: { text: trailer } }] } },
+        { type: "user", message: { content: [{ type: "tool_result", content: JSON.stringify(assistant(trailer)) }] } },
+        { type: "user", nested: assistant(trailer) },
+        { ...terminal, result: trailer },
+        assistant(`TICKMARKR_RESULT_${NONCE} {"ok":true|false,"summary":"<one sentence>","deviations":[]}`),
+      ];
+      for (const echo of echoes) {
+        expect(parseQwenResult(stream([echo, terminal], clipped), NONCE).ok).toBe(false);
+      }
+      expect(parseQwenResult(stream([assistant(trailer), { ...terminal, is_error: true }], clipped), NONCE))
+        .toMatchObject({ ok: false, cause: "startup-failure" });
+      for (const failure of [
+        { type: "system", is_error: true },
+        { type: "system", permission_denials: ["shell"] },
+        { type: "system", stats: { models: { qwen: { api: { totalErrors: 1 } } } } },
+      ]) {
+        expect(parseQwenResult(stream([failure, assistant(trailer), terminal], clipped), NONCE))
+          .toMatchObject({ ok: false, cause: "startup-failure" });
+      }
+      expect(parseQwenResult(stream([{ ...terminal, subtype: "error_during_execution", error: { message: "auth failed" } }], clipped), NONCE))
+        .toMatchObject({ ok: false, cause: "startup-failure", summary: "auth failed" });
+    }
+    const incomplete = `clipped"},${JSON.stringify(assistant(trailer))}`;
+    expect(parseQwenResult(incomplete, NONCE).ok).toBe(false);
+  });
+
+
+  test("the committed captures are the redacted raw a1 plus a0 records from run 0044 with the clipped prefix preserved under a sibling provenance header, citing the added fixture lines", () => {
+    const provenance = fixture("run-0044.provenance.md");
+    for (const [name, hash] of [
+      ["run-0044-T9-a0.out", "32ebfbee65f3bd6dd2b0e4a6aa9e23b94bc0e0f7129dac826da1aa5a1e574788"],
+      ["run-0044-T9-a1.out", "97ff4ad7a586caa5d633ea1eea6fa4629ba2e2d8552e638b6d91efe8a3865153"],
+    ]) {
+      expect(createHash("sha256").update(fixture(name)).digest("hex")).toBe(hash);
+      expect(provenance).toContain(`${name}:1`);
+      expect(provenance).toContain(hash);
+    }
+    expect(fixture("run-0044-T9-a1.out").split("\n")[2]).toBe("TICKMARKR_EXIT_f6da4b83:0");
+    const bannerLines = fixture("run-0044-T9-a0.out").trimEnd().split("\n");
+    expect(bannerLines).toHaveLength(11);
+    expect(bannerLines[1]).toContain("TICKMARKR_CHECKOUT");
+    expect(provenance).toContain("line 2 is the\nTICKMARKR_CHECKOUT echo; lines 3–11");
+    expect(provenance).toContain("run-20260921-164444-0000000000000044");
+  });
+
 });

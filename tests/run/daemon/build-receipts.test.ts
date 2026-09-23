@@ -139,3 +139,32 @@ describe("build receipt journal", () => {
     expect(rows.at(-1)!.data.attribution).toEqual(starts[2]!.data.attribution);
   });
 });
+
+test("test: a daemon gate result row for each of build test and lint carries the receipt the producer returned including its invocation id artifact references hashes counts and availability, so a writer that copies its closed key list without the receipt fails", async () => {
+  const produced: Awaited<ReturnType<typeof baselineModule.compareToBaseline>> = [];
+  const original = baselineModule.compareToBaseline;
+  const spy = vi.spyOn(baselineModule, "compareToBaseline").mockImplementation(async (...args) => {
+    const rows = await original(...args);
+    produced.push(...rows);
+    return rows;
+  });
+  try {
+    const { repo, fake } = setupRepo([T("T1", { gates: ["build", "test", "lint", "evidence", "scope"] })], {
+      tasks: { T1: [{ shell: `echo work > work.txt; ${COMMIT} work`, result: { ok: true, summary: "landed" } }] },
+    }, 'gates: { build: "printf build", test: "printf test", lint: "printf lint" }\n');
+    const runId = "run-gate-evidence";
+    expect((await runDaemon(repo, { adapters: [fake], runId })).done).toContain("T1");
+    const rows = Journal.open(repo, runId).read().filter(row => row.event === "gate-result");
+    for (const gate of ["build", "test", "lint"]) {
+      const result = produced.find(row => row.gate === gate)!;
+      expect(result.evidenceReceipt).toMatchObject({
+        invocationId: expect.any(String), availability: "available",
+        stdout: { sha256: expect.any(String), retainedBytes: expect.any(Number), droppedBytes: 0 },
+        stderr: { sha256: expect.any(String), retainedBytes: 0, availability: "available" },
+      });
+      const row = rows.find(row => row.data.gate === gate)!;
+      expect(row.data.evidenceReceipt).toEqual(result.evidenceReceipt);
+      expect(row.data.evidenceReceipts).toEqual(result.evidenceReceipts);
+    }
+  } finally { spy.mockRestore(); }
+}, 60_000);

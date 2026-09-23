@@ -4,6 +4,8 @@ import {
   collateralLints, sourceScopeFindings, sourceScopeLints, type SourceScopeFinding,
 } from "../../compile/collateral.js";
 import { CompileError } from "../../compile/common.js";
+import { loadConfig } from "../../config/config.js";
+import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
 import { compileSource } from "../../compile/index.js";
 import { retiredLiteralErrors } from "../../compile/retired-literals.js";
 import { clearCompileRefusal, saveCompileRefusal, saveGraph, stateDirName } from "../../graph/graph.js";
@@ -93,6 +95,15 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
     const uncovered = retiredLiteralErrors(g.tasks, cwd);
     if (uncovered.length > 0) {
       throw new CompileError(`${src} has uncovered declared pin obligations:\n${uncovered.map((line) => `  - ${line}`).join("\n")}${diagnostics}`);
+    }
+    // v2.5.9 T11 (OBS-1086): a shape whose pool the config denies in full is unroutable for every task
+    // that uses it; plan already said so, compile now refuses the seal before any state write so a dry
+    // run reaches the same refusal. Pool only: a partial deny leaves live members, and pin/prefer
+    // collisions on the default map stay doctor's and resume's business. Scoped to the graph's shapes.
+    const deadPools = denyPreferCollisions(loadConfig(cwd), g.tasks.map((task) => task.shape))
+      .filter((collision) => collision.kind === "pool");
+    if (deadPools.length > 0) {
+      throw new CompileError(`${src} routes a task shape to a fully denied pool:\n${deadPools.map((collision) => `  - ${denyPreferCollisionLine(collision)}`).join("\n")}${diagnostics}`);
     }
     // One bounded read supplies both cross-run surfaces: unresolved findings below and merge facts for
     // the ancestry check. Neither fact mutates the compiled graph; status and every readiness predicate

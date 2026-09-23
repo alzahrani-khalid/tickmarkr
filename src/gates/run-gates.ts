@@ -8,7 +8,7 @@ import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate } from "./acceptance.js";
-import { type Baseline, type RetryOptions, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
+import { type Baseline, type RetryOptions, type GateEvidenceOptions, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
 import { disallowedBy } from "../route/preference.js";
@@ -159,6 +159,7 @@ export type GateEvent =
   | { phase: "note"; gate: GateName; name: string; payload: Record<string, unknown>; result?: GateResult };
 
 export interface GateContext {
+  evidence?: GateEvidenceOptions;
   buildReceiptIdentity?: Omit<CommandReceiptAttribution, "invocation">;
   authorizeInfraRetry?: (subject: string, cause?: VerificationRetryCause) => boolean;
   verificationScope?: VerificationScope;
@@ -176,6 +177,8 @@ export interface GateContext {
   cfg: TickmarkrConfig;
   via?: GateVia; // v1.1: present → judge/review run as visible named agents through the driver
   carriedFindings?: readonly StructuredFinding[];
+  /** Approval reason bound to this attempt; guidance, never criterion or closure authority. */
+  operatorContext?: string;
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
   demotedReviewers?: Set<string>;
   // OBS-1025 add.2: run-scoped no-verdict causes per reviewer seat; a seat at two leaves the rotation for the run.
@@ -331,7 +334,7 @@ async function runVitestManifestGate(
   baseline: Baseline,
   selected: readonly string[] | undefined,
   artifactDir?: string,
-  retry: RetryOptions = {},
+  retry: RetryOptions & { evidence?: GateEvidenceOptions } = {},
   retried = false,
 ): Promise<GateResult> {
   const entry = baseline.commands.test;
@@ -340,21 +343,24 @@ async function runVitestManifestGate(
     longestFile: entry?.longestFile,
     overallCeilingMs: effectiveCeilingMs(entry),
     artifactDir,
+    evidence: retry.evidence,
   });
   const reportPath = outcome.reportPath;
+  const evidence = { evidenceReceipt: outcome.evidenceReceipt, evidenceReceipts: outcome.evidenceReceipts };
   if (!retried && retry.authorizeRetry && failureDisposition(outcome) === "infrastructure"
       && outcome.meta?.retryable !== false) {
     const waitedMs = await waitForCalmWindow(executionSignal());
-    if (!calmWindowReady()) return { gate: "test", pass: false, details: outcome.details,
+    if (!calmWindowReady()) return { ...evidence, gate: "test", pass: false, details: outcome.details,
       meta: { ...outcome.meta, reportPath, recoveryBlocked: "calm window unavailable within the existing wait ceiling" } };
     if (!retry.authorizeRetry("infra")) {
-      return { gate: "test", pass: false, details: outcome.details,
+      return { ...evidence, gate: "test", pass: false, details: outcome.details,
         meta: { ...outcome.meta, reportPath, recoveryBlocked: "infrastructure retry allowance exhausted or subject unavailable" } };
     }
     const result = await runVitestManifestGate(worktree, cmd, baseline, selected, artifactDir, retry, true);
-    return { ...result, meta: { ...result.meta, runnerInfraRerun: { count: 1, waitedMs, firstReportPath: reportPath } } };
+    return { ...result, evidenceReceipts: [...(outcome.evidenceReceipts ?? []), ...(result.evidenceReceipts ?? [])], meta: { ...result.meta, runnerInfraRerun: { count: 1, waitedMs, firstReportPath: reportPath } } };
   }
   return {
+    ...evidence,
     gate: "test",
     pass: outcome.pass,
     details: outcome.details,
@@ -380,6 +386,12 @@ export async function runGates(
   ctx: GateContext,
 ): Promise<{ results: GateResult[]; commits: string[] }> {
   const results: GateResult[] = [];
+  const evidence: GateEvidenceOptions = {
+    artifactDir: ctx.artifactDir,
+    runId: ctx.buildReceiptIdentity?.runId ?? ctx.artifactDir ?? "standalone",
+    taskId: task.id, attempt: ctx.buildReceiptIdentity?.attempt ?? 0,
+    ...ctx.evidence,
+  };
   // Receipt identity belongs to this round, never to a cached verdict. Each call from the shell
   // allocates a new invocation, including retries whose local spawn counter starts at one again.
   let currentBuild: CommandReceiptAttribution | undefined;
@@ -788,8 +800,8 @@ export async function runGates(
           // other scripted test command keeps today's exit-code contract byte-identically.
           const useManifest = g === "test" && commands.test !== undefined && isVitestTestCommand(commands.test, ctx.worktree);
           r = useManifest
-            ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir, retryOptions(identity)))
-            : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], { ...retryOptions(identity), ...(g === "build" ? { onReceipt: buildReceipt, taskBuildAttribution: beginBuild } : {}), ...(g === "test" && selected ? { selected } : {}) })))[0];
+            ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir, { ...retryOptions(identity), evidence }))
+            : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], { ...retryOptions(identity), evidence, ...(g === "build" ? { onReceipt: buildReceipt, taskBuildAttribution: beginBuild } : {}), ...(g === "test" && selected ? { selected } : {}) })))[0];
         } finally { await receiptNotes; }
       }
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
@@ -802,7 +814,7 @@ export async function runGates(
       if (!cached && r!.pass && commands[g]) {
         const dirt = await dirtyWorktree();
         if (dirt) {
-          await record(await dirtyRefusal(g, dirt, commands[g]!));
+          await record({ ...await dirtyRefusal(g, dirt, commands[g]!), evidenceReceipt: r!.evidenceReceipt, evidenceReceipts: r!.evidenceReceipts });
           return;
         }
       }
@@ -1041,7 +1053,7 @@ export async function runGates(
     const priorReviewers = [...(ctx.priorReviewers ?? []), ...(ctx.excludeReviewers ?? [])];
     const carriedAuthors = ctx.carriedAuthors ?? [];
     let exclusions = [...(ctx.excludeReviewers ?? []), ...retired];
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors));
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors, ctx.operatorContext));
     // OBS-193/574: an unparseable review verdict retries the REVIEW, preferring a different adapter. Only
     // a single-adapter eligible pool may fall back to another channel on the flaked adapter. The flaked
     // verdict never enters results; an exhausted pool preserves its cause.
@@ -1079,7 +1091,7 @@ export async function runGates(
       exclusions = [...exclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors,
+        retryVia, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
@@ -1238,8 +1250,8 @@ export async function runGates(
     if (!full) {
       const fullUsesManifest = ctx.commands.test !== undefined && isVitestTestCommand(ctx.commands.test, ctx.worktree);
       full = fullUsesManifest
-        ? await measure("test", () => runVitestManifestGate(ctx.worktree, ctx.commands.test!, ctx.baseline, undefined, ctx.artifactDir, retryOptions(identity)))
-        : (await measure("test", () => compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"], retryOptions(identity))))[0];
+        ? await measure("test", () => runVitestManifestGate(ctx.worktree, ctx.commands.test!, ctx.baseline, undefined, ctx.artifactDir, { ...retryOptions(identity), evidence }))
+        : (await measure("test", () => compareToBaseline(ctx.worktree, ctx.commands, ctx.baseline, ["test"], { ...retryOptions(identity), evidence })))[0];
     }
     fullDurationMs = spans.get("test") ? spans.get("test")!.durationMs - (selectedDurationMs ?? 0) : 0;
     const dirt = (!cached && full!.pass) ? await dirtyWorktree() : undefined;
@@ -1248,8 +1260,9 @@ export async function runGates(
       verdictStore.set(identity, { ...full, meta: { ...full.meta, source: "gate", runDir: ctx.artifactDir } });
     }
     const merged = withTelemetry(dirt
-      ? await dirtyRefusal("test", dirt, ctx.commands.test!)
+      ? { ...await dirtyRefusal("test", dirt, ctx.commands.test!), evidenceReceipt: full!.evidenceReceipt, evidenceReceipts: full!.evidenceReceipts }
       : { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } });
+    merged.evidenceReceipts = [...(heldTest?.evidenceReceipts ?? []), ...(full?.evidenceReceipts ?? [])];
     results[results.findIndex((r) => r.gate === "test")] = merged;
     heldTest = undefined;
     await ctx.onGate?.({ phase: "end", gate: "test", result: merged });

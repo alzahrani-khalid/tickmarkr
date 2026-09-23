@@ -98,9 +98,74 @@ const PrefBlockSchema = z.object({
   adapters: z.array(z.string()).optional(),
   models: z.array(z.string()).optional(),
 });
-const DenyBlockSchema = PrefBlockSchema.extend({
+// exported so a test can extend the PRODUCTION deny shape and watch the enumeration grow (OBS-1099 add.1)
+export const DenyBlockSchema = PrefBlockSchema.extend({
   workers: PrefBlockSchema.optional(),
 });
+
+// OBS-1099 add.1: every deny scope the schema accepts, DERIVED from DenyBlockSchema's shape — one
+// scope per string-array leaf, nested blocks walked. The reader, the fleet browser and the writer
+// all range over this list, so a list the schema gains is a scope the fleet edits: nothing repeats
+// the scopes by hand. routing.allow is not a deny scope (an exclusion by absence, never lifted).
+type DenyKeysOf<T, P extends string> = {
+  [K in keyof T & string]: NonNullable<T[K]> extends string[] ? `${P}${Capitalize<K>}`
+    : DenyKeysOf<NonNullable<T[K]>, `${P}${Capitalize<K>}`>;
+}[keyof T & string];
+export type DenyScopeKey = DenyKeysOf<z.infer<typeof DenyBlockSchema>, "deny">;
+export type DenyScope = {
+  /** the FleetEditable field: deny + the path segments capitalized (denyWorkersModels) */
+  key: DenyScopeKey;
+  /** the overlay path: ["routing", "deny", ...segments] */
+  path: string[];
+  /** the dotted config path the exclusion collector reports (routing.deny.workers.models) */
+  dotted: string;
+};
+export function denyScopesOf(
+  schema: z.ZodObject<z.ZodRawShape>,
+  segments: string[] = [],
+): Array<{ key: string; path: string[]; dotted: string }> {
+  const unwrap = (t: z.ZodTypeAny): z.ZodTypeAny => t instanceof z.ZodOptional ? unwrap(t.unwrap() as z.ZodTypeAny) : t;
+  return Object.entries(schema.shape).flatMap(([name, type]) => {
+    const inner = unwrap(type as z.ZodTypeAny);
+    const below = [...segments, name];
+    if (inner instanceof z.ZodObject) return denyScopesOf(inner as z.ZodObject<z.ZodRawShape>, below);
+    if (!(inner instanceof z.ZodArray)) return [];
+    const path = ["routing", "deny", ...below];
+    return [{ key: `deny${below.map((s) => s[0].toUpperCase() + s.slice(1)).join("")}`, path, dotted: path.join(".") }];
+  });
+}
+export const DENY_SCOPES: readonly DenyScope[] = denyScopesOf(DenyBlockSchema) as DenyScope[];
+/** the staged-set key the fleet browser uses for a scope: its key minus the `deny` prefix (denyWorkersAdapters → workersAdapters) */
+export type StagedDenyKey = DenyScopeKey extends `deny${infer Rest}` ? Uncapitalize<Rest> : never;
+export const stagedDenyKeyOf = (scope: DenyScope): StagedDenyKey =>
+  (scope.key[4].toLowerCase() + scope.key.slice(5)) as StagedDenyKey;
+/** the FleetApp prop that seeds one scope's staged set (initialDenyWorkersAdapters). Lives here, not in
+ * fleet-app.tsx, so the fleet command needs no runtime import of the Ink module (the print path must
+ * never load Ink, and chalk reads FORCE_COLOR at import time). */
+export type InitialDenyProps = { [K in DenyScopeKey as `initial${Capitalize<K>}`]?: string[] };
+export const initialDenyPropOf = (scope: DenyScope): keyof InitialDenyProps =>
+  `initial${scope.key[0].toUpperCase()}${scope.key.slice(1)}` as keyof InitialDenyProps;
+/** the authored list at one deny scope of a routing block, undefined when the scope is absent */
+export function denyEntriesAt(routing: TickmarkrConfig["routing"], scope: DenyScope): string[] | undefined {
+  let cur: unknown = routing;
+  for (const segment of scope.path.slice(1)) {
+    if (cur === undefined || cur === null || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[segment];
+  }
+  return Array.isArray(cur) ? (cur as string[]) : undefined;
+}
+/** a routing.deny block built from per-scope lists (absent or empty lists are left out) */
+export function denyBlockFrom(lists: Partial<Record<DenyScopeKey, string[]>>): NonNullable<TickmarkrConfig["routing"]["deny"]> {
+  const block: Record<string, unknown> = {};
+  for (const scope of DENY_SCOPES) {
+    const entries = lists[scope.key];
+    if (!entries?.length) continue;
+    let cur = block;
+    for (const segment of scope.path.slice(2, -1)) cur = (cur[segment] ??= {}) as Record<string, unknown>;
+    cur[scope.path[scope.path.length - 1]] = [...entries];
+  }
+  return block as NonNullable<TickmarkrConfig["routing"]["deny"]>;
+}
 
 // v1.20 REC-02: operator-maintained price table for the usage/cost report (src/report/cost.ts). Two
 // channel economics, never conflated (spec cost model): API = tokens × per-Mtok rate; sub = flat plan
@@ -946,16 +1011,14 @@ export type { FleetOverlayWrite } from "./fleet-overlay.js";
 
 export type FleetTierAssignment = { tier: Tier; provenance?: string };
 
-export type FleetEditable = {
+// OBS-1099 add.1: one string list per enumerated deny scope, keyed by DenyScopeKey. The flat
+// scopes are required; the rest stay optional so a pre-existing FleetEditable literal elsewhere
+// in the tree still type-checks — every reader/writer treats an absent list as empty.
+// OBS-994/FL-1: the workers scope is NEVER folded into the allow-complement (it is a raw literal
+// deny list, not a universe-derived membership scope).
+export type FleetEditable = Partial<Record<DenyScopeKey, string[]>> & {
   denyAdapters: string[];
   denyModels: string[];
-  // OBS-994/FL-1: the worker-only deny scope, read and written beside the flat (all-seats)
-  // scopes above — NEVER folded into the allow-complement (workers is not a universe-derived
-  // membership scope, it is a raw literal deny list). Optional so a pre-existing FleetEditable
-  // literal elsewhere in the tree (a fixture this task does not own) still type-checks; every
-  // reader/writer in this task treats an absent array as empty.
-  denyWorkersAdapters?: string[];
-  denyWorkersModels?: string[];
   // OBS-1046: the routing.allow complement over the discovered universe — adapter ids and
   // adapter:model keys the allow form does NOT admit — kept DISTINCT from the authored deny lists
   // above, so one Space press clears one reason and the writer keeps routing.allow while an
@@ -1019,8 +1082,9 @@ export function fleetEditableFromConfig(
       tiers[adapter][model] = { tier };
     }
   }
-  const denyAdapters = [...(cfg.routing.deny?.adapters ?? [])].sort();
-  const denyModels = [...(cfg.routing.deny?.models ?? [])].sort();
+  // every enumerated deny scope rides verbatim (sorted) under its own key
+  const denyLists = Object.fromEntries(DENY_SCOPES.map((scope) =>
+    [scope.key, [...(denyEntriesAt(cfg.routing, scope) ?? [])].sort()])) as Record<DenyScopeKey, string[]>;
   let allowOut: string[] | undefined;
   if (universe !== undefined) {
     const { allow } = cfg.routing;
@@ -1042,13 +1106,8 @@ export function fleetEditableFromConfig(
     allowOut = [...new Set([...adaptersOut, ...modelsOut])].sort();
   }
   return {
-    denyAdapters,
-    denyModels,
+    ...denyLists,
     ...(allowOut !== undefined ? { allowOut } : {}),
-    // OBS-994: workers-only deny is never folded into the all-seats complement above — it is
-    // returned verbatim beside the flat scopes so the fleet browser can show and toggle it.
-    denyWorkersAdapters: [...(cfg.routing.deny?.workers?.adapters ?? [])].sort(),
-    denyWorkersModels: [...(cfg.routing.deny?.workers?.models ?? [])].sort(),
     tiers,
     map: structuredClone(cfg.routing.map),
     floors: { ...cfg.routing.floors },
@@ -1090,10 +1149,7 @@ export function formatFleetPrint(repoRoot: string, opts: { globalDir?: string } 
       node.comment = ` ${fleetKeyLayer(repoRoot, dotted, opts)}`;
     }
   };
-  if (effective.routing.deny?.adapters !== undefined) annotate(["routing", "deny", "adapters"]);
-  if (effective.routing.deny?.models !== undefined) annotate(["routing", "deny", "models"]);
-  if (effective.routing.deny?.workers?.adapters !== undefined) annotate(["routing", "deny", "workers", "adapters"]);
-  if (effective.routing.deny?.workers?.models !== undefined) annotate(["routing", "deny", "workers", "models"]);
+  for (const scope of DENY_SCOPES) if (denyEntriesAt(effective.routing, scope) !== undefined) annotate(scope.path);
   for (const shape of Object.keys(effective.routing.map)) annotate(["routing", "map", shape]);
   annotate(["routing", "floors"]);
   for (const [adapter, entry] of Object.entries(effective.tiers)) {

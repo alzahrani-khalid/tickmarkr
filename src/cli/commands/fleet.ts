@@ -5,15 +5,18 @@ import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthE
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
 import { CATALOG_REFRESH_TIMEOUT_MS, formatCatalogRefreshLegs, type CatalogFetcher, type CatalogModelEvidence, type CatalogReadResult, readCachedCatalog, refreshCatalogCommand } from "../../adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
-import type { WorkerAdapter } from "../../adapters/types.js";
+import type { BillingChannel, WorkerAdapter } from "../../adapters/types.js";
 import {
   fleetEditableFromConfig,
   fleetEditableEquals,
   formatFleetPrint,
   globalConfigDir,
+  DENY_SCOPES,
+  initialDenyPropOf,
   loadConfigWithMode,
   overlayBytesLoadError,
   readOverlayFile,
+  stagedDenyKeyOf,
   renderFleetOverlayWrite,
   repoOverlayPath,
   ROUTING_MODES,
@@ -34,11 +37,13 @@ import { route } from "../../route/router.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, entryMatchesChannel, exclusionCollector } from "../../route/preference.js";
 import { resolveRunMode, type ResolvedRunMode } from "../../run/daemon.js";
 import { loadRoutingProfile } from "../../run/journal.js";
+// type-only: the Ink module must never load on the print path (nor before the TTY/FORCE_COLOR fixture)
 import type {
   FleetEditorResult,
   FleetEditorState,
   FleetModelEvidence,
   FleetOverlayReview,
+  FleetStagedDeny,
   FleetSteeringKey,
 } from "../../tui/ink/fleet-app.js";
 
@@ -410,15 +415,15 @@ export async function assembleFleetEditor(
   // leaves the picker immediately and one toggled back in reappears without a relaunch (both
   // directions exact — the on-disk scopes would otherwise pre-filter the pool at startup and lie
   // until restart).
-  type StagedDeny = { adapters: string[]; models: string[]; workersAdapters: string[]; workersModels: string[]; allowOut?: string[] };
+  // OBS-1099 add.1: the staged deny lists travel one per schema-enumerated scope, never four hand fields
+  type StagedDeny = FleetStagedDeny;
+  const stagedDenyOf = (editable: FleetEditable): StagedDeny =>
+    Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), editable[scope.key] ?? []])) as StagedDeny;
   const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny): FleetEditable => ({
     ...structuredClone(initial),
-    denyAdapters: deny.adapters,
-    denyModels: deny.models,
+    ...Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, deny[stagedDenyKeyOf(scope)]])),
     // OBS-1046: the allow complement is staged beside the deny lists, never folded into them
     allowOut: deny.allowOut ?? initial.allowOut,
-    denyWorkersAdapters: deny.workersAdapters,
-    denyWorkersModels: deny.workersModels,
     map,
   });
   // LEG2-T3 finding 2: a preview is the config loader over the candidate bytes the writer would
@@ -686,17 +691,34 @@ export async function assembleFleetEditor(
     const floor = cfgPreview.routing.floors[shape];
     const collisions = denyPreferCollisions(cfgPreview, [shape]);
     const discovered = new Set(previewChannels.map((c) => `${c.adapter}:${c.model}`));
-    // discovery already dropped a channel whose model probe failed — it still gets its own row
-    const unauthedRows = [
-      ...unauthedClis.map((adapter) => `${adapter} — CLI unauthed — re-probe with tickmarkr doctor`),
-      ...unauthedModels.filter(({ key }) => !discovered.has(key))
-        .map(({ key, reason }) => `${key.replace(":", "/")} — unauthed (${reason}) — re-probe with tickmarkr doctor`),
-    ];
-    return [...unauthedRows, ...previewChannels.flatMap((c) => {
+    // T2 review (D-225): discovery already dropped a channel whose model probe failed — it is
+    // rebuilt as a structured channel from its adapter's own declaration and walks the SAME
+    // reach + collector path as every other row, the auth reason appended LAST; never a bare string
+    const withIdentity = (adapter: string, declared: BillingChannel) => {
+      const identity = health[adapter]?.modelAuth?.[declared.model]?.identity ?? health[adapter]?.modelIdentities?.[declared.model];
+      return identity ? { ...declared, identity } : declared;
+    };
+    const failedProbes = unauthedModels.filter(({ key }) => !discovered.has(key)).flatMap(({ key, adapter, reason }) => {
+      const declared = adapters.find((a) => a.id === adapter)?.channels(cfg).find((c) => `${c.adapter}:${c.model}` === key);
+      return declared ? [{ ...withIdentity(adapter, declared), authReason: `unauthed (${reason}) — re-probe with tickmarkr doctor` }] : [];
+    });
+    // T2 review round 6: an installed-but-unauthed CLI is dropped by discovery AND by the model
+    // probe list, so its configured channels are rebuilt from the adapter's own declaration too —
+    // each greys with its reach and covering entry, the CLI auth reason last; never one bare adapter line
+    const unauthedCliChannels = unauthedClis.flatMap((adapter) => (adapters.find((a) => a.id === adapter)?.channels(cfg) ?? [])
+      .map((declared) => ({ ...withIdentity(adapter, declared), authReason: `${adapter} CLI unauthed — re-probe with tickmarkr doctor` })));
+    // D-225: the ledger is the EXCLUDED half of a closed partition — a channel the picker offers
+    // never greys beside itself; its pin/pool/floor/prefer captions stay in excludedNote
+    const ledgerChannels = [...previewChannels.map((c) => ({ ...c, authReason: undefined as string | undefined })), ...failedProbes, ...unauthedCliChannels]
+      .filter((c) => !offered.has(`${c.adapter}:${c.model}`));
+    return ledgerChannels.flatMap((c) => {
       const key = `${c.adapter}:${c.model}`;
       const reasons = exclusionCollector(c, cfgPreview.routing, "worker").map(exclusionReason);
-      if (health[c.adapter]?.authed === false) reasons.push(`${c.adapter} CLI unauthed — re-probe with tickmarkr doctor`);
-      else if (health[c.adapter]?.modelAuth?.[c.model]?.authed === false) reasons.push("unauthed — re-probe with tickmarkr doctor");
+      // OBS-1065: a greyed picker row carries its reach beside its reasons, like the models view
+      const allSeats = exclusionCollector(c, cfgPreview.routing, "judge");
+      const reach = allSeats.some((scope) => scope.by === "deny") ? "out all"
+        : allSeats.length ? "out allow" : reasons.length ? "out workers" : "in";
+      if (!c.authReason && health[c.adapter]?.modelAuth?.[c.model]?.authed === false) reasons.push("unauthed — re-probe with tickmarkr doctor");
       if (entry?.pin && key !== `${entry.pin.via}:${entry.pin.model}`) {
         reasons.push(`not routing.map.${shape}.pin (${entry.pin.via}:${entry.pin.model}) — not manageable here`);
       }
@@ -713,9 +735,10 @@ export async function assembleFleetEditor(
         const named = collision.detail.split(" > ").some((p) => entryMatchesChannel(p, c));
         if (named || offered.size === 0) reasons.push(denyPreferCollisionLine(collision));
       }
+      if (c.authReason) reasons.push(c.authReason);
       // labelled like the models view's row (adapter/model), so a ledger row never reads as a candidate
-      return reasons.length ? [`${c.adapter}/${c.model} — ${reasons.join("; ")}`] : [];
-    })];
+      return reasons.length ? [`${c.adapter}/${c.model} — reach: ${reach} — ${reasons.join("; ")}`] : [];
+    });
   };
   const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) => {
     const preview = previewCfg(mode, map, deny);
@@ -725,6 +748,8 @@ export async function assembleFleetEditor(
       id: `${candidate.assignment.adapter}:${candidate.assignment.model}`,
       label: candidateRow(candidate, cfg.pricing),
       pin: { via: candidate.assignment.adapter, model: candidate.assignment.model },
+      // OBS-1065: a picker lift reads eligibility from here, not the ledger strings
+      belowFloor: candidate.belowFloor,
     }));
     const offered = new Set(rows.map((row) => row.id));
     const notes = [excludedNoteFor(cfgPreview), ...shapeExclusionCaptions(shape, map, cfgPreview)].filter(
@@ -755,12 +780,9 @@ export async function assembleFleetEditor(
   let pendingWrite: FleetOverlayWrite | null = null;
   const reviewOverlay = (state: FleetEditorState): FleetOverlayReview => {
     const staged = structuredClone(initial) as FleetEditable;
-    staged.denyAdapters = state.denyAdapters;
-    staged.denyModels = state.denyModels;
+    // OBS-994/FL-1, OBS-1099 add.1: every schema-enumerated deny scope rides the same review/write funnel
+    for (const scope of DENY_SCOPES) staged[scope.key] = state[scope.key];
     staged.allowOut = state.allowOut ?? initial.allowOut;
-    // OBS-994/FL-1: the workers-only deny scope rides the same review/write funnel as the flat one.
-    staged.denyWorkersAdapters = state.denyWorkersAdapters;
-    staged.denyWorkersModels = state.denyWorkersModels;
     staged.map = state.map;
     const today = new Date().toISOString().slice(0, 10);
     for (const classification of state.classifications) {
@@ -815,11 +837,8 @@ export async function assembleFleetEditor(
     ageMs: doctorAgeMs(cwd),
     adapters,
     health,
-    initialDenyAdapters: editable.denyAdapters,
-    initialDenyModels: editable.denyModels,
+    ...Object.fromEntries(DENY_SCOPES.map((scope) => [initialDenyPropOf(scope), editable[scope.key] ?? []])),
     initialAllowOut: editable.allowOut,
-    initialDenyWorkersAdapters: editable.denyWorkersAdapters,
-    initialDenyWorkersModels: editable.denyWorkersModels,
     modelGroups,
     initialMode: rm.mode.mode,
     modeOptions: ROUTING_MODES.map((mode) => ({ id: mode, gloss: MODE_GLOSS[mode] })),
@@ -878,11 +897,6 @@ export async function assembleFleetEditor(
   return {
     props,
     commit,
-    renderWhy: () => renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map, {
-      adapters: editable.denyAdapters,
-      models: editable.denyModels,
-      workersAdapters: editable.denyWorkersAdapters ?? [],
-      workersModels: editable.denyWorkersModels ?? [],
-    })),
+    renderWhy: () => renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map, stagedDenyOf(editable))),
   };
 }

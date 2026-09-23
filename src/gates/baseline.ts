@@ -1,5 +1,8 @@
-import { existsSync, readFileSync } from "node:fs";
-import { availableParallelism, loadavg } from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { type EvidenceArtifact, type GateEvidenceReceipt, type ShellReceipt } from "../run/protocol.js";
+import { existsSync, readFileSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, rmdirSync } from "node:fs";
+import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
@@ -20,7 +23,131 @@ import { isVitestTestCommand, manifestFileCount } from "./test-manifest.js";
 declare module "./types.js" {
   interface GateResult {
     capacity?: RunCapacity;
+    evidenceReceipt?: GateEvidenceReceipt;
+    evidenceReceipts?: GateEvidenceReceipt[];
   }
+}
+
+/** Evidence is observational: the command verdict never depends on this store. */
+export interface GateEvidenceOptions {
+  artifactDir?: string;
+  runId?: string;
+  taskId?: string;
+  attempt?: number;
+  subjectCommit?: string;
+  quotaBytes?: number;
+  env?: NodeJS.ProcessEnv;
+  /** Injectable storage boundary; mandatory manifest/reporter writes do not use it. */
+  write?: (path: string, bytes: Buffer) => void;
+}
+export const EVIDENCE_TAIL_BYTES = 16 * 1024;
+export const EVIDENCE_RUN_QUOTA_BYTES = 8 * 1024 * 1024;
+
+export function redactGateOutput(text: string, env: NodeJS.ProcessEnv): string {
+  // One pass over the original bytes: replacing an environment value must not break a token
+  // recognizer, and a short environment value must not rewrite the redaction marker itself.
+  // Short operational values (0, true, vi, test) occur throughout ordinary diagnostics.
+  // Only secret-named keys justify redacting short values.
+  const values = [...new Set(Object.entries(env)
+    .filter(([key, value]) => !!value && (value.length >= 8 || /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(key)))
+    .map(([, value]) => value!))]
+    .sort((a, b) => b.length - a.length).map(v => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const tokens = String.raw`\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b`;
+  const assignments = String.raw`(?:authorization\s*:\s*bearer|(?:api[_-]?key|token|password|secret)\s*[:=])\s*[^\s"']+`;
+  return text.replace(new RegExp([tokens, assignments, ...values].join("|"), "gi"), "[REDACTED]");
+}
+
+/** Resolve a snapshot reference against actual bytes: eviction never fabricates a live artifact. */
+export function resolveEvidenceArtifact(root: string, ref: EvidenceArtifact): EvidenceArtifact {
+  if (ref.availability !== "available") return ref;
+  if (ref.path.startsWith("/") || ref.path.includes("\\") || ref.path.split("/").includes("..")) return { ...ref, availability: "missing" };
+  try {
+    const bytes = readFileSync(join(root, ref.path));
+    return bytes.length === ref.retainedBytes && createHash("sha256").update(bytes).digest("hex") === ref.sha256
+      ? ref : { ...ref, availability: "missing" };
+  } catch { return { ...ref, availability: "missing" }; }
+}
+
+export function beginGateEvidence(cwd: string, gate: string, command: string, opts: GateEvidenceOptions = {}, nonce?: string) {
+  let invocationId = nonce ?? randomUUID();
+  let artifactId = /^[a-zA-Z0-9-]+$/.test(invocationId) ? invocationId : createHash("sha256").update(invocationId).digest("hex");
+  let subjectCommit = opts.subjectCommit ?? null;
+  if (!subjectCommit) {
+    try { subjectCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { /* unknown subject */ }
+  }
+  const root = opts.artifactDir ?? join(tmpdir(), "tickmarkr-gate-evidence", createHash("sha256").update(cwd).digest("hex"));
+  const env = { ...process.env, ...opts.env };
+  for (const match of command.matchAll(/(?:^|\s)[A-Za-z_][A-Za-z_0-9]*=(?:'([^']*)'|"([^"$]*)"|([^\s;&|]+))/g)) {
+    env[`assignment_${match.index}`] = match[1] ?? match[2] ?? match[3];
+  }
+  let observed: ShellReceipt | undefined;
+  let pendingId: string | undefined;
+  const history: GateEvidenceReceipt[] = [];
+  return {
+    root, history,
+    observe(receipt: ShellReceipt) {
+      if (pendingId) {
+        history.push(this.finish());
+        invocationId = pendingId; artifactId = pendingId; pendingId = undefined;
+      }
+      observed = receipt;
+      // A shell-internal pre-spawn retry receives an id before it executes too. Keep the failed
+      // attempt current until a later observation proves that the shell actually tried again.
+      if (receipt.outcome === "spawn-failed") pendingId = randomUUID();
+    },
+    finish(stdout = "", stderr = ""): GateEvidenceReceipt {
+      const termination: GateEvidenceReceipt["termination"] = {
+        kind: !observed ? "unknown" : !observed.confirmedStart ? "not-started" : observed.outcome === "timed-out" ? "timeout" : observed.signal ? "signal" : observed.exitCode != null ? "exit" : "unknown",
+        exitCode: observed?.exitCode ?? null, signal: observed?.signal ?? null,
+        timedOut: observed ? observed.outcome === "timed-out" : null,
+      };
+      const clean = [redactGateOutput(stdout, env), redactGateOutput(stderr, env)];
+      const refs = clean.map((text, i): EvidenceArtifact => {
+        const bytes = Buffer.from(text);
+        const tail = bytes.subarray(-EVIDENCE_TAIL_BYTES);
+        return { path: `gate-evidence/${artifactId}-${i === 0 ? "stdout" : "stderr"}.log`,
+          availability: termination.kind === "not-started" ? "not-started" : "available",
+          sha256: termination.kind === "not-started" ? null : createHash("sha256").update(tail).digest("hex"), retainedBytes: tail.length,
+          droppedBytes: bytes.length - tail.length, truncated: bytes.length > tail.length };
+      });
+      let availability: GateEvidenceReceipt["availability"] = termination.kind === "not-started" ? "not-started" : "available";
+      if (availability === "available") {
+        let lock: string | undefined;
+        try {
+          const dir = join(root, "gate-evidence");
+          mkdirSync(dir, { recursive: true });
+          mkdirSync(join(dir, ".write-lock"));
+          lock = join(dir, ".write-lock");
+          const quota = opts.quotaBytes !== undefined && Number.isFinite(opts.quotaBytes)
+            ? Math.max(0, Math.floor(opts.quotaBytes)) : EVIDENCE_RUN_QUOTA_BYTES;
+          const files = readdirSync(dir).filter(f => /^[a-zA-Z0-9-]+-(stdout|stderr)\.log$/.test(f)).map(f => ({ path: join(dir, f), stat: statSync(join(dir, f)) }))
+            .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs || a.path.localeCompare(b.path));
+          let total = files.reduce((sum, f) => sum + f.stat.size, 0);
+          const incoming = refs.reduce((sum, ref) => sum + ref.retainedBytes, 0);
+          if (incoming > quota) throw new Error("evidence quota cannot retain this invocation");
+          while (files.length && total + incoming > quota) {
+            const oldest = files.shift()!;
+            unlinkSync(oldest.path); total -= oldest.stat.size;
+          }
+          for (const [i, ref] of refs.entries()) {
+            (opts.write ?? writeFileSync)(join(root, ref.path), Buffer.from(clean[i]!).subarray(-EVIDENCE_TAIL_BYTES));
+          }
+        } catch {
+          availability = "capture-failed";
+          for (const ref of refs) {
+            ref.availability = "capture-failed";
+            ref.sha256 = null;
+            try { unlinkSync(join(root, ref.path)); } catch { /* best effort cleanup */ }
+          }
+        } finally {
+          if (lock) { try { rmdirSync(lock); } catch { /* observational cleanup */ } }
+        }
+      }
+      return { invocationId, ...(nonce ? { nonce } : {}),
+        subject: { runId: opts.runId ?? "standalone", taskId: opts.taskId ?? null, attempt: opts.attempt ?? null, gate, subjectCommit },
+        termination, availability, redaction: { material: clean[0] !== stdout || clean[1] !== stderr }, stdout: refs[0]!, stderr: refs[1]! };
+    },
+  };
 }
 
 export interface BaselineCommand {
@@ -76,6 +203,8 @@ export interface BaselineFileDuration {
 }
 
 export interface Baseline {
+  /** Observational capture receipts stay outside the forgiveness-bearing command entries. */
+  evidenceReceipts?: Record<string, GateEvidenceReceipt>;
   commands: Record<string, BaselineCommand>;
   warnings?: BaselineWarning[];
 }
@@ -588,6 +717,7 @@ export function staleFileCountCommands(baseline: Baseline, commands: Record<stri
 }
 
 export interface BaselineReceiptOptions {
+  evidence?: GateEvidenceOptions;
   onReceipt?: ShellOptions["onReceipt"];
   /** Only comparison's build command may carry task-build identity; capture never does. */
   taskBuildAttribution?: ShellOptions["receiptAttribution"];
@@ -599,7 +729,9 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
     if (name === "tipTest" && commands.test !== undefined && cmd === commands.test) {
       continue;
     }
-    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS, { onReceipt: opts.onReceipt });
+    const evidence = beginGateEvidence(cwd, name, cmd, opts.evidence);
+    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS, { env: opts.evidence?.env, onReceipt: receipt => { evidence.observe(receipt); opts.onReceipt?.(receipt); } });
+    (base.evidenceReceipts ??= {})[name] = evidence.finish(r.stdout, r.stderr);
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
     // ponytail: a capture that was itself killed records the ceiling as its "measurement", which
     // scales the next ceiling up — the right direction for a suite that never finished once.
@@ -764,15 +896,34 @@ export async function compareToBaseline(
     }
     const entry = baseline.commands[name];
     const ceilingMs = effectiveCeilingMs(entry);
-    const r = await sh(cmd, cwd, ceilingMs, {
-      onReceipt: opts.onReceipt,
-      ...(name === "build" ? { receiptAttribution: opts.taskBuildAttribution } : {}),
-    });
+    const evidence = beginGateEvidence(cwd, name, cmd, opts.evidence);
+    let r: ShResult;
+    try {
+      r = await sh(cmd, cwd, ceilingMs, {
+        env: opts.evidence?.env,
+        onReceipt: receipt => { evidence.observe(receipt); opts.onReceipt?.(receipt); },
+        ...(name === "build" ? { receiptAttribution: opts.taskBuildAttribution } : {}),
+      });
+    } catch (error) {
+      const evidenceReceipt = evidence.finish();
+      // A launch refusal is infrastructure; cancellation and other thrown control flow still unwind.
+      if (evidenceReceipt.termination.kind !== "not-started" || executionSignal()?.aborted) throw error;
+      results.push({ gate: name, pass: false, details: `infra; command failed to launch: ${String(error)}`,
+        meta: { classification: "infra", infra: true }, evidenceReceipt, evidenceReceipts: [...evidence.history, evidenceReceipt] });
+      continue;
+    }
+    const evidenceReceipt = evidence.finish(r.stdout, r.stderr);
+    if (evidenceReceipt.termination.kind === "not-started") {
+      results.push({ gate: name, pass: false, details: `infra; command failed to launch: ${r.stderr}`,
+        meta: { classification: "infra", infra: true }, evidenceReceipt, evidenceReceipts: [...evidence.history, evidenceReceipt] });
+      continue;
+    }
     // T7: every verdict below carries the capacity ITS OWN command ran under, taken off the shell
     // result rather than re-derived after the fact. The skip row above ran no command and therefore
     // states no capacity — a row that never divided the machine must not claim that it did.
     let recoveryBlocked: string | undefined;
     const record = (g: GateResult): void => {
+      g = { ...g, evidenceReceipt, evidenceReceipts: [...evidence.history, evidenceReceipt] };
       if (recoveryBlocked) g = { ...g, meta: { ...g.meta, recoveryBlocked } };
       const withReap = r.reapedGroup ? { ...g, meta: { ...g.meta, reapedGroup: true } } : g;
       const withReapError = r.reapError ? { ...withReap, meta: { ...withReap.meta, reapError: r.reapError } } : withReap;
@@ -862,7 +1013,7 @@ export async function compareToBaseline(
         recoveryBlocked = "infrastructure retry allowance exhausted or subject unavailable";
       } else {
         const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
-        results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, infraRerun: provenance }));
+        results.push(...(await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, infraRerun: provenance })).map(row => ({ ...row, evidenceReceipts: [...evidence.history, evidenceReceipt, ...(row.evidenceReceipts ?? [])] })));
         continue;
       }
     }
@@ -879,7 +1030,7 @@ export async function compareToBaseline(
         // Compatibility with OBS-896, not an infrastructure reclassification: a persistent
         // timeout remains the ordinary conservative verdict after the single bounded remeasure.
         const provenance = { durationMs: r.durationMs ?? 0, referenceMs: entry?.durationMs ?? 0, waitedMs };
-        results.push(...await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, rerunOf: provenance }));
+        results.push(...(await compareToBaseline(cwd, { [name]: cmd }, baseline, [name], { ...opts, rerunOf: provenance })).map(row => ({ ...row, evidenceReceipts: [...evidence.history, evidenceReceipt, ...(row.evidenceReceipts ?? [])] })));
         continue;
       }
     }

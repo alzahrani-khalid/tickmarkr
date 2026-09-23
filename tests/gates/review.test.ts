@@ -17,7 +17,7 @@ import { fetchTaskDiff, isReviewClosureMismatch, matchClosureId, modelProvider, 
 import { extractJson } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
-import { structuredFindings, type StructuredFinding, deriveSignalBasis } from "../../src/run/journal.js";
+import { structuredFindings, carryReviewFindings, observedReviewFingerprints, outstandingReviewFindings, type JournalEvent, type StructuredFinding, deriveSignalBasis } from "../../src/run/journal.js";
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -990,8 +990,12 @@ describe("reviewGate material/minor classification (v1.70 T5)", () => {
     const r = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
     expect(r.pass).toBe(false);
     expect(r.details).toContain("off-by-one drops the last row");
-    // fails closed the same way a legacy request-changes verdict does: pass:false + the reviewer channel
-    expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-2", reviewerTier: "frontier", vendor: "fake-b", provider: "fake-b", reviewerFloor: "frontier", reviewerFloorCause: "author-tier" });
+    // Blocking verdicts retain the reviewer channel and now carry their structured findings.
+    expect(r.meta).toEqual({
+      policy: "full", reviewer: "fake:fake-2", reviewerTier: "frontier", vendor: "fake-b", provider: "fake-b",
+      reviewerFloor: "frontier", reviewerFloorCause: "author-tier",
+      findings: structuredFindings("review", "- [material] off-by-one drops the last row\n- [minor] minor spacing"),
+    });
   });
 
   test("a deferred finding is carried into the gate's recorded details with its rationale rather than silently dropped", async () => {
@@ -1157,6 +1161,60 @@ test("reviewer failover receives the same carried materials and must close them"
   expect(results[0].meta?.resolved).toEqual(ids);
 });
 
+
+async function blockingReviewFindings(note: string, paths: string[] = []) {
+  const { repo, base } = repoWithCommit();
+  const result = await reviewGate(mkTask(), repo, base, author, CH,
+    [fakeWith({ review: {
+      findings: [{ note, severity: "material" }],
+      comments: paths.map((path, i) => ({ path, line: i + 1, body: "Repair the defect here." })),
+    } })], DEFAULT_CONFIG);
+  expect(result.pass).toBe(false);
+  expect(Array.isArray(result.meta?.findings)).toBe(true);
+  return { result, findings: result.meta!.findings as StructuredFinding[] };
+}
+
+test("test: a material finding whose note names no path takes the verdict's comment path when every comment anchors one distinct path, so a finding left unidentified beside a single anchored path fails", async () => {
+  const note = "`select` loses the selected identity after prepend.";
+  for (const paths of [["src/mark.ts"], ["src/mark.ts", "src/mark.ts"], ["./src/mark.ts", "src/mark.ts"]]) {
+    const { findings } = await blockingReviewFindings(note, paths);
+    expect(findings.filter((finding) => finding.class === "review:material")).toEqual([{
+      class: "review:material", path: "src/mark.ts", symbol: "select", note,
+      fingerprint: "review:material|src/mark.ts|select",
+    }]);
+  }
+});
+
+test("test: a pathless finding on a verdict anchoring two distinct comment paths or no comment stays unidentified, so a fingerprint that guesses the first comment fails", async () => {
+  const note = "`select` loses the selected identity after prepend.";
+  for (const paths of [["src/mark.ts", "src/other.ts"], ["src/other.ts", "src/mark.ts"], ["src/mark.ts", "src/other file.ts"], []]) {
+    const { findings } = await blockingReviewFindings(note, paths);
+    expect(findings.filter((finding) => finding.class === "review:material")).toEqual([{
+      class: "review:material", path: "<unidentified>", symbol: "select", note,
+      fingerprint: "review:material|<unidentified>|select",
+    }]);
+  }
+});
+
+test("test: a finding whose note names its own path keeps it over a different single comment path, so a comment path overriding the note's own evidence fails", async () => {
+  const note = "src/own.ts `select` loses the selected identity after prepend.";
+  const { findings } = await blockingReviewFindings(note, ["src/other.ts"]);
+  expect(findings.filter((finding) => finding.class === "review:material"))
+    .toEqual(structuredFindings("review", `- [material] ${note}`));
+});
+
+test("test: a blocking initial verdict carrying no reraised prior still yields verdict derived findings on the result's meta in the form the daemon writer lifts, so a first row that falls back to details parsing fails", async () => {
+  const note = "`select` loses the selected identity after prepend.";
+  const { result, findings } = await blockingReviewFindings(note, ["src/mark.ts"]);
+  expect(result.meta).not.toHaveProperty("reraised");
+  expect(findings).toHaveLength(2);
+  expect(findings[0]).toEqual({
+    class: "review:material", path: "src/mark.ts", symbol: "select", note,
+    fingerprint: "review:material|src/mark.ts|select",
+  });
+  expect(findings[1]).toMatchObject({ class: "review:anchored", path: "src/mark.ts" });
+  expect(findings).not.toEqual(structuredFindings("review", result.details));
+});
 
 test("a re-raised material restated in findings keeps its original failure brief exactly once", async () => {
   const { repo, base } = repoWithCommit();
@@ -1349,4 +1407,478 @@ describe("review closure ids and the brief's copy block (OBS-1068)", () => {
     expect(line).toBe(`Fingerprint: ${fp}`);
     expect(matchClosureId(line, [fp])).toBe(fp);
   });
+});
+
+
+// Mirror the daemon's existing findings/resolved/reraised lift: lineage must survive this seam.
+const lineageEvent = (findings: StructuredFinding[], extra: Record<string, unknown> = {}): JournalEvent => ({
+  ts: "2026-09-22T00:00:00Z", event: "gate-result", taskId: "T15",
+  data: { gate: "review", pass: false, findings, ...extra },
+});
+const lineageFinding = (path: string, defect = "drops selection"): StructuredFinding =>
+  structuredFindings("review", `- [material] ${path} \`renderRow\` ${defect}.`)[0]!;
+const lineageReview = async (carriedFindings: StructuredFinding[], verdict: Record<string, unknown>) => {
+  const { repo, base } = repoWithCommit();
+  return (await runGates({ ...mkTask(), gates: ["review"] }, {
+    worktree: repo, baseRef: base, author, channels: CH, adapters: [fakeWith({ review: verdict })], cfg: DEFAULT_CONFIG,
+    commands: {}, baseline: { commands: {} }, result: { ok: true, summary: "repaired", deviations: [] }, carriedFindings,
+  })).results[0]!;
+};
+
+test("a same-path reworded restatement carrying reraised stays one chain", async () => {
+  const prior = lineageFinding("src/a.ts");
+  const restated = lineageFinding(prior.path, "still loses the selected row on refresh");
+  expect(restated.fingerprint).toBe(prior.fingerprint);
+  expect(restated.note).not.toBe(prior.note);
+  const prompt = promptSection(await captureReviewPrompt(mkTask(), [prior]), "Prior materials this attempt must close");
+  expect(prompt).toContain('For every findings entry that restates a reraised prior, whether at the same path or a new path, set its "reraised" field to the copied id');
+  const result = await lineageReview([prior], {
+    findings: [{ note: restated.note, severity: "material", reraised: prior.fingerprint }],
+    resolved: [], reraised: [prior.fingerprint],
+  });
+  expect(result.meta?.cause).toBeUndefined();
+  expect(result.meta?.findings).toEqual([{ ...restated, reraisedFrom: prior.fingerprint }]);
+  const carried = outstandingReviewFindings([
+    lineageEvent([prior]),
+    lineageEvent(result.meta!.findings as StructuredFinding[], {
+      resolved: result.meta!.resolved, reraised: result.meta!.reraised,
+    }),
+  ], "T15");
+  expect(carried).toEqual([{ ...restated, reraisedFrom: prior.fingerprint }]);
+  const block = renderPriorMaterials(carried);
+  expect(block.match(/^\d+\. /gm)).toHaveLength(1);
+  expect(block.split(`Fingerprint: ${prior.fingerprint}`).length - 1).toBe(1);
+  expect(block).toContain(restated.note);
+  expect(block).not.toContain(prior.note);
+});
+
+const movedLineage = async (path = "src/new.ts") => {
+  const old = lineageFinding("src/old.ts");
+  const current = lineageFinding(path);
+  const result = await lineageReview([old], {
+    findings: [{ note: current.note, severity: "material", reraised: `Fingerprint: ${old.fingerprint}` }],
+    resolved: [], reraised: [old.fingerprint],
+  });
+  const events = [lineageEvent([old]), lineageEvent(result.meta!.findings as StructuredFinding[], {
+    resolved: result.meta!.resolved, reraised: result.meta!.reraised,
+  })];
+  return { old, current, result, events, carried: outstandingReviewFindings(events, "T15") };
+};
+
+test("test: a carried open finding is linked to a new row at another path only through the reviewer's validated reraised id or an unambiguously resolved code identity and is then carried once at the newest path, so a chain split into two fingerprints or fused by symbol spelling alone fails", async () => {
+  const pathless = structuredFindings("review", "- [material] `renderRow` drops selection.")[0]!;
+  const anchored = await lineageReview([pathless], {
+    findings: [{ note: pathless.note, severity: "material", reraised: pathless.fingerprint }],
+    comments: [{ path: "src/anchored.ts", line: 12, body: "selection is lost here" }],
+    resolved: [], reraised: [pathless.fingerprint],
+  });
+  const anchoredCarry = outstandingReviewFindings([
+    lineageEvent([pathless]), lineageEvent(anchored.meta!.findings as StructuredFinding[]),
+  ], "T15").filter((finding) => finding.class === "review:material");
+  expect(anchoredCarry).toMatchObject([{ path: "src/anchored.ts", reraisedFrom: pathless.fingerprint }]);
+  expect(anchoredCarry).toHaveLength(1);
+  for (const path of ["src/new.ts", "<unidentified>"]) {
+    const { old, current, result, events, carried } = await movedLineage(path);
+    expect(result.pass).toBe(false);
+    expect(result.meta?.findings).toHaveLength(1);
+    expect(carried).toHaveLength(1);
+    expect(carried[0]).toMatchObject({ path, fingerprint: current.fingerprint, reraisedFrom: old.fingerprint });
+    expect(new Set(carried[0]!.observedFingerprints)).toEqual(new Set([old.fingerprint, current.fingerprint]));
+    expect(outstandingReviewFindings([...events, events[1]!], "T15")).toHaveLength(1);
+    // Without a per-row validated echo, symbol spelling is insufficient, even with one reraised id.
+    const ambiguous = await lineageReview([old], {
+      findings: [{ note: current.note, severity: "material" }], resolved: [], reraised: [old.fingerprint],
+    });
+    expect(outstandingReviewFindings([events[0]!, lineageEvent(ambiguous.meta!.findings as StructuredFinding[])], "T15")).toHaveLength(2);
+    const unvalidated = await lineageReview([old], {
+      findings: [{ note: current.note, severity: "material", reraised: "review:material|src/unknown.ts|renderRow" }],
+      resolved: [], reraised: [old.fingerprint],
+    });
+    expect((unvalidated.meta!.findings as StructuredFinding[]).every((row) => !row.reraisedFrom)).toBe(true);
+    const competing = await lineageReview([old], {
+      findings: [current, lineageFinding("src/second.ts", "allows unsafe HTML")].map((row) => ({
+        note: row.note, severity: "material", reraised: old.fingerprint,
+      })), resolved: [], reraised: [old.fingerprint],
+    });
+    expect(outstandingReviewFindings([events[0]!, lineageEvent(competing.meta!.findings as StructuredFinding[])], "T15")).toHaveLength(3);
+    const codeIdentity = { definition: "definition:42", defect: "selection-loss" };
+    expect(outstandingReviewFindings([
+      lineageEvent([{ ...old, codeIdentity }]), lineageEvent([{ ...current, codeIdentity }]),
+    ], "T15")).toMatchObject([{ fingerprint: current.fingerprint, codeIdentity }]);
+  }
+});
+
+test("test: two distinct definitions both named renderRow or two material defects in one symbol stay separate chains and a sentence or hash symbol keeps its full triple, so linkage that erases a second defect fails", () => {
+  const first = lineageFinding("src/a.ts");
+  const movedLine = { ...first, note: first.note.replace("src/a.ts", "src/a.ts:42") };
+  expect(outstandingReviewFindings([lineageEvent([first]), lineageEvent([movedLine])], "T15")).toHaveLength(1);
+  const otherModule = lineageFinding("src/b.ts");
+  const otherDefect = lineageFinding("src/a.ts", "allows unsafe HTML");
+  const carried = outstandingReviewFindings([lineageEvent([first, otherModule, otherDefect])], "T15");
+  expect(carried).toHaveLength(3);
+  expect(new Set(carried.map((row) => row.fingerprint)).size).toBe(3);
+  expect(carried.map((row) => row.note)).toEqual([first.note, otherModule.note, otherDefect.note]);
+  expect(outstandingReviewFindings([lineageEvent([first, otherModule, otherDefect]), lineageEvent([otherDefect])], "T15")).toHaveLength(3);
+  for (const note of ["The selection disappears.", "A very long explanation ".repeat(30)]) {
+    const rows = ["src/a.ts", "src/b.ts"].map((path) => structuredFindings("review", `- [material] ${path} ${note}`)[0]!);
+    const separate = outstandingReviewFindings([lineageEvent(rows)], "T15");
+    expect(separate.map((row) => row.fingerprint)).toEqual(rows.map((row) => row.fingerprint));
+    expect(separate).toHaveLength(2);
+  }
+  const codeIdentity = { definition: "definition:42", defect: "selection-loss" };
+  // Conflicting preexisting claims are not an unambiguously resolved code identity.
+  const ambiguous = carryReviewFindings([
+    { ...first, codeIdentity }, { ...otherModule, codeIdentity },
+  ], [{ ...lineageFinding("src/c.ts"), codeIdentity }]);
+  expect(ambiguous).toHaveLength(3);
+  const sameDefinition = outstandingReviewFindings([lineageEvent([
+    { ...first, codeIdentity },
+    { ...otherDefect, codeIdentity: { ...codeIdentity, defect: "unsafe-html" } },
+  ])], "T15");
+  expect(sameDefinition).toHaveLength(2);
+  const restated = carryReviewFindings(sameDefinition, [
+    { ...otherDefect, codeIdentity: { ...codeIdentity, defect: "unsafe-html" } },
+  ]);
+  expect(restated).toHaveLength(2);
+  expect(new Set(restated.map((row) => row.fingerprint)).size).toBe(2);
+  expect(matchClosureId(first.fingerprint, restated)).toBe(first.fingerprint);
+});
+
+test("test: the review gate accepts an observed old or current fingerprint of one explicitly linked finding chain exactly once but refuses an unobserved alias and keeps unrelated same named symbols separate, so changing the path spelling closes only the linked prior material and never another defect", async () => {
+  const { old, current, carried, events } = await movedLineage();
+  const unrelated = lineageFinding("src/unrelated.ts");
+  for (const fp of [old.fingerprint, current.fingerprint]) {
+    const result = await lineageReview([...carried, unrelated], {
+      findings: [], resolved: [`Fingerprint: ${fp}`], reraised: [unrelated.fingerprint],
+    });
+    expect(result.meta?.cause).toBeUndefined();
+    expect(result.meta?.resolvedMatches).toEqual([current.fingerprint]);
+    expect(result.meta?.reraisedMatches).toEqual([unrelated.fingerprint]);
+    const remaining = outstandingReviewFindings([...events, lineageEvent([unrelated]), lineageEvent(result.meta!.findings as StructuredFinding[], {
+      resolved: result.meta!.resolved, reraised: result.meta!.reraised,
+    })], "T15");
+    expect(remaining).toEqual([unrelated]);
+    expect((await lineageReview(carried, { findings: [], resolved: [fp], reraised: [] })).pass).toBe(true);
+  }
+  const duplicate = await lineageReview(carried, { findings: [], resolved: [old.fingerprint, current.fingerprint], reraised: [] });
+  expect(duplicate.meta?.cause).toBe("malformed-verdict");
+  const mixed = await lineageReview(carried, { findings: [], resolved: [old.fingerprint], reraised: [current.fingerprint] });
+  expect(mixed.meta?.cause).toBe("malformed-verdict");
+  const alias = await lineageReview(carried, { findings: [], resolved: [lineageFinding("src/unobserved.ts").fingerprint], reraised: [] });
+  expect(alias.meta?.cause).toBe("closure-mismatch");
+  const rejected = await lineageReview(carried, {
+    findings: [], resolved: [old.fingerprint, lineageFinding("src/unobserved.ts").fingerprint], reraised: [],
+  });
+  expect(rejected.meta?.cause).toBe("closure-mismatch");
+  // Mirror daemon journaling: rejected closure lists and diagnostic findings are both retained.
+  const rejectedRow = lineageEvent(structuredFindings("review", rejected.details), {
+    ...rejected.meta, pass: rejected.pass,
+  });
+  expect(outstandingReviewFindings([...events, rejectedRow], "T15")).toEqual(carried);
+  // Each rejection marker independently prevents additions and retirement, even with a pass flag.
+  for (const marker of [{ unparseable: true }, { noVerdict: true }, { cause: "closure-mismatch" }]) {
+    for (const pass of [false, true]) {
+      expect(outstandingReviewFindings([...events, lineageEvent([unrelated], {
+        ...marker, pass, resolved: [current.fingerprint],
+      })], "T15")).toEqual(carried);
+    }
+  }
+  const omitted = await lineageReview([...carried, unrelated], { findings: [], resolved: [old.fingerprint], reraised: [] });
+  expect(omitted.meta?.cause).toBe("malformed-verdict");
+});
+
+test("an unlinked round-3 finding at a linked chain's old path has a distinct, closable fingerprint", async () => {
+  const { old, current, carried, events } = await movedLineage();
+  for (const row of [old, lineageFinding(old.path, "allows unsafe HTML")]) {
+    const third = await lineageReview(carried, {
+      findings: [{ note: row.note, severity: "material" }],
+      resolved: [], reraised: [current.fingerprint],
+    });
+    expect(third.meta?.cause).toBeUndefined();
+    const roundThree = [...events, lineageEvent(third.meta!.findings as StructuredFinding[], {
+      resolved: third.meta!.resolved, reraised: third.meta!.reraised,
+    })];
+    const priors = outstandingReviewFindings(roundThree, "T15");
+    expect(priors).toHaveLength(2);
+    const separate = priors.find((finding) => finding.path === old.path)!;
+    expect(separate.fingerprint).toMatch(/^review:material\|src\/old\.ts\|renderRow#[a-f0-9]{12}$/);
+    expect(matchClosureId(old.fingerprint, priors)).toBe(current.fingerprint);
+    expect(matchClosureId(separate.fingerprint, priors)).toBe(separate.fingerprint);
+    const block = renderPriorMaterials(priors);
+    expect(block.match(/^\d+\. /gm)).toHaveLength(2);
+    const copyLines = block.split("\n").filter((line) => line.startsWith("Fingerprint: "));
+    expect(copyLines).toHaveLength(3);
+    expect(new Set(copyLines).size).toBe(3);
+    for (const spelling of [old.fingerprint, current.fingerprint]) {
+      const closed = await lineageReview(priors, {
+        findings: [], resolved: [spelling, separate.fingerprint], reraised: [],
+      });
+      expect(closed.meta?.cause).toBeUndefined();
+      expect(closed.pass).toBe(true);
+      expect(closed.meta?.resolvedMatches).toEqual([current.fingerprint, separate.fingerprint]);
+      expect(outstandingReviewFindings([...roundThree, lineageEvent([], {
+        pass: closed.pass, resolved: closed.meta!.resolved,
+      })], "T15")).toEqual([]);
+    }
+  }
+});
+
+test("test: the prior materials block rendered for the next round presents a positively linked path change chain as one carried finding listing its observed spellings while two independent chains stay two, so a block that shows one finding twice fails", async () => {
+  const { old, current, carried } = await movedLineage();
+  const unrelated = lineageFinding("src/independent.ts");
+  const materials = [...carried, unrelated];
+  for (const block of [renderPriorMaterials(materials), promptSection(await captureReviewPrompt(mkTask(), materials), "Prior materials this attempt must close")]) {
+    expect(block.match(/^\d+\. /gm)).toHaveLength(2);
+    for (const fp of [old.fingerprint, current.fingerprint, unrelated.fingerprint]) {
+      expect(block.split(`Fingerprint: ${fp}`).length - 1).toBe(1);
+    }
+    expect(block).toContain("choose one observed spelling");
+    expect(block).toContain(current.note);
+    expect(block).not.toContain(old.note);
+  }
+});
+
+
+test("a hashed sibling moved away in round four cannot share its observed spelling with a round-five row", async () => {
+  const { old, current, carried, events } = await movedLineage();
+  const sibling = lineageFinding(old.path, "allows unsafe HTML");
+  const third = await lineageReview(carried, {
+    findings: [{ note: sibling.note, severity: "material" }],
+    resolved: [], reraised: [current.fingerprint],
+  });
+  const roundThree = [...events, lineageEvent(third.meta!.findings as StructuredFinding[])];
+  const three = outstandingReviewFindings(roundThree, "T15");
+  const hashed = three.find((row) => row.path === old.path)!;
+  expect(hashed.fingerprint).toContain("renderRow#");
+  const moved = lineageFinding("src/moved.ts", "allows unsafe HTML");
+  const fourth = await lineageReview(three, {
+    findings: [{ note: moved.note, severity: "material", reraised: hashed.fingerprint }],
+    resolved: [], reraised: three.map((row) => row.fingerprint),
+  });
+  const roundFour = [...roundThree, lineageEvent(fourth.meta!.findings as StructuredFinding[])];
+  const four = outstandingReviewFindings(roundFour, "T15");
+  expect(four).toHaveLength(2);
+  expect(four.find((row) => row.path === moved.path)!.observedFingerprints).toContain(hashed.fingerprint);
+
+  // Both the unlinked collision branch and a positive link to the OTHER chain must
+  // check the generated hash, which is now only a historical spelling of the sibling.
+  for (const reraised of [undefined, current.fingerprint]) {
+    const fifth = await lineageReview(four, {
+      findings: [{ note: sibling.note, severity: "material", ...(reraised ? { reraised } : {}) }],
+      resolved: [], reraised: four.map((row) => row.fingerprint),
+    });
+    const five = outstandingReviewFindings([
+      ...roundFour, lineageEvent(fifth.meta!.findings as StructuredFinding[]),
+    ], "T15");
+    expect(five).toHaveLength(reraised ? 2 : 3);
+    const spellings = five.flatMap(observedReviewFingerprints);
+    expect(new Set(spellings).size).toBe(spellings.length);
+    expect(matchClosureId(hashed.fingerprint, five)).toBe(moved.fingerprint);
+    const block = renderPriorMaterials(five);
+    expect(block.split("\n").filter((line) => line.startsWith("Fingerprint: "))).toHaveLength(spellings.length);
+    for (const chain of five) {
+      for (const spelling of observedReviewFingerprints(chain)) {
+        expect(matchClosureId(spelling, five)).toBe(chain.fingerprint);
+        const closed = await lineageReview(five, {
+          findings: [], resolved: five.map((row) => row === chain ? spelling : row.fingerprint), reraised: [],
+        });
+        expect(closed.meta?.cause).toBeUndefined();
+        expect(closed.pass).toBe(true);
+      }
+    }
+  }
+
+  // A path supplied by an anchor can move without changing the note identity.
+  // Re-seating that repeated row must retain every spelling from its history.
+  const anchored = { ...hashed, path: moved.path, fingerprint: moved.fingerprint, reraisedFrom: hashed.fingerprint };
+  const anchoredFour = carryReviewFindings(three, [anchored]);
+  const repeated = carryReviewFindings(anchoredFour, [sibling]);
+  expect(repeated).toHaveLength(2);
+  expect(repeated.flatMap(observedReviewFingerprints).sort()).toEqual(anchoredFour.flatMap(observedReviewFingerprints).sort());
+  expect(matchClosureId(moved.fingerprint, repeated)).toBe(hashed.fingerprint);
+});
+
+// OBS-1091: capture both production surfaces; saved briefs also pass through redaction.
+async function operatorBrief(operatorContext?: string) {
+  const { repo, base } = repoWithCommit();
+  const artifacts = mkdtempSync(join(tmpdir(), "tickmarkr-operator-brief-"));
+  const carried = structuredFindings("review", "- [material] src/model.ts loses selection on prepend.");
+  const fake = fakeWith({ review: { approve: true, findings: [], resolved: [], reraised: [] } });
+  const command = fake.headlessCommand.bind(fake);
+  let delivered = "";
+  fake.headlessCommand = (file, model) => {
+    delivered = readFileSync(file, "utf8");
+    return command(file, model);
+  };
+  const result = await reviewGate(mkTask({ files: ["a.txt"] }), repo, base, author, CH, [fake], DEFAULT_CONFIG,
+    undefined, undefined, artifacts, undefined, undefined, carried, [], [], operatorContext);
+  return { delivered, saved: readFileSync(String(result.meta?.briefPath), "utf8"), result };
+}
+
+const normalizeBriefNonce = (brief: string) => brief.replaceAll(/VERDICT_NONCE: ([0-9a-f]+)/.exec(brief)![1]!, "<nonce>");
+
+test("test: a round given no operator context over identical task diff plus carried inputs renders delivered and saved briefs each equal to its nonce normalized baseline, so a heading rendered empty or a stale reason carried in fails", async () => {
+  const { delivered, saved } = await operatorBrief();
+  // Captured after T15, before OBS-1091 changes, from identical task/diff/carried inputs.
+  expect(normalizeBriefNonce(delivered)).toMatchInlineSnapshot(`
+    "TICKMARKR-REVIEW
+    You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
+    Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
+
+    ## Completion-faking checklist
+    Hunt for these concrete completion-faking shortcuts before ruling on any criterion:
+    - hardcoded-result: output or fixture hardcoded to satisfy the stated criterion instead of real logic
+    - test-weakening: tests skipped, deleted, or assertions loosened until failing behavior looks green
+    - vacuous-assertion: a test that cannot fail (asserts a constant, asserts its own setup, no assertion)
+    - fixture-overfit: implementation narrowed to the exact test inputs rather than the described behavior
+    - echo-not-implement: criterion text echoed in names, comments, or strings without the behavior itself
+    - stub-left-behind: TODO, throw, or no-op stub where the real implementation should be
+    - error-swallowing: catch or fallback that hides failures instead of handling them
+    - self-mocking: the code under test mocked or faked so the test exercises the mock
+    - check-bypass: lint, type, or CI checks disabled, relaxed, or excluded to get green
+    - rename-as-work: code moved or renamed and presented as the requested change
+    - scope-padding: unrelated edits padding the diff while the criterion's behavior is untouched
+    When a criterion fails, the verdict MUST name which shortcut above it matches, or state that none does.
+
+    ## Task T1: t (complexity 8)
+    ## Goal (authoritative — compiled from the sealed graph; the worktree's spec file may be stale after resume --graph-changed)
+    g
+
+    ## Acceptance criteria
+    - a
+
+    ## Declared write scope
+    The task DECLARED these write-scope patterns:
+    - a.txt
+
+    ## Reviewer suite budget
+    No suite may be run: files[] names no explicit test file owned by this task. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.
+
+    ## Prior materials this attempt must close
+    For each finding below, copy exactly ONE of its observed fingerprints into resolved or reraised.
+    Use only these observed spellings. For every findings entry that restates a reraised prior, whether at the same path or a new path, set its "reraised" field to the copied id; unrelated defects need separate entries.
+    The fingerprints appear once, in this block:
+    \`\`\`text
+    Fingerprint: review:material|src/model.ts|src/model.ts loses selection on prepend.
+    \`\`\`
+    1. src/model.ts loses selection on prepend.
+
+    ## Diff
+    \`\`\`diff
+    diff --git a/a.txt b/a.txt
+    index 587be6b4c3f93f93c489c0111bba5596147a26cb..975fbec8256d3e8a3797e7a3611380f27c49f4ac 100644
+    --- a/a.txt
+    +++ b/a.txt
+    @@ -1 +1 @@
+    -x
+    +y
+
+    \`\`\`
+
+    VERDICT_NONCE: <nonce>
+
+    Classify every concern as "material" (a correctness, security, or acceptance-criteria defect that must
+    block the merge) or "minor" (style, naming, or preference that should not block). ONLY material findings
+    block approval. For a minor concern you have decided not to block on, set "defer": true and give a
+    one-line "rationale" — it is recorded in the review, never dropped.
+    A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+
+    Respond with ONLY this JSON:
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
+    (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
+    Approve iff no material finding remains and every prior material is resolved.
+    The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    "
+  `);
+  expect(normalizeBriefNonce(saved)).toMatchInlineSnapshot(`
+    "TICKMARKR-REVIEW
+    You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
+    Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
+
+    ## Completion-faking checklist
+    Hunt for these concrete completion-faking shortcuts before ruling on any criterion:
+    - hardcoded-result: output or fixture hardcoded to satisfy the stated criterion instead of real logic
+    - test-weakening: tests skipped, deleted, or assertions loosened until failing behavior looks green
+    - vacuous-assertion: a test that cannot fail (asserts a constant, asserts its own setup, no assertion)
+    - fixture-overfit: implementation narrowed to the exact test inputs rather than the described behavior
+    - echo-not-implement: criterion text echoed in names, comments, or strings without the behavior itself
+    - stub-left-behind: TODO, throw, or no-op stub where the real implementation should be
+    - error-swallowing: catch or fallback that hides failures instead of handling them
+    - self-mocking: the code under test mocked or faked so the test exercises the mock
+    - check-bypass: lint, type, or CI checks disabled, relaxed, or excluded to get green
+    - rename-as-work: code moved or renamed and presented as the requested change
+    - scope-padding: unrelated edits padding the diff while the criterion's behavior is untouched
+    When a criterion fails, the verdict MUST name which shortcut above it matches, or state that none does.
+
+    ## Task T1: t (complexity 8)
+    ## Goal (authoritative — compiled from the sealed graph; the worktree's spec file may be stale after resume --graph-changed)
+    g
+
+    ## Acceptance criteria
+    - a
+
+    ## Declared write scope
+    The task DECLARED these write-scope patterns:
+    - a.txt
+
+    ## Reviewer suite budget
+    No suite may be run: files[] names no explicit test file owned by this task. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.
+
+    ## Prior materials this attempt must close
+    For each finding below, copy exactly ONE of its observed fingerprints into resolved or reraised.
+    Use only these observed spellings. For every findings entry that restates a reraised prior, whether at the same path or a new path, set its "reraised" field to the copied id; unrelated defects need separate entries.
+    The fingerprints appear once, in this block:
+    \`\`\`text
+    Fingerprint: review:material|src/model.ts|src/model.ts loses selection on prepend.
+    \`\`\`
+    1. src/model.ts loses selection on prepend.
+
+    ## Diff
+    \`\`\`diff
+    diff --git a/a.txt b/a.txt
+    index 587be6b4c3f93f93c489c0111bba5596147a26cb..975fbec8256d3e8a3797e7a3611380f27c49f4ac 100644
+    --- a/a.txt
+    +++ b/a.txt
+    @@ -1 +1 @@
+    -x
+    +y
+
+    \`\`\`
+
+    VERDICT_NONCE: <nonce>
+
+    Classify every concern as "material" (a correctness, security, or acceptance-criteria defect that must
+    block the merge) or "minor" (style, naming, or preference that should not block). ONLY material findings
+    block approval. For a minor concern you have decided not to block on, set "defer": true and give a
+    one-line "rationale" — it is recorded in the review, never dropped.
+    A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+
+    Respond with ONLY this JSON:
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
+    (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
+    Approve iff no material finding remains and every prior material is resolved.
+    The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    "
+  `);
+});
+
+test("test: a review round given an operator context renders it under an operator context heading between the prior materials and the diff, so a brief that omits the reason fails", async () => {
+  const reason = "Keep the explicit selection policy; verify prepend preserves it.";
+  const { delivered, saved } = await operatorBrief(reason);
+  for (const brief of [delivered, saved]) {
+    const context = brief.indexOf("## Operator context\n");
+    expect(context).toBeGreaterThan(brief.indexOf("## Prior materials this attempt must close\n"));
+    expect(context).toBeLessThan(brief.indexOf("## Diff\n"));
+    expect(promptSection(brief, "Operator context")).toContain(reason);
+    expect(promptSection(brief, "Operator context")).toContain("never substitutes for an acceptance criterion or closes a prior material");
+  }
+});
+
+test("test: a verdict that resolves no prior material still fails the gate when the brief carried an operator reason, so a reason read as a closure fails", async () => {
+  const { delivered, result } = await operatorBrief("I approve this approach; keep the design.");
+  expect(delivered).toContain("I approve this approach; keep the design.");
+  expect(result.pass).toBe(false);
+  expect(result.meta).toMatchObject({ cause: "malformed-verdict", unparseable: true });
 });

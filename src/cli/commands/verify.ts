@@ -6,7 +6,7 @@ import { parseArgs } from "node:util";
 import { allAdapters, probeAll, readDoctor, rolePools } from "../../adapters/registry.js";
 import { channelKey, type Assignment, type BillingChannel } from "../../adapters/types.js";
 import { loadConfig } from "../../config/config.js";
-import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline } from "../../gates/baseline.js";
+import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline, type GateEvidenceOptions } from "../../gates/baseline.js";
 import { modelProvider } from "../../gates/review.js";
 import { runGates } from "../../gates/run-gates.js";
 import type { GateResult } from "../../gates/types.js";
@@ -142,7 +142,7 @@ export const VERIFY_HELP = `usage: tickmarkr verify [--base <ref>] [--criteria <
 The final verdict and JSON result are written to stdout; progress and diagnostics are written to stderr.
 Do not merge stdout and stderr (for example with 2>&1): doing so corrupts the verdict stream.`;
 
-export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
+export async function verify(argv: string[], cwd = process.cwd(), options: { evidence?: GateEvidenceOptions } = {}): Promise<{ out: string; code: number }> {
   if (argv.some((arg) => arg === "--help" || arg === "-h")) return { out: VERIFY_HELP, code: 0 };
   const { values } = parseArgs({
     args: argv,
@@ -342,6 +342,7 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     worktree: cwd, baseRef: mergeBase,
     result: { ok: true, summary: "standalone verify — no worker claims to trust", deviations: [], raw: "" },
     author, commands, baseline, channels, ...(judgeChannels ? { judgeChannels } : {}), adapters, cfg,
+    evidence: options.evidence,
     verificationScope: "standalone", artifactDir, stateDir: join(stateRoot, ".tickmarkr"),
     onGate: (e) => {
       if (e.phase === "start") console.error(`verify: → ${e.gate} (${e.index}/${e.total})`);
@@ -357,17 +358,26 @@ export async function verify(argv: string[], cwd = process.cwd()): Promise<{ out
     return match ? [{ classification: match[1], note: match[2], reviewer: result.meta?.reviewer }] : [];
   }));
   const artifactPath = join(artifactDir, "verify-results.json");
-  writeFileSync(artifactPath, JSON.stringify({ base: baseTip, head, mergeBase, green, gateRows: results, reviewFindings }, null, 2) + "\n");
-  console.error(`verify: artifacts written to ${artifactPath}`);
+  const artifactBytes = Buffer.from(JSON.stringify({ base: baseTip, head, mergeBase, green, gateRows: results, reviewFindings }, null, 2) + "\n");
+  let artifactSha256: string | null = null;
+  let artifactAvailability: "available" | "capture-failed" = "capture-failed";
+  try {
+    writeFileSync(artifactPath, artifactBytes, { flag: "wx" });
+    artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
+    artifactAvailability = "available";
+    console.error(`verify: artifacts written to ${artifactPath}`);
+  } catch {
+    console.error(`verify: evidence capture failed for ${artifactPath}`);
+  }
   const review = reviewRows.at(-1);
   if (recordJournal && review) {
     recordJournal.append("review-leg2", values.task ?? "VERIFY", {
-      base: baseTip, head, mergeBase, author: channelKey(author), artifactPath,
+      base: baseTip, head, mergeBase, author: channelKey(author), artifactPath, artifactSha256, artifactAvailability,
       ...review,
     });
   }
   if (values.json) {
-    return { out: JSON.stringify({ base: baseTip, head, mergeBase, green, artifactPath, results }, null, 2), code: green ? 0 : 2 };
+    return { out: JSON.stringify({ base: baseTip, head, mergeBase, green, artifactPath, artifactSha256, artifactAvailability, results }, null, 2), code: green ? 0 : 2 };
   }
   const lines = results.map((r: GateResult) =>
     `${r.pass ? "PASS" : "FAIL"} ${r.gate}\n${r.details.split("\n").map((l) => `  ${l}`).join("\n")}`);

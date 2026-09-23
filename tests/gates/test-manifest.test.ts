@@ -167,12 +167,15 @@ test("verifyIntegrationTip and runGates each spawn the worktree's vitest with th
     const expected = (await compareToBaseline(f.repo, {test:scripted}, base, ["test"]))[0];
     const actual = await round(f, scripted, {fileCount:null});
     // runGates adds the same volatile measurement fields to every base result row.
-    const { meta: measurement, ...rowWithoutMeasurement } = actual;
+    const { meta: measurement, evidenceReceipt: actualReceipt, evidenceReceipts: actualReceipts, ...rowWithoutMeasurement } = actual;
     // R41: `verification` (protocol + effective lifecycle) is the one non-volatile stamp every row carries.
     expect(Object.keys(measurement!).sort()).toEqual(["durationMs","load1End","load1Max","load1Mean","load1Start","verification"]);
-    expect(rowWithoutMeasurement).toEqual(expected);
+    const { evidenceReceipt: expectedReceipt, evidenceReceipts: expectedReceipts, ...expectedVerdict } = expected;
+    expect(rowWithoutMeasurement).toEqual(expectedVerdict);
+    expect(actualReceipt?.invocationId).not.toBe(expectedReceipt?.invocationId);
+    expect(actualReceipts).toHaveLength(1); expect(expectedReceipts).toHaveLength(1);
     const [tipScript] = await verifyIntegrationTip(f.repo, {test:scripted}, f.artifacts, base);
-    expect(tipScript).toEqual({gate:"test",cmd:scripted,pass:true,exitCode:0,fingerprints:[],details:"exit 0"});
+    expect(tipScript).toMatchObject({gate:"test",cmd:scripted,pass:true,exitCode:0,fingerprints:[],details:"exit 0"});
   }
 }, 90_000);
 
@@ -466,7 +469,7 @@ test("test: a manifested vitest run whose report is green but whose runner print
   expect(row.details).toContain("Error EAGAIN");
   for (const [key, ending] of [["stdoutPath", "runner stdout tail"], ["stderrPath", "Error EAGAIN\n"]]) {
     const path = String(row.meta?.[key]);
-    expect(dirname(path)).toBe(dirname(String(row.meta?.reportPath)));
+    expect(path).toBe(join(f.artifacts, row.evidenceReceipt![key === "stdoutPath" ? "stdout" : "stderr"].path));
     const bytes = readFileSync(path);
     expect(bytes.length).toBe(16 * 1024);
     expect(bytes.toString().endsWith(ending)).toBe(true);
@@ -516,3 +519,141 @@ test("test: through the test gate a vitest run holding one failing assertion yie
   expect(evidence[0]!.text).toContain("src/nested/in-scope.ts");
   expect(Buffer.byteLength(evidence[0]!.text)).toBeLessThanOrEqual(4096);
 }, 60_000);
+
+test("test: a test gate receipt carries the invocation nonce beside the same artifact hash and count fields as build and lint, so a test row whose paths carry no hash fails", async () => {
+  const { createHash } = await import("node:crypto");
+  const { GateEvidenceReceiptSchema } = await import("../../src/run/protocol.js");
+  const { evaluateManifestedTest } = await import("../../src/gates/test-manifest.js");
+  const f = fixture(false); fault(f, "evidence", "runner-red");
+  const row = await evaluateManifestedTest("vitest run --globals", f.repo, { artifactDir: f.artifacts });
+  const receipt = row.evidenceReceipt!;
+  expect(GateEvidenceReceiptSchema.safeParse(receipt).success).toBe(true);
+  expect(receipt.invocationId).toBe(row.meta.nonce); expect(receipt.nonce).toBe(row.meta.nonce);
+  for (const ref of [receipt.stdout, receipt.stderr]) {
+    const bytes = readFileSync(join(f.artifacts, ref.path));
+    expect(ref.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+    expect(ref.retainedBytes).toBe(bytes.length); expect(ref.retainedBytes).toBe(16384);
+    expect(ref.droppedBytes).toBeGreaterThan(0); expect(ref.truncated).toBe(true);
+  }
+});
+
+test("test: one successful plus one failed executed command each under healthy or injected failing evidence persistence through the manifested or the non manifested production call keep pass classification plus recovery decision unchanged under capture-failed evidence whereas a command that failed to launch stays infra, so a successful command turned infra by a lost tail fails", async () => {
+  const { evaluateManifestedTest } = await import("../../src/gates/test-manifest.js");
+  const { failureDisposition } = await import("../../src/run/recovery.js");
+  const { setSpawnForTests, resetSpawnForTests } = await import("../../src/run/git.js");
+  const failWrite = () => { throw new Error("injected evidence disk failure"); };
+  for (const failed of [false, true]) {
+    const f = fixture(false); fault(f, "persistence", failed ? "failed" : "pass");
+    const cmd = "vitest run --globals";
+    const normal = await evaluateManifestedTest(cmd, f.repo, { artifactDir: f.artifacts });
+    const lost = await evaluateManifestedTest(cmd, f.repo, { artifactDir: f.artifacts, evidence: { write: failWrite } });
+    expect(lost.pass).toBe(!failed); expect(lost.pass).toBe(normal.pass);
+    expect(lost.classification).toBe(normal.classification);
+    expect(failureDisposition(lost)).toBe(failureDisposition(normal));
+    expect(lost.evidenceReceipt?.availability).toBe("capture-failed");
+    expect(normal.evidenceReceipt?.availability).toBe("available");
+    for (const gate of ["build", "lint", "test"]) {
+      const scripted = failed ? "echo 'Error: assertion broken'; exit 1" : "echo fine";
+      const base = { commands: { [gate]: { exitCode: 0, fingerprints: [] } } };
+      let retries = 0;
+      const [healthy] = await compareToBaseline(f.repo, { [gate]: scripted }, base, [gate], { evidence: { artifactDir: f.artifacts }, authorizeRetry: () => { retries++; return false; } });
+      const [broken] = await compareToBaseline(f.repo, { [gate]: scripted }, base, [gate], { evidence: { artifactDir: f.artifacts, write: failWrite }, authorizeRetry: () => { retries++; return false; } });
+      expect(broken.pass).toBe(!failed); expect(broken.pass).toBe(healthy.pass);
+      expect(broken.meta?.classification).toBe(healthy.meta?.classification);
+      expect(failureDisposition(broken)).toBe(failureDisposition(healthy)); expect(retries).toBe(0);
+      expect(broken.evidenceReceipt?.availability).toBe("capture-failed");
+      const captured = await captureBaseline(f.repo, { [gate]: scripted }, { evidence: { artifactDir: f.artifacts, write: failWrite } });
+      expect(captured.commands[gate].exitCode).toBe(failed ? 1 : 0);
+      expect(captured.evidenceReceipts?.[gate].availability).toBe("capture-failed");
+    }
+  }
+  const f = fixture(false); fault(f, "launch", "pass");
+  try {
+    setSpawnForTests(() => { throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }); });
+    const missing = await evaluateManifestedTest("vitest run", f.repo, { artifactDir: f.artifacts, evidence: { write: failWrite } });
+    expect(missing.pass).toBe(false); expect(missing.classification).toBe("infra");
+    expect(failureDisposition(missing)).toBe("infrastructure");
+    expect(missing.evidenceReceipt?.availability).toBe("not-started");
+    const [scripted] = await compareToBaseline(f.repo, { build: "echo fine" }, { commands: {} }, ["build"], { evidence: { artifactDir: f.artifacts, write: failWrite } });
+    expect(scripted.pass).toBe(false); expect(failureDisposition(scripted)).toBe("infrastructure"); expect(scripted.evidenceReceipt?.availability).toBe("not-started");
+    expect(scripted.evidenceReceipt?.termination.kind).toBe("not-started");
+  } finally { resetSpawnForTests(); }
+}, 30_000);
+
+test("test: a receipt survives the dirty worktree substitution at both battery seams and binds run task attempt gate plus subject commit under distinct invocation ids across a retry a selected screen or the full suite, so a receipt lost at substitution or reused invocation ids fail", async () => {
+  const { GateEvidenceReceiptSchema } = await import("../../src/run/protocol.js");
+  const { setCalmWindowForTests, resetCalmWindowForTests } = await import("../../src/gates/baseline.js");
+  const allIds: string[] = [];
+  for (const fullOnly of [false, true]) {
+    const f = fixture(false);
+    writeFileSync(join(f.repo, "gate.sh"), `if ${fullOnly ? '[ "$#" = 0 ]' : 'true'}; then echo dirty >> src/a.ts; fi\necho completed\n`); commit(f.repo);
+    const subjectCommit = git(f.repo, "rev-parse", "HEAD");
+    const cmd = "sh gate.sh";
+    const result = await runGates(task, {
+      worktree: f.repo, baseRef: f.base, author: { adapter: "fake", model: "fake", tier: "mid", channel: "sub" },
+      result: { ok: true, summary: "done", deviations: [], raw: "" }, commands: { test: cmd }, baseline: baseline(cmd, { fileCount: null }),
+      channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), artifactDir: f.artifacts, selectTests: fullOnly,
+      buildReceiptIdentity: { runId: "receipt-run", taskId: "T1", attempt: 3, gateRound: 2 },
+    });
+    const row = result.results.find(r => r.gate === "test")!;
+    expect(row.pass, row.details).toBe(false); expect(row.details).toMatch(/dirty|tracked/i);
+    expect(row.evidenceReceipt?.termination.exitCode).toBe(0);
+    expect(row.evidenceReceipts).toHaveLength(fullOnly ? 2 : 1);
+    for (const receipt of row.evidenceReceipts!) {
+      expect(GateEvidenceReceiptSchema.safeParse(receipt).success).toBe(true);
+      expect(receipt.subject).toEqual({ runId: "receipt-run", taskId: "T1", attempt: 3, gate: "test", subjectCommit });
+      allIds.push(receipt.invocationId);
+    }
+  }
+  const f = fixture(false);
+  const marker = join(f.artifacts, "retry-marker");
+  const cmd = `if [ -f '${marker}' ]; then echo done; else touch '${marker}'; echo 'Error: spawn EAGAIN'; exit 1; fi`;
+  try {
+    setCalmWindowForTests({ loadProvider: () => 0, calmLoad: () => 1 });
+    const [row] = await compareToBaseline(f.repo, { test: cmd }, baseline(cmd, { fileCount: null }), ["test"], {
+      authorizeRetry: () => true, evidence: { artifactDir: f.artifacts, runId: "receipt-run", taskId: "T1", attempt: 4 },
+    });
+    expect(row.pass).toBe(true); expect(row.evidenceReceipts).toHaveLength(2);
+    expect(row.evidenceReceipts!.map(r => r.termination.exitCode)).toEqual([1, 0]);
+    for (const receipt of row.evidenceReceipts!) {
+      expect(receipt.subject.attempt).toBe(4); allIds.push(receipt.invocationId);
+    }
+  } finally { resetCalmWindowForTests(); }
+  const { spawn } = await import("node:child_process");
+  const { setSpawnForTests, resetSpawnForTests } = await import("../../src/run/git.js");
+  let spawns = 0;
+  try {
+    setSpawnForTests(((...args: Parameters<typeof spawn>) => {
+      if (spawns++ === 0) {
+        const refused = spawn("/__tickmarkr_missing_evidence_runner__", [], args[2]);
+        refused.prependListener("error", error => Object.assign(error, { code: "EAGAIN" }));
+        return refused;
+      }
+      return spawn(...args);
+    }) as typeof spawn);
+    const [row] = await compareToBaseline(f.repo, { build: "echo completed" }, { commands: {} }, ["build"], { evidence: { artifactDir: f.artifacts } });
+    expect(row.pass).toBe(true); expect(row.evidenceReceipts).toHaveLength(2);
+    expect(row.evidenceReceipts!.map(r => r.termination.kind)).toEqual(["not-started", "exit"]);
+    allIds.push(...row.evidenceReceipts!.map(r => r.invocationId));
+  } finally { resetSpawnForTests(); }
+  expect(new Set(allIds).size).toBe(allIds.length);
+}, 30_000);
+
+
+test("manifest evidence with an undefined artifact override persists at its reported paths", async () => {
+  const { evaluateManifestedTest } = await import("../../src/gates/test-manifest.js");
+  const f = fixture(false); fault(f, "artifact-fallback", "pass");
+  const row = await evaluateManifestedTest("vitest run --globals", f.repo, {
+    artifactDir: f.artifacts, evidence: { artifactDir: undefined },
+  });
+  expect(row.pass, row.details).toBe(true);
+  expect(row.evidenceReceipts).toHaveLength(2);
+  for (const receipt of row.evidenceReceipts!) {
+    expect(receipt.availability).toBe("available");
+    for (const ref of [receipt.stdout, receipt.stderr]) {
+      expect(readFileSync(join(f.artifacts, ref.path)).length).toBe(ref.retainedBytes);
+    }
+  }
+  expect(row.meta.stdoutPath).toBe(join(f.artifacts, row.evidenceReceipt!.stdout.path));
+  expect(row.meta.stderrPath).toBe(join(f.artifacts, row.evidenceReceipt!.stderr.path));
+});

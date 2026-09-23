@@ -1,9 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { shq } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import {
   type Baseline,
+  beginGateEvidence,
+  type GateEvidenceOptions,
   ceilingKillResult,
   classifyFreshRunnerOutput,
   classifyRunnerOutput,
@@ -26,8 +28,23 @@ import {
 } from "../gates/cache.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { describeCapacity, gitHead, linkNodeModules, resolveIntegrationBranch, resolvedCapacity, sameCapacity, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
+import { executionSignal } from "./execution-budget.js";
+import type { GateEvidenceReceipt } from "./protocol.js";
+
+// Diagnostic convenience logs are observational, just like receipt persistence.
+function writeTipLog(path: string, text: string): void {
+  try { writeFileSync(path, text); } catch { /* the command verdict remains authoritative */ }
+}
 
 export interface TipVerifyResult {
+  evidenceReceipt?: GateEvidenceReceipt;
+  evidenceReceipts?: GateEvidenceReceipt[];
+  evidenceAbsence?: "provenance-refused" | "not-started" | "historical-cache";
+  /** Absolute directory against which the original receipt artifact paths resolve. */
+  originRunRoot?: string;
+  nonce?: string;
+  stdoutPath?: string;
+  stderrPath?: string;
   gate: string;
   cmd: string;
   pass: boolean;
@@ -46,6 +63,22 @@ export interface TipVerifyResult {
    * for a kill, the shared runner classifier for everything else. `infra` means nothing was verified.
    */
   cause?: FailureClassification;
+}
+
+/** Carry execution evidence without minting an invocation or rebasing its artifact paths. */
+export function reusedTipEvidence(source: Partial<TipVerifyResult>): Partial<TipVerifyResult> {
+  return {
+    reused: true,
+    ...(source.evidenceReceipt ? { evidenceReceipt: source.evidenceReceipt } : {}),
+    ...(source.evidenceReceipts ? { evidenceReceipts: source.evidenceReceipts } : {}),
+    ...(source.originRunRoot ? { originRunRoot: source.originRunRoot } : {}),
+    ...(!source.evidenceReceipt
+      ? { evidenceAbsence: source.evidenceAbsence ?? "historical-cache" }
+      : source.evidenceAbsence ? { evidenceAbsence: source.evidenceAbsence } : {}),
+    ...(source.nonce !== undefined ? { nonce: source.nonce } : {}),
+    ...(source.stdoutPath !== undefined ? { stdoutPath: source.stdoutPath } : {}),
+    ...(source.stderrPath !== undefined ? { stderrPath: source.stderrPath } : {}),
+  };
 }
 
 export function integrationBranch(cfg: TickmarkrConfig, runId: string): string {
@@ -106,6 +139,7 @@ export async function verifyIntegrationTip(
   commands: Record<string, string>,
   runDir: string,
   baseline?: Baseline,
+  evidenceOptions: GateEvidenceOptions = {},
 ): Promise<TipVerifyResult[]> {
   const results: TipVerifyResult[] = [];
   let runStartCommands: Record<string, string> | undefined;
@@ -159,7 +193,7 @@ export async function verifyIntegrationTip(
     for (const [gate, cmd] of gatesToRun) {
       const artifact = join(runDir, `tip-verify-${gate}.log`);
       const details = `tip verify could not establish command provenance: run-start evidence missing or malformed in journal`;
-      writeFileSync(artifact, details + "\n");
+      writeTipLog(artifact, details + "\n");
       results.push({
         gate,
         cmd,
@@ -167,6 +201,7 @@ export async function verifyIntegrationTip(
         exitCode: 1,
         fingerprints: [],
         details,
+        evidenceAbsence: "provenance-refused",
         artifact,
       });
     }
@@ -187,7 +222,7 @@ export async function verifyIntegrationTip(
       if (expectedCmd === undefined || cmd !== expectedCmd) {
         const artifact = join(runDir, `tip-verify-${gate}.log`);
         const details = `tip verify command "${cmd}" for gate "${gate}" was not named in run-start row`;
-        writeFileSync(artifact, details + "\n");
+        writeTipLog(artifact, details + "\n");
         results.push({
           gate,
           cmd,
@@ -195,6 +230,7 @@ export async function verifyIntegrationTip(
           exitCode: 1,
           fingerprints: [],
           details,
+          evidenceAbsence: "provenance-refused",
           artifact,
         });
         continue;
@@ -234,7 +270,7 @@ export async function verifyIntegrationTip(
         gate,
         cmd,
         pass: hit.pass,
-        reused: true,
+        ...reusedTipEvidence(hit.meta ?? {}),
         exitCode: hit.exitCode ?? 0,
         fingerprints: (hit.meta?.fingerprints as string[] | undefined) ?? [],
         ...(hit.meta?.forgiven ? { forgiven: true } : {}),
@@ -256,13 +292,20 @@ export async function verifyIntegrationTip(
         longestFile: entry?.longestFile,
         overallCeilingMs: effectiveCeilingMs(entry),
         artifactDir: runDir,
+        evidence: { artifactDir: runDir, runId: runDir, ...evidenceOptions },
       });
       const artifact = join(runDir, `tip-verify-${gate}.log`);
-      if (!outcome.pass) writeFileSync(artifact, outcome.details);
+      if (!outcome.pass) writeTipLog(artifact, outcome.details);
       results.push({
         gate,
         cmd,
         pass: outcome.pass,
+        evidenceReceipt: outcome.evidenceReceipt,
+        evidenceReceipts: outcome.evidenceReceipts,
+        ...(!outcome.evidenceReceipt ? { evidenceAbsence: "not-started" as const } : {}),
+        nonce: outcome.meta.nonce as string | undefined,
+        stdoutPath: outcome.meta.stdoutPath as string | undefined,
+        stderrPath: outcome.meta.stderrPath as string | undefined,
         exitCode: outcome.exitCode,
         reportPath: outcome.reportPath,
         spawnedCommand: outcome.meta.spawnedCommand as string,
@@ -278,17 +321,38 @@ export async function verifyIntegrationTip(
     // `sh` defaults to. A suite whose capture measured 600007ms carries a recorded 1800021ms ceiling;
     // running it under 600000ms here SIGKILLed a green tip three times while every per-task gate passed.
     const ceilingMs = effectiveCeilingMs(entry);
-    let r = await sh(cmd, intWt, ceilingMs);
+    const evidenceReceipts: GateEvidenceReceipt[] = [];
+    const execute = async () => {
+      const evidence = beginGateEvidence(intWt, gate, cmd, { artifactDir: runDir, runId: runDir, ...evidenceOptions });
+      try {
+        const result = await sh(cmd, intWt, ceilingMs, { env: evidenceOptions.env, onReceipt: receipt => evidence.observe(receipt) });
+        evidenceReceipts.push(...evidence.history, evidence.finish(result.stdout, result.stderr));
+        return result;
+      } catch (error) {
+        const receipt = evidence.finish();
+        if (receipt.termination.kind !== "not-started" || executionSignal()?.aborted) throw error;
+        evidenceReceipts.push(...evidence.history, receipt);
+        return { code: -1, stdout: "", stderr: String(error) };
+      }
+    };
+    let r = await execute();
     let raw = r.stdout + "\n" + r.stderr;
     let stripped = raw.split(intWt).join("");
     let rerun: string | undefined;
-    if (gate === "test" && !r.timedOut && !fileCountDeficit(entry, stripped)
+    if (evidenceReceipts.at(-1)?.termination.kind !== "not-started" && gate === "test" && !r.timedOut && !fileCountDeficit(entry, stripped)
       && classifyFreshRunnerOutput(entry, stripped, r.code) === "infra") {
       const waitedMs = await waitForCalmWindow();
       rerun = `runner-infra rerun after waiting ${waitedMs}ms for a calm load window`;
-      r = await sh(cmd, intWt, ceilingMs);
+      r = await execute();
       raw = r.stdout + "\n" + r.stderr;
       stripped = raw.split(intWt).join("");
+    }
+    const evidenceReceipt = evidenceReceipts.at(-1)!;
+    if (evidenceReceipt.termination.kind === "not-started") {
+      results.push({ gate, cmd, pass: false, exitCode: r.code, fingerprints: [],
+        details: `infra; command failed to launch: ${r.stderr}`, cause: "infra",
+        evidenceReceipt, evidenceReceipts, evidenceAbsence: "not-started" });
+      continue;
     }
     const artifact = join(runDir, `tip-verify-${gate}.log`);
     // Battery parity on the ceiling too (baseline.ts Q24): the kill is read BEFORE the exit code is
@@ -297,11 +361,12 @@ export async function verifyIntegrationTip(
     // operator cannot act on. The kill reader's own text (ceiling + elapsed) and cause replace it.
     const killed = ceilingKillResult(gate, r, ceilingMs);
     if (killed) {
-      writeFileSync(artifact, raw);
+      writeTipLog(artifact, raw);
       results.push({
         gate,
         cmd,
         pass: false,
+        evidenceReceipt, evidenceReceipts,
         exitCode: r.code,
         fingerprints: [],
         details: `${rerun ? `infra; ${rerun}: ` : ""}${killed.details}`,
@@ -337,11 +402,12 @@ export async function verifyIntegrationTip(
     const forgiven = r.code !== 0 && baselineRed && failing.length === 0 && !unreadable && cause !== "infra"
       && comparable;
     const pass = !deficit && (r.code === 0 || greenTeardown || forgiven);
-    if (!pass) writeFileSync(artifact, raw);
+    if (!pass) writeTipLog(artifact, raw);
     const tipResult: TipVerifyResult = {
       gate,
       cmd,
       pass,
+      evidenceReceipt, evidenceReceipts,
       exitCode: r.code,
       fingerprints: r.code !== 0 && !greenTeardown ? fingerprint(stripped) : [],
       details: `${cause === "infra" ? "infra; " : ""}${rerun ? `${rerun}: ` : ""}` + (deficit?.replace(/^infra; /, "") ?? (r.code === 0 ? "exit 0"
@@ -362,12 +428,16 @@ export async function verifyIntegrationTip(
   // spawns in the daemon child, and a command that changed the tree invalidates reuse.
   const completedTree = pending.size ? await getWorktreeTree(intWt) : undefined;
   for (const result of results) {
+    if (!result.reused && result.evidenceReceipt) result.originRunRoot = resolve(evidenceOptions.artifactDir ?? runDir);
     const id = pending.get(result.gate);
     if (id && id.tree === completedTree && !isInfraResult(result)) {
       store.set(id, { ...result, meta: {
         fingerprints: result.fingerprints, forgiven: result.forgiven,
         reportPath: result.reportPath, spawnedCommand: result.spawnedCommand,
         artifact: result.artifact,
+        evidenceReceipt: result.evidenceReceipt, evidenceReceipts: result.evidenceReceipts,
+        evidenceAbsence: result.evidenceAbsence, originRunRoot: result.originRunRoot,
+        nonce: result.nonce, stdoutPath: result.stdoutPath, stderrPath: result.stderrPath,
       } });
     }
   }

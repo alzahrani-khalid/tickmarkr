@@ -2,6 +2,23 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.5.9 — Fleet owns every deny; every red is reopenable
+
+**v2.5.9** — a deny the config accepts can now be seen, named and lifted in `tickmarkr fleet`, never only in YAML; and a red gate carries a bounded, redacted receipt of what its runner actually produced, so it can be reopened from its own record. Run `run-20260922-140654-0000000000000087`: 17/17 merged, every review cross-vendor or ruled, tip verify fresh (360 test files executed).
+
+- **T1/T2/T3 — Fleet owns every deny (OBS-1099, OBS-1065).** A row's reach is set through a picker that changes one reason per act on model and adapter rows alike, never cycled through a full deny; a covered alias row names the entry that covers it, and the shape picker shows denied channels with an inline lift; every DENY scope the config schema accepts has a Fleet edit path, proved by a test that enumerates the scopes from the schema.
+- **T4 — `approve` (OBS-1083, OBS-1084).** `approve --files` keeps its review-round ceiling; an authoring park whose red is a runner report admits `--recheck`.
+- **T5 — restored worktrees (OBS-1094; merges OBS-1049, OBS-1069).** Every restore that gates a recreated worktree without running build provisions it first.
+- **T6 — approval reason to the reviewer (OBS-1091).** The operator's approval reason reaches the reviewer as context, bound to the attempt it releases.
+- **T7/T15 — review findings (OBS-1100).** Every blocking review row carries verdict-derived findings, a pathless finding takes the verdict's single anchored path (fail-closed on ambiguity), and a finding chain is linked across a path change only by positive lineage.
+- **T8/T9/T16/T17 — evidence receipts (OBS-1101; merges OBS-1051).** An executed build, test or lint gate returns a bounded, redacted, invocation-bound receipt; it reaches daemon gate rows, tip verify and standalone verify; the cockpit Evidence view resolves it safely; a reused projection keeps its original receipt and mints nothing.
+- **T10 — qwen event stream (OBS-1085).** The clipped stream that parsed as unparseable now parses.
+- **T11 — compile (OBS-1086).** Compile refuses a graph whose task shape maps to a pool every channel of which the config denies.
+- **T12/T14 — beats and the overseer skill (OBS-1088, OBS-1087, OBS-1102, OBS-1050).** A beat arms under a durable arm identity, runs its own loop, and a stand-down dominates every later tick of that arm; the overseer skill keys Orca liveness on status running and arms the beat through its loop verb.
+- **T13 — dispatch ordinal (OBS-1089).** Dispatch rows carry a lifetime worker-dispatch ordinal beside the budget attempt.
+- **Fix leg landed after run-end, gated standalone and cross-vendor reviewed (D-265).** The overseer skill's pre-arm beat sweep matches the legacy wrapper loop again (no `--loop` qualifier), so a re-arm no longer leaves the old wrapper ticking.
+- **Known gaps (queued, not shipped).** A full suite can end at the parallel→serial handoff after a worker RPC timeout, leaving the serial projects never started (infra; re-run). An Orca worker whose shell startup prints an interactive prompt can lose the driver's leading `cd` and commit in the operator's checkout (OBS-1117). A tip verify that reused build and lint but ran the test fresh is labelled "cached" in the run record header.
+
 ## v2.5.8 — a run that does not lap
 
 **v2.5.8** — the laps v2.5.7 bought (park → close → resume, a full suite each) are removed where a harness or plan defect caused them: pending approvals fold once, a repair disposition is pure and bounded, declared pins and landing suites survive compile, and a run refuses the checkouts and hosts it cannot supervise. Run `run-20260921-164444-0000000000000044`: 15/15 merged, every review cross-vendor, tip verify uncached on the shipped commit.

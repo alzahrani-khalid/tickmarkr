@@ -201,6 +201,12 @@ export interface StructuredFinding {
   note: string;
   rationale?: string;
   fingerprint: string;
+  /** Closed list of spellings actually observed on this chain, including the current one. */
+  observedFingerprints?: string[];
+  /** Prior id validated against the reviewer's reraised list by the review gate. */
+  reraisedFrom?: string;
+  /** Resolved definition AND defect identity; bare symbol spelling is never lineage. */
+  codeIdentity?: { definition: string; defect: string };
 }
 
 const CONSULT_ACTIONS = ["retry", "reroute", "decompose", "human"] as const;
@@ -841,6 +847,83 @@ export function journaledFailureBrief(events: JournalEvent[], taskId: string): s
   return rows;
 }
 
+/** Never infer a cross-path alias from a symbol, sentence, or hash. */
+export function reviewFingerprintMatches(candidate: unknown, fingerprint: string): boolean {
+  return typeof candidate === "string"
+    && candidate.replace(/^\s*fingerprint\s*:\s*/i, "").replace(/\s+/g, "") === fingerprint.replace(/\s+/g, "");
+}
+
+export function observedReviewFingerprints(finding: StructuredFinding): string[] {
+  const observed = Array.isArray(finding.observedFingerprints)
+    ? finding.observedFingerprints.filter((id) => typeof id === "string") : [];
+  return [...new Set([finding.fingerprint, ...observed])];
+}
+
+const reviewNoteIdentity = (note: string): string => note.replace(LINE_REF_RE, "").replace(/\s+/g, " ").trim();
+
+function distinctReviewFinding(row: StructuredFinding): StructuredFinding {
+  const identity = JSON.stringify([reviewNoteIdentity(row.note), row.codeIdentity ?? null]);
+  const symbol = `${row.symbol}#${createHash("sha256").update(identity).digest("hex").slice(0, 12)}`;
+  return { ...row, symbol, fingerprint: `${row.class}|${row.path}|${symbol}` };
+}
+
+/** Re-seat only an unambiguous, positively linked chain; retain the newest evidence path. */
+export function carryReviewFindings(priors: readonly StructuredFinding[], rows: readonly StructuredFinding[]): StructuredFinding[] {
+  const open = [...priors];
+  for (const row of rows) {
+    const identity = row.codeIdentity;
+    const matches = open.filter((prior) => {
+      if (prior.class !== row.class) return false;
+      if (row.reraisedFrom) return rows.filter((other) => other.reraisedFrom === row.reraisedFrom).length === 1
+        && observedReviewFingerprints(prior).includes(row.reraisedFrom);
+      if (identity?.definition && identity.defect && prior.codeIdentity) {
+        return prior.codeIdentity.definition === identity.definition && prior.codeIdentity.defect === identity.defect;
+      }
+      return prior.fingerprint === row.fingerprint && reviewNoteIdentity(prior.note) === reviewNoteIdentity(row.note);
+    });
+    if (matches.length === 1) {
+      const prior = matches[0]!;
+      // Positive lineage does not grant this chain another open defect's display spelling.
+      let newest = row;
+      while (open.some((other) => other !== prior && observedReviewFingerprints(other).includes(newest.fingerprint))) {
+        newest = distinctReviewFinding(newest);
+      }
+      const observed = [...new Set([...observedReviewFingerprints(prior), ...observedReviewFingerprints(newest)])];
+      open[open.indexOf(prior)] = {
+        ...newest,
+        ...(prior.codeIdentity && !newest.codeIdentity ? { codeIdentity: prior.codeIdentity } : {}),
+        ...(observed.length > 1 ? { observedFingerprints: observed } : {}),
+      };
+    } else {
+      // Two defects may name the same definition. Preserve both, with a copyable full triple.
+      // Deferrals intentionally replace their rationale without changing their note.
+      const collision = open.some((prior) => observedReviewFingerprints(prior).includes(row.fingerprint));
+      if (collision) {
+        let distinct = distinctReviewFinding(row);
+        // A generated spelling may itself belong to a chain that has since moved away.
+        // Reuse only a matching row; otherwise keep minting until the spelling is unowned.
+        while (true) {
+          const owners = open.filter((prior) => observedReviewFingerprints(prior).includes(distinct.fingerprint));
+          if (owners.length === 0) {
+            open.push(distinct);
+            break;
+          }
+          if (owners.length === 1 && reviewNoteIdentity(owners[0]!.note) === reviewNoteIdentity(row.note)) {
+            const prior = owners[0]!;
+            open[open.indexOf(prior)] = {
+              ...prior, ...distinct,
+              observedFingerprints: [...new Set([...observedReviewFingerprints(prior), ...observedReviewFingerprints(distinct)])],
+            };
+            break;
+          }
+          distinct = distinctReviewFinding(distinct);
+        }
+      } else open.push(row);
+    }
+  }
+  return open;
+}
+
 /**
  * T6: the review findings still OUTSTANDING on a task. A review finding is a property of the TASK,
  * not of the attempt that drew it: it stays outstanding until a later review PASSES on the task (or
@@ -862,7 +945,8 @@ export function journaledFailureBrief(events: JournalEvent[], taskId: string): s
  * other gate settled that gate, not this one. Reading "approved" as "settled" is how a still-open
  * finding was dropped at the exact moment the operator paid for another attempt to fix it. A review
  * that DECLINED (`skipped`) is not a verdict and neither adds nor retires — fail closed. Findings are
- * keyed by fingerprint, so a reviewer restating one across rounds carries it once, not once per round.
+ * linked by validated lineage across paths; observed spellings remain a closed list. Repeating the
+ * same row carries it once, while distinct defects sharing a symbol retain separate fingerprints.
  *
  * v2.1.5 T2: a passing review settles the findings it BLOCKED on. It does not settle the ones it
  * DEFERRED — those it saw, declined to block on, and recorded a rationale for, and nothing has fixed
@@ -878,25 +962,38 @@ export function journaledFailureBrief(events: JournalEvent[], taskId: string): s
  * row. N rounds of the same concern therefore carry the newest accepted explanation once, not N rows.
  */
 export function outstandingReviewFindings(events: JournalEvent[], taskId: string): StructuredFinding[] {
-  const open = new Map<string, StructuredFinding>();
+  let open: StructuredFinding[] = [];
   for (const e of events) {
     if (e.taskId !== taskId) continue;
     if (e.event === "task-approved") {
-      if (e.data.release === GATE_SATISFIED_RELEASE && e.data.gate === "review") open.clear();
+      if (e.data.release === GATE_SATISFIED_RELEASE && e.data.gate === "review") open = [];
       continue;
     }
     if (e.event !== "gate-result" || e.data.gate !== "review" || e.data.skipped === true) continue;
+    // Rejected or missing verdicts carry diagnostics, not accepted findings or closures.
+    if (e.data.unparseable === true || e.data.noVerdict === true || e.data.cause !== undefined) continue;
+    // A failed review can resolve one chain while re-raising another. Only observed, uniquely
+    // matched spellings retire a chain; skipped/no-verdict rows were excluded above.
+    if (Array.isArray(e.data.resolved)) {
+      const resolved = e.data.resolved;
+      const settled = new Set(resolved.flatMap((id) => {
+        const matches = open.filter((finding) => finding.class === "review:material"
+          && observedReviewFingerprints(finding).some((fp) => reviewFingerprintMatches(id, fp)));
+        return matches.length === 1 ? matches : [];
+      }));
+      open = open.filter((finding) => !settled.has(finding));
+    }
     if (e.data.pass !== false) {
       // a later review PASSED on this task: every finding it BLOCKED on is settled …
-      for (const [key, finding] of open) if (!isDeferredFinding(finding)) open.delete(key);
+      open = open.filter(isDeferredFinding);
       // … and no deferral is, whether or not this pass restated it. A pass is silent about a
       // deferral it does not mention: the concern is unfixed either way, and the reviewer that
       // waved it through is not the release that accepts it. Retiring on omission would drop it on
       // the very next round — the same silent drop by a different door.
-      for (const finding of findingRows(e, "review").filter(isDeferredFinding)) open.set(finding.fingerprint, finding);
-    } else for (const finding of findingRows(e, "review")) open.set(finding.fingerprint, finding);
+      open = carryReviewFindings(open, findingRows(e, "review").filter(isDeferredFinding));
+    } else open = carryReviewFindings(open, findingRows(e, "review"));
   }
-  return [...open.values()];
+  return open;
 }
 
 /** The findings a funded repair must carry into the next dispatch, or undefined if none is pending. */

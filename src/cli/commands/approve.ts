@@ -109,9 +109,15 @@ export function permittedDecisionVerbs(park: Pick<NewestPark, "kind" | "failedGa
     return park.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
   }
   if (park.kind === "infra") return ["approve", "recheck"];
+  // OBS-1084: an authoring park whose newest gate row is a red tool gate is a runner report (a load
+  // flake in an unowned suite), so the battery re-runs on the preserved ref with no worker.
+  if (park.kind === "authoring" && isToolGate(park.failedGate)) return ["approve", "recheck"];
   if (park.kind === "diff-cap") return ["recheck"]; // OBS-1007: a cap trip is re-gated under a raised cap, never re-bought
   return ["approve"];
 }
+
+const TOOL_GATES: readonly string[] = ["build", "test", "lint"];
+const isToolGate = (gate: string | undefined): gate is string => gate !== undefined && TOOL_GATES.includes(gate);
 
 /** The release marker this command appends for a verb on a park — the fact a read-back must match. */
 export function releaseForDecision(verb: DecisionVerb, park: Pick<NewestPark, "kind" | "failedGate">): string | undefined {
@@ -242,7 +248,8 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   const capPark = park?.kind === ATTEMPT_CAP_RELEASE;
   const gateFailPark = park?.kind === "gate-fail";
   const infraPark = park?.kind === "infra" || park?.kind === "diff-cap";
-  const failedGate = gateFailPark ? park?.failedGate : undefined;
+  const authoringRunnerPark = park?.kind === "authoring" && isToolGate(park.failedGate);
+  const failedGate = gateFailPark || authoringRunnerPark ? park?.failedGate : undefined;
   if ((park?.kind === "scope-request" && !decisions) || files !== undefined) {
     if (park?.kind !== "scope-request") throw new Error("--files requires a scope-request park");
     if (!files?.length) throw new Error(`scope-request for ${taskId} requires --files <glob,…>`);
@@ -269,6 +276,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     }
     journal.append("task-approved", taskId, {
       by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request",
+      ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }), // OBS-1083
       amendment: { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park.line, definition: taskDefinitionFingerprint(task) },
     });
     // Do not write graph.json from this process while the daemon owns it: its sweep materializes
@@ -298,14 +306,18 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     return disposition(cwd, runId, "fund-fixed-attempt", `upheld the reviewer for ${taskId} in ${runId} — by ${by}`, serialization.contended);
   }
   if (recheck) {
-    if ((!gateFailPark || !failedGate) && !infraPark) {
-      throw new Error(`--recheck applies to a gate-fail, infra or diff-cap park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
+    if ((!gateFailPark || !failedGate) && !infraPark && !authoringRunnerPark) {
+      throw new Error(`--recheck applies to a gate-fail, infra, diff-cap or red-tool-gate authoring park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
       by,
       ...(reason ? { reason } : {}),
       via: "cli",
       release: RECHECK_RELEASE,
+      // OBS-1084: failedGate names the runner report for every recheck. Authoring rechecks additionally
+      // carry gate so their durable release row identifies the red tool gate that made recheck admissible.
+      ...(failedGate ? { failedGate } : {}),
+      ...(authoringRunnerPark && failedGate ? { gate: failedGate } : {}),
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
     return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : `${park!.kind} park`}; no gate marked satisfied`, serialization.contended);

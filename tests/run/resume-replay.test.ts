@@ -60,6 +60,125 @@ const postResume = (all: JournalEvent[]): JournalEvent[] => {
 
 const dispatchAssignment = (e: JournalEvent) => (e.data as { assignment: { adapter: string; model: string } }).assignment;
 
+describe("OBS-1089 lifetime worker dispatch identity", () => {
+  test("consecutive dispatches after a budget release advance the lifetime ordinal within the same engagement", async () => {
+    const { repo, fake } = setupRepo([T("T1")], {
+      tasks: { T1: [
+        { shell: AUTH_FAIL },
+        { shell: `echo done > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1 done" } },
+      ] },
+    });
+    const runId = "run-ordinal-failover";
+    await seedJournal(repo, runId, [
+      ...Array.from({ length: 5 }, (_, attempt) => ({
+        event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt },
+      })),
+      { event: "task-approved", taskId: "T1", data: { release: "attempt-cap" } },
+    ]);
+    const result = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(result.done).toEqual(["T1"]);
+    const journal = Journal.open(repo, runId);
+    const rows = postResume(journal.read());
+    expect(rows.some((e) => e.event === "dead-channel-failover")).toBe(true);
+    expect(rows.filter((e) => e.event === "task-dispatch").map((e) => ({
+      attempt: e.data.attempt, ordinal: e.data.workerDispatchOrdinal,
+    }))).toEqual([
+      { attempt: 0, ordinal: 5 },
+      { attempt: 1, ordinal: 6 },
+    ]);
+    // Only the two new dispatches consume the released budget.
+    expect(journal.replayResumeState().get("T1")!.attempts).toBe(2);
+  });
+
+  test("test: every task dispatch row the daemon writes carries a zero based worker dispatch ordinal counted from that task's prior task dispatch rows across this run's engagements which an attempt cap or upheld release never resets, so a row reading attempt zero with no ordinal after five dispatches fails", async () => {
+    for (const release of ["attempt-cap", "review-upheld"]) {
+      const { repo, fake } = setupResumeRepo();
+      const runId = `run-ordinal-${release}`;
+      const graph = loadGraph(repo);
+      saveGraph(repo, validateGraph({ ...graph, tasks: [...graph.tasks, T("other", { status: "done" })] }));
+      const hash = graphDefinitionHash(loadGraph(repo));
+      await seedJournal(repo, runId, [
+        { event: "task-dispatch", taskId: "other", data: { attempt: 0 } },
+        { event: "task-done", taskId: "other" },
+        ...["attempt-cap", "review-upheld", "recheck", "gate-satisfied", "scope-request"].flatMap((priorRelease) => [
+          { event: "run-resume" },
+          { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 0 } },
+          { event: "task-approved", taskId: "T1", data: {
+            release: priorRelease, gate: "review",
+            ...(priorRelease === "scope-request" ? { amendment: {
+              from: hash, to: hash, beforeFiles: [], files: [], parkLine: 1,
+            } } : {}),
+          } },
+          ...(priorRelease === "recheck" ? [{ event: "recheck-battery", taskId: "T1" }] : []),
+        ]),
+        { event: "task-approved", taskId: "T1", data: { release } },
+      ]);
+      const before = Journal.open(repo, runId).read().length;
+      const result = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      expect(result.done).toContain("T1");
+      const journal = Journal.open(repo, runId);
+      const rows = journal.read().slice(before).filter((e) => e.event === "task-dispatch");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.data).toMatchObject({ attempt: 0, workerDispatchOrdinal: 5 });
+      expect(journal.replayResumeState().get("T1")!.attempts).toBe(1);
+    }
+  });
+
+  test("test: a repair dispatch row carries the same ordinal as its worker attempt and a resume restore names the restored dispatch's ordinal while legacy rows without one stay valid, so an annotation that increments the ordinal fails", async () => {
+    for (const legacy of [false, true]) {
+      const { repo, fake } = setupResumeRepo();
+      const runId = `run-ordinal-repair-${legacy}`;
+      await seedJournal(repo, runId, [
+        { event: "task-dispatch", taskId: "T1", data: {
+          assignment: fake1, attempt: 0, ...(legacy ? {} : { workerDispatchOrdinal: 0 }),
+        } },
+        { event: "repair-dispatch", taskId: "T1", data: legacy ? {} : { workerDispatchOrdinal: 0 } },
+        { event: "resume-restore", taskId: "T1", data: legacy ? {} : { workerDispatchOrdinal: 0 } },
+        { event: "repair-attempt", taskId: "T1", data: { findings: "Fix the outstanding finding" } },
+      ]);
+      const before = Journal.open(repo, runId).read().length;
+      const result = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      expect(result.done).toEqual(["T1"]);
+      const journal = Journal.open(repo, runId);
+      const rows = journal.read().slice(before);
+      const dispatch = rows.find((e) => e.event === "task-dispatch")!;
+      expect(dispatch.data).toMatchObject({ attempt: 1, workerDispatchOrdinal: 1 });
+      const repairs = rows.filter((e) => e.event === "repair-dispatch");
+      expect(repairs).toHaveLength(1);
+      expect(repairs[0]!.data.workerDispatchOrdinal).toBe(dispatch.data.workerDispatchOrdinal);
+      const restores = rows.filter((e) => e.event === "resume-restore");
+      expect(restores).toHaveLength(1);
+      expect(restores[0]!.data.workerDispatchOrdinal).toBe(legacy ? null : 0);
+      expect(journal.replayResumeState().get("T1")!.attempts).toBe(2);
+    }
+  });
+
+  test("test: the budget attempt field beside the ordinal keeps its reset on an attempt cap release and its count across a recheck exactly as before, so an ordinal that replaces the budget count fails", async () => {
+    const { repo, fake } = setupResumeRepo();
+    const runId = "run-ordinal-budget";
+    await seedJournal(repo, runId, [
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 0, workerDispatchOrdinal: 0 } },
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 1, workerDispatchOrdinal: 1 } },
+      { event: "task-approved", taskId: "T1", data: { release: "attempt-cap" } },
+    ]);
+    const journal = Journal.open(repo, runId);
+    expect(journal.replayResumeState().get("T1")!.attempts).toBe(0);
+    journal.append("task-dispatch", "T1", { assignment: fake1, attempt: 0, workerDispatchOrdinal: 2 });
+    journal.append("task-approved", "T1", { release: "recheck" });
+    expect(journal.replayResumeState().get("T1")!.attempts).toBe(1);
+    // The recheck battery has already been enacted before interruption; the resumed worker
+    // still inherits its budget count, independently of the lifetime dispatch identity.
+    journal.append("recheck-battery", "T1", {});
+    const before = journal.read().length;
+    const result = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(result.done).toEqual(["T1"]);
+    const dispatches = journal.read().slice(before).filter((e) => e.event === "task-dispatch");
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0]!.data).toMatchObject({ attempt: 1, workerDispatchOrdinal: 3 });
+    expect(journal.replayResumeState().get("T1")!.attempts).toBe(2);
+  });
+}, 120000);
+
 describe("Phase 46 resume-replay (RES-01/RES-02 daemon oracles, zero tokens)", () => {
   test("RES-01/RES-02: resume continues the escalation ladder (incident analog)", async () => {
     const { repo, fake } = setupResumeRepo();
@@ -127,6 +246,7 @@ describe("Phase 46 resume-replay (RES-01/RES-02 daemon oracles, zero tokens)", (
     expect(all.filter((e) => e.event === "resume-restore")).toHaveLength(0);
     const first = all.find((e) => e.event === "task-dispatch" && e.taskId === "T1")!;
     expect((first.data as { attempt: number }).attempt).toBe(0);
+    expect(first.data.workerDispatchOrdinal).toBe(0);
   });
 
   // Pins the third seed branch (nextChannel-null fallback) so its coverage is planned, not reactive.
@@ -239,6 +359,8 @@ describe("OBS-119 dead-channel exclusion resume (v1.71 T4, zero tokens)", () => 
     const s = await runDaemon(repo, { adapters: [fakeDead], runId });
     expect(s.done).toEqual(["T1"]);
     const excl = Journal.open(repo, runId).read().filter((e) => e.event === "channel-exclusion");
+    const dispatches = Journal.open(repo, runId).read().filter((e) => e.event === "task-dispatch");
+    expect(dispatches.map((e) => e.data.workerDispatchOrdinal)).toEqual([0, 1]);
     expect(excl).toHaveLength(1);
     expect(excl[0]!.data).toMatchObject({ channel: "fake:fake-1", reason: "auth-required", kind: "dead-channel" });
   }, 30_000);

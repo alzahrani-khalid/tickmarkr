@@ -3,7 +3,7 @@
 // gate suite, for the case where the gate failed against a stale task DECLARATION (spec files[]) rather
 // than a bad diff. Fail-closed like every approve path: refusals are loud and append nothing.
 import { describe, expect, test } from "vitest";
-import { approve } from "../../src/cli/commands/approve.js";
+import { approve, newestPark, permittedDecisionVerbs, readJournalEvents } from "../../src/cli/commands/approve.js";
 import { Journal } from "../../src/run/journal.js";
 import { setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -56,7 +56,7 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     j.append("task-human", "T1", { kind: "reroute-exhausted", reason: "every channel demoted" });
 
     await expect(approve(["run-recheck-refuse", "T1", "--recheck"], repo))
-      .rejects.toThrow(/--recheck applies to a gate-fail, infra or diff-cap park/);
+      .rejects.toThrow(/--recheck applies to a gate-fail, infra, diff-cap or red-tool-gate authoring park/);
     expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
   });
 
@@ -97,5 +97,43 @@ describe("tickmarkr approve --recheck (OBS-203, zero-token)", () => {
     await expect(approve(["run-recheck-unmatched", "T1", "--recheck"], repo))
       .rejects.toThrow(/newest park is reroute-exhausted/);
     expect(unmatched.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
+  });
+});
+
+// OBS-1084: an authoring park whose red is a runner report (a load flake in an unowned suite) admits
+// --recheck; the daemon re-runs the battery on the preserved ref with no worker. A park with no red
+// gate row (a worker refusal) stays plain-approve only.
+describe("tickmarkr approve --recheck on an authoring park (OBS-1084, zero-token)", () => {
+  test("test: recheck on an authoring park whose newest gate result is a red test gate journals a recheck release naming that gate so the verb table offers recheck for it, so a refusal listing only gate fail infra or diff cap fails", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-recheck-authoring");
+    j.append("task-dispatch", "T1", { assignment, attempt: 0 });
+    j.append("gate-result", "T1", { gate: "test", pass: false, details: "unowned suite failed to load" });
+    j.append("task-human", "T1", { kind: "authoring", reason: "runner report", source: "test" });
+
+    const { events, sourceIndexes } = readJournalEvents(j);
+    expect(permittedDecisionVerbs(newestPark(events, "T1", sourceIndexes))).toEqual(["approve", "recheck"]);
+
+    const msg = await approve(["run-recheck-authoring", "T1", "--recheck", "--by", "overseer"], repo);
+    expect(msg).toContain("failed gate test");
+    const approvals = j.read().filter((e) => e.event === "task-approved");
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]).toMatchObject({ taskId: "T1", data: { by: "overseer", via: "cli", release: "recheck", failedGate: "test", gate: "test" } });
+    expect(j.replaySatisfiedGates()).toEqual(new Map());
+    expect(j.replayStatuses().get("T1")).toBe("pending");
+  });
+
+  test("test: recheck on an authoring park raised by a worker refusal with no red gate result stays refused and the verb table offers approve alone, so a recheck that re-runs a battery nothing failed fails", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-recheck-authoring-refusal");
+    j.append("task-dispatch", "T1", { assignment, attempt: 0 });
+    j.append("task-human", "T1", { kind: "authoring", reason: "worker refused: task needs out-of-scope edits", source: "worker" });
+
+    const { events, sourceIndexes } = readJournalEvents(j);
+    expect(permittedDecisionVerbs(newestPark(events, "T1", sourceIndexes))).toEqual(["approve"]);
+
+    await expect(approve(["run-recheck-authoring-refusal", "T1", "--recheck"], repo))
+      .rejects.toThrow(/--recheck applies to .*newest park is authoring with failed gate none/);
+    expect(j.read().filter((e) => e.event === "task-approved")).toHaveLength(0);
   });
 });

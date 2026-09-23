@@ -95,9 +95,21 @@ SEAT="$TARGET"
 # would emit one before any successful read and break rule 2 outright, and a probe that parses the
 # usage banner binds this script to another command's help text. Beating is what we do anyway, so it
 # perturbs nothing — and because a beat only ever follows a successful read, rule 2 still holds.
+# OBS-583/OBS-1088: a bare `tickmarkr beat` reuses whatever durable arm is already on disk, so a fresh
+# script instance beating a tier a PRIOR instance stood down would either silently re-arm the stand-down
+# (pre-fence) or, now that a stand-down fences the old arm, sit refused forever. The skill's beat recipe
+# names that bare-call shape the unsafe legacy form for the same reason; this loop arms through the same
+# explicit verb: `--new-arm` on the first beat only, so this instance's arm always acknowledges whatever
+# marker is current before settling into ordinary per-tick beats.
 beat_refused=0
+armed=0
 beat() {
-  tickmarkr beat "$TIER" --seat "$SEAT" >/dev/null 2>&1 && return 0
+  new_arm=""
+  [ "$armed" -eq 0 ] && new_arm="--new-arm"
+  if tickmarkr beat "$TIER" --seat "$SEAT" $new_arm >/dev/null 2>&1; then
+    armed=1
+    return 0
+  fi
   if [ "$beat_refused" -eq 0 ]; then
     beat_refused=1
     echo "TIER_UNREGISTERED ${TIER} — the product refused this tier (its set: src/run/supervision.ts:45)"
@@ -106,7 +118,7 @@ beat() {
   fi
   return 0
 }
-stand_down() { tickmarkr beat "$TIER" --stand-down --seat "$SEAT" >/dev/null 2>&1; return 0; }
+stand_down() { armed=0; tickmarkr beat "$TIER" --stand-down --seat "$SEAT" >/dev/null 2>&1; return 0; }
 # EVERY terminal exit — act, unsafe-act, cap — leaves through here, so none of them can forget to
 # record the hand-off. A killed watcher never runs it, which is the one case that must read STALE.
 cleanup() { stand_down; clear_pid; }

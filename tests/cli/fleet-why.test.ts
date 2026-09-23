@@ -318,22 +318,33 @@ describe("fleet --why", () => {
       }
     }
     // 1. allow — the channel's row names the allowlist that does not admit it
-    expect(rowFor("implement", "fake:fake-5")).toContain("fake/fake-5 — routing.allow (not admitted)");
-    // 2. pin — a channel that is not the pin names the pin, not manageable here
-    expect(rowFor("tests", "fake:fake-2")).toContain("not routing.map.tests.pin (fake:fake-3) — not manageable here");
-    // 2. pool — a channel outside the declared pool names the pool, not manageable here
-    expect(rowFor("docs", "fake:fake-1")).toContain("outside routing.map.docs.pool — not manageable here");
-    // 3. floor — the below-floor channel names the shape's floor
-    expect(rowFor("implement", "fake:fake-1")).toContain("below routing.floors.implement (mid) — not manageable here");
-    // 4. unauthed probe — the unauthed channel's row points at the doctor re-probe
-    expect(rowFor("implement", "fake:fake-4")).toContain("unauthed (quota exceeded) — re-probe with tickmarkr doctor");
-    // 7. task hint — the channel a shape's prefer names carries the not-manageable caption
-    expect(rowFor("chore", "fake:fake-2")).toContain("task hint: routing.map.chore.prefer names it — not manageable here");
+    expect(rowFor("implement", "fake:fake-5")).toContain("fake/fake-5 — reach: out allow — routing.allow (not admitted)");
+    // D-225: the picker is a closed offered-or-greyed partition — shapeCandidates strips pin/pool
+    // and offers below-floor fallbacks, so those channels stay OFFERED (never greyed beside
+    // themselves) and the pin/pool/floor mechanism renders as the shape's caption instead
+    // 2. pin — the caption names the pin, not manageable here; the offered channel greys nowhere
+    expect(pick("tests").rows.map((row) => row.id)).toContain("fake:fake-2");
+    expect(rowFor("tests", "fake:fake-2")).toBe("");
+    expect(noteFor("tests")).toContain("pin: routing.map.tests.pin fixes this shape to fake:fake-3 — not manageable here");
+    // 2. pool — the caption counts the channels outside the declared pool
+    expect(pick("docs").rows.map((row) => row.id)).toContain("fake:fake-1");
+    expect(rowFor("docs", "fake:fake-1")).toBe("");
+    expect(noteFor("docs")).toContain("outside routing.map.docs.pool's declared set — not manageable here");
+    // 3. floor — implement offers nothing (its prefer collides with allow), so the below-floor
+    // channel greys naming the shape's floor
+    expect(rowFor("implement", "fake:fake-1")).toContain("fake/fake-1 — reach: in — below routing.floors.implement (mid) — not manageable here");
+    // 4. unauthed probe — the failed-probe channel walks the same reach path; the probe reason lands LAST
+    expect(rowFor("implement", "fake:fake-4")).toMatch(/^fake\/fake-4 — reach: in — .*; unauthed \(quota exceeded\) — re-probe with tickmarkr doctor$/);
+    // 7. task hint — the channel a shape's prefer names stays offered (D-225: never greyed beside
+    // itself); the shape's caption carries the not-manageable note
+    expect(pick("chore").rows.map((row) => row.id)).toContain("fake:fake-2");
+    expect(rowFor("chore", "fake:fake-2")).toBe("");
+    expect(noteFor("chore")).toContain("task hint: routing.map.chore.prefer ranks fake:fake-2 — not manageable here");
     // 8. deny∩prefer — the collided channel's row carries the standing lint, with the ACTUAL scope
     // (fake-5 is outside the allowlist; nothing denies it)
     expect(rowFor("refactor", "fake:fake-5")).toContain("deny∩prefer: routing.map.refactor.prefer fake:fake-5 fully disallowed by routing.allow");
     // 9. first-match provenance — a channel both denied and outside the allowlist lists BOTH scopes
-    expect(rowFor("implement", "fake:fake-6")).toContain("fake/fake-6 — routing.deny.models (fake:fake-6); routing.allow (not admitted)");
+    expect(rowFor("implement", "fake:fake-6")).toContain("fake/fake-6 — reach: out all — routing.deny.models (fake:fake-6); routing.allow (not admitted)");
     expect(disallowedBy({ adapter: "fake", model: "fake-6" }, loadConfig(repoRoot, { globalDir }).routing)).toEqual({ by: "deny", entry: "fake:fake-6" });
     // 5. tombstone and 6. explore/learned knobs mask or tune a whole shape rather than one channel —
     // each keeps its not-manageable caption row
@@ -358,12 +369,14 @@ describe("fleet --why", () => {
     const all = stripAnsi(frames.join(""));
     expect(all).toContain("pool · docs"); // docs declares a pool, so its picker opens as the pool chain
     for (const row of [
-      "fake/fake-1 — outside routing.map.docs.pool — not manageable here",
-      "fake/fake-4 — unauthed (quota exceeded) — re-probe with tickmarkr doctor",
-      "fake/fake-5 — routing.allow (not admitted); outside routing.map.docs.pool — not manageable here",
-      "fake/fake-6 — routing.deny.models (fake:fake-6); routing.allow (not admitted); outside routing.map.docs.pool",
+      // D-225: the failed probe walks the reach path too; the panel clips its tail
+      "fake/fake-4 — reach: in — outside routing.map.docs.pool — not manageable here; u",
+      "fake/fake-5 — reach: out allow — routing.allow (not admitted); outside routing.map.docs.pool",
+      "fake/fake-6 — reach: out all — routing.deny.models (fake:fake-6); routing.allow (not admitted)",
     ]) {
       expect(all, row).toContain(row);
     }
+    // D-225: fake-1 is offered by the docs pool chain, so it never greys beside itself
+    expect(all).not.toContain("fake/fake-1 — ");
   });
 });

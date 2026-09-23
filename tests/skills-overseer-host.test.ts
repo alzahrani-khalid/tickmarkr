@@ -132,3 +132,47 @@ test("host scope parser rejects escaped commands, fences, mandates and missing s
     expect(hostViolations(`## On herdr\n${token}`)).not.toEqual([]);
   }
 });
+
+test("replaying the recorded Orca screen read receipts exited beside ok true versus running against the changed seat liveness procedure declares the first dead plus the second live from result.terminal.status rather than the envelope ok, citing the changed skill lines", () => {
+  const skill = readShippedSkill();
+  expect(skill).toMatch(/key liveness on `result\.terminal\.status === "running"` — never on the envelope's own `ok`/);
+  expect(skill).toMatch(/a closed seat's read still returns that same `ok: true` with `result\.terminal\.status: "exited"`/);
+  expect(skill).toContain("a matcher keyed on `ok` reads that exited seat as alive and never fires (OBS-1087)");
+  expect(skill).toMatch(/Treat `result\.terminal\.status !== "running"`, `terminal_handle_stale`, or a missing terminal as seat death/);
+});
+
+test("the read-first procedure on both hosts appends one opened line per cited file to an append-only log under .tickmarkr/overseer and names that log as the record a later handoff is measured against, citing the changed lines", () => {
+  const skill = readShippedSkill();
+  // Universal law (CITE-IS-NOT-READ), the herdr handoff protocol, and the Orca instruments each cite the log.
+  expect(skill.match(/\.tickmarkr\/overseer\/opened-files\.log/g)?.length).toBeGreaterThanOrEqual(3);
+  expect(skill).toMatch(/On BOTH hosts, log the open:\*\*\s*\n\s*append one line, `opened <path>`, to the append-only log `\.tickmarkr\/overseer\/opened-files\.log`/);
+  expect(skill).toMatch(/is the record a later handoff is measured against: a claimed read with no matching line here did not\s*\n\s*happen\./);
+  expect(skill).toContain("Nothing else records which cited files a successor actually opened after a clear (OBS-1102)");
+  expect(skill).toMatch(/Log every open per CITE-IS-NOT-READ:\*\* the moment the returning seat opens `<handoff>` or\s*\n\s*`<brief>`/);
+  expect(skill).toMatch(/On both hosts this log — not the\s*\n\s*transcript — is the record a later handoff is measured against \(OBS-1102\)/);
+  expect(skill).toContain("log the open per CITE-IS-NOT-READ (`opened <path>` appended to `.tickmarkr/overseer/opened-files.log`)");
+});
+
+test("the beat recipe arms through the explicit new-arm and loop verbs and names the legacy wrapper loop as the unsafe form that re-armed after a stand-down, citing the changed lines", () => {
+  const skill = readShippedSkill();
+  expect(skill).toContain("it arms through two explicit verbs, `--new-arm` and `--loop` —\nnever a bare invocation");
+  expect(skill).toContain("cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop");
+  expect(skill).not.toMatch(/while :; do tickmarkr beat overseer --seat <overseer-agent-or-pane>; sleep 10; done/);
+  expect(skill).toMatch(/The legacy wrapper loop, `while :; do tickmarkr beat overseer --seat <pane>; sleep 10; done`, is the\s*\nUNSAFE form and must not be used\./);
+  expect(skill).toMatch(/it is the shape that re-armed a recorded stand-down \(OBS-583, OBS-1088\)/);
+  expect(skill).toContain("`--new-arm` and `--loop` are the only verbs that acknowledge a stand-down; a bare beat, wrapped in");
+  expect(skill).toContain("**STAND DOWN THE BEAT THROUGH `--stand-down`, THEN VERIFY THE `--loop` EXITS.** The shipped loop");
+  expect(skill).toContain("observes the recorded marker and exits within one interval; it does not re-arm after the stand-down.");
+
+  const watchContext = readFileSync(new URL("../skills/tickmarkr-overseer/scripts/watch-context.sh", import.meta.url), "utf8");
+  expect(watchContext).toContain('[ "$armed" -eq 0 ] && new_arm="--new-arm"');
+  expect(watchContext).toContain('tickmarkr beat "$TIER" --seat "$SEAT" $new_arm');
+  expect(watchContext).toMatch(/The skill's beat recipe\s*\n# names that bare-call shape the unsafe legacy form/);
+});
+
+test("D-265: the pre-arm beat sweep matches the legacy wrapper — the pgrep pattern never regains a --loop qualifier, because a --loop self-retires on a new arm and the wrapper is the writer that survives it", () => {
+  const skill = readShippedSkill();
+  expect(skill).toContain('(`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected**');
+  expect(skill).toContain("**The PRIMARY target is the legacy\n  `while … tickmarkr beat <tier>` wrapper**");
+  expect(skill).not.toMatch(/pgrep -f "tickmarkr beat <tier>[^"]*--loop/);
+});

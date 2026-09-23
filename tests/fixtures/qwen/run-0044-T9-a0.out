@@ -1,0 +1,11 @@
+rompts/T9-a0cd '/Users/operator/orca/workspaces/tkr-spec/spec-257/.tickmarkr/worktrees.noindex/tickmarkr-run-20260921-164444-0000000000000044--T9'    printf '%s\n' 'TICKMARKR_CHECKOUT 129:2f55736572732f6f70657261746f722f6f7263612f776f726b7370616365732f746b722d737065632f737065632d3235372f2e7469636b6d61726b722f776f726b74726565732e6e6f696e6465782f7469636b6d61726b722d72756e2d32303236303932312d3136343434342d303030303030303030303030303034342d2d5439;'    sh    'bash '  '/Users/operator/orca/workspaces/tkr-spec/spec-257/.tickmarkr/runs/run-20260921-164444-0000000000000044/prompts/T9-a0.sh'  ''
+TICKMARKR_CHECKOUT 129:2f55736572732f6f70657261746f722f6f7263612f776f726b7370616365732f746b722d737065632f737065632d3235372f2e7469636b6d61726b722f776f726b74726565732e6e6f696e6465782f7469636b6d61726b722d72756e2d32303236303932312d3136343434342d303030303030303030303030303034342d2d5439;
+       ▄▖
+     ▄█▀
+▗▄ ▄█▀             tickmarkr
+ ▝█▛               spec in, verified work out.
+
+tickmarkr
+TICKMARKR_DISPATCH_20397786
+⚠ SAFE MODE — all customizations disabled (hooks, extensions, skills, MCP servers, QWEN.md). Restart without --safe-mode to resume normal operation.
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.

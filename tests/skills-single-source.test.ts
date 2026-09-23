@@ -53,3 +53,23 @@ test("the overseer skill states in both tracked copies that a seat retires only 
   expect(skill).toMatch(/RESUME-AWARE CONTAMINATION[\s\S]{0,300}continue across `run-resume`/);
   expect(skill).toMatch(/RE-RUN A PREMISE[\s\S]{0,400}call-site premise[\s\S]{0,160}rejected alternatives/);
 });
+
+test("T14: both tracked copies key Orca liveness on result.terminal.status, log cited opens under .tickmarkr/overseer, and arm the beat loop through --new-arm/--loop (OBS-1087, OBS-1102, OBS-1050 (1))", () => {
+  for (const root of [canonicalRoot, installedRoot]) {
+    if (!existsSync(root)) continue;
+    const skill = readFileSync(resolve(root, "SKILL.md"), "utf8");
+    expect(skill, `${root} SKILL.md`).toContain(
+      'key liveness on `result.terminal.status === "running"` — never on the envelope\'s own `ok`',
+    );
+    expect(skill, `${root} SKILL.md`).toContain("reads that exited seat as alive and never fires (OBS-1087)");
+    expect(skill.match(/\.tickmarkr\/overseer\/opened-files\.log/g)?.length, `${root} SKILL.md`).toBeGreaterThanOrEqual(3);
+    expect(skill, `${root} SKILL.md`).toContain("Nothing else records which cited files a successor actually opened after a clear (OBS-1102)");
+    expect(skill, `${root} SKILL.md`).toContain("`--new-arm` and `--loop` are the only verbs that acknowledge a stand-down");
+    expect(skill, `${root} SKILL.md`).toContain("it is the shape that re-armed a recorded stand-down (OBS-583, OBS-1088)");
+
+    const watchContext = readFileSync(resolve(root, "scripts/watch-context.sh"), "utf8");
+    expect(watchContext, `${root} watch-context.sh`).toContain("OBS-583/OBS-1088");
+    expect(watchContext, `${root} watch-context.sh`).toContain('[ "$armed" -eq 0 ] && new_arm="--new-arm"');
+    expect(watchContext, `${root} watch-context.sh`).toContain('tickmarkr beat "$TIER" --seat "$SEAT" $new_arm');
+  }
+});

@@ -1,11 +1,12 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Baseline } from "../../src/gates/baseline.js";
 import { captureBaseline, compareToBaseline, setCalmWindowForTests, resetCalmWindowForTests, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { verifyIntegrationTipCached } from "../../src/run/daemon.js";
-import { DEFAULT_SHELL_TIMEOUT_MS, type ShResult } from "../../src/run/git.js";
-import type { Journal, JournalEvent } from "../../src/run/journal.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, type ShResult, type ShellOptions } from "../../src/run/git.js";
+import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
@@ -17,17 +18,17 @@ import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 // vi.hoisted: the mock factory is hoisted above the imports, so its state must be too.
 const shSpy = vi.hoisted(() => ({
   calls: [] as { cmd: string; timeoutMs: number | undefined }[],
-  stub: undefined as undefined | ((cmd: string) => ShResult | undefined),
+  stub: undefined as undefined | ((cmd: string, options?: ShellOptions) => ShResult | undefined),
 }));
 
 vi.mock("../../src/run/git.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/run/git.js")>();
   return {
     ...actual,
-    sh: (cmd: string, cwd: string, timeoutMs?: number) => {
+    sh: (cmd: string, cwd: string, timeoutMs?: number, options?: ShellOptions) => {
       shSpy.calls.push({ cmd, timeoutMs });
-      const stubbed = shSpy.stub?.(cmd);
-      return stubbed ? Promise.resolve(stubbed) : actual.sh(cmd, cwd, timeoutMs);
+      const stubbed = shSpy.stub?.(cmd, options);
+      return stubbed ? Promise.resolve(stubbed) : actual.sh(cmd, cwd, timeoutMs, options);
     },
   };
 });
@@ -396,3 +397,64 @@ test("a tip verify whose run-start row records distinct task and tip commands se
   expect(converged!.forgiven).toBeUndefined();
 });
 
+
+test("test: a tip verify row for each executed build test or lint invocation red or green carries a receipt binding immutable stdout plus stderr references by hash whereas a never started or provenance refused row states that absence fabricating none, so a hash of a derived log or an invented receipt fails", async () => {
+  const repo = makeRepo({ "a.txt": "a", ".gitignore": ".tickmarkr/\n" });
+  const ids = new Set<string>();
+  for (const code of [0, 1]) {
+    const journal = Journal.create(repo, `run-tip-receipts-${code}`);
+    const commands = Object.fromEntries(["build", "test", "lint"].map(gate =>
+      [gate, `printf '${gate} output'; printf 'FAIL fresh assertion' >&2; exit ${code}`]));
+    journal.append("run-start", undefined, { commands });
+    expect(await verifyIntegrationTipCached(repo, commands, journal)).toBe(code !== 0);
+    const rows = journal.read().filter(row => ["tip-verify", "tip-verify-failed"].includes(row.event));
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      const receipt = row.data.evidenceReceipt as import("../../src/run/protocol.js").GateEvidenceReceipt;
+      expect(receipt.termination).toMatchObject({ kind: "exit", exitCode: code });
+      expect(row.data.cause).toBe(code === 0 ? undefined : "regression");
+      expect(ids.has(receipt.invocationId)).toBe(false);
+      ids.add(receipt.invocationId);
+      for (const stream of ["stdout", "stderr"] as const) {
+        const ref = receipt[stream];
+        const bytes = readFileSync(join(journal.dir, ref.path));
+        expect(ref.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+        expect(ref.retainedBytes).toBe(bytes.length);
+        expect(bytes.toString()).toBe(stream === "stdout" ? `${row.data.gate} output` : "FAIL fresh assertion");
+      }
+    }
+    const refused = await verifyIntegrationTip(repo, { build: "printf unrecorded" }, journal.dir);
+    expect(refused[0]).toMatchObject({ pass: false, evidenceAbsence: "provenance-refused" });
+    expect(refused[0]!.evidenceReceipt).toBeUndefined();
+  }
+  for (const code of [0, 1]) {
+    const fixture = makeRepo({
+      ".gitignore": "node_modules/\n",
+      "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run" } }),
+      "sample.test.ts": `import { test, expect } from "vitest"; test("sample", () => { console.log("runner stdout"); console.error("runner stderr"); expect(${code}).toBe(0); });`,
+    });
+    symlinkSync(join(import.meta.dirname, "../../node_modules"), join(fixture, "node_modules"), "dir");
+    const dir = makeTestTempDir("tip-manifest-receipts-");
+    const [row] = await verifyIntegrationTip(fixture, { test: "npm test" }, dir);
+    expect(row!.pass).toBe(code === 0);
+    const receipt = row!.evidenceReceipt!;
+    expect(receipt.nonce).toBe(JSON.parse(readFileSync(row!.reportPath!, "utf8")).nonce);
+    expect(row!.nonce).toBe(receipt.nonce);
+    expect(row!.stdoutPath).toBe(join(dir, receipt.stdout.path));
+    expect(row!.stderrPath).toBe(join(dir, receipt.stderr.path));
+    expect(row!.evidenceReceipts!.length).toBeGreaterThanOrEqual(2); // discovery and runner
+    for (const ref of [receipt.stdout, receipt.stderr]) {
+      expect(ref.sha256).toBe(createHash("sha256").update(readFileSync(join(dir, ref.path))).digest("hex"));
+    }
+  }
+  shSpy.stub = (_cmd, options) => {
+    options?.onReceipt?.({ outcome: "spawn-failed", confirmedStart: false });
+    return { code: 127, stdout: "", stderr: "spawn refused" };
+  };
+  const never = await verifyIntegrationTip(repo, { build: "unavailable" }, makeTestTempDir("never-started-"));
+  expect(never[0]!.evidenceReceipt).toMatchObject({
+    availability: "not-started", termination: { kind: "not-started" },
+    stdout: { availability: "not-started", sha256: null },
+    stderr: { availability: "not-started", sha256: null },
+  });
+}, 60_000);

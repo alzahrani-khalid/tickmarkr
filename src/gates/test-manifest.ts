@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { TEST_REPORTER_SOURCE } from "./test-reporter.js";
 import { shq } from "../adapters/types.js";
-import type { BaselineFileDuration } from "./baseline.js";
+import { beginGateEvidence, redactGateOutput, type GateEvidenceOptions, type BaselineFileDuration } from "./baseline.js";
+import type { GateEvidenceReceipt } from "../run/protocol.js";
 import { FORK_CAP_ENV, ROUTING_ENV_SEAMS, SUITE_PARENT_ENV, shell, resolvedCapacity, verificationProtocol } from "../run/git.js";
 
 /**
@@ -371,6 +372,8 @@ export function fileHangBudgetMs(file: string, baselineDurations?: readonly Base
 }
 
 export interface ManifestRunResult {
+  evidenceReceipt: GateEvidenceReceipt;
+  evidenceReceipts: GateEvidenceReceipt[];
   exitCode: number | undefined;
   stdout: string;
   stderr: string;
@@ -388,6 +391,7 @@ export function runManifestedTest(
   cmd: string,
   cwd: string,
   opts: {
+    evidence?: GateEvidenceOptions;
     manifest: readonly string[];
     nonce: string;
     reportPath: string;
@@ -401,6 +405,7 @@ export function runManifestedTest(
   const pollMs = opts.pollMs ?? 20;
   const overallCeilingMs = usable(opts.overallCeilingMs) ? opts.overallCeilingMs : DEFAULT_FILE_HANG_BUDGET_MS;
   const env: NodeJS.ProcessEnv = { ...(opts.env ?? process.env), TICKMARKR_TEST_REPORT: opts.reportPath, TICKMARKR_TEST_NONCE: opts.nonce };
+  const evidence = beginGateEvidence(cwd, "test", cmd, { ...opts.evidence, env }, opts.nonce);
   const controller = new AbortController();
   let pid: number | undefined;
   let killedFile: string | undefined;
@@ -423,6 +428,7 @@ export function runManifestedTest(
     }
   };
   return shell(cmd, cwd, overallCeilingMs, false, {
+    onReceipt: receipt => evidence.observe(killedFile && receipt.outcome === "cancelled" ? { ...receipt, outcome: "timed-out" } : receipt),
     env, signal: controller.signal, onTimeout: () => checkHang(true),
     onSpawn: (childPid) => {
       pid = childPid;
@@ -430,14 +436,26 @@ export function runManifestedTest(
       clearInterval(poll);
       poll = setInterval(checkHang, pollMs);
     },
-  }).then((result) => ({
-    exitCode: result.signalExit ? undefined : result.code,
-    stdout: result.stdout, stderr: result.stderr,
-    report: readTestReport(opts.reportPath), killedFile, hangBudgetMs, pid,
-  })).finally(() => { clearInterval(poll); });
+  }).then((result) => {
+    const evidenceReceipt = evidence.finish(result.stdout, result.stderr);
+    return {
+      evidenceReceipt, evidenceReceipts: [...evidence.history, evidenceReceipt],
+      exitCode: result.signalExit ? undefined : result.code,
+      stdout: result.stdout, stderr: result.stderr,
+      report: readTestReport(opts.reportPath), killedFile, hangBudgetMs, pid,
+    };
+  }).catch((error: unknown) => {
+    if (error instanceof Error) {
+      const evidenceReceipt = evidence.finish();
+      Object.assign(error, { evidenceReceipt, evidenceReceipts: [...evidence.history, evidenceReceipt] });
+    }
+    throw error;
+  }).finally(() => { clearInterval(poll); });
 }
 
 export interface ManifestGateOutcome {
+  evidenceReceipt?: GateEvidenceReceipt;
+  evidenceReceipts?: GateEvidenceReceipt[];
   pass: boolean;
   kind: ManifestVerdictKind;
   details: string;
@@ -461,27 +479,28 @@ function manifestEnvironment(cwd: string): { env: NodeJS.ProcessEnv; verificatio
   return { env, verification };
 }
 
-export interface DiscoveredManifest { files: string[]; listing: string; separator: string; listingExit: number | undefined; listingStdout: string }
+export interface DiscoveredManifest { files: string[]; listing: string; separator: string; listingExit: number | undefined; listingStdout: string; evidenceReceipt: GateEvidenceReceipt; evidenceReceipts: GateEvidenceReceipt[] }
 
 /** OBS-1044: THE discovery seam — the files the runner would collect under this exact invocation,
  * from its own listing and never from a stdout summary. The gate and the baseline capture share it,
  * so the count a capture records is the count the gate later asks the report to certify. Throws
  * when the runner cannot list: a count that is not the runner's own is not a count. */
-export async function discoverTestManifest(cmd: string, cwd: string, opts: { dir: string; nonce: string; env: NodeJS.ProcessEnv; overallCeilingMs?: number }): Promise<DiscoveredManifest> {
+export async function discoverTestManifest(cmd: string, cwd: string, opts: { dir: string; nonce: string; env: NodeJS.ProcessEnv; overallCeilingMs?: number; evidence?: GateEvidenceOptions }): Promise<DiscoveredManifest> {
   const invocation = runnerInvocation(cmd, cwd);
   const listed = await runManifestedTest(invocation.listing, cwd, {
-    manifest: [], nonce: opts.nonce, reportPath: join(opts.dir, `listing-${opts.nonce}.json`), env: opts.env,
+    evidence: opts.evidence, manifest: [], nonce: `${opts.nonce}-listing`, reportPath: join(opts.dir, `listing-${opts.nonce}.json`), env: opts.env,
     overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
   });
-  if (listed.exitCode !== 0) throw new Error(`vitest cannot list files (exit ${listed.exitCode ?? "signal"}): ${listed.stderr || listed.stdout}`);
+  const discoveryError = (message: string) => Object.assign(new Error(message), { evidenceReceipt: listed.evidenceReceipt, evidenceReceipts: listed.evidenceReceipts });
+  if (listed.exitCode !== 0) throw discoveryError(`vitest cannot list files (exit ${listed.exitCode ?? "signal"}): ${listed.stderr || listed.stdout}`);
   let files: string[];
   try {
     const rows: unknown = JSON.parse(listed.stdout.slice(listed.stdout.indexOf("[")));
     if (!Array.isArray(rows) || !rows.every((r) => typeof r?.file === "string")) throw new Error("invalid listing");
     files = [...new Set(rows.map((r) => toManifestPath(r.file, cwd)))].sort();
-  } catch { throw new Error(`vitest cannot list files: invalid JSON listing: ${listed.stdout}`); }
-  if (!files.length) throw new Error("vitest cannot list files: empty manifest");
-  return { files, listing: invocation.listing, separator: invocation.separator, listingExit: listed.exitCode, listingStdout: listed.stdout };
+  } catch { throw discoveryError(`vitest cannot list files: invalid JSON listing: ${listed.stdout}`); }
+  if (!files.length) throw discoveryError("vitest cannot list files: empty manifest");
+  return { files, listing: invocation.listing, separator: invocation.separator, listingExit: listed.exitCode, listingStdout: listed.stdout, evidenceReceipt: listed.evidenceReceipt, evidenceReceipts: listed.evidenceReceipts };
 }
 
 /** The baseline capture's reading of the same seam: the manifest's file count, or null when the
@@ -502,16 +521,19 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
   longestFile?: BaselineFileDuration | null;
   overallCeilingMs?: number;
   artifactDir?: string;
+  evidence?: GateEvidenceOptions;
 }): Promise<ManifestGateOutcome> {
   const dir = opts.artifactDir ?? mkdtempSync(join(tmpdir(), "tickmarkr-test-report-"));
   const nonce = randomBytes(16).toString("hex");
   const reportPath = join(dir, `test-manifest-report-${nonce}.json`);
   const reporterPath = join(dir, `test-reporter-${nonce}.mjs`);
+  const evidenceReceipts: GateEvidenceReceipt[] = [];
   let spawnedCommand = cmd;
   let manifestPath: string | undefined;
   const { env, verification } = manifestEnvironment(cwd);
   try {
-    const invocation = await discoverTestManifest(cmd, cwd, { dir, nonce, env, overallCeilingMs: opts.overallCeilingMs });
+    const invocation = await discoverTestManifest(cmd, cwd, { dir, nonce, env, overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } });
+    evidenceReceipts.push(...invocation.evidenceReceipts);
     const files = invocation.files;
     // R41: the EXPECTED manifest is evidence in its own right — persisted beside the report with the
     // exact discovery invocation, so a later reader can tell what this invocation was asked to prove
@@ -525,7 +547,7 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
     writeFileSync(reporterPath, TEST_REPORTER_SOURCE);
     spawnedCommand = `${cmd}${invocation.separator} --reporter=${shq(reporterPath)} --outputFile=${shq(reportPath)}`;
     const invoked = await runManifestedTest(spawnedCommand, cwd, {
-      manifest: files, nonce, reportPath, env,
+      evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir }, manifest: files, nonce, reportPath, env,
       baselineDurations: opts.baselineDurations?.map((d) => ({ ...d, file: toManifestPath(d.file, cwd) })),
       longestFile: opts.longestFile,
       overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
@@ -534,12 +556,13 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
     const verdict = verifyManifestReport({ manifest: files, nonce, exitCode: invoked.exitCode,
       report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs });
     // Preserve the validator's verdict and classification; runner evidence only explains it.
-    const stdoutPath = join(dir, `test-runner-stdout-${nonce}.log`);
-    const stderrPath = join(dir, `test-runner-stderr-${nonce}.log`);
-    const stdoutTail = Buffer.from(invoked.stdout).subarray(-16 * 1024);
-    const stderrTail = Buffer.from(invoked.stderr).subarray(-16 * 1024);
-    writeFileSync(stdoutPath, stdoutTail);
-    writeFileSync(stderrPath, stderrTail);
+    const evidenceReceipt = invoked.evidenceReceipt;
+    evidenceReceipts.push(...invoked.evidenceReceipts);
+    const evidenceRoot = opts.evidence?.artifactDir ?? dir;
+    const stdoutPath = join(evidenceRoot, evidenceReceipt.stdout.path);
+    const stderrPath = join(evidenceRoot, evidenceReceipt.stderr.path);
+    const stdoutTail = Buffer.from(redactGateOutput(invoked.stdout, env)).subarray(-16 * 1024);
+    const stderrTail = Buffer.from(redactGateOutput(invoked.stderr, env)).subarray(-16 * 1024);
     const report = invoked.report?.nonce === nonce ? invoked.report : undefined;
     const neverStarted = report ? files.filter(file => !(file in report.started)).length : "unknown";
     const errors = report?.certificate?.errors;
@@ -547,18 +570,20 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
     const reportedDiagnostics = report?.certificate?.diagnostics;
     const runnerErrors = Array.isArray(reportedDiagnostics) ? reportedDiagnostics.filter(error => typeof error === "string") : [];
     const diagnostics = !verdict.pass
-      ? `\nclassification: ${verdict.meta.classification ?? "unknown"}; runner-level diagnostic: never-started ${neverStarted}; reporter errors ${reporterErrors}`
+      ? `\nclassification: ${verdict.meta.classification ?? "unknown"}; runner-level diagnostic: never-started ${neverStarted}; reporter errors ${reporterErrors}; runner vitest`
         + [...runnerErrors,
           stdoutTail.toString(), stderrTail.toString()].filter(Boolean).map(text => `\n${text}`).join("")
       : "";
-    return { pass: verdict.pass, kind: verdict.kind,
+    return { evidenceReceipt, evidenceReceipts, pass: verdict.pass, kind: verdict.kind,
       details: verdict.details + diagnostics,
       classification: verdict.meta.classification as "infra" | "regression" | undefined,
       meta: { ...verdict.meta, nonce, manifest: files, manifestPath, listingCommand: invocation.listing, verification,
         spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid, stdoutPath, stderrPath },
       exitCode: invoked.exitCode ?? -1, reportPath };
   } catch (error) {
-    return { pass: false, kind: "infra", classification: "infra", exitCode: -1, reportPath,
+    const evidenceReceipt = (error as { evidenceReceipt?: GateEvidenceReceipt })?.evidenceReceipt;
+    if (evidenceReceipt) evidenceReceipts.push(...((error as { evidenceReceipts?: GateEvidenceReceipt[] }).evidenceReceipts ?? [evidenceReceipt]));
+    return { evidenceReceipt, evidenceReceipts, pass: false, kind: "infra", classification: "infra", exitCode: -1, reportPath,
       details: error instanceof Error ? error.message : String(error),
       meta: { classification: "infra", infra: true, manifestDiscoveryFailed: true, spawnedCommand, verification, ...(manifestPath ? { manifestPath } : {}) } };
   }

@@ -73,3 +73,27 @@ test("test: the same grant lifting a four criterion task from five files pattern
     data: { by: "operator", release: "scope-request", amendment: { beforeFiles: patterns(5), files: [...patterns(5), "needed.txt"] } },
   });
 });
+
+// OBS-1083: the scope-request path parses --review-rounds with every other release path and must write it.
+test("test: approve files with review rounds journals the scope request approval carrying that review round ceiling, so a grant that parses the flag and drops it fails", async () => {
+  const { repo, journal } = parked("T1", criteria(4), patterns(5), "needed.txt");
+
+  await approve([journal.runId, "T1", "--files", "needed.txt", "--review-rounds", "2", "--by", "operator"], repo);
+
+  const rows = approvals(journal);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.data).toMatchObject({ release: "scope-request", reviewRoundCeiling: 2 });
+});
+
+test("test: approve files with a non positive review rounds value is refused before any row is appended exactly as the waive path refuses it, so a grant that appends then errors fails", async () => {
+  const { repo, journal, before, journalPath } = parked("T1", criteria(4), patterns(5), "needed.txt");
+
+  for (const value of ["0", "-1"]) {
+    await expect(approve([journal.runId, "T1", "--files", "needed.txt", "--review-rounds", value], repo))
+      .rejects.toThrow(/--review-rounds must be a positive integer/);
+    await expect(approve([journal.runId, "T1", "--waive", "--review-rounds", value], repo))
+      .rejects.toThrow(/--review-rounds must be a positive integer/);
+  }
+  expect(approvals(journal)).toHaveLength(0);
+  expect(readFileSync(journalPath, "utf8")).toBe(before);
+});
