@@ -540,6 +540,10 @@ const BRANCH_LEDGER = [
   },
 ] as const satisfies readonly BranchLedgerEntry[];
 
+// OBS-1141: local ≈2 s/entry (≈70 s / 35); the public 2-core runner blew a flat 180 s (>5 s/entry), so 20 s/entry
+// is ≥3x that floor (10x local) plus 60 s for the sandbox — 35 × 20 s + 60 s = 760 s, and it grows with the ledger.
+const BRANCH_LEDGER_LEAF_TIMEOUT_MS = BRANCH_LEDGER.length * 20_000 + 60_000;
+
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const VITEST_BIN = join(PROJECT_ROOT, "node_modules", "vitest", "vitest.mjs");
 
@@ -2357,7 +2361,7 @@ describe("executed cockpit branch ledger", () => {
         await proveLedgerEntry(sandbox, entry, passed);
       }
     });
-  }, 180_000);
+  }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
 
   test("test: a ledger broken arm breaks the production branch it names rather than code the test owns, so an arm that fails by construction without touching production makes the assertion fail", async () => {
     await withBranchSandbox(async (sandbox) => {
@@ -2385,5 +2389,5 @@ describe("executed cockpit branch ledger", () => {
           .rejects.toThrow(/named test did not execute and fail/u);
       }
     });
-  }, 180_000);
+  }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
 });
