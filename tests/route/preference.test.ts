@@ -7,7 +7,7 @@ import { type AuthHealth, type BillingChannel, channelKey, channelsFromConfig } 
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../src/config/config.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { modelProvider } from "../../src/gates/review.js";
-import { disallowedBy, denyPreferCollisions, preferEntryDenied, preferRanks, routingModelProvider } from "../../src/route/preference.js";
+import { exclusionCollector, disallowedBy, denyPreferCollisions, preferEntryDenied, preferRanks, routingModelProvider } from "../../src/route/preference.js";
 import { nextChannel, route, RoutingError } from "../../src/route/router.js";
 import { authedModels } from "../helpers/tmprepo.js";
 
@@ -255,8 +255,8 @@ describe("T10 role-scoped deny", () => {
     const routerSrc = readFileSync(join(import.meta.dirname, "../../src/route/router.ts"), "utf8");
 
     expect(prefSrc).toContain("export function disallowedBy");
-    expect(prefSrc).toContain('role === "worker"');
-    expect(prefSrc).toContain("deny?.workers");
+    expect(prefSrc).toContain("for (const scope of DENY_SCOPES)");
+    expect(prefSrc).toContain("denyEntriesAt(routing, scope)");
     expect(routerSrc).toContain("disallowedBy(");
     expect(routerSrc).not.toContain("deny?.workers");
   });
@@ -337,4 +337,30 @@ describe("T7 deny∩prefer static preflight", () => {
     expect(prefSrc).toContain("route(preflightTask, probe, [])");
     expect(prefSrc).not.toMatch(/if \(p\.includes\(":"\)\)/);
   });
+});
+
+
+test("test: for each production deny scope the collector's exclusion for a denied channel keeps today's scope path config path entry and role, so a derivation that renames a scope or widens workers fails", () => {
+  const target = { adapter: "codex", model: "gpt-5.5" };
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.routing.allow = { models: ["unrelated"] };
+  cfg.routing.deny = {
+    adapters: ["codex", "unrelated"],
+    models: ["codex:gpt-5.5", "gpt-5.5"],
+    workers: { adapters: ["codex"], models: ["gpt-5.5"] },
+  };
+  const expected = [
+    ["routing.deny.adapters", "codex"],
+    ["routing.deny.models", "codex:gpt-5.5"],
+    ["routing.deny.models", "gpt-5.5"],
+    ["routing.deny.workers.adapters", "codex"],
+    ["routing.deny.workers.models", "gpt-5.5"],
+  ].map(([path, entry]) => ({ scope: path, path, configPath: path, entry, by: "deny" }));
+  const allow = { scope: "routing.allow", path: "routing.allow", configPath: "routing.allow", entry: "unrelated", by: "allow" };
+  for (const role of ["worker", "judge", "review", "consult"] as const) {
+    const exclusions = [...(role === "worker" ? expected : expected.slice(0, 3)), allow];
+    expect(exclusionCollector(target, cfg.routing, role), role).toEqual(exclusions);
+    expect(exclusionCollector(target, cfg, role), role).toEqual(exclusions);
+  }
+  expect(exclusionCollector(target, cfg)).toEqual([...expected, allow]);
 });

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { execFileSync, execSync } from "node:child_process";
@@ -37,6 +37,87 @@ function freshProcess(script: string): unknown {
     "--import", createRequire(import.meta.url).resolve("tsx"), "--input-type=module", "-e", script,
   ], { encoding: "utf8", timeout: 20_000 }));
 }
+
+test("test: two worktrees with identical trees whose admitted links target different in tree packages compute different verification identities while identical resolutions in relocated worktrees share one, so a key that omits resolution fails", async () => {
+  const files = { ".gitignore": "node_modules\n", "packages/a/index.js": "export default 1;\n",
+    "packages/b/index.js": "export default 2;\n" };
+  const repos = [makeRepo(files), makeRepo(files), makeRepo(files)];
+  for (const [index, repo] of repos.entries()) {
+    // An external dependency root models the harness-provisioned node_modules link.
+    const dependencies = makeTestTempDir("tickmarkr-resolution-");
+    mkdirSync(join(dependencies, "@scope"));
+    mkdirSync(join(dependencies, ".store/a"), { recursive: true });
+    mkdirSync(join(dependencies, ".store/b"), { recursive: true });
+    symlinkSync(dependencies, join(repo, "node_modules"), "dir");
+    // Reverse creation order in the relocated control; inventory order must be canonical.
+    const links = [
+      ["workspace", join(repo, "packages", index === 1 ? "b" : "a")],
+      ["@scope/installed", join(dependencies, ".store/a")],
+    ];
+    for (const [link, target] of index === 2 ? links.reverse() : links) {
+      symlinkSync(target!, join(dependencies, link!), "dir");
+    }
+  }
+  const identify = (worktree: string) => computeVerificationIdentity({ worktree, gate: "test", command: "npm test",
+    capacity: { forkCap: 2, cores: 4 },
+    verification: { protocol: VERIFICATION_PROTOCOL, lifecycle: "hooks", source: "explicit" } });
+  const [first, changed, relocated] = await Promise.all(repos.map(identify));
+  expect(first?.tree).toBeTruthy();
+  expect(changed?.tree).toBe(first!.tree);
+  expect(relocated?.tree).toBe(first!.tree);
+  expect(verificationIdentityKey(changed!)).not.toBe(verificationIdentityKey(first!));
+  expect(verificationIdentityKey(relocated!)).toBe(verificationIdentityKey(first!));
+  // The admitted dependency-store links are part of the whole inventory too.
+  const installed = join(repos[2]!, "node_modules/@scope/installed");
+  rmSync(installed);
+  symlinkSync(join(realpathSync(join(repos[2]!, "node_modules")), ".store/b"), installed, "dir");
+  expect(verificationIdentityKey((await identify(repos[2]!))!)).not.toBe(verificationIdentityKey(first!));
+});
+
+test("test: a verdict write whose final replacement fails after its temp file was written leaves the previous record readable at the final path, so a store that unlinks the final file before copying fails", () => {
+  const dir = makeTestTempDir("tickmarkr-atomic-verdict-");
+  const id = { gate: "test", tree: "tree", command: "npm test", baseline: "none", environment: "env" };
+  const store = new VerdictStore(dir);
+  const previous = { gate: "test", pass: true, details: "previous completed verdict" };
+  expect(store.set(id, previous)).toBe(true);
+  const finalPath = join(dir, `verdict-${verificationIdentityKey(id)}.json`);
+  const before = readFileSync(finalPath, "utf8");
+  const failure = freshProcess(`
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const finalPath = ${JSON.stringify(finalPath)};
+    const write = fs.writeFileSync;
+    let tempWritten = false;
+    let replacementAttempted = false;
+    const fail = () => { replacementAttempted = true; throw new Error("replacement denied"); };
+    fs.writeFileSync = (path, ...args) => {
+      if (path === finalPath) fail();
+      const result = write(path, ...args);
+      if (String(path).endsWith(".tmp")) tempWritten = fs.existsSync(path);
+      return result;
+    };
+    fs.renameSync = (source, destination) => {
+      if (destination !== finalPath) throw new Error("unexpected destination");
+      tempWritten = tempWritten && fs.existsSync(source);
+      fail();
+    };
+    syncBuiltinESMExports();
+    const { VerdictStore } = await import(${JSON.stringify(new URL("../../src/gates/cache.ts", import.meta.url).href)});
+    let error;
+    try {
+      new VerdictStore(${JSON.stringify(dir)}).set(${JSON.stringify(id)},
+        { gate: "test", pass: false, details: "replacement verdict" });
+    } catch (caught) { error = caught.message; }
+    console.log(JSON.stringify({ tempWritten, replacementAttempted, error }));
+  `);
+  expect(failure).toEqual({ tempWritten: true, replacementAttempted: true, error: "replacement denied" });
+  expect(readFileSync(finalPath, "utf8")).toBe(before);
+  expect(new VerdictStore(dir).get(id)).toEqual(previous);
+  expect(readdirSync(dir).filter(file => file.endsWith(".tmp"))).toEqual([]);
+  const replacement = { gate: "test", pass: false, details: "replacement verdict" };
+  expect(store.set(id, replacement)).toBe(true);
+  expect(new VerdictStore(dir).get(id)).toEqual(replacement);
+});
 
 async function assertCancelledTipWritesNothing(): Promise<void> {
   const repo = makeRepo({ "code.txt": "ok\n", ".gitignore": "calls.log\nstarted\nrelease\n" });
@@ -972,3 +1053,30 @@ test("test: a reused verdict retains its original receipt bound to its origin ru
   expect(cacheEvidenceBytes(join(original.dir, "gate-evidence"))).toEqual(beforeEvidence);
   expect(existsSync(join(next.dir, "gate-evidence"))).toBe(false);
 });
+
+test("test: the daemon's gate row for a task gate verdict reused from the store in a fresh process carries the original receipt invocation id and origin run root under the reused marker, so a reused row with no receipt or a newly minted one fails", async () => {
+  const { repo, fake, scriptPath } = setupRepo([T("T1")], {
+    tasks: { T1: [{ shell: 'echo one > t1.txt && git add t1.txt && git commit --no-gpg-sign -m one', result: { ok: true, summary: "one" } }] },
+  }, 'gates: { build: "echo original-build-output" }\n');
+  const graphPath = join(repo, ".tickmarkr", "graph.json");
+  const graph = readFileSync(graphPath);
+  await runDaemon(repo, { adapters: [fake], runId: "run-task-receipt-source", approvalWindowMs: 0 });
+  const original = Journal.open(repo, "run-task-receipt-source");
+  const fresh = original.read().find(e => e.event === "gate-result" && e.data.gate === "build")!;
+  expect(fresh.data.evidenceReceipt).toBeDefined();
+  const before = cacheEvidenceBytes(join(original.dir, "gate-evidence"));
+  writeFileSync(graphPath, graph);
+  // A separate Node process must read the persisted verdict, with no in-memory result to borrow.
+  execFileSync(process.execPath, ["--import", createRequire(import.meta.url).resolve("tsx"), "--input-type=module", "-e", `
+    import { runDaemon } from ${JSON.stringify(new URL("../../src/run/daemon.ts", import.meta.url).href)};
+    import { FakeAdapter } from ${JSON.stringify(new URL("../../src/adapters/fake.ts", import.meta.url).href)};
+    await runDaemon(${JSON.stringify(repo)}, { adapters: [new FakeAdapter(${JSON.stringify(scriptPath)})],
+      runId: "run-task-receipt-reused", approvalWindowMs: 0 });
+  `], { encoding: "utf8", timeout: 90_000 });
+  const reused = Journal.open(repo, "run-task-receipt-reused").read()
+    .find(e => e.event === "gate-result" && e.data.gate === "build")!;
+  expect(reused.data).toMatchObject({ reused: true, originRunRoot: original.dir,
+    evidenceReceipt: fresh.data.evidenceReceipt, evidenceReceipts: fresh.data.evidenceReceipts });
+  expect(reused.data.evidenceReceipt).toEqual(fresh.data.evidenceReceipt);
+  expect(cacheEvidenceBytes(join(original.dir, "gate-evidence"))).toEqual(before);
+}, 120_000);

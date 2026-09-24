@@ -20,6 +20,7 @@ import {
   type OrcaFamily,
 } from "../../src/drivers/orca.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
+import { herdrSealShellPrefix } from "../../src/drivers/subprocess.js";
 import { FakeOrca, ORCA_FIXTURE_NONCE, ORCA_LITERAL_MARKER, pagedMarkerLines, steppedTime, type FakeOrcaOpts } from "../helpers/fake-orca.js";
 
 const WT = "/tmp/orca-wt/T1";
@@ -104,8 +105,9 @@ describe("OrcaDriver", () => {
     // Control: ONE unpaged tail read. Neither marker is there in any form — raw or de-wrapped —
     // because the literal's halves sit either side of a cursor page boundary and the trailer's
     // wrapped body is further back than a tail read reaches.
+    const afterLaunch = fake.calls.length;
     const tail = await driver.read(slot, 3);
-    expect(fake.calls.filter((a) => a[1] === "read").every((a) => !a.includes("--cursor"))).toBe(true);
+    expect(fake.calls.slice(afterLaunch).filter((a) => a[1] === "read").every((a) => !a.includes("--cursor"))).toBe(true);
     expect(tail).not.toContain(ORCA_LITERAL_MARKER);
     expect(joinWrapped(tail)).not.toContain(ORCA_LITERAL_MARKER);
     expect(new RegExp(TRAILER_RE).test(tail)).toBe(false);
@@ -125,7 +127,7 @@ describe("OrcaDriver", () => {
     // Production argv and the shim speak the real 1.4.186 contract, not an invented lookalike.
     expect(fake.calls.every((args) => args.at(-1) === "--json")).toBe(true);
     expect(fake.calls.find((args) => args[1] === "create")).toEqual([
-      "terminal", "create", "--worktree", `path:${WT}`, "--title", TITLE, "--command", inCheckout(WT, "bash"), "--json",
+      "terminal", "create", "--worktree", `path:${WT}`, "--title", TITLE, "--command", inCheckout(WT, `${herdrSealShellPrefix().split(";")[0]}; bash`), "--json",
     ]);
     expect(fake.calls.filter((args) => args[1] === "read" && !args.includes("--screen"))
       .every((args) => args.includes("--limit") && !args.includes("--lines"))).toBe(true);
@@ -205,14 +207,14 @@ describe("OrcaDriver", () => {
 
     // Validation is per PAGE, not per sweep: this terminal is running for the anchor read and the
     // first page (which carries the marker's first half) and dead by the second.
-    const mid = rig({ flipStatusAfterReads: 2 });
+    const mid = rig({ flipStatusAfterReads: 4 }); // two startup proof reads precede the sweep
     const midSlot = await bound(mid.driver, mid.fake, pagedMarkerLines());
     const midErr = await mid.driver.waitOutput(midSlot, ORCA_LITERAL_MARKER, 1_000).then((v) => v, (e: unknown) => e);
     expect(midErr).toBeInstanceOf(OrcaUnavailableError);
 
     // The false-clean control: a reader that validates only the INITIAL read and then pages blindly
     // reassembles the marker off a terminal that died mid-sweep.
-    const lax = new FakeOrca({ flipStatusAfterReads: 2 });
+    const lax = new FakeOrca({ flipStatusAfterReads: 4 });
     const laxDriver = new OrcaDriver({ exec: lax.exec, time: steppedTime() });
     await bound(laxDriver, lax, pagedMarkerLines());
     const handle = lax.last()!.handle;
@@ -238,7 +240,7 @@ describe("OrcaDriver", () => {
     const statusRaceDriver = new OrcaDriver({
       exec: async (args, cwd, timeoutMs) => {
         const res = await origStatusRaceExec(args, cwd, timeoutMs);
-        if (args[0] === "terminal" && args[1] === "read" && args.some(arg => arg.includes("term_1"))) {
+        if (args[0] === "terminal" && args[1] === "read" && args.includes("--screen") && args.some(arg => arg.includes("term_1"))) {
           // Restart server after read leg of status()
           statusRaceFake.restart("rt-2", [
             { handle: "term_2", title: TITLE, worktree: WT, status: "exited", connected: true },
@@ -308,7 +310,14 @@ describe("OrcaDriver", () => {
     const invoke: Record<OrcaFamily, (opts: FakeOrcaOpts) => Promise<unknown>> = {
       status: async (o) => rig(o).driver.probeRuntime(WT),
       create: async (o) => { const r = rig(o); return r.driver.run(await r.driver.slot(WT, TITLE), "bash"); },
-      read: async (o) => { const r = rig(o); return r.driver.read(await bound(r.driver, r.fake, ["x"]), 3); },
+      read: async (o) => {
+        const raw = o.raw!.read;
+        delete o.raw!.read;
+        const r = rig(o);
+        const slot = await bound(r.driver, r.fake, ["x"]);
+        o.raw!.read = raw;
+        return r.driver.read(slot, 3);
+      },
       show: async (o) => { const r = rig(o); return r.driver.status(await bound(r.driver, r.fake, ["x"])); },
       send: async (o) => { const r = rig(o); const s = await bound(r.driver, r.fake, ["x"]); return r.driver.run(s, "second turn"); },
       wait: async (o) => { const r = rig(o); return r.driver.waitAgentStatus(await bound(r.driver, r.fake, ["x"]), "done", 1_000); },
@@ -432,8 +441,10 @@ describe("OrcaDriver", () => {
       result: { terminal: { handle: foreignHandle, status: "running", tail: ["should never be trusted"], oldestCursor: "0", nextCursor: "1", limited: false } },
       _meta: { runtimeId: "rt-1" },
     });
-    const foreignReadRig = rig({ raw: { read: foreignRead } });
+    const foreignReadOverrides: FakeOrcaOpts["raw"] = {};
+    const foreignReadRig = rig({ raw: foreignReadOverrides });
     const foreignReadSlot = await bound(foreignReadRig.driver, foreignReadRig.fake, ["x"]);
+    foreignReadOverrides.read = foreignRead;
     const readMismatch = await foreignReadRig.driver.read(foreignReadSlot, 3).then((v) => v, (e: unknown) => e);
     expect(readMismatch).toBeInstanceOf(OrcaUnavailableError);
     expect((readMismatch as OrcaUnavailableError).message).toContain(foreignHandle);
@@ -581,10 +592,11 @@ describe("OrcaDriver", () => {
     // body) recovers identically — the refusal code must survive the nonzero exit to fire at all.
     const stale = rig({ runtimeId: "rt-1", nextHandle: "term_A" });
     const staleWindowSlot = await bound(stale.driver, stale.fake, ["before"]);
+    const afterStaleLaunch = stale.fake.calls.length;
     stale.fake.terminals = [{ handle: "term_B2", title: TITLE, worktree: WT, lines: ["AFTER SAME-RUNTIME STALE"] }];
     expect(await stale.driver.read(staleWindowSlot, 5)).toBe("AFTER SAME-RUNTIME STALE");
     expect(stale.fake.countOf("list")).toBe(1);
-    expect(stale.fake.calls.filter((a) => a[1] === "read" && a.some(x => x.includes("term_A")))).toHaveLength(1);
+    expect(stale.fake.calls.slice(afterStaleLaunch).filter((a) => a[1] === "read" && a.some(x => x.includes("term_A")))).toHaveLength(1);
 
     // (c) a CHANGED runtime id answering ok:true for the old handle value is discarded, not read:
     // that response is a lookalike's bytes until the relist proves otherwise.
@@ -606,10 +618,11 @@ describe("OrcaDriver", () => {
     const during = new FakeOrca({ runtimeId: "rt-1", nextHandle: "term_A", pageSize: 3 });
     const restartMarker = "TICKMARKR_FOUND_AFTER_MID_SWEEP_RESTART";
     let cursorPages = 0;
+    let sweepStarted = false;
     const duringDriver = new OrcaDriver({
       exec: async (args, cwd, timeoutMs) => {
         const result = await during.exec(args, cwd, timeoutMs);
-        if (args[0] === "terminal" && args[1] === "read" && args.includes("--cursor") && ++cursorPages === 1) {
+        if (sweepStarted && args[0] === "terminal" && args[1] === "read" && args.includes("--cursor") && ++cursorPages === 1) {
           during.restart("rt-2", [{
             handle: "term_NEW",
             title: TITLE,
@@ -622,8 +635,10 @@ describe("OrcaDriver", () => {
       time: steppedTime(),
     });
     const duringSlot = await bound(duringDriver, during, ["old 0", "old 1", "old 2", "old 3", "old 4", "old 5", "old 6", "old 7"]);
+    sweepStarted = true;
+    const afterDuringLaunch = during.calls.length;
     expect(await duringDriver.waitOutput(duringSlot, restartMarker, 1_000)).toBe(true);
-    const duringReads = during.calls.filter((a) => a[0] === "terminal" && a[1] === "read");
+    const duringReads = during.calls.slice(afterDuringLaunch).filter((a) => a[0] === "terminal" && a[1] === "read");
     expect(duringReads.filter((a) => !a.includes("--cursor"))).toHaveLength(2); // original + recovered anchors
     expect(duringReads.filter((a) => a.includes("--cursor")).map((a) => a[a.indexOf("--cursor") + 1]))
       .toEqual(expect.arrayContaining(["0", "0"])); // one page pre-restart, a fresh anchor page after
@@ -639,10 +654,11 @@ describe("OrcaDriver", () => {
     expect(joinWrapped([...oldLines.slice(0, 3), ...newLines].join("\n"))).toContain(SPLIT_MARKER);
     const poison = new FakeOrca({ runtimeId: "rt-1", nextHandle: "term_A", pageSize: 3 });
     let poisonPages = 0;
+    let poisonSweepStarted = false;
     const poisonDriver = new OrcaDriver({
       exec: async (args, cwd, timeoutMs) => {
         const result = await poison.exec(args, cwd, timeoutMs);
-        if (args[0] === "terminal" && args[1] === "read" && args.includes("--cursor") && ++poisonPages === 1) {
+        if (poisonSweepStarted && args[0] === "terminal" && args[1] === "read" && args.includes("--cursor") && ++poisonPages === 1) {
           poison.restart("rt-2", [{ handle: "term_NEW", title: TITLE, worktree: WT, lines: newLines }]);
         }
         return result;
@@ -650,6 +666,7 @@ describe("OrcaDriver", () => {
       time: steppedTime(),
     });
     const poisonSlot = await bound(poisonDriver, poison, oldLines);
+    poisonSweepStarted = true;
     expect(await poisonDriver.waitOutput(poisonSlot, SPLIT_MARKER, 800)).toBe(false);
     expect(poison.countOf("list")).toBe(1); // the restart WAS observed — only the stale bytes went
 
@@ -770,9 +787,10 @@ describe("OrcaDriver", () => {
     for (const code of [STALE_HANDLE_CODE, TERMINAL_GONE_CODE]) {
       const fake = new FakeOrca({ runtimeId: "rt-1", nextHandle: "term_A" });
       let refused = false;
+      let launched = false;
       const driver = new OrcaDriver({
         exec: async (args, cwd, timeoutMs) => {
-          if (!refused && args[0] === "terminal" && args[1] === "read" && args.includes("term_A")) {
+          if (launched && !refused && args[0] === "terminal" && args[1] === "read" && args.includes("term_A")) {
             refused = true;
             return {
               code: 1,
@@ -789,6 +807,7 @@ describe("OrcaDriver", () => {
         time: steppedTime(),
       });
       const slot = await bound(driver, fake, ["before"]);
+      launched = true;
       fake.terminals = [{ handle: "term_B", title: TITLE, worktree: WT, lines: [`after ${code}`] }];
 
       await expect(driver.read(slot, 5)).resolves.toBe(`after ${code}`);
@@ -847,12 +866,13 @@ describe("OrcaDriver", () => {
   test("test: status reads the rendered screen so a fixture whose screen read reports source screen-unavailable answers unknown with zero wait calls and never idle while the trailer sweep still finds a marker split across two cursor-paged stream reads whereas a driver whose status leg reads the stream or treats screen-unavailable as idle fails", async () => {
     const unavailable = rig();
     const unavailableSlot = await bound(unavailable.driver, unavailable.fake, ["fragment", "prompt"]);
+    const afterUnavailableLaunch = unavailable.fake.calls.length;
     unavailable.fake.last()!.screenSource = "screen-unavailable";
     unavailable.fake.last()!.tuiIdle = true; // a stream/probe-based implementation would say idle
 
     expect(await unavailable.driver.status(unavailableSlot)).toBe("unknown");
     expect(unavailable.fake.countOf("wait")).toBe(0);
-    const statusReads = unavailable.fake.calls.filter((call) => call[0] === "terminal" && call[1] === "read");
+    const statusReads = unavailable.fake.calls.slice(afterUnavailableLaunch).filter((call) => call[0] === "terminal" && call[1] === "read");
     expect(statusReads).toHaveLength(1);
     expect(statusReads[0]).toContain("--screen");
     expect(statusReads[0]).not.toContain("--cursor");
@@ -1031,6 +1051,7 @@ describe("OrcaDriver", () => {
   test("test: nudge answers true only after a satisfied tui-idle probe and a handle-bound send receipt proven by its turn_started stage or by the composer emptying on a screen read and answers false when the probe elapses or the text still sits on the frame and never throws whereas a nudge that reports delivery from stream echo fails", async () => {
     const delivered = rig({ echoSends: false });
     const deliveredSlot = await bound(delivered.driver, delivered.fake, ["ready"]);
+    const afterDeliveredLaunch = delivered.fake.calls.length;
     delivered.fake.last()!.tuiIdle = true;
     expect(await delivered.driver.nudge(deliveredSlot, "continue now")).toBe(true);
     const families = delivered.fake.families();
@@ -1039,7 +1060,7 @@ describe("OrcaDriver", () => {
     expect(waitAt).toBeGreaterThanOrEqual(0);
     expect(sendAt).toBeGreaterThan(waitAt);
     expect(delivered.fake.calls.slice(sendAt + 1).some((call) => call[1] === "read" && call.includes("--screen"))).toBe(true);
-    expect(delivered.fake.calls.some((call) => call[1] === "read" && call.includes("--cursor"))).toBe(false);
+    expect(delivered.fake.calls.slice(afterDeliveredLaunch).some((call) => call[1] === "read" && call.includes("--cursor"))).toBe(false);
     expect(delivered.fake.sent.get(delivered.fake.last()!.handle)).toEqual(["continue now"]);
 
     const busy = rig();

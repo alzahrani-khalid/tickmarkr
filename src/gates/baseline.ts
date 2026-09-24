@@ -6,7 +6,7 @@ import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
-import { DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShellOptions, type ShResult } from "../run/git.js";
+import { dependencyLinkRefusal, DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShellOptions, type ShResult } from "../run/git.js";
 import { executionSignal } from "../run/execution-budget.js";
 import type { GateOutcome } from "../run/outcome.js";
 import type { GateResult } from "./types.js";
@@ -203,6 +203,8 @@ export interface BaselineFileDuration {
 }
 
 export interface Baseline {
+  /** No command ran because the dependency inventory could not establish isolation. */
+  refusal?: string;
   /** Observational capture receipts stay outside the forgiveness-bearing command entries. */
   evidenceReceipts?: Record<string, GateEvidenceReceipt>;
   commands: Record<string, BaselineCommand>;
@@ -725,6 +727,14 @@ export interface BaselineReceiptOptions {
 
 export async function captureBaseline(cwd: string, commands: Record<string, string>, opts: BaselineReceiptOptions = {}): Promise<Baseline> {
   const base: Baseline = { commands: {} };
+  const refusal = dependencyLinkRefusal(cwd);
+  if (refusal) {
+    base.refusal = refusal;
+    for (const name of Object.keys(commands)) {
+      base.commands[name] = { infra: true, invalidCause: "infra", fingerprints: [], invalidatingLines: [refusal] };
+    }
+    return base;
+  }
   for (const [name, cmd] of Object.entries(commands)) {
     if (name === "tipTest" && commands.test !== undefined && cmd === commands.test) {
       continue;

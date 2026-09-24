@@ -321,6 +321,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       try {
         linkNodeModules(cwd, baseDir, { force: true });
         baseline = await captureBaseline(baseDir, commands);
+        if (baseline.refusal) return { out: baseline.refusal, code: 1 };
         const missing = verdictlessCommands(baseline, commands);
         if (missing.length) {
           writeFileSync(verdictlessMarker, JSON.stringify({ base: mergeBase, commands: missing }) + "\n");

@@ -1,3 +1,11 @@
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { shq } from "../../src/adapters/types.js";
+import { approve } from "../../src/cli/commands/approve.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
+import { createWorktree, gitHead } from "../../src/run/git.js";
 import { stringify } from "yaml";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
@@ -159,4 +167,107 @@ describe("merge satisfaction of an infra-only gate result (fake adapter, zero to
     expect(greenEvents.filter((e) => e.event === "merge" && e.taskId === "T1").length).toBeGreaterThan(0);
     expect(greenEvents.some((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.infra === true)).toBe(false);
   }, 240000);
+});
+
+// Seed an already-waived park, including the recreation that consumed its first enactment.
+// The next daemon is real: shell markers and reviewer invocations prove what the recheck runs.
+async function recheckWaiver(gate: "review" | "test", changed = false) {
+  const marker = join(makeTestTempDir("tickmarkr-waiver-carry-"), "tools.log");
+  const commands = Object.fromEntries(["build", "test", "lint"].map((name) => [name,
+    `if [[ "$PWD" == *--T1 ]]; then echo ${name} >> ${shq(marker)}; fi`,
+  ]));
+  const { repo, fake } = setupRepo([T("T1", {
+    complexity: 8, files: ["work.ts"], gates: ["build", "test", "lint", "evidence", "scope", "review"],
+  })], { tasks: {} }, stringify({ gates: commands }));
+  const runId = `run-carry-${gate}-${changed}`;
+  const baseRef = await gitHead(repo);
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  const branch = `tickmarkr/${runId}`;
+  git(repo, "branch", branch, baseRef);
+  const wt = await createWorktree(repo, `${branch}--T1`, baseRef);
+  writeFileSync(join(wt, "work.ts"), "export const value = 1;\n");
+  git(wt, "add", "work.ts");
+  git(wt, "commit", "--no-gpg-sign", "-m", "work");
+  const subject = createHash("sha256").update(git(wt, "log", "--reverse",
+    "--format=%T%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e", `${baseRef}..HEAD`)).digest("hex");
+  const journal = Journal.create(repo, runId);
+  journal.append("run-start", undefined, { baseRef, branch, commands, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+  journal.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" }, attempt: 0 });
+  journal.append("worker-result", "T1", { ok: true, summary: "landed", deviations: [] });
+  journal.append("gate-result", "T1", { gate, pass: false, commit: subject, details: "operator disputes this verdict" });
+  journal.append("task-human", "T1", { kind: "gate-fail" });
+  await approve([runId, "T1", "--waive"], repo);
+  expect(journal.replaySatisfiedGates().get("T1")).toBe(gate);
+  journal.append("worktree-recreation", "T1", { attempted: [], carried: [] });
+  expect(journal.replaySatisfiedGates().has("T1")).toBe(false);
+  journal.append("task-human", "T1", { kind: "infra", reason: "environment unavailable after waiver" });
+  if (changed) {
+    writeFileSync(join(wt, "work.ts"), "export const value = 2;\n");
+    git(wt, "add", "work.ts");
+    git(wt, "commit", "--no-gpg-sign", "-m", "new subject");
+  }
+  await approve([runId, "T1", "--recheck"], repo);
+  expect(journal.replaySatisfiedGates(new Map([["T1", changed ? "different-subject" : subject]])).get("T1"))
+    .toBe(gate === "review" && !changed ? "review" : undefined);
+  writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({
+    commands: Object.fromEntries(Object.keys(commands).map((name) => [name, { exitCode: 0, fingerprints: [] }])),
+  }));
+  let reviews = 0;
+  const headless = fake.headlessCommand.bind(fake);
+  fake.headlessCommand = (prompt, model) => {
+    if (readFileSync(prompt, "utf8").includes("TICKMARKR-REVIEW")) reviews++;
+    return headless(prompt, model);
+  };
+  const before = journal.read().length;
+  const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  expect(summary.done).toEqual(["T1"]);
+  const events = journal.read().slice(before).filter((e) => e.taskId === "T1");
+  expect(events.filter((e) => e.event === "task-dispatch" || e.event === "worker-launch")).toEqual([]);
+  expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(["build", "lint", "test"]);
+  return { events, reviews, subject };
+}
+
+test("test: a recheck released on the same subject after a review waiver re-runs the tool gates but not the waived review and journals the waiver as carried, so a recheck battery that re-runs the waived review fails", async () => {
+  const { events, reviews, subject } = await recheckWaiver("review");
+  expect(reviews).toBe(0);
+  expect(events.filter((e) => e.event === "gate-result").map((e) => e.data.gate).sort()).toEqual(["build", "evidence", "lint", "scope", "test"]);
+  expect(events.filter((e) => e.event === "gate-waiver-carried").map((e) => e.data))
+    .toEqual([{ gate: "review", commit: subject, carried: true, release: "recheck" }]);
+}, 60_000);
+
+test("test: a recheck after the subject gained a commit runs the review the operator waived on the older subject, so a waiver carried onto a different tree fails", async () => {
+  const { events, reviews, subject } = await recheckWaiver("review", true);
+  expect(reviews).toBe(1);
+  const review = events.find((e) => e.event === "gate-result" && e.data.gate === "review");
+  expect(review?.data.pass).toBe(true);
+  expect(review?.data.commit).not.toBe(subject);
+  expect(events.filter((e) => e.event === "gate-waiver-carried")).toEqual([]);
+}, 60_000);
+
+test("test: a waiver of the test gate followed by a recheck of the same subject runs the test gate again, so a carry that skips a rechecked tool gate fails", async () => {
+  const { events } = await recheckWaiver("test");
+  expect(events.find((e) => e.event === "gate-result" && e.data.gate === "test")?.data.pass).toBe(true);
+  expect(events.filter((e) => e.event === "gate-waiver-carried")).toEqual([]);
+}, 60_000);
+
+
+test("review waiver carry fails closed without a subject and ends on superseding authority or worker dispatch", () => {
+  for (const ending of ["review-upheld", "attempt-cap", "untyped", "dispatch", "changed", "missing"]) {
+    const journal = Journal.create(makeTestTempDir("tickmarkr-waiver-boundary-"), `run-${ending}`);
+    journal.append("gate-result", "T1", { gate: "review", pass: false, ...(ending === "missing" ? {} : { commit: "subject" }) });
+    journal.append("task-approved", "T1", { release: "gate-satisfied", gate: "review" });
+    journal.append("worktree-recreation", "T1", {});
+    // Unrelated tasks and daemon annotations confer no authority on this task.
+    journal.append("task-approved", "T2", { release: "review-upheld" });
+    journal.append("gate-waiver-carried", "T3", { gate: "review", commit: "subject", carried: true });
+    journal.append("task-approved", "T1", { release: "recheck" });
+    expect(journal.replaySatisfiedGates().get("T1")).toBe(ending === "missing" ? undefined : "review");
+    expect(journal.replaySatisfiedGates().has("T3")).toBe(false);
+    journal.append("worktree-recreation", "T1", {});
+    if (ending === "dispatch") journal.append("task-dispatch", "T1", {});
+    else if (ending === "changed") journal.append("gate-result", "T1", { gate: "test", pass: true, commit: "new-subject" });
+    else if (ending !== "missing") journal.append("task-approved", "T1", ending === "untyped" ? {} : { release: ending });
+    journal.append("task-approved", "T1", { release: "recheck" });
+    expect(journal.replaySatisfiedGates(new Map([["T1", "subject"]])).has("T1")).toBe(false);
+  }
 });

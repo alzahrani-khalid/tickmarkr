@@ -271,6 +271,33 @@ describe("tickmarkr init --agent portable docs (T3)", () => {
     expect(text).toMatch(/keep me below/);
     expect(text.match(/tickmarkr:agent-docs begin/g)).toHaveLength(1);
   });
+
+  test("the scaffolded verified-handoffs rule states the staged-text-and-no-prompt guard and resolve-first path, citing the changed init.ts lines", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "AGENTS.md": "# Repo agents\n" });
+
+    await runInit(repo, "--agent", "--docs");
+
+    const section = agentDocsSection(repo);
+    const begin = section.indexOf("### Verified handoffs");
+    const end = section.indexOf("### Orient before you act", begin);
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(begin);
+    const handoffs = section.slice(begin, end);
+
+    // src/cli/commands/init.ts:118-120 (OBS-1119): the retry Enter is gated on BOTH the composer
+    // showing the staged text AND no prompt/choice holding focus — a read where a permission prompt
+    // holds focus beneath the staged text fails the second half of that AND, so the rule's own retry
+    // clause never fires for it.
+    expect(handoffs).toContain(
+      "retry the Enter only when that composer read shows the staged text and no permission prompt or numbered choice holds focus",
+    );
+    expect(handoffs).toContain(
+      "an Enter sent onto an active prompt approves it or picks a choice instead of submitting the message (OBS-1119)",
+    );
+    expect(handoffs).toContain("when a prompt or choice holds focus instead, resolve it first and re-read before retrying");
+
+  });
 });
 
 describe("tickmarkr init --agent preflight authority (T3)", () => {

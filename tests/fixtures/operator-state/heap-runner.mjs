@@ -65,7 +65,8 @@ try {
   await yieldTick();
   for (tick = 1; tick <= 11000; tick++) {
     if (shape === 'growth' && tick % 10 === 0) appendFileSync(journal, event('worker-nudge', 'T1', { reason: 'heap fixture' }));
-    if (shape === 'resize' && tick % 100 === 0) {
+    // OBS-1132: the board paints only on change, so resize must change geometry as often as growth appends.
+    if (shape === 'resize' && tick % 10 === 0) {
       output.columns = output.columns === 120 ? 80 : 120; output.rows = output.columns === 120 ? 40 : 24;
       output.emit('resize'); store.resize(output.columns, output.rows);
     }

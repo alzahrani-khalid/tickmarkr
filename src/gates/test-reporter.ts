@@ -35,6 +35,10 @@ export default class TickmarkrReporter {
   }
   onTestRunStart(specifications) {
     this.report.requested = specifications.map(s => this.file(s));
+    // The files-only CLI listing has no scheduling information. These are the resolved
+    // specifications the pool will consume, including per-file pool overrides.
+    this.report.scheduling = Object.fromEntries(specifications.filter(s => s.project?.config && typeof s.pool === 'string')
+      .map(s => [this.file(s), { pool: s.pool, singleFork: s.project.config.poolOptions?.forks?.singleFork === true }]));
     this.save();
   }
   onTestModuleStart(module) {

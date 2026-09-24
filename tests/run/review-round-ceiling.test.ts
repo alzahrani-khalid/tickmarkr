@@ -1,3 +1,8 @@
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { extractPromptNonce } from "../../src/gates/llm.js";
+import { shq } from "../../src/adapters/types.js";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { approve } from "../../src/cli/commands/approve.js";
@@ -28,7 +33,7 @@ describe("operator-stated review round ceiling (OBS-419)", () => {
 
     await approve([runId, "T1", "--uphold", "--review-rounds", "1", "--by", "operator"], repo);
     const resumed = await runDaemon(repo, {
-      adapters: [new FakeAdapter(scriptPath)], runId, resume: true,
+      adapters: [new FakeAdapter(scriptPath), reviewOnlySeat(repo, scriptPath)], runId, resume: true,
     });
 
     expect(resumed.human).toEqual(["T1"]);
@@ -86,3 +91,29 @@ describe("operator-stated review round ceiling (OBS-419)", () => {
     expect(String(events.at(-1)?.data.reason)).toMatch(/review round cap \(2\)/);
   }, 120_000);
 });
+
+// These carry/retry scenarios author work on both fake vendors. Keep the third seat
+// local and review-only, with the same scripted verdict and explicit closure evidence.
+function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
+  const configPath = join(repo, ".tickmarkr", "config.yaml");
+  const config = parseYaml(readFileSync(configPath, "utf8"));
+  config.routing ??= {};
+  config.routing.deny ??= {};
+  config.routing.deny.workers ??= {};
+  config.routing.deny.workers.adapters = [...new Set([...(config.routing.deny.workers.adapters ?? []), "third-review"])];
+  writeFileSync(configPath, stringifyYaml(config));
+  const seat = new FakeAdapter(scriptPath);
+  seat.id = "third-review";
+  seat.vendor = "third-vendor";
+  seat.probe = async () => ({ installed: true, authed: true, version: "fake", models: [seat.id],
+    modelAuth: { [seat.id]: { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } } });
+  seat.channels = () => [{ adapter: seat.id, model: seat.id, vendor: seat.vendor, channel: "api", tier: "frontier" }];
+  seat.headlessCommand = (file) => {
+    const prompt = readFileSync(file, "utf8");
+    const prior = [...prompt.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]);
+    const { review } = JSON.parse(readFileSync(scriptPath, "utf8"));
+    return `printf '%s\\n' ${shq(JSON.stringify({ ...review, nonce: extractPromptNonce(prompt),
+      resolved: review.approve ? prior : [], reraised: review.approve ? [] : prior }))}`;
+  };
+  return seat;
+}

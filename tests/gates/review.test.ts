@@ -61,6 +61,109 @@ async function captureReviewPrompt(task = mkTask(), carriedFindings: StructuredF
   return prompt;
 }
 
+async function captureSavedReview(task = mkTask(), carriedFindings: StructuredFinding[] = []) {
+  const { repo, base } = repoWithCommit();
+  const artifacts = mkdtempSync(join(tmpdir(), "tickmarkr-review-bounds-"));
+  const fake = fakeWith({ review: { approve: true, findings: [] } });
+  const command = fake.headlessCommand.bind(fake);
+  let delivered = "";
+  fake.headlessCommand = (file, model) => {
+    delivered = readFileSync(file, "utf8");
+    return command(file, model);
+  };
+  const result = await reviewGate(task, repo, base, author, CH, [fake], DEFAULT_CONFIG,
+    undefined, undefined, artifacts, undefined, undefined, carriedFindings);
+  expect(result.meta?.briefPath).toBeDefined();
+  return { delivered, saved: readFileSync(String(result.meta?.briefPath), "utf8") };
+}
+
+test("test: a task declaring no out of scope items renders delivered and saved review briefs each equal to its nonce normalized baseline, so an empty heading fails", async () => {
+  const normalize = (prompt: string) => prompt.replaceAll(/VERDICT_NONCE: ([0-9a-f]+)/.exec(prompt)![1]!, "<nonce>");
+  // Baseline captured before adding outOfScope rendering; only the random nonce is normalized.
+  const first = await captureSavedReview();
+  const baseline = normalize(first.delivered);
+  expect(baseline).toMatchInlineSnapshot(`
+    "TICKMARKR-REVIEW
+    You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
+    Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
+
+    ## Completion-faking checklist
+    Hunt for these concrete completion-faking shortcuts before ruling on any criterion:
+    - hardcoded-result: output or fixture hardcoded to satisfy the stated criterion instead of real logic
+    - test-weakening: tests skipped, deleted, or assertions loosened until failing behavior looks green
+    - vacuous-assertion: a test that cannot fail (asserts a constant, asserts its own setup, no assertion)
+    - fixture-overfit: implementation narrowed to the exact test inputs rather than the described behavior
+    - echo-not-implement: criterion text echoed in names, comments, or strings without the behavior itself
+    - stub-left-behind: TODO, throw, or no-op stub where the real implementation should be
+    - error-swallowing: catch or fallback that hides failures instead of handling them
+    - self-mocking: the code under test mocked or faked so the test exercises the mock
+    - check-bypass: lint, type, or CI checks disabled, relaxed, or excluded to get green
+    - rename-as-work: code moved or renamed and presented as the requested change
+    - scope-padding: unrelated edits padding the diff while the criterion's behavior is untouched
+    When a criterion fails, the verdict MUST name which shortcut above it matches, or state that none does.
+
+    ## Task T1: t (complexity 8)
+    ## Goal (authoritative — compiled from the sealed graph; the worktree's spec file may be stale after resume --graph-changed)
+    g
+
+    ## Acceptance criteria
+    - a
+
+    ## Declared write scope
+    Unrestricted: this task declared no write-scope patterns.
+
+    ## Reviewer suite budget
+    No suite may be run: files[] names no explicit test file owned by this task. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.
+
+    ## Diff
+    \`\`\`diff
+    diff --git a/a.txt b/a.txt
+    index 587be6b4c3f93f93c489c0111bba5596147a26cb..975fbec8256d3e8a3797e7a3611380f27c49f4ac 100644
+    --- a/a.txt
+    +++ b/a.txt
+    @@ -1 +1 @@
+    -x
+    +y
+
+    \`\`\`
+
+    VERDICT_NONCE: <nonce>
+
+    Classify every concern as "material" (a correctness, security, or acceptance-criteria defect that must
+    block the merge) or "minor" (style, naming, or preference that should not block). ONLY material findings
+    block approval. For a minor concern you have decided not to block on, set "defer": true and give a
+    one-line "rationale" — it is recorded in the review, never dropped.
+    A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+
+    Respond with ONLY this JSON:
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
+    (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
+    Approve iff no material finding remains and every prior material is resolved.
+    The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    "
+  `);
+  expect(normalize(first.saved)).toBe(baseline);
+  const empty = await captureSavedReview(mkTask({ outOfScope: [] }));
+  expect(normalize(empty.delivered)).toBe(baseline);
+  expect(normalize(empty.saved)).toBe(baseline);
+});
+
+test("test: a review round for a task declaring out of scope items renders them under an out of scope heading between the prior materials and the diff stating a finding inside them is not material, so a brief that omits them fails", async () => {
+  const outOfScope = ["Chasing ancestor symlinks", "Parser or classifier changes"];
+  const prior = structuredFindings("review", "- [material] Selection loses its identity after prepend.");
+  const { delivered, saved } = await captureSavedReview(mkTask({ outOfScope }), prior);
+  expect(saved).toBe(delivered);
+  const section = promptSection(delivered, "Out of scope");
+  for (const item of outOfScope) expect(section).toContain(`- ${item}`);
+  expect(section).toContain("A finding inside these declared bounds is not material");
+  const priorAt = delivered.indexOf("## Prior materials this attempt must close");
+  const boundsAt = delivered.indexOf("## Out of scope");
+  expect(priorAt).toBeGreaterThan(-1);
+  expect(boundsAt).toBeGreaterThan(priorAt);
+  expect(boundsAt).toBeLessThan(delivered.indexOf("## Diff"));
+});
+
 function promptSection(prompt: string, heading: string): string {
   const marker = `## ${heading}\n`;
   const start = prompt.indexOf(marker);
@@ -325,7 +428,7 @@ describe("reviewGate fail-closed on unreachable/empty reviewer pool (FLEET-05)",
     expect(r.details).toMatch(/no.*reviewer/i);
   });
 
-  test("D: model-identity-emptied pool → fail-closed by default, waivable by config", async () => {
+  test("D: model-identity-emptied pool fails closed regardless of review.required", async () => {
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ review: { approve: true, issues: [] } });
     const siblings = [gOpencode, gPi];
@@ -335,7 +438,7 @@ describe("reviewGate fail-closed on unreachable/empty reviewer pool (FLEET-05)",
     const lax = structuredClone(DEFAULT_CONFIG);
     lax.review.required = false;
     const r2 = await reviewGate(mkTask(), repo, base, asAuthor(gOpencode), siblings, [fake], lax);
-    expect(r2.pass).toBe(true);
+    expect(r2.pass).toBe(false);
     expect(r2.details).toMatch(/no cross-vendor/i);
   });
 });
@@ -900,7 +1003,7 @@ describe("reviewGate", () => {
     expect(r.meta).toEqual({ policy: "full", reviewer: "fake:fake-3", reviewerTier: "frontier", vendor: "fake-c", provider: "fake-c", reviewerFloor: "frontier", reviewerFloorCause: "author-tier" });
   });
 
-  test("no cross-vendor channel: required → fail; not required → pass-with-warning", async () => {
+  test("no cross-vendor channel fails regardless of review.required", async () => {
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({});
     const r1 = await reviewGate(mkTask(), repo, base, author, [CH[0]], [fake], DEFAULT_CONFIG);
@@ -908,7 +1011,7 @@ describe("reviewGate", () => {
     const lax = structuredClone(DEFAULT_CONFIG);
     lax.review.required = false;
     const r2 = await reviewGate(mkTask(), repo, base, author, [CH[0]], [fake], lax);
-    expect(r2.pass).toBe(true);
+    expect(r2.pass).toBe(false);
     expect(r2.details).toMatch(/no cross-vendor/i);
   });
 });

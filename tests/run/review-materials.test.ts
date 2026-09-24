@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq } from "../../src/adapters/types.js";
@@ -8,11 +9,12 @@ import { runDaemon } from "../../src/run/daemon.js";
 import { Journal, structuredFindings } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
-test("daemon carries repair materials into re-review and journals their certified closure", async () => {
+test("test: the repair prompt written for a review red on a task declaring out of scope items carries the same items as its first worker prompt, so a repair worker briefed without them fails", async () => {
   const note = "`select` loses the selected identity after prepend.";
   const [identified] = structuredFindings("review", `- [material] src/mark.ts ${note}`);
   const finding = { ...identified, note };
-  const fixture = setupRepo([T("T1")], {
+  const outOfScope = ["Chasing ancestor symlinks", "Parser or classifier changes"];
+  const fixture = setupRepo([T("T1", { outOfScope })], {
     tasks: { T1: [
       { shell: `mkdir -p src && echo one > src/mark.ts && ${COMMIT} initial`, result: { ok: true, summary: "initial" } },
       { shell: `echo two >> src/mark.ts && ${COMMIT} repair`, result: { ok: true, summary: "repaired" } },
@@ -37,7 +39,19 @@ test("daemon carries repair materials into re-review and journals their certifie
   }
   const runId = "run-material-closure";
   await runDaemon(fixture.repo, { adapters: [new ClosingReviewer(fixture.scriptPath)], runId });
-  const events = Journal.open(fixture.repo, runId).read();
+  const journal = Journal.open(fixture.repo, runId);
+  const events = journal.read();
+  const promptDir = join(journal.dir, "prompts");
+  const workerPrompts = readdirSync(promptDir).filter((file) => /^T1-a\d+\.md$/.test(file)).sort()
+    .map((file) => readFileSync(join(promptDir, file), "utf8"));
+  expect(workerPrompts).toHaveLength(2);
+  for (const prompt of workerPrompts) {
+    const section = /## Out of scope\n([\s\S]*?)(?=\n## )/.exec(prompt)?.[1];
+    expect(section).toBeDefined();
+    for (const item of outOfScope) expect(section).toContain(`- ${item}`);
+  }
+  expect(workerPrompts[1]).toContain("## Previous attempt failed gates");
+  expect(workerPrompts[1]).toContain(note);
   const initialReview = events.find((event) => event.event === "gate-result"
     && event.data.gate === "review" && event.data.pass === false);
   expect(initialReview?.data.findings).toContainEqual(finding);

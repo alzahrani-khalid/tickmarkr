@@ -1,3 +1,5 @@
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { extractPromptNonce } from "../../src/gates/llm.js";
 // OBS-189 (park-economics patch): a review park costs one decision, never a run. `approve --uphold`
 // sides with the reviewer and funds ONE fixed worker attempt carrying the findings; the review round
 // budget is scoped to the engagement (since the newest approval) so the funded attempt actually
@@ -8,7 +10,7 @@ import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { TickmarkrConfig } from "../../src/config/config.js";
-import type { BillingChannel } from "../../src/adapters/types.js";
+import { shq, type BillingChannel } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
@@ -98,7 +100,7 @@ describe("approve --uphold round trip — a park costs one attempt, never a run 
     writeFileSync(scriptPath, JSON.stringify({ ...script, review: { approve: true, issues: [] } }));
 
     // fresh adapter instance re-reads the script; same journal — the run is NOT restarted
-    const resumed = await runDaemon(repo, { adapters: [new FakeAdapter(scriptPath)], runId, resume: true });
+    const resumed = await runDaemon(repo, { adapters: [new FakeAdapter(scriptPath), reviewOnlySeat(repo, scriptPath)], runId, resume: true });
     expect(resumed.done).toEqual(["T1"]);
     const evs = Journal.open(repo, runId).read();
     // exactly ONE funded attempt on top of the two parked rounds — never a fresh journal
@@ -186,7 +188,7 @@ async function postApprovalUpholdScenario(): Promise<PostApprovalUpholdResult> {
   writeFileSync(scriptPath, JSON.stringify({ ...script, review: { approve: true, issues: [] } }));
   const fundedStart = Journal.open(repo, runId).read().length;
   const fundedSummary = await runDaemon(repo, {
-    adapters: [new FakeAdapter(scriptPath)],
+    adapters: [new FakeAdapter(scriptPath), reviewOnlySeat(repo, scriptPath)],
     runId,
     resume: true,
   });
@@ -317,3 +319,29 @@ test("test: every daemon-authored gate-fail park reason — the post-approval, r
     }
   }
 }, 180_000);
+
+// These carry/retry scenarios author work on both fake vendors. Keep the third seat
+// local and review-only, with the same scripted verdict and explicit closure evidence.
+function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
+  const configPath = join(repo, ".tickmarkr", "config.yaml");
+  const config = parseYaml(readFileSync(configPath, "utf8"));
+  config.routing ??= {};
+  config.routing.deny ??= {};
+  config.routing.deny.workers ??= {};
+  config.routing.deny.workers.adapters = [...new Set([...(config.routing.deny.workers.adapters ?? []), "third-review"])];
+  writeFileSync(configPath, stringifyYaml(config));
+  const seat = new FakeAdapter(scriptPath);
+  seat.id = "third-review";
+  seat.vendor = "third-vendor";
+  seat.probe = async () => ({ installed: true, authed: true, version: "fake", models: [seat.id],
+    modelAuth: { [seat.id]: { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } } });
+  seat.channels = () => [{ adapter: seat.id, model: seat.id, vendor: seat.vendor, channel: "api", tier: "frontier" }];
+  seat.headlessCommand = (file) => {
+    const prompt = readFileSync(file, "utf8");
+    const prior = [...prompt.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]);
+    const { review } = JSON.parse(readFileSync(scriptPath, "utf8"));
+    return `printf '%s\\n' ${shq(JSON.stringify({ ...review, nonce: extractPromptNonce(prompt),
+      resolved: review.approve ? prior : [], reraised: review.approve ? [] : prior }))}`;
+  };
+  return seat;
+}

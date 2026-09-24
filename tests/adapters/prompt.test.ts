@@ -18,6 +18,42 @@ const task = validateGraph({
 }).tasks[0];
 
 describe("buildTaskPrompt", () => {
+  test("test: a task declaring no out of scope items writes a worker prompt byte identical to its prompt before this change, so a heading rendered empty fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-prompt-bounds-"));
+    // Baseline captured before adding outOfScope rendering.
+    const baseline = buildTaskPrompt(task, "", N);
+    expect(baseline).toMatchInlineSnapshot(`
+      "You are an autonomous coding worker dispatched by tickmarkr into an isolated git worktree.
+
+      ## Task T1: add refresh
+      Goal: 401s retried once
+
+      ## Acceptance criteria (you will be judged against these, verbatim)
+      - retries once with refreshed token
+
+      ## File scope — touch ONLY paths matching:
+      - src/auth/**
+
+      ## Context (read these first)
+      - specs/auth.md#refresh
+
+      ## Rules
+      - Work only inside the current directory (your isolated worktree). Never push. Never switch branches.
+      - Make small atomic git commits as you go (git add + git commit, conventional messages).
+      - Touch ONLY paths matching the file scope. Out-of-scope edits FAIL the scope gate. The operator's allowlist is fixed when the run starts and nothing you do can change it while your work is judged; declaring a deviation never passes the gate either. If you cannot complete the task without an out-of-scope edit, stop and report ok:false explaining why in "summary". List any out-of-scope paths you did touch, each with a reason, in "deviations" (journaled for the operator's audit).
+      - No background process may outlive the worker, and no suite may run beside another.
+      - Do not ask questions; you are unattended. Make the smallest correct change.
+
+      When finished, end your final message with exactly one line (no code fence):
+      TICKMARKR_RESULT_testnonce {"ok":true|false,"summary":"<one sentence>","deviations":["<path or reason>"]}
+      "
+    `);
+    for (const variant of [task, { ...task, outOfScope: [] }]) {
+      const path = writePrompt(dir, variant, 0, "", N);
+      expect(readFileSync(path, "utf8")).toBe(baseline);
+    }
+  });
+
   test("contains task fields, rules, and the trailer contract", () => {
     const p = buildTaskPrompt(task, "", N);
     expect(p).toContain("T1: add refresh");

@@ -6,7 +6,7 @@
 - **done:** 1
 - **failed:** 0
 - **human:** 0
-- **verification:** absent — no tip verification recorded: neither passed nor failed
+- **verification:** passed — tip proof: reused — commit deadbeef; build: cached (reused) — carried, not re-run; test: verified fresh; lint: cached (reused) — carried, not re-run
 
 ## Usage & efficiency
 

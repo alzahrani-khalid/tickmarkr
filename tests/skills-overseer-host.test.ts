@@ -176,3 +176,98 @@ test("D-265: the pre-arm beat sweep matches the legacy wrapper — the pgrep pat
   expect(skill).toContain("**The PRIMARY target is the legacy\n  `while … tickmarkr beat <tier>` wrapper**");
   expect(skill).not.toMatch(/pgrep -f "tickmarkr beat <tier>[^"]*--loop/);
 });
+
+test("the overseer skill's briefing recipe states the staged-text-and-no-prompt guard, resolve-first path, and post-Enter read-back, citing the changed skill lines", () => {
+  const skill = readShippedSkill();
+
+  // skills/tickmarkr-overseer/SKILL.md:826-833 (OBS-1119): the herdr "Verified send protocol" no
+  // longer fires `send-keys Enter` blind after the sleep — it reads back first and only retries the
+  // Enter when that read-back shows the staged text with no prompt/choice holding focus.
+  const protocolStart = skill.indexOf("- **Verified send protocol**:");
+  const protocol = skill.slice(
+    protocolStart,
+    skill.indexOf("- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Briefs travel as a file", protocolStart),
+  );
+  expect(protocol).toContain(
+    "Send `send-keys Enter` only when that read-back shows the staged text on the\n    composer and no permission prompt or numbered choice holds focus",
+  );
+  expect(protocol).toContain(
+    "an Enter sent onto an active prompt\n    approves it or picks a choice instead of submitting the brief (OBS-1119)",
+  );
+  expect(protocol).toContain("When a prompt or choice holds\n    focus instead, resolve it first, then re-read before retrying");
+  expect(protocol).not.toMatch(/sleep 2–3s → send-keys Enter → read back/);
+
+  // The pre-Enter read only proves Enter was safe to send; restore a SEPARATE post-Enter read that
+  // confirms the brief actually went through before reporting "briefed" (material review finding).
+  expect(protocol).toContain(
+    "After a submitted Enter, read back once\n    more and confirm the composer is empty or the agent shows `working`",
+  );
+  expect(protocol).toContain(
+    "the pre-Enter read only proved\n    Enter was safe to send, not that the brief was submitted",
+  );
+  expect(protocol).toContain('Never report "briefed" without\n    both read-backs.');
+});
+
+test("replaying D-307-pre, a codex exec from an agent shell blocked on reading additional input from stdin, against the changed skill rule closes stdin, citing the changed lines", () => {
+  const skill = readShippedSkill();
+  const rule = skill.slice(
+    skill.indexOf("**Every one-shot `codex exec` from an agent shell closes stdin (D-307-pre).**"),
+    skill.indexOf("4. **Gate every exec lane"),
+  );
+  // skills/tickmarkr-overseer/SKILL.md — the one-shot codex exec rule (D-307-pre / OBS-1134).
+  expect(rule.length).toBeGreaterThan(0);
+  expect(rule).toContain("closes stdin");
+  // The incident is historical. Present-tense "never closes stdin" contradicts the mandatory close.
+  expect(rule).toContain("the seat's ad-hoc one-shot\n   did not close stdin");
+  expect(rule).not.toMatch(/never closes stdin/);
+  expect(rule).not.toMatch(/still closes stdin/);
+  expect(rule).toMatch(/blocks on reading\s+additional input from stdin/);
+  expect(rule).toContain("Reading additional input from stdin…");
+  expect(rule).toContain("`codex exec … < /dev/null`");
+});
+
+test("replaying D-302 add.3's orphaned home-wide recursive glob against the changed skill rule forbids the glob by name and binds the seat's background tasks to its life, citing the changed lines", () => {
+  const skill = readShippedSkill();
+  const rule = skill.slice(
+    skill.indexOf("**A seat's background tasks are bound to the seat's life (D-302 add.3).**"),
+    skill.indexOf("**And EVERY process-table probe"),
+  );
+  // skills/tickmarkr-overseer/SKILL.md — rule 11 lifetime (D-302 add.3 / OBS-1135).
+  expect(rule.length).toBeGreaterThan(0);
+  expect(rule).toContain("bound to the seat's life");
+  expect(rule).toContain("dies with the seat");
+  expect(rule).toContain("reparented to pid 1");
+  expect(rule).toContain("Forbid the home-wide recursive glob by name");
+  expect(rule).toContain("glob.glob('~/**/.tickmarkr/runs/*/journal.jsonl', recursive=True)");
+});
+
+test("the liveness-reads bullet covers both the loop arm and the legacy wrapper forms, citing the changed lines", () => {
+  const skill = readShippedSkill();
+  const bulletStart = skill.indexOf("- **Split the liveness reads.**");
+  const bullet = skill.slice(bulletStart, skill.indexOf("- **At every adopt", bulletStart));
+  // skills/tickmarkr-overseer/SKILL.md — the liveness-reads bullet (OBS-1136).
+  expect(bullet).toMatch(/tier's liveness is read from beat freshness/);
+  expect(bullet).toMatch(/loop's liveness is read from the live process payload/);
+  expect(bullet).toContain("the loop arm");
+  expect(bullet).toContain("`tickmarkr beat <tier> --seat <seat> --loop`");
+  expect(bullet).toContain("the legacy wrapper");
+  expect(bullet).toContain("`while :; do tickmarkr beat <tier> --seat <seat>; sleep 10; done`");
+  expect(bullet).toMatch(/Neither liveness claim is read from a recorded pid/);
+});
+
+test("replaying D-265 (4) against the changed beat section finds the stand-down command entering the repository root and the pre-arm pgrep probe reconciled with the recorded-pid ownership rule, citing the changed lines", () => {
+  const skill = readShippedSkill();
+  const beat = skill.slice(
+    skill.indexOf("**Arm your OWN tier first"),
+    skill.indexOf("Arm the bundled watcher as its OWN Bash call"),
+  );
+  // skills/tickmarkr-overseer/SKILL.md — beat arm, stand-down, and the pre-arm probe (D-265 (4)).
+  expect(beat).toContain("cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop");
+  expect(beat).toContain("cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down");
+  expect(beat).toContain('(`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected**');
+  expect(beat).toContain("**Reconcile this probe with the recorded-pid ownership rule.**");
+  expect(beat).toMatch(/retires watchers this seat\s+armed by the exact recorded pid/);
+  expect(beat).toMatch(/never uses `pkill -f`, `pgrep -f`, or an argv pattern/);
+  expect(beat).toMatch(/A stop is kill-by-pid of an unowned\s+survivor after the two reads\./);
+  expect(beat).not.toMatch(/pgrep -f "tickmarkr beat <tier>[^"]*--loop/);
+});

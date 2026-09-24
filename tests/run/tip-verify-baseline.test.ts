@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Baseline } from "../../src/gates/baseline.js";
-import { captureBaseline, compareToBaseline, setCalmWindowForTests, resetCalmWindowForTests, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
+import { beginGateEvidence, captureBaseline, compareToBaseline, setCalmWindowForTests, resetCalmWindowForTests, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { verifyIntegrationTipCached } from "../../src/run/daemon.js";
 import { DEFAULT_SHELL_TIMEOUT_MS, type ShResult, type ShellOptions } from "../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
@@ -458,3 +458,54 @@ test("test: a tip verify row for each executed build test or lint invocation red
     stderr: { availability: "not-started", sha256: null },
   });
 }, 60_000);
+
+test("tip verify takes each receipt's origin run root from the evidence root its evidence setup returned instead of re-deriving it from the options, citing the changed merge.ts line", async () => {
+  const mergeSource = readFileSync(new URL("../../src/run/merge.ts", import.meta.url), "utf8");
+  const assignment = mergeSource.split("\n").filter((line) => line.includes("originRunRoot ="));
+  // src/run/merge.ts — the receipt stamp uses the root each branch's OWN evidence setup returned.
+  expect(assignment).toContain("      result.originRunRoot = evidenceRoot;");
+  expect(mergeSource).toContain("evidenceRoots.set(gate, evidence.root);");
+  // The manifested-test (vitest) branch receives the exact root returned by its evidence setup,
+  // rather than reconstructing one from the caller's options before it executes.
+  expect(mergeSource).toContain("const evidence = beginGateEvidence(intWt, gate, cmd, evidenceSetup);");
+  expect(mergeSource).toContain("artifactDir: evidence.root");
+  expect(mergeSource).toContain("evidenceRoots.set(gate, evidence.root);");
+  expect(mergeSource).not.toContain("const artifactDir = evidenceSetup.artifactDir ?? runDir;");
+  expect(mergeSource).not.toContain("resolve(evidenceOptions.artifactDir ?? runDir)");
+
+  const repo = makeRepo({ ".gitignore": "calls.log\n" });
+  const runDir = join(repo, "run");
+  mkdirSync(runDir);
+  // `/.` survives on the evidence setup's returned root and disappears from path.resolve.
+  const returnedRoot = `${runDir}/.`;
+  const commands = { build: "echo build-out", lint: "echo lint-out" };
+  const evidenceSetup = { artifactDir: returnedRoot, runId: runDir };
+  const results = await verifyIntegrationTip(repo, commands, runDir, undefined, evidenceSetup);
+  expect(results.map((row) => row.gate)).toEqual(["build", "lint"]);
+  for (const row of results) {
+    const evidenceRoot = beginGateEvidence(repo, row.gate, row.cmd, evidenceSetup).root;
+    expect(evidenceRoot).toBe(returnedRoot);
+    expect(resolve(returnedRoot)).not.toBe(evidenceRoot);
+    expect(row.evidenceReceipt?.availability).toBe("available");
+    expect(row.originRunRoot).toBe(evidenceRoot);
+  }
+
+  // Same proof for the manifested-test (vitest) branch specifically: its receipt's originRunRoot
+  // must be the exact, unresolved root the evidence setup carried — never a value independently
+  // reconstructed by a second beginGateEvidence call in merge.ts.
+  const vitestFixture = makeRepo({
+    ".gitignore": "node_modules/\n",
+    "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run" } }),
+    "sample.test.ts": `import { test, expect } from "vitest"; test("sample", () => { expect(1).toBe(1); });`,
+  });
+  symlinkSync(join(import.meta.dirname, "../../node_modules"), join(vitestFixture, "node_modules"), "dir");
+  const vitestRunDir = join(vitestFixture, "run");
+  mkdirSync(vitestRunDir);
+  const vitestReturnedRoot = `${vitestRunDir}/.`;
+  expect(resolve(vitestReturnedRoot)).not.toBe(vitestReturnedRoot);
+  const vitestEvidenceSetup = { artifactDir: vitestReturnedRoot, runId: vitestRunDir };
+  const [vitestRow] = await verifyIntegrationTip(vitestFixture, { test: "npm test" }, vitestRunDir, undefined, vitestEvidenceSetup);
+  expect(vitestRow!.pass).toBe(true);
+  expect(vitestRow!.evidenceReceipt?.availability).toBe("available");
+  expect(vitestRow!.originRunRoot).toBe(vitestReturnedRoot);
+}, 30_000);

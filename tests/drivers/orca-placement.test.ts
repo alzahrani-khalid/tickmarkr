@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 import { canonicalWorktreePath, casBoard, checkoutPrefix, checkoutProofLine, inCheckout, OrcaDriver, OrcaError, OrcaUnavailableError, PENDING_PROJECT_GRACE_MS, type OrcaExec } from "../../src/drivers/orca.js";
 import { stateDirName } from "../../src/graph/graph.js";
-import { SubprocessDriver } from "../../src/drivers/subprocess.js";
+import { herdrSealShellPrefix, SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type Slot } from "../../src/drivers/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { createWorktree, worktreePath } from "../../src/run/git.js";
@@ -51,6 +51,55 @@ function ambientSelector(fake: FakeOrca, selector: "active" | "current", cliCwd?
 }
 
 const git = (cwd: string, cmd: string): string => execSync(`git ${cmd}`, { cwd, encoding: "utf8" }).trim();
+
+test("test: an Orca worker terminal whose scrollback carries no complete proof frame for its checkout or a frame naming another checkout is closed and latched as infra before the worker counts as launched while a terminal proving its checkout proceeds, so a launch trusted on the create receipt alone fails", async () => {
+  for (const mode of ["absent", "incomplete", "foreign", "valid"] as const) {
+    const { repo, fake: adapter } = setupRepo([T("T1")], {
+      tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] },
+    });
+    const fake = new FakeOrca({ executeCommands: mode === "valid" });
+    let latched = false;
+    class CapturedDriver extends OrcaDriver {
+      override async run(slot: Slot, command: string): Promise<void> {
+        try {
+          await super.run(slot, command);
+        } catch (error) {
+          const creates = fake.countOf("create");
+          await expect(super.run(slot, "must-not-run")).rejects.toBeInstanceOf(OrcaUnavailableError);
+          expect(fake.countOf("create")).toBe(creates);
+          expect(this.describe(slot)).toBeUndefined();
+          latched = error instanceof OrcaUnavailableError;
+          throw error;
+        }
+      }
+    }
+    const driver = new CapturedDriver({
+      ...(mode === "valid" ? { pollMs: 50 } : { time: steppedTime() }),
+      exec: async (args, cwd, timeout) => {
+        const receipt = await fake.exec(args, cwd, timeout);
+        if (args[1] === "create" && mode !== "valid") {
+          fake.last()!.lines = mode === "absent" ? [] : [
+            mode === "foreign" ? checkoutProofLine(repo) : checkoutProofLine(cwd).slice(0, -1),
+          ];
+        }
+        return receipt;
+      },
+    });
+    const runId = `run-proof-${mode}`;
+    const summary = await runDaemon(repo, { adapters: [adapter], runId, driver });
+    const events = Journal.open(repo, runId).read();
+    if (mode === "valid") {
+      expect(summary.done).toEqual(["T1"]);
+      expect(events.some((event) => event.event === "worker-launch")).toBe(true);
+    } else {
+      expect(summary.done).toEqual([]);
+      expect(events.some((event) => event.event === "worker-launch")).toBe(false);
+      expect(events.some((event) => event.event === "task-failed" && event.data.kind === "dispatch")).toBe(true);
+      expect(fake.countOf("close")).toBeGreaterThan(0);
+      expect(latched).toBe(true);
+    }
+  }
+}, 60_000);
 
 /**
  * The checkout contract a tickmarkr worker is handed, as four named facts: the path the daemon
@@ -152,8 +201,7 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     const runId = "run-orca-tracked";
     const branch = `tickmarkr/${runId}--TA`;
     const fake = new FakeOrca({ executeCommands: true });
-    const time = steppedTime();
-    const driver = new OrcaDriver({ exec: fake.exec, time });
+    const driver = new OrcaDriver({ exec: fake.exec });
     const worktree = await driver.worktree(repo, branch, "HEAD");
     const checkout = canonicalWorktreePath(worktree);
     expect(checkout.startsWith(`${clone}/`)).toBe(true); // nested under the clone, `.git` a FILE
@@ -163,15 +211,14 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     await driver.run(slot, "pwd");
 
     // `worktree current` was asked FROM the checkout and answered the enclosing clone — once, and
-    // the driver went straight on: no polling, no stepped-clock time spent waiting for adoption.
+    // the driver went straight on without polling for adoption.
     const currents = fake.calls.flatMap((call, index) => call[0] === "worktree" && call[1] === "current" ? [index] : []);
     expect(currents).toHaveLength(1);
     expect(fake.callCwds[currents[0]!]).toBe(checkout);
-    expect(time.now()).toBe(0);
     // The terminal is created ON the tracked clone with the command cd'ed into the checkout, and the
     // receipt binds it to the clone; identity is the handle plus the owned tab title.
     expect(fake.calls.find((call) => call[1] === "create")).toEqual([
-      "terminal", "create", "--worktree", `path:${clone}`, "--title", slot.name, "--command", inCheckout(checkout, "pwd"), "--json",
+      "terminal", "create", "--worktree", `path:${clone}`, "--title", slot.name, "--command", inCheckout(checkout, `${herdrSealShellPrefix().split(";")[0]}; pwd`), "--json",
     ]);
     expect(fake.last()).toMatchObject({ worktree: clone, title: slot.name });
     // …and the command really ran INSIDE the checkout: the wrapper shell printed the checkout path.
@@ -249,12 +296,11 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     mkdirSync(A); mkdirSync(B);
     const TITLE = owned("T1", 0, RUN); // the SAME full owned title on both — the adversarial case astra reproduced
     const fake = new FakeOrca({ runtimeId: "rt-1", trackedWorktrees: [parent], executeCommands: true });
-    const time = steppedTime();
-    const driver = new OrcaDriver({ exec: fake.exec, time, pollMs: 1 });
+    const driver = new OrcaDriver({ exec: fake.exec, pollMs: 1 });
     const a = await driver.slot(A, TITLE);
     const b = await driver.slot(B, TITLE);
-    await driver.run(a, "printf 'a-ready\\n'; sleep 30");
-    await driver.run(b, "printf 'b-ready\\n'; sleep 30");
+    await driver.run(a, "printf 'a-ready\\n'");
+    await driver.run(b, "printf 'b-ready\\n'");
     const [termA, termB] = fake.terminals.map((t) => t.handle);
     await expect.poll(() => fake.of(termA)!.lines.some((l) => l === "a-ready"), { timeout: 5_000 }).toBe(true);
     await expect.poll(() => fake.of(termB)!.lines.some((l) => l === "b-ready"), { timeout: 5_000 }).toBe(true);
@@ -277,9 +323,9 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     // Legitimate recovery: the slot's OWN terminal survives the restart under a new handle — its
     // earliest page names this checkout, so the read recovers to it exactly as before.
     const own = new FakeOrca({ runtimeId: "rt-1", trackedWorktrees: [parent], executeCommands: true });
-    const ownDriver = new OrcaDriver({ exec: own.exec, time: steppedTime(), pollMs: 1 });
+    const ownDriver = new OrcaDriver({ exec: own.exec, pollMs: 1 });
     const ownSlot = await ownDriver.slot(A, TITLE);
-    await ownDriver.run(ownSlot, "printf 'own-ready\\n'; sleep 30");
+    await ownDriver.run(ownSlot, "printf 'own-ready\\n'");
     await expect.poll(() => own.last()!.lines.some((l) => l === "own-ready"), { timeout: 5_000 }).toBe(true);
     own.restart("rt-2", [{ handle: "term_a_after", title: TITLE, worktree: parent, lines: [...own.terminals[0]!.lines, "AFTER RESTART"] }]);
     expect(await ownDriver.read(ownSlot, 1)).toBe("AFTER RESTART");
@@ -319,7 +365,7 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     mkdirSync(A); mkdirSync(AB);
     const TITLE = owned("T1", 0, RUN);
     const fake = new FakeOrca({ runtimeId: "rt-1", trackedWorktrees: [parent], executeCommands: true });
-    const driver = new OrcaDriver({ exec: fake.exec, time: steppedTime(), pollMs: 1 });
+    const driver = new OrcaDriver({ exec: fake.exec, pollMs: 1 });
     const a = await driver.slot(A, TITLE);
     const b = await driver.slot(AB, TITLE);
     await driver.run(a, "pwd");
@@ -416,7 +462,7 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     const A = join(parent, "A");
     mkdirSync(A);
     const fake = new FakeOrca({ trackedWorktrees: [parent], executeCommands: true });
-    const driver = new OrcaDriver({ exec: fake.exec, time: steppedTime() });
+    const driver = new OrcaDriver({ exec: fake.exec });
     const slot = await driver.slot(A, owned("TW", 0, RUN));
     await driver.run(slot, "pwd & wait; pwd; (cd / && pwd) ; pwd");
     await expect.poll(() => fake.executed[0]?.exitCode, { timeout: 5_000 }).toBe(0);
@@ -425,13 +471,18 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
 
     const missing = join(parent, "missing");
     const gone = new FakeOrca({ trackedWorktrees: [parent], executeCommands: true });
-    const goneDriver = new OrcaDriver({ exec: gone.exec, time: steppedTime() });
+    let goneLines: string[] = [];
+    const goneDriver = new OrcaDriver({ exec: async (args, cwd, timeout) => {
+      if (args[1] === "close") goneLines = [...gone.last()!.lines];
+      return gone.exec(args, cwd, timeout);
+    } });
     const goneSlot = await goneDriver.slot(missing, owned("TX", 0, RUN));
-    await goneDriver.run(goneSlot, "printf 'first\\n'; pwd");
+    await expect(goneDriver.run(goneSlot, "printf 'first\\n'; pwd")).rejects.toBeInstanceOf(OrcaUnavailableError);
     await expect.poll(() => gone.executed[0]?.exitCode, { timeout: 5_000 }).not.toBeUndefined();
     expect(gone.executed[0]!.exitCode).not.toBe(0);
-    expect(gone.last()!.lines.some((l) => l === "first" || l === parent)).toBe(false); // nothing of the payload ran
-    expect(gone.last()!.lines.some((l) => l.startsWith("TICKMARKR_CHECKOUT "))).toBe(false); // and no proof line was minted
+    expect(gone.countOf("close")).toBe(1);
+    expect(goneLines.some((l) => l === "first" || l === parent)).toBe(false); // nothing of the payload ran
+    expect(goneLines.some((l) => l.startsWith("TICKMARKR_CHECKOUT "))).toBe(false); // and no proof line was minted
   });
 
   test("test: a create receipt whose surface is not visible raises one attention notify naming the surface whereas a receipt whose surface is visible or absent raises none so a driver that accepts a background surface silently fails", async () => {
@@ -470,8 +521,8 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     // Each create NAMES its own checkout outright — `path:<abs>`, never an ambient selector.
     const creates = fake.calls.filter((c) => c[1] === "create");
     expect(creates).toEqual([
-      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, "run-a"), "--json"],
-      ["terminal", "create", "--worktree", `path:${WT_B}`, "--title", TITLE_B, "--command", inCheckout(WT_B, "run-b"), "--json"],
+      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, `${herdrSealShellPrefix().split(";")[0]}; run-a`), "--json"],
+      ["terminal", "create", "--worktree", `path:${WT_B}`, "--title", TITLE_B, "--command", inCheckout(WT_B, `${herdrSealShellPrefix().split(";")[0]}; run-b`), "--json"],
     ]);
     // …and asking is not getting: the RECEIPTS bind to those same two distinct checkouts, which is
     // what the driver checked before it kept either handle.
@@ -528,7 +579,7 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     await driver.run(slot, "bash -lc 'first'");
     expect(fake.countOf("create")).toBe(1);
     expect(fake.calls.find((c) => c[1] === "create")).toEqual(
-      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, "bash -lc 'first'"), "--json"],
+      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, `${herdrSealShellPrefix().split(";")[0]}; bash -lc 'first'`), "--json"],
     );
     expect(fake.countOf("send")).toBe(0);
     const handle = fake.last()!.handle;

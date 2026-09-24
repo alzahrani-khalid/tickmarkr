@@ -2,7 +2,7 @@ import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, readlinkSyn
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { shq } from "../adapters/types.js";
-import { createWorktree, sh, type ShResult } from "../run/git.js";
+import { createWorktree, FORK_CAP_ENV, resolvedForkCap, sh, type ShResult } from "../run/git.js";
 import { Journal, type JournalEvent, parseRunId } from "../run/journal.js";
 import { stateDirName } from "../graph/graph.js";
 import { readWatchBoard, requestWatchBoardStop, stopWatchBoard, WATCH_OWNER_ENV, type WatchBoardOwner } from "../run/supervision.js";
@@ -226,7 +226,7 @@ function enclosesCheckout(reported: string | undefined, checkout: string): boole
   return tracked === checkout || checkout.startsWith(`${tracked}/`);
 }
 
-/** The proof line a worker terminal prints first: recovery and focus read it back (FX-N01). */
+/** The proof line a worker terminal prints first: create, recovery and focus read it back. */
 export const CHECKOUT_MARK = "TICKMARKR_CHECKOUT";
 // FX-N05: the proof is a FRAMED value — `TICKMARKR_CHECKOUT <byteLength>:<utf8 bytes as hex>;` — so it
 // carries no whitespace or quotes, survives renderer wrapping (hex rows re-join losslessly), and is
@@ -234,6 +234,7 @@ export const CHECKOUT_MARK = "TICKMARKR_CHECKOUT";
 // never decode to this one; `A` versus `A B`, `…--T1` versus `…--T10` are different frames.
 const CHECKOUT_FRAME_RE = /TICKMARKR_CHECKOUT (\d+):([0-9a-f]*)(;?)/g;
 const PROOF_PAGES = 16; // pages read from the oldest cursor before the proof is declared absent
+const CHECKOUT_PROOF_TIMEOUT_MS = 2_000; // allow the wrapper shell to emit its startup proof
 
 /** The exact bytes the create command prints as its first line. */
 export function checkoutProofLine(checkout: string): string {
@@ -855,9 +856,10 @@ export class OrcaDriver implements ExecutorDriver {
     // The selector names the TRACKED worktree enclosing this slot's checkout outright — never the
     // UI's active worktree (`active`/`current`) nor the daemon's cwd — and the command itself moves
     // into the checkout, because Orca cannot be asked to place a terminal in a path it does not
-    // track (OBS-1004). `--command` runs inside Orca's wrapper shell, so a `cd` prefix is honoured.
+    // track (OBS-1004). Shell startup can swallow that prefix; prove it from scrollback below.
+    const payload = `export ${FORK_CAP_ENV}=${shq(process.env[FORK_CAP_ENV] ?? resolvedForkCap())}; ${cmd}`;
     const env = await this.call("create", [
-      "terminal", "create", "--worktree", `path:${tracked}`, "--title", st.title, "--command", inCheckout(st.cwd, cmd),
+      "terminal", "create", "--worktree", `path:${tracked}`, "--title", st.title, "--command", inCheckout(st.cwd, payload),
     ], this.cliCwd(st));
     const term = requireTerminal("create", env);
     const handle = str(term.handle);
@@ -876,6 +878,20 @@ export class OrcaDriver implements ExecutorDriver {
         await this.closeTerminal({ ...st, handle, runtimeId: env.runtimeId });
       } catch { /* already gone, or no longer provably ours — never a blind retry */ }
       throw this.latched("create", st, `create receipt bound to ${worktree ?? "no worktree"}, not the tracked ${tracked} enclosing ${st.cwd}`, env.raw);
+    }
+    // A receipt only proves placement on the enclosing tracked checkout. Wait briefly for the
+    // startup command's proof before run() can resolve and the daemon can count a worker launch.
+    const deadline = this.time.now() + CHECKOUT_PROOF_TIMEOUT_MS;
+    let proof = await this.checkoutProven(handle, st.cwd, this.cliCwd(st), env.runtimeId);
+    while (!proof.proven && this.time.now() < deadline) {
+      await this.time.sleep(POLL_MS);
+      proof = await this.checkoutProven(handle, st.cwd, this.cliCwd(st), env.runtimeId);
+    }
+    if (!proof.proven) {
+      try {
+        await this.closeTerminal({ ...st, handle, runtimeId: env.runtimeId });
+      } catch { /* best effort under the answering runtime; the latch prevents another launch */ }
+      throw this.latched("create", st, `terminal ${handle} does not prove checkout ${st.cwd} (${proof.reason})`, env.raw);
     }
     st.handle = handle;
     // The handle is bound to the runtime identity that ANSWERED its create.

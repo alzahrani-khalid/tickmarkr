@@ -116,7 +116,11 @@ function mkReportRepo(): string {
     { ts: "2026-07-18T10:00:04.000Z", event: "consult-verdict", taskId: "T1", data: { action: "retry", notes: "fix the test" } },
     { ts: "2026-07-18T10:00:05.000Z", event: "task-done", taskId: "T1", data: { attempts: 2 } },
     { ts: "2026-07-18T10:00:06.000Z", event: "merge", taskId: "T1", data: { branch: "tickmarkr/run-brand-pin--T1", commit: "deadbeef" } },
-    { ts: "2026-07-18T10:01:30.000Z", event: "run-end", data: { runId: "run-brand-pin", branch: "tickmarkr/run-brand-pin", done: ["T1"], failed: [], human: [], blocked: [], pending: [] } },
+    { ts: "2026-07-18T10:01:20.000Z", event: "tip-verify-start", data: { tip: "deadbeef", gates: ["build", "test", "lint"], cached: false } },
+    { ts: "2026-07-18T10:01:21.000Z", event: "tip-verify", data: { tip: "deadbeef", gate: "build", pass: true, cached: true } },
+    { ts: "2026-07-18T10:01:22.000Z", event: "tip-verify", data: { tip: "deadbeef", gate: "test", pass: true } },
+    { ts: "2026-07-18T10:01:23.000Z", event: "tip-verify", data: { tip: "deadbeef", gate: "lint", pass: true, cached: true } },
+    { ts: "2026-07-18T10:01:30.000Z", event: "run-end", data: { runId: "run-brand-pin", branch: "tickmarkr/run-brand-pin", tipVerify: "passed", done: ["T1"], failed: [], human: [], blocked: [], pending: [] } },
   ].map((e) => JSON.stringify(e)).join("\n") + "\n");
   return repo;
 }

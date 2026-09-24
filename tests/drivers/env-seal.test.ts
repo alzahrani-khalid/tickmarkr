@@ -1,9 +1,13 @@
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
-import { DEFAULT_FORK_CAP, FORK_CAP_ENV } from "../../src/run/git.js";
+import { DEFAULT_FORK_CAP, FORK_CAP_ENV, runWithForkBudget } from "../../src/run/git.js";
+import { OrcaDriver } from "../../src/drivers/orca.js";
+import { FakeOrca, steppedTime } from "../helpers/fake-orca.js";
+import { makeTestTempDir } from "../helpers/tmprepo.js";
 import {
   HERDR_CONTROL_VARS,
   herdrSealShellPrefix,
@@ -13,6 +17,36 @@ import {
 
 // v1.22 T3 / OBS-843: workers/judges/reviews/consults must not inherit an addressable operator
 // host session. Regression for the herdr watch-tab leak and Orca terminal-identity leak classes.
+
+test("test: an Orca worker terminal's launch command exports the run's fork cap exactly as the herdr pane seal does while an operator exported cap still wins, so an Orca worker suite that falls back to the default six forks fails", async () => {
+  const previous = process.env[FORK_CAP_ENV];
+  const cwd = makeTestTempDir("orca-fork-cap-");
+  try {
+    for (const operatorCap of [undefined, "3"]) {
+      if (operatorCap === undefined) delete process.env[FORK_CAP_ENV];
+      else process.env[FORK_CAP_ENV] = operatorCap;
+      await runWithForkBudget(100_000, async () => {
+        const fake = new FakeOrca({ trackedWorktrees: [cwd] });
+        const driver = new OrcaDriver({ exec: fake.exec, time: steppedTime() });
+        const slot = await driver.slot(cwd, "T1-worker-fake-a0-r");
+        await driver.run(slot, `printf 'CAP=%s\\n' "$${FORK_CAP_ENV}"`);
+        const create = fake.calls.find((args) => args[1] === "create")!;
+        const command = create[create.indexOf("--command") + 1]!;
+        const herdrExport = herdrSealShellPrefix().split(";")[0]!;
+        expect(herdrExport).toContain(`'${operatorCap ?? "1"}'`);
+        // Compare the executed shell export too: quoting through sh -c must preserve the value.
+        const output = execFileSync("sh", ["-c", command], { cwd, encoding: "utf8", env: { PATH: process.env.PATH } });
+        const herdrOutput = execFileSync("sh", ["-c", `${herdrExport}; printf 'CAP=%s\\n' "$${FORK_CAP_ENV}"`], { encoding: "utf8" });
+        expect(output).toContain(herdrOutput);
+        expect(output).toContain(`CAP=${operatorCap ?? "1"}\n`);
+        await driver.close(slot);
+      });
+    }
+  } finally {
+    if (previous === undefined) delete process.env[FORK_CAP_ENV];
+    else process.env[FORK_CAP_ENV] = previous;
+  }
+});
 
 function makeStub(): { bin: string; log: string; cwd: string } {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-env-seal-"));

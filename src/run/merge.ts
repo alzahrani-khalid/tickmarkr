@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { shq } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import {
@@ -27,7 +27,7 @@ import {
   type VerificationIdentity,
 } from "../gates/cache.js";
 import { tickmarkrDir } from "../graph/graph.js";
-import { describeCapacity, gitHead, linkNodeModules, resolveIntegrationBranch, resolvedCapacity, sameCapacity, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
+import { dependencyLinkRefusal, describeCapacity, gitHead, linkNodeModules, resolveIntegrationBranch, resolvedCapacity, sameCapacity, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
 import { executionSignal } from "./execution-budget.js";
 import type { GateEvidenceReceipt } from "./protocol.js";
 
@@ -40,7 +40,7 @@ export interface TipVerifyResult {
   evidenceReceipt?: GateEvidenceReceipt;
   evidenceReceipts?: GateEvidenceReceipt[];
   evidenceAbsence?: "provenance-refused" | "not-started" | "historical-cache";
-  /** Absolute directory against which the original receipt artifact paths resolve. */
+  /** Directory the evidence setup returned; receipt artifact paths resolve against it. */
   originRunRoot?: string;
   nonce?: string;
   stdoutPath?: string;
@@ -189,6 +189,17 @@ export async function verifyIntegrationTip(
     gatesToRun.push(["test", commands.tipTest]);
   }
 
+  const dependencyRefusal = dependencyLinkRefusal(intWt);
+  if (dependencyRefusal) {
+    for (const [gate, cmd] of gatesToRun.length ? gatesToRun : [["build", ""]]) {
+      const artifact = join(runDir, `tip-verify-${gate}.log`);
+      writeTipLog(artifact, dependencyRefusal + "\n");
+      results.push({ gate, cmd, pass: false, exitCode: 1, fingerprints: [],
+        cause: "infra", details: dependencyRefusal, evidenceAbsence: "not-started", artifact });
+    }
+    return results;
+  }
+
   if (journalFound && hasRunEvidenceOrMalformed && runStartCommands === undefined) {
     for (const [gate, cmd] of gatesToRun) {
       const artifact = join(runDir, `tip-verify-${gate}.log`);
@@ -213,6 +224,8 @@ export async function verifyIntegrationTip(
   // Publish only after the entire verification completes. The daemon kills a cancelled
   // verifier process, so completed early gates must remain in memory until then.
   const pending = new Map<string, VerificationIdentity>();
+  // D-267 (1): each fresh receipt's origin is the root its own beginGateEvidence returned.
+  const evidenceRoots = new Map<string, string>();
 
   for (const [gate, cmd] of gatesToRun) {
     if (runStartCommands !== undefined) {
@@ -286,13 +299,20 @@ export async function verifyIntegrationTip(
     // a detected vitest test command never reaches the stdout-count/file-count path below (this
     // gate's own manifest is always the FULL suite; verify has no selected screen to hold). A
     // scripted test command that is not the detected runner falls through unchanged.
+    const evidenceSetup: GateEvidenceOptions = { artifactDir: runDir, runId: runDir, ...evidenceOptions };
     if (gate === "test" && isVitestTestCommand(cmd, intWt)) {
+      // D-267 (1): stamp the root the evidence setup returned, then give that exact root to every
+      // manifested invocation. Do not reconstruct it from the caller's options: the receipt's
+      // artifact paths are relative to the root returned by beginGateEvidence.
+      const evidence = beginGateEvidence(intWt, gate, cmd, evidenceSetup);
+      const manifestedEvidence: GateEvidenceOptions = { ...evidenceSetup, artifactDir: evidence.root };
+      evidenceRoots.set(gate, evidence.root);
       const outcome = await evaluateManifestedTest(cmd, intWt, {
         baselineDurations: entry?.fileDurations,
         longestFile: entry?.longestFile,
         overallCeilingMs: effectiveCeilingMs(entry),
         artifactDir: runDir,
-        evidence: { artifactDir: runDir, runId: runDir, ...evidenceOptions },
+        evidence: manifestedEvidence,
       });
       const artifact = join(runDir, `tip-verify-${gate}.log`);
       if (!outcome.pass) writeTipLog(artifact, outcome.details);
@@ -323,7 +343,8 @@ export async function verifyIntegrationTip(
     const ceilingMs = effectiveCeilingMs(entry);
     const evidenceReceipts: GateEvidenceReceipt[] = [];
     const execute = async () => {
-      const evidence = beginGateEvidence(intWt, gate, cmd, { artifactDir: runDir, runId: runDir, ...evidenceOptions });
+      const evidence = beginGateEvidence(intWt, gate, cmd, evidenceSetup);
+      evidenceRoots.set(gate, evidence.root);
       try {
         const result = await sh(cmd, intWt, ceilingMs, { env: evidenceOptions.env, onReceipt: receipt => evidence.observe(receipt) });
         evidenceReceipts.push(...evidence.history, evidence.finish(result.stdout, result.stderr));
@@ -428,7 +449,11 @@ export async function verifyIntegrationTip(
   // spawns in the daemon child, and a command that changed the tree invalidates reuse.
   const completedTree = pending.size ? await getWorktreeTree(intWt) : undefined;
   for (const result of results) {
-    if (!result.reused && result.evidenceReceipt) result.originRunRoot = resolve(evidenceOptions.artifactDir ?? runDir);
+    if (!result.reused && result.evidenceReceipt) {
+      const evidenceRoot = evidenceRoots.get(result.gate);
+      if (evidenceRoot === undefined) throw new Error(`tip verify receipt for ${result.gate} has no evidence root from its evidence setup`);
+      result.originRunRoot = evidenceRoot;
+    }
     const id = pending.get(result.gate);
     if (id && id.tree === completedTree && !isInfraResult(result)) {
       store.set(id, { ...result, meta: {

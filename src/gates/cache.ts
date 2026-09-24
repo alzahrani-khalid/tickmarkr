@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Baseline } from "./baseline.js";
 import type { GateResult } from "./types.js";
-import { describeCapacity, type RunCapacity, resolvedCapacity, shGit, type VerificationProtocol, verificationProtocol } from "../run/git.js";
+import { describeCapacity, inventoryDependencyLinks, type RunCapacity, resolvedCapacity, shGit, type VerificationProtocol, verificationProtocol } from "../run/git.js";
 import { shq } from "../adapters/types.js";
 
 export const DEFAULT_VERDICT_CACHE_BOUND = 128;
@@ -110,6 +110,15 @@ export function environmentFingerprint(env: GateEnvironmentInput): { fingerprint
   const capacity: RunCapacity = { forkCap: cap.forkCap, cores: cap.cores };
   const selectedSet = env.selectedSet ? [...env.selectedSet].sort() : undefined;
   const verification = env.verification ?? verificationProtocol(process.env, env.worktree ?? process.cwd());
+  // Admitted links still affect resolution. Normalize against the classified root so relocating
+  // an otherwise identical checkout (including its dependency store) preserves the identity.
+  const resolution = env.worktree ? inventoryDependencyLinks(env.worktree).map(({ link, target, classification }) => ({
+    link,
+    classification,
+    target: classification === "outside" ? target : relative(realpathSync(
+      classification === "worktree" ? env.worktree! : join(env.worktree!, "node_modules"),
+    ), target),
+  })).sort((a, b) => a.link < b.link ? -1 : a.link > b.link ? 1 : 0) : [];
 
   // R41: the protocol and the EFFECTIVE lifecycle are IN the hashed payload, so every entry written
   // before this stamp — green or red — keys differently and is never answered; no store surgery is
@@ -119,6 +128,7 @@ export function environmentFingerprint(env: GateEnvironmentInput): { fingerprint
     nodeRuntime,
     lockfile,
     capacity,
+    resolution,
     selectedSet: selectedSet ?? null,
     scope: env.scope ?? "battery",
     verification: { protocol: verification.protocol, lifecycle: verification.lifecycle },
@@ -202,7 +212,16 @@ export function formatReusedDetails(originalDetails: string, id: VerificationIde
   return `${prefix}: ${unadorned}`;
 }
 
+declare module "./types.js" {
+  interface GateResult {
+    originRunRoot?: string;
+  }
+}
+
 export interface CachedVerdict {
+  evidenceReceipt?: GateResult["evidenceReceipt"];
+  evidenceReceipts?: GateResult["evidenceReceipts"];
+  originRunRoot?: string;
   gate: string;
   pass: boolean;
   details: string;
@@ -223,6 +242,9 @@ export function formatReusedRow(cached: CachedVerdict, id: VerificationIdentity)
     pass: cached.pass,
     details: cached.pass ? reusedDetails : cached.details,
     capacity: cached.capacity,
+    ...(cached.evidenceReceipt ? { evidenceReceipt: cached.evidenceReceipt } : {}),
+    ...(cached.evidenceReceipts ? { evidenceReceipts: cached.evidenceReceipts } : {}),
+    ...(cached.originRunRoot ? { originRunRoot: cached.originRunRoot } : {}),
     meta: {
       ...cached.meta,
       reused: true,
@@ -383,6 +405,10 @@ export class VerdictStore {
         ...("exitCode" in verdict ? { exitCode: verdict.exitCode } : {}),
         ...(verdict.capacity ? { capacity: verdict.capacity } : {}),
         ...(verdict.meta ? { meta: verdict.meta } : {}),
+        ...(verdict.evidenceReceipt ? { evidenceReceipt: verdict.evidenceReceipt } : {}),
+        ...(verdict.evidenceReceipts ? { evidenceReceipts: verdict.evidenceReceipts } : {}),
+        ...(verdict.originRunRoot ? { originRunRoot: verdict.originRunRoot }
+          : typeof verdict.meta?.runDir === "string" ? { originRunRoot: resolve(verdict.meta.runDir) } : {}),
       },
       timestamp: Date.now(),
       sequence: ++globalStoreSequence,
@@ -393,15 +419,13 @@ export class VerdictStore {
 
     writeFileSync(tmpPath, JSON.stringify(record, null, 2) + "\n");
     try {
-      unlinkSync(finalPath);
-    } catch {
-      // ignore
-    }
-    writeFileSync(finalPath, readFileSync(tmpPath));
-    try {
-      unlinkSync(tmpPath);
-    } catch {
-      // ignore
+      renameSync(tmpPath, finalPath);
+    } finally {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Already renamed, or best-effort cleanup after a failed replacement.
+      }
     }
 
     this.evictOldest(bound);

@@ -110,6 +110,14 @@ export function claudeSlug(real: string): string {
   return real.replace(/[^A-Za-z0-9]/g, "-");
 }
 
+// Shared resolution for context and resume identity: never scan a neighbouring session.
+function sessionTranscriptPath(session: SessionRef): string | null {
+  const real = realpathSync(session.cwd);
+  const sid = session.id.replace(/\.jsonl$/i, "");
+  if (!sid || sid.includes("/") || sid.includes("\\") || sid.includes("..")) return null;
+  return join(homedir(), ".claude", "projects", claudeSlug(real), `${sid}.jsonl`);
+}
+
 // newest-first by mtime, bounded — mtime picks WHICH files to scan, never a record's cursor.
 // Shared by collectUsage (spend) and readClaudeAliasIdentity (OBS-145): same store, same bounds.
 function newestSessionFiles(dir: string): string[] {
@@ -315,18 +323,22 @@ export const claudeCode: WorkerAdapter = {
       return undefined; // missing dir / any throw ⇒ fail open
     }
   },
+  readSessionTranscript(session: SessionRef): { bytes: number } | null {
+    try {
+      const file = sessionTranscriptPath(session);
+      return file ? { bytes: readFileSync(file).byteLength } : null;
+    } catch {
+      return null;
+    }
+  },
   // v1.23 T1: last-turn context fill from ~/.claude/projects/<slug>/<sessionId>.jsonl ONLY.
   // tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens of the LAST
   // assistant usage record (not a sum over turns — ctx-watch.sh class; overseer wake signal).
   // Disk read only: no claude spawn, no pane, no network. null = unknown.
   contextUsage(session: SessionRef): ContextUsage | null {
     try {
-      const real = realpathSync(session.cwd);
-      const slug = claudeSlug(real);
-      // session id is a filename stem (herdr agent_session.value); refuse path traversal.
-      const sid = session.id.replace(/\.jsonl$/i, "");
-      if (!sid || sid.includes("/") || sid.includes("\\") || sid.includes("..")) return null;
-      const file = join(homedir(), ".claude", "projects", slug, `${sid}.jsonl`);
+      const file = sessionTranscriptPath(session);
+      if (!file) return null;
       let text: string;
       try {
         text = readFileSync(file, "utf8").slice(0, MAX_SESSION_BYTES);

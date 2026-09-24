@@ -97,3 +97,31 @@ test("test: two reports of one failing test that differ only in their evidence p
   expect((va.meta.failureEvidence as Array<{ text: string }>)[0]!.text).toContain("src/nested/a.ts");
   expect((vb.meta.failureEvidence as Array<{ truncated?: boolean }>)[0]!.truncated).toBe(true);
 });
+
+test("test: under the installed vitest the gate's report records each requested file's pool and single fork setting from its resolved project, so a recovery keyed on a project name fails", async () => {
+  const { symlinkSync } = await import("node:fs");
+  const { makeRepo } = await import("../helpers/tmprepo.js");
+  const { evaluateManifestedTest, readTestReport } = await import("../../src/gates/test-manifest.js");
+  const body = 'import { test, expect } from "vitest"; test("runs", () => expect(1).toBe(1));';
+  const repo = makeRepo({
+    ".gitignore": "node_modules/\n",
+    "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run" } }),
+    "parallel.test.ts": body, "single.test.ts": body, "thread.test.ts": body,
+    // Deliberately reverse familiar project names. Pool overrides belong to the specification.
+    "vitest.config.mjs": `export default { test: { projects: [
+      { test: { name: 'built-cli', include: ['parallel.test.ts'], pool: 'forks' } },
+      { test: { name: 'suite', include: ['single.test.ts', 'thread.test.ts'], pool: 'forks',
+        poolMatchGlobs: [['**/thread.test.ts', 'threads']], poolOptions: { forks: { singleFork: true } } } }
+    ] } };`,
+  });
+  symlinkSync(join(process.cwd(), "node_modules"), join(repo, "node_modules"), "dir");
+  const outcome = await evaluateManifestedTest("npm test -- --configLoader runner", repo, { artifactDir: makeTestTempDir("scheduling-") });
+  expect(outcome.pass, outcome.details).toBe(true);
+  const report = readTestReport(outcome.reportPath)!;
+  expect(report.requested.slice().sort()).toEqual(["parallel.test.ts", "single.test.ts", "thread.test.ts"]);
+  expect(report.scheduling).toEqual({
+    "parallel.test.ts": { pool: "forks", singleFork: false },
+    "single.test.ts": { pool: "forks", singleFork: true },
+    "thread.test.ts": { pool: "threads", singleFork: true },
+  });
+}, 60_000);

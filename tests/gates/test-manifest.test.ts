@@ -657,3 +657,136 @@ test("manifest evidence with an undefined artifact override persists at its repo
   expect(row.meta.stdoutPath).toBe(join(f.artifacts, row.evidenceReceipt!.stdout.path));
   expect(row.meta.stderrPath).toBe(join(f.artifacts, row.evidenceReceipt!.stderr.path));
 });
+
+// A deterministic pool-boundary fault, with real child processes and independent invocation logs.
+// Only the runner's transport failure is injected; discovery, gate, receipts and tip journal are real.
+function strandedFixture(mutate = "", retryMode = "pass", allSkipped = false) {
+  const f = fixture(false);
+  const files = ["tests/a.test.ts", "tests/parallel-skip.test.ts", "tests/single.test.ts", "tests/single-skip.test.ts"];
+  const log = join(f.artifacts, "invocations.json");
+  mkdirSync(join(f.repo, "node_modules/.bin"), { recursive: true });
+  writeFileSync(join(f.repo, "node_modules/.bin/vitest"), `#!/usr/bin/env node
+const fs = require('fs'), path = require('path');
+const args = process.argv.slice(2), all = ${JSON.stringify(files)}, log = ${JSON.stringify(log)};
+const filters = args.filter(a => !a.startsWith('-') && a.endsWith('.test.ts'));
+const excluded = args.filter(a => a.startsWith('--exclude=')).map(a => a.slice(10));
+const files = all.filter(f => (!filters.length || filters.some(q => path.resolve(f).includes(q))) && !excluded.includes(f));
+if (args[0] === 'list') { console.log(JSON.stringify(files.map(file => ({ file: path.resolve(file) })))); process.exit(0); }
+const runs = fs.existsSync(log) ? JSON.parse(fs.readFileSync(log, 'utf8')) : [];
+const retry = runs.length > 0, now = Date.now();
+const present = retry ? files : files.filter(f => !f.includes('single'));
+const report = { nonce: process.env.TICKMARKR_TEST_NONCE, requested: files,
+ scheduling: Object.fromEntries(files.map(f => [f, { pool: 'forks', singleFork: f.includes('single') }])),
+ started: Object.fromEntries(present.map(f => [f, now])),
+ completed: Object.fromEntries(present.map(f => [f, { at: now, status: ${allSkipped} || f.includes('skip') ? 'skipped' : 'passed' }])),
+ certificate: { at: now, exitCode: retry ? 0 : 1, errors: retry ? 0 : 1,
+ diagnostics: retry ? [] : ['Error: [vitest-worker]: Timeout calling "onTaskUpdate"'] } };
+let code = retry ? 0 : 1;
+if (!retry) { ${mutate} }
+if (retry && ${JSON.stringify(retryMode)} === 'failed') { report.completed[files[0]].status = 'failed'; report.certificate.exitCode = code = 1; }
+if (retry && ${JSON.stringify(retryMode)} === 'stranded') { delete report.started[files[0]]; delete report.completed[files[0]]; report.certificate.exitCode = code = 1; report.certificate.errors = 1; report.certificate.diagnostics = ['Error: [vitest-worker]: Timeout calling "onTaskUpdate"']; }
+if (retry && ${JSON.stringify(retryMode)} === 'skipped') for (const c of Object.values(report.completed)) c.status = 'skipped';
+runs.push({ args, files, nonce: report.nonce, reportPath: process.env.TICKMARKR_TEST_REPORT });
+fs.writeFileSync(log, JSON.stringify(runs));
+fs.writeFileSync(process.env.TICKMARKR_TEST_REPORT, JSON.stringify(report));
+console.log('invocation phase ' + runs.length); console.error('stderr phase ' + runs.length);
+process.exit(code);
+`, { mode: 0o755 });
+  return { ...f, files, runs: () => JSON.parse(readFileSync(log, "utf8")) as Array<{ args: string[]; files: string[]; nonce: string; reportPath: string }> };
+}
+
+test("test: through the gate battery a first run whose single fork files never started after a worker RPC timeout re-runs exactly those files once and passes when they pass even though a parallel file and a single fork file were skipped whole, so a gate that fails closed or re-runs the whole suite or counts a skip as a failure fails", async () => {
+  const f = strandedFixture();
+  const row = await round(f);
+  expect(row.pass, row.details).toBe(true);
+  const runs = f.runs();
+  expect(runs.map(r => r.files)).toEqual([f.files, f.files.slice(2)]);
+  expect(runs[0]!.nonce).not.toBe(runs[1]!.nonce);
+  expect(row.meta).toMatchObject({ executedModules: 2, skippedModules: [f.files[1], f.files[3]], retryable: false });
+  for (const run of runs) expect(row.details).toContain(run.nonce);
+  expect(readTestReport(runs[0]!.reportPath)?.certificate?.exitCode).toBe(1);
+  expect(readTestReport(runs[1]!.reportPath)?.certificate?.exitCode).toBe(0);
+  // Skips are accounted across BOTH phases; a wholly skipped retry can still finish the manifest.
+  const skippedRetry = strandedFixture("", "skipped");
+  expect((await round(skippedRetry)).meta).toMatchObject({ executedModules: 1 });
+  const noExecution = strandedFixture("", "pass", true);
+  const refused = await round(noExecution);
+  expect(refused.pass).toBe(false);
+  expect(refused.meta?.noExecutedModules).toBe(true);
+  expect(noExecution.runs()).toHaveLength(2);
+}, 60_000);
+
+test("test: a report stranding a whole parallel project or lacking the reporter's scheduling record or starting no file or holding an unexpected lifecycle member or a certificate exit that disagrees with the process or a failed or unfinished started file or a diagnostic other than a worker RPC timeout is never re-run and keeps today's fail-closed verdict, so a retry that launders a runner failure fails", async () => {
+  const mutations = [
+    "delete report.started[all[1]]; delete report.completed[all[1]];",
+    "delete report.scheduling;", "delete report.scheduling[all[0]];",
+    "report.scheduling[all[0]].singleFork = undefined;", "report.scheduling[all[0]].pool = 'threads';",
+    "report.started = {}; report.completed = {};",
+    "report.started['unexpected.test.ts'] = now;", "report.requested.push('unexpected.test.ts');",
+    "report.completed['unexpected.test.ts'] = { at: now, status: 'passed' };",
+    "report.certificate.exitCode = 0;", "code = 0;", "code = 2; report.certificate.exitCode = 2;",
+    "report.completed[all[0]].status = 'failed';", "delete report.completed[all[0]];",
+    "report.certificate.diagnostics.push('Error: spawn EAGAIN'); report.certificate.errors++;",
+    "report.certificate.diagnostics = ['AssertionError: [vitest-worker]: Timeout calling \"onTaskUpdate\"'];",
+    "report.certificate.diagnostics = ['Error: [vitest-api]: Timeout calling \"onTaskUpdate\"'];",
+    "report.certificate.diagnostics = [];", "report.certificate.errors = 2;", "delete report.certificate;",
+    "report.nonce = 'old';", "report.requested.push(all[0]);", "report.duplicateCompletions = [all[0]];",
+    "delete report.started[all[0]];", "report.started[all[2]] = now;",
+  ];
+  for (const mutation of mutations) {
+    const f = strandedFixture(mutation);
+    const row = await round(f);
+    expect(row.pass, mutation).toBe(false);
+    expect(f.runs(), mutation).toHaveLength(1);
+    const run = f.runs()[0]!;
+    const original = verifyManifestReport({ manifest: f.files, nonce: row.meta!.nonce as string,
+      exitCode: row.meta!.processExit as number, report: readTestReport(run.reportPath) });
+    expect(row.details, mutation).toContain(original.details);
+  }
+}, 60_000);
+
+test("test: a re-run whose own report fails or strands a file fails the gate naming both nonces and launches no second re-run while each invocation keeps its own receipt, so a retry that reports the first run's green or overwrites its evidence fails", async () => {
+  const { createHash } = await import("node:crypto");
+  for (const mode of ["failed", "stranded"]) {
+    const f = strandedFixture("", mode);
+    const row = await round(f);
+    expect(row.pass).toBe(false);
+    expect(row.meta?.retryable).toBe(false);
+    const runs = f.runs();
+    expect(runs).toHaveLength(2);
+    expect(runs[1]!.files).toEqual(f.files.slice(2));
+    expect(row.meta?.nonce).toBe(runs[1]!.nonce);
+    const ids = new Set<string>();
+    for (const [index, run] of runs.entries()) {
+      expect(row.details).toContain(run.nonce);
+      const receipt = row.evidenceReceipts!.find(r => r.nonce === run.nonce)!;
+      expect(receipt.invocationId).toBe(run.nonce);
+      ids.add(receipt.invocationId);
+      expect(readTestReport(run.reportPath)?.nonce).toBe(run.nonce);
+      for (const stream of [receipt.stdout, receipt.stderr]) {
+        const bytes = readFileSync(join(f.artifacts, stream.path));
+        expect(stream.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+        expect(bytes.toString()).toContain(`phase ${index + 1}`);
+      }
+    }
+    expect(ids.size).toBe(2);
+    expect(row.evidenceReceipt?.nonce).toBe(runs[1]!.nonce);
+  }
+}, 60_000);
+
+test("test: tip verify of an integration tip whose first run stranded its single fork files after a worker RPC timeout re-runs only those files once and journals a passing tip row naming the retry, so a tip verify that stays red on the stall fails", async () => {
+  const { Journal } = await import("../../src/run/journal.js");
+  const { verifyIntegrationTipCached } = await import("../../src/run/daemon.js");
+  const f = strandedFixture();
+  const journal = Journal.create(f.repo, "run-stranded-tip");
+  const commands = { test: "vitest run --globals" };
+  journal.append("run-start", undefined, { commands });
+  expect(await verifyIntegrationTipCached(f.repo, commands, journal)).toBe(false);
+  const runs = f.runs();
+  expect(runs.map(r => r.files)).toEqual([f.files, f.files.slice(2)]);
+  const rows = journal.read().filter(r => r.event === "tip-verify");
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.data).toMatchObject({ pass: true, nonce: runs[1]!.nonce });
+  expect(rows[0]!.data.details).toContain(runs[0]!.nonce);
+  expect(rows[0]!.data.details).toContain(runs[1]!.nonce);
+}, 60_000);

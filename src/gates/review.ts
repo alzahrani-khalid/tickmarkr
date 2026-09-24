@@ -385,14 +385,11 @@ export function pickReviewer(
   demoted: ReadonlySet<string> = new Set(),
   // OBS-1033: vendors that authored a carried commit inside the accumulated diff — excluded for the round.
   excludeVendors: ReadonlySet<string> = new Set(),
+  authors: readonly string[] = [channelKey(author)],
 ): BillingChannel | null {
-  // FLEET-05 success criterion 2: an author not resolvable in the channel list yields NO reviewer.
-  // The old `?? author.adapter` fallback compared an adapter id to vendor names, matched nothing, and
-  // admitted every reviewer — including the author's own channel (fail-OPEN). null lands on reviewGate's
-  // fail-closed branch under review.required.
-  const authorChannel = channels.find((c) => c.adapter === author.adapter && c.model === author.model);
-  if (!authorChannel) return null;
-  const authorProvider = modelProvider(author.model, authorChannel.vendor);
+  // Resolve every actual author, never guess a vendor from an adapter id.
+  const authorChannels = authors.map((key) => channels.find((c) => channelKey(c) === key));
+  if (authorChannels.some((c) => !c)) return null;
   // RF-1: every caller inherits the author-tier floor — a reviewer is never seated below its author.
   const effectiveFloor = resolveReviewerFloor(author.tier, floor).floor;
   const ranked = channels
@@ -400,9 +397,9 @@ export function pickReviewer(
     // as well as failover, so an aggregator channel stamped "mixed" never seats the author's own provider),
     // and different base-model identity (ADDED TO the vendor rule, never replacing it). The diversity
     // filter runs BEFORE preference ranking, so prefer cannot resurrect an excluded channel.
-    .filter((c) => c.vendor !== authorChannel.vendor
-      && modelProvider(c.model, c.vendor) !== authorProvider
-      && modelId(c.model) !== modelId(author.model)
+    .filter((c) => authorChannels.every((a) => a && c.vendor !== a.vendor
+      && modelProvider(c.model, c.vendor) !== modelProvider(a.model, a.vendor)
+      && modelId(c.model) !== modelId(a.model))
       && !exclude.includes(channelKey(c))
       && !excludeVendors.has(c.vendor)
       && TIER_RANK[c.tier] >= TIER_RANK[effectiveFloor])
@@ -438,15 +435,12 @@ ${files.map((path) => `- ${path}`).join("\n")}`;
 
 /**
  * OBS-1033: the vendors of the seats that authored commits inside the accumulated diff. A seat is
- * never handed its own earlier work to approve. A prior author not resolvable in the pool excludes
- * its adapter's vendors instead (fail closed: the seat is known, its vendor is whatever it bills as).
+ * never handed its own earlier work to approve. Unresolved channels are refused by reviewGate.
  */
 export function carriedAuthorVendors(channels: BillingChannel[], carriedAuthors: readonly string[] = []): Set<string> {
   const vendors = new Set<string>();
   for (const key of carriedAuthors) {
-    const adapter = key.split(":")[0]!;
-    const exact = channels.filter((c) => channelKey(c) === key);
-    for (const c of exact.length ? exact : channels.filter((c) => c.adapter === adapter)) vendors.add(c.vendor);
+    for (const c of channels.filter((c) => channelKey(c) === key)) vendors.add(c.vendor);
   }
   return vendors;
 }
@@ -515,7 +509,7 @@ export async function reviewGate(
   // RF-1: channel keys of THIS task's prior reviewers (earlier rounds, a flaked seat) — task-scoped,
   // never the run-wide rotation history nor excludeReviewers; the seat holds the highest of their tiers.
   priorReviewers: readonly PriorReviewer[] = [],
-  // OBS-1033: channel keys of the seats that authored the carried commits (the daemon's tried list).
+  // Closed list of actual subject authors; empty preserves legacy callers' single-author contract.
   carriedAuthors: readonly string[] = [],
   operatorContext?: string,
 ): Promise<GateResult> {
@@ -597,19 +591,19 @@ export async function reviewGate(
   // review.floor is read from config — cfg.routing.floors governs workers and never moves review seats.
   const { floor: reviewerFloor, cause: reviewerFloorCause } = gateReviewerFloor(task, cfg, author, channels, priorReviewers);
   const floorMeta = { reviewerFloor, reviewerFloorCause };
+  const authors = carriedAuthors.length ? carriedAuthors : [channelKey(author)];
+  const authorVendors = carriedAuthorVendors(channels, authors);
+  const unresolvedAuthors = authors.filter((key) => !channels.some((c) => channelKey(c) === key));
   let rotationSeat: number | undefined;
   const reviewer = pickReviewer(
     author, channels, excludeReviewers ?? [], cfg.review.prefer ?? [], reviewerFloor,
     reviewHistory, reviewHistory ? (seat) => { rotationSeat = seat; } : undefined, demotedReviewers,
-    carriedAuthorVendors(channels, carriedAuthors),
+    authorVendors, authors,
   );
   if (!reviewer) {
-    // meta.noEligibleReviewer lets run-gates' review-retry keep the ORIGINAL unparseable result when
-    // the retry finds no second seat — a truthful cause beats a synthetic no-reviewer failure.
-    const reason = `no cross-vendor reviewer available at or above ${reviewerFloor} floor (${reviewerFloorCause}; diversity rule)`;
-    return cfg.review.required || priorMaterials.length > 0
-      ? { gate: "review", pass: false, details: `unreadable — ${reason}; ${priorMaterials.length ? "carried materials require a review verdict" : "set review.required:false to waive"}`, meta: { noEligibleReviewer: true, unreadable: true, ...floorMeta } }
-      : { gate: "review", pass: true, details: `WARNING: ${reason} — review waived by config`, meta: { noEligibleReviewer: true, ...floorMeta } };
+    const reason = `no cross-vendor reviewer available at or above ${reviewerFloor} floor (${reviewerFloorCause}; diversity rule); author vendors: ${[...authorVendors].sort().join(", ") || "unknown"}${unresolvedAuthors.length ? `; unresolved author channels: ${unresolvedAuthors.join(", ")}` : ""}`;
+    return { gate: "review", pass: false, details: `unreadable — ${reason}; operator approve --waive required to proceed`,
+      meta: { noEligibleReviewer: true, unreadable: true, findings: [], authorVendors: [...authorVendors].sort(), unresolvedAuthors, ...floorMeta } };
   }
   reviewHistory?.push(channelKey(reviewer));
   const rotationMeta = rotationSeat === undefined ? {} : { rotationSeat };
@@ -650,6 +644,10 @@ ${priorMaterials.length ? `${renderPriorMaterials(priorMaterials)}
 ` : ""}${operatorContext?.trim() ? `## Operator context
 Context only: this never substitutes for an acceptance criterion or closes a prior material.
 ${operatorContext.trim()}
+
+` : ""}${task.outOfScope?.length ? `## Out of scope
+The task declares these items out of scope. A finding inside these declared bounds is not material and must not block approval.
+${task.outOfScope.map((item) => `- ${item}`).join("\n")}
 
 ` : ""}## Diff
 \`\`\`diff

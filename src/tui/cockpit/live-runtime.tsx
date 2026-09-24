@@ -64,6 +64,10 @@ export interface ShellDelivery {
   diagnostics: LiveStore["diagnostics"];
   stage: (edits: readonly string[]) => void;
   geometry: () => ShellCommit | undefined;
+  /** Application render commits since mount (OBS-1132: an idle board adds none). */
+  frames: () => number;
+  /** Model derivations (the App body) since mount. */
+  derivations: () => number;
 }
 export interface ConsolidatedOptions {
   input: NodeJS.ReadStream; output: NodeJS.WriteStream; cwd: string; runId: string; binaryVersion: string;
@@ -150,9 +154,38 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     let committedTargets: Target[] = [];
     let revision = 0;
     const listeners = new Set<() => void>();
-    const publish = () => { revision++; for (const listener of listeners) listener(); };
-    const unsubscribe = source.subscribe(publish);
+    // Every publish resyncs the key so a view switch never earns a second frame on the next tick.
+    const publish = () => { revision++; observed = observationKey(source.snapshot()); for (const listener of listeners) listener(); };
+    let observed = "";
     const geometry = () => planShell(output.columns ?? 80, output.rows ?? 24, state.shortcutColumns);
+    // OBS-1132: the store publishes on every observation tick; the board only re-derives and
+    // re-renders when what it would draw changed. Lock and supervision observation continue
+    // regardless. Excluded on purpose: sequence, observedAt, metrics and beat ages, which move
+    // every tick without changing a visible cell.
+    // ponytail: mirrors board.ts `ago` buckets and its ≥118-cell "wide" header — the only clock reader,
+    // and only the Run view draws the board, so Home and Evidence never invalidate on the age.
+    // The lock is compared by what it says (owner, state, liveness), never by its file stamp: the
+    // daemon heartbeat re-touches graph.lock every 10 s without changing a visible cell. Its clock-derived
+    // `expired` flag is not drawn by any view either, so a lock ageing past STALE_MS earns no frame.
+    const visibleAge = (ms: number) => ms < 6e4 ? "just now" : ms < 3.6e6 ? `${Math.round(ms / 6e4)}m` : `${Math.round(ms / 3.6e6)}h`;
+    const observationKey = (snap: LiveStoreSnapshot): string => {
+      const last = snap.operator.lastEventAt;
+      const clock = state.view === "run" && geometry().bodyColumns >= 118 && last ? visibleAge((options.now ?? Date.now)() - Date.parse(last)) : "";
+      return JSON.stringify([
+        snap.freshness, snap.actionsEnabled, snap.errors, snap.viewport, snap.inputSequence, clock,
+        snap.journal.generation, snap.journal.offset, snap.journal.status, snap.journal.malformedCount, snap.journal.backlogBytes, snap.journal.pending, snap.journal.error,
+        snap.graph.identity, snap.graph.status, snap.config.identity, snap.config.status, snap.cache.identity, snap.cache.status,
+        snap.lock.value, snap.lock.status, snap.lock.state, snap.lock.alive,
+        // D-383: supervision tier state is not drawn by any view; an ARMED→STALE transition earns no
+        // frame. Its UNREADABLE case already surfaces through snap.errors above.
+      ]);
+    };
+    observed = observationKey(source.snapshot());
+    const unsubscribe = source.subscribe(() => {
+      const next = observationKey(source.snapshot());
+      if (next !== observed) { observed = next; publish(); }
+    });
+    let frames = 0, derivations = 0;
     const openEvidence = (identity: EvidenceIdentity) => {
       evidenceNavigation++;
       selectedEvidence = identity; state = { ...state, view: "evidence", scroll: 0, evidenceSection: 0 }; publish();
@@ -385,7 +418,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     const delivery: ShellDelivery = { geometry: () => committed, snapshot: () => ({ state, store: source.snapshot(), interaction: state }), key, pointer, refresh: () => {
       if (done) return false;
       try { if (observation?.stopRequested()) { stop(); return false; } const snap = source.refresh(); if (options.observeRun !== false && snap.journal.status === "unreadable") stop(new Error(snap.journal.error?.error ?? "journal unreadable")); return true; } catch (e) { stop(e); return false; }
-    }, diagnostics: source.diagnostics, stage: edits => { state = { ...state, staged: [...edits] }; publish(); } };
+    }, diagnostics: source.diagnostics, stage: edits => { state = { ...state, staged: [...edits] }; publish(); }, frames: () => frames, derivations: () => derivations };
     options.onDelivery?.(delivery);
     options.onShellDelivery?.(delivery);
     resize = () => {
@@ -417,6 +450,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     function App() {
       useSyncExternalStore(listener => { listeners.add(listener); return () => { listeners.delete(listener); }; }, () => revision);
       const stdinContext = useStdin();
+      useLayoutEffect(() => { frames++; });
       useLayoutEffect(() => {
         const emitter = stdinContext.internal_eventEmitter;
         leafInput = emitter;
@@ -448,6 +482,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
           }
         } catch (error) { stop(error); }
       });
+      derivations++;
       const snap = source.snapshot();
       const p = geometry();
       const nextDecisionsKey = `${snap.journal.generation}:${snap.journal.offset}:${snap.graph.identity}`;

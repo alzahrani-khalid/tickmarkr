@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import { ui } from "../../src/cli/commands/ui.js";
 import { graphDefinitionHash, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
+import { supervisionBeatPath, type SupervisionTier } from "../../src/run/supervision.js";
 import { runViewRowIdentities } from "../../src/tui/cockpit/derive.js";
 import {
   deriveLiveRunCockpitData,
@@ -3606,8 +3608,11 @@ test.each(HEAP_PROTOCOL_CASES)(`${C1_CRITERIA[4]} [%o]`, async ({ production, sh
       expect(result.samples.map((s: { tick: number }) => s.tick)).toEqual(Array.from({ length: 11 }, (_, i) => (i + 1) * 1000));
       for (const sample of result.samples) { expect(sample.heap).toBeLessThanOrEqual(64 * 1048576); expect(sample.performanceMeasures).toBeLessThan(1000); }
       expect(result.lateGrowth).toBeLessThanOrEqual(16 * 1048576);
-      expect(result.verdict).toBe("pass"); expect(result.writes).toBeGreaterThan(10000);
-      expect(result.bytes).toBeGreaterThan(100000); expect(result.pendingOutputBytes).toBe(0);
+      // OBS-1132: an idle tick writes no frame, so the render writes are the shape's real changes —
+      // 11 arrow keys (static), 1100 journal appends (growth), 110 resizes (resize) — never one per tick.
+      expect(result.verdict).toBe("pass"); expect(result.writes).toBeGreaterThan({ static: 10, growth: 1000, resize: 100 }[shape]);
+      expect(result.writes).toBeLessThan(result.warmupTicks + result.measuredTicks);
+      expect(result.bytes).toBeGreaterThan(shape === "static" ? 50_000 : 100_000); expect(result.pendingOutputBytes).toBe(0);
       expect(result.lastFrame.length).toBeLessThanOrEqual(20000);
       expect(result.lastFrame).toContain("heap-fixture");
     }
@@ -3994,4 +3999,148 @@ test("test: in the mounted shell Home's selected Activity row is marked by a gly
     await m.close();
     f.close();
   }
+});
+
+// OBS-1132: the board renders on change and spends no frames while idle. A frame is an application
+// render commit after initial settling, read from the delivery's commit counter.
+async function mountIdleBoard(clock: () => number, view: "run" | "home" = "run") {
+  const f = shellFixture();
+  // A live daemon lock whose heartbeat re-touches the file every 10 s (src/run/lock.ts).
+  const lockPath = join(f.cwd, ".tickmarkr", "graph.lock");
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, runId: f.runId, startedAt: IDLE_LAST_EVENT }));
+  const input = ttyInput();
+  let writes = 0;
+  const output = new Writable({ write(_chunk, _encoding, next) { writes++; next(); } }) as NodeJS.WriteStream;
+  Object.assign(output, { isTTY: true, columns: 180, rows: 40 });
+  let delivery!: ShellDelivery;
+  const mounted = runConsolidatedCockpit({
+    cwd: f.cwd, runId: f.runId, input, output, binaryVersion: "fixture", debug: true, refreshMs: 2 ** 30, now: clock,
+    initialView: view, environment: { NO_COLOR: "1" },
+    onShellDelivery: d => { delivery = d; },
+  });
+  const result = mounted.then(() => undefined, error => error as Error);
+  await sleep(60);
+  if (!delivery) throw await result;
+  // The first tick observes the supervision tier this mount armed; settling includes it.
+  delivery.refresh(); await sleep(40);
+  const settle = { frames: delivery.frames(), derivations: delivery.derivations(), writes };
+  return {
+    delivery, input, output, f,
+    heartbeat: () => { const t = new Date(); utimesSync(lockPath, t, t); },
+    ageLock: (at: number) => { const t = new Date(at); utimesSync(lockPath, t, t); },
+    tier: (name: string) => delivery.snapshot().store.supervision.find(t => t.tier === name),
+    ageBeat: (name: SupervisionTier, at: number) => { const t = new Date(at); utimesSync(supervisionBeatPath(f.cwd, name), t, t); },
+    frames: () => delivery.frames() - settle.frames,
+    derivations: () => delivery.derivations() - settle.derivations,
+    writes: () => writes - settle.writes,
+    close: async () => { delivery.key({ input: "c", key: { ctrl: true } }); await result; input.destroy(); output.destroy(); f.close(); },
+  };
+}
+const IDLE_LAST_EVENT = Date.parse("2026-09-05T00:00:00.000Z");
+
+test("test: a live board over an unchanged journal receiving no input under a held injected clock runs no model derivation and writes no frame across ten refresh ticks, so a board that re-renders on a free running timer fails", async () => {
+  const held = IDLE_LAST_EVENT + 10_000;
+  const m = await mountIdleBoard(() => held);
+  try {
+    expect(m.delivery.snapshot().store.operator.lastEventAt).toBe(new Date(IDLE_LAST_EVENT).toISOString());
+    expect(m.delivery.snapshot().store.lock.state).toBe("alive");
+    // The daemon heartbeat only moves the lock's mtime/ctime; that is not a visible change.
+    for (let tick = 0; tick < 10; tick++) { m.heartbeat(); await sleep(2); expect(m.delivery.refresh()).toBe(true); await sleep(5); }
+    await sleep(40);
+    expect(m.derivations()).toBe(0);
+    expect(m.frames()).toBe(0);
+    expect(m.writes()).toBe(0);
+  } finally { await m.close(); }
+});
+
+test("test: a clock advancing within one visible age writes no frame and the tick that changes the visible age writes exactly one, so a board redrawn on every clock tick fails", async () => {
+  let clock = IDLE_LAST_EVENT + 10_000;
+  const m = await mountIdleBoard(() => clock);
+  try {
+    // "just now" holds under a minute; one-second ticks keep the store's own freshness undelayed.
+    while (clock < IDLE_LAST_EVENT + 59_000) { clock += 1_000; expect(m.delivery.refresh()).toBe(true); await sleep(2); }
+    await sleep(40);
+    expect(m.frames()).toBe(0);
+    clock = IDLE_LAST_EVENT + 60_000;
+    expect(m.delivery.refresh()).toBe(true);
+    await sleep(40);
+    expect(m.frames()).toBe(1);
+    expect(m.derivations()).toBe(1);
+  } finally { await m.close(); }
+  // Only the Run board draws the age: a wide Home view crossing the same boundary stays idle.
+  clock = IDLE_LAST_EVENT + 10_000;
+  const home = await mountIdleBoard(() => clock, "home");
+  try {
+    expect(home.delivery.geometry()?.bodyColumns ?? 0).toBeGreaterThanOrEqual(118);
+    clock = IDLE_LAST_EVENT + 60_000;
+    expect(home.delivery.refresh()).toBe(true);
+    await sleep(40);
+    expect(home.frames()).toBe(0);
+    expect(home.derivations()).toBe(0);
+  } finally { await home.close(); }
+});
+
+test("test: one appended journal row one resize and one keypress each produce exactly one frame, so a frame budget that drops a real change fails", async () => {
+  const held = IDLE_LAST_EVENT + 10_000;
+  const m = await mountIdleBoard(() => held);
+  try {
+    appendFileSync(join(m.f.cwd, ".tickmarkr", "runs", m.f.runId, "journal.jsonl"),
+      JSON.stringify({ ts: "2026-09-05T00:01:00.000Z", event: "worker-nudge", data: { reason: "obs-1132" } }) + "\n");
+    expect(m.delivery.refresh()).toBe(true);
+    await sleep(40);
+    expect(m.frames()).toBe(1);
+    Object.assign(m.output, { rows: 38 });
+    m.output.emit("resize");
+    await sleep(40);
+    expect(m.frames()).toBe(2);
+    m.input.write("?");
+    await sleep(40);
+    expect(m.delivery.snapshot().state.help).toBe(true);
+    expect(m.frames()).toBe(3);
+  } finally { await m.close(); }
+});
+
+test("test: a supervision tier transition with an unchanged journal, visible clock text, input and geometry writes no frame, so a key that invalidates on unrendered supervision state fails", async () => {
+  const held = IDLE_LAST_EVENT + 10_000;
+  const m = await mountIdleBoard(() => held);
+  try {
+    // The mount armed the watch tier with a real-clock beat, which the held clock reads as UNREADABLE
+    // (a visible error). Re-stamp it a second before the held clock so the tier settles ARMED.
+    m.ageBeat("watch", held - 1_000);
+    expect(m.delivery.refresh()).toBe(true);
+    await sleep(40);
+    expect(m.tier("watch")?.state).toBe("ARMED");
+    const settled = { frames: m.frames(), derivations: m.derivations(), writes: m.writes() };
+    // Ageing the beat past the stale ceiling flips ARMED → STALE; no view draws that.
+    m.ageBeat("watch", held - 61_000);
+    expect(m.delivery.refresh()).toBe(true);
+    await sleep(40);
+    expect(m.tier("watch")?.state).toBe("STALE");
+    expect(m.derivations()).toBe(settled.derivations);
+    expect(m.frames()).toBe(settled.frames);
+    expect(m.writes()).toBe(settled.writes);
+  } finally { await m.close(); }
+});
+
+test("test: a lock whose mtime crosses expiration within one visible age writes no frame, so a key that invalidates on the unrendered expired flag fails", async () => {
+  const held = IDLE_LAST_EVENT + 10_000;
+  const m = await mountIdleBoard(() => held);
+  try {
+    // Fresh under the held clock: written 59 s ago, inside STALE_MS; the displayed age stays "just now".
+    m.ageLock(held - 59_000);
+    expect(m.delivery.refresh()).toBe(true);
+    await sleep(40);
+    expect(m.delivery.snapshot().store.lock.expired).toBe(false);
+    expect(m.delivery.snapshot().store.lock.state).toBe("alive");
+    const settled = { frames: m.frames(), derivations: m.derivations(), writes: m.writes() };
+    // Ageing past STALE_MS flips expired → true; no view draws that flag and nothing visible moved.
+    m.ageLock(held - 61_000);
+    expect(m.delivery.refresh()).toBe(true);
+    await sleep(40);
+    expect(m.delivery.snapshot().store.lock.expired).toBe(true);
+    expect(m.delivery.snapshot().store.lock.state).toBe("alive");
+    expect(m.derivations()).toBe(settled.derivations);
+    expect(m.frames()).toBe(settled.frames);
+    expect(m.writes()).toBe(settled.writes);
+  } finally { await m.close(); }
 });

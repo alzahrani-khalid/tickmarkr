@@ -115,10 +115,11 @@ describe("OrcaDriver harvest truth", () => {
     const emptied = rig({ echoSends: false });
     const emptiedSlot = await emptied.driver.slot(WT, TITLE);
     await emptied.driver.run(emptiedSlot, "bash");
+    const afterEmptiedLaunch = emptied.fake.calls.length;
     Object.assign(emptied.fake.last()!, { tuiIdle: true, lines: ["> "], screenLines: ["⏺ working on it", "> "] });
     expect(await emptied.driver.nudge(emptiedSlot, message)).toBe(true);
     expect(screenReads(emptied.fake)).toBe(1);
-    expect(emptied.fake.calls.some((c) => c[1] === "read" && c.includes("--cursor"))).toBe(false);
+    expect(emptied.fake.calls.slice(afterEmptiedLaunch).some((c) => c[1] === "read" && c.includes("--cursor"))).toBe(false);
 
     // accepted, but the frame still shows the text in the composer: false at the echo timeout —
     // and the stream DOES carry the echo here, so a driver proving delivery from the echo says true

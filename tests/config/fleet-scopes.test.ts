@@ -165,3 +165,80 @@ test("test: the exported deny scope enumeration is derived from the routing sche
   const editable = fleetEditableFromConfig({ ...cfg, routing });
   for (const scope of DENY_SCOPES) expect(editable[scope.key], scope.dotted).toEqual(lists[scope.key]);
 });
+
+test("test: a deny list added to the routing schema in the test excludes its channel from routing and the channel ledger names that scope, so a collector that hand lists four scopes fails", async () => {
+  const proto = Object.getPrototypeOf(z.object({})) as object;
+  const original = Object.getOwnPropertyDescriptor(proto, "extend")!;
+  Object.defineProperty(proto, "extend", {
+    ...original,
+    get(this: z.ZodObject<z.ZodRawShape>) {
+      const extend = original.get!.call(this) as (shape: z.ZodRawShape) => z.ZodObject<z.ZodRawShape>;
+      return (shape: z.ZodRawShape) => extend.call(this,
+        "workers" in shape ? { ...shape, quarantine: z.array(z.string()).optional() } : shape);
+    },
+  });
+  try {
+    vi.resetModules();
+    const fresh = await import("../../src/config/config.js");
+    const { exclusionCollector } = await import("../../src/route/preference.js");
+    const { route } = await import("../../src/route/router.js");
+    const { validateGraph } = await import("../../src/graph/schema.js");
+    const { assembleFleetEditor } = await import("../../src/cli/commands/fleet.js");
+    const { channelsFromConfig } = await import("../../src/adapters/types.js");
+    const { writeDoctor, discoverChannels } = await import("../../src/adapters/registry.js");
+    const { FakeAdapter } = await import("../../src/adapters/fake.js");
+    const repo = makeRepo({ "keep.txt": "x" });
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), `tiers:
+  fake:
+    vendor: fake
+    channel: sub
+    models: { fake-1: mid, fake-2: mid }
+routing:
+  learned: off
+  explore: { mode: off }
+  deny:
+    quarantine: [fake:fake-2]
+`);
+    const cfg = fresh.loadConfig(repo, { globalDir: repo });
+    const channels = channelsFromConfig("fake", cfg);
+    const target = channels.find((c) => c.model === "fake-2")!;
+    const task = validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "chore", complexity: 1, acceptance: ["a"] }],
+    }).tasks[0];
+    expect(fresh.DENY_SCOPES.map((s) => s.dotted)).toContain("routing.deny.quarantine");
+    expect(exclusionCollector(target, cfg)).toEqual([{
+      scope: "routing.deny.quarantine", path: "routing.deny.quarantine",
+      configPath: "routing.deny.quarantine", entry: "fake:fake-2", by: "deny",
+    }]);
+    // Pins consult policy directly; automatic routing consumes discovery's filtered pool.
+    const pinned = { ...task, routingHints: { pin: { via: "fake", model: "fake-2" } } };
+    expect(() => route(pinned, cfg, channels)).toThrow(/routing.deny/);
+    const lifted = structuredClone(cfg);
+    delete lifted.routing.deny;
+    expect(route(task, lifted, [target]).assignment.model).toBe("fake-2");
+    writeDoctor(repo, { fake: {
+      installed: true, authed: true, models: ["fake-1", "fake-2"],
+      modelAuth: Object.fromEntries(["fake-1", "fake-2"].map((m) => [m, { authed: true, probedAt: new Date().toISOString() }])),
+    } });
+    writeFileSync(join(repo, "fake.json"), JSON.stringify({ tasks: {} }));
+    const adapter = new FakeAdapter(join(repo, "fake.json"));
+    const discovered = discoverChannels(cfg, [adapter], { fake: await adapter.probe() });
+    expect(discovered.map((c) => c.model)).toEqual(["fake-1"]);
+    expect(route(task, cfg, discovered).assignment.model).toBe("fake-1");
+    const assembled = await assembleFleetEditor(repo, [adapter], {}, { globalDir: repo });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    const props = assembled.props;
+    const staged = Object.fromEntries(fresh.DENY_SCOPES.map((scope) => [
+      fresh.stagedDenyKeyOf(scope), fresh.denyEntriesAt(cfg.routing, scope) ?? [],
+    ]));
+    const picker = props.candidatesForShape("chore", "risk-based", props.initialMap,
+      staged as Parameters<typeof props.candidatesForShape>[3]);
+    expect(picker.rows.map((row) => row.id)).not.toContain("fake:fake-2");
+    expect(picker.ledger).toContain("fake/fake-2 — reach: out all — routing.deny.quarantine (fake:fake-2)");
+  } finally {
+    Object.defineProperty(proto, "extend", original);
+    vi.resetModules();
+  }
+});

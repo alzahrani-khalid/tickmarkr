@@ -1,3 +1,4 @@
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -779,20 +780,32 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(existsSync(worktreePath(repo, `${s.branch}--${parkedId}`))).toBe(true);
     });
 
-    test("resume of a prior run whose worktrees were cleaned re-creates what it needs and completes", async () => {
+    // OBS-1128 (absorbing OBS-1095): this fixture (the equal `sleep 0.3` pair at retry.test.ts:788-789)
+    // and the runId-isolation one below (the pair at :819-820) raced their two workers, so on a loaded
+    // host either merge could land first and neither landed in time (D-295 add.3). Both now carry the
+    // hardened sibling's ordered pair from retry.test.ts:763-764 — 0.2 then 1.2 — and name the earlier
+    // worker as the one that merges. Delays only: no fixture's repair budget (its absence of an inline
+    // timeout) is touched, so both keep the project's 20 s ceiling they already ran under.
+    test("resume of a prior run whose worktrees were cleaned merges the earlier finishing worker first then re-creates what it needs and completes", async () => {
       const { repo, fake, scriptPath } = setupRepo(
         [T("T1"), T("T2")],
         {
           consult: { action: "human", notes: "conflicting edits need a person" },
           tasks: {
-            T1: [{ shell: `sleep 0.3 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
-            T2: [{ shell: `sleep 0.3 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
+            T1: [{ shell: `sleep 0.2 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
+            T2: [{ shell: `sleep 1.2 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
           },
         },
       );
       const first = await runDaemon(repo, { adapters: [fake], runId: "run-wt-resume" });
-      expect(first.done).toHaveLength(1);
-      expect(first.human).toHaveLength(1);
+      // The 0.2s worker reaches the clean integration tip first and merges; the 1.2s worker meets
+      // its shared.txt already written and parks on the merge conflict.
+      expect(first.done).toEqual(["T1"]);
+      expect(first.human).toEqual(["T2"]);
+      const firstRows = Journal.open(repo, "run-wt-resume").read();
+      expect(firstRows.filter((e) => e.event === "merge").map((e) => e.taskId)).toEqual(["T1"]);
+      expect(firstRows.findIndex((e) => e.event === "merge" && e.taskId === "T1"))
+        .toBeLessThan(firstRows.findIndex((e) => e.event === "merge-conflict" && e.taskId === "T2"));
       const parkedId = first.human[0]!;
       expect(existsSync(worktreePath(repo, `${first.branch}--${first.done[0]}`))).toBe(false);
 
@@ -810,20 +823,26 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(runWorktreeDirs(repo, resumed.branch)).toEqual([]);
     });
 
-    test("only worktrees recorded for THIS runId are touched — never another run's", async () => {
+    test("only worktrees recorded for THIS run id are touched with the earlier finishing worker merged first and never another run's", async () => {
       const { repo, fake } = setupRepo(
         [T("T1"), T("T2")],
         {
           consult: { action: "human", notes: "conflicting edits need a person" },
           tasks: {
-            T1: [{ shell: `sleep 0.3 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
-            T2: [{ shell: `sleep 0.3 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
+            // OBS-1128: the sibling's ordered pair (retry.test.ts:763-764), not the equal `sleep 0.3`
+            // race this fixture carried — the cleanup oracle needs a merge that lands in time.
+            T1: [{ shell: `sleep 0.2 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
+            T2: [{ shell: `sleep 1.2 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
           },
         },
       );
       const partial = await runDaemon(repo, { adapters: [fake], runId: "run-wt-keep" });
-      expect(partial.done).toHaveLength(1);
-      expect(partial.human).toHaveLength(1);
+      expect(partial.done).toEqual(["T1"]);
+      expect(partial.human).toEqual(["T2"]);
+      const partialRows = Journal.open(repo, "run-wt-keep").read();
+      expect(partialRows.filter((e) => e.event === "merge").map((e) => e.taskId)).toEqual(["T1"]);
+      expect(partialRows.findIndex((e) => e.event === "merge" && e.taskId === "T1"))
+        .toBeLessThan(partialRows.findIndex((e) => e.event === "merge-conflict" && e.taskId === "T2"));
       const keptDirs = runWorktreeDirs(repo, partial.branch);
       expect(keptDirs.length).toBeGreaterThan(0);
 
@@ -836,6 +855,35 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(green.done).toEqual(["T1"]);
       expect(runWorktreeDirs(repo, green.branch)).toEqual([]);
       expect(runWorktreeDirs(repo, partial.branch)).toEqual(keptDirs);
+    });
+
+    // OBS-1128 (absorbing OBS-1095): the closed list this describe's conflict fixtures come from.
+    // Two of the three pairs above raced on equal `sleep 0.3`, so a loaded host landed neither merge
+    // in time (D-295 add.3) and the fixture could not say which worker merged. Scanning the source
+    // keeps the list closed — a fourth pair, or a revert to equal delays, is red here rather than
+    // flaky under suite load.
+    test("both conflict fixtures delay their two workers by distinct sleeps ordered as the hardened sibling at retry.test.ts:763 does, citing the changed lines", () => {
+      // A pattern over the fixture shape, never a fixture line, so this scanner collects no part of
+      // its own source.
+      const conflictFixture = /^\s*T([12]): \[\{ shell: `sleep ([0-9.]+) && echo [AB] > shared\.txt/;
+      const found: Array<{ id: string; delay: number; line: number }> = [];
+      readFileSync(new URL(import.meta.url), "utf8").split("\n").forEach((text, index) => {
+        const hit = conflictFixture.exec(text);
+        if (hit) found.push({ id: hit[1]!, delay: Number(hit[2]), line: index + 1 });
+      });
+      const cite = (rows: Array<{ line: number }>) => rows.map((row) => `retry.test.ts:${row.line}`).join(" + ");
+
+      // The hardened sibling first, then the two fixtures this change ordered: nothing else in the
+      // file races two workers over one contended path.
+      expect(found.map((row) => row.id), cite(found)).toEqual(["1", "2", "1", "2", "1", "2"]);
+
+      // The sibling's own ordered pair (retry.test.ts:763-764): T1 lands on the clean integration
+      // tip, T2 arrives a second later and meets the conflict it wrote.
+      const ordered = [0.2, 1.2];
+      for (const pair of [found.slice(0, 2), found.slice(2, 4), found.slice(4, 6)]) {
+        expect(pair[1]!.delay, cite(pair)).toBeGreaterThan(pair[0]!.delay);
+        expect(pair.map((row) => row.delay), cite(pair)).toEqual(ordered);
+      }
     });
   });
 
@@ -1027,14 +1075,14 @@ describe("per-task timeout override (OBS-37b)", () => {
   });
 
   test("OBS-58: a retry worktree recreation carries a prior attempt's cleanly-applying commit forward", async () => {
-    const { repo, fake } = setupRepo(
+    const { repo, fake, scriptPath } = setupRepo(
       [T("T1")],
       { tasks: { T1: [
         { shell: `echo carried > kept.txt && ${COMMIT} carry && echo 'usage limit reached for this model'; exit 1` },
         { shell: `test -f kept.txt && echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } },
       ] } },
     );
-    const s = await runDaemon(repo, { adapters: [fake], runId: "run-obs58-carry" });
+    const s = await runDaemon(repo, { adapters: [fake, reviewOnlySeat(repo, scriptPath)], runId: "run-obs58-carry" });
     expect(s.done).toEqual(["T1"]);
     const recreation = Journal.open(repo, "run-obs58-carry").read().find((e) => e.event === "worktree-recreation");
     expect(recreation).toBeDefined();
@@ -1043,7 +1091,7 @@ describe("per-task timeout override (OBS-37b)", () => {
   });
 
   test("OBS-58: the retry brief names prior attempt commits by hash", async () => {
-    const { repo, fake } = setupRepo(
+    const { repo, fake, scriptPath } = setupRepo(
       [T("T1")],
       { tasks: { T1: [
         { shell: `echo carried > kept.txt && ${COMMIT} carry && echo 'usage limit reached for this model'; exit 1` },
@@ -1051,7 +1099,7 @@ describe("per-task timeout override (OBS-37b)", () => {
       ] } },
     );
     const runId = "run-obs58-hash";
-    const s = await runDaemon(repo, { adapters: [fake], runId });
+    const s = await runDaemon(repo, { adapters: [fake, reviewOnlySeat(repo, scriptPath)], runId });
     expect(s.done).toEqual(["T1"]);
     const carried = (Journal.open(repo, runId).read().find((e) => e.event === "worktree-recreation")!.data.carried as string[])[0];
     const retryPrompt = readFileSync(join(tickmarkrDir(repo), "runs", runId, "prompts", "T1-a1.md"), "utf8");
@@ -1146,7 +1194,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     // fixture made only of oracle failures would leave that override untested.
     // Each round's failure carries different assertion content, so the failures stay repair-eligible
     // without tripping the normalized-identical fingerprint cap (the other half of this seam, below).
-    const { repo, fake } = setupRepo(
+    const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { complexity: 8, acceptance: [{ oracle: "command", command: "cat marker.txt; test -f pass.txt" }] })],
       {
         review: {
@@ -1164,7 +1212,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
         ] },
       },
     );
-    const s = await runDaemon(repo, { adapters: [fake], runId: "run-repair-budget" });
+    const s = await runDaemon(repo, { adapters: [fake, reviewOnlySeat(repo, scriptPath)], runId: "run-repair-budget" });
     expect(s.human).toEqual(["T1"]);
     const evs = evsOf(repo, "run-repair-budget");
 
@@ -1211,7 +1259,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
   test("test: a funded repair whose battery died at the test gate before reaching the review gate it was funded for is not charged so a third repair is still funded and the repair-exhausted row names per repair the funded gates the gate reached and the gate it died at whereas the shipped counter that charges every repair-attempt row and names only the last round's failing gates fails", async () => {
     const runId = "run-repair-reached";
     const testCmd = "test ! -f broken.txt";
-    const { repo, fake } = setupRepo(
+    const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { status: "human", humanGate: true, complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
       {
         review: { approve: false, findings: [{ note: "`fixReview` in src/review.ts is incomplete", severity: "material" }] },
@@ -1237,7 +1285,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
       commands: { test: { exitCode: 0, fingerprints: [] } },
     }));
     await approve([runId, "T1", "--review-rounds", "10", "--by", "test"], repo);
-    await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    await runDaemon(repo, { adapters: [fake, reviewOnlySeat(repo, scriptPath)], runId, resume: true });
     const events = evsOf(repo, runId);
     const repairs = events.filter((e) => e.event === "repair-attempt" && e.taskId === "T1");
     expect(repairs).toHaveLength(3);
@@ -1722,7 +1770,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     // the same thing of each: the prompt reproduces the gate-result bytes the journal already holds
     // for the attempt before it. The consult round is the one that used to lose them, by replacing
     // the brief with its own guidance rather than adding to it.
-    const { repo, fake } = setupRepo(
+    const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { acceptance: [{ oracle: "command", command: "cat marker.txt; test -f pass.txt" }] })],
       {
         consult: { action: "retry", notes: "commit the marker file this time" },
@@ -1736,7 +1784,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
         ] },
       },
     );
-    const s = await runDaemon(repo, { adapters: [fake], runId: "run-no-amnesia" });
+    const s = await runDaemon(repo, { adapters: [fake, reviewOnlySeat(repo, scriptPath)], runId: "run-no-amnesia" });
     expect(s.done).toEqual(["T1"]);
     const evs = evsOf(repo, "run-no-amnesia");
 
@@ -2072,7 +2120,7 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
       },
     );
     repo = s.repo;
-    await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised")], runId });
+    await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised"), reviewOnlySeat(s.repo, s.scriptPath)], runId });
     await approve([runId, "T1", "--uphold", "--by", "op"], repo);
 
     // run B's reviewer APPROVES. The worker's own step commits the sibling change into the live
@@ -2091,7 +2139,7 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
         { shell: `echo settled > shared.txt && ${COMMIT} w2`, result: { ok: true, summary: "a3" } },
       ] },
     }));
-    await runDaemon(repo, { adapters: [closingReview(new FakeAdapter(s.scriptPath), s.scriptPath, "resolved")], runId, resume: true });
+    await runDaemon(repo, { adapters: [closingReview(new FakeAdapter(s.scriptPath), s.scriptPath, "resolved"), reviewOnlySeat(s.repo, s.scriptPath)], runId, resume: true });
 
     evs = evsOf(repo, runId);
     dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1");
@@ -2228,7 +2276,7 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
       "gates: { test: 'test ! -f broken.txt' }\n",
     );
     repo = s.repo;
-    await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised")], runId });
+    await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised"), reviewOnlySeat(s.repo, s.scriptPath)], runId });
     // the dispatch AFTER the test-gate round: its own feedback quotes neither finding, so whatever it
     // says about them it says on the journal's evidence alone. Read here, before run B can reuse a
     // prompt path for the same attempt number.
@@ -2255,7 +2303,7 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
         { shell: `echo two >> src/mark.ts && ${COMMIT} m3`, result: { ok: true, summary: "a3 — fixed the material finding" } },
       ] },
     }));
-    await runDaemon(repo, { adapters: [closingReview(new FakeAdapter(s.scriptPath), s.scriptPath, "resolved")], runId, resume: true });
+    await runDaemon(repo, { adapters: [closingReview(new FakeAdapter(s.scriptPath), s.scriptPath, "resolved"), reviewOnlySeat(s.repo, s.scriptPath)], runId, resume: true });
     evs = evsOf(repo, runId);
   }, 300_000);
 
@@ -2743,3 +2791,29 @@ describe("unowned test detection site repair wiring", () => {
     expect(battery.every((e) => e.data.pass === true || e.data.skipped === true)).toBe(true);
   });
 });
+
+// These carry/retry scenarios author work on both fake vendors. Keep the third seat
+// local and review-only, with the same scripted verdict and explicit closure evidence.
+function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
+  const configPath = join(repo, ".tickmarkr", "config.yaml");
+  const config = parseYaml(readFileSync(configPath, "utf8"));
+  config.routing ??= {};
+  config.routing.deny ??= {};
+  config.routing.deny.workers ??= {};
+  config.routing.deny.workers.adapters = [...new Set([...(config.routing.deny.workers.adapters ?? []), "third-review"])];
+  writeFileSync(configPath, stringifyYaml(config));
+  const seat = new FakeAdapter(scriptPath);
+  seat.id = "third-review";
+  seat.vendor = "third-vendor";
+  seat.probe = async () => ({ installed: true, authed: true, version: "fake", models: [seat.id],
+    modelAuth: { [seat.id]: { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } } });
+  seat.channels = () => [{ adapter: seat.id, model: seat.id, vendor: seat.vendor, channel: "api", tier: "frontier" }];
+  seat.headlessCommand = (file) => {
+    const prompt = readFileSync(file, "utf8");
+    const prior = [...prompt.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]);
+    const { review } = JSON.parse(readFileSync(scriptPath, "utf8"));
+    return `printf '%s\\n' ${shq(JSON.stringify({ ...review, nonce: extractPromptNonce(prompt),
+      resolved: review.approve ? prior : [], reraised: review.approve ? [] : prior }))}`;
+  };
+  return seat;
+}

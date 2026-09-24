@@ -139,3 +139,21 @@ describe("prior-run finding evidence", () => {
       .toBe(taskContentDigest(direct.tasks[0]!));
   }, 120_000);
 });
+
+describe("out-of-scope content identity (OBS-1126)", () => {
+  test("test: a task whose out of scope list changed since the prior run admits none of that run's findings as current feedback while an unchanged list admits them, so a changed bound that still admits stale findings fails", () => {
+    const bounded = T("T1", { goal: "stable", files: ["src/a.ts"], acceptance: ["observable"], outOfScope: ["src/b.ts"] });
+    const fixture = setupRepo([bounded], {});
+    const task = loadGraph(fixture.repo).tasks[0]!;
+    const digest = taskContentDigest(task);
+    Journal.create(fixture.repo, "run-prior").append("gate-result", "T1", blocking("T1", digest, "bound finding").data);
+
+    expect(readPriorRunEvidence(fixture.repo, [task]).findings.map((f) => f.finding.note)).toEqual(["bound finding"]);
+    const rebounded = { ...task, outOfScope: ["src/b.ts", "src/c.ts"] };
+    expect(readPriorRunEvidence(fixture.repo, [rebounded]).findings).toEqual([]);
+    // an absent list keeps the historical digest bytes, so pre-field evidence still joins
+    const { outOfScope: _o, ...unbounded } = task;
+    expect(taskContentDigest(unbounded)).toBe(taskContentDigest({ ...unbounded, outOfScope: undefined }));
+    expect(taskContentDigest(unbounded)).not.toBe(digest);
+  });
+});

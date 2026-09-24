@@ -1,5 +1,5 @@
 import { type AuthHealth, channelKey, channelsFromConfig } from "../adapters/types.js";
-import type { TickmarkrConfig } from "../config/config.js";
+import { DENY_SCOPES, denyEntriesAt, type TickmarkrConfig } from "../config/config.js";
 import { validateGraph } from "../graph/schema.js";
 import { route, RoutingError } from "./router.js";
 
@@ -141,49 +141,16 @@ export function exclusionCollector(
 ): ExclusionScope[] {
   const routing = "routing" in routingOrCfg ? routingOrCfg.routing : routingOrCfg;
   const out: ExclusionScope[] = [];
-  const { allow, deny } = routing ?? {};
-  for (const entry of deny?.adapters ?? []) {
-    if (entryMatchesChannel(entry, c, true)) {
-      out.push({
-        scope: "routing.deny.adapters",
-        path: "routing.deny.adapters",
-        configPath: "routing.deny.adapters",
-        entry,
-        by: "deny",
-      });
-    }
-  }
-
-  for (const entry of deny?.models ?? []) {
-    if (entryMatchesChannel(entry, c, true)) {
-      out.push({
-        scope: "routing.deny.models",
-        path: "routing.deny.models",
-        configPath: "routing.deny.models",
-        entry,
-        by: "deny",
-      });
-    }
-  }
-
-  if (role === "worker") {
-    for (const entry of deny?.workers?.adapters ?? []) {
+  const { allow } = routing ?? {};
+  for (const scope of DENY_SCOPES) {
+    // Lists under workers apply only to worker seats; flat deny lists cover every role.
+    if (scope.path[2] === "workers" && role !== "worker") continue;
+    for (const entry of denyEntriesAt(routing, scope) ?? []) {
       if (entryMatchesChannel(entry, c, true)) {
         out.push({
-          scope: "routing.deny.workers.adapters",
-          path: "routing.deny.workers.adapters",
-          configPath: "routing.deny.workers.adapters",
-          entry,
-          by: "deny",
-        });
-      }
-    }
-    for (const entry of deny?.workers?.models ?? []) {
-      if (entryMatchesChannel(entry, c, true)) {
-        out.push({
-          scope: "routing.deny.workers.models",
-          path: "routing.deny.workers.models",
-          configPath: "routing.deny.workers.models",
+          scope: scope.dotted,
+          path: scope.dotted,
+          configPath: scope.dotted,
           entry,
           by: "deny",
         });

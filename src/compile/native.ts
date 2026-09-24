@@ -72,7 +72,7 @@ const NESTED_RE = /^\s+- (.+)$/;
 // v1.19: a typed acceptance oracle line — "command: ...", "test: ...", or "judge: ...". Anything
 // without one of these prefixes is a plain-string judge criterion (compat path, emits a warning).
 const ORACLE_RE = new RegExp(`^(${ORACLES.join("|")}):\\s*(.*)$`);
-const FIELDS = new Set(["goal", "shape", "deps", "files", "context", "complexity", "humangate", "pin", "floor", "gates", "acceptance", "timeout", "pins"]);
+const FIELDS = new Set(["goal", "shape", "deps", "files", "context", "complexity", "humangate", "pin", "floor", "gates", "acceptance", "timeout", "pins", "outofscope"]);
 
 interface Draft {
   id: string;
@@ -85,7 +85,8 @@ interface Draft {
   gates: string[];
   hasGates: boolean;
   pinsRaw: string[];
-  list: "acceptance" | "gates" | "pins" | null;
+  outOfScope: string[];
+  list: "acceptance" | "gates" | "pins" | "outofscope" | null;
   // true while the last item of `list` may still absorb wrapped continuation lines; cleared by
   // any field bullet or blank line, so a dangling indented line elsewhere fails closed below.
   itemOpen: boolean;
@@ -93,7 +94,10 @@ interface Draft {
 }
 
 const listItems = (draft: Draft) =>
-  draft.list === "acceptance" ? draft.acceptanceRaw : draft.list === "pins" ? draft.pinsRaw : draft.gates;
+  draft.list === "acceptance" ? draft.acceptanceRaw
+    : draft.list === "pins" ? draft.pinsRaw
+    : draft.list === "outofscope" ? draft.outOfScope
+    : draft.gates;
 
 // v2.5.8 T7: one declared pin item — "literal: <exact text> | glob: <search glob>" (split at the LAST
 // " | glob: " so the text may itself hold a bar) or "fixture: <path set>". A declaration missing the
@@ -469,7 +473,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
   for (const [index, line] of content.split("\n").entries()) {
     const heading = line.match(HEAD_RE);
     if (heading) {
-      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptanceRaw: [], acceptance: [], gates: [], hasGates: false, pinsRaw: [], list: null, itemOpen: false, continuationField: null });
+      drafts.push({ id: heading[1], title: heading[2].trim(), fields: {}, acceptanceRaw: [], acceptance: [], gates: [], hasGates: false, pinsRaw: [], outOfScope: [], list: null, itemOpen: false, continuationField: null });
       continue;
     }
     const draft = drafts.at(-1);
@@ -504,7 +508,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
       if (!FIELDS.has(name)) invalid(draft.id, field[1], "is unknown");
       const value = field[2].trim();
       draft.itemOpen = false;
-      if (name === "acceptance" || name === "gates" || name === "pins") {
+      if (name === "acceptance" || name === "gates" || name === "pins" || name === "outofscope") {
         if (value) invalid(draft.id, field[1], "must be a nested list");
         draft.list = name;
         if (name === "gates") draft.hasGates = true;
@@ -775,6 +779,9 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
       ...(routingHints ? { routingHints } : {}),
       ...(draft.hasGates ? { gates: draft.gates } : {}),
       ...(draft.pinsRaw.length ? { pins: draft.pinsRaw.map((raw, i) => parsePin(draft.id, raw, i, pinPaths)) } : {}),
+      // OBS-1126: an absent list emits no key — a sealed graph's bytes must not move for tasks that
+      // never declared a bound.
+      ...(draft.outOfScope.length ? { outOfScope: draft.outOfScope } : {}),
     };
   });
 
@@ -904,6 +911,23 @@ acceptance is required on every task (a nested list of observable outcomes).
                                                                   it carries no literal text)
                  LAW: a pins declaration is a LIMITED AUTHORING CONTRACT, not an assertion analyzer —
                  tickmarkr holds you to the obligations you DECLARE; it does not discover the pins you forgot.
+                 THE PIN SWEEP IS BY CALLERS OF EVERY RESHAPED TYPE, NOT BY THE LITERAL (OBS-1127): for each
+                 type, field or return shape the task changes, enumerate EVERY CALLER and EVERY BRIDGE — the
+                 command layer that re-serialises it, the live cockpit that renders it, the fixture that
+                 byte-pins it — and declare each one. A grep for the retired literal finds the sites that
+                 SPELL the old shape; it misses the sites that CONSUME it under another name. Measured in
+                 v2.5.9, twice: a deny-scope reshape swept by literal missed the Fleet command bridge that
+                 re-emitted the old scope set; a pane-status reshape missed the live cockpit caller that
+                 still read the retired field. Both compiled, both passed the declared pins, both shipped.
+    outOfScope:  nested list (optional) of bounds the task must NOT cross — carried onto the graph task
+                 and into its content identity (OBS-1126): a changed list retires prior-run findings.
+                 It is the DECLARED BOUND the reviewer and the repair worker are HELD TO, stated as EXPLICIT
+                 EXCLUSIONS ALONGSIDE the authoritative goal and acceptance criteria — it never displaces
+                 them. The review brief carries the goal (authoritative), the criteria and this list, so a
+                 finding inside the list is NOT MATERIAL and must not block approval (the reviewer may
+                 still raise it as minor); the repair worker receives the complete task prompt — goal,
+                 criteria and this list — not only the finding, so a repair that crosses the list fails
+                 even when it would silence the finding.
 
   HARD BOUNDS — these FAIL the compile, they do not warn:
     - at most 6 acceptance items per task (no exception path)
@@ -939,6 +963,15 @@ acceptance is required on every task (a nested list of observable outcomes).
       A criterion naming a CAPABILITY is satisfiable by a stub whose only caller is its own test, and the
       judge cannot catch it — it reads the DIFF, and a stub's hunks are real. Name the PRODUCTION CALLER
       that must exercise the capability, and the path it runs on; "X is supported" ships as dead code.
+    - A CRITERION RUNS END-TO-END THROUGH ITS PRODUCTION CALLER, STATED ONCE. Pin the observable at the
+      outermost production entry point — the CLI bridge, the rendered frame, the journal line — and let the
+      layers beneath it be exercised by that one claim. A criterion pinned at a helper is satisfied by the
+      helper alone while every layer above it is still wrong, and the fix then CLIMBS: each review round
+      moves the pin up one layer and burns a round. Measured in v2.5.9 (OBS-1127): a deny-scope criterion
+      first pinned the helper, then the production shape, then the Fleet state, then the CLI bridge — four
+      review rounds for one claim, "tkr fleet deny lists every scope the schema declares", that stated once
+      at the bridge would have failed at round one. Ask: WHAT DOES THE OPERATOR INVOKE, AND WHAT DO THEY
+      SEE? Pin that. A criterion satisfied one layer short of the operator is a criterion about plumbing.
     - Enumerating one axis exhaustively is what hides the others. A spec that guards PARTIAL coverage
       site-by-site, member-by-member, can be defeated wholesale by CONDITIONAL coverage, which leaves
       every enumeration satisfied. After you enumerate, ask what a single flag would do to the whole set.
@@ -985,6 +1018,9 @@ acceptance is required on every task (a nested list of observable outcomes).
   PRE-SCOPE BY TEXT, ENUMERATE BLOCKERS BY EXECUTION:
     - Before assigning files[], sweep text across the repository tree for names, callers, tests and prose.
       A text sweep produces a candidate list; only running the change enumerates the real blocker set.
+      For every type the task RESHAPES, the sweep is by CALLER, not by literal: list each consumer and each
+      bridge of the type (command layer, cockpit, fixtures) and put every one in files[] or in a dep's —
+      the two v2.5.9 misses above were consumers that never spelled the retired literal (OBS-1127).
       Keep the candidates for scope, then execute the production path and full gates before declaring the
       set closed — this milestone paid a halted run to learn that the two populations are not identical.
     - SPIKE-THE-CONTRACT-THEN-SCOPE trigger question: COULD A TEST THIS TASK DOES NOT OWN BE ASSERTING THE

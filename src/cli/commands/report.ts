@@ -18,6 +18,7 @@ import {
 } from "../../report/operator-record.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
 import { Journal, loadRoutingProfile, type JournalEvent, type TelemetryRow } from "../../run/journal.js";
+import { formatTipProof, runEndTipProof } from "../../run/daemon.js";
 import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
 
 const n = (x: number) => x.toLocaleString("en-US"); // explicit locale — CI/darwin flake guard
@@ -190,6 +191,16 @@ const VERIFICATION_READING: Record<Verification, string> = {
   absent: "absent — no tip verification recorded: neither passed nor failed",
 };
 
+function verificationReading(runId: string, events: JournalEvent[]): string {
+  const state = verificationOf(runId, events);
+  const proof = runEndTipProof(closedCycle(events));
+  if ((state === "passed" || state === "cached") && proof.gates?.length) {
+    const allCarried = proof.gates.every(({ kind }) => kind === "reused");
+    return `${allCarried ? "cached" : "passed"} — ${formatTipProof(proof)}`;
+  }
+  return VERIFICATION_READING[state];
+}
+
 // VIS-07 / REC-01: derived only from the run journal, telemetry, and local configuration.
 export function renderMarkdownRecord(runId: string, events: JournalEvent[], prices: ChannelCost[] = [], rows: TelemetryRow[] = []): string {
   const runStart = events.find((e) => e.event === "run-start");
@@ -225,7 +236,7 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     `- **done:** ${count("done")}`,
     `- **failed:** ${count("failed")}`,
     `- **human:** ${count("human")}`,
-    `- **verification:** ${VERIFICATION_READING[verificationOf(runId, events)]}`,
+    `- **verification:** ${verificationReading(runId, events)}`,
     "",
     "## Usage & efficiency",
     "",

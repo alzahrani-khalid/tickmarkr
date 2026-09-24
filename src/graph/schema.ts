@@ -83,6 +83,8 @@ export const TaskSchema = z.object({
     )
     .optional(),
   pins: z.array(PinSchema).optional(),
+  // OBS-1126: declared bounds the task must not cross; absent ⇒ no key (sealed graph bytes hold).
+  outOfScope: z.array(z.string().min(1)).optional(),
   gates: z
     .array(z.enum(GATE_NAMES))
     .default(["build", "test", "lint", "evidence", "scope", "acceptance", "review"])

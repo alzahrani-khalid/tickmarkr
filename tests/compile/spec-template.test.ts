@@ -274,3 +274,108 @@ describe("spec template — stub-satisfiability law", () => {
     }
   });
 });
+
+// T17 (OBS-1126 template, OBS-1127): the out-of-scope bound, the caller-driven pin sweep, and end-to-end criteria.
+function outOfScopeField(written: string): string {
+  return written.slice(written.indexOf("outOfScope:"), written.indexOf("HARD BOUNDS"));
+}
+function pinsField(written: string): string {
+  return written.slice(written.indexOf("pins:"), written.indexOf("outOfScope:"));
+}
+
+function bindsReviewerAndRepairToOutOfScope(section: string): boolean {
+  return /DECLARED BOUND the reviewer and the repair worker are HELD TO/.test(section)
+    && /review brief carries the goal \(authoritative\), the criteria and this list/.test(section)
+    && /repair worker receives the complete task prompt/.test(section);
+}
+
+// The sweep law as a predicate: it holds only when the sweep is BY CALLERS of every reshaped type — a
+// literal-only sweep is the neighbouring wrong wording that shipped both v2.5.9 misses.
+function sweepsByCallersOfEveryReshapedType(section: string): boolean {
+  return /PIN SWEEP IS BY CALLERS OF EVERY RESHAPED TYPE, NOT BY THE LITERAL/.test(section)
+    && /enumerate EVERY CALLER and EVERY BRIDGE/.test(section);
+}
+
+// Replay one v2.5.9 miss: given the reshaped type's callers, does the sweep text demand the consumer that
+// never spelled the retired literal? Under a literal sweep it is found only when it spells the literal.
+type Caller = { name: string; spellsLiteral: boolean };
+function sweptCallers(section: string, callers: Caller[]): string[] {
+  return sweepsByCallersOfEveryReshapedType(section)
+    ? callers.map((c) => c.name)
+    : callers.filter((c) => c.spellsLiteral).map((c) => c.name);
+}
+
+function statesEndToEndOnce(section: string): boolean {
+  return /RUNS END-TO-END THROUGH ITS PRODUCTION CALLER, STATED ONCE/.test(section)
+    && /outermost production entry point/.test(section)
+    && /the fix then CLIMBS/.test(section);
+}
+
+// Replay the climb: a criterion pinned at each layer in turn is four rounds; the end-to-end law collapses
+// it to one claim at the bridge.
+const DENY_SCOPE_CLIMB = ["helper", "production shape", "Fleet state", "CLI bridge"];
+function roundsToPinDenyScope(section: string): number {
+  return statesEndToEndOnce(section) ? 1 : DENY_SCOPE_CLIMB.length;
+}
+
+describe("spec template — T17 out-of-scope bound, caller pin sweep, end-to-end criteria", () => {
+  test("the template documents the out-of-scope list as the declared bound a reviewer and a repair worker are held to, citing the changed template lines", async () => {
+    const written = await initialisedSpec();
+    const field = outOfScopeField(written);
+
+    expect(bindsReviewerAndRepairToOutOfScope(field)).toBe(true);
+    expect(field).toMatch(/NOT MATERIAL and must not block approval/);
+    expect(field).toMatch(/reviewer may\s+still raise it as minor/);
+    // The goal stays authoritative beside the list; the repair worker sees the whole prompt, not the finding alone.
+    expect(field).toMatch(/EXPLICIT\s+EXCLUSIONS ALONGSIDE the authoritative goal and acceptance criteria/);
+    expect(field).toMatch(/complete task prompt/);
+    expect(field).not.toMatch(/prose is context/);
+
+    // The neighbouring wrong wording: OBS-1126 identity only, nobody held to anything.
+    const identityOnly = "outOfScope: nested list of bounds — carried onto the graph task and into its content identity.";
+    expect(bindsReviewerAndRepairToOutOfScope(identityOnly)).toBe(false);
+  });
+
+  test("replaying the two v2.5.9 pin-sweep misses against the changed pin-sweep text finds each missed bridge by enumerating the callers of every reshaped type, citing the changed lines", async () => {
+    const written = await initialisedSpec();
+    const field = pinsField(written);
+
+    expect(sweepsByCallersOfEveryReshapedType(field)).toBe(true);
+    expect(field).toMatch(/Fleet command bridge/);
+    expect(field).toMatch(/live cockpit caller/);
+    expect(spikeSection(written)).toMatch(/the sweep is by CALLER, not by literal/);
+
+    const denyScopeCallers: Caller[] = [
+      { name: "deny-scope helper", spellsLiteral: true },
+      { name: "Fleet command bridge (T3)", spellsLiteral: false },
+    ];
+    const paneStatusCallers: Caller[] = [
+      { name: "pane-status reducer", spellsLiteral: true },
+      { name: "live cockpit caller (T16)", spellsLiteral: false },
+    ];
+    expect(sweptCallers(field, denyScopeCallers)).toContain("Fleet command bridge (T3)");
+    expect(sweptCallers(field, paneStatusCallers)).toContain("live cockpit caller (T16)");
+
+    // The literal-only sweep that shipped v2.5.9 misses both bridges.
+    const literalOnly = "pins: - literal: <exact text> | glob: <search glob> — every file holding the text is obligated.";
+    expect(sweptCallers(literalOnly, denyScopeCallers)).not.toContain("Fleet command bridge (T3)");
+    expect(sweptCallers(literalOnly, paneStatusCallers)).not.toContain("live cockpit caller (T16)");
+  });
+
+  test("replaying the v2.5.9 deny-scope criterion that climbed four layers in review against the changed criterion text states it once end-to-end through its production caller, citing the changed lines", async () => {
+    const written = await initialisedSpec();
+    const section = criterionSection(written);
+
+    expect(statesEndToEndOnce(section)).toBe(true);
+    for (const layer of DENY_SCOPE_CLIMB) expect(section).toContain(layer);
+    expect(section).toContain('"tkr fleet deny lists every scope the schema declares"');
+    expect(roundsToPinDenyScope(section)).toBe(1);
+
+    // The existing stub law alone names a production caller but never says ONCE, at the outermost layer —
+    // the climb still happens one layer per round.
+    const callerOnly = "Name the PRODUCTION CALLER that must exercise the capability, and the path it runs on.";
+    expect(statesEndToEndOnce(callerOnly)).toBe(false);
+    expect(roundsToPinDenyScope(callerOnly)).toBe(DENY_SCOPE_CLIMB.length);
+    expect(carriesEveryExistingLaw(section)).toBe(true);
+  });
+});

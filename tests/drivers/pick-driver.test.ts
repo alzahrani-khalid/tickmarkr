@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate } from "../../src/config/config.js";
 import { driverEvidence, pickDriver } from "../../src/drivers/index.js";
-import { OrcaDriver } from "../../src/drivers/orca.js";
+import { checkoutProofLine, OrcaDriver } from "../../src/drivers/orca.js";
 import type { OrcaExec } from "../../src/drivers/orca.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import * as DaemonModule from "../../src/run/daemon.js";
@@ -141,7 +141,7 @@ describe("pickDriver", () => {
       if (family === "create") {
         const t = refusedFakeOrca.last();
         if (t) {
-          t.lines = ["mock-ready", "TICKMARKR_RESULT_dummy {}"];
+          t.lines = [checkoutProofLine(cwd), "mock-ready", "TICKMARKR_RESULT_dummy {}"];
         }
       }
       return res;

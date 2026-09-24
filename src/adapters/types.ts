@@ -423,6 +423,9 @@ export interface WorkerAdapter {
   // fake). Callers MUST treat null as unknown: never as 0, never as over-threshold (telemetry
   // fail-open — opposite of gates). claude/pi implement; others omit or return null.
   contextUsage?(session: SessionRef): ContextUsage | null;
+  // OBS-1120: readable byte extent of this exact session's own transcript. Missing/unreadable
+  // is null, never zero. Growth can confirm a resume only against a readable pre-launch baseline.
+  readSessionTranscript?(session: SessionRef): { bytes: number } | null;
   // v1.22 T5: optional trust check-and-seed. doctor only. Absent = n/a (adapter has no trust concept,
   // or already bypasses via a CLI flag like pi --approve). Side-effecting when it seeds a writable store.
   trust?(repoRoot: string): TrustVerdict;

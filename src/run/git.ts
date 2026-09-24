@@ -5,7 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { availableParallelism, homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
@@ -693,6 +693,55 @@ function excludeNodeModules(dir: string): void {
     mkdirSync(join(gitDir, "info"), { recursive: true });
     writeFileSync(exclude, current + (current && !current.endsWith("\n") ? "\n" : "") + "node_modules\n");
   } catch { /* not a git checkout (bare tmpdir in tests) — never fail provisioning over the exclude */ }
+}
+
+export interface DependencyLink {
+  /** Package link, relative to node_modules (including @scope/name). */
+  link: string;
+  target: string;
+  classification: "worktree" | "node_modules" | "outside";
+}
+
+/** Inventory only package-level links; never descend into installed packages. */
+export function inventoryDependencyLinks(worktree: string): DependencyLink[] {
+  const dependencyPath = join(worktree, "node_modules");
+  try { lstatSync(dependencyPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const root = realpathSync(worktree);
+  const dependencies = realpathSync(dependencyPath);
+  const inside = (parent: string, target: string): boolean => {
+    const rel = relative(parent, target);
+    return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+  };
+  const links: DependencyLink[] = [];
+  const inspect = (link: string): void => {
+    const path = join(dependencies, link);
+    if (!lstatSync(path).isSymbolicLink()) return;
+    const target = realpathSync(path);
+    links.push({ link, target, classification: inside(root, target) ? "worktree"
+      : inside(dependencies, target) ? "node_modules" : "outside" });
+  };
+  for (const entry of readdirSync(dependencies).sort()) {
+    inspect(entry);
+    if (entry.startsWith("@") && statSync(join(dependencies, entry)).isDirectory()) {
+      for (const child of readdirSync(join(dependencies, entry)).sort()) inspect(join(entry, child));
+    }
+  }
+  return links;
+}
+
+/** Shared pre-command refusal; unreadable inventories cannot establish isolation either. */
+export function dependencyLinkRefusal(worktree: string): string | undefined {
+  try {
+    const outside = inventoryDependencyLinks(worktree).filter(link => link.classification === "outside");
+    if (!outside.length) return undefined;
+    return "infra: OBS-1118 refusing verification: dependency links resolve outside the worktree and real node_modules:\n"
+      + outside.map(({ link, target }) => `node_modules/${link} -> ${target}`).join("\n");
+  } catch (error) {
+    return `infra: OBS-1118 refusing verification: cannot inventory dependency links in ${worktree}: ${String(error)}`;
+  }
 }
 
 export function linkNodeModules(repo: string, dir: string, { force = false } = {}): boolean {

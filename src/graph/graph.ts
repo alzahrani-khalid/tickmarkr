@@ -115,9 +115,14 @@ export function graphDefinitionHash(g: RunGraph): string {
 // finding; changing the goal, write surface or acceptance contract does. Keep the full digest here:
 // unlike graphDefinitionHash this value is persisted beside evidence and is the fail-closed join a
 // later run uses, so there is no benefit in making collision diagnosis less explicit.
-export function taskContentDigest(task: Pick<Task, "goal" | "files" | "acceptance">): string {
+// OBS-1126: outOfScope joins the identity only when present — an absent list keeps the historical
+// bytes so every digest persisted before the field existed still joins.
+export function taskContentDigest(task: Pick<Task, "goal" | "files" | "acceptance" | "outOfScope">): string {
   return createHash("sha256")
-    .update(JSON.stringify({ goal: task.goal, files: task.files, acceptance: task.acceptance }))
+    .update(JSON.stringify({
+      goal: task.goal, files: task.files, acceptance: task.acceptance,
+      ...(task.outOfScope ? { outOfScope: task.outOfScope } : {}),
+    }))
     .digest("hex");
 }
 

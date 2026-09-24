@@ -92,7 +92,7 @@ Per release:
    badge and never an in-progress run — with the shipped tri-state grader:
 
    ```bash
-   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> <N> v2.5.9
+   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> <N> v2.6.0
    ```
 
    `gh run view --job --log` can be empty while a run is in progress, so `UNREADABLE` (exit 2) is a hard
@@ -105,8 +105,8 @@ Per release:
    push the tag:
 
    ```bash
-   git tag -a v2.5.9 -m "v2.5.9"
-   git push origin v2.5.9
+   git tag -a v2.6.0 -m "v2.6.0"
+   git push origin v2.6.0
    ```
 
 5. The tag push runs `release.yml` in the public repository:

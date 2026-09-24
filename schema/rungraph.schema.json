@@ -255,6 +255,13 @@
               ]
             }
           },
+          "outOfScope": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
           "gates": {
             "default": [
               "build",

@@ -62,7 +62,7 @@ through brief lineage. **An executor choice nobody made is still an executor cho
    - **On herdr (`HERDR_ENV=1`)**: Every bundled `watch-*.sh` arm, including `watch-artifacts.sh`, sets `TKR_ARMING_SEAT=<seat>` and writes its own pid under
      `<state-dir>/overseer/pids/<arming-seat>-<script>-<pid>.pid`. A seat retires only watchers it armed,
      by reading those files and killing the exact recorded pids; it never uses `pkill -f`, `pgrep -f`, or
-     any argv/path pattern. A journal path is shared by partner tiers and therefore cannot prove ownership.
+     any argv/path pattern. The pre-arm beat probe lists unowned writers and is reconciled in the beat section; retiring a watcher this seat armed stays kill-by-recorded-pid and never that probe. A journal path is shared by partner tiers and therefore cannot prove ownership.
      Verify each executing pid in two process-table reads before acting, kill-by-pid, arm the replacement,
      then verify its new pid in two process-table reads. A stand-down order inventories both sets: the
      ordering seat's recorded pids to retire, and the partner's watchers armed on the ordering seat that
@@ -72,7 +72,7 @@ through brief lineage. **An executor choice nobody made is still an executor cho
      and nothing had been watching either file.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: File and journal watchers record
      owner pid and arm id beside the evidence files; a seat retires only watchers it armed, by those
-     recorded pids. It never uses `pkill -f`, `pgrep -f`, or any argv/path pattern. Verify each executing
+     recorded pids. It never uses `pkill -f`, `pgrep -f`, or any argv/path pattern. The pre-arm beat probe lists unowned writers and is reconciled in the beat section; retiring a watcher this seat armed stays kill-by-recorded-pid and never that probe. Verify each executing
      pid in two process-table reads before acting. A stand-down inventories this seat's recorded pids
      and the partner's watchers that must survive it.
    **An adopted seat ANNOUNCES itself, in the same act as re-arming:** tell the adopted orchestrator the
@@ -806,6 +806,12 @@ they are left implicit:
    report INSIDE the worktree and to commit nothing — the overseer commits from the main checkout — or give the work to a
    claude seat, or to a throwaway CLONE (a real `.git` directory). A brief that tells a codex-in-worktree seat to commit
    buys a stall, not a commit.
+
+   **Every one-shot `codex exec` from an agent shell closes stdin (D-307-pre).** This skill has no
+   `codex exec` recipe — cross-vendor seats are spawned interactive — and the seat's ad-hoc one-shot
+   did not close stdin on that command. The agent shell left stdin open, and `codex exec` then
+   blocks on reading additional input from stdin (`Reading additional input from stdin…`) until the
+   pipe ends (42 minutes, measured). Run it as `codex exec … < /dev/null`.
 4. **Gate every exec lane with the shipped battery, not hand-rolled greps.**
    `tickmarkr verify --base <ref> --criteria <file>` is the standalone form of the engine's own gates —
    build/test/lint diffed against a recorded baseline, evidence, scope, plus the semantic judges — one
@@ -826,8 +832,13 @@ they are left implicit:
 - **Verified send protocol**:
   - **On herdr (`HERDR_ENV=1`)**: `herdr agent send` writes WITHOUT Enter, and `pane run`'s Enter can be swallowed
     by bracketed-paste on long payloads. Robust sequence: read the pane (bare prompt required) → send-text →
-    sleep 2–3s → send-keys Enter → read back (input empty / agent `working`). Never report "briefed" without
-    the read-back. Long content goes in a brief file, never pane text. `scripts/seat-send.sh` encodes
+    sleep 2–3s → read back. Send `send-keys Enter` only when that read-back shows the staged text on the
+    composer and no permission prompt or numbered choice holds focus — an Enter sent onto an active prompt
+    approves it or picks a choice instead of submitting the brief (OBS-1119). When a prompt or choice holds
+    focus instead, resolve it first, then re-read before retrying. After a submitted Enter, read back once
+    more and confirm the composer is empty or the agent shows `working` — the pre-Enter read only proved
+    Enter was safe to send, not that the brief was submitted. Never report "briefed" without
+    both read-backs. Long content goes in a brief file, never pane text. `scripts/seat-send.sh` encodes
     this whole path — size guard, atomic prompt, prompt-line read-back, optional interrupt — and never
     auto-resends. Each adapter declares its prompt glyph beside its input-box matchers; `seat-send.sh` reads
     that declaration rather than assuming Claude's `❯`.
@@ -1009,7 +1020,7 @@ the repo root as its own `run_in_background` Bash call:
 
 ```bash
 cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop
-tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down  # deliberately hand off; --loop exits
+cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down  # deliberately hand off; --loop exits
 ```
 
 **The legacy wrapper loop, `while :; do tickmarkr beat overseer --seat <pane>; sleep 10; done`, is the
@@ -1043,9 +1054,10 @@ had three beat writers, one owned by an unrelated session. The shipped `--loop` 
 but its process ownership still needs a live check. So:
 
 - **Split the liveness reads.** A tier's liveness is read from beat freshness in the repository status
-  path; the loop's liveness is read from the live process payload (`tickmarkr beat <tier> --seat <seat>
-  --loop` in this repo). Neither liveness claim is read from a recorded pid: a pid
-  recorded earlier can be stale, reused, or detached from the beat now holding the tier green.
+  path. The loop's liveness is read from the live process payload of both arm forms: the loop arm
+  (`tickmarkr beat <tier> --seat <seat> --loop` in this repo) and the legacy wrapper
+  (`while :; do tickmarkr beat <tier> --seat <seat>; sleep 10; done`). Neither liveness claim is read from a recorded pid:
+  a pid recorded earlier can be stale, reused, or detached from the beat now holding the tier green.
 - **At every adopt, clear, or re-brief, sweep for pre-existing beat writers on YOUR tier before
   arming one** (`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected** — this exact probe
   returned its own shell as pid 14680 on 2026-08-31). **The PRIMARY target is the legacy
@@ -1053,6 +1065,11 @@ but its process ownership still needs a live check. So:
   a `--loop` exits by itself once your new arm replaces its own, but the wrapper's bare tick beats
   whatever arm is on disk, so it survives your re-arm and never exits on its own. Trace each survivor
   to its parent session. Stop an unowned writer only — never its parent — then verify the parent survived.
+  **Reconcile this probe with the recorded-pid ownership rule.** That rule retires watchers this seat
+  armed by the exact recorded pid, and it never uses `pkill -f`, `pgrep -f`, or an argv pattern. This
+  probe is the listing of unowned legacy writers that have no pid file; the pattern stays
+  `pgrep -f "tickmarkr beat <tier>"` with no `--loop` qualifier. A stop is kill-by-pid of an unowned
+  survivor after the two reads. The probe does not retire a recorded pid.
 - **`ARMED (<seat>)` is an attributable claim, not proof that the named seat is still alive.** Before
   trusting it, ask whose session owns the beater; a still-running `--loop` can keep naming a departed
   seat (rule 11's outliving-its-trigger failure, in beat form).
@@ -1547,6 +1564,14 @@ twice.** They are mission-independent on purpose: nothing here names a task, a l
     the same root read the other way: a DETACHED loop outlives its seat and holds a tier `ARMED` with
     nobody home (OBS-583). Neither direction may be assumed; the lifetime is a property of how the watcher
     was launched, and it belongs in writing next to every claim that one is armed.
+    **A seat's background tasks are bound to the seat's life (D-302 add.3).** An ad-hoc background task —
+    an analysis heredoc, a one-shot shell — dies with the seat that launched it. Record its pid and kill
+    that pid at stand-down, the same recorded-pid act as any other task this seat owns. Leave it attached
+    to the seat so it is not reparented to pid 1 and left running after the seat is gone. A watcher this
+    skill explicitly labels detached, with its heartbeat file, is the process that may outlive the seat.
+    **Forbid the home-wide recursive glob by name:** `glob.glob('~/**/.tickmarkr/runs/*/journal.jsonl', recursive=True)`.
+    That heredoc walked the whole home (`~/**`, every worktree, `node_modules`, Library) and ran orphaned
+    for 30 hours at 100% CPU after its seat was gone. No seat glob starts at `~` or `$HOME`.
     **And EVERY process-table probe has an idiom that defeats it, so the rule above needs the one test
     that survives all of them. Lead with this; it is not the last resort, it is the first move:**
 

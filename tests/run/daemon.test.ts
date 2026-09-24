@@ -1,3 +1,4 @@
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 // The daemon suite is partitioned across this file and tests/run/daemon/*.test.ts so the runner,
 // which schedules by file, stops serialising the whole suite behind one 400s+ file. This file keeps
 // the `daemon integration` block and stays the path the shipped testing guide cites; the retry,
@@ -12,7 +13,7 @@ import { TIER_RANK, type Tier } from "../../src/config/config.js";
 import { DeliveryReadinessError } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
-import { gatePaneName } from "../../src/gates/llm.js";
+import { gatePaneName, extractPromptNonce } from "../../src/gates/llm.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead, shOk, worktreePath } from "../../src/run/git.js";
@@ -976,7 +977,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     // OBS-189 (park-economics patch): review rejections now converge via forced same-channel retries
     // and park at the engagement round cap WITHOUT consulting — so this test's consult-label guard
     // (WR-01) rides a judge rejection instead, which still walks retry → escalate → consult → park.
-    const { repo, fake } = setupRepo(
+    const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { complexity: 8 })],
       {
         judge: { pass: false, criteria: [{ criterion: "a", met: false, reason: "not met" }] }, // rejection every attempt
@@ -1010,7 +1011,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
       async close(s: { id: string; name: string; cwd: string }) { open.delete(s.name); return inner.close(s); },
       worktree: inner.worktree.bind(inner),
     };
-    const s = await runDaemon(repo, { adapters: [fake], runId: "run-uniq", driver });
+    const s = await runDaemon(repo, { adapters: [fake, reviewOnlySeat(repo, scriptPath)], runId: "run-uniq", driver });
     expect(s.failed).toEqual([]); // a name collision would crash the task into "failed"
     expect(s.human).toEqual(["T1"]); // the legitimate path: judge rejections → consult → park
     // D-07: judge panes self-clean between attempts — canonical names reuse safely (no agent_name_taken)
@@ -1594,3 +1595,29 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(prompt).toMatch(/never commit, delete, or replace/i);
   });
 }, 120000);
+
+// These carry/retry scenarios author work on both fake vendors. Keep the third seat
+// local and review-only, with the same scripted verdict and explicit closure evidence.
+function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
+  const configPath = join(repo, ".tickmarkr", "config.yaml");
+  const config = parseYaml(readFileSync(configPath, "utf8"));
+  config.routing ??= {};
+  config.routing.deny ??= {};
+  config.routing.deny.workers ??= {};
+  config.routing.deny.workers.adapters = [...new Set([...(config.routing.deny.workers.adapters ?? []), "third-review"])];
+  writeFileSync(configPath, stringifyYaml(config));
+  const seat = new FakeAdapter(scriptPath);
+  seat.id = "third-review";
+  seat.vendor = "third-vendor";
+  seat.probe = async () => ({ installed: true, authed: true, version: "fake", models: [seat.id],
+    modelAuth: { [seat.id]: { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } } });
+  seat.channels = () => [{ adapter: seat.id, model: seat.id, vendor: seat.vendor, channel: "api", tier: "frontier" }];
+  seat.headlessCommand = (file) => {
+    const prompt = readFileSync(file, "utf8");
+    const prior = [...prompt.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]);
+    const { review } = JSON.parse(readFileSync(scriptPath, "utf8"));
+    return `printf '%s\\n' ${shq(JSON.stringify({ ...review, nonce: extractPromptNonce(prompt),
+      resolved: review.approve ? prior : [], reraised: review.approve ? [] : prior }))}`;
+  };
+  return seat;
+}

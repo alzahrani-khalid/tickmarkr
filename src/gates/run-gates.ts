@@ -19,7 +19,7 @@ import { evaluateManifestedTest, isVitestTestCommand } from "./test-manifest.js"
 import type { GateResult } from "./types.js";
 import { executionSignal } from "../run/execution-budget.js";
 import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
-import { preserveWorktree, shGit, resolvedCapacity, verificationProtocol } from "../run/git.js";
+import { dependencyLinkRefusal, preserveWorktree, shGit, resolvedCapacity, verificationProtocol } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 import {
   computeVerificationIdentity,
@@ -427,6 +427,16 @@ export async function runGates(
   };
   let selectionDecision: Record<string, unknown> | undefined;
   let commits: string[] = [];
+  // Check before cache identity, npm policy probes, or any gate command.
+  const dependencyRefusal = dependencyLinkRefusal(ctx.worktree);
+  if (dependencyRefusal) {
+    const gate = GATE_NAMES.find(g => task.gates.includes(g)) ?? "build";
+    const result: GateResult = { gate, pass: false, details: dependencyRefusal,
+      meta: { infra: true, classification: "infra", retryable: false, kind: "workspace-dependency" } };
+    await noBuild("refused", dependencyRefusal);
+    await ctx.onGate?.({ phase: "end", gate, result });
+    return { results: [result], commits: [] };
+  }
   const stateDir = ctx.stateDir ?? resolveStateDir(ctx.worktree, ctx.artifactDir);
   const verdictStore = getVerdictStore(stateDir);
   // R41: the verification protocol and the EFFECTIVE npm lifecycle policy measured for THIS

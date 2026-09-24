@@ -1,3 +1,5 @@
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { writeBashEnvFixture } from "../../helpers/bash-env.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -255,12 +257,12 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       const trailered = setupRepo([T("T1", { timeoutMinutes: 0.02 })], {
         ...red, tasks: { T1: [{ shell, result: { ok: true, summary: "claimed" } }] },
       });
-      const claimed = await runDaemon(trailered.repo, { adapters: [trailered.fake], runId: "run-ladder-claimed" });
+      const claimed = await runDaemon(trailered.repo, { adapters: [trailered.fake, reviewOnlySeat(trailered.repo, trailered.scriptPath)], runId: "run-ladder-claimed" });
 
       const silent = setupRepo([T("T1", { timeoutMinutes: 0.02 })], {
         ...red, tasks: { T1: [{ shell }] }, // no trailer — harvested
       });
-      const harvested = await runDaemon(silent.repo, { adapters: [silent.fake], runId: "run-ladder-harvested", driver: hdriver({ useRealRead: true }) });
+      const harvested = await runDaemon(silent.repo, { adapters: [silent.fake, reviewOnlySeat(silent.repo, silent.scriptPath)], runId: "run-ladder-harvested", driver: hdriver({ useRealRead: true }) });
 
       const ladder = (repo: string, runId: string) =>
         evsOf(repo, runId).filter((e) => e.event === "escalation").map((e) => e.data.step);
@@ -1105,7 +1107,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       const silent = setupRepo([T("T1", { timeoutMinutes: 5 })], { ...red, tasks: { T1: [{ shell }] } });
       const restoreProbe = await cpuProbeFallback(silent.repo, "run-harvest-streak", "flat");
       try {
-        await runDaemon(silent.repo, { adapters: [silent.fake], runId: "run-harvest-streak", driver: hdriver() });
+        await runDaemon(silent.repo, { adapters: [silent.fake, reviewOnlySeat(silent.repo, silent.scriptPath)], runId: "run-harvest-streak", driver: hdriver() });
       } finally {
         restoreProbe();
       }
@@ -1131,7 +1133,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       const trailered = setupRepo([T("T1", { timeoutMinutes: 5 })], {
         ...red, tasks: { T1: [{ shell, result: { ok: true, summary: "claimed" } }] },
       });
-      await runDaemon(trailered.repo, { adapters: [trailered.fake], runId: "run-harvest-streak-claimed" });
+      await runDaemon(trailered.repo, { adapters: [trailered.fake, reviewOnlySeat(trailered.repo, trailered.scriptPath)], runId: "run-harvest-streak-claimed" });
       const claimedEvs = evsOf(trailered.repo, "run-harvest-streak-claimed");
       expect(claimedEvs.filter((e) => e.event === "worker-result-harvested")).toHaveLength(0);
       expect(claimedEvs.filter((e) => e.event === "channel-demotion")).toHaveLength(0);
@@ -1213,3 +1215,29 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
   }, 240_000);
 
 });
+
+// These carry/retry scenarios author work on both fake vendors. Keep the third seat
+// local and review-only, with the same scripted verdict and explicit closure evidence.
+function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
+  const configPath = join(tickmarkrDir(repo), "config.yaml");
+  const config = parseYaml(readFileSync(configPath, "utf8"));
+  config.routing ??= {};
+  config.routing.deny ??= {};
+  config.routing.deny.workers ??= {};
+  config.routing.deny.workers.adapters = [...new Set([...(config.routing.deny.workers.adapters ?? []), "third-review"])];
+  writeFileSync(configPath, stringifyYaml(config));
+  const seat = new FakeAdapter(scriptPath);
+  seat.id = "third-review";
+  seat.vendor = "third-vendor";
+  seat.probe = async () => ({ installed: true, authed: true, version: "fake", models: [seat.id],
+    modelAuth: { [seat.id]: { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } } });
+  seat.channels = () => [{ adapter: seat.id, model: seat.id, vendor: seat.vendor, channel: "api", tier: "frontier" }];
+  seat.headlessCommand = (file) => {
+    const prompt = readFileSync(file, "utf8");
+    const prior = [...prompt.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]);
+    const { review } = JSON.parse(readFileSync(scriptPath, "utf8"));
+    return `printf '%s\\n' ${shq(JSON.stringify({ ...review, nonce: extractPromptNonce(prompt),
+      resolved: review.approve ? prior : [], reraised: review.approve ? [] : prior }))}`;
+  };
+  return seat;
+}

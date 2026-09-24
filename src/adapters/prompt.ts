@@ -20,7 +20,7 @@ Goal: ${task.goal}
 
 ## Acceptance criteria (you will be judged against these, verbatim)
 ${list(task.acceptance.map(renderAcceptanceItem))}
-${task.files.length ? `\n## File scope — touch ONLY paths matching:\n${list(task.files)}\n` : ""}${task.context.length ? `\n## Context (read these first)\n${list(task.context)}\n` : ""}
+${task.files.length ? `\n## File scope — touch ONLY paths matching:\n${list(task.files)}\n` : ""}${task.context.length ? `\n## Context (read these first)\n${list(task.context)}\n` : ""}${task.outOfScope?.length ? `\n## Out of scope\nStay within the task’s declared bounds; do not pursue these items:\n${list(task.outOfScope)}\n` : ""}
 ## Rules
 - Work only inside the current directory (your isolated worktree). Never push. Never switch branches.
 - Make small atomic git commits as you go (git add + git commit, conventional messages).

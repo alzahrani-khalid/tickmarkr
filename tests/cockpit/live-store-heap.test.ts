@@ -40,7 +40,11 @@ test("the ordinary-environment heap result survives the test's cleanup at a prin
       expect(result.sourceCommit).toMatch(/^[a-f0-9]{40}$/);
       expect(result.warmupTicks).toBe(1000); expect(result.measuredTicks).toBe(10000);
       expect(result.environment.NODE_ENV).toBe(production ? "production" : null);
-      expect(result.writes).toBeGreaterThan(1000); expect(result.bytes).toBeGreaterThan(100000);
+      // OBS-1132 (D-378): a static board renders on change only — its writes are the mount, the
+      // eleven keypress frames and the unmount, a fixed budget that must not grow with 11000 ticks.
+      // Growth and resize drive a real change every 10 ticks and must keep painting.
+      if (shape === "static") { expect(result.writes).toBeLessThanOrEqual(40); expect(result.writes).toBeGreaterThan(0); }
+      else { expect(result.writes).toBeGreaterThan(1000); expect(result.bytes).toBeGreaterThan(100000); }
       expect(result.lastFrame.length).toBeLessThanOrEqual(20000); expect(result.lastFrame).toContain("heap-fixture");
       expect(result.pendingOutputBytes).toBe(0);
       for (const sample of result.samples) {

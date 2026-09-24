@@ -1878,25 +1878,56 @@ export class Journal {
     return m;
   }
 
-  // OBS-130/OBS-571: gate satisfaction is authority, not an inferred daemon state. Only an explicit
-  // task-approved event with the typed release marker and a known gate enters this fold. Authority is
-  // scoped to that approval: any later approval supersedes it, and the worktree-recreation row written
-  // before the approved gate suffix runs consumes it at enactment. A daemon-made gate-satisfied event,
-  // a prior pass/fail result, malformed data, or another task's approval is inert.
-  replaySatisfiedGates(): Map<string, GateName> {
+  // OBS-130/OBS-571: only an explicit approval grants gate authority; recreation consumes
+  // its immediate enactment. OBS-1133: retain a review waiver's subject separately so a later
+  // recheck may carry it. Tool waivers never survive recheck. The daemon supplies the recreated
+  // subject before using a carried waiver; absent that, replay can only compare journaled subjects.
+  replaySatisfiedGates(currentSubjects?: ReadonlyMap<string, string>): Map<string, GateName> {
     const satisfied = new Map<string, GateName>();
+    const reviewSubjects = new Map<string, string>();
+    const subjects = new Map<string, string>();
+    const reviewWaivers = new Map<string, string>();
     for (const e of this.read()) {
       if (!e.taskId) continue;
+      if (e.event === "task-dispatch") {
+        reviewSubjects.delete(e.taskId);
+        subjects.delete(e.taskId);
+        reviewWaivers.delete(e.taskId);
+        satisfied.delete(e.taskId);
+      }
+      if (e.event === "gate-result") {
+        const commit = typeof e.data.commit === "string" && e.data.commit ? e.data.commit : undefined;
+        if (commit) subjects.set(e.taskId, commit);
+        else subjects.delete(e.taskId);
+        if (reviewWaivers.has(e.taskId) && reviewWaivers.get(e.taskId) !== commit) {
+          reviewWaivers.delete(e.taskId);
+        }
+        if (e.data.gate === "review") {
+          if (commit && e.data.pass === false) reviewSubjects.set(e.taskId, commit);
+          else reviewSubjects.delete(e.taskId);
+        }
+      }
       if (e.event === "worktree-recreation") {
         satisfied.delete(e.taskId);
         continue;
       }
       if (e.event === "task-approved") {
         satisfied.delete(e.taskId);
+        if (e.data.release === RECHECK_RELEASE) {
+          const waivedSubject = reviewWaivers.get(e.taskId);
+          const subject = currentSubjects?.get(e.taskId) ?? subjects.get(e.taskId);
+          if (waivedSubject && waivedSubject === subject) satisfied.set(e.taskId, "review");
+          continue;
+        }
+        reviewWaivers.delete(e.taskId);
         if (e.data.release === GATE_SATISFIED_RELEASE
             && typeof e.data.gate === "string"
             && (GATE_NAMES as readonly string[]).includes(e.data.gate)) {
           satisfied.set(e.taskId, e.data.gate as GateName);
+          const subject = reviewSubjects.get(e.taskId);
+          if (e.data.gate === "review" && subject && subject === subjects.get(e.taskId)) {
+            reviewWaivers.set(e.taskId, subject);
+          }
         }
       }
     }

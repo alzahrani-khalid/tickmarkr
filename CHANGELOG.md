@@ -2,6 +2,48 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.6.0 — the suite finishes and the gate tests the task's own tree
+
+**v2.6.0** makes a full test suite finish without a human, and makes the gate refuse to test a tree other than the task's own. Run `run-20260924-034515-0000000000000105`: 16/16 merged. Every review was cross-vendor or ruled. Tip verify ran fresh (366 test files present; 364 executed).
+
+- **T1 — the stranded serial phase (OBS-1111, P0).** The test gate re-runs a stranded single-fork phase once, and only when the reporter's recorded scheduling proves every parallel file finished before a worker RPC timeout stranded it. Every other shape stays fail-closed.
+- **T2/T3 — the gate tests the task's own tree (OBS-1118; merges OBS-1121).**
+  - A battery refuses a worktree whose workspace dependency resolves into another tree, before any command runs.
+  - The verdict key carries the dependency resolution.
+  - A verdict write replaces its file by rename.
+- **T4 — worker launch (OBS-1117, OBS-1105).**
+  - A worker launch enters its own worktree.
+  - An Orca launch proves it before the worker counts.
+  - An Orca worker inherits the run's fork cap.
+- **T5 — review excludes every author's vendor (OBS-1125, P1).**
+  - Review excludes the vendor of every commit author on the subject, not only the latest one.
+  - When no reviewer is eligible, a failed review gate parks, and the operator can waive it.
+- **T6/T7/T17 — the out-of-scope list (OBS-1126, OBS-1127).**
+  - A spec task declares an out-of-scope list. It compiles onto the graph task and into its content identity.
+  - The review brief and the worker and repair prompts carry that list.
+  - The spec template teaches it, together with the pin sweep by callers of reshaped types and end-to-end criteria.
+- **T8 — waivers (OBS-1133).** A review waiver survives a recheck of the same subject, and never carries over to a new one.
+- **T9 — tip provenance (OBS-1130; merges OBS-1137).**
+  - The tip proof and the record header say which tip gates ran fresh and which were carried.
+  - A reused task-gate row keeps its receipt.
+- **T10 — resume facts (OBS-1120).** A worker resume journals requested, launched and identity-confirmed as three separate facts, read through the adapter's own transcript reader.
+- **T12 — the live board (OBS-1132).** The board renders on change and spends no frames while idle. The 2.5.9 board it replaces burned 53–84 % CPU for the whole of this run.
+- **T13 — one deny set (OBS-1129).** The exclusion collector ranges over the schema-derived deny scopes, so the router and Fleet read the same set.
+- **T14 — test fixtures (OBS-1128; merges OBS-1095).** The two `retry.test.ts` conflict fixtures order their workers the way their hardened sibling does.
+- **T15 — Verified handoffs (OBS-1119).** The scaffolded rule never sends its retry Enter onto an active prompt.
+- **T16 — overseer skill hygiene and the tip receipt root (OBS-1134, OBS-1135, OBS-1136).**
+  - Codex one-shots close stdin.
+  - Seats own their background work.
+  - The tip receipt root comes from the gate's own evidence setup.
+- **Known gaps (queued, not shipped).**
+  - The live board drops the graph once `graph.json` passes 1 MB (OBS-1152).
+  - The board's channel column names the latest dispatch, not the channel that wrote the merged code (OBS-1153).
+  - A re-running gate keeps showing its previous ✖ (OBS-1154).
+  - A worker that prints a provider-capacity error pages the operator instead of failing over.
+  - Suites start with no host-health probe, so a slow host turns into hang parks.
+  - An approved recheck queues behind deeper fresh work.
+  - The repository's own tests leak temp directories into TMPDIR.
+
 ## v2.5.9 — Fleet owns every deny; every red is reopenable
 
 **v2.5.9** — a deny the config accepts can now be seen, named and lifted in `tickmarkr fleet`, never only in YAML; and a red gate carries a bounded, redacted receipt of what its runner actually produced, so it can be reopened from its own record. Run `run-20260922-140654-0000000000000087`: 17/17 merged, every review cross-vendor or ruled, tip verify fresh (360 test files executed).
