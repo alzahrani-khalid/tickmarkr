@@ -34,6 +34,8 @@ export const COMMAND_HELP = {
   fleet: {
     usage: "fleet [options]", description: "Edit fleet configuration interactively, or print it for scripts.",
     options: {
+      "--pick <role>": "Resolve one role preference as JSON without launching a seat (review or consult; roles without prefer refuse).",
+      "--exclude-vendor <vendor>": "Exclude a vendor from --pick; repeat for multiple vendors.",
       "--print": "Print fleet configuration without opening the editor.",
       "--why": "Include routing eligibility explanations in printed output.",
       "--global-dir <path>": "Use this global configuration directory.",

@@ -1,12 +1,13 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { writeBashEnvFixture } from "../../helpers/bash-env.js";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import * as stall from "../../../src/run/stall.js";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { shq } from "../../../src/adapters/types.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
@@ -1241,3 +1242,92 @@ function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
   };
   return seat;
 }
+
+// OBS-1173: a busy worker launches short-lived tool children; one exiting between the reap's cwd
+// probe and its identity recheck is a normal race, not unreadable ownership. Treating it as unknown
+// parked the whole attempt as "cleanup unknown" and swallowed the harvest (7/9 reds at 3-way load).
+describe("reap: a candidate exiting after its cwd probe is spared, never unknown (OBS-1173)", () => {
+  const sweep = async (recheck: string | null | undefined, cwdReadable = true) => {
+    const root = realpathSync(makeTestTempDir("reap-race"));
+    const marker = join(root, "dispatch.sh");
+    const group = 700_001;
+    const child = 700_002;
+    const rows = new Map<number, stall.ReapProcess>([
+      [group, { pid: group, ppid: 1, group, session: "9", identity: `${group}:o`, command: `bash ${marker}` }],
+      [child, { pid: child, ppid: group, group, session: "9", identity: `${child}:o`, command: "tool-child" }],
+    ]);
+    vi.spyOn(stall.workerReapHost, "snapshot").mockImplementation(async () => [...rows.values()].map((r) => ({ ...r })));
+    vi.spyOn(stall.workerReapHost, "inspect").mockImplementation(async (pid) =>
+      pid === child && !cwdReadable ? undefined : { cwd: root });
+    vi.spyOn(stall.workerReapHost, "identity").mockImplementation(async (pid) =>
+      pid === child ? recheck : rows.get(pid)?.identity);
+    vi.spyOn(stall.workerReapHost, "kill").mockImplementation((pid) => { rows.delete(Math.abs(pid)); });
+    try {
+      return await stall.reapOwnedProcessGroup(group, root, { marker, excludedGroups: [], excludedWorktrees: [], strays: [] });
+    } finally { vi.restoreAllMocks(); }
+  };
+
+  test("an exited candidate yields a clean census while a reused pid still fails closed", async () => {
+    expect(await sweep(undefined)).toEqual([]);
+    expect(await sweep("700002:replacement")).toBeNull();
+  });
+
+  // OBS-1173 add.2: a probe that timed out or was signalled proves nothing. A live in-worktree
+  // candidate whose recheck FAILS is unknown (harvest refused), on both the readable-cwd branch and
+  // the unreadable-cwd branch; a pid that is really gone is still spared on both.
+  test("a failed identity recheck is unknown, never gone — on either cwd branch", async () => {
+    expect(await sweep(null)).toBeNull();
+    expect(await sweep(null, false)).toBeNull();
+    expect(await sweep(undefined, false)).toEqual([]);
+  });
+});
+
+// OBS-1170: ownership is the recorded group, the dispatch root and descendants observed while the
+// root lived — never the session id. On Linux a same-session sibling in a kept pane whose cwd is the
+// worktree is not a descendant and must survive; an observed descendant that detached is still ours.
+describe("reap: a same-session non-descendant survives, an observed detached descendant is reaped (OBS-1170)", () => {
+  const sweep = async (descendantObserved: boolean) => {
+    const root = realpathSync(makeTestTempDir("reap-session"));
+    const marker = join(root, "dispatch.sh");
+    const group = 710_001;
+    const sibling = 710_002; // same session as the dispatch, child of the pane shell, cwd in the worktree
+    const detached = 710_003; // setsid child of the dispatch: its own group and session
+    const rows = new Map<number, stall.ReapProcess>([
+      [1, { pid: 1, ppid: 0, group: 1, session: "1", identity: "1:o", command: "init" }],
+      [700, { pid: 700, ppid: 1, group: 700, session: "700", identity: "700:o", command: "pane-shell" }],
+      [group, { pid: group, ppid: 700, group, session: "700", identity: `${group}:o`, command: `bash ${marker}` }],
+      [sibling, { pid: sibling, ppid: 700, group: sibling, session: "700", identity: `${sibling}:o`, command: "operator-job" }],
+      [detached, { pid: detached, ppid: 1, group: detached, session: String(detached), identity: `${detached}:o`, command: "stray" }],
+    ]);
+    const killed: number[] = [];
+    vi.spyOn(stall.workerReapHost, "snapshot").mockImplementation(async () => [...rows.values()].map((r) => ({ ...r })));
+    vi.spyOn(stall.workerReapHost, "inspect").mockImplementation(async () => ({ cwd: root }));
+    vi.spyOn(stall.workerReapHost, "identity").mockImplementation(async (pid) => rows.get(pid)?.identity);
+    vi.spyOn(stall.workerReapHost, "kill").mockImplementation((pid) => {
+      killed.push(pid);
+      if (pid < 0) { for (const row of rows.values()) if (row.group === -pid) rows.delete(row.pid); return; }
+      rows.delete(pid);
+    });
+    try {
+      const strays: number[] = [];
+      const survivors = await stall.reapOwnedProcessGroup(group, root, { marker, session: "700", strays,
+        descendants: descendantObserved ? new Map([[detached, `${detached}:o`]]) : undefined,
+        excludedGroups: [], excludedWorktrees: [] });
+      return { survivors, strays, killed, alive: [...rows.keys()] };
+    } finally { vi.restoreAllMocks(); }
+  };
+
+  test("the same-session sibling is never signalled; the observed descendant is reaped only when observed", async () => {
+    const observed = await sweep(true);
+    expect(observed.survivors).toEqual([]);
+    expect(observed.strays).toEqual([710_003]);
+    expect(observed.killed).not.toContain(710_002);
+    expect(observed.alive).toContain(710_002);
+    expect(observed.alive).not.toContain(710_003);
+    const unobserved = await sweep(false);
+    expect(unobserved.survivors).toEqual([]);
+    expect(unobserved.killed).not.toContain(710_002);
+    expect(unobserved.killed).not.toContain(710_003);
+    expect(unobserved.alive).toEqual(expect.arrayContaining([710_002, 710_003]));
+  });
+});

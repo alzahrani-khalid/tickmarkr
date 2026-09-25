@@ -407,7 +407,8 @@ describe("export workflow correctness — the exported CI stands alone", () => {
     const c = getCandidate();
     expect(c.paths).toContain(".gitignore");
     const lines = readFileSync(join(c.root, ".gitignore"), "utf8").split("\n").map((l) => l.trim());
-    for (const entry of ["node_modules/", "dist/", "coverage/", ".tickmarkr/"]) {
+    // .vitest-cache/: the per-worktree Vitest cache (OBS-1159) must not dirty a gated worktree in the public tree.
+    for (const entry of ["node_modules/", "dist/", "coverage/", ".vitest-cache/", ".tickmarkr/"]) {
       expect(lines, entry).toContain(entry);
     }
   });

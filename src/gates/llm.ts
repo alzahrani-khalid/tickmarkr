@@ -461,7 +461,10 @@ async function runViaDriverDetailed(
         // The ceiling wins if it coincides with the first beat (or the read crosses it).
         // That seat was killed by its configured timeout, not an early launch reroute.
         if (now - startedAt >= timeoutMs) break;
-        if (reviewing && !firstLivenessObserved && now - startedAt >= REVIEW_FIRST_LIVENESS_MS) {
+        // OBS-1177: the beat is armed for an INTERACTIVE (pane) driver only. On the subprocess driver
+        // a headless `claude -p` buffers every byte until it exits, so 0 seat bytes at 30 s is not a
+        // dead launch; that seat keeps its full ceiling, which still bounds it (fail-closed by timeout).
+        if (reviewing && via.driver.interactive && !firstLivenessObserved && now - startedAt >= REVIEW_FIRST_LIVENESS_MS) {
           firstLivenessObserved = true;
           // RS-2: the beat reads seat-authored bytes ALONE. CPU evidence never holds a preamble-only
           // capture open to the ceiling; a seat that has not written one byte of its own is re-routed.

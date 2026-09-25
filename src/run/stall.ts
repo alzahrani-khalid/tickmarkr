@@ -1,5 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
-import { shGit } from "./git.js";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { isAbsolute, relative, sep } from "node:path";
+import { activeShellIdentities, processIdentity, resolveActiveShellIdentities, shGit, SUITE_PARENT_ENV } from "./git.js";
 
 // OBS-82: normalize known presentation tokens before measuring transcript extent or filtering an
 // LLM-bound transcript. This remains a closed allowlist — ANSI/VT escapes, braille-range spinner
@@ -78,7 +80,8 @@ export function readOwnedProcessGroup(path: string): number | undefined {
 }
 
 /** Never infer ownership from a task name or scan another attempt's marker when reaping. */
-export async function reapOwnedProcessGroup(group: number | undefined, cwd: string): Promise<number[] | null> {
+export async function reapOwnedProcessGroup(group: number | undefined, cwd: string, ownership?: WorkerReapOwnership): Promise<number[] | null> {
+  if (ownership) return reapWorkerProcesses(group, cwd, ownership);
   if (group === undefined) return null;
   const own = await shGit(`ps -o pgid= -p ${process.pid}`, cwd, 5_000);
   // An in-process driver fixture (or a non-isolating host) can share the daemon's
@@ -100,6 +103,224 @@ export async function reapOwnedProcessGroup(group: number | undefined, cwd: stri
     if (probe < 4) await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return survivors;
+}
+
+export interface ReapProcess {
+  pid: number; ppid: number; group: number; session: string; identity: string; command: string;
+  startedAt?: string;
+}
+
+export interface WorkerReapOwnership {
+  marker: string;
+  /** Session recorded by the dispatch shell before its children can detach. */
+  session?: string;
+  parent?: { pid: number; startedAt: string };
+  identities?: Map<number, string>;
+  /** Descendants observed while the dispatch root was still alive. */
+  descendants?: Map<number, string>;
+  excludedGroups: number[];
+  excludedWorktrees: string[];
+  /** Discovery evidence is distinct from the final survivor census. */
+  strays: number[];
+}
+
+const below = (root: string, path: string): boolean => {
+  const rel = relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
+// Every probe is async and bounded like the CPU accountant's ps: a loaded host is slow, not unreadable.
+const probeExec = (command: string, args: string[]): Promise<string> => new Promise((resolve, reject) =>
+  execFile(command, args, { encoding: "utf8", timeout: 15_000, maxBuffer: 4 * 1024 * 1024 },
+    (error, stdout) => (error ? reject(error) : resolve(stdout))));
+
+/** Bounded host boundary, also used to inject unreadability and pid reuse in regressions. */
+export const workerReapHost = {
+  async snapshot(): Promise<ReapProcess[] | undefined> {
+    try {
+      const out = await probeExec("ps", ["-Awwo", "pid=,ppid=,pgid=,sess=,stat=,lstart=,command="]);
+      const rows: ReapProcess[] = [];
+      const lines = out.split("\n").filter((line) => line.trim());
+      if (!lines.length || lines.length > 20_000) return undefined;
+      for (const line of lines) {
+        const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.*)$/.exec(line);
+        if (!m) return undefined;
+        if (m[5]!.startsWith("Z")) continue;
+        const pid = Number(m[1]);
+        const identity = process.platform === "linux" ? await processIdentity(pid) : `${pid}:${m[6]!.trim().replace(/\s+/g, " ")}`;
+        // A process disappearing during ps is normal; a present, unreadable identity is not.
+        if (!identity) {
+          try { process.kill(pid, 0); return undefined; } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") return undefined;
+          }
+          continue;
+        }
+        rows.push({ pid, ppid: Number(m[2]), group: Number(m[3]), session: m[4]!, identity,
+          startedAt: m[6]!.trim().replace(/\s+/g, " "), command: m[7]! });
+      }
+      return rows;
+    } catch { return undefined; }
+  },
+  async inspect(pid: number): Promise<{ cwd: string; suiteParent?: number } | undefined> {
+    try {
+      let cwd: string;
+      let env: string[];
+      if (process.platform === "linux") {
+        cwd = realpathSync(`/proc/${pid}/cwd`);
+        env = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+      } else {
+        const [open, command] = await Promise.all([
+          probeExec("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]),
+          probeExec("ps", ["eww", "-p", String(pid), "-o", "command="]),
+        ]);
+        const path = open.split("\n").find((line) => line.startsWith("n"))?.slice(1);
+        if (!path) return undefined;
+        cwd = realpathSync(path);
+        env = command.split(/\s+/);
+      }
+      const parent = env.find((entry) => entry.startsWith(`${SUITE_PARENT_ENV}=`))?.slice(SUITE_PARENT_ENV.length + 1);
+      return { cwd, ...(parent && /^\d+$/.test(parent) ? { suiteParent: Number(parent) } : {}) };
+    } catch { return undefined; }
+  },
+  // Lazy: a partial module mock of git.js must not fail at import time.
+  identity: (pid: number): Promise<string | null | undefined> => processIdentity(pid),
+  kill(pid: number): void { process.kill(pid, "SIGKILL"); },
+};
+
+async function reapWorkerProcesses(group: number | undefined, cwd: string, ownership: WorkerReapOwnership): Promise<number[] | null> {
+  let root: string;
+  let excludedPaths: string[];
+  try {
+    root = realpathSync(cwd);
+    excludedPaths = ownership.excludedWorktrees.map((path) => realpathSync(path));
+  } catch { return null; }
+  let rows = await workerReapHost.snapshot();
+  if (!rows) return null;
+  const roots = rows.filter((row) => row.command === `bash ${ownership.marker}` || row.command === `/bin/bash ${ownership.marker}`);
+  // Ownership evidence: the recorded group, a live dispatch root, or descendants observed while it
+  // lived. cwd alone is never authority, and neither is the session id (OBS-1170): on Linux a
+  // same-session SIBLING that never descended from the dispatch — an operator job in a kept pane
+  // whose cwd is the worktree — is not ours to signal. `ownership.session` stays recorded as
+  // evidence only. With none of these in a readable snapshot nothing owned is observable: the
+  // dispatch has retired, so the census is empty rather than unknown (a finished root leaves no row).
+  const groupRows = group === undefined ? [] : rows.filter((row) => row.group === group && row.pid !== process.pid);
+  if (roots.length === 0 && !ownership.descendants?.size && groupRows.length === 0) return [];
+  const owned = new Map(ownership.descendants);
+  const protectedIds = new Map<number, string>();
+  const recordedParent = rows.find((row) => row.pid === ownership.parent?.pid && row.startedAt === ownership.parent.startedAt);
+  // Never reap a pane's shell (an ancestor of the dispatch root), or the daemon.
+  for (const start of [...roots.map((row) => row.ppid), ...(recordedParent ? [recordedParent.pid] : []), process.pid]) {
+    const seen = new Set<number>();
+    for (let pid = start; pid && !seen.has(pid);) {
+      seen.add(pid);
+      const row = rows.find((p) => p.pid === pid);
+      if (!row) break;
+      protectedIds.set(pid, row.identity);
+      pid = row.ppid;
+    }
+  }
+  const targets = new Map<number, string>();
+  const observed = ownership.identities ?? new Map<number, string>();
+  for (const [pid, identity] of owned) if (!observed.has(pid)) observed.set(pid, identity);
+  for (const row of rows) if (!observed.has(row.pid)) observed.set(row.pid, row.identity);
+  let unknown = false;
+  // Bounds the whole sweep; each probe is bounded on its own (15 s) and never blocks the loop.
+  const deadline = Date.now() + 60_000;
+  // One cwd verdict per identity: a later round never re-probes a process it already classified.
+  const inspected = new Set<string>();
+  const discover = async (snapshot: ReapProcess[]) => {
+    const children = new Map<number, number[]>();
+    for (const row of snapshot) {
+      const siblings = children.get(row.ppid) ?? [];
+      siblings.push(row.pid);
+      children.set(row.ppid, siblings);
+    }
+    const descendants = (seeds: Set<number>, stop = new Set<number>()) => {
+      const queue = [...seeds];
+      for (let index = 0; index < queue.length; index++) {
+        for (const pid of children.get(queue[index]!) ?? []) if (!seeds.has(pid) && !stop.has(pid)) {
+          seeds.add(pid); queue.push(pid);
+        }
+      }
+    };
+    const tree = new Set(snapshot.filter((row) =>
+      owned.get(row.pid) === row.identity || roots.some((r) => r.pid === row.pid && r.identity === row.identity)
+      || (group !== undefined && row.group === group)).map((row) => row.pid));
+    descendants(tree);
+    await resolveActiveShellIdentities();
+    const receipts = activeShellIdentities();
+    for (const [pid, identity] of receipts) if (identity === undefined && tree.has(pid)) unknown = true;
+    const excluded = new Set(snapshot.filter((row) => row.pid === process.pid
+      || ownership.excludedGroups.includes(row.group)
+      || (receipts.has(row.pid) && (receipts.get(row.pid) === undefined || receipts.get(row.pid) === row.identity))).map((row) => row.pid));
+    // A daemon ancestor is protected, but the explicitly owned dispatch branch is not.
+    descendants(excluded, new Set(snapshot.filter((row) => roots.some((r) => r.pid === row.pid && r.identity === row.identity)).map((row) => row.pid)));
+    for (const row of snapshot) if (protectedIds.get(row.pid) === row.identity) excluded.add(row.pid);
+    const candidates: ReapProcess[] = [];
+    for (const row of snapshot) {
+      if (!tree.has(row.pid) || excluded.has(row.pid)) continue;
+      if (observed.has(row.pid) && observed.get(row.pid) !== row.identity) { unknown = true; continue; }
+      observed.set(row.pid, row.identity);
+      owned.set(row.pid, row.identity);
+      if (!inspected.has(row.identity)) { inspected.add(row.identity); candidates.push(row); }
+    }
+    if (candidates.length && Date.now() > deadline) { unknown = true; return; }
+    // Probe concurrently, then record verdicts in snapshot order.
+    const verdicts = await Promise.all(candidates.map(async (row): Promise<"target" | "spared" | "unknown"> => {
+      const details = await workerReapHost.inspect(row.pid);
+      // A child that exited between the snapshot and this probe is a normal race, not
+      // unreadable ownership; only a still-live identity with no readable cwd is unknown.
+      // OBS-1173 add.2: a FAILED recheck (null) is unknown too — it never reads as gone.
+      if (!details) {
+        const recheck = await workerReapHost.identity(row.pid);
+        return recheck === row.identity || recheck === null ? "unknown" : "spared";
+      }
+      if (details.suiteParent === process.pid || excludedPaths.some((path) => below(path, details.cwd))) return "spared";
+      if (!below(root, details.cwd)) return "spared";
+      // OBS-1173: the same race after a readable cwd — a short-lived tool child that exits between
+      // inspect and this recheck is gone, not unreadable. Only a live, different identity — or a
+      // failed probe (null, OBS-1173 add.2), which is never gone — is unknown.
+      const current = await workerReapHost.identity(row.pid);
+      if (current === row.identity) return "target";
+      return current === undefined ? "spared" : "unknown";
+    }));
+    candidates.forEach((row, index) => {
+      if (verdicts[index] === "unknown") unknown = true;
+      if (verdicts[index] !== "target") return;
+      targets.set(row.pid, row.identity);
+      if (row.group !== group && !ownership.strays.includes(row.pid)) ownership.strays.push(row.pid);
+    });
+  };
+  await discover(rows); // capture detached ancestry before killing its parents
+  // A protected/foreign group member rules out a group signal. Signal only proven identities.
+  const members = group === undefined ? [] : rows.filter((row) => row.group === group);
+  if (group !== undefined && members.length && members.every((row) => targets.get(row.pid) === row.identity)
+      && (await Promise.all(members.map((row) => workerReapHost.identity(row.pid)))).every((identity, index) => identity === members[index]!.identity)) {
+    try { workerReapHost.kill(-group); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") unknown = true;
+    }
+  }
+  let survivors: number[] = [];
+  if (targets.size === 0) return unknown ? null : [];
+  for (let probe = 0; probe < 5; probe++) {
+    // Revalidate immediately before each signal, including after any slow cwd probe.
+    await Promise.all([...targets].map(async ([pid, identity]) => {
+      const current = await workerReapHost.identity(pid);
+      if (current !== identity) {
+        if (current !== undefined) unknown = true;
+        return;
+      }
+      try { workerReapHost.kill(pid); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") unknown = true;
+      }
+    }));
+    await new Promise((resolve) => setTimeout(resolve, probe === 0 ? 10 : 50));
+    rows = await workerReapHost.snapshot();
+    if (!rows || Date.now() > deadline) return null;
+    await discover(rows);
+    survivors = rows.filter((row) => targets.get(row.pid) === row.identity).map((row) => row.pid);
+    if (!survivors.length) return unknown ? null : [];
+  }
+  return unknown ? null : survivors;
 }
 
 interface WorkerTreeCpuSnapshot {
@@ -134,7 +355,7 @@ function linuxProcessCpuMs(pid: string, cwd: string): Promise<{ ms: number; reso
 // Every non-seeded worker process descends from its attempt-unique dispatch script. One ps snapshot
 // finds that root and its descendants. An empty tree is measurable zero; a failed or unparseable
 // snapshot is undefined because missing evidence can never prove inactivity.
-async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number): Promise<WorkerTreeCpuSnapshot | undefined> {
+async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number, identities?: Map<number, string>): Promise<WorkerTreeCpuSnapshot | undefined> {
   const snapshot = await shGit("ps -Awwo pid=,ppid=,time=,command=", cwd, 15_000);
   if (snapshot.code !== 0) return undefined;
   const rows: { pid: string; ppid: string; cpuMs: number; frac: boolean; cmd: string }[] = [];
@@ -146,6 +367,8 @@ async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number
   }
   if (rows.length === 0) return undefined;
   const tree = new Set(rows.filter((p) => p.cmd.includes(marker)).map((p) => p.pid));
+  // CPU presentation matching is intentionally broader than authority to signal a process.
+  const owned = new Set(rows.filter((p) => p.cmd === `bash ${marker}` || p.cmd === `/bin/bash ${marker}`).map((p) => p.pid));
   if (group !== undefined) {
     const groups = await shGit("ps -Awwo pid=,pgid=", cwd, 15_000);
     if (groups.code !== 0) return undefined;
@@ -158,6 +381,7 @@ async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number
   for (let grew = true; grew;) {
     grew = false;
     for (const p of rows) {
+      if (!owned.has(p.pid) && owned.has(p.ppid)) { owned.add(p.pid); grew = true; }
       if (!tree.has(p.pid) && tree.has(p.ppid)) {
         tree.add(p.pid);
         grew = true;
@@ -168,6 +392,10 @@ async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number
   let preciseResolutionMs: number | undefined;
   for (const p of rows) {
     if (!tree.has(p.pid)) continue;
+    if (identities && owned.has(p.pid) && !identities.has(Number(p.pid))) {
+      const identity = await processIdentity(Number(p.pid));
+      if (identity) identities.set(Number(p.pid), identity);
+    }
     const cpu = await linuxProcessCpuMs(p.pid, cwd);
     precise.set(p.pid, cpu?.ms ?? p.cpuMs);
     if (cpu !== undefined) preciseResolutionMs = cpu.resolutionMs;
@@ -206,10 +434,11 @@ export class WorkerTreeCpuAccountant {
   private consecutiveGaps = 0;
   private latest: { ms: number; resolutionMs: number } | undefined;
 
-  constructor(private marker: string, private cwd: string, private group?: () => number | undefined) {}
+  constructor(private marker: string, private cwd: string, private group?: () => number | undefined,
+    private identities?: Map<number, string>) {}
 
   private async sample(): Promise<void> {
-    const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd, this.group?.());
+    const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd, this.group?.(), this.identities);
     if (snapshot === undefined) {
       this.gaps++;
       this.live.clear();

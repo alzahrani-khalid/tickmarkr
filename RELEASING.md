@@ -86,13 +86,13 @@ Per release:
    A bare git pathspec such as `tests/**/*.test.ts` does not give `**` glob semantics; use `:(glob)` as
    above (or `git ls-files | grep`) or the expected count is false. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that exact mirror `main`
    push to reach **run-end**. Its `test` and `test-macos` jobs run the parallel `suite` project under
-   coverage and the three single-fork projects independently, then count-assert the sum of both
+   coverage and the single-fork projects `ci.public.yml` runs by name independently, then count-assert the sum of both
    collected test-file totals against `N`.
 4. At run-end, match the run's head SHA to the mirror's `HEAD`, then grade the two JOB LOGS — never the
    badge and never an in-progress run — with the shipped tri-state grader:
 
    ```bash
-   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> <N> v2.6.0
+   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> <N> v2.6.1
    ```
 
    `gh run view --job --log` can be empty while a run is in progress, so `UNREADABLE` (exit 2) is a hard
@@ -105,8 +105,8 @@ Per release:
    push the tag:
 
    ```bash
-   git tag -a v2.6.0 -m "v2.6.0"
-   git push origin v2.6.0
+   git tag -a v2.6.1 -m "v2.6.1"
+   git push origin v2.6.1
    ```
 
 5. The tag push runs `release.yml` in the public repository:
@@ -116,7 +116,7 @@ Per release:
    - `npm run lint`
    - `npx vitest run --project built-cli --project signal-reaper` (artifact-scoped release gate —
      it proves only the built CLI and signal-reaper scope it runs. It does not rerun or establish
-     the four-project, tree-count-asserted full-suite proof from step 3, nor verify that proof is on
+     the multi-project, tree-count-asserted full-suite proof from step 3, nor verify that proof is on
      record for this exact SHA; matching the pre-tag run remains the operator's required manual
      precondition. The teardown RPC timeout is real, but release trees have also carried genuine
      assertion failures this subset does not run)
@@ -126,6 +126,22 @@ Per release:
    `dist.attestations`. Registry propagation can lag the completed run by seconds: if the first read
    returns the prior version, wait and **re-read the registry before ruling**. Record publication only
    after a fresh read shows the intended version and provenance.
+
+6. Before a release is complete, run and retain the enabled forced-stall proof for the release tree:
+
+   ```bash
+   TICKMARKR_TEST_FORCE_STALL=1 npx --no-install vitest run tests/e2e/forced-stall.e2e.test.ts -t 'the enabled forced-stall release proof makes the integration tip verifier recover a real RPC-stranded serial file as parallel exit1 then serial-only exit0 under distinct nonces, so a helper-only green or a full-suite retry fails'
+   ```
+
+   This opt-in experiment takes at least 60 seconds: it drops only the final parallel worker
+   acknowledgement after the production reporter records completion, then lets the installed
+   Vitest RPC timer expire. It must pass through `verifyIntegrationTip`, with the two-file manifest
+   leading to parallel exit1 and a serial-only retry exit0 under distinct nonces. Retain the printed
+   artifact directory: both expected manifests, original reporter certificates, stdout/stderr and
+   their hashed receipts, the dropped-ack record, execution log, and `tip-result.json` must prove
+   manifest-to-retry continuity without overwriting the first invocation. A helper-only green,
+   full-suite retry, or skipped expensive leaf is not release proof. Normal suites may skip this
+   experiment; the healthy, assertion-red, and all-skipped controls always run in unfiltered suites.
 
 Publish is fail-closed: a failing build, lint, or test blocks publication.
 
@@ -177,7 +193,7 @@ The script:
    - `ASSESSMENT-*.md`, `CLAUDE.md`, `.gitignore` (private operator files)
    - internal measurement scripts
    - any `*.local.*` files
-3. Generates a `.gitignore` covering `node_modules/`, `dist/`, `coverage/`, `.tickmarkr/`, environment files, and editor/OS debris.
+3. Generates a `.gitignore` covering `node_modules/`, `dist/`, `coverage/`, `.vitest-cache/`, `.tickmarkr/`, environment files, and editor/OS debris.
 4. `git init` + one orphan commit: `tickmarkr <version> — public export`
 5. Prints the export path and runs leak checks:
    - scans for retired vocabulary in committed history

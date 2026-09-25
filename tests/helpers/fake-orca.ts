@@ -613,10 +613,11 @@ export class FakeOrca {
       this.terminals.push(t);
       const command = flag(args, "--command");
       if (this.opts.executeCommands && command !== undefined) this.execute(t, command, worktree);
-      // Non-executing fixtures replay the proof printed by the actual launch command.
+      // Non-executing fixtures replay the proof printed by the actual launch command. Since OBS-1168
+      // the typed command never carries the marker verbatim: printf builds it from two arguments.
       else if (command !== undefined) {
-        const proof = command.match(/TICKMARKR_CHECKOUT \d+:[0-9a-f]*;/)?.[0];
-        if (proof) t.lines.push(proof);
+        const built = /printf '%s%s\\n' (\S+) '(_CHECKOUT \d+:[0-9a-f]*;)'/.exec(command);
+        if (built) t.lines.push(`${built[1]}${built[2]}`);
       }
       // Recorded create receipt: durable tabId + composite worktree identity; status is absent.
       const terminal: Record<string, unknown> = {

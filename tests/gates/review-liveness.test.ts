@@ -190,7 +190,8 @@ describe("a review round that produced nothing spends no worker", () => {
     expect(REVIEW_SILENT_BYTE_FLOOR).toBeLessThanOrEqual(200);
     const PREAMBLE = `export HERDR_WORKSPACE_ID='wZ'; export TICKMARKR_PANE_IDENTITY='review · T1 · attempt 0 · run-test'; bash /tmp/tickmarkr-llm-test/dispatch.sh\nTICKMARKR_START_1234\n${PLAIN_BANNER}\nreview · T1 · attempt 0 · run-test\n`;
     class ClockedPane implements ExecutorDriver {
-      id = "clocked"; interactive = false; elapsed = 0; closed = 0; seats = 0;
+      // A pane driver is interactive; the first-liveness beat is armed for panes only (OBS-1177).
+      id = "clocked"; interactive = true; elapsed = 0; closed = 0; seats = 0;
       private replacementNonce = "";
       constructor(private text: string) {}
       async slot(cwd: string, name: string): Promise<Slot> { this.seats++; return { id: name, name, cwd }; }
@@ -247,6 +248,63 @@ describe("a review round that produced nothing spends no worker", () => {
     const headless = await reviewGate(mkTask(), repo, base, author, [chAuthor, { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" }], [new TenByteHeadless(scriptPath())], cfg);
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300);
     expect(headless.meta).toMatchObject({ cause: "truncated", seatAuthoredBytes: 10, timeoutMs: 300 });
+  });
+
+  // OBS-1177: under `--driver subprocess` the review gate still takes the via-driver path, but the
+  // seat is a headless `claude -p` that buffers ALL output until it exits. A first-liveness beat
+  // there read 0 seat bytes at 30 s and killed every claude-code reviewer as launch-never-started.
+  // The beat is armed for an interactive (pane) driver only; a non-interactive seat keeps its ceiling.
+  test("test: a non-interactive driver whose reviewer writes nothing past the first liveness beat and then emits its verdict gets that verdict, while the same buffering seat on an interactive driver is still killed at the beat, so a beat armed on the subprocess driver fails", async () => {
+    const PREAMBLE = `export HERDR_WORKSPACE_ID='wZ'; export TICKMARKR_PANE_IDENTITY='review · T1 · attempt 0 · run-test'; bash /tmp/tickmarkr-llm-test/dispatch.sh\nTICKMARKR_START_1234\n${PLAIN_BANNER}\nreview · T1 · attempt 0 · run-test\n`;
+    class BufferingSeat implements ExecutorDriver {
+      id = "buffering"; elapsed = 0; seats = 0; closed = 0;
+      private nonce = "";
+      private done = false;
+      constructor(readonly interactive: boolean) {}
+      async slot(cwd: string, name: string): Promise<Slot> { this.seats++; return { id: name, name, cwd }; }
+      async run(): Promise<void> {}
+      async waitOutput(_s: Slot, pattern: string, timeoutMs = 0): Promise<boolean> {
+        // The first seat buffers until twice the beat; a replacement seat answers at once.
+        if (this.seats === 1) { this.elapsed += timeoutMs; if (this.elapsed < 2 * REVIEW_FIRST_LIVENESS_MS) return false; }
+        this.nonce = /TICKMARKR_EXIT_([0-9a-f]+):/.exec(pattern)![1]!;
+        this.done = true;
+        return true;
+      }
+      async waitAgentStatus(): Promise<boolean> { return true; }
+      async status(): Promise<"unknown"> { return "unknown"; }
+      async read(): Promise<string> {
+        return this.done ? `${PREAMBLE}${JSON.stringify({ nonce: this.nonce, approve: true, findings: [] })}
+TICKMARKR_EXIT_${this.nonce}:0
+` : PREAMBLE;
+      }
+      async notify(): Promise<void> {}
+      async close(): Promise<void> { this.closed++; }
+      async worktree(): Promise<string> { return ""; }
+    }
+    const round = async (interactive: boolean) => {
+      const { repo, base } = repoWithCommit();
+      const seat = new BufferingSeat(interactive);
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => 1_800_000_000_000 + seat.elapsed);
+      setGateCpuAccountantFactoryForTests(() => ({ async start() {}, async stop() {}, read: () => ({ cpu: { ms: 40, resolutionMs: 10 }, gaps: 0 }) }));
+      try {
+        const events: GateEvent[] = [];
+        const via: GateVia = { driver: seat, nameFor: () => "review-liveness", labelFor: () => "REVIEW T1" };
+        const result = await runGates({ ...mkTask(), gates: ["review"] }, await ctxFor(repo, base, [new Seat("seat-b", "approve"), new Seat("seat-c", "approve")], { via, carriedFindings: [], demotedReviewers: new Set() }, events));
+        return { row: result.results[0]!, seat, events };
+      } finally { clock.mockRestore(); resetGateCpuAccountantFactoryForTests(); }
+    };
+    const subprocess = await round(false);
+    expect(subprocess.seat.elapsed).toBeGreaterThanOrEqual(2 * REVIEW_FIRST_LIVENESS_MS);
+    expect(subprocess.seat.seats).toBe(1);
+    expect(subprocess.events.find((e) => e.phase === "note" && e.name === "review-no-verdict")).toBeUndefined();
+    expect(subprocess.row).toMatchObject({ gate: "review", pass: true });
+    // Control: the same buffering seat on a pane driver is still killed at the beat and re-routed.
+    const pane = await round(true);
+    expect(pane.seat.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
+    expect(pane.seat.seats).toBe(2);
+    const note = pane.events.find((e) => e.phase === "note" && e.name === "review-no-verdict") as Extract<GateEvent, { phase: "note" }>;
+    expect(note.payload).toMatchObject({ reviewer: "seat-b:seat-b", cause: "launch-never-started", seatAuthoredBytes: 0, infra: true });
+    expect(pane.row).toMatchObject({ pass: true, meta: { reviewRetry: { flaked: "seat-b:seat-b", retried: "seat-c:seat-c" } } });
   });
 
   test("test: a seat with two no-verdicts in one run leaves the rotation for the rest of that run with a review-pool-demotion note naming both causes, a seat whose vendor authored a carried commit inside the accumulated diff is excluded for that round while a seat of another vendor stays eligible, and the brief carries the task goal from the compiled graph under an authoritative heading and names the daemon's repository root path for specs and planning records when the worktree's spec text differs, so a rotation that re-seats a twice-silent seat, seats a vendor over its own commits, or briefs from the stale spec without the root fails", async () => {

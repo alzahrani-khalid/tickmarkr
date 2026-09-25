@@ -1824,6 +1824,13 @@ export class Journal {
           if (undo.consumedReroute) pendingReroute.add(e.taskId);
           lastDispatch.delete(e.taskId);
         }
+      } else if (e.event === "capacity-requeue") {
+        // OBS-1161: a capacity requeue is free — the daemon re-dispatches the SAME attempt on the SAME
+        // seat — so the dispatch it closes must not count, or a resume bills every busy-seat wait
+        // against MAX_ATTEMPTS. Only the attempt rewinds: the seat stays tried and in force (busy, not
+        // burned). Idempotent by the same rule as the scope rewind: only the OUTSTANDING dispatch.
+        const st = m.get(e.taskId);
+        if (st && lastDispatch.delete(e.taskId)) st.attempts = Math.max(0, st.attempts - 1);
       } else if (e.event === "consult-verdict" && e.data.action === "reroute") {
         // A reroute bans the in-force channel; retry/decompose/human verdicts ban nothing (D-03).
         pendingReroute.add(e.taskId);

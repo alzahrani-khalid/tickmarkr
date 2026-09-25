@@ -1,3 +1,5 @@
+import { HOST_PROBE_SAMPLE_MS, HOST_PROBE_SAMPLES, HostDegradedError, hostDegraded, observeHost, type HostObservation } from "./host-health.js";
+import { VITEST_CACHE_ENV, worktreeVitestCache } from "../gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, runWithCommandLease, withCommandLease } from "./lease.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
@@ -8,9 +10,9 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stringify } from "yaml";
-import { classifyDeadChannel, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
+import { classifyDeadChannel, classifyTransientCapacity, NO_TRAILER_SUMMARY, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
-import { type Assignment, SettledTrailerTracker, addUsage, channelKey, matchesInputBox, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
+import { type Assignment, SettledTrailerTracker, addUsage, CAPACITY_RE, channelKey, matchesInputBox, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { collateralHits, type ScopeCollateralVerdict } from "../compile/collateral.js";
 import {
@@ -23,9 +25,10 @@ import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subp
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { type Baseline, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
 import { runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
+import { isInfraResult } from "../gates/cache.js";
 import type { GateResult } from "../gates/types.js";
 import { filesGlob } from "../graph/files-glob.js";
-import { addEvidence, attributeBlocked, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
+import { addEvidence, attributeBlocked, batteryPriority, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, type GateName, type RunGraph, type Task } from "../graph/schema.js";
 import { distFingerprint } from "../cli/commands/version.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultVerdict } from "./consult.js";
@@ -33,7 +36,7 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, preserveWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
 import { applyScopeAmendments, activeRetryBan, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
@@ -286,7 +289,8 @@ const GATE_SATISFIED_ENACTMENT = "worktree-recreation";
 
 // Older daemons enacted rechecks through worker-launch, before recheck-battery existed.
 // Preserve that consumption at every scheduling read without changing continuing permission.
-function pendingDaemonApprovalActions(events: JournalEvent[]) {
+// OBS-1158: exported so plan folds battery priority through the SAME consumption-aware seam.
+export function pendingDaemonApprovalActions(events: JournalEvent[]) {
   const actions = pendingApprovalActions(events);
   const rechecks = pendingRechecks(events);
   for (const [id, action] of actions) {
@@ -402,6 +406,17 @@ function classifySignalOnlyTest(g: GateResult): void {
   const named = Array.isArray(g.meta?.failingTests) && g.meta.failingTests.length > 0;
   if (named || FAILURE_IDENTITY_RE.test(g.details)) return;
   g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false, kind: "signal-exit" };
+}
+
+/** OBS-1106: ONE infrastructure predicate for classification, persistence and repair admission. A red
+ * that carries an infra fingerprint or classification without `meta.infra` (a legacy journal row, an
+ * oracle that named only its classification) is still a non-verdict about the work: it is normalized
+ * here BEFORE its journal row and before any park/repair seam reads it, so those seams can key on the
+ * same `isInfraResult` the gate cache keys on and never on one metadata field alone. */
+function classifyInfraResult(g: GateResult): void {
+  classifySignalOnlyTest(g);
+  if (g.pass || g.meta?.infra === true || !isInfraResult(g)) return;
+  g.meta = { ...g.meta, classification: "infra", infra: true };
 }
 
 // v1.85 T3: the gates whose failure IS a deterministic measurement — a machine re-ran a command over a
@@ -547,6 +562,15 @@ export const setApprovalWindowForTests = (ms: number): void => { approvalWindowM
 export const resetApprovalWindowForTests = (): void => { approvalWindowMs = DEFAULT_APPROVAL_WINDOW_MS; };
 const PROVIDER_DEATH_REQUEUE_CAP = 2; // v1.46 T1: requeue same assignment twice, then fall through to the normal ladder
 const PROVIDER_DEATH_BACKOFF_MS = 500; // short backoff before provider-death requeue
+// OBS-1161: transient capacity ("Selected model is at capacity") — bounded same-seat requeues with a
+// real wait between them, THEN a same-floor failover; never a demotion. The budget is per task and
+// seat, counted from the journal's own capacity-requeue rows so a resume continues it, never restarts it.
+const CAPACITY_REQUEUE_CAP = 2;
+const CAPACITY_BACKOFF_MS = 60_000;
+let capacityBackoffMs = CAPACITY_BACKOFF_MS;
+/** Test seam — shrink the capacity backoff without minute-long sleeps. */
+export function setCapacityBackoffMsForTests(ms: number): void { capacityBackoffMs = ms; }
+export function resetCapacityBackoffMsForTests(): void { capacityBackoffMs = CAPACITY_BACKOFF_MS; }
 const NO_TRAILER_DEMOTION_STREAK = 2; // OBS-57: consecutive no-trailer windows demote a channel for the rest of the run
 // OBS-117 (v1.71 T6): a worker pane that never prints a byte by T+60s after dispatch is a dead
 // channel — don't burn the full stall window waiting for a silent launch failure. Checked on the
@@ -1632,6 +1656,33 @@ async function cherryPickCommits(wt: string, commits: string[]): Promise<string[
   return carried;
 }
 
+const PRESERVED_REF_PREFIX = "refs/tickmarkr/preserved/";
+const preservedRefOf = (data: Record<string, unknown>): string | undefined =>
+  [data.ref, data.preservedRef].find((v): v is string => typeof v === "string" && v.startsWith(PRESERVED_REF_PREFIX));
+
+/** The attempt whose worker last launched into the task's current checkout; "unknown" once a
+ * recreation replaced that tree without a new launch (recheck, gate-only restore) or when no
+ * dispatch assignment is on record. Never the newest dispatch by itself. */
+export function knownProducer(events: readonly JournalEvent[], taskId: string): PreserveProducer {
+  let dispatched: PreserveProducer = "unknown";
+  let producer: PreserveProducer = "unknown";
+  for (const row of events) {
+    if (row.taskId !== taskId) continue;
+    if (row.event === "task-dispatch") {
+      const a = row.data.assignment as Partial<Assignment> | undefined;
+      dispatched = typeof a?.adapter === "string" && typeof a?.model === "string"
+        ? { channel: `${a.adapter}:${a.model}`, attempt: typeof row.data.attempt === "number" ? row.data.attempt : 0 } : "unknown";
+    } else if (row.event === "worker-launch") producer = dispatched;
+    else if (row.event === "worktree-recreation") producer = "unknown";
+  }
+  return producer;
+}
+
+/** Distinct author channels of the subject for task-done/status/board rows: "unknown" replaces every
+ * unresolvable owner (legacy unattributed preservation, dispatch without assignment). */
+const mergedAuthors = (authors: readonly string[]): string[] =>
+  [...new Set(authors.map((a) => a.startsWith("unknown author") ? "unknown" : a))].sort();
+
 /** Fold lifetime dispatch/carry evidence, independent of attempt budgets and routing exclusions.
  * Recreation rows name SOURCE hashes, so ownership is joined by stable patch identity. Each
  * attempt owns only what the next carry (or current subject) adds beyond its own incoming set.
@@ -1660,17 +1711,37 @@ async function subjectAuthors(events: readonly JournalEvent[], taskId: string, w
   let previous: Attempt | undefined;
   let awaitingCarry = false;
   const owners = new Map<string, Set<string>>();
+  // Preserved engine commits carry their producing attempt on the row; a row without one is legacy
+  // and stays explicitly unknown rather than inheriting the seat that later carried the patch.
+  const preservedOwner = new Map<string, string>();
   const attribute = (ids: Set<string>, attempt: Attempt | undefined) => {
     for (const id of ids) {
       if (attempt?.incoming.has(id)) continue;
       const authors = owners.get(id) ?? new Set<string>();
-      authors.add(attempt?.author ?? "unknown author (missing task-dispatch assignment)");
+      authors.add(preservedOwner.get(id) ?? attempt?.author ?? "unknown author (missing task-dispatch assignment)");
       owners.set(id, authors);
     }
   };
   try {
     for (const row of events) {
       if (row.taskId !== taskId) continue;
+      const preserved = preservedRefOf(row.data);
+      if (preserved) {
+        // Only an engine preserve commit is owned by its row; a ref naming a worker's own commit keeps
+        // that commit's dispatch attribution.
+        const shown = await shGit(`git show -s ${shq(`--format=%H%n%s%n%(trailers:key=${PRESERVE_PRODUCER_TRAILER},valueonly)`)} ${shq(`${preserved}^{commit}`)}`, wt);
+        const [commit, subject, trailer] = shown.stdout.trim().split("\n");
+        if (shown.code === 0 && commit && subject === PRESERVE_COMMIT_SUBJECT) {
+          // A row that merely mentions the ref (a park naming it) defers to the commit's own trailer;
+          // only a commit with neither is legacy. A known owner is never downgraded by a later mention.
+          const owner = typeof row.data.producer === "string" ? row.data.producer
+            : trailer?.trim().replace(/ attempt \d+$/, "") || "unknown author (legacy unattributed preservation)";
+          for (const id of await patches([commit])) {
+            const prior = preservedOwner.get(id);
+            if (prior === undefined || prior === "unknown" || prior.startsWith("unknown author")) preservedOwner.set(id, owner);
+          }
+        }
+      }
       if (row.event === "task-dispatch") {
         previous = current;
         const a = row.data.assignment as Partial<Assignment> | undefined;
@@ -1835,6 +1906,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let fatalPhase = "setup";
   let deliberateTermination = false;
   const fatalStop = new AbortController();
+  const hostStop = new AbortController();
+  const hostChecks = new Set<Promise<unknown>>();
   const inflight = new Map<string, Promise<void>>();
   let retireFatalSlots: (() => Promise<void>) | undefined;
   let branch = "";
@@ -1928,27 +2001,52 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const liveSlots = new Set<Slot>();
   // A driver handle identifies the physical slot even if a retry returns a new Slot object.
   const trustAnsweredSlots = new Set<string>();
-  const workerOwners = new Map<Slot, { taskId: string; attempt: number; groupFile: string }>();
-  const reapReports = new Map<Slot, { processGroup: number | null; survivors: number[] | null }>();
+  const workerOwners = new Map<Slot, { taskId: string; attempt: number; groupFile: string; marker: string;
+    identities: Map<number, string>; descendants: Map<number, string> }>();
+  const reapReports = new Map<Slot, { processGroup: number | null; strays: number[]; survivors: number[] | null }>();
   const reapWorker = async (slot: Slot): Promise<void> => {
     const owner = workerOwners.get(slot);
     if (owner) {
       const processGroup = readOwnedProcessGroup(owner.groupFile);
       let survivors: number[] | null;
+      const strays: number[] = [];
+      let session: string | undefined;
       try {
         const shared = processGroup !== undefined && [...workerOwners].some(([other, otherOwner]) =>
           other !== slot && liveSlots.has(other) && readOwnedProcessGroup(otherOwner.groupFile) === processGroup);
         if (shared) throw new Error(`worker group ${processGroup} is shared with another live attempt`);
-        survivors = await reapOwnedProcessGroup(processGroup, slot.cwd);
+        try { session = readFileSync(`${owner.groupFile}.session`, "utf8").trim() || undefined; } catch { /* pre-launch or older driver */ }
+        let parent: { pid: number; startedAt: string } | undefined;
+        try {
+          const row = /^\s*(\d+)\s+(.+)$/.exec(readFileSync(`${owner.groupFile}.parent`, "utf8").trim());
+          if (row) parent = { pid: Number(row[1]), startedAt: row[2]!.trim().replace(/\s+/g, " ") };
+        } catch { /* a live dispatch root can still prove its parent */ }
+        const others = [...workerOwners].filter(([other]) => other !== slot && liveSlots.has(other));
+        survivors = await reapOwnedProcessGroup(processGroup, slot.cwd, {
+          marker: owner.marker, session, parent, identities: owner.identities, descendants: owner.descendants, strays,
+          excludedGroups: others.flatMap(([, other]) => {
+            const group = readOwnedProcessGroup(other.groupFile);
+            return group === undefined ? [] : [group];
+          }),
+          excludedWorktrees: others.map(([other]) => other.cwd).filter((cwd) => cwd !== slot.cwd),
+        });
       } catch (error) {
         journal.append("worker-process-reaped", owner.taskId, { slot: slot.name, attempt: owner.attempt,
-          processGroup: processGroup ?? null, survivors: null, error: String(error) });
+          processGroup: processGroup ?? null, strays, survivors: null, error: String(error) });
+        workerOwners.delete(slot); // one reap row per attempt: a later close never re-sweeps
         throw error;
       }
-      reapReports.set(slot, { processGroup: processGroup ?? null, survivors });
+      reapReports.set(slot, { processGroup: processGroup ?? null, strays, survivors });
       journal.append("worker-process-reaped", owner.taskId, {
-        slot: slot.name, attempt: owner.attempt, processGroup: processGroup ?? null, survivors,
+        slot: slot.name, attempt: owner.attempt, processGroup: processGroup ?? null, strays, survivors,
       });
+      // Every outcome retires the claim: one reap row per attempt, whatever the verdict.
+      workerOwners.delete(slot);
+      // Pre-launch and in-process drivers have no OS dispatch claim; their close owns retirement.
+      // Once any dispatch ownership exists, an unreadable sweep must block the next gate.
+      if (survivors === null && (processGroup !== undefined || session !== undefined || owner.descendants.size > 0)) {
+        throw new Error(`worker group ${processGroup} cleanup unknown`);
+      }
       if (survivors && survivors.length > 0) throw new Error(`worker group ${processGroup} survivors: ${survivors.join(", ")}`);
     }
   };
@@ -2039,6 +2137,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // new attempt while this reaper is still closing the old ones.
         const termination = new Error(`terminated by ${sig}`);
         abortRun(termination);
+        hostStop.abort(termination);
+        await Promise.allSettled(hostChecks);
         if (activeTipVerify) {
           activeTipVerify.controller.abort(termination);
           await activeTipVerify.settled;
@@ -2210,31 +2310,128 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     console.error(`tickmarkr: board not reopened (attempt ${attempt}): ${reopened.error}`);
   };
 
+  // Reference rows are the durable source of truth; old journals establish one on first resume.
+  const priorReference = opts.resume ? [...journal.read()].reverse().find(e =>
+    ["host-reference", "host-reference-reset"].includes(e.event)
+    && typeof e.data.medianMs === "number" && Number.isFinite(e.data.medianMs) && e.data.medianMs > 0) : undefined;
+  let hostReferenceMs = priorReference?.data.medianMs as number | undefined;
+  const hostSignal = (signal?: AbortSignal) => AbortSignal.any(
+    [hostStop.signal, fatalStop.signal, signal, executionSignal()].filter((s): s is AbortSignal => !!s));
+  const trackHost = <T>(promise: Promise<T>): Promise<T> => {
+    hostChecks.add(promise);
+    void promise.finally(() => hostChecks.delete(promise)).catch(() => {});
+    return promise;
+  };
+  const recordReference = (observation: HostObservation) => {
+    if (observation.medianMs === null) return;
+    journal.append("host-reference", undefined, { ...observation });
+    hostReferenceMs = observation.medianMs;
+  };
+  // Health and occupancy share a deadline, but only healthy occupancy gets the bounded fallback.
+  const admitHost = async (taskId: string | undefined, signal: AbortSignal, initial?: HostObservation,
+    resuming = false, gate?: GateName, onWait?: () => void): Promise<number> => {
+    const startedAt = Date.now();
+    let lastCount = -1;
+    let observation = initial;
+    let first = true;
+    let resetEligible = resuming && hostReferenceMs !== undefined;
+    for (;;) {
+      signal.throwIfAborted();
+      const count = await liveSuiteCount(repoRoot);
+      signal.throwIfAborted();
+      const remaining = suiteWaitCeilingMs - (Date.now() - startedAt);
+      // Reserve a full bounded batch. A partial last batch would manufacture an unreadable
+      // host at an otherwise healthy occupancy deadline. Retain the latest complete observation.
+      const probeBudget = HOST_PROBE_SAMPLE_MS * HOST_PROBE_SAMPLES;
+      if (!observation || (!first && remaining >= probeBudget)) {
+        observation = await observeHost(signal, remaining > 0 ? Math.min(probeBudget, remaining) : undefined);
+        journal.append("host-observation", taskId, { ...observation, referenceMs: hostReferenceMs ?? null, resuming });
+      }
+      first = false;
+      if (hostReferenceMs === undefined && observation.medianMs !== null) recordReference(observation);
+      const degraded = hostDegraded(observation, hostReferenceMs);
+      resetEligible &&= count === 0 && observation.medianMs !== null && degraded;
+      if (!degraded && (count === 0 || resuming)) return count;
+      onWait?.();
+      if (degraded) journal.append("host-degraded", taskId, {
+        ...observation, referenceMs: hostReferenceMs ?? null, ...(gate ? { gate } : {}), count, waitedMs: Date.now() - startedAt,
+      });
+      else if (count !== lastCount) journal.append("suite-wait", taskId, { count, ...(gate ? { gate } : {}) });
+      lastCount = count;
+      if (Date.now() - startedAt >= suiteWaitCeilingMs) {
+        if (degraded) {
+          if (resetEligible) {
+            // Append BOTH medians before adoption. An unreadable sample or live suite vetoes reset.
+            journal.append("host-reference-reset", undefined, {
+              referenceMs: hostReferenceMs, medianMs: observation.medianMs, waitedMs: Date.now() - startedAt,
+            });
+            hostReferenceMs = observation.medianMs!;
+            return count;
+          }
+          throw new HostDegradedError("host latency remained degraded or unreadable through suite-wait deadline");
+        }
+        journal.append("suite-wait-ceiling", taskId, { count, waitedMs: Date.now() - startedAt });
+        return count;
+      }
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => { clearTimeout(timer); reject(signal.reason); };
+        const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); },
+          Math.min(SUITE_POLL_MS, Math.max(0, suiteWaitCeilingMs - (Date.now() - startedAt))));
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+    }
+  };
+  const initializeHost = () => trackHost((async () => {
+    const signal = hostSignal();
+    const observation = await observeHost(signal);
+    journal.append("host-observation", undefined, { ...observation, referenceMs: hostReferenceMs ?? null, resuming: !!opts.resume });
+    if (hostReferenceMs === undefined) recordReference(observation);
+    if (opts.resume || observation.medianMs === null) await admitHost(undefined, signal, observation, !!opts.resume);
+  })());
   // Context carries attribution through gates and remote inference; only shell commands acquire.
   const commandLeases = new CommandLeases();
-  const withCommandContext = <T>(taskId: string | undefined, run: () => Promise<T>, signal: AbortSignal | undefined = executionSignal()): Promise<T> =>
-    runWithCommandLease((_command, execute) => commandLeases.run(async () => {
-      let lastCount = -1;
-      const startedAt = Date.now();
-      for (;;) {
-        signal?.throwIfAborted();
-        fatalStop.signal.throwIfAborted();
-        executionSignal()?.throwIfAborted();
-        const count = await liveSuiteCount(repoRoot);
-        if (count === 0) break;
-        if (count !== lastCount) journal.append("suite-wait", taskId, { count });
-        lastCount = count;
-        if (Date.now() - startedAt >= suiteWaitCeilingMs) {
-          journal.append("suite-wait-ceiling", taskId, { count, waitedMs: Date.now() - startedAt });
+  // Only an unambiguous, currently open phase can attribute a command wait. Parallel siblings
+  // deliberately leave gate absent; neither the last phase nor the last red is a safe substitute.
+  const activeGatePhases = new Map<string, Set<GateName>>();
+  const withCommandContext = <T>(taskId: string | undefined, run: () => Promise<T>, signal: AbortSignal | undefined = executionSignal()): Promise<T> => {
+    let hostFailure: HostDegradedError | undefined;
+    return runWithCommandLease((_command, execute) => {
+      const active = taskId ? activeGatePhases.get(taskId) : undefined;
+      const gate = active?.size === 1 ? [...active][0] : undefined;
+      let waited = false;
+      return commandLeases.run(async () => {
+        if (hostFailure) throw hostFailure;
+        let count: number;
+        try { count = await trackHost(admitHost(taskId, hostSignal(signal), undefined, false, gate, () => { waited = true; })); }
+        catch (error) {
+          if (error instanceof HostDegradedError) hostFailure = error;
+          throw error;
+        }
+        if (waited && taskId) {
+          if (gate) journal.phaseStart(taskId, phaseForGate(gate), { gate, admitted: true });
+          else journal.append("suite-admitted", taskId, {});
+        }
+        if (count > 0) {
           journal.append("suite-budget", taskId, {
             count, occupancyCap: occupancyCapacity.forkCap, conservativeCap: conservativeCapacity.forkCap,
           });
           return await runWithVerificationBudget(conservativeCapacity, execute);
         }
-        await new Promise((wake) => setTimeout(wake, SUITE_POLL_MS));
-      }
-      return await execute();
-    }, (count) => journal.append("suite-wait", taskId, { count }), SUITE_POLL_MS, signal), run);
+        return await execute();
+      }, (count) => {
+        waited = true;
+        journal.append("suite-wait", taskId, { count, ...(gate ? { gate } : {}) });
+      }, SUITE_POLL_MS, signal);
+    }, async () => {
+      try {
+        const result = await run();
+        // Some command oracles turn launch errors into results. Admission failure still parks infra.
+        if (hostFailure) throw hostFailure;
+        return result;
+      } finally { if (taskId) activeGatePhases.delete(taskId); }
+    });
+  };
 
   let baseRef: string;
   let baseline!: Baseline;
@@ -2353,6 +2550,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     });
     runStarted = true;
     await placeBoard();
+    // A terminal resume with no commands has no execution to admit.
+    if (Object.keys(commands).length > 0 || graph.tasks.some(t => ["pending", "running", "gated"].includes(t.status))) {
+      baselineCapture = initializeHost();
+      void baselineCapture.catch(() => { baselineFailed = true; });
+    }
   } else {
     baseRef = await gitHead(repoRoot);
     journal.append("baseline-start", undefined, { baseRef, commands, capacity: resolvedCapacity() });
@@ -2361,7 +2563,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // Workers can run beside capture, but no gate may observe an absent or partial baseline.
     // Keep publication and warnings inside the same barrier as the suite's final verdict.
     baselineCapture = withCommandContext(undefined, async () => {
-      const captured = await captureBaseline(repoRoot, commands);
+      // With no commands, capture is already complete: persist it before the probe can wait.
+      // Otherwise a kill during startup can strand a resumable run without baseline.json.
+      const emptyCapture = Object.keys(commands).length === 0 ? await captureBaseline(repoRoot, commands) : undefined;
+      if (emptyCapture) writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(emptyCapture, null, 2));
+      await initializeHost();
+      const captured = emptyCapture ?? await captureBaseline(repoRoot, commands);
       writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(captured, null, 2));
       baseline = captured;
       for (const warning of captured.warnings ?? []) journal.append("baseline-warning", undefined, { ...warning });
@@ -2613,8 +2820,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     return false;
   };
 
+  // OBS-1158: admission reads the same journal snapshot the sweep folded, through the shared seam.
+  let admissionPriority = batteryPriority(startupActions.values());
+  const admissible = () => readyTasks(graph, admissionPriority);
   const sweepLiveApprovals = (): void => {
     const events = journal.read();
+    admissionPriority = batteryPriority(pendingDaemonApprovalActions(events).values());
     const approvals = events.slice(approvalSweepCursor)
       .filter((e) => e.event === "task-approved" && e.taskId);
     approvalSweepCursor = events.length;
@@ -2677,9 +2888,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // old path. A preservation failure throws and therefore leaves the old checkout in place. The
     // row is deliberately written before the later worktree-recreation row so the journal cannot
     // describe only the commits it carried while omitting uncommitted work the removal destroyed.
+    const producerNow = (): PreserveProducer => knownProducer(journal.read(), t.id);
     const recreateTaskWorktree = async (taskBranch: string, taskBase: string, priorWt: string) => {
-      const ref = await preserveWorktree(priorWt);
-      if (ref) journal.append("worktree-preserved", t.id, { ref });
+      const producer = producerNow();
+      const ref = await preserveWorktree(priorWt, producer);
+      if (ref) journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
       return driver.worktree(repoRoot, taskBranch, taskBase);
     };
 
@@ -2713,7 +2926,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // IS the fix; the tried seed and the attempt-loop start close RES-01/RES-02 alongside it.
     //
     // v1.24 OBS-18: a task-approved{release:attempt-cap} zeros rs.attempts (fresh budget) and clears
-    // lastAssignment while keeping tried. Only restore lastAssignment when attempts > 0 — after a
+    // lastAssignment while keeping tried, so the restore below is skipped — after a
     // fresh-budget release, prefer nextChannel over the surviving tried-list so burned channels are
     // not re-tried first (consult bans / prior failovers survive the release).
     const rs = resume.get(t.id);
@@ -2733,7 +2946,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       to: channelKey(assignment),
       reason: JSON.stringify(previousHints?.pin) !== JSON.stringify(t.routingHints?.pin) ? "pin changed" : "floor changed",
     });
-    if (!hintsChanged && rs?.lastAssignment && rs.attempts > 0
+    // OBS-1161: no `attempts > 0` guard — every release already clears lastAssignment in the replay,
+    // and a lastAssignment at zero attempts is a first dispatch whose capacity requeue was taken back:
+    // the seat is still in force, so restore it instead of failing over its own tried[] entry early.
+    if (!hintsChanged && rs?.lastAssignment
         && channels.some((c) => channelKey(c) === channelKey(rs.lastAssignment!))
         && !demotedChannels.has(channelKey(rs.lastAssignment!))) {
       assignment = rs.lastAssignment; // restore the consult-chosen assignment (bypasses route()'s static re-pick)
@@ -2889,6 +3105,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           dirtyWorktree: true, dirtyPaths: g.meta.paths,
           ...(typeof g.meta.culprit === "string" ? { culprit: g.meta.culprit } : {}),
           ...(typeof g.meta.preservedRef === "string" ? { preservedRef: g.meta.preservedRef } : {}),
+          ...(typeof g.meta.producer === "string" ? { producer: g.meta.producer } : {}),
+          ...(typeof g.meta.producerAttempt === "number" ? { producerAttempt: g.meta.producerAttempt } : {}),
         } : {}),
         ...(cfg.executionPolicy && !g.pass ? { disposition: failureDisposition(g) } : {}),
         ...Object.fromEntries(["runnerInfraRerun", "hostStarvedRerun", "recoveryBlocked", "failingFiles", "selectionDecision", "failureEvidence"]
@@ -2992,6 +3210,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const parallelPending = new Set<GateName>();
     let heldParallel: (() => void) | undefined;
     const notePhaseStart = (e: Extract<GateEvent, { phase: "start" }>) => {
+      const active = activeGatePhases.get(t.id) ?? new Set<GateName>();
+      active.add(e.gate);
+      activeGatePhases.set(t.id, active);
       if (e.parentAt !== undefined) parallelPending.add(e.gate);
     };
     const inParallelOrder = (gate: GateName, publish: () => void) => {
@@ -3079,7 +3300,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
     // ROUTE-13: learned within-band failover + deviation audit. nextChannel stays pure (route/ never
     // journals); the daemon compares the learned pick against the static pick and owns the journal write.
-    const failover = (site: "consult-reroute" | "quota-failover" | "dead-channel" | "escalate"): Assignment | null => {
+    const failover = (site: "consult-reroute" | "quota-failover" | "capacity-failover" | "dead-channel" | "escalate"): Assignment | null => {
       const next = nextChannel(assignment, t, cfg, channels, tried, profile, demotedChannels);
       if (profile && next) {
         const staticNext = nextChannel(assignment, t, cfg, channels, tried, undefined, demotedChannels);
@@ -3088,6 +3309,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
       }
       return next;
+    };
+
+    // OBS-1161: capacity requeues spent on a seat for this task since its last operator release —
+    // journal-derived so the budget survives a resume instead of restarting with the process.
+    const capacityRequeuesOn = (channel: string): number => {
+      const rows = journal.read().filter((e) => e.taskId === t.id);
+      const since = rows.map((e) => e.event).lastIndexOf("task-approved");
+      return rows.slice(since + 1).filter((e) => e.event === "capacity-requeue" && e.data.channel === channel).length;
     };
 
     // OBS-202 (operator law: "you can spawn as many as you want"): channels are session FACTORIES,
@@ -3396,6 +3625,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const { results } = await withCommandContext(t.id,
           async () => runReviewRecovery(resumedTask, {
           carriedAuthors: await subjectAuthors(journal.read(), t.id, wt, taskBase),
+          producer: producerNow(),
           carriedFindings: outstandingReviewFindings(journal.read(), t.id),
           operatorContext,
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
@@ -3428,7 +3658,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               return;
             }
             const g = e.result;
-            classifySignalOnlyTest(g);
+            activeGatePhases.get(t.id)?.delete(e.gate);
+            classifyInfraResult(g);
             inParallelOrder(g.gate as GateName, () => {
               journalGateResult(g);
               noteReviewRetry(g);
@@ -3439,7 +3670,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             });
           },
         }, false));
-        results.forEach(classifySignalOnlyTest);
+        results.forEach(classifyInfraResult);
         if (pendingDaemonApprovalActions(journal.read()).get(t.id)?.authority === "battery") {
           journal.append("recheck-battery", t.id, {
             commit: gateSubject.commit,
@@ -3457,7 +3688,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               startMs, gateFails, consults, tokens, metered, retryMode);
             return;
           }
-          const infra = results.find((g) => g.meta?.infra === true);
+          // OBS-1106: same predicate as classification — an infra replay is parked, never repaired.
+          const infra = results.find((g) => gateFailed(g) && isInfraResult(g));
           if (infra) {
             await park(t, `${infra.gate}: ${infra.details}`, "infra", gateAuthor, rs?.attempts ?? 0,
               startMs, gateFails, consults, tokens, metered, retryMode);
@@ -3548,6 +3780,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         saveGraph(repoRoot, graph);
         journal.append("task-done", t.id, {
           attempts: rs?.attempts ?? 0, assignment: gateAuthor, taskContentDigest: contentDigest,
+          authors: mergedAuthors(await subjectAuthors(journal.read(), t.id, wt, taskBase)),
         });
         journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
         await trackedDriver.project?.(t.id, "completed");
@@ -3947,13 +4180,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // Approval can reset the attempt counter while the old pane remains retained.
       // Its ownership claim must survive a new engagement reusing the script path.
       const groupFile = `${dispatchScript}.${nonce}.pgid`;
-      workerOwners.set(slot, { taskId: t.id, attempt, groupFile });
+      workerOwners.set(slot, { taskId: t.id, attempt, groupFile, marker: dispatchScript, identities: new Map(), descendants: new Map() });
       writeFileSync(dispatchScript, [
         // Shell startup can swallow the driver's leading cd; the payload owns its checkout too.
         `cd ${shq(wt)} || exit 1`,
+        `export ${VITEST_CACHE_ENV}=${shq(worktreeVitestCache(wt))}`,
         // A driver may launch inside the daemon's group. That group is never worker-owned.
         `worker_pgid=$(ps -o pgid= -p $$ 2>/dev/null); daemon_pgid=$(ps -o pgid= -p ${process.pid} 2>/dev/null)`,
         `if [ -n "$worker_pgid" ] && [ -n "$daemon_pgid" ] && [ "$worker_pgid" != "$daemon_pgid" ]; then printf '%s\\n' "$worker_pgid" > ${shq(groupFile)}; fi`,
+        `ps -o sess= -p $$ > ${shq(`${groupFile}.session`)} 2>/dev/null`,
+        `ps -o pid=,lstart= -p $PPID > ${shq(`${groupFile}.parent`)} 2>/dev/null`,
         "export BASH_SILENCE_DEPRECATION_WARNING=1",
         bannerShell(),
         `printf '%s\\n' 'TICKMARKR_DISPATCH_${nonce}'`,
@@ -4035,7 +4271,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           return;
         }
         if (hasSeed || cpuAccountant !== undefined) return;
-        cpuAccountant = new WorkerTreeCpuAccountant(dispatchScript, wt, () => readOwnedProcessGroup(groupFile));
+        cpuAccountant = new WorkerTreeCpuAccountant(dispatchScript, wt, () => readOwnedProcessGroup(groupFile), workerOwners.get(slot)!.descendants);
         await cpuAccountant.start();
       };
       const readCpuLeg = (): CpuLeg => {
@@ -4126,6 +4362,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let deadChannelKilled = false;
       let hardTimedOut = false;
       let quotaBannerKilled = false;
+      let capacityBannerKilled = false; // OBS-1161: same banner filter and gates, transient outcome
       let driverProbeFailed = false;
       let heldLegs: string[] = [];
       const noteDriverUnreadable = (error: unknown) => {
@@ -4430,17 +4667,30 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // filtered by identity, never by novelty — a banner already on screen at launch
             // classifies exactly like one printed mid-attempt (T1 review: a novelty baseline
             // exculpated the launch-throttle case forever).
-            const bannerMatch = QUOTA_RE.exec(stallSnapshotBannerRows(paneText));
+            // OBS-1161: a transient-capacity banner rides the SAME filter, streak and silence gates,
+            // and concludes the attempt the same way — only its post-loop outcome differs (bounded
+            // requeue on this seat, then same-floor failover, never demotion). Quota wins a tie.
+            const bannerRows = stallSnapshotBannerRows(paneText);
+            const quotaBanner = QUOTA_RE.exec(bannerRows);
+            const bannerMatch = quotaBanner ?? CAPACITY_RE.exec(bannerRows);
             if (bannerMatch) quotaStreak++;
             else quotaStreak = 0;
-            if (bannerMatch && !stallProgress.rowSignalSaturated && !nudgeFailed
+            if (bannerMatch && !quotaBanner && !stallProgress.rowSignalSaturated && !nudgeFailed
+                && !(driver.nudge && NUDGEABLE_ADAPTERS.has(adapter.id) && (!nudged || nudgeDeadline !== undefined))
+                && readCpuLeg().state === "flat"
+                && quotaStreak >= 2 && sliceNow - lastProgressAt >= quotaBannerSilentMs) {
+              capacityBannerKilled = true;
+              journal.append("capacity-banner", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastProgressAt, matched: bannerMatch[0], excerpt: bannerMatch.input, regex: CAPACITY_RE.source });
+              break;
+            }
+            if (quotaBanner && !stallProgress.rowSignalSaturated && !nudgeFailed
                 && !(driver.nudge && NUDGEABLE_ADAPTERS.has(adapter.id) && (!nudged || nudgeDeadline !== undefined))
                 && readCpuLeg().state === "flat"
                 && quotaStreak >= 2 && sliceNow - lastProgressAt >= quotaBannerSilentMs) {
               // no `output =` here: the post-loop no-trailer tail re-reads the pane anyway, so an
               // assignment would only split the classification read from the verdict read.
               quotaBannerKilled = true;
-              journal.append("quota-banner", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastProgressAt, matched: bannerMatch[0], excerpt: bannerMatch.input, regex: QUOTA_RE.source });
+              journal.append("quota-banner", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastProgressAt, matched: quotaBanner[0], excerpt: quotaBanner.input, regex: QUOTA_RE.source });
               break;
             }
             // T1 (OBS-262): the `paged` latch is deleted — status is sampled EVERY slice (and
@@ -4586,7 +4836,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               const ref = preservation.ref;
               const reason = `worker is unambiguously dead: pane absent, process tree empty, and worktree unchanged; preserved at ${ref}`;
               deadWorkerPark = { ref, reason };
-              journal.append("worktree-preserved", t.id, { ref });
+              journal.append("worktree-preserved", t.id, { ref, ...producerFields(producerNow()) });
               noteWorkerLiveness("worker-dead-held", {
                 slot: slot.name, attempt, reason: "unambiguous-worker-death", ref,
               });
@@ -4939,9 +5189,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         try {
           await closeSlot(slot);
           if (!workerFinished) {
-            const ref = await preserveWorktree(wt);
+            const producer = producerNow();
+            const ref = await preserveWorktree(wt, producer);
             if (ref) {
-              journal.append("worktree-preserved", t.id, { ref });
+              journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
               reapedWorktreeRef = ref;
             }
             journal.append("worker-reaped-before-harvest", t.id, {
@@ -4955,6 +5206,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           reapFailure = error instanceof Error ? error.message : String(error);
         }
       } else if (keepOpen && (workerFinished || processExited || driver.id !== "subprocess")) {
+        await reapWorker(slot);
         keptSlots.push(slot);
         supersededWorkerSlot = slot;
       } else {
@@ -5012,8 +5264,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         stallReaps = stallSeat === seat ? stallReaps + 1 : 1;
         stallSeat = seat;
         if (stallReaps >= 2) {
-          const ref = await preserveWorktree(wt);
-          if (ref) journal.append("worktree-preserved", t.id, { ref });
+          const producer = producerNow();
+          const ref = await preserveWorktree(wt, producer);
+          if (ref) journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
           await park(t, `two consecutive stall reaps without a gate on seat ${seat}`, "stall", assignment,
             attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode, { seat, stallReaps });
           return;
@@ -5055,6 +5308,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const quotaMatch = (interactive ? !workerFinished : exitCode !== 0)
         ? QUOTA_RE.exec(stallSnapshotBannerRows(output))
         : null;
+      // OBS-1161: transient capacity reads the SAME tail under the same guards — a live idle banner
+      // and a no-trailer capacity exit classify identically — through the parse-boundary rule that a
+      // parsed verdict (either way) is work, so a trailer QUOTING the phrase never lands here.
+      const capacityMatch = !quotaMatch && (interactive ? !workerFinished : exitCode !== 0)
+        ? classifyTransientCapacity({ ...preHarvestResult, raw: stallSnapshotBannerRows(output) })
+        : null;
       // Q-1: a graph pin is an operator instruction — a quota match ALONE never overrides it; only a
       // channel-attributed error (auth/setup/outage/timeout, the typed dead-channel classes) may.
       const pin = t.routingHints?.pin;
@@ -5064,7 +5323,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // a refused quota window is not a no-trailer verdict on the pinned channel: counting it would
       // demote the pin two tails in and the demotion re-dispatch would move the task off it.
       if (preHarvestResult.ok && workerFinished) noTrailerStreak.set(channelKey(assignment), 0);
-      else if (!workerFinished && cause !== "provider-death" && !pinRefusesQuota) {
+      else if (!workerFinished && cause !== "provider-death" && !pinRefusesQuota && !capacityMatch) {
         const ck = channelKey(assignment);
         const streak = (noTrailerStreak.get(ck) ?? 0) + 1;
         noTrailerStreak.set(ck, streak);
@@ -5082,6 +5341,46 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await new Promise((r) => setTimeout(r, PROVIDER_DEATH_BACKOFF_MS));
         attempt--;
         continue;
+      }
+
+      // OBS-1161: transient capacity → bounded same-seat requeue with backoff (no attempt burn, no
+      // consult), then a same-floor failover exactly like quota — but the seat is NEVER demoted or
+      // excluded: it is busy, not dead, and a later task may find it free. The budget is read from
+      // the journal, never a loop-local counter, so a resume continues the count it left off at.
+      if (capacityMatch) {
+        const from = channelKey(assignment);
+        const requeues = capacityRequeuesOn(from);
+        const source = capacityBannerKilled ? "banner" : "exit";
+        if (requeues < CAPACITY_REQUEUE_CAP) {
+          journal.append("capacity-requeue", t.id, {
+            attempt, requeue: requeues + 1, of: CAPACITY_REQUEUE_CAP, channel: from, assignment,
+            matched: capacityMatch[0], source, backoffMs: capacityBackoffMs,
+          });
+          await new Promise((r) => setTimeout(r, capacityBackoffMs));
+          attempt--;
+          continue;
+        }
+        const next = failover("capacity-failover");
+        journal.append("capacity-failover", t.id, {
+          from, to: next ? channelKey(next) : null, matched: capacityMatch[0], source, requeues, cause: "capacity",
+        });
+        if (next) {
+          await driver.notify(`tickmarkr ${runId}: ${t.id} capacity failover`, { tier: "attention" });
+          if (!keepForever) {
+            const idx = keptSlots.indexOf(slot);
+            if (idx >= 0) {
+              keptSlots.splice(idx, 1);
+              try { await closeSlot(slot); } catch { /* cosmetic — reconcile is the backstop */ }
+            }
+            if (supersededWorkerSlot === slot) supersededWorkerSlot = undefined;
+          }
+          assignment = next;
+          tried.push(channelKey(next));
+          continue;
+        }
+        await park(t, `capacity exhausted on ${from} after ${requeues} requeues and no eligible channel at floor`, "quota",
+          assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode, { cause: "capacity", channel: from, requeues });
+        return;
       }
 
       // quota exhaustion → failover within floor; does NOT consume the ladder (spec §4)
@@ -5242,7 +5541,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           return;
         }
         const g = e.result;
-        classifySignalOnlyTest(g);
+        activeGatePhases.get(t.id)?.delete(e.gate);
+        classifyInfraResult(g);
         inParallelOrder(g.gate as GateName, () => {
           // GATE-09 (ROADMAP SC-4): journal every judge retry as an attributable event — which gate flaked,
           // which channel flaked, which channel retried — so `tickmarkr journal`/report can distinguish "judge
@@ -5299,6 +5599,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               !(GATE_TELEMETRY_KEYS as readonly string[]).includes(key) && key !== "capacity")),
           }));
           commits = await commitsAheadOf(taskBase, wt);
+          // OBS-1106: a replayed legacy infra row lacking `infra` is re-classified before it is
+          // re-journaled and before the infra park below reads it.
+          results.forEach(classifyInfraResult);
           for (const g of results) {
             journal.append("gate-replayed", t.id, {
               attempt, priorAttempt: attempt - 1, gate: g.gate, commit: gateSubject.commit,
@@ -5311,6 +5614,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ({ results, commits } = await withCommandContext(t.id,
             async () => runReviewRecovery(t, {
             carriedAuthors: await subjectAuthors(journal.read(), t.id, wt, taskBase),
+            producer: producerNow(),
             carriedFindings: outstandingFindings,
             operatorContext,
             worktree: wt, baseRef: taskBase, result, author: assignment,
@@ -5340,7 +5644,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             onGate,
           })));
         }
-        results.forEach(classifySignalOnlyTest);
+        results.forEach(classifyInfraResult);
         graph = addEvidence(graph, t.id, { commits, gateResults: results, artifacts: [promptFile] });
         saveGraph(repoRoot, graph);
         if (results.some((g) => g.gate === "test" && !g.pass
@@ -5375,6 +5679,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           saveGraph(repoRoot, graph);
           journal.append("task-done", t.id, {
             attempts: attempt + 1, assignment, taskContentDigest: contentDigest,
+            authors: mergedAuthors(await subjectAuthors(journal.read(), t.id, wt, taskBase)),
           });
           journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
           await trackedDriver.project?.(t.id, "completed");
@@ -5410,7 +5715,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
-      const infraFailure = results.find((g) => gateFailed(g) && g.meta?.infra === true);
+      const infraFailure = results.find((g) => gateFailed(g) && isInfraResult(g));
       if (infraFailure) {
         await park(
           t,
@@ -5632,7 +5937,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const holdEndCondition = (closing = true): boolean => {
     sweepLiveApprovals();
     const freeSlots = Math.max(0, concurrency - inflight.size);
-    const dispatchable = readyTasks(graph).filter((t) => !inflight.has(t.id));
+    const dispatchable = admissible().filter((t) => !inflight.has(t.id));
     if (freeSlots === 0 || dispatchable.length === 0) return false;
     if (closing) {
       for (const task of dispatchable) {
@@ -5650,7 +5955,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (termSignal) throw new Error(`terminated by ${termSignal}`);
       await watchBoard();
       sweepLiveApprovals();
-      const ready = readyTasks(graph)
+      const ready = admissible()
         .filter((t) => !inflight.has(t.id))
         .slice(0, Math.max(0, concurrency - inflight.size));
       for (const t of ready) {
@@ -5668,24 +5973,31 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
             if (fatalStop.signal.aborted) return;
             const cleanupEvidence = cleanupErrors.length ? { cleanupErrors } : {};
+            if (err instanceof HostDegradedError) {
+              await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
+                { disposition: "host-degraded", ...cleanupEvidence });
+              return;
+            }
             if (err instanceof HeldProbeExhausted) {
               const wt = worktreePath(repoRoot, `${branch}--${t.id}`);
-              let ref = await withoutExecutionBudget(() => preserveWorktree(wt));
+              const producer = knownProducer(journal.read(), t.id);
+              let ref = await withoutExecutionBudget(() => preserveWorktree(wt, producer));
               if (!ref) {
                 const head = await gitHead(wt);
                 ref = `refs/tickmarkr/preserved/${head}`;
                 const saved = await shGit(`git update-ref ${shq(ref)} ${shq(head)}`, wt);
                 if (saved.code !== 0) throw new Error(`could not preserve ${head}: ${saved.stderr}`);
               }
-              journal.append("worktree-preserved", t.id, { ref });
+              journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
               await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
                 { disposition: "transport-uncertain", ref, ...cleanupEvidence });
               return;
             }
             if (err instanceof ExecutionBudgetExceeded) {
               const wt = worktreePath(repoRoot, `${branch}--${t.id}`);
-              const ref = await preserveWorktree(wt);
-              if (ref) journal.append("worktree-preserved", t.id, { ref });
+              const producer = knownProducer(journal.read(), t.id);
+              const ref = await preserveWorktree(wt, producer);
+              if (ref) journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
               const dispatch = journal.read().reverse().find((e) => e.taskId === t.id && e.event === "task-dispatch");
               await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
                 { disposition: "execution-budget-exhausted", limitMs: cfg.executionPolicy!.taskExecutionLimitMs,
@@ -5721,7 +6033,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             journal.append("approval-window-start", undefined, { windowMs, parked: [...parked] });
             // The narrator may itself append a decision at this boundary.
             sweepLiveApprovals();
-            if (readyTasks(graph).length) { approvalDeadline = undefined; continue; }
+            if (admissible().length) { approvalDeadline = undefined; continue; }
           }
           if (Date.now() < approvalDeadline) {
             await Promise.race([aborted, new Promise((wake) => setTimeout(wake,
@@ -5767,7 +6079,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     };
 
     fatalPhase = "baseline";
-    await baselineCapture; // also drain capture when every worker parks or fails before its gates
+    await baselineCapture.catch(error => {
+      // A host park is resumable only after baseline publication. Before that, retain the
+      // fatal baseline failure: resume requires baseline.json and cannot recover this capture.
+      if (!(error instanceof HostDegradedError) || !existsSync(join(journal.dir, "baseline.json"))) throw error;
+    });
 
     fatalPhase = "tip-verify";
     // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
@@ -5778,7 +6094,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const checkApprovals = () => {
         try {
           sweepLiveApprovals();
-          if (readyTasks(graph).length) controller.abort(cancellation);
+          if (admissible().length) controller.abort(cancellation);
           if (termSignal) controller.abort(new Error(`terminated by ${termSignal}`));
         } catch (error) { controller.abort(error); }
       };

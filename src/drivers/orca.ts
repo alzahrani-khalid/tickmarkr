@@ -272,7 +272,12 @@ export function provesCheckout(text: string, checkout: string): boolean {
  * subshell inside it all start in the checkout and its exit status is the payload's (FX-N02).
  */
 export function checkoutPrefix(checkout: string): string {
-  return `cd ${shq(checkout)} && printf '%s\\n' ${shq(checkoutProofLine(checkout))} && sh -c `;
+  // OBS-1168: printf BUILDS the marker from two arguments, so the typed command never carries
+  // `TICKMARKR_CHECKOUT ` verbatim. The shell's echo of the typed line is repainted and truncated in
+  // the scrollback, which used to leave an INCOMPLETE frame beside the complete printed one and made
+  // provesCheckout refuse a correct launch. The printed bytes are exactly checkoutProofLine(checkout).
+  const head = CHECKOUT_MARK.slice(0, CHECKOUT_MARK.indexOf("_"));
+  return `cd ${shq(checkout)} && printf '%s%s\\n' ${head} ${shq(checkoutProofLine(checkout).slice(head.length))} && sh -c `;
 }
 
 /** The command a terminal on the tracked worktree runs so that it executes INSIDE the checkout. */

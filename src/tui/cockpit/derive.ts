@@ -1,5 +1,6 @@
 // Consolidated C1/C6 readers use the incremental lifecycle contract; legacy captures keep their API.
 export { readOperatorState as deriveOperatorState } from "../../run/operator-state.js";
+import { doneAuthors } from "../../run/operator-state.js";
 import { channelKey } from "../../adapters/types.js";
 import { newestPark, permittedDecisionVerbs } from "../../cli/commands/approve.js";
 import { parseOwnedName } from "../../drivers/types.js";
@@ -164,6 +165,8 @@ export type TaskRow = {
   readonly state?: TaskState;
   readonly attempts?: number;
   readonly actor?: string;
+  /** Distinct merged-author channels from task-done; legacy rows say ["unknown"]. Not the actor. */
+  readonly authors?: readonly string[];
   readonly lastEventTime?: string;
   /** Complete UTC instant paired with `lastEventTime`; additive for existing consumers. */
   readonly lastEventTimestamp?: string;
@@ -253,6 +256,7 @@ type RunLifecycle = "active" | "completed" | "superseded";
 type TaskFact = {
   readonly id: string;
   readonly dispatches: DispatchFact[];
+  authors?: readonly string[];
   /** Undefined until an event records a state — silence is not "pending". */
   state: TaskState | undefined;
   /**
@@ -512,6 +516,7 @@ function deriveTasks(
     if (state) {
       const fact = task(event.taskId, index, event.ts);
       fact.state = state;
+      if (event.event === "task-done") fact.authors = doneAuthors(event.data);
       // The park kind travels with the park: `task-human` records it, and the
       // next recorded state — approved, done, failed — retires it with the park
       // it named. A resolved state must not leave its badge behind (OBS-256).
@@ -916,6 +921,7 @@ function taskRows(
       ...(state === undefined ? {} : { state }),
       ...(attempts === 0 ? {} : { attempts }),
       ...(assignment === undefined ? {} : { actor: channelKey(assignment) }),
+      ...(fact?.authors === undefined ? {} : { authors: fact.authors }),
       ...(lastTs === undefined ? {} : { lastEventTime: eventTime(lastTs) }),
       ...(lastTs === undefined ? {} : { lastEventTimestamp: lastTs }),
       ...(title === undefined ? {} : { title }),

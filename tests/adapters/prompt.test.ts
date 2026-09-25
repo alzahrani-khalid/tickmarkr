@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { buildTaskPrompt, classifyDeadChannel, parseWorkerResult, trailerPattern, writePrompt } from "../../src/adapters/prompt.js";
+import { buildTaskPrompt, classifyDeadChannel, classifyTransientCapacity, parseWorkerResult, trailerPattern, writePrompt } from "../../src/adapters/prompt.js";
 import { validateGraph } from "../../src/graph/schema.js";
 
 const N = "testnonce"; // fixed nonce for direct-call tests; the daemon uses a random per-run one
@@ -268,6 +268,28 @@ describe("classifyDeadChannel (v1.65 T1)", () => {
 
   test("a no-trailer failure without a dead-channel signature stays untyped", () => {
     expect(dead("still working on the diff...")).toBeUndefined();
+  });
+});
+
+// OBS-1161: transient capacity shares the parse boundary AND a row boundary — the phrase is a banner
+// only when it opens its row; a `>` quote, a quotation mark or a sentence in front is work evidence.
+describe("classifyTransientCapacity (OBS-1161)", () => {
+  const cap = (raw: string) => classifyTransientCapacity(parseWorkerResult(raw, N))?.[0];
+
+  test("a banner row opening with the phrase classifies as capacity, glyph or error label allowed", () => {
+    expect(cap("working…\nSelected model is at capacity\nplease try again later")).toBe("Selected model is at capacity");
+    expect(cap("■ Selected model is at capacity. Please try a different model.")).toMatch(/Selected model is at capacity$/);
+    expect(cap("stream error: model is at capacity")).toMatch(/model is at capacity$/);
+  });
+
+  test("the phrase quoted in a no-trailer transcript is work evidence, never capacity", () => {
+    expect(cap("> Selected model is at capacity")).toBeUndefined();
+    expect(cap('the log said "Selected model is at capacity"')).toBeUndefined();
+    expect(cap("  - handle `Selected model is at capacity` banners")).toBeUndefined();
+  });
+
+  test("a parsed trailer quoting the phrase is the worker speaking, never capacity", () => {
+    expect(classifyTransientCapacity(parseWorkerResult(`Selected model is at capacity\nTICKMARKR_RESULT_${N} {"ok":false,"summary":"tests failing"}`, N))).toBeNull();
   });
 });
 

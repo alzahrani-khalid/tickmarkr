@@ -13,6 +13,7 @@ import { gitHead, shOk } from "../../src/run/git.js";
 import { ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../src/run/journal.js";
 import { isPidLive } from "../../src/run/lock.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
+import { releaseAll, releaseIndex, releaseOn, releaseOnAll, workerBarrier, type WorkerBarrier } from "../helpers/worker-barrier.js";
 
 const assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
 const dispatches = (events: JournalEvent[], taskId: string) =>
@@ -20,29 +21,39 @@ const dispatches = (events: JournalEvent[], taskId: string) =>
 const afterApproval = (events: JournalEvent[], taskId: string) =>
   events.slice(events.findIndex((e) => e.event === "task-approved" && e.taskId === taskId) + 1);
 
-function liveApprovalRepo() {
+// OBS-1163: B's worker is barrier-held (released on A's dispatch) so B is still in flight when the
+// approval is consumed — a hold on the event under test, not a sleep a loaded host could outrun.
+function liveApprovalRepo(b: WorkerBarrier) {
   return setupRepo(
     [T("A", { humanGate: true }), T("B")],
     { tasks: {
       A: [{ shell: `echo a > a.txt && ${COMMIT} a`, result: { ok: true, summary: "a" } }],
-      B: [{ shell: `sleep 0.8; echo b > b.txt && ${COMMIT} b`, result: { ok: true, summary: "b" } }],
+      B: [{ shell: `${b.hold} && echo b > b.txt && ${COMMIT} b`, result: { ok: true, summary: "b" } }],
     } },
   );
 }
 
-test("test: a task-approved row appended while a slot is free and no in-flight task has settled dispatches the released task within one poll interval whereas the shipped loop that consumes it only at the next task boundary fails", async () => {
-  const runId = "run-live-approval-boundary";
-  const { repo, fake } = liveApprovalRepo();
-  const summary = await runDaemon(repo, { approvalWindowMs: 1,
+/** A's approval is appended on B's dispatch; B's worker holds until A's dispatch is journaled. */
+function liveApprovalRun(runId: string) {
+  const b = workerBarrier(`${runId}-B`);
+  const { repo, fake } = liveApprovalRepo(b);
+  const run = () => runDaemon(repo, { approvalWindowMs: 1,
     adapters: [fake],
     runId,
     concurrency: 2,
-    narrate: (e) => {
+    narrate: releaseOn(b, "task-dispatch", "A", (e) => {
       if (e.event === "task-dispatch" && e.taskId === "B") {
         Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
       }
-    },
-  });
+    }),
+  }).finally(() => releaseAll(b));
+  return { repo, fake, run };
+}
+
+test("test: a task-approved row appended while a slot is free and no in-flight task has settled dispatches the released task within one poll interval whereas the shipped loop that consumes it only at the next task boundary fails", async () => {
+  const runId = "run-live-approval-boundary";
+  const { repo, run } = liveApprovalRun(runId);
+  const summary = await run();
   const events = Journal.open(repo, runId).read();
   const approvedAt = events.findIndex((e) => e.event === "task-approved" && e.taskId === "A");
   const dispatchAt = events.findIndex((e, i) => i > approvedAt && e.event === "task-dispatch" && e.taskId === "A");
@@ -52,7 +63,13 @@ test("test: a task-approved row appended while a slot is free and no in-flight t
   expect(dispatchAt).toBeLessThan(siblingSettledAt);
 });
 
-async function seededReleaseRun(runId: string) {
+// OBS-1163: S's worker holds until the daemon has journaled every seeded release's ENACTMENT (below),
+// so each release is consumed while S is still in flight — the event, not a sleep, keeps the slot busy.
+const SEEDED_ENACTMENTS = [
+  ["task-dispatch", "H"], ["worktree-recreation", "G"], ["recheck-battery", "R"], ["task-dispatch", "U"], ["task-dispatch", "C"],
+] as const;
+
+async function seededReleaseRun(runId: string, s: WorkerBarrier) {
   const suiteLog = join(makeTestTempDir("tickmarkr-approval-suite-"), "suite.log");
   const testCmd = `printf '%s argc=%s args=%s\\n' "$(basename "$PWD")" "$#" "$*" >> ${shq(suiteLog)}`;
   const tasks = [
@@ -68,7 +85,7 @@ async function seededReleaseRun(runId: string) {
     R: [{ shell: `echo r > r.txt && ${COMMIT} r`, result: { ok: true, summary: "r" } }],
     U: [{ shell: `echo u > u.txt && ${COMMIT} u`, result: { ok: true, summary: "u" } }],
     C: [{ shell: `echo c > c.txt && ${COMMIT} c`, result: { ok: true, summary: "c" } }],
-    S: [{ shell: `sleep 0.15; echo s > s.txt && ${COMMIT} s`, result: { ok: true, summary: "s" } }],
+    S: [{ shell: `${s.hold} && echo s > s.txt && ${COMMIT} s`, result: { ok: true, summary: "s" } }],
   } }, `gates: { test: ${JSON.stringify(testCmd)} }\n`);
 
   const baseRef = await gitHead(repo);
@@ -165,13 +182,16 @@ test("test: a recheck release of a gate-fail park and of an infra park each re-r
 
 test("each live release encoding reaches its production path, including a worker-free recheck battery", async () => {
   const runId = "run-live-release-kinds";
-  const { repo, fake, suiteLog } = await seededReleaseRun(runId);
+  const sHeld = workerBarrier("release-kinds-S");
+  const { repo, fake, suiteLog } = await seededReleaseRun(runId, sHeld);
   await runDaemon(repo, { approvalWindowMs: 1,
     adapters: [fake],
     runId,
     resume: true,
     concurrency: 2,
-    narrate: (e) => {
+    // the approvals are appended on S's dispatch; S's worker is released only by the daemon's own
+    // narration of the last enactment, never by the test's journal handle writing the approvals
+    narrate: releaseOnAll(sHeld, SEEDED_ENACTMENTS, (e) => {
       if (e.event !== "task-dispatch" || e.taskId !== "S") return;
       const journal = Journal.open(repo, runId);
       journal.append("task-approved", "H", { by: "test", via: "test" });
@@ -179,10 +199,20 @@ test("each live release encoding reaches its production path, including a worker
       journal.append("task-approved", "R", { by: "test", via: "test", release: RECHECK_RELEASE });
       journal.append("task-approved", "U", { by: "test", via: "test", release: REVIEW_UPHELD_RELEASE, gate: "review" });
       journal.append("task-approved", "C", { by: "test", via: "test", release: ATTEMPT_CAP_RELEASE });
-    },
-  });
+    }),
+  }).finally(() => releaseAll(sHeld));
 
   const events = Journal.open(repo, runId).read();
+  // every enactment follows its approval and precedes S's result, and S was released by the last one
+  const sResult = events.findIndex((e) => e.event === "worker-result" && e.taskId === "S");
+  for (const [event, taskId] of SEEDED_ENACTMENTS) {
+    const approvedAt = events.findIndex((e) => e.event === "task-approved" && e.taskId === taskId);
+    const enactedAt = events.findIndex((e, i) => i > approvedAt && e.event === event && e.taskId === taskId);
+    expect(approvedAt, `${taskId} approved`).toBeGreaterThanOrEqual(0);
+    expect(enactedAt, `${event} ${taskId} enacted after its approval`).toBeGreaterThan(approvedAt);
+    expect(enactedAt, `${event} ${taskId} enacted while S was in flight`).toBeLessThan(sResult);
+    expect(enactedAt, `${event} ${taskId} enacted no later than S's release`).toBeLessThanOrEqual(releaseIndex(events, sHeld));
+  }
   expect(dispatches(afterApproval(events, "H"), "H")).toHaveLength(1);
   expect(dispatches(afterApproval(events, "G"), "G")).toHaveLength(0);
   expect(afterApproval(events, "G").some((e) => e.event === "worktree-recreation" && e.taskId === "G")).toBe(true);
@@ -217,17 +247,8 @@ test("test: the daemon's worker slot request carries the assignment's adapter id
 
 test("test: a run whose live approvals were all consumed at task boundaries ends with approvalDisposition complete while the shipped run ending outstanding over an approval accepted hours before run-end fails", async () => {
   const runId = "run-live-approval-complete";
-  const { repo, fake } = liveApprovalRepo();
-  const summary = await runDaemon(repo, { approvalWindowMs: 1,
-    adapters: [fake],
-    runId,
-    concurrency: 2,
-    narrate: (e) => {
-      if (e.event === "task-dispatch" && e.taskId === "B") {
-        Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
-      }
-    },
-  });
+  const { repo, run } = liveApprovalRun(runId);
+  const summary = await run();
   expect(summary.approvalDisposition).toBe("complete");
   expect(summary.outstandingApprovals).toBeUndefined();
   expect(Journal.open(repo, runId).read().find((e) => e.event === "run-end")?.data.approvalDisposition).toBe("complete");
@@ -235,17 +256,8 @@ test("test: a run whose live approvals were all consumed at task boundaries ends
 
 test("test: a boundary sweep with no new approvals changes nothing and a resume replay of a run that consumed approvals mid-run reconstructs the same task statuses from the journal alone while a sweep that double-consumes an approval on replay fails", async () => {
   const runId = "run-live-approval-replay";
-  const { repo, fake } = liveApprovalRepo();
-  const first = await runDaemon(repo, { approvalWindowMs: 1,
-    adapters: [fake],
-    runId,
-    concurrency: 2,
-    narrate: (e) => {
-      if (e.event === "task-dispatch" && e.taskId === "B") {
-        Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
-      }
-    },
-  });
+  const { repo, fake, run } = liveApprovalRun(runId);
+  const first = await run();
   expect(first.done.sort()).toEqual(["A", "B"]);
   const before = Journal.open(repo, runId).read();
   const replay = Journal.open(repo, runId).replayStatuses();
@@ -292,14 +304,15 @@ test("test: a run whose loop drains with a parked task blocking every remaining 
     const { repo, fake } = closingRepo(mode !== "no-park");
     const runId = `run-approval-window-${mode}`;
     let approval: Promise<string> | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const windowMs = mode === "no-park" ? 10_000 : 500;
-    try {
+    {
+      // OBS-1163: the approval is issued on the approval-window-start row itself — an approval
+      // barrier keyed to the event, not a timer racing the window.
       const summary = await runDaemon(repo, {
         adapters: [fake], runId, approvalWindowMs: windowMs,
         narrate: (e) => {
           if (e.event === "approval-window-start" && mode === "approved") {
-            timer = setTimeout(() => { approval = approve([runId, "A", "--by", "test"], repo); }, 50);
+            approval = approve([runId, "A", "--by", "test"], repo);
           }
         },
       });
@@ -329,8 +342,6 @@ test("test: a run whose loop drains with a parked task blocking every remaining 
           expect(summary.human).toEqual(["A"]);
         }
       }
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 }, 120_000);

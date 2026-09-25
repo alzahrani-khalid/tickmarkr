@@ -8,6 +8,7 @@ import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { dewrapPaneVerdict, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
+import { rankPreferredChannels } from "../route/role-pick.js";
 import { disallowedBy, routingModelProvider } from "../route/preference.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
@@ -260,15 +261,14 @@ export async function consult(
     return parsed;
   };
 
-  // v1.54 T1: ranked seat failover. Walk consult.prefer (adapter:model entries) to the first entry
-  // whose adapter is in the live channel set; a failed seat or unparseable verdict falls to the next;
-  // the pinned consult.adapter/model is always the final seat. No channels provided (non-daemon
-  // callers) ⇒ empty live set ⇒ pin only, byte-identical to pre-v1.54 behavior. Failover changes
-  // only WHICH seat answers — per-seat parsing and the fail-safe human action below are untouched.
-  const live = new Set((opts.channels ?? []).map((c) => c.adapter));
-  const seats = (cfg.consult.prefer ?? [])
-    .map((entry) => ({ adapter: entry.slice(0, entry.indexOf(":")), model: entry.slice(entry.indexOf(":") + 1) }))
-    .filter((s) => live.has(s.adapter));
+  // Rank only exact live models from the daemon's role-scoped discovery pool.
+  // The explicit pin remains a caller-owned fallback, outside strict preference selection.
+  const live = (opts.channels ?? []).filter(
+    (c): c is typeof c & { model: string } => typeof c.model === "string",
+  );
+  const seats: Array<{ adapter: string; model: string }> = rankPreferredChannels(
+    live.filter((c) => disallowedBy(c, cfg.routing, "consult") === null), cfg.consult.prefer,
+  );
   seats.push({ adapter: cfg.consult.adapter, model: cfg.consult.model });
   // v1.87 T2: a consult seat reads the code, so it passes through the operator's policy exactly like
   // a worker does. The filter runs AFTER the pin is pushed, so the final pinned seat is checked by

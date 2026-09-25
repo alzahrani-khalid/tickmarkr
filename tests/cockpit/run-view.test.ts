@@ -263,9 +263,9 @@ describe("C4 — Run and validated decisions", () => {
     expect(row("T1")).toMatch(/^ {2}❯ T1 {3}— {15}— {13}Task T1 .*✔ {2}✔ {2}✔ {2}✔ {2}✔ {2}✔ {2}✔ {4}fake:fake-1 +1 *$/u);
     expect(row("T2")).toMatch(/✔ {2}✖ {2}· {2}· {2}· {2}· {2}· {4}fake:fake-1 +1 +✖ test · 2\/7 gates run$/u);
     expect(row("T3")).toMatch(/T3 {3}— {15}T2 {12}Task T3 .*· {2}· {2}· {2}· {2}· {2}· {2}· {4}— +0 +waiting on T2$/u);
-    expect(row("T4")).toMatch(/· {2}· {2}· {2}· {2}· {2}· {2}✔ {4}fake:fake-1 +1 +1\/7 gates run$/u);
-    expect(row("T5")).toMatch(/✔ {2}✔ {2}✔ {2}· {2}· {2}· {2}· {4}fake:fake-1 +1 +3\/7 gates run$/u);
-    expect(row("T7")).toMatch(/· {2}· {2}· {2}· {2}· {2}· {2}· {4}fake:fake-1 +2 +in flight$/u);
+    expect(row("T4")).toMatch(/· {2}· {2}· {2}· {2}\? {2}D {2}✔ {4}fake:fake-1 +1 +1\/7 gates run$/u);
+    expect(row("T5")).toMatch(/✔ {2}✔ {2}✔ {2}R {2}· {2}· {2}· {4}fake:fake-1 +1 +running · evidence$/u);
+    expect(row("T7")).toMatch(/R {2}· {2}· {2}· {2}· {2}· {2}· {4}fake:fake-1 +2 +running · build$/u);
     expect(frame).toContain("RUN / RUNNING · 1/7 merged | human T2 | blocked T3 | pending T4,T5,T6,T7 | current-cycle tip PENDING | RUNNING | matching graph");
     expect(row("T6")).toMatch(/· {2}· {2}· {2}· {2}· {2}· {2}✖ {4}fake:fake-1 +1 +✖ review · 1\/7 gates run$/u);
     expect(frame).toContain("gates left→right in declaration order");

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions } from "../../adapters/registry.js";
+import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions, PREFERENCE_ROLES } from "../../adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
 import { CATALOG_REFRESH_TIMEOUT_MS, formatCatalogRefreshLegs, type CatalogFetcher, type CatalogModelEvidence, type CatalogReadResult, readCachedCatalog, refreshCatalogCommand } from "../../adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
@@ -34,6 +34,7 @@ import { SHAPES, TIERS, type Shape, type Task } from "../../graph/schema.js";
 import { doctor } from "./doctor.js";
 import { candidateRow, costSignal, shapeCandidates } from "./fleet-picker.js";
 import { route } from "../../route/router.js";
+import { pickRole } from "../../route/role-pick.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, entryMatchesChannel, exclusionCollector } from "../../route/preference.js";
 import { resolveRunMode, type ResolvedRunMode } from "../../run/daemon.js";
 import { loadRoutingProfile } from "../../run/journal.js";
@@ -152,6 +153,8 @@ export async function fleet(
   const { values } = parseArgs({
     args: argv,
     options: {
+      pick: { type: "string" },
+      "exclude-vendor": { type: "string", multiple: true },
       print: { type: "boolean" },
       why: { type: "boolean" },
       "global-dir": { type: "string" },
@@ -159,6 +162,25 @@ export async function fleet(
     },
   });
   const globalDir = values["global-dir"] ?? globalConfigDir();
+  if (values.pick !== undefined) {
+    const role = PREFERENCE_ROLES.find((role) => role === values.pick);
+    const refuse = (reason: string) => ({ out: `tickmarkr fleet --pick ${values.pick}: ${reason}`, code: 1 });
+    if (!role) return refuse("unsupported-role — expected worker, judge, review or consult; no role prefer resolved");
+    if (values.print || values.why || values.fresh) return refuse("incompatible options — --pick cannot use --print, --why or --fresh");
+    const { cfg } = resolveRunMode(cwd, { globalDir });
+    const { reuse, health } = initDoctorReuse(cwd, false);
+    const selection = pickRole(role, cfg, adapters, reuse && health ? health : {}, {
+      excludeVendors: new Set(values["exclude-vendor"] ?? []),
+    });
+    if (!selection.ok) {
+      return refuse(selection.reason === "missing-prefer" ? `${role}.prefer: missing-prefer`
+        : !reuse || !health ? `${role}.prefer: probe data missing or stale — run tickmarkr doctor first`
+        : `${role}.prefer: ${selection.reason}`);
+    }
+    const { adapter, model, vendor, channel } = selection.channel;
+    return JSON.stringify({ role, adapter, model, vendor, channel });
+  }
+  if (values["exclude-vendor"]?.length) return { out: "tickmarkr fleet: --exclude-vendor requires --pick <role>", code: 1 };
   const print = values.print ?? false;
   const why = values.why ?? false;
   const input = io.input ?? (process.stdin as FleetInput);

@@ -75,7 +75,7 @@ export function evidenceLookup(rows: readonly RunEvidenceRow[], page?: EvidenceP
 }
 
 export const GATE_CELL_LETTERS: Record<OperatorGateState, string> = {
-  passed: "P", failed: "F", running: "R", "not-run": "-", disabled: "D", unknown: "?",
+  passed: "P", failed: "F", queued: "Q", running: "R", "not-run": "-", disabled: "D", unknown: "?",
 };
 
 /** The outcome selector's vocabulary — a classification of the row, never a word search. */
@@ -121,10 +121,8 @@ function outcomeLabel(outcome: GateOutcome): string {
   }
 }
 
-/**
- * The current attempt's seven cells in declaration order. `rows` supplies the later journal rows
- * that give a cell its inherited/satisfied label; only rows for this task after the evidence line count.
- */
+/** Current-attempt cells in declaration order; later task rows supply inherited/satisfied labels.
+ * Only rows after each cell's own evidence line count. */
 export function runGateCells(task: OperatorTask, evidence: EvidenceLookup, rows: readonly RunEvidenceRow[] = []): readonly RunGateCell[] {
   return GATE_NAMES.map((gate): RunGateCell => {
     const cell = task.gates[gate] ?? { state: "unknown" as const };
@@ -134,10 +132,12 @@ export function runGateCells(task: OperatorTask, evidence: EvidenceLookup, rows:
     const labels: string[] = [];
     let outcome: GateOutcome | undefined;
     if (data === undefined) {
-      labels.push(line === undefined ? { "not-run": "not run", disabled: "disabled by policy", running: "running", unknown: "unknown", passed: "passed", failed: "failed" }[cell.state] : `evidence #L${line} unavailable`);
+      labels.push(line === undefined ? { "not-run": "not run", disabled: "disabled by policy", queued: "queued", running: "running", unknown: "unknown", passed: "passed", failed: "failed" }[cell.state] : `evidence #L${line} unavailable`);
+    } else if (cell.state === "queued") {
+      labels.push(`queued — ${row?.event?.event ?? "wait"}${typeof data.count === "number" ? ` (${data.count} suites)` : ""}`);
     } else if (data.disabled === true) {
       labels.push("disabled by policy");
-    } else if (row?.event?.event === "gate-start") {
+    } else if (["gate-start", "gate-phase-start", "phase-start"].includes(row?.event?.event ?? "")) {
       labels.push("running");
     } else {
       outcome = normalizeGateOutcome(data);
@@ -156,7 +156,7 @@ export function runGateCells(task: OperatorTask, evidence: EvidenceLookup, rows:
       if (e.event === "gate-reused" && e.data.gate === gate) labels.push(`inherited from ${str(e.data.commit) ?? "unknown commit"} · #L${later.line}`);
       if (e.event === "task-approved" && e.data.release === "gate-satisfied" && e.data.gate === gate) labels.push(`satisfied by approval #L${later.line}`);
     }
-    const verdict = typeof data?.details === "string" ? data.details.split("\n") : [];
+    const verdict = row?.event?.event === "gate-result" && typeof data?.details === "string" ? data.details.split("\n") : [];
     return { gate, state: cell.state, letter: GATE_CELL_LETTERS[cell.state], ...(line === undefined ? {} : { line }), ...(outcome ? { outcome } : {}), outcomeClass: outcomeClassOf(outcome, cell.state), labels, verdict };
   });
 }

@@ -2354,6 +2354,43 @@ describe("run row identity and empty-view invariants", () => {
 });
 
 describe("executed cockpit branch ledger", () => {
+  test("ledger sweep budgets follow the runtime ledger size", ({ task }) => {
+    // Observe registered Vitest leaf timeouts, including both complete mutation sweeps.
+    for (const title of [
+      "test: the branch ledger is proved by breaking each reachable branch and observing the test the entry names fail, not a weaker inline assertion beside it",
+      "deleting any test the ledger names makes the ledger itself fail rather than pass by silence",
+      "test: the serialized keys ledger still fails when a named production branch is broken or its named test is deleted and derives its timeout from ledger size, so replacing mutation evidence with a source assertion or a flat budget fails",
+    ]) {
+      const sweep = task.suite!.tasks.find((candidate) => candidate.name === title);
+      expect(sweep?.type).toBe("test");
+      if (sweep?.type === "test") expect(sweep.timeout).toBe(BRANCH_LEDGER.length * 20_000 + 60_000);
+    }
+  });
+
+  test("test: the serialized keys ledger still fails when a named production branch is broken or its named test is deleted and derives its timeout from ledger size, so replacing mutation evidence with a source assertion or a flat budget fails", async ({ task }) => {
+    expect(task.timeout).toBe(BRANCH_LEDGER.length * 20_000 + 60_000);
+    await withBranchSandbox(async (sandbox) => {
+      const entry = BRANCH_LEDGER[0];
+      const passed = new Set<string>();
+      // This runs the named baseline, breaks the production arm, and requires that named test to fail.
+      await proveLedgerEntry(sandbox, entry, passed);
+      // Removing the same test must then invalidate that evidence, not silently satisfy it.
+      await expect(proveLedgerEntry(sandbox, entry, passed, { deleteNamedTest: true }))
+        .rejects.toThrow(/named test did not execute and fail/u);
+
+      // Grow the real ledger in the sandbox, then collect its actual test registrations again.
+      // A flat timeout equal to today's formula must fail after this size perturbation.
+      const testPath = join(sandbox, KEYS_TEST);
+      const source = readFileSync(testPath, "utf8");
+      const grown = source.replace("const BRANCH_LEDGER = [", "const ORIGINAL_BRANCH_LEDGER = [")
+        .replace("// OBS-1141: local", "const BRANCH_LEDGER = [...ORIGINAL_BRANCH_LEDGER, ORIGINAL_BRANCH_LEDGER[0]];\n\n// OBS-1141: local");
+      expect(grown).not.toBe(source);
+      writeFileSync(testPath, grown);
+      const budgetEntry = { ...entry, testTitle: "ledger sweep budgets follow the runtime ledger size" };
+      assertNamedTestPassed(budgetEntry, await runNamedLedgerTest(sandbox, budgetEntry));
+    });
+  }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
+
   test("test: the branch ledger is proved by breaking each reachable branch and observing the test the entry names fail, not a weaker inline assertion beside it", async () => {
     await withBranchSandbox(async (sandbox) => {
       const passed = new Set<string>();

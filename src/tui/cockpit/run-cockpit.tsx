@@ -32,6 +32,7 @@ import {
   type BandColumnContent,
   type JournalRow,
 } from "./components.js";
+import { authorsNote } from "../../run/operator-state.js";
 import { fieldReading, type RunCockpitData, type TaskRow } from "./derive.js";
 import { STALL_MARKER } from "./run-view.js";
 import {
@@ -565,7 +566,8 @@ function promotedViewRows(
       state: taskRowState(row),
       text: `${row.taskId} · ${fieldReading(row.state)} · ${runAttemptLabel(row.attempts)} · ${
         fieldReading(row.actor)
-      }${row.title === undefined ? "" : ` · ${row.title}`} · ${taskProjectionText(row, data.journalRows)}`,
+      }${authorsNote(row.authors, row.actor) === undefined ? "" : ` · ${authorsNote(row.authors, row.actor)}`}${
+        row.title === undefined ? "" : ` · ${row.title}`} · ${taskProjectionText(row, data.journalRows)}`,
     }));
   }
   if (viewId === "gates") {

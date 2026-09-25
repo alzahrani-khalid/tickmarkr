@@ -1,5 +1,5 @@
 tickmarkr capture | RUN | run-20260905-000000
-1 Home  4 Run  5 Evidence | content | 1–33/75 | 42 hidden
+1 Home  4 Run  5 Evidence | content | 1–33/76 | 43 hidden
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │1 Home         │RUN / RUNNING · 1/4 merged | blocked T3 | current-cycle tip PENDING | RUNNING |│1 Home                │
 │4 Run          │ tickmarkr  run-20260905-000000  │  1/4 done  │  0 esc  │  0h00m               │4 Run                 │
@@ -19,12 +19,13 @@ tickmarkr capture | RUN | run-20260905-000000
 │               │         ·  ·  ·  ·  ·  ·  ·    —           0                                  │                      │
 │               │         waiting on T2                                                         │                      │
 │               │    Txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx—          │                      │
-│               │         ·  ·  ·  ·  ·  ·  ·    —           0                                  │                      │
+│               │         D  ·  ·  ·  ·  ·  ·    —           0                                  │                      │
 │               │         queued                                                                │                      │
 │               │                                                                               │                      │
 │               │    area    SPEC · FLEET · RUN · GATE · UI · DOCS · REPO                       │                      │
 │               │    gates   bu build  te test  li lint  ev evidence  sc scope  ac acceptance  r│                      │
 │               │            ✔ passed   ✖ failed   · pending   ─ not declared (acceptance and re│                      │
+│               │    R running   Q queued   ? unknown   D disabled                              │                      │
 │               │                                                                               │                      │
 │               │───────────────────────────────────────────────────────────────────────────────│                      │
 │               │                                                                               │                      │
@@ -33,7 +34,6 @@ tickmarkr capture | RUN | run-20260905-000000
 │               │    T1    ███████████████████  1 dispatch · 2 review · 0 park                  │                      │
 │               │    T2    ████████████  1 dispatch · 0 review · 1 park                         │                      │
 │               │    T3      0 dispatch · 0 review · 0 park                                     │                      │
-│               │    Txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  0 dispatc│                      │
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 RUNNING | MERGED 1/4 | CURRENT TIP PENDING | fresh
 Tab Focus | Enter Open | a Actions | ? Keys | q Quit

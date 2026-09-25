@@ -499,3 +499,24 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
     }
   });
 });
+
+test("docs/codebase/TESTING.md's changed host-health section precisely documents the implemented latency-admission protocol including its measurement bounds.", () => {
+  const guide = readFileSync(join(codebaseDocs, "TESTING.md"), "utf8").split("**Host-health admission (OBS-1160):**")[1]?.split("**Regression tests")[0];
+  expect(guide, "host-health admission section").toBeTruthy();
+  const source = readFileSync(join(repoRoot, "src/run/host-health.ts"), "utf8");
+  const daemon = readFileSync(join(repoRoot, "src/run/daemon.ts"), "utf8");
+  const slack = readFileSync(join(repoRoot, "src/gates/test-manifest.ts"), "utf8");
+  const constant = (text: string, name: string) => Number(text.match(new RegExp(`export const ${name} = ([\\d_]+)`))?.[1].replaceAll("_", ""));
+  expect(constant(source, "HOST_PROBE_SAMPLES")).toBe(3);
+  expect(constant(source, "HOST_PROBE_SAMPLE_MS")).toBe(1_000);
+  expect(constant(source, "HOST_LATENCY_FLOOR_MS")).toBe(50);
+  expect(constant(slack, "FILE_HANG_SLACK")).toBe(3);
+  expect(constant(daemon, "SUITE_WAIT_CEILING_MS")).toBe(600_000);
+  expect(constant(daemon, "SUITE_POLL_MS")).toBe(250);
+  for (const clause of ["three sequential", "1,000 ms timeout", "3,000 ms budget", "max(50 ms, 3.0 × reference median)",
+    "600,000 ms", "250 ms", "at least 3,000 ms remains", "latest complete observation", "NODE_OPTIONS", "SIGKILL", "await close",
+    "host-reference", "host-observation", "host-degraded", "host-reference-reset", "referenceMs", "medianMs", "zero live suites at every poll",
+    "entire admission deadline", "unreadable host parks infra", "conservative-cap fallback", "Legacy journals"]) {
+    expect(guide, `host-health documentation lost ${clause}`).toContain(clause);
+  }
+});

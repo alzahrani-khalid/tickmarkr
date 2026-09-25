@@ -851,3 +851,18 @@ describe("release documentation", () => {
   });
 
 });
+
+test("RELEASING.md's per-release steps gain one appended numbered step, after step 5, that names the `TICKMARKR_TEST_FORCE_STALL=1` single-file command and the manifest-to-retry receipt proof it must produce before a release is complete.", () => {
+  const steps = perReleaseSteps();
+  expect([...steps.matchAll(/^([0-9]+)\. /gm)].map(match => Number(match[1]))).toEqual([1, 2, 3, 4, 5, 6]);
+  const appended = steps.slice(steps.indexOf("\n6. "));
+  expect(appended).toContain("Before a release is complete");
+  expect(appended).toContain("TICKMARKR_TEST_FORCE_STALL=1 npx --no-install vitest run tests/e2e/forced-stall.e2e.test.ts -t 'the enabled forced-stall release proof makes the integration tip verifier recover a real RPC-stranded serial file as parallel exit1 then serial-only exit0 under distinct nonces, so a helper-only green or a full-suite retry fails'");
+  for (const evidence of ["verifyIntegrationTip", "two-file manifest", "parallel exit1", "serial-only retry exit0", "distinct nonces", "both expected manifests", "original reporter certificates", "hashed receipts", "manifest-to-retry", "skipped expensive leaf is not release proof"]) {
+    expect(appended).toContain(evidence);
+  }
+  expect(steps).toContain("the single-fork projects `ci.public.yml` runs by name");
+  expect(steps).toContain("multi-project, tree-count-asserted full-suite proof");
+  expect(steps).not.toContain("the three single-fork projects");
+  expect(steps).not.toContain("four-project");
+});

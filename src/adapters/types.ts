@@ -509,6 +509,17 @@ export function promptFitsArgv(promptFile: string, platform: string = process.pl
 // ZAI coding-plan exhaustion text: "Insufficient balance or no resource package. Please recharge."
 // Anchor the distinctive full phrase, not the two-word "insufficient balance" fragment — that fires
 // on ordinary billing/wallet task output the harness edits (research Pitfall 3, 2026-07-10).
+// OBS-1161: transient provider capacity ("Selected model is at capacity") is NOT quota — the seat
+// comes back within minutes, so it takes bounded same-seat backoff before a same-floor failover and
+// never permanent demotion. Kept apart from QUOTA_RE so permanent quota policy stays untouched, and
+// anchored on the full phrase (the Pitfall-3 lesson: a bare "capacity" fires on ordinary work text).
+// A banner is the CLI speaking, so the phrase must OPEN its row — after at most an error glyph
+// (codex paints "■ Selected model is at capacity. …") or an "error:" label. Anything else in front —
+// a `>` quote, a quotation mark, a sentence — is the transcript QUOTING it: work evidence, never capacity.
+// ponytail: row-start grammar, not per-adapter fixtures — the ceiling is a worker whose own output
+// opens a row with the bare phrase inside the banner tail; widen the glyph set only from a captured frame.
+export const CAPACITY_RE = /^[ \t■⚠✗✘×!]*(?:(?:stream )?error:[ \t]*)?(?:(?:selected |the )?model is (?:currently |temporarily )?at capacity|(?:provider|service|server) is (?:currently )?at capacity)/im;
+
 export const QUOTA_RE = /rate.?limit|quota|usage limit|out of credits|insufficient credit|insufficient balance or no resource|\b429\b/i;
 
 // v1.5 MODEL-01: charset gate for detected model ids (research Pitfall 4, verified 2026-07-10).

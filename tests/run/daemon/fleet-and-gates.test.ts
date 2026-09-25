@@ -18,6 +18,7 @@ import { daemonEntrypoint, runDaemon, watchCommand } from "../../../src/run/daem
 import { gitHead, shOk } from "../../../src/run/git.js";
 import { journaledFailureBrief, Journal, reviewRoundsSinceApproval, runHasEnded } from "../../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
+import { releaseAll, releaseOn, workerBarrier } from "../../helpers/worker-barrier.js";
 
 
 async function seedGateSatisfiedResume(
@@ -474,24 +475,29 @@ describe("HYG-09 fleet hygiene (fake adapter, zero tokens)", () => {
 
   test("HYG-09: close only what you own — task A's done-close never closes task B's slot", async () => {
     // Pitfall 5 (anonymous-live-daemon trap): the done-close targets the slot handle the closer itself
-    // created, never a scan/label. Two concurrent tasks; T1 (instant shell) merges first — its done-close
-    // targets ONLY its own worker name. A scan would close T2's worker too (double-close for T2 ⇒ RED).
+    // created, never a scan/label. Two concurrent tasks; T1 merges first — its done-close targets ONLY
+    // its own worker name. A scan would close T2's worker too (double-close for T2 ⇒ RED).
+    // OBS-1163: T2's worker is barrier-held until the journal records T1's task-done, so T1 finishes
+    // first by construction rather than by a sleep that a loaded host could outrun.
+    const t2 = workerBarrier("hyg09-own-T2");
     const { repo, fake } = setupRepo(
       [T("T1"), T("T2")],
       { tasks: {
         T1: [{ shell: `echo a > a.txt && ${COMMIT} a`, result: { ok: true, summary: "a" } }],
-        T2: [{ shell: `sleep 0.4 && echo b > b.txt && ${COMMIT} b`, result: { ok: true, summary: "b" } }],
+        T2: [{ shell: `${t2.hold} && echo b > b.txt && ${COMMIT} b`, result: { ok: true, summary: "b" } }],
       } },
       "visibility:\n  keepPanes: run\n",
     );
     const { driver, ops } = orderedDriver();
-    const s = await runDaemon(repo, { adapters: [fake], runId: "run-hyg09-own", driver, concurrency: 2 });
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-hyg09-own", driver, concurrency: 2, narrate: releaseOn(t2, "task-done", "T1") })
+      .finally(() => releaseAll(t2));
     expect(s.done.sort()).toEqual(["T1", "T2"]);
+    expect(t2.releasedOn?.taskId).toBe("T1");
     const t1Name = ops.find((o) => o.kind === "slot" && /T1-worker-fake-a0-/.test(o.name ?? ""))?.name;
     const t2Name = ops.find((o) => o.kind === "slot" && /T2-worker-fake-a0-/.test(o.name ?? ""))?.name;
     expect(t1Name).toBeDefined();
     expect(t2Name).toBeDefined();
-    // T1 (instant) finishes first; the first worker close targets T1's own name, never T2's
+    // T1 finishes first (T2 was held on T1's task-done); the first worker close targets T1's own name, never T2's
     const firstWorkerClose = ops.find((o) => o.kind === "close" && /-worker-fake-a0-/.test(o.name ?? ""));
     expect(firstWorkerClose?.name).toBe(t1Name);
     // each task's worker slot closed exactly once — a scan that hit T2 during T1's done-close would

@@ -1,11 +1,16 @@
 // T7: journal + telemetry identical with vs without the attention-only notify sink
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead, worktreePath } from "../../src/run/git.js";
 import { Journal, type JournalEvent, type TelemetryRow } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+
+// Hold measured host input constant when comparing the observational sinks byte for byte.
+import { resetHostLatencySampleForTests, setHostLatencySampleForTests } from "../../src/run/host-health.js";
+beforeEach(() => { setHostLatencySampleForTests(async () => 20); });
+afterEach(() => { resetHostLatencySampleForTests(); });
 
 const VERDICT = "fake-judge-verdict-marker-39";
 

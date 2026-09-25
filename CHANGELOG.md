@@ -2,6 +2,41 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.6.1 — the suite stays honest under load
+
+**v2.6.1** removes false work signals from a loaded host: fixtures order by events rather than sleeps, a degraded host waits instead of spending a gate, and capacity errors fail over instead of paging. Run `run-20260925-022253-0000000000000127`: 15/15 merged. Every review was cross-vendor or ruled. Tip verify ran fresh (376 test files present; 374 executed).
+
+- **T1 — fixtures order by events (OBS-1163, OBS-1162).** The fake-worker race fixtures release on recorded events, not sleeps, and the quota fixtures write to their own isolated paths. An opt-in stress matrix (`TICKMARKR_TEST_STRESS`) proves the order under load.
+- **T2 — stranded-phase recovery on demand (OBS-1164).** An opt-in forced-stall fixture drives a real RPC-stranded serial file through the production tip verifier, which recovers it with one serial retry.
+- **T3/T4 — suite hygiene (OBS-1155, OBS-1159).**
+  - Cleanup reclaims only recorded test temporaries and every manifest listing directory.
+  - Gate and worker worktrees get their own Vitest cache.
+- **T5 — the executed keys ledger (OBS-1141).** The ledger runs serially, with its budget and mutations intact.
+- **T6 — host health (OBS-1160).** A degraded host keeps a gate in suite-wait instead of spending it.
+- **T7 — the worker reap (OBS-1146).** Detached children a worker leaves in its worktree are reaped before harvest, and the result is reported.
+- **T8 — build outputs (OBS-1094 add.2).** A recreated worktree rebuilds instead of borrowing a cached build verdict it has no outputs for.
+- **T9 — capacity (OBS-1161).** A transient provider-capacity error waits briefly, then fails over within the capability floor.
+- **T10/T11 — rechecks (OBS-1158, OBS-1106).**
+  - Plan and daemon give an approved recheck the same bounded priority.
+  - An infrastructure recheck re-parks without buying a repair.
+  - T10 also fixed a harvest race: a reap candidate that exits mid-sweep is gone, not unknown (OBS-1173).
+- **T12/T13 — the board and the record (OBS-1152, OBS-1154, OBS-1153).**
+  - Large valid graphs are retained.
+  - The board shows the real gate queue and phase transitions.
+  - The record names merged authors and credits preserved work to the attempt that produced it.
+- **T14/T15 — Fleet picks (OBS-1165).** Role preference selection is shared with production routing. `tickmarkr fleet --pick <role>` resolves a review or consult preference as JSON, and the overseer skill opens those seats through it.
+- **Fixed beside the run (own cross-vendor review and standalone verify).**
+  - The Linux worker reap no longer kills a same-session process that is not a descendant of the dispatch (OBS-1170).
+  - A timed-out or signalled process probe counts as unknown, not gone, so a live process is never spared (OBS-1173).
+  - The Orca launch command never types the checkout-proof frame verbatim, so a repainted echo can no longer fail a correct launch (OBS-1168).
+  - The 30 s first-liveness check applies only to pane drivers, so a buffering headless reviewer on the subprocess driver keeps its full timeout (OBS-1177).
+  - A stalled SELECTED suite now recovers: the one serial retry is built from the un-narrowed test command, so it lists exactly the stranded files (OBS-1166).
+- **Known gaps (queued, not shipped).**
+  - An approval acts on whatever park is open when it lands, not the one it was written for (OBS-1178).
+  - A selected-test pass that starts judge and review is not journaled (OBS-1176).
+  - The stress harness's deadline can leave fixture children behind (OBS-1167).
+  - A reap TOCTOU window between the last identity check and the signal (OBS-1171).
+
 ## v2.6.0 — the suite finishes and the gate tests the task's own tree
 
 **v2.6.0** makes a full test suite finish without a human, and makes the gate refuse to test a tree other than the task's own. Run `run-20260924-034515-0000000000000105`: 16/16 merged. Every review was cross-vendor or ruled. Tip verify ran fresh (366 test files present; 364 executed).

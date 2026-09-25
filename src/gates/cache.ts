@@ -5,7 +5,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Baseline } from "./baseline.js";
 import type { GateResult } from "./types.js";
-import { describeCapacity, inventoryDependencyLinks, type RunCapacity, resolvedCapacity, shGit, type VerificationProtocol, verificationProtocol } from "../run/git.js";
+import { checkoutIncarnation, describeCapacity, inventoryDependencyLinks, type RunCapacity, resolvedCapacity, shGit, type VerificationProtocol, verificationProtocol } from "../run/git.js";
 import { shq } from "../adapters/types.js";
 
 export const DEFAULT_VERDICT_CACHE_BOUND = 128;
@@ -147,9 +147,11 @@ export interface VerificationIdentity {
   gate?: string;
   /** which verifier produced it: a battery gate row or an integration-tip row (own report, own forgiveness rule) */
   scope?: VerificationScope;
-  /** Checkout location is diagnostic metadata; equal trees share verdicts across worktrees. */
+  /** Checkout location is diagnostic metadata; build outputs additionally require an incarnation. */
   worktree?: string;
   tree: string;
+  /** Build success also promises local outputs, which die with the checkout. */
+  checkoutIncarnation?: string;
   command: string;
   baseline: string;
   environment: string;
@@ -171,6 +173,8 @@ export async function computeVerificationIdentity(params: {
 }): Promise<VerificationIdentity | undefined> {
   const tree = params.tree ?? (await getWorktreeTree(params.worktree));
   if (!tree) return undefined;
+  const incarnation = params.gate === "build" ? checkoutIncarnation(params.worktree) : undefined;
+  if (params.gate === "build" && !incarnation) return undefined;
   const baseline = baselineIdentity(params.baseline);
   const env = environmentFingerprint({
     worktree: params.worktree,
@@ -187,6 +191,7 @@ export async function computeVerificationIdentity(params: {
     scope: params.scope ?? "battery",
     worktree: realpathSync(params.worktree),
     tree,
+    ...(incarnation ? { checkoutIncarnation: incarnation } : {}),
     command: params.command,
     baseline,
     environment: env.fingerprint,
@@ -197,8 +202,10 @@ export async function computeVerificationIdentity(params: {
 export function verificationIdentityKey(id: VerificationIdentity): string {
   const cmdHash = createHash("sha256").update(id.command).digest("hex").slice(0, 16);
   const gate = id.gate ?? "gate";
-  // Checkout location is diagnostic only. Scope separates each verifier's evidence policy.
-  const workingTree = createHash("sha256").update(id.tree).digest("hex");
+  // Lint/test remain content-addressed. Builds also promise outputs in this physical checkout.
+  // Scope continues to separate each verifier's evidence policy.
+  const workingTree = createHash("sha256").update(id.tree)
+    .update(id.gate === "build" ? `\0checkout:${id.checkoutIncarnation ?? "unbound"}` : "").digest("hex");
   return `${id.scope ?? "battery"}-${gate}-${workingTree}-${cmdHash}-${id.baseline}-${id.environment}`;
 }
 
@@ -259,6 +266,7 @@ export function reusedIdentity(id: VerificationIdentity): Record<string, unknown
     gate: id.gate ?? "gate",
     scope: id.scope ?? "battery",
     tree: id.tree,
+    ...(id.checkoutIncarnation ? { checkoutIncarnation: id.checkoutIncarnation } : {}),
     ...(id.worktree ? { worktree: id.worktree } : {}),
     command: id.command,
     baseline: id.baseline,

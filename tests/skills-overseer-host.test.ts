@@ -271,3 +271,29 @@ test("replaying D-265 (4) against the changed beat section finds the stand-down 
   expect(beat).toMatch(/A stop is kill-by-pid of an unowned\s+survivor after the two reads\./);
   expect(beat).not.toMatch(/pgrep -f "tickmarkr beat <tier>[^"]*--loop/);
 });
+
+
+test("The changed canonical overseer spawn/respawn contract requires every mapped seat purpose to consume a successful Fleet pick with the applicable vendor exclusions before using the existing visible-seat transport safeguards.", () => {
+  const skill = readShippedSkill();
+  const contract = skill.slice(skill.indexOf("**Fleet selection contract (OBS-1165)"), skill.indexOf("- **On herdr", skill.indexOf("**Fleet selection contract (OBS-1165)")));
+  for (const purpose of ["orchestrator", "records", "author (including planner, executor and scout)", "consultant", "lab-rater"]) {
+    expect(contract).toContain(`| ${purpose} | consult |`);
+  }
+  expect(contract).toContain("| independent reviewer (including checker and verifier) | review |");
+  expect(contract).toContain("including every respawn, replacement, delegated spawn and Leg-2 dispatch");
+  expect(contract).toContain("Never reuse a prior pick at respawn");
+  expect(contract).toContain("--pick review --exclude-vendor <author-vendor> --exclude-vendor <prior-reviewer-vendor>");
+  expect(contract).toContain("Consume only exit status zero and one complete JSON identity");
+  for (const field of ["role", "adapter", "model", "vendor", "channel"]) expect(contract).toContain(`\`${field}\``);
+  expect(contract).toContain("A nonzero refusal");
+  expect(contract).toContain("stops the spawn");
+  expect(contract).toContain("Build the launch command from the returned `adapter` and `model`");
+  expect(contract).toContain("Preserve the existing\nvisible-seat transport safeguards");
+  expect(contract).toContain("Unknown seat purposes require an explicit mapping decision");
+  expect(skill).toContain("First consume a successful `tickmarkr fleet --pick consult`");
+  expect(skill).toContain("Buy seat diversity through Fleet, at every dispatch and respawn");
+  expect(skill).toContain("--dangerously-bypass-approvals-and-sandbox");
+  expect(skill).toContain("-a never --sandbox workspace-write");
+  expect(skill).toContain("promptSuggestionEnabled");
+  expect(skill).toContain("turn_started");
+});

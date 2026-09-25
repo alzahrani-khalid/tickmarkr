@@ -14,6 +14,7 @@ import { retiredModelReason } from "../../src/adapters/model-lints.js";
 import { GLYPHS } from "../../src/brand.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
 import { formatFleetPrint, loadConfig, overlayBytesLoadError } from "../../src/config/config.js";
+import { pickRole } from "../../src/route/role-pick.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -2623,5 +2624,74 @@ describe("D-225: greyed ledger rows", () => {
     expect(picked.rows.every((row) => row.belowFloor)).toBe(true);
     expect(picked.ledger ?? []).toEqual([]);
     expect(picked.excludedNote).toContain("below routing.floors.implement (frontier) — not manageable here");
+  });
+});
+
+
+describe("Fleet role selection", () => {
+  test("test: fleet --pick returns the shared role choice as complete JSON identity after vendor exclusion without launching a seat or changing configuration, so printing a preference list instead of a resolved choice fails", async () => {
+    const { repo, adapter } = setup();
+    const globalDir = isolatedGlobal();
+    withOverlay(repo, `${FAKE_TIERS}consult:\n  prefer: [fake:fake-1, fake:fake-2]\n`);
+    const configPath = join(repo, ".tickmarkr", "config.yaml");
+    const before = readFileSync(configPath, "utf8");
+    const doctorPath = join(repo, ".tickmarkr", "doctor.json");
+    const doctorBefore = readFileSync(doctorPath, "utf8");
+    const probe = vi.spyOn(adapter, "probe");
+    const launch = vi.spyOn(adapter, "headlessCommand");
+    const interactiveLaunch = vi.spyOn(adapter, "interactiveCommand");
+    const fetcher = vi.fn(() => { throw new Error("pick must not refresh catalogs"); });
+    const output = vi.fn();
+    const cfg = loadConfig(repo, { globalDir });
+    const shared = pickRole("consult", cfg, [adapter], registry.readDoctor(repo)!, {
+      excludeVendors: new Set(["fake-a", "unrelated"]),
+    });
+    expect(shared.ok).toBe(true);
+    for (const isTTY of [false, true]) {
+      const input = new PassThrough();
+      Object.assign(input, { isTTY });
+      const result = await fleet(["--pick", "consult", "--exclude-vendor", "fake-a", "--exclude-vendor", "unrelated", "--global-dir", globalDir], repo, [adapter], {
+        input, output: { isTTY, write: output }, catalogFetcher: fetcher,
+      });
+      expect(typeof result).toBe("string");
+      const identity = JSON.parse(result as string);
+      expect(identity).toEqual({ role: "consult", adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api" });
+      if (shared.ok) expect(identity).toEqual({ role: "consult", ...Object.fromEntries(
+        ["adapter", "model", "vendor", "channel"].map((key) => [key, shared.channel[key as keyof typeof shared.channel]]),
+      ) });
+    }
+    expect(probe).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+    expect(interactiveLaunch).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(output).not.toHaveBeenCalled();
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(readFileSync(doctorPath, "utf8")).toBe(doctorBefore);
+  });
+
+  test("test: fleet --pick returns a named nonzero refusal for missing prefer versus a complete eligible selection for configured prefer, so unsupported roles or exhausted vendor filters silently defaulting fails", async () => {
+    const { repo, adapter } = setup();
+    const globalDir = isolatedGlobal();
+    const pick = (role: string, extra: string[] = []) => fleet(["--pick", role, "--global-dir", globalDir, ...extra], repo, [adapter]);
+    for (const role of ["consult", "review", "worker", "judge"]) {
+      expect(await pick(role)).toEqual({ code: 1, out: expect.stringContaining(`${role}.prefer: missing-prefer`) });
+    }
+    expect(await pick("orchestrator")).toEqual({ code: 1, out: expect.stringMatching(/orchestrator: unsupported-role/) });
+    for (const role of ["consult", "review"]) {
+      withOverlay(repo, `${FAKE_TIERS}${role}:\n  prefer: [fake:fake-1, fake:fake-2]\nrouting:\n  deny:\n    models: [fake:fake-1]\n`);
+      expect(JSON.parse(await pick(role) as string)).toEqual({ role, adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api" });
+      expect(await pick(role, ["--exclude-vendor", "fake-a", "--exclude-vendor", "fake-b"]))
+        .toEqual({ code: 1, out: expect.stringContaining(`${role}.prefer: no-eligible-preferred-channel`) });
+      withOverlay(repo, `${FAKE_TIERS}${role}:\n  prefer: [fake:fake-1]\nrouting:\n  allow:\n    models: [fake:fake-2]\n`);
+      expect(await pick(role)).toEqual({ code: 1, out: expect.stringContaining("no-eligible-preferred-channel") });
+    }
+    withOverlay(repo, `${FAKE_TIERS}consult:\n  prefer: [fake:fake-1]\n`);
+    const health = registry.readDoctor(repo)!;
+    health.fake.modelAuth!["fake-1"].authed = false;
+    registry.writeDoctor(repo, health);
+    expect(await pick("consult")).toEqual({ code: 1, out: expect.stringContaining("consult.prefer: no-eligible-preferred-channel") });
+    const stale = new Date(0);
+    utimesSync(join(repo, ".tickmarkr", "doctor.json"), stale, stale);
+    expect(await pick("consult")).toEqual({ code: 1, out: expect.stringContaining("consult.prefer: probe data missing or stale") });
   });
 });

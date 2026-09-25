@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { compareToBaseline, fingerprint } from "../../src/gates/baseline.js";
-import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, assertRefsWritable, createWorktree, gitHead, linkNodeModules, preserveWorktree, probeRefsWritable, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, assertRefsWritable, classifyIdentityProbe, createWorktree, gitHead, linkNodeModules, preserveWorktree, probeRefsWritable, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -882,4 +882,18 @@ test("test: every existing pid-callback consumer still receives the pid it recei
     ]);
     expect(receipts.slice(1).every((r) => r.pid === pids[1])).toBe(true);
   } finally { resetSpawnForTests(); }
+});
+
+// OBS-1173 add.2: the ps identity probe distinguishes a pid that is GONE (ps's clean exit 1 with
+// nothing printed, "") from a probe that FAILED and proves nothing (null): its 15 s timeout kill, a
+// signal, a spawn error, an overflow, or any other exit. Classified without a real ps or a 15 s wait.
+test("processIdentity classifies only ps's clean no-such-process exit as gone; a timeout or signal is a failed probe", () => {
+  expect(classifyIdentityProbe(null, " Fri Sep 25   02:00:00 2026\n")).toBe("Fri Sep 25 02:00:00 2026");
+  expect(classifyIdentityProbe({ code: 1 }, "")).toBe("");
+  expect(classifyIdentityProbe({ code: null, killed: true, signal: "SIGTERM" }, "")).toBeNull();
+  expect(classifyIdentityProbe({ code: null, signal: "SIGKILL" }, "")).toBeNull();
+  expect(classifyIdentityProbe({ code: "ENOENT" }, "")).toBeNull();
+  expect(classifyIdentityProbe({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }, "Fri")).toBeNull();
+  expect(classifyIdentityProbe({ code: 2 }, "")).toBeNull();
+  expect(classifyIdentityProbe(null, "")).toBeNull();
 });

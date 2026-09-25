@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { afterEach, expect, test, vi } from "vitest";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../../src/drivers/types.js";
@@ -9,9 +9,12 @@ import * as git from "../../../src/run/git.js";
 import { Journal } from "../../../src/run/journal.js";
 import { loadGraph } from "../../../src/graph/graph.js";
 import { COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+import { ShellReceiptSchema } from "../../../src/run/protocol.js";
 
 const STALL = 600;
-afterEach(() => {
+const childCleanup: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const cleanup of childCleanup.splice(0)) await cleanup();
   vi.restoreAllMocks();
   daemon.resetAttemptHardTimeoutMsForTests();
   daemon.resetNudgeTimingForTests();
@@ -27,6 +30,7 @@ type Scenario = {
   transportError?: boolean; dirtyRetry?: boolean; sibling?: boolean; dispatchError?: boolean;
   repeat?: boolean; halt?: boolean;
   cleanupFailure?: "survivors" | "reaper" | "driver";
+  ownedReap?: ReturnType<typeof ownedReapHarness>;
 };
 async function scenario(options: Scenario = {}) {
   vi.restoreAllMocks();
@@ -65,7 +69,7 @@ async function scenario(options: Scenario = {}) {
   const groupFiles = new Map<string, number>();
   let cleanupFailed = false;
   vi.spyOn(stall, "readOwnedProcessGroup").mockImplementation((path) => groupFiles.get(path));
-  vi.spyOn(stall, "reapOwnedProcessGroup").mockImplementation(async (group) => {
+  if (!options.ownedReap) vi.spyOn(stall, "reapOwnedProcessGroup").mockImplementation(async (group) => {
     if (!cleanupFailed && options.cleanupFailure !== "driver" && options.cleanupFailure
         && [...workers.values()].some((worker) => worker.task === "T1" && worker.group === group)) {
       cleanupFailed = true;
@@ -75,6 +79,7 @@ async function scenario(options: Scenario = {}) {
     if (group !== undefined) { kills.push(group); alive.delete(group); }
     return [];
   });
+  options.ownedReap?.install(alive, kills);
   const priorHandlers = process.listeners("SIGTERM");
   let halted = false;
   let exited = false;
@@ -93,6 +98,7 @@ async function scenario(options: Scenario = {}) {
       const groupFile = / > '([^']+\.pgid)'/.exec(readFileSync(script, "utf8"))![1]!;
       groupFiles.set(groupFile, group);
       alive.add(group);
+      await options.ownedReap?.launch(slot, script, group);
       if (options.dirtyRetry && task === "T1") {
         if (attempt === 0) writeFileSync(`${slot.cwd}/rescue.txt`, "uncommitted rescue bytes\n");
         else carries.push(readFileSync(`${slot.cwd}/rescue.txt`, "utf8"));
@@ -134,6 +140,7 @@ async function scenario(options: Scenario = {}) {
     waitAgentStatus: async () => true,
     nudge: async () => false,
     async close(slot) {
+      if (workers.has(slot.id)) options.ownedReap?.beforeGate();
       if (!cleanupFailed && options.cleanupFailure === "driver" && workers.get(slot.id)?.task === "T1") {
         cleanupFailed = true;
         throw new Error("driver close failed");
@@ -279,3 +286,178 @@ test.each(["survivors", "reaper", "driver"] as const)("failed-task cleanup recor
       .toMatchObject({ processGroup: group, survivors: [group] });
   }
 }, 30_000);
+
+// The host boundary is deterministic even on sandboxed macOS (where ps is denied).
+// The stray and spared controls are real, detached, live OS children. Only process
+// observation is injected; runDaemon, its close path, receipts and the reaper are real.
+function ownedReapHarness(mode: "clean" | "exited" | "exclusions" | "snapshot" | "ownership" | "survivor" | "reuse") {
+  const rows = new Map<number, stall.ReapProcess>();
+  const details = new Map<number, { cwd: string; suiteParent?: number }>();
+  const children: ChildProcess[] = [];
+  const signalled: number[] = [];
+  let stray: ChildProcess;
+  let gatePid: number | undefined;
+  let postKill = false;
+  let replaced = false;
+  let beforeGate = false;
+  let nextFakePid = 910_000;
+  const running = (child: ChildProcess) => child.exitCode === null && child.signalCode === null;
+  const add = (pid: number, ppid: number, group: number, session: string, cwd: string, command = "fixture-child") => {
+    rows.set(pid, { pid, ppid, group, session, identity: `${pid}:original`, command });
+    details.set(pid, { cwd: realpathSync(cwd) });
+  };
+  const launchChild = async (cwd: string) => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, detached: true, stdio: "ignore" });
+    children.push(child);
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.once("exit", () => rows.delete(child.pid!));
+    childCleanup.push(async () => {
+      if (!running(child)) return;
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      child.kill("SIGKILL");
+      await exited;
+    });
+    return child;
+  };
+  return {
+    signalled, children,
+    get strayPid() { return stray.pid!; },
+    get gatePid() { return gatePid; },
+    get advanced() { return beforeGate; },
+    install(alive: Set<number>, kills: number[]) {
+      const activeReceipts = git.activeShellIdentities;
+      vi.spyOn(git, "activeShellIdentities").mockImplementation(() => new Map([...activeReceipts()]
+        .map(([pid, identity]) => [pid, identity ?? rows.get(pid)?.identity])));
+      vi.spyOn(stall.workerReapHost, "snapshot").mockImplementation(() => {
+        if (mode === "snapshot" && postKill) return undefined;
+        return [...rows.values()].map((row) => ({ ...row }));
+      });
+      vi.spyOn(stall.workerReapHost, "inspect").mockImplementation((pid) => {
+        if (mode === "ownership" && pid === stray?.pid) return undefined;
+        return details.get(pid);
+      });
+      vi.spyOn(stall.workerReapHost, "identity").mockImplementation((pid) => {
+        if (mode === "reuse" && postKill && pid === stray?.pid && !replaced) {
+          replaced = true;
+          rows.get(pid)!.identity = `${pid}:replacement`;
+        }
+        return rows.get(pid)?.identity;
+      });
+      vi.spyOn(stall.workerReapHost, "kill").mockImplementation((pid) => {
+        signalled.push(pid);
+        postKill = true;
+        if (pid < 0) {
+          kills.push(-pid); alive.delete(-pid);
+          for (const row of rows.values()) if (row.group === -pid) rows.delete(row.pid);
+          return;
+        }
+        if (alive.has(pid)) { kills.push(pid); alive.delete(pid); rows.delete(pid); return; }
+        if (mode === "survivor" && pid === stray.pid) return;
+        process.kill(pid, "SIGKILL");
+      });
+    },
+    async launch(slot: Slot, script: string, group: number) {
+      const nested = `${slot.cwd}/nested/deeper`;
+      mkdirSync(nested, { recursive: true });
+      // The shell is an ancestor in the same session, but is never a target.
+      const pane = nextFakePid++;
+      add(pane, 1, pane, String(pane), slot.cwd, "operator-pane-shell");
+      add(group, pane, group, String(pane), slot.cwd, `bash ${script}`);
+      stray = await launchChild(nested);
+      // A setsid child has a different group AND session, but descends from dispatch.
+      add(stray.pid!, group, stray.pid!, String(stray.pid), nested);
+      if (mode === "exited") {
+        const groupFile = / > '([^']+\.pgid)'/.exec(readFileSync(script, "utf8"))![1]!;
+        const startedAt = "Fri Sep 25 02:00:00 2026";
+        rows.get(pane)!.startedAt = startedAt;
+        writeFileSync(`${groupFile}.session`, String(pane));
+        writeFileSync(`${groupFile}.parent`, `${pane} ${startedAt}\n`);
+        rows.delete(group);
+        rows.get(stray.pid!)!.ppid = 1;
+        rows.get(stray.pid!)!.session = String(pane);
+        // OBS-1170: the session id is evidence only. With the root gone, the stray is owned because
+        // the CPU accountant OBSERVED it as a descendant while the root lived — seed that record.
+        const start = stall.WorkerTreeCpuAccountant.prototype.start;
+        vi.spyOn(stall.WorkerTreeCpuAccountant.prototype, "start").mockImplementation(async function (this: stall.WorkerTreeCpuAccountant) {
+          (this as unknown as { identities?: Map<number, string> }).identities?.set(stray.pid!, rows.get(stray.pid!)!.identity);
+          return start.call(this);
+        });
+      }
+      if (mode !== "exclusions") return;
+      const sibling = `${slot.cwd}-sibling`;
+      mkdirSync(sibling, { recursive: true });
+      const neighbor = await launchChild(sibling);
+      add(neighbor.pid!, group, neighbor.pid!, String(pane), sibling);
+      const foreign = await launchChild(nested);
+      add(foreign.pid!, 1, foreign.pid!, String(foreign.pid), nested);
+      const marked = await launchChild(nested);
+      add(marked.pid!, group, marked.pid!, String(pane), nested);
+      details.get(marked.pid!)!.suiteParent = process.pid;
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => { started = resolve; });
+      const gate = git.shell("exec sleep 30", nested, 30_000, false, { onReceipt(receipt) {
+        expect(ShellReceiptSchema.safeParse(receipt).success).toBe(true);
+        if (receipt.outcome !== "started") return;
+        gatePid = receipt.pid!;
+        add(gatePid, group, gatePid, String(pane), nested);
+        // Receipt ownership independently protects this child, with no suite env marker.
+        void git.resolveActiveShellIdentities().then(() => {
+          const identity = git.activeShellIdentities().get(gatePid!);
+          if (identity) rows.get(gatePid!)!.identity = identity;
+          started();
+        });
+      } });
+      childCleanup.push(async () => {
+        if (gatePid !== undefined) { try { process.kill(-gatePid, "SIGKILL"); } catch { /* exited */ } }
+        await gate;
+        expect(git.activeShellIdentities().has(gatePid!)).toBe(false);
+      });
+      await ready;
+    },
+    beforeGate() {
+      beforeGate = true;
+      expect(running(stray), "the detached worker must be dead before close permits gates").toBe(false);
+      for (const child of children.filter((child) => child !== stray)) expect(running(child)).toBe(true);
+      if (gatePid !== undefined) expect(() => process.kill(gatePid!, 0)).not.toThrow();
+    },
+  };
+}
+
+test("test: the production daemon reaps the detached nested-cwd worker child before the next gate then records its stray pid with zero survivors, so the live child retained by pgid-only cleanup fails", async () => {
+  for (const mode of ["clean", "exited"] as const) {
+    const host = ownedReapHarness(mode);
+    const result = await scenario({ ownedReap: host, trailerAt: 0 });
+    expect(result.summary.done, mode).toEqual(["T1"]);
+    expect(host.advanced).toBe(true);
+    const reap = result.events.findIndex((event) => event.event === "worker-process-reaped");
+    const gate = result.events.findIndex((event) => event.event === "phase-start" && event.data.phase === "gates");
+    expect(reap).toBeGreaterThanOrEqual(0);
+    expect(gate).toBeGreaterThan(reap);
+    expect(result.events[reap]!.data).toMatchObject({ strays: [host.strayPid], survivors: [] });
+  }
+}, 30_000);
+
+test("test: the production daemon reaps a nested-cwd stray preserving the receipt-owned gate child, the similarly prefixed sibling-worktree child and a foreign-session process whose cwd is inside the same worktree, so ownership based on a raw path prefix or on cwd alone fails", async () => {
+  const host = ownedReapHarness("exclusions");
+  const result = await scenario({ ownedReap: host, trailerAt: 0 });
+  expect(result.summary.done).toEqual(["T1"]);
+  expect(host.advanced).toBe(true);
+  expect(host.signalled.filter((pid) => pid > 0)).toEqual([host.strayPid]);
+  expect(result.events.find((event) => event.event === "worker-process-reaped")?.data)
+    .toMatchObject({ strays: [host.strayPid], survivors: [] });
+  expect(git.activeShellIdentities().has(host.gatePid!)).toBe(true);
+}, 30_000);
+
+test("test: the production daemon refuses to advance after an incomplete sweep with unknown or surviving identity evidence while sparing a reused pid identity, so an unreadable snapshot reported as zero survivors fails", async () => {
+  for (const mode of ["snapshot", "ownership", "survivor", "reuse"] as const) {
+    const host = ownedReapHarness(mode);
+    const result = await scenario({ ownedReap: host, trailerAt: 0 });
+    expect(result.summary.done, mode).toEqual([]);
+    expect(host.advanced, mode).toBe(false);
+    expect(result.events.some((event) => event.event === "phase-start" && event.data.phase === "gates"), mode).toBe(false);
+    const reap = result.events.find((event) => event.event === "worker-process-reaped")!;
+    expect(reap.data.survivors, mode).toEqual(mode === "survivor" ? [host.strayPid] : null);
+    if (mode === "reuse") expect(host.signalled).not.toContain(host.strayPid);
+    for (const cleanup of childCleanup.splice(0)) await cleanup();
+  }
+}, 60_000);

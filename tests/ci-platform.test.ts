@@ -14,7 +14,7 @@ const splitGateCommands = [
   "npm run build",
   "npm run lint",
   "npm run test:coverage -- --project suite --project built-cli --project signal-reaper",
-  "npx vitest run --project sync-heavy",
+  "npx vitest run --project sync-heavy --project keys-ledger",
 ];
 const publicGateCommands = [
   "npm run build",
@@ -23,7 +23,7 @@ const publicGateCommands = [
 npm run test:coverage -- --project suite 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
 `,
   `set -o pipefail
-npx vitest run --project sync-heavy --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
 `,
   `sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"`,
 ];
@@ -84,7 +84,7 @@ describe("CI platform lanes", () => {
     // The matcher must recognise plain runner forms as well as the coverage form — asserted on the
     // commands themselves, not by counting steps: the public export ships only ci.public.yml, whose
     // every runner step IS a coverage invocation, so a step-count guard reds the exported tree alone.
-    expect(invokesTestRunner("npx vitest run --project sync-heavy"), "plain vitest form").toBe(true);
+    expect(invokesTestRunner("npx vitest run --project sync-heavy --project keys-ledger"), "plain vitest form").toBe(true);
     expect(invokesTestRunner(publicGateCommands[2]!), "coverage form").toBe(true);
     expect(invokesTestRunner("npm run build"), "non-runner command").toBe(false);
 

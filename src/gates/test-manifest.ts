@@ -1,12 +1,22 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TEST_REPORTER_SOURCE } from "./test-reporter.js";
 import { shq } from "../adapters/types.js";
 import { beginGateEvidence, redactGateOutput, type GateEvidenceOptions, type BaselineFileDuration } from "./baseline.js";
 import type { GateEvidenceReceipt } from "../run/protocol.js";
 import { FORK_CAP_ENV, ROUTING_ENV_SEAMS, SUITE_PARENT_ENV, shell, resolvedCapacity, verificationProtocol } from "../run/git.js";
+
+// Outside the shared dependency symlink and ignored by the shipped repository.
+export const VITEST_CACHE_ENV = "TICKMARKR_VITEST_CACHE_DIR";
+export function worktreeVitestCache(cwd: string, inherited?: string): string {
+  const local = resolve(cwd, ".vitest-cache");
+  const candidate = inherited ? resolve(cwd, inherited) : local;
+  const within = relative(local, candidate);
+  return within === "" || (!isAbsolute(within) && within !== ".." && !within.startsWith(`..${sep}`))
+    ? candidate : local;
+}
 
 /**
  * VL-1 (OBS-985 lineage): a test gate's completion must be the runner's OWN report, never a stdout
@@ -473,6 +483,7 @@ export interface ManifestGateOutcome {
  * verdict measured with `pretest` hooks is never compared to one without. */
 function manifestEnvironment(cwd: string): { env: NodeJS.ProcessEnv; verification: ReturnType<typeof verificationProtocol> } {
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(cwd, "node_modules/.bin")}:${process.env.PATH ?? ""}`,
+    [VITEST_CACHE_ENV]: worktreeVitestCache(cwd),
     [FORK_CAP_ENV]: String(resolvedCapacity().forkCap), [SUITE_PARENT_ENV]: String(process.pid) };
   const verification = verificationProtocol(env, cwd);
   for (const key of ROUTING_ENV_SEAMS) delete env[key];
@@ -514,6 +525,7 @@ export async function manifestFileCount(cmd: string, cwd: string): Promise<numbe
     const { files } = await discoverTestManifest(cmd, cwd, { dir, nonce: randomBytes(16).toString("hex"), env: manifestEnvironment(cwd).env });
     return files.length;
   } catch { return null; }
+  finally { rmSync(dir, { recursive: true, force: true }); } // OBS-1155: the listing directory is the capture's alone, listed or not
 }
 
 /** Vitest's forks pool awaits the parallel phase, then throws before the single-fork phase
@@ -546,6 +558,17 @@ function strandedSingleForkFiles(files: string[], nonce: string, run: ManifestRu
   return single;
 }
 
+/** The stranded single-fork retry: positional filters are substring matches that OR with any filter
+ * the command already carries, and under a `projects` config the CLI `--exclude` never subtracts such a
+ * selection (OBS-1166: a selected screen's retry rediscovered the whole selection and refused). So the
+ * retry is built from the UN-narrowed base command, its own `--` rule, the stranded files as the only
+ * positional filters, and an `--exclude` of every completed file; the caller then requires discovery
+ * to prove the exact retry set before launch. */
+export function singleForkRetryCommand(base: string, cwd: string, stranded: readonly string[], completed: readonly string[]): string {
+  const excluded = completed.map(f => `--exclude=${shq(f.replace(/[\\*?[\]{}()!+@]/g, "\\$&"))}`).join(" ");
+  return `${base}${runnerInvocation(base, cwd).separator} ${stranded.map(f => shq(join(cwd, f))).join(" ")} ${excluded}`;
+}
+
 /** One configured runner execution, and its own collection under the same arguments and environment.
  * The installed runner is trusted (R28 add.1 option B); the nonce catches stale artifacts, not forgery. */
 export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
@@ -554,6 +577,9 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
   overallCeilingMs?: number;
   artifactDir?: string;
   evidence?: GateEvidenceOptions;
+  /** OBS-1166: the configured command BEFORE a selected screen narrowed it, so a stranded retry's
+   * only positional filters are the stranded files. Absent (a full suite), `cmd` is that command. */
+  retryBaseCommand?: string;
 }): Promise<ManifestGateOutcome> {
   const dir = opts.artifactDir ?? mkdtempSync(join(tmpdir(), "tickmarkr-test-report-"));
   let nonce = randomBytes(16).toString("hex");
@@ -596,11 +622,7 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
       recovery = { firstNonce: nonce, firstReportPath: reportPath, retryNonce, files: stranded };
       nonce = retryNonce;
       reportPath = join(dir, `test-manifest-report-${nonce}.json`);
-      // Positional filters are substring matches (and OR with existing filters). Exclude every
-      // completed file as well, then require discovery to prove the exact retry set before launch.
-      const excluded = files.filter(f => !stranded.includes(f)).map(f =>
-        `--exclude=${shq(f.replace(/[\\*?[\]{}()!+@]/g, "\\$&"))}`).join(" ");
-      const retryCommand = `${cmd}${invocation.separator} ${stranded.map(f => shq(join(cwd, f))).join(" ")} ${excluded}`;
+      const retryCommand = singleForkRetryCommand(opts.retryBaseCommand ?? cmd, cwd, stranded, files.filter(f => !stranded.includes(f)));
       const listed = await discoverTestManifest(retryCommand, cwd, { dir, nonce, env,
         overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } });
       evidenceReceipts.push(...listed.evidenceReceipts);

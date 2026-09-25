@@ -19,6 +19,7 @@ import { runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../../src/run/git.js";
 import { activeRetryBan, deferredReviewFindings, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingConsultGuidance, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
 import { COMMIT, authedModels, setupRepo, T } from "../../helpers/tmprepo.js";
+import { sameBasePair } from "../../helpers/worker-barrier.js";
 
 
 /**
@@ -754,19 +755,22 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
     });
 
     test("a run ending with a failed/blocked task keeps that task's worktree and removes only merged-done ones", async () => {
+      const pair = sameBasePair("wt-partial", "T1", "T2");
       const { repo, fake } = setupRepo(
         [T("T1"), T("T2")],
         {
           consult: { action: "human", notes: "conflicting edits need a person" },
           tasks: {
-            // Keep both worktrees based on the same integration tip, but make the first merge
-            // deterministic under full-suite load so this remains a cleanup oracle, not a race.
-            T1: [{ shell: `sleep 0.2 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
-            T2: [{ shell: `sleep 1.2 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
+            // Keep both worktrees based on the same integration tip: T2's worker is barrier-held until
+            // the journal records T1's merge, and T1's until T2's worker-launch (OBS-1163), so this
+            // stays a cleanup oracle, not a race.
+            T1: [{ shell: `${pair.ready.hold} && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
+            T2: [{ shell: `${pair.loser.hold} && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
           },
         },
       );
-      const s = await runDaemon(repo, { adapters: [fake], runId: "run-wt-partial" });
+      const s = await runDaemon(repo, { adapters: [fake], runId: "run-wt-partial", narrate: pair.narrate() }).finally(pair.release);
+      expect(pair.violations(Journal.open(repo, "run-wt-partial").read())).toEqual([]);
       expect(s.done).toHaveLength(1);
       expect(s.human).toHaveLength(1);
       const doneId = s.done[0]!;
@@ -780,26 +784,27 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(existsSync(worktreePath(repo, `${s.branch}--${parkedId}`))).toBe(true);
     });
 
-    // OBS-1128 (absorbing OBS-1095): this fixture (the equal `sleep 0.3` pair at retry.test.ts:788-789)
-    // and the runId-isolation one below (the pair at :819-820) raced their two workers, so on a loaded
-    // host either merge could land first and neither landed in time (D-295 add.3). Both now carry the
-    // hardened sibling's ordered pair from retry.test.ts:763-764 — 0.2 then 1.2 — and name the earlier
-    // worker as the one that merges. Delays only: no fixture's repair budget (its absence of an inline
-    // timeout) is touched, so both keep the project's 20 s ceiling they already ran under.
+    // OBS-1128 (absorbing OBS-1095): this fixture and the runId-isolation one below raced their two
+    // workers on equal sleeps, so on a loaded host either merge could land first and neither landed
+    // in time (D-295 add.3). OBS-1163 replaced the ordered sleeps that followed with barriers: T2's
+    // worker holds until the journal records T1's merge and T1's until T2's worker-launch, so the
+    // earlier worker is named by the event it waited for, not by a delay a loaded host could outrun.
     test("resume of a prior run whose worktrees were cleaned merges the earlier finishing worker first then re-creates what it needs and completes", async () => {
+      const pair = sameBasePair("wt-resume", "T1", "T2");
       const { repo, fake, scriptPath } = setupRepo(
         [T("T1"), T("T2")],
         {
           consult: { action: "human", notes: "conflicting edits need a person" },
           tasks: {
-            T1: [{ shell: `sleep 0.2 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
-            T2: [{ shell: `sleep 1.2 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
+            T1: [{ shell: `${pair.ready.hold} && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
+            T2: [{ shell: `${pair.loser.hold} && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
           },
         },
       );
-      const first = await runDaemon(repo, { adapters: [fake], runId: "run-wt-resume" });
-      // The 0.2s worker reaches the clean integration tip first and merges; the 1.2s worker meets
-      // its shared.txt already written and parks on the merge conflict.
+      const first = await runDaemon(repo, { adapters: [fake], runId: "run-wt-resume", narrate: pair.narrate() }).finally(pair.release);
+      expect(pair.violations(Journal.open(repo, "run-wt-resume").read())).toEqual([]);
+      // T1 is released once T2 has launched on the same tip, and merges; T2, released on that merge
+      // row, meets its shared.txt already written and parks on the merge conflict.
       expect(first.done).toEqual(["T1"]);
       expect(first.human).toEqual(["T2"]);
       const firstRows = Journal.open(repo, "run-wt-resume").read();
@@ -824,19 +829,21 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
     });
 
     test("only worktrees recorded for THIS run id are touched with the earlier finishing worker merged first and never another run's", async () => {
+      const pair = sameBasePair("wt-keep", "T1", "T2");
       const { repo, fake } = setupRepo(
         [T("T1"), T("T2")],
         {
           consult: { action: "human", notes: "conflicting edits need a person" },
           tasks: {
-            // OBS-1128: the sibling's ordered pair (retry.test.ts:763-764), not the equal `sleep 0.3`
-            // race this fixture carried — the cleanup oracle needs a merge that lands in time.
-            T1: [{ shell: `sleep 0.2 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
-            T2: [{ shell: `sleep 1.2 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
+            // OBS-1163: T2 holds until T1's merge row and T1 until T2's launch — the cleanup oracle
+            // needs a same-base merge that lands first.
+            T1: [{ shell: `${pair.ready.hold} && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
+            T2: [{ shell: `${pair.loser.hold} && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
           },
         },
       );
-      const partial = await runDaemon(repo, { adapters: [fake], runId: "run-wt-keep" });
+      const partial = await runDaemon(repo, { adapters: [fake], runId: "run-wt-keep", narrate: pair.narrate() }).finally(pair.release);
+      expect(pair.violations(Journal.open(repo, "run-wt-keep").read())).toEqual([]);
       expect(partial.done).toEqual(["T1"]);
       expect(partial.human).toEqual(["T2"]);
       const partialRows = Journal.open(repo, "run-wt-keep").read();
@@ -857,34 +864,6 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(runWorktreeDirs(repo, partial.branch)).toEqual(keptDirs);
     });
 
-    // OBS-1128 (absorbing OBS-1095): the closed list this describe's conflict fixtures come from.
-    // Two of the three pairs above raced on equal `sleep 0.3`, so a loaded host landed neither merge
-    // in time (D-295 add.3) and the fixture could not say which worker merged. Scanning the source
-    // keeps the list closed — a fourth pair, or a revert to equal delays, is red here rather than
-    // flaky under suite load.
-    test("both conflict fixtures delay their two workers by distinct sleeps ordered as the hardened sibling at retry.test.ts:763 does, citing the changed lines", () => {
-      // A pattern over the fixture shape, never a fixture line, so this scanner collects no part of
-      // its own source.
-      const conflictFixture = /^\s*T([12]): \[\{ shell: `sleep ([0-9.]+) && echo [AB] > shared\.txt/;
-      const found: Array<{ id: string; delay: number; line: number }> = [];
-      readFileSync(new URL(import.meta.url), "utf8").split("\n").forEach((text, index) => {
-        const hit = conflictFixture.exec(text);
-        if (hit) found.push({ id: hit[1]!, delay: Number(hit[2]), line: index + 1 });
-      });
-      const cite = (rows: Array<{ line: number }>) => rows.map((row) => `retry.test.ts:${row.line}`).join(" + ");
-
-      // The hardened sibling first, then the two fixtures this change ordered: nothing else in the
-      // file races two workers over one contended path.
-      expect(found.map((row) => row.id), cite(found)).toEqual(["1", "2", "1", "2", "1", "2"]);
-
-      // The sibling's own ordered pair (retry.test.ts:763-764): T1 lands on the clean integration
-      // tip, T2 arrives a second later and meets the conflict it wrote.
-      const ordered = [0.2, 1.2];
-      for (const pair of [found.slice(0, 2), found.slice(2, 4), found.slice(4, 6)]) {
-        expect(pair[1]!.delay, cite(pair)).toBeGreaterThan(pair[0]!.delay);
-        expect(pair.map((row) => row.delay), cite(pair)).toEqual(ordered);
-      }
-    });
   });
 
   describe("OBS-34 integration-tip verify", () => {
@@ -1068,7 +1047,7 @@ describe("per-task timeout override (OBS-37b)", () => {
     const source = readFileSync(join(import.meta.dirname, "..", "..", "..", "src", "run", "daemon.ts"), "utf8");
     expect(source.match(/await recreateTaskWorktree\(taskBranch, taskBase, priorWt\)/g)).toHaveLength(2);
     expect(source.match(/driver\.worktree\(repoRoot, taskBranch, taskBase\)/g)).toHaveLength(1);
-    const preserveAt = source.indexOf("await preserveWorktree(priorWt)");
+    const preserveAt = source.indexOf("await preserveWorktree(priorWt, producer)");
     const removeAt = source.indexOf("return driver.worktree(repoRoot, taskBranch, taskBase)");
     expect(preserveAt).toBeGreaterThanOrEqual(0);
     expect(removeAt).toBeGreaterThan(preserveAt);

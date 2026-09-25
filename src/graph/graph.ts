@@ -220,22 +220,35 @@ export function chainDepth(g: RunGraph): Map<string, number> {
 // OBS-1018: admission is critical-path order — deepest chain root first, ties in declaration order.
 // The daemon's dispatch loop slices this list unchanged. Stated limit: resume-restore of previously
 // in-flight attempts keeps its own precedence (src/run/daemon.ts); only fresh admission is ordered here.
-export function readyTasks(g: RunGraph): Task[] {
+// OBS-1158: `prioritized` names tasks holding a pending battery (recheck) approval. Among READY tasks
+// of equal depth an approved recheck precedes fresh work; deeper fresh work keeps its rank, and a
+// recheck that is not ready (dependency-blocked) is not admitted at all, so it gains nothing here.
+export function readyTasks(g: RunGraph, prioritized: ReadonlySet<string> = NO_PRIORITY): Task[] {
   const done = new Set(g.tasks.filter((t) => t.status === "done").map((t) => t.id));
   const depth = chainDepth(g);
+  const rank = (t: Task) => (prioritized.has(t.id) ? 1 : 0);
   return g.tasks
     .filter((t) => t.status === "pending" && t.deps.every((d) => done.has(d)))
-    .sort((a, b) => depth.get(b.id)! - depth.get(a.id)!); // Array#sort is stable: equal depths keep declaration order
+    .sort((a, b) => depth.get(b.id)! - depth.get(a.id)! || rank(b) - rank(a)); // Array#sort is stable: remaining ties keep declaration order
+}
+
+const NO_PRIORITY: ReadonlySet<string> = new Set();
+
+// OBS-1158: the one seam plan and the daemon share for battery priority — journal approval actions
+// in (src/run/journal.ts pendingApprovalActions), the ids whose pending authority is `battery` out.
+// Waivers, worker-funding approvals and inert releases never qualify; a consumed approval is absent.
+export function batteryPriority(actions: Iterable<{ taskId: string; authority: string }>): Set<string> {
+  return new Set([...actions].filter((a) => a.authority === "battery").map((a) => a.taskId));
 }
 
 // OBS-1018: the dispatch wave each pending task would enter at `concurrency` slots if every wave
 // took one tick — computed by draining readyTasks, so plan and daemon can never disagree on order.
 // Tasks already past pending carry no wave.
-export function dispatchWaves(g: RunGraph, concurrency: number): Map<string, number> {
+export function dispatchWaves(g: RunGraph, concurrency: number, prioritized: ReadonlySet<string> = NO_PRIORITY): Map<string, number> {
   const waves = new Map<string, number>();
   let sim = g;
   for (let wave = 1; ; wave++) {
-    const batch = readyTasks(sim).slice(0, Math.max(1, concurrency));
+    const batch = readyTasks(sim, prioritized).slice(0, Math.max(1, concurrency));
     if (!batch.length) return waves;
     for (const t of batch) { waves.set(t.id, wave); sim = setStatus(sim, t.id, "done"); }
   }

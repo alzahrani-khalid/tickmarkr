@@ -2,6 +2,8 @@ import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
+import { graphDefinitionHash } from "../../src/graph/graph.js";
+import { boardFrame, renderBoard } from "../../src/tui/cockpit/board.js";
 import { createLiveStore, JournalTail, STORE_LIMITS } from "../../src/tui/cockpit/live-store.js";
 import { graph, partial, rawOf, ev } from "../fixtures/operator-state/fixture.js";
 const dirs: string[] = [];
@@ -84,4 +86,44 @@ test("The exported store independently delivers changed graph/config/cache ident
   expect(store.diagnostics()).toMatchObject({ pendingReads: 0, metrics: STORE_LIMITS.metrics });
   const removers = Array.from({ length: STORE_LIMITS.subscribers - 1 }, () => store.subscribe(() => {})); expect(() => store.subscribe(() => {})).toThrow(/limit/); removers.forEach(remove => remove());
   unsubscribe(); store.dispose(); expect(store.diagnostics().subscriptions).toBe(0);
+});
+
+
+test("test: the live board renders the complete matching 1.8 MiB plan versus named unreadability above its graph cap or noncomparability for a mismatched hash, so inheriting the journal record cap fails", () => {
+  const f = fixture();
+  const large = structuredClone(graph);
+  large.tasks = Array.from({ length: 120 }, (_, i) => ({ ...structuredClone(graph.tasks[0]!), id: `T${i + 1}`, title: `Plan task ${i + 1}`, goal: "x".repeat(15_500) }));
+  const raw = JSON.stringify(large);
+  expect(Buffer.byteLength(raw)).toBeGreaterThan(1.8 * 1024 * 1024);
+  expect(Buffer.byteLength(raw)).toBeLessThan(1.9 * 1024 * 1024);
+  writeFileSync(join(f.state, "graph.json"), raw);
+  writeFileSync(f.path, rawOf([ev("run-start", { graphDefinitionHash: graphDefinitionHash(large) }), ev("task-dispatch", {}, "T1")]));
+  const store = createLiveStore(f);
+  const frame = () => boardFrame({ runId: f.runId, snapshot: store.snapshot().operator, graph: store.snapshot().graph.value, now: 0, colour: false }, 180);
+  const rendered = () => renderBoard({ runId: f.runId, snapshot: store.snapshot().operator, graph: store.snapshot().graph.value, now: 0, colour: false }, 180).join("\n");
+  try {
+    expect(store.snapshot().graph.status).toBe("readable");
+    expect(store.snapshot().operator.planned).toBe(120);
+    expect(frame().rows.map(r => r.id)).toEqual(large.tasks.map(t => t.id));
+    expect(rendered()).toContain("Plan task 120");
+    // A valid graph beyond its own finite bound must evict the cached good value.
+    const oversized = structuredClone(large);
+    oversized.tasks[0]!.goal = "x".repeat(STORE_LIMITS.graphBytes);
+    writeFileSync(join(f.state, "graph.json"), JSON.stringify(oversized)); store.refresh();
+    expect(store.snapshot().graph).toMatchObject({ status: "unreadable" });
+    expect(store.snapshot().graph.value).toBeUndefined();
+    expect(store.snapshot().operator.planned).toBeUndefined();
+    expect(rendered()).toContain(`graph unreadable: source exceeds ${STORE_LIMITS.graphBytes} byte cap`);
+    expect(frame().rows.map(r => r.id)).toEqual(["T1"]);
+    large.tasks[0]!.goal += "changed";
+    writeFileSync(join(f.state, "graph.json"), JSON.stringify(large)); store.refresh();
+    expect(store.snapshot().graph.status).toBe("readable");
+    expect(rendered()).toContain("graph not comparable");
+    expect(rendered()).not.toContain("Plan task 120");
+    expect(store.snapshot().operator.planned).toBeUndefined();
+    expect(STORE_LIMITS.recordBytes).toBe(1024 * 1024);
+    appendFileSync(f.path, rawOf([ev("worker-nudge", { text: "x".repeat(STORE_LIMITS.recordBytes) }, "T1")]));
+    do { store.refresh(); } while (store.snapshot().journal.backlogBytes);
+    expect(store.snapshot().journal.errors.at(-1)?.error).toContain("record exceeds 1048576 bytes");
+  } finally { store.dispose(); }
 });

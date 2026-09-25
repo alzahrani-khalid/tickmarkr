@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,11 +17,24 @@ export const T = (id: string, over: Record<string, unknown> = {}) => ({
 const testTempDirs = new Set<string>();
 
 /**
+ * OBS-1155: tests/setup.ts relocates TMPDIR into one recorded directory per test file so every
+ * direct child-process temporary (mktemp, tsx, git) is reaped with the file. The pre-relocation value
+ * is pinned in this env var: a following file in the same fork (or a nested runner) reads its base
+ * from here instead of nesting under a live or stale relocation, which keeps every path short.
+ */
+export const TEST_BASE_TMPDIR_ENV = "TICKMARKR_TEST_BASE_TMPDIR";
+let liveTmpDir: string | undefined;
+/** The TMPDIR and marker this file inherited, each restored exactly (absent stays absent): a nested
+ * runner's next file must still read the OUTER base, never nest under the outer's relocated TMPDIR. */
+let inheritedTmpDir: string | undefined;
+let inheritedBase: string | undefined;
+
+/**
  * OBS-1054: every temp directory this runner creates lives under ONE namespace root keyed by this
  * process's pid plus a nonce, so two parallel runners of the same suite file never share a flat
  * prefix — a sweep of one runner's root cannot touch another runner's fixture repository.
  */
-export const TEST_TEMP_ROOT = join(tmpdir(), "tickmarkr-tests", `${process.pid}-${randomBytes(4).toString("hex")}`);
+export const TEST_TEMP_ROOT = join(process.env[TEST_BASE_TMPDIR_ENV] ?? tmpdir(), "tkr", `${process.pid}-${randomBytes(4).toString("hex")}`);
 
 /**
  * The temp-directory seam for tests. Create test-owned temp directories through this helper
@@ -34,9 +47,46 @@ export function makeTestTempDir(prefix: string): string {
   return dir;
 }
 
-/** Removes exactly the directories this runner recorded — never a prefix sweep, never the root's other children. */
+/** Points TMPDIR at a fresh recorded directory. The leaf is short (`t-XXXXXX` under a `tkr/<pid>-<nonce>`
+ * root) so tsx's `<TMPDIR>/tsx-<uid>/<pid>.pipe` stays under macOS's 104-byte sun_path. */
+export function relocateTestTmpDir(): void {
+  inheritedTmpDir = process.env.TMPDIR;
+  inheritedBase = process.env[TEST_BASE_TMPDIR_ENV];
+  // The marker is always an absolute effective base: a nested runner must never resolve a relative root.
+  process.env[TEST_BASE_TMPDIR_ENV] ??= inheritedTmpDir || tmpdir();
+  liveTmpDir = makeTestTempDir("t-");
+  process.env.TMPDIR = liveTmpDir;
+}
+
+/** Restores the inherited TMPDIR and marker, then reaps the relocated directory with everything else recorded. */
+export function restoreTestTmpDir(): void {
+  if (inheritedBase === undefined) delete process.env[TEST_BASE_TMPDIR_ENV]; else process.env[TEST_BASE_TMPDIR_ENV] = inheritedBase;
+  if (inheritedTmpDir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = inheritedTmpDir;
+  liveTmpDir = undefined;
+  reapTestTempDirs();
+}
+
+/** OBS-1155: a child vitest run, launched by tests/config/tmpdir.test.ts, records where its temporaries land.
+ * It lives here, not in that test file: importing a test file re-registers its tests in the importer. */
+export const TMPDIR_CHILD_ENV = "TICKMARKR_TMPDIR_CHILD";
+export const TMPDIR_CHILD_TEST = "child runner: record this file's TMPDIR and one child-process temporary";
+export interface TmpdirChildRecord { at: number; pid: number; tmpdir: string; base: string | undefined; mktemp: string; mkdtemp: string }
+export const recordTmpdirChild = (name: string): TmpdirChildRecord => {
+  const record: TmpdirChildRecord = {
+    at: Date.now(), pid: process.pid, tmpdir: process.env.TMPDIR ?? "", base: process.env[TEST_BASE_TMPDIR_ENV],
+    // a real child process (not this runner) resolving the temp dir from its inherited environment
+    mktemp: execFileSync(process.execPath, ["-e", "process.stdout.write(require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'child-')))"], { encoding: "utf8" }).trim(),
+    mkdtemp: mkdtempSync(join(tmpdir(), "tickmarkr-child-")),
+  };
+  writeFileSync(join(process.env[TMPDIR_CHILD_ENV]!, name), JSON.stringify(record));
+  return record;
+};
+
+/** Removes exactly the directories this runner recorded — never a prefix sweep, never the root's other
+ * children, and never the live TMPDIR (mid-file callers would strand every later temporary). */
 export function reapTestTempDirs(): void {
   for (const dir of testTempDirs) {
+    if (dir === liveTmpDir) continue;
     rmSync(dir, { recursive: true, force: true });
     testTempDirs.delete(dir);
   }

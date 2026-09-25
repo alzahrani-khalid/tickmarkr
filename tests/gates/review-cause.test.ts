@@ -19,7 +19,7 @@ import { makeRepo } from "../helpers/tmprepo.js";
 
 class VerdictPane implements ExecutorDriver {
   id = "verdict-pane";
-  interactive = false;
+  interactive = true; // a pane driver: the first-liveness beat is armed for panes only (OBS-1177)
   private nonce = "";
 
   constructor(private readonly output: (nonce: string) => string) {}

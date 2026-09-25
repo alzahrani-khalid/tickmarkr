@@ -13,6 +13,7 @@ import {
 import { blockedTasks, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { GATE_NAMES, type GateName, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
 import { projectActivity } from "../../run/activity.js";
+import { authorsNote, doneAuthors } from "../../run/operator-state.js";
 import { projectOperatorSummary, type OperatorTaskSummary } from "../../run/operator-summary.js";
 import { trackJournalRows } from "../../run/protocol.js";
 import { newestPark, permittedDecisionVerbs } from "./approve.js";
@@ -1184,6 +1185,7 @@ const renderFrame = (
   const comparable = record?.comparable ?? false;
   const rehashAt = record?.rehashAt;
   const assignments = new Map<string, string>();
+  const authorsByTask = new Map<string, readonly string[]>();
   const contexts = new Map<string, number>();
   // v1.53 T5: this run is dead — a newer run replaced it
   const supersededBy = [...events].reverse()
@@ -1195,6 +1197,10 @@ const renderFrame = (
         if (typeof a.adapter === "string" && typeof a.model === "string") {
           assignments.set(e.taskId, `${a.adapter}:${a.model}`);
         }
+      }
+      if (e.event === "task-done" && e.taskId) {
+        const authors = doneAuthors(e.data);
+        if (authors) authorsByTask.set(e.taskId, authors);
       }
       if (e.event === "context-sample" && e.taskId && typeof e.data.tokens === "number" && Number.isFinite(e.data.tokens)) {
         contexts.set(e.taskId, e.data.tokens as number); // last write wins
@@ -1306,12 +1312,14 @@ const renderFrame = (
     const label = isStarved ? " starved" : phrase ? ` ${phrase}` : "";
     const channel = journalRowsOnly ? folded?.actor ?? "-" : assignments.get(t.id) ?? "-";
     const ctx = contexts.get(t.id);
-    const assignCol = ctx !== undefined ? `${channel}${divider}ctx ${ctx}` : channel;
+    // Merged authors are their own fact beside the last dispatch: a carry-only seat authored nothing.
+    const authors = authorsNote(authorsByTask.get(t.id), channel);
+    const assignCol = [channel, ctx !== undefined ? `ctx ${ctx}` : "", authors ?? ""].filter(Boolean).join(divider);
     const gates = comparable
       ? gateSnapshot(t, events, rehashAt)
       : { states: defaultGateStates(t), priorGraph: false };
     const pane = panes.get(t.id);
-    return { t, st, merged, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, livePhase, pane, summary, ...gates };
+    return { t, st, merged, failureKind, redTier, label, assignCol, isStarved, phrase, channel, ctx, authors, livePhase, pane, summary, ...gates };
   });
 
   if (!unicode) {
@@ -1420,7 +1428,7 @@ const renderFrame = (
   }).join("");
   const gateHeader = GATE_NAMES.map((gate) => fitCells(gate.slice(0, 2), 3)).join("");
   const noteFor = (cell: (typeof cells)[number]): string => {
-    const { t, st, merged, failureKind, redTier, states, priorGraph, isStarved, phrase, ctx, livePhase, pane } = cell;
+    const { t, st, merged, failureKind, redTier, states, priorGraph, isStarved, phrase, ctx, livePhase, pane, authors } = cell;
     const effort = effortByTask.get(t.id);
     const blocking = graphTaskStatus(st, t.status) === "done" ? [] : dependents.get(t.id) ?? [];
     const failed = failedGates(states);
@@ -1447,6 +1455,7 @@ const renderFrame = (
       blocking.length ? `blocks ${blocking.join(", ")}` : "",
       pane ? `pane ${pane}` : "",
       ctx !== undefined ? `ctx ${ctx}` : "",
+      authors ?? "",
     ].filter(Boolean).join(" · ");
   };
 

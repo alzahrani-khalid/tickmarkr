@@ -1,11 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
-import { runGates } from "../../src/gates/run-gates.js";
-import { fileHangBudgetMs, isVitestTestCommand, readTestReport, verifyManifestReport } from "../../src/gates/test-manifest.js";
+import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
+import { discoverTestManifest, fileHangBudgetMs, isVitestTestCommand, readTestReport, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
 import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -65,7 +67,7 @@ if (args[0] === 'list') {
 }
 fs.writeFileSync(marker, JSON.stringify({ args, pid: process.pid }));
 if (mode === 'refuse') { console.error('case-specific refused reporter'); process.exit(2); }
-if (mode === 'absent') process.exit(0);
+if (mode === 'absent' || mode === 'list') process.exit(0); // a runner that cannot list may still run green
 if (mode === 'selected-missing' && selected) {
   // Positive screen delegates to the real runner and the real reporter; only the full run is faulty.
   const cp = require('child_process');
@@ -389,7 +391,7 @@ const SCRATCH_PRETEST_FILES = {
   "package.json": JSON.stringify({ type: "module", scripts: { pretest: "npm run build", build: "node build.mjs", test: "vitest run --globals" } }),
 };
 
-test("through the production worktree recreation on one preserved clean commit, where the task checkout is preserved and re-added from its base with node_modules linked and nothing built and its carried commit is cherry-picked back so the gated tree is byte-identical, a battery whose build verdict is the compatible cached green of the prior checkout runs no build command so the recreated checkout still has no dist, and under an explicit lifecycle hooks its test gate actually runs with pretest provisioning dist inside the recreated checkout before the one module starts, completes and passes, while the same recreation under lifecycle ignore-scripts reuses the same build green, runs the test, starts no module and fails closed with dist still absent, so a recreation that inherits a build without its artifacts, a test gate that does not run, or a provisioning by anything but the hook fails", async () => {
+test("production worktree recreation rebuilds a preserved clean tree before manifested tests under both hooks and ignore-scripts, while the unchanged checkout reuses its build receipt", async () => {
   for (const [value, lifecycle] of [["false", "hooks"], ["true", "ignore-scripts"]] as const) {
     const repo = makeRepo(SCRATCH_PRETEST_FILES);
     symlinkSync(install, join(repo, "node_modules"), "dir");
@@ -420,6 +422,11 @@ test("through the production worktree recreation on one preserved clean commit, 
     expect(existsSync(join(wt, "dist/a.js"))).toBe(true);
     expect(priorBuild.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle, source: "explicit" });
 
+    const live = await underLifecycle(value, () => battery(wt, { build: "npm run build" }));
+    const liveBuild = live.results.find((r) => r.gate === "build")!;
+    expect(liveBuild.meta?.reused).toBe(true);
+    expect(liveBuild.evidenceReceipt).toEqual(priorBuild.evidenceReceipt);
+
     // The production recreation the daemon performs: preserve (nothing to preserve on a clean
     // checkout), re-add the worktree from its base, link node_modules only, carry the commit back.
     expect(await preserveWorktree(wt)).toBeUndefined();
@@ -435,26 +442,24 @@ test("through the production worktree recreation on one preserved clean commit, 
     const round2 = await underLifecycle(value, () => battery(recreated, { build: "npm run build", test: "npm test" }));
     const build2 = round2.results.find((r) => r.gate === "build")!;
     expect(build2.pass).toBe(true);
-    expect(build2.meta?.reused).toBe(true);
-    expect(String(build2.details)).toMatch(new RegExp(`reused verdict \\(identity: gate=build .*lifecycle=${lifecycle} \\(explicit\\)\\]`));
+    expect(build2.meta?.reused).not.toBe(true);
+    expect(build2.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle, source: "explicit" });
+    expect(build2.evidenceReceipt?.termination).toMatchObject({ kind: "exit", exitCode: 0 });
+    expect(build2.evidenceReceipt?.invocationId).toBeDefined();
+    expect(build2.evidenceReceipt?.invocationId).not.toBe(priorBuild.evidenceReceipt?.invocationId);
     const test2 = round2.results.find((r) => r.gate === "test")!;
     expect(String(test2.meta?.spawnedCommand).startsWith("npm test -- --reporter=")).toBe(true);
     expect(test2.meta?.verification).toEqual({ protocol: VERIFICATION_PROTOCOL, lifecycle, source: "explicit" });
     const report = readTestReport(String(test2.meta?.reportPath))!;
     expect(report.requested).toEqual(["tests/a.test.ts"]);
-    if (lifecycle === "hooks") {
-      expect(test2.pass, test2.details).toBe(true);
-      expect(existsSync(join(recreated, "dist/a.js"))).toBe(true);
-      expect(report.started).toHaveProperty("tests/a.test.ts");
-      expect(report.completed["tests/a.test.ts"]).toMatchObject({ status: "passed", tests: { passed: 1, failed: 0, skipped: 0 } });
-      expect(report.certificate?.exitCode).toBe(0);
-      expect(test2.meta?.executedModules).toBe(1);
-    } else {
-      expect(test2.pass).toBe(false);
-      expect(test2.meta?.classification).toBe("infra");
-      expect(existsSync(join(recreated, "dist"))).toBe(false);
-      expect({ started: report.started, completed: report.completed, exit: report.certificate?.exitCode }).toEqual({ started: {}, completed: {}, exit: 1 });
-    }
+    // The fresh build supplies dist even when npm lifecycle hooks are disabled.
+    expect(test2.meta?.reused).not.toBe(true);
+    expect(test2.pass, test2.details).toBe(true);
+    expect(existsSync(join(recreated, "dist/a.js"))).toBe(true);
+    expect(report.started).toHaveProperty("tests/a.test.ts");
+    expect(report.completed["tests/a.test.ts"]).toMatchObject({ status: "passed", tests: { passed: 1, failed: 0, skipped: 0 } });
+    expect(report.certificate?.exitCode).toBe(0);
+    expect(test2.meta?.executedModules).toBe(1);
   }
 }, 240_000);
 
@@ -716,6 +721,54 @@ test("test: through the gate battery a first run whose single fork files never s
   expect(noExecution.runs()).toHaveLength(2);
 }, 60_000);
 
+test("test: OBS-1166 under a real vitest projects config a stranded single-fork retry built from the selected screen's narrowed command lists the whole selection, whereas one built from the un-narrowed command lists exactly the stranded file through both a direct runner command and an npm script, and a full-suite retry still lists exactly the stranded file, and through the gate battery a selected screen that strands its single fork file re-runs it with the stranded file as the only positional filter, so a retry that keeps the selection's filters or a gate that hands the narrowed command to the retry fails", async () => {
+  const files = ["tests/p1.test.ts", "tests/p2.test.ts", "tests/s.test.ts"];
+  const body = "import { test, expect } from 'vitest'; test('owned', () => expect(1).toBe(1));\n";
+  // realpath: the retry names the stranded file by its absolute path, and vitest matches that filter
+  // against the resolved module path (macOS's /var -> /private/var), exactly as forced-stall.e2e does.
+  const repo = realpathSync(makeRepo({
+    ".gitignore": "node_modules/\n",
+    "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run --configLoader native" } }),
+    ...Object.fromEntries(files.map(f => [f, body])),
+    // Mirrors this repository's config shape: every project declares its own exclude, so the CLI's
+    // --exclude never reaches the project — only the positional filters decide what it collects.
+    "vitest.config.mjs": `export default { test: { pool: 'forks', projects: [
+  { extends: true, test: { name: 'parallel', include: ['tests/p1.test.ts', 'tests/p2.test.ts'], exclude: ['**/node_modules/**'], pool: 'forks' } },
+  { extends: true, test: { name: 'serial', include: ['tests/s.test.ts'], exclude: ['**/node_modules/**'], pool: 'forks', poolOptions: { forks: { singleFork: true } } } }
+] } };\n`,
+  }));
+  symlinkSync(install, join(repo, "node_modules"), "dir");
+  const stranded = ["tests/s.test.ts"], completed = ["tests/p1.test.ts", "tests/p2.test.ts"];
+  const env = { ...process.env };
+  for (const key of ["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"]) delete env[key];
+  const dir = makeTestTempDir("obs1166-listing-");
+  const listed = async (command: string) => (await discoverTestManifest(command, repo, { dir, nonce: randomBytes(8).toString("hex"), env })).files;
+  for (const cmd of ["vitest run --configLoader native", "npm test"]) {
+    // The shipped 2.6.0 construction: the narrowed command plus the stranded paths — the selection's filters OR in.
+    const narrowed = singleForkRetryCommand(testCommandForFiles(cmd, files), repo, stranded, completed);
+    expect(narrowed).toContain("--exclude=");
+    const before = await listed(narrowed);
+    expect(before.length, `${cmd}: ${before.join(",")}`).toBeGreaterThan(stranded.length);
+    const rebuilt = singleForkRetryCommand(cmd, repo, stranded, completed);
+    expect(rebuilt).toContain("--exclude=");
+    expect(rebuilt.split("--exclude=")[0]).not.toContain("tests/p1.test.ts"); // completed files appear only under --exclude, never as filters
+    expect(await listed(rebuilt), cmd).toEqual(stranded);
+  }
+  // A full suite has no prior positional filters: the same construction still lists exactly the stranded set.
+  expect(await listed(singleForkRetryCommand("vitest run --configLoader native", repo, stranded, completed))).toEqual(stranded);
+
+  // The gate battery: a selected screen over a changed parallel and single fork file strands the latter.
+  const f = strandedFixture();
+  writeFileSync(join(f.repo, "tests/single.test.ts"), 'import { a } from "../src/a"; test("single", () => expect(a).toBe(3));\n'); commit(f.repo);
+  const row = await round(f, "vitest run --globals", {}, true);
+  expect(row.pass, row.details).toBe(true);
+  const runs = f.runs();
+  expect(runs.slice(0, 2).map(r => r.files)).toEqual([["tests/a.test.ts", "tests/single.test.ts"], ["tests/single.test.ts"]]);
+  const retryFilters = runs[1]!.args.filter(a => !a.startsWith("-") && a !== "run");
+  expect(retryFilters).toEqual([join(f.repo, "tests/single.test.ts")]);
+  expect(runs[1]!.args).toContain("--exclude=tests/a.test.ts");
+}, 90_000);
+
 test("test: a report stranding a whole parallel project or lacking the reporter's scheduling record or starting no file or holding an unexpected lifecycle member or a certificate exit that disagrees with the process or a failed or unfinished started file or a diagnostic other than a worker RPC timeout is never re-run and keeps today's fail-closed verdict, so a retry that launders a runner failure fails", async () => {
   const mutations = [
     "delete report.started[all[1]]; delete report.completed[all[1]];",
@@ -790,3 +843,30 @@ test("test: tip verify of an integration tip whose first run stranded its single
   expect(rows[0]!.data.details).toContain(runs[0]!.nonce);
   expect(rows[0]!.data.details).toContain(runs[1]!.nonce);
 }, 60_000);
+
+test("test: baseline capture preserves successful versus failed discovery results while reclaiming exactly the owned listing directory in both cases, so one leaked directory or deletion of an unrelated sibling fails", async () => {
+  // OBS-1155: TMPDIR is this file's recorded directory (tests/setup.ts), so every listing directory
+  // the capture makes is visible here, and an unrelated sibling planted beside them must survive.
+  const listings = () => readdirSync(tmpdir()).filter((name) => name.startsWith("tickmarkr-test-manifest-"));
+  const sibling = join(tmpdir(), "tickmarkr-test-manifest-unrelated");
+  mkdirSync(sibling);
+  writeFileSync(join(sibling, "keep.txt"), "keep\n");
+  expect(listings()).toEqual(["tickmarkr-test-manifest-unrelated"]);
+
+  // `npm test` puts each fixture's own node_modules/.bin (the stand-in) on PATH for the run, exactly as
+  // discovery does for the listing, so neither depends on the outer runner's PATH.
+  const listed = fixture(false); fault(listed, "absent", "absent"); // list succeeds (two files); run exits 0
+  const success = await captureBaseline(listed.repo, { test: "npm test" });
+  expect(success.commands.test).toMatchObject({ exitCode: 0, fileCount: 2, fileCountSource: "manifest" });
+  expect(existsSync(receipt(listed, "absent") + ".list.receipt")).toBe(true); // discovery really ran
+
+  const refused = fixture(false); fault(refused, "list", "list"); // list exits 2; run exits 0
+  const failure = await captureBaseline(refused.repo, { test: "npm test" });
+  expect(failure.commands.test.exitCode).toBe(0);
+  expect(failure.commands.test.fileCount).toBeNull();
+  expect(failure.commands.test.fileCountSource).toBeUndefined();
+  expect(existsSync(receipt(refused, "list") + ".list.receipt")).toBe(true);
+
+  expect(listings()).toEqual(["tickmarkr-test-manifest-unrelated"]); // no leaked listing directory, sibling untouched
+  expect(readFileSync(join(sibling, "keep.txt"), "utf8")).toBe("keep\n");
+}, 90_000);

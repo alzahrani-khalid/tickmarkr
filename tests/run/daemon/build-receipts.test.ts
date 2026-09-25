@@ -168,3 +168,56 @@ test("test: a daemon gate result row for each of build test and lint carries the
     }
   } finally { spy.mockRestore(); }
 }, 60_000);
+
+test("test: the production daemon rechecking a recreated same-path same-commit checkout records a fresh build receipt before tests observe dist versus build reuse in the unchanged checkout, so cached success without outputs fails", async () => {
+  vi.stubEnv("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z");
+  try {
+    const { existsSync, readFileSync } = await import("node:fs");
+    const { worktreePath } = await import("../../../src/run/git.js");
+    const flag = join(makeTestTempDir("recheck-build-output-"), "allow-test");
+    const commands = {
+      build: "mkdir -p dist; echo built > dist/output",
+      test: `[ ! -f work.txt ] || { test -f dist/output && test -f '${flag}'; }`,
+    };
+    const { repo, fake } = setupRepo([T("T1", { gates: ["build", "test", "lint", "evidence", "scope"] })], {
+      consult: { action: "human", notes: "operator recheck" },
+      tasks: { T1: [{ shell: `echo work > work.txt; ${COMMIT} work`, result: { ok: true, summary: "landed" } }] },
+    }, `gates: ${JSON.stringify(commands)}\n`);
+    writeFileSync(join(repo, ".gitignore"), ".tickmarkr/\ndist/\n");
+    await shOk(`${COMMIT} ignore-build-output`, repo);
+    const runId = "run-recreated-build";
+    expect((await runDaemon(repo, { adapters: [fake], runId })).human).toContain("T1");
+    const journal = Journal.open(repo, runId);
+    const worktree = worktreePath(repo, `tickmarkr/${runId}--T1`);
+    const head = await gitHead(worktree);
+    const notes: string[] = [];
+    const liveContext: GateContext = {
+      worktree, baseRef: journal.read().find(e => e.event === "run-start")!.data.baseRef as string,
+      author, commands, baseline: JSON.parse(readFileSync(join(journal.dir, "baseline.json"), "utf8")),
+      result: { ok: true, summary: "done", deviations: [], raw: "" }, channels: [], adapters: [], cfg: DEFAULT_CONFIG,
+      stateDir: join(repo, ".tickmarkr"),
+      onGate: e => { if (e.phase === "note" && e.name === "build-receipt") notes.push(e.payload.outcome as string); },
+    };
+    const priorBuild = (await runGates(T("T1", { gates: ["build"] }), liveContext)).results[0]!;
+    expect(existsSync(join(worktree, "dist/output"))).toBe(true);
+    notes.length = 0;
+    const live = await runGates(T("T1", { gates: ["build"] }), liveContext);
+    expect(live.results[0]?.meta?.reused).toBe(true);
+    expect(notes).toEqual(["reused-result"]);
+    writeFileSync(flag, "go");
+    await approve([runId, "T1", "--recheck", "--by", "test"], repo);
+    const offset = journal.read().length;
+    expect((await runDaemon(repo, { adapters: [fake], runId, resume: true })).done).toContain("T1");
+    const rows = journal.read().slice(offset).filter(e => e.taskId === "T1");
+    expect(rows.some(e => e.event === "worktree-recreation")).toBe(true);
+    const pair = receipts(rows);
+    expect(pair.map(e => e.data.outcome)).toEqual(["started", "completed"]);
+    expect(pair[1]?.data).toMatchObject({ confirmedStart: true, exitCode: 0 });
+    const testAt = rows.findIndex(e => e.event === "gate-result" && e.data.gate === "test");
+    expect(testAt).toBeGreaterThan(rows.indexOf(pair[1]!));
+    expect(rows[testAt]?.data.pass).toBe(true);
+    const build = rows.find(e => e.event === "gate-result" && e.data.gate === "build")!;
+    expect(build.data.evidenceReceipt).not.toEqual(priorBuild.evidenceReceipt);
+    expect((build.data.evidenceReceipt as { subject: { subjectCommit: string } }).subject.subjectCommit).toBe(head);
+  } finally { vi.unstubAllEnvs(); }
+}, 60_000);

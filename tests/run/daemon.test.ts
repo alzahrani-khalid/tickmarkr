@@ -20,6 +20,7 @@ import { gitHead, shOk, worktreePath } from "../../src/run/git.js";
 import { Journal, recordedTaskFailureKind } from "../../src/run/journal.js";
 import { normalizeGateOutcome } from "../../src/run/outcome.js";
 import { COMMIT, authedModels, setupRepo, T } from "../helpers/tmprepo.js";
+import { sameBasePair } from "../helpers/worker-barrier.js";
 
 
 const interactiveDriver = () => {
@@ -671,20 +672,25 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
   });
 
   test("merge conflict → consult verdict applied (human): loser parks, integration stays clean", async () => {
+    // OBS-1163: T2's worker holds until the journal records T1's merge, and T1's until T2's
+    // worker-launch — T2's worktree exists on the pre-merge tip before T1 may commit, so the pair
+    // conflicts on the same base in a known order instead of racing two equal sleeps.
+    const pair = sameBasePair("conflict", "T1", "T2");
     const { repo, fake } = setupRepo(
       [T("T1"), T("T2")],
       {
         consult: { action: "human", notes: "conflicting edits need a person" },
         tasks: {
-          T1: [{ shell: `sleep 0.3 && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
-          T2: [{ shell: `sleep 0.3 && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
+          T1: [{ shell: `${pair.ready.hold} && echo A > shared.txt && ${COMMIT} ta`, result: { ok: true, summary: "ta" } }],
+          T2: [{ shell: `${pair.loser.hold} && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
         },
       },
     );
-    const s = await runDaemon(repo, { adapters: [fake], runId: "run-conflict" });
-    expect(s.done).toHaveLength(1); // whichever merged first
-    expect(s.human).toHaveLength(1); // the conflict loser, parked by the consult verdict
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-conflict", narrate: pair.narrate() }).finally(pair.release);
+    expect(s.done).toEqual(["T1"]); // merged first — T2 was held on that merge row
+    expect(s.human).toEqual(["T2"]); // the conflict loser, parked by the consult verdict
     const evs = Journal.open(repo, "run-conflict").read();
+    expect(pair.violations(evs)).toEqual([]);
     expect(evs.some((e) => e.event === "merge-conflict")).toBe(true);
     expect(evs.some((e) => e.event === "consult-verdict" && e.data.action === "human")).toBe(true);
     // the aborted merge left the integration worktree clean

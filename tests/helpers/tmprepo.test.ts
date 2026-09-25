@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { makeRepo, makeTestTempDir, TEST_TEMP_ROOT } from "./tmprepo.js";
+import { makeRepo, makeTestTempDir, recordTmpdirChild, TEST_TEMP_ROOT, TMPDIR_CHILD_ENV, TMPDIR_CHILD_TEST } from "./tmprepo.js";
 
 const CHILD_ENV = "TICKMARKR_TMPREPO_CHILD";
 const CHILD_TEST = "child runner: plant one fixture repository and hold it until released";
@@ -16,6 +16,9 @@ test.skipIf(!process.env[CHILD_ENV])(CHILD_TEST, async () => {
   writeFileSync(outFile, JSON.stringify({ pid: process.pid, repo, root: TEST_TEMP_ROOT }));
   for (let i = 0; i < 300 && !existsSync(`${outFile}.release`); i++) await sleep(100);
 }, 60_000);
+
+// OBS-1155: the second, green file of tests/config/tmpdir.test.ts's single-fork child run.
+test.skipIf(!process.env[TMPDIR_CHILD_ENV])(TMPDIR_CHILD_TEST, () => { recordTmpdirChild("passing.json"); });
 
 function spawnRunner(outFile: string): Promise<number | null> {
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("VITEST")));

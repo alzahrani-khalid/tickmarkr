@@ -12,7 +12,10 @@ import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 const fixture = (name: string) => fileURLToPath(new URL(`../fixtures/quota/${name}`, import.meta.url));
 const dump = (name: string) => `cat ${shq(fixture(name))}; exit 1`;
-const OK_STEP = { shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } };
+// OBS-1162: each task's retry commits its OWN file — two tasks sharing ok.txt let a retry find
+// nothing to commit once the other's ok.txt reached the integration tip.
+const okStep = (id: string) => ({ shell: `echo ok > ${id}.txt && ${COMMIT} ${id}`, result: { ok: true, summary: `ok ${id}` } });
+const OK_STEP = okStep("T1");
 const RETRY = { action: "retry", notes: "a no-trailer exit is not a channel verdict" };
 const events = (repo: string, runId: string) => Journal.open(repo, runId).read();
 
@@ -22,7 +25,7 @@ describe("Q-1 quota failover", () => {
     for (const f of ["run3522-T2-a0.out", "run3522-T2-a2.out"]) expect(QUOTA_RE.test(readFileSync(fixture(f), "utf8"))).toBe(true);
     const { repo, fake } = setupRepo(
       [T("T1"), T("T2")],
-      { tasks: { T1: [{ shell: dump("run3522-T2-a0.out") }, OK_STEP], T2: [{ shell: dump("run3522-T2-a2.out") }, OK_STEP] }, consult: RETRY },
+      { tasks: { T1: [{ shell: dump("run3522-T2-a0.out") }, okStep("T1")], T2: [{ shell: dump("run3522-T2-a2.out") }, okStep("T2")] }, consult: RETRY },
     );
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-q1-neg" });
     expect(s.done).toEqual(["T1", "T2"]);

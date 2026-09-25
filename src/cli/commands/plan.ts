@@ -7,10 +7,10 @@ import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
 import { classifyContextPath } from "../../compile/native.js";
 import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MODES, type RoutingMode, TIER_RANK, type TickmarkrConfig } from "../../config/config.js";
-import { chainDepth, dispatchWaves, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
+import { batteryPriority, chainDepth, dispatchWaves, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { filesGlob } from "../../graph/files-glob.js";
-import { renderAcceptanceItem, type Task } from "../../graph/schema.js";
-import { resolveRunMode } from "../../run/daemon.js";
+import { renderAcceptanceItem, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
+import { pendingDaemonApprovalActions, resolveRunMode } from "../../run/daemon.js";
 import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } from "../../route/preference.js";
 import { decayWeight, HALF_LIFE_RUNS, staffLedEvidence } from "../../route/profile.js";
 import { route, RoutingError } from "../../route/router.js";
@@ -205,7 +205,7 @@ export async function plan(
   // journal never mentions). done, failed and human are all skipped alike, so rendering their preview
   // picks must not advance the shared reviewHistory — a phantom draw wraps the LRU and makes a later
   // pending task print the ranked-first seat while the journal's actual next draw is a later channel.
-  const taskStatuses = matchingRunId ? Journal.open(cwd, matchingRunId).replayStatuses() : new Map<string, string>();
+  const taskStatuses = matchingRunId ? Journal.open(cwd, matchingRunId).replayStatuses() : new Map<string, TaskStatus>();
   const oracleRefusals = new Map<string, string[]>();
   const oracleAdvisories = new Map<string, string[]>();
   if (g.tasks.some((task) => task.acceptance.some((item) => typeof item === "object" && item.oracle === "test"))) {
@@ -380,7 +380,11 @@ export async function plan(
   // OBS-1018: depth and wave come from the same functions the daemon admits by, so the plan shows the
   // critical path the run will actually follow at this concurrency.
   const depths = chainDepth(g);
-  const waves = dispatchWaves(g, cfg.concurrency);
+  // OBS-1158: waves simulate the graph the daemon would admit on resume — the journal's replayed
+  // statuses (an approval releases its park to pending) and its pending recheck approvals ranked
+  // through the same seam the daemon admits by.
+  const projected: RunGraph = { ...g, tasks: g.tasks.map((t) => ({ ...t, status: taskStatuses.get(t.id) ?? t.status })) };
+  const waves = dispatchWaves(projected, cfg.concurrency, batteryPriority(pendingDaemonApprovalActions(matchingEvents ?? []).values()));
   const byId = new Map(g.tasks.map((t) => [t.id, t]));
   const chainLine = (t: Task) => {
     const wave = waves.get(t.id);

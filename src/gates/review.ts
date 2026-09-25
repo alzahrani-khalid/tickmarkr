@@ -12,7 +12,7 @@ import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
 import { carryReviewFindings, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
-import { marginalCostRank } from "../route/router.js";
+import { rankPreferredChannels, reviewPreferenceTieBreak } from "../route/role-pick.js";
 import { modelProvider } from "../route/preference.js";
 import { resolveStateDir } from "./cache.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, verdictNonceLine } from "./llm.js";
@@ -306,14 +306,6 @@ export function isReviewClosureMismatch(
   return ids.some((id) => matchClosureId(id, priors) === undefined);
 }
 
-// v1.53 T2: same entry grammar as routing.map.prefer (router.ts preferIndex — router is out of this
-// module's dependency direction for a private fn, so the 3 lines live here too): `adapter` matches
-// every channel of that adapter, `adapter:model` exactly one; unmatched channels sort after all entries.
-function reviewPreferIndex(c: BillingChannel, prefer: string[]): number {
-  const i = prefer.findIndex((p) => p === c.adapter || p === channelKey(c));
-  return i === -1 ? prefer.length : i;
-}
-
 export type ReviewerFloorCause = "author-tier" | "task-floor" | "config" | "prior-reviewer";
 
 /**
@@ -392,7 +384,7 @@ export function pickReviewer(
   if (authorChannels.some((c) => !c)) return null;
   // RF-1: every caller inherits the author-tier floor — a reviewer is never seated below its author.
   const effectiveFloor = resolveReviewerFloor(author.tier, floor).floor;
-  const ranked = channels
+  const eligible = channels
     // Three independent axes: different vendor, different resolved provider identity (OBS-946: on initial pick
     // as well as failover, so an aggregator channel stamped "mixed" never seats the author's own provider),
     // and different base-model identity (ADDED TO the vendor rule, never replacing it). The diversity
@@ -402,8 +394,11 @@ export function pickReviewer(
       && modelId(c.model) !== modelId(a.model))
       && !exclude.includes(channelKey(c))
       && !excludeVendors.has(c.vendor)
-      && TIER_RANK[c.tier] >= TIER_RANK[effectiveFloor])
-    .sort((a, b) => reviewPreferIndex(a, prefer) - reviewPreferIndex(b, prefer) || TIER_RANK[b.tier] - TIER_RANK[a.tier] || marginalCostRank(a) - marginalCostRank(b));
+      && TIER_RANK[c.tier] >= TIER_RANK[effectiveFloor]);
+  const ranked = rankPreferredChannels(eligible, prefer, {
+    includeUnpreferred: true,
+    tieBreak: reviewPreferenceTieBreak,
+  });
   const reviewer = [...ranked].sort((a, b) =>
     Number(demoted.has(channelKey(a))) - Number(demoted.has(channelKey(b)))
     || history.lastIndexOf(channelKey(a)) - history.lastIndexOf(channelKey(b))

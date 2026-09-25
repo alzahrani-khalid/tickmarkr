@@ -67,10 +67,29 @@ function resolvePin(pin: { via: string; model: string }, channels: BillingChanne
   return c;
 }
 
-function preferIndex(c: BillingChannel, prefer: string[] = []): number {
+// Keep pure preference ranking below discovery in the dependency graph: router is also
+// loaded by environment setup, which must not initialize adapter probes or shell helpers.
+type ChannelSeat = { adapter: string; model: string };
+
+/** Shared adapter | adapter:model grammar; unmatched channels follow every declared entry. */
+export function preferIndex(c: ChannelSeat, prefer: readonly string[] = []): number {
   const i = prefer.findIndex((p) => p === c.adapter || p === channelKey(c));
   return i === -1 ? prefer.length : i;
 }
+
+/** Rank an already eligible pool. Review alone retains its legacy unpreferred tail. */
+export function rankPreferredChannels<C extends ChannelSeat>(
+  channels: readonly C[],
+  prefer: readonly string[] = [],
+  opts: { includeUnpreferred?: boolean; tieBreak?: (a: C, b: C) => number } = {},
+): C[] {
+  return channels.filter((c) => opts.includeUnpreferred || preferIndex(c, prefer) < prefer.length)
+    .sort((a, b) => preferIndex(a, prefer) - preferIndex(b, prefer) || opts.tieBreak?.(a, b) || 0);
+}
+
+/** Review preserves its established tier-then-cost order inside a preference band. */
+export const reviewPreferenceTieBreak = (a: BillingChannel, b: BillingChannel): number =>
+  TIER_RANK[b.tier] - TIER_RANK[a.tier] || Number(a.channel === "api") - Number(b.channel === "api");
 
 function ladderFor(task: Task, entry?: { escalate?: boolean }): LadderStep[] {
   const escalate = task.routingHints?.escalate ?? entry?.escalate ?? true;

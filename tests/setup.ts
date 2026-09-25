@@ -6,7 +6,7 @@
 // Runtime entrypoints also delete QUALITY_ENV; this setup guard keeps direct route() unit tests hermetic.
 import { afterAll } from "vitest";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../src/route/router.js";
-import { reapTestTempDirs } from "./helpers/tmprepo.js";
+import { relocateTestTmpDir, restoreTestTmpDir } from "./helpers/tmprepo.js";
 
 for (const k of [QUALITY_ENV, NO_EXPLORE_ENV]) delete process.env[k];
 
@@ -18,4 +18,7 @@ for (const k of [QUALITY_ENV, NO_EXPLORE_ENV]) delete process.env[k];
 // was not that config). Tests that need a host set it explicitly inside the test.
 for (const k of ["TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "HERDR_ENV"]) delete process.env[k];
 
-afterAll(reapTestTempDirs);
+// OBS-1155: every temporary this file or its child processes create lands in one recorded TMPDIR,
+// reaped at teardown together with the inherited value's restoration.
+relocateTestTmpDir();
+afterAll(restoreTestTmpDir);

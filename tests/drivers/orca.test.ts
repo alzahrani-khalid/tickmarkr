@@ -1,13 +1,18 @@
-import { mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { trailerPattern } from "../../src/adapters/prompt.js";
 import {
+  CHECKOUT_MARK,
+  checkoutPrefix,
+  checkoutProofLine,
   joinWrapped,
   mapAgentState,
   NOT_WRITABLE_CODE,
   inCheckout,
+  provesCheckout,
   OrcaDriver,
   OrcaError,
   OrcaUnavailableError,
@@ -1120,4 +1125,33 @@ describe("OrcaDriver", () => {
     expect(fake.workspaceStatuses.get(WT)).toBe("in-review");
   });
 
+});
+
+// OBS-1168 add.3: the shell echoes the typed launch line into the scrollback, repainted and
+// truncated. When that line carried the proof frame verbatim, the echo was an INCOMPLETE frame
+// beside the complete printed one, and provesCheckout refused a correct launch (three live
+// occurrences on 2026-09-25). The typed text must never contain the marker; the printed bytes must.
+describe("checkoutPrefix keeps the proof marker out of the typed command (OBS-1168)", () => {
+  const checkout = realpathSync(mkdtempSync(join(tmpdir(), "tickmarkr-orca-proof-"))); // proofs compare canonical paths
+
+  test("the typed prefix never contains the marker, but a real sh prints exactly the proof line", () => {
+    const prefix = checkoutPrefix(checkout);
+    expect(prefix).not.toContain(`${CHECKOUT_MARK} `);
+    expect(prefix).not.toContain(CHECKOUT_MARK);
+    const printed = execFileSync("sh", ["-c", inCheckout(checkout, "true")], { encoding: "utf8" });
+    expect(printed).toBe(`${checkoutProofLine(checkout)}\n`);
+  });
+
+  test("a scrollback holding a truncated echo of the typed command beside the complete printed frame proves the checkout", () => {
+    const typed = inCheckout(checkout, "bash /tmp/prompts/T14-a0.sh");
+    const cut = typed.indexOf(";'");
+    expect(cut).toBeGreaterThan(0);
+    const truncatedEcho = typed.slice(0, cut - 40);
+    const page = `${truncatedEcho}\n${checkoutProofLine(checkout)}\nmock-ready\n`;
+    expect(provesCheckout(page, checkout)).toBe(true);
+    // Control: the pre-fix typed form left an incomplete frame in the same echo and was refused.
+    const oldTyped = `cd '${checkout}' && printf '%s\\n' '${checkoutProofLine(checkout)}' && sh -c 'bash /tmp/prompts/T14-a0.sh'`;
+    const oldEcho = oldTyped.slice(0, oldTyped.indexOf(";'") - 40);
+    expect(provesCheckout(`${oldEcho}\n${checkoutProofLine(checkout)}\n`, checkout)).toBe(false);
+  });
 });

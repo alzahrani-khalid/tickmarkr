@@ -19,7 +19,7 @@ import { evaluateManifestedTest, isVitestTestCommand } from "./test-manifest.js"
 import type { GateResult } from "./types.js";
 import { executionSignal } from "../run/execution-budget.js";
 import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
-import { dependencyLinkRefusal, preserveWorktree, shGit, resolvedCapacity, verificationProtocol } from "../run/git.js";
+import { dependencyLinkRefusal, preserveWorktree, type PreserveProducer, producerFields, shGit, resolvedCapacity, verificationProtocol } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 import {
   computeVerificationIdentity,
@@ -191,6 +191,9 @@ export interface GateContext {
   // OBS-1033: channel keys of the seats that authored the carried commits (the task's tried list) —
   // a reviewer of that vendor is excluded for the round, never handed its own work to approve.
   carriedAuthors?: readonly string[];
+  /** The attempt whose worker last wrote the gated checkout; a dirty-tree refusal stamps it on the
+   * preserve commit and its row. Absent (standalone verify, gate-only restores) preserves as "unknown". */
+  producer?: PreserveProducer;
   reviewHistory?: string[]; // run-scoped LRU reviewer rotation; mutated synchronously when a seat is reserved
   priorReviewers?: PriorReviewer[]; // RF-1: seats THIS task's earlier review rows name, with their journaled dispatch tier — the floor a later round holds
   artifactDir?: string; // OBS-196: run dir for raw reviewer-output persistence on unparseable verdicts
@@ -334,7 +337,7 @@ async function runVitestManifestGate(
   baseline: Baseline,
   selected: readonly string[] | undefined,
   artifactDir?: string,
-  retry: RetryOptions & { evidence?: GateEvidenceOptions } = {},
+  retry: RetryOptions & { evidence?: GateEvidenceOptions; retryBaseCommand?: string } = {},
   retried = false,
 ): Promise<GateResult> {
   const entry = baseline.commands.test;
@@ -344,6 +347,7 @@ async function runVitestManifestGate(
     overallCeilingMs: effectiveCeilingMs(entry),
     artifactDir,
     evidence: retry.evidence,
+    retryBaseCommand: retry.retryBaseCommand, // OBS-1166: the un-narrowed command for a selected screen's stranded retry
   });
   const reportPath = outcome.reportPath;
   const evidence = { evidenceReceipt: outcome.evidenceReceipt, evidenceReceipts: outcome.evidenceReceipts };
@@ -610,7 +614,7 @@ export async function runGates(
     let preservedRef: string | undefined;
     let preservationError: string | undefined;
     try {
-      preservedRef = await preserveWorktree(ctx.worktree);
+      preservedRef = await preserveWorktree(ctx.worktree, ctx.producer);
     } catch (error) {
       // Never masks the refusal, but never pretends a snapshot exists either — surfaced below.
       preservationError = error instanceof Error ? error.message : String(error);
@@ -666,6 +670,7 @@ export async function runGates(
       dirtyWorktree: true,
       ref: preservedRef,
       preservedRef,
+      ...producerFields(ctx.producer),
       paths: dirtyPaths,
       files: dirtyPaths,
       path: primaryFile,
@@ -717,7 +722,7 @@ export async function runGates(
     let preservedRef: string | undefined;
     let preservationError: string | undefined;
     try {
-      preservedRef = await preserveWorktree(ctx.worktree);
+      preservedRef = await preserveWorktree(ctx.worktree, ctx.producer);
     } catch (error) {
       preservationError = error instanceof Error ? error.message : String(error);
     }
@@ -748,6 +753,7 @@ export async function runGates(
         dirtyAtRoundEnd: true,
         ref: preservedRef,
         preservedRef,
+        ...producerFields(ctx.producer),
         paths: dirtyPaths,
         files: dirtyPaths,
         path: primaryFile,
@@ -810,7 +816,7 @@ export async function runGates(
           // other scripted test command keeps today's exit-code contract byte-identically.
           const useManifest = g === "test" && commands.test !== undefined && isVitestTestCommand(commands.test, ctx.worktree);
           r = useManifest
-            ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir, { ...retryOptions(identity), evidence }))
+            ? await measure(g, () => runVitestManifestGate(ctx.worktree, commands.test!, ctx.baseline, selected, ctx.artifactDir, { ...retryOptions(identity), evidence, ...(selected ? { retryBaseCommand: ctx.commands.test } : {}) }))
             : (await measure(g, () => compareToBaseline(ctx.worktree, commands, ctx.baseline, [g], { ...retryOptions(identity), evidence, ...(g === "build" ? { onReceipt: buildReceipt, taskBuildAttribution: beginBuild } : {}), ...(g === "test" && selected ? { selected } : {}) })))[0];
         } finally { await receiptNotes; }
       }

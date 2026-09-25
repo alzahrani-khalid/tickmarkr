@@ -1,11 +1,16 @@
 import { isolatedBuild } from "../fixtures/screen-soak/isolated-build.js";
 import { readFileSync, mkdirSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { formatJournalNarration, Journal, type JournalEvent } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+
+// Hold measured host input constant when comparing the observational sinks byte for byte.
+import { resetHostLatencySampleForTests, setHostLatencySampleForTests } from "../../src/run/host-health.js";
+beforeEach(() => { setHostLatencySampleForTests(async () => 20); });
+afterEach(() => { resetHostLatencySampleForTests(); });
 
 // Narration regression: the `narrate` callback is an OBSERVATIONAL side-channel. Journal.append writes
 // to disk FIRST, then calls narrate inside a try/catch (src/run/journal.ts), so on-disk content is

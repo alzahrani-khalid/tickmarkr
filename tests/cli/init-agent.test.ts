@@ -109,7 +109,8 @@ describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
     expect(installed).toMatch(/pane run[\s\S]*read(?:ing)? the pane back/);
     expect(installed).toMatch(/Claude or Grok seat/);
     expect(installed).toMatch(/never use `agent prompt`/);
-    expect(installed).toContain("-m grok-4.6");
+    expect(installed).toContain("Build the launch command from the returned `adapter` and `model`");
+    expect(installed).toContain("herdr agent start <seat> --kind grok --pane <pane> -- -m <picked-model>");
     expect(installed).toMatch(/Codex reviewer under[\s\S]*workspace-write[\s\S]*in-worktree verdict path/);
   });
 });

@@ -9,13 +9,14 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { allAdapters, discoverChannels, rolePools } from "../../src/adapters/registry.js";
-import { type Assignment, type AuthHealth, type BillingChannel, channelKey, shq, type WorkerAdapter } from "../../src/adapters/types.js";
+import { type Assignment, type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, shq, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../src/config/config.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
-import { pickReviewer } from "../../src/gates/review.js";
+import { pickReviewer, reviewGate } from "../../src/gates/review.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { validateGraph } from "../../src/graph/schema.js";
+import { pickRole } from "../../src/route/role-pick.js";
 import { consult, type Dossier } from "../../src/run/consult.js";
 import { authedModels, makeRepo } from "../helpers/tmprepo.js";
 
@@ -214,4 +215,113 @@ describe("v1.87 T2 role-scoped channel pools", () => {
       expect(discoverChannels(cfg, adapters, h)).toEqual(rolePools(cfg, adapters, h).worker);
     }
   });
+});
+
+
+// Real discovery inputs shared by the strict picker and the production role callers.
+function preferredFleet() {
+  const cfg = consultCfg([]);
+  cfg.visibility.llm = "headless";
+  const alpha = seatAdapter("alpha", { action: "retry", notes: "alpha" });
+  const beta = seatAdapter("beta", { action: "retry", notes: "beta" });
+  const omega = seatAdapter("omega", { action: "retry", notes: "pin" });
+  const seats = [beta, alpha, omega]; // discovery order deliberately opposes prefer order
+  cfg.tiers.alpha = { vendor: "a-vendor", channel: "sub", models: { "a-1": "frontier", "a-sibling": "frontier" } };
+  cfg.tiers.beta = { vendor: "b-vendor", channel: "sub", models: { "b-1": "frontier" } };
+  cfg.tiers.omega = { vendor: "pin-vendor", channel: "sub", models: { "om-1": "frontier" } };
+  const health: Record<string, AuthHealth> = {};
+  for (const { adapter } of seats) {
+    adapter.channels = (c) => channelsFromConfig(adapter.id, c);
+    const models = Object.keys(cfg.tiers[adapter.id].models);
+    health[adapter.id] = { installed: true, authed: true, models, modelAuth: authedModels(models) };
+  }
+  return { cfg, health, adapters: seats.map((s) => s.adapter), alpha, beta, omega };
+}
+
+test("test: production consult equals the strict role picker when preferred A changes from healthy to denied/unhealthy with B eligible, so duplicated ranking or applying worker-only deny to consult fails", async () => {
+  const { cfg, health, adapters, alpha, beta, omega } = preferredFleet();
+  const run = async (expected: string) => {
+    const strict = pickRole("consult", cfg, adapters, health);
+    expect(strict.ok).toBe(true);
+    if (!strict.ok) throw new Error(strict.reason);
+    expect(channelKey(strict.channel)).toBe(expected);
+    const actual = await consult(dossier, cfg, adapters, new SubprocessDriver(), "/tmp", runDir(), {
+      channels: discoverChannels(cfg, adapters, health, "consult"),
+    });
+    expect(`${actual.adapter}:${actual.model}`).toBe(channelKey(strict.channel));
+  };
+  cfg.routing.deny = { workers: { adapters: ["alpha"] } };
+  await run("alpha:a-1");
+  cfg.consult.prefer = ["beta:b-1", "alpha:a-1"];
+  await run("beta:b-1");
+  cfg.consult.prefer.reverse();
+  cfg.routing.deny.models = ["a-1"];
+  await run("beta:b-1");
+  delete cfg.routing.deny.models;
+  health.alpha.modelAuth!["a-1"].authed = false;
+  // The sibling remains live: adapter-only liveness would incorrectly resurrect a-1.
+  expect(discoverChannels(cfg, adapters, health, "consult").some((c) => c.model === "a-sibling")).toBe(true);
+  await run("beta:b-1");
+  expect(alpha.calls).toEqual(["a-1"]);
+  expect(beta.calls).toEqual(["b-1", "b-1", "b-1"]);
+  expect(omega.calls).toEqual([]);
+});
+
+test("test: the production review gate shares the strict review picker preference order within its author-excluded floor-eligible pool, so prefer resurrecting an excluded author or vendor fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const fake = countingFake([]);
+  // Replace the script with a real, nonce-aware approving review fixture.
+  const approving = seatAdapter("fake", { approve: true, issues: [] });
+  fake.headlessCommand = approving.adapter.headlessCommand;
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.visibility.llm = "headless";
+  const pool: BillingChannel[] = [
+    ...FAKE_TWO_CHANNELS,
+    { adapter: "fake", model: "same-vendor", vendor: "fake-a", channel: "sub", tier: "frontier" },
+    { adapter: "fake", model: "too-low", vendor: "low-vendor", channel: "sub", tier: "mid" },
+    { adapter: "fake", model: "third", vendor: "third-vendor", channel: "sub", tier: "frontier" },
+  ];
+  fake.channels = () => pool;
+  const health = { fake: { installed: true, authed: true, models: pool.map((c) => c.model), modelAuth: authedModels(pool.map((c) => c.model)) } };
+  const excludeVendors = new Set(["fake-a"]);
+  const eligible = (c: BillingChannel) => c.tier === "frontier";
+  for (const order of [["fake:third", "fake:fake-2"], ["fake:fake-2", "fake:third"]]) {
+    cfg.review.prefer = ["fake:fake-1", "fake:same-vendor", "fake:too-low", ...order];
+    const strict = pickRole("review", cfg, [fake], health, { excludeVendors, eligible });
+    expect(strict.ok).toBe(true);
+    if (!strict.ok) throw new Error(strict.reason);
+    expect(channelKey(strict.channel)).toBe(order[0]);
+    const result = await reviewGate(mkTask(), repo, base, author, discoverChannels(cfg, [fake], health, "review"), [fake], cfg);
+    expect(result.pass).toBe(true);
+    expect(result.meta?.reviewer).toBe(channelKey(strict.channel));
+    expect(approving.calls.at(-1)).toBe(strict.channel.model);
+  }
+  // Rotation and task history remain review constraints above preference ranking.
+  expect(pickReviewer(author, pool, [], cfg.review.prefer, "frontier", ["fake:fake-2"])?.model).toBe("third");
+  expect(pickRole("review", cfg, [fake], health, {
+    excludeVendors: new Set(pool.map((c) => c.vendor)),
+  })).toEqual({ ok: false, reason: "no-eligible-preferred-channel" });
+});
+
+test("test: the strict role picker refuses absent role-level prefer versus production consult retaining its explicit pin fallback, so a silent strict-picker default or changed existing fallback fails", async () => {
+  const { cfg, health, adapters, alpha, beta, omega } = preferredFleet();
+  delete cfg.consult.prefer;
+  delete cfg.review.prefer;
+  for (const role of ["consult", "review", "judge", "worker"] as const) {
+    expect(pickRole(role, cfg, adapters, health)).toEqual({ ok: false, reason: "missing-prefer" });
+  }
+  // Even without a live pin in discovery, consult retains its explicit configured fallback.
+  health.omega.authed = false;
+  const invoke = () => consult(dossier, cfg, adapters, new SubprocessDriver(), "/tmp", runDir(), {
+    channels: discoverChannels(cfg, adapters, health, "consult"),
+  });
+  expect(await invoke()).toMatchObject({ adapter: "omega", model: "om-1", notes: "pin" });
+  cfg.consult.prefer = ["alpha:missing-model"];
+  expect(pickRole("consult", cfg, adapters, health)).toEqual({ ok: false, reason: "no-eligible-preferred-channel" });
+  expect(await invoke()).toMatchObject({ adapter: "omega", model: "om-1" });
+  cfg.routing.deny = { models: ["om-1"] };
+  expect(await invoke()).toMatchObject({ action: "human", notes: expect.stringContaining("routing.deny") });
+  expect(alpha.calls).toEqual([]);
+  expect(beta.calls).toEqual([]);
+  expect(omega.calls).toEqual(["om-1", "om-1"]);
 });

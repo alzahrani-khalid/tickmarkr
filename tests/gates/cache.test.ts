@@ -608,7 +608,7 @@ gates:
     expect(tipRows.map((e) => e.data.gate).sort()).toEqual(["build", "test"]);
     expect(tipRows.every((e) => e.data.details === "exit 0")).toBe(true);
 
-    // A fresh process in another checkout must read the prior completed TIP entry.
+    // A fresh process in another checkout reuses the TIP test verdict, but must build its own outputs.
     const tipResults = freshProcess(`
       import { verifyIntegrationTip } from ${JSON.stringify(new URL("../../src/run/merge.ts", import.meta.url).href)};
       import { runWithVerificationBudget } from ${JSON.stringify(new URL("../../src/run/git.ts", import.meta.url).href)};
@@ -616,16 +616,17 @@ gates:
         verifyIntegrationTip(${JSON.stringify(taskWorktree)}, ${JSON.stringify(commands)}, ${JSON.stringify(tipJournal.dir)}, ${JSON.stringify(baseline)}));
       console.log(JSON.stringify(results));
     `) as Array<{ gate: string; details: string }>;
-    expect(readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(countAfterRun + 2);
+    expect(readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(countAfterRun + 3);
     expect(tipResults.map((e) => e.gate).sort()).toEqual(["build", "test"]);
-    expect(tipResults.every((e) => e.details.includes("reused tip verdict (identity:"))).toBe(true);
+    expect(tipResults.find(e => e.gate === "test")?.details).toContain("reused tip verdict (identity:");
+    expect(tipResults.find(e => e.gate === "build")?.details).toBe("exit 0");
 
     // Even deleting the store cannot displace the daemon's completed cycle cache.
     tipStore.clear();
     // Second cycle is the daemon's cycle cache
     expect(await verifyIntegrationTipCached(integrationWorktree, commands, tipJournal, { baseline })).toBe(false);
     const countAfterTip = readFileSync(marker, "utf8").trim().split("\n").length;
-    expect(countAfterTip).toBe(countAfterRun + 2); // Still no new command ran!
+    expect(countAfterTip).toBe(countAfterRun + 3); // Still no new command ran!
     const cycleCachedRows = tipJournal.read().filter((e) => e.event === "tip-verify" && e.data.cached === true);
     expect(cycleCachedRows.map((e) => e.data.gate).sort()).toEqual(["build", "test"]);
     expect(tipJournal.read().filter((e) => e.event === "tip-verify-cached")).toHaveLength(1);
@@ -674,7 +675,7 @@ gates:
     await assertScopeRedPolicies();
   }, 60_000);
 
-  test("a daemon round whose battery returns a cached deterministic red journals that gate result naming the reuse, runs no command, and charges the round exactly the failure-policy rows a fresh red charges with no second charge and no free retry, so a reuse that skips or doubles the ladder charge fails", async () => {
+  test("a daemon retry in a recreated checkout records a fresh deterministic build red and preserves the identical-failure policy without a free retry", async () => {
     const { repo, fake } = setupRepo(
       [T("T1", { files: ["code.txt", "ok.flag", "build.sh"] })],
       {
@@ -706,24 +707,15 @@ gates:
     const gateResults = events.filter((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "build");
     expect(gateResults.length).toBeGreaterThanOrEqual(2);
 
-    // Attempt 1's gate result is journaled: its details are the fresh red's, byte for byte (the
-    // fingerprint cap compares them), and the reuse row beside it names the reuse and the identity.
     const attempt0Result = gateResults.find((e) => e.data.attempt === 0)!;
     const attempt1Result = gateResults.find((e) => e.data.attempt === 1)!;
     expect(attempt1Result.data.pass).toBe(false);
     expect(attempt1Result.data.details).toBe(attempt0Result.data.details);
-    const reuseRows = events.filter((e) => e.event === "gate-reused-verdict" && e.taskId === "T1");
-    const reusedAttempts = gateResults.filter((e) => e.data.attempt !== 0);
-    expect(reuseRows).toHaveLength(reusedAttempts.length); // every attempt after the first reused, none ran
-    expect(reuseRows[0]!.data).toMatchObject({ gate: "build", pass: false, scope: "battery" });
-    expect(String(reuseRows[0]!.data.details)).toMatch(/reused verdict \(identity: gate=build tree=/);
-    expect(events.indexOf(reuseRows[0]!)).toBeLessThan(events.indexOf(attempt1Result));
-    // the cached red is the identical failure a fresh red would be: the fingerprint cap trips on it
-    expect(events.some((e) => e.event === "gate-fingerprint-cap" && e.taskId === "T1" && e.data.gate === "build")).toBe(true);
-
-    // No command ran for attempt 1's build
-    const runs = readFileSync(join(repo, "marker.log"), "utf8").trim().split("\n").filter(Boolean);
-    expect(runs).toHaveLength(1); // Build command executed only once!
+    expect(events.filter(e => e.event === "gate-reused-verdict" && e.taskId === "T1")).toEqual([]);
+    expect(attempt1Result.data.evidenceReceipt).not.toEqual(attempt0Result.data.evidenceReceipt);
+    expect(events.filter(e => e.event === "build-receipt" && e.taskId === "T1" && e.data.outcome === "started"))
+      .toHaveLength(gateResults.length);
+    expect(events.some(e => e.event === "gate-fingerprint-cap" && e.taskId === "T1" && e.data.gate === "build")).toBe(true);
 
     // Charges the round exactly the failure-policy rows a fresh red charges:
     const escalations = events.filter((e) => e.event === "escalation" && e.taskId === "T1");
@@ -1057,12 +1049,12 @@ test("test: a reused verdict retains its original receipt bound to its origin ru
 test("test: the daemon's gate row for a task gate verdict reused from the store in a fresh process carries the original receipt invocation id and origin run root under the reused marker, so a reused row with no receipt or a newly minted one fails", async () => {
   const { repo, fake, scriptPath } = setupRepo([T("T1")], {
     tasks: { T1: [{ shell: 'echo one > t1.txt && git add t1.txt && git commit --no-gpg-sign -m one', result: { ok: true, summary: "one" } }] },
-  }, 'gates: { build: "echo original-build-output" }\n');
+  }, 'gates: { lint: "echo original-lint-output" }\n');
   const graphPath = join(repo, ".tickmarkr", "graph.json");
   const graph = readFileSync(graphPath);
   await runDaemon(repo, { adapters: [fake], runId: "run-task-receipt-source", approvalWindowMs: 0 });
   const original = Journal.open(repo, "run-task-receipt-source");
-  const fresh = original.read().find(e => e.event === "gate-result" && e.data.gate === "build")!;
+  const fresh = original.read().find(e => e.event === "gate-result" && e.data.gate === "lint")!;
   expect(fresh.data.evidenceReceipt).toBeDefined();
   const before = cacheEvidenceBytes(join(original.dir, "gate-evidence"));
   writeFileSync(graphPath, graph);
@@ -1074,9 +1066,92 @@ test("test: the daemon's gate row for a task gate verdict reused from the store 
       runId: "run-task-receipt-reused", approvalWindowMs: 0 });
   `], { encoding: "utf8", timeout: 90_000 });
   const reused = Journal.open(repo, "run-task-receipt-reused").read()
-    .find(e => e.event === "gate-result" && e.data.gate === "build")!;
+    .find(e => e.event === "gate-result" && e.data.gate === "lint")!;
   expect(reused.data).toMatchObject({ reused: true, originRunRoot: original.dir,
     evidenceReceipt: fresh.data.evidenceReceipt, evidenceReceipts: fresh.data.evidenceReceipts });
   expect(reused.data.evidenceReceipt).toEqual(fresh.data.evidenceReceipt);
   expect(cacheEvidenceBytes(join(original.dir, "gate-evidence"))).toEqual(before);
 }, 120_000);
+
+test("test: the gate battery invalidates recreated-checkout build identity while retaining unchanged-checkout reuse across process restart plus existing lint/test identity, so a process-only generation or wholesale cache disabling fails", async () => {
+  const { createWorktree } = await import("../../src/run/git.js");
+  const repo = makeRepo({ "source.txt": "base", ".gitignore": ".tickmarkr/\ndist/\n" });
+  const baseRef = await gitHead(repo);
+  writeFileSync(join(repo, "source.txt"), "task");
+  commitAll(repo, "task");
+  const head = await gitHead(repo);
+  const worktree = await createWorktree(repo, "incarnation-battery", head);
+  const task = T("T1", { gates: ["build", "test", "lint"] });
+  const ctx: GateContext = {
+    worktree, baseRef, commands: { build: "mkdir -p dist; echo built > dist/output", test: "test -f dist/output", lint: "true" },
+    baseline: { commands: {} }, author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    result: { ok: true, summary: "done", deviations: [], raw: "" }, channels: [], adapters: [], cfg: DEFAULT_CONFIG,
+    stateDir: join(repo, ".tickmarkr"),
+  };
+  const first = await runGates(task, ctx);
+  expect(first.results.every(r => r.pass)).toBe(true);
+  const restarted = freshProcess(`
+    import { runGates } from ${JSON.stringify(new URL("../../src/gates/run-gates.ts", import.meta.url).href)};
+    import { runWithVerificationBudget } from ${JSON.stringify(new URL("../../src/run/git.ts", import.meta.url).href)};
+    console.log(JSON.stringify(await runWithVerificationBudget(${JSON.stringify(resolvedCapacity())}, () => runGates(${JSON.stringify(task)}, ${JSON.stringify(ctx)}))));
+  `) as Awaited<ReturnType<typeof runGates>>;
+  for (const gate of ["build", "test", "lint"]) {
+    expect(restarted.results.find(r => r.gate === gate)).toMatchObject({ pass: true, meta: { reused: true } });
+  }
+  const keys = async () => Promise.all(["build", "test", "lint"].map(async gate => verificationIdentityKey((await computeVerificationIdentity({ worktree, gate, command: ctx.commands[gate]! }))!)));
+  const before = await keys();
+  expect(await createWorktree(repo, "incarnation-battery", head)).toBe(worktree);
+  expect(await gitHead(worktree)).toBe(head);
+  expect(existsSync(join(worktree, "dist/output"))).toBe(false);
+  const after = await keys();
+  expect(after[0]).not.toBe(before[0]);
+  expect(after.slice(1)).toEqual(before.slice(1));
+  const fresh = await runGates(task, ctx);
+  const build = fresh.results.find(r => r.gate === "build")!;
+  expect(build.pass).toBe(true);
+  expect(build.meta?.reused).not.toBe(true);
+  expect(build.evidenceReceipt?.invocationId).not.toBe(first.results.find(r => r.gate === "build")!.evidenceReceipt?.invocationId);
+  expect(existsSync(join(worktree, "dist/output"))).toBe(true);
+  for (const gate of ["test", "lint"]) expect(fresh.results.find(r => r.gate === gate)?.meta?.reused).toBe(true);
+}, 60_000);
+
+test("test: standalone verify plus the integration tip verifier retain a fresh failing build receipt after checkout recreation instead of the former green, so either entry point borrowing the dead checkout build fails", async () => {
+  const { createWorktree } = await import("../../src/run/git.js");
+  const flag = join(makeTestTempDir("incarnation-failure-"), "fail");
+  const command = `if [ -f '${flag}' ]; then echo 'source.ts(1,1): error TS9999: fresh build failed'; exit 1; fi; mkdir -p dist; echo built > dist/output`;
+  const repo = makeRepo({ "source.txt": "base", ".gitignore": ".tickmarkr/\ndist/\n" });
+  writeFileSync(join(repo, "source.txt"), "task");
+  commitAll(repo, "task");
+  // Keep main at the baseline so standalone verification has a real diff.
+  execFileSync("git", ["branch", "-f", "base", "HEAD~1"], { cwd: repo });
+  const head = await gitHead(repo);
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr/config.yaml"), `gates:\n  build: ${JSON.stringify(command)}\n`);
+  const worktree = await createWorktree(repo, "incarnation-verifiers", head);
+  const args = ["--base", "base", "--no-review", "--json"];
+  const green = JSON.parse((await verify(args, worktree)).out);
+  expect(green.green).toBe(true);
+  const commands = { build: command };
+  const journal = Journal.create(repo, "run-incarnation-tip");
+  journal.append("run-start", undefined, { commands });
+  const [tipGreen] = await verifyIntegrationTip(worktree, commands, journal.dir);
+  expect(tipGreen?.pass).toBe(true);
+  expect((await verifyIntegrationTip(worktree, commands, journal.dir))[0]?.reused).toBe(true);
+  expect(JSON.parse((await verify(args, worktree)).out).results.find((r: { gate: string }) => r.gate === "build").meta.reused).toBe(true);
+  await createWorktree(repo, "incarnation-verifiers", head);
+  expect(existsSync(join(worktree, "dist/output"))).toBe(false);
+  writeFileSync(flag, "fail");
+  const red = JSON.parse((await verify(args, worktree)).out);
+  expect(red.green).toBe(false);
+  const build = red.results.find((r: { gate: string }) => r.gate === "build");
+  expect(build.meta?.reused).not.toBe(true);
+  expect(build.evidenceReceipt.termination).toMatchObject({ kind: "exit", exitCode: 1 });
+  expect(build.evidenceReceipt.invocationId).not.toBe(green.results.find((r: { gate: string }) => r.gate === "build").evidenceReceipt.invocationId);
+  expect(build.meta?.classification).toBe("regression");
+  const [tipRed] = await verifyIntegrationTip(worktree, commands, journal.dir);
+  expect(tipRed).toMatchObject({ pass: false, exitCode: 1 });
+  expect(tipRed?.reused).not.toBe(true);
+  expect(tipRed?.cause).toBe("regression");
+  expect(tipRed?.evidenceReceipt?.termination).toMatchObject({ kind: "exit", exitCode: 1 });
+  expect(tipRed?.evidenceReceipt?.invocationId).not.toBe(tipGreen?.evidenceReceipt?.invocationId);
+}, 60_000);

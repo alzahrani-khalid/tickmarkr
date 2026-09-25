@@ -1,5 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { graphDefinitionHash } from "../../src/graph/graph.js";
+import { boardFrame } from "../../src/tui/cockpit/board.js";
+import { evidenceLookup, runGateCells } from "../../src/tui/cockpit/run-view.js";
 import { readOperatorState } from "../../src/run/operator-state.js";
 import { graph, partial, approved, resumed, complete, ev } from "../fixtures/operator-state/fixture.js";
 
@@ -67,4 +69,32 @@ describe("current attempt gate evidence", () => {
     expect(s.gatesRan).toEqual({ passed: 0, total: 0 });
     expect(readOperatorState({ events: [...events, ev("task-dispatch", { attempt: 4 }, "T1")], graph }).tasks[0]!.gates.review).toEqual({ state: "not-run" });
   });
+});
+
+
+test("gate waits retain their own attribution and host context without borrowing old failures", () => {
+  const events = [partial[0]!, ev("gate-result", { gate: "test", pass: false }, "T1"), ev("task-approved", { release: "recheck" }, "T1")];
+  for (const event of ["suite-wait", "host-degraded"]) {
+    const snapshot = readOperatorState({ events: [...events, ev(event, { count: 2 }, "T1")], graph });
+    const task = snapshot.tasks[0]!;
+    expect(task.gateActivity).toMatchObject({ state: "queued", reason: event, count: 2 });
+    expect(task.gateActivity?.gate).toBeUndefined();
+    const board = boardFrame({ runId: "run-test", snapshot, graph, now: 0, colour: false }, 180);
+    expect(board.rows[0]!.note).toContain(`queued · gate unknown · ${event} (2 suites)`);
+    expect(Object.values(task.gates).every(cell => cell.state === "not-run" && cell.evidence === undefined)).toBe(true);
+    const attributed = readOperatorState({ events: [...events, ev(event, { count: 2, gate: "test" }, "T1")], graph }).tasks[0]!;
+    expect(attributed.gates.test?.state).toBe("queued");
+    const rows = [...events, ev(event, { count: 2, gate: "test" }, "T1")].map((event, i) => ({ event, line: i + 1 }));
+    const cell = runGateCells(attributed, evidenceLookup(rows)).find(c => c.gate === "test")!;
+    expect(cell.labels).toEqual([`queued — ${event} (2 suites)`]);
+    expect(cell.verdict).toEqual([]);
+  }
+  const parallel = readOperatorState({ events: [...events,
+    ev("phase-start", { phase: "judge", gate: "acceptance", parallel: true }, "T1"),
+    ev("phase-start", { phase: "review", gate: "review", parallel: true }, "T1"),
+    ev("suite-wait", { count: 1 }, "T1"),
+  ], graph }).tasks[0]!;
+  expect(parallel.gates.acceptance?.state).toBe("running");
+  expect(parallel.gates.review?.state).toBe("running");
+  expect(parallel.gateActivity?.gate).toBeUndefined();
 });

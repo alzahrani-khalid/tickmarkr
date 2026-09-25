@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readFileSync, readSync, statSync, type BigIntStats } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } from "node:fs";
 import { join } from "node:path";
 import { graphPath, stateDirName } from "../../graph/graph.js";
 import { validateGraph, type RunGraph } from "../../graph/schema.js";
@@ -8,7 +8,8 @@ import { readTierLiveness, SUPERVISION_TIERS } from "../../run/supervision.js";
 import { OperatorStateFold, type OperatorRecord } from "../../run/operator-state.js";
 
 export const OBSERVATION_INTERVAL_MS = 1_000;
-export const STORE_LIMITS = { history: 256, historyBytes: 2 * 1024 * 1024, recordBytes: 1024 * 1024, readBytes: 1024 * 1024, subscribers: 64, metrics: 12, errors: 32 } as const;
+// Graph declarations have a separate 16 MiB bound; journal retention remains unchanged.
+export const STORE_LIMITS = { graphBytes: 16 * 1024 * 1024, history: 256, historyBytes: 2 * 1024 * 1024, recordBytes: 1024 * 1024, readBytes: 1024 * 1024, subscribers: 64, metrics: 12, errors: 32 } as const;
 export interface SourceError { source: string; error: string; line?: number; id?: string }
 export interface JournalLine extends Omit<OperatorRecord, "event"> { event?: JournalEvent; raw: string; error?: string; offset: number; endOffset: number }
 export interface TailSnapshot {
@@ -147,14 +148,28 @@ export class JournalTail {
 export interface CachedSource<T = unknown> { source: string; identity?: string; value?: T; status: "readable" | "absent" | "unreadable"; error?: string; observedAt: number }
 class JsonSource<T> {
   private cached?: CachedSource<T>;
-  constructor(private path: string, private parse: (raw: string) => T) {}
+  constructor(private path: string, private parse: (raw: string) => T, private maxBytes: number = STORE_LIMITS.recordBytes) {}
   read(now: number): CachedSource<T> {
     try {
       const st = statSync(this.path, { bigint: true });
       const id = stamp(st);
       if (this.cached?.identity === id && this.cached.status === "readable") return this.cached = { ...this.cached, observedAt: now };
-      if (!st.isFile() || st.size > BigInt(STORE_LIMITS.recordBytes)) throw new Error("source is not a bounded regular file");
-      const value = this.parse(readFileSync(this.path, "utf8"));
+      if (!st.isFile()) throw new Error("source is not a regular file");
+      if (st.size > BigInt(this.maxBytes)) throw new Error(`source exceeds ${this.maxBytes} byte cap`);
+      // Bound the read itself too: a writer can grow the file after stat.
+      const fd = openSync(this.path, "r");
+      let value: T;
+      try {
+        const bytes = Buffer.alloc(Number(st.size) + 1);
+        let length = 0;
+        while (length < bytes.length) {
+          const n = readSync(fd, bytes, length, bytes.length - length, length);
+          if (!n) break;
+          length += n;
+        }
+        if (length !== Number(st.size) || stamp(fstatSync(fd, { bigint: true })) !== id) throw new Error("source changed during read; retry observation");
+        value = this.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length)));
+      } finally { closeSync(fd); }
       return this.cached = { source: this.path, identity: id, value, status: "readable", observedAt: now };
     } catch (e) {
       const absent = (e as NodeJS.ErrnoException).code === "ENOENT";
@@ -175,7 +190,7 @@ export function createLiveStore(options: LiveStoreOptions) {
   const tail = new JournalTail(join(state, "runs", parseRunId(options.runId), "journal.jsonl"), {
     reset: () => { fold = new OperatorStateFold(); }, record: record => fold.apply(record),
   });
-  const graph = new JsonSource<RunGraph>(graphPath(options.cwd), raw => validateGraph(JSON.parse(raw)));
+  const graph = new JsonSource<RunGraph>(graphPath(options.cwd), raw => validateGraph(JSON.parse(raw)), STORE_LIMITS.graphBytes);
   const config = new JsonSource(options.configPath ?? join(state, "config.yaml"), raw => raw);
   const cache = new JsonSource(options.cachePath ?? join(state, "doctor.json"), JSON.parse);
   const lock = new JsonSource<{ pid: number; runId: string; startedAt: number }>(join(state, "graph.lock"), raw => {
@@ -207,7 +222,7 @@ export function createLiveStore(options: LiveStoreOptions) {
     const readable = journal.status === "readable" && journal.backlogBytes === 0;
     return {
       sequence: ++sequence, observedAt, delayed, freshness: errors.length ? "failed" : delayed ? "delayed" : "fresh",
-      operator: fold.snapshot({ graph: graphReading.status === "readable" ? graphReading.value : undefined, sequence, observedAt, readable }),
+      operator: fold.snapshot({ graph: graphReading.status === "readable" ? graphReading.value : undefined, sequence, observedAt, readable, graphAvailability: { status: graphReading.status, error: graphReading.error } }),
       journal, graph: graphReading, config: configReading, cache: cacheReading,
       lock: { ...owner, state: lockState, alive, expired: owner.identity ? observedAt - Number(owner.identity.split(":")[3]) / 1e6 > STALE_MS : undefined },
       supervision, errors, actionsEnabled: readable && !errors.length && !delayed,

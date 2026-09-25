@@ -1,3 +1,4 @@
+import { VITEST_CACHE_ENV, worktreeVitestCache } from "./src/gates/test-manifest.js";
 import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/config";
 import { DEFAULT_FORK_CAP } from "./src/run/git.js";
 
@@ -75,7 +76,15 @@ export const resolveForkCap = (value: string | undefined): number => {
 // never carries their sync work; locally they simply serialize in one fork.
 export const SYNC_HEAVY_TESTS = ["tests/cockpit/sweep.test.ts", "tests/docs-truth-testing.test.ts"];
 
+// OBS-1141: the executed ledger has a size-derived leaf budget and real mutation children.
+// Keep it separate from sync-heavy's no-inline-timeout law; projects schedule whole files.
+export const KEYS_LEDGER_TESTS = [
+  "tests/cockpit/keys.test.ts",
+  "tests/e2e/forced-stall.e2e.test.ts",
+];
+
 export const createVitestConfig = (forkCapValue: string | undefined) => defineConfig({
+  cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
     testTimeout: 20000,
@@ -86,20 +95,24 @@ export const createVitestConfig = (forkCapValue: string | undefined) => defineCo
     // local runs keep full reporters. Env-only delta: run commands and the ci-platform pin
     // stay byte-stable.
     ...(process.env.TICKMARKR_CI_LEAN_REPORTERS === "1" ? { reporters: ["dot" as const] } : {}),
+    // Each project owns a Vite server; set its cacheDir explicitly as well as the root.
+    // Leave test.cache untouched so --no-cache keeps disabling result persistence.
     projects: [
       {
         extends: true,
+        cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
         test: {
           name: "suite",
           include: ["tests/**/*.test.ts"],
-          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS, ...SYNC_HEAVY_TESTS],
-          // the only PARALLEL project — the other three already pin singleFork, so this is the one
+          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS, ...SYNC_HEAVY_TESTS, ...KEYS_LEDGER_TESTS],
+          // the only PARALLEL project — the other projects already pin singleFork, so this is the one
           // that was running at ~cores-1 while the daemon believed it had said 6.
           poolOptions: { forks: { maxForks: resolveForkCap(forkCapValue) } },
         },
       },
       {
         extends: true,
+        cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
         test: {
           name: "sync-heavy",
           include: SYNC_HEAVY_TESTS,
@@ -110,6 +123,17 @@ export const createVitestConfig = (forkCapValue: string | undefined) => defineCo
       },
       {
         extends: true,
+        cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
+        test: {
+          name: "keys-ledger",
+          include: KEYS_LEDGER_TESTS,
+          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS],
+          poolOptions: { forks: { singleFork: true } },
+        },
+      },
+      {
+        extends: true,
+        cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
         test: {
           name: "built-cli",
           include: DIST_COUPLED_TESTS,
@@ -118,6 +142,7 @@ export const createVitestConfig = (forkCapValue: string | undefined) => defineCo
       },
       {
         extends: true,
+        cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
         test: {
           name: "signal-reaper",
           include: SIGNAL_REAPER_TESTS,

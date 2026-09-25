@@ -356,7 +356,7 @@ t6AcceptanceTest(
 
     const listed = listRepositoryAllProjects();
     expect(new Set(listed.map((entry) => entry.projectName)))
-      .toEqual(new Set(["suite", "built-cli", "signal-reaper", "sync-heavy"]));
+      .toEqual(new Set(["suite", "built-cli", "signal-reaper", "sync-heavy", "keys-ledger"]));
     const outsideTest = listed.find((entry) => entry.projectName !== "suite")!;
     const outsideCriterion = runnerVisibleName(outsideTest.name);
     // A suite-project control drawn from the listing itself, so suite-project matching is proven

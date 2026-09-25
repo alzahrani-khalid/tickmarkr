@@ -2,7 +2,7 @@ import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
-import type { WorkerResult } from "./types.js";
+import { CAPACITY_RE, type WorkerResult } from "./types.js";
 
 // v1.87 T5: the scope rule states only what the runtime enforces, and no more. What it enforces:
 // `scope.allowDeviations` comes from the operator's config, is snapshotted and frozen when a gate
@@ -149,6 +149,15 @@ const AUTH_RE = /not logged in|please (?:log ?in|sign in)|please run [^\n]{0,30}
 const SETUP_RE = /command not found|not recognized as an internal or external command|spawn \S+ ENOENT|missing required config|workspace trust (?:required|not granted)/i;
 const OUTAGE_RE = /unable to reach the model provider|cannot reach the model provider|model provider.{0,40}(?:unavailable|unreachable)|service (?:is )?temporarily unavailable|upstream connect error|overloaded_error/i;
 const TIMEOUT_RE = /\bETIMEDOUT\b|request timed out|connection timed out|deadline exceeded|timed out waiting for/i;
+
+// OBS-1161: transient capacity is the fourth classification beside quota and the typed dead-channel
+// reasons, and it obeys the same boundary rule: a parsed trailer — ok:true OR ok:false — is the worker
+// speaking, so a verdict that QUOTES the capacity phrase stays ordinary work evidence. The caller
+// hands in the chrome-filtered banner rows as `raw`, exactly as it does for classifyDeadChannel.
+export function classifyTransientCapacity(result: WorkerResult): RegExpExecArray | null {
+  if (result.ok || (result.summary !== NO_TRAILER_SUMMARY && result.summary !== UNPARSEABLE_TRAILER_SUMMARY)) return null;
+  return CAPACITY_RE.exec(result.raw);
+}
 
 export function classifyDeadChannel(result: WorkerResult): DeadChannelReason | undefined {
   // A parsed trailer — ok:true OR ok:false — is the worker speaking: genuine work outcomes walk

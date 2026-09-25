@@ -2,7 +2,7 @@ import type { CommandReceiptAttribution, ShellReceipt } from "./protocol.js";
 import { executionSignal } from "./execution-budget.js";
 import { commandLeaseEnvironment, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { availableParallelism, homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -19,6 +19,47 @@ export { ROUTING_ENV_SEAMS };
 // as argv (OBS-55) so child test oracles stay intact. The operator's own export wins.
 export const FORK_CAP_ENV = "VITEST_MAX_FORKS";
 export const SUITE_PARENT_ENV = "TICKMARKR_SUITE_PARENT";
+
+/** A pid is an address, not an identity. Keep this evidence out of ShellReceipt. */
+const linuxIdentity = (pid: number): string | undefined => {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const start = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[19];
+    return start && /^\d+$/.test(start) ? `${pid}:${start}` : undefined;
+  } catch { return undefined; }
+};
+/** OBS-1173 add.2: only ps's clean "no such process" (exit 1, nothing printed) means gone (""). A
+ *  timeout, a signal, a spawn error or any other exit is a FAILED probe (null) that says nothing. */
+export function classifyIdentityProbe(error: { code?: number | string | null; killed?: boolean; signal?: string | null } | null, stdout: string): string | null {
+  const start = stdout.trim().replace(/\s+/g, " ");
+  if (!error) return start || null;
+  return !error.killed && !error.signal && error.code === 1 && !start ? "" : null;
+}
+/** `undefined` = the pid is gone; `null` = the probe failed and proves nothing (never gone, never a match). */
+export async function processIdentity(pid: number): Promise<string | null | undefined> {
+  if (process.platform === "linux") return linuxIdentity(pid);
+  // Async and bounded like every other ps probe: a loaded host is slow, not unreadable.
+  const start = await new Promise<string | null>((done) => execFile("ps", ["-p", String(pid), "-o", "lstart="], {
+    encoding: "utf8", timeout: 15_000, maxBuffer: 4096,
+  }, (error, stdout) => done(classifyIdentityProbe(error, stdout))));
+  if (start === null) return null;
+  return start ? `${pid}:${start}` : undefined;
+}
+
+// Started receipts own these live pids; terminal receipts retire exactly that invocation. The
+// shell hot path never probes: Linux reads /proc in place, other hosts resolve on demand below.
+const activeShells = new Map<number, { identity?: string | null; startedMs: number; invocation: symbol }>();
+export const activeShellIdentities = (): ReadonlyMap<number, string | undefined> =>
+  new Map([...activeShells].map(([pid, live]) => [pid, live.identity ?? undefined]));
+/** A process that started after its receipt is a pid reuse, never that receipt's child. */
+export async function resolveActiveShellIdentities(): Promise<void> {
+  await Promise.all([...activeShells].filter(([, live]) => live.identity === undefined).map(async ([pid, live]) => {
+    const identity = await processIdentity(pid);
+    if (identity === null) return; // a failed probe resolves nothing; the next resolve retries
+    const started = identity ? Date.parse(identity.slice(identity.indexOf(":") + 1)) : NaN;
+    if (live.identity === undefined) live.identity = identity && started <= live.startedMs + 1_000 ? identity : null;
+  }));
+}
 export const DEFAULT_FORK_CAP = "6";
 
 /** Worker concurrency is resolved once per run and isolated from other async runs. */
@@ -297,6 +338,8 @@ export function shell(cmd: string, cwd: string, timeoutMs: number, login = false
   let attribution: CommandReceiptAttribution | undefined;
   let confirmedStart = false;
   let terminal = false;
+  let activePid: number | undefined;
+  let activeInvocation: symbol | undefined;
   const begin = (invocation: number) => {
     attribution = options.receiptAttribution?.(invocation);
     confirmedStart = false;
@@ -304,8 +347,19 @@ export function shell(cmd: string, cwd: string, timeoutMs: number, login = false
   };
   const emit = (receipt: Omit<ShellReceipt, "attribution" | "confirmedStart">) => {
     if (terminal) return;
-    if (receipt.outcome === "started") confirmedStart = true;
-    else terminal = true;
+    if (receipt.outcome === "started") {
+      confirmedStart = true;
+      activePid = receipt.pid;
+      if (activePid !== undefined) {
+        activeInvocation = Symbol("shell invocation");
+        activeShells.set(activePid, { startedMs: Date.now(), invocation: activeInvocation,
+          ...(process.platform === "linux" ? { identity: linuxIdentity(activePid) ?? null } : {}) });
+      }
+    } else {
+      terminal = true;
+      if (activePid !== undefined && activeShells.get(activePid)?.invocation === activeInvocation) activeShells.delete(activePid);
+      activePid = undefined;
+    }
     // Observational callbacks must not change process cleanup, retries or cancellation.
     try { options.onReceipt?.({ ...receipt, confirmedStart, ...(attribution ? { attribution: { ...attribution } } : {}) }); }
     catch { /* receipt sinks are observational */ }
@@ -613,6 +667,24 @@ const resolveTaskBranch = async (repo: string, branch: string): Promise<string> 
 };
 
 /**
+ * The attempt whose worker last wrote in a checkout, or explicit "unknown" when no worker launch is
+ * on record for the current tree (gate-only recreations, standalone verify, legacy callers). The
+ * label is what the preserve commit trailer and every `worktree-preserved`/refusal row carry, so a
+ * preserved engine commit is never credited to whichever seat is dispatched next.
+ */
+export type PreserveProducer = { channel: string; attempt: number } | "unknown";
+export const PRESERVE_PRODUCER_TRAILER = "Tickmarkr-Producer";
+/** Subject of every engine preserve commit; only such commits are owned by their preserve row. */
+export const PRESERVE_COMMIT_SUBJECT = "tickmarkr: preserve uncommitted worktree";
+export const producerFields = (producer: PreserveProducer | undefined): { producer: string; producerAttempt?: number } =>
+  producer && producer !== "unknown" ? { producer: producer.channel, producerAttempt: producer.attempt } : { producer: "unknown" };
+
+const producerLabel = (producer: PreserveProducer): string => {
+  const f = producerFields(producer);
+  return f.producerAttempt === undefined ? f.producer : `${f.producer} attempt ${f.producerAttempt}`;
+};
+
+/**
  * Preserve the bytes an existing checkout holds before recreation removes it.
  *
  * `git stash create` cannot do this job: its apparent `-u` argument is accepted as a message and
@@ -626,7 +698,7 @@ const resolveTaskBranch = async (repo: string, branch: string): Promise<string> 
  * neither a commit nor a ref, keeping meaningful deaths visible rather than minting one ref per
  * ordinary dispatch.
  */
-export async function preserveWorktree(cwd: string): Promise<string | undefined> {
+export async function preserveWorktree(cwd: string, producer: PreserveProducer = "unknown"): Promise<string | undefined> {
   if (!existsSync(cwd)) return undefined;
   const scratch = mkdtempSync(join(tmpdir(), "tickmarkr-preserve-index-"));
   const index = join(scratch, "index");
@@ -643,7 +715,7 @@ export async function preserveWorktree(cwd: string): Promise<string | undefined>
     const identity = "GIT_AUTHOR_NAME=tickmarkr GIT_AUTHOR_EMAIL=tickmarkr@localhost "
       + "GIT_COMMITTER_NAME=tickmarkr GIT_COMMITTER_EMAIL=tickmarkr@localhost";
     const commit = (await shGitOk(
-      `${identity} git commit-tree ${shq(tree)} -p HEAD -m ${shq("tickmarkr: preserve uncommitted worktree")}`,
+      `${identity} git commit-tree ${shq(tree)} -p HEAD -m ${shq(PRESERVE_COMMIT_SUBJECT)} -m ${shq(`${PRESERVE_PRODUCER_TRAILER}: ${producerLabel(producer)}`)}`,
       cwd,
     )).trim();
     const ref = `refs/tickmarkr/preserved/${commit}`;
@@ -652,6 +724,20 @@ export async function preserveWorktree(cwd: string): Promise<string | undefined>
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+/**
+ * Identity of the physical checkout, including recreation at the same path. Unlike mtime/ctime,
+ * birthtime does not change when builds add outputs. Read from disk on every call so process
+ * restarts preserve reuse. Filesystems without birthtime cannot prove build-output continuity.
+ */
+export function checkoutIncarnation(worktree: string): string | undefined {
+  try {
+    const root = realpathSync(worktree);
+    const stat = statSync(root, { bigint: true });
+    if (!stat.isDirectory() || stat.birthtimeNs <= 0n) return undefined;
+    return `${root}:${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+  } catch { return undefined; }
 }
 
 export async function createWorktree(repo: string, branch: string, baseRef: string): Promise<string> {

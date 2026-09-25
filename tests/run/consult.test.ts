@@ -441,19 +441,19 @@ describe("consult.prefer seat failover", () => {
     const { cfg, fake, runDir } = setup({ action: "retry", notes: "pinned seat" });
     const alpha = seatAdapter("alpha", { action: "reroute", notes: "wrong seat" });
     const v = await consult(dossier, cfg, [alpha.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
-      channels: [{ adapter: "alpha" }, { adapter: "fake" }],
+      channels: [{ adapter: "alpha", model: "a-1" }, { adapter: "fake" }],
     });
     expect(v).toMatchObject({ action: "retry", notes: "pinned seat" });
     expect(alpha.calls.count).toBe(0);
   });
 
-  test("the consult seat uses the first prefer entry whose adapter is live", async () => {
+  test("the consult seat uses the first prefer entry whose model is live", async () => {
     const { cfg, fake, runDir } = setup({ action: "human", notes: "pin must not answer" });
     cfg.consult.prefer = ["alpha:a-1", "beta:b-1"];
     const alpha = seatAdapter("alpha", { action: "retry", notes: "seat alpha" });
     const beta = seatAdapter("beta", { action: "reroute", notes: "seat beta" });
     const v = await consult(dossier, cfg, [alpha.adapter, beta.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
-      channels: [{ adapter: "alpha" }, { adapter: "beta" }],
+      channels: [{ adapter: "alpha", model: "a-1" }, { adapter: "beta", model: "b-1" }],
     });
     expect(v).toMatchObject({ action: "retry", notes: "seat alpha" });
     expect(alpha.calls).toEqual({ count: 1, models: ["a-1"] });
@@ -466,7 +466,7 @@ describe("consult.prefer seat failover", () => {
     const ghost = seatAdapter("ghost", { action: "reroute", notes: "dead seat" });
     const alpha = seatAdapter("alpha", { action: "retry", notes: "live seat" });
     const v = await consult(dossier, cfg, [ghost.adapter, alpha.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
-      channels: [{ adapter: "alpha" }],
+      channels: [{ adapter: "alpha", model: "a-1" }],
     });
     expect(v).toMatchObject({ action: "retry", notes: "live seat" });
     expect(ghost.calls.count).toBe(0);
@@ -479,7 +479,7 @@ describe("consult.prefer seat failover", () => {
     const alpha = seatAdapter("alpha", "gibberish, not a verdict");
     const beta = seatAdapter("beta", { action: "retry", notes: "seat beta answered" });
     const v = await consult(dossier, cfg, [alpha.adapter, beta.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
-      channels: [{ adapter: "alpha" }, { adapter: "beta" }],
+      channels: [{ adapter: "alpha", model: "a-1" }, { adapter: "beta", model: "b-1" }],
     });
     expect(v).toMatchObject({ action: "retry", notes: "seat beta answered" });
     expect(alpha.calls.count).toBe(1);
@@ -516,7 +516,7 @@ describe("consult.prefer seat failover", () => {
       worktree: async () => "/tmp/wt",
     };
     const v = await consult(dossier, cfg, [alpha.adapter, beta.adapter, fake], stub, "/tmp", runDir, {
-      channels: [{ adapter: "alpha" }, { adapter: "beta" }],
+      channels: [{ adapter: "alpha", model: "a-1" }, { adapter: "beta", model: "b-1" }],
     });
     expect(v).toMatchObject({ action: "retry", notes: "seat two pane" });
     expect(runs).toBe(2); // seat one dispatched and died; seat two dispatched and answered
@@ -532,7 +532,7 @@ describe("consult.prefer seat failover", () => {
     const omega = seatAdapter("omega", { action: "decompose", notes: "pin seat answered" });
     // omega is NOT in the live channels — the pinned final seat needs no liveness entry
     const v = await consult(dossier, cfg, [alpha.adapter, omega.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
-      channels: [{ adapter: "alpha" }],
+      channels: [{ adapter: "alpha", model: "a-1" }],
     });
     expect(v).toMatchObject({ action: "decompose", notes: "pin seat answered" });
     expect(alpha.calls.count).toBe(1);
@@ -544,7 +544,7 @@ describe("consult.prefer seat failover", () => {
     cfg.consult.prefer = ["alpha:a-1"];
     const alpha = seatAdapter("alpha", "seat gibberish, not a verdict");
     const v = await consult(dossier, cfg, [alpha.adapter, fake], new SubprocessDriver(), "/tmp", runDir, {
-      channels: [{ adapter: "alpha" }],
+      channels: [{ adapter: "alpha", model: "a-1" }],
     });
     expect(v).toMatchObject({ action: "human", notes: "consult verdict unparseable — failing safe to human" });
     expect(alpha.calls.count).toBe(1);

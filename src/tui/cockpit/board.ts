@@ -1,5 +1,5 @@
 import { GATE_NAMES, type RunGraph } from "../../graph/schema.js";
-import type { OperatorSnapshot, OperatorTask } from "../../run/operator-state.js";
+import { authorsNote, type OperatorSnapshot, type OperatorTask } from "../../run/operator-state.js";
 import type { AttemptHarvest, TaskRow } from "./derive.js";
 import { cellWidth, sliceCells } from "./width.js";
 
@@ -170,7 +170,8 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
   // recompile) lends nothing — no titles, deps, declarations or denominator — so the rows are the
   // journal's tasks alone and every gate reads as declared.
   const graphTasks = input.graph?.tasks && s.comparable ? input.graph.tasks : s.tasks.map((t) => ({ id: t.id, title: t.title ?? "", deps: [] as string[], files: [] as string[], gates: undefined as readonly string[] | undefined }));
-  const uncomparable = input.graph !== undefined && !s.comparable;
+  const uncomparable = !s.comparable;
+  const graphStatus = s.graphAvailability?.status ?? (input.graph ? "readable" : "absent");
   const doneIds = new Set(s.tasks.filter(isDone).map((t) => t.id));
   const t0 = s.firstEventAt ? Date.parse(s.firstEventAt) : input.now;
   const t1 = s.lastEventAt ? Date.parse(s.lastEventAt) : input.now;
@@ -178,7 +179,7 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
 
   const top: string[] = [];
   top.push(`${bg(16, 2)(" tickmarkr ")} ${bold(input.runId)}  ${chrome("│")}  ` +
-    `${pass(`${doneIds.size}/${graphTasks.length} done`)}  ` +
+    `${pass(`${doneIds.size}/${s.comparable ? graphTasks.length : "?"} done`)}  ` +
     (wide
       ? `${chrome("│")}  ${warn(`${s.resumes} restarts`)}  ${chrome("│")}  ${fail(`${s.escalations} escalations`)}  `
       : `${chrome("│")}  ${fail(`${s.escalations} esc`)}  `) +
@@ -203,7 +204,7 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
     top.push(`  ${accent("▌")} ${bold("NOW")}        ${now}`);
     top.push("");
   }
-  top.push(`  ${accent("▌")} ${bold("TASKS")}   ${mute(uncomparable ? `${doneIds.size} of ${graphTasks.length} journal tasks merged · graph not comparable` : `${doneIds.size} of ${graphTasks.length} merged in this graph`)}` +
+  top.push(`  ${accent("▌")} ${bold("TASKS")}   ${mute(uncomparable ? `${doneIds.size} journal tasks merged · ${graphStatus === "readable" ? "graph not comparable" : `graph ${graphStatus}${s.graphAvailability?.error ? `: ${s.graphAvailability.error}` : ""}`}` : `${doneIds.size} of ${graphTasks.length} merged in this graph`)}` +
     (wide ? mute(" · rows in dispatch order · gates left→right in declaration order") : ""));
   top.push("");
 
@@ -230,7 +231,7 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
     };
     const strip = BOARD_GATES.map((k) => {
       const v = cell(k);
-      return pad(v === true ? pass("✔") : v === false ? fail("✖") : !declared.has(k) ? faint("─") : faint("·"), BOARD_CELL);
+      return pad(v === true ? pass("✔") : v === false ? fail("✖") : t?.gates[k]?.state === "queued" ? warn("Q") : t?.gates[k]?.state === "running" ? accent("R") : t?.gates[k]?.state === "unknown" ? warn("?") : t?.gates[k]?.state === "disabled" ? faint("D") : !declared.has(k) ? faint("─") : faint("·"), BOARD_CELL);
     }).join("");
     const unrun = BOARD_GATES.filter((k) => declared.has(k) && cell(k) === undefined).length;
     const failedGates = BOARD_GATES.filter((k) => cell(k) === false);
@@ -260,7 +261,11 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
       parks >= 3 ? park(`◍ parked ×${parks}`) : "",
       reviews > 2 ? warn(`↻ ${reviews} review rounds`) : "",
       failedGates.length ? fail(`✖ ${failedGates.join(",")}`) : "",
-      !attempts
+      // Merged authors beside the last-dispatched channel; equal-to-channel says nothing new.
+      authorsNote(t?.authors, t?.channel) ? faint(authorsNote(t?.authors, t?.channel)!) : "",
+      t?.gateActivity
+        ? `${t.gateActivity.state} · ${t.gateActivity.gate ?? "gate unknown"}${t.gateActivity.reason ? ` · ${t.gateActivity.reason}` : ""}${t.gateActivity.count === undefined ? "" : ` (${t.gateActivity.count} suites)`}`
+        : !attempts
         ? (() => {
           const blockers = depIds.filter((d) => !doneIds.has(d));
           if (!blockers.length) return faint("queued");
@@ -291,6 +296,7 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
   if (unmappedPaths.size) bottom.push(`    ${pad("", 8)}${fail("UNMAPPED")} ${mute([...unmappedPaths].slice(0, 3).join("  "))}${unmappedPaths.size > 3 ? mute(`  +${unmappedPaths.size - 3}`) : ""}`);
   bottom.push(`    ${faint("gates")}   ${BOARD_GATES.map((k) => `${body(k.slice(0, BOARD_CELL - 1))} ${mute(k)}`).join("  ")}`);
   bottom.push(`    ${faint("     ")}   ${pass("✔")} ${mute("passed")}   ${fail("✖")} ${mute("failed")}   ${faint("·")} ${mute("pending")}   ${faint("─")} ${mute("not declared (acceptance and review are the optional two)")}`);
+  if (s.tasks.some(t => Object.values(t.gates).some(cell => ["queued", "running", "unknown", "disabled"].includes(cell.state)))) bottom.push(`    ${accent("R")} running   ${warn("Q")} queued   ${warn("?")} unknown   ${faint("D")} disabled`);
   bottom.push("");
   // the gap is stated, never silently skipped — derived, so it cannot go stale
   const retired = s.tasks.map((t) => t.id).filter((id) => !graphTasks.some((g) => g.id === id)).sort();
